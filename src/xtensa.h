@@ -218,6 +218,12 @@ static inline int32_t sign_extend(uint32_t val, int bits) {
 int xtensa_fetch(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out);
 
 /*
+ * Special register access helpers for RSR/WSR/XSR
+ */
+uint32_t sr_read(const xtensa_cpu_t *cpu, int sr);
+void     sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val);
+
+/*
  * Public API
  */
 void xtensa_cpu_init(xtensa_cpu_t *cpu);
