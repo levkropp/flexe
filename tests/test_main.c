@@ -6,6 +6,9 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_alu.c"
 #include "test_shift.c"
 #include "test_move.c"
+#include "test_loadstore.c"
+#include "test_memory.c"
+#include "test_loader.c"
 
 int main(void) {
     printf("Running xtensa-emulator tests...\n\n");
@@ -14,6 +17,9 @@ int main(void) {
     run_alu_tests();
     run_shift_tests();
     run_move_tests();
+    run_loadstore_tests();
+    run_memory_tests();
+    run_loader_tests();
 
     printf("\n%d tests, %d passed, %d failed\n",
            test_count, test_passes, test_failures);
