@@ -8,6 +8,7 @@ add_library(xtensa-emu-lib STATIC
     src/xtensa_disasm.c
     src/memory.c
     src/loader.c
+    src/peripherals.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 target_link_libraries(xtensa-emu-lib PUBLIC m)
