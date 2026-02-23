@@ -12,6 +12,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_branch.c"
 #include "test_loop.c"
 #include "test_integration.c"
+#include "test_window.c"
 
 int main(void) {
     printf("Running xtensa-emulator tests...\n\n");
@@ -26,6 +27,7 @@ int main(void) {
     run_branch_tests();
     run_loop_tests();
     run_integration_tests();
+    run_window_tests();
 
     printf("\n%d tests, %d passed, %d failed\n",
            test_count, test_passes, test_failures);

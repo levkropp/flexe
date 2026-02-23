@@ -122,6 +122,10 @@ typedef struct xtensa_mem xtensa_mem_t;
 #define XT_PS_CALLINC(ps)   (((ps) >> 16) & 3)
 #define XT_PS_WOE(ps)       (((ps) >> 18) & 1)
 
+#define XT_PS_SET_CALLINC(ps, v) ((ps) = ((ps) & ~(3u << 16)) | (((v) & 3u) << 16))
+#define XT_PS_SET_OWB(ps, v)     ((ps) = ((ps) & ~(0xFu << 8)) | (((v) & 0xFu) << 8))
+#define XT_PS_SET_EXCM(ps, v)    ((ps) = ((ps) & ~(1u << 4)) | (((v) & 1u) << 4))
+
 /*
  * CPU State
  */
