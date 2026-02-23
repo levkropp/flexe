@@ -89,6 +89,19 @@ typedef int (*xtensa_pc_hook_fn)(xtensa_cpu_t *cpu, uint32_t pc, void *ctx);
 #define XT_SR_MISC3         247
 
 /*
+ * Stop reason — why did execution end?
+ */
+typedef enum {
+    STOP_RUNNING,           /* Still running (not stopped) */
+    STOP_MAX_CYCLES,        /* Hit cycle limit */
+    STOP_BREAKPOINT,        /* Hit a breakpoint address */
+    STOP_HALT,              /* WAITI instruction, no wake */
+    STOP_EXCEPTION_LOOP,    /* Same exception repeated at same PC */
+    STOP_SOFTWARE_RESET,    /* software_reset ROM stub called */
+    STOP_CPU_STOPPED,       /* cpu->running == false (other cause) */
+} stop_reason_t;
+
+/*
  * EXCCAUSE constants
  */
 #define EXCCAUSE_ILLEGAL            0
@@ -239,6 +252,13 @@ struct xtensa_cpu {
     /* PC hook (for ROM stubs etc.) */
     xtensa_pc_hook_fn pc_hook;
     void             *pc_hook_ctx;
+
+    /* Breakpoints */
+#define MAX_BREAKPOINTS 16
+    uint32_t breakpoints[MAX_BREAKPOINTS];
+    int      breakpoint_count;
+    bool     breakpoint_hit;
+    uint32_t breakpoint_hit_addr;
 };
 
 /*
@@ -287,5 +307,12 @@ int  xtensa_disasm(const xtensa_cpu_t *cpu, uint32_t addr, char *buf, int bufsiz
  */
 void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr);
 void xtensa_check_interrupts(xtensa_cpu_t *cpu);
+
+/*
+ * Breakpoint support
+ */
+int  xtensa_set_breakpoint(xtensa_cpu_t *cpu, uint32_t addr);
+int  xtensa_clear_breakpoint(xtensa_cpu_t *cpu, uint32_t addr);
+void xtensa_clear_all_breakpoints(xtensa_cpu_t *cpu);
 
 #endif /* XTENSA_H */

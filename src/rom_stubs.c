@@ -18,6 +18,7 @@ typedef struct {
     uint32_t    addr;
     rom_stub_fn fn;
     const char *name;
+    uint32_t    call_count;
 } rom_stub_entry_t;
 
 struct esp32_rom_stubs {
@@ -27,6 +28,8 @@ struct esp32_rom_stubs {
     char             output[OUTPUT_BUF_SIZE];
     int              output_len;
     uint32_t         cpu_freq_mhz;
+    rom_log_fn       log_fn;
+    void            *log_ctx;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -286,6 +289,9 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
     for (int i = 0; i < s->count; i++) {
         if (s->entries[i].addr == pc) {
+            s->entries[i].call_count++;
+            if (s->log_fn)
+                s->log_fn(s->log_ctx, pc, s->entries[i].name, cpu);
             s->entries[i].fn(cpu, s);
             return 1;
         }
@@ -355,4 +361,22 @@ const char *rom_stubs_output_buf(const esp32_rom_stubs_t *stubs) {
 void rom_stubs_output_clear(esp32_rom_stubs_t *stubs) {
     stubs->output_len = 0;
     stubs->output[0] = '\0';
+}
+
+void rom_stubs_set_log_callback(esp32_rom_stubs_t *stubs, rom_log_fn fn, void *ctx) {
+    stubs->log_fn = fn;
+    stubs->log_ctx = ctx;
+}
+
+int rom_stubs_stub_count(const esp32_rom_stubs_t *stubs) {
+    return stubs->count;
+}
+
+int rom_stubs_get_stats(const esp32_rom_stubs_t *stubs, int index,
+                        const char **name_out, uint32_t *addr_out, uint32_t *count_out) {
+    if (index < 0 || index >= stubs->count) return -1;
+    if (name_out) *name_out = stubs->entries[index].name;
+    if (addr_out) *addr_out = stubs->entries[index].addr;
+    if (count_out) *count_out = stubs->entries[index].call_count;
+    return 0;
 }
