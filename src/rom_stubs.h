@@ -17,4 +17,14 @@ int  rom_stubs_output_count(const esp32_rom_stubs_t *stubs);
 const char *rom_stubs_output_buf(const esp32_rom_stubs_t *stubs);
 void rom_stubs_output_clear(esp32_rom_stubs_t *stubs);
 
+/* Verbose logging callback (called before each ROM stub executes) */
+typedef void (*rom_log_fn)(void *ctx, uint32_t addr, const char *name,
+                           const xtensa_cpu_t *cpu);
+void rom_stubs_set_log_callback(esp32_rom_stubs_t *stubs, rom_log_fn fn, void *ctx);
+
+/* Statistics: iterate over stubs with call counts */
+int rom_stubs_stub_count(const esp32_rom_stubs_t *stubs);
+int rom_stubs_get_stats(const esp32_rom_stubs_t *stubs, int index,
+                        const char **name_out, uint32_t *addr_out, uint32_t *count_out);
+
 #endif /* ROM_STUBS_H */

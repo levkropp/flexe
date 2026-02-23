@@ -10,6 +10,7 @@ add_library(xtensa-emu-lib STATIC
     src/loader.c
     src/peripherals.c
     src/rom_stubs.c
+    src/elf_symbols.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 target_link_libraries(xtensa-emu-lib PUBLIC m)

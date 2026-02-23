@@ -1573,6 +1573,18 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         return cpu->exception ? -1 : 0;
     }
 
+    /* Breakpoint check */
+    cpu->breakpoint_hit = false;
+    if (cpu->breakpoint_count > 0) {
+        for (int i = 0; i < cpu->breakpoint_count; i++) {
+            if (cpu->breakpoints[i] == cpu->pc) {
+                cpu->breakpoint_hit = true;
+                cpu->breakpoint_hit_addr = cpu->pc;
+                return -1;
+            }
+        }
+    }
+
     /* PC hook: intercept execution at specific addresses (e.g. ROM stubs) */
     if (cpu->pc_hook && cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
         cpu->ccount++;
@@ -1667,11 +1679,36 @@ int xtensa_step(xtensa_cpu_t *cpu) {
 
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
     int i;
-    for (i = 0; i < max_cycles && cpu->running && !cpu->exception; i++) {
+    for (i = 0; i < max_cycles && cpu->running && !cpu->exception && !cpu->breakpoint_hit; i++) {
         if (xtensa_step(cpu) != 0)
             break;
     }
     return i;
+}
+
+/* ===== Breakpoint API ===== */
+
+int xtensa_set_breakpoint(xtensa_cpu_t *cpu, uint32_t addr) {
+    if (cpu->breakpoint_count >= MAX_BREAKPOINTS) return -1;
+    /* Check for duplicate */
+    for (int i = 0; i < cpu->breakpoint_count; i++)
+        if (cpu->breakpoints[i] == addr) return 0;
+    cpu->breakpoints[cpu->breakpoint_count++] = addr;
+    return 0;
+}
+
+int xtensa_clear_breakpoint(xtensa_cpu_t *cpu, uint32_t addr) {
+    for (int i = 0; i < cpu->breakpoint_count; i++) {
+        if (cpu->breakpoints[i] == addr) {
+            cpu->breakpoints[i] = cpu->breakpoints[--cpu->breakpoint_count];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void xtensa_clear_all_breakpoints(xtensa_cpu_t *cpu) {
+    cpu->breakpoint_count = 0;
 }
 
 /* xtensa_disasm() is in xtensa_disasm.c */
