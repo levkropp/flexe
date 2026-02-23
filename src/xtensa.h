@@ -5,8 +5,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Forward declaration */
+/* Forward declarations */
 typedef struct xtensa_mem xtensa_mem_t;
+typedef struct xtensa_cpu xtensa_cpu_t;
+
+/* PC hook: return non-zero to skip normal fetch/execute for this cycle */
+typedef int (*xtensa_pc_hook_fn)(xtensa_cpu_t *cpu, uint32_t pc, void *ctx);
 
 /*
  * Special Register Numbers (for RSR/WSR/XSR)
@@ -163,7 +167,7 @@ typedef struct xtensa_mem xtensa_mem_t;
 /*
  * CPU State
  */
-typedef struct {
+struct xtensa_cpu {
     /* General-purpose registers: 64 physical, 16 visible via window */
     uint32_t ar[64];
 
@@ -231,7 +235,11 @@ typedef struct {
 
     /* Memory subsystem (set by caller) */
     xtensa_mem_t *mem;
-} xtensa_cpu_t;
+
+    /* PC hook (for ROM stubs etc.) */
+    xtensa_pc_hook_fn pc_hook;
+    void             *pc_hook_ctx;
+};
 
 /*
  * Inline register access helpers
