@@ -229,10 +229,10 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         uint32_t target = ar_read(cpu, s);
                         if (nn > 0) {
                             /* windowed call - simplified for now */
-                            ar_write(cpu, nn * 4, (cpu->pc & 0xC0000000) | (((cpu->pc >> 2) + 3) << 0));
+                            ar_write(cpu, nn * 4, (cpu->pc & 0xC0000000) | (cpu->pc >> 2));
                             /* TODO: proper window rotation */
                         } else {
-                            ar_write(cpu, 0, cpu->pc + 3);
+                            ar_write(cpu, 0, cpu->pc);
                         }
                         cpu->pc = target;
                         return;
@@ -648,8 +648,16 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
               int imm7 = ((t & 7) << 4) | r;
               int32_t val = sign_extend(imm7, 7);
               ar_write(cpu, s, (uint32_t)val);
+          } else if (t_hi == 2) {
+              /* BEQZ.N */
+              int imm6 = ((t & 3) << 4) | r;
+              if (ar_read(cpu, s) == 0)
+                  cpu->pc = cpu->pc + (uint32_t)imm6 + 2;
           } else {
-              /* BEQZ.N / BNEZ.N: stub for M4 (branches) */
+              /* BNEZ.N */
+              int imm6 = ((t & 3) << 4) | r;
+              if (ar_read(cpu, s) != 0)
+                  cpu->pc = cpu->pc + (uint32_t)imm6 + 2;
           }
         } break;
 
@@ -685,6 +693,170 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
     }
 }
 
+/* B4const / B4constu lookup tables for immediate branches */
+static const int32_t b4const[16] = {
+    -1, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 32, 64, 128, 256
+};
+static const uint32_t b4constu[16] = {
+    32768, 65536, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 32, 64, 128, 256
+};
+
+/* Execute op0=5 (CALLN) - PC-relative calls */
+static void exec_calln(xtensa_cpu_t *cpu, uint32_t insn) {
+    int nn = XT_N(insn);
+    int32_t offset = sign_extend(XT_OFFSET18(insn), 18);
+    /* target[31:2] = (original_pc[31:2] + offset + 1), target[1:0] = 00 */
+    uint32_t original_pc = cpu->pc - 3;
+    uint32_t target = (((original_pc >> 2) + (uint32_t)offset + 1) << 2);
+
+    if (nn > 0) {
+        /* Windowed call - simplified stub for M5 */
+        ar_write(cpu, nn * 4, (cpu->pc & 0xC0000000) | (cpu->pc >> 2));
+    } else {
+        /* CALL0: return address = next instruction */
+        ar_write(cpu, 0, cpu->pc);
+    }
+    cpu->pc = target;
+}
+
+/* Execute op0=6 (SI) - J, BRI12, BRI8, LOOP, ENTRY */
+static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
+    int nn = XT_N(insn);
+    int m = XT_M(insn);
+    int s = XT_S(insn);
+
+    switch (nn) {
+    case 0: /* J - unconditional jump */
+        { int32_t offset = sign_extend(XT_OFFSET18(insn), 18);
+          cpu->pc = cpu->pc + (uint32_t)offset + 1;
+        } break;
+
+    case 1: /* BZ - BRI12 zero-compare branches */
+        { int32_t imm12 = sign_extend(XT_IMM12(insn), 12);
+          uint32_t target = cpu->pc + (uint32_t)imm12 + 1;
+          int32_t val = (int32_t)ar_read(cpu, s);
+          switch (m) {
+          case 0: if (val == 0) cpu->pc = target; break;  /* BEQZ */
+          case 1: if (val != 0) cpu->pc = target; break;  /* BNEZ */
+          case 2: if (val < 0)  cpu->pc = target; break;  /* BLTZ */
+          case 3: if (val >= 0) cpu->pc = target; break;  /* BGEZ */
+          }
+        } break;
+
+    case 2: /* BI0 - BRI8 immediate-compare branches */
+        { int imm8 = XT_IMM8(insn);
+          int r = XT_R(insn);
+          int32_t offset8 = sign_extend(imm8, 8);
+          uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
+          int32_t val = (int32_t)ar_read(cpu, s);
+          switch (m) {
+          case 0: if (val == b4const[r]) cpu->pc = target; break;  /* BEQI */
+          case 1: if (val != b4const[r]) cpu->pc = target; break;  /* BNEI */
+          case 2: if (val < b4const[r])  cpu->pc = target; break;  /* BLTI */
+          case 3: if (val >= b4const[r]) cpu->pc = target; break;  /* BGEI */
+          }
+        } break;
+
+    case 3: /* BI1 */
+        { int imm8 = XT_IMM8(insn);
+          int r = XT_R(insn);
+          switch (m) {
+          case 0: /* ENTRY - stub for M5 */
+              break;
+          case 1: /* B1: BF, BT, LOOP, LOOPNEZ, LOOPGTZ */
+              { int32_t offset8 = sign_extend(imm8, 8);
+                uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
+                switch (r) {
+                case 0: /* BF */
+                    if (!(cpu->br & (1u << s)))
+                        cpu->pc = target;
+                    break;
+                case 1: /* BT */
+                    if (cpu->br & (1u << s))
+                        cpu->pc = target;
+                    break;
+                case 8: /* LOOP */
+                    cpu->lend = target;
+                    cpu->lbeg = cpu->pc;
+                    cpu->lcount = ar_read(cpu, s) - 1;
+                    break;
+                case 9: /* LOOPNEZ */
+                    cpu->lend = target;
+                    cpu->lbeg = cpu->pc;
+                    if (ar_read(cpu, s) == 0) {
+                        cpu->pc = target;
+                    } else {
+                        cpu->lcount = ar_read(cpu, s) - 1;
+                    }
+                    break;
+                case 10: /* LOOPGTZ */
+                    cpu->lend = target;
+                    cpu->lbeg = cpu->pc;
+                    if ((int32_t)ar_read(cpu, s) <= 0) {
+                        cpu->pc = target;
+                    } else {
+                        cpu->lcount = ar_read(cpu, s) - 1;
+                    }
+                    break;
+                default: break;
+                }
+              } break;
+          case 2: /* BLTUI */
+              { int32_t offset8 = sign_extend(imm8, 8);
+                uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
+                if (ar_read(cpu, s) < b4constu[r])
+                    cpu->pc = target;
+              } break;
+          case 3: /* BGEUI */
+              { int32_t offset8 = sign_extend(imm8, 8);
+                uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
+                if (ar_read(cpu, s) >= b4constu[r])
+                    cpu->pc = target;
+              } break;
+          }
+        } break;
+    }
+}
+
+/* Execute op0=7 (B) - RRI8 conditional branches */
+static void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
+    int r = XT_R(insn);
+    int s = XT_S(insn);
+    int t = XT_T(insn);
+    int imm8 = XT_IMM8(insn);
+    int32_t offset = sign_extend(imm8, 8);
+    uint32_t target = cpu->pc + (uint32_t)offset + 1;
+    uint32_t vs = ar_read(cpu, s);
+    uint32_t vt = ar_read(cpu, t);
+
+    int taken = 0;
+    switch (r) {
+    case 0:  taken = (vs & vt) == 0; break;                       /* BNONE */
+    case 1:  taken = vs == vt; break;                              /* BEQ */
+    case 2:  taken = (int32_t)vs < (int32_t)vt; break;            /* BLT */
+    case 3:  taken = vs < vt; break;                               /* BLTU */
+    case 4:  taken = (~vs & vt) == 0; break;                       /* BALL */
+    case 5:  taken = !(vs & (1u << (vt & 31))); break;             /* BBC */
+    case 6: case 14: /* BBCI */
+        { int bit = t | ((r & 1) << 4);
+          taken = !(vs & (1u << bit));
+        } break;
+    case 7: case 15: /* BBSI */
+        { int bit = t | ((r & 1) << 4);
+          taken = (vs & (1u << bit)) != 0;
+        } break;
+    case 8:  taken = (vs & vt) != 0; break;                       /* BANY */
+    case 9:  taken = vs != vt; break;                              /* BNE */
+    case 10: taken = (int32_t)vs >= (int32_t)vt; break;           /* BGE */
+    case 11: taken = vs >= vt; break;                              /* BGEU */
+    case 12: taken = (~vs & vt) != 0; break;                       /* BNALL */
+    case 13: taken = (vs & (1u << (vt & 31))) != 0; break;         /* BBS */
+    }
+
+    if (taken)
+        cpu->pc = target;
+}
+
 /* ===== Main step function ===== */
 
 int xtensa_step(xtensa_cpu_t *cpu) {
@@ -712,8 +884,17 @@ int xtensa_step(xtensa_cpu_t *cpu) {
               ar_write(cpu, lt, mem_read32(cpu->mem, target));
             } break;
         case 2: exec_lsai(cpu, insn); break;
+        case 5: exec_calln(cpu, insn); break;
+        case 6: exec_si(cpu, insn); break;
+        case 7: exec_b(cpu, insn); break;
         default: break;
         }
+    }
+
+    /* Zero-overhead loop: loop back when PC reaches LEND */
+    if (cpu->lcount > 0 && cpu->pc == cpu->lend) {
+        cpu->lcount--;
+        cpu->pc = cpu->lbeg;
     }
 
     cpu->ccount++;
