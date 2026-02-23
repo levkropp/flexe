@@ -5,6 +5,12 @@
 
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
+    for (int i = 0; i < 32; i++)
+        cpu->int_level[i] = 1;
+    /* ESP32 timer interrupt level defaults */
+    cpu->int_level[6]  = 1;   /* CCOMPARE0 → level 1 */
+    cpu->int_level[15] = 3;   /* CCOMPARE1 → level 3 */
+    cpu->int_level[16] = 5;   /* CCOMPARE2 → level 5 */
 }
 
 void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
@@ -173,7 +179,8 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_EXCSAVE6:    cpu->excsave[5] = val; break;
     case XT_SR_EXCSAVE7:    cpu->excsave[6] = val; break;
     case XT_SR_CPENABLE:    cpu->cpenable = val; break;
-    case XT_SR_INTSET:   cpu->interrupt = val; break;
+    case XT_SR_INTSET:   cpu->interrupt |= val; break;
+    case XT_SR_INTCLEAR: cpu->interrupt &= ~val; break;
     case XT_SR_INTENABLE:   cpu->intenable = val; break;
     case XT_SR_PS:          cpu->ps = val; break;
     case XT_SR_VECBASE:     cpu->vecbase = val; break;
@@ -183,14 +190,87 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_ICOUNT:      cpu->icount = val; break;
     case XT_SR_ICOUNTLEVEL: cpu->icountlevel = val; break;
     case XT_SR_EXCVADDR:    cpu->excvaddr = val; break;
-    case XT_SR_CCOMPARE0:   cpu->ccompare[0] = val; break;
-    case XT_SR_CCOMPARE1:   cpu->ccompare[1] = val; break;
-    case XT_SR_CCOMPARE2:   cpu->ccompare[2] = val; break;
+    case XT_SR_CCOMPARE0:   cpu->ccompare[0] = val; cpu->interrupt &= ~(1u << 6); break;
+    case XT_SR_CCOMPARE1:   cpu->ccompare[1] = val; cpu->interrupt &= ~(1u << 15); break;
+    case XT_SR_CCOMPARE2:   cpu->ccompare[2] = val; cpu->interrupt &= ~(1u << 16); break;
     case XT_SR_MISC0:       cpu->misc[0] = val; break;
     case XT_SR_MISC1:       cpu->misc[1] = val; break;
     case XT_SR_MISC2:       cpu->misc[2] = val; break;
     case XT_SR_MISC3:       cpu->misc[3] = val; break;
     default: break; /* ignore writes to unknown/read-only SRs */
+    }
+}
+
+/* ===== Exception/Interrupt Dispatch ===== */
+
+void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr) {
+    uint32_t vec;
+    if (XT_PS_EXCM(cpu->ps)) {
+        /* Double exception */
+        cpu->depc = fault_pc;
+        cpu->exccause = cause;
+        cpu->excvaddr = vaddr;
+        vec = cpu->vecbase + VECOFS_DOUBLE_EXC;
+    } else {
+        cpu->epc[0] = fault_pc;   /* EPC1 */
+        cpu->exccause = cause;
+        cpu->excvaddr = vaddr;
+        /* Save UM state before setting EXCM */
+        uint32_t user_mode = XT_PS_UM(cpu->ps);
+        XT_PS_SET_EXCM(cpu->ps, 1);
+        vec = cpu->vecbase + (user_mode ? VECOFS_USER_EXC : VECOFS_KERNEL_EXC);
+    }
+    if (!mem_get_ptr(cpu->mem, vec)) {
+        cpu->exception = true;
+        cpu->running = false;
+        return;
+    }
+    cpu->pc = vec;
+}
+
+#define EXCMLEVEL 1  /* ESP32 config */
+
+void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
+    uint32_t pending = cpu->interrupt & cpu->intenable;
+    if (!pending) return;
+
+    int eff_level = XT_PS_INTLEVEL(cpu->ps);
+    if (XT_PS_EXCM(cpu->ps) && EXCMLEVEL > eff_level)
+        eff_level = EXCMLEVEL;
+
+    /* Find highest-level pending interrupt */
+    int best_level = 0;
+    for (int i = 0; i < 32; i++) {
+        if (!(pending & (1u << i))) continue;
+        int lvl = cpu->int_level[i];
+        if (lvl > eff_level && lvl > best_level)
+            best_level = lvl;
+    }
+    if (best_level == 0) return;
+
+    if (best_level == 1) {
+        /* Level-1: dispatched as exception */
+        xtensa_raise_exception(cpu, EXCCAUSE_LEVEL1_INT, cpu->pc, 0);
+    } else {
+        /* High-priority (levels 2-7) */
+        int idx = best_level - 1;
+        cpu->epc[idx] = cpu->pc;
+        cpu->eps[idx] = cpu->ps;
+        XT_PS_SET_INTLEVEL(cpu->ps, best_level);
+        XT_PS_SET_EXCM(cpu->ps, 1);
+
+        static const uint32_t vecofs[] = {
+            0, 0, VECOFS_LEVEL2_INT, VECOFS_LEVEL3_INT,
+            VECOFS_LEVEL4_INT, VECOFS_LEVEL5_INT,
+            VECOFS_DEBUG_EXC, VECOFS_NMI
+        };
+        uint32_t vec = cpu->vecbase + vecofs[best_level];
+        if (!mem_get_ptr(cpu->mem, vec)) {
+            cpu->exception = true;
+            cpu->running = false;
+            return;
+        }
+        cpu->pc = vec;
     }
 }
 
@@ -329,7 +409,8 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             case 0: /* SNM0 */
                 if (s == 0 && t == 0) {
                     /* ILL */
-                    cpu->exception = true;
+                    xtensa_raise_exception(cpu, EXCCAUSE_ILLEGAL, cpu->pc - 3, 0);
+                    return;
                 } else {
                     int m = XT_M(insn);
                     int nn = XT_N(insn);
@@ -399,7 +480,6 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                     }
                     break;
                 case 1: /* RFI */
-                    XT_PS_SET_EXCM(cpu->ps, 0);
                     if (s >= 1 && s <= 7) {
                         cpu->ps = cpu->eps[s - 1];
                         cpu->pc = cpu->epc[s - 1];
@@ -412,13 +492,15 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 cpu->debug_break = true;
                 break;
             case 5: /* SYSCALL - raise exception */
-                cpu->exception = true;
-                break;
+                xtensa_raise_exception(cpu, EXCCAUSE_SYSCALL, cpu->pc - 3, 0);
+                return;
             case 6: /* RSIL - read/set interrupt level */
                 ar_write(cpu, t, cpu->ps);
                 cpu->ps = (cpu->ps & ~0xF) | (s & 0xF);
                 break;
-            case 7: /* WAITI - simplified: just a NOP */
+            case 7: /* WAITI */
+                XT_PS_SET_INTLEVEL(cpu->ps, s);
+                cpu->halted = true;
                 break;
             default: break;
             }
@@ -587,12 +669,12 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             } break;
         case 12: /* QUOU */
             { uint32_t divisor = ar_read(cpu, t);
-              if (divisor == 0) { cpu->exception = true; break; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
               ar_write(cpu, r, ar_read(cpu, s) / divisor);
             } break;
         case 13: /* QUOS */
             { int32_t divisor = (int32_t)ar_read(cpu, t);
-              if (divisor == 0) { cpu->exception = true; break; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
               int32_t dividend = (int32_t)ar_read(cpu, s);
               /* Handle INT_MIN / -1 overflow */
               if (dividend == (int32_t)0x80000000 && divisor == -1)
@@ -602,12 +684,12 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             } break;
         case 14: /* REMU */
             { uint32_t divisor = ar_read(cpu, t);
-              if (divisor == 0) { cpu->exception = true; break; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
               ar_write(cpu, r, ar_read(cpu, s) % divisor);
             } break;
         case 15: /* REMS */
             { int32_t divisor = (int32_t)ar_read(cpu, t);
-              if (divisor == 0) { cpu->exception = true; break; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
               int32_t dividend = (int32_t)ar_read(cpu, s);
               if (dividend == (int32_t)0x80000000 && divisor == -1)
                   ar_write(cpu, r, 0);
@@ -849,8 +931,8 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
             case 3: /* NOP.N */
                 break;
             case 6: /* ILL.N */
-                cpu->exception = true;
-                break;
+                xtensa_raise_exception(cpu, EXCCAUSE_ILLEGAL, cpu->pc - 2, 0);
+                return;
             default: break;
             }
             break;
@@ -1046,10 +1128,26 @@ static void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
 
 int xtensa_step(xtensa_cpu_t *cpu) {
     uint32_t insn;
+    if (cpu->halted) {
+        cpu->ccount++;
+        cpu->cycle_count++;
+        /* Timer check while halted */
+        if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
+        if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
+        if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+        uint32_t pending = cpu->interrupt & cpu->intenable;
+        if (pending) {
+            cpu->halted = false;
+            xtensa_check_interrupts(cpu);
+        }
+        return cpu->exception ? -1 : 0;
+    }
+
     int ilen = xtensa_fetch(cpu, cpu->pc, &insn);
     if (ilen == 0) {
-        cpu->exception = true;
-        return -1;
+        xtensa_raise_exception(cpu, EXCCAUSE_IFETCH_ERROR, cpu->pc, 0);
+        if (cpu->exception) return -1;
+        return 0;
     }
 
     int op0 = XT_OP0(insn);
@@ -1084,6 +1182,15 @@ int xtensa_step(xtensa_cpu_t *cpu) {
 
     cpu->ccount++;
     cpu->cycle_count++;
+
+    /* Timer interrupts */
+    if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
+    if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
+    if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+
+    /* Interrupt dispatch */
+    xtensa_check_interrupts(cpu);
+
     return cpu->exception ? -1 : 0;
 }
 
