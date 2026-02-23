@@ -2,6 +2,7 @@
 #include "memory.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
@@ -391,6 +392,256 @@ static void exec_retw(xtensa_cpu_t *cpu) {
     cpu->windowbase = ret_wb;
 
     cpu->pc = next_pc;
+}
+
+/* ===== Floating-Point Helpers ===== */
+
+static inline uint32_t float_to_bits(float f) {
+    uint32_t b; memcpy(&b, &f, 4); return b;
+}
+static inline float bits_to_float(uint32_t b) {
+    float f; memcpy(&f, &b, 4); return f;
+}
+
+/* CONST.S lookup table (ISA Table 7-3, reciprocal estimation constants) */
+static const uint32_t fp_const_table[16] = {
+    0x00000000, /* 0: +0.0 */
+    0x3F800000, /* 1: 1.0 */
+    0x40000000, /* 2: 2.0 */
+    0x3F000000, /* 3: 0.5 */
+    0x00000000, /* 4: +0.0 (reserved) */
+    0x00000000, /* 5: +0.0 (reserved) */
+    0x00000000, /* 6: +0.0 (reserved) */
+    0x00000000, /* 7: +0.0 (reserved) */
+    0x00000000, /* 8: +0.0 (reserved) */
+    0x00000000, /* 9: +0.0 (reserved) */
+    0x00000000, /* 10: +0.0 (reserved) */
+    0x00000000, /* 11: +0.0 (reserved) */
+    0x00000000, /* 12: +0.0 (reserved) */
+    0x00000000, /* 13: +0.0 (reserved) */
+    0x00000000, /* 14: +0.0 (reserved) */
+    0x00000000, /* 15: +0.0 (reserved) */
+};
+
+/* Execute FP0 (op0=0, op1=10): arithmetic, conversions, FP1OP */
+static void exec_fp0(xtensa_cpu_t *cpu, uint32_t insn) {
+    int op2 = XT_OP2(insn);
+    int r = XT_R(insn);
+    int s = XT_S(insn);
+    int t = XT_T(insn);
+
+    switch (op2) {
+    case 0: /* ADD.S */
+        cpu->fr[r] = cpu->fr[s] + cpu->fr[t];
+        break;
+    case 1: /* SUB.S */
+        cpu->fr[r] = cpu->fr[s] - cpu->fr[t];
+        break;
+    case 2: /* MUL.S */
+        cpu->fr[r] = cpu->fr[s] * cpu->fr[t];
+        break;
+    case 4: /* MADD.S */
+        cpu->fr[r] = cpu->fr[r] + (cpu->fr[s] * cpu->fr[t]);
+        break;
+    case 5: /* MSUB.S */
+        cpu->fr[r] = cpu->fr[r] - (cpu->fr[s] * cpu->fr[t]);
+        break;
+    case 6: /* MADDN.S (same as MSUB.S, forces round-to-nearest) */
+        cpu->fr[r] = cpu->fr[r] - (cpu->fr[s] * cpu->fr[t]);
+        break;
+    case 7: { /* DIVN.S: fr[r] = fr[s] * fr[t] */
+        cpu->fr[r] = cpu->fr[s] * cpu->fr[t];
+    } break;
+    case 8: { /* ROUND.S: ar[t] = (int32_t)roundf(fr[s] * 2^r) */
+        float val = cpu->fr[s];
+        if (r) val = val * (float)(1u << r);
+        ar_write(cpu, t, (uint32_t)(int32_t)roundf(val));
+    } break;
+    case 9: { /* TRUNC.S: ar[t] = (int32_t)truncf(fr[s] * 2^r) */
+        float val = cpu->fr[s];
+        if (r) val = val * (float)(1u << r);
+        ar_write(cpu, t, (uint32_t)(int32_t)truncf(val));
+    } break;
+    case 10: { /* FLOOR.S: ar[t] = (int32_t)floorf(fr[s] * 2^r) */
+        float val = cpu->fr[s];
+        if (r) val = val * (float)(1u << r);
+        ar_write(cpu, t, (uint32_t)(int32_t)floorf(val));
+    } break;
+    case 11: { /* CEIL.S: ar[t] = (int32_t)ceilf(fr[s] * 2^r) */
+        float val = cpu->fr[s];
+        if (r) val = val * (float)(1u << r);
+        ar_write(cpu, t, (uint32_t)(int32_t)ceilf(val));
+    } break;
+    case 12: { /* FLOAT.S: fr[r] = (float)(int32_t)ar[s] * 2^(-t) */
+        float val = (float)(int32_t)ar_read(cpu, s);
+        if (t) val = val / (float)(1u << t);
+        cpu->fr[r] = val;
+    } break;
+    case 13: { /* UFLOAT.S: fr[r] = (float)(uint32_t)ar[s] * 2^(-t) */
+        float val = (float)ar_read(cpu, s);
+        if (t) val = val / (float)(1u << t);
+        cpu->fr[r] = val;
+    } break;
+    case 14: { /* UTRUNC.S: ar[t] = (uint32_t)(fr[s] * 2^r) */
+        float val = cpu->fr[s];
+        if (r) val = val * (float)(1u << r);
+        ar_write(cpu, t, (uint32_t)val);
+    } break;
+    case 15: /* FP1OP: sub-dispatch on t */
+        switch (t) {
+        case 0: /* MOV.S */
+            cpu->fr[r] = cpu->fr[s];
+            break;
+        case 1: /* ABS.S */
+            cpu->fr[r] = fabsf(cpu->fr[s]);
+            break;
+        case 3: /* CONST.S */
+            cpu->fr[r] = bits_to_float(fp_const_table[s]);
+            break;
+        case 4: { /* RFR: ar[r] = fr[s] as bits */
+            ar_write(cpu, r, float_to_bits(cpu->fr[s]));
+        } break;
+        case 5: /* WFR: fr[r] = ar[s] as bits */
+            cpu->fr[r] = bits_to_float(ar_read(cpu, s));
+            break;
+        case 6: /* NEG.S */
+            cpu->fr[r] = -cpu->fr[s];
+            break;
+        case 7: { /* DIV0.S: initial reciprocal approx */
+            /* Produce approximate 1/fr[s] using host division */
+            float fs = cpu->fr[s];
+            if (fs == 0.0f)
+                cpu->fr[r] = bits_to_float(0x7F800000); /* +inf */
+            else
+                cpu->fr[r] = 1.0f / fs;
+        } break;
+        case 8: { /* RECIP0.S: reciprocal initial approximation */
+            float fs = cpu->fr[s];
+            if (fs == 0.0f)
+                cpu->fr[r] = bits_to_float(0x7F800000);
+            else
+                cpu->fr[r] = 1.0f / fs;
+        } break;
+        case 9: { /* SQRT0.S: square root initial approximation */
+            float fs = cpu->fr[s];
+            cpu->fr[r] = sqrtf(fs);
+        } break;
+        case 10: { /* RSQRT0.S: reciprocal square root initial */
+            float fs = cpu->fr[s];
+            if (fs <= 0.0f)
+                cpu->fr[r] = bits_to_float(0x7F800000);
+            else
+                cpu->fr[r] = 1.0f / sqrtf(fs);
+        } break;
+        case 11: { /* NEXP01.S: force exponent to 127 (range [1.0, 2.0)) */
+            uint32_t bits = float_to_bits(cpu->fr[s]);
+            bits = (bits & 0x807FFFFFu) | (127u << 23);
+            cpu->fr[r] = bits_to_float(bits);
+        } break;
+        case 12: { /* MKSADJ.S: make sqrt exponent adjustment */
+            uint32_t bits = float_to_bits(cpu->fr[s]);
+            int exp = (int)((bits >> 23) & 0xFF);
+            int adj = 253 - exp; /* for sqrt: (253 - exp) */
+            if ((exp & 1) == 0) adj--; /* even exponent */
+            uint32_t result = ((uint32_t)(adj & 0xFF) << 23);
+            if (bits & 0x80000000u) result |= 0x80000000u;
+            cpu->fr[r] = bits_to_float(result);
+        } break;
+        case 13: { /* MKDADJ.S: make div exponent adjustment */
+            uint32_t bits = float_to_bits(cpu->fr[s]);
+            int exp = (int)((bits >> 23) & 0xFF);
+            int adj = 253 - exp;
+            uint32_t result = ((uint32_t)(adj & 0xFF) << 23);
+            if (bits & 0x80000000u) result |= 0x80000000u;
+            cpu->fr[r] = bits_to_float(result);
+        } break;
+        case 14: { /* ADDEXP.S: add exponent of fr[s] to fr[r], XOR signs */
+            uint32_t rbits = float_to_bits(cpu->fr[r]);
+            uint32_t sbits = float_to_bits(cpu->fr[s]);
+            int rexp = (int)((rbits >> 23) & 0xFF);
+            int sexp = (int)((sbits >> 23) & 0xFF);
+            int newexp = rexp + sexp - 127;
+            if (newexp < 0) newexp = 0;
+            if (newexp > 255) newexp = 255;
+            rbits = (rbits & 0x807FFFFFu) | ((uint32_t)(newexp & 0xFF) << 23);
+            rbits ^= (sbits & 0x80000000u);
+            cpu->fr[r] = bits_to_float(rbits);
+        } break;
+        case 15: { /* ADDEXPM.S: add exponent from mantissa bits of fr[s] */
+            uint32_t rbits = float_to_bits(cpu->fr[r]);
+            uint32_t sbits = float_to_bits(cpu->fr[s]);
+            int rexp = (int)((rbits >> 23) & 0xFF);
+            int mexp = (int)((sbits >> 14) & 0xFF);
+            int newexp = rexp + mexp - 127;
+            if (newexp < 0) newexp = 0;
+            if (newexp > 255) newexp = 255;
+            rbits = (rbits & 0x807FFFFFu) | ((uint32_t)(newexp & 0xFF) << 23);
+            rbits ^= ((sbits & (1u << 22)) << 9); /* XOR sign with mantissa bit 22 */
+            cpu->fr[r] = bits_to_float(rbits);
+        } break;
+        default: break;
+        }
+        break;
+    default: break;
+    }
+}
+
+/* Execute FP1 (op0=0, op1=11): comparisons, conditional FP moves */
+static void exec_fp1(xtensa_cpu_t *cpu, uint32_t insn) {
+    int op2 = XT_OP2(insn);
+    int r = XT_R(insn);
+    int s = XT_S(insn);
+    int t = XT_T(insn);
+
+    switch (op2) {
+    case 1: { /* UN.S */
+        int result = isnan(cpu->fr[s]) || isnan(cpu->fr[t]);
+        cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)(result != 0) << r);
+    } break;
+    case 2: { /* OEQ.S */
+        int result = !isnan(cpu->fr[s]) && !isnan(cpu->fr[t]) && cpu->fr[s] == cpu->fr[t];
+        cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)(result != 0) << r);
+    } break;
+    case 3: { /* UEQ.S */
+        int result = isnan(cpu->fr[s]) || isnan(cpu->fr[t]) || cpu->fr[s] == cpu->fr[t];
+        cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)(result != 0) << r);
+    } break;
+    case 4: { /* OLT.S */
+        int result = !isnan(cpu->fr[s]) && !isnan(cpu->fr[t]) && cpu->fr[s] < cpu->fr[t];
+        cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)(result != 0) << r);
+    } break;
+    case 5: { /* ULT.S */
+        int result = isnan(cpu->fr[s]) || isnan(cpu->fr[t]) || cpu->fr[s] < cpu->fr[t];
+        cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)(result != 0) << r);
+    } break;
+    case 6: { /* OLE.S */
+        int result = !isnan(cpu->fr[s]) && !isnan(cpu->fr[t]) && cpu->fr[s] <= cpu->fr[t];
+        cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)(result != 0) << r);
+    } break;
+    case 7: { /* ULE.S */
+        int result = isnan(cpu->fr[s]) || isnan(cpu->fr[t]) || cpu->fr[s] <= cpu->fr[t];
+        cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)(result != 0) << r);
+    } break;
+    case 8: /* MOVEQZ.S */
+        if (ar_read(cpu, t) == 0) cpu->fr[r] = cpu->fr[s];
+        break;
+    case 9: /* MOVNEZ.S */
+        if (ar_read(cpu, t) != 0) cpu->fr[r] = cpu->fr[s];
+        break;
+    case 10: /* MOVLTZ.S */
+        if ((int32_t)ar_read(cpu, t) < 0) cpu->fr[r] = cpu->fr[s];
+        break;
+    case 11: /* MOVGEZ.S */
+        if ((int32_t)ar_read(cpu, t) >= 0) cpu->fr[r] = cpu->fr[s];
+        break;
+    case 12: /* MOVF.S */
+        if (!((cpu->br >> t) & 1)) cpu->fr[r] = cpu->fr[s];
+        break;
+    case 13: /* MOVT.S */
+        if ((cpu->br >> t) & 1) cpu->fr[r] = cpu->fr[s];
+        break;
+    default: break;
+    }
 }
 
 /* Execute op0=0 (QRST) - the main RRR instruction group */
@@ -833,6 +1084,34 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
           ar_write(cpu, r, (ar_read(cpu, t) >> shift) & mask);
         } break;
 
+    case 8: /* LSCX: indexed FP loads/stores */
+        switch (op2) {
+        case 0: { /* LSX: fr[r] = mem32[ar[s] + ar[t]] */
+            uint32_t addr = ar_read(cpu, s) + ar_read(cpu, t);
+            uint32_t tmp = mem_read32(cpu->mem, addr);
+            memcpy(&cpu->fr[r], &tmp, 4);
+        } break;
+        case 1: { /* LSXP: fr[r] = mem32[ar[s]]; ar[s] += ar[t] */
+            uint32_t base = ar_read(cpu, s);
+            uint32_t tmp = mem_read32(cpu->mem, base);
+            memcpy(&cpu->fr[r], &tmp, 4);
+            ar_write(cpu, s, base + ar_read(cpu, t));
+        } break;
+        case 4: { /* SSX: mem32[ar[s] + ar[t]] = fr[r] */
+            uint32_t addr = ar_read(cpu, s) + ar_read(cpu, t);
+            uint32_t tmp; memcpy(&tmp, &cpu->fr[r], 4);
+            mem_write32(cpu->mem, addr, tmp);
+        } break;
+        case 5: { /* SSXP: mem32[ar[s]] = fr[r]; ar[s] += ar[t] */
+            uint32_t base = ar_read(cpu, s);
+            uint32_t tmp; memcpy(&tmp, &cpu->fr[r], 4);
+            mem_write32(cpu->mem, base, tmp);
+            ar_write(cpu, s, base + ar_read(cpu, t));
+        } break;
+        default: break;
+        }
+        break;
+
     case 9: /* LSC4: L32E, S32E */
         switch (op2) {
         case 0: { /* L32E */
@@ -845,6 +1124,14 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
         } break;
         default: break;
         }
+        break;
+
+    case 10: /* FP0: FP arithmetic, conversions */
+        exec_fp0(cpu, insn);
+        break;
+
+    case 11: /* FP1: FP comparisons, conditional moves */
+        exec_fp1(cpu, insn);
         break;
 
     default:

@@ -10,6 +10,7 @@ add_library(xtensa-emu-lib STATIC
     src/loader.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
+target_link_libraries(xtensa-emu-lib PUBLIC m)
 target_compile_options(xtensa-emu-lib PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 
 # Main executable
