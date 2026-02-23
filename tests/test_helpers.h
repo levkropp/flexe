@@ -43,4 +43,38 @@ extern int test_failures;
 
 #define TEST_SUITE(name) printf("Suite: %s\n", name)
 
+/*
+ * Shared test helpers: instruction builders, setup/teardown
+ */
+#define BASE 0x40080000u
+
+static inline void put_insn3(xtensa_cpu_t *cpu, uint32_t addr, uint32_t insn) {
+    mem_write8(cpu->mem, addr,     (uint8_t)(insn & 0xFF));
+    mem_write8(cpu->mem, addr + 1, (uint8_t)((insn >> 8) & 0xFF));
+    mem_write8(cpu->mem, addr + 2, (uint8_t)((insn >> 16) & 0xFF));
+}
+
+static inline void put_insn2(xtensa_cpu_t *cpu, uint32_t addr, uint16_t insn) {
+    mem_write8(cpu->mem, addr,     (uint8_t)(insn & 0xFF));
+    mem_write8(cpu->mem, addr + 1, (uint8_t)((insn >> 8) & 0xFF));
+}
+
+static inline uint32_t rrr(int op2, int op1, int r, int s, int t) {
+    return (uint32_t)((op2 << 20) | (op1 << 16) | (r << 12) | (s << 8) | (t << 4) | 0);
+}
+
+static inline uint16_t narrow(int op0, int r, int s, int t) {
+    return (uint16_t)((r << 12) | (s << 8) | (t << 4) | op0);
+}
+
+static inline void setup(xtensa_cpu_t *cpu) {
+    xtensa_cpu_init(cpu);
+    cpu->mem = mem_create();
+    cpu->pc = BASE;
+}
+
+static inline void teardown(xtensa_cpu_t *cpu) {
+    mem_destroy(cpu->mem);
+}
+
 #endif /* TEST_HELPERS_H */

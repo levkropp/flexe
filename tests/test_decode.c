@@ -6,19 +6,6 @@
 #include "test_helpers.h"
 #include <string.h>
 
-/* Helper: write a 24-bit instruction at addr and disassemble */
-static void put_insn3(xtensa_cpu_t *cpu, uint32_t addr, uint32_t insn) {
-    mem_write8(cpu->mem, addr,     (uint8_t)(insn & 0xFF));
-    mem_write8(cpu->mem, addr + 1, (uint8_t)((insn >> 8) & 0xFF));
-    mem_write8(cpu->mem, addr + 2, (uint8_t)((insn >> 16) & 0xFF));
-}
-
-/* Helper: write a 16-bit instruction at addr */
-static void put_insn2(xtensa_cpu_t *cpu, uint32_t addr, uint16_t insn) {
-    mem_write8(cpu->mem, addr,     (uint8_t)(insn & 0xFF));
-    mem_write8(cpu->mem, addr + 1, (uint8_t)((insn >> 8) & 0xFF));
-}
-
 /* Helper: disasm and check result contains expected substring */
 static int check_disasm(xtensa_cpu_t *cpu, uint32_t addr, const char *expected, int expect_len) {
     char buf[128];
@@ -36,7 +23,7 @@ static int check_disasm(xtensa_cpu_t *cpu, uint32_t addr, const char *expected, 
     return pass;
 }
 
-#define BASE 0x40080000u
+/* BASE defined in test_helpers.h */
 
 /* ===== RRR Format Tests ===== */
 
