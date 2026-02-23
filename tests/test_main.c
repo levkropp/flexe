@@ -17,6 +17,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_boolean.c"
 #include "test_mac16.c"
 #include "test_fp_ldst.c"
+#include "test_fp_arith.c"
 
 int main(void) {
     printf("Running xtensa-emulator tests...\n\n");
@@ -36,6 +37,7 @@ int main(void) {
     run_boolean_tests();
     run_mac16_tests();
     run_fp_ldst_tests();
+    run_fp_arith_tests();
 
     printf("\n%d tests, %d passed, %d failed\n",
            test_count, test_passes, test_failures);

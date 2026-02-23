@@ -399,32 +399,80 @@ static int disasm_qrst(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
           EMIT("extui\ta%d, a%d, %d, %d", r, t, shift, mask);
         } break;
 
-    case 8: /* LSCX - L32E, S32E, floating-point loads/stores */
+    case 8: /* LSCX - indexed FP loads/stores */
         switch (op2) {
-        case 0:
-            if (r < 4) {
-                /* L32E: offset = (r << 2) - 64 = r*4 - 64 */
-                EMIT("l32e\ta%d, a%d, %d", t, s, (r << 2) - 64);
-            } else {
-                EMIT("??lscx.0 r=%d", r);
-            }
-            break;
-        case 4:
-            if (r < 4) {
-                EMIT("s32e\ta%d, a%d, %d", t, s, (r << 2) - 64);
-            } else {
-                EMIT("??lscx.4 r=%d", r);
-            }
-            break;
+        case 0: EMIT("lsx\tf%d, a%d, a%d", r, s, t); break;
+        case 1: EMIT("lsxp\tf%d, a%d, a%d", r, s, t); break;
+        case 4: EMIT("ssx\tf%d, a%d, a%d", r, s, t); break;
+        case 5: EMIT("ssxp\tf%d, a%d, a%d", r, s, t); break;
         default: EMIT("??lscx op2=%d", op2); break;
         }
         break;
 
-    case 9: /* LSC4 - L32E/S32E with different encoding, or cache ops */
+    case 9: /* LSC4 - L32E/S32E */
         switch (op2) {
         case 0: EMIT("l32e\ta%d, a%d, %d", t, s, (r << 2) - 64); break;
         case 4: EMIT("s32e\ta%d, a%d, %d", t, s, (r << 2) - 64); break;
         default: EMIT("??lsc4 op2=%d", op2); break;
+        }
+        break;
+
+    case 10: /* FP0 - FP arithmetic, conversions */
+        switch (op2) {
+        case 0: EMIT("add.s\tf%d, f%d, f%d", r, s, t); break;
+        case 1: EMIT("sub.s\tf%d, f%d, f%d", r, s, t); break;
+        case 2: EMIT("mul.s\tf%d, f%d, f%d", r, s, t); break;
+        case 4: EMIT("madd.s\tf%d, f%d, f%d", r, s, t); break;
+        case 5: EMIT("msub.s\tf%d, f%d, f%d", r, s, t); break;
+        case 6: EMIT("maddn.s\tf%d, f%d, f%d", r, s, t); break;
+        case 7: EMIT("divn.s\tf%d, f%d, f%d", r, s, t); break;
+        case 8: EMIT("round.s\ta%d, f%d, %d", t, s, r); break;
+        case 9: EMIT("trunc.s\ta%d, f%d, %d", t, s, r); break;
+        case 10: EMIT("floor.s\ta%d, f%d, %d", t, s, r); break;
+        case 11: EMIT("ceil.s\ta%d, f%d, %d", t, s, r); break;
+        case 12: EMIT("float.s\tf%d, a%d, %d", r, s, t); break;
+        case 13: EMIT("ufloat.s\tf%d, a%d, %d", r, s, t); break;
+        case 14: EMIT("utrunc.s\ta%d, f%d, %d", t, s, r); break;
+        case 15: /* FP1OP */
+            switch (t) {
+            case 0: EMIT("mov.s\tf%d, f%d", r, s); break;
+            case 1: EMIT("abs.s\tf%d, f%d", r, s); break;
+            case 3: EMIT("const.s\tf%d, %d", r, s); break;
+            case 4: EMIT("rfr\ta%d, f%d", r, s); break;
+            case 5: EMIT("wfr\tf%d, a%d", r, s); break;
+            case 6: EMIT("neg.s\tf%d, f%d", r, s); break;
+            case 7: EMIT("div0.s\tf%d, f%d", r, s); break;
+            case 8: EMIT("recip0.s\tf%d, f%d", r, s); break;
+            case 9: EMIT("sqrt0.s\tf%d, f%d", r, s); break;
+            case 10: EMIT("rsqrt0.s\tf%d, f%d", r, s); break;
+            case 11: EMIT("nexp01.s\tf%d, f%d", r, s); break;
+            case 12: EMIT("mksadj.s\tf%d, f%d", r, s); break;
+            case 13: EMIT("mkdadj.s\tf%d, f%d", r, s); break;
+            case 14: EMIT("addexp.s\tf%d, f%d", r, s); break;
+            case 15: EMIT("addexpm.s\tf%d, f%d", r, s); break;
+            default: EMIT("??fp1op t=%d", t); break;
+            }
+            break;
+        default: EMIT("??fp0 op2=%d", op2); break;
+        }
+        break;
+
+    case 11: /* FP1 - FP comparisons, conditional moves */
+        switch (op2) {
+        case 1: EMIT("un.s\tb%d, f%d, f%d", r, s, t); break;
+        case 2: EMIT("oeq.s\tb%d, f%d, f%d", r, s, t); break;
+        case 3: EMIT("ueq.s\tb%d, f%d, f%d", r, s, t); break;
+        case 4: EMIT("olt.s\tb%d, f%d, f%d", r, s, t); break;
+        case 5: EMIT("ult.s\tb%d, f%d, f%d", r, s, t); break;
+        case 6: EMIT("ole.s\tb%d, f%d, f%d", r, s, t); break;
+        case 7: EMIT("ule.s\tb%d, f%d, f%d", r, s, t); break;
+        case 8: EMIT("moveqz.s\tf%d, f%d, a%d", r, s, t); break;
+        case 9: EMIT("movnez.s\tf%d, f%d, a%d", r, s, t); break;
+        case 10: EMIT("movltz.s\tf%d, f%d, a%d", r, s, t); break;
+        case 11: EMIT("movgez.s\tf%d, f%d, a%d", r, s, t); break;
+        case 12: EMIT("movf.s\tf%d, f%d, b%d", r, s, t); break;
+        case 13: EMIT("movt.s\tf%d, f%d, b%d", r, s, t); break;
+        default: EMIT("??fp1 op2=%d", op2); break;
         }
         break;
 
