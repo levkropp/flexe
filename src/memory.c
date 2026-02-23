@@ -37,12 +37,22 @@
 #define RTC_SLOW_BASE   0x60000000u
 #define RTC_SLOW_END    0x60002000u
 
+#define PERIPH_PAGES 128  /* 512KB / 4KB */
+#define PAGE_SIZE    4096
+
+typedef struct {
+    mmio_read_fn  read;
+    mmio_write_fn write;
+    void         *ctx;
+} mmio_handler_t;
+
 struct xtensa_mem {
     uint8_t *sram;      /* Internal SRAM (data + instruction alias) */
     uint8_t *rom;       /* Internal ROM */
     uint8_t *flash;     /* External flash image */
     uint8_t *rtc_fast;  /* RTC FAST memory */
     uint8_t *rtc_slow;  /* RTC SLOW memory */
+    mmio_handler_t mmio[PERIPH_PAGES];
 };
 
 xtensa_mem_t *mem_create(void) {
@@ -121,46 +131,66 @@ static uint8_t *mem_translate(xtensa_mem_t *mem, uint32_t addr) {
     return NULL;  /* Unmapped */
 }
 
+/* MMIO dispatch helper: returns handler for peripheral address, or NULL */
+static mmio_handler_t *mmio_lookup(xtensa_mem_t *mem, uint32_t addr) {
+    if (addr >= PERIPH_BASE && addr < PERIPH_END) {
+        int page = (addr - PERIPH_BASE) / PAGE_SIZE;
+        mmio_handler_t *h = &mem->mmio[page];
+        if (h->read || h->write)
+            return h;
+    }
+    return NULL;
+}
+
 uint8_t mem_read8(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *ptr = mem_translate(mem, addr);
-    if (!ptr) return 0;
-    return *ptr;
+    if (ptr) return *ptr;
+    mmio_handler_t *h = mmio_lookup(mem, addr);
+    if (h && h->read) return (uint8_t)h->read(h->ctx, addr);
+    return 0;
 }
 
 uint16_t mem_read16(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *ptr = mem_translate(mem, addr);
-    if (!ptr) return 0;
-    /* Little-endian */
-    return (uint16_t)(ptr[0] | (ptr[1] << 8));
+    if (ptr) return (uint16_t)(ptr[0] | (ptr[1] << 8));
+    mmio_handler_t *h = mmio_lookup(mem, addr);
+    if (h && h->read) return (uint16_t)h->read(h->ctx, addr);
+    return 0;
 }
 
 uint32_t mem_read32(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *ptr = mem_translate(mem, addr);
-    if (!ptr) return 0;
-    /* Little-endian */
-    return (uint32_t)(ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24));
+    if (ptr) return (uint32_t)(ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24));
+    mmio_handler_t *h = mmio_lookup(mem, addr);
+    if (h && h->read) return h->read(h->ctx, addr);
+    return 0;
 }
 
 void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
     uint8_t *ptr = mem_translate(mem, addr);
-    if (!ptr) return;
-    *ptr = val;
+    if (ptr) { *ptr = val; return; }
+    mmio_handler_t *h = mmio_lookup(mem, addr);
+    if (h && h->write) h->write(h->ctx, addr, val);
 }
 
 void mem_write16(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
     uint8_t *ptr = mem_translate(mem, addr);
-    if (!ptr) return;
-    ptr[0] = (uint8_t)(val & 0xFF);
-    ptr[1] = (uint8_t)((val >> 8) & 0xFF);
+    if (ptr) { ptr[0] = (uint8_t)(val & 0xFF); ptr[1] = (uint8_t)((val >> 8) & 0xFF); return; }
+    mmio_handler_t *h = mmio_lookup(mem, addr);
+    if (h && h->write) h->write(h->ctx, addr, val);
 }
 
 void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
     uint8_t *ptr = mem_translate(mem, addr);
-    if (!ptr) return;
-    ptr[0] = (uint8_t)(val & 0xFF);
-    ptr[1] = (uint8_t)((val >> 8) & 0xFF);
-    ptr[2] = (uint8_t)((val >> 16) & 0xFF);
-    ptr[3] = (uint8_t)((val >> 24) & 0xFF);
+    if (ptr) {
+        ptr[0] = (uint8_t)(val & 0xFF);
+        ptr[1] = (uint8_t)((val >> 8) & 0xFF);
+        ptr[2] = (uint8_t)((val >> 16) & 0xFF);
+        ptr[3] = (uint8_t)((val >> 24) & 0xFF);
+        return;
+    }
+    mmio_handler_t *h = mmio_lookup(mem, addr);
+    if (h && h->write) h->write(h->ctx, addr, val);
 }
 
 int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len) {
@@ -174,4 +204,25 @@ int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len) 
 
 const uint8_t *mem_get_ptr(xtensa_mem_t *mem, uint32_t addr) {
     return mem_translate(mem, addr);
+}
+
+int mem_register_mmio(xtensa_mem_t *mem, int page_index,
+                      mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx) {
+    if (!mem || page_index < 0 || page_index >= PERIPH_PAGES)
+        return -1;
+    mem->mmio[page_index].read  = read_fn;
+    mem->mmio[page_index].write = write_fn;
+    mem->mmio[page_index].ctx   = ctx;
+    return 0;
+}
+
+int mem_register_mmio_range(xtensa_mem_t *mem, uint32_t base, uint32_t size,
+                            mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx) {
+    if (!mem || base < PERIPH_BASE || base + size > PERIPH_END)
+        return -1;
+    int start_page = (base - PERIPH_BASE) / PAGE_SIZE;
+    int num_pages  = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (int i = 0; i < num_pages; i++)
+        mem_register_mmio(mem, start_page + i, read_fn, write_fn, ctx);
+    return 0;
 }

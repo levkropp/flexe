@@ -6,6 +6,10 @@
 
 typedef struct xtensa_mem xtensa_mem_t;
 
+/* MMIO callback types */
+typedef uint32_t (*mmio_read_fn)(void *ctx, uint32_t addr);
+typedef void     (*mmio_write_fn)(void *ctx, uint32_t addr, uint32_t val);
+
 xtensa_mem_t *mem_create(void);
 void mem_destroy(xtensa_mem_t *mem);
 void mem_reset(xtensa_mem_t *mem);
@@ -23,5 +27,11 @@ int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len);
 
 /* Direct pointer access (for instruction fetch) */
 const uint8_t *mem_get_ptr(xtensa_mem_t *mem, uint32_t addr);
+
+/* MMIO peripheral registration */
+int mem_register_mmio(xtensa_mem_t *mem, int page_index,
+                      mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx);
+int mem_register_mmio_range(xtensa_mem_t *mem, uint32_t base, uint32_t size,
+                            mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx);
 
 #endif /* MEMORY_H */
