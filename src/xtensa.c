@@ -1573,6 +1573,17 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         return cpu->exception ? -1 : 0;
     }
 
+    /* PC hook: intercept execution at specific addresses (e.g. ROM stubs) */
+    if (cpu->pc_hook && cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
+        cpu->ccount++;
+        cpu->cycle_count++;
+        if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
+        if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
+        if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+        xtensa_check_interrupts(cpu);
+        return cpu->exception ? -1 : 0;
+    }
+
     int ilen = xtensa_fetch(cpu, cpu->pc, &insn);
     if (ilen == 0) {
         xtensa_raise_exception(cpu, EXCCAUSE_IFETCH_ERROR, cpu->pc, 0);

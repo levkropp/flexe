@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "loader.h"
 #include "peripherals.h"
+#include "rom_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,15 @@ int main(int argc, char *argv[]) {
     xtensa_cpu_reset(&cpu);
     cpu.mem = mem;
 
+    /* Install ROM function stubs */
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    if (!rom) {
+        fprintf(stderr, "Failed to create ROM stubs\n");
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return 1;
+    }
+
     if (has_entry_override)
         cpu.pc = entry_override;
     else if (res.entry_point != 0)
@@ -117,6 +127,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Final PC:   0x%08X\n", cpu.pc);
     fprintf(stderr, "UART TX:    %d bytes\n", periph_uart_tx_count(periph));
     fprintf(stderr, "Unhandled:  %d peripheral accesses\n", periph_unhandled_count(periph));
+    fprintf(stderr, "ROM calls:  %d output bytes\n", rom_stubs_output_count(rom));
 
     if (verbose) {
         fprintf(stderr, "\n--- Registers ---\n");
@@ -131,6 +142,7 @@ int main(int argc, char *argv[]) {
                     i+2, ar_read(&cpu, i+2), i+3, ar_read(&cpu, i+3));
     }
 
+    rom_stubs_destroy(rom);
     periph_destroy(periph);
     mem_destroy(mem);
     return 0;
