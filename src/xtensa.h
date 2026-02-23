@@ -85,6 +85,38 @@ typedef struct xtensa_mem xtensa_mem_t;
 #define XT_SR_MISC3         247
 
 /*
+ * EXCCAUSE constants
+ */
+#define EXCCAUSE_ILLEGAL            0
+#define EXCCAUSE_SYSCALL            1
+#define EXCCAUSE_IFETCH_ERROR       2
+#define EXCCAUSE_LOAD_STORE_ERROR   3
+#define EXCCAUSE_LEVEL1_INT         4
+#define EXCCAUSE_ALLOCA             5
+#define EXCCAUSE_DIVIDE_BY_ZERO     6
+#define EXCCAUSE_PRIVILEGED         8
+#define EXCCAUSE_LOAD_STORE_ALIGN   9
+
+/*
+ * ESP32 vector offsets from VECBASE
+ */
+#define VECOFS_WINDOW_OVERFLOW4     0x000
+#define VECOFS_WINDOW_UNDERFLOW4    0x040
+#define VECOFS_WINDOW_OVERFLOW8     0x080
+#define VECOFS_WINDOW_UNDERFLOW8    0x0C0
+#define VECOFS_WINDOW_OVERFLOW12    0x100
+#define VECOFS_WINDOW_UNDERFLOW12   0x140
+#define VECOFS_LEVEL2_INT           0x180
+#define VECOFS_LEVEL3_INT           0x1C0
+#define VECOFS_LEVEL4_INT           0x200
+#define VECOFS_LEVEL5_INT           0x240
+#define VECOFS_DEBUG_EXC            0x280
+#define VECOFS_NMI                  0x2C0
+#define VECOFS_KERNEL_EXC           0x300
+#define VECOFS_USER_EXC             0x340
+#define VECOFS_DOUBLE_EXC           0x3C0
+
+/*
  * Instruction field extraction macros (24-bit, little-endian)
  */
 #define XT_OP0(i)       ((i) & 0xF)
@@ -125,6 +157,8 @@ typedef struct xtensa_mem xtensa_mem_t;
 #define XT_PS_SET_CALLINC(ps, v) ((ps) = ((ps) & ~(3u << 16)) | (((v) & 3u) << 16))
 #define XT_PS_SET_OWB(ps, v)     ((ps) = ((ps) & ~(0xFu << 8)) | (((v) & 0xFu) << 8))
 #define XT_PS_SET_EXCM(ps, v)    ((ps) = ((ps) & ~(1u << 4)) | (((v) & 1u) << 4))
+#define XT_PS_SET_INTLEVEL(ps, v) ((ps) = ((ps) & ~0xFu) | ((v) & 0xFu))
+#define XT_PS_SET_UM(ps, v)       ((ps) = ((ps) & ~(1u << 5)) | (((v) & 1u) << 5))
 
 /*
  * CPU State
@@ -185,10 +219,14 @@ typedef struct {
     uint32_t fsr;           /* Floating-point status */
     float    fr[16];        /* Floating-point registers */
 
+    /* Interrupt configuration */
+    uint8_t  int_level[32]; /* Interrupt level per line (default: 1) */
+
     /* Execution state */
     bool     running;
     bool     exception;     /* Exception pending flag */
     bool     debug_break;   /* Debug break requested */
+    bool     halted;        /* WAITI halt state */
     uint64_t cycle_count;   /* Total emulated cycles */
 
     /* Memory subsystem (set by caller) */
@@ -235,5 +273,11 @@ void xtensa_cpu_reset(xtensa_cpu_t *cpu);
 int  xtensa_step(xtensa_cpu_t *cpu);
 int  xtensa_run(xtensa_cpu_t *cpu, int max_cycles);
 int  xtensa_disasm(const xtensa_cpu_t *cpu, uint32_t addr, char *buf, int bufsize);
+
+/*
+ * Exception/Interrupt support
+ */
+void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr);
+void xtensa_check_interrupts(xtensa_cpu_t *cpu);
 
 #endif /* XTENSA_H */
