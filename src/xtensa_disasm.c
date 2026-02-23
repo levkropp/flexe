@@ -168,6 +168,8 @@ static int disasm_qrst(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
                     case 0: EMIT("rfe"); break;
                     case 1: EMIT("rfue"); break;
                     case 2: EMIT("rfde"); break;
+                    case 4: EMIT("rfwo"); break;
+                    case 5: EMIT("rfwu"); break;
                     default: EMIT("??rfet s=%d", s); break;
                     }
                     break;

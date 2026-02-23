@@ -196,6 +196,123 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
 
 /* ===== Instruction Execution ===== */
 
+/* ===== Windowed Register Helpers ===== */
+
+/*
+ * Read a register from a specific physical window (not the current windowbase).
+ */
+static inline uint32_t phys_read(const xtensa_cpu_t *cpu, int widx, int reg) {
+    return cpu->ar[((widx * 4) + reg) & 63];
+}
+
+/*
+ * Write a register in a specific physical window.
+ */
+static inline void phys_write(xtensa_cpu_t *cpu, int widx, int reg, uint32_t val) {
+    cpu->ar[((widx * 4) + reg) & 63] = val;
+}
+
+/*
+ * Spill (save) registers of window widx to its stack frame.
+ * The window's a0 encodes the call size in bits [31:30].
+ * Always saves a0-a3 at SP-16; for CALL8+ also a4-a7 at SP-32;
+ * for CALL12 also a8-a11 at SP-48.
+ */
+static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
+    uint32_t sp = phys_read(cpu, widx, 1);  /* a1 = stack pointer */
+    uint32_t a0 = phys_read(cpu, widx, 0);
+    int callsize = (a0 >> 30) & 3;
+
+    /* Always save base 4 regs: a0-a3 at SP-16 */
+    for (int i = 0; i < 4; i++)
+        mem_write32(cpu->mem, sp - 16 + i * 4, phys_read(cpu, widx, i));
+
+    if (callsize >= 2) {
+        /* CALL8+: also save a4-a7 at SP-32 */
+        for (int i = 0; i < 4; i++)
+            mem_write32(cpu->mem, sp - 32 + i * 4, phys_read(cpu, widx, 4 + i));
+    }
+    if (callsize == 3) {
+        /* CALL12: also save a8-a11 at SP-48 */
+        for (int i = 0; i < 4; i++)
+            mem_write32(cpu->mem, sp - 48 + i * 4, phys_read(cpu, widx, 8 + i));
+    }
+
+    /* Clear windowstart bit for this window */
+    cpu->windowstart &= ~(1u << (widx & 0xF));
+}
+
+/*
+ * Overflow check: called during ENTRY to spill any live windows
+ * that would be overwritten by the new callinc rotation.
+ */
+static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
+    int new_wb = (cpu->windowbase + callinc) & 0xF;
+    for (int i = 1; i <= 3; i++) {
+        int w = (new_wb + i) & 0xF;
+        if (cpu->windowstart & (1u << w))
+            synth_spill_window(cpu, w);
+    }
+}
+
+/*
+ * Underflow fill: called during RETW when the caller's windowstart
+ * bit is clear (registers were spilled and need restoration).
+ */
+static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb) {
+    uint32_t sp = phys_read(cpu, ret_wb, 1);
+
+    /* Restore a0-a3 from SP-16 */
+    for (int i = 0; i < 4; i++)
+        phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, sp - 16 + i * 4));
+
+    /* Check restored a0 for call size to determine extra regs */
+    uint32_t a0 = phys_read(cpu, ret_wb, 0);
+    int callsize = (a0 >> 30) & 3;
+
+    if (callsize >= 2) {
+        for (int i = 0; i < 4; i++)
+            phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, sp - 32 + i * 4));
+    }
+    if (callsize == 3) {
+        for (int i = 0; i < 4; i++)
+            phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, sp - 48 + i * 4));
+    }
+
+    /* Set windowstart bit */
+    cpu->windowstart |= (1u << (ret_wb & 0xF));
+}
+
+/*
+ * RETW: shared helper for both RETW (24-bit) and RETW.N (16-bit).
+ * ISA: n = AR[0][31:30], nextPC = PC[31:30] | AR[0][29:0]
+ *   if WS[WB-n] set → normal: clear WS[owb], WB -= n
+ *   if WS[WB-n] clear → underflow fill, then WB -= n
+ */
+static void exec_retw(xtensa_cpu_t *cpu) {
+    uint32_t a0 = ar_read(cpu, 0);
+    int n = (a0 >> 30) & 3;
+    if (n == 0) n = 4;  /* n=0 encoding not used; safety fallback */
+
+    uint32_t next_pc = (cpu->pc & 0xC0000000) | (a0 & 0x3FFFFFFF);
+
+    int owb = cpu->windowbase;
+    int ret_wb = (owb - n) & 0xF;
+
+    if (!(cpu->windowstart & (1u << ret_wb))) {
+        /* Caller's window was spilled — fill it back */
+        synth_underflow_fill(cpu, ret_wb);
+    }
+
+    /* Clear current window's WS bit */
+    cpu->windowstart &= ~(1u << owb);
+
+    /* Rotate back */
+    cpu->windowbase = ret_wb;
+
+    cpu->pc = next_pc;
+}
+
 /* Execute op0=0 (QRST) - the main RRR instruction group */
 static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
     int op1 = XT_OP1(insn);
@@ -220,6 +337,10 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         /* RET: pc = a0 */
                         cpu->pc = ar_read(cpu, 0);
                         return; /* skip default pc advance */
+                    } else if (m == 2 && nn == 1) {
+                        /* RETW: windowed return */
+                        exec_retw(cpu);
+                        return;
                     } else if (m == 2 && nn == 2) {
                         /* JX: pc = ar[s] */
                         cpu->pc = ar_read(cpu, s);
@@ -228,9 +349,8 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         /* CALLX0/4/8/12 */
                         uint32_t target = ar_read(cpu, s);
                         if (nn > 0) {
-                            /* windowed call - simplified for now */
-                            ar_write(cpu, nn * 4, (cpu->pc & 0xC0000000) | (cpu->pc >> 2));
-                            /* TODO: proper window rotation */
+                            XT_PS_SET_CALLINC(cpu->ps, nn);
+                            ar_write(cpu, nn * 4, ((uint32_t)nn << 30) | (cpu->pc & 0x3FFFFFFF));
                         } else {
                             ar_write(cpu, 0, cpu->pc);
                         }
@@ -243,15 +363,50 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                     }
                 }
                 break;
-            case 1: /* MOVSP */
+            case 1: { /* MOVSP */
+                for (int i = 1; i <= 3; i++) {
+                    int w = (cpu->windowbase - i) & 15;
+                    if (cpu->windowstart & (1u << w))
+                        synth_spill_window(cpu, w);
+                }
                 ar_write(cpu, t, ar_read(cpu, s));
-                break;
+            } break;
             case 2: /* SYNC group */
                 /* NOP, ISYNC, RSYNC, ESYNC, DSYNC, EXTW, MEMW, EXCW */
                 /* All no-ops for emulation purposes */
                 break;
-            case 3: /* RFE and friends - return from exception */
-                /* Stub: will implement in exception milestone */
+            case 3: /* RFEI group */
+                switch (t) {
+                case 0: /* RFET: RFE, RFWO, RFWU */
+                    switch (s) {
+                    case 0: /* RFE */
+                        XT_PS_SET_EXCM(cpu->ps, 0);
+                        cpu->pc = cpu->epc[0];
+                        return;
+                    case 4: /* RFWO */
+                        XT_PS_SET_EXCM(cpu->ps, 0);
+                        cpu->windowstart &= ~(1u << cpu->windowbase);
+                        cpu->windowbase = XT_PS_OWB(cpu->ps);
+                        cpu->pc = cpu->epc[0];
+                        return;
+                    case 5: /* RFWU */
+                        XT_PS_SET_EXCM(cpu->ps, 0);
+                        cpu->windowstart |= (1u << cpu->windowbase);
+                        cpu->windowbase = XT_PS_OWB(cpu->ps);
+                        cpu->pc = cpu->epc[0];
+                        return;
+                    default: break;
+                    }
+                    break;
+                case 1: /* RFI */
+                    XT_PS_SET_EXCM(cpu->ps, 0);
+                    if (s >= 1 && s <= 7) {
+                        cpu->ps = cpu->eps[s - 1];
+                        cpu->pc = cpu->epc[s - 1];
+                    }
+                    return;
+                default: break;
+                }
                 break;
             case 4: /* BREAK */
                 cpu->debug_break = true;
@@ -537,6 +692,20 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
           ar_write(cpu, r, (ar_read(cpu, t) >> shift) & mask);
         } break;
 
+    case 9: /* LSC4: L32E, S32E */
+        switch (op2) {
+        case 0: { /* L32E */
+            uint32_t addr = ar_read(cpu, s) + (uint32_t)((int32_t)(r << 2) - 64);
+            ar_write(cpu, t, mem_read32(cpu->mem, addr));
+        } break;
+        case 4: { /* S32E */
+            uint32_t addr = ar_read(cpu, s) + (uint32_t)((int32_t)(r << 2) - 64);
+            mem_write32(cpu->mem, addr, ar_read(cpu, t));
+        } break;
+        default: break;
+        }
+        break;
+
     default:
         /* Unimplemented op1 groups */
         break;
@@ -671,8 +840,8 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
             case 0: /* RET.N */
                 cpu->pc = ar_read(cpu, 0);
                 return; /* skip default pc advance */
-            case 1: /* RETW.N - simplified: same as RET for now */
-                cpu->pc = ar_read(cpu, 0);
+            case 1: /* RETW.N */
+                exec_retw(cpu);
                 return;
             case 2: /* BREAK.N */
                 cpu->debug_break = true;
@@ -710,8 +879,9 @@ static void exec_calln(xtensa_cpu_t *cpu, uint32_t insn) {
     uint32_t target = (((original_pc >> 2) + (uint32_t)offset + 1) << 2);
 
     if (nn > 0) {
-        /* Windowed call - simplified stub for M5 */
-        ar_write(cpu, nn * 4, (cpu->pc & 0xC0000000) | (cpu->pc >> 2));
+        /* Windowed call: PS.CALLINC = nn, AR[nn*4] = nn || nextPC[29:0] */
+        XT_PS_SET_CALLINC(cpu->ps, nn);
+        ar_write(cpu, nn * 4, ((uint32_t)nn << 30) | (cpu->pc & 0x3FFFFFFF));
     } else {
         /* CALL0: return address = next instruction */
         ar_write(cpu, 0, cpu->pc);
@@ -761,8 +931,23 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
         { int imm8 = XT_IMM8(insn);
           int r = XT_R(insn);
           switch (m) {
-          case 0: /* ENTRY - stub for M5 */
-              break;
+          case 0: { /* ENTRY */
+              int callinc = XT_PS_CALLINC(cpu->ps);
+              uint32_t imm12 = XT_IMM12(insn);
+              uint32_t frame_size = imm12 << 3;
+
+              synth_overflow_check(cpu, callinc);
+
+              /* AR[callinc*4 | s&3] = AR[s] - framesize (before rotation) */
+              int new_reg = (callinc << 2) | (s & 3);
+              ar_write(cpu, new_reg, ar_read(cpu, s) - frame_size);
+
+              uint32_t owb = cpu->windowbase;
+              cpu->windowbase = (owb + callinc) & 0xF;
+              cpu->windowstart |= (1u << cpu->windowbase);
+              XT_PS_SET_OWB(cpu->ps, owb);
+              XT_PS_SET_CALLINC(cpu->ps, 0);
+          } break;
           case 1: /* B1: BF, BT, LOOP, LOOPNEZ, LOOPGTZ */
               { int32_t offset8 = sign_extend(imm8, 8);
                 uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
