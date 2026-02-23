@@ -552,18 +552,50 @@ static void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
 
     switch (r) {
     case 0x0: /* L8UI */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)imm8;
+          ar_write(cpu, t, mem_read8(cpu->mem, addr));
+        } break;
     case 0x1: /* L16UI */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 1);
+          ar_write(cpu, t, mem_read16(cpu->mem, addr));
+        } break;
     case 0x2: /* L32I */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 2);
+          ar_write(cpu, t, mem_read32(cpu->mem, addr));
+        } break;
     case 0x4: /* S8I */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)imm8;
+          mem_write8(cpu->mem, addr, (uint8_t)ar_read(cpu, t));
+        } break;
     case 0x5: /* S16I */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 1);
+          mem_write16(cpu->mem, addr, (uint16_t)ar_read(cpu, t));
+        } break;
     case 0x6: /* S32I */
-    case 0x7: /* CACHE ops */
-    case 0x9: /* L16SI */
-    case 0xB: /* L32AI */
-    case 0xE: /* S32C1I */
-    case 0xF: /* S32RI */
-        /* Load/store: stub for M3 */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 2);
+          mem_write32(cpu->mem, addr, ar_read(cpu, t));
+        } break;
+    case 0x7: /* CACHE ops (DPFR, DPFW, DHWB, etc.) - no-op */
         break;
+    case 0x9: /* L16SI */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 1);
+          ar_write(cpu, t, (uint32_t)sign_extend(mem_read16(cpu->mem, addr), 16));
+        } break;
+    case 0xB: /* L32AI (acquire semantics = no-op in emulator) */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 2);
+          ar_write(cpu, t, mem_read32(cpu->mem, addr));
+        } break;
+    case 0xE: /* S32C1I (conditional store) */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 2);
+          uint32_t old = mem_read32(cpu->mem, addr);
+          if (old == cpu->scompare1)
+              mem_write32(cpu->mem, addr, ar_read(cpu, t));
+          ar_write(cpu, t, old);
+        } break;
+    case 0xF: /* S32RI (release semantics = no-op in emulator) */
+        { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 2);
+          mem_write32(cpu->mem, addr, ar_read(cpu, t));
+        } break;
 
     case 0xA: /* MOVI */
         { int32_t imm12 = sign_extend(((uint32_t)s << 8) | (uint32_t)imm8, 12);
@@ -593,8 +625,11 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
     int r = XT_R(insn);
 
     switch (op0) {
-    case 0x8: /* L32I.N - stub for M3 */
-    case 0x9: /* S32I.N - stub for M3 */
+    case 0x8: /* L32I.N */
+        ar_write(cpu, t, mem_read32(cpu->mem, ar_read(cpu, s) + (uint32_t)(r << 2)));
+        break;
+    case 0x9: /* S32I.N */
+        mem_write32(cpu->mem, ar_read(cpu, s) + (uint32_t)(r << 2), ar_read(cpu, t));
         break;
 
     case 0xA: /* ADD.N */
@@ -670,8 +705,13 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         cpu->pc = next_pc;
         switch (op0) {
         case 0: exec_qrst(cpu, insn); break;
+        case 1: /* L32R */
+            { int lt = XT_T(insn);
+              uint16_t imm16 = (uint16_t)XT_IMM16(insn);
+              uint32_t target = (cpu->pc & ~3u) + (0xFFFC0000u | ((uint32_t)imm16 << 2));
+              ar_write(cpu, lt, mem_read32(cpu->mem, target));
+            } break;
         case 2: exec_lsai(cpu, insn); break;
-        /* op0=1 (L32R), op0=3-7: stubs for future milestones */
         default: break;
         }
     }
