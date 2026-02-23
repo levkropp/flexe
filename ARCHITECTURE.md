@@ -349,10 +349,9 @@ Bit 4:     EXCM     (exception mode, suppresses level-1 interrupts)
 Bit 5:     UM       (user mode, 0=kernel 1=user)
 Bit 6-7:   RING     (privilege ring, 0-3)
 Bit 8-11:  OWB      (old window base, saved during exceptions)
-Bit 12-15: CALLINC  (window increment for current call, set by CALLn)
-Bit 16:    WOE      (window overflow enable)
-Bit 17:    (reserved)
-Bit 18:    EXCM cleared on RFDE (implementation-specific)
+Bit 12-15: (reserved)
+Bit 16-17: CALLINC  (window increment for current call, 1/2/3 for CALL4/8/12)
+Bit 18:    WOE      (window overflow enable)
 ```
 
 ---
