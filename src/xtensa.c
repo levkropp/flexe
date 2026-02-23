@@ -502,6 +502,22 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 XT_PS_SET_INTLEVEL(cpu->ps, s);
                 cpu->halted = true;
                 break;
+            case 8: /* ANY4: bt = bs|bs+1|bs+2|bs+3 */
+                { int val = (cpu->br >> s) & 0xF;
+                  cpu->br = (cpu->br & ~(1u << t)) | ((val ? 1u : 0u) << t);
+                } break;
+            case 9: /* ALL4: bt = bs&bs+1&bs+2&bs+3 */
+                { int val = (cpu->br >> s) & 0xF;
+                  cpu->br = (cpu->br & ~(1u << t)) | (((val == 0xF) ? 1u : 0u) << t);
+                } break;
+            case 10: /* ANY8: bt = any of bs..bs+7 */
+                { int val = (cpu->br >> s) & 0xFF;
+                  cpu->br = (cpu->br & ~(1u << t)) | ((val ? 1u : 0u) << t);
+                } break;
+            case 11: /* ALL8: bt = all of bs..bs+7 */
+                { int val = (cpu->br >> s) & 0xFF;
+                  cpu->br = (cpu->br & ~(1u << t)) | (((val == 0xFF) ? 1u : 0u) << t);
+                } break;
             default: break;
             }
             break;
@@ -551,6 +567,11 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                   else { while (!(val & 0x80000000)) { val <<= 1; n++; } }
                   ar_write(cpu, t, (uint32_t)n);
                 } break;
+            case 6: /* RER: ar[t] = external_reg[ar[s]] */
+                ar_write(cpu, t, 0);  /* stub: return 0 */
+                break;
+            case 7: /* WER: external_reg[ar[s]] = ar[t] */
+                break; /* stub: ignore */
             default: break;
             }
             break;
@@ -650,6 +671,26 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
 
     case 2: /* RST2 */
         switch (op2) {
+        case 0: /* ANDB: br[r] = br[s] AND br[t] */
+            { int val = ((cpu->br >> s) & 1) & ((cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 1: /* ANDBC: br[r] = br[s] AND NOT br[t] */
+            { int val = ((cpu->br >> s) & 1) & (~(cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 2: /* ORB: br[r] = br[s] OR br[t] */
+            { int val = ((cpu->br >> s) & 1) | ((cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 3: /* ORBC: br[r] = br[s] OR NOT br[t] */
+            { int val = ((cpu->br >> s) & 1) | (~(cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 4: /* XORB: br[r] = br[s] XOR br[t] */
+            { int val = ((cpu->br >> s) & 1) ^ ((cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
         case 6: /* SALT */
             ar_write(cpu, r, (int32_t)ar_read(cpu, s) < (int32_t)ar_read(cpu, t) ? 1 : 0);
             break;
@@ -758,12 +799,30 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             if ((int32_t)ar_read(cpu, t) >= 0)
                 ar_write(cpu, r, ar_read(cpu, s));
             break;
+        case 12: /* MOVF: if (!bt) ar[r] = ar[s] */
+            if (!((cpu->br >> t) & 1))
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
+        case 13: /* MOVT: if (bt) ar[r] = ar[s] */
+            if ((cpu->br >> t) & 1)
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
         case 14: /* RUR */
-            ar_write(cpu, r, 0); /* stub */
-            break;
+            { int ur = (s << 4) | r;
+              switch (ur) {
+              case 232: ar_write(cpu, t, cpu->fcr); break;
+              case 233: ar_write(cpu, t, cpu->fsr); break;
+              default:  ar_write(cpu, t, 0); break;
+              }
+            } break;
         case 15: /* WUR */
-            /* stub */
-            break;
+            { int ur = (s << 4) | r;
+              switch (ur) {
+              case 232: cpu->fcr = ar_read(cpu, t); break;
+              case 233: cpu->fsr = ar_read(cpu, t); break;
+              default: break;
+              }
+            } break;
         default: break;
         }
         break;
@@ -1124,6 +1183,90 @@ static void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
         cpu->pc = target;
 }
 
+/* ===== MAC16 Helpers ===== */
+
+static inline int32_t mac16_half(uint32_t val, int hi) {
+    return hi ? (int16_t)(val >> 16) : (int16_t)(val & 0xFFFF);
+}
+
+static inline int64_t mac16_get_acc(const xtensa_cpu_t *cpu) {
+    return ((int64_t)(int8_t)cpu->acchi << 32) | (uint64_t)cpu->acclo;
+}
+
+static inline void mac16_set_acc(xtensa_cpu_t *cpu, int64_t val) {
+    cpu->acclo = (uint32_t)val;
+    cpu->acchi = (uint32_t)((val >> 32) & 0xFF);
+}
+
+static void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
+    int op1 = XT_OP1(insn);
+    int op2 = XT_OP2(insn);
+    int r = XT_R(insn);
+    int s = XT_S(insn);
+    int t = XT_T(insn);
+
+    /* LDDEC / LDINC: op2=4,5 with op1=0 */
+    if (op2 == 4 && (op1 & 0xC) == 0) {
+        /* LDDEC: mr[r/4] = mem32[as]; as -= 4 */
+        uint32_t addr = ar_read(cpu, s);
+        cpu->mr[r >> 2] = mem_read32(cpu->mem, addr);
+        ar_write(cpu, s, addr - 4);
+        return;
+    }
+    if (op2 == 5 && (op1 & 0xC) == 0) {
+        /* LDINC: mr[r/4] = mem32[as]; as += 4 */
+        uint32_t addr = ar_read(cpu, s);
+        cpu->mr[r >> 2] = mem_read32(cpu->mem, addr);
+        ar_write(cpu, s, addr + 4);
+        return;
+    }
+
+    /* Get source registers based on op2[3:2] */
+    uint32_t src1, src2;
+    int reg_mode = (op2 >> 2) & 3;
+    switch (reg_mode) {
+    case 0: /* AA */ src1 = ar_read(cpu, s); src2 = ar_read(cpu, t); break;
+    case 1: /* AD */ src1 = ar_read(cpu, s); src2 = cpu->mr[t >> 1]; break;
+    case 2: /* DA */ src1 = cpu->mr[s >> 1]; src2 = ar_read(cpu, t); break;
+    case 3: /* DD */ src1 = cpu->mr[s >> 1]; src2 = cpu->mr[t >> 1]; break;
+    default: return;
+    }
+
+    /* Get half-select from op1[1:0] */
+    int sel = op1 & 3;
+    int32_t h1 = mac16_half(src1, sel >> 1);
+    int32_t h2 = mac16_half(src2, sel & 1);
+
+    /* Operation from op1[3:2] */
+    int op = (op1 >> 2) & 3;
+    int64_t acc = mac16_get_acc(cpu);
+    int64_t product;
+
+    if (op == 3) {
+        /* UMUL: unsigned */
+        product = (int64_t)((uint32_t)(uint16_t)h1 * (uint32_t)(uint16_t)h2);
+        acc = product;
+    } else {
+        product = (int64_t)h1 * (int64_t)h2;
+        switch (op) {
+        case 0: acc = product; break;    /* MUL */
+        case 1: acc += product; break;   /* MULA */
+        case 2: acc -= product; break;   /* MULS */
+        }
+    }
+    mac16_set_acc(cpu, acc);
+
+    /* Combined load for op2=8-11: MULA.xx.yy.LDDEC/LDINC */
+    if ((op2 & 0xC) == 8) {
+        uint32_t addr = ar_read(cpu, s);
+        cpu->mr[r >> 2] = mem_read32(cpu->mem, addr);
+        if (op2 & 1)
+            ar_write(cpu, s, addr + 4); /* LDINC */
+        else
+            ar_write(cpu, s, addr - 4); /* LDDEC */
+    }
+}
+
 /* ===== Main step function ===== */
 
 int xtensa_step(xtensa_cpu_t *cpu) {
@@ -1167,6 +1310,36 @@ int xtensa_step(xtensa_cpu_t *cpu) {
               ar_write(cpu, lt, mem_read32(cpu->mem, target));
             } break;
         case 2: exec_lsai(cpu, insn); break;
+        case 3: /* LSCI - FP loads/stores */
+            { int lr = XT_R(insn);
+              int ls = XT_S(insn);
+              int lt = XT_T(insn);
+              int limm8 = XT_IMM8(insn);
+              uint32_t base = ar_read(cpu, ls);
+              uint32_t offset = (uint32_t)(limm8 << 2);
+              switch (lr) {
+              case 0: /* LSI: ft = mem32[as + imm8*4] */
+                  { uint32_t tmp = mem_read32(cpu->mem, base + offset);
+                    memcpy(&cpu->fr[lt], &tmp, 4);
+                  } break;
+              case 4: /* SSI: mem32[as + imm8*4] = ft */
+                  { uint32_t tmp; memcpy(&tmp, &cpu->fr[lt], 4);
+                    mem_write32(cpu->mem, base + offset, tmp);
+                  } break;
+              case 8: /* LSIU: ft = mem32[as + imm8*4]; as += imm8*4 */
+                  { uint32_t tmp = mem_read32(cpu->mem, base + offset);
+                    memcpy(&cpu->fr[lt], &tmp, 4);
+                    ar_write(cpu, ls, base + offset);
+                  } break;
+              case 12: /* SSIU: mem32[as + imm8*4] = ft; as += imm8*4 */
+                  { uint32_t tmp; memcpy(&tmp, &cpu->fr[lt], 4);
+                    mem_write32(cpu->mem, base + offset, tmp);
+                    ar_write(cpu, ls, base + offset);
+                  } break;
+              default: break;
+              }
+            } break;
+        case 4: exec_mac16(cpu, insn); break;
         case 5: exec_calln(cpu, insn); break;
         case 6: exec_si(cpu, insn); break;
         case 7: exec_b(cpu, insn); break;
