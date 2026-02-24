@@ -22,6 +22,9 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_rom_stubs.c"
 #include "test_debug.c"
 #include "test_memory_map.c"
+#include "test_freertos.c"
+#include "test_esp_timer.c"
+#include "test_firmware_compat.c"
 
 int main(void) {
     printf("Running xtensa-emulator tests...\n\n");
@@ -46,6 +49,9 @@ int main(void) {
     run_rom_stub_tests();
     run_debug_tests();
     run_memory_map_tests();
+    run_freertos_tests();
+    run_esp_timer_tests();
+    run_firmware_compat_tests();
 
     printf("\n%d tests, %d passed, %d failed\n",
            test_count, test_passes, test_failures);

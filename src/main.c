@@ -4,6 +4,8 @@
 #include "peripherals.h"
 #include "rom_stubs.h"
 #include "elf_symbols.h"
+#include "freertos_stubs.h"
+#include "esp_timer_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -259,9 +261,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Hook firmware functions by symbol name (newlib locks etc.) */
+    /* Hook firmware functions by symbol name (newlib locks, NVS, GPIO driver etc.) */
     if (syms)
         rom_stubs_hook_symbols(rom, syms);
+
+    /* FreeRTOS stubs */
+    freertos_stubs_t *frt = freertos_stubs_create(&cpu);
+    if (frt && syms)
+        freertos_stubs_hook_symbols(frt, syms);
+
+    /* esp_timer stubs */
+    esp_timer_stubs_t *etimer = esp_timer_stubs_create(&cpu);
+    if (etimer && syms)
+        esp_timer_stubs_hook_symbols(etimer, syms);
 
     /* Install ROM log callback for verbose trace */
     if (verbose_trace)
@@ -425,6 +437,9 @@ int main(int argc, char *argv[]) {
             stop_reason = STOP_MAX_CYCLES;
     }
 
+    /* Flush any buffered output to stdout before summary */
+    fflush(stdout);
+
     /* ===== Summary ===== */
     fprintf(stderr, "\n--- Execution summary ---\n");
 
@@ -495,6 +510,8 @@ int main(int argc, char *argv[]) {
     }
 
     /* Cleanup */
+    esp_timer_stubs_destroy(etimer);
+    freertos_stubs_destroy(frt);
     rom_stubs_destroy(rom);
     periph_destroy(periph);
     mem_destroy(mem);
