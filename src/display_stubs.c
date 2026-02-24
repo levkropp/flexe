@@ -125,7 +125,20 @@ struct display_stubs {
 
 static uint32_t ds_arg(xtensa_cpu_t *cpu, int n) {
     int ci = XT_PS_CALLINC(cpu->ps);
-    return ar_read(cpu, ci * 4 + 2 + n);
+    /* Max register args: min(6, 16 - first_arg_reg).
+     * For CALL8 (ci=2): first_arg = a10, max = 6.
+     * For CALL4 (ci=1): first_arg = a6,  max = 6 (really 10 but ABI caps at 6).
+     * For CALL0 (ci=0): a2-a7 = 6. */
+    int first_arg = ci * 4 + 2;
+    int max_reg = 16 - first_arg;
+    if (max_reg > 6) max_reg = 6;
+    if (n < max_reg)
+        return ar_read(cpu, first_arg + n);
+    /* Extra args beyond register capacity are on the caller's stack.
+     * Hook fires before ENTRY, so SP (a1) is still the caller's SP.
+     * Stack args start at [SP + 0] for the first extra arg. */
+    uint32_t sp = ar_read(cpu, 1);
+    return mem_read32(cpu->mem, sp + (uint32_t)((n - max_reg) * 4));
 }
 
 static void ds_return_void(xtensa_cpu_t *cpu) {
