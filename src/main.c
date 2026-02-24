@@ -123,6 +123,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -s <file.elf>   Load ELF symbols for trace/breakpoints\n");
     fprintf(stderr, "  -b <addr|name>  Set breakpoint (repeatable)\n");
     fprintf(stderr, "  -m <addr[:len]> Dump memory on exit (repeatable, default len=256)\n");
+    fprintf(stderr, "  -S <file.img>   SD card backing image file\n");
+    fprintf(stderr, "  -Z <bytes>      SD card size (default: auto from file, or 4GB)\n");
 }
 
 /* ===== Parse -m argument ===== */
@@ -174,13 +176,15 @@ int main(int argc, char *argv[]) {
     uint32_t entry_override = 0;
     int has_entry_override = 0;
     const char *elf_path = NULL;
+    const char *sdcard_path = NULL;
+    uint64_t sdcard_size = 0;
     const char *bp_args[MAX_BP_ARGS];
     int bp_count = 0;
     mem_dump_t mem_dumps[MAX_MEM_DUMPS];
     int dump_count = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:tTvqe:s:b:m:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:tTvqe:s:b:m:S:Z:")) != -1) {
         switch (opt) {
         case 'c': max_cycles = atoi(optarg); break;
         case 't': trace = 1; break;
@@ -192,6 +196,8 @@ int main(int argc, char *argv[]) {
             has_entry_override = 1;
             break;
         case 's': elf_path = optarg; break;
+        case 'S': sdcard_path = optarg; break;
+        case 'Z': sdcard_size = strtoull(optarg, NULL, 0); break;
         case 'b':
             if (bp_count < MAX_BP_ARGS) bp_args[bp_count++] = optarg;
             break;
@@ -292,10 +298,16 @@ int main(int argc, char *argv[]) {
     if (tstubs && syms)
         touch_stubs_hook_symbols(tstubs, syms);
 
-    /* SD card stubs (no image in standalone mode) */
+    /* SD card stubs */
     sdcard_stubs_t *sstubs = sdcard_stubs_create(&cpu);
-    if (sstubs && syms)
-        sdcard_stubs_hook_symbols(sstubs, syms);
+    if (sstubs) {
+        if (sdcard_path)
+            sdcard_stubs_set_image(sstubs, sdcard_path);
+        if (sdcard_size > 0)
+            sdcard_stubs_set_size(sstubs, sdcard_size);
+        if (syms)
+            sdcard_stubs_hook_symbols(sstubs, syms);
+    }
 
     /* Install ROM log callback for verbose trace */
     if (verbose_trace)
