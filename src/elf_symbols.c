@@ -10,8 +10,10 @@
 #define ELFCLASS32  1
 #define ELFDATA2LSB 1
 #define SHT_SYMTAB  2
+#define STT_OBJECT  1
 #define STT_FUNC    2
 #define ELF_ST_TYPE(info) ((info) & 0xF)
+#define IS_USEFUL_SYM(info) (ELF_ST_TYPE(info) == STT_FUNC || ELF_ST_TYPE(info) == STT_OBJECT)
 
 typedef struct {
     uint8_t  e_ident[EI_NIDENT];
@@ -149,13 +151,13 @@ elf_symbols_t *elf_symbols_load(const char *path) {
     elf32_shdr_t *strtab_shdr = &shdrs[strtab_idx];
     char *strtab = (char *)(buf + strtab_shdr->sh_offset);
 
-    /* Count FUNC symbols */
+    /* Count useful symbols (FUNC + OBJECT) */
     int nsyms = (int)(symtab_shdr->sh_size / symtab_shdr->sh_entsize);
     elf32_sym_t *elf_syms = (elf32_sym_t *)(buf + symtab_shdr->sh_offset);
 
     int func_count = 0;
     for (int i = 0; i < nsyms; i++) {
-        if (ELF_ST_TYPE(elf_syms[i].st_info) == STT_FUNC && elf_syms[i].st_value != 0)
+        if (IS_USEFUL_SYM(elf_syms[i].st_info) && elf_syms[i].st_value != 0)
             func_count++;
     }
 
@@ -174,7 +176,7 @@ elf_symbols_t *elf_symbols_load(const char *path) {
     /* First pass: calculate total name length */
     size_t total_names = 0;
     for (int i = 0; i < nsyms; i++) {
-        if (ELF_ST_TYPE(elf_syms[i].st_info) == STT_FUNC && elf_syms[i].st_value != 0) {
+        if (IS_USEFUL_SYM(elf_syms[i].st_info) && elf_syms[i].st_value != 0) {
             const char *name = strtab + elf_syms[i].st_name;
             total_names += strlen(name) + 1;
         }
@@ -187,7 +189,7 @@ elf_symbols_t *elf_symbols_load(const char *path) {
     int idx = 0;
     size_t name_off = 0;
     for (int i = 0; i < nsyms; i++) {
-        if (ELF_ST_TYPE(elf_syms[i].st_info) != STT_FUNC || elf_syms[i].st_value == 0)
+        if (!IS_USEFUL_SYM(elf_syms[i].st_info) || elf_syms[i].st_value == 0)
             continue;
         const char *name = strtab + elf_syms[i].st_name;
         size_t nlen = strlen(name) + 1;

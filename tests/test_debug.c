@@ -227,8 +227,8 @@ TEST(test_elf_load_valid) {
 
     elf_symbols_t *s = elf_symbols_load(path);
     ASSERT_TRUE(s != NULL);
-    /* Should have 2 FUNC symbols (app_main, uart_init), not some_data (OBJECT) */
-    ASSERT_EQ(elf_symbols_count(s), 2);
+    /* Should have 3 symbols: 2 FUNC (app_main, uart_init) + 1 OBJECT (some_data) */
+    ASSERT_EQ(elf_symbols_count(s), 3);
 
     elf_symbols_destroy(s);
 }
@@ -316,14 +316,14 @@ TEST(test_elf_find_not_found) {
     elf_symbols_destroy(s);
 }
 
-TEST(test_elf_skips_non_func) {
+TEST(test_elf_finds_object_symbols) {
     const char *path = build_test_elf();
     elf_symbols_t *s = elf_symbols_load(path);
 
-    /* some_data is an OBJECT symbol — should NOT be found */
+    /* some_data is an OBJECT symbol — should now be found */
     uint32_t addr;
     int rc = elf_symbols_find(s, "some_data", &addr);
-    ASSERT_EQ(rc, (uint32_t)-1);
+    ASSERT_EQ(rc, 0);
 
     elf_symbols_destroy(s);
 }
@@ -478,7 +478,7 @@ static void run_debug_tests(void) {
     RUN_TEST(test_elf_lookup_size_boundary);
     RUN_TEST(test_elf_find_by_name);
     RUN_TEST(test_elf_find_not_found);
-    RUN_TEST(test_elf_skips_non_func);
+    RUN_TEST(test_elf_finds_object_symbols);
 
     TEST_SUITE("Breakpoints");
     RUN_TEST(test_bp_set_and_hit);

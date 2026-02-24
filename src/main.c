@@ -6,11 +6,18 @@
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
 #include "esp_timer_stubs.h"
+#include "display_stubs.h"
+#include "touch_stubs.h"
+#include "sdcard_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <getopt.h>
+
+/* Provided by cyd-emulator's emu_touch.c in --firmware mode;
+ * standalone binary always keeps this set to 1. */
+volatile int emu_app_running = 1;
 
 /* ===== Configuration ===== */
 
@@ -275,6 +282,21 @@ int main(int argc, char *argv[]) {
     if (etimer && syms)
         esp_timer_stubs_hook_symbols(etimer, syms);
 
+    /* Display stubs (no framebuffer in standalone mode — just hooks) */
+    display_stubs_t *dstubs = display_stubs_create(&cpu);
+    if (dstubs && syms)
+        display_stubs_hook_symbols(dstubs, syms);
+
+    /* Touch stubs (no input in standalone mode) */
+    touch_stubs_t *tstubs = touch_stubs_create(&cpu);
+    if (tstubs && syms)
+        touch_stubs_hook_symbols(tstubs, syms);
+
+    /* SD card stubs (no image in standalone mode) */
+    sdcard_stubs_t *sstubs = sdcard_stubs_create(&cpu);
+    if (sstubs && syms)
+        sdcard_stubs_hook_symbols(sstubs, syms);
+
     /* Install ROM log callback for verbose trace */
     if (verbose_trace)
         rom_stubs_set_log_callback(rom, rom_log_cb, NULL);
@@ -510,6 +532,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* Cleanup */
+    sdcard_stubs_destroy(sstubs);
+    touch_stubs_destroy(tstubs);
+    display_stubs_destroy(dstubs);
     esp_timer_stubs_destroy(etimer);
     freertos_stubs_destroy(frt);
     rom_stubs_destroy(rom);
