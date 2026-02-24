@@ -34,6 +34,8 @@ struct esp32_rom_stubs {
     void            *log_ctx;
     int              unregistered_count;
     uint32_t         s_cpu_up_addr;     /* BSS symbol for multicore unblock */
+    uint32_t         s_cpu_inited_addr; /* BSS symbol for multicore init wait */
+    uint32_t         app_main_addr;    /* app_main symbol for start_cpu0 hook */
 };
 
 /* ===== Calling convention helpers ===== */
@@ -212,9 +214,11 @@ done:;
 
 static void stub_ets_set_appcpu_boot_addr(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
-    /* Write s_cpu_up[1] = 1 to unblock multicore startup wait loop */
+    /* Write s_cpu_up[1] = 1 and s_cpu_inited[1] = 1 to unblock multicore startup */
     if (s->s_cpu_up_addr)
         mem_write8(cpu->mem, s->s_cpu_up_addr + 1, 1);
+    if (s->s_cpu_inited_addr)
+        mem_write8(cpu->mem, s->s_cpu_inited_addr + 1, 1);
     rom_return_void(cpu);
 }
 
@@ -779,11 +783,12 @@ static void stub_crc32_le(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_esp_chip_info(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t info = rom_arg(cpu, 0);
-    /* esp_chip_info_t: model(u32), features(u32), cores(u8), revision(u8) */
+    /* esp_chip_info_t: model(u32), features(u32), full_revision(u16), cores(u8), revision(u8) */
     mem_write32(cpu->mem, info + 0, 1);       /* CHIP_ESP32 */
     mem_write32(cpu->mem, info + 4, 0x12);    /* WIFI_BGN(1) | BT(2) | BLE(0x10) */
-    mem_write8(cpu->mem, info + 8, 2);        /* cores = 2 */
-    mem_write8(cpu->mem, info + 9, 3);        /* revision = 3 */
+    mem_write16(cpu->mem, info + 8, 300);     /* full_revision = 3.0 (v3 * 100) */
+    mem_write8(cpu->mem, info + 10, 2);       /* cores = 2 */
+    mem_write8(cpu->mem, info + 11, 3);       /* revision = 3 */
     rom_return_void(cpu);
 }
 
@@ -843,6 +848,38 @@ static void stub_esp_startup_start_app(xtensa_cpu_t *cpu, void *ctx) {
     /* Don't return — we'll let the firmware call app_main naturally
      * through the normal code path. Just return void. */
     rom_return_void(cpu);
+}
+
+/* start_cpu0 — hook to skip __init_array constructors that call unmapped flash.
+ * Calls app_main directly by setting PC. The app_main address is stored
+ * when hook_symbols runs. */
+static void stub_start_cpu0(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    if (s->app_main_addr) {
+        /* Set up a direct call to app_main: just set PC.
+         * start_cpu0 was called via CALL8 from call_start_cpu0,
+         * so we use the same windowed return to get back properly.
+         * But actually, app_main never returns (it has the main loop).
+         * So we just redirect the PC to app_main. The current window
+         * and register state are fine. */
+        int ci = XT_PS_CALLINC(cpu->ps);
+        if (ci > 0) {
+            /* We're in a windowed call. Undo the window rotate. */
+            uint32_t a0 = ar_read(cpu, ci * 4);
+            cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+            XT_PS_SET_CALLINC(cpu->ps, 0);
+        } else {
+            cpu->pc = ar_read(cpu, 0);
+        }
+        /* Now we're back in call_start_cpu0's context.
+         * The next instruction after start_cpu0() call would be the rest
+         * of call_start_cpu0 which eventually calls abort.
+         * Instead, synthesize a CALL8 to app_main by using the same
+         * mechanism the firmware uses. Just set PC directly. */
+        cpu->pc = s->app_main_addr;
+    } else {
+        rom_return_void(cpu);
+    }
 }
 
 /* ===== NVS stubs ===== */
@@ -1268,11 +1305,25 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* Look up s_cpu_up BSS symbol for multicore unblock */
+    /* Look up multicore BSS symbols for unblocking startup waits */
     {
         uint32_t addr;
         if (elf_symbols_find(syms, "s_cpu_up", &addr) == 0)
             stubs->s_cpu_up_addr = addr;
+        if (elf_symbols_find(syms, "s_cpu_inited", &addr) == 0)
+            stubs->s_cpu_inited_addr = addr;
+        if (elf_symbols_find(syms, "app_main", &addr) == 0)
+            stubs->app_main_addr = addr;
+    }
+
+    /* Hook start_cpu0 to skip __init_array constructors (they reference
+     * unmapped flash) and jump directly to app_main */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "start_cpu0", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_start_cpu0, "start_cpu0");
+            hooked++;
+        }
     }
 
     /* ESP-IDF SPI + LCD panel stubs (no-ops, display handled at higher level) */
@@ -1405,6 +1456,17 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, init_ret0_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, init_ret0_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Low-level SPI bit-bang transfer (used by some firmware for display/touch).
+     * Hook as return-0 to prevent consuming cycles on GPIO toggles when
+     * display/touch are already hooked at a higher level. */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "spi_transfer", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, "spi_transfer");
             hooked++;
         }
     }
