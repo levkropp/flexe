@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#define MAX_ROM_STUBS 256
+#define MAX_ROM_STUBS 512
 #define OUTPUT_BUF_SIZE 8192
 
 /* ROM address range: 0x40000000 - 0x4005FFFF */
@@ -33,6 +33,7 @@ struct esp32_rom_stubs {
     rom_log_fn       log_fn;
     void            *log_ctx;
     int              unregistered_count;
+    uint32_t         s_cpu_up_addr;     /* BSS symbol for multicore unblock */
 };
 
 /* ===== Calling convention helpers ===== */
@@ -210,7 +211,10 @@ done:;
 /* ===== Boot-sequence ROM stubs ===== */
 
 static void stub_ets_set_appcpu_boot_addr(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
+    /* Write s_cpu_up[1] = 1 to unblock multicore startup wait loop */
+    if (s->s_cpu_up_addr)
+        mem_write8(cpu->mem, s->s_cpu_up_addr + 1, 1);
     rom_return_void(cpu);
 }
 
@@ -720,6 +724,127 @@ static void stub_nedf2(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, (da != db) ? 1 : 0);
 }
 
+/* __bswapsi2: byte-swap a 32-bit word */
+static void stub_bswapsi2(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t v = rom_arg(cpu, 0);
+    v = ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+        ((v << 8) & 0xFF0000) | ((v << 24) & 0xFF000000u);
+    rom_return(cpu, v);
+}
+
+/* __ashldi3: 64-bit left shift. (a2,a3) << a4, result in (a2,a3) */
+static void stub_ashldi3(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t lo = rom_arg(cpu, 0);
+    uint32_t hi = rom_arg(cpu, 1);
+    uint32_t sh = rom_arg(cpu, 2);
+    uint64_t val = ((uint64_t)hi << 32) | lo;
+    val <<= (sh & 63);
+    rom_return64(cpu, val);
+}
+
+/* CRC32 table (standard CRC-32/ISO-HDLC polynomial 0xEDB88320) */
+static uint32_t crc32_table[256];
+static int crc32_table_ready = 0;
+
+static void crc32_init_table(void) {
+    if (crc32_table_ready) return;
+    for (int i = 0; i < 256; i++) {
+        uint32_t c = (uint32_t)i;
+        for (int j = 0; j < 8; j++)
+            c = (c >> 1) ^ ((c & 1) ? 0xEDB88320u : 0);
+        crc32_table[i] = c;
+    }
+    crc32_table_ready = 1;
+}
+
+/* esp_rom_crc32_le(crc, buf, len) */
+static void stub_crc32_le(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    crc32_init_table();
+    uint32_t crc = rom_arg(cpu, 0) ^ 0xFFFFFFFFu;
+    uint32_t buf = rom_arg(cpu, 1);
+    uint32_t len = rom_arg(cpu, 2);
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t b = mem_read8(cpu->mem, buf + i);
+        crc = crc32_table[(crc ^ b) & 0xFF] ^ (crc >> 8);
+    }
+    rom_return(cpu, crc ^ 0xFFFFFFFFu);
+}
+
+/* ===== ESP-IDF infrastructure stubs ===== */
+
+/* esp_chip_info(info) — fill esp_chip_info_t struct */
+static void stub_esp_chip_info(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t info = rom_arg(cpu, 0);
+    /* esp_chip_info_t: model(u32), features(u32), cores(u8), revision(u8) */
+    mem_write32(cpu->mem, info + 0, 1);       /* CHIP_ESP32 */
+    mem_write32(cpu->mem, info + 4, 0x12);    /* WIFI_BGN(1) | BT(2) | BLE(0x10) */
+    mem_write8(cpu->mem, info + 8, 2);        /* cores = 2 */
+    mem_write8(cpu->mem, info + 9, 3);        /* revision = 3 */
+    rom_return_void(cpu);
+}
+
+/* esp_err_to_name(err) — return pointer to static string */
+static void stub_esp_err_to_name(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t err = rom_arg(cpu, 0);
+    /* Write small strings into high SRAM scratch area */
+    static const uint32_t str_addr = 0x3FFE3F00u;
+    if (err == 0) {
+        mem_write8(cpu->mem, str_addr, 'O');
+        mem_write8(cpu->mem, str_addr + 1, 'K');
+        mem_write8(cpu->mem, str_addr + 2, 0);
+    } else {
+        const char *s = "FAIL";
+        for (int i = 0; s[i]; i++)
+            mem_write8(cpu->mem, str_addr + (uint32_t)i, (uint8_t)s[i]);
+        mem_write8(cpu->mem, str_addr + 4, 0);
+    }
+    rom_return(cpu, str_addr);
+}
+
+/* esp_partition_find_first(type, subtype, label) — return fake partition ptr or NULL */
+static void stub_esp_partition_find_first(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t type    = rom_arg(cpu, 0);
+    uint32_t subtype = rom_arg(cpu, 1);
+    /* Only return a fake partition for data/coredump (type=1, subtype=0x40) */
+    if (type == 1 && subtype == 0x40) {
+        /* Return a fake partition struct at a fixed address */
+        static const uint32_t fake_part = 0x3FFE3E00u;
+        mem_write32(cpu->mem, fake_part + 0, 0x00200000u);  /* address */
+        mem_write32(cpu->mem, fake_part + 4, 0x00010000u);  /* size */
+        mem_write32(cpu->mem, fake_part + 8, type);
+        mem_write32(cpu->mem, fake_part + 12, subtype);
+        rom_return(cpu, fake_part);
+    } else {
+        rom_return(cpu, 0);
+    }
+}
+
+/* esp_partition_mmap(part, offset, size, type, *out_ptr, *out_handle) -> ESP_OK */
+static void stub_esp_partition_mmap(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* Just return a dummy pointer — firmware won't actually read coredump partition */
+    uint32_t out_ptr = rom_arg(cpu, 3);
+    uint32_t out_hnd = rom_arg(cpu, 4);
+    if (out_ptr) mem_write32(cpu->mem, out_ptr, 0x3FFE3E80u);
+    if (out_hnd) mem_write32(cpu->mem, out_hnd, 1);
+    rom_return(cpu, 0);
+}
+
+/* esp_startup_start_app — skip FreeRTOS scheduler, jump to app_main */
+static void stub_esp_startup_start_app(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    (void)s;
+    /* Don't return — we'll let the firmware call app_main naturally
+     * through the normal code path. Just return void. */
+    rom_return_void(cpu);
+}
+
 /* ===== NVS stubs ===== */
 
 #define ESP_OK              0
@@ -999,6 +1124,13 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* Soft-float double comparison */
     rom_stubs_register(s, 0x400636A8, stub_nedf2,               "__nedf2");
 
+    /* Byte-swap and 64-bit shift */
+    rom_stubs_register(s, 0x40064AE0, stub_bswapsi2,            "__bswapsi2");
+    rom_stubs_register(s, 0x4000C818, stub_ashldi3,             "__ashldi3");
+
+    /* CRC32 */
+    rom_stubs_register(s, 0x4005CFEC, stub_crc32_le,            "esp_rom_crc32_le");
+
     /* Flash/boot helpers */
     rom_stubs_register(s, 0x40062BC8, stub_unregistered,        "spi_flash_clk_cfg");
     rom_stubs_register(s, 0x40008264, stub_software_reset,      "software_reset_cpu");
@@ -1132,6 +1264,147 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, misc_hooks[i].name, &addr) == 0) {
             rom_stubs_register(stubs, addr, misc_hooks[i].fn, misc_hooks[i].name);
+            hooked++;
+        }
+    }
+
+    /* Look up s_cpu_up BSS symbol for multicore unblock */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "s_cpu_up", &addr) == 0)
+            stubs->s_cpu_up_addr = addr;
+    }
+
+    /* ESP-IDF SPI + LCD panel stubs (no-ops, display handled at higher level) */
+    static const char *lcd_noop_fns[] = {
+        "spi_bus_initialize",
+        "esp_lcd_new_panel_io_spi",
+        "esp_lcd_new_panel_st7789",
+        "esp_lcd_panel_reset",
+        "esp_lcd_panel_init",
+        "esp_lcd_panel_swap_xy",
+        "esp_lcd_panel_mirror",
+        "esp_lcd_panel_disp_on_off",
+        "esp_lcd_panel_draw_bitmap",
+        "esp_lcd_panel_io_tx_param",
+        "esp_lcd_panel_io_tx_color",
+        NULL
+    };
+    for (int i = 0; lcd_noop_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, lcd_noop_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, lcd_noop_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Interrupt allocation */
+    static const char *intr_fns[] = {
+        "esp_intr_alloc",
+        "esp_intr_alloc_intrstatus",
+        NULL
+    };
+    for (int i = 0; intr_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, intr_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, intr_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Chip info + error names */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "esp_chip_info", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_chip_info, "esp_chip_info");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "esp_err_to_name", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_err_to_name, "esp_err_to_name");
+            hooked++;
+        }
+    }
+
+    /* Logging (no-ops — UART logging via ets_printf already works) */
+    static const char *log_fns[] = {
+        "esp_log_level_set",
+        "esp_log_write",
+        "esp_log_writev",
+        NULL
+    };
+    for (int i = 0; log_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, log_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_void_unregistered, log_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Partition API */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "esp_partition_find_first", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_partition_find_first,
+                               "esp_partition_find_first");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "esp_partition_mmap", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_partition_mmap,
+                               "esp_partition_mmap");
+            hooked++;
+        }
+    }
+
+    /* App startup */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "esp_startup_start_app", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_startup_start_app,
+                               "esp_startup_start_app");
+            hooked++;
+        }
+    }
+
+    /* VFS stubs */
+    static const char *vfs_fns[] = {
+        "esp_vfs_register_fd_range",
+        "esp_vfs_dev_uart_register",
+        "esp_vfs_console_register",
+        "esp_vfs_null_register",
+        NULL
+    };
+    for (int i = 0; vfs_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, vfs_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, vfs_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Misc ESP-IDF init functions (all return 0 / void) */
+    static const char *init_ret0_fns[] = {
+        "esp_newlib_init",
+        "esp_newlib_init_global_stdio",
+        "esp_newlib_time_init",
+        "esp_time_impl_init",
+        "esp_timer_impl_early_init",
+        "esp_timer_impl_init_system_time",
+        "esp_int_wdt_init",
+        "esp_int_wdt_cpu_init",
+        "esp_task_wdt_init",
+        "esp_task_wdt_add",
+        "esp_task_wdt_reset",
+        "esp_crosscore_int_init",
+        "esp_cache_err_int_init",
+        "esp_ipc_isr_init",
+        "esp_register_shutdown_handler",
+        "esp_brownout_init",
+        NULL
+    };
+    for (int i = 0; init_ret0_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, init_ret0_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, init_ret0_fns[i]);
             hooked++;
         }
     }
