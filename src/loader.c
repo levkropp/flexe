@@ -99,9 +99,17 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
             return res;
         }
 
+        /* Record segment info */
+        if (i < MAX_SEGMENTS) {
+            res.segments[i].addr = load_addr;
+            res.segments[i].size = data_len;
+        }
+
         if (mem_load(mem, load_addr, buf, data_len) != 0) {
             res.result = -1;
-            snprintf(res.error, sizeof(res.error), "Segment %d load failed at 0x%08X", i, load_addr);
+            snprintf(res.error, sizeof(res.error),
+                     "Segment %d load failed at 0x%08X (%u bytes, region: %s)",
+                     i, load_addr, data_len, loader_region_name(load_addr));
             free(buf);
             fclose(f);
             return res;
@@ -110,10 +118,28 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
         free(buf);
     }
 
+    /* Write the 24-byte image header at 0x3F400000 so firmware can
+     * verify its own magic byte via the flash data cache mapping */
+    mem_load(mem, 0x3F400000u, hdr, 24);
+
     res.entry_point = entry;
     res.segment_count = seg_count;
     res.result = 0;
 
     fclose(f);
     return res;
+}
+
+const char *loader_region_name(uint32_t addr) {
+    if (addr >= 0x3F400000u && addr < 0x3F800000u) return "flash_data";
+    if (addr >= 0x3FF00000u && addr < 0x3FF80000u) return "peripheral";
+    if (addr >= 0x3FF80000u && addr < 0x3FF82000u) return "rtc_dram";
+    if (addr >= 0x3FFB0000u && addr < 0x40000000u) return "sram_data";
+    if (addr >= 0x40000000u && addr < 0x40060000u) return "rom";
+    if (addr >= 0x40070000u && addr < 0x400C0000u) return "sram_insn";
+    if (addr >= 0x400C0000u && addr < 0x400C2000u) return "rtc_iram";
+    if (addr >= 0x400C2000u && addr < 0x40C00000u) return "flash_insn";
+    if (addr >= 0x50000000u && addr < 0x50002000u) return "rtc_fast";
+    if (addr >= 0x60000000u && addr < 0x60002000u) return "rtc_slow";
+    return "unmapped";
 }

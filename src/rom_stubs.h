@@ -2,6 +2,7 @@
 #define ROM_STUBS_H
 
 #include "xtensa.h"
+#include "elf_symbols.h"
 #include <stdint.h>
 
 typedef struct esp32_rom_stubs esp32_rom_stubs_t;
@@ -26,5 +27,11 @@ void rom_stubs_set_log_callback(esp32_rom_stubs_t *stubs, rom_log_fn fn, void *c
 int rom_stubs_stub_count(const esp32_rom_stubs_t *stubs);
 int rom_stubs_get_stats(const esp32_rom_stubs_t *stubs, int index,
                         const char **name_out, uint32_t *addr_out, uint32_t *count_out);
+
+/* Hook known firmware functions by symbol name (e.g. newlib locks) */
+int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs, const elf_symbols_t *syms);
+
+/* Count of unregistered ROM calls (fallback handler) */
+int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs);
 
 #endif /* ROM_STUBS_H */

@@ -502,11 +502,12 @@ TEST(movsp_triggers_spill) {
     /* Window 0 should have been spilled: its WS bit cleared */
     ASSERT_FALSE(cpu.windowstart & (1u << 0));
 
-    /* Check spilled values in memory at sp0-16 */
-    ASSERT_EQ(mem_read32(cpu.mem, sp0 - 16 + 0), (1u << 30) | 0x1000); /* a0 */
-    ASSERT_EQ(mem_read32(cpu.mem, sp0 - 16 + 4), sp0);                  /* a1 */
-    ASSERT_EQ(mem_read32(cpu.mem, sp0 - 16 + 8), 0xAAAA);               /* a2 */
-    ASSERT_EQ(mem_read32(cpu.mem, sp0 - 16 + 12), 0xBBBB);              /* a3 */
+    /* Check spilled values in memory at callee's SP - 16 (hardware convention) */
+    uint32_t callee_sp = BASE + 0x3000;
+    ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16 + 0), (1u << 30) | 0x1000); /* a0 */
+    ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16 + 4), sp0);                  /* a1 */
+    ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16 + 8), 0xAAAA);               /* a2 */
+    ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16 + 12), 0xBBBB);              /* a3 */
 
     teardown(&cpu);
 }

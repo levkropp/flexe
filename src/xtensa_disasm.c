@@ -285,8 +285,8 @@ static int disasm_qrst(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
     case 1: /* RST1 */
         switch (op2) {
         case 0: case 1: /* SLLI */
-            { /* Xtensa.pdf: op2=000sh[4], r=dest, s=src, t=sh[3..0] */
-              int sa = ((op2 & 1) << 4) | t;
+            { /* Xtensa.pdf: encoded as 32-shift; op2=000sh[4], r=dest, s=src, t=sh[3..0] */
+              int sa = 32 - (((op2 & 1) << 4) | t);
               EMIT("slli\ta%d, a%d, %d", r, s, sa);
             } break;
         case 2: case 3: /* SRAI */
@@ -691,10 +691,9 @@ static int disasm_b(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
     case 4: EMIT("ball\ta%d, a%d, 0x%x", s, t, target); break;
     case 5: EMIT("bbc\ta%d, a%d, 0x%x", s, t, target); break;
     case 6: case 7:
-        /* BBCI / BBSI: bit number = (r-6)*16 + t => bit = t | ((r&1)<<4) */
+        /* BBCI: r[3]=0 → clear-test; r[0] selects low(0)/high(1) */
         { int bit = t | ((r & 1) << 4);
-          if (r == 6) EMIT("bbci\ta%d, %d, 0x%x", s, bit, target);
-          else        EMIT("bbsi\ta%d, %d, 0x%x", s, bit, target);
+          EMIT("bbci\ta%d, %d, 0x%x", s, bit, target);
         } break;
     case 8: EMIT("bany\ta%d, a%d, 0x%x", s, t, target); break;
     case 9: EMIT("bne\ta%d, a%d, 0x%x", s, t, target); break;
@@ -703,9 +702,9 @@ static int disasm_b(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
     case 12: EMIT("bnall\ta%d, a%d, 0x%x", s, t, target); break;
     case 13: EMIT("bbs\ta%d, a%d, 0x%x", s, t, target); break;
     case 14: case 15:
+        /* BBSI: r[3]=1 → set-test; r[0] selects low(0)/high(1) */
         { int bit = t | ((r & 1) << 4);
-          if (r == 14) EMIT("bbci\ta%d, %d, 0x%x", s, bit, target);
-          else         EMIT("bbsi\ta%d, %d, 0x%x", s, bit, target);
+          EMIT("bbsi\ta%d, %d, 0x%x", s, bit, target);
         } break;
     }
     return 3;
@@ -800,10 +799,10 @@ static int disasm_narrow(uint16_t insn, uint32_t pc, char *buf, int bufsize) {
 
                  So imm7[6:4] = t & 0x7 (bits 6:4), imm7[3:0] = r (bits 15:12)
                  Full 7-bit value = ((t & 7) << 4) | r
-                 Sign extend from bit 6: range -32..95
+                 Range is -32..95, NOT standard 7-bit sign extension.
               */
               int imm7 = ((t & 7) << 4) | r;
-              int32_t val = sign_extend(imm7, 7);
+              int32_t val = (imm7 >= 96) ? (imm7 - 128) : imm7;
               EMIT("movi.n\ta%d, %d", s, val);
           } else if (t_hi == 2) {
               /* BEQZ.N - RI6 format */

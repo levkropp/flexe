@@ -361,6 +361,16 @@ TEST(exec_movi_n_basic) {
     teardown(&cpu);
 }
 
+TEST(exec_movi_n_90) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    /* MOVI.N a5, 90: imm7=90=0b1011010, r=0xA, t[2:0]=5, t[3]=0
+       This tests the 64-95 range which is positive, NOT sign-extended */
+    put_insn2(&cpu, BASE, narrow(0xC, 0xA, 5, 5));
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 5), 90u);
+    teardown(&cpu);
+}
+
 TEST(exec_movi_n_negative) {
     xtensa_cpu_t cpu; setup(&cpu);
     /* MOVI.N a5, -32: imm7=96=0b1100000, r=0, t[2:0]=6, t[3]=0 */
@@ -698,6 +708,7 @@ void run_alu_tests(void) {
     RUN_TEST(exec_addi_n_basic);
     RUN_TEST(exec_addi_n_minus1);
     RUN_TEST(exec_movi_n_basic);
+    RUN_TEST(exec_movi_n_90);
     RUN_TEST(exec_movi_n_negative);
     RUN_TEST(exec_nop);
     RUN_TEST(exec_nop_n);

@@ -109,6 +109,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -t              Instruction trace to stderr\n");
     fprintf(stderr, "  -T              Verbose trace (reg changes, ROM calls, exceptions)\n");
     fprintf(stderr, "  -v              Verbose register dump on exit\n");
+    fprintf(stderr, "  -q              Quiet: suppress per-access unhandled peripheral warnings\n");
     fprintf(stderr, "  -e <addr>       Override entry point (hex)\n");
     fprintf(stderr, "  -s <file.elf>   Load ELF symbols for trace/breakpoints\n");
     fprintf(stderr, "  -b <addr|name>  Set breakpoint (repeatable)\n");
@@ -160,6 +161,7 @@ int main(int argc, char *argv[]) {
     int trace = 0;
     int verbose_trace = 0;
     int verbose = 0;
+    int quiet_unhandled = 0;
     uint32_t entry_override = 0;
     int has_entry_override = 0;
     const char *elf_path = NULL;
@@ -169,12 +171,13 @@ int main(int argc, char *argv[]) {
     int dump_count = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:tTve:s:b:m:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:tTvqe:s:b:m:")) != -1) {
         switch (opt) {
         case 'c': max_cycles = atoi(optarg); break;
         case 't': trace = 1; break;
         case 'T': verbose_trace = 1; trace = 1; break;
         case 'v': verbose = 1; break;
+        case 'q': quiet_unhandled = 1; break;
         case 'e':
             entry_override = (uint32_t)strtoul(optarg, NULL, 16);
             has_entry_override = 1;
@@ -234,6 +237,11 @@ int main(int argc, char *argv[]) {
     }
     fprintf(stderr, "Loaded %s: %d segments, entry=0x%08X\n",
             firmware, res.segment_count, res.entry_point);
+    for (int i = 0; i < res.segment_count; i++) {
+        fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
+                i, res.segments[i].addr, res.segments[i].size,
+                loader_region_name(res.segments[i].addr));
+    }
 
     /* Initialize CPU */
     xtensa_cpu_t cpu;
@@ -251,15 +259,20 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Hook firmware functions by symbol name (newlib locks etc.) */
+    if (syms)
+        rom_stubs_hook_symbols(rom, syms);
+
     /* Install ROM log callback for verbose trace */
     if (verbose_trace)
         rom_stubs_set_log_callback(rom, rom_log_cb, NULL);
 
-    /* Set entry point */
+    /* Set entry point and initial stack pointer */
     if (has_entry_override)
         cpu.pc = entry_override;
     else if (res.entry_point != 0)
         cpu.pc = res.entry_point;
+    ar_write(&cpu, 1, 0x3FFE0000u);  /* SP in SRAM data, above BSS */
 
     /* Resolve and install breakpoints */
     for (int i = 0; i < bp_count; i++) {
@@ -454,8 +467,11 @@ int main(int argc, char *argv[]) {
     }
     if (first_stat) fprintf(stderr, "(none)");
     fprintf(stderr, "\n");
+    if (rom_stubs_unregistered_count(rom) > 0)
+        fprintf(stderr, "Unregistered ROM calls: %d\n", rom_stubs_unregistered_count(rom));
 
-    fprintf(stderr, "Unhandled:  %d peripheral accesses\n", periph_unhandled_count(periph));
+    if (!quiet_unhandled || periph_unhandled_count(periph) > 0)
+        fprintf(stderr, "Unhandled:  %d peripheral accesses\n", periph_unhandled_count(periph));
 
     /* Register dump */
     if (verbose || stop_reason == STOP_BREAKPOINT) {

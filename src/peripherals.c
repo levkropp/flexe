@@ -6,12 +6,18 @@
 #define PERIPH_BASE     0x3FF00000u
 #define DPORT_BASE      0x3FF00000u
 #define UART0_BASE      0x3FF40000u
+#define UART1_BASE      0x3FF50000u
+#define UART2_BASE      0x3FF6E000u
+#define SPI1_BASE       0x3FF42000u
+#define SPI0_BASE       0x3FF43000u
 #define GPIO_BASE       0x3FF44000u
 #define RTC_CNTL_BASE   0x3FF48000u
+#define SENS_BASE       0x3FF48800u
 #define IO_MUX_BASE     0x3FF49000u
 #define EFUSE_BASE      0x3FF5A000u
 #define TIMG0_BASE      0x3FF5F000u
 #define TIMG1_BASE      0x3FF60000u
+#define SYSCON_BASE     0x3FF66000u
 #define PAGE_SIZE       4096
 
 /* Page index from absolute address */
@@ -39,6 +45,12 @@ typedef struct {
     uint32_t enable1;
 } gpio_state_t;
 
+/* RTC calibration state machine per timer group */
+typedef struct {
+    int      cal_started;    /* write to RTCCALICFG detected */
+    int      reads_since;    /* reads since cal_started */
+} rtc_cal_state_t;
+
 struct esp32_periph {
     xtensa_mem_t *mem;
 
@@ -54,6 +66,9 @@ struct esp32_periph {
 
     /* Timer groups WDT */
     wdt_state_t timg_wdt[2];
+
+    /* RTC calibration state */
+    rtc_cal_state_t rtc_cal[2];
 
     /* Unhandled access counter */
     int unhandled_count;
@@ -147,11 +162,18 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
     (void)ctx;
     uint32_t off = addr - RTC_CNTL_BASE;
+    /* SENS registers start at offset 0x800 within this page */
+    if (off >= 0x800) return 0;  /* SENS: return 0 for all */
     switch (off) {
+    case 0x00C: return (1u << 30);   /* TIME_UPDATE: time-valid bit always set */
+    case 0x010: return 0;           /* TIME_LOW0: RTC timer low word */
+    case 0x014: return 0;           /* TIME_HIGH0: RTC timer high word */
     case 0x034: return 1;           /* RESET_STATE: POWERON */
     case 0x038: return 1;           /* STORE0: wakeup cause = power-on */
     case 0x080: return 0;           /* SLP_TIMER_BASE */
+    case 0x070: return 0x00000080;  /* RTC_CLK_CONF: bit7=fast_clk_sel, slow_clk active */
     case 0x0A8: return 0x2210;      /* CLK_CONF: clocks ready */
+    case 0x0B0: return 0x00280028;  /* RTC_XTAL_FREQ_REG: 40 MHz crystal (both halves) */
     default: return 0;
     }
 }
@@ -205,6 +227,17 @@ static uint32_t timg_read(void *ctx, uint32_t addr) {
     case 0x058: return w->config4;
     case 0x05C: return w->config5;
     case 0x064: return w->protect;   /* TIMG_WDTWPROTECT_REG */
+    case 0x068: {                    /* TIMG_RTCCALICFG_REG */
+        rtc_cal_state_t *cal = &p->rtc_cal[group];
+        if (cal->cal_started) {
+            cal->reads_since++;
+            if (cal->reads_since <= 1)
+                return 0;            /* RDY=0: calibration in progress */
+            cal->cal_started = 0;    /* done, reset */
+        }
+        return 0x00008000;           /* RDY bit 15 set */
+    }
+    case 0x06C: return (267 << 7);   /* TIMG_RTCCALICFG1_REG: ~267 XTAL cycles per slow_clk */
     default: return 0;
     }
 }
@@ -225,8 +258,64 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
     case 0x05C: w->config5 = val; break;
     case 0x060: break;               /* TIMG_WDTFEED: accept feed */
     case 0x064: w->protect = val; break;
+    case 0x068: {                    /* TIMG_RTCCALICFG_REG: start calibration */
+        rtc_cal_state_t *cal = &p->rtc_cal[group];
+        cal->cal_started = 1;
+        cal->reads_since = 0;
+        break;
+    }
     default: break;
     }
+}
+
+/* ---- SPI0 (flash controller) ---- */
+
+#define SPI_CMD_REG      0x00
+#define SPI_STATUS_REG   0x10
+#define SPI_CTRL_REG     0x08
+#define SPI0_SHADOW_SIZE 64
+
+static uint32_t spi_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    (void)p;
+    uint32_t base = (addr >= SPI0_BASE) ? SPI0_BASE : SPI1_BASE;
+    uint32_t off = addr - base;
+    switch (off) {
+    case SPI_CMD_REG:    return 0;       /* Command done (not busy) */
+    case SPI_STATUS_REG: return 0;       /* Status: ready */
+    default:             return 0;
+    }
+}
+
+static void spi_write(void *ctx, uint32_t addr, uint32_t val) {
+    (void)ctx; (void)addr; (void)val;
+}
+
+/* ---- SYSCON ---- */
+
+static uint32_t syscon_read(void *ctx, uint32_t addr) {
+    (void)ctx;
+    uint32_t off = addr - SYSCON_BASE;
+    switch (off) {
+    case 0x000: return 0;       /* SYSCON_SYSCLK_CONF_REG */
+    case 0x07C: return 0x16042000; /* SYSCON_DATE_REG */
+    default:    return 0;
+    }
+}
+
+static void syscon_write(void *ctx, uint32_t addr, uint32_t val) {
+    (void)ctx; (void)addr; (void)val;
+}
+
+/* ---- UART1/UART2 (minimal shadow) ---- */
+
+static uint32_t uart_other_read(void *ctx, uint32_t addr) {
+    (void)ctx; (void)addr;
+    return 0;
+}
+
+static void uart_other_write(void *ctx, uint32_t addr, uint32_t val) {
+    (void)ctx; (void)addr; (void)val;
 }
 
 /* ---- Default handler (unhandled peripherals) ---- */
@@ -260,26 +349,45 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     for (int i = 0; i <= 4; i++)
         mem_register_mmio(mem, (int)PAGE_OF(DPORT_BASE) + i, dport_read, dport_write, p);
 
-    /* UART0: page 64 */
+    /* UART0 */
     mem_register_mmio(mem, (int)PAGE_OF(UART0_BASE), uart0_read, uart0_write, p);
 
-    /* GPIO: page 68 */
+    /* UART1 */
+    mem_register_mmio(mem, (int)PAGE_OF(UART1_BASE), uart_other_read, uart_other_write, p);
+
+    /* UART2 */
+    mem_register_mmio(mem, (int)PAGE_OF(UART2_BASE), uart_other_read, uart_other_write, p);
+
+    /* SPI1 (general SPI) */
+    mem_register_mmio(mem, (int)PAGE_OF(SPI1_BASE), spi_read, spi_write, p);
+
+    /* SPI0 (flash controller) */
+    mem_register_mmio(mem, (int)PAGE_OF(SPI0_BASE), spi_read, spi_write, p);
+
+    /* GPIO */
     mem_register_mmio(mem, (int)PAGE_OF(GPIO_BASE), gpio_read, gpio_write, p);
 
-    /* RTC_CNTL: page 72 */
+    /* RTC_CNTL */
     mem_register_mmio(mem, (int)PAGE_OF(RTC_CNTL_BASE), rtc_cntl_read, rtc_cntl_write, p);
 
-    /* IO_MUX: page 73 */
+    /* SENS (sensor) — shares 4KB page with RTC_CNTL (0x3FF48800 is in page 72) */
+    /* 0x3FF48800 falls in page 72 same as RTC_CNTL, but page 73 (0x3FF49000) is IO_MUX */
+    /* SENS is at offset 0x800 within the RTC_CNTL page — handled by rtc_cntl read/write */
+
+    /* IO_MUX */
     mem_register_mmio(mem, (int)PAGE_OF(IO_MUX_BASE), io_mux_read, io_mux_write, p);
 
-    /* EFUSE: page 90 */
+    /* EFUSE */
     mem_register_mmio(mem, (int)PAGE_OF(EFUSE_BASE), efuse_read, efuse_write, p);
 
-    /* TIMG0: page 95 */
+    /* TIMG0 */
     mem_register_mmio(mem, (int)PAGE_OF(TIMG0_BASE), timg_read, timg_write, p);
 
-    /* TIMG1: page 96 */
+    /* TIMG1 */
     mem_register_mmio(mem, (int)PAGE_OF(TIMG1_BASE), timg_read, timg_write, p);
+
+    /* SYSCON */
+    mem_register_mmio(mem, (int)PAGE_OF(SYSCON_BASE), syscon_read, syscon_write, p);
 
     return p;
 }

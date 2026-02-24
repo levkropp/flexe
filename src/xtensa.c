@@ -294,29 +294,48 @@ static inline void phys_write(xtensa_cpu_t *cpu, int widx, int reg, uint32_t val
 }
 
 /*
- * Spill (save) registers of window widx to its stack frame.
- * The window's a0 encodes the call size in bits [31:30].
- * Always saves a0-a3 at SP-16; for CALL8+ also a4-a7 at SP-32;
- * for CALL12 also a8-a11 at SP-48.
+ * Find the callee window (next active window after widx in the ring).
+ * In the Xtensa call chain, the callee is always forward from the caller.
+ */
+static int find_callee_window(xtensa_cpu_t *cpu, int widx) {
+    for (int i = 1; i < 16; i++) {
+        int w = (widx + i) & 0xF;
+        if (cpu->windowstart & (1u << w))
+            return w;
+    }
+    return widx; /* shouldn't happen — current WB always has WS bit set */
+}
+
+/*
+ * Spill (save) registers of window widx to its callee's stack frame.
+ * Uses the callee's SP as base pointer (matching hardware overflow convention)
+ * and records the base in spill_base[] for underflow restore.
  */
 static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
-    uint32_t sp = phys_read(cpu, widx, 1);  /* a1 = stack pointer */
     uint32_t a0 = phys_read(cpu, widx, 0);
     int callsize = (a0 >> 30) & 3;
 
-    /* Always save base 4 regs: a0-a3 at SP-16 */
+    /* Use callee's SP as base (matches real hardware overflow handler) */
+    int callee = find_callee_window(cpu, widx);
+    uint32_t base = phys_read(cpu, callee, 1);
+
+    /* Record where we saved, so underflow can find the data even if
+     * the callee's SP changes (e.g. via MOVSP) before RETW. */
+    cpu->spill_base[widx & 0xF] = base;
+
+    /* Always save base 4 regs: a0-a3 at base-16 */
     for (int i = 0; i < 4; i++)
-        mem_write32(cpu->mem, sp - 16 + i * 4, phys_read(cpu, widx, i));
+        mem_write32(cpu->mem, base - 16 + i * 4, phys_read(cpu, widx, i));
 
     if (callsize >= 2) {
-        /* CALL8+: also save a4-a7 at SP-32 */
+        /* CALL8+: also save a4-a7 at base-32 */
         for (int i = 0; i < 4; i++)
-            mem_write32(cpu->mem, sp - 32 + i * 4, phys_read(cpu, widx, 4 + i));
+            mem_write32(cpu->mem, base - 32 + i * 4, phys_read(cpu, widx, 4 + i));
     }
     if (callsize == 3) {
-        /* CALL12: also save a8-a11 at SP-48 */
+        /* CALL12: also save a8-a11 at base-48 */
         for (int i = 0; i < 4; i++)
-            mem_write32(cpu->mem, sp - 48 + i * 4, phys_read(cpu, widx, 8 + i));
+            mem_write32(cpu->mem, base - 48 + i * 4, phys_read(cpu, widx, 8 + i));
     }
 
     /* Clear windowstart bit for this window */
@@ -339,13 +358,16 @@ static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
 /*
  * Underflow fill: called during RETW when the caller's windowstart
  * bit is clear (registers were spilled and need restoration).
+ * Uses the recorded spill_base (where overflow actually saved the data).
  */
-static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb) {
-    uint32_t sp = phys_read(cpu, ret_wb, 1);
+static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
+    (void)owb;
+    /* Use the base address that was recorded during spill */
+    uint32_t base = cpu->spill_base[ret_wb & 0xF];
 
-    /* Restore a0-a3 from SP-16 */
+    /* Restore a0-a3 from base-16 */
     for (int i = 0; i < 4; i++)
-        phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, sp - 16 + i * 4));
+        phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, base - 16 + i * 4));
 
     /* Check restored a0 for call size to determine extra regs */
     uint32_t a0 = phys_read(cpu, ret_wb, 0);
@@ -353,11 +375,11 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb) {
 
     if (callsize >= 2) {
         for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, sp - 32 + i * 4));
+            phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, base - 32 + i * 4));
     }
     if (callsize == 3) {
         for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, sp - 48 + i * 4));
+            phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
     }
 
     /* Set windowstart bit */
@@ -382,7 +404,7 @@ static void exec_retw(xtensa_cpu_t *cpu) {
 
     if (!(cpu->windowstart & (1u << ret_wb))) {
         /* Caller's window was spilled — fill it back */
-        synth_underflow_fill(cpu, ret_wb);
+        synth_underflow_fill(cpu, ret_wb, owb);
     }
 
     /* Clear current window's WS bit */
@@ -696,12 +718,28 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 }
                 break;
             case 1: { /* MOVSP */
+                /* Spill any live windows below current */
                 for (int i = 1; i <= 3; i++) {
                     int w = (cpu->windowbase - i) & 15;
                     if (cpu->windowstart & (1u << w))
                         synth_spill_window(cpu, w);
                 }
-                ar_write(cpu, t, ar_read(cpu, s));
+                /* Copy base save area from old SP to new SP, and update
+                 * spill_base for any windows that were saved at old_sp. */
+                uint32_t old_sp = ar_read(cpu, 1);
+                uint32_t new_sp = ar_read(cpu, s);
+                if (old_sp != new_sp) {
+                    for (int i = 0; i < 12; i++) {
+                        uint32_t val = mem_read32(cpu->mem, old_sp - 48 + i * 4);
+                        mem_write32(cpu->mem, new_sp - 48 + i * 4, val);
+                    }
+                    /* Update spill_base for any window whose data was at old_sp */
+                    for (int i = 0; i < 16; i++) {
+                        if (cpu->spill_base[i] == old_sp)
+                            cpu->spill_base[i] = new_sp;
+                    }
+                }
+                ar_write(cpu, t, new_sp);
             } break;
             case 2: /* SYNC group */
                 /* NOP, ISYNC, RSYNC, ESYNC, DSYNC, EXTW, MEMW, EXCW */
@@ -872,8 +910,8 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
     case 1: /* RST1 */
         switch (op2) {
         case 0: case 1: /* SLLI */
-            { int sa = ((op2 & 1) << 4) | t;
-              ar_write(cpu, r, ar_read(cpu, s) << sa);
+            { int sa = 32 - (((op2 & 1) << 4) | t);
+              ar_write(cpu, r, (sa >= 32) ? 0 : ar_read(cpu, s) << sa);
             } break;
         case 2: case 3: /* SRAI */
             { int sa = ((op2 & 1) << 4) | s;
@@ -1241,9 +1279,9 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
     case 0xC: /* ST2: MOVI.N / BEQZ.N / BNEZ.N */
         { int t_hi = (t >> 2) & 3;
           if (t_hi < 2) {
-              /* MOVI.N */
+              /* MOVI.N: range -32..95, NOT standard 7-bit sign extension */
               int imm7 = ((t & 7) << 4) | r;
-              int32_t val = sign_extend(imm7, 7);
+              int32_t val = (imm7 >= 96) ? (imm7 - 128) : imm7;
               ar_write(cpu, s, (uint32_t)val);
           } else if (t_hi == 2) {
               /* BEQZ.N */
@@ -1450,11 +1488,11 @@ static void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
     case 3:  taken = vs < vt; break;                               /* BLTU */
     case 4:  taken = (~vs & vt) == 0; break;                       /* BALL */
     case 5:  taken = !(vs & (1u << (vt & 31))); break;             /* BBC */
-    case 6: case 14: /* BBCI */
+    case 6: case 7: /* BBCI: r[3]=0 → clear-test; r[0] selects low(0)/high(1) */
         { int bit = t | ((r & 1) << 4);
           taken = !(vs & (1u << bit));
         } break;
-    case 7: case 15: /* BBSI */
+    case 14: case 15: /* BBSI: r[3]=1 → set-test; r[0] selects low(0)/high(1) */
         { int bit = t | ((r & 1) << 4);
           taken = (vs & (1u << bit)) != 0;
         } break;

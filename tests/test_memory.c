@@ -27,17 +27,18 @@ TEST(mem_rw32_sram_data) {
     mem_destroy(mem);
 }
 
-/* ===== SRAM instruction region (alias) ===== */
+/* ===== SRAM instruction region (separate from data bus) ===== */
 
 TEST(mem_sram_alias) {
     xtensa_mem_t *mem = mem_create();
-    /* Write via data bus, read via instruction bus */
+    /* Data bus and instruction bus are separate regions (ESP32 aliasing
+     * has reversed byte order which we don't model) */
     mem_write32(mem, 0x3FFB0000, 0xCAFEBABE);
-    /* SRAM instruction base = 0x40070000, same physical offset */
-    ASSERT_EQ(mem_read32(mem, 0x40070000), 0xCAFEBABE);
-    /* And the reverse */
-    mem_write32(mem, 0x40070004, 0x12345678);
-    ASSERT_EQ(mem_read32(mem, 0x3FFB0004), 0x12345678);
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000), 0xCAFEBABE);
+    mem_write32(mem, 0x40070000, 0x12345678);
+    ASSERT_EQ(mem_read32(mem, 0x40070000), 0x12345678);
+    /* Verify they are independent */
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000), 0xCAFEBABE);
     mem_destroy(mem);
 }
 
