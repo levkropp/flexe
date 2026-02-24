@@ -45,6 +45,11 @@
 #define RTC_SLOW_BASE   0x60000000u
 #define RTC_SLOW_END    0x60002000u
 
+/* PSRAM (external SPI RAM): ESP32 maps at 0x3F800000 */
+#define PSRAM_BASE      0x3F800000u
+#define PSRAM_END       0x3FC00000u
+#define PSRAM_SIZE      (4 * 1024 * 1024)
+
 #define PERIPH_PAGES 128  /* 512KB / 4KB */
 #define PAGE_SIZE    4096
 
@@ -61,6 +66,7 @@ struct xtensa_mem {
     uint8_t *rtc_dram;  /* RTC Fast Memory (D-bus + I-bus alias) */
     uint8_t *rtc_fast;  /* RTC FAST memory (0x50000000) */
     uint8_t *rtc_slow;  /* RTC SLOW memory */
+    uint8_t *psram;     /* External PSRAM (SPI RAM) */
     mmio_handler_t mmio[PERIPH_PAGES];
 };
 
@@ -74,8 +80,9 @@ xtensa_mem_t *mem_create(void) {
     mem->rtc_dram = calloc(1, RTC_DRAM_SIZE);
     mem->rtc_fast = calloc(1, RTC_FAST_SIZE);
     mem->rtc_slow = calloc(1, RTC_SLOW_SIZE);
+    mem->psram    = calloc(1, PSRAM_SIZE);
 
-    if (!mem->sram || !mem->rom || !mem->flash || !mem->rtc_dram || !mem->rtc_fast || !mem->rtc_slow) {
+    if (!mem->sram || !mem->rom || !mem->flash || !mem->rtc_dram || !mem->rtc_fast || !mem->rtc_slow || !mem->psram) {
         mem_destroy(mem);
         return NULL;
     }
@@ -91,6 +98,7 @@ void mem_destroy(xtensa_mem_t *mem) {
     free(mem->rtc_dram);
     free(mem->rtc_fast);
     free(mem->rtc_slow);
+    free(mem->psram);
     free(mem);
 }
 
@@ -111,6 +119,10 @@ static uint8_t *mem_translate(xtensa_mem_t *mem, uint32_t addr) {
     /* SRAM data bus: 0x3FFB0000-0x3FFFFFFF */
     if (addr >= SRAM_DATA_BASE && addr < SRAM_DATA_END)
         return mem->sram + (addr - SRAM_DATA_BASE);
+
+    /* PSRAM (external SPI RAM): 0x3F800000-0x3FBFFFFF */
+    if (addr >= PSRAM_BASE && addr < PSRAM_END)
+        return mem->psram + (addr - PSRAM_BASE);
 
     /* RTC DRAM (D-bus alias): 0x3FF80000-0x3FF81FFF */
     if (addr >= RTC_DRAM_BASE && addr < RTC_DRAM_END)

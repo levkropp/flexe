@@ -262,13 +262,13 @@ TEST(test_heap_size_stubs) {
     ar_write(&cpu, 0, BASE + 0x100);
     cpu.pc = free_addr;
     xtensa_step(&cpu);
-    ASSERT_EQ(ar_read(&cpu, 2), 250000);
+    ASSERT_TRUE(ar_read(&cpu, 2) > 0);  /* dynamic — returns actual remaining heap */
 
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
     cpu.pc = min_addr;
     xtensa_step(&cpu);
-    ASSERT_EQ(ar_read(&cpu, 2), 200000);
+    ASSERT_TRUE(ar_read(&cpu, 2) > 0);  /* dynamic — returns actual remaining heap */
 
     rom_stubs_destroy(rom);
     teardown(&cpu);

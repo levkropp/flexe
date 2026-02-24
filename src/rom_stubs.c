@@ -1006,16 +1006,90 @@ void stub_gpio_isr_service(xtensa_cpu_t *cpu, void *ctx) {
 
 /* ===== Heap stubs ===== */
 
-/* esp_get_free_heap_size() -> 250000 */
-void stub_esp_get_free_heap_size(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    rom_return(cpu, 250000);
+/*
+ * Simple bump allocator for firmware malloc/free/calloc/realloc.
+ * Allocates from emulator SRAM starting at _heap_start.
+ * Each block has an 8-byte header: [size(4)] [magic(4)].
+ * Free is a no-op (bump allocator — memory is never reclaimed).
+ */
+#define HEAP_BASE    0x3F800000u  /* PSRAM base — 4MB available */
+#define HEAP_END     0x3FC00000u  /* PSRAM end */
+#define HEAP_MAGIC   0x48454150u  /* "HEAP" */
+#define HEAP_HDR_SZ  8
+
+static uint32_t heap_ptr = HEAP_BASE;
+
+static uint32_t heap_alloc(xtensa_cpu_t *cpu, uint32_t size) {
+    if (size == 0) return 0;
+    /* Align size to 4 bytes */
+    size = (size + 3) & ~3u;
+    uint32_t total = HEAP_HDR_SZ + size;
+    if (heap_ptr + total > HEAP_END) {
+        fprintf(stderr, "[heap] OOM: need %u, have %u\n", total, HEAP_END - heap_ptr);
+        return 0;
+    }
+    uint32_t block = heap_ptr;
+    mem_write32(cpu->mem, block, size);
+    mem_write32(cpu->mem, block + 4, HEAP_MAGIC);
+    heap_ptr += total;
+    return block + HEAP_HDR_SZ;
 }
 
-/* esp_get_minimum_free_heap_size() -> 200000 */
+/* malloc(size) -> pointer or NULL */
+static void stub_malloc(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t size = rom_arg(cpu, 0);
+    uint32_t ptr = heap_alloc(cpu, size);
+    rom_return(cpu, ptr);
+}
+
+/* calloc(nmemb, size) -> pointer or NULL (zeroed) */
+static void stub_calloc(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t nmemb = rom_arg(cpu, 0);
+    uint32_t size  = rom_arg(cpu, 1);
+    uint32_t total = nmemb * size;
+    uint32_t ptr = heap_alloc(cpu, total);
+    if (ptr) {
+        for (uint32_t i = 0; i < total; i++)
+            mem_write8(cpu->mem, ptr + i, 0);
+    }
+    rom_return(cpu, ptr);
+}
+
+/* free(ptr) -> void (no-op for bump allocator) */
+static void stub_free(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return_void(cpu);
+}
+
+/* realloc(ptr, size) -> pointer or NULL */
+static void stub_realloc(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t old_ptr = rom_arg(cpu, 0);
+    uint32_t new_size = rom_arg(cpu, 1);
+    if (new_size == 0) { rom_return(cpu, 0); return; }
+    uint32_t new_ptr = heap_alloc(cpu, new_size);
+    if (new_ptr && old_ptr) {
+        /* Copy old data — read old size from header */
+        uint32_t old_size = mem_read32(cpu->mem, old_ptr - HEAP_HDR_SZ);
+        uint32_t copy = old_size < new_size ? old_size : new_size;
+        for (uint32_t i = 0; i < copy; i++)
+            mem_write8(cpu->mem, new_ptr + i, mem_read8(cpu->mem, old_ptr + i));
+    }
+    rom_return(cpu, new_ptr);
+}
+
+/* esp_get_free_heap_size() -> remaining heap bytes */
+void stub_esp_get_free_heap_size(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, HEAP_END - heap_ptr);
+}
+
+/* esp_get_minimum_free_heap_size() -> remaining heap bytes */
 void stub_esp_get_minimum_free_heap_size(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    rom_return(cpu, 200000);
+    rom_return(cpu, HEAP_END - heap_ptr);
 }
 
 /* esp_log_timestamp() -> ccount / (cpu_freq_mhz * 1000) */
@@ -1289,6 +1363,28 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
+    /* Heap allocator stubs */
+    struct { const char *name; rom_stub_fn fn; } alloc_hooks[] = {
+        { "malloc",                         stub_malloc },
+        { "calloc",                         stub_calloc },
+        { "free",                           stub_free },
+        { "realloc",                        stub_realloc },
+        { "heap_caps_malloc",               stub_malloc },
+        { "heap_caps_malloc_default",       stub_malloc },
+        { "heap_caps_free",                 stub_free },
+        { "heap_caps_realloc",              stub_realloc },
+        { "heap_caps_realloc_default",      stub_realloc },
+        { "heap_caps_calloc",               stub_calloc },
+        { NULL, NULL }
+    };
+    for (int i = 0; alloc_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, alloc_hooks[i].name, &addr) == 0) {
+            rom_stubs_register(stubs, addr, alloc_hooks[i].fn, alloc_hooks[i].name);
+            hooked++;
+        }
+    }
+
     /* Heap size + logging stubs */
     struct { const char *name; rom_stub_fn fn; } misc_hooks[] = {
         { "esp_get_free_heap_size",        stub_esp_get_free_heap_size },
@@ -1467,6 +1563,29 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, "spi_transfer", &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, "spi_transfer");
+            hooked++;
+        }
+    }
+
+    /* SDMMC / SDSPI host infrastructure stubs.
+     * The actual sector I/O (sdmmc_read/write_sectors) and card init are
+     * hooked in sdcard_stubs.c.  These cover the SPI bus setup functions
+     * that the firmware calls before/after sdmmc_card_init. */
+    static const char *sdmmc_noop_fns[] = {
+        "sdspi_host_init",
+        "sdspi_host_set_card_clk",
+        "sdspi_host_remove_device",
+        "sdspi_host_get_real_freq",
+        "sdspi_host_io_int_enable",
+        "sdspi_host_get_dma_info",
+        "sdmmc_fix_host_flags",
+        "sdmmc_allocate_aligned_buf",
+        NULL
+    };
+    for (int i = 0; sdmmc_noop_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, sdmmc_noop_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, sdmmc_noop_fns[i]);
             hooked++;
         }
     }
