@@ -4,12 +4,16 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+
+#define DEFAULT_SD_SIZE (4ULL * 1024 * 1024 * 1024)  /* 4 GB */
 
 struct sdcard_stubs {
     xtensa_cpu_t       *cpu;
     esp32_rom_stubs_t  *rom;
     FILE               *img_file;
     uint64_t            img_size;
+    uint64_t            requested_size;   /* 0 = auto-detect from file */
     const char         *img_path;
 };
 
@@ -75,6 +79,12 @@ static void stub_sdcard_init(xtensa_cpu_t *cpu, void *ctx) {
         if (ss->img_file) {
             fseek(ss->img_file, 0, SEEK_END);
             ss->img_size = (uint64_t)ftell(ss->img_file);
+            /* Expand file to requested size if it's too small */
+            uint64_t target = ss->requested_size ? ss->requested_size : DEFAULT_SD_SIZE;
+            if (ss->img_size < target) {
+                if (ftruncate(fileno(ss->img_file), (off_t)target) == 0)
+                    ss->img_size = target;
+            }
             sd_return(cpu, 0);
             return;
         }
@@ -172,6 +182,11 @@ void sdcard_stubs_destroy(sdcard_stubs_t *ss) {
 void sdcard_stubs_set_image(sdcard_stubs_t *ss, const char *path) {
     if (!ss) return;
     ss->img_path = path;
+}
+
+void sdcard_stubs_set_size(sdcard_stubs_t *ss, uint64_t size_bytes) {
+    if (!ss) return;
+    ss->requested_size = size_bytes;
 }
 
 int sdcard_stubs_hook_symbols(sdcard_stubs_t *ss, const elf_symbols_t *syms) {
