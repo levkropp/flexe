@@ -30,3 +30,7 @@ target_compile_options(xtensa-tests PRIVATE -Wall -Wextra -Werror -Wno-unused-pa
 add_executable(xt-dis tools/xt-dis.c)
 target_link_libraries(xt-dis PRIVATE xtensa-emu-lib)
 target_compile_options(xt-dis PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+
+# Trace filter tool
+add_executable(trace-filter tools/trace-filter.c)
+target_compile_options(trace-filter PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)

@@ -398,11 +398,10 @@ TEST(test_slli) {
     xtensa_cpu_t cpu;
     xtensa_cpu_init(&cpu);
     cpu.mem = mem_create();
-    /* SLLI a3, a4, 5: op0=0, op1=1, op2=0(sh[4]=0), r=3(dest), s=4(src), t=5(sh[3:0])
-       sh = (op2[0]<<4)|t = (0<<4)|5 = 5
+    /* SLLI a3, a4, 27: encoded sa = 32-27 = 5 → op2=0, t=5
        insn = (0<<20)|(1<<16)|(3<<12)|(4<<8)|(5<<4)|0 = 0x013450 */
     put_insn3(&cpu, BASE, 0x013450);
-    ASSERT_TRUE(check_disasm(&cpu, BASE, "slli\ta3, a4, 5", 3));
+    ASSERT_TRUE(check_disasm(&cpu, BASE, "slli\ta3, a4, 27", 3));
     mem_destroy(cpu.mem);
 }
 
@@ -410,10 +409,10 @@ TEST(test_slli_large) {
     xtensa_cpu_t cpu;
     xtensa_cpu_init(&cpu);
     cpu.mem = mem_create();
-    /* SLLI a3, a4, 20: sh=20, sh[4]=1 → op2=1, sh[3:0]=4 → t=4
+    /* SLLI a3, a4, 12: encoded sa = 32-12 = 20 → sh[4]=1, sh[3:0]=4 → op2=1, t=4
        insn = (1<<20)|(1<<16)|(3<<12)|(4<<8)|(4<<4)|0 = 0x113440 */
     put_insn3(&cpu, BASE, 0x113440);
-    ASSERT_TRUE(check_disasm(&cpu, BASE, "slli\ta3, a4, 20", 3));
+    ASSERT_TRUE(check_disasm(&cpu, BASE, "slli\ta3, a4, 12", 3));
     mem_destroy(cpu.mem);
 }
 

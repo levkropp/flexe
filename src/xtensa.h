@@ -239,6 +239,9 @@ struct xtensa_cpu {
     /* Interrupt configuration */
     uint8_t  int_level[32]; /* Interrupt level per line (default: 1) */
 
+    /* Window spill base addresses: records where each window's regs were saved */
+    uint32_t spill_base[16]; /* base address used for synth_spill_window per window */
+
     /* Execution state */
     bool     running;
     bool     exception;     /* Exception pending flag */

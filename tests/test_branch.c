@@ -447,61 +447,59 @@ TEST(br_bbci_taken) {
     teardown(&cpu);
 }
 
-TEST(br_bbsi_taken) {
+TEST(br_bbci_high_r7_taken) {
     xtensa_cpu_t cpu; setup(&cpu);
-    /* BBSI: r=7, bit = t | ((r&1)<<4) = t | 16 */
-    /* To test bit 5: need bit=5, so t=5, r=7 -> bit = 5 | 16 = 21? No, we want bit 5. */
-    /* For low bits (0-15): use r=7, t=bit -> bit = t | 16. That tests bit (t+16).
-     * For bit 5 exactly: use r=15, t=5 -> bit = 5 | 16 = 21. Still wrong.
-     * Actually r=7 gives bit = t | (1<<4) = t+16 for t<16.
-     * For bits 0-15, use r=15: bit = t | (1<<4) = t+16. Still high bits.
-     * Hmm. r=6: bit = t | 0 = t. r=7: bit = t | 16. r=14: bit = t | 0 = t. r=15: bit = t | 16.
-     * So for BBSI with bit < 16, we can't use r=7. But BBSI is r=7 or r=15.
-     * r=7: bit = t | 16 (bits 16-31). r=15: bit = t | 16 (same!).
-     * Wait, the formula: bit = t | ((r & 1) << 4).
-     * r=7: r&1=1, so bit = t | 16 (range 16-31). r=15: r&1=1, so bit = t | 16 (same).
-     * For low bits (0-15): BBSI uses r=7 with t=bit? No, r=7 always sets bit 4.
-     * Actually I think BBCI uses r=6 (low bits) and r=14 (high bits).
-     * BBSI uses r=7 (low bits??)... wait no:
-     * r=6: BBCI, bit = t | 0 = t (0-15)
-     * r=14: BBCI, bit = t | 16 (16-31)
-     * r=7: BBSI, bit = t | 16 (16-31)  ← this seems wrong
-     * Actually re-reading the disasm: for r=6,7 the formula is bit = t | ((r&1)<<4)
-     * r=6: BBCI, bit = t | 0 = t
-     * r=7: BBSI, bit = t | 16
-     * And for r=14,15:
-     * r=14: BBCI, bit = t | 0 = t  ← but shouldn't this be high bits?
-     * r=15: BBSI, bit = t | 16
-     * Hmm wait. r=14: r&1=0, bit = t | 0 = t. r=15: r&1=1, bit = t | 16.
-     * That means r=6 and r=14 both give BBCI with bit=t (0-15).
-     * And r=7 and r=15 both give BBSI with bit=t+16 (16-31).
-     * That can't be right — there must be a way to do BBSI for bits 0-15.
-     * Looking at the Xtensa ISA more carefully: the BBCI/BBSI encoding uses
-     * the 5th bit from b = (r >> 2) & 4 | ... actually the ISA says:
-     * bbi = bit[4:0], where bit[3:0] = t and bit[4] = r[0].
-     * For r=7: bit[4] = 1, so range 16-31. For bit 0-15 of BBSI we need r with r[0]=0.
-     * But BBSI is only encoded at r=7 and r=15 in the op0=7 table.
-     * So: there's no BBSI encoding for bits 0-15?
-     * Actually looking at the ISA reference again: BBSI.L and BBSI use different r values.
-     * In the actual ISA: BBSI can only test bits 0-15 when encoded differently.
-     *
-     * Actually I think I'm overcomplicating this. Let me just test with a bit >= 16.
+    /* BBCI/BBSI encoding: r[3] = BBCI(0)/BBSI(1), r[0] = low(0)/high(1)
+     * r=6:  BBCI low  (bits 0-15)
+     * r=7:  BBCI high (bits 16-31)
+     * r=14: BBSI low  (bits 0-15)
+     * r=15: BBSI high (bits 16-31)
      */
-    /* Test bit 16: r=7, t=0 -> bit = 0 | 16 = 16 */
-    put_insn3(&cpu, BASE, branch_rri8(7, 4, 0, 8));
-    ar_write(&cpu, 4, 0x00010000); /* bit 16 set */
+    /* BBCI with r=7: bit = t | 16 = 19. r=7, t=3, s=4 */
+    put_insn3(&cpu, BASE, branch_rri8(7, 4, 3, 8));
+    ar_write(&cpu, 4, 0xFFF7FFFF); /* bit 19 clear */
     xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE + 12);
+    ASSERT_EQ(cpu.pc, BASE + 12); /* taken: bit 19 clear */
     teardown(&cpu);
 }
 
-TEST(br_bbsi_not_taken) {
+TEST(br_bbci_high_r7_not_taken) {
     xtensa_cpu_t cpu; setup(&cpu);
-    /* Test bit 16: r=7, t=0 -> bit = 16 */
-    put_insn3(&cpu, BASE, branch_rri8(7, 4, 0, 8));
-    ar_write(&cpu, 4, 0xFFFEFFFF); /* bit 16 clear */
+    /* BBCI with r=7: bit = t | 16 = 19 */
+    put_insn3(&cpu, BASE, branch_rri8(7, 4, 3, 8));
+    ar_write(&cpu, 4, 0x00080000); /* bit 19 set */
     xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE + 3);
+    ASSERT_EQ(cpu.pc, BASE + 3); /* not taken: bit 19 set */
+    teardown(&cpu);
+}
+
+TEST(br_bbsi_low_r14_taken) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    /* BBSI with r=14: bit = t | 0 = 4. r=14, t=4, s=4 */
+    put_insn3(&cpu, BASE, branch_rri8(14, 4, 4, 8));
+    ar_write(&cpu, 4, 0x00000010); /* bit 4 set */
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE + 12); /* taken: bit 4 set */
+    teardown(&cpu);
+}
+
+TEST(br_bbsi_low_r14_not_taken) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    /* BBSI with r=14: bit = t = 4 */
+    put_insn3(&cpu, BASE, branch_rri8(14, 4, 4, 8));
+    ar_write(&cpu, 4, 0xFFFFFFEF); /* bit 4 clear */
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE + 3); /* not taken: bit 4 clear */
+    teardown(&cpu);
+}
+
+TEST(br_bbsi_high_taken) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    /* BBSI with r=15: bit = t | 16. Test bit 20: r=15, t=4 -> bit = 4 | 16 = 20 */
+    put_insn3(&cpu, BASE, branch_rri8(15, 4, 4, 8));
+    ar_write(&cpu, 4, 0x00100000); /* bit 20 set */
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE + 12);
     teardown(&cpu);
 }
 
@@ -636,8 +634,11 @@ void run_branch_tests(void) {
     RUN_TEST(br_bbc_taken);
     RUN_TEST(br_bbs_taken);
     RUN_TEST(br_bbci_taken);
-    RUN_TEST(br_bbsi_taken);
-    RUN_TEST(br_bbsi_not_taken);
+    RUN_TEST(br_bbci_high_r7_taken);
+    RUN_TEST(br_bbci_high_r7_not_taken);
+    RUN_TEST(br_bbsi_low_r14_taken);
+    RUN_TEST(br_bbsi_low_r14_not_taken);
+    RUN_TEST(br_bbsi_high_taken);
     RUN_TEST(br_bf_taken);
     RUN_TEST(br_bf_not_taken);
     RUN_TEST(br_bt_taken);
