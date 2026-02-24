@@ -11,6 +11,8 @@ add_library(xtensa-emu-lib STATIC
     src/peripherals.c
     src/rom_stubs.c
     src/elf_symbols.c
+    src/freertos_stubs.c
+    src/esp_timer_stubs.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 target_link_libraries(xtensa-emu-lib PUBLIC m)

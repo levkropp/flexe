@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#define MAX_ROM_STUBS 128
+#define MAX_ROM_STUBS 256
 #define OUTPUT_BUF_SIZE 8192
 
 /* ROM address range: 0x40000000 - 0x4005FFFF */
@@ -20,6 +20,7 @@ typedef struct {
     rom_stub_fn fn;
     const char *name;
     uint32_t    call_count;
+    void       *user_ctx;   /* Per-entry context; NULL = use rom_stubs */
 } rom_stub_entry_t;
 
 struct esp32_rom_stubs {
@@ -719,6 +720,149 @@ static void stub_nedf2(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, (da != db) ? 1 : 0);
 }
 
+/* ===== NVS stubs ===== */
+
+#define ESP_OK              0
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+
+/* nvs_flash_init / nvs_flash_init_partition -> ESP_OK */
+void stub_nvs_flash_init(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_flash_erase -> ESP_OK */
+void stub_nvs_flash_erase(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_open(name, mode, *handle_out) -> ESP_OK, handle=1 */
+void stub_nvs_open(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t handle_out = rom_arg(cpu, 2);
+    if (handle_out)
+        mem_write32(cpu->mem, handle_out, 1);
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_open_from_partition(part, name, mode, *handle_out) -> ESP_OK */
+void stub_nvs_open_from_partition(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t handle_out = rom_arg(cpu, 3);
+    if (handle_out)
+        mem_write32(cpu->mem, handle_out, 1);
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_close(handle) -> void */
+void stub_nvs_close(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return_void(cpu);
+}
+
+/* nvs_get_* -> ESP_ERR_NVS_NOT_FOUND */
+void stub_nvs_get_notfound(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_ERR_NVS_NOT_FOUND);
+}
+
+/* nvs_set_* / nvs_commit -> ESP_OK */
+void stub_nvs_set_ok(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_OK);
+}
+
+/* ===== GPIO driver stubs ===== */
+
+/* gpio_config(config) -> ESP_OK */
+void stub_gpio_config(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_set_direction(pin, mode) -> ESP_OK */
+void stub_gpio_set_direction(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t pin  = rom_arg(cpu, 0);
+    uint32_t mode = rom_arg(cpu, 1);
+    /* Update GPIO ENABLE register if output mode */
+    if (mode >= 2 && pin < 32) {  /* GPIO_MODE_OUTPUT = 2 */
+        uint32_t enable = mem_read32(cpu->mem, 0x3FF44020u);
+        enable |= (1u << pin);
+        mem_write32(cpu->mem, 0x3FF44020u, enable);
+    }
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_set_level(pin, level) -> ESP_OK */
+void stub_gpio_set_level(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t pin   = rom_arg(cpu, 0);
+    uint32_t level = rom_arg(cpu, 1);
+    if (pin < 32) {
+        uint32_t out = mem_read32(cpu->mem, 0x3FF44004u);
+        if (level)
+            out |= (1u << pin);
+        else
+            out &= ~(1u << pin);
+        mem_write32(cpu->mem, 0x3FF44004u, out);
+    } else if (pin < 40) {
+        uint32_t out1 = mem_read32(cpu->mem, 0x3FF44010u);
+        if (level)
+            out1 |= (1u << (pin - 32));
+        else
+            out1 &= ~(1u << (pin - 32));
+        mem_write32(cpu->mem, 0x3FF44010u, out1);
+    }
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_get_level(pin) -> 0 (no input) */
+void stub_gpio_get_level(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t pin = rom_arg(cpu, 0);
+    uint32_t level = 0;
+    if (pin < 32)
+        level = (mem_read32(cpu->mem, 0x3FF4403Cu) >> pin) & 1;
+    else if (pin < 40)
+        level = (mem_read32(cpu->mem, 0x3FF44040u) >> (pin - 32)) & 1;
+    rom_return(cpu, level);
+}
+
+/* gpio_reset_pin(pin) -> ESP_OK */
+void stub_gpio_reset_pin(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_install_isr_service(flags) -> ESP_OK */
+void stub_gpio_isr_service(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_OK);
+}
+
+/* ===== Heap stubs ===== */
+
+/* esp_get_free_heap_size() -> 250000 */
+void stub_esp_get_free_heap_size(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 250000);
+}
+
+/* esp_get_minimum_free_heap_size() -> 200000 */
+void stub_esp_get_minimum_free_heap_size(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 200000);
+}
+
+/* esp_log_timestamp() -> ccount / (cpu_freq_mhz * 1000) */
+void stub_esp_log_timestamp(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t ms = cpu->ccount / (s->cpu_freq_mhz * 1000);
+    rom_return(cpu, ms);
+}
+
 /* Generic no-op ROM stub: returns 0 for unregistered ROM calls */
 static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -740,7 +884,8 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             s->entries[i].call_count++;
             if (s->log_fn)
                 s->log_fn(s->log_ctx, pc, s->entries[i].name, cpu);
-            s->entries[i].fn(cpu, s);
+            void *ctx = s->entries[i].user_ctx ? s->entries[i].user_ctx : s;
+            s->entries[i].fn(cpu, ctx);
             return 1;
         }
     }
@@ -856,7 +1001,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* Flash/boot helpers */
     rom_stubs_register(s, 0x40062BC8, stub_unregistered,        "spi_flash_clk_cfg");
-    rom_stubs_register(s, 0x40008264, stub_void_unregistered,   "software_reset_cpu");
+    rom_stubs_register(s, 0x40008264, stub_software_reset,      "software_reset_cpu");
 
     /* Misc */
     rom_stubs_register(s, 0x40008208, stub_void_unregistered,   "set_rtc_memory_crc");
@@ -908,15 +1053,104 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
+    /* NVS stubs */
+    struct { const char *name; rom_stub_fn fn; } nvs_hooks[] = {
+        { "nvs_flash_init",             stub_nvs_flash_init },
+        { "nvs_flash_init_partition",   stub_nvs_flash_init },
+        { "nvs_flash_erase",            stub_nvs_flash_erase },
+        { "nvs_open",                   stub_nvs_open },
+        { "nvs_open_from_partition",    stub_nvs_open_from_partition },
+        { "nvs_close",                  stub_nvs_close },
+        { "nvs_get_i8",                 stub_nvs_get_notfound },
+        { "nvs_get_u8",                 stub_nvs_get_notfound },
+        { "nvs_get_i16",                stub_nvs_get_notfound },
+        { "nvs_get_u16",                stub_nvs_get_notfound },
+        { "nvs_get_i32",                stub_nvs_get_notfound },
+        { "nvs_get_u32",                stub_nvs_get_notfound },
+        { "nvs_get_i64",                stub_nvs_get_notfound },
+        { "nvs_get_u64",                stub_nvs_get_notfound },
+        { "nvs_get_str",                stub_nvs_get_notfound },
+        { "nvs_get_blob",               stub_nvs_get_notfound },
+        { "nvs_set_i8",                 stub_nvs_set_ok },
+        { "nvs_set_u8",                 stub_nvs_set_ok },
+        { "nvs_set_i16",                stub_nvs_set_ok },
+        { "nvs_set_u16",                stub_nvs_set_ok },
+        { "nvs_set_i32",                stub_nvs_set_ok },
+        { "nvs_set_u32",                stub_nvs_set_ok },
+        { "nvs_set_i64",                stub_nvs_set_ok },
+        { "nvs_set_u64",                stub_nvs_set_ok },
+        { "nvs_set_str",                stub_nvs_set_ok },
+        { "nvs_set_blob",               stub_nvs_set_ok },
+        { "nvs_commit",                 stub_nvs_set_ok },
+        { NULL, NULL }
+    };
+    for (int i = 0; nvs_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, nvs_hooks[i].name, &addr) == 0) {
+            rom_stubs_register(stubs, addr, nvs_hooks[i].fn, nvs_hooks[i].name);
+            hooked++;
+        }
+    }
+
+    /* GPIO driver stubs */
+    struct { const char *name; rom_stub_fn fn; } gpio_hooks[] = {
+        { "gpio_config",                stub_gpio_config },
+        { "gpio_set_direction",         stub_gpio_set_direction },
+        { "gpio_set_level",             stub_gpio_set_level },
+        { "gpio_get_level",             stub_gpio_get_level },
+        { "gpio_reset_pin",             stub_gpio_reset_pin },
+        { "gpio_install_isr_service",   stub_gpio_isr_service },
+        { "gpio_isr_handler_add",       stub_gpio_isr_service },
+        { "gpio_isr_handler_remove",    stub_gpio_isr_service },
+        { "gpio_set_intr_type",         stub_gpio_isr_service },
+        { "gpio_intr_enable",           stub_gpio_isr_service },
+        { "gpio_intr_disable",          stub_gpio_isr_service },
+        { "gpio_pullup_en",             stub_gpio_isr_service },
+        { "gpio_pullup_dis",            stub_gpio_isr_service },
+        { "gpio_pulldown_en",           stub_gpio_isr_service },
+        { "gpio_pulldown_dis",          stub_gpio_isr_service },
+        { "gpio_set_pull_mode",         stub_gpio_isr_service },
+        { NULL, NULL }
+    };
+    for (int i = 0; gpio_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, gpio_hooks[i].name, &addr) == 0) {
+            rom_stubs_register(stubs, addr, gpio_hooks[i].fn, gpio_hooks[i].name);
+            hooked++;
+        }
+    }
+
+    /* Heap size + logging stubs */
+    struct { const char *name; rom_stub_fn fn; } misc_hooks[] = {
+        { "esp_get_free_heap_size",        stub_esp_get_free_heap_size },
+        { "esp_get_minimum_free_heap_size", stub_esp_get_minimum_free_heap_size },
+        { "esp_log_timestamp",             stub_esp_log_timestamp },
+        { "esp_log_early_timestamp",       stub_esp_log_timestamp },
+        { NULL, NULL }
+    };
+    for (int i = 0; misc_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, misc_hooks[i].name, &addr) == 0) {
+            rom_stubs_register(stubs, addr, misc_hooks[i].fn, misc_hooks[i].name);
+            hooked++;
+        }
+    }
+
     return hooked;
 }
 
 int rom_stubs_register(esp32_rom_stubs_t *stubs, uint32_t addr,
                        rom_stub_fn fn, const char *name) {
+    return rom_stubs_register_ctx(stubs, addr, fn, name, NULL);
+}
+
+int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
+                            rom_stub_fn fn, const char *name, void *user_ctx) {
     if (stubs->count >= MAX_ROM_STUBS) return -1;
     stubs->entries[stubs->count].addr = addr;
     stubs->entries[stubs->count].fn = fn;
     stubs->entries[stubs->count].name = name;
+    stubs->entries[stubs->count].user_ctx = user_ctx;
     stubs->count++;
     return 0;
 }

@@ -43,6 +43,13 @@ typedef struct {
     uint32_t out1;       /* GPIOs 32-39 */
     uint32_t enable;
     uint32_t enable1;
+    uint32_t in;         /* GPIO_IN_REG */
+    uint32_t in1;        /* GPIO_IN1_REG */
+    uint32_t status;     /* GPIO_STATUS_REG (interrupt status) */
+    uint32_t status1;    /* GPIO_STATUS1_REG */
+    uint32_t pin[40];    /* GPIO_PINn_REG */
+    uint32_t func_in_sel[256];   /* GPIO_FUNC_IN_SEL_CFG_REG */
+    uint32_t func_out_sel[40];   /* GPIO_FUNC_OUT_SEL_CFG_REG */
 } gpio_state_t;
 
 /* RTC calibration state machine per timer group */
@@ -132,28 +139,90 @@ static void uart0_write(void *ctx, uint32_t addr, uint32_t val) {
 static uint32_t gpio_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - GPIO_BASE;
+
+    /* Basic registers */
     switch (off) {
     case 0x004: return p->gpio.out;         /* GPIO_OUT_REG */
+    case 0x008: return 0;                   /* GPIO_OUT_W1TS (write-only) */
+    case 0x00C: return 0;                   /* GPIO_OUT_W1TC (write-only) */
     case 0x010: return p->gpio.out1;        /* GPIO_OUT1_REG */
     case 0x020: return p->gpio.enable;      /* GPIO_ENABLE_REG */
     case 0x02C: return p->gpio.enable1;     /* GPIO_ENABLE1_REG */
-    case 0x03C: return 0;                   /* GPIO_IN_REG: no input */
-    case 0x040: return 0;                   /* GPIO_IN1_REG */
-    default: return 0;
+    case 0x03C: return p->gpio.in;          /* GPIO_IN_REG */
+    case 0x040: return p->gpio.in1;         /* GPIO_IN1_REG */
+    case 0x044: return p->gpio.status;      /* GPIO_STATUS_REG */
+    case 0x048: return 0;                   /* GPIO_STATUS_W1TS (write-only) */
+    case 0x04C: return 0;                   /* GPIO_STATUS_W1TC (write-only) */
+    case 0x050: return p->gpio.status1;     /* GPIO_STATUS1_REG */
+    default: break;
     }
+
+    /* GPIO_PINn_REG: 0x088 + n*4, n=0..39 */
+    if (off >= 0x088 && off < 0x088 + 40 * 4) {
+        int n = (int)(off - 0x088) / 4;
+        return p->gpio.pin[n];
+    }
+
+    /* GPIO_FUNC_IN_SEL_CFG_REG: 0x130 + sig*4, sig=0..255 */
+    if (off >= 0x130 && off < 0x130 + 256 * 4) {
+        int sig = (int)(off - 0x130) / 4;
+        return p->gpio.func_in_sel[sig];
+    }
+
+    /* GPIO_FUNC_OUT_SEL_CFG_REG: 0x530 + n*4, n=0..39
+     * 0x530 = offset 1328. These extend beyond page boundary (page = 4096).
+     * But this handler is also registered for the next page. */
+    if (off >= 0x530 && off < 0x530 + 40 * 4) {
+        int n = (int)(off - 0x530) / 4;
+        return p->gpio.func_out_sel[n];
+    }
+
+    return 0;
 }
 
 static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - GPIO_BASE;
+
     switch (off) {
     case 0x004: p->gpio.out = val; break;        /* GPIO_OUT_REG */
     case 0x008: p->gpio.out |= val; break;       /* GPIO_OUT_W1TS */
     case 0x00C: p->gpio.out &= ~val; break;      /* GPIO_OUT_W1TC */
+    case 0x010: p->gpio.out1 = val; break;       /* GPIO_OUT1_REG */
+    case 0x014: p->gpio.out1 |= val; break;      /* GPIO_OUT1_W1TS */
+    case 0x018: p->gpio.out1 &= ~val; break;     /* GPIO_OUT1_W1TC */
     case 0x020: p->gpio.enable = val; break;      /* GPIO_ENABLE_REG */
     case 0x024: p->gpio.enable |= val; break;     /* GPIO_ENABLE_W1TS */
     case 0x028: p->gpio.enable &= ~val; break;    /* GPIO_ENABLE_W1TC */
+    case 0x02C: p->gpio.enable1 = val; break;     /* GPIO_ENABLE1_REG */
+    case 0x030: p->gpio.enable1 |= val; break;    /* GPIO_ENABLE1_W1TS */
+    case 0x034: p->gpio.enable1 &= ~val; break;   /* GPIO_ENABLE1_W1TC */
+    case 0x044: p->gpio.status = val; break;      /* GPIO_STATUS_REG */
+    case 0x048: p->gpio.status |= val; break;     /* GPIO_STATUS_W1TS */
+    case 0x04C: p->gpio.status &= ~val; break;    /* GPIO_STATUS_W1TC */
+    case 0x050: p->gpio.status1 = val; break;     /* GPIO_STATUS1_REG */
     default: break;
+    }
+
+    /* GPIO_PINn_REG */
+    if (off >= 0x088 && off < 0x088 + 40 * 4) {
+        int n = (int)(off - 0x088) / 4;
+        p->gpio.pin[n] = val;
+        return;
+    }
+
+    /* GPIO_FUNC_IN_SEL_CFG_REG */
+    if (off >= 0x130 && off < 0x130 + 256 * 4) {
+        int sig = (int)(off - 0x130) / 4;
+        p->gpio.func_in_sel[sig] = val;
+        return;
+    }
+
+    /* GPIO_FUNC_OUT_SEL_CFG_REG */
+    if (off >= 0x530 && off < 0x530 + 40 * 4) {
+        int n = (int)(off - 0x530) / 4;
+        p->gpio.func_out_sel[n] = val;
+        return;
     }
 }
 
@@ -364,8 +433,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* SPI0 (flash controller) */
     mem_register_mmio(mem, (int)PAGE_OF(SPI0_BASE), spi_read, spi_write, p);
 
-    /* GPIO */
+    /* GPIO: page 68 + page 69 (FUNC_OUT_SEL extends beyond 4096) */
     mem_register_mmio(mem, (int)PAGE_OF(GPIO_BASE), gpio_read, gpio_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(GPIO_BASE) + 1, gpio_read, gpio_write, p);
 
     /* RTC_CNTL */
     mem_register_mmio(mem, (int)PAGE_OF(RTC_CNTL_BASE), rtc_cntl_read, rtc_cntl_write, p);
