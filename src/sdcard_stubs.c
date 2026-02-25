@@ -275,6 +275,177 @@ static void stub_sdspi_host_init_device(xtensa_cpu_t *cpu, void *ctx) {
     sd_return(cpu, 0);
 }
 
+/* ===== Native FAT32/exFAT volume info (bypass emulated scan) ===== */
+
+/* Read a 512-byte sector from the image file into buf.
+ * Returns 0 on success, -1 on failure. */
+static int img_read_sector(sdcard_stubs_t *ss, uint32_t lba, uint8_t *buf) {
+    if (!ss->img_file) return -1;
+    if (fseek(ss->img_file, (long)lba * 512, SEEK_SET) != 0) return -1;
+    size_t got = fread(buf, 1, 512, ss->img_file);
+    if (got < 512) memset(buf + got, 0, 512 - got);
+    return 0;
+}
+
+/*
+ * fat32_volume_info(uint64_t *total_bytes, uint64_t *free_bytes) -> int
+ *
+ * The firmware's version scans the entire FAT table on the emulated CPU,
+ * which is extremely slow (~seconds). We replace it by scanning the FAT
+ * natively from the host image file, which takes milliseconds.
+ */
+static void stub_fat32_volume_info(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    uint32_t total_ptr = sd_arg(cpu, 0);
+    uint32_t free_ptr  = sd_arg(cpu, 1);
+
+    if (!ss->img_file) { sd_return(cpu, (uint32_t)-1); return; }
+
+    /* Find partition start (same logic as firmware's find_partition) */
+    uint8_t sec[512];
+    uint32_t part_start = 0;
+    if (img_read_sector(ss, 0, sec) == 0 && sec[510] == 0x55 && sec[511] == 0xAA) {
+        uint8_t ptype = sec[446 + 4];
+        uint32_t start_lba = sec[446+8] | (sec[446+9]<<8) |
+                             (sec[446+10]<<16) | (sec[446+11]<<24);
+        if (ptype == 0x0B || ptype == 0x0C || ptype == 0x07)
+            part_start = start_lba;
+        /* GPT or other: leave at 0 (superfloppy) */
+    }
+
+    /* Read BPB */
+    if (img_read_sector(ss, part_start, sec) != 0 ||
+        sec[510] != 0x55 || sec[511] != 0xAA) {
+        sd_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    uint32_t spc = sec[0x0D];
+    uint32_t reserved = sec[0x0E] | (sec[0x0F] << 8);
+    uint32_t num_fats = sec[0x10];
+    uint32_t fat_size = sec[0x24] | (sec[0x25]<<8) | (sec[0x26]<<16) | (sec[0x27]<<24);
+    uint32_t total_sectors = sec[0x20] | (sec[0x21]<<8) | (sec[0x22]<<16) | (sec[0x23]<<24);
+
+    if (spc == 0 || fat_size == 0) { sd_return(cpu, (uint32_t)-1); return; }
+
+    uint32_t fat_start = part_start + reserved;
+    uint32_t total_clusters = (total_sectors - reserved - fat_size * num_fats) / spc;
+    uint32_t cluster_size = spc * 512;
+
+    /* Scan FAT natively — count free entries (value == 0) */
+    uint32_t free_count = 0;
+    uint32_t cl = 2;
+    for (uint32_t s = 0; s < fat_size && cl < total_clusters + 2; s++) {
+        if (img_read_sector(ss, fat_start + s, sec) != 0) break;
+        uint32_t *fat = (uint32_t *)sec;
+        uint32_t start = (s == 0) ? 2 : 0;
+        for (uint32_t i = start; i < 128 && cl < total_clusters + 2; i++, cl++) {
+            if ((fat[i] & 0x0FFFFFFF) == 0)
+                free_count++;
+        }
+    }
+
+    uint64_t total_bytes = (uint64_t)total_clusters * cluster_size;
+    uint64_t free_bytes  = (uint64_t)free_count * cluster_size;
+
+    /* Write uint64_t results to emulator memory (little-endian) */
+    if (total_ptr) {
+        mem_write32(cpu->mem, total_ptr,     (uint32_t)total_bytes);
+        mem_write32(cpu->mem, total_ptr + 4, (uint32_t)(total_bytes >> 32));
+    }
+    if (free_ptr) {
+        mem_write32(cpu->mem, free_ptr,     (uint32_t)free_bytes);
+        mem_write32(cpu->mem, free_ptr + 4, (uint32_t)(free_bytes >> 32));
+    }
+
+    fprintf(stderr, "[SD] fat32_volume_info: total=%lluMB free=%lluMB (native scan)\n",
+            (unsigned long long)(total_bytes / (1024*1024)),
+            (unsigned long long)(free_bytes / (1024*1024)));
+    sd_return(cpu, 0);
+}
+
+/*
+ * exfat_volume_info(vol, uint64_t *total_bytes, uint64_t *free_bytes) -> int
+ *
+ * Similar native acceleration for exFAT. Parses the exFAT boot sector
+ * and allocation bitmap directly from the image file.
+ */
+static void stub_exfat_volume_info(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    (void)sd_arg(cpu, 0);  /* vol ptr — ignored, we read from image */
+    uint32_t total_ptr = sd_arg(cpu, 1);
+    uint32_t free_ptr  = sd_arg(cpu, 2);
+
+    if (!ss->img_file) { sd_return(cpu, (uint32_t)-1); return; }
+
+    /* Find partition start */
+    uint8_t sec[512];
+    uint32_t part_start = 0;
+    if (img_read_sector(ss, 0, sec) == 0 && sec[510] == 0x55 && sec[511] == 0xAA) {
+        uint8_t ptype = sec[446 + 4];
+        uint32_t start_lba = sec[446+8] | (sec[446+9]<<8) |
+                             (sec[446+10]<<16) | (sec[446+11]<<24);
+        if (ptype == 0x0B || ptype == 0x0C || ptype == 0x07 || ptype == 0xEE)
+            part_start = start_lba;
+    }
+
+    /* Read exFAT boot sector */
+    if (img_read_sector(ss, part_start, sec) != 0) {
+        sd_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    /* Verify "EXFAT   " signature at offset 3 */
+    if (memcmp(sec + 3, "EXFAT   ", 8) != 0) {
+        sd_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    uint32_t cluster_heap_offset = sec[88] | (sec[89]<<8) | (sec[90]<<16) | (sec[91]<<24);
+    uint32_t cluster_count = sec[92] | (sec[93]<<8) | (sec[94]<<16) | (sec[95]<<24);
+    uint8_t  bps_shift = sec[108];
+    uint8_t  spc_shift = sec[109];
+    uint32_t bytes_per_sector = 1u << bps_shift;
+    uint32_t spc = 1u << spc_shift;
+    uint32_t cluster_size = spc * bytes_per_sector;
+
+    uint64_t total_bytes = (uint64_t)cluster_count * cluster_size;
+
+    /* Scan allocation bitmap for free clusters.
+     * The bitmap is typically in cluster 2, at cluster_heap_offset.
+     * Each bit = one cluster: 0 = free, 1 = allocated. */
+    uint32_t bitmap_lba = part_start + cluster_heap_offset;
+    uint32_t free_count = 0;
+    uint32_t checked = 0;
+    uint32_t bitmap_sectors = (cluster_count + (bytes_per_sector * 8) - 1) / (bytes_per_sector * 8);
+
+    for (uint32_t s = 0; s < bitmap_sectors && checked < cluster_count; s++) {
+        if (img_read_sector(ss, bitmap_lba + s, sec) != 0) break;
+        for (int b = 0; b < 512 && checked < cluster_count; b++) {
+            for (int bit = 0; bit < 8 && checked < cluster_count; bit++, checked++) {
+                if (!(sec[b] & (1 << bit)))
+                    free_count++;
+            }
+        }
+    }
+
+    uint64_t free_bytes = (uint64_t)free_count * cluster_size;
+
+    if (total_ptr) {
+        mem_write32(cpu->mem, total_ptr,     (uint32_t)total_bytes);
+        mem_write32(cpu->mem, total_ptr + 4, (uint32_t)(total_bytes >> 32));
+    }
+    if (free_ptr) {
+        mem_write32(cpu->mem, free_ptr,     (uint32_t)free_bytes);
+        mem_write32(cpu->mem, free_ptr + 4, (uint32_t)(free_bytes >> 32));
+    }
+
+    fprintf(stderr, "[SD] exfat_volume_info: total=%lluMB free=%lluMB (native scan)\n",
+            (unsigned long long)(total_bytes / (1024*1024)),
+            (unsigned long long)(free_bytes / (1024*1024)));
+    sd_return(cpu, 0);
+}
+
 /* ===== Public API ===== */
 
 sdcard_stubs_t *sdcard_stubs_create(xtensa_cpu_t *cpu) {
@@ -329,6 +500,9 @@ int sdcard_stubs_hook_symbols(sdcard_stubs_t *ss, const elf_symbols_t *syms) {
         { "sdmmc_read_sectors_dma", stub_sdmmc_read_sectors },
         { "sdmmc_write_sectors_dma", stub_sdmmc_write_sectors },
         { "sdspi_host_init_device", stub_sdspi_host_init_device },
+        /* Native-accelerated volume info (bypass slow emulated FAT scan) */
+        { "fat32_volume_info",     stub_fat32_volume_info },
+        { "exfat_volume_info",     stub_exfat_volume_info },
         { NULL, NULL }
     };
 
