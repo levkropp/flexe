@@ -247,6 +247,7 @@ struct xtensa_cpu {
     bool     exception;     /* Exception pending flag */
     bool     debug_break;   /* Debug break requested */
     bool     halted;        /* WAITI halt state */
+    bool     _pc_written;   /* Set when instruction modifies PC (branch/call/ret) */
     uint64_t cycle_count;   /* Total emulated cycles */
 
     /* Memory subsystem (set by caller) */

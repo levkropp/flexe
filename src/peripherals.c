@@ -91,6 +91,11 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
     case 0x040: return 0x0A;        /* PRO_CACHE_CTRL: cache enabled */
     case 0x044: return 0x0A;        /* PRO_CACHE_CTRL1 */
     case 0x058: return 0x0A;        /* APP_CACHE_CTRL: cache enabled */
+    case 0x3F0: return 0x80;        /* PRO_DCACHE_DBUG0: cache idle (bits[18:7]=1) */
+    case 0x3F4: return 0x80;        /* PRO_DCACHE_DBUG1 */
+    case 0x3F8: return 0x80;        /* PRO_DCACHE_DBUG2 */
+    case 0x3FC: return 0x80;        /* PRO_DCACHE_DBUG3 */
+    case 0x418: return 0x80;        /* APP_DCACHE_DBUG0: cache idle (bits[18:7]=1) */
     case 0x3A0: return 0x16042000;  /* DPORT_DATE */
     default:
         /* Interrupt matrix: offsets 0x104-0x2FC, return 16 (disabled) */

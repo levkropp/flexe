@@ -447,6 +447,17 @@ int main(int argc, char *argv[]) {
                 stop_reason = STOP_CPU_STOPPED;
                 break;
             }
+            /* Detect infinite self-loop (j self) — trigger deferred task */
+            if (cpu.pc == prev_pc && frt) {
+                uint32_t param;
+                uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
+                if (fn) {
+                    ar_write(&cpu, 1, 0x3FFE0000u);
+                    ar_write(&cpu, 2, param);
+                    cpu.pc = fn;
+                    cpu.ps = 0x00040020u;
+                }
+            }
         }
         if (stop_reason == STOP_RUNNING)
             stop_reason = (cycles >= max_cycles) ? STOP_MAX_CYCLES : STOP_CPU_STOPPED;
@@ -454,11 +465,23 @@ int main(int argc, char *argv[]) {
         /* Batch execution in chunks */
         int batch = 10000;
         while (cycles < max_cycles && cpu.running && !cpu.halted && !cpu.breakpoint_hit) {
+            uint32_t pc_before = cpu.pc;
             int remaining = max_cycles - cycles;
             int n = remaining < batch ? remaining : batch;
             int ran = xtensa_run(&cpu, n);
             cycles += ran;
             if (ran < n) break;
+            /* Detect infinite self-loop (j self) — trigger deferred task */
+            if (cpu.pc == pc_before && frt) {
+                uint32_t param;
+                uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
+                if (fn) {
+                    ar_write(&cpu, 1, 0x3FFE0000u);
+                    ar_write(&cpu, 2, param);
+                    cpu.pc = fn;
+                    cpu.ps = 0x00040020u; /* WOE=1, UM=1 */
+                }
+            }
         }
         /* Determine stop reason */
         if (cpu.breakpoint_hit)

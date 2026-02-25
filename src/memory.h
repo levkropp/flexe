@@ -25,6 +25,9 @@ void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
 /* Bulk load (for firmware loading) */
 int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len);
 
+/* Bulk load raw flash image (offset 0 = flash base) */
+int mem_load_flash(xtensa_mem_t *mem, const uint8_t *data, size_t len);
+
 /* Direct pointer access (for instruction fetch) */
 const uint8_t *mem_get_ptr(xtensa_mem_t *mem, uint32_t addr);
 

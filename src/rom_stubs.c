@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <zlib.h>
 
-#define MAX_ROM_STUBS 512
+#define MAX_ROM_STUBS 1024
 #define OUTPUT_BUF_SIZE 8192
 
 /* ROM address range: 0x40000000 - 0x4005FFFF */
@@ -36,7 +36,10 @@ struct esp32_rom_stubs {
     int              unregistered_count;
     uint32_t         s_cpu_up_addr;     /* BSS symbol for multicore unblock */
     uint32_t         s_cpu_inited_addr; /* BSS symbol for multicore init wait */
+    uint32_t         s_system_inited_addr;      /* system init complete flag */
+    uint32_t         s_system_full_inited_addr; /* system full init complete flag */
     uint32_t         app_main_addr;    /* app_main symbol for start_cpu0 hook */
+    const elf_symbols_t *syms;         /* ELF symbols (for symbol lookups in stubs) */
 };
 
 /* ===== Calling convention helpers ===== */
@@ -220,6 +223,16 @@ static void stub_ets_set_appcpu_boot_addr(xtensa_cpu_t *cpu, void *ctx) {
         mem_write8(cpu->mem, s->s_cpu_up_addr + 1, 1);
     if (s->s_cpu_inited_addr)
         mem_write8(cpu->mem, s->s_cpu_inited_addr + 1, 1);
+    /* Pre-set system init flags for both cores to avoid polling loop in start_cpu0.
+     * s_system_inited is a per-core byte array: [0]=PRO_CPU, [1]=APP_CPU */
+    if (s->s_system_inited_addr) {
+        mem_write8(cpu->mem, s->s_system_inited_addr, 1);      /* core 0 */
+        mem_write8(cpu->mem, s->s_system_inited_addr + 1, 1);  /* core 1 */
+    }
+    if (s->s_system_full_inited_addr) {
+        mem_write8(cpu->mem, s->s_system_full_inited_addr, 1);
+        mem_write8(cpu->mem, s->s_system_full_inited_addr + 1, 1);
+    }
     rom_return_void(cpu);
 }
 
@@ -831,6 +844,64 @@ static void stub_esp_partition_find_first(xtensa_cpu_t *cpu, void *ctx) {
     }
 }
 
+/* esp_newlib_init — allocate and initialise a minimal _reent struct so that
+ * newlib's __sinit / __sfp don't recurse with a NULL pointer.
+ * We also write the pointer into _global_impure_ptr (if the symbol exists). */
+static void stub_esp_newlib_init(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    /* Allocate 256 bytes for a minimal _reent struct at a fixed scratch addr */
+    static const uint32_t reent_addr = 0x3FFE3C00u;
+    /* Zero it out */
+    for (uint32_t i = 0; i < 256; i += 4)
+        mem_write32(cpu->mem, reent_addr + i, 0);
+    /* Set __sdidinit = 1 (offset 24) to prevent __sinit recursion */
+    mem_write32(cpu->mem, reent_addr + 24, 1);
+    /* Set stdin/stdout/stderr to minimal FILE-like stubs.
+     * offset 0: _stdin,  offset 4: _stdout,  offset 8: _stderr
+     * Point them at small per-stream structs just past the reent. */
+    uint32_t stdin_addr  = reent_addr + 256;
+    uint32_t stdout_addr = reent_addr + 256 + 64;
+    uint32_t stderr_addr = reent_addr + 256 + 128;
+    mem_write32(cpu->mem, reent_addr + 0, stdin_addr);
+    mem_write32(cpu->mem, reent_addr + 4, stdout_addr);
+    mem_write32(cpu->mem, reent_addr + 8, stderr_addr);
+    /* Write _global_impure_ptr if we know the address */
+    if (s->syms) {
+        uint32_t addr;
+        if (elf_symbols_find(s->syms, "_global_impure_ptr", &addr) == 0) {
+            mem_write32(cpu->mem, addr, reent_addr);
+        }
+        /* Also set _impure_ptr (per-task reent pointer, same in single-thread) */
+        if (elf_symbols_find(s->syms, "_impure_ptr", &addr) == 0) {
+            mem_write32(cpu->mem, addr, reent_addr);
+        }
+    }
+    rom_return(cpu, 0);
+}
+
+/* __getreent — return global reent pointer (same as set up by esp_newlib_init) */
+static void stub_getreent(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 0x3FFE3C00u);  /* same address as stub_esp_newlib_init */
+}
+
+/* esp_ota_get_running_partition() — return fake "factory" partition */
+static void stub_esp_ota_get_running_partition(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint32_t fake_part = 0x3FFE3D00u;
+    mem_write32(cpu->mem, fake_part + 0, 0);             /* flash_chip = NULL */
+    mem_write32(cpu->mem, fake_part + 4, 0);             /* type = APP (0) */
+    mem_write32(cpu->mem, fake_part + 8, 0);             /* subtype = FACTORY (0) */
+    mem_write32(cpu->mem, fake_part + 12, 0x00010000u);  /* address = 0x10000 */
+    mem_write32(cpu->mem, fake_part + 16, 0x00100000u);  /* size = 1MB */
+    /* label at offset 20: "factory\0" */
+    const char *label = "factory";
+    for (int i = 0; i < 8; i++)
+        mem_write8(cpu->mem, fake_part + 20 + (uint32_t)i, (uint8_t)label[i]);
+    mem_write8(cpu->mem, fake_part + 37, 0);             /* encrypted = false */
+    rom_return(cpu, fake_part);
+}
+
 /* esp_partition_mmap(part, offset, size, type, *out_ptr, *out_handle) -> ESP_OK */
 static void stub_esp_partition_mmap(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -842,41 +913,46 @@ static void stub_esp_partition_mmap(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
-/* esp_startup_start_app — skip FreeRTOS scheduler, jump to app_main */
-static void stub_esp_startup_start_app(xtensa_cpu_t *cpu, void *ctx) {
+/* startup_resume_other_cores — called right before the system init polling loop.
+ * In real ESP32, this wakes other cores to run their init functions.
+ * We set s_system_inited[1] = 1 here so the polling loop (which checks all cores)
+ * doesn't spin forever waiting for core 1 that never starts. */
+static void stub_startup_resume_other_cores(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
-    (void)s;
-    /* Don't return — we'll let the firmware call app_main naturally
-     * through the normal code path. Just return void. */
+    if (s->s_system_inited_addr)
+        mem_write8(cpu->mem, s->s_system_inited_addr + 1, 1);  /* core 1 */
     rom_return_void(cpu);
 }
 
-/* start_cpu0 — hook to skip __init_array constructors that call unmapped flash.
- * Calls app_main directly by setting PC. The app_main address is stored
- * when hook_symbols runs. */
-static void stub_start_cpu0(xtensa_cpu_t *cpu, void *ctx) {
+/* do_system_init_fn — runs the system_init_fn array, sets s_system_inited.
+ * Our stub sets all system_inited flags for both cores and also writes 1
+ * to the caller's a2 so start_cpu0 sees "all inited" and skips the polling
+ * loop.  The caller stores a2 on the stack right after this call returns
+ * and uses it to decide whether to enter the polling loop.
+ * (There's also a register window issue where a4 gets corrupted after the
+ * call, making the polling accumulator wrong even with flags set.) */
+static void stub_do_system_init_fn(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    if (s->s_system_inited_addr) {
+        mem_write8(cpu->mem, s->s_system_inited_addr, 1);      /* core 0 */
+        mem_write8(cpu->mem, s->s_system_inited_addr + 1, 1);  /* core 1 */
+    }
+    if (s->s_system_full_inited_addr)
+        mem_write8(cpu->mem, s->s_system_full_inited_addr, 1);
+    /* rom_return sets ar[ci*4+2] (= caller's a10 for CALL8), but the caller
+     * checks a2 after the return.  Hook fires before ENTRY, so ar[2] is
+     * still the caller's a2.  Write 1 there so beqz a2 falls through. */
+    ar_write(cpu, 2, 1);
+    rom_return(cpu, 1);
+}
+
+/* esp_startup_start_app — skip FreeRTOS scheduler, redirect to app_main.
+ * At this point start_cpu0 has already run __init_array (C++ global
+ * constructors), so vtables and other globals are initialised.  We skip
+ * the scheduler and jump to app_main directly. */
+static void stub_esp_startup_start_app(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
     if (s->app_main_addr) {
-        /* Set up a direct call to app_main: just set PC.
-         * start_cpu0 was called via CALL8 from call_start_cpu0,
-         * so we use the same windowed return to get back properly.
-         * But actually, app_main never returns (it has the main loop).
-         * So we just redirect the PC to app_main. The current window
-         * and register state are fine. */
-        int ci = XT_PS_CALLINC(cpu->ps);
-        if (ci > 0) {
-            /* We're in a windowed call. Undo the window rotate. */
-            uint32_t a0 = ar_read(cpu, ci * 4);
-            cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
-            XT_PS_SET_CALLINC(cpu->ps, 0);
-        } else {
-            cpu->pc = ar_read(cpu, 0);
-        }
-        /* Now we're back in call_start_cpu0's context.
-         * The next instruction after start_cpu0() call would be the rest
-         * of call_start_cpu0 which eventually calls abort.
-         * Instead, synthesize a CALL8 to app_main by using the same
-         * mechanism the firmware uses. Just set PC directly. */
         cpu->pc = s->app_main_addr;
     } else {
         rom_return_void(cpu);
@@ -1301,6 +1377,21 @@ static void stub_void_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+/* Generic stub that returns ESP_FAIL (-1) */
+static void stub_ret_esp_fail(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, (uint32_t)-1);  /* ESP_FAIL */
+}
+
+/* __assert_func / abort — skip assertion failures (missing infra).
+ * For noreturn functions, stop the CPU so the main loop can redirect
+ * to a deferred task or halt cleanly.  Returning would enter undefined
+ * territory (unreachable code after the call). */
+static void stub_abort_stop(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    cpu->running = 0;
+}
+
 /* ===== PC hook ===== */
 
 static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
@@ -1437,7 +1528,11 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* Flash/boot helpers */
     rom_stubs_register(s, 0x40062BC8, stub_unregistered,        "spi_flash_clk_cfg");
+    rom_stubs_register(s, 0x40009F0C, stub_void_unregistered,   "spi_flash_attach");
     rom_stubs_register(s, 0x40008264, stub_software_reset,      "software_reset_cpu");
+
+    /* GPIO */
+    rom_stubs_register(s, 0x4000C84C, stub_void_unregistered,   "gpio_output_set");
 
     /* Misc */
     rom_stubs_register(s, 0x40008208, stub_void_unregistered,   "set_rtc_memory_crc");
@@ -1465,6 +1560,7 @@ void rom_stubs_destroy(esp32_rom_stubs_t *stubs) {
 int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
                            const elf_symbols_t *syms) {
     if (!stubs || !syms) return 0;
+    stubs->syms = syms;
     int hooked = 0;
 
     /* Newlib lock functions — no-op in single-threaded emulator */
@@ -1479,6 +1575,17 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "__retarget_lock_try_acquire_recursive",
         "__retarget_lock_release",
         "__retarget_lock_release_recursive",
+        /* ESP-IDF internal lock functions (use FreeRTOS semaphores) */
+        "_lock_init",
+        "_lock_init_recursive",
+        "_lock_close",
+        "_lock_close_recursive",
+        "_lock_acquire",
+        "_lock_acquire_recursive",
+        "_lock_try_acquire",
+        "_lock_try_acquire_recursive",
+        "_lock_release",
+        "_lock_release_recursive",
         NULL
     };
     for (int i = 0; lock_fns[i]; i++) {
@@ -1601,16 +1708,35 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
             stubs->s_cpu_up_addr = addr;
         if (elf_symbols_find(syms, "s_cpu_inited", &addr) == 0)
             stubs->s_cpu_inited_addr = addr;
+        if (elf_symbols_find(syms, "s_system_inited", &addr) == 0)
+            stubs->s_system_inited_addr = addr;
+        if (elf_symbols_find(syms, "s_system_full_inited", &addr) == 0)
+            stubs->s_system_full_inited_addr = addr;
         if (elf_symbols_find(syms, "app_main", &addr) == 0)
             stubs->app_main_addr = addr;
     }
 
-    /* Hook start_cpu0 to skip __init_array constructors (they reference
-     * unmapped flash) and jump directly to app_main */
-    {
+    /* Don't hook start_cpu0 — let it run naturally so __init_array
+     * constructors execute (needed for C++ global objects like Serial).
+     * esp_startup_start_app (called at the end of start_cpu0) redirects
+     * to app_main instead of starting the FreeRTOS scheduler. */
+
+    /* SPI flash init stubs — skip actual SPI communication, flash data is
+     * already memory-mapped.  Return ESP_OK (0). */
+    static const char *flash_init_fns[] = {
+        "esp_flash_init_main",
+        "esp_flash_init_default_chip",
+        "esp_flash_read_chip_id",
+        "spi_flash_init_chip_state",
+        "spi_flash_op_lock",
+        "spi_flash_op_unlock",
+        "spi_flash_op_block_func",
+        NULL
+    };
+    for (int i = 0; flash_init_fns[i]; i++) {
         uint32_t addr;
-        if (elf_symbols_find(syms, "start_cpu0", &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_start_cpu0, "start_cpu0");
+        if (elf_symbols_find(syms, flash_init_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, flash_init_fns[i]);
             hooked++;
         }
     }
@@ -1693,6 +1819,12 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
                                "esp_partition_mmap");
             hooked++;
         }
+        if (elf_symbols_find(syms, "esp_ota_get_running_partition", &addr) == 0) {
+            rom_stubs_register_ctx(stubs, addr,
+                                   stub_esp_ota_get_running_partition,
+                                   "esp_ota_get_running_partition", stubs);
+            hooked++;
+        }
     }
 
     /* App startup */
@@ -1701,6 +1833,16 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         if (elf_symbols_find(syms, "esp_startup_start_app", &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_esp_startup_start_app,
                                "esp_startup_start_app");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "startup_resume_other_cores", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_startup_resume_other_cores,
+                               "startup_resume_other_cores");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "do_system_init_fn", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_do_system_init_fn,
+                               "do_system_init_fn");
             hooked++;
         }
     }
@@ -1721,9 +1863,40 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
+    /* Pthread stubs — single-threaded, all ops succeed (return 0) */
+    static const char *pthread_fns[] = {
+        "pthread_mutex_init",
+        "pthread_mutex_destroy",
+        "pthread_mutex_lock",
+        "pthread_mutex_unlock",
+        "pthread_mutex_lock_internal",
+        "pthread_mutex_init_if_static$part$3",
+        NULL
+    };
+    for (int i = 0; pthread_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, pthread_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, pthread_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* esp_newlib_init — needs special handling to set up _reent struct */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "esp_newlib_init", &addr) == 0) {
+            rom_stubs_register_ctx(stubs, addr, stub_esp_newlib_init,
+                                   "esp_newlib_init", stubs);
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "__getreent", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_getreent, "__getreent");
+            hooked++;
+        }
+    }
+
     /* Misc ESP-IDF init functions (all return 0 / void) */
     static const char *init_ret0_fns[] = {
-        "esp_newlib_init",
         "esp_newlib_init_global_stdio",
         "esp_newlib_time_init",
         "esp_time_impl_init",
@@ -1739,6 +1912,10 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "esp_ipc_isr_init",
         "esp_register_shutdown_handler",
         "esp_brownout_init",
+        "esp_core_dump_init",
+        "esp_core_dump_flash_init",
+        "esp_core_dump_to_flash",
+        "esp_spiffs_mounted",
         NULL
     };
     for (int i = 0; init_ret0_fns[i]; i++) {
@@ -1749,13 +1926,137 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* Low-level SPI bit-bang transfer (used by some firmware for display/touch).
-     * Hook as return-0 to prevent consuming cycles on GPIO toggles when
-     * display/touch are already hooked at a higher level. */
+    /* SPIFFS / filesystem stubs — return ESP_FAIL so callers skip gracefully */
+    static const char *spiffs_fail_fns[] = {
+        "esp_vfs_spiffs_register",
+        "esp_vfs_spiffs_unregister",
+        "esp_spiffs_init",
+        "esp_spiffs_format",
+        "esp_spiffs_info",
+        "esp_spiffs_check",
+        NULL
+    };
+    for (int i = 0; spiffs_fail_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, spiffs_fail_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_esp_fail, spiffs_fail_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* WiFi / network stubs — return ESP_FAIL to prevent network init */
+    static const char *wifi_fail_fns[] = {
+        "esp_wifi_init",
+        "esp_wifi_init_internal",
+        "esp_wifi_start",
+        "esp_wifi_stop",
+        "esp_wifi_connect",
+        "esp_wifi_disconnect",
+        "esp_netif_init",
+        "tcpip_adapter_init",
+        "tcpip_init",
+        "tcpip_send_msg_wait_sem",
+        NULL
+    };
+    for (int i = 0; wifi_fail_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, wifi_fail_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_esp_fail, wifi_fail_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* __stack_chk_fail — noreturn, stop CPU so main loop can redirect.
+     * Don't stub __assert_func or esp_system_abort — let them run the
+     * natural panic path to esp_restart_noos, where the self-loop
+     * detector can redirect to a deferred task. */
     {
         uint32_t addr;
-        if (elf_symbols_find(syms, "spi_transfer", &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_unregistered, "spi_transfer");
+        if (elf_symbols_find(syms, "__stack_chk_fail", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_abort_stop, "__stack_chk_fail");
+            hooked++;
+        }
+    }
+
+    /* FreeType stubs — return non-zero (error) to skip font loading */
+    static const char *ft_fail_fns[] = {
+        "FT_Init_FreeType",
+        "FT_New_Face",
+        "FT_New_Memory_Face",
+        "FT_Open_Face",
+        NULL
+    };
+    for (int i = 0; ft_fail_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, ft_fail_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_esp_fail, ft_fail_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Arduino framework GPIO wrappers.
+     * __pinMode calls gpio_set_direction whose ENTRY instruction sits right
+     * before the gpio_config symbol — instruction alignment means our
+     * gpio_config hook is never hit.  Hook at the Arduino wrapper level. */
+    static const char *arduino_gpio_fns[] = {
+        "__pinMode",
+        "pinMode",
+        "__digitalWrite",
+        "digitalWrite",
+        "__digitalRead",
+        "digitalRead",
+        "__analogRead",
+        "analogRead",
+        "analogWrite",
+        "ledcSetup",
+        "ledcAttachPin",
+        "ledcWrite",
+        NULL
+    };
+    for (int i = 0; arduino_gpio_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, arduino_gpio_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, arduino_gpio_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Arduino Serial (HardwareSerial) — just no-op to avoid UART register access */
+    static const char *serial_fns[] = {
+        "_ZN14HardwareSerial5beginEmh",       /* HardwareSerial::begin(unsigned long, uint8_t) */
+        "_ZN14HardwareSerial3endEv",          /* HardwareSerial::end() */
+        "_ZN14HardwareSerial9availableEv",    /* HardwareSerial::available() */
+        NULL
+    };
+    for (int i = 0; serial_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, serial_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, serial_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Arduino SPI transfer functions — these poll SPI peripheral registers
+     * which we don't emulate.  Hook them to return immediately.
+     * The NL (No Lock) variants are the innermost transfer functions.
+     * For display drivers like TFT_eSPI, these write commands/data to the
+     * ILI9341/ST7789.  We stub them as no-ops (return 0). */
+    static const char *spi_transfer_fns[] = {
+        "spiTransferByteNL", "spiTransferShortNL", "spiTransferLongNL",
+        "spiTransferBytesNL", "spiTransferByte", "spiTransferWord",
+        "spiTransferLong", "spiTransferBytes", "spiWriteByteNL",
+        "spiWriteShortNL", "spiWriteLongNL", "spiWritePixelsNL",
+        "spiWriteNL", "spiWriteByte", "spiWriteWord",
+        "spi_transfer",
+        "_Z6sdWaithi", "_Z9sdCommandhcjPj",
+        "_Z11sdReadByteshPci", "_Z6sdStoph",
+        "_Z16ff_sd_initializeh",
+        NULL
+    };
+    for (int i = 0; spi_transfer_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, spi_transfer_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, spi_transfer_fns[i]);
             hooked++;
         }
     }
@@ -1799,6 +2100,30 @@ int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
     stubs->entries[stubs->count].name = name;
     stubs->entries[stubs->count].user_ctx = user_ctx;
     stubs->count++;
+
+    /* Xtensa windowed ABI: ELF symbols sometimes point past the ENTRY
+     * instruction (which is 3 bytes, op0 = 0x6, s field = a1).  CALL8/CALL12
+     * target the ENTRY itself, so the hook at 'addr' never fires.  Scan the
+     * preceding bytes for an ENTRY and register a second hook there.
+     * Only do this for firmware addresses (not ROM, which uses ILL placeholders). */
+    if (addr >= 0x40080000u && addr < 0x40200000u && stubs->cpu && stubs->cpu->mem) {
+        for (int off = 1; off <= 8; off++) {
+            uint32_t ea = addr - (uint32_t)off;
+            uint8_t b0 = mem_read8(stubs->cpu->mem, ea);
+            uint8_t b1 = mem_read8(stubs->cpu->mem, ea + 1);
+            /* ENTRY: op0 = 6, s = a1 (bits 3:0 of byte1 = 1) */
+            if ((b0 & 0xF) == 0x6 && (b1 & 0xF) == 1) {
+                if (stubs->count < MAX_ROM_STUBS) {
+                    stubs->entries[stubs->count].addr = ea;
+                    stubs->entries[stubs->count].fn = fn;
+                    stubs->entries[stubs->count].name = name;
+                    stubs->entries[stubs->count].user_ctx = user_ctx;
+                    stubs->count++;
+                }
+                break;
+            }
+        }
+    }
     return 0;
 }
 
