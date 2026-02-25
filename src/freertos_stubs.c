@@ -434,6 +434,9 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xTaskGetSchedulerState",        stub_xTaskGetSchedulerState },
         { "esp_ipc_call",                  stub_esp_ipc_noop },
         { "esp_ipc_call_blocking",         stub_esp_ipc_noop },
+        { "vApplicationStackOverflowHook", stub_disableCoreWDT },
+        { "vPortYield",                    stub_disableCoreWDT },
+        { "vTaskSwitchContext",            stub_disableCoreWDT },
         { NULL, NULL }
     };
 

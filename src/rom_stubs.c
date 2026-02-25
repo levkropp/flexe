@@ -39,6 +39,7 @@ struct esp32_rom_stubs {
     uint32_t         s_system_inited_addr;      /* system init complete flag */
     uint32_t         s_system_full_inited_addr; /* system full init complete flag */
     uint32_t         app_main_addr;    /* app_main symbol for start_cpu0 hook */
+    uint32_t         stack_chk_guard_addr; /* __stack_chk_guard BSS address */
     const elf_symbols_t *syms;         /* ELF symbols (for symbol lookups in stubs) */
 };
 
@@ -791,6 +792,21 @@ static void stub_crc32_le(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, crc ^ 0xFFFFFFFFu);
 }
 
+/* esp_crc8(buf, len) — CRC-8 used for eFuse MAC address validation */
+static void stub_crc8(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t buf = rom_arg(cpu, 0);
+    uint32_t len = rom_arg(cpu, 1);
+    uint8_t crc = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t b = mem_read8(cpu->mem, buf + i);
+        crc ^= b;
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 0x80) ? (crc << 1) ^ 0x07 : (crc << 1);
+    }
+    rom_return(cpu, crc);
+}
+
 /* ===== ESP-IDF infrastructure stubs ===== */
 
 /* esp_chip_info(info) — fill esp_chip_info_t struct */
@@ -952,6 +968,12 @@ static void stub_do_system_init_fn(xtensa_cpu_t *cpu, void *ctx) {
  * the scheduler and jump to app_main directly. */
 static void stub_esp_startup_start_app(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
+    /* Set __stack_chk_guard now that BSS has been zeroed.  Without this,
+     * the guard is 0 when functions save it in their prologue, then
+     * esp_init_stack_guard() (called from __init_array) sets a non-zero
+     * value, causing false-positive canary mismatches. */
+    if (s->stack_chk_guard_addr)
+        mem_write32(cpu->mem, s->stack_chk_guard_addr, 0x00000100u);
     if (s->app_main_addr) {
         cpu->pc = s->app_main_addr;
     } else {
@@ -1520,8 +1542,9 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x40064AE0, stub_bswapsi2,            "__bswapsi2");
     rom_stubs_register(s, 0x4000C818, stub_ashldi3,             "__ashldi3");
 
-    /* CRC32 */
+    /* CRC */
     rom_stubs_register(s, 0x4005CFEC, stub_crc32_le,            "esp_rom_crc32_le");
+    rom_stubs_register(s, 0x4005D144, stub_crc8,                "esp_crc8");
 
     /* DEFLATE decompression (used by PNG decoder via sped.c) */
     rom_stubs_register(s, 0x4005ef30, stub_tinfl_decompress,    "tinfl_decompress");
@@ -1714,6 +1737,8 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
             stubs->s_system_full_inited_addr = addr;
         if (elf_symbols_find(syms, "app_main", &addr) == 0)
             stubs->app_main_addr = addr;
+        if (elf_symbols_find(syms, "__stack_chk_guard", &addr) == 0)
+            stubs->stack_chk_guard_addr = addr;
     }
 
     /* Don't hook start_cpu0 — let it run naturally so __init_array
@@ -1764,10 +1789,13 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* Interrupt allocation */
+    /* Interrupt allocation / management */
     static const char *intr_fns[] = {
         "esp_intr_alloc",
         "esp_intr_alloc_intrstatus",
+        "esp_intr_free",
+        "esp_intr_disable",
+        "esp_intr_enable",
         NULL
     };
     for (int i = 0; intr_fns[i]; i++) {

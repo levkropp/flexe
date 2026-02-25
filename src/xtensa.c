@@ -297,16 +297,25 @@ static inline void phys_write(xtensa_cpu_t *cpu, int widx, int reg, uint32_t val
 }
 
 /*
- * Find the callee window (next active window after widx in the ring).
- * In the Xtensa call chain, the callee is always forward from the caller.
+ * Find the callee window for widx.
+ * Derive directly from widx's a0[31:30] (call size encoded in return addr).
+ * The callee is always widx + callsize in the window ring.
+ * This avoids the bug where searching via WindowStart skips spilled
+ * intermediate windows and lands on a distant window sharing the same SP base.
  */
 static int find_callee_window(xtensa_cpu_t *cpu, int widx) {
-    for (int i = 1; i < 16; i++) {
-        int w = (widx + i) & 0xF;
-        if (cpu->windowstart & (1u << w))
-            return w;
+    uint32_t a0 = phys_read(cpu, widx, 0);
+    int callsize = (a0 >> 30) & 3;
+    if (callsize == 0) {
+        /* callsize=0 not valid for windowed calls; search fallback */
+        for (int i = 1; i < 16; i++) {
+            int w = (widx + i) & 0xF;
+            if (cpu->windowstart & (1u << w))
+                return w;
+        }
+        return widx;
     }
-    return widx; /* shouldn't happen — current WB always has WS bit set */
+    return (widx + callsize) & 0xF;
 }
 
 /*
@@ -322,8 +331,24 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
     int callee = find_callee_window(cpu, widx);
     uint32_t base = phys_read(cpu, callee, 1);
 
+    if (cpu->window_trace) {
+        fprintf(stderr, "     [WIN] SPILL w%d (call%d) callee=w%d base=0x%08X"
+                " WS=0x%04X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X",
+                widx, callsize * 4, callee, base, cpu->windowstart,
+                phys_read(cpu, widx, 0), phys_read(cpu, widx, 1),
+                phys_read(cpu, widx, 2), phys_read(cpu, widx, 3));
+        if (callsize >= 2)
+            fprintf(stderr, " a4=0x%08X a5=0x%08X a6=0x%08X a7=0x%08X",
+                    phys_read(cpu, widx, 4), phys_read(cpu, widx, 5),
+                    phys_read(cpu, widx, 6), phys_read(cpu, widx, 7));
+        fprintf(stderr, "\n");
+    }
+
     /* Record where we saved, so underflow can find the data even if
      * the callee's SP changes (e.g. via MOVSP) before RETW. */
+    if (cpu->window_trace && cpu->spill_base[widx & 0xF] != 0 && cpu->spill_base[widx & 0xF] != base)
+        fprintf(stderr, "     [WIN] spill_base[%d] OVERWRITE 0x%08X -> 0x%08X\n",
+                widx & 0xF, cpu->spill_base[widx & 0xF], base);
     cpu->spill_base[widx & 0xF] = base;
 
     /* Always save base 4 regs: a0-a3 at base-16 */
@@ -346,13 +371,30 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
 }
 
 /*
- * Overflow check: called during ENTRY to spill any live windows
- * that would be overwritten by the new callinc rotation.
+ * Overflow check: called during ENTRY to spill all endangered windows.
+ *
+ * Two sources of danger:
+ * 1. ISA ENTRY check: wb+1..wb+callinc — windows being rotated over
+ * 2. Per-instruction WindowCheck: new_wb+1..new_wb+3 — windows the callee
+ *    may access via a4-a15 (the ISA checks these on every instruction,
+ *    but we don't, so we do it preemptively here)
+ *
+ * We spill the union: wb+1 through wb+callinc+3 (= new_wb+3).
  */
 static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
-    int new_wb = (cpu->windowbase + callinc) & 0xF;
-    for (int i = 1; i <= 3; i++) {
-        int w = (new_wb + i) & 0xF;
+    int limit = callinc + 3;  /* check wb+1 through wb+callinc+3 */
+    if (cpu->window_trace) {
+        int any = 0;
+        for (int i = 1; i <= limit; i++) {
+            int w = (cpu->windowbase + i) & 0xF;
+            if (cpu->windowstart & (1u << w)) any = 1;
+        }
+        if (any)
+            fprintf(stderr, "     [WIN] OVERFLOW_CHK wb=%d callinc=%d WS=0x%04X\n",
+                    cpu->windowbase, callinc, cpu->windowstart);
+    }
+    for (int i = 1; i <= limit; i++) {
+        int w = (cpu->windowbase + i) & 0xF;
         if (cpu->windowstart & (1u << w))
             synth_spill_window(cpu, w);
     }
@@ -364,9 +406,11 @@ static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
  * Uses the recorded spill_base (where overflow actually saved the data).
  */
 static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
-    (void)owb;
-    /* Use the base address that was recorded during spill */
-    uint32_t base = cpu->spill_base[ret_wb & 0xF];
+    /* Use callee's a1 (SP) as base — this is how real Xtensa hardware works.
+     * The overflow handler saves the caller's registers at the callee's SP.
+     * The RETW chain guarantees each callee's a1 is restored before its caller.
+     * Using spill_base[] is unreliable because window reuse overwrites entries. */
+    uint32_t base = phys_read(cpu, owb, 1);
 
     /* Restore a0-a3 from base-16 */
     for (int i = 0; i < 4; i++)
@@ -383,6 +427,21 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
     if (callsize == 3) {
         for (int i = 0; i < 4; i++)
             phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
+    }
+
+    if (cpu->window_trace) {
+        fprintf(stderr, "     [WIN] FILL  w%d (call%d) base=0x%08X [spill_base={",
+                ret_wb, callsize * 4, base);
+        for (int _i = 0; _i < 16; _i++)
+            fprintf(stderr, "%s0x%X", _i ? "," : "", cpu->spill_base[_i]);
+        fprintf(stderr, "}] a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X",
+                phys_read(cpu, ret_wb, 0), phys_read(cpu, ret_wb, 1),
+                phys_read(cpu, ret_wb, 2), phys_read(cpu, ret_wb, 3));
+        if (callsize >= 2)
+            fprintf(stderr, " a4=0x%08X a5=0x%08X a6=0x%08X a7=0x%08X",
+                    phys_read(cpu, ret_wb, 4), phys_read(cpu, ret_wb, 5),
+                    phys_read(cpu, ret_wb, 6), phys_read(cpu, ret_wb, 7));
+        fprintf(stderr, "\n");
     }
 
     /* Set windowstart bit */
@@ -405,7 +464,13 @@ static void exec_retw(xtensa_cpu_t *cpu) {
     int owb = cpu->windowbase;
     int ret_wb = (owb - n) & 0xF;
 
-    if (!(cpu->windowstart & (1u << ret_wb))) {
+    bool need_fill = !(cpu->windowstart & (1u << ret_wb));
+    if (cpu->window_trace && need_fill) {
+        fprintf(stderr, "     [WIN] RETW wb=%d->%d (n=%d) UNDERFLOW WS=0x%04X\n",
+                owb, ret_wb, n, cpu->windowstart);
+    }
+
+    if (need_fill) {
         /* Caller's window was spilled — fill it back */
         synth_underflow_fill(cpu, ret_wb, owb);
     }
@@ -738,8 +803,12 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                     }
                     /* Update spill_base for any window whose data was at old_sp */
                     for (int i = 0; i < 16; i++) {
-                        if (cpu->spill_base[i] == old_sp)
+                        if (cpu->spill_base[i] == old_sp) {
+                            if (cpu->window_trace)
+                                fprintf(stderr, "     [WIN] MOVSP spill_base[%d] 0x%08X -> 0x%08X (wb=%d)\n",
+                                        i, old_sp, new_sp, cpu->windowbase);
                             cpu->spill_base[i] = new_sp;
+                        }
                     }
                 }
                 ar_write(cpu, t, new_sp);
