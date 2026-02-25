@@ -926,25 +926,24 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
               ar_write(cpu, t, sr_read(cpu, sr_num));
               sr_write(cpu, sr_num, tmp);
             } break;
-        case 8: /* SRC - funnel shift */
-            { uint32_t sa = cpu->sar & 0x1F;
-              if (sa == 0)
-                  ar_write(cpu, r, ar_read(cpu, t));
-              else
-                  ar_write(cpu, r, (ar_read(cpu, s) << (32 - sa)) | (ar_read(cpu, t) >> sa));
+        case 8: /* SRC - funnel shift: (AR[s]:AR[t]) >> SAR, SAR 0-32 */
+            { uint32_t sa = cpu->sar & 0x3F;
+              uint64_t concat = ((uint64_t)ar_read(cpu, s) << 32) | (uint64_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)(concat >> sa));
             } break;
-        case 9: /* SRL */
-            { uint32_t sa = cpu->sar & 0x1F;
-              ar_write(cpu, r, ar_read(cpu, t) >> sa);
+        case 9: /* SRL - funnel shift: (0:AR[t]) >> SAR */
+            { uint32_t sa = cpu->sar & 0x3F;
+              ar_write(cpu, r, sa >= 32 ? 0 : ar_read(cpu, t) >> sa);
             } break;
-        case 10: /* SLL */
-            { uint32_t sa = cpu->sar & 0x1F;
-              uint32_t shift = 32 - sa;
-              ar_write(cpu, r, shift >= 32 ? 0 : (ar_read(cpu, s) << shift));
+        case 10: /* SLL - funnel shift: (AR[s]:0) >> SAR */
+            { uint32_t sa = cpu->sar & 0x3F;
+              uint64_t concat = (uint64_t)ar_read(cpu, s) << 32;
+              ar_write(cpu, r, (uint32_t)(concat >> sa));
             } break;
-        case 11: /* SRA */
-            { uint32_t sa = cpu->sar & 0x1F;
-              ar_write(cpu, r, (uint32_t)((int32_t)ar_read(cpu, t) >> sa));
+        case 11: /* SRA - arithmetic right shift by SAR */
+            { uint32_t sa = cpu->sar & 0x3F;
+              int32_t val = (int32_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)(sa >= 32 ? (val >> 31) : (val >> sa)));
             } break;
         case 12: /* MUL16U */
             ar_write(cpu, r, (ar_read(cpu, s) & 0xFFFF) * (ar_read(cpu, t) & 0xFFFF));

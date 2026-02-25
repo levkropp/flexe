@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <zlib.h>
 
 #define MAX_ROM_STUBS 512
 #define OUTPUT_BUF_SIZE 8192
@@ -1004,28 +1005,184 @@ void stub_gpio_isr_service(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, ESP_OK);
 }
 
+/* ===== tinfl_decompress stub (ROM function, uses host zlib) ===== */
+
+/*
+ * tinfl_decompress is an ESP32 ROM function for DEFLATE decompression.
+ * The firmware's PNG decoder (sped.c) calls it via the ROM address.
+ * We implement it using the host's zlib inflate() instead of the
+ * actual tinfl algorithm, avoiding struct layout mismatches between
+ * 32-bit Xtensa and 64-bit host.
+ *
+ * Firmware calling convention:
+ *   tinfl_decompress(r, in_ptr, &in_size, out_start, out_next, &out_size, flags)
+ *   7 args — for CALL4 (CALLINC=1), args 0-5 in a6..a11, arg 6 on stack.
+ *
+ * tinfl_status values: DONE=0, NEEDS_MORE_INPUT=1, HAS_MORE_OUTPUT=2, <0=error
+ * tinfl flags: PARSE_ZLIB_HEADER=1, HAS_MORE_INPUT=2
+ */
+
+static z_stream tinfl_zstream;
+static int tinfl_zstream_inited = 0;
+
+static void stub_tinfl_decompress(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* Read arguments: 7 args total */
+    uint32_t r_addr       = rom_arg(cpu, 0);  /* tinfl_decompressor* */
+    uint32_t in_ptr       = rom_arg(cpu, 1);  /* const uint8_t* compressed data */
+    uint32_t in_sz_ptr    = rom_arg(cpu, 2);  /* size_t* input bytes available */
+    uint32_t out_start    = rom_arg(cpu, 3);  /* uint8_t* dict start */
+    uint32_t out_next     = rom_arg(cpu, 4);  /* uint8_t* current write pos */
+    uint32_t out_sz_ptr   = rom_arg(cpu, 5);  /* size_t* output space available */
+    /* arg 6 = flags: 7th arg is on the caller's stack.
+     * Before ENTRY, window hasn't rotated, so a1 = caller's SP.
+     * Xtensa windowed ABI: stack args start at caller_sp + 0. */
+    uint32_t caller_sp = ar_read(cpu, 1);
+    uint32_t flags = mem_read32(cpu->mem, caller_sp);
+
+    uint32_t in_size  = mem_read32(cpu->mem, in_sz_ptr);
+    uint32_t out_size = mem_read32(cpu->mem, out_sz_ptr);
+
+    fprintf(stderr, "[tinfl] r=%08x in=%08x(%u) out_start=%08x out_next=%08x out_sz=%u flags=%u\n",
+            r_addr, in_ptr, in_size, out_start, out_next, out_size, flags);
+
+    /* Detect fresh decompressor: firmware calls tinfl_init() which sets m_state=0 */
+    uint32_t m_state = mem_read32(cpu->mem, r_addr);
+    if (m_state == 0 || !tinfl_zstream_inited) {
+        if (tinfl_zstream_inited)
+            inflateEnd(&tinfl_zstream);
+        memset(&tinfl_zstream, 0, sizeof(tinfl_zstream));
+        int wbits = (flags & 1) ? 15 : -15;  /* TINFL_FLAG_PARSE_ZLIB_HEADER */
+        fprintf(stderr, "[tinfl] init wbits=%d m_state=%u\n", wbits, m_state);
+        inflateInit2(&tinfl_zstream, wbits);
+        tinfl_zstream_inited = 1;
+        /* Mark as active so we don't re-init on next call */
+        mem_write32(cpu->mem, r_addr, 1);
+    }
+
+    /* Copy input from emulator memory to host buffer */
+    uint8_t *host_in = NULL;
+    if (in_size > 0) {
+        host_in = malloc(in_size);
+        const uint8_t *src = mem_get_ptr(cpu->mem, in_ptr);
+        if (src)
+            memcpy(host_in, src, in_size);
+        else
+            for (uint32_t i = 0; i < in_size; i++)
+                host_in[i] = mem_read8(cpu->mem, in_ptr + i);
+    }
+
+    /* Run inflate */
+    tinfl_zstream.next_in = host_in;
+    tinfl_zstream.avail_in = in_size;
+
+    uint8_t *host_out = malloc(out_size > 0 ? out_size : 1);
+    tinfl_zstream.next_out = host_out;
+    tinfl_zstream.avail_out = out_size;
+
+    int zret = inflate(&tinfl_zstream, Z_SYNC_FLUSH);
+
+    uint32_t in_consumed = in_size - (uint32_t)tinfl_zstream.avail_in;
+    uint32_t out_produced = out_size - (uint32_t)tinfl_zstream.avail_out;
+
+    fprintf(stderr, "[tinfl] zret=%d consumed=%u produced=%u\n", zret, in_consumed, out_produced);
+
+    /* Copy output to emulator memory */
+    if (out_produced > 0) {
+        uint8_t *dst = (uint8_t *)mem_get_ptr(cpu->mem, out_next);
+        if (dst)
+            memcpy(dst, host_out, out_produced);
+        else
+            for (uint32_t i = 0; i < out_produced; i++)
+                mem_write8(cpu->mem, out_next + i, host_out[i]);
+    }
+
+    /* Write back consumed/produced sizes */
+    mem_write32(cpu->mem, in_sz_ptr, in_consumed);
+    mem_write32(cpu->mem, out_sz_ptr, out_produced);
+
+    free(host_in);
+    free(host_out);
+
+    /* Map zlib status to tinfl_status */
+    int32_t tinfl_status;
+    if (zret == Z_STREAM_END) {
+        tinfl_status = 0;  /* TINFL_STATUS_DONE */
+        inflateEnd(&tinfl_zstream);
+        tinfl_zstream_inited = 0;
+    } else if (zret == Z_OK || zret == Z_BUF_ERROR) {
+        if (tinfl_zstream.avail_out == 0)
+            tinfl_status = 2;  /* TINFL_STATUS_HAS_MORE_OUTPUT */
+        else
+            tinfl_status = 1;  /* TINFL_STATUS_NEEDS_MORE_INPUT */
+    } else {
+        fprintf(stderr, "[tinfl] ERROR zret=%d msg=%s\n", zret,
+                tinfl_zstream.msg ? tinfl_zstream.msg : "(null)");
+        tinfl_status = -1;  /* TINFL_STATUS_FAILED */
+        inflateEnd(&tinfl_zstream);
+        tinfl_zstream_inited = 0;
+    }
+
+    fprintf(stderr, "[tinfl] returning status=%d\n", tinfl_status);
+    rom_return(cpu, (uint32_t)tinfl_status);
+}
+
 /* ===== Heap stubs ===== */
 
 /*
- * Simple bump allocator for firmware malloc/free/calloc/realloc.
- * Allocates from emulator SRAM starting at _heap_start.
+ * Heap allocator for firmware malloc/free/calloc/realloc.
+ * Allocates from emulator PSRAM (4MB at 0x3F800000).
  * Each block has an 8-byte header: [size(4)] [magic(4)].
- * Free is a no-op (bump allocator — memory is never reclaimed).
+ * Free reclaims top-of-heap blocks and maintains a free list for reuse.
  */
 #define HEAP_BASE    0x3F800000u  /* PSRAM base — 4MB available */
 #define HEAP_END     0x3FC00000u  /* PSRAM end */
 #define HEAP_MAGIC   0x48454150u  /* "HEAP" */
+#define HEAP_FREE    0x46524545u  /* "FREE" */
 #define HEAP_HDR_SZ  8
 
 static uint32_t heap_ptr = HEAP_BASE;
+
+/* Free list: freed blocks stored as linked list via their header.
+ * Header layout for free blocks: [size(4)] [HEAP_FREE(4)] [next_free(4)]
+ * next_free is stored in the user data area (first 4 bytes after header). */
+static uint32_t free_list = 0;  /* head of free list (emulator address, 0=empty) */
+
+/* Try to find a free-list block >= requested size */
+static uint32_t freelist_alloc(xtensa_cpu_t *cpu, uint32_t size) {
+    uint32_t prev_addr = 0;
+    uint32_t cur = free_list;
+    while (cur) {
+        uint32_t block_size = mem_read32(cpu->mem, cur);
+        uint32_t next = mem_read32(cpu->mem, cur + HEAP_HDR_SZ);  /* next ptr in user area */
+        if (block_size >= size) {
+            /* Unlink from free list */
+            if (prev_addr)
+                mem_write32(cpu->mem, prev_addr + HEAP_HDR_SZ, next);
+            else
+                free_list = next;
+            /* Mark as allocated */
+            mem_write32(cpu->mem, cur + 4, HEAP_MAGIC);
+            return cur + HEAP_HDR_SZ;
+        }
+        prev_addr = cur;
+        cur = next;
+    }
+    return 0;
+}
 
 static uint32_t heap_alloc(xtensa_cpu_t *cpu, uint32_t size) {
     if (size == 0) return 0;
     /* Align size to 4 bytes */
     size = (size + 3) & ~3u;
+    /* Try free list first */
+    uint32_t ptr = freelist_alloc(cpu, size);
+    if (ptr) return ptr;
+    /* Bump allocate */
     uint32_t total = HEAP_HDR_SZ + size;
     if (heap_ptr + total > HEAP_END) {
-        fprintf(stderr, "[heap] OOM: need %u, have %u\n", total, HEAP_END - heap_ptr);
+        fprintf(stderr, "[heap] OOM: need %u, have %u free_list=%u\n",
+                total, HEAP_END - heap_ptr, free_list ? 1 : 0);
         return 0;
     }
     uint32_t block = heap_ptr;
@@ -1035,11 +1192,36 @@ static uint32_t heap_alloc(xtensa_cpu_t *cpu, uint32_t size) {
     return block + HEAP_HDR_SZ;
 }
 
+static void heap_free(xtensa_cpu_t *cpu, uint32_t ptr) {
+    if (ptr == 0 || ptr < HEAP_BASE + HEAP_HDR_SZ || ptr >= HEAP_END) return;
+    uint32_t block = ptr - HEAP_HDR_SZ;
+    uint32_t magic = mem_read32(cpu->mem, block + 4);
+    if (magic != HEAP_MAGIC) return;  /* double free or corruption */
+    uint32_t size = mem_read32(cpu->mem, block);
+    uint32_t total = HEAP_HDR_SZ + ((size + 3) & ~3u);
+
+    /* If this is the topmost block, shrink the heap */
+    if (block + total == heap_ptr) {
+        mem_write32(cpu->mem, block + 4, 0);  /* clear magic */
+        heap_ptr = block;
+        /* Single-block reclaim handles the common malloc-then-free pattern.
+         * We can't walk backwards because block sizes vary. */
+        return;
+    }
+    /* Otherwise, add to free list */
+    mem_write32(cpu->mem, block + 4, HEAP_FREE);
+    mem_write32(cpu->mem, ptr, free_list);  /* store next ptr in user data */
+    free_list = block;
+}
+
 /* malloc(size) -> pointer or NULL */
 static void stub_malloc(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t size = rom_arg(cpu, 0);
     uint32_t ptr = heap_alloc(cpu, size);
+    if (size >= 1024)
+        fprintf(stderr, "[heap] malloc(%u) -> 0x%08X (free=%u)\n",
+                size, ptr, HEAP_END - heap_ptr);
     rom_return(cpu, ptr);
 }
 
@@ -1057,9 +1239,16 @@ static void stub_calloc(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, ptr);
 }
 
-/* free(ptr) -> void (no-op for bump allocator) */
+/* free(ptr) -> void */
 static void stub_free(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
+    uint32_t ptr = rom_arg(cpu, 0);
+    if (ptr >= HEAP_BASE && ptr < HEAP_END) {
+        uint32_t size = mem_read32(cpu->mem, ptr - HEAP_HDR_SZ);
+        if (size >= 1024)
+            fprintf(stderr, "[heap] free(0x%08X) size=%u\n", ptr, size);
+    }
+    heap_free(cpu, ptr);
     rom_return_void(cpu);
 }
 
@@ -1068,7 +1257,7 @@ static void stub_realloc(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t old_ptr = rom_arg(cpu, 0);
     uint32_t new_size = rom_arg(cpu, 1);
-    if (new_size == 0) { rom_return(cpu, 0); return; }
+    if (new_size == 0) { heap_free(cpu, old_ptr); rom_return(cpu, 0); return; }
     uint32_t new_ptr = heap_alloc(cpu, new_size);
     if (new_ptr && old_ptr) {
         /* Copy old data — read old size from header */
@@ -1076,6 +1265,7 @@ static void stub_realloc(xtensa_cpu_t *cpu, void *ctx) {
         uint32_t copy = old_size < new_size ? old_size : new_size;
         for (uint32_t i = 0; i < copy; i++)
             mem_write8(cpu->mem, new_ptr + i, mem_read8(cpu->mem, old_ptr + i));
+        heap_free(cpu, old_ptr);
     }
     rom_return(cpu, new_ptr);
 }
@@ -1241,6 +1431,9 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* CRC32 */
     rom_stubs_register(s, 0x4005CFEC, stub_crc32_le,            "esp_rom_crc32_le");
+
+    /* DEFLATE decompression (used by PNG decoder via sped.c) */
+    rom_stubs_register(s, 0x4005ef30, stub_tinfl_decompress,    "tinfl_decompress");
 
     /* Flash/boot helpers */
     rom_stubs_register(s, 0x40062BC8, stub_unregistered,        "spi_flash_clk_cfg");

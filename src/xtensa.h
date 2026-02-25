@@ -281,6 +281,7 @@ static inline void ar_write(xtensa_cpu_t *cpu, int n, uint32_t val) {
  */
 static inline int32_t sign_extend(uint32_t val, int bits) {
     uint32_t sign_bit = 1u << (bits - 1);
+    val &= (sign_bit << 1) - 1;  /* mask to 'bits' width */
     return (int32_t)((val ^ sign_bit) - sign_bit);
 }
 
