@@ -200,11 +200,12 @@ static void stub_sdmmc_card_init(xtensa_cpu_t *cpu, void *ctx) {
          * The firmware's sdmmc_read_sectors will read capacity from one of them.
          */
         uint32_t sectors = (uint32_t)(ss->img_size / 512);
-        /* Try common CSD offset candidates for ESP-IDF v4.4/v5.x.
-         * CSD.capacity is typically 8 bytes into the CSD struct.
-         * CSD.sector_size is 12 bytes into the CSD struct. */
-        static const int csd_offsets[] = { 92, 100, 108, 116, 124 };
-        for (int i = 0; i < 5; i++) {
+        /* sdmmc_csd_t layout: { csd_ver, mmc_ver, capacity, sector_size, ... }
+         * capacity at csd+8, sector_size at csd+12.
+         * The CSD offset within sdmmc_card_t varies by ESP-IDF version
+         * (depends on sdmmc_host_t size). Write at candidate offsets. */
+        static const int csd_offsets[] = { 92, 100, 108, 116, 124, 128, 132 };
+        for (int i = 0; i < 7; i++) {
             int off = csd_offsets[i];
             mem_write32(cpu->mem, card + (uint32_t)off + 8, sectors);  /* capacity */
             mem_write32(cpu->mem, card + (uint32_t)off + 12, 512);    /* sector_size */
