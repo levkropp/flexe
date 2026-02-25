@@ -63,7 +63,7 @@ TEST(test_xTaskCreate_returns_pdPASS) {
     extern void stub_xTaskCreate(xtensa_cpu_t *, void *);
     rom_stubs_register_ctx(rom, xtc_addr, (rom_stub_fn)stub_xTaskCreate, "xTaskCreate", frt);
 
-    /* a2=func, a3=name, a4=stack, a5=param, a6=prio, a7=handle_out */
+    /* xTaskCreate(func, name, stack, param, prio, handle_out) */
     /* With CALL0 convention, args at a2..a7 */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
@@ -71,11 +71,12 @@ TEST(test_xTaskCreate_returns_pdPASS) {
     ar_write(&cpu, 3, 0);          /* name */
     ar_write(&cpu, 4, 2048);       /* stack */
     ar_write(&cpu, 5, 0);          /* param */
+    ar_write(&cpu, 6, 1);          /* prio */
 
-    /* handle_out at a6 (arg index 4) */
+    /* handle_out at a7 (arg index 5) */
     uint32_t handle_out_addr = 0x3FFB1000;
     mem_write32(cpu.mem, handle_out_addr, 0);
-    ar_write(&cpu, 6, handle_out_addr);
+    ar_write(&cpu, 7, handle_out_addr);
 
     cpu.pc = xtc_addr;
     xtensa_step(&cpu);
