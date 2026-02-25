@@ -60,13 +60,14 @@ typedef struct {
 } mmio_handler_t;
 
 struct xtensa_mem {
-    uint8_t *sram;      /* Internal SRAM (data + instruction alias) */
-    uint8_t *rom;       /* Internal ROM */
-    uint8_t *flash;     /* External flash image */
-    uint8_t *rtc_dram;  /* RTC Fast Memory (D-bus + I-bus alias) */
-    uint8_t *rtc_fast;  /* RTC FAST memory (0x50000000) */
-    uint8_t *rtc_slow;  /* RTC SLOW memory */
-    uint8_t *psram;     /* External PSRAM (SPI RAM) */
+    uint8_t *sram;        /* Internal SRAM (data + instruction alias) */
+    uint8_t *rom;         /* Internal ROM */
+    uint8_t *flash_data;  /* Flash data cache (0x3F400000), separate from insn */
+    uint8_t *flash_insn;  /* Flash instruction cache (0x400C2000), separate from data */
+    uint8_t *rtc_dram;    /* RTC Fast Memory (D-bus + I-bus alias) */
+    uint8_t *rtc_fast;    /* RTC FAST memory (0x50000000) */
+    uint8_t *rtc_slow;    /* RTC SLOW memory */
+    uint8_t *psram;       /* External PSRAM (SPI RAM) */
     mmio_handler_t mmio[PERIPH_PAGES];
 };
 
@@ -74,15 +75,17 @@ xtensa_mem_t *mem_create(void) {
     xtensa_mem_t *mem = calloc(1, sizeof(xtensa_mem_t));
     if (!mem) return NULL;
 
-    mem->sram     = calloc(1, SRAM_SIZE);
-    mem->rom      = calloc(1, ROM_SIZE);
-    mem->flash    = calloc(1, FLASH_SIZE);
-    mem->rtc_dram = calloc(1, RTC_DRAM_SIZE);
-    mem->rtc_fast = calloc(1, RTC_FAST_SIZE);
-    mem->rtc_slow = calloc(1, RTC_SLOW_SIZE);
-    mem->psram    = calloc(1, PSRAM_SIZE);
+    mem->sram       = calloc(1, SRAM_SIZE);
+    mem->rom        = calloc(1, ROM_SIZE);
+    mem->flash_data = calloc(1, FLASH_SIZE);
+    mem->flash_insn = calloc(1, FLASH_SIZE);
+    mem->rtc_dram   = calloc(1, RTC_DRAM_SIZE);
+    mem->rtc_fast   = calloc(1, RTC_FAST_SIZE);
+    mem->rtc_slow   = calloc(1, RTC_SLOW_SIZE);
+    mem->psram      = calloc(1, PSRAM_SIZE);
 
-    if (!mem->sram || !mem->rom || !mem->flash || !mem->rtc_dram || !mem->rtc_fast || !mem->rtc_slow || !mem->psram) {
+    if (!mem->sram || !mem->rom || !mem->flash_data || !mem->flash_insn ||
+        !mem->rtc_dram || !mem->rtc_fast || !mem->rtc_slow || !mem->psram) {
         mem_destroy(mem);
         return NULL;
     }
@@ -94,7 +97,8 @@ void mem_destroy(xtensa_mem_t *mem) {
     if (!mem) return;
     free(mem->sram);
     free(mem->rom);
-    free(mem->flash);
+    free(mem->flash_data);
+    free(mem->flash_insn);
     free(mem->rtc_dram);
     free(mem->rtc_fast);
     free(mem->rtc_slow);
@@ -142,11 +146,11 @@ static uint8_t *mem_translate(xtensa_mem_t *mem, uint32_t addr) {
 
     /* Flash data bus: 0x3F400000-0x3F7FFFFF */
     if (addr >= FLASH_DATA_BASE && addr < FLASH_DATA_END)
-        return mem->flash + (addr - FLASH_DATA_BASE);
+        return mem->flash_data + (addr - FLASH_DATA_BASE);
 
     /* Flash instruction bus: 0x400C2000-0x40BFFFFF */
     if (addr >= FLASH_INSN_BASE && addr < FLASH_INSN_END)
-        return mem->flash + (addr - FLASH_INSN_BASE);
+        return mem->flash_insn + (addr - FLASH_INSN_BASE);
 
     /* RTC FAST: 0x50000000-0x50001FFF */
     if (addr >= RTC_FAST_BASE && addr < RTC_FAST_END)
@@ -231,6 +235,16 @@ int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len) 
         if (!ptr) return -1;
         *ptr = data[i];
     }
+    return 0;
+}
+
+int mem_load_flash(xtensa_mem_t *mem, const uint8_t *data, size_t len) {
+    if (!mem || !data) return -1;
+    if (len > FLASH_SIZE) len = FLASH_SIZE;
+    /* Load raw flash into both data and instruction arrays.
+     * Segment loading will overwrite the correct regions later. */
+    memcpy(mem->flash_data, data, len);
+    memcpy(mem->flash_insn, data, len);
     return 0;
 }
 

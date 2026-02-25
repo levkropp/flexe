@@ -53,10 +53,13 @@ TEST(mem_rw32_flash_data) {
 
 TEST(mem_flash_alias) {
     xtensa_mem_t *mem = mem_create();
-    /* Flash data base = 0x3F400000, flash insn base = 0x400C2000 */
-    /* Both map to same physical flash at the same offset */
+    /* Flash data and insn buses use separate backing arrays (like real MMU pages) */
     mem_write32(mem, 0x3F400000, 0xAAAABBBB);
-    ASSERT_EQ(mem_read32(mem, 0x400C2000), 0xAAAABBBB);
+    ASSERT_EQ(mem_read32(mem, 0x3F400000), 0xAAAABBBB);
+    mem_write32(mem, 0x400C2000, 0xCCCCDDDD);
+    ASSERT_EQ(mem_read32(mem, 0x400C2000), 0xCCCCDDDD);
+    /* They are independent */
+    ASSERT_EQ(mem_read32(mem, 0x3F400000), 0xAAAABBBB);
     mem_destroy(mem);
 }
 

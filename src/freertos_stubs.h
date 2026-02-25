@@ -15,4 +15,10 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
 /* Access the bump allocator pointer (for testing) */
 uint32_t freertos_stubs_bump_ptr(const freertos_stubs_t *frt);
 
+/* Get deferred task info (saved by xTaskCreate/xTaskCreatePinnedToCore) */
+uint32_t freertos_stubs_deferred_task(const freertos_stubs_t *frt, uint32_t *param_out);
+
+/* Consume (get and clear) the deferred task — one-shot, returns 0 on second call */
+uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *param_out);
+
 #endif /* FREERTOS_STUBS_H */

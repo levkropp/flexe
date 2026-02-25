@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <math.h>
 
+/* Set PC from instruction handler (branch/call/ret/exception) and mark it */
+#define BRANCH_TO(cpu, addr) do { (cpu)->pc = (addr); (cpu)->_pc_written = true; } while(0)
+
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
     for (int i = 0; i < 32; i++)
@@ -226,7 +229,7 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
         cpu->running = false;
         return;
     }
-    cpu->pc = vec;
+    BRANCH_TO(cpu, vec);
 }
 
 #define EXCMLEVEL 1  /* ESP32 config */
@@ -271,7 +274,7 @@ void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
             cpu->running = false;
             return;
         }
-        cpu->pc = vec;
+        BRANCH_TO(cpu, vec);
     }
 }
 
@@ -413,7 +416,7 @@ static void exec_retw(xtensa_cpu_t *cpu) {
     /* Rotate back */
     cpu->windowbase = ret_wb;
 
-    cpu->pc = next_pc;
+    BRANCH_TO(cpu, next_pc);
 }
 
 /* ===== Floating-Point Helpers ===== */
@@ -689,7 +692,7 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                     int nn = XT_N(insn);
                     if (m == 2 && nn == 0) {
                         /* RET: pc = a0 */
-                        cpu->pc = ar_read(cpu, 0);
+                        BRANCH_TO(cpu, ar_read(cpu, 0));
                         return; /* skip default pc advance */
                     } else if (m == 2 && nn == 1) {
                         /* RETW: windowed return */
@@ -697,7 +700,7 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         return;
                     } else if (m == 2 && nn == 2) {
                         /* JX: pc = ar[s] */
-                        cpu->pc = ar_read(cpu, s);
+                        BRANCH_TO(cpu, ar_read(cpu, s));
                         return;
                     } else if (m == 3) {
                         /* CALLX0/4/8/12 */
@@ -708,7 +711,7 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         } else {
                             ar_write(cpu, 0, cpu->pc);
                         }
-                        cpu->pc = target;
+                        BRANCH_TO(cpu, target);
                         return;
                     }
                     /* BREAK, etc. */
@@ -751,19 +754,19 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                     switch (s) {
                     case 0: /* RFE */
                         XT_PS_SET_EXCM(cpu->ps, 0);
-                        cpu->pc = cpu->epc[0];
+                        BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     case 4: /* RFWO */
                         XT_PS_SET_EXCM(cpu->ps, 0);
                         cpu->windowstart &= ~(1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
-                        cpu->pc = cpu->epc[0];
+                        BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     case 5: /* RFWU */
                         XT_PS_SET_EXCM(cpu->ps, 0);
                         cpu->windowstart |= (1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
-                        cpu->pc = cpu->epc[0];
+                        BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     default: break;
                     }
@@ -771,7 +774,7 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 case 1: /* RFI */
                     if (s >= 1 && s <= 7) {
                         cpu->ps = cpu->eps[s - 1];
-                        cpu->pc = cpu->epc[s - 1];
+                        BRANCH_TO(cpu, cpu->epc[s - 1]);
                     }
                     return;
                 default: break;
@@ -780,9 +783,24 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             case 4: /* BREAK */
                 cpu->debug_break = true;
                 break;
-            case 5: /* SYSCALL - raise exception */
-                xtensa_raise_exception(cpu, EXCCAUSE_SYSCALL, cpu->pc - 3, 0);
-                return;
+            case 5: /* SYSCALL */
+                if (XT_PS_WOE(cpu->ps)) {
+                    /* Synthesized window spill-all.  The firmware's SYSCALL
+                     * handler uses ROTW to walk all windows and trigger
+                     * overflow exceptions.  Our emulator doesn't raise
+                     * overflows on ROTW, so intercept here and do the
+                     * spill in C. */
+                    for (unsigned w = 0; w < 16; w++) {
+                        if (w != cpu->windowbase &&
+                            (cpu->windowstart & (1u << w)))
+                            synth_spill_window(cpu, (int)w);
+                    }
+                } else {
+                    xtensa_raise_exception(cpu, EXCCAUSE_SYSCALL,
+                                           cpu->pc - 3, 0);
+                    return;
+                }
+                break;
             case 6: /* RSIL - read/set interrupt level */
                 ar_write(cpu, t, cpu->ps);
                 cpu->ps = (cpu->ps & ~0xF) | (s & 0xF);
@@ -1286,12 +1304,12 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
               /* BEQZ.N */
               int imm6 = ((t & 3) << 4) | r;
               if (ar_read(cpu, s) == 0)
-                  cpu->pc = cpu->pc + (uint32_t)imm6 + 2;
+                  BRANCH_TO(cpu, cpu->pc + (uint32_t)imm6 + 2);
           } else {
               /* BNEZ.N */
               int imm6 = ((t & 3) << 4) | r;
               if (ar_read(cpu, s) != 0)
-                  cpu->pc = cpu->pc + (uint32_t)imm6 + 2;
+                  BRANCH_TO(cpu, cpu->pc + (uint32_t)imm6 + 2);
           }
         } break;
 
@@ -1303,7 +1321,7 @@ static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
         case 15: /* ST3 r=15 subgroup */
             switch (t) {
             case 0: /* RET.N */
-                cpu->pc = ar_read(cpu, 0);
+                BRANCH_TO(cpu, ar_read(cpu, 0));
                 return; /* skip default pc advance */
             case 1: /* RETW.N */
                 exec_retw(cpu);
@@ -1351,7 +1369,7 @@ static void exec_calln(xtensa_cpu_t *cpu, uint32_t insn) {
         /* CALL0: return address = next instruction */
         ar_write(cpu, 0, cpu->pc);
     }
-    cpu->pc = target;
+    BRANCH_TO(cpu, target);
 }
 
 /* Execute op0=6 (SI) - J, BRI12, BRI8, LOOP, ENTRY */
@@ -1363,7 +1381,7 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
     switch (nn) {
     case 0: /* J - unconditional jump */
         { int32_t offset = sign_extend(XT_OFFSET18(insn), 18);
-          cpu->pc = cpu->pc + (uint32_t)offset + 1;
+          BRANCH_TO(cpu, cpu->pc + (uint32_t)offset + 1);
         } break;
 
     case 1: /* BZ - BRI12 zero-compare branches */
@@ -1371,10 +1389,10 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
           uint32_t target = cpu->pc + (uint32_t)imm12 + 1;
           int32_t val = (int32_t)ar_read(cpu, s);
           switch (m) {
-          case 0: if (val == 0) cpu->pc = target; break;  /* BEQZ */
-          case 1: if (val != 0) cpu->pc = target; break;  /* BNEZ */
-          case 2: if (val < 0)  cpu->pc = target; break;  /* BLTZ */
-          case 3: if (val >= 0) cpu->pc = target; break;  /* BGEZ */
+          case 0: if (val == 0) BRANCH_TO(cpu, target); break;  /* BEQZ */
+          case 1: if (val != 0) BRANCH_TO(cpu, target); break;  /* BNEZ */
+          case 2: if (val < 0)  BRANCH_TO(cpu, target); break;  /* BLTZ */
+          case 3: if (val >= 0) BRANCH_TO(cpu, target); break;  /* BGEZ */
           }
         } break;
 
@@ -1385,10 +1403,10 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
           uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
           int32_t val = (int32_t)ar_read(cpu, s);
           switch (m) {
-          case 0: if (val == b4const[r]) cpu->pc = target; break;  /* BEQI */
-          case 1: if (val != b4const[r]) cpu->pc = target; break;  /* BNEI */
-          case 2: if (val < b4const[r])  cpu->pc = target; break;  /* BLTI */
-          case 3: if (val >= b4const[r]) cpu->pc = target; break;  /* BGEI */
+          case 0: if (val == b4const[r]) BRANCH_TO(cpu, target); break;  /* BEQI */
+          case 1: if (val != b4const[r]) BRANCH_TO(cpu, target); break;  /* BNEI */
+          case 2: if (val < b4const[r])  BRANCH_TO(cpu, target); break;  /* BLTI */
+          case 3: if (val >= b4const[r]) BRANCH_TO(cpu, target); break;  /* BGEI */
           }
         } break;
 
@@ -1419,11 +1437,11 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                 switch (r) {
                 case 0: /* BF */
                     if (!(cpu->br & (1u << s)))
-                        cpu->pc = target;
+                        BRANCH_TO(cpu, target);
                     break;
                 case 1: /* BT */
                     if (cpu->br & (1u << s))
-                        cpu->pc = target;
+                        BRANCH_TO(cpu, target);
                     break;
                 case 8: /* LOOP */
                     cpu->lend = target;
@@ -1434,7 +1452,7 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                     cpu->lend = target;
                     cpu->lbeg = cpu->pc;
                     if (ar_read(cpu, s) == 0) {
-                        cpu->pc = target;
+                        BRANCH_TO(cpu, target);
                     } else {
                         cpu->lcount = ar_read(cpu, s) - 1;
                     }
@@ -1443,7 +1461,7 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                     cpu->lend = target;
                     cpu->lbeg = cpu->pc;
                     if ((int32_t)ar_read(cpu, s) <= 0) {
-                        cpu->pc = target;
+                        BRANCH_TO(cpu, target);
                     } else {
                         cpu->lcount = ar_read(cpu, s) - 1;
                     }
@@ -1455,13 +1473,13 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
               { int32_t offset8 = sign_extend(imm8, 8);
                 uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
                 if (ar_read(cpu, s) < b4constu[r])
-                    cpu->pc = target;
+                    BRANCH_TO(cpu, target);
               } break;
           case 3: /* BGEUI */
               { int32_t offset8 = sign_extend(imm8, 8);
                 uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
                 if (ar_read(cpu, s) >= b4constu[r])
-                    cpu->pc = target;
+                    BRANCH_TO(cpu, target);
               } break;
           }
         } break;
@@ -1504,7 +1522,7 @@ static void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
     }
 
     if (taken)
-        cpu->pc = target;
+        BRANCH_TO(cpu, target);
 }
 
 /* ===== MAC16 Helpers ===== */
@@ -1642,6 +1660,7 @@ int xtensa_step(xtensa_cpu_t *cpu) {
 
     int op0 = XT_OP0(insn);
     uint32_t next_pc = cpu->pc + (uint32_t)ilen;
+    cpu->_pc_written = false;
 
     if (ilen == 2) {
         cpu->pc = next_pc; /* set before exec so RET can override */
@@ -1694,8 +1713,8 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         }
     }
 
-    /* Zero-overhead loop: loop back when PC reaches LEND */
-    if (cpu->lcount > 0 && cpu->pc == cpu->lend) {
+    /* Zero-overhead loop: loop back on sequential flow to LEND (not branches) */
+    if (cpu->lcount > 0 && cpu->pc == cpu->lend && !cpu->_pc_written) {
         cpu->lcount--;
         cpu->pc = cpu->lbeg;
     }
