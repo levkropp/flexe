@@ -18,7 +18,11 @@ uint32_t freertos_stubs_bump_ptr(const freertos_stubs_t *frt);
 /* Get deferred task info (saved by xTaskCreate/xTaskCreatePinnedToCore) */
 uint32_t freertos_stubs_deferred_task(const freertos_stubs_t *frt, uint32_t *param_out);
 
-/* Consume (get and clear) the deferred task — one-shot, returns 0 on second call */
+/* Consume (get and clear) the deferred task — one-shot, returns 0 on second call.
+ * If multiple tasks were registered, starts the cooperative scheduler and returns 0. */
 uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *param_out);
+
+/* Returns true if the cooperative scheduler is running (multi-task mode) */
+bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
 
 #endif /* FREERTOS_STUBS_H */
