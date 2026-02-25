@@ -248,6 +248,7 @@ struct xtensa_cpu {
     bool     debug_break;   /* Debug break requested */
     bool     halted;        /* WAITI halt state */
     bool     _pc_written;   /* Set when instruction modifies PC (branch/call/ret) */
+    bool     window_trace;  /* Emit window spill/fill/ENTRY/RETW trace to stderr */
     uint64_t cycle_count;   /* Total emulated cycles */
 
     /* Memory subsystem (set by caller) */

@@ -123,6 +123,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -s <file.elf>   Load ELF symbols for trace/breakpoints\n");
     fprintf(stderr, "  -b <addr|name>  Set breakpoint (repeatable)\n");
     fprintf(stderr, "  -m <addr[:len]> Dump memory on exit (repeatable, default len=256)\n");
+    fprintf(stderr, "  -W              Window trace (spill/fill/ENTRY/RETW events)\n");
     fprintf(stderr, "  -S <file.img>   SD card backing image file\n");
     fprintf(stderr, "  -Z <bytes>      SD card size (default: auto from file, or 4GB)\n");
 }
@@ -171,6 +172,7 @@ int main(int argc, char *argv[]) {
     int max_cycles = 10000000;
     int trace = 0;
     int verbose_trace = 0;
+    int window_trace = 0;
     int verbose = 0;
     int quiet_unhandled = 0;
     uint32_t entry_override = 0;
@@ -184,11 +186,12 @@ int main(int argc, char *argv[]) {
     int dump_count = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:tTvqe:s:b:m:S:Z:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:tTWvqe:s:b:m:S:Z:")) != -1) {
         switch (opt) {
         case 'c': max_cycles = atoi(optarg); break;
         case 't': trace = 1; break;
         case 'T': verbose_trace = 1; trace = 1; break;
+        case 'W': window_trace = 1; trace = 1; break;
         case 'v': verbose = 1; break;
         case 'q': quiet_unhandled = 1; break;
         case 'e':
@@ -263,6 +266,7 @@ int main(int argc, char *argv[]) {
     xtensa_cpu_init(&cpu);
     xtensa_cpu_reset(&cpu);
     cpu.mem = mem;
+    cpu.window_trace = window_trace;
 
     /* Install ROM function stubs */
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
