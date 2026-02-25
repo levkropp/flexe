@@ -294,8 +294,10 @@ int main(int argc, char *argv[]) {
 
     /* Display stubs (no framebuffer in standalone mode — just hooks) */
     display_stubs_t *dstubs = display_stubs_create(&cpu);
-    if (dstubs && syms)
+    if (dstubs && syms) {
         display_stubs_hook_symbols(dstubs, syms);
+        display_stubs_hook_tft_espi(dstubs, syms);
+    }
 
     /* Touch stubs (no input in standalone mode) */
     touch_stubs_t *tstubs = touch_stubs_create(&cpu);

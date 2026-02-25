@@ -8,6 +8,8 @@
 
 #define MAX_ROM_STUBS 1024
 #define OUTPUT_BUF_SIZE 8192
+#define HOOK_HT_SIZE  2048
+#define HOOK_HT_MASK  (HOOK_HT_SIZE - 1)
 
 /* ROM address range: 0x40000000 - 0x4005FFFF */
 #define ROM_BASE 0x40000000u
@@ -41,6 +43,10 @@ struct esp32_rom_stubs {
     uint32_t         app_main_addr;    /* app_main symbol for start_cpu0 hook */
     uint32_t         stack_chk_guard_addr; /* __stack_chk_guard BSS address */
     const elf_symbols_t *syms;         /* ELF symbols (for symbol lookups in stubs) */
+    struct {
+        uint32_t addr;     /* 0 = empty */
+        int      idx;      /* index into entries[] */
+    } ht[HOOK_HT_SIZE];
 };
 
 /* ===== Calling convention helpers ===== */
@@ -1405,6 +1411,12 @@ static void stub_ret_esp_fail(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, (uint32_t)-1);  /* ESP_FAIL */
 }
 
+/* Return WL_CONNECTED (3) for WiFi.status() */
+static void stub_ret_wl_connected(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 3);  /* WL_CONNECTED */
+}
+
 /* __assert_func / abort — skip assertion failures (missing infra).
  * For noreturn functions, stop the CPU so the main loop can redirect
  * to a deferred task or halt cleanly.  Returning would enter undefined
@@ -1416,17 +1428,44 @@ static void stub_abort_stop(xtensa_cpu_t *cpu, void *ctx) {
 
 /* ===== PC hook ===== */
 
+/* ===== PC hook hash table ===== */
+
+static uint32_t hook_hash(uint32_t addr) {
+    return (addr * 2654435761u) >> 21;  /* 11-bit index for 2048 slots */
+}
+
+static int hook_ht_lookup(const esp32_rom_stubs_t *s, uint32_t pc) {
+    uint32_t h = hook_hash(pc) & HOOK_HT_MASK;
+    for (int probe = 0; probe < 16; probe++) {
+        uint32_t slot = (h + probe) & HOOK_HT_MASK;
+        if (s->ht[slot].addr == pc) return s->ht[slot].idx;
+        if (s->ht[slot].addr == 0) return -1;
+    }
+    return -1;
+}
+
+static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
+    uint32_t h = hook_hash(addr) & HOOK_HT_MASK;
+    for (int probe = 0; probe < HOOK_HT_SIZE; probe++) {
+        uint32_t slot = (h + probe) & HOOK_HT_MASK;
+        if (s->ht[slot].addr == 0) {
+            s->ht[slot].addr = addr;
+            s->ht[slot].idx = idx;
+            return;
+        }
+    }
+}
+
 static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
-    for (int i = 0; i < s->count; i++) {
-        if (s->entries[i].addr == pc) {
-            s->entries[i].call_count++;
-            if (s->log_fn)
-                s->log_fn(s->log_ctx, pc, s->entries[i].name, cpu);
-            void *ctx = s->entries[i].user_ctx ? s->entries[i].user_ctx : s;
-            s->entries[i].fn(cpu, ctx);
-            return 1;
-        }
+    int idx = hook_ht_lookup(s, pc);
+    if (idx >= 0) {
+        s->entries[idx].call_count++;
+        if (s->log_fn)
+            s->log_fn(s->log_ctx, pc, s->entries[idx].name, cpu);
+        void *ectx = s->entries[idx].user_ctx ? s->entries[idx].user_ctx : s;
+        s->entries[idx].fn(cpu, ectx);
+        return 1;
     }
     /* Only intercept unregistered calls in ROM range */
     if (pc >= ROM_BASE && pc < ROM_END) {
@@ -1972,8 +2011,10 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* WiFi / network stubs — return ESP_FAIL to prevent network init */
-    static const char *wifi_fail_fns[] = {
+    /* WiFi / network stubs — return ESP_OK (0) so init succeeds.
+     * NerdMiner and similar firmwares check the return value and fall into
+     * blocking captive-portal loops when esp_netif_init() returns ESP_FAIL. */
+    static const char *wifi_ok_fns[] = {
         "esp_wifi_init",
         "esp_wifi_init_internal",
         "esp_wifi_start",
@@ -1986,10 +2027,10 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "tcpip_send_msg_wait_sem",
         NULL
     };
-    for (int i = 0; wifi_fail_fns[i]; i++) {
+    for (int i = 0; wifi_ok_fns[i]; i++) {
         uint32_t addr;
-        if (elf_symbols_find(syms, wifi_fail_fns[i], &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_ret_esp_fail, wifi_fail_fns[i]);
+        if (elf_symbols_find(syms, wifi_ok_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, wifi_ok_fns[i]);
             hooked++;
         }
     }
@@ -2089,6 +2130,24 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
+    /* WiFi manager stubs — skip WiFi setup entirely for NerdMiner etc.
+     * These are C++ mangled names; only match firmwares with these symbols. */
+    static const struct { const char *name; rom_stub_fn fn; } wifi_mgr_hooks[] = {
+        { "_Z16init_WifiManagerv",       stub_void_unregistered },  /* init_WifiManager() */
+        { "_Z18wifiManagerProcessv",     stub_void_unregistered },  /* wifiManagerProcess() */
+        { "_ZN11WiFiManager7processEv",  stub_void_unregistered },  /* WiFiManager::process() */
+        { "_ZN12WiFiSTAClass6statusEv",  stub_ret_wl_connected },   /* WiFi.status() → WL_CONNECTED */
+        { NULL, NULL }
+    };
+    for (int i = 0; wifi_mgr_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, wifi_mgr_hooks[i].name, &addr) == 0) {
+            rom_stubs_register(stubs, addr, wifi_mgr_hooks[i].fn,
+                               wifi_mgr_hooks[i].name);
+            hooked++;
+        }
+    }
+
     /* SDMMC / SDSPI host infrastructure stubs.
      * The actual sector I/O (sdmmc_read/write_sectors) and card init are
      * hooked in sdcard_stubs.c.  These cover the SPI bus setup functions
@@ -2128,6 +2187,7 @@ int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
     stubs->entries[stubs->count].name = name;
     stubs->entries[stubs->count].user_ctx = user_ctx;
     stubs->count++;
+    hook_ht_insert(stubs, addr, stubs->count - 1);
 
     /* Xtensa windowed ABI: ELF symbols sometimes point past the ENTRY
      * instruction (which is 3 bytes, op0 = 0x6, s field = a1).  CALL8/CALL12
@@ -2147,6 +2207,7 @@ int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
                     stubs->entries[stubs->count].name = name;
                     stubs->entries[stubs->count].user_ctx = user_ctx;
                     stubs->count++;
+                    hook_ht_insert(stubs, ea, stubs->count - 1);
                 }
                 break;
             }

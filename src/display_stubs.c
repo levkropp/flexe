@@ -119,6 +119,11 @@ struct display_stubs {
     pthread_mutex_t    *framebuf_mtx;
     int                 width;
     int                 height;
+    /* TFT_eSPI state tracking */
+    uint16_t            textcolor;
+    uint16_t            textbgcolor;
+    uint8_t             textsize;
+    uint8_t             rotation;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -148,6 +153,19 @@ static void ds_return_void(xtensa_cpu_t *cpu) {
         cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
+        cpu->pc = ar_read(cpu, 0);
+    }
+}
+
+static void ds_return(xtensa_cpu_t *cpu, uint32_t val) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    if (ci > 0) {
+        ar_write(cpu, ci * 4 + 2, val);
+        uint32_t a0 = ar_read(cpu, ci * 4);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        XT_PS_SET_CALLINC(cpu->ps, 0);
+    } else {
+        ar_write(cpu, 2, val);
         cpu->pc = ar_read(cpu, 0);
     }
 }
@@ -328,6 +346,341 @@ static void stub_display_draw_rgb565_line(xtensa_cpu_t *cpu, void *ctx) {
     ds_return_void(cpu);
 }
 
+/* ===== TFT_eSPI C++ method stubs =====
+ *
+ * For C++ member functions, arg0 = this pointer. Actual parameters start at
+ * arg1.  We ignore 'this' and work directly with the emulator framebuffer. */
+
+/* TFT_eSPI::fillScreen(unsigned int color) */
+static void stub_tft_fillScreen(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint16_t color = (uint16_t)ds_arg(cpu, 1);  /* arg0=this, arg1=color */
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int i = 0; i < ds->width * ds->height; i++)
+            ds->framebuf[i] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::fillRect(int x, int y, int w, int h, unsigned int color) */
+static void stub_tft_fillRect(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > ds->width)  w = ds->width - x;
+    if (y + h > ds->height) h = ds->height - y;
+    if (w <= 0 || h <= 0) { ds_return_void(cpu); return; }
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int row = y; row < y + h; row++) {
+            uint16_t *dst = &ds->framebuf[row * ds->width + x];
+            for (int i = 0; i < w; i++)
+                dst[i] = color;
+        }
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawPixel(int x, int y, unsigned int color) */
+static void stub_tft_drawPixel(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    uint16_t color = (uint16_t)ds_arg(cpu, 3);
+
+    if (x >= 0 && x < ds->width && y >= 0 && y < ds->height &&
+        ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        ds->framebuf[y * ds->width + x] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawFastHLine(int x, int y, int w, unsigned int color) */
+static void stub_tft_drawFastHLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (y < 0 || y >= ds->height || w <= 0) { ds_return_void(cpu); return; }
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > ds->width) w = ds->width - x;
+    if (w <= 0) { ds_return_void(cpu); return; }
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        uint16_t *dst = &ds->framebuf[y * ds->width + x];
+        for (int i = 0; i < w; i++)
+            dst[i] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawFastVLine(int x, int y, int h, unsigned int color) */
+static void stub_tft_drawFastVLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int h = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (x < 0 || x >= ds->width || h <= 0) { ds_return_void(cpu); return; }
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > ds->height) h = ds->height - y;
+    if (h <= 0) { ds_return_void(cpu); return; }
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int row = y; row < y + h; row++)
+            ds->framebuf[row * ds->width + x] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawRect(int x, int y, int w, int h, unsigned int color) */
+static void stub_tft_drawRect(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (w <= 0 || h <= 0 || !ds->framebuf || !ds->framebuf_mtx) {
+        ds_return_void(cpu); return;
+    }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    /* Top and bottom edges */
+    for (int i = 0; i < w; i++) {
+        int px = x + i;
+        if (px >= 0 && px < ds->width) {
+            if (y >= 0 && y < ds->height)
+                ds->framebuf[y * ds->width + px] = color;
+            int by = y + h - 1;
+            if (by >= 0 && by < ds->height)
+                ds->framebuf[by * ds->width + px] = color;
+        }
+    }
+    /* Left and right edges */
+    for (int i = 1; i < h - 1; i++) {
+        int py = y + i;
+        if (py >= 0 && py < ds->height) {
+            if (x >= 0 && x < ds->width)
+                ds->framebuf[py * ds->width + x] = color;
+            int rx = x + w - 1;
+            if (rx >= 0 && rx < ds->width)
+                ds->framebuf[py * ds->width + rx] = color;
+        }
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::pushImage(int x, int y, int w, int h, const uint16_t *data) */
+static void stub_tft_pushImage(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint32_t data_addr = ds_arg(cpu, 5);
+
+    if (w <= 0 || h <= 0 || !ds->framebuf || !ds->framebuf_mtx) {
+        ds_return_void(cpu); return;
+    }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= ds->height) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= ds->width) continue;
+            uint32_t src = data_addr + (uint32_t)((row * w + col) * 2);
+            uint8_t lo = mem_read8(cpu->mem, src);
+            uint8_t hi = mem_read8(cpu->mem, src + 1);
+            ds->framebuf[dy * ds->width + dx] = (uint16_t)((hi << 8) | lo);
+        }
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+/* Render one glyph at (cx, cy) with scaling, returns glyph pixel width */
+static int tft_render_glyph(display_stubs_t *ds, int cx, int cy,
+                             char c, uint16_t fg, uint16_t bg, int scale) {
+    if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
+    const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+    int gw = FONT_W * scale;
+
+    for (int row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < FONT_W; col++) {
+            uint16_t pix = (bits & (0x80 >> col)) ? fg : bg;
+            /* Scale pixel */
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= ds->height) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= ds->width) continue;
+                    ds->framebuf[dy * ds->width + dx] = pix;
+                }
+            }
+        }
+    }
+    return gw;
+}
+
+/* TFT_eSPI::drawString(const char *str, int x, int y, unsigned char font)
+ * Returns int16_t pixel width of rendered string. */
+static void stub_tft_drawString(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t str_addr = ds_arg(cpu, 1);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+    /* arg4 = font number, ignored — we use our embedded font */
+
+    uint16_t fg = ds->textcolor;
+    uint16_t bg = ds->textbgcolor;
+    int scale = ds->textsize > 0 ? ds->textsize : 1;
+    int gw = FONT_W * scale;
+    int total_w = 0;
+
+    if (!ds->framebuf || !ds->framebuf_mtx) {
+        ds_return(cpu, 0);
+        return;
+    }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    int cx = x;
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, str_addr++);
+        if (ch == 0) break;
+        if (ch == '\n') {
+            cx = x;
+            y += FONT_H * scale;
+            continue;
+        }
+        tft_render_glyph(ds, cx, y, (char)ch, fg, bg, scale);
+        cx += gw;
+        total_w += gw;
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return(cpu, (uint32_t)total_w);
+}
+
+/* TFT_eSPI::drawChar(unsigned short c, int x, int y)
+ * Uses current textcolor/textbgcolor/textsize. */
+static void stub_tft_drawChar_3(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    char c = (char)(ds_arg(cpu, 1) & 0xFF);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+
+    int scale = ds->textsize > 0 ? ds->textsize : 1;
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        tft_render_glyph(ds, x, y, c, ds->textcolor, ds->textbgcolor, scale);
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawChar(int x, int y, unsigned short c, unsigned int fg,
+ *                     unsigned int bg, unsigned char size) */
+static void stub_tft_drawChar_6(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    char c = (char)(ds_arg(cpu, 3) & 0xFF);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 4);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 5);
+    /* arg6 = size, on stack for CALL8 */
+    int ci = XT_PS_CALLINC(cpu->ps);
+    int first_arg = ci * 4 + 2;
+    int max_reg = 16 - first_arg;
+    if (max_reg > 6) max_reg = 6;
+    uint32_t size_val;
+    if (6 < max_reg)
+        size_val = ar_read(cpu, first_arg + 6);
+    else {
+        uint32_t sp = ar_read(cpu, 1);
+        size_val = mem_read32(cpu->mem, sp + (uint32_t)((6 - max_reg) * 4));
+    }
+    int scale = size_val > 0 ? (int)size_val : 1;
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        tft_render_glyph(ds, x, y, c, fg, bg, scale);
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setTextColor(unsigned short fg) */
+static void stub_tft_setTextColor_1(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds->textcolor = (uint16_t)ds_arg(cpu, 1);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setTextColor(unsigned short fg, unsigned short bg, bool fillbg) */
+static void stub_tft_setTextColor_3(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds->textcolor = (uint16_t)ds_arg(cpu, 1);
+    ds->textbgcolor = (uint16_t)ds_arg(cpu, 2);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setTextSize(unsigned char size) */
+static void stub_tft_setTextSize(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds->textsize = (uint8_t)ds_arg(cpu, 1);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setRotation(unsigned char r) */
+static void stub_tft_setRotation(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds->rotation = (uint8_t)ds_arg(cpu, 1);
+    ds_return_void(cpu);
+}
+
+/* Generic void return for TFT_eSPI methods we don't need to emulate */
+static void stub_tft_void(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::width() / height() — return display dimensions */
+static void stub_tft_width(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds_return(cpu, (uint32_t)ds->width);
+}
+
+static void stub_tft_height(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds_return(cpu, (uint32_t)ds->height);
+}
+
 /* ===== Public API ===== */
 
 display_stubs_t *display_stubs_create(xtensa_cpu_t *cpu) {
@@ -336,6 +689,9 @@ display_stubs_t *display_stubs_create(xtensa_cpu_t *cpu) {
     ds->cpu = cpu;
     ds->width = DISP_W;
     ds->height = DISP_H;
+    ds->textcolor = 0xFFFF;   /* white */
+    ds->textbgcolor = 0x0000; /* black */
+    ds->textsize = 1;
     return ds;
 }
 
@@ -371,6 +727,70 @@ int display_stubs_hook_symbols(display_stubs_t *ds, const elf_symbols_t *syms) {
         { "display_string",            stub_display_string },
         { "display_draw_bitmap1bpp",   stub_display_draw_bitmap1bpp },
         { "display_draw_rgb565_line",  stub_display_draw_rgb565_line },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ds);
+            hooked++;
+        }
+    }
+
+    return hooked;
+}
+
+int display_stubs_hook_tft_espi(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        /* Core rendering */
+        { "_ZN8TFT_eSPI10fillScreenEj",    stub_tft_fillScreen },
+        { "_ZN8TFT_eSPI8fillRectEiiiij",   stub_tft_fillRect },
+        { "_ZN8TFT_eSPI9drawPixelEiij",    stub_tft_drawPixel },
+        { "_ZN8TFT_eSPI13drawFastHLineEiiij", stub_tft_drawFastHLine },
+        { "_ZN8TFT_eSPI13drawFastVLineEiiij", stub_tft_drawFastVLine },
+        { "_ZN8TFT_eSPI8drawRectEiiiij",   stub_tft_drawRect },
+        /* Image blitting — all overloads use same blit logic */
+        { "_ZN8TFT_eSPI9pushImageEiiiiPKt", stub_tft_pushImage },
+        { "_ZN8TFT_eSPI9pushImageEiiiiPt",  stub_tft_pushImage },
+        /* Text */
+        { "_ZN8TFT_eSPI10drawStringEPKciih", stub_tft_drawString },
+        { "_ZN8TFT_eSPI8drawCharEtii",     stub_tft_drawChar_3 },
+        { "_ZN8TFT_eSPI8drawCharEiitjjh",  stub_tft_drawChar_6 },
+        /* State tracking */
+        { "_ZN8TFT_eSPI12setTextColorEt",   stub_tft_setTextColor_1 },
+        { "_ZN8TFT_eSPI12setTextColorEttb", stub_tft_setTextColor_3 },
+        { "_ZN8TFT_eSPI11setTextSizeEh",    stub_tft_setTextSize },
+        { "_ZN8TFT_eSPI11setRotationEh",    stub_tft_setRotation },
+        /* Dimension queries */
+        { "_ZN8TFT_eSPI4widthEv",           stub_tft_width },
+        { "_ZN8TFT_eSPI5widthEv",           stub_tft_width },
+        { "_ZN8TFT_eSPI4heightEv",          stub_tft_height },
+        { "_ZN8TFT_eSPI6heightEv",          stub_tft_height },
+        /* No-op config methods */
+        { "_ZN8TFT_eSPI4initEh",            stub_tft_void },
+        { "_ZN8TFT_eSPI7initBusEv",         stub_tft_void },
+        { "_ZN8TFT_eSPI11setTextFontEh",    stub_tft_void },
+        { "_ZN8TFT_eSPI12setTextDatumEh",   stub_tft_void },
+        { "_ZN8TFT_eSPI11setFreeFontEPK7GFXfont", stub_tft_void },
+        { "_ZN8TFT_eSPI12setSwapBytesEb",   stub_tft_void },
+        { "_ZN8TFT_eSPI11setViewportEiiiib", stub_tft_void },
+        { "_ZN8TFT_eSPI13resetViewportEv",  stub_tft_void },
+        { "_ZN8TFT_eSPI10startWriteEv",     stub_tft_void },
+        { "_ZN8TFT_eSPI8endWriteEv",        stub_tft_void },
+        { "_ZN8TFT_eSPI13invertDisplayEb",  stub_tft_void },
+        { "_ZN8TFT_eSPI10unloadFontEv",     stub_tft_void },
+        { "_ZN8TFT_eSPI7dmaWaitEv",         stub_tft_void },
         { NULL, NULL }
     };
 
