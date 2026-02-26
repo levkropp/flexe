@@ -2141,7 +2141,6 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "esp_wifi_disconnect",
         "esp_netif_init",
         "tcpip_adapter_init",
-        "tcpip_init",
         "tcpip_send_msg_wait_sem",
         NULL
     };
@@ -2149,6 +2148,36 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, wifi_ok_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, wifi_ok_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* tcpip_init — return 0 */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "tcpip_init", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, "tcpip_init");
+            hooked++;
+        }
+    }
+
+    /* Set tcpip_mbox to non-zero so tcpip_callback's
+     * sys_mbox_valid() assertion passes. tcpip_init may never be called
+     * because our stubs skip the real init, but lwip_setsockopt still
+     * calls tcpip_callback directly which asserts mbox validity. */
+    {
+        uint32_t mbox_addr;
+        if (elf_symbols_find(syms, "tcpip_mbox", &mbox_addr) == 0) {
+            mem_write32(stubs->cpu->mem, mbox_addr, 0xDEAD0001u);
+        }
+    }
+
+    /* Stub tcpip_callback too — it tries to post to the mbox which
+     * doesn't really exist. Just return ERR_OK (0). */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "tcpip_callback", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, "tcpip_callback");
             hooked++;
         }
     }
