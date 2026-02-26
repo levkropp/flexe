@@ -889,6 +889,9 @@ int main(int argc, char *argv[]) {
                 }
                 exc_repeat = 0;
             }
+            /* Preemptive timeslice check */
+            if (frt) freertos_stubs_check_preempt(frt);
+
             if (!cpu.running) {
                 stop_reason = STOP_CPU_STOPPED;
                 break;
@@ -916,6 +919,7 @@ int main(int argc, char *argv[]) {
             int n = remaining < batch ? remaining : batch;
             int ran = xtensa_run(&cpu, n);
             cycles += ran;
+            if (frt) freertos_stubs_check_preempt(frt);
             if (ran < n) break;
             /* Detect infinite self-loop (j self) — trigger deferred task */
             if (cpu.pc == pc_before && frt) {

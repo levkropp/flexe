@@ -28,4 +28,8 @@ bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
 /* Start the cooperative scheduler (called on self-loop detection) */
 void freertos_stubs_start_scheduler(freertos_stubs_t *frt);
 
+/* Check if current task's timeslice expired; if so, preempt.
+ * Call from main run loop after each xtensa_run() batch. */
+bool freertos_stubs_check_preempt(freertos_stubs_t *frt);
+
 #endif /* FREERTOS_STUBS_H */

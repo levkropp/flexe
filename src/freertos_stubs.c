@@ -84,6 +84,7 @@ struct freertos_stubs {
     int        task_count;
     int        current_task;       /* -1 during boot */
     bool       scheduler_started;
+    uint64_t   last_switch_cycle;  /* cycle_count at last context switch */
 };
 
 static void stub_deferred_task_trampoline(xtensa_cpu_t *cpu, void *ctx);
@@ -239,6 +240,7 @@ static void sched_switch(freertos_stubs_t *frt) {
     }
     frt->current_task = next;
     frt->tasks[next].state = TASK_RUNNING;
+    frt->last_switch_cycle = frt->cpu->cycle_count;
     sched_restore_context(frt);
 }
 
@@ -286,8 +288,24 @@ static void sched_start(freertos_stubs_t *frt) {
     if (next >= 0) {
         frt->current_task = next;
         frt->tasks[next].state = TASK_RUNNING;
+        frt->last_switch_cycle = frt->cpu->cycle_count;
         sched_restore_context(frt);
     }
+}
+
+/* Promote from legacy single-task mode to scheduler mode.
+ * Called when a new task is registered while already running in legacy mode.
+ * The currently-executing code becomes task 0 (already in the tasks array). */
+static void sched_promote_legacy(freertos_stubs_t *frt) {
+    if (frt->scheduler_started || frt->task_count < 2)
+        return;
+    frt->scheduler_started = true;
+    /* The legacy task is tasks[0] — mark it as RUNNING and current */
+    frt->current_task = 0;
+    frt->tasks[0].state = TASK_RUNNING;
+    /* Save current CPU context into tasks[0] so context switches work */
+    sched_save_context(frt);
+    frt->last_switch_cycle = frt->cpu->cycle_count;
 }
 
 /* ===== FreeRTOS stub implementations ===== */
@@ -334,6 +352,9 @@ void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
     if (task_fn && prio < 20) {
         if (!fake_handle) fake_handle = bump_alloc(frt, 4);
         sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        /* If we're in legacy single-task mode, promote to scheduler */
+        if (!frt->scheduler_started && frt->task_count > 1)
+            sched_promote_legacy(frt);
     }
 
     /* Legacy deferred task (for single-task compat) */
@@ -363,6 +384,9 @@ void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
     if (task_fn && prio < 20) {
         if (!fake_handle) fake_handle = bump_alloc(frt, 4);
         sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        /* If we're in legacy single-task mode, promote to scheduler */
+        if (!frt->scheduler_started && frt->task_count > 1)
+            sched_promote_legacy(frt);
     }
 
     /* Legacy: save most recent task for deferred execution */
@@ -670,6 +694,40 @@ void stub_xQueueGenericSend(xtensa_cpu_t *cpu, void *ctx) {
 /* xQueueGenericSendFromISR */
 void stub_xQueueGenericSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
     stub_xQueueSend(cpu, ctx);
+}
+
+/* ===== Preemptive timeslice check ===== */
+
+bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
+    if (!frt || !frt->scheduler_started || frt->current_task < 0)
+        return false;
+    if (frt->cpu->cycle_count - frt->last_switch_cycle < frt->cycles_per_tick)
+        return false;
+    /* Timeslice expired: save current task, mark READY, switch.
+     * Use round-robin across all runnable tasks (not just same-priority)
+     * so that a high-priority non-yielding task doesn't starve others. */
+    sched_save_context(frt);
+    frt->tasks[frt->current_task].state = TASK_READY;
+
+    /* Wake sleepers first */
+    sched_wake_sleepers(frt);
+
+    /* Round-robin: pick any READY task after current, regardless of priority */
+    int next = -1;
+    for (int j = 1; j < frt->task_count; j++) {
+        int i = (frt->current_task + j) % frt->task_count;
+        if (frt->tasks[i].state == TASK_READY) {
+            next = i;
+            break;
+        }
+    }
+    if (next < 0) next = frt->current_task; /* no other runnable task */
+
+    frt->current_task = next;
+    frt->tasks[next].state = TASK_RUNNING;
+    frt->last_switch_cycle = frt->cpu->cycle_count;
+    sched_restore_context(frt);
+    return true;
 }
 
 /* ===== Public API ===== */
