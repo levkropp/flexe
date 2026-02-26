@@ -1516,6 +1516,13 @@ static void stub_ret_wl_connected(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 3);  /* WL_CONNECTED */
 }
 
+/* digitalRead returns HIGH (1) — prevents firmware from thinking
+ * buttons are pressed (most buttons are active-low). */
+static void stub_digital_read_high(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 1);
+}
+
 /* __assert_func / abort — skip assertion failures (missing infra).
  * For noreturn functions, stop the CPU so the main loop can redirect
  * to a deferred task or halt cleanly.  Returning would enter undefined
@@ -2219,8 +2226,6 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "pinMode",
         "__digitalWrite",
         "digitalWrite",
-        "__digitalRead",
-        "digitalRead",
         "__analogRead",
         "analogRead",
         "analogWrite",
@@ -2233,6 +2238,33 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, arduino_gpio_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, arduino_gpio_fns[i]);
+            hooked++;
+        }
+    }
+    /* digitalRead returns HIGH (1) — buttons are active-low, so returning 0
+     * makes firmware think buttons are pressed (triggering WiFi reset etc.) */
+    static const char *digital_read_fns[] = {
+        "__digitalRead", "digitalRead", NULL
+    };
+    for (int i = 0; digital_read_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, digital_read_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_digital_read_high, digital_read_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* esp_restart — halt CPU instead of rebooting (which re-enters firmware
+     * with stale ccount, causing infinite restart loops) */
+    static const char *restart_fns[] = {
+        "esp_restart", "esp_restart_noos",
+        "_ZN8EspClass7restartEv",  /* ESP.restart() */
+        NULL
+    };
+    for (int i = 0; restart_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, restart_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_abort_stop, restart_fns[i]);
             hooked++;
         }
     }
