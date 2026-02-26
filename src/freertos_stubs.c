@@ -275,6 +275,12 @@ static void sched_start(freertos_stubs_t *frt) {
     frt->scheduler_started = true;
     frt->current_task = -1;
 
+    /* Reset ccount so millis()/micros() start near zero when tasks begin.
+     * Boot-time ets_delay_us() calls inflate ccount to billions, which
+     * causes firmware division-by-subtraction loops on millis() to hang. */
+    frt->cpu->ccount = 0;
+    frt->cpu->cycle_count = 0;
+
     /* All registered tasks are READY; pick the first to run */
     int next = sched_pick_next(frt);
     if (next >= 0) {
@@ -629,6 +635,15 @@ static void stub_esp_ipc_noop(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, 0);
 }
 
+/* vTaskStartScheduler — start cooperative scheduler, never returns */
+static void stub_vTaskStartScheduler(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    (void)cpu;
+    sched_start(frt);
+    /* sched_start jumps to first task via sched_restore_context,
+     * so we never return to the caller's j-self loop. */
+}
+
 /* vPortYield / vTaskSwitchContext — yield to scheduler */
 static void stub_vPortYield(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
@@ -728,6 +743,7 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "esp_ipc_call",                  stub_esp_ipc_noop },
         { "esp_ipc_call_blocking",         stub_esp_ipc_noop },
         { "vApplicationStackOverflowHook", stub_disableCoreWDT },
+        { "vTaskStartScheduler",           stub_vTaskStartScheduler },
         { "vPortYield",                    stub_vPortYield },
         { "vTaskSwitchContext",            stub_vPortYield },
         { NULL, NULL }
@@ -807,4 +823,22 @@ uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *p
 
 bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt) {
     return frt && frt->scheduler_started;
+}
+
+void freertos_stubs_start_scheduler(freertos_stubs_t *frt) {
+    if (!frt) return;
+    if (frt->task_count > 1) {
+        sched_start(frt);
+    } else if (frt->deferred_task_fn) {
+        /* Legacy single-task: jump directly to the deferred task */
+        uint32_t fn = frt->deferred_task_fn;
+        uint32_t param = frt->deferred_task_param;
+        frt->deferred_task_fn = 0;
+        ar_write(frt->cpu, 1, 0x3FFE0000u);
+        ar_write(frt->cpu, 2, param);
+        frt->cpu->pc = fn;
+        frt->cpu->ps = 0x00040020u;
+    } else {
+        frt->cpu->running = 0;
+    }
 }

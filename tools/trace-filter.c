@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <signal.h>
 
 #define MAX_CONTEXT 50
 #define MAX_SYMBOLS 16
@@ -187,6 +188,11 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Line-buffered stdout for streaming pipeline use */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    /* Clean exit when piped to head/tail */
+    signal(SIGPIPE, SIG_DFL);
+
     filter_opts_t opts = {0};
     opts.context = 0;
 

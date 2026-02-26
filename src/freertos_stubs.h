@@ -25,4 +25,7 @@ uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *p
 /* Returns true if the cooperative scheduler is running (multi-task mode) */
 bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
 
+/* Start the cooperative scheduler (called on self-loop detection) */
+void freertos_stubs_start_scheduler(freertos_stubs_t *frt);
+
 #endif /* FREERTOS_STUBS_H */

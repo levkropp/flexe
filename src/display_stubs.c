@@ -112,6 +112,21 @@ static const uint8_t font_8x16[95][16] = {
     /*126 '~' */ { 0x00,0x00,0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
 };
 
+/* ===== Sprite support ===== */
+#define MAX_SPRITES 16
+
+typedef struct {
+    uint32_t  this_ptr;    /* C++ 'this' pointer — sprite identity */
+    int16_t   w, h;
+    uint16_t *buf;         /* host-side pixel buffer (malloc'd) */
+    /* setWindow cursor state for pushColor */
+    int       win_x1, win_y1, win_x2, win_y2;
+    int       win_cx, win_cy;
+    /* text state */
+    uint16_t  textcolor, textbgcolor;
+    uint8_t   textsize;
+} sprite_t;
+
 struct display_stubs {
     xtensa_cpu_t       *cpu;
     esp32_rom_stubs_t  *rom;
@@ -124,6 +139,9 @@ struct display_stubs {
     uint16_t            textbgcolor;
     uint8_t             textsize;
     uint8_t             rotation;
+    /* Sprite table */
+    sprite_t            sprites[MAX_SPRITES];
+    int                 sprite_count;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -681,6 +699,508 @@ static void stub_tft_height(xtensa_cpu_t *cpu, void *ctx) {
     ds_return(cpu, (uint32_t)ds->height);
 }
 
+/* ===== TFT_eSprite method stubs ===== */
+
+static sprite_t *find_sprite(display_stubs_t *ds, uint32_t this_ptr) {
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (ds->sprites[i].this_ptr == this_ptr && ds->sprites[i].buf)
+            return &ds->sprites[i];
+    }
+    return NULL;
+}
+
+static sprite_t *alloc_sprite(display_stubs_t *ds, uint32_t this_ptr) {
+    /* Reuse existing slot for same this_ptr */
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (ds->sprites[i].this_ptr == this_ptr) {
+            free(ds->sprites[i].buf);
+            ds->sprites[i].buf = NULL;
+            return &ds->sprites[i];
+        }
+    }
+    /* Find empty slot */
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (!ds->sprites[i].buf && ds->sprites[i].this_ptr == 0)
+            return &ds->sprites[i];
+    }
+    /* Append */
+    if (ds->sprite_count < MAX_SPRITES)
+        return &ds->sprites[ds->sprite_count++];
+    return NULL;
+}
+
+static void free_sprite(display_stubs_t *ds, uint32_t this_ptr) {
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (ds->sprites[i].this_ptr == this_ptr) {
+            free(ds->sprites[i].buf);
+            memset(&ds->sprites[i], 0, sizeof(sprite_t));
+        }
+    }
+}
+
+/* Bresenham line drawing into a pixel buffer */
+static void sprite_draw_line(uint16_t *buf, int sw, int sh,
+                              int x0, int y0, int x1, int y1, uint16_t color) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < sw && y0 >= 0 && y0 < sh)
+            buf[y0 * sw + x0] = color;
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* TFT_eSprite::TFT_eSprite(TFT_eSPI*) — constructor, no-op */
+static void stub_sprite_ctor(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::~TFT_eSprite() — destructor */
+static void stub_sprite_dtor(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    free_sprite(ds, this_ptr);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::createSprite(short w, short h, unsigned char depth) */
+static void stub_sprite_createSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    int16_t w = (int16_t)ds_arg(cpu, 1);
+    int16_t h = (int16_t)ds_arg(cpu, 2);
+
+    sprite_t *sp = alloc_sprite(ds, this_ptr);
+    if (!sp || w <= 0 || h <= 0) {
+        ds_return(cpu, 0);
+        return;
+    }
+    sp->this_ptr = this_ptr;
+    sp->w = w;
+    sp->h = h;
+    sp->buf = calloc((size_t)w * h, sizeof(uint16_t));
+    sp->textcolor = 0xFFFF;
+    sp->textbgcolor = 0x0000;
+    sp->textsize = 1;
+    sp->win_x1 = 0; sp->win_y1 = 0;
+    sp->win_x2 = w - 1; sp->win_y2 = h - 1;
+    sp->win_cx = 0; sp->win_cy = 0;
+    ds_return(cpu, sp->buf ? 1 : 0);
+}
+
+/* TFT_eSprite::deleteSprite() */
+static void stub_sprite_deleteSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    free_sprite(ds, this_ptr);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::fillSprite(unsigned int color) */
+static void stub_sprite_fillSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        uint16_t color = (uint16_t)ds_arg(cpu, 1);
+        int n = sp->w * sp->h;
+        for (int i = 0; i < n; i++)
+            sp->buf[i] = color;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::fillRect(int x, int y, int w, int h, unsigned int color) */
+static void stub_sprite_fillRect(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > sp->w) w = sp->w - x;
+    if (y + h > sp->h) h = sp->h - y;
+    if (w <= 0 || h <= 0) { ds_return_void(cpu); return; }
+
+    for (int row = y; row < y + h; row++) {
+        uint16_t *dst = &sp->buf[row * sp->w + x];
+        for (int i = 0; i < w; i++)
+            dst[i] = color;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawPixel(int x, int y, unsigned int color) */
+static void stub_sprite_drawPixel(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        int x = (int32_t)ds_arg(cpu, 1);
+        int y = (int32_t)ds_arg(cpu, 2);
+        uint16_t color = (uint16_t)ds_arg(cpu, 3);
+        if (x >= 0 && x < sp->w && y >= 0 && y < sp->h)
+            sp->buf[y * sp->w + x] = color;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawFastHLine(int x, int y, int w, unsigned int color) */
+static void stub_sprite_drawFastHLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (y < 0 || y >= sp->h || w <= 0) { ds_return_void(cpu); return; }
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > sp->w) w = sp->w - x;
+    if (w <= 0) { ds_return_void(cpu); return; }
+
+    uint16_t *dst = &sp->buf[y * sp->w + x];
+    for (int i = 0; i < w; i++)
+        dst[i] = color;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawFastVLine(int x, int y, int h, unsigned int color) */
+static void stub_sprite_drawFastVLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int h = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (x < 0 || x >= sp->w || h <= 0) { ds_return_void(cpu); return; }
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > sp->h) h = sp->h - y;
+    if (h <= 0) { ds_return_void(cpu); return; }
+
+    for (int row = y; row < y + h; row++)
+        sp->buf[row * sp->w + x] = color;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawLine(int x0, int y0, int x1, int y1, unsigned int color) */
+static void stub_sprite_drawLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        int x0 = (int32_t)ds_arg(cpu, 1);
+        int y0 = (int32_t)ds_arg(cpu, 2);
+        int x1 = (int32_t)ds_arg(cpu, 3);
+        int y1 = (int32_t)ds_arg(cpu, 4);
+        uint16_t color = (uint16_t)ds_arg(cpu, 5);
+        sprite_draw_line(sp->buf, sp->w, sp->h, x0, y0, x1, y1, color);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::pushImage(int x, int y, int w, int h, const uint16_t *data) */
+static void stub_sprite_pushImage(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint32_t data_addr = ds_arg(cpu, 5);
+
+    if (w <= 0 || h <= 0) { ds_return_void(cpu); return; }
+
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= sp->h) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= sp->w) continue;
+            uint32_t src = data_addr + (uint32_t)((row * w + col) * 2);
+            uint8_t lo = mem_read8(cpu->mem, src);
+            uint8_t hi = mem_read8(cpu->mem, src + 1);
+            sp->buf[dy * sp->w + dx] = (uint16_t)((hi << 8) | lo);
+        }
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::pushSprite(int x, int y) — blit sprite to display framebuffer */
+static void stub_sprite_pushSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp || !ds->framebuf || !ds->framebuf_mtx) {
+        ds_return_void(cpu);
+        return;
+    }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    for (int row = 0; row < sp->h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= ds->height) continue;
+        for (int col = 0; col < sp->w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= ds->width) continue;
+            ds->framebuf[dy * ds->width + dx] = sp->buf[row * sp->w + col];
+        }
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::setWindow(int x1, int y1, int x2, int y2) */
+static void stub_sprite_setWindow(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        sp->win_x1 = (int32_t)ds_arg(cpu, 1);
+        sp->win_y1 = (int32_t)ds_arg(cpu, 2);
+        sp->win_x2 = (int32_t)ds_arg(cpu, 3);
+        sp->win_y2 = (int32_t)ds_arg(cpu, 4);
+        sp->win_cx = sp->win_x1;
+        sp->win_cy = sp->win_y1;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::pushColor(unsigned short color) */
+static void stub_sprite_pushColor(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        uint16_t color = (uint16_t)ds_arg(cpu, 1);
+        int x = sp->win_cx, y = sp->win_cy;
+        if (x >= 0 && x < sp->w && y >= 0 && y < sp->h)
+            sp->buf[y * sp->w + x] = color;
+        /* Advance cursor within window */
+        sp->win_cx++;
+        if (sp->win_cx > sp->win_x2) {
+            sp->win_cx = sp->win_x1;
+            sp->win_cy++;
+            if (sp->win_cy > sp->win_y2)
+                sp->win_cy = sp->win_y1;
+        }
+    }
+    ds_return_void(cpu);
+}
+
+/* Render one glyph into a sprite buffer, returns glyph pixel width */
+static int sprite_render_glyph(sprite_t *sp, int cx, int cy,
+                                char c, uint16_t fg, uint16_t bg, int scale) {
+    if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
+    const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+    int gw = FONT_W * scale;
+
+    for (int row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < FONT_W; col++) {
+            uint16_t pix = (bits & (0x80 >> col)) ? fg : bg;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= sp->h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= sp->w) continue;
+                    sp->buf[dy * sp->w + dx] = pix;
+                }
+            }
+        }
+    }
+    return gw;
+}
+
+/* TFT_eSprite::drawChar(unsigned short c, int x, int y) — 3-param */
+static void stub_sprite_drawChar_3(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        char c = (char)(ds_arg(cpu, 1) & 0xFF);
+        int x = (int32_t)ds_arg(cpu, 2);
+        int y = (int32_t)ds_arg(cpu, 3);
+        int scale = sp->textsize > 0 ? sp->textsize : 1;
+        sprite_render_glyph(sp, x, y, c, sp->textcolor, sp->textbgcolor, scale);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawChar(unsigned short c, int x, int y, unsigned char font) — 4-param */
+static void stub_sprite_drawChar_4(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        char c = (char)(ds_arg(cpu, 1) & 0xFF);
+        int x = (int32_t)ds_arg(cpu, 2);
+        int y = (int32_t)ds_arg(cpu, 3);
+        int scale = sp->textsize > 0 ? sp->textsize : 1;
+        sprite_render_glyph(sp, x, y, c, sp->textcolor, sp->textbgcolor, scale);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawChar(int x, int y, unsigned short c, unsigned int fg,
+ *                        unsigned int bg, unsigned char size) — 6-param */
+static void stub_sprite_drawChar_6(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    char c = (char)(ds_arg(cpu, 3) & 0xFF);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 4);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 5);
+    /* arg6 = size, may be on stack */
+    int ci = XT_PS_CALLINC(cpu->ps);
+    int first_arg = ci * 4 + 2;
+    int max_reg = 16 - first_arg;
+    if (max_reg > 6) max_reg = 6;
+    uint32_t size_val;
+    if (6 < max_reg)
+        size_val = ar_read(cpu, first_arg + 6);
+    else {
+        uint32_t sp_reg = ar_read(cpu, 1);
+        size_val = mem_read32(cpu->mem, sp_reg + (uint32_t)((6 - max_reg) * 4));
+    }
+    int scale = size_val > 0 ? (int)size_val : 1;
+    sprite_render_glyph(sp, x, y, c, fg, bg, scale);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawGlyph(unsigned short) — no-op (FreeFont not supported) */
+static void stub_sprite_drawGlyph(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::width() */
+static void stub_sprite_width(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    ds_return(cpu, sp ? (uint32_t)sp->w : 0);
+}
+
+/* TFT_eSprite::height() */
+static void stub_sprite_height(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    ds_return(cpu, sp ? (uint32_t)sp->h : 0);
+}
+
+/* TFT_eSprite::created() */
+static void stub_sprite_created(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    ds_return(cpu, sp ? 1 : 0);
+}
+
+/* TFT_eSprite::readPixel(int x, int y) */
+static void stub_sprite_readPixel(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        int x = (int32_t)ds_arg(cpu, 1);
+        int y = (int32_t)ds_arg(cpu, 2);
+        if (x >= 0 && x < sp->w && y >= 0 && y < sp->h) {
+            ds_return(cpu, sp->buf[y * sp->w + x]);
+            return;
+        }
+    }
+    ds_return(cpu, 0);
+}
+
+/* TFT_eSprite::setColorDepth(signed char) — no-op, only 16-bit supported */
+static void stub_sprite_setColorDepth(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return(cpu, 16);
+}
+
+/* TFT_eSprite::createPalette / callocSprite / begin_nin_write / end_nin_write — no-ops */
+static void stub_sprite_noop(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+static void stub_sprite_noop_ret0(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return(cpu, 0);
+}
+
+/* ===== TFT_eSPI additional stubs ===== */
+
+/* TFT_eSPI::drawLine(int x0, int y0, int x1, int y1, unsigned int color) */
+static void stub_tft_drawLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x0 = (int32_t)ds_arg(cpu, 1);
+    int y0 = (int32_t)ds_arg(cpu, 2);
+    int x1 = (int32_t)ds_arg(cpu, 3);
+    int y1 = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        sprite_draw_line(ds->framebuf, ds->width, ds->height,
+                          x0, y0, x1, y1, color);
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::textWidth(const char *str, unsigned char font) */
+static void stub_tft_textWidth(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t str_addr = ds_arg(cpu, 1);
+    int scale = ds->textsize > 0 ? ds->textsize : 1;
+    int len = 0;
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, str_addr++);
+        if (ch == 0) break;
+        len++;
+    }
+    ds_return(cpu, (uint32_t)(len * FONT_W * scale));
+}
+
+/* TFT_eSPI::fontHeight(short font) / fontHeight() */
+static void stub_tft_fontHeight(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int scale = ds->textsize > 0 ? ds->textsize : 1;
+    ds_return(cpu, (uint32_t)(FONT_H * scale));
+}
+
+/* TFT_eSPI::color565(unsigned char r, unsigned char g, unsigned char b) */
+static void stub_tft_color565(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint8_t r = (uint8_t)ds_arg(cpu, 1);
+    uint8_t g = (uint8_t)ds_arg(cpu, 2);
+    uint8_t b = (uint8_t)ds_arg(cpu, 3);
+    uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    ds_return(cpu, c);
+}
+
+/* TFT_eSPI::getRotation() */
+static void stub_tft_getRotation(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds_return(cpu, ds->rotation);
+}
+
 /* ===== Public API ===== */
 
 display_stubs_t *display_stubs_create(xtensa_cpu_t *cpu) {
@@ -696,6 +1216,9 @@ display_stubs_t *display_stubs_create(xtensa_cpu_t *cpu) {
 }
 
 void display_stubs_destroy(display_stubs_t *ds) {
+    if (!ds) return;
+    for (int i = 0; i < ds->sprite_count; i++)
+        free(ds->sprites[i].buf);
     free(ds);
 }
 
@@ -791,6 +1314,83 @@ int display_stubs_hook_tft_espi(display_stubs_t *ds, const elf_symbols_t *syms) 
         { "_ZN8TFT_eSPI13invertDisplayEb",  stub_tft_void },
         { "_ZN8TFT_eSPI10unloadFontEv",     stub_tft_void },
         { "_ZN8TFT_eSPI7dmaWaitEv",         stub_tft_void },
+        /* Line drawing */
+        { "_ZN8TFT_eSPI8drawLineEiiiij",    stub_tft_drawLine },
+        /* Text metrics */
+        { "_ZN8TFT_eSPI9textWidthEPKch",    stub_tft_textWidth },
+        { "_ZN8TFT_eSPI10fontHeightEs",     stub_tft_fontHeight },
+        { "_ZN8TFT_eSPI10fontHeightEv",     stub_tft_fontHeight },
+        /* Color conversion */
+        { "_ZN8TFT_eSPI8color565Ehhh",      stub_tft_color565 },
+        /* Rotation query */
+        { "_ZN8TFT_eSPI11getRotationEv",    stub_tft_getRotation },
+        /* Additional drawChar overloads */
+        { "_ZN8TFT_eSPI8drawCharEtiih",     stub_tft_drawChar_3 },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ds);
+            hooked++;
+        }
+    }
+
+    return hooked;
+}
+
+int display_stubs_hook_tft_esprite(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        /* Constructor / destructor */
+        { "_ZN11TFT_eSpriteC1EP8TFT_eSPI",   stub_sprite_ctor },
+        { "_ZN11TFT_eSpriteC2EP8TFT_eSPI",   stub_sprite_ctor },
+        { "_ZN11TFT_eSpriteD0Ev",             stub_sprite_dtor },
+        { "_ZN11TFT_eSpriteD1Ev",             stub_sprite_dtor },
+        { "_ZN11TFT_eSpriteD2Ev",             stub_sprite_dtor },
+        /* Sprite lifecycle */
+        { "_ZN11TFT_eSprite12createSpriteEssh", stub_sprite_createSprite },
+        { "_ZN11TFT_eSprite12deleteSpriteEv",   stub_sprite_deleteSprite },
+        { "_ZN11TFT_eSprite13setColorDepthEa",  stub_sprite_setColorDepth },
+        { "_ZN11TFT_eSprite13createPaletteEPKth", stub_sprite_noop_ret0 },
+        { "_ZN11TFT_eSprite12callocSpriteEssh",   stub_sprite_createSprite },
+        /* Drawing */
+        { "_ZN11TFT_eSprite10fillSpriteEj",      stub_sprite_fillSprite },
+        { "_ZN11TFT_eSprite8fillRectEiiiij",     stub_sprite_fillRect },
+        { "_ZN11TFT_eSprite9drawPixelEiij",      stub_sprite_drawPixel },
+        { "_ZN11TFT_eSprite13drawFastHLineEiiij", stub_sprite_drawFastHLine },
+        { "_ZN11TFT_eSprite13drawFastVLineEiiij", stub_sprite_drawFastVLine },
+        { "_ZN11TFT_eSprite8drawLineEiiiij",     stub_sprite_drawLine },
+        /* Image / blit */
+        { "_ZN11TFT_eSprite9pushImageEiiiiPKt",  stub_sprite_pushImage },
+        { "_ZN11TFT_eSprite9pushImageEiiiiPth",  stub_sprite_pushImage },
+        { "_ZN11TFT_eSprite10pushSpriteEii",     stub_sprite_pushSprite },
+        /* Window / cursor */
+        { "_ZN11TFT_eSprite9setWindowEiiii",     stub_sprite_setWindow },
+        { "_ZN11TFT_eSprite9pushColorEt",        stub_sprite_pushColor },
+        /* Text */
+        { "_ZN11TFT_eSprite8drawCharEtii",       stub_sprite_drawChar_3 },
+        { "_ZN11TFT_eSprite8drawCharEtiih",      stub_sprite_drawChar_4 },
+        { "_ZN11TFT_eSprite8drawCharEiitjjh",   stub_sprite_drawChar_6 },
+        { "_ZN11TFT_eSprite9drawGlyphEt",        stub_sprite_drawGlyph },
+        /* Queries */
+        { "_ZN11TFT_eSprite5widthEv",            stub_sprite_width },
+        { "_ZN11TFT_eSprite6heightEv",           stub_sprite_height },
+        { "_ZN11TFT_eSprite7createdEv",          stub_sprite_created },
+        { "_ZN11TFT_eSprite9readPixelEii",       stub_sprite_readPixel },
+        /* No-ops */
+        { "_ZN11TFT_eSprite15begin_nin_writeEv", stub_sprite_noop },
+        { "_ZN11TFT_eSprite13end_nin_writeEv",   stub_sprite_noop },
         { NULL, NULL }
     };
 
