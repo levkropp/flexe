@@ -731,22 +731,121 @@ static void stub_fflush_r(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
-/*
- * __nedf2: double not-equal comparison.
- * Returns 0 if a==b, nonzero otherwise. Arguments in a2:a3 and a4:a5.
- */
-static void stub_nedf2(xtensa_cpu_t *cpu, void *ctx) {
+/* Helper: read double from arg pair (a2:a3 or a4:a5) */
+static double rom_read_double(xtensa_cpu_t *cpu, int arg_pair) {
+    uint32_t lo = rom_arg(cpu, arg_pair * 2);
+    uint32_t hi = rom_arg(cpu, arg_pair * 2 + 1);
+    uint64_t bits = ((uint64_t)hi << 32) | lo;
+    double d;
+    memcpy(&d, &bits, 8);
+    return d;
+}
+
+/* Helper: return double via rom_return64 */
+static void rom_return_double(xtensa_cpu_t *cpu, double d) {
+    uint64_t bits;
+    memcpy(&bits, &d, 8);
+    rom_return64(cpu, bits);
+}
+
+/* __adddf3: double + double */
+static void stub_adddf3(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    uint32_t a_lo = rom_arg(cpu, 0);  /* a2 */
-    uint32_t a_hi = rom_arg(cpu, 1);  /* a3 */
-    uint32_t b_lo = rom_arg(cpu, 2);  /* a4 */
-    uint32_t b_hi = rom_arg(cpu, 3);  /* a5 */
-    uint64_t a = ((uint64_t)a_hi << 32) | a_lo;
-    uint64_t b = ((uint64_t)b_hi << 32) | b_lo;
-    double da, db;
-    memcpy(&da, &a, 8);
-    memcpy(&db, &b, 8);
-    rom_return(cpu, (da != db) ? 1 : 0);
+    rom_return_double(cpu, rom_read_double(cpu, 0) + rom_read_double(cpu, 1));
+}
+
+/* __subdf3: double - double */
+static void stub_subdf3(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return_double(cpu, rom_read_double(cpu, 0) - rom_read_double(cpu, 1));
+}
+
+/* __muldf3: double * double */
+static void stub_muldf3(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return_double(cpu, rom_read_double(cpu, 0) * rom_read_double(cpu, 1));
+}
+
+/* __divdf3: double / double */
+static void stub_divdf3(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return_double(cpu, rom_read_double(cpu, 0) / rom_read_double(cpu, 1));
+}
+
+/* __floatunsidf: unsigned int → double */
+static void stub_floatunsidf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return_double(cpu, (double)rom_arg(cpu, 0));
+}
+
+/* __floatsidf: signed int → double */
+static void stub_floatsidf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return_double(cpu, (double)(int32_t)rom_arg(cpu, 0));
+}
+
+/* __fixdfsi: double → signed int (truncate toward zero) */
+static void stub_fixdfsi(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, (uint32_t)(int32_t)rom_read_double(cpu, 0));
+}
+
+/* __fixunsdfsi: double → unsigned int */
+static void stub_fixunsdfsi(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, (uint32_t)rom_read_double(cpu, 0));
+}
+
+/*
+ * GCC soft-float comparison convention:
+ * __ledf2: returns <= 0 if a <= b, > 0 otherwise (for LE test)
+ * __ltdf2: returns < 0 if a < b, >= 0 otherwise (for LT test)
+ * __gedf2: returns >= 0 if a >= b, < 0 otherwise (for GE test)
+ * __gtdf2: returns > 0 if a > b, <= 0 otherwise (for GT test)
+ * __eqdf2: returns 0 if a == b
+ * All return -1/0/1 like strcmp: a<b → -1, a==b → 0, a>b → 1
+ * __unorddf2: returns nonzero if either is NaN
+ */
+static void stub_cmpdf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    double a = rom_read_double(cpu, 0);
+    double b = rom_read_double(cpu, 1);
+    int result;
+    if (__builtin_isnan(a) || __builtin_isnan(b))
+        result = 1;  /* unordered → positive (like a > b for le/lt) */
+    else if (a < b)
+        result = -1;
+    else if (a > b)
+        result = 1;
+    else
+        result = 0;
+    rom_return(cpu, (uint32_t)(int32_t)result);
+}
+
+/* __unorddf2: returns nonzero if either arg is NaN */
+static void stub_unorddf2(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    double a = rom_read_double(cpu, 0);
+    double b = rom_read_double(cpu, 1);
+    rom_return(cpu, (__builtin_isnan(a) || __builtin_isnan(b)) ? 1 : 0);
+}
+
+/* __truncdfsf2: double → float */
+static void stub_truncdfsf2(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    float f = (float)rom_read_double(cpu, 0);
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    rom_return(cpu, bits);
+}
+
+/* __extendsfdf2: float → double */
+static void stub_extendsfdf2(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t fbits = rom_arg(cpu, 0);
+    float f;
+    memcpy(&f, &fbits, 4);
+    rom_return_double(cpu, (double)f);
 }
 
 /* __bswapsi2: byte-swap a 32-bit word */
@@ -1574,8 +1673,27 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* Newlib stdio flush */
     rom_stubs_register(s, 0x40059320, stub_fflush_r,             "_fflush_r");
 
-    /* Soft-float double comparison */
-    rom_stubs_register(s, 0x400636A8, stub_nedf2,               "__nedf2");
+    /* Soft-float double arithmetic */
+    rom_stubs_register(s, 0x40002590, stub_adddf3,              "__adddf3");
+    rom_stubs_register(s, 0x400026E4, stub_subdf3,              "__subdf3");
+    rom_stubs_register(s, 0x4006358C, stub_muldf3,              "__muldf3");
+    rom_stubs_register(s, 0x40002954, stub_divdf3,              "__divdf3");
+
+    /* Soft-float double conversions */
+    rom_stubs_register(s, 0x4000C938, stub_floatunsidf,         "__floatunsidf");
+    rom_stubs_register(s, 0x4000C944, stub_floatsidf,           "__floatsidf");
+    rom_stubs_register(s, 0x40002A78, stub_fixdfsi,             "__fixdfsi");
+    rom_stubs_register(s, 0x40002B30, stub_fixunsdfsi,          "__fixunsdfsi");
+    rom_stubs_register(s, 0x40002B90, stub_truncdfsf2,          "__truncdfsf2");
+    rom_stubs_register(s, 0x40002C34, stub_extendsfdf2,         "__extendsfdf2");
+
+    /* Soft-float double comparisons (all use same -1/0/1 logic except unord) */
+    rom_stubs_register(s, 0x400636A8, stub_cmpdf,               "__nedf2");
+    rom_stubs_register(s, 0x400636DC, stub_cmpdf,               "__gtdf2");
+    rom_stubs_register(s, 0x40063704, stub_cmpdf,               "__ledf2");
+    rom_stubs_register(s, 0x40063768, stub_cmpdf,               "__gedf2");
+    rom_stubs_register(s, 0x40063790, stub_cmpdf,               "__ltdf2");
+    rom_stubs_register(s, 0x400637F4, stub_unorddf2,            "__unorddf2");
 
     /* Byte-swap and 64-bit shift */
     rom_stubs_register(s, 0x40064AE0, stub_bswapsi2,            "__bswapsi2");

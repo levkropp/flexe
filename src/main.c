@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <ctype.h>
 #include <getopt.h>
 
@@ -24,11 +25,328 @@ volatile int emu_app_running = 1;
 #define MAX_BP_ARGS     16
 #define MAX_MEM_DUMPS   8
 #define EXC_LOOP_THRESH 3
+#define MAX_COND_FUNCS  8
+#define MAX_COND_RANGES 8
+#define MAX_ASSERTIONS  16
 
 typedef struct {
     uint32_t addr;
     uint32_t len;
 } mem_dump_t;
+
+/* Forward declarations */
+static void format_addr(const elf_symbols_t *syms, uint32_t addr, char *buf, int bufsize);
+
+/* ===== Ring-buffer trace (Feature 4) ===== */
+
+typedef struct {
+    char **lines;
+    int capacity;
+    int head;
+    int count;
+    uint64_t total;
+} ring_buf_t;
+
+static ring_buf_t *ring_create(int capacity) {
+    ring_buf_t *rb = calloc(1, sizeof(ring_buf_t));
+    if (!rb) return NULL;
+    rb->lines = calloc((size_t)capacity, sizeof(char *));
+    if (!rb->lines) { free(rb); return NULL; }
+    for (int i = 0; i < capacity; i++) {
+        rb->lines[i] = malloc(512);
+        if (!rb->lines[i]) {
+            for (int j = 0; j < i; j++) free(rb->lines[j]);
+            free(rb->lines); free(rb); return NULL;
+        }
+        rb->lines[i][0] = '\0';
+    }
+    rb->capacity = capacity;
+    return rb;
+}
+
+static void ring_push(ring_buf_t *rb, const char *line) {
+    int idx = (rb->head + rb->count) % rb->capacity;
+    if (rb->count == rb->capacity) {
+        idx = rb->head;
+        rb->head = (rb->head + 1) % rb->capacity;
+    } else {
+        rb->count++;
+    }
+    strncpy(rb->lines[idx], line, 511);
+    rb->lines[idx][511] = '\0';
+    rb->total++;
+}
+
+static void ring_flush(ring_buf_t *rb) {
+    if (rb->total > (uint64_t)rb->count)
+        fprintf(stderr, "\n--- Ring buffer: last %d of %llu trace lines ---\n",
+                rb->count, (unsigned long long)rb->total);
+    else
+        fprintf(stderr, "\n--- Ring buffer: %d trace lines ---\n", rb->count);
+    for (int i = 0; i < rb->count; i++) {
+        int idx = (rb->head + i) % rb->capacity;
+        fputs(rb->lines[idx], stderr);
+    }
+}
+
+static void ring_destroy(ring_buf_t *rb) {
+    if (!rb) return;
+    for (int i = 0; i < rb->capacity; i++) free(rb->lines[i]);
+    free(rb->lines);
+    free(rb);
+}
+
+/* Global ring buffer pointer (NULL = direct output) */
+static ring_buf_t *g_ring = NULL;
+
+static void trace_emit(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (g_ring)
+        ring_push(g_ring, buf);
+    else
+        fputs(buf, stderr);
+}
+
+/* ===== Conditional trace (Feature 2) ===== */
+
+typedef struct {
+    struct { char name[128]; uint32_t addr, end; int resolved; } funcs[MAX_COND_FUNCS];
+    int func_count;
+    uint64_t after_cycle;
+    struct { uint32_t lo, hi; } ranges[MAX_COND_RANGES];
+    int range_count;
+    char until_name[128];
+    uint32_t until_addr;
+    int until_resolved;
+    int until_triggered;
+    int active;
+} cond_trace_t;
+
+static void cond_trace_resolve(cond_trace_t *ct, const elf_symbols_t *syms) {
+    if (!syms) return;
+    for (int i = 0; i < ct->func_count; i++) {
+        if (ct->funcs[i].resolved) continue;
+        uint32_t addr;
+        if (elf_symbols_find(syms, ct->funcs[i].name, &addr) == 0) {
+            elf_sym_info_t info;
+            ct->funcs[i].addr = addr;
+            if (elf_symbols_lookup(syms, addr, &info) && info.size > 0)
+                ct->funcs[i].end = addr + info.size;
+            else
+                ct->funcs[i].end = addr + 0x10000; /* fallback: 64K */
+            ct->funcs[i].resolved = 1;
+            fprintf(stderr, "Conditional trace: func '%s' resolved to 0x%08X-0x%08X\n",
+                    ct->funcs[i].name, ct->funcs[i].addr, ct->funcs[i].end);
+        } else {
+            fprintf(stderr, "Warning: cannot resolve conditional trace func '%s'\n",
+                    ct->funcs[i].name);
+        }
+    }
+    if (ct->until_name[0] && !ct->until_resolved) {
+        if (elf_symbols_find(syms, ct->until_name, &ct->until_addr) == 0) {
+            ct->until_resolved = 1;
+            fprintf(stderr, "Conditional trace: until '%s' resolved to 0x%08X\n",
+                    ct->until_name, ct->until_addr);
+        } else {
+            fprintf(stderr, "Warning: cannot resolve 'until:%s'\n", ct->until_name);
+        }
+    }
+}
+
+static int cond_trace_active(const cond_trace_t *ct, uint32_t pc, uint64_t cycle) {
+    if (ct->until_triggered) return 0;
+    if (ct->after_cycle > 0 && cycle < ct->after_cycle) return 0;
+    if (ct->func_count > 0) {
+        int in_func = 0;
+        for (int i = 0; i < ct->func_count; i++) {
+            if (ct->funcs[i].resolved && pc >= ct->funcs[i].addr && pc < ct->funcs[i].end) {
+                in_func = 1;
+                break;
+            }
+        }
+        if (!in_func) return 0;
+    }
+    if (ct->range_count > 0) {
+        int in_range = 0;
+        for (int i = 0; i < ct->range_count; i++) {
+            if (pc >= ct->ranges[i].lo && pc <= ct->ranges[i].hi) {
+                in_range = 1;
+                break;
+            }
+        }
+        if (!in_range) return 0;
+    }
+    return 1;
+}
+
+static void cond_trace_check_until(cond_trace_t *ct, uint32_t pc) {
+    if (ct->until_resolved && !ct->until_triggered && pc == ct->until_addr) {
+        ct->until_triggered = 1;
+        trace_emit("     [COND] until:%s triggered, tracing stopped\n", ct->until_name);
+    }
+}
+
+static int parse_cond(cond_trace_t *ct, const char *arg) {
+    if (strncmp(arg, "func:", 5) == 0) {
+        if (ct->func_count >= MAX_COND_FUNCS) return -1;
+        strncpy(ct->funcs[ct->func_count].name, arg + 5, 127);
+        ct->funcs[ct->func_count].name[127] = '\0';
+        ct->func_count++;
+    } else if (strncmp(arg, "after:", 6) == 0) {
+        ct->after_cycle = strtoull(arg + 6, NULL, 0);
+    } else if (strncmp(arg, "range:", 6) == 0) {
+        if (ct->range_count >= MAX_COND_RANGES) return -1;
+        char *dash = strchr(arg + 6, '-');
+        if (!dash) return -1;
+        ct->ranges[ct->range_count].lo = (uint32_t)strtoul(arg + 6, NULL, 16);
+        ct->ranges[ct->range_count].hi = (uint32_t)strtoul(dash + 1, NULL, 16);
+        ct->range_count++;
+    } else if (strncmp(arg, "until:", 6) == 0) {
+        strncpy(ct->until_name, arg + 6, 127);
+        ct->until_name[127] = '\0';
+    } else {
+        return -1;
+    }
+    ct->active = 1;
+    return 0;
+}
+
+/* ===== Function-call trace (Feature 3) ===== */
+
+typedef enum {
+    INSN_OTHER = 0,
+    INSN_CALL,
+    INSN_CALLX,
+    INSN_ENTRY,
+    INSN_RET,
+    INSN_RETW,
+} insn_type_t;
+
+static insn_type_t classify_insn(const xtensa_cpu_t *cpu) {
+    uint32_t insn;
+    int len = xtensa_fetch(cpu, cpu->pc, &insn);
+    if (len <= 0) return INSN_OTHER;
+
+    if (len == 2) {
+        /* Narrow instructions: RET.N (op0=13, r=15, t=0), RETW.N (op0=13, r=15, t=1) */
+        uint8_t op0 = insn & 0xF;
+        uint8_t r = (insn >> 12) & 0xF;
+        uint8_t t = (insn >> 4) & 0xF;
+        if (op0 == 0xD && r == 0xF) {
+            if (t == 0) return INSN_RET;
+            if (t == 1) return INSN_RETW;
+        }
+        return INSN_OTHER;
+    }
+
+    /* 3-byte instructions */
+    uint8_t op0 = insn & 0xF;
+
+    /* CALL4/8/12: op0=5 */
+    if (op0 == 5) return INSN_CALL;
+
+    /* CALLX4/8/12, RET, RETW, ENTRY all have op0=0 */
+    if (op0 == 0) {
+        uint8_t op1 = (insn >> 16) & 0xF;
+        uint8_t op2 = (insn >> 20) & 0xF;
+        uint8_t r = (insn >> 12) & 0xF;
+        uint8_t m = (insn >> 6) & 0x3;
+        uint8_t n = (insn >> 4) & 0x3;
+
+        /* CALLX: op0=0, op1=0, op2=0, r!=0, m=3 */
+        if (op1 == 0 && op2 == 0 && m == 3 && r != 0) return INSN_CALLX;
+
+        /* RET: op0=0, op1=0, op2=0, r=0, m=2, n=0 */
+        if (op1 == 0 && op2 == 0 && r == 0 && m == 2 && n == 0) return INSN_RET;
+
+        /* RETW: op0=0, op1=0, op2=0, r=0, m=2, n=1 */
+        if (op1 == 0 && op2 == 0 && r == 0 && m == 2 && n == 1) return INSN_RETW;
+
+        /* ENTRY: op0=6 in the n field... actually ENTRY is op0=6, let me fix */
+    }
+
+    /* ENTRY: op0=6, subop n=3, m=0 — wait, ENTRY encoding: op0=0b0110 = 6 */
+    if (op0 == 6) return INSN_ENTRY;
+
+    return INSN_OTHER;
+}
+
+/* ===== Trace assertions (Feature 5) ===== */
+
+typedef enum {
+    ASSERT_REG_EQ,
+    ASSERT_PC_EQ,
+    ASSERT_MEM_EQ,
+} assert_type_t;
+
+typedef struct {
+    assert_type_t type;
+    int reg_idx;        /* 0-15 for a0-a15 */
+    uint32_t addr;      /* for PC or MEM assertions */
+    uint32_t value;
+    char desc[64];
+} trace_assert_t;
+
+static int parse_assert(trace_assert_t *ta, const char *arg) {
+    /* pc=0xADDR */
+    if (strncmp(arg, "pc=", 3) == 0) {
+        ta->type = ASSERT_PC_EQ;
+        ta->value = (uint32_t)strtoul(arg + 3, NULL, 16);
+        snprintf(ta->desc, sizeof(ta->desc), "pc==0x%08X", ta->value);
+        return 0;
+    }
+    /* mem:ADDR=VAL */
+    if (strncmp(arg, "mem:", 4) == 0) {
+        ta->type = ASSERT_MEM_EQ;
+        char *eq = strchr(arg + 4, '=');
+        if (!eq) return -1;
+        ta->addr = (uint32_t)strtoul(arg + 4, NULL, 16);
+        ta->value = (uint32_t)strtoul(eq + 1, NULL, 16);
+        snprintf(ta->desc, sizeof(ta->desc), "mem:0x%08X==0x%X", ta->addr, ta->value);
+        return 0;
+    }
+    /* aNN=VAL */
+    if (arg[0] == 'a' && isdigit((unsigned char)arg[1])) {
+        char *eq = strchr(arg, '=');
+        if (!eq) return -1;
+        ta->type = ASSERT_REG_EQ;
+        ta->reg_idx = atoi(arg + 1);
+        if (ta->reg_idx < 0 || ta->reg_idx > 15) return -1;
+        ta->value = (uint32_t)strtoul(eq + 1, NULL, 0);
+        snprintf(ta->desc, sizeof(ta->desc), "a%d==0x%X", ta->reg_idx, ta->value);
+        return 0;
+    }
+    return -1;
+}
+
+static void check_assertions(const trace_assert_t *asserts, int count,
+                              const xtensa_cpu_t *cpu, const elf_symbols_t *syms,
+                              uint64_t cycle, xtensa_mem_t *mem) {
+    for (int i = 0; i < count; i++) {
+        int triggered = 0;
+        switch (asserts[i].type) {
+        case ASSERT_REG_EQ:
+            triggered = (ar_read(cpu, asserts[i].reg_idx) == asserts[i].value);
+            break;
+        case ASSERT_PC_EQ:
+            triggered = (cpu->pc == asserts[i].value);
+            break;
+        case ASSERT_MEM_EQ:
+            triggered = (mem_read32(mem, asserts[i].addr) == asserts[i].value);
+            break;
+        }
+        if (triggered) {
+            char sym_buf[128];
+            format_addr(syms, cpu->pc, sym_buf, sizeof(sym_buf));
+            fprintf(stderr, "[ASSERT] cycle=%llu pc=%s: %s\n",
+                    (unsigned long long)cycle, sym_buf, asserts[i].desc);
+        }
+    }
+}
 
 /* ===== UART stdout callback ===== */
 
@@ -84,7 +402,19 @@ static void format_addr(const elf_symbols_t *syms, uint32_t addr, char *buf, int
 static void rom_log_cb(void *ctx, uint32_t addr, const char *name,
                         const xtensa_cpu_t *cpu) {
     (void)ctx; (void)addr; (void)cpu;
-    fprintf(stderr, "     [ROM] %s @ 0x%08X\n", name, addr);
+    trace_emit("     [ROM] %s @ 0x%08X\n", name, addr);
+}
+
+/* ===== ROM stub log callback for call trace ===== */
+
+static const elf_symbols_t *g_call_syms = NULL;
+static int g_call_depth = 0;
+
+static void rom_log_call_cb(void *ctx, uint32_t addr, const char *name,
+                             const xtensa_cpu_t *cpu) {
+    (void)ctx; (void)addr; (void)cpu;
+    int indent = g_call_depth < 128 ? g_call_depth : 128;
+    fprintf(stderr, "%*s-> [ROM] %s (0x%08X)\n", indent * 2, "", name, addr);
 }
 
 /* ===== Hex dump ===== */
@@ -126,6 +456,17 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -W              Window trace (spill/fill/ENTRY/RETW events)\n");
     fprintf(stderr, "  -S <file.img>   SD card backing image file\n");
     fprintf(stderr, "  -Z <bytes>      SD card size (default: auto from file, or 4GB)\n");
+    fprintf(stderr, "  -C <cond>       Conditional trace (repeatable, implies -T):\n");
+    fprintf(stderr, "                    func:NAME  — only trace inside function\n");
+    fprintf(stderr, "                    after:N    — start tracing after cycle N\n");
+    fprintf(stderr, "                    range:A-B  — only trace when PC in hex range\n");
+    fprintf(stderr, "                    until:NAME — trace until function entered\n");
+    fprintf(stderr, "  -F              Function-call trace (CALL/RET tree)\n");
+    fprintf(stderr, "  -B <N>          Ring-buffer trace: keep last N lines, dump on exit\n");
+    fprintf(stderr, "  -A <cond>       Trace assertion (repeatable):\n");
+    fprintf(stderr, "                    a6=0       — log when register equals value\n");
+    fprintf(stderr, "                    pc=0xADDR  — log when PC hits address\n");
+    fprintf(stderr, "                    mem:ADDR=V — log when memory equals value\n");
 }
 
 /* ===== Parse -m argument ===== */
@@ -175,6 +516,8 @@ int main(int argc, char *argv[]) {
     int window_trace = 0;
     int verbose = 0;
     int quiet_unhandled = 0;
+    int call_trace = 0;
+    int ring_size = 0;
     uint32_t entry_override = 0;
     int has_entry_override = 0;
     const char *elf_path = NULL;
@@ -184,9 +527,12 @@ int main(int argc, char *argv[]) {
     int bp_count = 0;
     mem_dump_t mem_dumps[MAX_MEM_DUMPS];
     int dump_count = 0;
+    cond_trace_t cond = {0};
+    trace_assert_t asserts[MAX_ASSERTIONS];
+    int assert_count = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:tTWvqe:s:b:m:S:Z:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:tTWvqe:s:b:m:S:Z:C:FB:A:")) != -1) {
         switch (opt) {
         case 'c': max_cycles = atoi(optarg); break;
         case 't': trace = 1; break;
@@ -207,6 +553,34 @@ int main(int argc, char *argv[]) {
         case 'm':
             if (dump_count < MAX_MEM_DUMPS) parse_mem_dump(optarg, &mem_dumps[dump_count++]);
             break;
+        case 'C':
+            if (parse_cond(&cond, optarg) != 0) {
+                fprintf(stderr, "Invalid -C condition: %s\n", optarg);
+                return 1;
+            }
+            verbose_trace = 1; trace = 1;
+            break;
+        case 'F':
+            call_trace = 1; trace = 1;
+            break;
+        case 'B':
+            ring_size = atoi(optarg);
+            if (ring_size <= 0) {
+                fprintf(stderr, "Invalid -B size: %s\n", optarg);
+                return 1;
+            }
+            verbose_trace = 1; trace = 1;
+            break;
+        case 'A':
+            if (assert_count < MAX_ASSERTIONS) {
+                if (parse_assert(&asserts[assert_count], optarg) != 0) {
+                    fprintf(stderr, "Invalid -A assertion: %s\n", optarg);
+                    return 1;
+                }
+                assert_count++;
+            }
+            trace = 1; /* force per-step mode */
+            break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -216,6 +590,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     const char *firmware = argv[optind];
+
+    /* Set up ring buffer if requested */
+    if (ring_size > 0) {
+        g_ring = ring_create(ring_size);
+        if (!g_ring) {
+            fprintf(stderr, "Failed to allocate ring buffer (%d slots)\n", ring_size);
+            return 1;
+        }
+    }
 
     /* Load ELF symbols if requested */
     elf_symbols_t *syms = NULL;
@@ -232,6 +615,7 @@ int main(int argc, char *argv[]) {
     if (!mem) {
         fprintf(stderr, "Failed to allocate memory\n");
         elf_symbols_destroy(syms);
+        ring_destroy(g_ring);
         return 1;
     }
 
@@ -240,6 +624,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to create peripherals\n");
         mem_destroy(mem);
         elf_symbols_destroy(syms);
+        ring_destroy(g_ring);
         return 1;
     }
     periph_set_uart_callback(periph, uart_stdout_cb, NULL);
@@ -251,6 +636,7 @@ int main(int argc, char *argv[]) {
         periph_destroy(periph);
         mem_destroy(mem);
         elf_symbols_destroy(syms);
+        ring_destroy(g_ring);
         return 1;
     }
     fprintf(stderr, "Loaded %s: %d segments, entry=0x%08X\n",
@@ -275,6 +661,7 @@ int main(int argc, char *argv[]) {
         periph_destroy(periph);
         mem_destroy(mem);
         elf_symbols_destroy(syms);
+        ring_destroy(g_ring);
         return 1;
     }
 
@@ -297,6 +684,7 @@ int main(int argc, char *argv[]) {
     if (dstubs && syms) {
         display_stubs_hook_symbols(dstubs, syms);
         display_stubs_hook_tft_espi(dstubs, syms);
+        display_stubs_hook_tft_esprite(dstubs, syms);
     }
 
     /* Touch stubs (no input in standalone mode) */
@@ -315,9 +703,17 @@ int main(int argc, char *argv[]) {
             sdcard_stubs_hook_symbols(sstubs, syms);
     }
 
-    /* Install ROM log callback for verbose trace */
-    if (verbose_trace)
+    /* Install ROM log callback for verbose trace or call trace */
+    if (call_trace) {
+        g_call_syms = syms;
+        rom_stubs_set_log_callback(rom, rom_log_call_cb, NULL);
+    } else if (verbose_trace) {
         rom_stubs_set_log_callback(rom, rom_log_cb, NULL);
+    }
+
+    /* Resolve conditional trace symbols */
+    if (cond.active)
+        cond_trace_resolve(&cond, syms);
 
     /* Set entry point and initial stack pointer */
     if (has_entry_override)
@@ -364,19 +760,34 @@ int main(int argc, char *argv[]) {
         uint32_t prev_sar = 0, prev_ps = 0;
         uint32_t prev_pc;
 
+        /* Call trace state */
+        int call_depth = 0;
+
         for (int i = 0; i < max_cycles; i++) {
+            /* Determine if we should emit trace for this step */
+            int do_trace_output = (verbose_trace || (!call_trace && !assert_count));
+            if (do_trace_output && cond.active)
+                do_trace_output = cond_trace_active(&cond, cpu.pc, (uint64_t)i);
+
+            /* Classify instruction before step (for call trace) */
+            insn_type_t itype = INSN_OTHER;
+            if (call_trace)
+                itype = classify_insn(&cpu);
+
             /* Disassemble before step */
-            xtensa_disasm(&cpu, cpu.pc, disasm_buf, sizeof(disasm_buf));
-            if (syms) {
-                char sym_buf[128];
-                format_addr(syms, cpu.pc, sym_buf, sizeof(sym_buf));
-                fprintf(stderr, "[%08X] %s: %s\n", cpu.pc, sym_buf, disasm_buf);
-            } else {
-                fprintf(stderr, "[%08X] %s\n", cpu.pc, disasm_buf);
+            if (do_trace_output) {
+                xtensa_disasm(&cpu, cpu.pc, disasm_buf, sizeof(disasm_buf));
+                if (syms) {
+                    char sym_buf[128];
+                    format_addr(syms, cpu.pc, sym_buf, sizeof(sym_buf));
+                    trace_emit("[%08X] %s: %s\n", cpu.pc, sym_buf, disasm_buf);
+                } else {
+                    trace_emit("[%08X] %s\n", cpu.pc, disasm_buf);
+                }
             }
 
             /* Snapshot for verbose trace */
-            if (verbose_trace) {
+            if (do_trace_output && verbose_trace) {
                 for (int r = 0; r < 16; r++) prev_ar[r] = ar_read(&cpu, r);
                 prev_sar = cpu.sar;
                 prev_ps = cpu.ps;
@@ -387,40 +798,69 @@ int main(int argc, char *argv[]) {
             cycles++;
 
             /* Verbose trace: register changes */
-            if (verbose_trace) {
+            if (do_trace_output && verbose_trace) {
                 for (int r = 0; r < 16; r++) {
                     uint32_t cur = ar_read(&cpu, r);
                     if (cur != prev_ar[r])
-                        fprintf(stderr, "     a%-2d: 0x%08X -> 0x%08X\n", r, prev_ar[r], cur);
+                        trace_emit("     a%-2d: 0x%08X -> 0x%08X\n", r, prev_ar[r], cur);
                 }
                 if (cpu.sar != prev_sar)
-                    fprintf(stderr, "     SAR: %u -> %u\n", prev_sar, cpu.sar);
+                    trace_emit("     SAR: %u -> %u\n", prev_sar, cpu.sar);
                 if (cpu.ps != prev_ps)
-                    fprintf(stderr, "     PS:  0x%08X -> 0x%08X\n", prev_ps, cpu.ps);
+                    trace_emit("     PS:  0x%08X -> 0x%08X\n", prev_ps, cpu.ps);
             }
+
+            /* Call trace output */
+            if (call_trace) {
+                g_call_depth = call_depth;
+                if (itype == INSN_CALL || itype == INSN_CALLX) {
+                    char sym_buf[128];
+                    format_addr(syms, cpu.pc, sym_buf, sizeof(sym_buf));
+                    int indent = call_depth < 128 ? call_depth : 128;
+                    fprintf(stderr, "%*s-> %s (0x%08X)\n", indent * 2, "", sym_buf, cpu.pc);
+                    if (call_depth < 128) call_depth++;
+                } else if (itype == INSN_ENTRY) {
+                    /* ENTRY is already inside the callee — no extra output needed,
+                     * the CALL/CALLX already printed the entry */
+                } else if (itype == INSN_RET || itype == INSN_RETW) {
+                    if (call_depth > 0) call_depth--;
+                    char sym_buf[128];
+                    format_addr(syms, prev_pc, sym_buf, sizeof(sym_buf));
+                    int indent = call_depth < 128 ? call_depth : 128;
+                    fprintf(stderr, "%*s<- %s\n", indent * 2, "", sym_buf);
+                }
+            }
+
+            /* Trace assertions */
+            if (assert_count > 0)
+                check_assertions(asserts, assert_count, &cpu, syms, (uint64_t)i, mem);
+
+            /* Conditional trace: check until */
+            if (cond.active)
+                cond_trace_check_until(&cond, cpu.pc);
 
             if (rc < 0) {
                 if (cpu.breakpoint_hit) {
                     char sym_buf[128];
                     format_addr(syms, cpu.breakpoint_hit_addr, sym_buf, sizeof(sym_buf));
-                    fprintf(stderr, "[BP] Hit breakpoint at 0x%08X (%s)\n",
+                    trace_emit("[BP] Hit breakpoint at 0x%08X (%s)\n",
                             cpu.breakpoint_hit_addr, sym_buf);
                     stop_reason = STOP_BREAKPOINT;
                     break;
                 }
                 if (cpu.halted) {
-                    fprintf(stderr, "CPU halted (WAITI) at cycle %d\n", cycles);
+                    trace_emit("CPU halted (WAITI) at cycle %d\n", cycles);
                     stop_reason = STOP_HALT;
                     break;
                 }
                 /* Exception/interrupt event logging */
-                if (cpu.exception && verbose_trace) {
+                if (cpu.exception && do_trace_output && verbose_trace) {
                     /* Detect vector entry */
                     const char *vec = detect_vector(cpu.pc, cpu.vecbase);
                     if (vec) {
-                        fprintf(stderr, "     [INT] %s vector at 0x%08X\n", vec, cpu.pc);
+                        trace_emit("     [INT] %s vector at 0x%08X\n", vec, cpu.pc);
                     } else {
-                        fprintf(stderr, "     [EXC] cause=%u (%s) at 0x%08X\n",
+                        trace_emit("     [EXC] cause=%u (%s) at 0x%08X\n",
                                 cpu.exccause, exc_cause_name(cpu.exccause), cpu.epc[0]);
                     }
                 }
@@ -429,7 +869,7 @@ int main(int argc, char *argv[]) {
                     if (cpu.epc[0] == last_exc_pc && cpu.exccause == last_exc_cause) {
                         exc_repeat++;
                         if (exc_repeat >= EXC_LOOP_THRESH) {
-                            fprintf(stderr, "[STOP] Exception loop: cause=%u (%s) at 0x%08X, repeated %dx\n",
+                            trace_emit("[STOP] Exception loop: cause=%u (%s) at 0x%08X, repeated %dx\n",
                                     cpu.exccause, exc_cause_name(cpu.exccause), cpu.epc[0], exc_repeat);
                             stop_reason = STOP_EXCEPTION_LOOP;
                             break;
@@ -442,10 +882,10 @@ int main(int argc, char *argv[]) {
                 }
             } else {
                 /* Detect vector entry on normal steps too (interrupt taken) */
-                if (verbose_trace && cpu.pc != prev_pc + 2 && cpu.pc != prev_pc + 3) {
+                if (do_trace_output && verbose_trace && cpu.pc != prev_pc + 2 && cpu.pc != prev_pc + 3) {
                     const char *vec = detect_vector(cpu.pc, cpu.vecbase);
                     if (vec)
-                        fprintf(stderr, "     [INT] %s vector at 0x%08X\n", vec, cpu.pc);
+                        trace_emit("     [INT] %s vector at 0x%08X\n", vec, cpu.pc);
                 }
                 exc_repeat = 0;
             }
@@ -502,6 +942,10 @@ int main(int argc, char *argv[]) {
 
     /* Flush any buffered output to stdout before summary */
     fflush(stdout);
+
+    /* Dump ring buffer if used */
+    if (g_ring)
+        ring_flush(g_ring);
 
     /* ===== Summary ===== */
     fprintf(stderr, "\n--- Execution summary ---\n");
@@ -573,6 +1017,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Cleanup */
+    ring_destroy(g_ring);
     sdcard_stubs_destroy(sstubs);
     touch_stubs_destroy(tstubs);
     display_stubs_destroy(dstubs);
