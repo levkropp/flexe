@@ -49,6 +49,7 @@ typedef struct {
     uint32_t     param;
     uint8_t      priority;
     task_state_t state;
+    char         name[16];
     uint64_t     wake_cycle;     /* cycle_count threshold for SLEEPING */
     uint32_t     blocked_queue;  /* queue handle for BLOCKED_QUEUE */
     /* Saved CPU context */
@@ -85,6 +86,10 @@ struct freertos_stubs {
     int        current_task;       /* -1 during boot */
     bool       scheduler_started;
     uint64_t   last_switch_cycle;  /* cycle_count at last context switch */
+
+    /* Event callback for task switches */
+    freertos_event_fn event_fn;
+    void             *event_ctx;
 };
 
 static void stub_deferred_task_trampoline(xtensa_cpu_t *cpu, void *ctx);
@@ -233,6 +238,7 @@ static int sched_pick_next(freertos_stubs_t *frt) {
 /* Context-switch: save current, pick next, restore next.
  * If no runnable task, halt CPU. */
 static void sched_switch(freertos_stubs_t *frt) {
+    int prev = frt->current_task;
     int next = sched_pick_next(frt);
     if (next < 0) {
         frt->cpu->running = false;
@@ -242,6 +248,23 @@ static void sched_switch(freertos_stubs_t *frt) {
     frt->tasks[next].state = TASK_RUNNING;
     frt->last_switch_cycle = frt->cpu->cycle_count;
     sched_restore_context(frt);
+
+    /* Emit event callback on task change */
+    if (frt->event_fn && next != prev) {
+        const char *from = (prev >= 0) ? frt->tasks[prev].name : "boot";
+        const char *to = frt->tasks[next].name;
+        frt->event_fn(from, to, frt->cpu->cycle_count, frt->event_ctx);
+    }
+}
+
+/* Read a C string from emulator memory into buf */
+static void frt_read_string(xtensa_cpu_t *cpu, uint32_t addr, char *buf, int max) {
+    for (int i = 0; i < max - 1; i++) {
+        uint8_t c = mem_read8(cpu->mem, addr + (uint32_t)i);
+        buf[i] = (char)c;
+        if (c == 0) return;
+    }
+    buf[max - 1] = '\0';
 }
 
 /* Register a new task in the scheduler TCB table.
@@ -337,9 +360,14 @@ void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
 void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     uint32_t task_fn    = frt_arg(cpu, 0);
+    uint32_t name_addr  = frt_arg(cpu, 1);
     uint32_t task_par   = frt_arg(cpu, 3);
     uint32_t prio       = frt_arg(cpu, 4);
     uint32_t handle_out = frt_arg(cpu, 5);
+
+    char task_name[16] = "?";
+    if (name_addr)
+        frt_read_string(cpu, name_addr, task_name, sizeof(task_name));
 
     uint32_t fake_handle = 0;
     if (handle_out) {
@@ -351,7 +379,9 @@ void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
     /* Register in scheduler if app-level task (priority < 20) */
     if (task_fn && prio < 20) {
         if (!fake_handle) fake_handle = bump_alloc(frt, 4);
-        sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        if (idx >= 0)
+            memcpy(frt->tasks[idx].name, task_name, sizeof(task_name));
         /* If we're in legacy single-task mode, promote to scheduler */
         if (!frt->scheduler_started && frt->task_count > 1)
             sched_promote_legacy(frt);
@@ -369,9 +399,14 @@ void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
 void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     uint32_t task_fn    = frt_arg(cpu, 0);
+    uint32_t name_addr  = frt_arg(cpu, 1);
     uint32_t task_par   = frt_arg(cpu, 3);
     uint32_t prio       = frt_arg(cpu, 4);
     uint32_t handle_out = frt_arg(cpu, 5);
+
+    char task_name[16] = "?";
+    if (name_addr)
+        frt_read_string(cpu, name_addr, task_name, sizeof(task_name));
 
     uint32_t fake_handle = 0;
     if (handle_out) {
@@ -383,7 +418,9 @@ void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
     /* Register in scheduler if app-level task (priority < 20) */
     if (task_fn && prio < 20) {
         if (!fake_handle) fake_handle = bump_alloc(frt, 4);
-        sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        if (idx >= 0)
+            memcpy(frt->tasks[idx].name, task_name, sizeof(task_name));
         /* If we're in legacy single-task mode, promote to scheduler */
         if (!frt->scheduler_started && frt->task_count > 1)
             sched_promote_legacy(frt);
@@ -703,16 +740,12 @@ bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
         return false;
     if (frt->cpu->cycle_count - frt->last_switch_cycle < frt->cycles_per_tick)
         return false;
-    /* Timeslice expired: save current task, mark READY, switch.
-     * Use round-robin across all runnable tasks (not just same-priority)
-     * so that a high-priority non-yielding task doesn't starve others. */
+    int prev = frt->current_task;
     sched_save_context(frt);
     frt->tasks[frt->current_task].state = TASK_READY;
 
-    /* Wake sleepers first */
     sched_wake_sleepers(frt);
 
-    /* Round-robin: pick any READY task after current, regardless of priority */
     int next = -1;
     for (int j = 1; j < frt->task_count; j++) {
         int i = (frt->current_task + j) % frt->task_count;
@@ -721,12 +754,18 @@ bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
             break;
         }
     }
-    if (next < 0) next = frt->current_task; /* no other runnable task */
+    if (next < 0) next = frt->current_task;
 
     frt->current_task = next;
     frt->tasks[next].state = TASK_RUNNING;
     frt->last_switch_cycle = frt->cpu->cycle_count;
     sched_restore_context(frt);
+
+    if (frt->event_fn && next != prev) {
+        const char *from = frt->tasks[prev].name;
+        const char *to = frt->tasks[next].name;
+        frt->event_fn(from, to, frt->cpu->cycle_count, frt->event_ctx);
+    }
     return true;
 }
 
@@ -745,6 +784,17 @@ freertos_stubs_t *freertos_stubs_create(xtensa_cpu_t *cpu) {
 
 void freertos_stubs_destroy(freertos_stubs_t *frt) {
     free(frt);
+}
+
+void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, void *ctx) {
+    if (!frt) return;
+    frt->event_fn = fn;
+    frt->event_ctx = ctx;
+}
+
+const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt) {
+    if (!frt || frt->current_task < 0) return NULL;
+    return frt->tasks[frt->current_task].name;
 }
 
 int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms) {

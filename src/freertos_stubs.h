@@ -22,6 +22,14 @@ uint32_t freertos_stubs_deferred_task(const freertos_stubs_t *frt, uint32_t *par
  * If multiple tasks were registered, starts the cooperative scheduler and returns 0. */
 uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *param_out);
 
+/* Event callback: called on task switches */
+typedef void (*freertos_event_fn)(const char *from, const char *to,
+                                   uint64_t cycle, void *ctx);
+void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, void *ctx);
+
+/* Current task name (for heartbeat display) */
+const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt);
+
 /* Returns true if the cooperative scheduler is running (multi-task mode) */
 bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
 

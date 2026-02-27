@@ -36,6 +36,7 @@ struct esp32_rom_stubs {
     rom_log_fn       log_fn;
     void            *log_ctx;
     int              unregistered_count;
+    uint32_t         total_calls;       /* running counter for heartbeat */
     uint32_t         s_cpu_up_addr;     /* BSS symbol for multicore unblock */
     uint32_t         s_cpu_inited_addr; /* BSS symbol for multicore init wait */
     uint32_t         s_system_inited_addr;      /* system init complete flag */
@@ -1567,6 +1568,7 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     int idx = hook_ht_lookup(s, pc);
     if (idx >= 0) {
         s->entries[idx].call_count++;
+        s->total_calls++;
         if (s->log_fn)
             s->log_fn(s->log_ctx, pc, s->entries[idx].name, cpu);
         void *ectx = s->entries[idx].user_ctx ? s->entries[idx].user_ctx : s;
@@ -2424,6 +2426,10 @@ int rom_stubs_get_stats(const esp32_rom_stubs_t *stubs, int index,
     if (addr_out) *addr_out = stubs->entries[index].addr;
     if (count_out) *count_out = stubs->entries[index].call_count;
     return 0;
+}
+
+uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs) {
+    return stubs ? stubs->total_calls : 0;
 }
 
 int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs) {
