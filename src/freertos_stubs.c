@@ -216,7 +216,7 @@ static int sched_pick_next(freertos_stubs_t *frt) {
     if (nearest != UINT64_MAX) {
         uint64_t advance = nearest - frt->cpu->cycle_count;
         frt->cpu->cycle_count = nearest;
-        frt->cpu->ccount += (uint32_t)advance;
+        frt->cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
         /* Wake them and retry */
         sched_wake_sleepers(frt);
 
@@ -285,11 +285,16 @@ static int sched_register_task(freertos_stubs_t *frt, uint32_t fn, uint32_t para
     t->state = TASK_READY;
     /* Assign a stack in PSRAM */
     t->stack_top = TASK_STACK_BASE + (uint32_t)(idx + 1) * TASK_STACK_SIZE;
-    /* Pre-initialize saved context for first switch-in */
+    /* Pre-initialize saved context for first switch-in.
+     * a0 must encode the call size in bits [31:30] so the window overflow
+     * handler saves enough registers: 0→4, 1→4, 2→8, 3→12.
+     * Use CALL8 encoding (bits 31:30 = 10) so a0-a7 are all preserved. */
     t->pc = fn;
-    t->ps = 0x00040020u;  /* WOE=1, UM=1 */
+    t->ps = 0x00040020u;  /* WOE=1, UM=1, CALLINC=0 */
     t->windowbase = 0;
     t->windowstart = 1;   /* window 0 valid */
+    /* a0 = dummy addr with CALL8 encoding so overflow spills 8 regs */
+    t->ar[0] = 0x80000000u;
     /* a1 = SP (physical ar[1]), a2 = param (physical ar[2]) */
     t->ar[1] = t->stack_top;
     t->ar[2] = param;
@@ -353,7 +358,7 @@ void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
         sched_switch(frt);
     } else {
         /* Legacy: single-task mode */
-        cpu->ccount += (uint32_t)advance;
+        cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
         cpu->cycle_count += advance;
         frt_return_void(cpu);
     }
@@ -462,10 +467,12 @@ void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
     }
 }
 
-/* xTaskGetTickCount() -> ccount / cycles_per_tick */
+/* xTaskGetTickCount() -> virtual ticks (100 Hz) */
 void stub_xTaskGetTickCount(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
-    uint32_t ticks = cpu->ccount / frt->cycles_per_tick;
+    /* Convert virtual_time_us to ticks: 1 tick = 10ms = 10000 us */
+    uint64_t total_us = cpu->virtual_time_us + (uint64_t)cpu->ccount / frt->cpu_freq_mhz;
+    uint32_t ticks = (uint32_t)(total_us / 10000);
     frt_return(cpu, ticks);
 }
 
@@ -579,11 +586,11 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
             sched_switch(frt);
             return;
         }
-        /* Legacy: advance ccount and return pdFALSE */
+        /* Legacy: advance virtual time and return pdFALSE */
         if (timeout > 0 && timeout != 0xFFFFFFFFu) {
             uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
             if (advance > 200000000ULL) advance = 200000000ULL;
-            cpu->ccount += (uint32_t)advance;
+            cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
         }
         frt_return(cpu, pdFALSE);
         return;
@@ -743,21 +750,50 @@ bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
         return false;
     if (frt->cpu->cycle_count - frt->last_switch_cycle < frt->cycles_per_tick)
         return false;
+
+    int cur_prio = frt->tasks[frt->current_task].priority;
+
+    /* Wake any sleeping tasks whose delay has expired */
+    sched_wake_sleepers(frt);
+
+    /* Find highest-priority READY task (other than current) */
+    int best_prio = -1;
+    int next = -1;
+    int start = (frt->current_task + 1) % frt->task_count;
+    for (int j = 0; j < frt->task_count; j++) {
+        int i = (start + j) % frt->task_count;
+        if (i == frt->current_task) continue;
+        if (frt->tasks[i].state == TASK_READY && frt->tasks[i].priority > best_prio) {
+            best_prio = frt->tasks[i].priority;
+            next = i;
+        }
+    }
+
+    /* FreeRTOS preemption rules:
+     * - Higher-priority task woke up: preempt immediately
+     * - Equal-priority task ready: round-robin timeslice
+     * - Only lower-priority tasks ready: don't preempt */
+    if (next < 0 || best_prio < cur_prio)
+        return false;
+
+    /* For equal priority, round-robin: pick first READY at this priority
+     * starting after current_task in array order */
+    if (best_prio == cur_prio) {
+        next = -1;
+        for (int j = 1; j < frt->task_count; j++) {
+            int i = (frt->current_task + j) % frt->task_count;
+            if (frt->tasks[i].state == TASK_READY &&
+                frt->tasks[i].priority == cur_prio) {
+                next = i;
+                break;
+            }
+        }
+        if (next < 0) return false; /* no equal-priority peer to rotate to */
+    }
+
     int prev = frt->current_task;
     sched_save_context(frt);
     frt->tasks[frt->current_task].state = TASK_READY;
-
-    sched_wake_sleepers(frt);
-
-    int next = -1;
-    for (int j = 1; j < frt->task_count; j++) {
-        int i = (frt->current_task + j) % frt->task_count;
-        if (frt->tasks[i].state == TASK_READY) {
-            next = i;
-            break;
-        }
-    }
-    if (next < 0) next = frt->current_task;
 
     frt->current_task = next;
     frt->tasks[next].state = TASK_RUNNING;

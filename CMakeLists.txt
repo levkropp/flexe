@@ -17,6 +17,7 @@ add_library(xtensa-emu-lib STATIC
     src/touch_stubs.c
     src/sdcard_stubs.c
     src/wifi_stubs.c
+    src/sha_stubs.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 target_link_libraries(xtensa-emu-lib PUBLIC m z)

@@ -265,6 +265,7 @@ struct xtensa_cpu {
     bool     window_trace;  /* Emit window spill/fill/ENTRY/RETW trace to stderr */
     bool     window_trace_active; /* Set by main loop to gate window trace in trace windows */
     uint64_t cycle_count;   /* Total emulated cycles */
+    uint64_t virtual_time_us; /* Simulated wall-clock microseconds (advanced by sleep stubs) */
 
     /* Memory subsystem (set by caller) */
     xtensa_mem_t *mem;

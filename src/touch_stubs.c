@@ -83,8 +83,6 @@ static void stub_touch_wait_tap(xtensa_cpu_t *cpu, void *ctx) {
     if (!ts->get_state) { ts_return_void(cpu); return; }
 
     int tx = 0, ty = 0;
-    /* 20ms per poll iteration in ccount cycles */
-    uint32_t advance = (uint32_t)ts->cpu_freq_mhz * 20000;
 
     /* Wait for finger down */
     while (emu_app_running && cpu->running) {
@@ -93,7 +91,7 @@ static void stub_touch_wait_tap(xtensa_cpu_t *cpu, void *ctx) {
             tx = x; ty = y;
             break;
         }
-        cpu->ccount += advance;
+        cpu->virtual_time_us += 20000;
         usleep(20000);
     }
 
@@ -103,7 +101,7 @@ static void stub_touch_wait_tap(xtensa_cpu_t *cpu, void *ctx) {
         if (!ts->get_state(&x, &y, ts->state_ctx))
             break;
         tx = x; ty = y;
-        cpu->ccount += advance;
+        cpu->virtual_time_us += 20000;
         usleep(20000);
     }
 

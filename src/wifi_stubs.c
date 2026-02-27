@@ -33,6 +33,7 @@
 #define REENT_ERRNO_OFS  0
 
 /* newlib EINPROGRESS (different from Linux host value) */
+#define NEWLIB_EAGAIN      11
 #define NEWLIB_EINPROGRESS 119
 
 /* lwip error codes */
@@ -337,7 +338,7 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     uint8_t *tmp = malloc(len);
     if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
 
-    ssize_t n = recv(s->host_fd, tmp, len, 0);
+    ssize_t n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
     if (n > 0) {
         for (ssize_t i = 0; i < n; i++)
             mem_write8(cpu->mem, buf + (uint32_t)i, tmp[i]);
@@ -347,7 +348,8 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     free(tmp);
 
     if (n < 0) {
-        /* EAGAIN/EWOULDBLOCK → return -1, firmware handles retry */
+        /* EAGAIN/EWOULDBLOCK → return -1 with errno, firmware handles retry */
+        set_firmware_errno(cpu, NEWLIB_EAGAIN);
         ws_return(cpu, (uint32_t)-1);
         return;
     }

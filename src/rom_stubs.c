@@ -385,9 +385,9 @@ static void stub_ets_install_putc1(xtensa_cpu_t *cpu, void *ctx) {
 }
 
 static void stub_ets_delay_us(xtensa_cpu_t *cpu, void *ctx) {
-    esp32_rom_stubs_t *s = ctx;
+    (void)ctx;
     uint32_t us = rom_arg(cpu, 0);
-    cpu->ccount += us * s->cpu_freq_mhz;
+    cpu->virtual_time_us += us;
     rom_return_void(cpu);
 }
 

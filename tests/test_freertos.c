@@ -35,7 +35,7 @@ TEST(test_vTaskDelay_advances_ccount) {
     /* We use the rom_stubs_register to hook the address */
     rom_stubs_register_ctx(rom, vtd_addr, (rom_stub_fn)stub_vTaskDelay, "vTaskDelay", frt);
 
-    uint32_t ccount_before = cpu.ccount;
+    uint64_t vtime_before = cpu.virtual_time_us;
     /* Set up call: a2 = ticks = 10 */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
@@ -45,8 +45,8 @@ TEST(test_vTaskDelay_advances_ccount) {
     /* Step to trigger the PC hook */
     xtensa_step(&cpu);
 
-    /* 10 ticks * 1,600,000 cycles/tick = 16,000,000 cycles + 1 for step overhead */
-    ASSERT_EQ(cpu.ccount - ccount_before, 16000001);
+    /* 10 ticks * 10,000 us/tick = 100,000 us */
+    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 100000);
     /* PC should have returned */
     ASSERT_EQ(cpu.pc, BASE + 0x100);
 
@@ -188,7 +188,7 @@ TEST(test_queue_receive_empty_returns_false) {
 
     /* Receive from empty queue with timeout=10 */
     uint32_t recv_buf = 0x3FFB2010;
-    uint32_t ccount_before = cpu.ccount;
+    uint64_t vtime_before = cpu.virtual_time_us;
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
     ar_write(&cpu, 2, handle);
@@ -197,8 +197,8 @@ TEST(test_queue_receive_empty_returns_false) {
     cpu.pc = recv_addr;
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 2), 0);  /* pdFALSE */
-    /* ccount should advance by 10 ticks + 1 for step overhead */
-    ASSERT_EQ(cpu.ccount - ccount_before, 16000001);
+    /* virtual_time_us should advance by 10 ticks * 10,000 us/tick = 100,000 us */
+    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 100000);
 
     frt_teardown(&cpu, rom, frt);
 }
@@ -288,7 +288,7 @@ TEST(test_vTaskDelay_caps_large_ticks) {
     extern void stub_vTaskDelay(xtensa_cpu_t *, void *);
     rom_stubs_register_ctx(rom, vtd_addr, (rom_stub_fn)stub_vTaskDelay, "vTaskDelay", frt);
 
-    uint32_t ccount_before = cpu.ccount;
+    uint64_t vtime_before = cpu.virtual_time_us;
     /* Very large ticks value that would overflow without cap */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
@@ -296,8 +296,8 @@ TEST(test_vTaskDelay_caps_large_ticks) {
     cpu.pc = vtd_addr;
     xtensa_step(&cpu);
 
-    /* Should be capped at 200M + 1 for step overhead */
-    ASSERT_EQ(cpu.ccount - ccount_before, 200000001);
+    /* Capped at 200M cycles / 160 MHz = 1,250,000 us */
+    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 200000000 / 160);
 
     frt_teardown(&cpu, rom, frt);
 }
