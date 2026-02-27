@@ -554,13 +554,23 @@ static void stub_lwip_setsockopt(xtensa_cpu_t *cpu, void *ctx)
 static void stub_lwip_getsockopt(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
-    uint32_t fd = ws_arg(cpu, 0);
+    uint32_t fd      = ws_arg(cpu, 0);
+    /* uint32_t level   = ws_arg(cpu, 1); */
+    uint32_t optname = ws_arg(cpu, 2);
+    uint32_t optval  = ws_arg(cpu, 3);
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
         ws_return(cpu, (uint32_t)-1);
         return;
     }
+
+    /* SO_ERROR (0x1007 on lwip, 4 on Linux) — write 0 (no error) to optval.
+     * WiFiClient::connect() checks this after select() to verify connection. */
+    if (optval && (optname == 0x1007 || optname == 4)) {
+        mem_write32(cpu->mem, optval, 0);
+    }
+
     ws_return(cpu, 0);
 }
 
@@ -701,6 +711,20 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
     stub_lwip_read(cpu, ctx);
 }
 
+/* ===== VFS wrappers ===== */
+
+/* VFS wrappers — same logic as lwip_* versions.
+ * WiFiClient calls these instead of lwip_fcntl/lwip_select. */
+static void stub_vfs_fcntl(xtensa_cpu_t *cpu, void *ctx)
+{
+    stub_lwip_fcntl(cpu, ctx);
+}
+
+static void stub_vfs_select(xtensa_cpu_t *cpu, void *ctx)
+{
+    stub_lwip_select(cpu, ctx);
+}
+
 /* ===== Scratch memory allocation ===== */
 
 /* Allocate a small region in emulator address space for hostent data.
@@ -772,6 +796,11 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "lwip_getsockopt",    stub_lwip_getsockopt },
         { "lwip_fcntl",         stub_lwip_fcntl },
         { "lwip_getsockname",   stub_lwip_getsockname },
+
+        /* VFS wrappers (WiFiClient uses these instead of lwip_*) */
+        { "fcntl",              stub_vfs_fcntl },
+        { "select",             stub_vfs_select },
+        { "esp_vfs_select",     stub_vfs_select },
 
         /* Tier 5: Server stubs */
         { "lwip_bind",          stub_lwip_bind },
