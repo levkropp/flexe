@@ -978,15 +978,16 @@ static void stub_esp_newlib_init(xtensa_cpu_t *cpu, void *ctx) {
         mem_write32(cpu->mem, reent_addr + i, 0);
     /* Set __sdidinit = 1 (offset 24) to prevent __sinit recursion */
     mem_write32(cpu->mem, reent_addr + 24, 1);
-    /* Set stdin/stdout/stderr to minimal FILE-like stubs.
-     * offset 0: _stdin,  offset 4: _stdout,  offset 8: _stderr
-     * Point them at small per-stream structs just past the reent. */
+    /* newlib struct _reent layout:
+     * offset 0: _errno,  offset 4: _stdin,  offset 8: _stdout,  offset 12: _stderr
+     * Point stdio at small per-stream structs just past the reent. */
     uint32_t stdin_addr  = reent_addr + 256;
     uint32_t stdout_addr = reent_addr + 256 + 64;
     uint32_t stderr_addr = reent_addr + 256 + 128;
-    mem_write32(cpu->mem, reent_addr + 0, stdin_addr);
-    mem_write32(cpu->mem, reent_addr + 4, stdout_addr);
-    mem_write32(cpu->mem, reent_addr + 8, stderr_addr);
+    /* _errno already 0 from zeroing */
+    mem_write32(cpu->mem, reent_addr + 4, stdin_addr);
+    mem_write32(cpu->mem, reent_addr + 8, stdout_addr);
+    mem_write32(cpu->mem, reent_addr + 12, stderr_addr);
     /* Write _global_impure_ptr if we know the address */
     if (s->syms) {
         uint32_t addr;
