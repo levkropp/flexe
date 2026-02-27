@@ -27,6 +27,14 @@
 
 #define MAX_SOCKETS 16
 
+/* Firmware's reent address (set by rom_stubs esp_newlib_init).
+ * newlib struct _reent has _errno at offset 0. */
+#define REENT_ADDR       0x3FFE3C00u
+#define REENT_ERRNO_OFS  0
+
+/* newlib EINPROGRESS (different from Linux host value) */
+#define NEWLIB_EINPROGRESS 119
+
 /* lwip error codes */
 #define ERR_OK   0
 #define ERR_VAL -6
@@ -185,6 +193,11 @@ static void stub_lwip_socket(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, (uint32_t)idx);
 }
 
+static void set_firmware_errno(xtensa_cpu_t *cpu, int eno)
+{
+    mem_write32(cpu->mem, REENT_ADDR + REENT_ERRNO_OFS, (uint32_t)eno);
+}
+
 static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -206,13 +219,25 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
     wifi_log(ws, "connect(slot %u) → %s:%d\n",
             fd, ip_str, ntohs(sa.sin_port));
 
-    /* Make socket non-blocking for connect, with a 5-second timeout */
+    /* Ensure host socket matches firmware non-blocking state */
     int flags = fcntl(s->host_fd, F_GETFL, 0);
-    fcntl(s->host_fd, F_SETFL, flags | O_NONBLOCK);
+    if (s->nonblocking)
+        fcntl(s->host_fd, F_SETFL, flags | O_NONBLOCK);
+    else
+        fcntl(s->host_fd, F_SETFL, flags & ~O_NONBLOCK);
 
     int ret = connect(s->host_fd, (struct sockaddr *)&sa, sizeof(sa));
+
     if (ret < 0 && errno == EINPROGRESS) {
-        /* Wait for connection with timeout */
+        if (s->nonblocking) {
+            /* Firmware expects non-blocking connect: return -1/EINPROGRESS.
+             * Firmware will call select() then getsockopt(SO_ERROR). */
+            wifi_log(ws, "connect: non-blocking, EINPROGRESS\n");
+            set_firmware_errno(cpu, NEWLIB_EINPROGRESS);
+            ws_return(cpu, (uint32_t)-1);
+            return;
+        }
+        /* Blocking mode: wait with 5-second timeout */
         fd_set wset;
         FD_ZERO(&wset);
         FD_SET(s->host_fd, &wset);
@@ -236,9 +261,7 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
         wifi_log(ws, "connect failed: %s\n", strerror(errno));
     }
 
-    /* Restore blocking mode (firmware expects blocking by default) */
-    fcntl(s->host_fd, F_SETFL, flags);
-
+    set_firmware_errno(cpu, ret < 0 ? errno : 0);
     ws_return(cpu, (uint32_t)(ret < 0 ? -1 : 0));
 }
 
@@ -565,10 +588,13 @@ static void stub_lwip_getsockopt(xtensa_cpu_t *cpu, void *ctx)
         return;
     }
 
-    /* SO_ERROR (0x1007 on lwip, 4 on Linux) — write 0 (no error) to optval.
+    /* SO_ERROR (0x1007 on lwip, 4 on Linux) — relay real host socket error.
      * WiFiClient::connect() checks this after select() to verify connection. */
     if (optval && (optname == 0x1007 || optname == 4)) {
-        mem_write32(cpu->mem, optval, 0);
+        int err = 0;
+        socklen_t elen = sizeof(err);
+        getsockopt(s->host_fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+        mem_write32(cpu->mem, optval, (uint32_t)err);
     }
 
     ws_return(cpu, 0);
