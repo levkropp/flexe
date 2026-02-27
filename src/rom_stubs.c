@@ -1534,6 +1534,35 @@ static void stub_abort_stop(xtensa_cpu_t *cpu, void *ctx) {
     cpu->running = 0;
 }
 
+/* esp_panic_handler(XtExcFrame *frame) — dump exception info before restart.
+ * XtExcFrame layout (esp-idf xtensa_context.h):
+ *   exit(0) pc(4) ps(8) a0(12)..a15(72) sar(76) exccause(80) excvaddr(84) */
+static void stub_panic_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t frame = rom_arg(cpu, 0);
+    uint32_t pc_val    = mem_read32(cpu->mem, frame + 4);
+    uint32_t ps_val    = mem_read32(cpu->mem, frame + 8);
+    uint32_t exccause  = mem_read32(cpu->mem, frame + 80);
+    uint32_t excvaddr  = mem_read32(cpu->mem, frame + 84);
+    static const char *exc_names[] = {
+        [0]  = "IllegalInstruction", [2]  = "InstructionFetchError",
+        [3]  = "LoadStoreError",     [6]  = "IntegerDivideByZero",
+        [9]  = "LoadStoreAlignment", [28] = "LoadProhibited",
+        [29] = "StoreProhibited",
+    };
+    const char *name = (exccause < 30 && exc_names[exccause])
+                       ? exc_names[exccause] : "Unknown";
+    fprintf(stderr, "\n[PANIC] %s (cause=%u) at PC=0x%08X  EXCVADDR=0x%08X  PS=0x%08X\n",
+            name, exccause, pc_val, excvaddr, ps_val);
+    fprintf(stderr, "  Registers from frame at 0x%08X:\n", frame);
+    for (int i = 0; i < 16; i++) {
+        uint32_t val = mem_read32(cpu->mem, frame + 12 + i * 4);
+        fprintf(stderr, "  a%-2d=0x%08X%s", i, val, (i % 4 == 3) ? "\n" : "  ");
+    }
+    fprintf(stderr, "  SAR=0x%08X\n", mem_read32(cpu->mem, frame + 76));
+    cpu->running = 0;
+}
+
 /* ===== PC hook ===== */
 
 /* ===== PC hook hash table ===== */
@@ -2253,6 +2282,15 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, digital_read_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_digital_read_high, digital_read_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* esp_panic_handler — dump exception info before stopping */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "esp_panic_handler", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_panic_handler, "esp_panic_handler");
             hooked++;
         }
     }

@@ -57,6 +57,7 @@ typedef struct {
     uint32_t     pc, ps;
     uint32_t     windowbase, windowstart;
     uint32_t     spill_base[16];
+    struct { uint32_t base[8]; int depth; } spill_stack[16];
     uint32_t     sar, lbeg, lend, lcount;
     uint32_t     stack_top;
 } task_tcb_t;
@@ -148,6 +149,7 @@ static void sched_save_context(freertos_stubs_t *frt) {
     t->windowbase = cpu->windowbase;
     t->windowstart = cpu->windowstart;
     memcpy(t->spill_base, cpu->spill_base, sizeof(cpu->spill_base));
+    memcpy(t->spill_stack, cpu->spill_stack, sizeof(cpu->spill_stack));
     t->sar = cpu->sar;
     t->lbeg = cpu->lbeg;
     t->lend = cpu->lend;
@@ -163,6 +165,7 @@ static void sched_restore_context(freertos_stubs_t *frt) {
     cpu->windowbase = t->windowbase;
     cpu->windowstart = t->windowstart;
     memcpy(cpu->spill_base, t->spill_base, sizeof(cpu->spill_base));
+    memcpy(cpu->spill_stack, t->spill_stack, sizeof(cpu->spill_stack));
     cpu->sar = t->sar;
     cpu->lbeg = t->lbeg;
     cpu->lend = t->lend;

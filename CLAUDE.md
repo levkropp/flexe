@@ -36,13 +36,14 @@ cmake --build build
 | `-q` | Quiet: suppress per-access unhandled peripheral warnings |
 | `-s file.elf` | Load ELF symbols for trace/breakpoints |
 | `-t` | Basic instruction trace to stderr |
-| `-T` | Verbose trace (reg changes, ROM calls, exceptions) |
-| `-T START:END` | Windowed trace: verbose only in cycle range, batch elsewhere |
+| `-T` | Verbose trace (always via ring buffer, auto-dumps on crash) |
+| `-T START:END` | Windowed trace: collect only in cycle range, batch elsewhere |
+| `-D mode` | Dump condition: `crash` (default), `flush`, `tail:N` (repeatable) |
 | `-E` | Event log: stub calls, task switches, exceptions (fast, tiny output) |
 | `-P N` | Progress heartbeat every N cycles |
 | `-W` | Window trace (spill/fill/ENTRY/RETW events) |
 | `-F` | Function-call trace (CALL/RET tree) |
-| `-B N` | Ring-buffer trace: keep last N lines, dump on exit |
+| `-B N` | Ring-buffer size override (default: 50000 when `-T` used) |
 | `-C cond` | Conditional trace (func:NAME, after:N, range:A-B, until:NAME) |
 | `-A cond` | Trace assertion (a6=0, pc=0xADDR, mem:ADDR=V) |
 | `-b addr` | Breakpoint (hex address or symbol name, repeatable) |

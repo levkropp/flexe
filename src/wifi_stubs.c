@@ -301,6 +301,11 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
         tmp[i] = mem_read8(cpu->mem, buf + i);
 
     ssize_t n = send(s->host_fd, tmp, len, MSG_NOSIGNAL);
+
+    if (n > 0)
+        wifi_log(ws, "send(slot %u, %zd bytes): %.*s\n",
+                fd, n, (int)(n > 200 ? 200 : n), (char *)tmp);
+
     free(tmp);
 
     if (n < 0) {
@@ -336,6 +341,8 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     if (n > 0) {
         for (ssize_t i = 0; i < n; i++)
             mem_write8(cpu->mem, buf + (uint32_t)i, tmp[i]);
+        wifi_log(ws, "recv(slot %u, %zd bytes): %.*s\n",
+                fd, n, (int)(n > 200 ? 200 : n), (char *)tmp);
     }
     free(tmp);
 
