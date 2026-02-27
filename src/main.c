@@ -11,6 +11,7 @@
 #include "sdcard_stubs.h"
 #include "wifi_stubs.h"
 #include "sha_stubs.h"
+#include "aes_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -811,6 +812,11 @@ int main(int argc, char *argv[]) {
     if (shstubs && syms)
         sha_stubs_hook_symbols(shstubs, syms);
 
+    /* AES hardware accelerator stubs */
+    aes_stubs_t *astubs = aes_stubs_create(&cpu);
+    if (astubs && syms)
+        aes_stubs_hook_symbols(astubs, syms);
+
     /* WiFi / lwip socket bridge */
     wifi_stubs_t *wstubs = wifi_stubs_create(&cpu);
     if (wstubs && syms)
@@ -1208,6 +1214,7 @@ int main(int argc, char *argv[]) {
     ring_destroy(g_ring);
     wifi_stubs_destroy(wstubs);
     sha_stubs_destroy(shstubs);
+    aes_stubs_destroy(astubs);
     sdcard_stubs_destroy(sstubs);
     touch_stubs_destroy(tstubs);
     display_stubs_destroy(dstubs);

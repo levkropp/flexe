@@ -18,6 +18,7 @@ add_library(xtensa-emu-lib STATIC
     src/sdcard_stubs.c
     src/wifi_stubs.c
     src/sha_stubs.c
+    src/aes_stubs.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 target_link_libraries(xtensa-emu-lib PUBLIC m z)
