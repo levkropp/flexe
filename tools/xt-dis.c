@@ -83,38 +83,54 @@ int main(int argc, char *argv[]) {
     uint32_t raw_base = 0x40080000;
     int raw_mode = 0;
 
-    int opt_idx = 1;
-    while (opt_idx < argc && argv[opt_idx][0] == '-') {
-        const char *flag = argv[opt_idx];
-        if (strcmp(flag, "-s") == 0 && opt_idx + 1 < argc) {
-            elf_path = argv[++opt_idx];
-        } else if (strcmp(flag, "-f") == 0 && opt_idx + 1 < argc) {
-            func_name = argv[++opt_idx];
-        } else if (strcmp(flag, "-a") == 0 && opt_idx + 1 < argc) {
-            start_addr = (uint32_t)strtoul(argv[++opt_idx], NULL, 0);
-            has_start_addr = 1;
-        } else if (strcmp(flag, "-n") == 0 && opt_idx + 1 < argc) {
-            max_insns = atoi(argv[++opt_idx]);
-        } else if (strcmp(flag, "-b") == 0 && opt_idx + 1 < argc) {
-            raw_base = (uint32_t)strtoul(argv[++opt_idx], NULL, 0);
-        } else if (strcmp(flag, "-r") == 0) {
-            raw_mode = 1;
-        } else if (strcmp(flag, "-h") == 0 || strcmp(flag, "--help") == 0) {
-            usage();
-            return 0;
+    /* Parse all flags and collect positional args (flags can appear anywhere) */
+    const char *positional[8];
+    int npos = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            const char *flag = argv[i];
+            if (strcmp(flag, "-s") == 0 && i + 1 < argc) {
+                elf_path = argv[++i];
+            } else if (strcmp(flag, "-f") == 0 && i + 1 < argc) {
+                func_name = argv[++i];
+            } else if (strcmp(flag, "-a") == 0 && i + 1 < argc) {
+                start_addr = (uint32_t)strtoul(argv[++i], NULL, 0);
+                has_start_addr = 1;
+            } else if (strcmp(flag, "-n") == 0 && i + 1 < argc) {
+                max_insns = atoi(argv[++i]);
+            } else if (strcmp(flag, "-b") == 0 && i + 1 < argc) {
+                raw_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+            } else if (strcmp(flag, "-r") == 0) {
+                raw_mode = 1;
+            } else if (strcmp(flag, "-h") == 0 || strcmp(flag, "--help") == 0) {
+                usage();
+                return 0;
+            } else {
+                fprintf(stderr, "Unknown option: %s\n", flag);
+                usage();
+                return 1;
+            }
         } else {
-            fprintf(stderr, "Unknown option: %s\n", flag);
-            usage();
-            return 1;
+            if (npos < 8) positional[npos++] = argv[i];
         }
-        opt_idx++;
     }
 
-    if (opt_idx >= argc) {
+    /* Positional args: <binary> [addr] [count] */
+    if (npos < 1) {
         usage();
         return 1;
     }
-    const char *bin_path = argv[opt_idx];
+    const char *bin_path = positional[0];
+
+    /* Backward-compatible positional args: xt-dis binary [addr] [count] */
+    if (!has_start_addr && !func_name && npos >= 2) {
+        start_addr = (uint32_t)strtoul(positional[1], NULL, 0);
+        has_start_addr = 1;
+    }
+    if (npos >= 3) {
+        max_insns = atoi(positional[2]);
+    }
 
     /* Create CPU + memory */
     xtensa_cpu_t cpu;

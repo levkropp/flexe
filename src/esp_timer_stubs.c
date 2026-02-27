@@ -70,7 +70,10 @@ static void et_return_void(xtensa_cpu_t *cpu) {
 /* ===== Helper: get current time in microseconds ===== */
 
 static uint64_t current_time_us(esp_timer_stubs_t *et) {
-    return (uint64_t)et->cpu->ccount / et->cpu_freq_mhz;
+    /* Virtual wall-clock = accumulated sleep time + instruction-driven time.
+     * ccount only advances per-instruction (stays small), so inlined
+     * 64-bit divisions complete in reasonable iterations. */
+    return et->cpu->virtual_time_us + (uint64_t)et->cpu->ccount / et->cpu_freq_mhz;
 }
 
 /* ===== Find timer by handle ===== */
@@ -269,11 +272,11 @@ void stub_esp_timer_is_active(xtensa_cpu_t *cpu, void *ctx) {
     et_return(cpu, (t && t->active) ? 1 : 0);
 }
 
-/* usleep(us) — advance ccount, check/dispatch expired timers */
+/* usleep(us) — advance virtual time, check/dispatch expired timers */
 void stub_usleep(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
     uint32_t us = et_arg(cpu, 0);
-    cpu->ccount += us * et->cpu_freq_mhz;
+    cpu->virtual_time_us += us;
     dispatch_expired_timers(et);
     et_return(cpu, 0);
 }
@@ -282,6 +285,32 @@ void stub_usleep(xtensa_cpu_t *cpu, void *ctx) {
 void stub_esp_timer_init(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     et_return(cpu, ESP_OK);
+}
+
+/* millis() — return esp_timer_get_time() / 1000.
+ * The firmware's millis() uses an inlined 64-bit software division that
+ * takes millions of iterations when ccount is large. Stub it out. */
+void stub_millis(xtensa_cpu_t *cpu, void *ctx) {
+    esp_timer_stubs_t *et = ctx;
+    uint64_t us = current_time_us(et);
+    uint32_t ms = (uint32_t)(us / 1000);
+    et_return(cpu, ms);
+}
+
+/* micros() — return esp_timer_get_time() as uint32_t */
+void stub_micros(xtensa_cpu_t *cpu, void *ctx) {
+    esp_timer_stubs_t *et = ctx;
+    uint32_t us = (uint32_t)current_time_us(et);
+    et_return(cpu, us);
+}
+
+/* delay(ms) — advance virtual time, dispatch timers */
+void stub_delay(xtensa_cpu_t *cpu, void *ctx) {
+    esp_timer_stubs_t *et = ctx;
+    uint32_t ms = et_arg(cpu, 0);
+    cpu->virtual_time_us += (uint64_t)ms * 1000;
+    dispatch_expired_timers(et);
+    et_return_void(cpu);
 }
 
 /* ===== Public API ===== */
@@ -318,10 +347,14 @@ int esp_timer_stubs_hook_symbols(esp_timer_stubs_t *et, const elf_symbols_t *sym
         { "esp_timer_stop",            stub_esp_timer_stop },
         { "esp_timer_delete",          stub_esp_timer_delete },
         { "esp_timer_get_time",        stub_esp_timer_get_time },
+        { "esp_timer_impl_get_time",   stub_esp_timer_get_time },
         { "esp_timer_dump",            stub_esp_timer_dump },
         { "esp_timer_is_active",       stub_esp_timer_is_active },
         { "esp_timer_init",            stub_esp_timer_init },
         { "usleep",                    stub_usleep },
+        { "millis",                    stub_millis },
+        { "micros",                    stub_micros },
+        { "delay",                     stub_delay },
         { NULL, NULL }
     };
 

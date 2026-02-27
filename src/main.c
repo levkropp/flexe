@@ -10,6 +10,7 @@
 #include "touch_stubs.h"
 #include "sdcard_stubs.h"
 #include "wifi_stubs.h"
+#include "sha_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -805,6 +806,11 @@ int main(int argc, char *argv[]) {
             sdcard_stubs_hook_symbols(sstubs, syms);
     }
 
+    /* SHA hardware accelerator stubs */
+    sha_stubs_t *shstubs = sha_stubs_create(&cpu);
+    if (shstubs && syms)
+        sha_stubs_hook_symbols(shstubs, syms);
+
     /* WiFi / lwip socket bridge */
     wifi_stubs_t *wstubs = wifi_stubs_create(&cpu);
     if (wstubs && syms)
@@ -1201,6 +1207,7 @@ int main(int argc, char *argv[]) {
     /* Cleanup */
     ring_destroy(g_ring);
     wifi_stubs_destroy(wstubs);
+    sha_stubs_destroy(shstubs);
     sdcard_stubs_destroy(sstubs);
     touch_stubs_destroy(tstubs);
     display_stubs_destroy(dstubs);

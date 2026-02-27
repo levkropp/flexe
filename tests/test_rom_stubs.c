@@ -293,7 +293,7 @@ TEST(test_stub_delay_us) {
 
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
 
-    uint32_t ccount_before = cpu.ccount;
+    uint64_t vtime_before = cpu.virtual_time_us;
 
     /* CALL0 to ets_delay_us(100) */
     cpu.pc = 0x40008534;
@@ -303,9 +303,8 @@ TEST(test_stub_delay_us) {
 
     xtensa_step(&cpu);
 
-    /* Default freq = 160 MHz, so ccount should advance by 100*160 = 16000 */
-    /* Plus 1 from the step's own ccount increment */
-    ASSERT_EQ(cpu.ccount - ccount_before, 100 * 160 + 1);
+    /* virtual_time_us should advance by 100 us */
+    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 100);
     ASSERT_EQ(cpu.pc, BASE);
 
     rom_stubs_destroy(rom);
