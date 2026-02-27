@@ -239,8 +239,22 @@ struct xtensa_cpu {
     /* Interrupt configuration */
     uint8_t  int_level[32]; /* Interrupt level per line (default: 1) */
 
-    /* Window spill base addresses: records where each window's regs were saved */
-    uint32_t spill_base[16]; /* base address used for synth_spill_window per window */
+    /* Window spill base stack: each window slot can be spilled multiple times
+     * (when the window ring wraps around). We track all spill locations so
+     * underflow fill uses the correct base for each nesting level. */
+    struct {
+        uint32_t base[8];    /* stack of spill bases (deepest first) */
+        int depth;            /* current stack depth */
+    } spill_stack[16];
+    uint32_t spill_base[16]; /* legacy: most recent base per window (for -W trace) */
+
+    /* Spill verification: shadow copies to detect stack corruption between spill/fill */
+    struct {
+        uint32_t regs[12];   /* saved register values (a0-a11 max) */
+        uint32_t base;       /* base address used during spill */
+        int count;           /* number of regs saved (4, 8, or 12) */
+    } spill_shadow[16];
+    bool spill_verify;       /* Enable spill/fill verification */
 
     /* Execution state */
     bool     running;
@@ -249,6 +263,7 @@ struct xtensa_cpu {
     bool     halted;        /* WAITI halt state */
     bool     _pc_written;   /* Set when instruction modifies PC (branch/call/ret) */
     bool     window_trace;  /* Emit window spill/fill/ENTRY/RETW trace to stderr */
+    bool     window_trace_active; /* Set by main loop to gate window trace in trace windows */
     uint64_t cycle_count;   /* Total emulated cycles */
 
     /* Memory subsystem (set by caller) */

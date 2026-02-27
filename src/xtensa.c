@@ -331,7 +331,7 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
     int callee = find_callee_window(cpu, widx);
     uint32_t base = phys_read(cpu, callee, 1);
 
-    if (cpu->window_trace) {
+    if (cpu->window_trace && cpu->window_trace_active) {
         fprintf(stderr, "     [WIN] SPILL w%d (call%d) callee=w%d base=0x%08X"
                 " WS=0x%04X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X",
                 widx, callsize * 4, callee, base, cpu->windowstart,
@@ -351,19 +351,49 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
                 widx & 0xF, cpu->spill_base[widx & 0xF], base);
     cpu->spill_base[widx & 0xF] = base;
 
+    /* Push onto spill stack for correct underflow restore */
+    {
+        int si = widx & 0xF;
+        int d = cpu->spill_stack[si].depth;
+        if (d < 8)
+            cpu->spill_stack[si].base[d] = base;
+        cpu->spill_stack[si].depth = d + 1;
+    }
+
+    int nregs = 4;
     /* Always save base 4 regs: a0-a3 at base-16 */
     for (int i = 0; i < 4; i++)
         mem_write32(cpu->mem, base - 16 + i * 4, phys_read(cpu, widx, i));
 
     if (callsize >= 2) {
+        nregs = 8;
         /* CALL8+: also save a4-a7 at base-32 */
         for (int i = 0; i < 4; i++)
             mem_write32(cpu->mem, base - 32 + i * 4, phys_read(cpu, widx, 4 + i));
     }
     if (callsize == 3) {
+        nregs = 12;
         /* CALL12: also save a8-a11 at base-48 */
         for (int i = 0; i < 4; i++)
             mem_write32(cpu->mem, base - 48 + i * 4, phys_read(cpu, widx, 8 + i));
+    }
+
+    /* Save shadow copies for spill/fill verification */
+    if (cpu->spill_verify) {
+        int si = widx & 0xF;
+        /* Warn if overwriting an unfilled spill record */
+        if (cpu->spill_shadow[si].count > 0 &&
+            cpu->spill_shadow[si].base != base) {
+            fprintf(stderr, "[SPILL_OVERWRITE] w%d: old_base=0x%08X new_base=0x%08X"
+                    " PC=0x%08X cycle=%llu WS=0x%04X\n",
+                    widx, cpu->spill_shadow[si].base, base,
+                    cpu->pc, (unsigned long long)cpu->cycle_count,
+                    cpu->windowstart);
+        }
+        cpu->spill_shadow[si].base = base;
+        cpu->spill_shadow[si].count = nregs;
+        for (int i = 0; i < nregs; i++)
+            cpu->spill_shadow[si].regs[i] = phys_read(cpu, widx, i);
     }
 
     /* Clear windowstart bit for this window */
@@ -383,7 +413,7 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
  */
 static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
     int limit = callinc + 3;  /* check wb+1 through wb+callinc+3 */
-    if (cpu->window_trace) {
+    if (cpu->window_trace && cpu->window_trace_active) {
         int any = 0;
         for (int i = 1; i <= limit; i++) {
             int w = (cpu->windowbase + i) & 0xF;
@@ -406,11 +436,20 @@ static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
  * Uses the recorded spill_base (where overflow actually saved the data).
  */
 static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
-    /* Use callee's a1 (SP) as base — this is how real Xtensa hardware works.
-     * The overflow handler saves the caller's registers at the callee's SP.
-     * The RETW chain guarantees each callee's a1 is restored before its caller.
-     * Using spill_base[] is unreliable because window reuse overwrites entries. */
-    uint32_t base = phys_read(cpu, owb, 1);
+    /* Pop from the spill stack to get the correct base for this nesting level.
+     * Window slots can be spilled multiple times when the ring wraps, and each
+     * spill pushes onto the stack. The innermost (most recent) spill is on top
+     * and corresponds to the next RETW that needs filling. */
+    int si = ret_wb & 0xF;
+    uint32_t callee_sp = phys_read(cpu, owb, 1);
+    uint32_t base;
+    if (cpu->spill_stack[si].depth > 0) {
+        cpu->spill_stack[si].depth--;
+        int d = cpu->spill_stack[si].depth;
+        base = (d < 8) ? cpu->spill_stack[si].base[d] : callee_sp;
+    } else {
+        base = callee_sp;
+    }
 
     /* Restore a0-a3 from base-16 */
     for (int i = 0; i < 4; i++)
@@ -429,7 +468,31 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
             phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
     }
 
-    if (cpu->window_trace) {
+    /* Verify restored values match what was originally spilled */
+    if (cpu->spill_verify) {
+        int si = ret_wb & 0xF;
+        int nregs = cpu->spill_shadow[si].count;
+        if (nregs > 0) {
+            for (int i = 0; i < nregs; i++) {
+                uint32_t restored = phys_read(cpu, ret_wb, i);
+                uint32_t expected = cpu->spill_shadow[si].regs[i];
+                if (restored != expected) {
+                    uint32_t spill_base = cpu->spill_shadow[si].base;
+                    int slot = (i < 4) ? 0 : (i < 8) ? 1 : 2;
+                    uint32_t mem_addr = spill_base - 16 * (slot + 1) + (i % 4) * 4;
+                    fprintf(stderr, "[SPILL_CORRUPT] w%d a%d: spilled=0x%08X"
+                            " restored=0x%08X at mem=0x%08X"
+                            " (orig_base=0x%08X fill_base=0x%08X owb=%d)"
+                            " PC=0x%08X cycle=%llu\n",
+                            ret_wb, i, expected, restored, mem_addr,
+                            spill_base, base, owb, cpu->pc,
+                            (unsigned long long)cpu->cycle_count);
+                }
+            }
+        }
+    }
+
+    if (cpu->window_trace && cpu->window_trace_active) {
         fprintf(stderr, "     [WIN] FILL  w%d (call%d) base=0x%08X [spill_base={",
                 ret_wb, callsize * 4, base);
         for (int _i = 0; _i < 16; _i++)
@@ -443,6 +506,10 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
                     phys_read(cpu, ret_wb, 6), phys_read(cpu, ret_wb, 7));
         fprintf(stderr, "\n");
     }
+
+    /* Clear shadow after fill */
+    if (cpu->spill_verify)
+        cpu->spill_shadow[ret_wb & 0xF].count = 0;
 
     /* Set windowstart bit */
     cpu->windowstart |= (1u << (ret_wb & 0xF));
@@ -801,13 +868,17 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         uint32_t val = mem_read32(cpu->mem, old_sp - 48 + i * 4);
                         mem_write32(cpu->mem, new_sp - 48 + i * 4, val);
                     }
-                    /* Update spill_base for any window whose data was at old_sp */
+                    /* Update spill_base and spill_stack for any window whose data was at old_sp */
                     for (int i = 0; i < 16; i++) {
                         if (cpu->spill_base[i] == old_sp) {
-                            if (cpu->window_trace)
+                            if (cpu->window_trace && cpu->window_trace_active)
                                 fprintf(stderr, "     [WIN] MOVSP spill_base[%d] 0x%08X -> 0x%08X (wb=%d)\n",
                                         i, old_sp, new_sp, cpu->windowbase);
                             cpu->spill_base[i] = new_sp;
+                        }
+                        for (int j = 0; j < cpu->spill_stack[i].depth && j < 8; j++) {
+                            if (cpu->spill_stack[i].base[j] == old_sp)
+                                cpu->spill_stack[i].base[j] = new_sp;
                         }
                     }
                 }

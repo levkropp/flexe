@@ -90,6 +90,18 @@ static void ring_flush(ring_buf_t *rb) {
     }
 }
 
+static void ring_flush_tail(ring_buf_t *rb, int n) {
+    if (n <= 0 || rb->count == 0) return;
+    if (n > rb->count) n = rb->count;
+    int skip = rb->count - n;
+    fprintf(stderr, "\n--- Ring buffer: last %d of %llu trace lines ---\n",
+            n, (unsigned long long)rb->total);
+    for (int i = skip; i < rb->count; i++) {
+        int idx = (rb->head + i) % rb->capacity;
+        fputs(rb->lines[idx], stderr);
+    }
+}
+
 static void ring_destroy(ring_buf_t *rb) {
     if (!rb) return;
     for (int i = 0; i < rb->capacity; i++) free(rb->lines[i]);
@@ -97,8 +109,17 @@ static void ring_destroy(ring_buf_t *rb) {
     free(rb);
 }
 
-/* Global ring buffer pointer (NULL = direct output) */
+/* Global ring buffer pointer — always non-NULL when tracing */
 static ring_buf_t *g_ring = NULL;
+
+/* Dump condition flags */
+#define DUMP_CRASH  1   /* dump ring buffer on panic/exception stop */
+#define DUMP_FLUSH  2   /* flush entire ring buffer to stderr on exit */
+#define DUMP_TAIL   4   /* dump last N lines on exit */
+#define DEFAULT_RING_SIZE 50000
+
+static int g_dump_mode = 0;
+static int g_dump_tail_n = 0;
 
 static void trace_emit(const char *fmt, ...) {
     char buf[512];
@@ -475,17 +496,22 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -Z <bytes>      SD card size (default: auto from file, or 4GB)\n");
     fprintf(stderr, "  -C <cond>       Conditional trace (repeatable, implies -T):\n");
     fprintf(stderr, "                    func:NAME  — only trace inside function\n");
-    fprintf(stderr, "                    after:N    — start tracing after cycle N\n");
+    fprintf(stderr, "                    after:N    — start tracing after virtual cycle N\n");
     fprintf(stderr, "                    range:A-B  — only trace when PC in hex range\n");
     fprintf(stderr, "                    until:NAME — trace until function entered\n");
     fprintf(stderr, "  -F              Function-call trace (CALL/RET tree)\n");
-    fprintf(stderr, "  -B <N>          Ring-buffer trace: keep last N lines, dump on exit\n");
+    fprintf(stderr, "  -B <N>          Ring-buffer size (default: 50000 when -T used)\n");
+    fprintf(stderr, "  -D <mode>       Dump condition (repeatable, default: crash):\n");
+    fprintf(stderr, "                    crash    — dump ring buffer on panic/exception\n");
+    fprintf(stderr, "                    flush    — flush entire ring buffer on exit\n");
+    fprintf(stderr, "                    tail:N   — dump last N lines on exit\n");
     fprintf(stderr, "  -A <cond>       Trace assertion (repeatable):\n");
     fprintf(stderr, "                    a6=0       — log when register equals value\n");
     fprintf(stderr, "                    pc=0xADDR  — log when PC hits address\n");
     fprintf(stderr, "                    mem:ADDR=V — log when memory equals value\n");
     fprintf(stderr, "  -E              Event log (stubs, task switches, exceptions)\n");
     fprintf(stderr, "  -P <N>          Progress heartbeat every N cycles (default: 1000000)\n");
+    fprintf(stderr, "  -V              Verify window spill/fill integrity (detect stack corruption)\n");
 }
 
 /* ===== Parse -m argument ===== */
@@ -550,11 +576,12 @@ int main(int argc, char *argv[]) {
     trace_assert_t asserts[MAX_ASSERTIONS];
     int assert_count = 0;
     int event_log = 0;
+    int spill_verify = 0;
     uint64_t heartbeat_interval = 0;
     uint64_t trace_start = 0, trace_end = UINT64_MAX;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:tT::Wvqe:s:b:m:S:Z:C:FB:A:EP:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:")) != -1) {
         switch (opt) {
         case 'c': max_cycles = atoi(optarg); break;
         case 't': trace = 1; break;
@@ -567,6 +594,7 @@ int main(int argc, char *argv[]) {
             }
             break;
         case 'W': window_trace = 1; trace = 1; break;
+        case 'V': spill_verify = 1; break;
         case 'v': verbose = 1; break;
         case 'q': quiet_unhandled = 1; break;
         case 'e':
@@ -598,7 +626,19 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Invalid -B size: %s\n", optarg);
                 return 1;
             }
-            verbose_trace = 1; trace = 1;
+            break;
+        case 'D':
+            if (strcmp(optarg, "crash") == 0)
+                g_dump_mode |= DUMP_CRASH;
+            else if (strcmp(optarg, "flush") == 0)
+                g_dump_mode |= DUMP_FLUSH;
+            else if (strncmp(optarg, "tail:", 5) == 0) {
+                g_dump_mode |= DUMP_TAIL;
+                g_dump_tail_n = atoi(optarg + 5);
+            } else {
+                fprintf(stderr, "Invalid -D mode: %s\n", optarg);
+                return 1;
+            }
             break;
         case 'A':
             if (assert_count < MAX_ASSERTIONS) {
@@ -616,19 +656,48 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* -T with optional space-separated START:END — if -T was given bare
+       and the next non-option arg looks like a trace range, consume it. */
+    if (verbose_trace && trace_start == 0 && optind < argc) {
+        char *maybe = argv[optind];
+        char *colon = strchr(maybe, ':');
+        if (colon && colon != maybe) {
+            /* Check both sides are numeric */
+            char *endA, *endB;
+            uint64_t a = strtoull(maybe, &endA, 0);
+            uint64_t b = strtoull(colon + 1, &endB, 0);
+            if (endA == colon && *endB == '\0' && a < b) {
+                trace_start = a;
+                trace_end = b;
+                optind++; /* consume this arg */
+            }
+        }
+    }
+
+    /* -C after:N implies a trace window start — use batch execution
+       until we reach the conditional trace activation cycle. */
+    if (cond.active && cond.after_cycle > 0 && trace_start < cond.after_cycle)
+        trace_start = cond.after_cycle;
+
     if (optind >= argc) {
         usage(argv[0]);
         return 1;
     }
     const char *firmware = argv[optind];
 
-    /* Set up ring buffer if requested */
+    /* Set up ring buffer: always used when -T is active.
+     * -B N overrides default size.  Without -B, default to 50K lines. */
+    if (verbose_trace && ring_size == 0)
+        ring_size = DEFAULT_RING_SIZE;
     if (ring_size > 0) {
         g_ring = ring_create(ring_size);
         if (!g_ring) {
             fprintf(stderr, "Failed to allocate ring buffer (%d slots)\n", ring_size);
             return 1;
         }
+        /* Default dump mode: crash if none specified */
+        if (g_dump_mode == 0)
+            g_dump_mode = DUMP_CRASH;
     }
 
     /* Load ELF symbols if requested */
@@ -684,6 +753,8 @@ int main(int argc, char *argv[]) {
     xtensa_cpu_reset(&cpu);
     cpu.mem = mem;
     cpu.window_trace = window_trace;
+    cpu.window_trace_active = (window_trace && trace_start == 0);
+    cpu.spill_verify = spill_verify;
 
     /* Install ROM function stubs */
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
@@ -817,16 +888,23 @@ int main(int argc, char *argv[]) {
     /* Unified execution loop */
     int batch = 10000;
     while (cycles < max_cycles_u64 && cpu.running && !cpu.halted && !cpu.breakpoint_hit) {
-        /* Are we in a trace window? */
+        /* Are we in a trace window?
+         * Use cpu.cycle_count (virtual time including FreeRTOS skips)
+         * so trace windows match event log timestamps. */
+        uint64_t ccnt = cpu.cycle_count;
+        /* Update window trace gating */
+        if (window_trace)
+            cpu.window_trace_active = (trace_start == 0 || ccnt >= trace_start) &&
+                                      (ccnt < trace_end);
         int in_trace_window = need_step &&
-            (trace_start == 0 || cycles >= trace_start) &&
-            (cycles < trace_end);
+            (trace_start == 0 || ccnt >= trace_start) &&
+            (ccnt < trace_end);
 
         if (in_trace_window) {
             /* --- Single-step with full trace output --- */
             int do_trace_output = (verbose_trace || (!call_trace && !assert_count));
             if (do_trace_output && cond.active)
-                do_trace_output = cond_trace_active(&cond, cpu.pc, cycles);
+                do_trace_output = cond_trace_active(&cond, cpu.pc, ccnt);
 
             insn_type_t itype = INSN_OTHER;
             if (call_trace)
@@ -967,9 +1045,10 @@ int main(int argc, char *argv[]) {
             uint32_t pc_before = cpu.pc;
             uint64_t remaining = max_cycles_u64 - cycles;
             int n = remaining < (uint64_t)batch ? (int)remaining : batch;
-            /* Cap batch at trace window boundary if approaching */
-            if (need_step && cycles < trace_start) {
-                uint64_t to_window = trace_start - cycles;
+            /* Cap batch at trace window boundary if approaching.
+             * Use cpu.cycle_count to match event log timestamps. */
+            if (need_step && cpu.cycle_count < trace_start) {
+                uint64_t to_window = trace_start - cpu.cycle_count;
                 if (to_window < (uint64_t)n) n = (int)to_window;
             }
             int ran = xtensa_run(&cpu, n);
@@ -1007,14 +1086,15 @@ int main(int argc, char *argv[]) {
         if (frt) freertos_stubs_check_preempt(frt);
 
         /* Progress heartbeat */
-        if (heartbeat_interval > 0 && cycles / heartbeat_interval > last_heartbeat) {
-            last_heartbeat = cycles / heartbeat_interval;
+        if (heartbeat_interval > 0 &&
+            cpu.cycle_count / heartbeat_interval > last_heartbeat) {
+            last_heartbeat = cpu.cycle_count / heartbeat_interval;
             uint32_t cur_stubs = rom_stubs_total_calls(rom);
             char sym_buf[128];
             format_addr(syms, cpu.pc, sym_buf, sizeof(sym_buf));
             const char *task_name = frt ? freertos_stubs_current_task_name(frt) : NULL;
             fprintf(stderr, "[%10llu] ---- %s | stubs:%u | task:%s ----\n",
-                    (unsigned long long)cycles, sym_buf,
+                    (unsigned long long)cpu.cycle_count, sym_buf,
                     cur_stubs - hb_stub_count,
                     task_name ? task_name : "(none)");
             hb_stub_count = cur_stubs;
@@ -1036,9 +1116,17 @@ int main(int argc, char *argv[]) {
     /* Flush any buffered output to stdout before summary */
     fflush(stdout);
 
-    /* Dump ring buffer if used */
-    if (g_ring)
-        ring_flush(g_ring);
+    /* Dump ring buffer based on dump conditions */
+    if (g_ring) {
+        int is_crash = (stop_reason == STOP_CPU_STOPPED ||
+                        stop_reason == STOP_EXCEPTION_LOOP);
+        if ((g_dump_mode & DUMP_CRASH) && is_crash)
+            ring_flush(g_ring);
+        else if (g_dump_mode & DUMP_FLUSH)
+            ring_flush(g_ring);
+        else if (g_dump_mode & DUMP_TAIL)
+            ring_flush_tail(g_ring, g_dump_tail_n);
+    }
 
     /* ===== Summary ===== */
     fprintf(stderr, "\n--- Execution summary ---\n");
@@ -1057,7 +1145,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Stop reason: %s\n", stop_reason_str(stop_reason));
     }
 
-    fprintf(stderr, "Cycles:     %llu\n", (unsigned long long)cycles);
+    fprintf(stderr, "Cycles:     %llu (virtual: %llu)\n",
+            (unsigned long long)cycles, (unsigned long long)cpu.cycle_count);
 
     /* Final PC with symbol */
     char pc_sym[128];
