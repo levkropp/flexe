@@ -1572,43 +1572,54 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
               XT_PS_SET_CALLINC(cpu->ps, 0);
           } break;
           case 1: /* B1: BF, BT, LOOP, LOOPNEZ, LOOPGTZ */
-              { int32_t offset8 = sign_extend(imm8, 8);
-                uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
-                switch (r) {
-                case 0: /* BF */
-                    if (!(cpu->br & (1u << s)))
-                        BRANCH_TO(cpu, target);
-                    break;
-                case 1: /* BT */
-                    if (cpu->br & (1u << s))
-                        BRANCH_TO(cpu, target);
-                    break;
-                case 8: /* LOOP */
-                    cpu->lend = target;
-                    cpu->lbeg = cpu->pc;
-                    cpu->lcount = ar_read(cpu, s) - 1;
-                    break;
-                case 9: /* LOOPNEZ */
-                    cpu->lend = target;
-                    cpu->lbeg = cpu->pc;
-                    if (ar_read(cpu, s) == 0) {
-                        BRANCH_TO(cpu, target);
-                    } else {
-                        cpu->lcount = ar_read(cpu, s) - 1;
-                    }
-                    break;
-                case 10: /* LOOPGTZ */
-                    cpu->lend = target;
-                    cpu->lbeg = cpu->pc;
-                    if ((int32_t)ar_read(cpu, s) <= 0) {
-                        BRANCH_TO(cpu, target);
-                    } else {
-                        cpu->lcount = ar_read(cpu, s) - 1;
-                    }
-                    break;
-                default: break;
-                }
-              } break;
+              switch (r) {
+              case 0: /* BF */
+              case 1: /* BT */
+              {
+                  /* Branches use sign-extended offset: target = PC + sext(imm8) + 4 */
+                  int32_t offset8 = sign_extend(imm8, 8);
+                  uint32_t target = cpu->pc + (uint32_t)offset8 + 1;
+                  if (r == 0) {
+                      if (!(cpu->br & (1u << s)))
+                          BRANCH_TO(cpu, target);
+                  } else {
+                      if (cpu->br & (1u << s))
+                          BRANCH_TO(cpu, target);
+                  }
+                  break;
+              }
+              case 8:  /* LOOP */
+              case 9:  /* LOOPNEZ */
+              case 10: /* LOOPGTZ */
+              {
+                  /* LOOP uses zero-extended offset: LEND = PC + zext(imm8) + 4
+                   * Since cpu->pc is already advanced by 3: LEND = cpu->pc + imm8 + 1 */
+                  uint32_t loop_end = cpu->pc + (uint32_t)imm8 + 1;
+                  cpu->lend = loop_end;
+                  cpu->lbeg = cpu->pc;
+                  if (r == 8) {
+                      /* LOOP: always enter */
+                      cpu->lcount = ar_read(cpu, s) - 1;
+                  } else if (r == 9) {
+                      /* LOOPNEZ: skip if count == 0 */
+                      if (ar_read(cpu, s) == 0) {
+                          BRANCH_TO(cpu, loop_end);
+                      } else {
+                          cpu->lcount = ar_read(cpu, s) - 1;
+                      }
+                  } else {
+                      /* LOOPGTZ: skip if count <= 0 */
+                      if ((int32_t)ar_read(cpu, s) <= 0) {
+                          BRANCH_TO(cpu, loop_end);
+                      } else {
+                          cpu->lcount = ar_read(cpu, s) - 1;
+                      }
+                  }
+                  break;
+              }
+              default: break;
+              }
+              break;
           case 2: /* BLTUI */
               { int32_t offset8 = sign_extend(imm8, 8);
                 uint32_t target = cpu->pc + (uint32_t)offset8 + 1;

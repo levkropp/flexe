@@ -18,6 +18,7 @@
 #define TIMG0_BASE      0x3FF5F000u
 #define TIMG1_BASE      0x3FF60000u
 #define SYSCON_BASE     0x3FF66000u
+#define WDEV_BASE       0x3FF75000u  /* WiFi device (contains RNG register) */
 #define PAGE_SIZE       4096
 
 /* Page index from absolute address */
@@ -392,6 +393,26 @@ static void uart_other_write(void *ctx, uint32_t addr, uint32_t val) {
     (void)ctx; (void)addr; (void)val;
 }
 
+/* ---- WDEV (WiFi device — RNG register) ---- */
+
+static uint32_t wdev_read(void *ctx, uint32_t addr) {
+    (void)ctx;
+    if (addr == 0x3FF75144u) {
+        /* WDEV_RND_REG — return random data */
+        static uint64_t rng_state = 0x12345678ABCDEF01ULL;
+        /* xorshift64 PRNG — fast, good enough for TLS nonces */
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        return (uint32_t)rng_state;
+    }
+    return 0;
+}
+
+static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
+    (void)ctx; (void)addr; (void)val;
+}
+
 /* ---- Default handler (unhandled peripherals) ---- */
 
 static uint32_t default_read(void *ctx, uint32_t addr) {
@@ -463,6 +484,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     /* SYSCON */
     mem_register_mmio(mem, (int)PAGE_OF(SYSCON_BASE), syscon_read, syscon_write, p);
+
+    /* WDEV (WiFi device — RNG register at 0x3FF75144) */
+    mem_register_mmio(mem, (int)PAGE_OF(WDEV_BASE), wdev_read, wdev_write, p);
 
     return p;
 }
