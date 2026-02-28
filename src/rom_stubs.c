@@ -45,6 +45,10 @@ struct esp32_rom_stubs {
     uint32_t         app_main_addr;    /* app_main symbol for start_cpu0 hook */
     uint32_t         stack_chk_guard_addr; /* __stack_chk_guard BSS address */
     const elf_symbols_t *syms;         /* ELF symbols (for symbol lookups in stubs) */
+    uint32_t         s_resume_cores_addr;      /* s_resume_cores BSS address */
+    uint32_t         app_cpu_boot_addr;        /* Boot address for APP CPU (core 1) */
+    bool             app_cpu_start_requested;  /* Core 0 requested core 1 start */
+    bool             single_core_mode;         /* -1 flag: fake core 1 init variables */
     struct {
         uint32_t addr;     /* 0 = empty */
         int      idx;      /* index into entries[] */
@@ -227,21 +231,27 @@ done:;
 
 static void stub_ets_set_appcpu_boot_addr(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
-    /* Write s_cpu_up[1] = 1 and s_cpu_inited[1] = 1 to unblock multicore startup */
+    uint32_t addr = rom_arg(cpu, 0);
+    s->app_cpu_boot_addr = addr;
+
+    /* Always set s_cpu_up[1] = 1 (tells core 0 that core 1 is alive) */
     if (s->s_cpu_up_addr)
         mem_write8(cpu->mem, s->s_cpu_up_addr + 1, 1);
-    if (s->s_cpu_inited_addr)
-        mem_write8(cpu->mem, s->s_cpu_inited_addr + 1, 1);
-    /* Pre-set system init flags for both cores to avoid polling loop in start_cpu0.
-     * s_system_inited is a per-core byte array: [0]=PRO_CPU, [1]=APP_CPU */
-    if (s->s_system_inited_addr) {
-        mem_write8(cpu->mem, s->s_system_inited_addr, 1);      /* core 0 */
-        mem_write8(cpu->mem, s->s_system_inited_addr + 1, 1);  /* core 1 */
+
+    if (s->single_core_mode) {
+        /* Single-core: fake all init variables so core 0 doesn't hang */
+        if (s->s_cpu_inited_addr)
+            mem_write8(cpu->mem, s->s_cpu_inited_addr + 1, 1);
+        if (s->s_system_inited_addr) {
+            mem_write8(cpu->mem, s->s_system_inited_addr, 1);
+            mem_write8(cpu->mem, s->s_system_inited_addr + 1, 1);
+        }
+        if (s->s_system_full_inited_addr) {
+            mem_write8(cpu->mem, s->s_system_full_inited_addr, 1);
+            mem_write8(cpu->mem, s->s_system_full_inited_addr + 1, 1);
+        }
     }
-    if (s->s_system_full_inited_addr) {
-        mem_write8(cpu->mem, s->s_system_full_inited_addr, 1);
-        mem_write8(cpu->mem, s->s_system_full_inited_addr + 1, 1);
-    }
+    /* Dual-core: core 1 will set its own init variables when it starts */
     rom_return_void(cpu);
 }
 
@@ -1039,12 +1049,19 @@ static void stub_esp_partition_mmap(xtensa_cpu_t *cpu, void *ctx) {
 
 /* startup_resume_other_cores — called right before the system init polling loop.
  * In real ESP32, this wakes other cores to run their init functions.
- * We set s_system_inited[1] = 1 here so the polling loop (which checks all cores)
- * doesn't spin forever waiting for core 1 that never starts. */
+ * In dual-core mode, we signal the main loop to start core 1.
+ * In single-core mode, we fake s_system_inited[1] = 1. */
 static void stub_startup_resume_other_cores(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
+    if (!s->single_core_mode)
+        s->app_cpu_start_requested = true;
+    /* Always set s_system_inited[1] so core 0's polling loop doesn't hang.
+     * In dual-core, core 1 will set the real value later. */
     if (s->s_system_inited_addr)
-        mem_write8(cpu->mem, s->s_system_inited_addr + 1, 1);  /* core 1 */
+        mem_write8(cpu->mem, s->s_system_inited_addr + 1, 1);
+    /* Signal core 1 to proceed past its call_start_cpu1 wait loop */
+    if (s->s_resume_cores_addr)
+        mem_write8(cpu->mem, s->s_resume_cores_addr, 1);
     rom_return_void(cpu);
 }
 
@@ -2219,6 +2236,8 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
             stubs->app_main_addr = addr;
         if (elf_symbols_find(syms, "__stack_chk_guard", &addr) == 0)
             stubs->stack_chk_guard_addr = addr;
+        if (elf_symbols_find(syms, "s_resume_cores", &addr) == 0)
+            stubs->s_resume_cores_addr = addr;
     }
 
     /* Don't hook start_cpu0 — let it run naturally so __init_array
@@ -2765,4 +2784,20 @@ uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs) {
 
 int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs) {
     return stubs ? stubs->unregistered_count : 0;
+}
+
+void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core) {
+    if (stubs) stubs->single_core_mode = single_core;
+}
+
+bool rom_stubs_app_cpu_start_requested(const esp32_rom_stubs_t *stubs) {
+    return stubs ? stubs->app_cpu_start_requested : false;
+}
+
+uint32_t rom_stubs_app_cpu_boot_addr(const esp32_rom_stubs_t *stubs) {
+    return stubs ? stubs->app_cpu_boot_addr : 0;
+}
+
+void rom_stubs_clear_app_cpu_start(esp32_rom_stubs_t *stubs) {
+    if (stubs) stubs->app_cpu_start_requested = false;
 }

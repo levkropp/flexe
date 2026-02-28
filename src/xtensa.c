@@ -9,6 +9,7 @@
 
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
+    cpu->core_id = 0;
     for (int i = 0; i < 32; i++)
         cpu->int_level[i] = 1;
     /* ESP32 timer interrupt level defaults */

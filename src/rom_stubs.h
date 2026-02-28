@@ -41,4 +41,10 @@ uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs);
 /* Count of unregistered ROM calls (fallback handler) */
 int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs);
 
+/* Dual-core boot support */
+void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core);
+bool rom_stubs_app_cpu_start_requested(const esp32_rom_stubs_t *stubs);
+uint32_t rom_stubs_app_cpu_boot_addr(const esp32_rom_stubs_t *stubs);
+void rom_stubs_clear_app_cpu_start(esp32_rom_stubs_t *stubs);
+
 #endif /* ROM_STUBS_H */

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 
 /* Bump allocator region in high SRAM */
 #define BUMP_BASE   0x3FFF0000u
@@ -39,7 +40,7 @@ typedef enum {
     TASK_BLOCKED_QUEUE
 } task_state_t;
 
-#define MAX_TASKS        8
+#define MAX_TASKS        16
 #define TASK_STACK_SIZE  0x4000u      /* 16KB per task */
 #define TASK_STACK_BASE  0x3FB00000u  /* PSRAM, 3MB offset from 0x3F800000 */
 
@@ -48,6 +49,7 @@ typedef struct {
     uint32_t     entry_fn;
     uint32_t     param;
     uint8_t      priority;
+    int          core_affinity;   /* -1 = no affinity, 0 or 1 = pinned */
     task_state_t state;
     char         name[16];
     uint64_t     wake_cycle;     /* cycle_count threshold for SLEEPING */
@@ -63,8 +65,8 @@ typedef struct {
 } task_tcb_t;
 
 struct freertos_stubs {
-    xtensa_cpu_t       *cpu;
-    esp32_rom_stubs_t  *rom;   /* for registering hooks */
+    xtensa_cpu_t       *cpu[2];     /* Per-core CPU pointers */
+    esp32_rom_stubs_t  *rom;        /* for registering hooks */
 
     /* Bump allocator */
     uint32_t bump_ptr;
@@ -84,9 +86,12 @@ struct freertos_stubs {
     /* Cooperative scheduler */
     task_tcb_t tasks[MAX_TASKS];
     int        task_count;
-    int        current_task;       /* -1 during boot */
+    int        current_task[2];       /* Per-core current task (-1 during boot) */
     bool       scheduler_started;
-    uint64_t   last_switch_cycle;  /* cycle_count at last context switch */
+    uint64_t   last_switch_cycle[2];  /* Per-core cycle at last context switch */
+
+    /* Thread safety */
+    pthread_mutex_t lock;
 
     /* Event callback for task switches */
     freertos_event_fn event_fn;
@@ -140,9 +145,9 @@ static uint32_t bump_alloc(freertos_stubs_t *frt, uint32_t size) {
 
 /* ===== Cooperative scheduler core ===== */
 
-static void sched_save_context(freertos_stubs_t *frt) {
-    xtensa_cpu_t *cpu = frt->cpu;
-    task_tcb_t *t = &frt->tasks[frt->current_task];
+static void sched_save_context(freertos_stubs_t *frt, int core_id) {
+    xtensa_cpu_t *cpu = frt->cpu[core_id];
+    task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
     memcpy(t->ar, cpu->ar, sizeof(cpu->ar));
     t->pc = cpu->pc;
     t->ps = cpu->ps;
@@ -156,9 +161,9 @@ static void sched_save_context(freertos_stubs_t *frt) {
     t->lcount = cpu->lcount;
 }
 
-static void sched_restore_context(freertos_stubs_t *frt) {
-    xtensa_cpu_t *cpu = frt->cpu;
-    task_tcb_t *t = &frt->tasks[frt->current_task];
+static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
+    xtensa_cpu_t *cpu = frt->cpu[core_id];
+    task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
     memcpy(cpu->ar, t->ar, sizeof(cpu->ar));
     cpu->pc = t->pc;
     cpu->ps = t->ps;
@@ -174,8 +179,8 @@ static void sched_restore_context(freertos_stubs_t *frt) {
 
 /* Wake any SLEEPING tasks whose wake_cycle has been reached.
  * Returns the nearest wake time if all tasks are sleeping, or 0. */
-static uint64_t sched_wake_sleepers(freertos_stubs_t *frt) {
-    uint64_t now = frt->cpu->cycle_count;
+static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
+    uint64_t now = frt->cpu[core_id]->cycle_count;
     uint64_t nearest = UINT64_MAX;
     for (int i = 0; i < frt->task_count; i++) {
         task_tcb_t *t = &frt->tasks[i];
@@ -190,73 +195,87 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt) {
     return nearest;
 }
 
-/* Find the highest-priority READY task, round-robin among equals.
- * Returns task index or -1 if none runnable. */
-static int sched_pick_next(freertos_stubs_t *frt) {
-    uint64_t nearest = sched_wake_sleepers(frt);
+/* Find the highest-priority READY task eligible for core_id,
+ * round-robin among equals.  Returns task index or -1. */
+static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
+    uint64_t nearest = sched_wake_sleepers(frt, core_id);
 
-    /* Find highest priority among READY tasks */
+    /* Find highest priority among READY tasks eligible for this core */
     int best_prio = -1;
     for (int i = 0; i < frt->task_count; i++) {
-        if (frt->tasks[i].state == TASK_READY && frt->tasks[i].priority > best_prio)
-            best_prio = frt->tasks[i].priority;
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->state != TASK_READY) continue;
+        if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
+        if (t->priority > best_prio)
+            best_prio = t->priority;
     }
 
     if (best_prio >= 0) {
         /* Round-robin: start searching after current_task */
-        int start = (frt->current_task + 1) % frt->task_count;
+        int cur = frt->current_task[core_id];
+        int start = (cur >= 0) ? (cur + 1) % frt->task_count : 0;
         for (int j = 0; j < frt->task_count; j++) {
             int i = (start + j) % frt->task_count;
-            if (frt->tasks[i].state == TASK_READY && frt->tasks[i].priority == best_prio)
+            task_tcb_t *t = &frt->tasks[i];
+            if (t->state == TASK_READY && t->priority == best_prio &&
+                (t->core_affinity < 0 || t->core_affinity == core_id))
                 return i;
         }
     }
 
-    /* No READY tasks — if there are sleepers, fast-forward time */
-    if (nearest != UINT64_MAX) {
-        uint64_t advance = nearest - frt->cpu->cycle_count;
-        frt->cpu->cycle_count = nearest;
-        frt->cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
-        /* Wake them and retry */
-        sched_wake_sleepers(frt);
+    /* No READY tasks — fast-forward through sleeping tasks until we find
+     * one eligible for this core, or exhaust all sleepers. */
+    while (nearest != UINT64_MAX) {
+        xtensa_cpu_t *cpu = frt->cpu[core_id];
+        uint64_t advance = nearest - cpu->cycle_count;
+        cpu->cycle_count = nearest;
+        cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
+        /* Wake tasks at this time and find next nearest */
+        nearest = sched_wake_sleepers(frt, core_id);
 
         best_prio = -1;
         for (int i = 0; i < frt->task_count; i++) {
-            if (frt->tasks[i].state == TASK_READY && frt->tasks[i].priority > best_prio)
-                best_prio = frt->tasks[i].priority;
+            task_tcb_t *t = &frt->tasks[i];
+            if (t->state != TASK_READY) continue;
+            if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
+            if (t->priority > best_prio)
+                best_prio = t->priority;
         }
         if (best_prio >= 0) {
-            int start = (frt->current_task + 1) % frt->task_count;
+            int cur = frt->current_task[core_id];
+            int start = (cur >= 0) ? (cur + 1) % frt->task_count : 0;
             for (int j = 0; j < frt->task_count; j++) {
                 int i = (start + j) % frt->task_count;
-                if (frt->tasks[i].state == TASK_READY && frt->tasks[i].priority == best_prio)
+                task_tcb_t *t = &frt->tasks[i];
+                if (t->state == TASK_READY && t->priority == best_prio &&
+                    (t->core_affinity < 0 || t->core_affinity == core_id))
                     return i;
             }
         }
     }
 
-    return -1;  /* all tasks blocked/unused */
+    return -1;  /* all tasks blocked/unused/pinned elsewhere */
 }
 
-/* Context-switch: save current, pick next, restore next.
+/* Context-switch on a specific core: save current, pick next, restore.
  * If no runnable task, halt CPU. */
-static void sched_switch(freertos_stubs_t *frt) {
-    int prev = frt->current_task;
-    int next = sched_pick_next(frt);
+static void sched_switch(freertos_stubs_t *frt, int core_id) {
+    int prev = frt->current_task[core_id];
+    int next = sched_pick_next(frt, core_id);
     if (next < 0) {
-        frt->cpu->running = false;
+        frt->cpu[core_id]->running = false;
         return;
     }
-    frt->current_task = next;
+    frt->current_task[core_id] = next;
     frt->tasks[next].state = TASK_RUNNING;
-    frt->last_switch_cycle = frt->cpu->cycle_count;
-    sched_restore_context(frt);
+    frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
+    sched_restore_context(frt, core_id);
 
     /* Emit event callback on task change */
     if (frt->event_fn && next != prev) {
         const char *from = (prev >= 0) ? frt->tasks[prev].name : "boot";
         const char *to = frt->tasks[next].name;
-        frt->event_fn(from, to, frt->cpu->cycle_count, frt->event_ctx);
+        frt->event_fn(from, to, frt->cpu[core_id]->cycle_count, frt->event_ctx);
     }
 }
 
@@ -273,7 +292,7 @@ static void frt_read_string(xtensa_cpu_t *cpu, uint32_t addr, char *buf, int max
 /* Register a new task in the scheduler TCB table.
  * Returns the task index, or -1 if table is full. */
 static int sched_register_task(freertos_stubs_t *frt, uint32_t fn, uint32_t param,
-                               uint8_t priority, uint32_t handle) {
+                               uint8_t priority, uint32_t handle, int core_affinity) {
     if (frt->task_count >= MAX_TASKS) return -1;
     int idx = frt->task_count++;
     task_tcb_t *t = &frt->tasks[idx];
@@ -282,6 +301,7 @@ static int sched_register_task(freertos_stubs_t *frt, uint32_t fn, uint32_t para
     t->entry_fn = fn;
     t->param = param;
     t->priority = priority;
+    t->core_affinity = core_affinity;
     t->state = TASK_READY;
     /* Assign a stack in PSRAM */
     t->stack_top = TASK_STACK_BASE + (uint32_t)(idx + 1) * TASK_STACK_SIZE;
@@ -306,21 +326,22 @@ static int sched_register_task(freertos_stubs_t *frt, uint32_t fn, uint32_t para
 static void sched_start(freertos_stubs_t *frt) {
     if (frt->scheduler_started) return;
     frt->scheduler_started = true;
-    frt->current_task = -1;
+    frt->current_task[0] = -1;
+    frt->current_task[1] = -1;
 
     /* Reset ccount so millis()/micros() start near zero when tasks begin.
      * Boot-time ets_delay_us() calls inflate ccount to billions, which
      * causes firmware division-by-subtraction loops on millis() to hang. */
-    frt->cpu->ccount = 0;
-    frt->cpu->cycle_count = 0;
+    frt->cpu[0]->ccount = 0;
+    frt->cpu[0]->cycle_count = 0;
 
-    /* All registered tasks are READY; pick the first to run */
-    int next = sched_pick_next(frt);
+    /* All registered tasks are READY; pick the first to run on core 0 */
+    int next = sched_pick_next(frt, 0);
     if (next >= 0) {
-        frt->current_task = next;
+        frt->current_task[0] = next;
         frt->tasks[next].state = TASK_RUNNING;
-        frt->last_switch_cycle = frt->cpu->cycle_count;
-        sched_restore_context(frt);
+        frt->last_switch_cycle[0] = frt->cpu[0]->cycle_count;
+        sched_restore_context(frt, 0);
     }
 }
 
@@ -331,12 +352,12 @@ static void sched_promote_legacy(freertos_stubs_t *frt) {
     if (frt->scheduler_started || frt->task_count < 2)
         return;
     frt->scheduler_started = true;
-    /* The legacy task is tasks[0] — mark it as RUNNING and current */
-    frt->current_task = 0;
+    /* The legacy task is tasks[0] — mark it as RUNNING and current on core 0 */
+    frt->current_task[0] = 0;
     frt->tasks[0].state = TASK_RUNNING;
     /* Save current CPU context into tasks[0] so context switches work */
-    sched_save_context(frt);
-    frt->last_switch_cycle = frt->cpu->cycle_count;
+    sched_save_context(frt, 0);
+    frt->last_switch_cycle[0] = frt->cpu[0]->cycle_count;
 }
 
 /* ===== FreeRTOS stub implementations ===== */
@@ -347,16 +368,20 @@ void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t ticks = frt_arg(cpu, 0);
     uint64_t advance = (uint64_t)ticks * frt->cycles_per_tick;
     if (advance > 200000000ULL) advance = 200000000ULL;
+    int core_id = cpu->core_id;
 
-    if (frt->scheduler_started && frt->current_task >= 0) {
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
         /* Yield: unwind call, save, sleep, switch */
         frt_return_void(cpu);
-        sched_save_context(frt);
-        task_tcb_t *t = &frt->tasks[frt->current_task];
+        sched_save_context(frt, core_id);
+        task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
         t->state = TASK_SLEEPING;
         t->wake_cycle = cpu->cycle_count + advance;
-        sched_switch(frt);
+        sched_switch(frt, core_id);
+        pthread_mutex_unlock(&frt->lock);
     } else {
+        pthread_mutex_unlock(&frt->lock);
         /* Legacy: single-task mode */
         cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
         cpu->cycle_count += advance;
@@ -377,6 +402,8 @@ void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
     if (name_addr)
         frt_read_string(cpu, name_addr, task_name, sizeof(task_name));
 
+    pthread_mutex_lock(&frt->lock);
+
     uint32_t fake_handle = 0;
     if (handle_out) {
         fake_handle = bump_alloc(frt, 4);
@@ -387,7 +414,8 @@ void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
     /* Register in scheduler if app-level task (priority < 20) */
     if (task_fn && prio < 20) {
         if (!fake_handle) fake_handle = bump_alloc(frt, 4);
-        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio,
+                                      fake_handle, -1);  /* no affinity */
         if (idx >= 0)
             memcpy(frt->tasks[idx].name, task_name, sizeof(task_name));
         /* If we're in legacy single-task mode, promote to scheduler */
@@ -400,6 +428,8 @@ void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
         frt->deferred_task_fn = task_fn;
         frt->deferred_task_param = task_par;
     }
+
+    pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, pdPASS);
 }
 
@@ -411,10 +441,16 @@ void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t task_par   = frt_arg(cpu, 3);
     uint32_t prio       = frt_arg(cpu, 4);
     uint32_t handle_out = frt_arg(cpu, 5);
+    int32_t  core       = (int32_t)frt_arg(cpu, 6);
+
+    /* tskNO_AFFINITY is typically 0x7FFFFFFF or -1 */
+    int affinity = (core < 0 || core > 1) ? -1 : core;
 
     char task_name[16] = "?";
     if (name_addr)
         frt_read_string(cpu, name_addr, task_name, sizeof(task_name));
+
+    pthread_mutex_lock(&frt->lock);
 
     uint32_t fake_handle = 0;
     if (handle_out) {
@@ -426,7 +462,8 @@ void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
     /* Register in scheduler if app-level task (priority < 20) */
     if (task_fn && prio < 20) {
         if (!fake_handle) fake_handle = bump_alloc(frt, 4);
-        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio, fake_handle);
+        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio,
+                                      fake_handle, affinity);
         if (idx >= 0)
             memcpy(frt->tasks[idx].name, task_name, sizeof(task_name));
         /* If we're in legacy single-task mode, promote to scheduler */
@@ -439,6 +476,8 @@ void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
         frt->deferred_task_fn = task_fn;
         frt->deferred_task_param = task_par;
     }
+
+    pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, pdPASS);
 }
 
@@ -446,13 +485,15 @@ void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
 void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     uint32_t handle = frt_arg(cpu, 0);
+    int core_id = cpu->core_id;
 
+    pthread_mutex_lock(&frt->lock);
     if (frt->scheduler_started) {
         frt_return_void(cpu);
-        if (handle == 0 && frt->current_task >= 0) {
+        if (handle == 0 && frt->current_task[core_id] >= 0) {
             /* Delete self: mark UNUSED and switch away */
-            frt->tasks[frt->current_task].state = TASK_UNUSED;
-            sched_switch(frt);
+            frt->tasks[frt->current_task[core_id]].state = TASK_UNUSED;
+            sched_switch(frt, core_id);
         } else {
             /* Delete by handle — find and mark UNUSED */
             for (int i = 0; i < frt->task_count; i++) {
@@ -465,6 +506,7 @@ void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
     } else {
         frt_return_void(cpu);
     }
+    pthread_mutex_unlock(&frt->lock);
 }
 
 /* xTaskGetTickCount() -> virtual ticks (100 Hz) */
@@ -482,15 +524,21 @@ void stub_xQueueCreate(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t length = frt_arg(cpu, 0);
     uint32_t item_size = frt_arg(cpu, 1);
 
+    pthread_mutex_lock(&frt->lock);
     if (frt->queue_count >= MAX_QUEUES || item_size > MAX_ITEM_SIZE ||
         length > MAX_QUEUE_ITEMS) {
+        pthread_mutex_unlock(&frt->lock);
         frt_return(cpu, 0);
         return;
     }
 
     queue_t *q = &frt->queues[frt->queue_count];
     uint32_t handle = bump_alloc(frt, 4);
-    if (!handle) { frt_return(cpu, 0); return; }
+    if (!handle) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0);
+        return;
+    }
 
     q->handle = handle;
     q->item_size = (int)item_size;
@@ -499,6 +547,7 @@ void stub_xQueueCreate(xtensa_cpu_t *cpu, void *ctx) {
     q->head = 0;
     q->tail = 0;
     frt->queue_count++;
+    pthread_mutex_unlock(&frt->lock);
 
     frt_return(cpu, handle);
 }
@@ -517,14 +566,15 @@ void stub_xQueueSend(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t handle = frt_arg(cpu, 0);
     uint32_t item_ptr = frt_arg(cpu, 1);
 
+    pthread_mutex_lock(&frt->lock);
     queue_t *q = find_queue(frt, handle);
     if (!q) {
-        /* Unknown handle — probably a mutex created via xQueueCreateMutex
-         * which only bump-allocates a handle.  Return success. */
+        pthread_mutex_unlock(&frt->lock);
         frt_return(cpu, pdTRUE);
         return;
     }
     if (q->count >= q->max_items) {
+        pthread_mutex_unlock(&frt->lock);
         frt_return(cpu, pdFALSE);
         return;
     }
@@ -546,6 +596,7 @@ void stub_xQueueSend(xtensa_cpu_t *cpu, void *ctx) {
             }
         }
     }
+    pthread_mutex_unlock(&frt->lock);
 
     frt_return(cpu, pdTRUE);
 }
@@ -561,17 +612,23 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t handle = frt_arg(cpu, 0);
     uint32_t buf_ptr = frt_arg(cpu, 1);
     uint32_t timeout = frt_arg(cpu, 2);
+    int core_id = cpu->core_id;
 
+    pthread_mutex_lock(&frt->lock);
     queue_t *q = find_queue(frt, handle);
-    if (!q) { frt_return(cpu, pdFALSE); return; }
+    if (!q) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdFALSE);
+        return;
+    }
 
     if (q->count == 0) {
-        if (frt->scheduler_started && frt->current_task >= 0 &&
+        if (frt->scheduler_started && frt->current_task[core_id] >= 0 &&
             timeout > 0) {
             /* Block: unwind call (returning pdFALSE), save, sleep/block, switch */
             frt_return(cpu, pdFALSE);
-            sched_save_context(frt);
-            task_tcb_t *t = &frt->tasks[frt->current_task];
+            sched_save_context(frt, core_id);
+            task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
             if (timeout == 0xFFFFFFFFu) {
                 /* portMAX_DELAY: block on queue indefinitely */
                 t->state = TASK_BLOCKED_QUEUE;
@@ -583,9 +640,11 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
                 t->state = TASK_SLEEPING;
                 t->wake_cycle = cpu->cycle_count + advance;
             }
-            sched_switch(frt);
+            sched_switch(frt, core_id);
+            pthread_mutex_unlock(&frt->lock);
             return;
         }
+        pthread_mutex_unlock(&frt->lock);
         /* Legacy: advance virtual time and return pdFALSE */
         if (timeout > 0 && timeout != 0xFFFFFFFFu) {
             uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
@@ -602,6 +661,7 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
         mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
     q->head = (q->head + 1) % q->max_items;
     q->count--;
+    pthread_mutex_unlock(&frt->lock);
 
     frt_return(cpu, pdTRUE);
 }
@@ -609,14 +669,18 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
 /* xSemaphoreCreateMutex() -> non-null handle */
 void stub_xSemaphoreCreateMutex(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
     uint32_t handle = bump_alloc(frt, 4);
+    pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, handle);
 }
 
 /* xSemaphoreCreateBinary() -> non-null handle */
 void stub_xSemaphoreCreateBinary(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
     uint32_t handle = bump_alloc(frt, 4);
+    pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, handle);
 }
 
@@ -636,7 +700,9 @@ void stub_xSemaphoreGive(xtensa_cpu_t *cpu, void *ctx) {
 void stub_pvPortMalloc(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     uint32_t size = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
     uint32_t ptr = bump_alloc(frt, size);
+    pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, ptr);
 }
 
@@ -649,9 +715,14 @@ void stub_vPortFree(xtensa_cpu_t *cpu, void *ctx) {
 /* xTaskGetCurrentTaskHandle() -> current task handle or fixed fake */
 void stub_xTaskGetCurrentTaskHandle(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
-    if (frt->scheduler_started && frt->current_task >= 0) {
-        frt_return(cpu, frt->tasks[frt->current_task].handle);
+    int core_id = cpu->core_id;
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
+        uint32_t h = frt->tasks[frt->current_task[core_id]].handle;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, h);
     } else {
+        pthread_mutex_unlock(&frt->lock);
         frt_return(cpu, 0x3FFF0100u); /* fixed fake handle */
     }
 }
@@ -659,14 +730,17 @@ void stub_xTaskGetCurrentTaskHandle(xtensa_cpu_t *cpu, void *ctx) {
 /* vTaskSuspend(handle) — mark task UNUSED and switch */
 void stub_vTaskSuspend(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
-    if (frt->scheduler_started && frt->current_task >= 0) {
+    int core_id = cpu->core_id;
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
         frt_return_void(cpu);
-        sched_save_context(frt);
-        frt->tasks[frt->current_task].state = TASK_UNUSED;
-        sched_switch(frt);
+        sched_save_context(frt, core_id);
+        frt->tasks[frt->current_task[core_id]].state = TASK_UNUSED;
+        sched_switch(frt, core_id);
     } else {
         cpu->running = false;
     }
+    pthread_mutex_unlock(&frt->lock);
 }
 
 /* uxTaskGetStackHighWaterMark() -> return a comfortable margin */
@@ -687,8 +761,7 @@ static void stub_xTaskGetIdleTaskHandleForCPU(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, 0x3FFF0200u);
 }
 
-/* xPortEnterCriticalTimeout / vPortExitCritical — no-op in emulator
- * (single-threaded, no contention) */
+/* xPortEnterCriticalTimeout / vPortExitCritical — no-op */
 static void stub_xPortEnterCriticalTimeout(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     frt_return_void(cpu);
@@ -710,7 +783,9 @@ static void stub_esp_ipc_noop(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_vTaskStartScheduler(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     (void)cpu;
+    pthread_mutex_lock(&frt->lock);
     sched_start(frt);
+    pthread_mutex_unlock(&frt->lock);
     /* sched_start jumps to first task via sched_restore_context,
      * so we never return to the caller's j-self loop. */
 }
@@ -718,14 +793,17 @@ static void stub_vTaskStartScheduler(xtensa_cpu_t *cpu, void *ctx) {
 /* vPortYield / vTaskSwitchContext — yield to scheduler */
 static void stub_vPortYield(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
-    if (frt->scheduler_started && frt->current_task >= 0) {
+    int core_id = cpu->core_id;
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
         frt_return_void(cpu);
-        sched_save_context(frt);
-        frt->tasks[frt->current_task].state = TASK_READY;
-        sched_switch(frt);
+        sched_save_context(frt, core_id);
+        frt->tasks[frt->current_task[core_id]].state = TASK_READY;
+        sched_switch(frt, core_id);
     } else {
         frt_return_void(cpu);
     }
+    pthread_mutex_unlock(&frt->lock);
 }
 
 /* xQueueGenericCreate (underlying implementation xQueueCreate may alias) */
@@ -743,28 +821,80 @@ void stub_xQueueGenericSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
     stub_xQueueSend(cpu, ctx);
 }
 
+/* xPortGetCoreID() -> cpu->core_id */
+static void stub_xPortGetCoreID(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return(cpu, (uint32_t)cpu->core_id);
+}
+
+/* esp_startup_start_app_other_cores — start core 1's scheduler portion.
+ * Called by core 1's startup code after init. Picks first task for core 1. */
+static void stub_esp_startup_start_app_other_cores(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+
+    /* Pick first task for this core */
+    int next = sched_pick_next(frt, core_id);
+    if (next >= 0) {
+        frt->current_task[core_id] = next;
+        frt->tasks[next].state = TASK_RUNNING;
+        frt->last_switch_cycle[core_id] = cpu->cycle_count;
+        sched_restore_context(frt, core_id);
+    } else {
+        /* No tasks for this core yet — return from function and let core
+         * idle. check_preempt_core will pick up tasks when they appear. */
+        frt_return_void(cpu);
+    }
+    pthread_mutex_unlock(&frt->lock);
+}
+
 /* ===== Preemptive timeslice check ===== */
 
-bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
-    if (!frt || !frt->scheduler_started || frt->current_task < 0)
-        return false;
-    if (frt->cpu->cycle_count - frt->last_switch_cycle < frt->cycles_per_tick)
-        return false;
+bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id) {
+    if (!frt || !frt->cpu[core_id]) return false;
 
-    int cur_prio = frt->tasks[frt->current_task].priority;
+    pthread_mutex_lock(&frt->lock);
+    if (!frt->scheduler_started) {
+        pthread_mutex_unlock(&frt->lock);
+        return false;
+    }
+    /* Core has no current task — try to pick up a newly created one */
+    if (frt->current_task[core_id] < 0) {
+        int next = sched_pick_next(frt, core_id);
+        if (next >= 0) {
+            frt->current_task[core_id] = next;
+            frt->tasks[next].state = TASK_RUNNING;
+            frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
+            sched_restore_context(frt, core_id);
+        }
+        pthread_mutex_unlock(&frt->lock);
+        return next >= 0;
+    }
+    if (frt->cpu[core_id]->cycle_count - frt->last_switch_cycle[core_id] <
+        frt->cycles_per_tick) {
+        pthread_mutex_unlock(&frt->lock);
+        return false;
+    }
+
+    int cur_prio = frt->tasks[frt->current_task[core_id]].priority;
 
     /* Wake any sleeping tasks whose delay has expired */
-    sched_wake_sleepers(frt);
+    sched_wake_sleepers(frt, core_id);
 
-    /* Find highest-priority READY task (other than current) */
+    /* Find highest-priority READY task eligible for this core (other than current) */
     int best_prio = -1;
     int next = -1;
-    int start = (frt->current_task + 1) % frt->task_count;
+    int start = (frt->current_task[core_id] + 1) % frt->task_count;
     for (int j = 0; j < frt->task_count; j++) {
         int i = (start + j) % frt->task_count;
-        if (i == frt->current_task) continue;
-        if (frt->tasks[i].state == TASK_READY && frt->tasks[i].priority > best_prio) {
-            best_prio = frt->tasks[i].priority;
+        if (i == frt->current_task[core_id]) continue;
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->state != TASK_READY) continue;
+        if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
+        if (t->priority > best_prio) {
+            best_prio = t->priority;
             next = i;
         }
     }
@@ -773,39 +903,50 @@ bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
      * - Higher-priority task woke up: preempt immediately
      * - Equal-priority task ready: round-robin timeslice
      * - Only lower-priority tasks ready: don't preempt */
-    if (next < 0 || best_prio < cur_prio)
+    if (next < 0 || best_prio < cur_prio) {
+        pthread_mutex_unlock(&frt->lock);
         return false;
+    }
 
     /* For equal priority, round-robin: pick first READY at this priority
      * starting after current_task in array order */
     if (best_prio == cur_prio) {
         next = -1;
         for (int j = 1; j < frt->task_count; j++) {
-            int i = (frt->current_task + j) % frt->task_count;
-            if (frt->tasks[i].state == TASK_READY &&
-                frt->tasks[i].priority == cur_prio) {
+            int i = (frt->current_task[core_id] + j) % frt->task_count;
+            task_tcb_t *t = &frt->tasks[i];
+            if (t->state == TASK_READY && t->priority == cur_prio &&
+                (t->core_affinity < 0 || t->core_affinity == core_id)) {
                 next = i;
                 break;
             }
         }
-        if (next < 0) return false; /* no equal-priority peer to rotate to */
+        if (next < 0) {
+            pthread_mutex_unlock(&frt->lock);
+            return false;
+        }
     }
 
-    int prev = frt->current_task;
-    sched_save_context(frt);
-    frt->tasks[frt->current_task].state = TASK_READY;
+    int prev = frt->current_task[core_id];
+    sched_save_context(frt, core_id);
+    frt->tasks[frt->current_task[core_id]].state = TASK_READY;
 
-    frt->current_task = next;
+    frt->current_task[core_id] = next;
     frt->tasks[next].state = TASK_RUNNING;
-    frt->last_switch_cycle = frt->cpu->cycle_count;
-    sched_restore_context(frt);
+    frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
+    sched_restore_context(frt, core_id);
 
     if (frt->event_fn && next != prev) {
         const char *from = frt->tasks[prev].name;
         const char *to = frt->tasks[next].name;
-        frt->event_fn(from, to, frt->cpu->cycle_count, frt->event_ctx);
+        frt->event_fn(from, to, frt->cpu[core_id]->cycle_count, frt->event_ctx);
     }
+    pthread_mutex_unlock(&frt->lock);
     return true;
+}
+
+bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
+    return freertos_stubs_check_preempt_core(frt, 0);
 }
 
 /* ===== Public API ===== */
@@ -813,16 +954,26 @@ bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
 freertos_stubs_t *freertos_stubs_create(xtensa_cpu_t *cpu) {
     freertos_stubs_t *frt = calloc(1, sizeof(*frt));
     if (!frt) return NULL;
-    frt->cpu = cpu;
+    frt->cpu[0] = cpu;
+    frt->cpu[1] = NULL;
     frt->bump_ptr = BUMP_BASE;
     frt->cpu_freq_mhz = 160;
     frt->cycles_per_tick = 1600000;  /* 160 MHz / 100 Hz */
-    frt->current_task = -1;
+    frt->current_task[0] = -1;
+    frt->current_task[1] = -1;
+    pthread_mutex_init(&frt->lock, NULL);
     return frt;
 }
 
 void freertos_stubs_destroy(freertos_stubs_t *frt) {
+    if (!frt) return;
+    pthread_mutex_destroy(&frt->lock);
     free(frt);
+}
+
+void freertos_stubs_attach_cpu(freertos_stubs_t *frt, int core_id, xtensa_cpu_t *cpu) {
+    if (!frt || core_id < 0 || core_id > 1) return;
+    frt->cpu[core_id] = cpu;
 }
 
 void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, void *ctx) {
@@ -831,16 +982,17 @@ void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, vo
     frt->event_ctx = ctx;
 }
 
-const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt) {
-    if (!frt || frt->current_task < 0) return NULL;
-    return frt->tasks[frt->current_task].name;
+const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt, int core_id) {
+    if (!frt || core_id < 0 || core_id > 1) return NULL;
+    if (frt->current_task[core_id] < 0) return NULL;
+    return frt->tasks[frt->current_task[core_id]].name;
 }
 
 int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms) {
     if (!frt || !syms) return 0;
 
     /* We need a rom_stubs handle to register hooks. Get it from cpu->pc_hook_ctx */
-    esp32_rom_stubs_t *rom = frt->cpu->pc_hook_ctx;
+    esp32_rom_stubs_t *rom = frt->cpu[0]->pc_hook_ctx;
     if (!rom) return 0;
     frt->rom = rom;
 
@@ -893,6 +1045,8 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "vTaskStartScheduler",           stub_vTaskStartScheduler },
         { "vPortYield",                    stub_vPortYield },
         { "vTaskSwitchContext",            stub_vPortYield },
+        { "xPortGetCoreID",               stub_xPortGetCoreID },
+        { "esp_startup_start_app_other_cores", stub_esp_startup_start_app_other_cores },
         { NULL, NULL }
     };
 
@@ -926,19 +1080,23 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
  * start the cooperative scheduler.  Otherwise, use legacy single-task launch. */
 static void stub_deferred_task_trampoline(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
     if (frt->task_count > 1) {
         /* Multi-task: start cooperative scheduler */
         sched_start(frt);
+        pthread_mutex_unlock(&frt->lock);
     } else if (frt->deferred_task_fn) {
         uint32_t fn = frt->deferred_task_fn;
         uint32_t param = frt->deferred_task_param;
         frt->deferred_task_fn = 0;  /* one-shot */
+        pthread_mutex_unlock(&frt->lock);
         /* Set up a fresh call context for the task function */
         ar_write(cpu, 1, 0x3FFE0000u);  /* SP */
         ar_write(cpu, 2, param);
         cpu->pc = fn;
         cpu->ps = 0x00040020u;  /* WOE=1, UM=1 */
     } else {
+        pthread_mutex_unlock(&frt->lock);
         cpu->running = 0;
     }
 }
@@ -955,16 +1113,22 @@ uint32_t freertos_stubs_deferred_task(const freertos_stubs_t *frt, uint32_t *par
 
 uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *param_out) {
     if (!frt) return 0;
+    pthread_mutex_lock(&frt->lock);
     /* If scheduler has multiple tasks, start it and signal caller to skip manual setup */
     if (frt->task_count > 1) {
         sched_start(frt);
+        pthread_mutex_unlock(&frt->lock);
         return 0;  /* tell caller not to do manual PC/SP setup */
     }
     /* Legacy single-task path */
-    if (!frt->deferred_task_fn) return 0;
+    if (!frt->deferred_task_fn) {
+        pthread_mutex_unlock(&frt->lock);
+        return 0;
+    }
     uint32_t fn = frt->deferred_task_fn;
     if (param_out) *param_out = frt->deferred_task_param;
     frt->deferred_task_fn = 0;  /* one-shot */
+    pthread_mutex_unlock(&frt->lock);
     return fn;
 }
 
@@ -974,6 +1138,7 @@ bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt) {
 
 void freertos_stubs_start_scheduler(freertos_stubs_t *frt) {
     if (!frt) return;
+    pthread_mutex_lock(&frt->lock);
     if (frt->task_count > 1) {
         sched_start(frt);
     } else if (frt->deferred_task_fn) {
@@ -981,11 +1146,12 @@ void freertos_stubs_start_scheduler(freertos_stubs_t *frt) {
         uint32_t fn = frt->deferred_task_fn;
         uint32_t param = frt->deferred_task_param;
         frt->deferred_task_fn = 0;
-        ar_write(frt->cpu, 1, 0x3FFE0000u);
-        ar_write(frt->cpu, 2, param);
-        frt->cpu->pc = fn;
-        frt->cpu->ps = 0x00040020u;
+        ar_write(frt->cpu[0], 1, 0x3FFE0000u);
+        ar_write(frt->cpu[0], 2, param);
+        frt->cpu[0]->pc = fn;
+        frt->cpu[0]->ps = 0x00040020u;
     } else {
-        frt->cpu->running = 0;
+        frt->cpu[0]->running = 0;
     }
+    pthread_mutex_unlock(&frt->lock);
 }

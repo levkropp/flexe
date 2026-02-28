@@ -219,6 +219,7 @@ struct xtensa_cpu {
     uint32_t configid0;     /* SR 176: Processor config ID 0 */
     uint32_t configid1;     /* SR 208: Processor config ID 1 */
     uint32_t prid;          /* SR 235: Processor ID */
+    int      core_id;       /* Core ID (0=PRO_CPU, 1=APP_CPU) */
     uint32_t intenable;     /* SR 228: Interrupt enable mask */
     uint32_t interrupt;     /* SR 226: Interrupt pending bits */
     uint32_t cpenable;      /* SR 224: Coprocessor enable */

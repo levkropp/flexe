@@ -9,6 +9,9 @@ typedef struct freertos_stubs freertos_stubs_t;
 freertos_stubs_t *freertos_stubs_create(xtensa_cpu_t *cpu);
 void freertos_stubs_destroy(freertos_stubs_t *frt);
 
+/* Register a second CPU for dual-core scheduling */
+void freertos_stubs_attach_cpu(freertos_stubs_t *frt, int core_id, xtensa_cpu_t *cpu);
+
 /* Look up ELF symbols and register PC hooks for FreeRTOS functions */
 int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms);
 
@@ -27,8 +30,8 @@ typedef void (*freertos_event_fn)(const char *from, const char *to,
                                    uint64_t cycle, void *ctx);
 void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, void *ctx);
 
-/* Current task name (for heartbeat display) */
-const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt);
+/* Current task name for a specific core (for heartbeat display) */
+const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt, int core_id);
 
 /* Returns true if the cooperative scheduler is running (multi-task mode) */
 bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
@@ -39,5 +42,8 @@ void freertos_stubs_start_scheduler(freertos_stubs_t *frt);
 /* Check if current task's timeslice expired; if so, preempt.
  * Call from main run loop after each xtensa_run() batch. */
 bool freertos_stubs_check_preempt(freertos_stubs_t *frt);
+
+/* Per-core preemption check for dual-core mode */
+bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id);
 
 #endif /* FREERTOS_STUBS_H */
