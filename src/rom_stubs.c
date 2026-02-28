@@ -24,6 +24,7 @@ typedef struct {
     const char *name;
     uint32_t    call_count;
     void       *user_ctx;   /* Per-entry context; NULL = use rom_stubs */
+    int         spy;        /* If true: call fn, then let original execute */
 } rom_stub_entry_t;
 
 struct esp32_rom_stubs {
@@ -1563,6 +1564,261 @@ static void stub_panic_handler(xtensa_cpu_t *cpu, void *ctx) {
     cpu->running = 0;
 }
 
+/* ===== RNG stubs ===== */
+
+static uint32_t emu_random32(void) {
+    static uint64_t state = 0xDEADBEEFCAFEBABEULL;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return (uint32_t)state;
+}
+
+/* esp_random() -> uint32_t */
+static void stub_esp_random(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, emu_random32());
+}
+
+/* esp_fill_random(buf, len) */
+static void stub_esp_fill_random(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t buf = rom_arg(cpu, 0);
+    uint32_t len = rom_arg(cpu, 1);
+    for (uint32_t i = 0; i < len; i++)
+        mem_write8(cpu->mem, buf + i, (uint8_t)(emu_random32() >> 16));
+    rom_return_void(cpu);
+}
+
+/* hal_random() -> uint32_t (Arduino wrapper) */
+static void stub_hal_random(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, emu_random32());
+}
+
+/* bootloader_fill_random(buf, len) */
+static void stub_bootloader_fill_random(xtensa_cpu_t *cpu, void *ctx) {
+    stub_esp_fill_random(cpu, ctx);
+}
+
+/* ===== MD5 ROM stubs ===== */
+
+/* MD5 context layout in emulator memory (matches ESP32 ROM struct) */
+#define MD5_CTX_STATE_OFS  0    /* uint32_t buf[4] — state a,b,c,d */
+#define MD5_CTX_BITS_OFS   16   /* uint32_t bits[2] — count low, high */
+#define MD5_CTX_IN_OFS     24   /* uint8_t in[64] — input buffer */
+#define MD5_CTX_SIZE       88
+
+/* MD5 round functions */
+#define MD5_F(x,y,z) (((x)&(y))|((~(x))&(z)))
+#define MD5_G(x,y,z) (((x)&(z))|((y)&(~(z))))
+#define MD5_H(x,y,z) ((x)^(y)^(z))
+#define MD5_I(x,y,z) ((y)^((x)|(~(z))))
+#define MD5_ROL(x,n) (((x)<<(n))|((x)>>(32-(n))))
+
+#define MD5_STEP(f,a,b,c,d,x,t,s) do { \
+    (a) += f((b),(c),(d)) + (x) + (t); \
+    (a) = MD5_ROL((a),(s)); \
+    (a) += (b); \
+} while(0)
+
+static void md5_transform(uint32_t state[4], const uint32_t block[16]) {
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+
+    /* Round 1 */
+    MD5_STEP(MD5_F,a,b,c,d, block[ 0], 0xd76aa478,  7);
+    MD5_STEP(MD5_F,d,a,b,c, block[ 1], 0xe8c7b756, 12);
+    MD5_STEP(MD5_F,c,d,a,b, block[ 2], 0x242070db, 17);
+    MD5_STEP(MD5_F,b,c,d,a, block[ 3], 0xc1bdceee, 22);
+    MD5_STEP(MD5_F,a,b,c,d, block[ 4], 0xf57c0faf,  7);
+    MD5_STEP(MD5_F,d,a,b,c, block[ 5], 0x4787c62a, 12);
+    MD5_STEP(MD5_F,c,d,a,b, block[ 6], 0xa8304613, 17);
+    MD5_STEP(MD5_F,b,c,d,a, block[ 7], 0xfd469501, 22);
+    MD5_STEP(MD5_F,a,b,c,d, block[ 8], 0x698098d8,  7);
+    MD5_STEP(MD5_F,d,a,b,c, block[ 9], 0x8b44f7af, 12);
+    MD5_STEP(MD5_F,c,d,a,b, block[10], 0xffff5bb1, 17);
+    MD5_STEP(MD5_F,b,c,d,a, block[11], 0x895cd7be, 22);
+    MD5_STEP(MD5_F,a,b,c,d, block[12], 0x6b901122,  7);
+    MD5_STEP(MD5_F,d,a,b,c, block[13], 0xfd987193, 12);
+    MD5_STEP(MD5_F,c,d,a,b, block[14], 0xa679438e, 17);
+    MD5_STEP(MD5_F,b,c,d,a, block[15], 0x49b40821, 22);
+
+    /* Round 2 */
+    MD5_STEP(MD5_G,a,b,c,d, block[ 1], 0xf61e2562,  5);
+    MD5_STEP(MD5_G,d,a,b,c, block[ 6], 0xc040b340,  9);
+    MD5_STEP(MD5_G,c,d,a,b, block[11], 0x265e5a51, 14);
+    MD5_STEP(MD5_G,b,c,d,a, block[ 0], 0xe9b6c7aa, 20);
+    MD5_STEP(MD5_G,a,b,c,d, block[ 5], 0xd62f105d,  5);
+    MD5_STEP(MD5_G,d,a,b,c, block[10], 0x02441453,  9);
+    MD5_STEP(MD5_G,c,d,a,b, block[15], 0xd8a1e681, 14);
+    MD5_STEP(MD5_G,b,c,d,a, block[ 4], 0xe7d3fbc8, 20);
+    MD5_STEP(MD5_G,a,b,c,d, block[ 9], 0x21e1cde6,  5);
+    MD5_STEP(MD5_G,d,a,b,c, block[14], 0xc33707d6,  9);
+    MD5_STEP(MD5_G,c,d,a,b, block[ 3], 0xf4d50d87, 14);
+    MD5_STEP(MD5_G,b,c,d,a, block[ 8], 0x455a14ed, 20);
+    MD5_STEP(MD5_G,a,b,c,d, block[13], 0xa9e3e905,  5);
+    MD5_STEP(MD5_G,d,a,b,c, block[ 2], 0xfcefa3f8,  9);
+    MD5_STEP(MD5_G,c,d,a,b, block[ 7], 0x676f02d9, 14);
+    MD5_STEP(MD5_G,b,c,d,a, block[12], 0x8d2a4c8a, 20);
+
+    /* Round 3 */
+    MD5_STEP(MD5_H,a,b,c,d, block[ 5], 0xfffa3942,  4);
+    MD5_STEP(MD5_H,d,a,b,c, block[ 8], 0x8771f681, 11);
+    MD5_STEP(MD5_H,c,d,a,b, block[11], 0x6d9d6122, 16);
+    MD5_STEP(MD5_H,b,c,d,a, block[14], 0xfde5380c, 23);
+    MD5_STEP(MD5_H,a,b,c,d, block[ 1], 0xa4beea44,  4);
+    MD5_STEP(MD5_H,d,a,b,c, block[ 4], 0x4bdecfa9, 11);
+    MD5_STEP(MD5_H,c,d,a,b, block[ 7], 0xf6bb4b60, 16);
+    MD5_STEP(MD5_H,b,c,d,a, block[10], 0xbebfbc70, 23);
+    MD5_STEP(MD5_H,a,b,c,d, block[13], 0x289b7ec6,  4);
+    MD5_STEP(MD5_H,d,a,b,c, block[ 0], 0xeaa127fa, 11);
+    MD5_STEP(MD5_H,c,d,a,b, block[ 3], 0xd4ef3085, 16);
+    MD5_STEP(MD5_H,b,c,d,a, block[ 6], 0x04881d05, 23);
+    MD5_STEP(MD5_H,a,b,c,d, block[ 9], 0xd9d4d039,  4);
+    MD5_STEP(MD5_H,d,a,b,c, block[12], 0xe6db99e5, 11);
+    MD5_STEP(MD5_H,c,d,a,b, block[15], 0x1fa27cf8, 16);
+    MD5_STEP(MD5_H,b,c,d,a, block[ 2], 0xc4ac5665, 23);
+
+    /* Round 4 */
+    MD5_STEP(MD5_I,a,b,c,d, block[ 0], 0xf4292244,  6);
+    MD5_STEP(MD5_I,d,a,b,c, block[ 7], 0x432aff97, 10);
+    MD5_STEP(MD5_I,c,d,a,b, block[14], 0xab9423a7, 15);
+    MD5_STEP(MD5_I,b,c,d,a, block[ 5], 0xfc93a039, 21);
+    MD5_STEP(MD5_I,a,b,c,d, block[12], 0x655b59c3,  6);
+    MD5_STEP(MD5_I,d,a,b,c, block[ 3], 0x8f0ccc92, 10);
+    MD5_STEP(MD5_I,c,d,a,b, block[10], 0xffeff47d, 15);
+    MD5_STEP(MD5_I,b,c,d,a, block[ 1], 0x85845dd1, 21);
+    MD5_STEP(MD5_I,a,b,c,d, block[ 8], 0x6fa87e4f,  6);
+    MD5_STEP(MD5_I,d,a,b,c, block[15], 0xfe2ce6e0, 10);
+    MD5_STEP(MD5_I,c,d,a,b, block[ 6], 0xa3014314, 15);
+    MD5_STEP(MD5_I,b,c,d,a, block[13], 0x4e0811a1, 21);
+    MD5_STEP(MD5_I,a,b,c,d, block[ 4], 0xf7537e82,  6);
+    MD5_STEP(MD5_I,d,a,b,c, block[11], 0xbd3af235, 10);
+    MD5_STEP(MD5_I,c,d,a,b, block[ 2], 0x2ad7d2bb, 15);
+    MD5_STEP(MD5_I,b,c,d,a, block[ 9], 0xeb86d391, 21);
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+}
+
+static void md5_process(xtensa_cpu_t *cpu, uint32_t ctx_addr) {
+    uint32_t state[4], block[16];
+    for (int i = 0; i < 4; i++)
+        state[i] = mem_read32(cpu->mem, ctx_addr + MD5_CTX_STATE_OFS + i * 4);
+    for (int i = 0; i < 16; i++)
+        block[i] = mem_read32(cpu->mem, ctx_addr + MD5_CTX_IN_OFS + i * 4);
+    md5_transform(state, block);
+    for (int i = 0; i < 4; i++)
+        mem_write32(cpu->mem, ctx_addr + MD5_CTX_STATE_OFS + i * 4, state[i]);
+}
+
+/* esp_rom_md5_init(md5_context_t *ctx) */
+static void stub_md5_init(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t md5ctx = rom_arg(cpu, 0);
+    /* Standard MD5 IV */
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_STATE_OFS + 0, 0x67452301);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_STATE_OFS + 4, 0xefcdab89);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_STATE_OFS + 8, 0x98badcfe);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_STATE_OFS + 12, 0x10325476);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS + 0, 0);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS + 4, 0);
+    for (int i = 0; i < 64; i++)
+        mem_write8(cpu->mem, md5ctx + MD5_CTX_IN_OFS + (uint32_t)i, 0);
+    rom_return_void(cpu);
+}
+
+/* esp_rom_md5_update(md5_context_t *ctx, const void *data, uint32_t len) */
+static void stub_md5_update(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t md5ctx  = rom_arg(cpu, 0);
+    uint32_t data    = rom_arg(cpu, 1);
+    uint32_t len     = rom_arg(cpu, 2);
+
+    /* Read bit count */
+    uint32_t lo = mem_read32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS);
+    uint32_t hi = mem_read32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS + 4);
+    uint32_t buf_used = (lo >> 3) & 0x3F;  /* bytes in buffer */
+
+    /* Update bit count */
+    uint64_t bits = ((uint64_t)hi << 32) | lo;
+    bits += (uint64_t)len << 3;
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS, (uint32_t)bits);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS + 4, (uint32_t)(bits >> 32));
+
+    uint32_t off = 0;
+
+    /* Fill existing buffer */
+    if (buf_used > 0) {
+        uint32_t fill = 64 - buf_used;
+        if (len < fill) fill = len;
+        for (uint32_t i = 0; i < fill; i++)
+            mem_write8(cpu->mem, md5ctx + MD5_CTX_IN_OFS + buf_used + i,
+                       mem_read8(cpu->mem, data + i));
+        buf_used += fill;
+        off += fill;
+        len -= fill;
+        if (buf_used == 64) {
+            md5_process(cpu, md5ctx);
+            buf_used = 0;
+        }
+    }
+
+    /* Process full blocks */
+    while (len >= 64) {
+        for (int i = 0; i < 64; i++)
+            mem_write8(cpu->mem, md5ctx + MD5_CTX_IN_OFS + (uint32_t)i,
+                       mem_read8(cpu->mem, data + off + (uint32_t)i));
+        md5_process(cpu, md5ctx);
+        off += 64;
+        len -= 64;
+    }
+
+    /* Store remainder in buffer */
+    for (uint32_t i = 0; i < len; i++)
+        mem_write8(cpu->mem, md5ctx + MD5_CTX_IN_OFS + i,
+                   mem_read8(cpu->mem, data + off + i));
+
+    rom_return_void(cpu);
+}
+
+/* esp_rom_md5_final(uint8_t digest[16], md5_context_t *ctx) */
+static void stub_md5_final(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t digest  = rom_arg(cpu, 0);
+    uint32_t md5ctx  = rom_arg(cpu, 1);
+
+    uint32_t lo = mem_read32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS);
+    uint32_t buf_used = (lo >> 3) & 0x3F;
+
+    /* Pad: 0x80, then zeros, then 8-byte bit count (LE) */
+    mem_write8(cpu->mem, md5ctx + MD5_CTX_IN_OFS + buf_used, 0x80);
+    for (uint32_t i = buf_used + 1; i < 64; i++)
+        mem_write8(cpu->mem, md5ctx + MD5_CTX_IN_OFS + i, 0);
+
+    if (buf_used >= 56) {
+        md5_process(cpu, md5ctx);
+        for (int i = 0; i < 56; i++)
+            mem_write8(cpu->mem, md5ctx + MD5_CTX_IN_OFS + (uint32_t)i, 0);
+    }
+
+    /* Append bit count as little-endian 64-bit */
+    uint32_t hi = mem_read32(cpu->mem, md5ctx + MD5_CTX_BITS_OFS + 4);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_IN_OFS + 56, lo);
+    mem_write32(cpu->mem, md5ctx + MD5_CTX_IN_OFS + 60, hi);
+    md5_process(cpu, md5ctx);
+
+    /* Write digest (state as LE bytes) */
+    for (int i = 0; i < 4; i++) {
+        uint32_t val = mem_read32(cpu->mem, md5ctx + MD5_CTX_STATE_OFS + i * 4);
+        mem_write8(cpu->mem, digest + (uint32_t)(i * 4 + 0), (uint8_t)(val));
+        mem_write8(cpu->mem, digest + (uint32_t)(i * 4 + 1), (uint8_t)(val >> 8));
+        mem_write8(cpu->mem, digest + (uint32_t)(i * 4 + 2), (uint8_t)(val >> 16));
+        mem_write8(cpu->mem, digest + (uint32_t)(i * 4 + 3), (uint8_t)(val >> 24));
+    }
+
+    rom_return_void(cpu);
+}
+
 /* ===== PC hook ===== */
 
 /* ===== PC hook hash table ===== */
@@ -1585,7 +1841,7 @@ static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
     uint32_t h = hook_hash(addr) & HOOK_HT_MASK;
     for (int probe = 0; probe < HOOK_HT_SIZE; probe++) {
         uint32_t slot = (h + probe) & HOOK_HT_MASK;
-        if (s->ht[slot].addr == 0) {
+        if (s->ht[slot].addr == 0 || s->ht[slot].addr == addr) {
             s->ht[slot].addr = addr;
             s->ht[slot].idx = idx;
             return;
@@ -1603,6 +1859,8 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             s->log_fn(s->log_ctx, pc, s->entries[idx].name, cpu);
         void *ectx = s->entries[idx].user_ctx ? s->entries[idx].user_ctx : s;
         s->entries[idx].fn(cpu, ectx);
+        if (s->entries[idx].spy)
+            return 0; /* spy: let original function execute */
         return 1;
     }
     /* Only intercept unregistered calls in ROM range */
@@ -1760,6 +2018,16 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x4000c728, stub_void_unregistered,   "__dummy_lock");
     rom_stubs_register(s, 0x4000c730, stub_unregistered,        "__dummy_lock_try");
 
+    /* MD5 ROM functions */
+    rom_stubs_register(s, 0x4005DA7C, stub_md5_init,            "esp_rom_md5_init");
+    rom_stubs_register(s, 0x4005DA9C, stub_md5_update,          "esp_rom_md5_update");
+    rom_stubs_register(s, 0x4005DB1C, stub_md5_final,           "esp_rom_md5_final");
+
+    /* POSIX syscall stubs (used by VFS / mbedTLS for socket I/O) */
+    rom_stubs_register(s, 0x40001778, stub_void_unregistered,   "close");
+    rom_stubs_register(s, 0x400017DC, stub_unregistered,        "read");
+    rom_stubs_register(s, 0x4000181C, stub_unregistered,        "write");
+
     return s;
 }
 
@@ -1900,6 +2168,22 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, alloc_hooks[i].name, &addr) == 0) {
             rom_stubs_register(stubs, addr, alloc_hooks[i].fn, alloc_hooks[i].name);
+            hooked++;
+        }
+    }
+
+    /* RNG stubs */
+    struct { const char *name; rom_stub_fn fn; } rng_hooks[] = {
+        { "esp_random",                    stub_esp_random },
+        { "esp_fill_random",               stub_esp_fill_random },
+        { "hal_random",                    stub_hal_random },
+        { "bootloader_fill_random",        stub_bootloader_fill_random },
+        { NULL, NULL }
+    };
+    for (int i = 0; rng_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, rng_hooks[i].name, &addr) == 0) {
+            rom_stubs_register(stubs, addr, rng_hooks[i].fn, rng_hooks[i].name);
             hooked++;
         }
     }
@@ -2397,6 +2681,14 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
 int rom_stubs_register(esp32_rom_stubs_t *stubs, uint32_t addr,
                        rom_stub_fn fn, const char *name) {
     return rom_stubs_register_ctx(stubs, addr, fn, name, NULL);
+}
+
+int rom_stubs_register_spy(esp32_rom_stubs_t *stubs, uint32_t addr,
+                            rom_stub_fn fn, const char *name, void *user_ctx) {
+    int rc = rom_stubs_register_ctx(stubs, addr, fn, name, user_ctx);
+    if (rc == 0)
+        stubs->entries[stubs->count - 1].spy = 1;
+    return rc;
 }
 
 int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,

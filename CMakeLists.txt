@@ -19,9 +19,11 @@ add_library(xtensa-emu-lib STATIC
     src/wifi_stubs.c
     src/sha_stubs.c
     src/aes_stubs.c
+    src/mpi_stubs.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
-target_link_libraries(xtensa-emu-lib PUBLIC m z)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(xtensa-emu-lib PUBLIC m z OpenSSL::Crypto)
 target_compile_options(xtensa-emu-lib PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 
 # Main executable

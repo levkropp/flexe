@@ -12,6 +12,7 @@
 #include "wifi_stubs.h"
 #include "sha_stubs.h"
 #include "aes_stubs.h"
+#include "mpi_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -817,10 +818,16 @@ int main(int argc, char *argv[]) {
     if (astubs && syms)
         aes_stubs_hook_symbols(astubs, syms);
 
+    /* MPI (RSA) hardware accelerator stubs */
+    mpi_stubs_t *mstubs = mpi_stubs_create(&cpu);
+    if (mstubs && syms)
+        mpi_stubs_hook_symbols(mstubs, syms);
+
     /* WiFi / lwip socket bridge */
     wifi_stubs_t *wstubs = wifi_stubs_create(&cpu);
     if (wstubs && syms)
         wifi_stubs_hook_symbols(wstubs, syms);
+
 
     /* Install ROM log callback for verbose trace, call trace, or event log */
     if (call_trace) {
@@ -1215,6 +1222,7 @@ int main(int argc, char *argv[]) {
     wifi_stubs_destroy(wstubs);
     sha_stubs_destroy(shstubs);
     aes_stubs_destroy(astubs);
+    mpi_stubs_destroy(mstubs);
     sdcard_stubs_destroy(sstubs);
     touch_stubs_destroy(tstubs);
     display_stubs_destroy(dstubs);

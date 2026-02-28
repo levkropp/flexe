@@ -3,6 +3,7 @@
 #include "memory.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 /* ESP-IDF AES mode constants */
 #define AES_MODE_ENCRYPT 1

@@ -22,6 +22,7 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 /* ===== Constants ===== */
 
@@ -291,6 +292,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
+        wifi_log(ws, "write(fd=%u, len=%u): no such slot\n", fd, len);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -304,8 +306,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
     ssize_t n = send(s->host_fd, tmp, len, MSG_NOSIGNAL);
 
     if (n > 0)
-        wifi_log(ws, "send(slot %u, %zd bytes): %.*s\n",
-                fd, n, (int)(n > 200 ? 200 : n), (char *)tmp);
+        wifi_log(ws, "send(slot %u, %zd bytes)\n", fd, n);
 
     free(tmp);
 
@@ -322,6 +323,9 @@ static void stub_lwip_send(xtensa_cpu_t *cpu, void *ctx)
     stub_lwip_write(cpu, ctx);
 }
 
+/* lwip_read / lwip_recv — used for TCP data (including TLS via VFS).
+ * For blocking sockets (nonblocking=false), polls with a timeout so that
+ * TLS handshakes can complete. Non-blocking sockets use MSG_DONTWAIT. */
 static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -331,6 +335,7 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
+        wifi_log(ws, "read(fd=%u, len=%u): no such slot\n", fd, len);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -338,17 +343,38 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     uint8_t *tmp = malloc(len);
     if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
 
-    ssize_t n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
+    ssize_t n;
+    if (s->nonblocking) {
+        n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
+    } else {
+        /* Blocking socket: poll with 10s timeout then recv.
+         * This lets TLS handshakes complete (server needs time to respond). */
+        struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 10000);
+        if (pr > 0) {
+            n = recv(s->host_fd, tmp, len, 0);
+            if (n > 0)
+                wifi_log(ws, "recv(slot %u, %zd/%u bytes)\n", fd, n, len);
+            else if (n == 0)
+                wifi_log(ws, "recv(slot %u): EOF\n", fd);
+            else
+                wifi_log(ws, "recv(slot %u): error %s\n", fd, strerror(errno));
+        } else if (pr == 0) {
+            wifi_log(ws, "recv(slot %u): timeout 10s\n", fd);
+            n = -1;
+            errno = EAGAIN;
+        } else {
+            n = -1;
+        }
+    }
+
     if (n > 0) {
         for (ssize_t i = 0; i < n; i++)
             mem_write8(cpu->mem, buf + (uint32_t)i, tmp[i]);
-        wifi_log(ws, "recv(slot %u, %zd bytes): %.*s\n",
-                fd, n, (int)(n > 200 ? 200 : n), (char *)tmp);
     }
     free(tmp);
 
     if (n < 0) {
-        /* EAGAIN/EWOULDBLOCK → return -1 with errno, firmware handles retry */
         set_firmware_errno(cpu, NEWLIB_EAGAIN);
         ws_return(cpu, (uint32_t)-1);
         return;
@@ -740,10 +766,38 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, (uint32_t)(n < 0 ? -1 : n));
 }
 
+/* lwip_recvfrom — always non-blocking (used for UDP polling like NTP).
+ * Unlike lwip_read, never blocks even on blocking sockets. */
 static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
 {
-    /* Delegate to lwip_read (ignore src addr) */
-    stub_lwip_read(cpu, ctx);
+    wifi_stubs_t *ws = ctx;
+    uint32_t fd   = ws_arg(cpu, 0);
+    uint32_t buf  = ws_arg(cpu, 1);
+    uint32_t len  = ws_arg(cpu, 2);
+
+    emu_socket_t *s = slot_get(ws, (int)fd);
+    if (!s) {
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    uint8_t *tmp = malloc(len);
+    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+
+    ssize_t n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
+
+    if (n > 0) {
+        for (ssize_t i = 0; i < n; i++)
+            mem_write8(cpu->mem, buf + (uint32_t)i, tmp[i]);
+    }
+    free(tmp);
+
+    if (n < 0) {
+        set_firmware_errno(cpu, NEWLIB_EAGAIN);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+    ws_return(cpu, (uint32_t)n);
 }
 
 /* ===== VFS wrappers ===== */
@@ -853,6 +907,14 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
             hooked++;
         }
     }
+
+    /* Override POSIX syscall ROM stubs with socket-aware versions.
+     * These are fallback paths — most socket I/O goes through lwip_*
+     * hooks above. But some code may call read()/write()/close() directly. */
+    rom_stubs_register_ctx(rom, 0x4000181C, stub_lwip_write, "write", ws);
+    rom_stubs_register_ctx(rom, 0x400017DC, stub_lwip_read,  "read",  ws);
+    rom_stubs_register_ctx(rom, 0x40001778, stub_lwip_close, "close", ws);
+    hooked += 3;
 
     if (hooked > 0)
         fprintf(stderr, "[wifi] hooked %d lwip symbols\n", hooked);
