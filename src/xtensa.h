@@ -204,6 +204,7 @@ struct xtensa_cpu {
     uint32_t depc;          /* SR 192: Double exception PC */
     uint32_t ccount;        /* SR 234: Cycle counter */
     uint32_t ccompare[3];   /* SR 240-242: Cycle compare */
+    uint32_t next_timer_event; /* Nearest ccompare value (for batched timer check) */
     uint32_t scompare1;     /* SR 12: Compare value for S32C1I */
     uint32_t misc[4];       /* SR 244-247: Misc scratch registers */
     uint32_t litbase;       /* SR 5:  Literal base (Extended L32R) */
@@ -274,6 +275,7 @@ struct xtensa_cpu {
     /* PC hook (for ROM stubs etc.) */
     xtensa_pc_hook_fn pc_hook;
     void             *pc_hook_ctx;
+    const uint64_t   *pc_hook_bitmap;  /* Fast-path bitmap: skip hook if bit not set */
 
     /* Breakpoints */
 #define MAX_BREAKPOINTS 16

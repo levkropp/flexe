@@ -1,11 +1,41 @@
 #include "xtensa.h"
 #include "memory.h"
+#include "rom_stubs.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 
 /* Set PC from instruction handler (branch/call/ret/exception) and mark it */
 #define BRANCH_TO(cpu, addr) do { (cpu)->pc = (addr); (cpu)->_pc_written = true; } while(0)
+
+/* Recompute the nearest ccompare value for timer batching.
+ * We pick the ccompare that will fire soonest AFTER current ccount.
+ * If none are ahead, we use 0 (which means "check every cycle" is impossible
+ * since ccount is 0 only once in 2^32 cycles — effectively a no-op). */
+static inline void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
+    /* Distance from ccount to each ccompare (wrapping arithmetic).
+     * 0 distance means "just matched" (already fired) — treat as max. */
+    uint32_t d0 = cpu->ccompare[0] - cpu->ccount;
+    uint32_t d1 = cpu->ccompare[1] - cpu->ccount;
+    uint32_t d2 = cpu->ccompare[2] - cpu->ccount;
+    if (d0 == 0) d0 = UINT32_MAX;
+    if (d1 == 0) d1 = UINT32_MAX;
+    if (d2 == 0) d2 = UINT32_MAX;
+    if (d0 <= d1 && d0 <= d2)
+        cpu->next_timer_event = cpu->ccompare[0];
+    else if (d1 <= d2)
+        cpu->next_timer_event = cpu->ccompare[1];
+    else
+        cpu->next_timer_event = cpu->ccompare[2];
+}
+
+/* Fire any matching ccompare timers and recompute next event */
+static inline void xtensa_fire_timers(xtensa_cpu_t *cpu) {
+    if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
+    if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
+    if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+    xtensa_recompute_next_timer(cpu);
+}
 
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
@@ -195,9 +225,12 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_ICOUNT:      cpu->icount = val; break;
     case XT_SR_ICOUNTLEVEL: cpu->icountlevel = val; break;
     case XT_SR_EXCVADDR:    cpu->excvaddr = val; break;
-    case XT_SR_CCOMPARE0:   cpu->ccompare[0] = val; cpu->interrupt &= ~(1u << 6); break;
-    case XT_SR_CCOMPARE1:   cpu->ccompare[1] = val; cpu->interrupt &= ~(1u << 15); break;
-    case XT_SR_CCOMPARE2:   cpu->ccompare[2] = val; cpu->interrupt &= ~(1u << 16); break;
+    case XT_SR_CCOMPARE0:   cpu->ccompare[0] = val; cpu->interrupt &= ~(1u << 6);
+                            xtensa_recompute_next_timer(cpu); break;
+    case XT_SR_CCOMPARE1:   cpu->ccompare[1] = val; cpu->interrupt &= ~(1u << 15);
+                            xtensa_recompute_next_timer(cpu); break;
+    case XT_SR_CCOMPARE2:   cpu->ccompare[2] = val; cpu->interrupt &= ~(1u << 16);
+                            xtensa_recompute_next_timer(cpu); break;
     case XT_SR_MISC0:       cpu->misc[0] = val; break;
     case XT_SR_MISC1:       cpu->misc[1] = val; break;
     case XT_SR_MISC2:       cpu->misc[2] = val; break;
@@ -243,13 +276,15 @@ void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
     if (XT_PS_EXCM(cpu->ps) && EXCMLEVEL > eff_level)
         eff_level = EXCMLEVEL;
 
-    /* Find highest-level pending interrupt */
+    /* Find highest-level pending interrupt using bit scan */
     int best_level = 0;
-    for (int i = 0; i < 32; i++) {
-        if (!(pending & (1u << i))) continue;
+    uint32_t tmp = pending;
+    while (tmp) {
+        int i = __builtin_ctz(tmp);
         int lvl = cpu->int_level[i];
         if (lvl > eff_level && lvl > best_level)
             best_level = lvl;
+        tmp &= tmp - 1;  /* clear lowest set bit */
     }
     if (best_level == 0) return;
 
@@ -1768,10 +1803,8 @@ int xtensa_step(xtensa_cpu_t *cpu) {
     if (cpu->halted) {
         cpu->ccount++;
         cpu->cycle_count++;
-        /* Timer check while halted */
-        if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
-        if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
-        if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+        if (cpu->ccount == cpu->next_timer_event)
+            xtensa_fire_timers(cpu);
         uint32_t pending = cpu->interrupt & cpu->intenable;
         if (pending) {
             cpu->halted = false;
@@ -1792,13 +1825,15 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         }
     }
 
-    /* PC hook: intercept execution at specific addresses (e.g. ROM stubs) */
-    if (cpu->pc_hook && cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
+    /* PC hook: intercept execution at specific addresses (e.g. ROM stubs).
+     * Bitmap fast-path: skip the hook call entirely if the bit isn't set. */
+    if (cpu->pc_hook && (!cpu->pc_hook_bitmap ||
+        rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc)) &&
+        cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
         cpu->ccount++;
         cpu->cycle_count++;
-        if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
-        if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
-        if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+        if (cpu->ccount == cpu->next_timer_event)
+            xtensa_fire_timers(cpu);
         xtensa_check_interrupts(cpu);
         return cpu->exception ? -1 : 0;
     }
@@ -1874,13 +1909,13 @@ int xtensa_step(xtensa_cpu_t *cpu) {
     cpu->ccount++;
     cpu->cycle_count++;
 
-    /* Timer interrupts */
-    if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
-    if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
-    if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+    /* Timer interrupts (batched: single compare instead of 3) */
+    if (cpu->ccount == cpu->next_timer_event)
+        xtensa_fire_timers(cpu);
 
-    /* Interrupt dispatch */
-    xtensa_check_interrupts(cpu);
+    /* Interrupt dispatch (skip if nothing pending) */
+    if (cpu->interrupt & cpu->intenable)
+        xtensa_check_interrupts(cpu);
 
     return cpu->exception ? -1 : 0;
 }

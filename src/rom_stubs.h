@@ -41,6 +41,20 @@ uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs);
 /* Count of unregistered ROM calls (fallback handler) */
 int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs);
 
+/* PC hook bitmap: fast test to skip pc_hook calls for non-hooked addresses.
+ * Covers instruction-space addresses (word-aligned, >> 2) with possible
+ * false positives but no false negatives. */
+#define HOOK_BITMAP_BITS  (1u << 19)  /* 512K bits = 64KB */
+#define HOOK_BITMAP_WORDS (HOOK_BITMAP_BITS / 64)
+
+static inline int rom_stubs_hook_bitmap_test(const uint64_t *bitmap, uint32_t pc) {
+    uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
+    return (bitmap[idx / 64] >> (idx & 63)) & 1;
+}
+
+/* Get the hook bitmap pointer (for use in hot path) */
+const uint64_t *rom_stubs_get_hook_bitmap(const esp32_rom_stubs_t *stubs);
+
 /* Dual-core boot support */
 void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core);
 bool rom_stubs_app_cpu_start_requested(const esp32_rom_stubs_t *stubs);

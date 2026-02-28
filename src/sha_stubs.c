@@ -62,8 +62,8 @@ struct sha_stubs {
     /* Per-engine lock state.  On real hardware, esp_sha_try_lock_engine()
      * uses a FreeRTOS semaphore per engine.  If the engine is already locked
      * by another context, try_lock returns false and the caller falls back
-     * to software SHA.  Without this, interleaving contexts (e.g. TLS
-     * handshake hash + ECDSA cert verification) corrupt shared engine state. */
+     * to software SHA.  Simple bools suffice since both cores execute
+     * sequentially on the same host thread. */
     bool engine_locked[SHA_NUM_ENGINES];
 
     int current_type;   /* last sha_type used */
