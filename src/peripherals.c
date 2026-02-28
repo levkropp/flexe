@@ -1,6 +1,7 @@
 #include "peripherals.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 /* ESP32 peripheral base addresses */
 #define PERIPH_BASE     0x3FF00000u
@@ -78,6 +79,9 @@ struct esp32_periph {
     /* RTC calibration state */
     rtc_cal_state_t rtc_cal[2];
 
+    /* APP_CPU reset state for DPORT */
+    bool app_cpu_in_reset;   /* true = core 1 held in reset */
+
     /* Unhandled access counter */
     int unhandled_count;
 };
@@ -85,10 +89,12 @@ struct esp32_periph {
 /* ---- DPORT ---- */
 
 static uint32_t dport_read(void *ctx, uint32_t addr) {
-    (void)ctx;
+    esp32_periph_t *p = ctx;
     uint32_t off = addr - DPORT_BASE;
     switch (off) {
-    case 0x018: return 1;           /* APPCPU_CTRL_D: core 1 in reset */
+    case 0x018: return p->app_cpu_in_reset ? 1 : 0; /* APPCPU_CTRL_D: reset state */
+    case 0x02C: return p->app_cpu_in_reset ? 0 : 1; /* APPCPU_CTRL_A: clock gate */
+    case 0x030: return p->app_cpu_in_reset ? 0 : 1; /* APPCPU_CTRL_B: clock enable */
     case 0x040: return 0x0A;        /* PRO_CACHE_CTRL: cache enabled */
     case 0x044: return 0x0A;        /* PRO_CACHE_CTRL1 */
     case 0x058: return 0x0A;        /* APP_CACHE_CTRL: cache enabled */
@@ -107,8 +113,17 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
 }
 
 static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
-    (void)ctx; (void)addr; (void)val;
-    /* Accept and drop DPORT writes */
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - DPORT_BASE;
+    switch (off) {
+    case 0x02C: /* APPCPU_CTRL_A: writing 1 releases APP_CPU from reset */
+        if (val & 1) p->app_cpu_in_reset = false;
+        break;
+    case 0x030: /* APPCPU_CTRL_B: clock gate enable */
+        break;
+    default:
+        break;
+    }
 }
 
 /* ---- UART0 ---- */
@@ -434,6 +449,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     esp32_periph_t *p = calloc(1, sizeof(esp32_periph_t));
     if (!p) return NULL;
     p->mem = mem;
+    p->app_cpu_in_reset = true;
 
     /* Register default handler on all 128 peripheral pages */
     for (int i = 0; i < 128; i++)
@@ -511,4 +527,8 @@ const uint8_t *periph_uart_tx_buf(const esp32_periph_t *p) {
 
 int periph_unhandled_count(const esp32_periph_t *p) {
     return p ? p->unhandled_count : 0;
+}
+
+bool periph_app_cpu_released(const esp32_periph_t *p) {
+    return p ? !p->app_cpu_in_reset : false;
 }

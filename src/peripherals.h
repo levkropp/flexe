@@ -2,6 +2,7 @@
 #define PERIPHERALS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "memory.h"
 
 typedef struct esp32_periph esp32_periph_t;
@@ -16,5 +17,8 @@ void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx);
 int  periph_uart_tx_count(const esp32_periph_t *p);
 const uint8_t *periph_uart_tx_buf(const esp32_periph_t *p);
 int  periph_unhandled_count(const esp32_periph_t *p);
+
+/* Returns true once the APP_CPU has been released from reset (DPORT write) */
+bool periph_app_cpu_released(const esp32_periph_t *p);
 
 #endif /* PERIPHERALS_H */
