@@ -402,7 +402,7 @@ TEST(timer_ccompare0_fires) {
     xtensa_cpu_t cpu;
     setup(&cpu); /* no vecbase mapped — just check interrupt bit */
     cpu.ccount = 99;
-    cpu.ccompare[0] = 100;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 100);
     cpu.intenable = 0; /* disabled so it won't try to dispatch */
     put_insn3(&cpu, BASE, INSN_NOP);
     xtensa_step(&cpu);
@@ -417,7 +417,7 @@ TEST(timer_ccompare_dispatch) {
     setup_exc(&cpu);
     cpu.ps = 0;
     cpu.ccount = 99;
-    cpu.ccompare[0] = 100;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 100);
     cpu.intenable = (1u << 6); /* enable timer 0 interrupt */
     put_insn3(&cpu, BASE, INSN_NOP);
     xtensa_step(&cpu);
@@ -497,7 +497,7 @@ TEST(waiti_wakes_on_interrupt) {
     put_insn3(&cpu, BASE, INSN_WAITI(0));
     /* Set up timer to fire: ccount will increment in step */
     cpu.ccount = 98;
-    cpu.ccompare[0] = 100;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 100);
     cpu.intenable = (1u << 6);
     /* Step 1: execute WAITI, halt */
     xtensa_step(&cpu);

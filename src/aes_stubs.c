@@ -17,9 +17,10 @@ struct aes_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
 
-    uint32_t round_key[AES_MAX_RK];
-    int      nr;          /* number of rounds (10/12/14) */
-    int      mode;        /* 0=decrypt, 1=encrypt */
+    /* Per-core key state so interleaved batches don't corrupt */
+    uint32_t round_key[2][AES_MAX_RK];
+    int      nr[2];          /* number of rounds (10/12/14) */
+    int      mode[2];        /* 0=decrypt, 1=encrypt */
 };
 
 /* ===== Calling convention helpers ===== */
@@ -242,6 +243,18 @@ static void aes_decrypt_block(const uint8_t in[16], uint8_t out[16],
     memcpy(out, s, 16);
 }
 
+/* ===== Hardware acquire/release stubs ===== */
+
+static void stub_aes_acquire_hardware(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    aes_return_void(cpu);
+}
+
+static void stub_aes_release_hardware(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    aes_return_void(cpu);
+}
+
 /* ===== HAL stub implementations ===== */
 
 /*
@@ -258,6 +271,7 @@ static void stub_aes_hal_setkey(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t key_ptr   = aes_arg(cpu, 0);
     uint32_t key_bytes = aes_arg(cpu, 1);
     uint32_t mode      = aes_arg(cpu, 2);
+    int c = cpu->core_id;
 
     if (key_bytes > 32) key_bytes = 32;
 
@@ -266,8 +280,8 @@ static void stub_aes_hal_setkey(xtensa_cpu_t *cpu, void *ctx) {
     for (uint32_t i = 0; i < key_bytes; i++)
         key[i] = mem_read8(cpu->mem, key_ptr + i);
 
-    as->mode = (int)mode;
-    as->nr = aes_key_expand(key, (int)key_bytes, as->round_key);
+    as->mode[c] = (int)mode;
+    as->nr[c] = aes_key_expand(key, (int)key_bytes, as->round_key[c]);
 
     aes_return(cpu, key_bytes);
 }
@@ -281,16 +295,17 @@ static void stub_aes_hal_transform_block(xtensa_cpu_t *cpu, void *ctx) {
     aes_stubs_t *as = ctx;
     uint32_t in_ptr  = aes_arg(cpu, 0);
     uint32_t out_ptr = aes_arg(cpu, 1);
+    int c = cpu->core_id;
 
     /* Read 16-byte input block from emulator memory */
     uint8_t in[16], out[16];
     for (int i = 0; i < 16; i++)
         in[i] = mem_read8(cpu->mem, in_ptr + (uint32_t)i);
 
-    if (as->mode == AES_MODE_ENCRYPT)
-        aes_encrypt_block(in, out, as->round_key, as->nr);
+    if (as->mode[c] == AES_MODE_ENCRYPT)
+        aes_encrypt_block(in, out, as->round_key[c], as->nr[c]);
     else
-        aes_decrypt_block(in, out, as->round_key, as->nr);
+        aes_decrypt_block(in, out, as->round_key[c], as->nr[c]);
 
     /* Write 16-byte output block to emulator memory */
     for (int i = 0; i < 16; i++)
@@ -305,8 +320,8 @@ aes_stubs_t *aes_stubs_create(xtensa_cpu_t *cpu) {
     aes_stubs_t *as = calloc(1, sizeof(*as));
     if (!as) return NULL;
     as->cpu = cpu;
-    as->nr = 10;   /* default AES-128 */
-    as->mode = AES_MODE_ENCRYPT;
+    as->nr[0] = as->nr[1] = 10;   /* default AES-128 */
+    as->mode[0] = as->mode[1] = AES_MODE_ENCRYPT;
     return as;
 }
 
@@ -326,8 +341,10 @@ int aes_stubs_hook_symbols(aes_stubs_t *as, const elf_symbols_t *syms) {
         const char *name;
         rom_stub_fn fn;
     } hooks[] = {
-        { "aes_hal_setkey",          stub_aes_hal_setkey },
-        { "aes_hal_transform_block", stub_aes_hal_transform_block },
+        { "aes_hal_setkey",              stub_aes_hal_setkey },
+        { "aes_hal_transform_block",     stub_aes_hal_transform_block },
+        { "esp_aes_acquire_hardware",    stub_aes_acquire_hardware },
+        { "esp_aes_release_hardware",    stub_aes_release_hardware },
         { NULL, NULL }
     };
 

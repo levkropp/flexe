@@ -53,6 +53,7 @@ struct esp32_rom_stubs {
         uint32_t addr;     /* 0 = empty */
         int      idx;      /* index into entries[] */
     } ht[HOOK_HT_SIZE];
+    uint64_t hook_bitmap[HOOK_BITMAP_WORDS];
 };
 
 /* ===== Calling convention helpers ===== */
@@ -1854,6 +1855,11 @@ static int hook_ht_lookup(const esp32_rom_stubs_t *s, uint32_t pc) {
     return -1;
 }
 
+static void hook_bitmap_set(esp32_rom_stubs_t *s, uint32_t addr) {
+    uint32_t idx = (addr >> 2) & (HOOK_BITMAP_BITS - 1);
+    s->hook_bitmap[idx / 64] |= 1ULL << (idx & 63);
+}
+
 static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
     uint32_t h = hook_hash(addr) & HOOK_HT_MASK;
     for (int probe = 0; probe < HOOK_HT_SIZE; probe++) {
@@ -1861,6 +1867,7 @@ static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
         if (s->ht[slot].addr == 0 || s->ht[slot].addr == addr) {
             s->ht[slot].addr = addr;
             s->ht[slot].idx = idx;
+            hook_bitmap_set(s, addr);
             return;
         }
     }
@@ -1902,6 +1909,11 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* Install PC hook */
     cpu->pc_hook = rom_pc_hook;
     cpu->pc_hook_ctx = s;
+
+    /* Pre-populate bitmap for entire ROM range (unregistered calls also intercepted) */
+    for (uint32_t a = ROM_BASE; a < ROM_END; a += 4)
+        hook_bitmap_set(s, a);
+    cpu->pc_hook_bitmap = s->hook_bitmap;
 
     /* Pre-initialize g_ticks_per_us_pro so firmware doesn't divide by zero */
     mem_write32(cpu->mem, G_TICKS_PER_US_PRO, 160);
@@ -2054,6 +2066,7 @@ void rom_stubs_destroy(esp32_rom_stubs_t *stubs) {
     if (stubs->cpu->pc_hook == rom_pc_hook) {
         stubs->cpu->pc_hook = NULL;
         stubs->cpu->pc_hook_ctx = NULL;
+        stubs->cpu->pc_hook_bitmap = NULL;
     }
     free(stubs);
 }
@@ -2784,6 +2797,10 @@ uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs) {
 
 int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs) {
     return stubs ? stubs->unregistered_count : 0;
+}
+
+const uint64_t *rom_stubs_get_hook_bitmap(const esp32_rom_stubs_t *stubs) {
+    return stubs ? stubs->hook_bitmap : NULL;
 }
 
 void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core) {

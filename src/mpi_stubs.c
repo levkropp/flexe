@@ -30,9 +30,10 @@ struct mpi_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
 
-    /* Result buffer for async mul operations */
-    uint32_t result[MPI_MAX_WORDS * 2];
-    size_t   result_words;
+    /* Per-core result buffer for async mul operations.
+     * Each core gets its own buffer so interleaved batches don't corrupt. */
+    uint32_t result[2][MPI_MAX_WORDS * 2];
+    size_t   result_words[2];
 };
 
 /* ===== Calling convention helpers ===== */
@@ -220,16 +221,17 @@ static void stub_esp_mpi_mul_mpi_hw_op(xtensa_cpu_t *cpu, void *ctx)
     uint32_t hw_words = mpi_arg(cpu, 2);
 
     if (hw_words > MPI_MAX_WORDS) hw_words = MPI_MAX_WORDS;
+    int c = cpu->core_id;
 
     uint32_t x[MPI_MAX_WORDS], y[MPI_MAX_WORDS];
     read_mpi_limbs(cpu, x_addr, x, hw_words);
     read_mpi_limbs(cpu, y_addr, y, hw_words);
 
-    ms->result_words = hw_words * 2;
-    if (ms->result_words > MPI_MAX_WORDS * 2)
-        ms->result_words = MPI_MAX_WORDS * 2;
+    ms->result_words[c] = hw_words * 2;
+    if (ms->result_words[c] > MPI_MAX_WORDS * 2)
+        ms->result_words[c] = MPI_MAX_WORDS * 2;
 
-    bignum_mul(x, hw_words, y, hw_words, ms->result, ms->result_words);
+    bignum_mul(x, hw_words, y, hw_words, ms->result[c], ms->result_words[c]);
 
     mpi_return_void(cpu);
 }
@@ -240,10 +242,11 @@ static void stub_esp_mpi_read_result_hw_op(xtensa_cpu_t *cpu, void *ctx)
     mpi_stubs_t *ms = ctx;
     uint32_t z_addr  = mpi_arg(cpu, 0);
     uint32_t z_words = mpi_arg(cpu, 1);
+    int c = cpu->core_id;
 
-    if (z_words > ms->result_words) z_words = ms->result_words;
+    if (z_words > ms->result_words[c]) z_words = ms->result_words[c];
 
-    write_mpi_limbs(cpu, z_addr, ms->result, z_words);
+    write_mpi_limbs(cpu, z_addr, ms->result[c], z_words);
 
     mpi_return_void(cpu);
 }
@@ -259,6 +262,7 @@ static void stub_esp_mpi_mult_mpi_failover_mod_mult_hw_op(xtensa_cpu_t *cpu,
     uint32_t num_words = mpi_arg(cpu, 2);
 
     if (num_words > MPI_MAX_WORDS) num_words = MPI_MAX_WORDS;
+    int c = cpu->core_id;
 
     uint32_t x[MPI_MAX_WORDS], y[MPI_MAX_WORDS];
     read_mpi_limbs(cpu, x_addr, x, num_words);
@@ -266,8 +270,8 @@ static void stub_esp_mpi_mult_mpi_failover_mod_mult_hw_op(xtensa_cpu_t *cpu,
 
     /* This is just plain multiplication (the hardware trick makes mod a no-op).
      * Result is num_words wide (not double-width, since the mod truncates). */
-    ms->result_words = num_words;
-    bignum_mul(x, num_words, y, num_words, ms->result, num_words);
+    ms->result_words[c] = num_words;
+    bignum_mul(x, num_words, y, num_words, ms->result[c], num_words);
 
     mpi_return_void(cpu);
 }

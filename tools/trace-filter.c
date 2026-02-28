@@ -79,8 +79,10 @@ static void ctx_push(context_buf_t *cb, const char *line, int linenum) {
     } else {
         cb->count++;
     }
-    strncpy(cb->lines[idx], line, LINE_MAX - 1);
-    cb->lines[idx][LINE_MAX - 1] = '\0';
+    size_t len = strlen(line);
+    if (len > LINE_MAX - 1) len = LINE_MAX - 1;
+    memcpy(cb->lines[idx], line, len);
+    cb->lines[idx][len] = '\0';
     cb->line_nums[idx] = linenum;
 }
 

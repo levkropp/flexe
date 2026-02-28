@@ -59,6 +59,12 @@ typedef struct {
     void         *ctx;
 } mmio_handler_t;
 
+/* Page table: 1M entries covering full 32-bit address space, indexed by addr >> 12.
+ * Each entry points to the start of the corresponding 4KB page in host memory.
+ * NULL entries indicate MMIO or unmapped pages.
+ * Lookup: page_table[addr >> 12] + (addr & 0xFFF) → host pointer */
+#define PAGE_TABLE_SIZE (1u << 20)  /* 1M pages */
+
 struct xtensa_mem {
     uint8_t *sram;        /* Internal SRAM (data + instruction alias) */
     uint8_t *rom;         /* Internal ROM */
@@ -69,7 +75,47 @@ struct xtensa_mem {
     uint8_t *rtc_slow;    /* RTC SLOW memory */
     uint8_t *psram;       /* External PSRAM (SPI RAM) */
     mmio_handler_t mmio[PERIPH_PAGES];
+    uint8_t *page_table[PAGE_TABLE_SIZE];
 };
+
+/* Populate page table entries for a contiguous region */
+static void page_table_map(xtensa_mem_t *mem, uint32_t base, uint32_t end, uint8_t *host) {
+    for (uint32_t page = base; page < end; page += PAGE_SIZE)
+        mem->page_table[page >> 12] = host + (page - base);
+}
+
+static void page_table_init(xtensa_mem_t *mem) {
+    /* SRAM data bus: 0x3FFA0000-0x3FFFFFFF */
+    page_table_map(mem, SRAM_DATA_BASE, SRAM_DATA_END, mem->sram);
+
+    /* SRAM instruction bus: 0x40070000-0x400BFFFF (alias, offset into same sram) */
+    page_table_map(mem, SRAM_INSN_BASE, SRAM_INSN_END,
+                   mem->sram + (SRAM_DATA_END - SRAM_DATA_BASE));
+
+    /* ROM: 0x40000000-0x4005FFFF */
+    page_table_map(mem, ROM_BASE, ROM_END, mem->rom);
+
+    /* Flash data bus: 0x3F400000-0x3F7FFFFF */
+    page_table_map(mem, FLASH_DATA_BASE, FLASH_DATA_END, mem->flash_data);
+
+    /* Flash instruction bus: 0x400C2000-0x40BFFFFF */
+    page_table_map(mem, FLASH_INSN_BASE, FLASH_INSN_END, mem->flash_insn);
+
+    /* RTC DRAM (D-bus alias): 0x3FF80000-0x3FF81FFF */
+    page_table_map(mem, RTC_DRAM_BASE, RTC_DRAM_END, mem->rtc_dram);
+
+    /* RTC IRAM (I-bus alias of same memory): 0x400C0000-0x400C1FFF */
+    page_table_map(mem, RTC_IRAM_BASE, RTC_IRAM_END, mem->rtc_dram);
+
+    /* PSRAM: 0x3F800000-0x3FBFFFFF */
+    page_table_map(mem, PSRAM_BASE, PSRAM_END, mem->psram);
+
+    /* RTC FAST: 0x50000000-0x50001FFF */
+    page_table_map(mem, RTC_FAST_BASE, RTC_FAST_END, mem->rtc_fast);
+
+    /* RTC SLOW: 0x60000000-0x60001FFF */
+    page_table_map(mem, RTC_SLOW_BASE, RTC_SLOW_END, mem->rtc_slow);
+}
 
 xtensa_mem_t *mem_create(void) {
     xtensa_mem_t *mem = calloc(1, sizeof(xtensa_mem_t));
@@ -89,6 +135,8 @@ xtensa_mem_t *mem_create(void) {
         mem_destroy(mem);
         return NULL;
     }
+
+    page_table_init(mem);
 
     return mem;
 }
@@ -117,54 +165,13 @@ void mem_reset(xtensa_mem_t *mem) {
 
 /*
  * Address translation: ESP32 address -> host pointer
- * Returns NULL for unmapped or peripheral addresses.
+ * Uses flat page table for O(1) lookup.
+ * Returns NULL for unmapped or peripheral (MMIO) addresses.
  */
-static uint8_t *mem_translate(xtensa_mem_t *mem, uint32_t addr) {
-    /* SRAM data bus: 0x3FFB0000-0x3FFFFFFF */
-    if (addr >= SRAM_DATA_BASE && addr < SRAM_DATA_END)
-        return mem->sram + (addr - SRAM_DATA_BASE);
-
-    /* PSRAM (external SPI RAM): 0x3F800000-0x3FBFFFFF */
-    if (addr >= PSRAM_BASE && addr < PSRAM_END)
-        return mem->psram + (addr - PSRAM_BASE);
-
-    /* RTC DRAM (D-bus alias): 0x3FF80000-0x3FF81FFF */
-    if (addr >= RTC_DRAM_BASE && addr < RTC_DRAM_END)
-        return mem->rtc_dram + (addr - RTC_DRAM_BASE);
-
-    /* SRAM instruction bus: 0x40070000-0x400BFFFF */
-    if (addr >= SRAM_INSN_BASE && addr < SRAM_INSN_END)
-        return mem->sram + (SRAM_DATA_END - SRAM_DATA_BASE) + (addr - SRAM_INSN_BASE);
-
-    /* RTC IRAM (I-bus alias of same RTC Fast memory): 0x400C0000-0x400C1FFF */
-    if (addr >= RTC_IRAM_BASE && addr < RTC_IRAM_END)
-        return mem->rtc_dram + (addr - RTC_IRAM_BASE);
-
-    /* ROM: 0x40000000-0x4005FFFF */
-    if (addr >= ROM_BASE && addr < ROM_END)
-        return mem->rom + (addr - ROM_BASE);
-
-    /* Flash data bus: 0x3F400000-0x3F7FFFFF */
-    if (addr >= FLASH_DATA_BASE && addr < FLASH_DATA_END)
-        return mem->flash_data + (addr - FLASH_DATA_BASE);
-
-    /* Flash instruction bus: 0x400C2000-0x40BFFFFF */
-    if (addr >= FLASH_INSN_BASE && addr < FLASH_INSN_END)
-        return mem->flash_insn + (addr - FLASH_INSN_BASE);
-
-    /* RTC FAST: 0x50000000-0x50001FFF */
-    if (addr >= RTC_FAST_BASE && addr < RTC_FAST_END)
-        return mem->rtc_fast + (addr - RTC_FAST_BASE);
-
-    /* RTC SLOW: 0x60000000-0x60001FFF */
-    if (addr >= RTC_SLOW_BASE && addr < RTC_SLOW_END)
-        return mem->rtc_slow + (addr - RTC_SLOW_BASE);
-
-    /* Peripheral region: return NULL (handled separately) */
-    if (addr >= PERIPH_BASE && addr < PERIPH_END)
-        return NULL;
-
-    return NULL;  /* Unmapped */
+static inline uint8_t *mem_translate(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (page) return page + (addr & 0xFFF);
+    return NULL;
 }
 
 /* MMIO dispatch helper: returns handler for peripheral address, or NULL */

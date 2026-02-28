@@ -2,6 +2,21 @@ cmake_minimum_required(VERSION 3.14)
 project(xtensa-emulator C)
 set(CMAKE_C_STANDARD 17)
 
+# Default to Release build (enables -O3)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# LTO and native tuning for Release builds
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT IPO_SUPPORTED)
+    if(IPO_SUPPORTED)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+    add_compile_options(-march=native)
+endif()
+
 # Library (core emulator)
 add_library(xtensa-emu-lib STATIC
     src/xtensa.c

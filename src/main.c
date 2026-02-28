@@ -77,8 +77,10 @@ static void ring_push(ring_buf_t *rb, const char *line) {
     } else {
         rb->count++;
     }
-    strncpy(rb->lines[idx], line, 511);
-    rb->lines[idx][511] = '\0';
+    size_t len = strlen(line);
+    if (len > 511) len = 511;
+    memcpy(rb->lines[idx], line, len);
+    rb->lines[idx][len] = '\0';
     rb->total++;
 }
 
