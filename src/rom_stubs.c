@@ -1531,6 +1531,13 @@ static void stub_ret_esp_fail(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, (uint32_t)-1);  /* ESP_FAIL */
 }
 
+/* Return STA_NODISK|STA_NOINIT (3) for ff_sd_initialize — tells FatFS
+ * there is no card so f_mount returns FR_NOT_READY immediately. */
+static void stub_ret_sd_nodisk(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 3);  /* STA_NOINIT | STA_NODISK */
+}
+
 /* Return WL_CONNECTED (3) for WiFi.status() */
 static void stub_ret_wl_connected(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -2466,7 +2473,23 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* SPIFFS / filesystem stubs — return ESP_FAIL so callers skip gracefully */
+    /* SPIFFS stubs — hook SPIFFSFS::begin() to return false immediately.
+     * This prevents the mount→format→retry error spam AND avoids file-open
+     * errors.  Firmware falls back to hardcoded defaults silently.
+     * Lower-level stubs kept as safety net for direct callers. */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "_ZN2fs8SPIFFSFS5beginEbPKchS2_", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered,
+                               "_ZN2fs8SPIFFSFS5beginEbPKchS2_");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "_ZN2fs8SPIFFSFS6formatEv", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered,
+                               "_ZN2fs8SPIFFSFS6formatEv");
+            hooked++;
+        }
+    }
     static const char *spiffs_fail_fns[] = {
         "esp_vfs_spiffs_register",
         "esp_vfs_spiffs_unregister",
@@ -2655,13 +2678,24 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "spi_transfer",
         "_Z6sdWaithi", "_Z9sdCommandhcjPj",
         "_Z11sdReadByteshPci", "_Z6sdStoph",
-        "_Z16ff_sd_initializeh",
         NULL
     };
     for (int i = 0; spi_transfer_fns[i]; i++) {
         uint32_t addr;
         if (elf_symbols_find(syms, spi_transfer_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, spi_transfer_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* ff_sd_initialize — return STA_NODISK|STA_NOINIT when no image
+     * is configured.  When the sdcard_stubs module has an image, the
+     * higher-level SDMMC hooks handle I/O. */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "_Z16ff_sd_initializeh", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_sd_nodisk,
+                               "_Z16ff_sd_initializeh");
             hooked++;
         }
     }

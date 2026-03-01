@@ -304,6 +304,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
         tmp[i] = mem_read8(cpu->mem, buf + i);
 
     ssize_t n = send(s->host_fd, tmp, len, MSG_NOSIGNAL);
+    int saved_errno = errno;
 
     if (n > 0)
         wifi_log(ws, "send(slot %u, %zd bytes)\n", fd, n);
@@ -311,6 +312,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
     free(tmp);
 
     if (n < 0) {
+        set_firmware_errno(cpu, saved_errno);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -741,10 +743,12 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
 static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
-    uint32_t fd      = ws_arg(cpu, 0);
-    uint32_t buf     = ws_arg(cpu, 1);
-    uint32_t len     = ws_arg(cpu, 2);
-    /* flags = arg 3, dest_addr = arg 4 (on stack), addrlen = arg 5 (on stack) */
+    uint32_t fd       = ws_arg(cpu, 0);
+    uint32_t buf      = ws_arg(cpu, 1);
+    uint32_t len      = ws_arg(cpu, 2);
+    /* uint32_t flags = ws_arg(cpu, 3); */
+    uint32_t sa_addr  = ws_arg(cpu, 4);
+    uint32_t addrlen  = ws_arg(cpu, 5);
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
@@ -757,13 +761,29 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
     for (uint32_t i = 0; i < len; i++)
         tmp[i] = mem_read8(cpu->mem, buf + i);
 
-    /* For connected sockets, sendto with NULL dest works.
-     * For unconnected UDP, we'd need the dest addr from the stack,
-     * but that's complex with windowed regs. Use send() instead. */
-    ssize_t n = send(s->host_fd, tmp, len, MSG_NOSIGNAL);
+    ssize_t n;
+    if (sa_addr && addrlen >= sizeof(struct sockaddr_in)) {
+        /* Unconnected UDP: read destination address from emulator memory */
+        struct sockaddr_in sa;
+        read_emu_sockaddr_in(cpu, sa_addr, &sa);
+        n = sendto(s->host_fd, tmp, len, MSG_NOSIGNAL,
+                   (struct sockaddr *)&sa, sizeof(sa));
+    } else {
+        /* Connected socket or no dest: use send() */
+        n = sendto(s->host_fd, tmp, len, MSG_NOSIGNAL, NULL, 0);
+    }
+    int saved_errno = errno;
     free(tmp);
 
-    ws_return(cpu, (uint32_t)(n < 0 ? -1 : n));
+    if (n > 0)
+        wifi_log(ws, "sendto(slot %u, %zd bytes)\n", fd, n);
+
+    if (n < 0) {
+        set_firmware_errno(cpu, saved_errno);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+    ws_return(cpu, (uint32_t)n);
 }
 
 /* lwip_recvfrom — always non-blocking (used for UDP polling like NTP).
