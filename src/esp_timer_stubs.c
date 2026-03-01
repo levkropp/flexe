@@ -95,20 +95,27 @@ static void dispatch_expired_timers(esp_timer_stubs_t *et) {
         if (!t->active) continue;
         if (now < t->alarm_us) continue;
 
-        /* Timer expired — dispatch callback using CALL0 convention.
-         * Save CPU state, set up call frame, run until sentinel. */
+        /* Timer expired — dispatch callback inline.
+         * The callback may be a windowed function (ENTRY/RETW/CALL8 etc.)
+         * that modifies physical registers across multiple windows. We must
+         * save and restore the ENTIRE register file + window state to prevent
+         * any side effects on the caller's register context. */
         uint32_t save_pc = et->cpu->pc;
         uint32_t save_ps = et->cpu->ps;
-        uint32_t save_a0 = ar_read(et->cpu, 0);
-        uint32_t save_a2 = ar_read(et->cpu, 2);
+        uint32_t save_wb = et->cpu->windowbase;
+        uint32_t save_ws = et->cpu->windowstart;
+        uint32_t save_sar = et->cpu->sar;
+        uint32_t save_lbeg = et->cpu->lbeg;
+        uint32_t save_lend = et->cpu->lend;
+        uint32_t save_lcount = et->cpu->lcount;
+        uint32_t save_ar[64];
+        memcpy(save_ar, et->cpu->ar, sizeof(save_ar));
 
-        /* Write RET instruction at sentinel (RET = 0x80, 0x00, 0x00 = ret.n won't work;
-         * use JX a0 won't work either. Instead we intercept via PC hook.) */
-        ar_write(et->cpu, 0, CALLBACK_SENTINEL);
-        ar_write(et->cpu, 2, t->arg);
-
-        /* Clear CALLINC so callback sees CALL0 convention */
-        XT_PS_SET_CALLINC(et->cpu->ps, 0);
+        /* Set up as CALL4: CALLINC=1, callee's a0 (at ar[4]) = sentinel
+         * with bits 31:30 = 01 (CALL4 return encoding), callee's a2 = arg */
+        XT_PS_SET_CALLINC(et->cpu->ps, 1);
+        ar_write(et->cpu, 4, CALLBACK_SENTINEL); /* bits 31:30 = 01, matches CALL4 */
+        ar_write(et->cpu, 6, t->arg);
 
         et->cpu->pc = t->callback_addr;
 
@@ -120,11 +127,16 @@ static void dispatch_expired_timers(esp_timer_stubs_t *et) {
             xtensa_step(et->cpu);
         }
 
-        /* Restore state */
+        /* Restore entire CPU register state */
+        memcpy(et->cpu->ar, save_ar, sizeof(save_ar));
         et->cpu->pc = save_pc;
         et->cpu->ps = save_ps;
-        ar_write(et->cpu, 0, save_a0);
-        ar_write(et->cpu, 2, save_a2);
+        et->cpu->windowbase = save_wb;
+        et->cpu->windowstart = save_ws;
+        et->cpu->sar = save_sar;
+        et->cpu->lbeg = save_lbeg;
+        et->cpu->lend = save_lend;
+        et->cpu->lcount = save_lcount;
 
         /* Reschedule periodic or deactivate */
         if (t->periodic) {

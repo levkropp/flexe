@@ -1642,6 +1642,20 @@ static void stub_panic_handler(xtensa_cpu_t *cpu, void *ctx) {
         fprintf(stderr, "  a%-2d=0x%08X%s", i, val, (i % 4 == 3) ? "\n" : "  ");
     }
     fprintf(stderr, "  SAR=0x%08X\n", mem_read32(cpu->mem, frame + 76));
+    /* Dump actual CPU state at panic time */
+    fprintf(stderr, "  --- Actual CPU state (not from frame) ---\n");
+    fprintf(stderr, "  EPC1=0x%08X EXCCAUSE=%u EXCVADDR=0x%08X\n",
+            cpu->epc[0], cpu->exccause, cpu->excvaddr);
+    fprintf(stderr, "  PS=0x%08X SAR=%u WB=%u WS=0x%X\n",
+            cpu->ps, cpu->sar, cpu->windowbase, cpu->windowstart);
+    fprintf(stderr, "  EPC2=0x%08X EPC3=0x%08X DEPC=0x%08X\n",
+            cpu->epc[1], cpu->epc[2], cpu->depc);
+    fprintf(stderr, "  cycle_count=%llu ccount=%u\n",
+            (unsigned long long)cpu->cycle_count, cpu->ccount);
+    for (int r = 0; r < 16; r += 4)
+        fprintf(stderr, "  AR%-2d=0x%08X  AR%-2d=0x%08X  AR%-2d=0x%08X  AR%-2d=0x%08X\n",
+                r, ar_read(cpu, r), r+1, ar_read(cpu, r+1),
+                r+2, ar_read(cpu, r+2), r+3, ar_read(cpu, r+3));
     cpu->running = 0;
 }
 

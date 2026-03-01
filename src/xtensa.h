@@ -247,10 +247,11 @@ struct xtensa_cpu {
      * Extra registers (a4-a7 for CALL8, a4-a11 for CALL12) are stored in
      * CPU-side buffers rather than on the stack, to avoid corruption when
      * deeper calls overwrite the stack memory. */
+#define SPILL_STACK_DEPTH 8
     struct {
-        uint32_t base[8];        /* stack of spill bases (deepest first) */
-        uint32_t core[8][4];     /* core[depth][0..3] = a0-a3 values */
-        uint32_t extra[8][8];    /* extra[depth][0..7] = a4-a11 values */
+        uint32_t base[SPILL_STACK_DEPTH];        /* stack of spill bases */
+        uint32_t core[SPILL_STACK_DEPTH][4];     /* core[depth][0..3] = a0-a3 values */
+        uint32_t extra[SPILL_STACK_DEPTH][8];    /* extra[depth][0..7] = a4-a11 values */
         int depth;               /* current stack depth */
     } spill_stack[16];
     uint32_t spill_base[16]; /* legacy: most recent base per window (for -W trace) */
@@ -288,6 +289,11 @@ struct xtensa_cpu {
     int      breakpoint_count;
     bool     breakpoint_hit;
     uint32_t breakpoint_hit_addr;
+
+    /* Debug: PC history ring buffer */
+#define PC_HISTORY_SIZE 32
+    uint32_t pc_history[PC_HISTORY_SIZE];
+    int      pc_history_idx;
 };
 
 /*

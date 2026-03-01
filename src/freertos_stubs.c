@@ -152,7 +152,14 @@ static uint32_t bump_alloc(freertos_stubs_t *frt, uint32_t size) {
 
 static void sched_save_context(freertos_stubs_t *frt, int core_id) {
     xtensa_cpu_t *cpu = frt->cpu[core_id];
-    task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+    int tidx = frt->current_task[core_id];
+    task_tcb_t *t = &frt->tasks[tidx];
+    /* Trap: detect saving a corrupted PC */
+    if (cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u) {
+        fprintf(stderr, "[SAVE-TRAP] Saving task %d '%s' with bad PC=0x%08X on core %d (cycle %llu)\n",
+                tidx, t->name, cpu->pc, core_id,
+                (unsigned long long)cpu->cycle_count);
+    }
     memcpy(t->ar, cpu->ar, sizeof(cpu->ar));
     t->pc = cpu->pc;
     t->ps = cpu->ps;
@@ -168,7 +175,19 @@ static void sched_save_context(freertos_stubs_t *frt, int core_id) {
 
 static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
     xtensa_cpu_t *cpu = frt->cpu[core_id];
-    task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+    int tidx = frt->current_task[core_id];
+    task_tcb_t *t = &frt->tasks[tidx];
+    /* Trap: detect task with corrupted saved PC */
+    if (t->pc < 0x40000000u || t->pc >= 0x40500000u) {
+        fprintf(stderr, "[SCHED-TRAP] Restoring task %d '%s' with bad PC=0x%08X on core %d (cycle %llu)\n",
+                tidx, t->name, t->pc, core_id,
+                (unsigned long long)cpu->cycle_count);
+        fprintf(stderr, "  task WB=%u WS=0x%X PS=0x%08X\n",
+                t->windowbase, t->windowstart, t->ps);
+        fprintf(stderr, "  task ar[0..7]: %08X %08X %08X %08X  %08X %08X %08X %08X\n",
+                t->ar[0], t->ar[1], t->ar[2], t->ar[3],
+                t->ar[4], t->ar[5], t->ar[6], t->ar[7]);
+    }
     memcpy(cpu->ar, t->ar, sizeof(cpu->ar));
     cpu->pc = t->pc;
     cpu->ps = t->ps;

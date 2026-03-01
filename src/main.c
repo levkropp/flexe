@@ -1,19 +1,10 @@
+#include "flexe_session.h"
 #include "xtensa.h"
 #include "memory.h"
-#include "loader.h"
 #include "peripherals.h"
 #include "rom_stubs.h"
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
-#include "esp_timer_stubs.h"
-#include "display_stubs.h"
-#include "touch_stubs.h"
-#include "sdcard_stubs.h"
-#include "wifi_stubs.h"
-#include "bt_stubs.h"
-#include "sha_stubs.h"
-#include "aes_stubs.h"
-#include "mpi_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -563,7 +554,7 @@ static const char *detect_vector(uint32_t pc, uint32_t vecbase) {
 /* ===== Main ===== */
 
 int main(int argc, char *argv[]) {
-    int max_cycles = 10000000;
+    long long max_cycles = 10000000;
     int trace = 0;
     int verbose_trace = 0;
     int window_trace = 0;
@@ -593,7 +584,7 @@ int main(int argc, char *argv[]) {
     while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:")) != -1) {
         switch (opt) {
         case '1': single_core = 1; break;
-        case 'c': max_cycles = atoi(optarg); break;
+        case 'c': max_cycles = strtoll(optarg, NULL, 10); break;
         case 't': trace = 1; break;
         case 'T':
             verbose_trace = 1; trace = 1;
@@ -710,192 +701,57 @@ int main(int argc, char *argv[]) {
             g_dump_mode = DUMP_CRASH;
     }
 
-    /* Load ELF symbols if requested */
-    elf_symbols_t *syms = NULL;
-    if (elf_path) {
-        syms = elf_symbols_load(elf_path);
-        if (syms)
-            fprintf(stderr, "Loaded %d symbols from %s\n", elf_symbols_count(syms), elf_path);
-        else
-            fprintf(stderr, "Warning: failed to load symbols from %s\n", elf_path);
-    }
-
-    /* Create memory and peripherals */
-    xtensa_mem_t *mem = mem_create();
-    if (!mem) {
-        fprintf(stderr, "Failed to allocate memory\n");
-        elf_symbols_destroy(syms);
+    /* Create emulator session (loads firmware, creates all stubs) */
+    flexe_session_config_t sess_cfg = {
+        .bin_path = firmware,
+        .elf_path = elf_path,
+        .sdcard_path = sdcard_path,
+        .sdcard_size = sdcard_size,
+        .entry_override = has_entry_override ? entry_override : 0,
+        .single_core = single_core,
+        .window_trace = window_trace,
+        .spill_verify = spill_verify,
+        .uart_cb = uart_stdout_cb,
+    };
+    flexe_session_t *session = flexe_session_create(&sess_cfg);
+    if (!session) {
+        fprintf(stderr, "Failed to create emulator session\n");
         ring_destroy(g_ring);
         return 1;
     }
 
-    esp32_periph_t *periph = periph_create(mem);
-    if (!periph) {
-        fprintf(stderr, "Failed to create peripherals\n");
-        mem_destroy(mem);
-        elf_symbols_destroy(syms);
-        ring_destroy(g_ring);
-        return 1;
-    }
-    periph_set_uart_callback(periph, uart_stdout_cb, NULL);
+    /* Pull out pointers for use in the execution loop */
+    xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
+    xtensa_mem_t *mem = flexe_session_mem(session);
+    const elf_symbols_t *syms = flexe_session_syms(session);
+    esp32_periph_t *periph = flexe_session_periph(session);
+    esp32_rom_stubs_t *rom = flexe_session_rom(session);
+    freertos_stubs_t *frt = flexe_session_frt(session);
 
-    /* Load firmware */
-    load_result_t res = loader_load_bin(mem, firmware);
-    if (res.result != 0) {
-        fprintf(stderr, "Load error: %s\n", res.error);
-        periph_destroy(periph);
-        mem_destroy(mem);
-        elf_symbols_destroy(syms);
-        ring_destroy(g_ring);
-        return 1;
-    }
-    fprintf(stderr, "Loaded %s: %d segments, entry=0x%08X\n",
-            firmware, res.segment_count, res.entry_point);
-    for (int i = 0; i < res.segment_count; i++) {
-        fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
-                i, res.segments[i].addr, res.segments[i].size,
-                loader_region_name(res.segments[i].addr));
-    }
-
-    /* Initialize CPUs (core 0 = PRO_CPU, core 1 = APP_CPU) */
-    xtensa_cpu_t cpu[2];
-    xtensa_cpu_init(&cpu[0]);
-    xtensa_cpu_reset(&cpu[0]);
-    cpu[0].mem = mem;
-    cpu[0].window_trace = window_trace;
-    cpu[0].window_trace_active = (window_trace && trace_start == 0);
-    cpu[0].spill_verify = spill_verify;
-
-    xtensa_cpu_init(&cpu[1]);
-    xtensa_cpu_reset(&cpu[1]);
-    cpu[1].mem = mem;
-    cpu[1].core_id = 1;
-    cpu[1].prid = 0xABAB;    /* APP_CPU PRID */
-    cpu[1].running = false;   /* Not started yet */
-    cpu[1].window_trace = window_trace;
-    cpu[1].window_trace_active = false;
-    cpu[1].spill_verify = spill_verify;
-
-    /* Install ROM function stubs */
-    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu[0]);
-    if (!rom) {
-        fprintf(stderr, "Failed to create ROM stubs\n");
-        periph_destroy(periph);
-        mem_destroy(mem);
-        elf_symbols_destroy(syms);
-        ring_destroy(g_ring);
-        return 1;
-    }
-
-    /* Set single-core mode on ROM stubs */
-    rom_stubs_set_single_core(rom, single_core);
-
-    /* Hook firmware functions by symbol name (newlib locks, NVS, GPIO driver etc.) */
-    if (syms)
-        rom_stubs_hook_symbols(rom, syms);
-
-    /* FreeRTOS stubs */
-    freertos_stubs_t *frt = freertos_stubs_create(&cpu[0]);
-    if (frt) {
-        if (!single_core)
-            freertos_stubs_attach_cpu(frt, 1, &cpu[1]);
-        if (syms)
-            freertos_stubs_hook_symbols(frt, syms);
-    }
-
-    /* esp_timer stubs */
-    esp_timer_stubs_t *etimer = esp_timer_stubs_create(&cpu[0]);
-    if (etimer && syms)
-        esp_timer_stubs_hook_symbols(etimer, syms);
-
-    /* Display stubs (no framebuffer in standalone mode — just hooks) */
-    display_stubs_t *dstubs = display_stubs_create(&cpu[0]);
-    if (dstubs && syms) {
-        display_stubs_hook_symbols(dstubs, syms);
-        display_stubs_hook_tft_espi(dstubs, syms);
-        display_stubs_hook_tft_esprite(dstubs, syms);
-        display_stubs_hook_ofr(dstubs, syms);
-    }
-
-    /* Touch stubs (no input in standalone mode) */
-    touch_stubs_t *tstubs = touch_stubs_create(&cpu[0]);
-    if (tstubs && syms)
-        touch_stubs_hook_symbols(tstubs, syms);
-
-    /* SD card stubs */
-    sdcard_stubs_t *sstubs = sdcard_stubs_create(&cpu[0]);
-    if (sstubs) {
-        if (sdcard_path)
-            sdcard_stubs_set_image(sstubs, sdcard_path);
-        if (sdcard_size > 0)
-            sdcard_stubs_set_size(sstubs, sdcard_size);
-        if (syms)
-            sdcard_stubs_hook_symbols(sstubs, syms);
-    }
-
-    /* SHA hardware accelerator stubs */
-    sha_stubs_t *shstubs = sha_stubs_create(&cpu[0]);
-    if (shstubs && syms)
-        sha_stubs_hook_symbols(shstubs, syms);
-
-    /* AES hardware accelerator stubs */
-    aes_stubs_t *astubs = aes_stubs_create(&cpu[0]);
-    if (astubs && syms)
-        aes_stubs_hook_symbols(astubs, syms);
-
-    /* MPI (RSA) hardware accelerator stubs */
-    mpi_stubs_t *mstubs = mpi_stubs_create(&cpu[0]);
-    if (mstubs && syms)
-        mpi_stubs_hook_symbols(mstubs, syms);
-
-    /* WiFi / lwip socket bridge */
-    wifi_stubs_t *wstubs = wifi_stubs_create(&cpu[0]);
-    if (wstubs && syms)
-        wifi_stubs_hook_symbols(wstubs, syms);
-
-    /* Bluetooth / NimBLE stubs */
-    bt_stubs_t *bstubs = bt_stubs_create(&cpu[0]);
-    if (bstubs && syms)
-        bt_stubs_hook_symbols(bstubs, syms);
-
-    /* Core 1 shares memory and PC hook table with core 0 */
-    if (!single_core) {
-        cpu[1].pc_hook = cpu[0].pc_hook;
-        cpu[1].pc_hook_ctx = cpu[0].pc_hook_ctx;
-    }
+    /* Window trace gating: session sets window_trace_active = window_trace,
+     * but if we have a trace window start, disable until we reach it. */
+    if (window_trace && trace_start > 0)
+        cpu->window_trace_active = false;
 
     /* Install ROM log callback for verbose trace, call trace, or event log */
     if (call_trace) {
         g_call_syms = syms;
-        rom_stubs_set_log_callback(rom, rom_log_call_cb, NULL);
+        flexe_session_set_rom_log_cb(session, rom_log_call_cb, NULL);
     } else if (event_log) {
-        rom_stubs_set_log_callback(rom, rom_log_event_cb, NULL);
+        flexe_session_set_rom_log_cb(session, rom_log_event_cb, NULL);
     } else if (verbose_trace) {
-        rom_stubs_set_log_callback(rom, rom_log_cb, NULL);
+        flexe_session_set_rom_log_cb(session, rom_log_cb, NULL);
     }
 
-    /* Install FreeRTOS event callback for event log */
-    if (event_log && frt)
-        freertos_stubs_set_event_fn(frt, freertos_event_cb, NULL);
-
-    /* Install WiFi event log mode */
-    if (event_log && wstubs)
-        wifi_stubs_set_event_log(wstubs, true);
-
-    /* Install BT event log mode */
-    if (event_log && bstubs)
-        bt_stubs_set_event_log(bstubs, true);
+    /* Install event log callbacks */
+    if (event_log) {
+        flexe_session_set_freertos_event_fn(session, freertos_event_cb, NULL);
+        flexe_session_set_event_log(session, 1);
+    }
 
     /* Resolve conditional trace symbols */
     if (cond.active)
         cond_trace_resolve(&cond, syms);
-
-    /* Set entry point and initial stack pointer */
-    if (has_entry_override)
-        cpu[0].pc = entry_override;
-    else if (res.entry_point != 0)
-        cpu[0].pc = res.entry_point;
-    ar_write(&cpu[0], 1, 0x3FFE0000u);  /* SP in SRAM data, above BSS */
 
     /* Resolve and install breakpoints */
     for (int i = 0; i < bp_count; i++) {
@@ -912,7 +768,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
         }
-        if (xtensa_set_breakpoint(&cpu[0], bp_addr) == 0) {
+        if (xtensa_set_breakpoint(cpu, bp_addr) == 0) {
             char sym_buf[128];
             format_addr(syms, bp_addr, sym_buf, sizeof(sym_buf));
             fprintf(stderr, "Breakpoint set at 0x%08X (%s)\n", bp_addr, sym_buf);
@@ -921,7 +777,7 @@ int main(int argc, char *argv[]) {
 
     /* ===== Execute ===== */
     uint64_t cycles = 0;
-    uint64_t max_cycles_u64 = (uint64_t)max_cycles;
+    uint64_t max_cycles_u64 = (uint64_t)(max_cycles > 0 ? max_cycles : 10000000);
     stop_reason_t stop_reason = STOP_RUNNING;
     char disasm_buf[128];
 
@@ -937,7 +793,7 @@ int main(int argc, char *argv[]) {
     /* Trace state (used in trace windows) */
     uint32_t prev_ar[16];
     uint32_t prev_sar = 0, prev_ps = 0;
-    uint32_t prev_pc = cpu[0].pc;
+    uint32_t prev_pc = cpu->pc;
     int call_depth = 0;
 
     /* Determine if we need per-step execution at all */
@@ -945,14 +801,14 @@ int main(int argc, char *argv[]) {
 
     /* Unified execution loop */
     int batch = 10000;
-    while (cycles < max_cycles_u64 && cpu[0].running && !cpu[0].halted && !cpu[0].breakpoint_hit) {
+    while (cycles < max_cycles_u64 && cpu->running && !cpu->halted && !cpu->breakpoint_hit) {
         /* Are we in a trace window?
-         * Use cpu[0].cycle_count (virtual time including FreeRTOS skips)
+         * Use cpu->cycle_count (virtual time including FreeRTOS skips)
          * so trace windows match event log timestamps. */
-        uint64_t ccnt = cpu[0].cycle_count;
+        uint64_t ccnt = cpu->cycle_count;
         /* Update window trace gating */
         if (window_trace)
-            cpu[0].window_trace_active = (trace_start == 0 || ccnt >= trace_start) &&
+            cpu->window_trace_active = (trace_start == 0 || ccnt >= trace_start) &&
                                       (ccnt < trace_end);
         int in_trace_window = need_step &&
             (trace_start == 0 || ccnt >= trace_start) &&
@@ -962,52 +818,52 @@ int main(int argc, char *argv[]) {
             /* --- Single-step with full trace output --- */
             int do_trace_output = (verbose_trace || (!call_trace && !assert_count));
             if (do_trace_output && cond.active)
-                do_trace_output = cond_trace_active(&cond, cpu[0].pc, ccnt);
+                do_trace_output = cond_trace_active(&cond, cpu->pc, ccnt);
 
             insn_type_t itype = INSN_OTHER;
             if (call_trace)
-                itype = classify_insn(&cpu[0]);
+                itype = classify_insn(cpu);
 
             if (do_trace_output) {
-                xtensa_disasm(&cpu[0], cpu[0].pc, disasm_buf, sizeof(disasm_buf));
+                xtensa_disasm(cpu, cpu->pc, disasm_buf, sizeof(disasm_buf));
                 if (syms) {
                     char sym_buf[128];
-                    format_addr(syms, cpu[0].pc, sym_buf, sizeof(sym_buf));
-                    trace_emit("[%08X] %s: %s\n", cpu[0].pc, sym_buf, disasm_buf);
+                    format_addr(syms, cpu->pc, sym_buf, sizeof(sym_buf));
+                    trace_emit("[%08X] %s: %s\n", cpu->pc, sym_buf, disasm_buf);
                 } else {
-                    trace_emit("[%08X] %s\n", cpu[0].pc, disasm_buf);
+                    trace_emit("[%08X] %s\n", cpu->pc, disasm_buf);
                 }
             }
 
             if (do_trace_output && verbose_trace) {
-                for (int r = 0; r < 16; r++) prev_ar[r] = ar_read(&cpu[0], r);
-                prev_sar = cpu[0].sar;
-                prev_ps = cpu[0].ps;
+                for (int r = 0; r < 16; r++) prev_ar[r] = ar_read(cpu, r);
+                prev_sar = cpu->sar;
+                prev_ps = cpu->ps;
             }
-            prev_pc = cpu[0].pc;
+            prev_pc = cpu->pc;
 
-            int rc = xtensa_step(&cpu[0]);
+            int rc = xtensa_step(cpu);
             cycles++;
 
             if (do_trace_output && verbose_trace) {
                 for (int r = 0; r < 16; r++) {
-                    uint32_t cur = ar_read(&cpu[0], r);
+                    uint32_t cur = ar_read(cpu, r);
                     if (cur != prev_ar[r])
                         trace_emit("     a%-2d: 0x%08X -> 0x%08X\n", r, prev_ar[r], cur);
                 }
-                if (cpu[0].sar != prev_sar)
-                    trace_emit("     SAR: %u -> %u\n", prev_sar, cpu[0].sar);
-                if (cpu[0].ps != prev_ps)
-                    trace_emit("     PS:  0x%08X -> 0x%08X\n", prev_ps, cpu[0].ps);
+                if (cpu->sar != prev_sar)
+                    trace_emit("     SAR: %u -> %u\n", prev_sar, cpu->sar);
+                if (cpu->ps != prev_ps)
+                    trace_emit("     PS:  0x%08X -> 0x%08X\n", prev_ps, cpu->ps);
             }
 
             if (call_trace) {
                 g_call_depth = call_depth;
                 if (itype == INSN_CALL || itype == INSN_CALLX) {
                     char sym_buf[128];
-                    format_addr(syms, cpu[0].pc, sym_buf, sizeof(sym_buf));
+                    format_addr(syms, cpu->pc, sym_buf, sizeof(sym_buf));
                     int indent = call_depth < 128 ? call_depth : 128;
-                    fprintf(stderr, "%*s-> %s (0x%08X)\n", indent * 2, "", sym_buf, cpu[0].pc);
+                    fprintf(stderr, "%*s-> %s (0x%08X)\n", indent * 2, "", sym_buf, cpu->pc);
                     if (call_depth < 128) call_depth++;
                 } else if (itype == INSN_ENTRY) {
                     /* ENTRY is inside the callee — CALL already printed */
@@ -1021,168 +877,138 @@ int main(int argc, char *argv[]) {
             }
 
             if (assert_count > 0)
-                check_assertions(asserts, assert_count, &cpu[0], syms, cycles, mem);
+                check_assertions(asserts, assert_count, cpu, syms, cycles, mem);
 
             if (cond.active)
-                cond_trace_check_until(&cond, cpu[0].pc);
+                cond_trace_check_until(&cond, cpu->pc);
 
             if (rc < 0) {
-                if (cpu[0].breakpoint_hit) {
+                if (cpu->breakpoint_hit) {
                     char sym_buf[128];
-                    format_addr(syms, cpu[0].breakpoint_hit_addr, sym_buf, sizeof(sym_buf));
+                    format_addr(syms, cpu->breakpoint_hit_addr, sym_buf, sizeof(sym_buf));
                     trace_emit("[BP] Hit breakpoint at 0x%08X (%s)\n",
-                            cpu[0].breakpoint_hit_addr, sym_buf);
+                            cpu->breakpoint_hit_addr, sym_buf);
                     stop_reason = STOP_BREAKPOINT;
                     break;
                 }
-                if (cpu[0].halted) {
+                if (cpu->halted) {
                     trace_emit("CPU halted (WAITI) at cycle %llu\n",
                             (unsigned long long)cycles);
                     stop_reason = STOP_HALT;
                     break;
                 }
-                if (cpu[0].exception && do_trace_output && verbose_trace) {
-                    const char *vec = detect_vector(cpu[0].pc, cpu[0].vecbase);
+                if (cpu->exception && do_trace_output && verbose_trace) {
+                    const char *vec = detect_vector(cpu->pc, cpu->vecbase);
                     if (vec)
-                        trace_emit("     [INT] %s vector at 0x%08X\n", vec, cpu[0].pc);
+                        trace_emit("     [INT] %s vector at 0x%08X\n", vec, cpu->pc);
                     else
                         trace_emit("     [EXC] cause=%u (%s) at 0x%08X\n",
-                                cpu[0].exccause, exc_cause_name(cpu[0].exccause), cpu[0].epc[0]);
+                                cpu->exccause, exc_cause_name(cpu->exccause), cpu->epc[0]);
                 }
                 /* Event log: exception events */
-                if (cpu[0].exception && event_log && !do_trace_output) {
-                    const char *vec = detect_vector(cpu[0].pc, cpu[0].vecbase);
+                if (cpu->exception && event_log && !do_trace_output) {
+                    const char *vec = detect_vector(cpu->pc, cpu->vecbase);
                     if (vec)
                         fprintf(stderr, "[%10llu] EXC   %s at 0x%08X\n",
-                                (unsigned long long)cycles, vec, cpu[0].pc);
+                                (unsigned long long)cycles, vec, cpu->pc);
                     else
                         fprintf(stderr, "[%10llu] EXC   cause=%u (%s) at 0x%08X\n",
                                 (unsigned long long)cycles,
-                                cpu[0].exccause, exc_cause_name(cpu[0].exccause), cpu[0].epc[0]);
+                                cpu->exccause, exc_cause_name(cpu->exccause), cpu->epc[0]);
                 }
-                if (cpu[0].exception) {
-                    if (cpu[0].epc[0] == last_exc_pc && cpu[0].exccause == last_exc_cause) {
+                if (cpu->exception) {
+                    if (cpu->epc[0] == last_exc_pc && cpu->exccause == last_exc_cause) {
                         exc_repeat++;
                         if (exc_repeat >= EXC_LOOP_THRESH) {
                             trace_emit("[STOP] Exception loop: cause=%u (%s) at 0x%08X, repeated %dx\n",
-                                    cpu[0].exccause, exc_cause_name(cpu[0].exccause), cpu[0].epc[0], exc_repeat);
+                                    cpu->exccause, exc_cause_name(cpu->exccause), cpu->epc[0], exc_repeat);
                             stop_reason = STOP_EXCEPTION_LOOP;
                             break;
                         }
                     } else {
-                        last_exc_pc = cpu[0].epc[0];
-                        last_exc_cause = cpu[0].exccause;
+                        last_exc_pc = cpu->epc[0];
+                        last_exc_cause = cpu->exccause;
                         exc_repeat = 1;
                     }
                 }
             } else {
-                if (do_trace_output && verbose_trace && cpu[0].pc != prev_pc + 2 && cpu[0].pc != prev_pc + 3) {
-                    const char *vec = detect_vector(cpu[0].pc, cpu[0].vecbase);
+                if (do_trace_output && verbose_trace && cpu->pc != prev_pc + 2 && cpu->pc != prev_pc + 3) {
+                    const char *vec = detect_vector(cpu->pc, cpu->vecbase);
                     if (vec)
-                        trace_emit("     [INT] %s vector at 0x%08X\n", vec, cpu[0].pc);
+                        trace_emit("     [INT] %s vector at 0x%08X\n", vec, cpu->pc);
                 }
                 exc_repeat = 0;
             }
 
-            if (!cpu[0].running) {
+            if (!cpu->running) {
                 stop_reason = STOP_CPU_STOPPED;
                 break;
             }
-            if (cpu[0].pc == prev_pc && frt) {
+            if (cpu->pc == prev_pc && frt) {
                 uint32_t param;
                 uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
                 if (fn) {
-                    ar_write(&cpu[0], 1, 0x3FFE0000u);
-                    ar_write(&cpu[0], 2, param);
-                    cpu[0].pc = fn;
-                    cpu[0].ps = 0x00040020u;
+                    ar_write(cpu, 1, 0x3FFE0000u);
+                    ar_write(cpu, 2, param);
+                    cpu->pc = fn;
+                    cpu->ps = 0x00040020u;
                 }
             }
         } else {
             /* --- Batch execution --- */
-            uint32_t pc_before = cpu[0].pc;
+            uint32_t pc_before = cpu->pc;
             uint64_t remaining = max_cycles_u64 - cycles;
             int n = remaining < (uint64_t)batch ? (int)remaining : batch;
             /* Cap batch at trace window boundary if approaching.
-             * Use cpu[0].cycle_count to match event log timestamps. */
-            if (need_step && cpu[0].cycle_count < trace_start) {
-                uint64_t to_window = trace_start - cpu[0].cycle_count;
+             * Use cpu->cycle_count to match event log timestamps. */
+            if (need_step && cpu->cycle_count < trace_start) {
+                uint64_t to_window = trace_start - cpu->cycle_count;
                 if (to_window < (uint64_t)n) n = (int)to_window;
             }
-            int ran = xtensa_run(&cpu[0], n);
+            int ran = xtensa_run(cpu, n);
             cycles += ran;
 
             /* Event log: check exception after batch */
-            if (event_log && cpu[0].exception) {
-                const char *vec = detect_vector(cpu[0].pc, cpu[0].vecbase);
+            if (event_log && cpu->exception) {
+                const char *vec = detect_vector(cpu->pc, cpu->vecbase);
                 if (vec)
                     fprintf(stderr, "[%10llu] EXC   %s at 0x%08X\n",
-                            (unsigned long long)cycles, vec, cpu[0].pc);
+                            (unsigned long long)cycles, vec, cpu->pc);
                 else
                     fprintf(stderr, "[%10llu] EXC   cause=%u (%s) at 0x%08X\n",
                             (unsigned long long)cycles,
-                            cpu[0].exccause, exc_cause_name(cpu[0].exccause), cpu[0].epc[0]);
+                            cpu->exccause, exc_cause_name(cpu->exccause), cpu->epc[0]);
             }
 
             if (ran < n) {
                 /* Check if we stopped for a good reason, or exception loop */
-                if (cpu[0].breakpoint_hit || cpu[0].halted || !cpu[0].running) break;
+                if (cpu->breakpoint_hit || cpu->halted || !cpu->running) break;
             }
-            if (cpu[0].pc == pc_before && frt) {
+            if (cpu->pc == pc_before && frt) {
                 uint32_t param;
                 uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
                 if (fn) {
-                    ar_write(&cpu[0], 1, 0x3FFE0000u);
-                    ar_write(&cpu[0], 2, param);
-                    cpu[0].pc = fn;
-                    cpu[0].ps = 0x00040020u;
+                    ar_write(cpu, 1, 0x3FFE0000u);
+                    ar_write(cpu, 2, param);
+                    cpu->pc = fn;
+                    cpu->ps = 0x00040020u;
                 }
             }
         }
 
-        /* Preemptive timeslice check (always) */
-        if (frt) freertos_stubs_check_preempt(frt);
-
-        /* Dual-core: check if core 1 should start.
-         * Core 1 starts when firmware releases it from reset via DPORT write
-         * AND the boot address has been set via ets_set_appcpu_boot_addr. */
-        if (!single_core && !cpu[1].running &&
-            periph_app_cpu_released(periph) &&
-            rom_stubs_app_cpu_boot_addr(rom) != 0) {
-            cpu[1].pc = rom_stubs_app_cpu_boot_addr(rom);
-            cpu[1].running = true;
-            fprintf(stderr, "[%10llu] CORE1 started at 0x%08X\n",
-                    (unsigned long long)cpu[0].cycle_count, cpu[1].pc);
-        }
-
-        /* Dual-core: run core 1 batch */
-        if (!single_core && cpu[1].running) {
-            int n1 = (max_cycles_u64 - cycles < (uint64_t)batch) ?
-                     (int)(max_cycles_u64 - cycles) : batch;
-            xtensa_run(&cpu[1], n1);
-            if (frt) freertos_stubs_check_preempt_core(frt, 1);
-            /* Sync cycle counts: both cores share the same clock, so use the
-             * maximum of the two.  This preserves vTaskDelay fast-forward
-             * advances on either core while keeping them in sync. */
-            if (cpu[1].cycle_count > cpu[0].cycle_count) {
-                cpu[0].cycle_count = cpu[1].cycle_count;
-                cpu[0].virtual_time_us = cpu[1].cycle_count / 160;
-            } else {
-                cpu[1].cycle_count = cpu[0].cycle_count;
-            }
-            cpu[1].virtual_time_us = cpu[0].virtual_time_us;
-        }
+        /* Preemptive timeslice + core 1 management */
+        flexe_session_post_batch(session, batch);
 
         /* Progress heartbeat */
         if (heartbeat_interval > 0 &&
-            cpu[0].cycle_count / heartbeat_interval > last_heartbeat) {
-            last_heartbeat = cpu[0].cycle_count / heartbeat_interval;
+            cpu->cycle_count / heartbeat_interval > last_heartbeat) {
+            last_heartbeat = cpu->cycle_count / heartbeat_interval;
             uint32_t cur_stubs = rom_stubs_total_calls(rom);
             char sym_buf[128];
-            format_addr(syms, cpu[0].pc, sym_buf, sizeof(sym_buf));
+            format_addr(syms, cpu->pc, sym_buf, sizeof(sym_buf));
             const char *task_name = frt ? freertos_stubs_current_task_name(frt, 0) : NULL;
             fprintf(stderr, "[%10llu] ---- %s | stubs:%u | task:%s ----\n",
-                    (unsigned long long)cpu[0].cycle_count, sym_buf,
+                    (unsigned long long)cpu->cycle_count, sym_buf,
                     cur_stubs - hb_stub_count,
                     task_name ? task_name : "(none)");
             hb_stub_count = cur_stubs;
@@ -1191,11 +1017,11 @@ int main(int argc, char *argv[]) {
 
     /* Determine stop reason */
     if (stop_reason == STOP_RUNNING) {
-        if (cpu[0].breakpoint_hit)
+        if (cpu->breakpoint_hit)
             stop_reason = STOP_BREAKPOINT;
-        else if (cpu[0].halted)
+        else if (cpu->halted)
             stop_reason = STOP_HALT;
-        else if (!cpu[0].running)
+        else if (!cpu->running)
             stop_reason = STOP_CPU_STOPPED;
         else
             stop_reason = STOP_MAX_CYCLES;
@@ -1226,24 +1052,25 @@ int main(int argc, char *argv[]) {
                 exc_cause_name(last_exc_cause), last_exc_pc, exc_repeat);
     } else if (stop_reason == STOP_BREAKPOINT) {
         char sym_buf[128];
-        format_addr(syms, cpu[0].breakpoint_hit_addr, sym_buf, sizeof(sym_buf));
+        format_addr(syms, cpu->breakpoint_hit_addr, sym_buf, sizeof(sym_buf));
         fprintf(stderr, "Stop reason: %s at 0x%08X (%s)\n",
-                stop_reason_str(stop_reason), cpu[0].breakpoint_hit_addr, sym_buf);
+                stop_reason_str(stop_reason), cpu->breakpoint_hit_addr, sym_buf);
     } else {
         fprintf(stderr, "Stop reason: %s\n", stop_reason_str(stop_reason));
     }
 
     fprintf(stderr, "Cycles:     %llu (virtual: %llu)\n",
-            (unsigned long long)cycles, (unsigned long long)cpu[0].cycle_count);
+            (unsigned long long)cycles, (unsigned long long)cpu->cycle_count);
 
     /* Final PC with symbol */
     char pc_sym[128];
-    format_addr(syms, cpu[0].pc, pc_sym, sizeof(pc_sym));
-    fprintf(stderr, "Final PC:   0x%08X (%s)\n", cpu[0].pc, pc_sym);
+    format_addr(syms, cpu->pc, pc_sym, sizeof(pc_sym));
+    fprintf(stderr, "Final PC:   0x%08X (%s)\n", cpu->pc, pc_sym);
     if (!single_core) {
+        xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
         char pc1_sym[128];
-        format_addr(syms, cpu[1].pc, pc1_sym, sizeof(pc1_sym));
-        fprintf(stderr, "Core 1 PC:  0x%08X (%s)\n", cpu[1].pc, pc1_sym);
+        format_addr(syms, cpu1->pc, pc1_sym, sizeof(pc1_sym));
+        fprintf(stderr, "Core 1 PC:  0x%08X (%s)\n", cpu1->pc, pc1_sym);
     }
 
     fprintf(stderr, "UART TX:    %d bytes\n", periph_uart_tx_count(periph));
@@ -1274,14 +1101,14 @@ int main(int argc, char *argv[]) {
     if (verbose || stop_reason == STOP_BREAKPOINT) {
         fprintf(stderr, "\n--- Registers ---\n");
         fprintf(stderr, "PS=0x%08X  SAR=%u  LBEG=0x%08X  LEND=0x%08X  LCOUNT=%u\n",
-                cpu[0].ps, cpu[0].sar, cpu[0].lbeg, cpu[0].lend, cpu[0].lcount);
+                cpu->ps, cpu->sar, cpu->lbeg, cpu->lend, cpu->lcount);
         fprintf(stderr, "WINDOWBASE=%u  WINDOWSTART=0x%04X  VECBASE=0x%08X\n",
-                cpu[0].windowbase, cpu[0].windowstart, cpu[0].vecbase);
-        fprintf(stderr, "EXCCAUSE=%u  EXCVADDR=0x%08X\n", cpu[0].exccause, cpu[0].excvaddr);
+                cpu->windowbase, cpu->windowstart, cpu->vecbase);
+        fprintf(stderr, "EXCCAUSE=%u  EXCVADDR=0x%08X\n", cpu->exccause, cpu->excvaddr);
         for (int i = 0; i < 16; i += 4)
             fprintf(stderr, "a%d=0x%08X  a%d=0x%08X  a%d=0x%08X  a%d=0x%08X\n",
-                    i, ar_read(&cpu[0], i), i+1, ar_read(&cpu[0], i+1),
-                    i+2, ar_read(&cpu[0], i+2), i+3, ar_read(&cpu[0], i+3));
+                    i, ar_read(cpu, i), i+1, ar_read(cpu, i+1),
+                    i+2, ar_read(cpu, i+2), i+3, ar_read(cpu, i+3));
     }
 
     /* Memory dumps */
@@ -1293,19 +1120,6 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     ring_destroy(g_ring);
-    bt_stubs_destroy(bstubs);
-    wifi_stubs_destroy(wstubs);
-    sha_stubs_destroy(shstubs);
-    aes_stubs_destroy(astubs);
-    mpi_stubs_destroy(mstubs);
-    sdcard_stubs_destroy(sstubs);
-    touch_stubs_destroy(tstubs);
-    display_stubs_destroy(dstubs);
-    esp_timer_stubs_destroy(etimer);
-    freertos_stubs_destroy(frt);
-    rom_stubs_destroy(rom);
-    periph_destroy(periph);
-    mem_destroy(mem);
-    elf_symbols_destroy(syms);
+    flexe_session_destroy(session);
     return 0;
 }
