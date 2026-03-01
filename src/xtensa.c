@@ -249,6 +249,17 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
 /* ===== Exception/Interrupt Dispatch ===== */
 
 void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr) {
+    /* Trap: catch exceptions with out-of-range fault PC */
+    if (__builtin_expect(fault_pc < 0x40000000u || fault_pc >= 0x40500000u, 0)) {
+        fprintf(stderr, "[EXC-TRAP] cause=%d fault_pc=0x%08X vaddr=0x%08X cycle=%llu core=%d\n",
+                cause, fault_pc, vaddr, (unsigned long long)cpu->cycle_count, cpu->prid ? 1 : 0);
+        fprintf(stderr, "  PS=0x%08X SAR=%u WB=%u WS=0x%X\n",
+                cpu->ps, cpu->sar, cpu->windowbase, cpu->windowstart);
+        for (int r = 0; r < 16; r += 4)
+            fprintf(stderr, "  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X\n",
+                    r, ar_read(cpu, r), r+1, ar_read(cpu, r+1),
+                    r+2, ar_read(cpu, r+2), r+3, ar_read(cpu, r+3));
+    }
     uint32_t vec;
     if (XT_PS_EXCM(cpu->ps)) {
         /* Double exception */
@@ -398,9 +409,14 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
     {
         int si = widx & 0xF;
         int d = cpu->spill_stack[si].depth;
-        if (d < 8)
+        if (d < SPILL_STACK_DEPTH) {
             cpu->spill_stack[si].base[d] = base;
-        cpu->spill_stack[si].depth = d + 1;
+            cpu->spill_stack[si].depth = d + 1;
+        } else {
+            fprintf(stderr, "[WARN] spill_stack[%d] depth %d exceeds limit %d at PC=0x%08X cycle=%llu\n",
+                    si, d, SPILL_STACK_DEPTH, cpu->pc,
+                    (unsigned long long)cpu->cycle_count);
+        }
     }
 
     int nregs = 4;
@@ -411,7 +427,7 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
     {
         int si0 = widx & 0xF;
         int d0 = cpu->spill_stack[si0].depth - 1; /* depth was already incremented */
-        if (d0 >= 0 && d0 < 8) {
+        if (d0 >= 0 && d0 < SPILL_STACK_DEPTH) {
             for (int i = 0; i < 4; i++)
                 cpu->spill_stack[si0].core[d0][i] = phys_read(cpu, widx, i);
         }
@@ -425,7 +441,7 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
          * CPU buffer avoids corruption when deeper calls overwrite stack. */
         int si2 = widx & 0xF;
         int d2 = cpu->spill_stack[si2].depth - 1; /* depth was already incremented */
-        if (d2 >= 0 && d2 < 8) {
+        if (d2 >= 0 && d2 < SPILL_STACK_DEPTH) {
             for (int i = 0; i < 4; i++)
                 cpu->spill_stack[si2].extra[d2][i] = phys_read(cpu, widx, 4 + i);
         }
@@ -435,7 +451,7 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
         /* CALL12: also save a8-a11 to CPU-side buffer */
         int si2 = widx & 0xF;
         int d2 = cpu->spill_stack[si2].depth - 1;
-        if (d2 >= 0 && d2 < 8) {
+        if (d2 >= 0 && d2 < SPILL_STACK_DEPTH) {
             for (int i = 0; i < 4; i++)
                 cpu->spill_stack[si2].extra[d2][4 + i] = phys_read(cpu, widx, 8 + i);
         }
@@ -511,7 +527,7 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
         cpu->spill_stack[si].depth--;
         int d = cpu->spill_stack[si].depth;
         fill_depth = d;
-        base = (d < 8) ? cpu->spill_stack[si].base[d] : callee_sp;
+        base = (d < SPILL_STACK_DEPTH) ? cpu->spill_stack[si].base[d] : callee_sp;
         /* Sanity check: base must be in valid data memory range.
          * If depth tracking is out of sync, we may pop a stale/wrong entry. */
         if (base < 0x3F800000 || base > 0x3FFFFFFF) {
@@ -524,7 +540,7 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
 
     /* Restore a0-a3 from CPU-side buffer (immune to stack overwrites),
      * falling back to stack memory if buffer unavailable */
-    if (fill_depth >= 0 && fill_depth < 8) {
+    if (fill_depth >= 0 && fill_depth < SPILL_STACK_DEPTH) {
         for (int i = 0; i < 4; i++)
             phys_write(cpu, ret_wb, i, cpu->spill_stack[si].core[fill_depth][i]);
     } else {
@@ -538,7 +554,7 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
 
     if (callsize >= 2) {
         /* Restore a4-a7 from CPU-side buffer */
-        if (fill_depth >= 0 && fill_depth < 8) {
+        if (fill_depth >= 0 && fill_depth < SPILL_STACK_DEPTH) {
             for (int i = 0; i < 4; i++)
                 phys_write(cpu, ret_wb, 4 + i, cpu->spill_stack[si].extra[fill_depth][i]);
         } else {
@@ -549,7 +565,7 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
     if (callsize == 3) {
         /* Restore a8-a11 from CPU-side buffer */
         int d = fill_depth;
-        if (d >= 0 && d < 8) {
+        if (d >= 0 && d < SPILL_STACK_DEPTH) {
             for (int i = 0; i < 4; i++)
                 phys_write(cpu, ret_wb, 8 + i, cpu->spill_stack[si].extra[d][4 + i]);
         } else {
@@ -1875,6 +1891,35 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
             xtensa_check_interrupts(cpu);
         }
         return cpu->exception ? -1 : 0;
+    }
+
+    /* Record PC history for debugging */
+    cpu->pc_history[cpu->pc_history_idx] = cpu->pc;
+    cpu->pc_history_idx = (cpu->pc_history_idx + 1) & (PC_HISTORY_SIZE - 1);
+
+    /* Invalid PC trap: catch jumps to unmapped/non-code regions.
+     * Valid ESP32 code: 0x40000000-0x400BFFFF (ROM/IRAM), 0x400D0000-0x404FFFFF (flash) */
+    if (__builtin_expect(cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u, 0)) {
+        cpu->cycle_count = *local_cc;
+        fprintf(stderr, "[TRAP] Invalid PC=0x%08X at cycle %llu (core %d, prid=0x%X)\n",
+                cpu->pc, (unsigned long long)*local_cc, cpu->core_id, cpu->prid);
+        fprintf(stderr, "  PS=0x%08X SAR=%u WindowBase=%u WindowStart=0x%X\n",
+                cpu->ps, cpu->sar, cpu->windowbase, cpu->windowstart);
+        for (int r = 0; r < 16; r += 4)
+            fprintf(stderr, "  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X\n",
+                    r, ar_read(cpu, r), r+1, ar_read(cpu, r+1),
+                    r+2, ar_read(cpu, r+2), r+3, ar_read(cpu, r+3));
+        fprintf(stderr, "  EPC1=0x%08X EPC2=0x%08X EPC3=0x%08X\n",
+                cpu->epc[0], cpu->epc[1], cpu->epc[2]);
+        /* Dump PC history (newest first) */
+        fprintf(stderr, "  PC history (last %d instructions):\n", PC_HISTORY_SIZE);
+        for (int i = 0; i < PC_HISTORY_SIZE; i++) {
+            int idx = (cpu->pc_history_idx - 1 - i) & (PC_HISTORY_SIZE - 1);
+            fprintf(stderr, "    [-%02d] 0x%08X\n", i, cpu->pc_history[idx]);
+        }
+        cpu->running = false;
+        cpu->exception = true;
+        return -1;
     }
 
     /* Breakpoint check */

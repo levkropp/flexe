@@ -36,6 +36,7 @@ add_library(xtensa-emu-lib STATIC
     src/sha_stubs.c
     src/aes_stubs.c
     src/mpi_stubs.c
+    src/flexe_session.c
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 find_package(OpenSSL REQUIRED)
