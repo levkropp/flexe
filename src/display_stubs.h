@@ -27,4 +27,9 @@ int display_stubs_hook_ofr(display_stubs_t *ds, const elf_symbols_t *syms);
 void display_stubs_set_framebuf(display_stubs_t *ds, uint16_t *fb,
                                  pthread_mutex_t *mtx, int w, int h);
 
+/* Query current display state (rotation-aware) */
+uint8_t display_stubs_get_rotation(const display_stubs_t *ds);
+int display_stubs_get_width(const display_stubs_t *ds);
+int display_stubs_get_height(const display_stubs_t *ds);
+
 #endif /* DISPLAY_STUBS_H */

@@ -274,6 +274,11 @@ freertos_stubs_t *flexe_session_frt(flexe_session_t *s)
     return s ? s->frt : NULL;
 }
 
+display_stubs_t *flexe_session_display(flexe_session_t *s)
+{
+    return s ? s->dstubs : NULL;
+}
+
 /* ===== Post-batch hook ===== */
 
 void flexe_session_post_batch(flexe_session_t *s, int batch_size)

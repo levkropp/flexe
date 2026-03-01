@@ -235,6 +235,8 @@ struct display_stubs {
     pthread_mutex_t    *framebuf_mtx;
     int                 width;
     int                 height;
+    int                 native_w;    /* original dimensions from set_framebuf */
+    int                 native_h;
     /* TFT_eSPI state tracking */
     uint16_t            textcolor;
     uint16_t            textbgcolor;
@@ -907,7 +909,17 @@ static void stub_tft_setTextDatum(xtensa_cpu_t *cpu, void *ctx) {
 /* TFT_eSPI::setRotation(unsigned char r) */
 static void stub_tft_setRotation(xtensa_cpu_t *cpu, void *ctx) {
     display_stubs_t *ds = ctx;
-    ds->rotation = (uint8_t)ds_arg(cpu, 1);
+    uint8_t r = (uint8_t)(ds_arg(cpu, 1) & 3);
+    ds->rotation = r;
+    if (r == 0 || r == 2) {
+        /* Portrait: narrow x tall */
+        ds->width  = ds->native_h;  /* 240 */
+        ds->height = ds->native_w;  /* 320 */
+    } else {
+        /* Landscape: wide x short */
+        ds->width  = ds->native_w;  /* 320 */
+        ds->height = ds->native_h;  /* 240 */
+    }
     ds_return_void(cpu);
 }
 
@@ -1602,6 +1614,20 @@ void display_stubs_set_framebuf(display_stubs_t *ds, uint16_t *fb,
     ds->framebuf_mtx = mtx;
     ds->width = w;
     ds->height = h;
+    ds->native_w = w;
+    ds->native_h = h;
+}
+
+uint8_t display_stubs_get_rotation(const display_stubs_t *ds) {
+    return ds ? ds->rotation : 1;
+}
+
+int display_stubs_get_width(const display_stubs_t *ds) {
+    return ds ? ds->width : DISP_W;
+}
+
+int display_stubs_get_height(const display_stubs_t *ds) {
+    return ds ? ds->height : DISP_H;
 }
 
 int display_stubs_hook_symbols(display_stubs_t *ds, const elf_symbols_t *syms) {

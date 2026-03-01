@@ -13,6 +13,7 @@
 #include "elf_symbols.h"
 #include "rom_stubs.h"
 #include "freertos_stubs.h"
+#include "display_stubs.h"
 #include "peripherals.h"
 #include <stdint.h>
 #include <pthread.h>
@@ -65,6 +66,7 @@ const elf_symbols_t *flexe_session_syms(const flexe_session_t *s);
 esp32_periph_t    *flexe_session_periph(flexe_session_t *s);
 esp32_rom_stubs_t *flexe_session_rom(flexe_session_t *s);
 freertos_stubs_t  *flexe_session_frt(flexe_session_t *s);
+display_stubs_t   *flexe_session_display(flexe_session_t *s);
 
 /* Post-batch hook: call after each core 0 batch.
  * - Checks preempt on core 0
