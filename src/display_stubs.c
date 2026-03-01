@@ -212,6 +212,246 @@ static int gfxfont_height(xtensa_mem_t *mem, uint32_t font_ptr, int scale) {
     return mem_read8(mem, font_ptr + GFXFONT_OFF_YADVANCE) * scale;
 }
 
+/* ===== TFT_eSPI built-in font support =====
+ *
+ * TFT_eSPI's fontdata[9] array stores per-font metadata:
+ *   struct { uint32_t chartbl, widthtbl; uint8_t height, baseline; }
+ * packed to 12 bytes per entry (2 pointers + 2 bytes + 2 padding).
+ * Font numbers 1-8 map to fontdata[0]-fontdata[7].
+ *
+ * Font 1 (GLCD): 5x7 columnar bitmap (256 chars × 5 bytes), fixed 6px cell.
+ * Font 2: Row-major bitmap, MSB-left, variable width, 16px height.
+ * Fonts 4,6,7,8: RLE encoded, variable width, various heights.
+ */
+
+#define FONTDATA_ENTRY_SIZE 12  /* sizeof in firmware memory */
+
+typedef struct {
+    uint32_t chartbl;    /* pointer to character bitmap table */
+    uint32_t widthtbl;   /* pointer to per-char width table */
+    uint8_t  height;     /* font height in pixels */
+    uint8_t  baseline;   /* baseline offset from top */
+} fontdata_entry_t;
+
+static fontdata_entry_t read_fontdata(xtensa_mem_t *mem, uint32_t base, int font) {
+    fontdata_entry_t fd = {0};
+    if (font < 1 || font > 8) return fd;
+    /* fontdata[0] is unused padding; fontdata[font] has the actual data */
+    uint32_t addr = base + (uint32_t)font * FONTDATA_ENTRY_SIZE;
+    fd.chartbl  = mem_read32(mem, addr);
+    fd.widthtbl = mem_read32(mem, addr + 4);
+    fd.height   = mem_read8(mem, addr + 8);
+    fd.baseline = mem_read8(mem, addr + 9);
+    return fd;
+}
+
+/* Get single character width from firmware width table */
+static int builtin_char_width(xtensa_mem_t *mem, const fontdata_entry_t *fd, uint8_t ch, int font) {
+    if (font == 1) return 6;  /* GLCD: fixed 6px (5 glyph + 1 gap) */
+    if (ch < 32 || !fd->widthtbl) return 0;
+    return mem_read8(mem, fd->widthtbl + (uint32_t)(ch - 32));
+}
+
+/* Measure string width using firmware font data */
+static int builtin_text_width(xtensa_mem_t *mem, uint32_t fontdata_addr,
+                               int font, uint32_t str_addr, int scale) {
+    fontdata_entry_t fd = read_fontdata(mem, fontdata_addr, font);
+    int total = 0;
+    for (;;) {
+        uint8_t ch = mem_read8(mem, str_addr++);
+        if (ch == 0) break;
+        total += builtin_char_width(mem, &fd, ch, font) * scale;
+    }
+    return total;
+}
+
+/* Get font height from firmware font data */
+static int builtin_font_height(xtensa_mem_t *mem, uint32_t fontdata_addr,
+                                int font, int scale) {
+    fontdata_entry_t fd = read_fontdata(mem, fontdata_addr, font);
+    return fd.height * scale;
+}
+
+/* Render GLCD Font 1 glyph (5x8 columnar, LSB=top row, 256 chars × 5 bytes).
+ * Returns cell width in pixels (6 * scale). */
+static int render_glcd_glyph(uint16_t *buf, int buf_w, int buf_h,
+                              xtensa_mem_t *mem, uint32_t chartbl,
+                              int cx, int cy, uint8_t ch,
+                              uint16_t fg, uint16_t bg, int scale,
+                              int draw_bg) {
+    /* chartbl is a flat 256×5 array: font[ch*5 .. ch*5+4] */
+    uint32_t gaddr = chartbl + (uint32_t)ch * 5;
+    for (int col = 0; col < 5; col++) {
+        uint8_t column = mem_read8(mem, gaddr + (uint32_t)col);
+        for (int row = 0; row < 8; row++) {
+            int set = (column >> row) & 1;
+            if (!set && !draw_bg) continue;
+            uint16_t pix = set ? fg : bg;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = pix;
+                }
+            }
+        }
+    }
+    /* Column 6 is the inter-character gap (background only) */
+    if (draw_bg) {
+        for (int row = 0; row < 8; row++) {
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + 5 * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = bg;
+                }
+            }
+        }
+    }
+    return 6 * scale;
+}
+
+/* Render Font 2 glyph (row-major bitmap, MSB-left, variable width, 16px height).
+ * chartbl[ch-32] is a uint32_t pointer to the bitmap. */
+static int render_font2_glyph(uint16_t *buf, int buf_w, int buf_h,
+                                xtensa_mem_t *mem, const fontdata_entry_t *fd,
+                                int cx, int cy, uint8_t ch,
+                                uint16_t fg, uint16_t bg, int scale,
+                                int draw_bg) {
+    if (ch < 32) return 0;
+    int idx = ch - 32;
+    /* chartbl is a table of uint32_t pointers, one per character */
+    uint32_t bm_ptr = mem_read32(mem, fd->chartbl + (uint32_t)(idx * 4));
+    int width = mem_read8(mem, fd->widthtbl + (uint32_t)idx);
+    if (width == 0 || !bm_ptr) return 0;
+    int bytes_per_row = (width + 6) / 8;  /* TFT_eSPI uses (width+6)/8 */
+    int height = fd->height;
+
+    for (int row = 0; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            int byte_idx = col / 8;
+            int bit_idx = 7 - (col % 8);
+            uint8_t byte = mem_read8(mem, bm_ptr + (uint32_t)(row * bytes_per_row + byte_idx));
+            int set = (byte >> bit_idx) & 1;
+            if (!set && !draw_bg) continue;
+            uint16_t pix = set ? fg : bg;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = pix;
+                }
+            }
+        }
+    }
+    return width * scale;
+}
+
+/* Render RLE-encoded glyph (Fonts 4,6,7,8).
+ * RLE format: byte & 0x80 → foreground run (length = low 7 bits + 1),
+ *             else background run (length = byte + 1).
+ * Total pixels = width × height, row-major. */
+static int render_rle_glyph(uint16_t *buf, int buf_w, int buf_h,
+                              xtensa_mem_t *mem, const fontdata_entry_t *fd,
+                              int cx, int cy, uint8_t ch,
+                              uint16_t fg, uint16_t bg, int scale,
+                              int draw_bg) {
+    if (ch < 32) return 0;
+    int idx = ch - 32;
+    uint32_t bm_ptr = mem_read32(mem, fd->chartbl + (uint32_t)(idx * 4));
+    int width = mem_read8(mem, fd->widthtbl + (uint32_t)idx);
+    if (width == 0 || !bm_ptr) return 0;
+    int height = fd->height;
+    int total_pixels = width * height;
+
+    uint32_t rle_addr = bm_ptr;
+    int pixel = 0;
+    while (pixel < total_pixels) {
+        uint8_t rle_byte = mem_read8(mem, rle_addr++);
+        int is_fg = rle_byte & 0x80;
+        int run_len = is_fg ? (rle_byte & 0x7F) + 1 : rle_byte + 1;
+        uint16_t pix = is_fg ? fg : bg;
+        int should_draw = is_fg || draw_bg;
+        for (int i = 0; i < run_len && pixel < total_pixels; i++, pixel++) {
+            if (!should_draw) continue;
+            int row = pixel / width;
+            int col = pixel % width;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = pix;
+                }
+            }
+        }
+    }
+    return width * scale;
+}
+
+/* Dispatch to the correct built-in font renderer.
+ * Returns glyph advance width in pixels.
+ * Falls back to 8x16 VGA font if fontdata_addr is 0. */
+static int render_builtin_glyph(uint16_t *buf, int buf_w, int buf_h,
+                                  xtensa_mem_t *mem, uint32_t fontdata_addr,
+                                  uint32_t glcd_font_addr,
+                                  int font, int cx, int cy, uint8_t ch,
+                                  uint16_t fg, uint16_t bg, int scale,
+                                  int draw_bg) {
+    if (!fontdata_addr || font < 1 || font > 8) {
+        /* Fallback to embedded 8x16 VGA font */
+        char c = (ch < FONT_FIRST || ch > FONT_LAST) ? ' ' : (char)ch;
+        const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+        for (int row = 0; row < FONT_H; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < FONT_W; col++) {
+                int set = bits & (0x80 >> col);
+                if (!set && !draw_bg) continue;
+                uint16_t pix = set ? fg : bg;
+                for (int sy = 0; sy < scale; sy++) {
+                    int dy = cy + row * scale + sy;
+                    if (dy < 0 || dy >= buf_h) continue;
+                    for (int sx = 0; sx < scale; sx++) {
+                        int dx = cx + col * scale + sx;
+                        if (dx < 0 || dx >= buf_w) continue;
+                        buf[dy * buf_w + dx] = pix;
+                    }
+                }
+            }
+        }
+        return FONT_W * scale;
+    }
+
+    fontdata_entry_t fd = read_fontdata(mem, fontdata_addr, font);
+    switch (font) {
+    case 1: {
+        /* Font 1 (GLCD) uses the global font[] array, NOT fontdata[1].chartbl.
+         * TFT_eSPI renders GLCD directly from font[]. Use glcd_font_addr if
+         * available, otherwise fall back to fontdata[0].chartbl which happens
+         * to store the correct address in some firmware builds. */
+        uint32_t chartbl = glcd_font_addr ? glcd_font_addr : fd.chartbl;
+        return render_glcd_glyph(buf, buf_w, buf_h, mem, chartbl,
+                                  cx, cy, ch, fg, bg, scale, draw_bg);
+    }
+    case 2:
+        return render_font2_glyph(buf, buf_w, buf_h, mem, &fd,
+                                   cx, cy, ch, fg, bg, scale, draw_bg);
+    case 4: case 6: case 7: case 8:
+        return render_rle_glyph(buf, buf_w, buf_h, mem, &fd,
+                                 cx, cy, ch, fg, bg, scale, draw_bg);
+    default:
+        /* Fonts 3, 5 don't exist in TFT_eSPI — fall back */
+        return FONT_W * scale;
+    }
+}
+
 /* ===== Sprite support ===== */
 #define MAX_SPRITES 16
 
@@ -225,6 +465,7 @@ typedef struct {
     /* text state */
     uint16_t  textcolor, textbgcolor;
     uint8_t   textsize;
+    uint8_t   textfont;        /* built-in font number 1-8 */
     uint32_t  gfxfont_ptr;   /* GFXfont pointer (0 = built-in font) */
 } sprite_t;
 
@@ -242,8 +483,11 @@ struct display_stubs {
     uint16_t            textbgcolor;
     uint8_t             textsize;
     uint8_t             textdatum;
+    uint8_t             textfont;        /* current built-in font number 1-8 */
     uint8_t             rotation;
     uint32_t            gfxfont_ptr;     /* GFXfont pointer (0 = built-in font) */
+    uint32_t            fontdata_addr;   /* address of fontdata[] in firmware flash */
+    uint32_t            glcd_font_addr;  /* address of GLCD font[] bitmap (256×5 bytes) */
     /* Sprite table */
     sprite_t            sprites[MAX_SPRITES];
     int                 sprite_count;
@@ -651,31 +895,6 @@ static void stub_tft_pushImage(xtensa_cpu_t *cpu, void *ctx) {
     ds_return_void(cpu);
 }
 
-/* Render one glyph at (cx, cy) with scaling, returns glyph pixel width */
-static int tft_render_glyph(display_stubs_t *ds, int cx, int cy,
-                             char c, uint16_t fg, uint16_t bg, int scale) {
-    if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
-    const uint8_t *glyph = font_8x16[c - FONT_FIRST];
-    int gw = FONT_W * scale;
-
-    for (int row = 0; row < FONT_H; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < FONT_W; col++) {
-            uint16_t pix = (bits & (0x80 >> col)) ? fg : bg;
-            for (int sy = 0; sy < scale; sy++) {
-                int dy = cy + row * scale + sy;
-                if (dy < 0 || dy >= ds->height) continue;
-                for (int sx = 0; sx < scale; sx++) {
-                    int dx = cx + col * scale + sx;
-                    if (dx < 0 || dx >= ds->width) continue;
-                    ds->framebuf[dy * ds->width + dx] = pix;
-                }
-            }
-        }
-    }
-    return gw;
-}
-
 /* TFT_eSPI::drawString(const char *str, int x, int y, unsigned char font)
  * Returns int16_t pixel width of rendered string.
  * Also handles sprite targets (TFT_eSprite inherits drawString). */
@@ -685,6 +904,8 @@ static void stub_tft_drawString(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t str_addr = ds_arg(cpu, 1);
     int x = (int32_t)ds_arg(cpu, 2);
     int y = (int32_t)ds_arg(cpu, 3);
+    /* arg4 = font number (optional, defaults to current textfont) */
+    uint8_t font_arg = (uint8_t)(ds_arg(cpu, 4) & 0xFF);
 
     sprite_t *sp = find_sprite(ds, this_ptr);
     uint16_t *buf   = sp ? sp->buf       : ds->framebuf;
@@ -695,6 +916,9 @@ static void stub_tft_drawString(xtensa_cpu_t *cpu, void *ctx) {
     int scale       = sp ? (sp->textsize > 0 ? sp->textsize : 1)
                          : (ds->textsize > 0 ? ds->textsize : 1);
     uint32_t font_ptr = sp ? sp->gfxfont_ptr : ds->gfxfont_ptr;
+    int textfont    = sp ? sp->textfont : ds->textfont;
+    /* If font arg is valid (1-8), use it; otherwise use current textfont */
+    if (font_arg >= 1 && font_arg <= 8) textfont = font_arg;
 
     if (!buf) { ds_return(cpu, 0); return; }
     if (!sp && ds->framebuf_mtx) pthread_mutex_lock(ds->framebuf_mtx);
@@ -707,12 +931,15 @@ static void stub_tft_drawString(xtensa_cpu_t *cpu, void *ctx) {
 
         /* Text datum alignment */
         uint8_t datum = ds->textdatum;
-        if (datum == 1 || datum == 4 || datum == 7) x -= total_w / 2;
-        else if (datum == 2 || datum == 5 || datum == 8) x -= total_w;
+        if (datum == 1 || datum == 4 || datum == 7 ||
+            datum == 10) x -= total_w / 2;
+        else if (datum == 2 || datum == 5 || datum == 8 ||
+                 datum == 11) x -= total_w;
+        int fh = gfxfont_height(cpu->mem, font_ptr, scale);
         if (datum >= 3 && datum <= 5)
-            y -= gfxfont_height(cpu->mem, font_ptr, scale) / 2;
-        else if (datum >= 6)
-            y -= gfxfont_height(cpu->mem, font_ptr, scale);
+            y -= fh / 2;
+        else if (datum >= 6 && datum <= 8)
+            y -= fh;
 
         int cx = x;
         uint32_t addr = str_addr;
@@ -723,46 +950,62 @@ static void stub_tft_drawString(xtensa_cpu_t *cpu, void *ctx) {
                                         font_ptr, cx, y, ch, fg, scale);
         }
     } else {
-        /* Built-in 8x16 font rendering */
-        int gw = FONT_W * scale;
-
-        /* Measure string length for datum alignment */
+        /* Built-in font rendering */
         uint8_t datum = sp ? 0 : ds->textdatum;
+
+        /* Measure string width for datum alignment */
         if (datum) {
-            int slen = 0;
-            uint32_t sa = str_addr;
-            for (;;) { uint8_t ch = mem_read8(cpu->mem, sa++); if (!ch) break; slen++; }
-            int tw = slen * gw;
-            if (datum == 1 || datum == 4 || datum == 7) x -= tw / 2;
-            else if (datum == 2 || datum == 5 || datum == 8) x -= tw;
-            if (datum >= 3 && datum <= 5) y -= (FONT_H * scale) / 2;
-            else if (datum >= 6) y -= FONT_H * scale;
+            if (ds->fontdata_addr)
+                total_w = builtin_text_width(cpu->mem, ds->fontdata_addr,
+                                              textfont, str_addr, scale);
+            else {
+                int slen = 0;
+                uint32_t sa = str_addr;
+                for (;;) { uint8_t ch = mem_read8(cpu->mem, sa++); if (!ch) break; slen++; }
+                total_w = slen * FONT_W * scale;
+            }
+            int tw = total_w;
+            /* Horizontal datum: 0,3,6,9=left  1,4,7,10=center  2,5,8,11=right */
+            if (datum == 1 || datum == 4 || datum == 7 ||
+                datum == 10) x -= tw / 2;
+            else if (datum == 2 || datum == 5 || datum == 8 ||
+                     datum == 11) x -= tw;
+            /* Vertical datum: 0-2=top  3-5=middle  6-8=bottom  9-11=baseline */
+            int fh = ds->fontdata_addr ?
+                     builtin_font_height(cpu->mem, ds->fontdata_addr, textfont, scale)
+                     : FONT_H * scale;
+            if (datum >= 3 && datum <= 5)
+                y -= fh / 2;
+            else if (datum >= 6 && datum <= 8)
+                y -= fh;
+            else if (datum >= 9 && datum <= 11) {
+                /* Baseline alignment */
+                if (ds->fontdata_addr) {
+                    fontdata_entry_t fd = read_fontdata(cpu->mem, ds->fontdata_addr, textfont);
+                    y -= fd.baseline * scale;
+                } else {
+                    y -= 13 * scale;  /* approximate baseline for 8x16 font */
+                }
+            }
         }
 
+        total_w = 0;
         int cx = x;
         for (;;) {
             uint8_t ch = mem_read8(cpu->mem, str_addr++);
             if (ch == 0) break;
-            if (ch == '\n') { cx = x; y += FONT_H * scale; continue; }
-            char c = (ch < FONT_FIRST || ch > FONT_LAST) ? ' ' : (char)ch;
-            const uint8_t *glyph_bm = font_8x16[c - FONT_FIRST];
-            for (int row = 0; row < FONT_H; row++) {
-                uint8_t bits = glyph_bm[row];
-                for (int col = 0; col < FONT_W; col++) {
-                    uint16_t pix = (bits & (0x80 >> col)) ? fg : bg;
-                    for (int sy = 0; sy < scale; sy++) {
-                        int dy = y + row * scale + sy;
-                        if (dy < 0 || dy >= buf_h) continue;
-                        for (int sx = 0; sx < scale; sx++) {
-                            int dx = cx + col * scale + sx;
-                            if (dx < 0 || dx >= buf_w) continue;
-                            buf[dy * buf_w + dx] = pix;
-                        }
-                    }
-                }
+            if (ch == '\n') {
+                int fh = ds->fontdata_addr ?
+                         builtin_font_height(cpu->mem, ds->fontdata_addr, textfont, scale)
+                         : FONT_H * scale;
+                cx = x; y += fh; continue;
             }
-            cx += gw;
-            total_w += gw;
+            int adv = render_builtin_glyph(buf, buf_w, buf_h, cpu->mem,
+                                            ds->fontdata_addr,
+                                            ds->glcd_font_addr, textfont,
+                                            cx, y, ch, fg, bg, scale, 1);
+            cx += adv;
+            total_w += adv;
         }
     }
 
@@ -771,7 +1014,7 @@ static void stub_tft_drawString(xtensa_cpu_t *cpu, void *ctx) {
 }
 
 /* TFT_eSPI::drawChar(unsigned short c, int x, int y)
- * Uses current textcolor/textbgcolor/textsize. */
+ * Uses current textcolor/textbgcolor/textsize/textfont. */
 static void stub_tft_drawChar_3(xtensa_cpu_t *cpu, void *ctx) {
     display_stubs_t *ds = ctx;
     uint8_t c = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
@@ -788,9 +1031,40 @@ static void stub_tft_drawChar_3(xtensa_cpu_t *cpu, void *ctx) {
                                           cpu->mem, ds->gfxfont_ptr,
                                           x, y, c, ds->textcolor, scale);
         } else {
-            tft_render_glyph(ds, x, y, (char)c, ds->textcolor,
-                              ds->textbgcolor, scale);
+            width = render_builtin_glyph(ds->framebuf, ds->width, ds->height,
+                                          cpu->mem, ds->fontdata_addr,
+                                          ds->glcd_font_addr,
+                                          ds->textfont, x, y, c,
+                                          ds->textcolor, ds->textbgcolor,
+                                          scale, 1);
         }
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return(cpu, (uint32_t)width);
+}
+
+/* TFT_eSPI::drawChar(unsigned short c, int x, int y, unsigned char font)
+ * 4-param version: font arg explicitly selects a built-in font (1-8).
+ * Always uses built-in font renderer, never GFXFont (TFT_eSPI behavior). */
+static void stub_tft_drawChar_4(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint8_t c = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+    uint8_t font = (uint8_t)(ds_arg(cpu, 4) & 0xFF);
+    if (font < 1 || font > 8) font = ds->textfont;
+
+    int scale = ds->textsize > 0 ? ds->textsize : 1;
+
+    int width = FONT_W * scale;
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        width = render_builtin_glyph(ds->framebuf, ds->width, ds->height,
+                                      cpu->mem, ds->fontdata_addr,
+                                      ds->glcd_font_addr,
+                                      font, x, y, c,
+                                      ds->textcolor, ds->textbgcolor,
+                                      scale, 1);
         pthread_mutex_unlock(ds->framebuf_mtx);
     }
     ds_return(cpu, (uint32_t)width);
@@ -827,7 +1101,11 @@ static void stub_tft_drawChar_6(xtensa_cpu_t *cpu, void *ctx) {
                                           cpu->mem, ds->gfxfont_ptr,
                                           x, y, c, fg, scale);
         } else {
-            tft_render_glyph(ds, x, y, (char)c, fg, bg, scale);
+            width = render_builtin_glyph(ds->framebuf, ds->width, ds->height,
+                                          cpu->mem, ds->fontdata_addr,
+                                          ds->glcd_font_addr,
+                                          ds->textfont, x, y, c,
+                                          fg, bg, scale, 1);
         }
         pthread_mutex_unlock(ds->framebuf_mtx);
     }
@@ -891,11 +1169,17 @@ static void stub_tft_setFreeFont(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_tft_setTextFont(xtensa_cpu_t *cpu, void *ctx) {
     display_stubs_t *ds = ctx;
     uint32_t this_ptr = ds_arg(cpu, 0);
+    uint8_t font = (uint8_t)ds_arg(cpu, 1);
+    if (font < 1) font = 1;
+    if (font > 8) font = 8;
     sprite_t *sp = find_sprite(ds, this_ptr);
-    if (sp)
+    if (sp) {
         sp->gfxfont_ptr = 0;
-    else
+        sp->textfont = font;
+    } else {
         ds->gfxfont_ptr = 0;
+        ds->textfont = font;
+    }
     ds_return_void(cpu);
 }
 
@@ -1028,6 +1312,7 @@ static void stub_sprite_createSprite(xtensa_cpu_t *cpu, void *ctx) {
     sp->textcolor = 0xFFFF;
     sp->textbgcolor = 0x0000;
     sp->textsize = 1;
+    sp->textfont = 1;
     sp->win_x1 = 0; sp->win_y1 = 0;
     sp->win_x2 = w - 1; sp->win_y2 = h - 1;
     sp->win_cx = 0; sp->win_cy = 0;
@@ -1427,14 +1712,20 @@ static void stub_tft_textWidth(xtensa_cpu_t *cpu, void *ctx) {
     display_stubs_t *ds = ctx;
     uint32_t this_ptr = ds_arg(cpu, 0);
     uint32_t str_addr = ds_arg(cpu, 1);
+    uint8_t font_arg = (uint8_t)(ds_arg(cpu, 2) & 0xFF);
     sprite_t *sp = find_sprite(ds, this_ptr);
     int scale = sp ? (sp->textsize > 0 ? sp->textsize : 1)
                    : (ds->textsize > 0 ? ds->textsize : 1);
     uint32_t font_ptr = sp ? sp->gfxfont_ptr : ds->gfxfont_ptr;
+    int textfont = sp ? sp->textfont : ds->textfont;
+    if (font_arg >= 1 && font_arg <= 8) textfont = font_arg;
 
     if (font_ptr) {
         ds_return(cpu, (uint32_t)gfxfont_text_width(cpu->mem, font_ptr,
                                                       str_addr, scale));
+    } else if (ds->fontdata_addr) {
+        ds_return(cpu, (uint32_t)builtin_text_width(cpu->mem, ds->fontdata_addr,
+                                                      textfont, str_addr, scale));
     } else {
         int len = 0;
         for (;;) {
@@ -1449,13 +1740,21 @@ static void stub_tft_textWidth(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_tft_fontHeight(xtensa_cpu_t *cpu, void *ctx) {
     display_stubs_t *ds = ctx;
     uint32_t this_ptr = ds_arg(cpu, 0);
+    /* fontHeight(short font) passes font as arg1; fontHeight() does not.
+     * We read arg1 and use it if valid, otherwise fall back to current font. */
+    uint8_t font_arg = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
     sprite_t *sp = find_sprite(ds, this_ptr);
     int scale = sp ? (sp->textsize > 0 ? sp->textsize : 1)
                    : (ds->textsize > 0 ? ds->textsize : 1);
     uint32_t font_ptr = sp ? sp->gfxfont_ptr : ds->gfxfont_ptr;
+    int textfont = sp ? sp->textfont : ds->textfont;
+    if (font_arg >= 1 && font_arg <= 8) textfont = font_arg;
 
     if (font_ptr)
         ds_return(cpu, (uint32_t)gfxfont_height(cpu->mem, font_ptr, scale));
+    else if (ds->fontdata_addr)
+        ds_return(cpu, (uint32_t)builtin_font_height(cpu->mem, ds->fontdata_addr,
+                                                       textfont, scale));
     else
         ds_return(cpu, (uint32_t)(FONT_H * scale));
 }
@@ -1597,6 +1896,7 @@ display_stubs_t *display_stubs_create(xtensa_cpu_t *cpu) {
     ds->textcolor = 0xFFFF;   /* white */
     ds->textbgcolor = 0x0000; /* black */
     ds->textsize = 1;
+    ds->textfont = 1;
     return ds;
 }
 
@@ -1701,8 +2001,8 @@ int display_stubs_hook_tft_espi(display_stubs_t *ds, const elf_symbols_t *syms) 
         { "_ZN8TFT_eSPI9textWidthEPKch",     stub_tft_textWidth },
         { "_ZN8TFT_eSPI10fontHeightEs",      stub_tft_fontHeight },
         { "_ZN8TFT_eSPI10fontHeightEv",      stub_tft_fontHeight },
-        /* drawChar with 'tiih' signature (used by some firmware) */
-        { "_ZN8TFT_eSPI8drawCharEtiih",      stub_tft_drawChar_3 },
+        /* drawChar with 'tiih' signature — 4-param with font number */
+        { "_ZN8TFT_eSPI8drawCharEtiih",      stub_tft_drawChar_4 },
         { "_ZN8TFT_eSPI11setRotationEh",    stub_tft_setRotation },
         /* Dimension queries */
         { "_ZN8TFT_eSPI4widthEv",           stub_tft_width },
@@ -1736,6 +2036,17 @@ int display_stubs_hook_tft_espi(display_stubs_t *ds, const elf_symbols_t *syms) 
             hooked++;
         }
     }
+
+    /* Look up fontdata[] symbol for built-in font rendering */
+    uint32_t fd_addr;
+    if (elf_symbols_find(syms, "_ZL8fontdata", &fd_addr) == 0)
+        ds->fontdata_addr = fd_addr;
+
+    /* Font 1 (GLCD) uses the global font[] array directly, NOT fontdata[1].chartbl.
+     * Look up the _ZL4font symbol separately for correct GLCD rendering. */
+    uint32_t glcd_addr;
+    if (elf_symbols_find(syms, "_ZL4font", &glcd_addr) == 0)
+        ds->glcd_font_addr = glcd_addr;
 
     return hooked;
 }
