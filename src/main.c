@@ -10,6 +10,7 @@
 #include "touch_stubs.h"
 #include "sdcard_stubs.h"
 #include "wifi_stubs.h"
+#include "bt_stubs.h"
 #include "sha_stubs.h"
 #include "aes_stubs.h"
 #include "mpi_stubs.h"
@@ -852,6 +853,11 @@ int main(int argc, char *argv[]) {
     if (wstubs && syms)
         wifi_stubs_hook_symbols(wstubs, syms);
 
+    /* Bluetooth / NimBLE stubs */
+    bt_stubs_t *bstubs = bt_stubs_create(&cpu[0]);
+    if (bstubs && syms)
+        bt_stubs_hook_symbols(bstubs, syms);
+
     /* Core 1 shares memory and PC hook table with core 0 */
     if (!single_core) {
         cpu[1].pc_hook = cpu[0].pc_hook;
@@ -875,6 +881,10 @@ int main(int argc, char *argv[]) {
     /* Install WiFi event log mode */
     if (event_log && wstubs)
         wifi_stubs_set_event_log(wstubs, true);
+
+    /* Install BT event log mode */
+    if (event_log && bstubs)
+        bt_stubs_set_event_log(bstubs, true);
 
     /* Resolve conditional trace symbols */
     if (cond.active)
@@ -1283,6 +1293,7 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     ring_destroy(g_ring);
+    bt_stubs_destroy(bstubs);
     wifi_stubs_destroy(wstubs);
     sha_stubs_destroy(shstubs);
     aes_stubs_destroy(astubs);

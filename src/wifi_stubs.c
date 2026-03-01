@@ -65,6 +65,53 @@ typedef struct {
     SSL_CTX *ssl_ctx;           /* OpenSSL context (owned per-socket) */
 } emu_socket_t;
 
+/* ESP-IDF wifi_mode_t values */
+#define WIFI_MODE_NULL  0
+#define WIFI_MODE_STA   1
+#define WIFI_MODE_AP    2
+#define WIFI_MODE_APSTA 3
+
+/* ESP-IDF wifi_auth_mode_t values */
+#define WIFI_AUTH_OPEN         0
+#define WIFI_AUTH_WEP          1
+#define WIFI_AUTH_WPA_PSK      2
+#define WIFI_AUTH_WPA2_PSK     3
+#define WIFI_AUTH_WPA_WPA2_PSK 4
+#define WIFI_AUTH_WPA3_PSK     6
+
+/* Scan done event dispatch delay (cycles after scan_start) */
+#define SCAN_DONE_DELAY 10000
+
+/* Event handler table */
+#define MAX_EVENT_HANDLERS 16
+
+typedef struct {
+    uint32_t handler_addr;   /* firmware callback address */
+    uint32_t event_base;     /* event base identifier (pointer in emu mem) */
+    int32_t  event_id;       /* event ID (-1 = any) */
+} event_handler_t;
+
+/* Synthetic AP for scan results */
+typedef struct {
+    char     ssid[33];
+    uint8_t  bssid[6];
+    uint8_t  channel;
+    int8_t   rssi;
+    uint8_t  auth;
+} fake_ap_t;
+
+static const fake_ap_t fake_aps[] = {
+    { "Linksys-5G",     {0x00,0x14,0xBF,0x12,0x34,0x56},  6, -45, WIFI_AUTH_WPA2_PSK },
+    { "NETGEAR-Home",   {0xC0,0x3F,0x0E,0xAB,0xCD,0xEF},  1, -62, WIFI_AUTH_WPA_WPA2_PSK },
+    { "xfinitywifi",    {0x06,0xA4,0x14,0x11,0x22,0x33}, 11, -71, WIFI_AUTH_OPEN },
+    { "ATT-WIFI-2.4G",  {0x2C,0xFD,0xA1,0x44,0x55,0x66},  3, -55, WIFI_AUTH_WPA2_PSK },
+    { "TP-Link_Guest",  {0x50,0xC7,0xBF,0x77,0x88,0x99},  9, -68, WIFI_AUTH_WPA_PSK },
+    { "FBI_Van",        {0xDE,0xAD,0xBE,0xEF,0x00,0x01},  4, -80, WIFI_AUTH_WPA2_PSK },
+    { "Pretty_Fly_WiFi",{0x10,0x20,0x30,0x40,0x50,0x60},  7, -73, WIFI_AUTH_WPA2_PSK },
+    { "DIRECT-roku",    {0xFA,0x8F,0xCA,0xAA,0xBB,0xCC},  6, -58, WIFI_AUTH_WPA2_PSK },
+};
+#define FAKE_AP_COUNT (sizeof(fake_aps) / sizeof(fake_aps[0]))
+
 struct wifi_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
@@ -75,6 +122,32 @@ struct wifi_stubs {
      * struct hostent and associated data. */
     uint32_t           hostent_buf;  /* emulator address of scratch area */
     bool               event_log;    /* use [cycle] WIFI prefix instead of [wifi] */
+
+    /* WiFi subsystem state */
+    uint32_t           wifi_mode;       /* WIFI_MODE_NULL/STA/AP/APSTA */
+    bool               wifi_started;
+    bool               wifi_inited;
+    uint8_t            channel;         /* 1-14 */
+    uint8_t            sta_mac[6];      /* STA MAC */
+    uint8_t            ap_mac[6];       /* AP MAC */
+    uint8_t            base_mac[6];     /* Base MAC */
+
+    /* Promiscuous mode */
+    bool               promisc_enabled;
+    uint32_t           promisc_filter;
+    uint32_t           promisc_cb_addr;
+
+    /* Scan state */
+    bool               scan_active;
+    bool               scan_done;       /* results ready to collect */
+
+    /* AP config storage */
+    uint8_t            ap_ssid[33];
+    uint8_t            ap_pass[65];
+
+    /* Event system */
+    event_handler_t    event_handlers[MAX_EVENT_HANDLERS];
+    int                event_handler_count;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -1268,6 +1341,387 @@ static void stub_vfs_select(xtensa_cpu_t *cpu, void *ctx)
     stub_lwip_select(cpu, ctx);
 }
 
+/* ===== ESP-IDF WiFi API Stubs ===== */
+
+static void stub_esp_wifi_init(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->wifi_inited = true;
+    wifi_log(ws, "esp_wifi_init()\n");
+    ws_return(cpu, 0); /* ESP_OK */
+}
+
+static void stub_esp_wifi_deinit(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->wifi_inited = false;
+    ws->wifi_started = false;
+    wifi_log(ws, "esp_wifi_deinit()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_start(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->wifi_started = true;
+    wifi_log(ws, "esp_wifi_start()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_stop(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->wifi_started = false;
+    wifi_log(ws, "esp_wifi_stop()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_set_mode(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->wifi_mode = ws_arg(cpu, 0);
+    wifi_log(ws, "esp_wifi_set_mode(%u)\n", ws->wifi_mode);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_get_mode(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t mode_ptr = ws_arg(cpu, 0);
+    if (mode_ptr)
+        mem_write32(cpu->mem, mode_ptr, ws->wifi_mode);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_set_config(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t iface = ws_arg(cpu, 0);
+    uint32_t config_ptr = ws_arg(cpu, 1);
+    /* Read SSID from config (first 32 bytes for both STA and AP config) */
+    if (config_ptr && iface == 1) { /* WIFI_IF_AP */
+        for (int i = 0; i < 32; i++)
+            ws->ap_ssid[i] = mem_read8(cpu->mem, config_ptr + (uint32_t)i);
+        ws->ap_ssid[32] = 0;
+        wifi_log(ws, "esp_wifi_set_config(AP, ssid=\"%s\")\n", ws->ap_ssid);
+    } else {
+        wifi_log(ws, "esp_wifi_set_config(iface=%u)\n", iface);
+    }
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_get_config(xtensa_cpu_t *cpu, void *ctx)
+{
+    (void)ctx;
+    uint32_t config_ptr = ws_arg(cpu, 1);
+    /* Zero out the config struct (at least first 128 bytes) */
+    if (config_ptr) {
+        for (int i = 0; i < 128; i++)
+            mem_write8(cpu->mem, config_ptr + (uint32_t)i, 0);
+    }
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_connect(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_wifi_connect()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_disconnect(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_wifi_disconnect()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_scan_start(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->scan_active = true;
+    ws->scan_done = true; /* results immediately available */
+    wifi_log(ws, "esp_wifi_scan_start() — %zu synthetic APs\n", FAKE_AP_COUNT);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_scan_stop(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->scan_active = false;
+    wifi_log(ws, "esp_wifi_scan_stop()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_scan_get_ap_num(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t num_ptr = ws_arg(cpu, 0);
+    if (num_ptr)
+        mem_write16(cpu->mem, num_ptr, (uint16_t)FAKE_AP_COUNT);
+    wifi_log(ws, "esp_wifi_scan_get_ap_num() → %zu\n", FAKE_AP_COUNT);
+    ws_return(cpu, 0);
+}
+
+/* wifi_ap_record_t layout (ESP-IDF):
+ *   +0:   uint8_t  bssid[6]
+ *   +6:   uint8_t  ssid[33]
+ *   +39:  uint8_t  primary (channel)
+ *   +40:  wifi_second_chan_t second (uint32_t)
+ *   +44:  int8_t   rssi
+ *   +45:  wifi_auth_mode_t authmode (uint32_t) — but packed at +45
+ *   Total struct size: ~80 bytes (varies by IDF version, use 80)
+ */
+#define WIFI_AP_RECORD_SIZE 80
+
+static void stub_esp_wifi_scan_get_ap_records(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t num_ptr  = ws_arg(cpu, 0);
+    uint32_t ap_array = ws_arg(cpu, 1);
+
+    uint16_t max_records = 0;
+    if (num_ptr)
+        max_records = mem_read16(cpu->mem, num_ptr);
+
+    uint16_t count = (uint16_t)FAKE_AP_COUNT;
+    if (count > max_records && max_records > 0)
+        count = max_records;
+
+    for (uint16_t i = 0; i < count; i++) {
+        uint32_t base = ap_array + (uint32_t)i * WIFI_AP_RECORD_SIZE;
+        /* Zero the record first */
+        for (int j = 0; j < WIFI_AP_RECORD_SIZE; j++)
+            mem_write8(cpu->mem, base + (uint32_t)j, 0);
+
+        /* bssid at +0 */
+        for (int j = 0; j < 6; j++)
+            mem_write8(cpu->mem, base + (uint32_t)j, fake_aps[i].bssid[j]);
+        /* ssid at +6 */
+        int slen = (int)strlen(fake_aps[i].ssid);
+        for (int j = 0; j < slen && j < 32; j++)
+            mem_write8(cpu->mem, base + 6 + (uint32_t)j, (uint8_t)fake_aps[i].ssid[j]);
+        /* primary channel at +39 */
+        mem_write8(cpu->mem, base + 39, fake_aps[i].channel);
+        /* rssi at +44 */
+        mem_write8(cpu->mem, base + 44, (uint8_t)fake_aps[i].rssi);
+        /* authmode at +45 — stored as single byte in packed struct */
+        mem_write8(cpu->mem, base + 45, fake_aps[i].auth);
+    }
+
+    if (num_ptr)
+        mem_write16(cpu->mem, num_ptr, count);
+
+    wifi_log(ws, "esp_wifi_scan_get_ap_records() → %u records\n", count);
+    ws->scan_active = false;
+    ws->scan_done = false;
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_set_channel(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->channel = (uint8_t)ws_arg(cpu, 0);
+    wifi_log(ws, "esp_wifi_set_channel(%u)\n", ws->channel);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_get_channel(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t pri_ptr = ws_arg(cpu, 0);
+    uint32_t sec_ptr = ws_arg(cpu, 1);
+    if (pri_ptr)
+        mem_write8(cpu->mem, pri_ptr, ws->channel);
+    if (sec_ptr)
+        mem_write32(cpu->mem, sec_ptr, 0); /* WIFI_SECOND_CHAN_NONE */
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_get_mac(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t iface   = ws_arg(cpu, 0);
+    uint32_t mac_ptr = ws_arg(cpu, 1);
+    const uint8_t *mac = (iface == 1) ? ws->ap_mac : ws->sta_mac;
+    if (mac_ptr) {
+        for (int i = 0; i < 6; i++)
+            mem_write8(cpu->mem, mac_ptr + (uint32_t)i, mac[i]);
+    }
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_set_mac(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t iface   = ws_arg(cpu, 0);
+    uint32_t mac_ptr = ws_arg(cpu, 1);
+    uint8_t *mac = (iface == 1) ? ws->ap_mac : ws->sta_mac;
+    if (mac_ptr) {
+        for (int i = 0; i < 6; i++)
+            mac[i] = mem_read8(cpu->mem, mac_ptr + (uint32_t)i);
+    }
+    wifi_log(ws, "esp_wifi_set_mac(iface=%u, %02x:%02x:%02x:%02x:%02x:%02x)\n",
+             iface, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_set_promiscuous(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->promisc_enabled = ws_arg(cpu, 0) != 0;
+    wifi_log(ws, "esp_wifi_set_promiscuous(%s)\n",
+             ws->promisc_enabled ? "true" : "false");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_set_promiscuous_rx_cb(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->promisc_cb_addr = ws_arg(cpu, 0);
+    wifi_log(ws, "esp_wifi_set_promiscuous_rx_cb(0x%08x)\n", ws->promisc_cb_addr);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_set_promiscuous_filter(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t filter_ptr = ws_arg(cpu, 0);
+    if (filter_ptr)
+        ws->promisc_filter = mem_read32(cpu->mem, filter_ptr);
+    wifi_log(ws, "esp_wifi_set_promiscuous_filter(0x%08x)\n", ws->promisc_filter);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_80211_tx(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    /* uint32_t iface = ws_arg(cpu, 0); */
+    uint32_t buf = ws_arg(cpu, 1);
+    uint32_t len = ws_arg(cpu, 2);
+    /* Read frame type from first byte */
+    uint8_t frame_type = 0;
+    if (buf && len > 0)
+        frame_type = mem_read8(cpu->mem, buf);
+    wifi_log(ws, "esp_wifi_80211_tx(len=%u, type=0x%02x) — NO-OP\n", len, frame_type);
+    ws_return(cpu, 0);
+}
+
+/* No-op WiFi stubs that just return ESP_OK */
+static void stub_esp_wifi_noop(xtensa_cpu_t *cpu, void *ctx)
+{
+    (void)ctx;
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_wifi_restore(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    ws->wifi_mode = WIFI_MODE_NULL;
+    ws->wifi_started = false;
+    ws->channel = 1;
+    ws->promisc_enabled = false;
+    ws->promisc_filter = 0;
+    wifi_log(ws, "esp_wifi_restore()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_base_mac_addr_set(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t mac_ptr = ws_arg(cpu, 0);
+    if (mac_ptr) {
+        for (int i = 0; i < 6; i++)
+            ws->base_mac[i] = mem_read8(cpu->mem, mac_ptr + (uint32_t)i);
+    }
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_base_mac_addr_get(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t mac_ptr = ws_arg(cpu, 0);
+    if (mac_ptr) {
+        for (int i = 0; i < 6; i++)
+            mem_write8(cpu->mem, mac_ptr + (uint32_t)i, ws->base_mac[i]);
+    }
+    ws_return(cpu, 0);
+}
+
+/* ===== Event System Stubs ===== */
+
+static void stub_esp_event_loop_create_default(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_event_loop_create_default()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_event_handler_register(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t event_base = ws_arg(cpu, 0);
+    int32_t  event_id   = (int32_t)ws_arg(cpu, 1);
+    uint32_t handler    = ws_arg(cpu, 2);
+
+    if (ws->event_handler_count < MAX_EVENT_HANDLERS) {
+        ws->event_handlers[ws->event_handler_count].handler_addr = handler;
+        ws->event_handlers[ws->event_handler_count].event_base = event_base;
+        ws->event_handlers[ws->event_handler_count].event_id = event_id;
+        ws->event_handler_count++;
+    }
+    wifi_log(ws, "esp_event_handler_register(base=0x%08x, id=%d, handler=0x%08x)\n",
+             event_base, event_id, handler);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_event_handler_instance_register(xtensa_cpu_t *cpu, void *ctx)
+{
+    /* Same as esp_event_handler_register but with extra instance out param */
+    stub_esp_event_handler_register(cpu, ctx);
+}
+
+static void stub_esp_event_handler_unregister(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_event_handler_unregister()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_event_post(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t event_base = ws_arg(cpu, 0);
+    int32_t  event_id   = (int32_t)ws_arg(cpu, 1);
+    wifi_log(ws, "esp_event_post(base=0x%08x, id=%d)\n", event_base, event_id);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_netif_init(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_netif_init()\n");
+    ws_return(cpu, 0);
+}
+
+/* esp_netif_create_default_wifi_sta/ap — return a non-NULL fake pointer */
+#define FAKE_NETIF_STA  0x3FFB0100u
+#define FAKE_NETIF_AP   0x3FFB0200u
+
+static void stub_esp_netif_create_default_wifi_sta(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_netif_create_default_wifi_sta()\n");
+    ws_return(cpu, FAKE_NETIF_STA);
+}
+
+static void stub_esp_netif_create_default_wifi_ap(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_netif_create_default_wifi_ap()\n");
+    ws_return(cpu, FAKE_NETIF_AP);
+}
+
 /* ===== Scratch memory allocation ===== */
 
 /* Allocate a small region in emulator address space for hostent data.
@@ -1283,6 +1737,17 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
     if (!ws) return NULL;
     ws->cpu = cpu;
     ws->hostent_buf = HOSTENT_SCRATCH_ADDR;
+    ws->channel = 1;
+    ws->wifi_mode = WIFI_MODE_NULL;
+
+    /* Default MACs (locally-administered) */
+    ws->sta_mac[0] = 0x24; ws->sta_mac[1] = 0x6F;
+    ws->sta_mac[2] = 0x28; ws->sta_mac[3] = 0xAA;
+    ws->sta_mac[4] = 0xBB; ws->sta_mac[5] = 0xCC;
+    ws->ap_mac[0]  = 0x24; ws->ap_mac[1]  = 0x6F;
+    ws->ap_mac[2]  = 0x28; ws->ap_mac[3]  = 0xAA;
+    ws->ap_mac[4]  = 0xBB; ws->ap_mac[5]  = 0xCD;
+    memcpy(ws->base_mac, ws->sta_mac, 6);
 
     for (int i = 0; i < MAX_EMU_SOCKETS; i++)
         ws->sockets[i].host_fd = -1;
@@ -1362,6 +1827,56 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "_Z15stop_ssl_socketP17sslclient_contextPKcS2_S2_",
                                 stub_stop_ssl_socket },
 
+        /* Tier 7: ESP-IDF WiFi API */
+        { "esp_wifi_init",                stub_esp_wifi_init },
+        { "esp_wifi_init_internal",       stub_esp_wifi_init },
+        { "esp_wifi_deinit",              stub_esp_wifi_deinit },
+        { "esp_wifi_start",               stub_esp_wifi_start },
+        { "esp_wifi_stop",                stub_esp_wifi_stop },
+        { "esp_wifi_set_mode",            stub_esp_wifi_set_mode },
+        { "esp_wifi_get_mode",            stub_esp_wifi_get_mode },
+        { "esp_wifi_set_config",          stub_esp_wifi_set_config },
+        { "esp_wifi_get_config",          stub_esp_wifi_get_config },
+        { "esp_wifi_connect",             stub_esp_wifi_connect },
+        { "esp_wifi_disconnect",          stub_esp_wifi_disconnect },
+        { "esp_wifi_scan_start",          stub_esp_wifi_scan_start },
+        { "esp_wifi_scan_stop",           stub_esp_wifi_scan_stop },
+        { "esp_wifi_scan_get_ap_num",     stub_esp_wifi_scan_get_ap_num },
+        { "esp_wifi_scan_get_ap_records", stub_esp_wifi_scan_get_ap_records },
+        { "esp_wifi_set_channel",         stub_esp_wifi_set_channel },
+        { "esp_wifi_get_channel",         stub_esp_wifi_get_channel },
+        { "esp_wifi_get_mac",             stub_esp_wifi_get_mac },
+        { "esp_wifi_set_mac",             stub_esp_wifi_set_mac },
+        { "esp_wifi_set_promiscuous",     stub_esp_wifi_set_promiscuous },
+        { "esp_wifi_set_promiscuous_rx_cb", stub_esp_wifi_set_promiscuous_rx_cb },
+        { "esp_wifi_set_promiscuous_filter", stub_esp_wifi_set_promiscuous_filter },
+        { "esp_wifi_80211_tx",            stub_esp_wifi_80211_tx },
+        { "esp_wifi_set_country",         stub_esp_wifi_noop },
+        { "esp_wifi_set_bandwidth",       stub_esp_wifi_noop },
+        { "esp_wifi_set_max_tx_power",    stub_esp_wifi_noop },
+        { "esp_wifi_set_storage",         stub_esp_wifi_noop },
+        { "esp_wifi_set_ps",              stub_esp_wifi_noop },
+        { "esp_wifi_get_ps",              stub_esp_wifi_noop },
+        { "esp_wifi_restore",             stub_esp_wifi_restore },
+        { "esp_base_mac_addr_set",        stub_esp_base_mac_addr_set },
+        { "esp_base_mac_addr_get",        stub_esp_base_mac_addr_get },
+        { "esp_read_mac",                 stub_esp_wifi_get_mac },
+        { "esp_efuse_mac_get_default",    stub_esp_wifi_get_mac },
+
+        /* Tier 8: Event system */
+        { "esp_event_loop_create_default",        stub_esp_event_loop_create_default },
+        { "esp_event_handler_register",           stub_esp_event_handler_register },
+        { "esp_event_handler_instance_register",  stub_esp_event_handler_instance_register },
+        { "esp_event_handler_unregister",         stub_esp_event_handler_unregister },
+        { "esp_event_post",                       stub_esp_event_post },
+        { "esp_event_post_to",                    stub_esp_event_post },
+        { "esp_event_send_internal",              stub_esp_event_post },
+
+        /* Tier 9: Network interface */
+        { "esp_netif_init",                       stub_esp_netif_init },
+        { "esp_netif_create_default_wifi_sta",    stub_esp_netif_create_default_wifi_sta },
+        { "esp_netif_create_default_wifi_ap",     stub_esp_netif_create_default_wifi_ap },
+
         { NULL, NULL }
     };
 
@@ -1383,7 +1898,7 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
     hooked += 3;
 
     if (hooked > 0)
-        fprintf(stderr, "[wifi] hooked %d lwip symbols\n", hooked);
+        fprintf(stderr, "[wifi] hooked %d symbols (lwip + esp_wifi + events)\n", hooked);
 
     return hooked;
 }

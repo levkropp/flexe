@@ -110,6 +110,72 @@ static void stub_touch_wait_tap(xtensa_cpu_t *cpu, void *ctx) {
     ts_return_void(cpu);
 }
 
+/*
+ * LVGL touchpad read callback:
+ *   bool my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
+ *
+ * lv_indev_data_t layout (LVGL 7.x):
+ *   +0: lv_point_t point  { int16_t x, int16_t y }  = 4 bytes
+ *   +4: uint32_t key
+ *   +8: uint32_t btn_id
+ *  +12: int16_t enc_diff
+ *  +14: uint8_t state   (LV_INDEV_STATE_REL=0, LV_INDEV_STATE_PR=1)
+ *
+ * Returns false (no more data to read).
+ */
+static void stub_lv_touchpad_read(xtensa_cpu_t *cpu, void *ctx) {
+    touch_stubs_t *ts = ctx;
+    uint32_t data_ptr = ts_arg(cpu, 1); /* arg1 = lv_indev_data_t* */
+
+    int x = 0, y = 0;
+    int pressed = 0;
+    if (ts->get_state)
+        pressed = ts->get_state(&x, &y, ts->state_ctx);
+
+    /* Write point.x, point.y as int16_t */
+    mem_write16(cpu->mem, data_ptr + 0, (uint16_t)(int16_t)x);
+    mem_write16(cpu->mem, data_ptr + 2, (uint16_t)(int16_t)y);
+    /* Write state */
+    mem_write8(cpu->mem, data_ptr + 14, pressed ? 1 : 0);
+
+    ts_return(cpu, 0); /* false = no more data */
+}
+
+/*
+ * TFT_eSPI::getTouch(uint16_t *x, uint16_t *y, uint16_t threshold)
+ * Returns true if touched (z > threshold).
+ * 'this' pointer is arg0 (C++ method).
+ */
+static void stub_tft_getTouch(xtensa_cpu_t *cpu, void *ctx) {
+    touch_stubs_t *ts = ctx;
+    uint32_t x_ptr = ts_arg(cpu, 1); /* arg1 = x ptr (arg0 = this) */
+    uint32_t y_ptr = ts_arg(cpu, 2); /* arg2 = y ptr */
+
+    int x = 0, y = 0;
+    int pressed = 0;
+    if (ts->get_state)
+        pressed = ts->get_state(&x, &y, ts->state_ctx);
+
+    if (pressed) {
+        mem_write16(cpu->mem, x_ptr, (uint16_t)x);
+        mem_write16(cpu->mem, y_ptr, (uint16_t)y);
+    }
+    ts_return(cpu, (uint32_t)pressed);
+}
+
+/*
+ * TFT_eSPI::getTouchRawZ() — returns pressure value.
+ * Return high value if pressed, 0 if not.
+ */
+static void stub_tft_getTouchRawZ(xtensa_cpu_t *cpu, void *ctx) {
+    touch_stubs_t *ts = ctx;
+    int x, y;
+    int pressed = 0;
+    if (ts->get_state)
+        pressed = ts->get_state(&x, &y, ts->state_ctx);
+    ts_return(cpu, pressed ? 2000 : 0);
+}
+
 /* ===== Public API ===== */
 
 touch_stubs_t *touch_stubs_create(xtensa_cpu_t *cpu) {
@@ -145,6 +211,12 @@ int touch_stubs_hook_symbols(touch_stubs_t *ts, const elf_symbols_t *syms) {
         { "touch_init",     stub_touch_init },
         { "touch_read",     stub_touch_read },
         { "touch_wait_tap", stub_touch_wait_tap },
+        /* LVGL touchpad callback (Marauder) */
+        { "_Z16my_touchpad_readP15_lv_indev_drv_tP15lv_indev_data_t",
+                            stub_lv_touchpad_read },
+        /* TFT_eSPI touch methods */
+        { "_ZN8TFT_eSPI8getTouchEPtS0_t",  stub_tft_getTouch },
+        { "_ZN8TFT_eSPI12getTouchRawZEv",   stub_tft_getTouchRawZ },
         { NULL, NULL }
     };
 

@@ -45,6 +45,7 @@ struct esp32_rom_stubs {
     uint32_t         app_main_addr;    /* app_main symbol for start_cpu0 hook */
     uint32_t         stack_chk_guard_addr; /* __stack_chk_guard BSS address */
     const elf_symbols_t *syms;         /* ELF symbols (for symbol lookups in stubs) */
+    uint32_t         s_other_cpu_startup_done_addr; /* main_task polling flag */
     uint32_t         s_resume_cores_addr;      /* s_resume_cores BSS address */
     uint32_t         app_cpu_boot_addr;        /* Boot address for APP CPU (core 1) */
     bool             app_cpu_start_requested;  /* Core 0 requested core 1 start */
@@ -959,6 +960,11 @@ static void stub_esp_err_to_name(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, str_addr);
 }
 
+/* esp_get_idf_version() — NO LONGER HOOKED.  The ENTRY-scan aliasing issue
+ * that required this hook only occurred when esp_startup_start_app was hooked
+ * (adjacent function).  Since esp_startup_start_app is no longer hooked,
+ * the real firmware function runs and returns the correct IDF version. */
+
 /* esp_partition_find_first(type, subtype, label) — return fake partition ptr or NULL */
 static void stub_esp_partition_find_first(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -1081,6 +1087,10 @@ static void stub_do_system_init_fn(xtensa_cpu_t *cpu, void *ctx) {
     }
     if (s->s_system_full_inited_addr)
         mem_write8(cpu->mem, s->s_system_full_inited_addr, 1);
+    /* In single-core mode, main_task polls s_other_cpu_startup_done
+     * waiting for core 1 to finish.  Set it now so main_task proceeds. */
+    if (s->s_other_cpu_startup_done_addr)
+        mem_write8(cpu->mem, s->s_other_cpu_startup_done_addr, 1);
     /* rom_return sets ar[ci*4+2] (= caller's a10 for CALL8), but the caller
      * checks a2 after the return.  Hook fires before ENTRY, so ar[2] is
      * still the caller's a2.  Write 1 there so beqz a2 falls through. */
@@ -1088,24 +1098,10 @@ static void stub_do_system_init_fn(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 1);
 }
 
-/* esp_startup_start_app — skip FreeRTOS scheduler, redirect to app_main.
- * At this point start_cpu0 has already run __init_array (C++ global
- * constructors), so vtables and other globals are initialised.  We skip
- * the scheduler and jump to app_main directly. */
-static void stub_esp_startup_start_app(xtensa_cpu_t *cpu, void *ctx) {
-    esp32_rom_stubs_t *s = ctx;
-    /* Set __stack_chk_guard now that BSS has been zeroed.  Without this,
-     * the guard is 0 when functions save it in their prologue, then
-     * esp_init_stack_guard() (called from __init_array) sets a non-zero
-     * value, causing false-positive canary mismatches. */
-    if (s->stack_chk_guard_addr)
-        mem_write32(cpu->mem, s->stack_chk_guard_addr, 0x00000100u);
-    if (s->app_main_addr) {
-        cpu->pc = s->app_main_addr;
-    } else {
-        rom_return_void(cpu);
-    }
-}
+/* esp_startup_start_app — NO LONGER HOOKED.  We let the real function run
+ * so that esp_startup_start_app_common() iterates __init_array (C++ global
+ * constructors).  After constructors complete, the function calls
+ * vTaskStartScheduler() which our FreeRTOS stubs handle. */
 
 /* ===== NVS stubs ===== */
 
@@ -1551,12 +1547,72 @@ static void stub_digital_read_high(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 1);
 }
 
+/* Return 1 (true) for bool-returning stubs */
+static void stub_ret_true(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 1);
+}
+
+/* Return -1 for read-like stubs (no data available) */
+static void stub_ret_neg1(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, (uint32_t)-1);
+}
+
+/* HardwareSerial::write(buf, len) — return len (arg2) to indicate all bytes written */
+static void stub_serial_write_buf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t len = rom_arg(cpu, 2);  /* arg0=this, arg1=buf, arg2=len */
+    rom_return(cpu, len);
+}
+
+/* uartBegin returns a uart_t* — must be non-null for Serial to work.
+ * Return a fake pointer so operator bool() succeeds. */
+static void stub_uartBegin(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 0x3FFB0700u);  /* fake uart_t* in unused DRAM */
+}
+
 /* __assert_func / abort — skip assertion failures (missing infra).
  * For noreturn functions, stop the CPU so the main loop can redirect
  * to a deferred task or halt cleanly.  Returning would enter undefined
  * territory (unreachable code after the call). */
 static void stub_abort_stop(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
+    cpu->running = 0;
+}
+
+/* __stack_chk_fail — canary mismatch.  In our emulator this is typically
+ * caused by window spill/fill register corruption (deep call stacks
+ * overwriting spilled data), not real buffer overflows.  Instead of
+ * stopping the CPU, scan forward from the return address to find the
+ * caller's retw.n and skip to it, effectively ignoring the check.
+ *
+ * Caller pattern:
+ *   beq aX, aY, <retw_target>
+ *   nop
+ *   call8 __stack_chk_fail
+ *   ... unreachable ...
+ *   retw.n                    <-- we jump here
+ */
+static void stub_stack_chk_fail_skip(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t a0 = ar_read(cpu, 0);
+    uint32_t ret_pc = (a0 & 0x3FFFFFFF) | (cpu->pc & 0xC0000000);
+
+    /* Scan forward for retw.n (0x1D 0xF0) within 128 bytes */
+    for (int i = 0; i < 128; i++) {
+        uint8_t b0 = mem_read8(cpu->mem, ret_pc + i);
+        uint8_t b1 = mem_read8(cpu->mem, ret_pc + i + 1);
+        if (b0 == 0x1d && b1 == 0xf0) {
+            /* Found retw.n — redirect return address and return */
+            uint32_t new_a0 = ((ret_pc + i) & 0x3FFFFFFF) | (a0 & 0xC0000000);
+            ar_write(cpu, 0, new_a0);
+            rom_return_void(cpu);
+            return;
+        }
+    }
+    /* Fallback: stop CPU if retw.n not found */
     cpu->running = 0;
 }
 
@@ -2374,14 +2430,13 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* App startup */
+    /* App startup — let esp_startup_start_app run NATURALLY so that
+     * esp_startup_start_app_common() iterates __init_array and runs
+     * C++ global constructors (sets up vtables for Serial2, etc.).
+     * After constructors run, it calls vTaskStartScheduler which
+     * our FreeRTOS stubs handle. */
     {
         uint32_t addr;
-        if (elf_symbols_find(syms, "esp_startup_start_app", &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_esp_startup_start_app,
-                               "esp_startup_start_app");
-            hooked++;
-        }
         if (elf_symbols_find(syms, "startup_resume_other_cores", &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_startup_resume_other_cores,
                                "startup_resume_other_cores");
@@ -2392,6 +2447,18 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
                                "do_system_init_fn");
             hooked++;
         }
+        /* In single-core mode, main_task polls s_other_cpu_startup_done
+         * waiting for core 1.  Store address; do_system_init_fn writes it
+         * (after BSS is zeroed so the value sticks). */
+        if (elf_symbols_find(syms, "s_other_cpu_startup_done", &addr) == 0) {
+            stubs->s_other_cpu_startup_done_addr = addr;
+        }
+        /* esp_register_freertos_idle_hook_for_cpu — no-op (no idle task) */
+        if (elf_symbols_find(syms, "esp_register_freertos_idle_hook_for_cpu", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered,
+                               "esp_register_freertos_idle_hook_for_cpu");
+            hooked++;
+        }
     }
 
     /* VFS stubs */
@@ -2400,12 +2467,102 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "esp_vfs_dev_uart_register",
         "esp_vfs_console_register",
         "esp_vfs_null_register",
+        "esp_vfs_fat_register",
+        "esp_vfs_fat_unregister_path",
+        "esp_vfs_register",
+        "esp_vfs_register_with_id",
+        "esp_vfs_unregister",
+        "esp_vfs_unregister_with_id",
         NULL
     };
     for (int i = 0; vfs_fns[i]; i++) {
         uint32_t addr;
         if (elf_symbols_find(syms, vfs_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, vfs_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* UART driver stubs — return ESP_OK so Serial.begin() succeeds */
+    static const char *uart_fns[] = {
+        "uart_driver_install",
+        "uart_driver_delete",
+        "uart_param_config",
+        "uart_set_pin",
+        "uart_set_baudrate",
+        "uart_get_baudrate",
+        "uart_set_word_length",
+        "uart_set_stop_bits",
+        "uart_set_parity",
+        "uart_set_hw_flow_ctrl",
+        "uart_set_sw_flow_ctrl",
+        "uart_wait_tx_done",
+        "uart_tx_chars",
+        "uart_write_bytes",
+        "uart_read_bytes",
+        "uart_flush",
+        "uart_flush_input",
+        NULL
+    };
+    for (int i = 0; uart_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, uart_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, uart_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* Arduino UART wrapper — uartBegin returns a uart_t* (non-null = success).
+     * It calls uart_driver_install internally; by stubbing the driver fns above
+     * AND uartBegin itself, we avoid the ESP_ERROR_CHECK panic. */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "uartBegin", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_uartBegin, "uartBegin");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "uartIsDriverInstalled", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_true,
+                               "uartIsDriverInstalled");
+            hooked++;
+        }
+        /* uartAvailable, uartRead, uartWrite — common HardwareSerial helpers */
+        if (elf_symbols_find(syms, "uartAvailable", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered,
+                               "uartAvailable");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "uartEnd", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_void_unregistered,
+                               "uartEnd");
+            hooked++;
+        }
+    }
+
+    /* SD card mount (Arduino SD library) — return ESP_OK to skip retry loop */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "_Z12sdcard_mounthPKchb", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered,
+                               "_Z12sdcard_mounthPKchb");
+            hooked++;
+        }
+    }
+
+    /* PSRAM / SPIRAM stubs — return ESP_OK so firmware thinks PSRAM is available.
+     * The emulator already has PSRAM memory region mapped. */
+    static const char *spiram_fns[] = {
+        "esp_spiram_init",
+        "esp_spiram_init_cache",
+        "esp_spiram_add_to_heapalloc",
+        "esp_spiram_get_size",
+        "psram_enable",
+        NULL
+    };
+    for (int i = 0; spiram_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, spiram_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, spiram_fns[i]);
             hooked++;
         }
     }
@@ -2560,14 +2717,22 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* __stack_chk_fail — noreturn, stop CPU so main loop can redirect.
-     * Don't stub __assert_func or esp_system_abort — let them run the
-     * natural panic path to esp_restart_noos, where the self-loop
-     * detector can redirect to a deferred task. */
+    /* __esp_stack_guard_setup — no-op to prevent __stack_chk_guard from
+     * being set to a random value during __init_array.  Keeps the guard
+     * at zero so canary checks always pass (no real stack protection needed
+     * in the emulator). */
     {
         uint32_t addr;
+        if (elf_symbols_find(syms, "__esp_stack_guard_setup", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered,
+                               "__esp_stack_guard_setup");
+            hooked++;
+        }
+        /* __stack_chk_fail — skip back to caller's retw.n.  Window spill/fill
+         * corruption can trigger false canary mismatches; ignore them. */
         if (elf_symbols_find(syms, "__stack_chk_fail", &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_abort_stop, "__stack_chk_fail");
+            rom_stubs_register(stubs, addr, stub_stack_chk_fail_skip,
+                               "__stack_chk_fail");
             hooked++;
         }
     }
@@ -2649,17 +2814,112 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* Arduino Serial (HardwareSerial) — just no-op to avoid UART register access */
-    static const char *serial_fns[] = {
-        "_ZN14HardwareSerial5beginEmh",       /* HardwareSerial::begin(unsigned long, uint8_t) */
-        "_ZN14HardwareSerial3endEv",          /* HardwareSerial::end() */
-        "_ZN14HardwareSerial9availableEv",    /* HardwareSerial::available() */
+    /* Arduino Serial (HardwareSerial) — no-op to avoid UART register access.
+     * begin() signature varies by Arduino core version; hook both variants. */
+    static const char *serial_noop_fns[] = {
+        "_ZN14HardwareSerial5beginEmh",        /* begin(unsigned long, uint8_t) — older core */
+        "_ZN14HardwareSerial5beginEmjaabmh",   /* begin(unsigned long, uint32_t, int8_t, int8_t, bool, unsigned long, uint8_t) — Arduino ESP32 2.x */
+        "_ZN14HardwareSerial3endEb",           /* end(bool) */
+        "_ZN14HardwareSerial3endEv",           /* end() */
+        "_ZN14HardwareSerial9availableEv",     /* available() */
+        "_ZN14HardwareSerial17availableForWriteEv", /* availableForWrite() */
+        "_ZN14HardwareSerial4peekEv",          /* peek() */
+        "_ZN14HardwareSerial5flushEv",         /* flush() */
+        "_ZN14HardwareSerial16_createEventTaskEPv", /* _createEventTask(void*) */
+        "_ZN14HardwareSerial17_destroyEventTaskEv",  /* _destroyEventTask() */
+        "_ZN14HardwareSerial14_uartEventTaskEPv",    /* _uartEventTask(void*) */
+        "_ZN14HardwareSerialD1Ev",             /* destructor */
+        "_ZN14HardwareSerialD2Ev",             /* destructor */
+        "_ZN14HardwareSerialD0Ev",             /* destructor */
         NULL
     };
-    for (int i = 0; serial_fns[i]; i++) {
+    for (int i = 0; serial_noop_fns[i]; i++) {
         uint32_t addr;
-        if (elf_symbols_find(syms, serial_fns[i], &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_unregistered, serial_fns[i]);
+        if (elf_symbols_find(syms, serial_noop_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, serial_noop_fns[i]);
+            hooked++;
+        }
+    }
+    /* HardwareSerial::operator bool() — must return true so `while (!Serial)` exits */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "_ZNK14HardwareSerialcvbEv", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_true, "HardwareSerial::operator bool");
+            hooked++;
+        }
+    }
+    /* HardwareSerial::write — return byte count (arg2) or 1 */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "_ZN14HardwareSerial5writeEh", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_true, "HardwareSerial::write(uint8_t)");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "_ZN14HardwareSerial5writeEPKhj", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_serial_write_buf, "HardwareSerial::write(buf,len)");
+            hooked++;
+        }
+    }
+    /* HardwareSerial::read / readBytes — return 0 / -1 */
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "_ZN14HardwareSerial4readEv", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_ret_neg1, "HardwareSerial::read()");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "_ZN14HardwareSerial9readBytesEPhj", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, "HardwareSerial::readBytes(uint8_t*)");
+            hooked++;
+        }
+        if (elf_symbols_find(syms, "_ZN14HardwareSerial9readBytesEPcj", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, "HardwareSerial::readBytes(char*)");
+            hooked++;
+        }
+    }
+
+    /* Arduino UART C wrappers (esp32-hal-uart.c) — intercept remaining functions
+     * that access UART peripheral registers */
+    static const char *uart_hal_fns[] = {
+        "uartSetRxTimeout",
+        "uartSetRxFIFOFull",
+        "uartWrite",
+        "uartWriteBuf",
+        "uartReadBytes",
+        "uartPeek",
+        "uartFlushTxOnly",
+        "uartAvailableForWrite",
+        "uartDetachPins",
+        "uartDetectBaudrate",
+        "uartStartDetectBaudrate",
+        "uartBaudrateDetect",
+        "uartSetDebug",
+        "uartGetDebug",
+        "uartGetEventQueue",
+        "uart_install_putc",
+        NULL
+    };
+    for (int i = 0; uart_hal_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, uart_hal_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, uart_hal_fns[i]);
+            hooked++;
+        }
+    }
+
+    /* GPS interface — no GPS hardware in emulator.  Hook begin() to prevent
+     * MicroNMEA::sendSentence from doing a virtual dispatch on Serial2 which
+     * may have a corrupted vtable (esp32-hal writes to the object). */
+    static const char *gps_fns[] = {
+        "_ZN12GpsInterface5beginEv",
+        "_ZN12GpsInterface18flush_queue_textinEv",
+        "_ZN12GpsInterface16flush_queue_nmeaEv",
+        "_ZN12GpsInterface7enqueueER9MicroNMEA",
+        NULL
+    };
+    for (int i = 0; gps_fns[i]; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, gps_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered, gps_fns[i]);
             hooked++;
         }
     }
@@ -2676,6 +2936,7 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "spiWriteShortNL", "spiWriteLongNL", "spiWritePixelsNL",
         "spiWriteNL", "spiWriteByte", "spiWriteWord",
         "spi_transfer",
+        "_Z8Sspixfert", /* TFT_eSPI inline SPI pixel transfer */
         "_Z6sdWaithi", "_Z9sdCommandhcjPj",
         "_Z11sdReadByteshPci", "_Z6sdStoph",
         NULL

@@ -243,10 +243,15 @@ struct xtensa_cpu {
 
     /* Window spill base stack: each window slot can be spilled multiple times
      * (when the window ring wraps around). We track all spill locations so
-     * underflow fill uses the correct base for each nesting level. */
+     * underflow fill uses the correct base for each nesting level.
+     * Extra registers (a4-a7 for CALL8, a4-a11 for CALL12) are stored in
+     * CPU-side buffers rather than on the stack, to avoid corruption when
+     * deeper calls overwrite the stack memory. */
     struct {
-        uint32_t base[8];    /* stack of spill bases (deepest first) */
-        int depth;            /* current stack depth */
+        uint32_t base[8];        /* stack of spill bases (deepest first) */
+        uint32_t core[8][4];     /* core[depth][0..3] = a0-a3 values */
+        uint32_t extra[8][8];    /* extra[depth][0..7] = a4-a11 values */
+        int depth;               /* current stack depth */
     } spill_stack[16];
     uint32_t spill_base[16]; /* legacy: most recent base per window (for -W trace) */
 

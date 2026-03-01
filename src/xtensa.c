@@ -404,21 +404,41 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
     }
 
     int nregs = 4;
-    /* Always save base 4 regs: a0-a3 at base-16 */
+    /* Always save base 4 regs: a0-a3 at base-16 (on stack for firmware compat)
+     * AND to CPU-side buffer (for correct restore immune to stack overwrites) */
     for (int i = 0; i < 4; i++)
         mem_write32(cpu->mem, base - 16 + i * 4, phys_read(cpu, widx, i));
+    {
+        int si0 = widx & 0xF;
+        int d0 = cpu->spill_stack[si0].depth - 1; /* depth was already incremented */
+        if (d0 >= 0 && d0 < 8) {
+            for (int i = 0; i < 4; i++)
+                cpu->spill_stack[si0].core[d0][i] = phys_read(cpu, widx, i);
+        }
+    }
 
     if (callsize >= 2) {
         nregs = 8;
-        /* CALL8+: also save a4-a7 at base-32 */
-        for (int i = 0; i < 4; i++)
-            mem_write32(cpu->mem, base - 32 + i * 4, phys_read(cpu, widx, 4 + i));
+        /* CALL8+: save a4-a7 to CPU-side buffer (not stack).
+         * On real hardware these go to grandparent_sp - 32, but computing
+         * the grandparent requires a chain of stack links.  Storing in a
+         * CPU buffer avoids corruption when deeper calls overwrite stack. */
+        int si2 = widx & 0xF;
+        int d2 = cpu->spill_stack[si2].depth - 1; /* depth was already incremented */
+        if (d2 >= 0 && d2 < 8) {
+            for (int i = 0; i < 4; i++)
+                cpu->spill_stack[si2].extra[d2][i] = phys_read(cpu, widx, 4 + i);
+        }
     }
     if (callsize == 3) {
         nregs = 12;
-        /* CALL12: also save a8-a11 at base-48 */
-        for (int i = 0; i < 4; i++)
-            mem_write32(cpu->mem, base - 48 + i * 4, phys_read(cpu, widx, 8 + i));
+        /* CALL12: also save a8-a11 to CPU-side buffer */
+        int si2 = widx & 0xF;
+        int d2 = cpu->spill_stack[si2].depth - 1;
+        if (d2 >= 0 && d2 < 8) {
+            for (int i = 0; i < 4; i++)
+                cpu->spill_stack[si2].extra[d2][4 + i] = phys_read(cpu, widx, 8 + i);
+        }
     }
 
     /* Save shadow copies for spill/fill verification */
@@ -486,29 +506,56 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
     int si = ret_wb & 0xF;
     uint32_t callee_sp = phys_read(cpu, owb, 1);
     uint32_t base;
+    int fill_depth = -1; /* depth index used for CPU buffer restore */
     if (cpu->spill_stack[si].depth > 0) {
         cpu->spill_stack[si].depth--;
         int d = cpu->spill_stack[si].depth;
+        fill_depth = d;
         base = (d < 8) ? cpu->spill_stack[si].base[d] : callee_sp;
+        /* Sanity check: base must be in valid data memory range.
+         * If depth tracking is out of sync, we may pop a stale/wrong entry. */
+        if (base < 0x3F800000 || base > 0x3FFFFFFF) {
+            base = callee_sp;
+            fill_depth = -1; /* don't trust CPU buffer either */
+        }
     } else {
         base = callee_sp;
     }
 
-    /* Restore a0-a3 from base-16 */
-    for (int i = 0; i < 4; i++)
-        phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, base - 16 + i * 4));
+    /* Restore a0-a3 from CPU-side buffer (immune to stack overwrites),
+     * falling back to stack memory if buffer unavailable */
+    if (fill_depth >= 0 && fill_depth < 8) {
+        for (int i = 0; i < 4; i++)
+            phys_write(cpu, ret_wb, i, cpu->spill_stack[si].core[fill_depth][i]);
+    } else {
+        for (int i = 0; i < 4; i++)
+            phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, base - 16 + i * 4));
+    }
 
     /* Check restored a0 for call size to determine extra regs */
     uint32_t a0 = phys_read(cpu, ret_wb, 0);
     int callsize = (a0 >> 30) & 3;
 
     if (callsize >= 2) {
-        for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, base - 32 + i * 4));
+        /* Restore a4-a7 from CPU-side buffer */
+        if (fill_depth >= 0 && fill_depth < 8) {
+            for (int i = 0; i < 4; i++)
+                phys_write(cpu, ret_wb, 4 + i, cpu->spill_stack[si].extra[fill_depth][i]);
+        } else {
+            for (int i = 0; i < 4; i++)
+                phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, base - 32 + i * 4));
+        }
     }
     if (callsize == 3) {
-        for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
+        /* Restore a8-a11 from CPU-side buffer */
+        int d = fill_depth;
+        if (d >= 0 && d < 8) {
+            for (int i = 0; i < 4; i++)
+                phys_write(cpu, ret_wb, 8 + i, cpu->spill_stack[si].extra[d][4 + i]);
+        } else {
+            for (int i = 0; i < 4; i++)
+                phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
+        }
     }
 
     /* Verify restored values match what was originally spilled */
@@ -1603,11 +1650,15 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
               uint32_t imm12 = XT_IMM12(insn);
               uint32_t frame_size = imm12 << 3;
 
-              synth_overflow_check(cpu, callinc);
-
-              /* AR[callinc*4 | s&3] = AR[s] - framesize (before rotation) */
+              /* Set callee's a1 (SP) BEFORE overflow check so that
+               * synth_spill_window reads the correct base address.
+               * The callee's a1 is in the rotated window at register
+               * index (callinc*4 | s&3), which is the same register
+               * the ENTRY instruction targets. */
               int new_reg = (callinc << 2) | (s & 3);
               ar_write(cpu, new_reg, ar_read(cpu, s) - frame_size);
+
+              synth_overflow_check(cpu, callinc);
 
               uint32_t owb = cpu->windowbase;
               cpu->windowbase = (owb + callinc) & 0xF;
