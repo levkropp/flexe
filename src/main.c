@@ -813,6 +813,7 @@ int main(int argc, char *argv[]) {
         display_stubs_hook_symbols(dstubs, syms);
         display_stubs_hook_tft_espi(dstubs, syms);
         display_stubs_hook_tft_esprite(dstubs, syms);
+        display_stubs_hook_ofr(dstubs, syms);
     }
 
     /* Touch stubs (no input in standalone mode) */

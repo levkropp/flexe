@@ -24,9 +24,22 @@
 #include <arpa/inet.h>
 #include <poll.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 /* ===== Constants ===== */
 
-#define MAX_SOCKETS 16
+#define MAX_EMU_SOCKETS 16
+
+/* Socket fd offset — matches ESP-IDF's LWIP_SOCKET_OFFSET (46).
+ * The VFS layer assigns file descriptors 0-45 for stdio, SPIFFS, NVS, etc.
+ * Socket fds start at 46 to avoid collision with VFS fds, which prevents
+ * the ROM close()/read()/write() hooks from accidentally operating on
+ * sockets when the firmware closes VFS files (and vice versa).
+ *
+ * Mapping: firmware fd = array_index + SOCKET_FD_BASE
+ *          array_index = firmware fd - SOCKET_FD_BASE */
+#define SOCKET_FD_BASE 46
 
 /* Firmware's reent address (set by rom_stubs esp_newlib_init).
  * newlib struct _reent has _errno at offset 0. */
@@ -48,12 +61,14 @@ typedef struct {
     bool     nonblocking;
     uint64_t total_received;     /* bytes received so far (for timeout policy) */
     bool     awaiting_response;  /* true after send(), cleared after recv() */
+    SSL     *ssl;               /* OpenSSL TLS session, or NULL for plain TCP */
+    SSL_CTX *ssl_ctx;           /* OpenSSL context (owned per-socket) */
 } emu_socket_t;
 
 struct wifi_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
-    emu_socket_t       sockets[MAX_SOCKETS];
+    emu_socket_t       sockets[MAX_EMU_SOCKETS];
 
     /* Static buffer for gethostbyname result written into emulator memory.
      * We allocate a scratch region in emulator address space for the
@@ -99,30 +114,54 @@ static void wifi_log(wifi_stubs_t *ws, const char *fmt, ...) {
 
 /* ===== Socket slot management ===== */
 
+/* Convert firmware fd to array index. Returns -1 if out of range. */
+static int fd_to_idx(int fd)
+{
+    int idx = fd - SOCKET_FD_BASE;
+    if (idx < 0 || idx >= MAX_EMU_SOCKETS) return -1;
+    return idx;
+}
+
 static int slot_alloc(wifi_stubs_t *ws, int host_fd)
 {
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
         if (ws->sockets[i].host_fd == -1) {
             ws->sockets[i].host_fd = host_fd;
             ws->sockets[i].nonblocking = false;
-            return i;
+            ws->sockets[i].total_received = 0;
+            ws->sockets[i].awaiting_response = false;
+            ws->sockets[i].ssl = NULL;
+            ws->sockets[i].ssl_ctx = NULL;
+            return i + SOCKET_FD_BASE;  /* return firmware fd */
         }
     }
     return -1;
 }
 
-static emu_socket_t *slot_get(wifi_stubs_t *ws, int idx)
+static emu_socket_t *slot_get(wifi_stubs_t *ws, int fd)
 {
-    if (idx < 0 || idx >= MAX_SOCKETS) return NULL;
+    int idx = fd_to_idx(fd);
+    if (idx < 0) return NULL;
     if (ws->sockets[idx].host_fd == -1) return NULL;
     return &ws->sockets[idx];
 }
 
-static void slot_free(wifi_stubs_t *ws, int idx)
+static void slot_free(wifi_stubs_t *ws, int fd)
 {
-    if (idx >= 0 && idx < MAX_SOCKETS) {
+    int idx = fd_to_idx(fd);
+    if (idx >= 0) {
+        if (ws->sockets[idx].ssl) {
+            SSL_shutdown(ws->sockets[idx].ssl);
+            SSL_free(ws->sockets[idx].ssl);
+        }
+        if (ws->sockets[idx].ssl_ctx)
+            SSL_CTX_free(ws->sockets[idx].ssl_ctx);
         ws->sockets[idx].host_fd = -1;
         ws->sockets[idx].nonblocking = false;
+        ws->sockets[idx].total_received = 0;
+        ws->sockets[idx].awaiting_response = false;
+        ws->sockets[idx].ssl = NULL;
+        ws->sockets[idx].ssl_ctx = NULL;
     }
 }
 
@@ -279,6 +318,8 @@ static void stub_lwip_close(xtensa_cpu_t *cpu, void *ctx)
         wifi_log(ws, "close(slot %u, host fd %d)\n", fd, s->host_fd);
         close(s->host_fd);
         slot_free(ws, (int)fd);
+    } else if (fd >= SOCKET_FD_BASE && fd < SOCKET_FD_BASE + MAX_EMU_SOCKETS) {
+        wifi_log(ws, "close(fd %u): no slot (passthrough)\n", fd);
     }
     ws_return(cpu, 0);
 }
@@ -345,6 +386,13 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
         return;
     }
 
+    /* len=0 is a connection check (WiFiClient::connected()), not a data
+     * read.  Return 0 without treating it as EOF. */
+    if (len == 0) {
+        ws_return(cpu, 0);
+        return;
+    }
+
     uint8_t *tmp = malloc(len);
     if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
 
@@ -377,11 +425,18 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
             int pr = poll(&pfd, 1, poll_ms);
             if (pr > 0) {
                 n = recv(s->host_fd, tmp, len, 0);
+                if (n == 0) {
+                    wifi_log(ws, "recv(slot %u): EOF (host_fd=%d)\n", fd, s->host_fd);
+                }
                 break;
             }
-            if (pr < 0) break;   /* poll error */
+            if (pr < 0) {
+                wifi_log(ws, "recv(slot %u): poll error errno=%d\n", fd, errno);
+                break;
+            }
             if (pfd.revents & (POLLHUP | POLLERR)) {
                 n = 0; /* EOF */
+                wifi_log(ws, "recv(slot %u): POLLHUP/POLLERR revents=0x%x\n", fd, pfd.revents);
                 break;
             }
         }
@@ -389,9 +444,13 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
             s->total_received += (uint64_t)n;
             s->awaiting_response = false;
             wifi_log(ws, "recv(slot %u, %zd/%u bytes)\n", fd, n, len);
-        } else if (n == 0) {
+        } else if (n == 0 && s->total_received > 0) {
+            /* Only log EOF for sockets that previously received data;
+             * first-recv EOF already logged above with detail */
             s->awaiting_response = false;
             wifi_log(ws, "recv(slot %u): EOF\n", fd);
+        } else if (n == -1) {
+            /* timeout: no data available within poll window */
         }
     }
 
@@ -546,22 +605,37 @@ static void stub_lwip_select(xtensa_cpu_t *cpu, void *ctx)
     /* timeout is arg 4, on stack for windowed calls */
 
     /* Build host fd_sets from emulator fd_sets.
-     * lwip fd_set on ESP32: array of uint32_t bitmasks, fd_setsize usually 64.
-     * For our MAX_SOCKETS=16, we only need the first uint32_t. */
+     * ESP-IDF lwip fd_set: array of uint32_t bitmasks, FD_SETSIZE=64.
+     * With SOCKET_FD_BASE=46, socket bits are in the second uint32_t
+     * (bits 32-63 of the fd_set). */
     fd_set hread, hwrite, hexc;
     FD_ZERO(&hread); FD_ZERO(&hwrite); FD_ZERO(&hexc);
     int maxfd = -1;
 
-    uint32_t emu_rbits = read_ptr  ? mem_read32(cpu->mem, read_ptr)  : 0;
-    uint32_t emu_wbits = write_ptr ? mem_read32(cpu->mem, write_ptr) : 0;
-    uint32_t emu_ebits = exc_ptr   ? mem_read32(cpu->mem, exc_ptr)   : 0;
+    /* Read the fd_set bitmask words covering our socket range.
+     * Bits are at bit position = fd, so fd 46 is at word[1] bit 14.
+     * We read 2 uint32_t words (bits 0-63) from each fd_set. */
+    uint32_t emu_rbits[2] = {0, 0};
+    uint32_t emu_wbits[2] = {0, 0};
+    uint32_t emu_ebits[2] = {0, 0};
+    if (read_ptr)  { emu_rbits[0] = mem_read32(cpu->mem, read_ptr);
+                     emu_rbits[1] = mem_read32(cpu->mem, read_ptr + 4); }
+    if (write_ptr) { emu_wbits[0] = mem_read32(cpu->mem, write_ptr);
+                     emu_wbits[1] = mem_read32(cpu->mem, write_ptr + 4); }
+    if (exc_ptr)   { emu_ebits[0] = mem_read32(cpu->mem, exc_ptr);
+                     emu_ebits[1] = mem_read32(cpu->mem, exc_ptr + 4); }
 
-    for (uint32_t i = 0; i < nfds && i < MAX_SOCKETS; i++) {
-        emu_socket_t *s = slot_get(ws, (int)i);
+    /* Check each possible socket fd */
+    for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
+        int fd = i + SOCKET_FD_BASE;
+        if ((uint32_t)fd >= nfds) break;
+        emu_socket_t *s = slot_get(ws, fd);
         if (!s) continue;
-        if (emu_rbits & (1u << i)) { FD_SET(s->host_fd, &hread); }
-        if (emu_wbits & (1u << i)) { FD_SET(s->host_fd, &hwrite); }
-        if (emu_ebits & (1u << i)) { FD_SET(s->host_fd, &hexc); }
+        int word = fd / 32;
+        uint32_t bit = 1u << (fd % 32);
+        if (emu_rbits[word] & bit) { FD_SET(s->host_fd, &hread); }
+        if (emu_wbits[word] & bit) { FD_SET(s->host_fd, &hwrite); }
+        if (emu_ebits[word] & bit) { FD_SET(s->host_fd, &hexc); }
         if (s->host_fd > maxfd) maxfd = s->host_fd;
     }
 
@@ -569,24 +643,32 @@ static void stub_lwip_select(xtensa_cpu_t *cpu, void *ctx)
     struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 }; /* 1ms */
     int ret = select(maxfd + 1, &hread, &hwrite, &hexc, &tv);
 
-    /* Translate results back */
+    /* Translate results back — clear both words, then set ready bits */
+    if (read_ptr)  { mem_write32(cpu->mem, read_ptr,     0);
+                     mem_write32(cpu->mem, read_ptr + 4, 0); }
+    if (write_ptr) { mem_write32(cpu->mem, write_ptr,     0);
+                     mem_write32(cpu->mem, write_ptr + 4, 0); }
+    if (exc_ptr)   { mem_write32(cpu->mem, exc_ptr,       0);
+                     mem_write32(cpu->mem, exc_ptr + 4,   0); }
+
     if (ret > 0) {
-        uint32_t out_r = 0, out_w = 0, out_e = 0;
-        for (uint32_t i = 0; i < nfds && i < MAX_SOCKETS; i++) {
-            emu_socket_t *s = slot_get(ws, (int)i);
+        uint32_t out_r[2] = {0, 0}, out_w[2] = {0, 0}, out_e[2] = {0, 0};
+        for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
+            int fd = i + SOCKET_FD_BASE;
+            emu_socket_t *s = slot_get(ws, fd);
             if (!s) continue;
-            if (FD_ISSET(s->host_fd, &hread))  out_r |= (1u << i);
-            if (FD_ISSET(s->host_fd, &hwrite)) out_w |= (1u << i);
-            if (FD_ISSET(s->host_fd, &hexc))   out_e |= (1u << i);
+            int word = fd / 32;
+            uint32_t bit = 1u << (fd % 32);
+            if (FD_ISSET(s->host_fd, &hread))  out_r[word] |= bit;
+            if (FD_ISSET(s->host_fd, &hwrite)) out_w[word] |= bit;
+            if (FD_ISSET(s->host_fd, &hexc))   out_e[word] |= bit;
         }
-        if (read_ptr)  mem_write32(cpu->mem, read_ptr,  out_r);
-        if (write_ptr) mem_write32(cpu->mem, write_ptr, out_w);
-        if (exc_ptr)   mem_write32(cpu->mem, exc_ptr,   out_e);
-    } else {
-        /* Timeout or error: clear all sets */
-        if (read_ptr)  mem_write32(cpu->mem, read_ptr,  0);
-        if (write_ptr) mem_write32(cpu->mem, write_ptr, 0);
-        if (exc_ptr)   mem_write32(cpu->mem, exc_ptr,   0);
+        if (read_ptr)  { mem_write32(cpu->mem, read_ptr,     out_r[0]);
+                         mem_write32(cpu->mem, read_ptr + 4, out_r[1]); }
+        if (write_ptr) { mem_write32(cpu->mem, write_ptr,     out_w[0]);
+                         mem_write32(cpu->mem, write_ptr + 4, out_w[1]); }
+        if (exc_ptr)   { mem_write32(cpu->mem, exc_ptr,       out_e[0]);
+                         mem_write32(cpu->mem, exc_ptr + 4,   out_e[1]); }
     }
 
     ws_return(cpu, (uint32_t)ret);
@@ -845,6 +927,333 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, (uint32_t)n);
 }
 
+/* ===== Host-side TLS (replaces firmware mbedtls) ===== */
+
+/* sslclient_context layout (from ESP32 Arduino ssl_client.h):
+ *   offset 0: int socket;    // lwip socket fd (our slot index)
+ *   offset 4: mbedtls_ssl_context ssl_ctx;
+ *   ...
+ * We only need offset 0 to get the socket slot. */
+#define SSLCTX_SOCKET_OFS  0
+
+/* Read the emulator fd from a sslclient_context pointer in emu memory.
+ * slot_get() handles fd→slot conversion internally. */
+static emu_socket_t *ssl_get_socket(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
+                                    uint32_t ctx_addr, int *out_fd)
+{
+    int fd = (int)mem_read32(cpu->mem, ctx_addr + SSLCTX_SOCKET_OFS);
+    if (out_fd) *out_fd = fd;
+    return slot_get(ws, fd);
+}
+
+/*
+ * start_ssl_client(sslclient_context*, IPAddress&, port, rootCA, ...)
+ *
+ * Replaces the firmware's mbedtls TLS handshake with host-side OpenSSL.
+ * This function creates its own socket, connects, and attempts TLS.
+ * If TLS fails (plain-text server like Stratum): reconnects as plain TCP.
+ * Returns socket slot on success, negative on failure.
+ */
+static void stub_start_ssl_client(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t ssl_ctx_addr = ws_arg(cpu, 0);
+    uint32_t ip_ref       = ws_arg(cpu, 1);  /* IPAddress const& */
+    uint32_t port         = ws_arg(cpu, 2);
+
+    /* Read IP address from IPAddress object.
+     * IPAddress inherits from Printable (vtable), so layout is:
+     *   offset 0: vtable pointer (4 bytes)
+     *   offset 4: _address.dword (4 bytes, network byte order) */
+    uint32_t ip_nbo = mem_read32(cpu->mem, ip_ref + 4);
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons((uint16_t)port);
+    peer.sin_addr.s_addr = ip_nbo;
+
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str));
+    wifi_log(ws, "start_ssl_client → %s:%u\n", ip_str, port);
+
+    /* Create host socket */
+    int hfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (hfd < 0) {
+        wifi_log(ws, "start_ssl_client: socket() failed: %s\n", strerror(errno));
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    /* Connect with 5-second timeout */
+    int cret = connect(hfd, (struct sockaddr *)&peer, sizeof(peer));
+    if (cret < 0 && errno == EINPROGRESS) {
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(hfd, &wset);
+        struct timeval ctv = { .tv_sec = 5, .tv_usec = 0 };
+        int sel = select(hfd + 1, NULL, &wset, NULL, &ctv);
+        if (sel <= 0) {
+            wifi_log(ws, "start_ssl_client: connect timed out\n");
+            close(hfd);
+            ws_return(cpu, (uint32_t)-1);
+            return;
+        }
+        int err = 0;
+        socklen_t elen = sizeof(err);
+        getsockopt(hfd, SOL_SOCKET, SO_ERROR, &err, &elen);
+        if (err != 0) {
+            wifi_log(ws, "start_ssl_client: connect failed: %s\n", strerror(err));
+            close(hfd);
+            ws_return(cpu, (uint32_t)-1);
+            return;
+        }
+    } else if (cret < 0) {
+        wifi_log(ws, "start_ssl_client: connect failed: %s\n", strerror(errno));
+        close(hfd);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    /* Allocate socket slot */
+    int slot = slot_alloc(ws, hfd);
+    if (slot < 0) {
+        wifi_log(ws, "start_ssl_client: no free slots\n");
+        close(hfd);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    emu_socket_t *s = &ws->sockets[slot];
+
+    /* Attempt host-side TLS handshake */
+    SSL_CTX *sctx = SSL_CTX_new(TLS_client_method());
+    if (!sctx) {
+        wifi_log(ws, "start_ssl_client: SSL_CTX_new failed\n");
+        close(hfd);
+        slot_free(ws, slot);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    SSL *ssl = SSL_new(sctx);
+    SSL_set_fd(ssl, hfd);
+
+    /* Set a 5-second recv timeout for the TLS handshake */
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(hfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int ret = SSL_connect(ssl);
+
+    /* Remove timeout */
+    tv.tv_sec = 0; tv.tv_usec = 0;
+    setsockopt(hfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (ret == 1) {
+        /* TLS handshake succeeded */
+        s->ssl = ssl;
+        s->ssl_ctx = sctx;
+        wifi_log(ws, "start_ssl_client(fd %d, port %u): TLS OK\n", slot, port);
+    } else {
+        /* TLS failed — server doesn't speak TLS. Reconnect as plain TCP. */
+        wifi_log(ws, "start_ssl_client(fd %d, port %u): TLS failed, plain TCP fallback\n",
+                 slot, port);
+        SSL_free(ssl);
+        SSL_CTX_free(sctx);
+
+        /* Reconnect: the TLS ClientHello corrupted the TCP stream */
+        close(hfd);
+        hfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (hfd < 0) {
+            slot_free(ws, slot);
+            ws_return(cpu, (uint32_t)-1);
+            return;
+        }
+        s->host_fd = hfd;
+        cret = connect(hfd, (struct sockaddr *)&peer, sizeof(peer));
+        if (cret < 0 && errno == EINPROGRESS) {
+            fd_set wset2;
+            FD_ZERO(&wset2);
+            FD_SET(hfd, &wset2);
+            struct timeval ctv2 = { .tv_sec = 5, .tv_usec = 0 };
+            select(hfd + 1, NULL, &wset2, NULL, &ctv2);
+        } else if (cret < 0) {
+            wifi_log(ws, "start_ssl_client: reconnect failed\n");
+            slot_free(ws, slot);
+            ws_return(cpu, (uint32_t)-1);
+            return;
+        }
+        wifi_log(ws, "start_ssl_client(fd %d, port %u): reconnected as plain TCP\n",
+                 slot, port);
+    }
+
+    /* Write socket slot to sslclient_context->socket */
+    mem_write32(cpu->mem, ssl_ctx_addr + SSLCTX_SOCKET_OFS, (uint32_t)slot);
+
+    ws_return(cpu, (uint32_t)slot);
+}
+
+/*
+ * send_ssl_data(sslclient_context*, data, len)
+ * Sends data via TLS (SSL_write) or plain TCP (send).
+ */
+static void stub_send_ssl_data(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t ssl_ctx_addr = ws_arg(cpu, 0);
+    uint32_t buf_addr     = ws_arg(cpu, 1);
+    uint32_t len          = ws_arg(cpu, 2);
+
+    int emufd;
+    emu_socket_t *s = ssl_get_socket(ws, cpu, ssl_ctx_addr, &emufd);
+    if (!s) { ws_return(cpu, (uint32_t)-1); return; }
+
+    uint8_t *tmp = malloc(len);
+    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+    for (uint32_t i = 0; i < len; i++)
+        tmp[i] = mem_read8(cpu->mem, buf_addr + i);
+
+    ssize_t n;
+    if (s->ssl)
+        n = SSL_write(s->ssl, tmp, (int)len);
+    else
+        n = send(s->host_fd, tmp, len, MSG_NOSIGNAL);
+    free(tmp);
+
+    if (n > 0) {
+        wifi_log(ws, "send_ssl(fd %d, %zd bytes)%s\n",
+                 emufd, n, s->ssl ? " [TLS]" : "");
+        s->awaiting_response = true;
+    }
+
+    ws_return(cpu, (uint32_t)(n > 0 ? (int)n : -1));
+}
+
+/*
+ * get_ssl_receive(sslclient_context*, buf, len)
+ * Receives data via TLS (SSL_read) or plain TCP (recv).
+ */
+static void stub_get_ssl_receive(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t ssl_ctx_addr = ws_arg(cpu, 0);
+    uint32_t buf_addr     = ws_arg(cpu, 1);
+    int32_t  len          = (int32_t)ws_arg(cpu, 2);
+
+    int emufd;
+    emu_socket_t *s = ssl_get_socket(ws, cpu, ssl_ctx_addr, &emufd);
+    if (!s || len <= 0) { ws_return(cpu, (uint32_t)-1); return; }
+
+    uint8_t *tmp = malloc((size_t)len);
+    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+
+    ssize_t n;
+    if (s->ssl) {
+        /* Check for buffered data in OpenSSL first */
+        int pending = SSL_pending(s->ssl);
+        if (pending <= 0) {
+            /* Poll the socket for incoming data */
+            int poll_ms = s->awaiting_response ? 500 : 1;
+            struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
+            if (poll(&pfd, 1, poll_ms) <= 0) {
+                free(tmp);
+                ws_return(cpu, (uint32_t)-1);
+                return;
+            }
+        }
+        n = SSL_read(s->ssl, tmp, len);
+    } else {
+        /* Plain TCP with adaptive timeout */
+        int poll_ms;
+        if (s->total_received == 0)
+            poll_ms = 5000;    /* first data: up to 5s */
+        else if (s->awaiting_response)
+            poll_ms = 500;     /* expecting reply */
+        else
+            poll_ms = 1;       /* idle check */
+        struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
+        if (poll(&pfd, 1, poll_ms) <= 0) {
+            free(tmp);
+            ws_return(cpu, (uint32_t)-1);
+            return;
+        }
+        n = recv(s->host_fd, tmp, (size_t)len, 0);
+    }
+
+    if (n > 0) {
+        for (ssize_t i = 0; i < n; i++)
+            mem_write8(cpu->mem, buf_addr + (uint32_t)i, tmp[i]);
+        s->total_received += (uint64_t)n;
+        s->awaiting_response = false;
+        wifi_log(ws, "recv_ssl(fd %d, %zd/%d bytes)%s\n",
+                 emufd, n, len, s->ssl ? " [TLS]" : "");
+    }
+
+    free(tmp);
+    ws_return(cpu, (uint32_t)(n > 0 ? (int)n : -1));
+}
+
+/*
+ * data_to_read(sslclient_context*)
+ * Returns number of bytes available to read.
+ */
+static void stub_data_to_read(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t ssl_ctx_addr = ws_arg(cpu, 0);
+
+    int emufd;
+    emu_socket_t *s = ssl_get_socket(ws, cpu, ssl_ctx_addr, &emufd);
+    if (!s) { ws_return(cpu, 0); return; }
+
+    int avail = 0;
+    if (s->ssl) {
+        avail = SSL_pending(s->ssl);
+        if (avail <= 0) {
+            struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
+            if (poll(&pfd, 1, 0) > 0)
+                avail = 1;  /* data on wire, not yet decrypted */
+        }
+    } else {
+        ioctl(s->host_fd, FIONREAD, &avail);
+    }
+
+    ws_return(cpu, (uint32_t)avail);
+}
+
+/*
+ * stop_ssl_socket(sslclient_context*, rootCA, cli_cert, cli_key)
+ * Cleans up TLS session and closes the underlying socket.
+ */
+static void stub_stop_ssl_socket(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t ssl_ctx_addr = ws_arg(cpu, 0);
+
+    int emufd;
+    emu_socket_t *s = ssl_get_socket(ws, cpu, ssl_ctx_addr, &emufd);
+    if (s) {
+        /* Only close sockets that were created by start_ssl_client
+         * (they have SSL state or were created via the SSL path).
+         * Refuse to close sockets that were created by lwip_socket
+         * to prevent accidental closure of unrelated connections
+         * (e.g., Stratum) due to uninitialized sslclient_context. */
+        if (s->ssl || s->ssl_ctx) {
+            wifi_log(ws, "stop_ssl(fd %d)%s\n", emufd, s->ssl ? " [TLS]" : "");
+            close(s->host_fd);
+            slot_free(ws, emufd);
+        } else {
+            wifi_log(ws, "stop_ssl(fd %d): SKIPPED — not an SSL socket (protecting plain TCP)\n", emufd);
+        }
+    } else {
+        wifi_log(ws, "stop_ssl: ctx at 0x%08x has fd=%d (no slot)\n", ssl_ctx_addr, emufd);
+    }
+
+    /* Mark the firmware's sslclient socket as closed */
+    mem_write32(cpu->mem, ssl_ctx_addr + SSLCTX_SOCKET_OFS, (uint32_t)-1);
+
+    ws_return(cpu, 0);
+}
+
 /* ===== VFS wrappers ===== */
 
 /* VFS wrappers — same logic as lwip_* versions.
@@ -875,7 +1284,7 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
     ws->cpu = cpu;
     ws->hostent_buf = HOSTENT_SCRATCH_ADDR;
 
-    for (int i = 0; i < MAX_SOCKETS; i++)
+    for (int i = 0; i < MAX_EMU_SOCKETS; i++)
         ws->sockets[i].host_fd = -1;
 
     return ws;
@@ -885,7 +1294,7 @@ void wifi_stubs_destroy(wifi_stubs_t *ws)
 {
     if (!ws) return;
     /* Close any open sockets */
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
         if (ws->sockets[i].host_fd >= 0)
             close(ws->sockets[i].host_fd);
     }
@@ -940,6 +1349,18 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "lwip_bind",          stub_lwip_bind },
         { "lwip_listen",        stub_lwip_listen },
         { "lwip_accept",        stub_lwip_accept },
+
+        /* Tier 6: Host-side TLS (replaces firmware mbedtls) */
+        { "_Z16start_ssl_clientP17sslclient_contextRK9IPAddressjPKciS5_bS5_S5_S5_S5_bPS5_",
+                                stub_start_ssl_client },
+        { "_Z13send_ssl_dataP17sslclient_contextPKhj",
+                                stub_send_ssl_data },
+        { "_Z15get_ssl_receiveP17sslclient_contextPhi",
+                                stub_get_ssl_receive },
+        { "_Z12data_to_readP17sslclient_context",
+                                stub_data_to_read },
+        { "_Z15stop_ssl_socketP17sslclient_contextPKcS2_S2_",
+                                stub_stop_ssl_socket },
 
         { NULL, NULL }
     };
