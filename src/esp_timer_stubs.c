@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #define ESP_OK    0
 #define MAX_TIMERS 16
@@ -28,6 +29,11 @@ struct esp_timer_stubs {
 
     emu_timer_t timers[MAX_TIMERS];
     int         timer_count;
+
+    /* Host wall-clock boot time for millis()/micros()/esp_timer_get_time().
+     * These return real elapsed time so the firmware's elapsed-time displays
+     * track wall-clock time instead of fast-forwarded virtual time. */
+    struct timespec boot_time;
 
     /* Bump allocator for timer handles */
     uint32_t bump_ptr;
@@ -69,6 +75,19 @@ static void et_return_void(xtensa_cpu_t *cpu) {
 
 /* ===== Helper: get current time in microseconds ===== */
 
+/* Host wall-clock elapsed time since boot.  Used by millis()/micros()/
+ * esp_timer_get_time() so firmware elapsed-time displays track real time
+ * instead of fast-forwarded virtual time from vTaskDelay. */
+static uint64_t host_elapsed_us(const esp_timer_stubs_t *et) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long sec  = now.tv_sec  - et->boot_time.tv_sec;
+    long nsec = now.tv_nsec - et->boot_time.tv_nsec;
+    if (nsec < 0) { sec--; nsec += 1000000000L; }
+    return (uint64_t)sec * 1000000ULL + (uint64_t)nsec / 1000ULL;
+}
+
+/* Virtual time for internal timer dispatch (includes fast-forwarded idle). */
 static uint64_t current_time_us(esp_timer_stubs_t *et) {
     /* Virtual wall-clock = accumulated sleep time + instruction-driven time.
      * ccount only advances per-instruction (stays small), so inlined
@@ -240,10 +259,12 @@ void stub_esp_timer_delete(xtensa_cpu_t *cpu, void *ctx) {
     et_return(cpu, ESP_OK);
 }
 
-/* esp_timer_get_time() -> int64_t microseconds (returned in a2:a3) */
+/* esp_timer_get_time() -> int64_t microseconds (returned in a2:a3).
+ * Returns host wall-clock elapsed time so firmware gettimeofday() (which
+ * calls esp_timer_get_time internally) tracks real time. */
 void stub_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint64_t us = current_time_us(et);
+    uint64_t us = host_elapsed_us(et);
     /* Return 64-bit value: low in a2, high in a3 */
     int ci = XT_PS_CALLINC(cpu->ps);
     if (ci > 0) {
@@ -299,20 +320,19 @@ void stub_esp_timer_init(xtensa_cpu_t *cpu, void *ctx) {
     et_return(cpu, ESP_OK);
 }
 
-/* millis() — return esp_timer_get_time() / 1000.
- * The firmware's millis() uses an inlined 64-bit software division that
- * takes millions of iterations when ccount is large. Stub it out. */
+/* millis() — return host wall-clock elapsed milliseconds since boot.
+ * Uses real time so firmware elapsed-time displays track the wall clock
+ * instead of fast-forwarded virtual time from vTaskDelay. */
 void stub_millis(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint64_t us = current_time_us(et);
-    uint32_t ms = (uint32_t)(us / 1000);
+    uint32_t ms = (uint32_t)(host_elapsed_us(et) / 1000);
     et_return(cpu, ms);
 }
 
-/* micros() — return esp_timer_get_time() as uint32_t */
+/* micros() — return host wall-clock elapsed microseconds as uint32_t */
 void stub_micros(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint32_t us = (uint32_t)current_time_us(et);
+    uint32_t us = (uint32_t)host_elapsed_us(et);
     et_return(cpu, us);
 }
 
@@ -333,6 +353,7 @@ esp_timer_stubs_t *esp_timer_stubs_create(xtensa_cpu_t *cpu) {
     et->cpu = cpu;
     et->cpu_freq_mhz = 160;
     et->bump_ptr = TIMER_BUMP_BASE;
+    clock_gettime(CLOCK_MONOTONIC, &et->boot_time);
     return et;
 }
 
