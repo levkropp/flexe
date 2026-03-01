@@ -337,7 +337,6 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        wifi_log(ws, "read(fd=%u, len=%u): no such slot\n", fd, len);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -349,25 +348,33 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     if (s->nonblocking) {
         n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
     } else {
-        /* Blocking socket: poll with 10s timeout then recv.
-         * This lets TLS handshakes complete (server needs time to respond). */
+        /* Blocking socket: poll until data arrives or connection drops.
+         * The firmware (mbedTLS bio callback, Arduino WiFiClient) expects
+         * read() to block until data is available — it does NOT retry on
+         * EAGAIN.  We poll in 100ms intervals so the emulator can still be
+         * interrupted (e.g., GUI close), but keep retrying for up to 5
+         * seconds.  This is long enough for TLS server responses and
+         * Stratum pool replies, but doesn't freeze the emulator for
+         * extended periods on idle connections. */
         struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, 10000);
-        if (pr > 0) {
-            n = recv(s->host_fd, tmp, len, 0);
-            if (n > 0)
-                wifi_log(ws, "recv(slot %u, %zd/%u bytes)\n", fd, n, len);
-            else if (n == 0)
-                wifi_log(ws, "recv(slot %u): EOF\n", fd);
-            else
-                wifi_log(ws, "recv(slot %u): error %s\n", fd, strerror(errno));
-        } else if (pr == 0) {
-            wifi_log(ws, "recv(slot %u): timeout 10s\n", fd);
-            n = -1;
-            errno = EAGAIN;
-        } else {
-            n = -1;
+        n = -1;
+        for (int attempt = 0; attempt < 50; attempt++) {
+            int pr = poll(&pfd, 1, 100);
+            if (pr > 0) {
+                n = recv(s->host_fd, tmp, len, 0);
+                break;
+            }
+            if (pr < 0) break;   /* poll error */
+            /* Check if the host socket was closed (POLLHUP) */
+            if (pfd.revents & (POLLHUP | POLLERR)) {
+                n = 0; /* EOF */
+                break;
+            }
         }
+        if (n > 0)
+            wifi_log(ws, "recv(slot %u, %zd/%u bytes)\n", fd, n, len);
+        else if (n == 0)
+            wifi_log(ws, "recv(slot %u): EOF\n", fd);
     }
 
     if (n > 0) {

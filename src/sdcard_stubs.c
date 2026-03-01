@@ -8,6 +8,12 @@
 
 #define DEFAULT_SD_SIZE (4ULL * 1024 * 1024 * 1024)  /* 4 GB */
 
+/* NerdMiner Settings struct address (BSS symbol "Settings") */
+#define SETTINGS_ADDR      0x3ffc5afc
+#define SETTINGS_WALLET    0x30   /* char[80] BTC wallet address */
+#define SETTINGS_POOLPASS  0x80   /* char[80] pool password */
+#define SETTINGS_POOLPORT  0xD0   /* uint32_t pool port */
+
 struct sdcard_stubs {
     xtensa_cpu_t       *cpu;
     esp32_rom_stubs_t  *rom;
@@ -474,6 +480,240 @@ void sdcard_stubs_set_size(sdcard_stubs_t *ss, uint64_t size_bytes) {
     ss->requested_size = size_bytes;
 }
 
+/* ===== FatFs disk I/O stubs (ff_sd_*) ===== */
+
+/* ff_sd_initialize(pdrv) -> DSTATUS (0=OK) */
+static void stub_ff_sd_initialize(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    int rc = ensure_image_open(ss);
+    fprintf(stderr, "[SD] ff_sd_initialize() path=%s rc=%d img_size=%llu\n",
+            ss->img_path ? ss->img_path : "(null)", rc,
+            (unsigned long long)ss->img_size);
+    sd_return(cpu, rc == 0 ? 0 : 1);  /* DSTATUS: 0=OK, 1=NOINIT */
+}
+
+/* ff_sd_status(pdrv) -> DSTATUS (0=OK) */
+static void stub_ff_sd_status(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    sd_return(cpu, ss->img_file ? 0 : 1);
+}
+
+/* ff_sd_read(pdrv, buff, sector, count) -> DRESULT (0=RES_OK) */
+static void stub_ff_sd_read(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    /* pdrv = arg 0 (ignored), buff = arg 1, sector = arg 2, count = arg 3 */
+    uint32_t data   = sd_arg(cpu, 1);
+    uint32_t sector = sd_arg(cpu, 2);
+    uint32_t count  = sd_arg(cpu, 3);
+
+    if (!ss->img_file) { sd_return(cpu, 1); return; } /* RES_ERROR */
+
+    uint64_t offset = (uint64_t)sector * 512;
+    uint8_t buf[512];
+
+    fseek(ss->img_file, (long)offset, SEEK_SET);
+    for (uint32_t i = 0; i < count; i++) {
+        size_t got = fread(buf, 1, 512, ss->img_file);
+        if (got < 512)
+            memset(buf + got, 0, 512 - got);
+        for (int j = 0; j < 512; j++)
+            mem_write8(cpu->mem, data + i * 512 + (uint32_t)j, buf[j]);
+    }
+    sd_return(cpu, 0); /* RES_OK */
+}
+
+/* ff_sd_write(pdrv, buff, sector, count) -> DRESULT (0=RES_OK) */
+static void stub_ff_sd_write(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    uint32_t data   = sd_arg(cpu, 1);
+    uint32_t sector = sd_arg(cpu, 2);
+    uint32_t count  = sd_arg(cpu, 3);
+
+    if (!ss->img_file) { sd_return(cpu, 1); return; }
+
+    uint64_t offset = (uint64_t)sector * 512;
+    uint8_t buf[512];
+
+    fseek(ss->img_file, (long)offset, SEEK_SET);
+    for (uint32_t i = 0; i < count; i++) {
+        for (int j = 0; j < 512; j++)
+            buf[j] = mem_read8(cpu->mem, data + i * 512 + (uint32_t)j);
+        fwrite(buf, 1, 512, ss->img_file);
+    }
+    fflush(ss->img_file);
+    sd_return(cpu, 0);
+}
+
+/* ff_sd_ioctl(pdrv, cmd, buff) -> DRESULT
+ * Commands: CTRL_SYNC=0, GET_SECTOR_COUNT=1, GET_SECTOR_SIZE=2, GET_BLOCK_SIZE=3 */
+static void stub_ff_sd_ioctl(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    uint32_t cmd  = sd_arg(cpu, 1);
+    uint32_t buff = sd_arg(cpu, 2);
+
+    switch (cmd) {
+    case 0: /* CTRL_SYNC */
+        if (ss->img_file) fflush(ss->img_file);
+        break;
+    case 1: /* GET_SECTOR_COUNT */
+        if (buff) mem_write32(cpu->mem, buff, (uint32_t)(ss->img_size / 512));
+        break;
+    case 2: /* GET_SECTOR_SIZE */
+        if (buff) mem_write16(cpu->mem, buff, 512);
+        break;
+    case 3: /* GET_BLOCK_SIZE */
+        if (buff) mem_write32(cpu->mem, buff, 1);
+        break;
+    }
+    sd_return(cpu, 0);
+}
+
+/* sdWait(pdrv, timeout) -> 0xFF on success (card ready) */
+static void stub_sd_wait(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    sd_return(cpu, 0xFF);
+}
+
+/* sdCommand(pdrv, cmd, arg, resp) -> 0 on success */
+static void stub_sd_command(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    sd_return(cpu, 0);
+}
+
+/* sdReadBytes(pdrv, buff, count) -> 0 on success */
+static void stub_sd_read_bytes(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    sd_return(cpu, 0);
+}
+
+/* sdSelectCard(pdrv) -> true (card selected) */
+static void stub_sd_select_card(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    sd_return(cpu, 1);
+}
+
+/* Write a C string into emulator memory */
+static void write_mem_string(xtensa_mem_t *mem, uint32_t addr, const char *s,
+                             size_t maxlen) {
+    size_t i;
+    for (i = 0; i < maxlen - 1 && s[i]; i++)
+        mem_write8(mem, addr + (uint32_t)i, (uint8_t)s[i]);
+    mem_write8(mem, addr + (uint32_t)i, 0);
+}
+
+/*
+ * Read config.json from the mounted SD image and patch the NerdMiner
+ * Settings struct in emulator memory.  Handles minimal JSON: looks for
+ * "BtcWallet":"...", "PoolPort":NNN, "PoolPassword":"...".
+ */
+static void patch_settings_from_image(sdcard_stubs_t *ss, xtensa_mem_t *mem) {
+    if (!ss->img_file) return;
+
+    /* Read config.json from FAT12 image — scan root directory for the file.
+     * FAT12 layout with our mkfs params:
+     *   sector 0: boot sector
+     *   sectors 1-2: FAT 1
+     *   sectors 3-4: FAT 2
+     *   sectors 5-36: root directory (512 entries × 32 bytes / 512)
+     *   sectors 37+: data area
+     */
+    uint8_t dir_entry[32];
+    uint16_t start_cluster = 0;
+    uint32_t file_size = 0;
+
+    fseek(ss->img_file, 5 * 512, SEEK_SET);  /* root dir at sector 5 */
+    for (int i = 0; i < 512; i++) {
+        if (fread(dir_entry, 1, 32, ss->img_file) != 32) break;
+        if (dir_entry[0] == 0x00) break;  /* end of directory */
+        if (dir_entry[0] == 0xE5) continue;  /* deleted */
+        /* Check for CONFIG~1.JSO (8.3 format) or config  json */
+        if (memcmp(dir_entry, "CONFIG~1JSO", 11) == 0 ||
+            memcmp(dir_entry, "CONFIG  JSO", 11) == 0 ||
+            memcmp(dir_entry, "CONFIG~1JSN", 11) == 0) {
+            start_cluster = dir_entry[26] | (dir_entry[27] << 8);
+            file_size = dir_entry[28] | (dir_entry[29] << 8) |
+                        (dir_entry[30] << 16) | (dir_entry[31] << 24);
+            break;
+        }
+    }
+
+    if (start_cluster == 0 || file_size == 0) {
+        fprintf(stderr, "[SD] config.json not found in root directory\n");
+        return;
+    }
+
+    /* Read file data: cluster 2 = sector 37, sectors_per_cluster = 4 */
+    uint32_t data_sector = 37 + (start_cluster - 2) * 4;
+    char buf[1024];
+    if (file_size > sizeof(buf) - 1) file_size = sizeof(buf) - 1;
+    fseek(ss->img_file, data_sector * 512, SEEK_SET);
+    size_t got = fread(buf, 1, file_size, ss->img_file);
+    buf[got] = '\0';
+
+    fprintf(stderr, "[SD] config.json (%u bytes): %s\n", file_size, buf);
+
+    /* Minimal JSON parsing: extract key-value pairs */
+    const char *p;
+
+    p = strstr(buf, "\"BtcWallet\"");
+    if (p) {
+        p = strchr(p + 11, '"');
+        if (p) {
+            p++;
+            const char *end = strchr(p, '"');
+            if (end && (size_t)(end - p) < 80) {
+                char wallet[80];
+                memcpy(wallet, p, (size_t)(end - p));
+                wallet[end - p] = '\0';
+                write_mem_string(mem, SETTINGS_ADDR + SETTINGS_WALLET,
+                                 wallet, 80);
+                fprintf(stderr, "[SD] Patched BtcWallet: %s\n", wallet);
+            }
+        }
+    }
+
+    p = strstr(buf, "\"PoolPassword\"");
+    if (p) {
+        p = strchr(p + 14, '"');
+        if (p) {
+            p++;
+            const char *end = strchr(p, '"');
+            if (end && (size_t)(end - p) < 80) {
+                char pass[80];
+                memcpy(pass, p, (size_t)(end - p));
+                pass[end - p] = '\0';
+                write_mem_string(mem, SETTINGS_ADDR + SETTINGS_POOLPASS,
+                                 pass, 80);
+                fprintf(stderr, "[SD] Patched PoolPassword: %s\n", pass);
+            }
+        }
+    }
+
+    p = strstr(buf, "\"PoolPort\"");
+    if (p) {
+        p = strchr(p + 10, ':');
+        if (p) {
+            uint32_t port = (uint32_t)strtoul(p + 1, NULL, 10);
+            if (port > 0 && port < 65536) {
+                mem_write32(mem, SETTINGS_ADDR + SETTINGS_POOLPORT, port);
+                fprintf(stderr, "[SD] Patched PoolPort: %u\n", port);
+            }
+        }
+    }
+}
+
+/* sdcard_type(pdrv) -> card type (2=CARD_SDHC) */
+static void stub_sdcard_type(xtensa_cpu_t *cpu, void *ctx) {
+    sdcard_stubs_t *ss = ctx;
+    static int patched = 0;
+    if (!patched && ss->img_file) {
+        patched = 1;
+        patch_settings_from_image(ss, cpu->mem);
+    }
+    sd_return(cpu, ss->img_file ? 2 : 0); /* CARD_SDHC if image open */
+}
+
+
 int sdcard_stubs_hook_symbols(sdcard_stubs_t *ss, const elf_symbols_t *syms) {
     if (!ss || !syms) return 0;
 
@@ -493,6 +733,18 @@ int sdcard_stubs_hook_symbols(sdcard_stubs_t *ss, const elf_symbols_t *syms) {
         { "sdcard_sector_size", stub_sdcard_sector_size },
         { "sdcard_read",        stub_sdcard_read },
         { "sdcard_write",       stub_sdcard_write },
+        /* FatFs disk I/O layer (NerdMiner firmware, C++ mangled names) */
+        { "_Z16ff_sd_initializeh",   stub_ff_sd_initialize },
+        { "_Z12ff_sd_statush",       stub_ff_sd_status },
+        { "_Z10ff_sd_readhPhjj",     stub_ff_sd_read },
+        { "_Z11ff_sd_writehPKhjj",   stub_ff_sd_write },
+        { "_Z11ff_sd_ioctlhhPv",     stub_ff_sd_ioctl },
+        { "_Z6sdWaithi",             stub_sd_wait },
+        { "_Z9sdCommandhcjPj",      stub_sd_command },
+        { "_Z11sdReadByteshPci",     stub_sd_read_bytes },
+        { "_Z12sdSelectCardh",       stub_sd_select_card },
+        /* Arduino SD card API (C++ mangled names) */
+        { "_Z11sdcard_typeh",        stub_sdcard_type },
         /* ESP-IDF SDMMC layer (used by filesystem: exFAT, FAT32) */
         { "sdmmc_card_init",       stub_sdmmc_card_init },
         { "sdmmc_read_sectors",    stub_sdmmc_read_sectors },

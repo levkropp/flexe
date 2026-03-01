@@ -1150,8 +1150,15 @@ int main(int argc, char *argv[]) {
                      (int)(max_cycles_u64 - cycles) : batch;
             xtensa_run(&cpu[1], n1);
             if (frt) freertos_stubs_check_preempt_core(frt, 1);
-            /* Sync cycle counts: core 1 tracks core 0's virtual time */
-            cpu[1].cycle_count = cpu[0].cycle_count;
+            /* Sync cycle counts: both cores share the same clock, so use the
+             * maximum of the two.  This preserves vTaskDelay fast-forward
+             * advances on either core while keeping them in sync. */
+            if (cpu[1].cycle_count > cpu[0].cycle_count) {
+                cpu[0].cycle_count = cpu[1].cycle_count;
+                cpu[0].virtual_time_us = cpu[1].cycle_count / 160;
+            } else {
+                cpu[1].cycle_count = cpu[0].cycle_count;
+            }
             cpu[1].virtual_time_us = cpu[0].virtual_time_us;
         }
 
