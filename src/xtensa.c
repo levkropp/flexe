@@ -79,17 +79,24 @@ void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
     cpu->running = true;
 }
 
-int xtensa_fetch(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out) {
-    const uint8_t *ptr = mem_get_ptr(cpu->mem, addr);
-    if (!ptr) return 0;
-    int op0 = ptr[0] & 0xF;
-    if (op0 >= 8) {
+/* Fast inline fetch for the hot path — avoids function call overhead */
+static inline __attribute__((always_inline))
+int xtensa_fetch_inline(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out) {
+    uint8_t *page = cpu->mem->page_table[addr >> 12];
+    if (__builtin_expect(!page, 0)) return 0;
+    const uint8_t *ptr = page + (addr & 0xFFF);
+    if (ptr[0] & 0x8) {
         *insn_out = ptr[0] | ((uint32_t)ptr[1] << 8);
         return 2;
     } else {
         *insn_out = ptr[0] | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16);
         return 3;
     }
+}
+
+/* External version for disasm/trace callers (not performance-critical) */
+int xtensa_fetch(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out) {
+    return xtensa_fetch_inline(cpu, addr, insn_out);
 }
 
 /* ===== Special Register Access ===== */
@@ -1446,7 +1453,8 @@ static void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
 }
 
 /* Execute narrow (16-bit) instructions */
-static void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline __attribute__((always_inline))
+void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
     int op0 = XT_OP0(insn);
     int t = XT_T(insn);
     int s = XT_S(insn);
@@ -1796,11 +1804,12 @@ static void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
     }
 }
 
-/* ===== Main step function ===== */
+/* ===== Main step function (always-inlined into xtensa_run hot loop) ===== */
 
-int xtensa_step(xtensa_cpu_t *cpu) {
+static inline __attribute__((always_inline))
+int xtensa_step_impl(xtensa_cpu_t *cpu) {
     uint32_t insn;
-    if (cpu->halted) {
+    if (__builtin_expect(cpu->halted, 0)) {
         cpu->ccount++;
         cpu->cycle_count++;
         if (cpu->ccount == cpu->next_timer_event)
@@ -1814,8 +1823,8 @@ int xtensa_step(xtensa_cpu_t *cpu) {
     }
 
     /* Breakpoint check */
-    cpu->breakpoint_hit = false;
-    if (cpu->breakpoint_count > 0) {
+    if (__builtin_expect(cpu->breakpoint_count > 0, 0)) {
+        cpu->breakpoint_hit = false;
         for (int i = 0; i < cpu->breakpoint_count; i++) {
             if (cpu->breakpoints[i] == cpu->pc) {
                 cpu->breakpoint_hit = true;
@@ -1834,12 +1843,13 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         cpu->cycle_count++;
         if (cpu->ccount == cpu->next_timer_event)
             xtensa_fire_timers(cpu);
-        xtensa_check_interrupts(cpu);
+        if (cpu->interrupt & cpu->intenable)
+            xtensa_check_interrupts(cpu);
         return cpu->exception ? -1 : 0;
     }
 
-    int ilen = xtensa_fetch(cpu, cpu->pc, &insn);
-    if (ilen == 0) {
+    int ilen = xtensa_fetch_inline(cpu, cpu->pc, &insn);
+    if (__builtin_expect(ilen == 0, 0)) {
         xtensa_raise_exception(cpu, EXCCAUSE_IFETCH_ERROR, cpu->pc, 0);
         if (cpu->exception) return -1;
         return 0;
@@ -1850,7 +1860,7 @@ int xtensa_step(xtensa_cpu_t *cpu) {
     cpu->_pc_written = false;
 
     if (ilen == 2) {
-        cpu->pc = next_pc; /* set before exec so RET can override */
+        cpu->pc = next_pc;
         exec_narrow(cpu, insn);
     } else {
         cpu->pc = next_pc;
@@ -1871,20 +1881,20 @@ int xtensa_step(xtensa_cpu_t *cpu) {
               uint32_t base = ar_read(cpu, ls);
               uint32_t offset = (uint32_t)(limm8 << 2);
               switch (lr) {
-              case 0: /* LSI: ft = mem32[as + imm8*4] */
+              case 0: /* LSI */
                   { uint32_t tmp = mem_read32(cpu->mem, base + offset);
                     memcpy(&cpu->fr[lt], &tmp, 4);
                   } break;
-              case 4: /* SSI: mem32[as + imm8*4] = ft */
+              case 4: /* SSI */
                   { uint32_t tmp; memcpy(&tmp, &cpu->fr[lt], 4);
                     mem_write32(cpu->mem, base + offset, tmp);
                   } break;
-              case 8: /* LSIU: ft = mem32[as + imm8*4]; as += imm8*4 */
+              case 8: /* LSIU */
                   { uint32_t tmp = mem_read32(cpu->mem, base + offset);
                     memcpy(&cpu->fr[lt], &tmp, 4);
                     ar_write(cpu, ls, base + offset);
                   } break;
-              case 12: /* SSIU: mem32[as + imm8*4] = ft; as += imm8*4 */
+              case 12: /* SSIU */
                   { uint32_t tmp; memcpy(&tmp, &cpu->fr[lt], 4);
                     mem_write32(cpu->mem, base + offset, tmp);
                     ar_write(cpu, ls, base + offset);
@@ -1900,8 +1910,9 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         }
     }
 
-    /* Zero-overhead loop: loop back on sequential flow to LEND (not branches) */
-    if (cpu->lcount > 0 && cpu->pc == cpu->lend && !cpu->_pc_written) {
+    /* Zero-overhead loop */
+    if (__builtin_expect(cpu->lcount > 0, 0) &&
+        cpu->pc == cpu->lend && !cpu->_pc_written) {
         cpu->lcount--;
         cpu->pc = cpu->lbeg;
     }
@@ -1909,21 +1920,29 @@ int xtensa_step(xtensa_cpu_t *cpu) {
     cpu->ccount++;
     cpu->cycle_count++;
 
-    /* Timer interrupts (batched: single compare instead of 3) */
     if (cpu->ccount == cpu->next_timer_event)
         xtensa_fire_timers(cpu);
 
-    /* Interrupt dispatch (skip if nothing pending) */
     if (cpu->interrupt & cpu->intenable)
         xtensa_check_interrupts(cpu);
 
     return cpu->exception ? -1 : 0;
 }
 
+/* External entry point (for single-step / trace callers) */
+int xtensa_step(xtensa_cpu_t *cpu) {
+    return xtensa_step_impl(cpu);
+}
+
+/* Batch execution: step_impl is always_inline → entire decode/execute loop
+ * lives in this function body, eliminating per-instruction call overhead. */
+__attribute__((no_stack_protector))
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
     int i;
-    for (i = 0; i < max_cycles && cpu->running && !cpu->exception && !cpu->breakpoint_hit; i++) {
-        if (xtensa_step(cpu) != 0)
+    for (i = 0; i < max_cycles; i++) {
+        if (__builtin_expect(xtensa_step_impl(cpu) != 0, 0))
+            break;
+        if (__builtin_expect(!cpu->running, 0))
             break;
     }
     return i;
