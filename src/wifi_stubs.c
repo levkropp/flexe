@@ -44,8 +44,10 @@
 /* ===== Socket state ===== */
 
 typedef struct {
-    int  host_fd;     /* real host socket fd, or -1 if unused */
-    bool nonblocking;
+    int      host_fd;            /* real host socket fd, or -1 if unused */
+    bool     nonblocking;
+    uint64_t total_received;     /* bytes received so far (for timeout policy) */
+    bool     awaiting_response;  /* true after send(), cleared after recv() */
 } emu_socket_t;
 
 struct wifi_stubs {
@@ -306,8 +308,10 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
     ssize_t n = send(s->host_fd, tmp, len, MSG_NOSIGNAL);
     int saved_errno = errno;
 
-    if (n > 0)
+    if (n > 0) {
         wifi_log(ws, "send(slot %u, %zd bytes)\n", fd, n);
+        s->awaiting_response = true;
+    }
 
     free(tmp);
 
@@ -348,33 +352,47 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     if (s->nonblocking) {
         n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
     } else {
-        /* Blocking socket: poll until data arrives or connection drops.
-         * The firmware (mbedTLS bio callback, Arduino WiFiClient) expects
-         * read() to block until data is available — it does NOT retry on
-         * EAGAIN.  We poll in 100ms intervals so the emulator can still be
-         * interrupted (e.g., GUI close), but keep retrying for up to 5
-         * seconds.  This is long enough for TLS server responses and
-         * Stratum pool replies, but doesn't freeze the emulator for
-         * extended periods on idle connections. */
+        /* Blocking socket: adaptive timeout based on socket state.
+         *
+         * Three modes:
+         * 1. Handshake (no data received yet): 5 seconds (50 × 100ms).
+         *    mbedTLS doesn't retry on EAGAIN so we must wait for the
+         *    server's TLS response.
+         * 2. Awaiting response (just sent data): 500ms single poll.
+         *    Expecting a server reply (authorize, Stratum, etc.).
+         * 3. Idle polling (data received, nothing recently sent): 1ms.
+         *    Quick check for async data (mining.notify), then let
+         *    FreeRTOS run other tasks (mining, display updates). */
+        int max_attempts, poll_ms;
+        if (s->total_received == 0) {
+            max_attempts = 50; poll_ms = 100;  /* handshake: up to 5s */
+        } else if (s->awaiting_response) {
+            max_attempts = 1;  poll_ms = 500;  /* expecting reply */
+        } else {
+            max_attempts = 1;  poll_ms = 1;    /* idle check */
+        }
         struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
         n = -1;
-        for (int attempt = 0; attempt < 50; attempt++) {
-            int pr = poll(&pfd, 1, 100);
+        for (int attempt = 0; attempt < max_attempts; attempt++) {
+            int pr = poll(&pfd, 1, poll_ms);
             if (pr > 0) {
                 n = recv(s->host_fd, tmp, len, 0);
                 break;
             }
             if (pr < 0) break;   /* poll error */
-            /* Check if the host socket was closed (POLLHUP) */
             if (pfd.revents & (POLLHUP | POLLERR)) {
                 n = 0; /* EOF */
                 break;
             }
         }
-        if (n > 0)
+        if (n > 0) {
+            s->total_received += (uint64_t)n;
+            s->awaiting_response = false;
             wifi_log(ws, "recv(slot %u, %zd/%u bytes)\n", fd, n, len);
-        else if (n == 0)
+        } else if (n == 0) {
+            s->awaiting_response = false;
             wifi_log(ws, "recv(slot %u): EOF\n", fd);
+        }
     }
 
     if (n > 0) {
