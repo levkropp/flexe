@@ -142,6 +142,9 @@ struct display_stubs {
     /* Sprite table */
     sprite_t            sprites[MAX_SPRITES];
     int                 sprite_count;
+    /* Most recently created sprite — used as render target for
+     * OpenFontRender hooks that don't carry a sprite pointer. */
+    sprite_t           *active_sprite;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -790,6 +793,7 @@ static void stub_sprite_createSprite(xtensa_cpu_t *cpu, void *ctx) {
     sp->win_x1 = 0; sp->win_y1 = 0;
     sp->win_x2 = w - 1; sp->win_y2 = h - 1;
     sp->win_cx = 0; sp->win_cy = 0;
+    ds->active_sprite = sp->buf ? sp : NULL;
     ds_return(cpu, sp->buf ? 1 : 0);
 }
 
@@ -1201,6 +1205,116 @@ static void stub_tft_getRotation(xtensa_cpu_t *cpu, void *ctx) {
     ds_return(cpu, ds->rotation);
 }
 
+/* ===== OpenFontRender stubs ===== */
+
+/* OFR object field offsets (from disassembly of setters) */
+#define OFR_FONT_SIZE   136   /* uint32_t */
+#define OFR_FONT_COLOR  140   /* uint16_t */
+
+/* Render one glyph into a sprite, foreground only (transparent bg) */
+static int sprite_render_glyph_fg(sprite_t *sp, int cx, int cy,
+                                   char c, uint16_t fg, int scale) {
+    if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
+    const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+    int gw = FONT_W * scale;
+
+    for (int row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < FONT_W; col++) {
+            if (!(bits & (0x80 >> col))) continue;   /* skip bg */
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= sp->h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= sp->w) continue;
+                    sp->buf[dy * sp->w + dx] = fg;
+                }
+            }
+        }
+    }
+    return gw;
+}
+
+/* Measure string width in bitmap font pixels */
+static int ofr_measure_string(xtensa_cpu_t *cpu, uint32_t str_addr, int gw) {
+    int len = 0;
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, str_addr++);
+        if (ch == 0) break;
+        len++;
+    }
+    return len * gw;
+}
+
+/* Compute bitmap font scale from OFR font size */
+static int ofr_scale(xtensa_cpu_t *cpu, uint32_t ofr_this) {
+    uint32_t sz = mem_read32(cpu->mem, ofr_this + OFR_FONT_SIZE);
+    if (sz < 8 || sz > 128) return 1;
+    return (int)((sz + 7) / 16);
+}
+
+/* Render string into active sprite with OFR-style transparent background.
+ * x_offset: 0 = left, 1 = center, 2 = right */
+static void ofr_render(xtensa_cpu_t *cpu, display_stubs_t *ds, int align) {
+    sprite_t *sp = ds->active_sprite;
+    if (!sp || !sp->buf) {
+        ds_return(cpu, 0);
+        return;
+    }
+
+    uint32_t ofr_this = ds_arg(cpu, 0);
+    uint32_t str_addr = ds_arg(cpu, 1);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 4);
+
+    int scale = ofr_scale(cpu, ofr_this);
+    int gw = FONT_W * scale;
+
+    /* Adjust x for alignment */
+    if (align > 0) {
+        int total_w = ofr_measure_string(cpu, str_addr, gw);
+        if (align == 1) x -= total_w / 2;  /* center */
+        else            x -= total_w;       /* right */
+    }
+
+    int cx = x;
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, str_addr++);
+        if (ch == 0) break;
+        sprite_render_glyph_fg(sp, cx, y, (char)ch, fg, scale);
+        cx += gw;
+    }
+    ds_return(cpu, 0);   /* FT_Error = 0 (success) */
+}
+
+/* OpenFontRender::drawString  — left-aligned */
+static void stub_ofr_drawString(xtensa_cpu_t *cpu, void *ctx) {
+    ofr_render(cpu, ctx, 0);
+}
+
+/* OpenFontRender::cdrawString — center-aligned */
+static void stub_ofr_cdrawString(xtensa_cpu_t *cpu, void *ctx) {
+    ofr_render(cpu, ctx, 1);
+}
+
+/* OpenFontRender::rdrawString — right-aligned */
+static void stub_ofr_rdrawString(xtensa_cpu_t *cpu, void *ctx) {
+    ofr_render(cpu, ctx, 2);
+}
+
+/* No-op stubs for OFR config methods */
+static void stub_ofr_void(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+static void stub_ofr_ret0(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return(cpu, 0);
+}
+
 /* ===== Public API ===== */
 
 display_stubs_t *display_stubs_create(xtensa_cpu_t *cpu) {
@@ -1391,6 +1505,47 @@ int display_stubs_hook_tft_esprite(display_stubs_t *ds, const elf_symbols_t *sym
         /* No-ops */
         { "_ZN11TFT_eSprite15begin_nin_writeEv", stub_sprite_noop },
         { "_ZN11TFT_eSprite13end_nin_writeEv",   stub_sprite_noop },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ds);
+            hooked++;
+        }
+    }
+
+    return hooked;
+}
+
+int display_stubs_hook_ofr(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        /* Text rendering */
+        { "_ZN14OpenFontRender10drawStringEPKciitt6Layout",  stub_ofr_drawString },
+        { "_ZN14OpenFontRender11cdrawStringEPKciitt6Layout", stub_ofr_cdrawString },
+        { "_ZN14OpenFontRender11rdrawStringEPKciitt6Layout", stub_ofr_rdrawString },
+        /* Font loading — return success (0) so firmware thinks font is ready */
+        { "_ZN14OpenFontRender8loadFontEPKhjh",   stub_ofr_ret0 },
+        { "_ZN14OpenFontRender8loadFontEN3OFR12LoadFontFromE", stub_ofr_ret0 },
+        /* setDrawer<TFT_eSprite> — no-op (we render directly, native code
+         * would try to set up std::function callbacks that we don't need) */
+        { "_ZN14OpenFontRender9setDrawerI11TFT_eSpriteEEvRT_", stub_ofr_void },
+        /* Metrics — return reasonable defaults */
+        { "_ZN14OpenFontRender16getFontMaxHeightEv",        stub_ofr_ret0 },
+        /* FreeType init — no-op success */
+        { "FT_Init_FreeType",                               stub_ofr_ret0 },
+        { "FT_Done_FreeType",                               stub_ofr_ret0 },
         { NULL, NULL }
     };
 

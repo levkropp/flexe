@@ -38,7 +38,7 @@ add_library(xtensa-emu-lib STATIC
 )
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 find_package(OpenSSL REQUIRED)
-target_link_libraries(xtensa-emu-lib PUBLIC m z pthread OpenSSL::Crypto)
+target_link_libraries(xtensa-emu-lib PUBLIC m z pthread OpenSSL::SSL OpenSSL::Crypto)
 target_compile_options(xtensa-emu-lib PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 
 # Disable stack protector on hot-path files (saves ~3-4% from canary checks per instruction)
