@@ -149,16 +149,15 @@ TEST(test_esp_timer_get_time) {
     uint32_t addr = 0x400D1040;
     rom_stubs_register_ctx(rom, addr, (rom_stub_fn)stub_esp_timer_get_time, "esp_timer_get_time", et);
 
-    /* Set ccount to 160,000 cycles = 1000 microseconds at 160 MHz */
-    cpu.ccount = 160000;
-
+    /* esp_timer_get_time returns host wall-clock elapsed microseconds.
+     * Just verify it returns a small non-negative value (test runs quickly). */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
     cpu.pc = addr;
     xtensa_step(&cpu);
 
-    /* Return value: a2 = low 32 bits = 1000 */
-    ASSERT_EQ(ar_read(&cpu, 2), 1000);
+    /* Return value: a2 = low 32 bits, should be small (< 1 second) */
+    ASSERT_TRUE(ar_read(&cpu, 2) < 1000000);  /* less than 1 second since boot */
 
     et_teardown(&cpu, rom, et);
 }
