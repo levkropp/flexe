@@ -59,7 +59,12 @@ typedef struct {
     uint32_t     pc, ps;
     uint32_t     windowbase, windowstart;
     uint32_t     spill_base[16];
-    struct { uint32_t base[8]; int depth; } spill_stack[16];
+    struct {
+        uint32_t base[8];
+        uint32_t core[8][4];
+        uint32_t extra[8][8];
+        int depth;
+    } spill_stack[16];
     uint32_t     sar, lbeg, lend, lcount;
     uint32_t     stack_top;
 } task_tcb_t;
