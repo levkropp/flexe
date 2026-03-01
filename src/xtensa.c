@@ -1805,13 +1805,17 @@ static void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
 }
 
 /* ===== Main step function (always-inlined into xtensa_run hot loop) ===== */
+/* Parameters local_cc/bitmap/hook are cached locals from xtensa_run to keep
+ * them in registers instead of reloading from the cpu struct each iteration.
+ * local_cc accumulates cycle_count in a register; flushed to cpu->cycle_count
+ * only before callbacks that may read it (pc_hook stubs). */
 
 static inline __attribute__((always_inline))
-int xtensa_step_impl(xtensa_cpu_t *cpu) {
+int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     uint32_t insn;
     if (__builtin_expect(cpu->halted, 0)) {
         cpu->ccount++;
-        cpu->cycle_count++;
+        ++*local_cc;
         if (cpu->ccount == cpu->next_timer_event)
             xtensa_fire_timers(cpu);
         uint32_t pending = cpu->interrupt & cpu->intenable;
@@ -1835,17 +1839,22 @@ int xtensa_step_impl(xtensa_cpu_t *cpu) {
     }
 
     /* PC hook: intercept execution at specific addresses (e.g. ROM stubs).
-     * Bitmap fast-path: skip the hook call entirely if the bit isn't set. */
+     * Bitmap fast-path: skip the hook call entirely if the bit isn't set.
+     * Flush cycle_count before hook callback since stubs may read it. */
     if (cpu->pc_hook && (!cpu->pc_hook_bitmap ||
-        rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc)) &&
-        cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
-        cpu->ccount++;
-        cpu->cycle_count++;
-        if (cpu->ccount == cpu->next_timer_event)
-            xtensa_fire_timers(cpu);
-        if (cpu->interrupt & cpu->intenable)
-            xtensa_check_interrupts(cpu);
-        return cpu->exception ? -1 : 0;
+        rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
+        cpu->cycle_count = *local_cc;  /* flush for stub visibility */
+        if (cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
+            cpu->ccount++;
+            ++*local_cc;
+            cpu->cycle_count = *local_cc;
+            if (cpu->ccount == cpu->next_timer_event)
+                xtensa_fire_timers(cpu);
+            if (cpu->interrupt & cpu->intenable)
+                xtensa_check_interrupts(cpu);
+            *local_cc = cpu->cycle_count;  /* reload (stub may advance time) */
+            return cpu->exception ? -1 : 0;
+        }
     }
 
     int ilen = xtensa_fetch_inline(cpu, cpu->pc, &insn);
@@ -1918,7 +1927,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu) {
     }
 
     cpu->ccount++;
-    cpu->cycle_count++;
+    ++*local_cc;
 
     if (cpu->ccount == cpu->next_timer_event)
         xtensa_fire_timers(cpu);
@@ -1931,20 +1940,27 @@ int xtensa_step_impl(xtensa_cpu_t *cpu) {
 
 /* External entry point (for single-step / trace callers) */
 int xtensa_step(xtensa_cpu_t *cpu) {
-    return xtensa_step_impl(cpu);
+    uint64_t cc = cpu->cycle_count;
+    int r = xtensa_step_impl(cpu, &cc);
+    cpu->cycle_count = cc;
+    return r;
 }
 
 /* Batch execution: step_impl is always_inline → entire decode/execute loop
- * lives in this function body, eliminating per-instruction call overhead. */
+ * lives in this function body, eliminating per-instruction call overhead.
+ * cycle_count is cached in a local to stay in a register across iterations
+ * (avoids per-instruction 64-bit memory increment). */
 __attribute__((no_stack_protector))
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
+    uint64_t cc = cpu->cycle_count;
     int i;
     for (i = 0; i < max_cycles; i++) {
-        if (__builtin_expect(xtensa_step_impl(cpu) != 0, 0))
+        if (__builtin_expect(xtensa_step_impl(cpu, &cc) != 0, 0))
             break;
         if (__builtin_expect(!cpu->running, 0))
             break;
     }
+    cpu->cycle_count = cc;
     return i;
 }
 
