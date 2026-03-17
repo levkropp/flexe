@@ -14,11 +14,13 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     if(IPO_SUPPORTED)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
     endif()
-    add_compile_options(-march=native)
+    if(NOT MSVC)
+        add_compile_options(-march=native)
+    endif()
 endif()
 
 # Library (core emulator)
-add_library(xtensa-emu-lib STATIC
+set(LIB_SOURCES
     src/xtensa.c
     src/xtensa_disasm.c
     src/memory.c
@@ -38,30 +40,60 @@ add_library(xtensa-emu-lib STATIC
     src/mpi_stubs.c
     src/flexe_session.c
 )
+
+if(MSVC)
+    list(APPEND LIB_SOURCES src/msvc_compat.c)
+endif()
+
+add_library(xtensa-emu-lib STATIC ${LIB_SOURCES})
 target_include_directories(xtensa-emu-lib PUBLIC src/)
 find_package(OpenSSL REQUIRED)
-target_link_libraries(xtensa-emu-lib PUBLIC m z pthread OpenSSL::SSL OpenSSL::Crypto)
-target_compile_options(xtensa-emu-lib PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+find_package(ZLIB REQUIRED)
+find_package(pthreads REQUIRED)
 
-# Disable stack protector on hot-path files (saves ~3-4% from canary checks per instruction)
-set_source_files_properties(src/xtensa.c src/memory.c
-    PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
+if(MSVC)
+    target_link_libraries(xtensa-emu-lib PUBLIC OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB PThreads4W::PThreads4W)
+    target_compile_options(xtensa-emu-lib PRIVATE /W4 /wd4100 /MP)
+    target_compile_definitions(xtensa-emu-lib PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_link_libraries(xtensa-emu-lib PUBLIC m z pthread OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(xtensa-emu-lib PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+    # Disable stack protector on hot-path files (saves ~3-4% from canary checks per instruction)
+    set_source_files_properties(src/xtensa.c src/memory.c
+        PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
+endif()
 
 # Main executable
 add_executable(xtensa-emu src/main.c)
 target_link_libraries(xtensa-emu PRIVATE xtensa-emu-lib)
-target_compile_options(xtensa-emu PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+if(MSVC)
+    target_compile_options(xtensa-emu PRIVATE /W4 /wd4100)
+else()
+    target_compile_options(xtensa-emu PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+endif()
 
 # Test runner
 add_executable(xtensa-tests tests/test_main.c)
 target_link_libraries(xtensa-tests PRIVATE xtensa-emu-lib)
-target_compile_options(xtensa-tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+if(MSVC)
+    target_compile_options(xtensa-tests PRIVATE /W4 /wd4100)
+else()
+    target_compile_options(xtensa-tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+endif()
 
 # Disassembler tool
 add_executable(xt-dis tools/xt-dis.c)
 target_link_libraries(xt-dis PRIVATE xtensa-emu-lib)
-target_compile_options(xt-dis PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+if(MSVC)
+    target_compile_options(xt-dis PRIVATE /W4 /wd4100)
+else()
+    target_compile_options(xt-dis PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+endif()
 
 # Trace filter tool
 add_executable(trace-filter tools/trace-filter.c)
-target_compile_options(trace-filter PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+if(MSVC)
+    target_compile_options(trace-filter PRIVATE /W4 /wd4100)
+else()
+    target_compile_options(trace-filter PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+endif()

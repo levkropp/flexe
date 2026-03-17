@@ -1,3 +1,7 @@
+#ifdef _MSC_VER
+#include "../src/msvc_compat.h"
+#endif
+
 /*
  * trace-filter: Post-process verbose trace output from xtensa-emu.
  *

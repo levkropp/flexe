@@ -1,3 +1,7 @@
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
 #include "flexe_session.h"
 #include "xtensa.h"
 #include "memory.h"
@@ -10,7 +14,9 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#ifndef _MSC_VER
 #include <getopt.h>
+#endif
 #include <pthread.h>
 
 /* Provided by cyd-emulator's emu_touch.c in --firmware mode;

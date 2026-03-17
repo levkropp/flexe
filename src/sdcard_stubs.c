@@ -1,10 +1,18 @@
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
 #include "sdcard_stubs.h"
 #include "rom_stubs.h"
 #include "memory.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#else
 #include <unistd.h>
+#endif
 
 #define DEFAULT_SD_SIZE (4ULL * 1024 * 1024 * 1024)  /* 4 GB */
 

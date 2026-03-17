@@ -1,3 +1,7 @@
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
 #include "xtensa.h"
 #include "memory.h"
 #include "rom_stubs.h"
