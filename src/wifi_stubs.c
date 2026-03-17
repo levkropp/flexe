@@ -1,3 +1,7 @@
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
 /*
  * wifi_stubs.c — lwip socket bridge to host TCP/IP
  *
@@ -14,15 +18,51 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#else
 #include <unistd.h>
+#endif
 #include <fcntl.h>
+#ifdef _MSC_VER
+// Winsock included in msvc_compat.h
+#else
+#ifndef _MSC_VER
+#ifndef _MSC_VER
 #include <sys/socket.h>
+#endif
+#endif
+#ifndef _MSC_VER
+#endif
+#ifndef _MSC_VER
+#endif
+#endif
+#ifndef _MSC_VER
+#ifndef _MSC_VER
 #include <sys/ioctl.h>
+#endif
+#endif
+#ifndef _MSC_VER
 #include <sys/select.h>
+#endif
+#ifndef _MSC_VER
 #include <netinet/in.h>
+#endif
+#ifndef _MSC_VER
+#ifndef _MSC_VER
 #include <netdb.h>
+#endif
+#endif
+#ifndef _MSC_VER
+#ifndef _MSC_VER
 #include <arpa/inet.h>
+#endif
+#endif
+#ifndef _MSC_VER
 #include <poll.h>
+#else
+// poll.h not needed on Windows - using select()
+#endif
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>

@@ -1,3 +1,7 @@
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
 #include "esp_timer_stubs.h"
 #include "rom_stubs.h"
 #include "memory.h"

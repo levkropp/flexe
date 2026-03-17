@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <string.h>
 
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
 /* MMIO callback types */
 typedef uint32_t (*mmio_read_fn)(void *ctx, uint32_t addr);
 typedef void     (*mmio_write_fn)(void *ctx, uint32_t addr, uint32_t val);

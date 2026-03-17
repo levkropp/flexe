@@ -1,8 +1,16 @@
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
 #include "touch_stubs.h"
 #include "rom_stubs.h"
 #include "memory.h"
 #include <stdlib.h>
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#else
 #include <unistd.h>
+#endif
 
 /* CPU frequency for ccount advance during wait_tap polling */
 #define DEFAULT_CPU_FREQ_MHZ 160
