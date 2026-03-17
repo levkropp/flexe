@@ -9,6 +9,7 @@
 #include "rom_stubs.h"
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
+#include "savestate.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -517,6 +518,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -E              Event log (stubs, task switches, exceptions)\n");
     fprintf(stderr, "  -P <N>          Progress heartbeat every N cycles (default: 1000000)\n");
     fprintf(stderr, "  -V              Verify window spill/fill integrity (detect stack corruption)\n");
+    fprintf(stderr, "\nCheckpoint options:\n");
+    fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
+    fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
+    fprintf(stderr, "  --restore <FILE>            Restore from checkpoint and resume execution\n");
 }
 
 /* ===== Parse -m argument ===== */
@@ -585,6 +590,33 @@ int main(int argc, char *argv[]) {
     int single_core = 0;
     uint64_t heartbeat_interval = 0;
     uint64_t trace_start = 0, trace_end = UINT64_MAX;
+    /* Checkpoint options */
+    const char *checkpoint_dir = NULL;
+    uint64_t checkpoint_interval = 0;
+    const char *restore_file = NULL;
+
+    /* Manual parsing for long options (--checkpoint-*, --restore) */
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "--checkpoint-dir") == 0 && i + 1 < argc) {
+            checkpoint_dir = argv[i + 1];
+            /* Remove these args from argv */
+            memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--checkpoint-interval") == 0 && i + 1 < argc) {
+            checkpoint_interval = strtoull(argv[i + 1], NULL, 0);
+            memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--restore") == 0 && i + 1 < argc) {
+            restore_file = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        }
+        i++;
+    }
 
     int opt;
     while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:")) != -1) {
@@ -734,6 +766,39 @@ int main(int argc, char *argv[]) {
     esp32_rom_stubs_t *rom = flexe_session_rom(session);
     freertos_stubs_t *frt = flexe_session_frt(session);
 
+    /* Restore from checkpoint if requested (overrides firmware load) */
+    if (restore_file) {
+        fprintf(stderr, "Restoring from checkpoint: %s\n", restore_file);
+        if (savestate_restore(cpu, frt, restore_file) != 0) {
+            fprintf(stderr, "Failed to restore checkpoint\n");
+            flexe_session_destroy(session);
+            ring_destroy(g_ring);
+            return 1;
+        }
+        fprintf(stderr, "Checkpoint restored successfully!\n");
+        fprintf(stderr, "  Cycle:      %llu\n", (unsigned long long)cpu->cycle_count);
+        fprintf(stderr, "  Core 0 PC:  0x%08X\n", cpu->pc);
+
+        if (frt) {
+            const char *task_c0 = freertos_stubs_current_task_name(frt, 0);
+            const char *task_c1 = freertos_stubs_current_task_name(frt, 1);
+            fprintf(stderr, "  Core 0 task:%s\n", task_c0 ? task_c0 : "(none)");
+            fprintf(stderr, "  Core 1 task:%s\n", task_c1 ? task_c1 : "(none)");
+
+            if (freertos_stubs_scheduler_active(frt)) {
+                fprintf(stderr, "  Scheduler:  ACTIVE\n");
+            } else {
+                fprintf(stderr, "  Scheduler:  not started\n");
+            }
+        }
+
+        /* No manual timer/interrupt reconfiguration needed.
+         * The checkpoint was saved during active task execution - FreeRTOS scheduler
+         * state has been restored and tasks will continue from their saved state.
+         * Note: Core 0 may remain in vTaskStartScheduler loop if all tasks are pinned
+         * to Core 1, which is normal for dual-core firmware. */
+    }
+
     /* Window trace gating: session sets window_trace_active = window_trace,
      * but if we have a trace window start, disable until we reach it. */
     if (window_trace && trace_start > 0)
@@ -795,6 +860,9 @@ int main(int argc, char *argv[]) {
     /* Heartbeat state */
     uint64_t last_heartbeat = 0;
     uint32_t hb_stub_count = 0;
+
+    /* Checkpoint state */
+    uint64_t next_checkpoint_cycle = checkpoint_interval;
 
     /* Trace state (used in trace windows) */
     uint32_t prev_ar[16];
@@ -1018,6 +1086,76 @@ int main(int argc, char *argv[]) {
                     cur_stubs - hb_stub_count,
                     task_name ? task_name : "(none)");
             hb_stub_count = cur_stubs;
+        }
+
+        /* Automatic checkpoint - only save when FreeRTOS scheduler is active */
+        if (checkpoint_interval > 0 && cpu->cycle_count >= next_checkpoint_cycle) {
+            /* Validate checkpoint safety: scheduler must be running with an active task.
+             * This prevents saving during initialization or in vTaskStartScheduler loop
+             * where the system hasn't fully transitioned to task execution yet. */
+            bool safe_to_checkpoint = true;
+            const char *defer_reason = NULL;
+
+            /* Check 1: FreeRTOS scheduler must be active (not in initialization) */
+            if (frt && !freertos_stubs_scheduler_active(frt)) {
+                safe_to_checkpoint = false;
+                defer_reason = "scheduler not started";
+            }
+
+            /* Check 2: Must have an active task on at least one core (not stuck in vTaskStartScheduler) */
+            if (safe_to_checkpoint && frt) {
+                const char *task_name_core0 = freertos_stubs_current_task_name(frt, 0);
+                const char *task_name_core1 = freertos_stubs_current_task_name(frt, 1);
+                bool has_task_core0 = (task_name_core0 && strcmp(task_name_core0, "(none)") != 0);
+                bool has_task_core1 = (task_name_core1 && strcmp(task_name_core1, "(none)") != 0);
+
+                if (!has_task_core0 && !has_task_core1) {
+                    safe_to_checkpoint = false;
+                    defer_reason = "no active task on any core";
+                }
+            }
+
+            /* Check 3: CPU must not be halted */
+            if (safe_to_checkpoint && cpu->halted) {
+                safe_to_checkpoint = false;
+                defer_reason = "CPU halted";
+            }
+
+            if (safe_to_checkpoint) {
+                char checkpoint_path[512];
+                const char *dir = checkpoint_dir ? checkpoint_dir : ".";
+                snprintf(checkpoint_path, sizeof(checkpoint_path),
+                         "%s/checkpoint-%llu.sav", dir,
+                         (unsigned long long)cpu->cycle_count);
+
+                const char *task_c0 = frt ? freertos_stubs_current_task_name(frt, 0) : "(none)";
+                const char *task_c1 = frt ? freertos_stubs_current_task_name(frt, 1) : "(none)";
+                fprintf(stderr, "[%10llu] Creating checkpoint: %s\n",
+                        (unsigned long long)cpu->cycle_count, checkpoint_path);
+                fprintf(stderr, "  Core0 task: %s, Core1 task: %s\n",
+                        task_c0 ? task_c0 : "(null)", task_c1 ? task_c1 : "(null)");
+                fprintf(stderr, "  INTENABLE=0x%08X, CCOMPARE[0]=%u\n",
+                        cpu->intenable, cpu->ccompare[0]);
+
+                char desc[256];
+                snprintf(desc, sizeof(desc), "auto-checkpoint at %llu cycles (c0:%s c1:%s)",
+                         (unsigned long long)cpu->cycle_count,
+                         task_c0 ? task_c0 : "(null)", task_c1 ? task_c1 : "(null)");
+
+                if (savestate_save(cpu, frt, checkpoint_path, desc) != 0) {
+                    fprintf(stderr, "[%10llu] WARNING: Failed to save checkpoint: %s\n",
+                            (unsigned long long)cpu->cycle_count, checkpoint_path);
+                } else {
+                    fprintf(stderr, "[%10llu] Checkpoint saved successfully\n",
+                            (unsigned long long)cpu->cycle_count);
+                }
+
+                next_checkpoint_cycle += checkpoint_interval;
+            } else if (event_log && defer_reason) {
+                fprintf(stderr, "[%10llu] Checkpoint DEFERRED (%s)\n",
+                        (unsigned long long)cpu->cycle_count, defer_reason);
+            }
+            /* If unsafe, we'll try again on the next cycle */
         }
     }
 
