@@ -10,6 +10,7 @@
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
 #include "savestate.h"
+#include "hierarchical_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +117,27 @@ static void ring_destroy(ring_buf_t *rb) {
 
 /* Global ring buffer pointer — always non-NULL when tracing */
 static ring_buf_t *g_ring = NULL;
+
+/* Global hierarchical trace pointer — non-NULL when -H enabled */
+static hierarchical_trace_t *g_htrace = NULL;
+
+/* PC hook chaining: we need to call both ROM hook and htrace hook */
+static xtensa_pc_hook_fn g_original_pc_hook = NULL;
+static void *g_original_pc_hook_ctx = NULL;
+
+static int combined_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
+    /* Call hierarchical trace hook first (fast) */
+    if (g_htrace) {
+        htrace_pc_hook(cpu, pc, g_htrace);
+    }
+
+    /* Call original ROM hook */
+    if (g_original_pc_hook) {
+        return g_original_pc_hook(cpu, pc, g_original_pc_hook_ctx);
+    }
+
+    return 0;
+}
 
 /* Dump condition flags */
 #define DUMP_CRASH  1   /* dump ring buffer on panic/exception stop */
@@ -518,6 +540,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -E              Event log (stubs, task switches, exceptions)\n");
     fprintf(stderr, "  -P <N>          Progress heartbeat every N cycles (default: 1000000)\n");
     fprintf(stderr, "  -V              Verify window spill/fill integrity (detect stack corruption)\n");
+    fprintf(stderr, "  -H              Hierarchical trace (16 levels, 64K entries/level, ~24MB RAM)\n");
+    fprintf(stderr, "                  Optimized PC hook with ~15%% overhead\n");
+    fprintf(stderr, "                  Ideal for debugging crashes in multi-billion cycle runs\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -588,6 +613,7 @@ int main(int argc, char *argv[]) {
     int event_log = 0;
     int spill_verify = 0;
     int single_core = 0;
+    int htrace_enabled = 0;
     uint64_t heartbeat_interval = 0;
     uint64_t trace_start = 0, trace_end = UINT64_MAX;
     /* Checkpoint options */
@@ -619,7 +645,7 @@ int main(int argc, char *argv[]) {
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:")) != -1) {
+    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:H")) != -1) {
         switch (opt) {
         case '1': single_core = 1; break;
         case 'c': max_cycles = strtoll(optarg, NULL, 10); break;
@@ -691,6 +717,7 @@ int main(int argc, char *argv[]) {
             break;
         case 'E': event_log = 1; break;
         case 'P': heartbeat_interval = strtoull(optarg, NULL, 0); break;
+        case 'H': htrace_enabled = 1; break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -765,6 +792,33 @@ int main(int argc, char *argv[]) {
     esp32_periph_t *periph = flexe_session_periph(session);
     esp32_rom_stubs_t *rom = flexe_session_rom(session);
     freertos_stubs_t *frt = flexe_session_frt(session);
+
+    /* Initialize hierarchical trace system */
+    if (htrace_enabled) {
+        g_htrace = htrace_create();
+        if (!g_htrace) {
+            fprintf(stderr, "Failed to allocate hierarchical trace (~24 MB)\n");
+            flexe_session_destroy(session);
+            ring_destroy(g_ring);
+            return 1;
+        }
+
+        /* Install PC hook by chaining with existing ROM hook */
+        g_original_pc_hook = cpu->pc_hook;
+        g_original_pc_hook_ctx = cpu->pc_hook_ctx;
+        cpu->pc_hook = combined_pc_hook;
+        cpu->pc_hook_ctx = NULL;  /* We use globals instead */
+
+        /* Also install on Core 1 if dual-core */
+        if (!single_core) {
+            xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
+            cpu1->pc_hook = combined_pc_hook;
+            cpu1->pc_hook_ctx = NULL;
+        }
+
+        fprintf(stderr, "Hierarchical trace enabled (16 levels, 64K entries/level, ~24MB RAM)\n");
+        fprintf(stderr, "Using optimized PC hook for minimal overhead\n");
+    }
 
     /* Restore from checkpoint if requested (overrides firmware load) */
     if (restore_file) {
@@ -870,7 +924,8 @@ int main(int argc, char *argv[]) {
     uint32_t prev_pc = cpu->pc;
     int call_depth = 0;
 
-    /* Determine if we need per-step execution at all */
+    /* Determine if we need per-step execution at all
+     * NOTE: g_htrace uses PC hook instead of single-step, so not listed here */
     int need_step = trace || call_trace || assert_count;
 
     /* Unified execution loop */
@@ -1186,6 +1241,13 @@ int main(int argc, char *argv[]) {
             ring_flush_tail(g_ring, g_dump_tail_n);
     }
 
+    /* Dump hierarchical trace on halt/crash */
+    if (g_htrace && g_htrace->dump_on_halt &&
+        (stop_reason == STOP_HALT || stop_reason == STOP_CPU_STOPPED ||
+         stop_reason == STOP_EXCEPTION_LOOP)) {
+        htrace_dump_on_crash(g_htrace, syms, stderr);
+    }
+
     /* ===== Summary ===== */
     fprintf(stderr, "\n--- Execution summary ---\n");
 
@@ -1262,8 +1324,17 @@ int main(int argc, char *argv[]) {
         hexdump(mem, mem_dumps[i].addr, mem_dumps[i].len);
     }
 
+    /* Hierarchical trace statistics */
+    if (g_htrace) {
+        htrace_print_stats(g_htrace, stderr);
+    }
+
     /* Cleanup */
     ring_destroy(g_ring);
+    if (g_htrace) {
+        htrace_destroy(g_htrace);
+        g_htrace = NULL;
+    }
     flexe_session_destroy(session);
     return 0;
 }

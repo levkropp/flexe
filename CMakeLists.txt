@@ -40,6 +40,7 @@ set(LIB_SOURCES
     src/mpi_stubs.c
     src/flexe_session.c
     src/savestate.c
+    src/hierarchical_trace.c
 )
 
 if(MSVC)
