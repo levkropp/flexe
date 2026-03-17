@@ -26,4 +26,11 @@ int elf_symbols_find(const elf_symbols_t *syms, const char *name, uint32_t *addr
 /* Number of loaded symbols */
 int elf_symbols_count(const elf_symbols_t *syms);
 
+/* Iterate through all symbols, calling callback for each.
+ * Callback signature: int callback(const char *name, uint32_t addr, uint32_t size, void *ctx)
+ * Return non-zero from callback to stop iteration early.
+ * Returns number of symbols iterated. */
+typedef int (*elf_symbols_iter_fn)(const char *name, uint32_t addr, uint32_t size, void *ctx);
+int elf_symbols_iterate(const elf_symbols_t *syms, elf_symbols_iter_fn callback, void *ctx);
+
 #endif /* ELF_SYMBOLS_H */

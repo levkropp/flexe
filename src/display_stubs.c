@@ -2247,6 +2247,49 @@ static void stub_lv_flush_cb_generic(xtensa_cpu_t *cpu, void *ctx) {
     ds_return_void(cpu);
 }
 
+/* Context for flush callback symbol scanner */
+struct flush_scan_ctx {
+    display_stubs_t *ds;
+    esp32_rom_stubs_t *rom;
+    int hooked;
+};
+
+/* Iterator callback: checks if symbol name matches flush callback patterns */
+static int scan_for_flush_callback(const char *name, uint32_t addr, uint32_t size, void *ctx) {
+    (void)size;  /* unused */
+    struct flush_scan_ctx *scan_ctx = ctx;
+
+    /* Pattern 1: ends with "_flush_cb" or "_flush" */
+    size_t len = strlen(name);
+    if (len > 9 && strcmp(name + len - 9, "_flush_cb") == 0) {
+        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_generic, name, scan_ctx->ds);
+        scan_ctx->hooked++;
+        return 0;  /* continue scanning */
+    }
+    if (len > 6 && strcmp(name + len - 6, "_flush") == 0) {
+        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_generic, name, scan_ctx->ds);
+        scan_ctx->hooked++;
+        return 0;
+    }
+
+    /* Pattern 2: contains "flush" (but not ROM functions like esp_rom_crc32_le) */
+    if (strstr(name, "flush") != NULL && strstr(name, "rom") == NULL) {
+        /* Be more selective - only hook if it looks like a display flush:
+         * must also contain "disp", "lcd", "tft", "lvgl", or "lv_" */
+        if (strstr(name, "disp") != NULL ||
+            strstr(name, "lcd") != NULL ||
+            strstr(name, "tft") != NULL ||
+            strstr(name, "lvgl") != NULL ||
+            strstr(name, "lv_") != NULL ||
+            strstr(name, "display") != NULL) {
+            rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_generic, name, scan_ctx->ds);
+            scan_ctx->hooked++;
+        }
+    }
+
+    return 0;  /* continue scanning */
+}
+
 int display_stubs_hook_lvgl(display_stubs_t *ds, const elf_symbols_t *syms) {
     if (!ds || !syms) return 0;
 
@@ -2304,9 +2347,12 @@ int display_stubs_hook_lvgl(display_stubs_t *ds, const elf_symbols_t *syms) {
         }
     }
 
-    /* TODO (Task #23): Implement wildcard symbol scanning for *_flush*, *flush_cb*
-     * patterns using elf_symbols_iterate() or similar API. This would catch
-     * any user-defined flush callback regardless of naming convention. */
+    /* Wildcard symbol scanning for flush callbacks (Task #23).
+     * Scans all symbols for patterns like *_flush*, *flush_cb*, *disp_flush*
+     * to catch user-defined callbacks regardless of naming convention. */
+    struct flush_scan_ctx scan_ctx = { ds, rom, 0 };
+    elf_symbols_iterate(syms, scan_for_flush_callback, &scan_ctx);
+    hooked += scan_ctx.hooked;
 
     return hooked;
 }
