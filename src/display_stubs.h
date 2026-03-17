@@ -23,6 +23,9 @@ int display_stubs_hook_tft_esprite(display_stubs_t *ds, const elf_symbols_t *sym
 /* Hook OpenFontRender methods for FreeType text rendering */
 int display_stubs_hook_ofr(display_stubs_t *ds, const elf_symbols_t *syms);
 
+/* Hook LVGL display flush callbacks for versions 7.x, 8.x, 9.x */
+int display_stubs_hook_lvgl(display_stubs_t *ds, const elf_symbols_t *syms);
+
 /* Set the framebuffer to render into (owned by cyd-emulator) */
 void display_stubs_set_framebuf(display_stubs_t *ds, uint16_t *fb,
                                  pthread_mutex_t *mtx, int w, int h);

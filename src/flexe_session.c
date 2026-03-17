@@ -138,6 +138,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
             display_stubs_hook_tft_espi(s->dstubs, s->syms);
             display_stubs_hook_tft_esprite(s->dstubs, s->syms);
             display_stubs_hook_ofr(s->dstubs, s->syms);
+            display_stubs_hook_lvgl(s->dstubs, s->syms);
         }
     }
 
