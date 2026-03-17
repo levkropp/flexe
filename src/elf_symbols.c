@@ -262,3 +262,19 @@ int elf_symbols_find(const elf_symbols_t *syms, const char *name, uint32_t *addr
 int elf_symbols_count(const elf_symbols_t *syms) {
     return syms ? syms->count : 0;
 }
+
+int elf_symbols_iterate(const elf_symbols_t *syms, elf_symbols_iter_fn callback, void *ctx) {
+    if (!syms || !callback) return 0;
+
+    for (int i = 0; i < syms->count; i++) {
+        const char *name = syms->names + syms->entries[i].name_offset;
+        uint32_t addr = syms->entries[i].addr;
+        uint32_t size = syms->entries[i].size;
+
+        /* Call callback - stop if it returns non-zero */
+        if (callback(name, addr, size, ctx) != 0)
+            return i + 1;  /* Return count of symbols processed so far */
+    }
+
+    return syms->count;  /* Processed all symbols */
+}
