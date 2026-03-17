@@ -328,7 +328,7 @@ static int render_font2_glyph(uint16_t *buf, int buf_w, int buf_h,
     uint32_t bm_ptr = mem_read32(mem, fd->chartbl + (uint32_t)(idx * 4));
     int width = mem_read8(mem, fd->widthtbl + (uint32_t)idx);
     if (width == 0 || !bm_ptr) return 0;
-    int bytes_per_row = (width + 6) / 8;  /* TFT_eSPI uses (width+6)/8 */
+    int bytes_per_row = (width + 7) / 8;  /* Standard bit-packing: (width + 7) / 8 */
     int height = fd->height;
 
     for (int row = 0; row < height; row++) {
