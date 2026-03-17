@@ -1509,6 +1509,171 @@ void stub_esp_log_timestamp(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, ms);
 }
 
+/* esp_log_write(level, tag, format, ...) - output via ets_printf mechanism */
+static void stub_esp_log_write(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t level = rom_arg(cpu, 0);
+    uint32_t tag_addr = rom_arg(cpu, 1);
+    uint32_t fmt_addr = rom_arg(cpu, 2);
+
+    /* Read tag string */
+    char tag[64] = "";
+    for (int i = 0; i < 63; i++) {
+        uint8_t c = mem_read8(cpu->mem, tag_addr + i);
+        if (c == 0) break;
+        tag[i] = (char)c;
+        tag[i + 1] = '\0';
+    }
+
+    /* Color codes for different log levels */
+    const char *color_start = "";
+    const char *color_end = "\033[0m";
+    const char *level_str = "?";
+
+    switch (level) {
+        case 1: /* ESP_LOG_ERROR */
+            color_start = "\033[0;31m";  /* Red */
+            level_str = "E";
+            break;
+        case 2: /* ESP_LOG_WARN */
+            color_start = "\033[0;33m";  /* Yellow */
+            level_str = "W";
+            break;
+        case 3: /* ESP_LOG_INFO */
+            color_start = "\033[0;32m";  /* Green */
+            level_str = "I";
+            break;
+        case 4: /* ESP_LOG_DEBUG */
+            color_start = "";
+            level_str = "D";
+            break;
+        case 5: /* ESP_LOG_VERBOSE */
+            color_start = "";
+            level_str = "V";
+            break;
+    }
+
+    /* Get timestamp */
+    uint32_t ms = cpu->ccount / (s->cpu_freq_mhz * 1000);
+
+    /* Output log prefix: color + level + timestamp + tag */
+    int n = snprintf(s->output + s->output_len, OUTPUT_BUF_SIZE - s->output_len,
+                     "%s%s (%u) %s: ", color_start, level_str, ms, tag);
+    if (n > 0 && s->output_len + n < OUTPUT_BUF_SIZE)
+        s->output_len += n;
+
+    /* Process format string and varargs (starting from arg 3) */
+    int argn = 3;  /* first variadic arg after format */
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, fmt_addr++);
+        if (ch == 0) break;
+
+        if (ch != '%') {
+            output_char(s, (char)ch);
+            continue;
+        }
+
+        /* Parse format specifier */
+        ch = mem_read8(cpu->mem, fmt_addr++);
+        if (ch == 0) break;
+
+        if (ch == '%') {
+            output_char(s, '%');
+            continue;
+        }
+
+        /* Parse flags */
+        char pad_char = ' ';
+        if (ch == '0') {
+            pad_char = '0';
+            ch = mem_read8(cpu->mem, fmt_addr++);
+            if (ch == 0) break;
+        }
+
+        /* Parse width */
+        int width = 0;
+        while (ch >= '0' && ch <= '9') {
+            width = width * 10 + (ch - '0');
+            ch = mem_read8(cpu->mem, fmt_addr++);
+            if (ch == 0) goto done;
+        }
+
+        /* Skip 'l' length modifier */
+        if (ch == 'l') {
+            ch = mem_read8(cpu->mem, fmt_addr++);
+            if (ch == 0) break;
+        }
+
+        uint32_t val = rom_arg(cpu, argn++);
+
+        char numbuf[12];
+        int numlen = 0;
+
+        switch (ch) {
+        case 'd': {
+            int32_t ival = (int32_t)val;
+            int neg = ival < 0;
+            if (neg) ival = -ival;
+            do { numbuf[numlen++] = '0' + (ival % 10); ival /= 10; } while (ival);
+            if (neg) numbuf[numlen++] = '-';
+            while (numlen < width) numbuf[numlen++] = pad_char;
+            for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+            break;
+        }
+        case 'u': {
+            uint32_t uval = val;
+            do { numbuf[numlen++] = '0' + (uval % 10); uval /= 10; } while (uval);
+            while (numlen < width) numbuf[numlen++] = pad_char;
+            for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+            break;
+        }
+        case 'x':
+        case 'X': {
+            uint32_t uval = val;
+            const char *hex = (ch == 'x') ? "0123456789abcdef" : "0123456789ABCDEF";
+            do { numbuf[numlen++] = hex[uval & 0xF]; uval >>= 4; } while (uval);
+            while (numlen < width) numbuf[numlen++] = pad_char;
+            for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+            break;
+        }
+        case 'p': {
+            uint32_t uval = val;
+            output_char(s, '0'); output_char(s, 'x');
+            for (int shift = 28; shift >= 0; shift -= 4) {
+                int digit = (uval >> shift) & 0xF;
+                output_char(s, "0123456789abcdef"[digit]);
+            }
+            break;
+        }
+        case 's': {
+            uint32_t str_addr = val;
+            for (int i = 0; i < 256; i++) {
+                uint8_t c = mem_read8(cpu->mem, str_addr + i);
+                if (c == 0) break;
+                output_char(s, (char)c);
+            }
+            break;
+        }
+        case 'c':
+            output_char(s, (char)(val & 0xFF));
+            break;
+        default:
+            output_char(s, '%');
+            output_char(s, (char)ch);
+            break;
+        }
+    }
+done:
+
+    /* Add color end and newline */
+    n = snprintf(s->output + s->output_len, OUTPUT_BUF_SIZE - s->output_len,
+                 "%s\n", color_end);
+    if (n > 0 && s->output_len + n < OUTPUT_BUF_SIZE)
+        s->output_len += n;
+
+    rom_return_void(cpu);
+}
+
 /* Generic no-op ROM stub: returns 0 for unregistered ROM calls */
 static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -2408,17 +2573,22 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* Logging (no-ops — UART logging via ets_printf already works) */
-    static const char *log_fns[] = {
-        "esp_log_level_set",
-        "esp_log_write",
-        "esp_log_writev",
-        NULL
-    };
-    for (int i = 0; log_fns[i]; i++) {
+    /* Logging */
+    {
         uint32_t addr;
-        if (elf_symbols_find(syms, log_fns[i], &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_void_unregistered, log_fns[i]);
+        /* esp_log_write - implement properly to show ESP_LOGI/ESP_LOGW/etc output */
+        if (elf_symbols_find(syms, "esp_log_write", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_log_write, "esp_log_write");
+            hooked++;
+        }
+        /* esp_log_writev - similar to esp_log_write but with va_list, use same stub */
+        if (elf_symbols_find(syms, "esp_log_writev", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_log_write, "esp_log_writev");
+            hooked++;
+        }
+        /* esp_log_level_set - no-op */
+        if (elf_symbols_find(syms, "esp_log_level_set", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_void_unregistered, "esp_log_level_set");
             hooked++;
         }
     }
