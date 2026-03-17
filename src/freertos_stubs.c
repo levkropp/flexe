@@ -1179,3 +1179,61 @@ void freertos_stubs_start_scheduler(freertos_stubs_t *frt) {
     }
     pthread_mutex_unlock(&frt->lock);
 }
+
+/* ===== Save/Restore FreeRTOS State ===== */
+
+int freertos_stubs_save_state(const freertos_stubs_t *frt, FILE *f) {
+    if (!frt || !f) return -1;
+
+    /* Save bump allocator state */
+    if (fwrite(&frt->bump_ptr, sizeof(frt->bump_ptr), 1, f) != 1) return -1;
+
+    /* Save tick configuration */
+    if (fwrite(&frt->cycles_per_tick, sizeof(frt->cycles_per_tick), 1, f) != 1) return -1;
+    if (fwrite(&frt->cpu_freq_mhz, sizeof(frt->cpu_freq_mhz), 1, f) != 1) return -1;
+
+    /* Save queue storage */
+    if (fwrite(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
+    if (fwrite(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
+
+    /* Save deferred task */
+    if (fwrite(&frt->deferred_task_fn, sizeof(frt->deferred_task_fn), 1, f) != 1) return -1;
+    if (fwrite(&frt->deferred_task_param, sizeof(frt->deferred_task_param), 1, f) != 1) return -1;
+
+    /* Save scheduler state */
+    if (fwrite(&frt->task_count, sizeof(frt->task_count), 1, f) != 1) return -1;
+    if (fwrite(frt->tasks, sizeof(frt->tasks), 1, f) != 1) return -1;
+    if (fwrite(frt->current_task, sizeof(frt->current_task), 1, f) != 1) return -1;
+    if (fwrite(&frt->scheduler_started, sizeof(frt->scheduler_started), 1, f) != 1) return -1;
+    if (fwrite(frt->last_switch_cycle, sizeof(frt->last_switch_cycle), 1, f) != 1) return -1;
+
+    return 0;
+}
+
+int freertos_stubs_restore_state(freertos_stubs_t *frt, FILE *f) {
+    if (!frt || !f) return -1;
+
+    /* Restore bump allocator state */
+    if (fread(&frt->bump_ptr, sizeof(frt->bump_ptr), 1, f) != 1) return -1;
+
+    /* Restore tick configuration */
+    if (fread(&frt->cycles_per_tick, sizeof(frt->cycles_per_tick), 1, f) != 1) return -1;
+    if (fread(&frt->cpu_freq_mhz, sizeof(frt->cpu_freq_mhz), 1, f) != 1) return -1;
+
+    /* Restore queue storage */
+    if (fread(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
+    if (fread(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
+
+    /* Restore deferred task */
+    if (fread(&frt->deferred_task_fn, sizeof(frt->deferred_task_fn), 1, f) != 1) return -1;
+    if (fread(&frt->deferred_task_param, sizeof(frt->deferred_task_param), 1, f) != 1) return -1;
+
+    /* Restore scheduler state */
+    if (fread(&frt->task_count, sizeof(frt->task_count), 1, f) != 1) return -1;
+    if (fread(frt->tasks, sizeof(frt->tasks), 1, f) != 1) return -1;
+    if (fread(frt->current_task, sizeof(frt->current_task), 1, f) != 1) return -1;
+    if (fread(&frt->scheduler_started, sizeof(frt->scheduler_started), 1, f) != 1) return -1;
+    if (fread(frt->last_switch_cycle, sizeof(frt->last_switch_cycle), 1, f) != 1) return -1;
+
+    return 0;
+}

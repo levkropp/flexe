@@ -1,6 +1,7 @@
 #ifndef FREERTOS_STUBS_H
 #define FREERTOS_STUBS_H
 
+#include <stdio.h>
 #include "xtensa.h"
 #include "elf_symbols.h"
 
@@ -45,5 +46,11 @@ bool freertos_stubs_check_preempt(freertos_stubs_t *frt);
 
 /* Per-core preemption check for dual-core mode */
 bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id);
+
+/* Save FreeRTOS state to file (for checkpoint/restore) */
+int freertos_stubs_save_state(const freertos_stubs_t *frt, FILE *f);
+
+/* Restore FreeRTOS state from file (for checkpoint/restore) */
+int freertos_stubs_restore_state(freertos_stubs_t *frt, FILE *f);
 
 #endif /* FREERTOS_STUBS_H */

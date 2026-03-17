@@ -39,6 +39,7 @@ set(LIB_SOURCES
     src/aes_stubs.c
     src/mpi_stubs.c
     src/flexe_session.c
+    src/savestate.c
 )
 
 if(MSVC)
