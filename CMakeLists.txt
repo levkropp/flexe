@@ -71,6 +71,14 @@ set(LIB_SOURCES
     src/hierarchical_trace.c
 )
 
+# JIT compiler: x86-64 only, non-MSVC
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    list(APPEND LIB_SOURCES src/jit.c)
+    message(STATUS "JIT compiler enabled (x86-64)")
+else()
+    message(STATUS "JIT compiler disabled (requires x86-64, non-MSVC)")
+endif()
+
 if(MSVC)
     list(APPEND LIB_SOURCES src/msvc_compat.c)
 endif()
@@ -96,7 +104,7 @@ else()
         PREDECODE_FLASH_MB=${PREDECODE_FLASH_MB})
 
     # Disable stack protector on hot-path files (saves ~3-4% from canary checks)
-    set_source_files_properties(src/xtensa.c src/memory.c
+    set_source_files_properties(src/xtensa.c src/memory.c src/jit.c
         PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 endif()
 

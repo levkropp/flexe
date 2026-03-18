@@ -11,6 +11,9 @@
 #include "freertos_stubs.h"
 #include "savestate.h"
 #include "hierarchical_trace.h"
+#ifndef _MSC_VER
+#include "jit.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -615,6 +618,9 @@ int main(int argc, char *argv[]) {
     int single_core = 0;
     int htrace_enabled = 0;
     int audit_unhooked = 0;
+    int jit_enabled = 0;
+    int jit_stats_enabled = 0;
+    int jit_verify = 0;
     uint64_t heartbeat_interval = 0;
     uint64_t trace_start = 0, trace_end = UINT64_MAX;
     /* Checkpoint options */
@@ -641,12 +647,24 @@ int main(int argc, char *argv[]) {
             memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
             continue;
+        } else if (strcmp(argv[i], "--jit-stats") == 0) {
+            jit_stats_enabled = 1;
+            memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--jit-verify") == 0) {
+            jit_enabled = 1;
+            jit_stats_enabled = 1;
+            jit_verify = 1;
+            memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
         }
         i++;
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:HU")) != -1) {
+    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:HUJ")) != -1) {
         switch (opt) {
         case '1': single_core = 1; break;
         case 'c': max_cycles = strtoll(optarg, NULL, 10); break;
@@ -720,6 +738,7 @@ int main(int argc, char *argv[]) {
         case 'P': heartbeat_interval = strtoull(optarg, NULL, 0); break;
         case 'H': htrace_enabled = 1; break;
         case 'U': audit_unhooked = 1; break;
+        case 'J': jit_enabled = 1; break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -901,6 +920,24 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Breakpoint set at 0x%08X (%s)\n", bp_addr, sym_buf);
         }
     }
+
+    /* Initialize JIT if requested */
+#ifndef _MSC_VER
+    jit_state_t *jit = NULL;
+    if (jit_enabled) {
+        jit = jit_init();
+        if (!jit) {
+            fprintf(stderr, "Failed to initialize JIT compiler\n");
+            jit_enabled = 0;
+        } else if (jit_verify) {
+            jit_set_verify(jit, true);
+            fprintf(stderr, "[JIT] Differential verification enabled\n");
+        }
+    }
+#else
+    (void)jit_enabled;
+    (void)jit_stats_enabled;
+#endif
 
     /* ===== Execute ===== */
     uint64_t cycles = 0;
@@ -1096,7 +1133,13 @@ int main(int argc, char *argv[]) {
                 uint64_t to_window = trace_start - cpu->cycle_count;
                 if (to_window < (uint64_t)n) n = (int)to_window;
             }
-            int ran = xtensa_run(cpu, n);
+            int ran;
+#ifndef _MSC_VER
+            if (jit)
+                ran = jit_run(jit, cpu, n);
+            else
+#endif
+                ran = xtensa_run(cpu, n);
             cycles += ran;
 
             /* Event log: check exception after batch */
@@ -1378,6 +1421,15 @@ int main(int argc, char *argv[]) {
     if (g_htrace) {
         htrace_print_stats(g_htrace, stderr);
     }
+
+    /* JIT cleanup and stats */
+#ifndef _MSC_VER
+    if (jit) {
+        if (jit_stats_enabled)
+            jit_print_stats(jit);
+        jit_destroy(jit);
+    }
+#endif
 
     /* Cleanup */
     ring_destroy(g_ring);
