@@ -13,6 +13,7 @@ endif()
 #   2. ./build-pgo/xtensa-emu -q -c 100000000 -s firmware.elf firmware.bin
 #   3. cmake -B build-pgo -DPGO=use && cmake --build build-pgo
 option(PGO "PGO mode: 'generate' to collect profiles, 'use' to apply them" "")
+set(PREDECODE_FLASH_MB "2" CACHE STRING "Pre-decode table flash coverage in MB (0=disabled, 2/4/8/16)")
 
 # LTO and native tuning for Release builds (GCC/Clang only)
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
@@ -85,11 +86,14 @@ if(MSVC)
         OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB Threads::Threads)
     target_compile_options(xtensa-emu-lib PRIVATE /W4 /wd4100 /wd4244 /wd4267 /MP)
     target_compile_definitions(xtensa-emu-lib PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(xtensa-emu-lib PUBLIC PREDECODE_FLASH_MB=${PREDECODE_FLASH_MB})
 else()
     target_link_libraries(xtensa-emu-lib PUBLIC
         m z Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
     target_compile_options(xtensa-emu-lib PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+    target_compile_definitions(xtensa-emu-lib PUBLIC
+        PREDECODE_FLASH_MB=${PREDECODE_FLASH_MB})
 
     # Disable stack protector on hot-path files (saves ~3-4% from canary checks)
     set_source_files_properties(src/xtensa.c src/memory.c

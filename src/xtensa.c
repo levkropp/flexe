@@ -5,6 +5,7 @@
 #include "xtensa.h"
 #include "memory.h"
 #include "rom_stubs.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -104,6 +105,39 @@ int xtensa_fetch_inline(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_o
 /* External version for disasm/trace callers (not performance-critical) */
 int xtensa_fetch(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out) {
     return xtensa_fetch_inline(cpu, addr, insn_out);
+}
+
+/* Pre-decode entire instruction memory at load time.
+ * Replaces per-instruction page_table lookup + byte assembly with
+ * a single indexed load from a flat array. */
+void xtensa_predecode_build(xtensa_cpu_t *cpu) {
+#if PREDECODE_SIZE == 0
+    (void)cpu;
+    return;
+#else
+    if (!cpu->predecode) {
+        size_t sz = (size_t)PREDECODE_SIZE * sizeof(uint32_t);
+        cpu->predecode = calloc(PREDECODE_SIZE, sizeof(uint32_t));
+        if (!cpu->predecode) {
+            fprintf(stderr, "[predecode] Failed to allocate %zu MB table\n",
+                    sz / (1024*1024));
+            return;
+        }
+    }
+
+    memset(cpu->predecode, 0, PREDECODE_SIZE * sizeof(uint32_t));
+    uint32_t count = 0;
+    for (uint32_t addr = PREDECODE_BASE; addr < PREDECODE_END; addr++) {
+        uint32_t insn;
+        int ilen = xtensa_fetch_inline(cpu, addr, &insn);
+        if (ilen > 0) {
+            cpu->predecode[addr - PREDECODE_BASE] = PREDECODE_PACK(insn, (uint32_t)ilen);
+            count++;
+        }
+    }
+    fprintf(stderr, "[predecode] Built table: %u entries, %u MB (%u MB flash coverage)\n",
+            count, (uint32_t)(PREDECODE_SIZE * 4 / (1024*1024)), PREDECODE_FLASH_MB);
+#endif
 }
 
 /* ===== Special Register Access ===== */
@@ -1956,12 +1990,31 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
         }
     }
 
-    int ilen = xtensa_fetch_inline(cpu, cpu->pc, &insn);
+    int ilen;
+#if PREDECODE_SIZE > 0
+    /* Pre-decoded instruction table: single indexed load replaces
+     * page_table lookup + byte assembly + ilen determination. */
+    if (__builtin_expect(cpu->predecode != NULL, 1)) {
+        uint32_t pc_off = cpu->pc - PREDECODE_BASE;
+        if (__builtin_expect(pc_off < PREDECODE_SIZE, 1)) {
+            uint32_t packed = cpu->predecode[pc_off];
+            if (__builtin_expect(packed != 0, 1)) {
+                insn = PREDECODE_INSN(packed);
+                ilen = (int)PREDECODE_ILEN(packed);
+                goto have_insn;
+            }
+        }
+    }
+#endif
+    ilen = xtensa_fetch_inline(cpu, cpu->pc, &insn);
     if (__builtin_expect(ilen == 0, 0)) {
         xtensa_raise_exception(cpu, EXCCAUSE_IFETCH_ERROR, cpu->pc, 0);
         if (cpu->exception) return -1;
         return 0;
     }
+#if PREDECODE_SIZE > 0
+have_insn:
+#endif
 
     cpu->_pc_written = false;
     cpu->pc += (uint32_t)ilen;

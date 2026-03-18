@@ -12,6 +12,37 @@ typedef struct xtensa_cpu xtensa_cpu_t;
 /* PC hook: return non-zero to skip normal fetch/execute for this cycle */
 typedef int (*xtensa_pc_hook_fn)(xtensa_cpu_t *cpu, uint32_t pc, void *ctx);
 
+/* Pre-decoded instruction table: entire firmware decoded at load time.
+ * Direct-indexed by (pc - PREDECODE_BASE), no tags, no cache misses.
+ * Packed: bits 0-23 = instruction word, bits 24-25 = ilen (2 or 3).
+ * 0 = invalid/not-decoded (unmapped memory).
+ *
+ * PREDECODE_END controls the flash size coverage. Benchmark with:
+ *   -DPREDECODE_FLASH_MB=4  (default, covers 4MB flash = 20MB table)
+ *   -DPREDECODE_FLASH_MB=2  (2MB flash = 12MB table)
+ *   -DPREDECODE_FLASH_MB=8  (8MB flash = 36MB table)
+ *   -DPREDECODE_FLASH_MB=16 (16MB flash = 68MB table)
+ *   -DPREDECODE_FLASH_MB=0  (disabled — no predecode table)
+ */
+#define PREDECODE_BASE  0x40000000u
+
+#ifndef PREDECODE_FLASH_MB
+#define PREDECODE_FLASH_MB 4
+#endif
+
+#if PREDECODE_FLASH_MB > 0
+/* PREDECODE_END = flash_base + flash_MB * 1048576 */
+#define PREDECODE_END   (0x400D0000u + (PREDECODE_FLASH_MB * 0x100000u))
+#define PREDECODE_SIZE  (PREDECODE_END - PREDECODE_BASE)
+#else
+#define PREDECODE_END   PREDECODE_BASE
+#define PREDECODE_SIZE  0u
+#endif
+
+#define PREDECODE_PACK(insn, ilen) ((insn) | ((uint32_t)(ilen) << 24))
+#define PREDECODE_INSN(packed)     ((packed) & 0x00FFFFFFu)
+#define PREDECODE_ILEN(packed)     ((packed) >> 24)
+
 /*
  * Special Register Numbers (for RSR/WSR/XSR)
  */
@@ -216,6 +247,7 @@ struct xtensa_cpu {
     xtensa_pc_hook_fn pc_hook;          /* PC hook (for ROM stubs etc.) */
     void             *pc_hook_ctx;
     const uint64_t   *pc_hook_bitmap;   /* Fast-path bitmap: skip hook if bit not set */
+    uint32_t         *predecode;        /* Pre-decoded instruction table (heap, 20MB) */
     uint32_t windowstart;               /* SR 73: Bitmask of valid windows */
 
     /* ================================================================
@@ -350,6 +382,7 @@ void     sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val);
  */
 void xtensa_cpu_init(xtensa_cpu_t *cpu);
 void xtensa_cpu_reset(xtensa_cpu_t *cpu);
+void xtensa_predecode_build(xtensa_cpu_t *cpu);  /* Pre-decode instruction memory */
 int  xtensa_step(xtensa_cpu_t *cpu);
 int  xtensa_run(xtensa_cpu_t *cpu, int max_cycles);
 int  xtensa_disasm(const xtensa_cpu_t *cpu, uint32_t addr, char *buf, int bufsize);
