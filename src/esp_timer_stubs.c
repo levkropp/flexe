@@ -41,6 +41,10 @@ struct esp_timer_stubs {
 
     /* Bump allocator for timer handles */
     uint32_t bump_ptr;
+
+    /* If true, use virtual time for millis/micros/esp_timer_get_time
+     * instead of host wall-clock (native FreeRTOS mode) */
+    int use_virtual_time;
 };
 
 #define TIMER_BUMP_BASE  0x3FFE8000u
@@ -264,11 +268,11 @@ void stub_esp_timer_delete(xtensa_cpu_t *cpu, void *ctx) {
 }
 
 /* esp_timer_get_time() -> int64_t microseconds (returned in a2:a3).
- * Returns host wall-clock elapsed time so firmware gettimeofday() (which
- * calls esp_timer_get_time internally) tracks real time. */
+ * In stub mode: host wall-clock so firmware gettimeofday() tracks real time.
+ * In native mode: virtual time so timing is deterministic. */
 void stub_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint64_t us = host_elapsed_us(et);
+    uint64_t us = et->use_virtual_time ? current_time_us(et) : host_elapsed_us(et);
     /* Return 64-bit value: low in a2, high in a3 */
     int ci = XT_PS_CALLINC(cpu->ps);
     if (ci > 0) {
@@ -324,20 +328,18 @@ void stub_esp_timer_init(xtensa_cpu_t *cpu, void *ctx) {
     et_return(cpu, ESP_OK);
 }
 
-/* millis() — return host wall-clock elapsed milliseconds since boot.
- * Uses real time so firmware elapsed-time displays track the wall clock
- * instead of fast-forwarded virtual time from vTaskDelay. */
+/* millis() — in stub mode: host wall-clock. In native mode: virtual time. */
 void stub_millis(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint32_t ms = (uint32_t)(host_elapsed_us(et) / 1000);
-    et_return(cpu, ms);
+    uint64_t us = et->use_virtual_time ? current_time_us(et) : host_elapsed_us(et);
+    et_return(cpu, (uint32_t)(us / 1000));
 }
 
-/* micros() — return host wall-clock elapsed microseconds as uint32_t */
+/* micros() — in stub mode: host wall-clock. In native mode: virtual time. */
 void stub_micros(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint32_t us = (uint32_t)host_elapsed_us(et);
-    et_return(cpu, us);
+    uint64_t us = et->use_virtual_time ? current_time_us(et) : host_elapsed_us(et);
+    et_return(cpu, (uint32_t)us);
 }
 
 /* delay(ms) — advance virtual time, dispatch timers */
@@ -408,4 +410,8 @@ int esp_timer_stubs_hook_symbols(esp_timer_stubs_t *et, const elf_symbols_t *sym
 
 int esp_timer_stubs_timer_count(const esp_timer_stubs_t *et) {
     return et ? et->timer_count : 0;
+}
+
+void esp_timer_stubs_set_virtual_time(esp_timer_stubs_t *et, int enable) {
+    if (et) et->use_virtual_time = enable;
 }

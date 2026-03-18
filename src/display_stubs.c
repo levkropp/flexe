@@ -3,6 +3,7 @@
 #include "memory.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 /* Display dimensions */
 #define DISP_W 320
 #define DISP_H 240
@@ -2173,10 +2174,8 @@ typedef struct {
 /* LVGL 8.x/9.x: lv_display_flush_ready(lv_display_t *disp)
  * LVGL 7.x: lv_disp_flush_ready(lv_disp_drv_t *disp_drv)
  * Called by flush callback to signal completion. We're instant, so just return. */
-static void stub_lv_display_flush_ready(xtensa_cpu_t *cpu, void *ctx) {
-    /* No-op: emulator flush is instantaneous */
-    ds_return_void(cpu);
-}
+/* lv_disp_flush_ready is no longer hooked — firmware must run it to clear
+ * LVGL's internal flushing flags so rendering advances to the next strip. */
 
 /* Generic LVGL flush callback handler for versions 7.x, 8.x, 9.x
  * Signature (all versions): void flush_cb(void *disp, const lv_area_t *area, lv_color_t *color_p)
@@ -2189,60 +2188,48 @@ static void stub_lv_display_flush_ready(xtensa_cpu_t *cpu, void *ctx) {
  * This intercepts user-defined flush callbacks and copies LVGL's framebuffer
  * data to our emulator framebuffer.
  */
-static void stub_lv_flush_cb_generic(xtensa_cpu_t *cpu, void *ctx) {
+/* Spy-mode flush callback: copies LVGL pixel data to emulator framebuffer
+ * WITHOUT returning. The firmware's flush callback still executes normally
+ * (calling lv_disp_flush_ready to signal LVGL), because this is registered
+ * as a spy hook — it observes arguments, copies pixels, then the interpreter
+ * executes the original firmware function. */
+static void stub_lv_flush_cb_spy(xtensa_cpu_t *cpu, void *ctx) {
     display_stubs_t *ds = ctx;
 
-    /* Read flush callback arguments */
-    uint32_t area_ptr = ds_arg(cpu, 1);   /* lv_area_t pointer */
-    uint32_t color_ptr = ds_arg(cpu, 2);  /* RGB565 buffer pointer */
+    uint32_t drv_ptr = ds_arg(cpu, 0);
+    uint32_t area_ptr = ds_arg(cpu, 1);
+    uint32_t color_ptr = ds_arg(cpu, 2);
 
-    if (!area_ptr || !color_ptr) {
-        ds_return_void(cpu);
-        return;
-    }
+    if (area_ptr && color_ptr) {
+        xtensa_mem_t *mem = cpu->mem;
+        int16_t x1 = (int16_t)mem_read16(mem, area_ptr + 0);
+        int16_t y1 = (int16_t)mem_read16(mem, area_ptr + 2);
+        int16_t x2 = (int16_t)mem_read16(mem, area_ptr + 4);
+        int16_t y2 = (int16_t)mem_read16(mem, area_ptr + 6);
 
-    /* Read lv_area_t bounds (8 bytes: x1, y1, x2, y2) */
-    xtensa_mem_t *mem = cpu->mem;
-    int16_t x1 = (int16_t)mem_read16(mem, area_ptr + 0);
-    int16_t y1 = (int16_t)mem_read16(mem, area_ptr + 2);
-    int16_t x2 = (int16_t)mem_read16(mem, area_ptr + 4);
-    int16_t y2 = (int16_t)mem_read16(mem, area_ptr + 6);
-
-    /* Bounds check */
-    if (x1 < 0 || x2 < x1 || x2 >= ds->width ||
-        y1 < 0 || y2 < y1 || y2 >= ds->height) {
-        ds_return_void(cpu);
-        return;
-    }
-
-    /* Copy LVGL's RGB565 buffer to emulator framebuffer */
-    if (ds->framebuf && ds->framebuf_mtx) {
-        pthread_mutex_lock(ds->framebuf_mtx);
-
-        /* LVGL provides a contiguous buffer for the rectangular region.
-         * Copy it row by row into the framebuffer. */
-        uint32_t src_ptr = color_ptr;
-
-        for (int y = y1; y <= y2; y++) {
-            for (int x = x1; x <= x2; x++) {
-                uint16_t color = mem_read16(mem, src_ptr);
-                ds->framebuf[y * ds->width + x] = color;
-                src_ptr += 2;  /* RGB565 is 2 bytes per pixel */
+        if (x1 >= 0 && x2 >= x1 && x2 < ds->width &&
+            y1 >= 0 && y2 >= y1 && y2 < ds->height) {
+            if (ds->framebuf && ds->framebuf_mtx) {
+                pthread_mutex_lock(ds->framebuf_mtx);
+                uint32_t src_ptr = color_ptr;
+                for (int y = y1; y <= y2; y++) {
+                    for (int x = x1; x <= x2; x++) {
+                        ds->framebuf[y * ds->width + x] = mem_read16(mem, src_ptr);
+                        src_ptr += 2;
+                    }
+                }
+                pthread_mutex_unlock(ds->framebuf_mtx);
             }
         }
 
-        pthread_mutex_unlock(ds->framebuf_mtx);
+        /* Clear LVGL's flushing flags (replaces lv_disp_flush_ready).
+         * draw_buf at drv+12, flushing at draw_buf+16, flushing_last at +20. */
+        uint32_t draw_buf_ptr = mem_read32(mem, drv_ptr + 12);
+        if (draw_buf_ptr) {
+            mem_write32(mem, draw_buf_ptr + 16, 0);
+            mem_write32(mem, draw_buf_ptr + 20, 0);
+        }
     }
-
-    /* Call lv_display_flush_ready() automatically.
-     * In LVGL, the flush callback must call this to signal completion.
-     * Since we're emulating, we call it immediately. */
-
-    /* For LVGL 8.x/9.x: lv_display_flush_ready(disp)
-     * For LVGL 7.x: lv_disp_flush_ready(disp_drv)
-     * Both take the first argument (disp pointer) which we have in a2.
-     * We'll make a synthetic call to the stub. */
-    stub_lv_display_flush_ready(cpu, ctx);
 
     ds_return_void(cpu);
 }
@@ -2259,15 +2246,25 @@ static int scan_for_flush_callback(const char *name, uint32_t addr, uint32_t siz
     (void)size;  /* unused */
     struct flush_scan_ctx *scan_ctx = ctx;
 
+    /* Skip LVGL internal functions — we want to hook user flush callbacks,
+     * not LVGL's internal dispatcher or state management functions. */
+    if (strcmp(name, "call_flush_cb") == 0 ||
+        strncmp(name, "lv_refr_", 8) == 0 ||
+        strstr(name, "flush_ready") != NULL ||
+        strncmp(name, "lv_disp_", 8) == 0 ||
+        strncmp(name, "lv_display_", 11) == 0) {
+        return 0;  /* skip */
+    }
+
     /* Pattern 1: ends with "_flush_cb" or "_flush" */
     size_t len = strlen(name);
     if (len > 9 && strcmp(name + len - 9, "_flush_cb") == 0) {
-        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_generic, name, scan_ctx->ds);
+        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
         scan_ctx->hooked++;
         return 0;  /* continue scanning */
     }
     if (len > 6 && strcmp(name + len - 6, "_flush") == 0) {
-        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_generic, name, scan_ctx->ds);
+        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
         scan_ctx->hooked++;
         return 0;
     }
@@ -2282,7 +2279,7 @@ static int scan_for_flush_callback(const char *name, uint32_t addr, uint32_t siz
             strstr(name, "lvgl") != NULL ||
             strstr(name, "lv_") != NULL ||
             strstr(name, "display") != NULL) {
-            rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_generic, name, scan_ctx->ds);
+            rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
             scan_ctx->hooked++;
         }
     }
@@ -2299,25 +2296,10 @@ int display_stubs_hook_lvgl(display_stubs_t *ds, const elf_symbols_t *syms) {
 
     int hooked = 0;
 
-    /* Hook LVGL API functions (both 7.x and 8.x/9.x) */
-    struct {
-        const char *name;
-        rom_stub_fn fn;
-    } api_hooks[] = {
-        /* LVGL 8.x/9.x: lv_display_flush_ready(lv_display_t *) */
-        { "lv_display_flush_ready", stub_lv_display_flush_ready },
-        /* LVGL 7.x: lv_disp_flush_ready(lv_disp_drv_t *) */
-        { "lv_disp_flush_ready",    stub_lv_display_flush_ready },
-        { NULL, NULL }
-    };
-
-    for (int i = 0; api_hooks[i].name; i++) {
-        uint32_t addr;
-        if (elf_symbols_find(syms, api_hooks[i].name, &addr) == 0) {
-            rom_stubs_register_ctx(rom, addr, api_hooks[i].fn, api_hooks[i].name, ds);
-            hooked++;
-        }
-    }
+    /* Do NOT hook lv_disp_flush_ready / lv_display_flush_ready.
+     * These clear LVGL's internal flushing flags — if we intercept them,
+     * LVGL thinks the flush is still in progress and never advances to
+     * the next screen region. Let the firmware handle flush_ready. */
 
     /* Hook common user-defined flush callback names.
      * These vary by project, so we scan for patterns. */
@@ -2326,15 +2308,15 @@ int display_stubs_hook_lvgl(display_stubs_t *ds, const elf_symbols_t *syms) {
         rom_stub_fn fn;
     } flush_patterns[] = {
         /* Common patterns in ESP32/LVGL projects */
-        { "my_disp_flush",          stub_lv_flush_cb_generic },
-        { "disp_flush",             stub_lv_flush_cb_generic },
-        { "tft_flush",              stub_lv_flush_cb_generic },
-        { "lcd_flush",              stub_lv_flush_cb_generic },
-        { "display_flush_cb",       stub_lv_flush_cb_generic },
-        { "lvgl_flush_cb",          stub_lv_flush_cb_generic },
-        { "lv_flush_cb",            stub_lv_flush_cb_generic },
+        { "my_disp_flush",          stub_lv_flush_cb_spy },
+        { "disp_flush",             stub_lv_flush_cb_spy },
+        { "tft_flush",              stub_lv_flush_cb_spy },
+        { "lcd_flush",              stub_lv_flush_cb_spy },
+        { "display_flush_cb",       stub_lv_flush_cb_spy },
+        { "lvgl_flush_cb",          stub_lv_flush_cb_spy },
+        { "lv_flush_cb",            stub_lv_flush_cb_spy },
         /* Marauder-specific (if it uses LVGL) */
-        { "marauder_disp_flush",    stub_lv_flush_cb_generic },
+        { "marauder_disp_flush",    stub_lv_flush_cb_spy },
         { NULL, NULL }
     };
 

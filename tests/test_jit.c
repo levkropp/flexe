@@ -420,7 +420,11 @@ TEST(test_jit_init_destroy) {
 TEST(test_jit_hot_threshold) {
     xtensa_cpu_t cpu;
     setup(&cpu);
-    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3)); /* NOP.N: op0=0xD, r=15, t=3 */
+    /* Need >= 4 instructions (minimum JIT block size) */
+    put_insn2(&cpu, BASE,     narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 2, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 4, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 6, narrow(0xD, 15, 0, 3)); /* NOP.N */
 
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);

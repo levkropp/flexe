@@ -580,4 +580,84 @@ static inline void emit_store32_sib(emit_t *e, int src, int base, int index, int
     emit32(e, (uint32_t)disp);
 }
 
+/* ===== Additional helpers for block chaining / regalloc / window ops ===== */
+
+/* cmp reg32, [base64 + disp32] */
+static inline void emit_cmp32_mem(emit_t *e, int reg, int base, int32_t disp) {
+    emit_rex(e, 0, reg, base);
+    emit8(e, 0x3B);
+    if ((base & 7) == RSP) {
+        emit8(e, modrm(2, reg, RSP));
+        emit8(e, sib(0, RSP, RSP));
+    } else {
+        emit8(e, modrm(2, reg, base));
+    }
+    emit32(e, (uint32_t)disp);
+}
+
+/* or reg32, imm32 */
+static inline void emit_or_reg32_imm32(emit_t *e, int reg, int32_t imm) {
+    emit_rex(e, 0, 0, reg);
+    emit8(e, 0x81);
+    emit8(e, modrm(3, 1, reg));
+    emit32(e, (uint32_t)imm);
+}
+
+/* not reg32 */
+static inline void emit_not_reg32(emit_t *e, int reg) {
+    emit_rex(e, 0, 0, reg);
+    emit8(e, 0xF7);
+    emit8(e, modrm(3, 2, reg));
+}
+
+/* popcnt reg32, reg32 — F3 0F B8 /r */
+static inline void emit_popcnt(emit_t *e, int dst, int src) {
+    emit8(e, 0xF3);
+    emit_rex(e, 0, dst, src);
+    emit8(e, 0x0F);
+    emit8(e, 0xB8);
+    emit8(e, modrm(3, dst, src));
+}
+
+/* bt reg32, reg32 — 0F A3 /r (tests bit src in reg) */
+static inline void emit_bt_reg_reg(emit_t *e, int reg, int bit_reg) {
+    emit_rex(e, 0, bit_reg, reg);
+    emit8(e, 0x0F);
+    emit8(e, 0xA3);
+    emit8(e, modrm(3, bit_reg, reg));
+}
+
+/* or [base64 + disp32], reg32 */
+static inline void emit_or_mem32_reg(emit_t *e, int base, int32_t disp, int src) {
+    emit_rex(e, 0, src, base);
+    emit8(e, 0x09);
+    if ((base & 7) == RSP) {
+        emit8(e, modrm(2, src, RSP));
+        emit8(e, sib(0, RSP, RSP));
+    } else {
+        emit8(e, modrm(2, src, base));
+    }
+    emit32(e, (uint32_t)disp);
+}
+
+/* and [base64 + disp32], reg32 */
+static inline void emit_and_mem32_reg(emit_t *e, int base, int32_t disp, int src) {
+    emit_rex(e, 0, src, base);
+    emit8(e, 0x21);
+    if ((base & 7) == RSP) {
+        emit8(e, modrm(2, src, RSP));
+        emit8(e, sib(0, RSP, RSP));
+    } else {
+        emit8(e, modrm(2, src, base));
+    }
+    emit32(e, (uint32_t)disp);
+}
+
+/* jmp to absolute address via rel32 (caller computes offset) */
+static inline void emit_jmp_rel32_to(emit_t *e, uint8_t *target) {
+    emit8(e, 0xE9);
+    int32_t rel = (int32_t)(target - (e->ptr + 4));
+    emit32(e, (uint32_t)rel);
+}
+
 #endif /* JIT_EMIT_X64_H */

@@ -10,7 +10,7 @@ cd flexe
 cmake -S . -B build
 cmake --build build
 ./build/xtensa-emu          # Run emulator
-./build/xtensa-tests        # Run test suite (459 tests)
+./build/xtensa-tests        # Run test suite (495 tests)
 ./build/xt-dis <file> [addr] # Disassemble binary
 ./build/trace-filter         # Post-process verbose trace output
 ```
@@ -64,6 +64,7 @@ cmake --build build
 | `-S file.img` | SD card backing image |
 | `-Z bytes` | SD card size |
 | `-1` | Single-core mode (disable APP_CPU/Core 1) |
+| `-N` | Native FreeRTOS: firmware runs its own scheduler (removes FreeRTOS stubs, enables interrupt matrix) |
 | `--checkpoint-interval N` | Auto-save checkpoint every N cycles |
 | `--checkpoint-dir PATH` | Directory for checkpoint files (default: `.`) |
 | `--restore FILE` | Restore from checkpoint and resume execution |
@@ -121,7 +122,7 @@ Post-processes verbose trace (`-T`) output:
 ### Tests (`tests/`)
 | File | Purpose |
 |------|---------|
-| `test_main.c` | All 459 unit tests |
+| `test_main.c` | All 495 unit tests |
 
 ## Architecture
 
@@ -150,7 +151,7 @@ Post-processes verbose trace (`-T`) output:
 ### Unit Tests
 ```bash
 cd flexe/build
-./xtensa-tests        # Run 459 unit tests
+./xtensa-tests        # Run 495 unit tests
 ```
 
 ### FreeRTOS Testing

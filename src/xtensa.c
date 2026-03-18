@@ -47,12 +47,24 @@ static inline void xtensa_fire_timers(xtensa_cpu_t *cpu) {
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->core_id = 0;
+    cpu->next_timer_event = UINT32_MAX;  /* No timer pending until ccompare is written */
+
+    /* ESP32 CPU interrupt level table (matches hardware):
+     * Level 1: 0-5, 8-10, 12-13, 17-18
+     * Level 2: 19-21
+     * Level 3: 11, 15, 22-23, 27, 29
+     * Level 4: 24-25, 28, 30
+     * Level 5: 16, 26, 31
+     * Level 6: 14 (debug)
+     * Level 7: 7 (NMI — software, keep at 1 for compat) */
+    static const uint8_t esp32_int_level[32] = {
+        1, 1, 1, 1, 1, 1, 1, 1,   /* 0-7:   all level 1 (int 7 = software/NMI) */
+        1, 1, 1, 3, 1, 1, 6, 3,   /* 8-15:  11=L3, 14=debug(L6), 15=L3(CCOMPARE1) */
+        5, 1, 1, 2, 2, 2, 3, 3,   /* 16-23: 16=L5(CCOMPARE2), 19-21=L2, 22-23=L3 */
+        4, 4, 5, 3, 4, 3, 4, 5,   /* 24-31: see ESP32 TRM Table 1-4 */
+    };
     for (int i = 0; i < 32; i++)
-        cpu->int_level[i] = 1;
-    /* ESP32 timer interrupt level defaults */
-    cpu->int_level[6]  = 1;   /* CCOMPARE0 → level 1 */
-    cpu->int_level[15] = 3;   /* CCOMPARE1 → level 3 */
-    cpu->int_level[16] = 5;   /* CCOMPARE2 → level 5 */
+        cpu->int_level[i] = esp32_int_level[i];
 }
 
 
@@ -325,7 +337,7 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
     BRANCH_TO(cpu, vec);
 }
 
-#define EXCMLEVEL 1  /* ESP32 config */
+#define EXCMLEVEL 3  /* ESP32 XCHAL_EXCM_LEVEL=3: when EXCM=1, levels 1-3 masked */
 
 void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
     uint32_t pending = cpu->interrupt & cpu->intenable;

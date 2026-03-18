@@ -27,10 +27,21 @@
 typedef struct {
     uint32_t pc;            /* Guest PC (tag for collision detection) */
     void    *code;          /* Pointer into code cache (NULL = empty) */
+    void    *chain_entry;   /* Entry point for chained blocks (after prologue) */
     uint32_t exec_count;    /* Hot counter / execution count */
     uint16_t guest_insns;   /* Number of guest instructions in block */
     uint16_t flags;         /* Reserved */
 } jit_block_t;
+
+/* Block chaining: max pending chain slots */
+#define MAX_CHAIN_SLOTS  131072
+
+/* Chain slot: records a jmp site that targets a specific guest (pc, wb) */
+typedef struct {
+    uint32_t  target_pc;   /* guest PC this exit targets (0 = inactive) */
+    uint32_t  target_wb;   /* windowbase expected at target */
+    uint8_t  *jmp_site;    /* address of the 0xE9 byte to patch */
+} chain_slot_t;
 
 /* JIT statistics */
 typedef struct {
@@ -40,6 +51,7 @@ typedef struct {
     uint64_t insns_interp;      /* Guest insns executed via interpreter */
     uint64_t cache_flushes;
     uint64_t fallbacks;         /* Instructions that fell back to interpreter */
+    uint64_t chains_patched;    /* Block chain links patched */
 } jit_stats_t;
 
 /* Opaque JIT state */

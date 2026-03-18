@@ -546,6 +546,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -H              Hierarchical trace (16 levels, 64K entries/level, ~24MB RAM)\n");
     fprintf(stderr, "                  Optimized PC hook with ~15%% overhead\n");
     fprintf(stderr, "                  Ideal for debugging crashes in multi-billion cycle runs\n");
+    fprintf(stderr, "  -N              Native FreeRTOS: let firmware run its own scheduler\n");
+    fprintf(stderr, "                  Removes FreeRTOS stubs, enables interrupt matrix hardware\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -618,6 +620,7 @@ int main(int argc, char *argv[]) {
     int single_core = 0;
     int htrace_enabled = 0;
     int audit_unhooked = 0;
+    int native_freertos = 0;
     int jit_enabled = 0;
     int jit_stats_enabled = 0;
     int jit_verify = 0;
@@ -664,7 +667,7 @@ int main(int argc, char *argv[]) {
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:HUJ")) != -1) {
+    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:HUNJ")) != -1) {
         switch (opt) {
         case '1': single_core = 1; break;
         case 'c': max_cycles = strtoll(optarg, NULL, 10); break;
@@ -738,6 +741,7 @@ int main(int argc, char *argv[]) {
         case 'P': heartbeat_interval = strtoull(optarg, NULL, 0); break;
         case 'H': htrace_enabled = 1; break;
         case 'U': audit_unhooked = 1; break;
+        case 'N': native_freertos = 1; break;
         case 'J': jit_enabled = 1; break;
         default: usage(argv[0]); return 1;
         }
@@ -795,6 +799,7 @@ int main(int argc, char *argv[]) {
         .sdcard_size = sdcard_size,
         .entry_override = has_entry_override ? entry_override : 0,
         .single_core = single_core,
+        .native_freertos = native_freertos,
         .window_trace = window_trace,
         .spill_verify = spill_verify,
         .uart_cb = uart_stdout_cb,
@@ -813,6 +818,9 @@ int main(int argc, char *argv[]) {
     esp32_periph_t *periph = flexe_session_periph(session);
     esp32_rom_stubs_t *rom = flexe_session_rom(session);
     freertos_stubs_t *frt = flexe_session_frt(session);
+
+    if (native_freertos)
+        fprintf(stderr, "Native FreeRTOS mode (-N): firmware runs its own scheduler\n");
 
     /* Initialize hierarchical trace system */
     if (htrace_enabled) {
@@ -933,8 +941,10 @@ int main(int argc, char *argv[]) {
             jit_set_verify(jit, true);
             fprintf(stderr, "[JIT] Differential verification enabled\n");
         }
-        /* JIT blocks are dispatched from jit_run's own loop.
-         * No hook installation needed — keeps interpreter baseline fast. */
+        /* Install JIT as pc_hook so the interpreter dispatches JIT blocks
+         * transparently. Hot PCs get compiled and executed via the hook;
+         * cold code runs at full interpreter speed (1000-insn batches). */
+        jit_install_hook(jit, cpu);
     }
 #else
     (void)jit_enabled;
@@ -1114,7 +1124,7 @@ int main(int argc, char *argv[]) {
                 stop_reason = STOP_CPU_STOPPED;
                 break;
             }
-            if (cpu->pc == prev_pc && frt) {
+            if (cpu->pc == prev_pc && frt && !native_freertos) {
                 uint32_t param;
                 uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
                 if (fn) {
@@ -1160,7 +1170,7 @@ int main(int argc, char *argv[]) {
                 /* Check if we stopped for a good reason, or exception loop */
                 if (cpu->breakpoint_hit || cpu->halted || !cpu->running) break;
             }
-            if (cpu->pc == pc_before && frt) {
+            if (cpu->pc == pc_before && frt && !native_freertos) {
                 uint32_t param;
                 uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
                 if (fn) {
