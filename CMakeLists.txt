@@ -13,7 +13,7 @@ endif()
 #   2. ./build-pgo/xtensa-emu -q -c 100000000 -s firmware.elf firmware.bin
 #   3. cmake -B build-pgo -DPGO=use && cmake --build build-pgo
 option(PGO "PGO mode: 'generate' to collect profiles, 'use' to apply them" "")
-set(PREDECODE_FLASH_MB "2" CACHE STRING "Pre-decode table flash coverage in MB (0=disabled, 2/4/8/16)")
+set(PREDECODE_FLASH_MB "4" CACHE STRING "Pre-decode table flash coverage in MB (0=disabled, 2/4/8/16)")
 
 # LTO and native tuning for Release builds (GCC/Clang only)
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
