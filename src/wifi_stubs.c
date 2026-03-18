@@ -1,13 +1,13 @@
-#ifdef _MSC_VER
-#include "msvc_compat.h"
-#endif
-
 /*
  * wifi_stubs.c — lwip socket bridge to host TCP/IP
  *
  * Hooks lwip_* symbols in the firmware ELF and bridges them to real host
  * sockets, giving the emulated firmware actual network connectivity.
  */
+
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
 
 #include "wifi_stubs.h"
 #include "rom_stubs.h"
@@ -18,50 +18,39 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
-#ifdef _MSC_VER
-#include "msvc_compat.h"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+typedef int socklen_t;
+#define close(s)              closesocket(s)
+#define SHUT_RDWR             SD_BOTH
+/* Map fcntl non-blocking to ioctlsocket */
+static inline int fcntl(int fd, int cmd, ...)
+{
+    if (cmd == F_SETFL) {
+        va_list ap;
+        va_start(ap, cmd);
+        int flags = va_arg(ap, int);
+        va_end(ap);
+        unsigned long mode = (flags & O_NONBLOCK) ? 1 : 0;
+        return ioctlsocket(fd, FIONBIO, &mode);
+    }
+    return 0; /* F_GETFL: return 0, caller ORs in O_NONBLOCK */
+}
+/* Map poll() to WSAPoll() — Winsock2 provides WSAPOLLFD, POLLIN, etc. */
+#define poll(fds, nfds, timeout)  WSAPoll((fds), (nfds), (timeout))
 #else
 #include <unistd.h>
-#endif
 #include <fcntl.h>
-#ifdef _MSC_VER
-// Winsock included in msvc_compat.h
-#else
-#ifndef _MSC_VER
-#ifndef _MSC_VER
 #include <sys/socket.h>
-#endif
-#endif
-#ifndef _MSC_VER
-#endif
-#ifndef _MSC_VER
-#endif
-#endif
-#ifndef _MSC_VER
-#ifndef _MSC_VER
 #include <sys/ioctl.h>
-#endif
-#endif
-#ifndef _MSC_VER
 #include <sys/select.h>
-#endif
-#ifndef _MSC_VER
 #include <netinet/in.h>
-#endif
-#ifndef _MSC_VER
-#ifndef _MSC_VER
 #include <netdb.h>
-#endif
-#endif
-#ifndef _MSC_VER
-#ifndef _MSC_VER
 #include <arpa/inet.h>
-#endif
-#endif
-#ifndef _MSC_VER
 #include <poll.h>
-#else
-// poll.h not needed on Windows - using select()
 #endif
 
 #include <openssl/ssl.h>
