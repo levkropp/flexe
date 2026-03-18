@@ -1,24 +1,46 @@
+/*
+ * msvc_compat.h — POSIX compatibility shims for MSVC/Windows builds
+ *
+ * Provides usleep, clock_gettime, nanosleep, file operations, getopt,
+ * GCC builtins, and other POSIX functions unavailable on MSVC.
+ *
+ * Include this BEFORE any standard headers in files that use POSIX APIs.
+ * Guarded by _MSC_VER so it's a no-op on GCC/Clang.
+ */
 #ifndef MSVC_COMPAT_H
 #define MSVC_COMPAT_H
 
 #ifdef _MSC_VER
 
-// Prevent winsock.h from being included (use winsock2.h instead)
+/* Suppress MSVC warnings for standard POSIX function names */
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#pragma warning(disable: 4996)  /* deprecated POSIX names (_fileno, etc.) */
+#pragma warning(disable: 4100)  /* unreferenced formal parameter */
+#pragma warning(disable: 4244)  /* possible loss of data (int64 -> long) */
+#pragma warning(disable: 4267)  /* size_t -> int conversion */
+
+/* Prevent winsock.h from being included (use winsock2.h instead) */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 
-// MSVC doesn't have __attribute__
-#define __attribute__(x)
+#include <windows.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 
-// MSVC doesn't have __builtin_expect
+/* ---- GCC builtins ---- */
+
+#define __attribute__(x)
 #define __builtin_expect(expr, expected) (expr)
 
-// MSVC __builtin_isnan
 #include <float.h>
 #define __builtin_isnan _isnan
 
-// MSVC __builtin_ctz (count trailing zeros)
 #include <intrin.h>
 static inline int __builtin_ctz(unsigned int x) {
     unsigned long index;
@@ -26,54 +48,84 @@ static inline int __builtin_ctz(unsigned int x) {
     return (int)index;
 }
 
-// Unistd.h replacement for MSVC
-#include <io.h>
-#include <process.h>
-#include <time.h>
+/* ---- Types ---- */
 
-// Socket operations (Winsock) - MUST be before windows.h
-#pragma comment(lib, "ws2_32.lib")
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-
-#define usleep(x) Sleep((x)/1000)
-#define sleep(x) Sleep((x)*1000)
-
-// clock_gettime replacement for MSVC
-#ifndef CLOCK_MONOTONIC
-#define CLOCK_MONOTONIC 1
-#define CLOCK_REALTIME 0
-
-static inline int clock_gettime(int clk_id, struct timespec *tp) {
-    static LARGE_INTEGER frequency = {0};
-    LARGE_INTEGER counter;
-
-    if (frequency.QuadPart == 0) {
-        QueryPerformanceFrequency(&frequency);
-    }
-
-    QueryPerformanceCounter(&counter);
-
-    tp->tv_sec = (time_t)(counter.QuadPart / frequency.QuadPart);
-    tp->tv_nsec = (long)(((counter.QuadPart % frequency.QuadPart) * 1000000000LL) / frequency.QuadPart);
-
-    return 0;
-}
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef intptr_t ssize_t;
 #endif
 
-// POSIX strdup
-#define strdup _strdup
+typedef unsigned int useconds_t;
 
-// POSIX file operations
-#define read _read
-#define write _write
-#define close _close
-#define lseek _lseek
-#define ftruncate _chsize
-typedef long off_t;
+/* ---- usleep / sleep ---- */
 
-// access() mode constants
+static inline void usleep(unsigned int usec)
+{
+    DWORD ms = usec / 1000;
+    if (ms == 0 && usec > 0) ms = 1;
+    Sleep(ms);
+}
+
+#define sleep(x) Sleep((x)*1000)
+
+/* ---- nanosleep ---- */
+
+static inline int nanosleep(const struct timespec *req, struct timespec *rem)
+{
+    (void)rem;
+    DWORD ms = (DWORD)(req->tv_sec * 1000 + req->tv_nsec / 1000000);
+    if (ms == 0 && (req->tv_sec > 0 || req->tv_nsec > 0)) ms = 1;
+    Sleep(ms);
+    return 0;
+}
+
+/* ---- clock_gettime ---- */
+
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME  0
+#endif
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+
+static inline int clock_gettime(int clk_id, struct timespec *tp)
+{
+    if (clk_id == CLOCK_MONOTONIC) {
+        static LARGE_INTEGER frequency = {0};
+        LARGE_INTEGER counter;
+        if (frequency.QuadPart == 0)
+            QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&counter);
+        tp->tv_sec  = (long)(counter.QuadPart / frequency.QuadPart);
+        tp->tv_nsec = (long)((counter.QuadPart % frequency.QuadPart) * 1000000000LL
+                             / frequency.QuadPart);
+    } else {
+        /* CLOCK_REALTIME: Windows FILETIME -> Unix epoch */
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        t -= 116444736000000000ULL; /* 100-ns intervals from 1601 to 1970 */
+        tp->tv_sec  = (long)(t / 10000000ULL);
+        tp->tv_nsec = (long)((t % 10000000ULL) * 100);
+    }
+    return 0;
+}
+
+/* ---- File operations ---- */
+
+#include <io.h>
+#include <direct.h>
+#include <sys/stat.h>
+
+#define ftruncate(fd, sz)          _chsize_s((fd), (long long)(sz))
+#define fileno(f)                  _fileno(f)
+#define fseeko(f, off, whence)     _fseeki64((f), (long long)(off), (whence))
+#define mkdir(path, mode)          _mkdir(path)
+#define strdup                     _strdup
+#define popen                      _popen
+#define pclose                     _pclose
+
+/* access() mode constants */
 #ifndef F_OK
 #define F_OK 0
 #define X_OK 1
@@ -81,136 +133,108 @@ typedef long off_t;
 #define R_OK 4
 #endif
 
-// useconds_t for usleep
-typedef unsigned int useconds_t;
+/* ---- NORETURN ---- */
 
-// POSIX compatibility for sockets
-#define socklen_t int
-typedef int ssize_t;
-
-// fcntl flags
-#define F_GETFL 3
-#define F_SETFL 4
-#define O_NONBLOCK 1
-
-// Socket flags
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
-#ifndef MSG_DONTWAIT
-#define MSG_DONTWAIT 0
+#ifndef NORETURN
+#define NORETURN __declspec(noreturn)
 #endif
 
-// fcntl, ioctl, poll, nanosleep - implemented in msvc_compat.c
-int fcntl(int fd, int cmd, ...);
-int ioctl(int fd, unsigned long request, ...);
-int nanosleep(const struct timespec *req, struct timespec *rem);
+/* ---- String functions ---- */
 
-// poll structure for Windows
-#ifndef POLLIN
-#define POLLIN  0x0001
-#define POLLOUT 0x0004
-#define POLLERR 0x0008
+#define strncasecmp  _strnicmp
+#define strcasecmp   _stricmp
 
-struct pollfd {
-    int fd;
-    short events;
-    short revents;
-};
+/* ---- Signals ---- */
 
-int poll(struct pollfd *fds, int nfds, int timeout);
-#endif
-
-// strncasecmp and strcasecmp
-#define strncasecmp _strnicmp
-#define strcasecmp _stricmp
-
-// popen/pclose
-#define popen _popen
-#define pclose _pclose
-
-// fseeko (Windows uses _fseeki64 for large file support)
-#define fseeko _fseeki64
-
-// SIGPIPE doesn't exist on Windows
+#include <signal.h>
 #ifndef SIGPIPE
 #define SIGPIPE 13
 #endif
 
-// signal() stub - does nothing on Windows for SIGPIPE
-#include <signal.h>
-#ifndef SIG_IGN
-#define SIG_IGN ((void (*)(int))1)
-#endif
+/* ---- Socket compat (declarations only — wifi_stubs.c handles includes) ---- */
 
-// getopt implementation for MSVC
-#include <stdio.h>
-#include <string.h>
-#include <stdarg.h>
+#define MSG_NOSIGNAL  0
+#define MSG_DONTWAIT  0
+#define F_GETFL       3
+#define F_SETFL       4
+#define O_NONBLOCK    1
 
-extern char *optarg;
-extern int optind, opterr, optopt;
+/* ---- getopt (supports optional args via "T::") ---- */
 
-static char *optarg = NULL;
-static int optind = 1;
-static int opterr = 1;
-static int optopt = 0;
+static char *optarg;
+static int   optind = 1;
+static int   opterr = 1;
+static int   optopt;
 
-static inline int getopt(int argc, char *const argv[], const char *optstring) {
-    static int optpos = 1;
-    const char *arg;
-
-    optarg = NULL;
+static inline int getopt(int argc, char *const argv[], const char *optstring)
+{
+    static int sp = 1;
 
     if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0')
         return -1;
-
-    if (argv[optind][1] == '-' && argv[optind][2] == '\0') {
+    if (argv[optind][0] == '-' && argv[optind][1] == '-' && argv[optind][2] == '\0') {
         optind++;
         return -1;
     }
 
-    optopt = argv[optind][optpos];
-    const char *p = strchr(optstring, optopt);
+    int c = argv[optind][sp];
+    const char *cp = NULL;
 
-    if (p == NULL) {
-        if (opterr && *optstring != ':')
-            fprintf(stderr, "%s: illegal option -- %c\n", argv[0], optopt);
-        if (argv[optind][++optpos] == '\0') {
-            optind++;
-            optpos = 1;
-        }
+    for (const char *p = optstring; *p; p++) {
+        if (*p == c) { cp = p; break; }
+    }
+
+    if (!cp || c == ':') {
+        optopt = c;
+        if (opterr) fprintf(stderr, "%s: unknown option '-%c'\n", argv[0], c);
+        if (argv[optind][++sp] == '\0') { optind++; sp = 1; }
         return '?';
     }
 
-    if (p[1] == ':') {
-        if (argv[optind][optpos + 1] != '\0') {
-            optarg = &argv[optind][optpos + 1];
+    if (cp[1] == ':') {
+        if (cp[2] == ':') {
+            /* Optional argument (e.g., "T::") */
+            if (argv[optind][sp + 1] != '\0')
+                optarg = &argv[optind][sp + 1];
+            else
+                optarg = NULL;
             optind++;
-            optpos = 1;
-        } else if (optind + 1 < argc) {
-            optarg = argv[++optind];
-            optind++;
-            optpos = 1;
+            sp = 1;
         } else {
-            if (opterr && *optstring != ':')
-                fprintf(stderr, "%s: option requires an argument -- %c\n", argv[0], optopt);
-            if (argv[optind][++optpos] == '\0') {
+            /* Required argument */
+            if (argv[optind][sp + 1] != '\0') {
+                optarg = &argv[optind][sp + 1];
+            } else if (++optind < argc) {
+                optarg = argv[optind];
+            } else {
+                optopt = c;
+                if (opterr)
+                    fprintf(stderr, "%s: option '-%c' requires an argument\n", argv[0], c);
+                sp = 1;
                 optind++;
-                optpos = 1;
+                return optstring[0] == ':' ? ':' : '?';
             }
-            return *optstring == ':' ? ':' : '?';
+            optind++;
+            sp = 1;
         }
     } else {
-        if (argv[optind][++optpos] == '\0') {
+        if (argv[optind][++sp] == '\0') {
             optind++;
-            optpos = 1;
+            sp = 1;
         }
+        optarg = NULL;
     }
 
-    return optopt;
+    return c;
 }
 
-#endif // _MSC_VER
+#else /* !_MSC_VER */
 
-#endif // MSVC_COMPAT_H
+/* On GCC/Clang, define NORETURN using __attribute__ */
+#ifndef NORETURN
+#define NORETURN __attribute__((noreturn))
+#endif
+
+#endif /* _MSC_VER */
+
+#endif /* MSVC_COMPAT_H */

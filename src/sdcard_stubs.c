@@ -8,9 +8,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#ifdef _MSC_VER
-#include "msvc_compat.h"
-#else
+#ifndef _MSC_VER
 #include <unistd.h>
 #endif
 

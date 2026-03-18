@@ -6,9 +6,7 @@
 #include "rom_stubs.h"
 #include "memory.h"
 #include <stdlib.h>
-#ifdef _MSC_VER
-#include "msvc_compat.h"
-#else
+#ifndef _MSC_VER
 #include <unistd.h>
 #endif
 

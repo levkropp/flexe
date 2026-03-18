@@ -19,7 +19,7 @@ typedef struct {
     uint64_t cycle;           /* Cycle count when executed */
     uint32_t a1;              /* Stack pointer (critical for debugging) */
     uint8_t  exception;       /* Exception cause (0 = none) */
-    uint8_t  call_depth;      /* Call stack depth (0-255) */
+    uint16_t call_depth;      /* Call stack depth */
     uint16_t flags;           /* CALL/RET/EXCEPTION/WINDOW/etc. */
 }
 #ifndef _MSC_VER
@@ -58,7 +58,7 @@ typedef struct {
 typedef struct {
     uint32_t call_stack_pc[HTRACE_MAX_CALL_DEPTH];   /* Return addresses */
     uint32_t call_stack_a1[HTRACE_MAX_CALL_DEPTH];   /* Stack pointer at each level */
-    uint8_t  call_depth;                              /* Current depth */
+    uint16_t call_depth;                              /* Current depth */
 
     htrace_level_t levels[HTRACE_LEVELS];
 
