@@ -10,6 +10,7 @@
  * SHA Transform functions for single-block compression. */
 #define OPENSSL_API_COMPAT 0x10100000L
 #include <openssl/sha.h>
+#include <openssl/md5.h>
 
 /* SHA type constants (matches esp_sha_type enum) */
 #define SHA_TYPE_1    0
@@ -79,6 +80,10 @@ struct sha_stubs {
         uint32_t    guest_addr;
         SHA_CTX     ctx;
     } mbed_sha1[MBED_CTX_SLOTS];
+    struct {
+        uint32_t    guest_addr;
+        MD5_CTX     ctx;
+    } mbed_md5[MBED_CTX_SLOTS];
 };
 
 /* ===== SHA peripheral MMIO handler ===== */
@@ -568,6 +573,89 @@ static void stub_mbedtls_sha1_free(xtensa_cpu_t *cpu, void *ctx) {
     sha_return_void(cpu);
 }
 
+/* ===== mbedtls software MD5 acceleration ===== */
+
+static int mbed_md5_find(sha_stubs_t *ss, uint32_t addr) {
+    for (int i = 0; i < MBED_CTX_SLOTS; i++)
+        if (ss->mbed_md5[i].guest_addr == addr) return i;
+    return -1;
+}
+
+static int mbed_md5_alloc(sha_stubs_t *ss, uint32_t addr) {
+    int idx = mbed_md5_find(ss, addr);
+    if (idx >= 0) return idx;
+    for (int i = 0; i < MBED_CTX_SLOTS; i++) {
+        if (ss->mbed_md5[i].guest_addr == 0) {
+            ss->mbed_md5[i].guest_addr = addr;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void stub_mbedtls_md5_starts(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    int idx = mbed_md5_alloc(ss, ctx_addr);
+    if (idx >= 0)
+        MD5_Init(&ss->mbed_md5[idx].ctx);
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_md5_update(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    uint32_t data_addr = sha_arg(cpu, 1);
+    uint32_t len = sha_arg(cpu, 2);
+    int idx = mbed_md5_find(ss, ctx_addr);
+    if (idx >= 0 && len > 0) {
+        uint32_t off = 0;
+        while (off < len) {
+            uint32_t chunk = len - off;
+            const uint8_t *p = mem_get_ptr(cpu->mem, data_addr + off);
+            if (p) {
+                uint32_t page_rem = 0x1000 - ((data_addr + off) & 0xFFF);
+                if (chunk > page_rem) chunk = page_rem;
+                MD5_Update(&ss->mbed_md5[idx].ctx, p, chunk);
+            } else {
+                uint8_t tmp = mem_read8(cpu->mem, data_addr + off);
+                MD5_Update(&ss->mbed_md5[idx].ctx, &tmp, 1);
+                chunk = 1;
+            }
+            off += chunk;
+        }
+    }
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_md5_finish(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    uint32_t out_addr = sha_arg(cpu, 1);
+    int idx = mbed_md5_find(ss, ctx_addr);
+    if (idx >= 0) {
+        unsigned char digest[16];
+        MD5_CTX copy = ss->mbed_md5[idx].ctx;
+        MD5_Final(digest, &copy);
+        uint8_t *p = mem_get_ptr_w(cpu->mem, out_addr);
+        if (p && ((out_addr & 0xFFF) <= 0xFF0))
+            memcpy(p, digest, 16);
+        else
+            for (int i = 0; i < 16; i++)
+                mem_write8(cpu->mem, out_addr + i, digest[i]);
+    }
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_md5_free(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    int idx = mbed_md5_find(ss, ctx_addr);
+    if (idx >= 0)
+        ss->mbed_md5[idx].guest_addr = 0;
+    sha_return_void(cpu);
+}
+
 int sha_stubs_hook_symbols(sha_stubs_t *ss, const elf_symbols_t *syms) {
     if (!ss || !syms) return 0;
 
@@ -621,6 +709,14 @@ int sha_stubs_hook_symbols(sha_stubs_t *ss, const elf_symbols_t *syms) {
         { "mbedtls_sha1_finish_ret",    stub_mbedtls_sha1_finish },
         { "mbedtls_sha1_finish",        stub_mbedtls_sha1_finish },
         { "mbedtls_sha1_free",          stub_mbedtls_sha1_free },
+        /* MD5 */
+        { "mbedtls_md5_starts_ret",     stub_mbedtls_md5_starts },
+        { "mbedtls_md5_starts",         stub_mbedtls_md5_starts },
+        { "mbedtls_md5_update_ret",     stub_mbedtls_md5_update },
+        { "mbedtls_md5_update",         stub_mbedtls_md5_update },
+        { "mbedtls_md5_finish_ret",     stub_mbedtls_md5_finish },
+        { "mbedtls_md5_finish",         stub_mbedtls_md5_finish },
+        { "mbedtls_md5_free",           stub_mbedtls_md5_free },
         { NULL, NULL }
     };
 
