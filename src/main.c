@@ -614,6 +614,7 @@ int main(int argc, char *argv[]) {
     int spill_verify = 0;
     int single_core = 0;
     int htrace_enabled = 0;
+    int audit_unhooked = 0;
     uint64_t heartbeat_interval = 0;
     uint64_t trace_start = 0, trace_end = UINT64_MAX;
     /* Checkpoint options */
@@ -645,7 +646,7 @@ int main(int argc, char *argv[]) {
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:H")) != -1) {
+    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:HU")) != -1) {
         switch (opt) {
         case '1': single_core = 1; break;
         case 'c': max_cycles = strtoll(optarg, NULL, 10); break;
@@ -718,6 +719,7 @@ int main(int argc, char *argv[]) {
         case 'E': event_log = 1; break;
         case 'P': heartbeat_interval = strtoull(optarg, NULL, 0); break;
         case 'H': htrace_enabled = 1; break;
+        case 'U': audit_unhooked = 1; break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -1302,6 +1304,54 @@ int main(int argc, char *argv[]) {
 
     if (!quiet_unhandled || periph_unhandled_count(periph) > 0)
         fprintf(stderr, "Unhandled:  %d peripheral accesses\n", periph_unhandled_count(periph));
+
+    /* -U: Audit unhooked firmware functions.
+     * Uses the ROM call stats from the completed run + symbol lookup
+     * to identify the hottest un-stubbed functions. */
+    if (audit_unhooked && syms) {
+        fprintf(stderr, "\n--- Unhooked function audit ---\n");
+        fprintf(stderr, "(Showing top ROM stub calls + identifying unstubbed function hotspots)\n");
+        fprintf(stderr, "Use the ROM calls list above to see already-stubbed functions.\n");
+        fprintf(stderr, "Functions NOT in that list that dominate execution time are\n");
+        fprintf(stderr, "candidates for native stubbing.\n\n");
+
+        /* For a proper PC profile, use: -t -c N then post-process the trace.
+         * Here we just list all ELF functions in the instruction space that
+         * could potentially be stubbed, with their address for reference. */
+        typedef struct { const char *name; uint32_t addr; uint32_t size; } fsym_t;
+        fsym_t fbuf[1024];
+        typedef struct { fsym_t *buf; int n, cap; } iter_ctx_t;
+        iter_ctx_t ictx = { fbuf, 0, 1024 };
+
+        int collect_fn(const char *name, uint32_t addr, uint32_t size, void *vctx) {
+            iter_ctx_t *c = vctx;
+            if (c->n >= c->cap) return 0;
+            if (addr < 0x40080000u || addr >= 0x40500000u) return 0; /* skip ROM */
+            if (size == 0) return 0;
+            /* Skip if already stubbed */
+            for (int i = 0; i < rom_stubs_stub_count(rom); i++) {
+                const char *rn; uint32_t ra, rc;
+                rom_stubs_get_stats(rom, i, &rn, &ra, &rc);
+                if (ra == addr) return 0; /* already hooked */
+            }
+            c->buf[c->n++] = (fsym_t){name, addr, size};
+            return 0;
+        }
+        elf_symbols_iterate(syms, collect_fn, &ictx);
+
+        /* Sort by size descending (larger = more potential savings) */
+        for (int a = 0; a < ictx.n - 1; a++)
+            for (int b = a + 1; b < ictx.n; b++)
+                if (fbuf[b].size > fbuf[a].size) {
+                    fsym_t tmp = fbuf[a]; fbuf[a] = fbuf[b]; fbuf[b] = tmp;
+                }
+
+        fprintf(stderr, "Largest unstubbed firmware functions (potential native-stub candidates):\n");
+        fprintf(stderr, "%-10s  %-10s  %s\n", "Size", "Address", "Function");
+        for (int i = 0; i < ictx.n && i < 40; i++)
+            fprintf(stderr, "%-10u  0x%08X  %s\n",
+                    fbuf[i].size, fbuf[i].addr, fbuf[i].name);
+    }
 
     /* Register dump */
     if (verbose || stop_reason == STOP_BREAKPOINT) {

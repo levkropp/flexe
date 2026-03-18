@@ -39,6 +39,7 @@ typedef int (*xtensa_pc_hook_fn)(xtensa_cpu_t *cpu, uint32_t pc, void *ctx);
 #define PREDECODE_SIZE  0u
 #endif
 
+/* Packed: bits 0-23 = instruction word, bits 24-31 = ilen (2 or 3). */
 #define PREDECODE_PACK(insn, ilen) ((insn) | ((uint32_t)(ilen) << 24))
 #define PREDECODE_INSN(packed)     ((packed) & 0x00FFFFFFu)
 #define PREDECODE_ILEN(packed)     ((packed) >> 24)
