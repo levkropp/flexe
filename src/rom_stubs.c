@@ -311,16 +311,37 @@ static void stub_bzero(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+/* ===== Native-accelerated string/memory stubs =====
+ * Resolve guest addresses to host pointers and use native libc.
+ * Page-boundary-safe: processes in page-sized chunks. */
+
 static void stub_strcmp(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t s1 = rom_arg(cpu, 0);
     uint32_t s2 = rom_arg(cpu, 1);
-    for (;;) {
-        uint8_t a = mem_read8(cpu->mem, s1++);
-        uint8_t b = mem_read8(cpu->mem, s2++);
-        if (a != b || a == 0) {
-            rom_return(cpu, (uint32_t)(int32_t)(a - b));
-            return;
+    /* Fast path: compare via host pointers */
+    while (1) {
+        const uint8_t *p1 = mem_get_ptr(cpu->mem, s1);
+        const uint8_t *p2 = mem_get_ptr(cpu->mem, s2);
+        if (p1 && p2) {
+            uint32_t remain1 = 0x1000 - (s1 & 0xFFF);
+            uint32_t remain2 = 0x1000 - (s2 & 0xFFF);
+            uint32_t chunk = remain1 < remain2 ? remain1 : remain2;
+            for (uint32_t i = 0; i < chunk; i++) {
+                if (p1[i] != p2[i] || p1[i] == 0) {
+                    rom_return(cpu, (uint32_t)(int32_t)(p1[i] - p2[i]));
+                    return;
+                }
+            }
+            s1 += chunk;
+            s2 += chunk;
+        } else {
+            uint8_t a = mem_read8(cpu->mem, s1++);
+            uint8_t b = mem_read8(cpu->mem, s2++);
+            if (a != b || a == 0) {
+                rom_return(cpu, (uint32_t)(int32_t)(a - b));
+                return;
+            }
         }
     }
 }
@@ -329,12 +350,28 @@ static void stub_strcpy(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t dst = rom_arg(cpu, 0);
     uint32_t src = rom_arg(cpu, 1);
-    uint32_t i = 0;
-    for (;;) {
-        uint8_t c = mem_read8(cpu->mem, src + i);
-        mem_write8(cpu->mem, dst + i, c);
-        if (c == 0) break;
-        i++;
+    uint32_t off = 0;
+    while (1) {
+        const uint8_t *sp = mem_get_ptr(cpu->mem, src + off);
+        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        if (sp && dp) {
+            uint32_t rem_s = 0x1000 - ((src + off) & 0xFFF);
+            uint32_t rem_d = 0x1000 - ((dst + off) & 0xFFF);
+            uint32_t chunk = rem_s < rem_d ? rem_s : rem_d;
+            const uint8_t *nul = memchr(sp, 0, chunk);
+            if (nul) {
+                uint32_t n = (uint32_t)(nul - sp) + 1; /* include NUL */
+                memcpy(dp, sp, n);
+                break;
+            }
+            memcpy(dp, sp, chunk);
+            off += chunk;
+        } else {
+            uint8_t c = mem_read8(cpu->mem, src + off);
+            mem_write8(cpu->mem, dst + off, c);
+            if (c == 0) break;
+            off++;
+        }
     }
     rom_return(cpu, dst);
 }
@@ -344,15 +381,37 @@ static void stub_strncpy(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t dst = rom_arg(cpu, 0);
     uint32_t src = rom_arg(cpu, 1);
     uint32_t n   = rom_arg(cpu, 2);
-    uint32_t i = 0;
+    uint32_t off = 0;
     int pad = 0;
-    for (i = 0; i < n; i++) {
+    while (off < n) {
+        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        uint32_t rem_d = 0x1000 - ((dst + off) & 0xFFF);
+        uint32_t chunk = n - off;
+        if (chunk > rem_d) chunk = rem_d;
         if (pad) {
-            mem_write8(cpu->mem, dst + i, 0);
+            if (dp) { memset(dp, 0, chunk); off += chunk; }
+            else { mem_write8(cpu->mem, dst + off, 0); off++; }
         } else {
-            uint8_t c = mem_read8(cpu->mem, src + i);
-            mem_write8(cpu->mem, dst + i, c);
-            if (c == 0) pad = 1;
+            const uint8_t *sp = mem_get_ptr(cpu->mem, src + off);
+            uint32_t rem_s = 0x1000 - ((src + off) & 0xFFF);
+            if (chunk > rem_s) chunk = rem_s;
+            if (dp && sp) {
+                const uint8_t *nul = memchr(sp, 0, chunk);
+                if (nul) {
+                    uint32_t pre = (uint32_t)(nul - sp) + 1;
+                    memcpy(dp, sp, pre);
+                    off += pre;
+                    pad = 1;
+                } else {
+                    memcpy(dp, sp, chunk);
+                    off += chunk;
+                }
+            } else {
+                uint8_t c = mem_read8(cpu->mem, src + off);
+                mem_write8(cpu->mem, dst + off, c);
+                if (c == 0) pad = 1;
+                off++;
+            }
         }
     }
     rom_return(cpu, dst);
@@ -363,14 +422,35 @@ static void stub_strlcpy(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t dst  = rom_arg(cpu, 0);
     uint32_t src  = rom_arg(cpu, 1);
     uint32_t size = rom_arg(cpu, 2);
-    /* Count total source length */
+    /* Count total source length using native strlen stub */
     uint32_t slen = 0;
-    while (mem_read8(cpu->mem, src + slen) != 0) slen++;
-    /* Copy up to size-1 chars */
+    while (1) {
+        const uint8_t *p = mem_get_ptr(cpu->mem, src + slen);
+        if (p) {
+            uint32_t rem = 0x1000 - ((src + slen) & 0xFFF);
+            const uint8_t *nul = memchr(p, 0, rem);
+            if (nul) { slen += (uint32_t)(nul - p); break; }
+            slen += rem;
+        } else {
+            if (mem_read8(cpu->mem, src + slen) == 0) break;
+            slen++;
+        }
+    }
+    /* Copy up to size-1 chars using native memcpy */
     if (size > 0) {
         uint32_t copy = (slen < size - 1) ? slen : size - 1;
-        for (uint32_t i = 0; i < copy; i++)
-            mem_write8(cpu->mem, dst + i, mem_read8(cpu->mem, src + i));
+        uint32_t off = 0;
+        while (off < copy) {
+            uint32_t rem_d = 0x1000 - ((dst + off) & 0xFFF);
+            uint32_t rem_s = 0x1000 - ((src + off) & 0xFFF);
+            uint32_t chunk = copy - off;
+            if (chunk > rem_d) chunk = rem_d;
+            if (chunk > rem_s) chunk = rem_s;
+            uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+            const uint8_t *sp = mem_get_ptr(cpu->mem, src + off);
+            if (dp && sp) { memcpy(dp, sp, chunk); off += chunk; }
+            else { mem_write8(cpu->mem, dst + off, mem_read8(cpu->mem, src + off)); off++; }
+        }
         mem_write8(cpu->mem, dst + copy, 0);
     }
     rom_return(cpu, slen);
@@ -454,18 +534,45 @@ static void stub_memcpy(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t dst = rom_arg(cpu, 0);
     uint32_t src = rom_arg(cpu, 1);
     uint32_t len = rom_arg(cpu, 2);
-    for (uint32_t i = 0; i < len; i++)
-        mem_write8(cpu->mem, dst + i, mem_read8(cpu->mem, src + i));
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t rem_d = 0x1000 - ((dst + off) & 0xFFF);
+        uint32_t rem_s = 0x1000 - ((src + off) & 0xFFF);
+        uint32_t chunk = len - off;
+        if (chunk > rem_d) chunk = rem_d;
+        if (chunk > rem_s) chunk = rem_s;
+        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        const uint8_t *sp = mem_get_ptr(cpu->mem, src + off);
+        if (dp && sp) {
+            memcpy(dp, sp, chunk);
+            off += chunk;
+        } else {
+            mem_write8(cpu->mem, dst + off, mem_read8(cpu->mem, src + off));
+            off++;
+        }
+    }
     rom_return(cpu, dst);
 }
 
 static void stub_memset(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t dst = rom_arg(cpu, 0);
-    uint32_t val = rom_arg(cpu, 1);
+    uint32_t val = rom_arg(cpu, 1) & 0xFF;
     uint32_t len = rom_arg(cpu, 2);
-    for (uint32_t i = 0; i < len; i++)
-        mem_write8(cpu->mem, dst + i, (uint8_t)(val & 0xFF));
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t rem = 0x1000 - ((dst + off) & 0xFFF);
+        uint32_t chunk = len - off;
+        if (chunk > rem) chunk = rem;
+        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        if (dp) {
+            memset(dp, (int)val, chunk);
+            off += chunk;
+        } else {
+            mem_write8(cpu->mem, dst + off, (uint8_t)val);
+            off++;
+        }
+    }
     rom_return(cpu, dst);
 }
 
@@ -473,7 +580,18 @@ static void stub_strlen(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t addr = rom_arg(cpu, 0);
     uint32_t len = 0;
-    while (mem_read8(cpu->mem, addr + len) != 0) len++;
+    while (1) {
+        const uint8_t *p = mem_get_ptr(cpu->mem, addr + len);
+        if (p) {
+            uint32_t rem = 0x1000 - ((addr + len) & 0xFFF);
+            const uint8_t *nul = memchr(p, 0, rem);
+            if (nul) { len += (uint32_t)(nul - p); break; }
+            len += rem;
+        } else {
+            if (mem_read8(cpu->mem, addr + len) == 0) break;
+            len++;
+        }
+    }
     rom_return(cpu, len);
 }
 

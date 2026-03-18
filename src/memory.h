@@ -68,7 +68,18 @@ void     mem_write8_slow(xtensa_mem_t *mem, uint32_t addr, uint8_t val);
  * Miss → fall through to MMIO slow path in memory.c.
  */
 
+/* Resolve guest address to host pointer (read-only).
+ * Returns NULL for MMIO or unmapped addresses. */
 static inline const uint8_t *mem_get_ptr(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1))
+        return page + (addr & 0xFFF);
+    return NULL;
+}
+
+/* Resolve guest address to writable host pointer.
+ * Returns NULL for MMIO or unmapped addresses. */
+static inline uint8_t *mem_get_ptr_w(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1))
         return page + (addr & 0xFFF);
