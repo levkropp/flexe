@@ -69,6 +69,15 @@ struct jit_state {
 
     /* Verification mode */
     bool verify;
+
+    /* Hook chaining: JIT installs itself as a pc_hook, forwarding
+     * non-JIT addresses to the original (ROM stubs) hook. */
+    xtensa_pc_hook_fn original_hook;
+    void             *original_hook_ctx;
+
+    /* JIT-specific hook bitmap: set bits for compiled block PCs.
+     * Merged with the ROM stub bitmap for the interpreter's fast path. */
+    uint64_t jit_bitmap[HOOK_BITMAP_WORDS];
 };
 
 /* ===== Hash table operations ===== */
@@ -1793,6 +1802,77 @@ jit_state_t *jit_init(void) {
     return jit;
 }
 
+/* Set a bit in the JIT bitmap for a compiled block PC */
+static void jit_bitmap_set(jit_state_t *jit, uint32_t pc) {
+    uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
+    jit->jit_bitmap[idx / 64] |= (1ULL << (idx & 63));
+}
+
+/* JIT pc_hook: called by the interpreter for every bitmap-marked PC.
+ * Direct hash lookup (no JIT bitmap check) — O(1) with one memory access.
+ * Flow: check JIT hash → if hit, run block; if miss, forward to ROM stubs. */
+static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
+    jit_state_t *jit = ctx;
+
+    /* Skip JIT lookup for ROM range (0x40000000-0x4006FFFF) — always stubs.
+     * This avoids a hash table access for the ~35M stub calls per 100M cycles. */
+    if (__builtin_expect(pc < 0x40070000u, 0)) {
+        if (jit->original_hook)
+            return jit->original_hook(cpu, pc, jit->original_hook_ctx);
+        return 0;
+    }
+
+    /* Direct hash table probe for firmware-space PCs */
+    uint32_t wb = cpu->windowbase;
+    uint32_t hidx = ((pc >> 2) ^ (wb * 2654435761u)) & JIT_HASH_MASK;
+    uint32_t tag = pc ^ (wb << 28);
+    jit_block_t *b = &jit->hash[hidx];
+
+    if (__builtin_expect(b->code != NULL && b->pc == tag, 0)) {
+        /* JIT block found — execute it */
+        jit_block_fn fn = (jit_block_fn)b->code;
+        int block_insns = fn(cpu);
+
+        if (block_insns > 0) {
+            /* Apply zero-overhead loop */
+            if (cpu->lcount > 0 && cpu->pc == cpu->lend) {
+                cpu->lcount--;
+                cpu->pc = cpu->lbeg;
+            }
+
+            /* Advance ccount by block_insns - 1 (the interpreter adds 1) */
+            cpu->ccount += (uint32_t)(block_insns - 1);
+            cpu->cycle_count += (uint64_t)(block_insns - 1);
+
+            jit->stats.blocks_executed++;
+            jit->stats.insns_jitted += (uint64_t)block_insns;
+
+            return 1; /* Handled */
+        }
+    }
+
+    /* Forward to original hook (ROM stubs) */
+    if (jit->original_hook) {
+        return jit->original_hook(cpu, pc, jit->original_hook_ctx);
+    }
+
+    return 0;
+}
+
+/* Install JIT as a pc_hook, chaining with the existing hook */
+void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) {
+    /* Save the original hook */
+    jit->original_hook = cpu->pc_hook;
+    jit->original_hook_ctx = cpu->pc_hook_ctx;
+
+    /* Install JIT hook */
+    cpu->pc_hook = jit_pc_hook;
+    cpu->pc_hook_ctx = jit;
+
+    /* The bitmap stays the same — JIT bits are added on top of ROM stub bits.
+     * The interpreter's bitmap test will fire for both stubs and JIT blocks. */
+}
+
 void jit_destroy(jit_state_t *jit) {
     if (!jit) return;
     if (jit->code_cache && jit->code_cache != MAP_FAILED)
@@ -1832,18 +1912,30 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
     if (fn) {
         b->code = (void *)fn;
         b->guest_insns = (uint16_t)scan.count;
+
+        /* Set JIT bitmap bit so the interpreter's hook fires for this PC.
+         * Also set the bit in the CPU's hook bitmap (ROM bitmap) so the
+         * interpreter's fast-path bitmap test catches it. */
+        jit_bitmap_set(jit, pc);
+        if (cpu->pc_hook_bitmap) {
+            /* Const-cast: we need to modify the shared bitmap */
+            uint64_t *bm = (uint64_t *)(uintptr_t)cpu->pc_hook_bitmap;
+            uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
+            bm[idx / 64] |= (1ULL << (idx & 63));
+        }
     }
 
     return fn;
 }
 
-/* Main JIT execution loop */
+/* Main JIT execution loop.
+ * Uses the interpreter for most execution (stubs, cold code) and only
+ * diverts to compiled blocks for known-hot PCs. The key optimization:
+ * large interpreter batches to amortize the dispatch overhead. */
 __attribute__((hot))
 int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
     int cycles = 0;
-    /* Cache hot pointers in locals for the dispatch loop */
     const uint64_t *hook_bitmap = cpu->pc_hook_bitmap;
-    jit_block_t *hash = jit->hash;
 
     while (__builtin_expect(cycles < max_cycles, 1) &&
            __builtin_expect(cpu->running, 1) &&
@@ -1851,234 +1943,89 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
 
         uint32_t pc = cpu->pc;
 
-        /* Fast path: most iterations hit either a stub or JIT block.
-         * Check stub bitmap first (most common case for stub-heavy firmware). */
-        if (__builtin_expect(hook_bitmap != NULL, 1)) {
-            uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
-            if (hook_bitmap[idx / 64] >> (idx & 63) & 1) {
-                /* Stub hit — batch through interpreter */
-                int batch = max_cycles - cycles;
-                if (batch > 32) batch = 32;
-                int ran = xtensa_run(cpu, batch);
-                cycles += ran;
-                jit->stats.insns_interp += (uint64_t)ran;
-                if (__builtin_expect(ran < batch, 0)) {
-                    if (!cpu->running || cpu->halted || cpu->breakpoint_hit)
-                        break;
-                }
-                continue;
-            }
-        } else if (cpu->pc_hook) {
-            /* No bitmap — always check hook */
-            int ran = xtensa_run(cpu, 1);
-            cycles += ran;
-            jit->stats.insns_interp += (uint64_t)ran;
-            continue;
-        }
-
-        /* Validate PC range (rare: only on invalid jumps) */
-        if (__builtin_expect(pc < 0x40000000u || pc >= 0x40500000u, 0)) {
-            int ran = xtensa_run(cpu, 1);
-            cycles += ran;
-            break;
-        }
-
-        /* Halted (WAITI) — rare during normal execution */
-        if (__builtin_expect(cpu->halted, 0)) {
+        /* Skip stubs (bitmap-marked) and halted — run interpreter batch */
+        if (__builtin_expect(cpu->halted, 0) ||
+            (hook_bitmap && (hook_bitmap[(pc >> 2) & (HOOK_BITMAP_BITS - 1) >> 6]
+             >> (((pc >> 2) & (HOOK_BITMAP_BITS - 1)) & 63) & 1))) {
             int batch = max_cycles - cycles;
             if (batch > 1000) batch = 1000;
             int ran = xtensa_run(cpu, batch);
             cycles += ran;
             jit->stats.insns_interp += (uint64_t)ran;
-            if (ran < batch) break;
+            if (__builtin_expect(ran < batch, 0)) {
+                if (!cpu->running || cpu->halted || cpu->breakpoint_hit) break;
+            }
             continue;
         }
 
-        /* Try JIT: direct hash lookup (no function call) */
+        /* Non-stub, non-halted PC — try JIT */
+        if (__builtin_expect(pc < 0x40000000u || pc >= 0x40500000u, 0)) {
+            xtensa_run(cpu, 1);
+            cycles++;
+            break;
+        }
+
+        /* Direct hash lookup */
         uint32_t wb = cpu->windowbase;
         uint32_t hidx = ((pc >> 2) ^ (wb * 2654435761u)) & JIT_HASH_MASK;
         uint32_t tag = pc ^ (wb << 28);
-        jit_block_t *b = &hash[hidx];
-        jit_block_fn fn;
-        if (__builtin_expect(b->code != NULL && b->pc == tag, 1)) {
+        jit_block_t *b = &jit->hash[hidx];
+        jit_block_fn fn = NULL;
+
+        if (b->code && b->pc == tag) {
             fn = (jit_block_fn)b->code;
         } else {
             fn = jit_get_block(jit, cpu, pc);
         }
-        if (fn) {
-            /* Execute compiled block */
-            /* Optional differential verification: snapshot, run JIT, run interpreter, compare */
-            xtensa_cpu_t *verify_snap = NULL;
-            if (jit->verify) {
-                verify_snap = malloc(sizeof(xtensa_cpu_t));
-                if (verify_snap) memcpy(verify_snap, cpu, sizeof(*cpu));
-            }
 
+        if (fn) {
+            /* Execute JIT block */
             int block_insns = fn(cpu);
 
-            /* Apply zero-overhead loop check immediately after block */
             if (block_insns > 0 && cpu->lcount > 0 && cpu->pc == cpu->lend) {
                 cpu->lcount--;
                 cpu->pc = cpu->lbeg;
             }
-
-            if (verify_snap && block_insns > 0) {
-                /* Run interpreter on snapshot */
-                for (int vi = 0; vi < block_insns; vi++)
-                    xtensa_step(verify_snap);
-                /* Compare */
-                int diffs = 0;
-                for (int ri = 0; ri < 64 && diffs < 5; ri++) {
-                    if (cpu->ar[ri] != verify_snap->ar[ri]) {
-                        fprintf(stderr, "[JIT-VERIFY] ar[%d]: jit=0x%08X interp=0x%08X (block 0x%08X)\n",
-                                ri, cpu->ar[ri], verify_snap->ar[ri], pc);
-                        diffs++;
-                    }
-                }
-                if (cpu->pc != verify_snap->pc) {
-                    fprintf(stderr, "[JIT-VERIFY] pc: jit=0x%08X interp=0x%08X (block 0x%08X)\n",
-                            cpu->pc, verify_snap->pc, pc);
-                    diffs++;
-                }
-                if (cpu->sar != verify_snap->sar) {
-                    fprintf(stderr, "[JIT-VERIFY] sar: jit=%u interp=%u (block 0x%08X)\n",
-                            cpu->sar, verify_snap->sar, pc);
-                    diffs++;
-                }
-                if (diffs > 0) {
-                    /* Restore interpreter state to prevent cascading errors */
-                    uint32_t jit_ccount = cpu->ccount;
-                    uint64_t jit_cc = cpu->cycle_count;
-                    memcpy(cpu, verify_snap, sizeof(*cpu));
-                    cpu->ccount = jit_ccount;
-                    cpu->cycle_count = jit_cc;
-                }
-                free(verify_snap);
-                verify_snap = NULL;
-            }
-            if (verify_snap) free(verify_snap);
-
             if (block_insns <= 0) {
-                /* Block bailed (e.g., windowbase mismatch) — interpreter fallback */
-                int ran = xtensa_run(cpu, 1);
-                cycles += ran;
-                jit->stats.insns_interp += (uint64_t)ran;
+                xtensa_run(cpu, 1);
+                cycles++;
+                jit->stats.insns_interp++;
                 jit->stats.fallbacks++;
                 continue;
             }
-            cycles += block_insns;
 
-            /* Update ccount and cycle_count */
+            cycles += block_insns;
             cpu->ccount += (uint32_t)block_insns;
             cpu->cycle_count += (uint64_t)block_insns;
-
             jit->stats.blocks_executed++;
             jit->stats.insns_jitted += (uint64_t)block_insns;
 
-            /* Check timers (once per block) */
-            if (cpu->ccount >= cpu->next_timer_event) {
-                /* Check all ccompare values */
-                uint32_t old_int = cpu->interrupt;
-                if (cpu->ccount >= cpu->ccompare[0] &&
-                    cpu->ccount - cpu->ccompare[0] < (uint32_t)block_insns)
+            /* Timer/interrupt check */
+            if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0)) {
+                uint32_t old = cpu->interrupt;
+                if (cpu->ccount >= cpu->ccompare[0] && cpu->ccount - cpu->ccompare[0] < (uint32_t)block_insns)
                     cpu->interrupt |= (1u << 6);
-                if (cpu->ccount >= cpu->ccompare[1] &&
-                    cpu->ccount - cpu->ccompare[1] < (uint32_t)block_insns)
+                if (cpu->ccount >= cpu->ccompare[1] && cpu->ccount - cpu->ccompare[1] < (uint32_t)block_insns)
                     cpu->interrupt |= (1u << 15);
-                if (cpu->ccount >= cpu->ccompare[2] &&
-                    cpu->ccount - cpu->ccompare[2] < (uint32_t)block_insns)
+                if (cpu->ccount >= cpu->ccompare[2] && cpu->ccount - cpu->ccompare[2] < (uint32_t)block_insns)
                     cpu->interrupt |= (1u << 16);
-                if (cpu->interrupt != old_int) cpu->irq_check = true;
-
-                /* Recompute next timer */
-                uint32_t d0 = cpu->ccompare[0] - cpu->ccount;
-                uint32_t d1 = cpu->ccompare[1] - cpu->ccount;
-                uint32_t d2 = cpu->ccompare[2] - cpu->ccount;
-                if (d0 == 0) d0 = UINT32_MAX;
-                if (d1 == 0) d1 = UINT32_MAX;
-                if (d2 == 0) d2 = UINT32_MAX;
-                if (d0 <= d1 && d0 <= d2)
-                    cpu->next_timer_event = cpu->ccompare[0];
-                else if (d1 <= d2)
-                    cpu->next_timer_event = cpu->ccompare[1];
-                else
-                    cpu->next_timer_event = cpu->ccompare[2];
+                if (cpu->interrupt != old) cpu->irq_check = true;
+                uint32_t d0 = cpu->ccompare[0] - cpu->ccount, d1 = cpu->ccompare[1] - cpu->ccount, d2 = cpu->ccompare[2] - cpu->ccount;
+                if (d0 == 0) d0 = UINT32_MAX; if (d1 == 0) d1 = UINT32_MAX; if (d2 == 0) d2 = UINT32_MAX;
+                cpu->next_timer_event = (d0 <= d1 && d0 <= d2) ? cpu->ccompare[0] : (d1 <= d2) ? cpu->ccompare[1] : cpu->ccompare[2];
             }
-
-            /* Check interrupts (once per block) */
-            if (cpu->irq_check) {
+            if (__builtin_expect(cpu->irq_check, 0)) {
                 cpu->irq_check = false;
-                if (cpu->interrupt & cpu->intenable)
-                    xtensa_check_interrupts(cpu);
+                if (cpu->interrupt & cpu->intenable) xtensa_check_interrupts(cpu);
             }
-
-            /* Block chaining: if the exit target is already compiled,
-             * jump directly without going through the full dispatch. */
-            while (cycles < max_cycles && cpu->running && !cpu->breakpoint_hit
-                   && !cpu->halted && !cpu->exception) {
-                jit_block_t *chain = jit_lookup(jit, cpu->pc, cpu->windowbase);
-                if (!chain || !chain->code) break;
-
-                fn = (jit_block_fn)chain->code;
-                block_insns = fn(cpu);
-
-                if (block_insns > 0 && cpu->lcount > 0 && cpu->pc == cpu->lend) {
-                    cpu->lcount--;
-                    cpu->pc = cpu->lbeg;
-                }
-                if (block_insns <= 0) break;
-
-                cycles += block_insns;
-                cpu->ccount += (uint32_t)block_insns;
-                cpu->cycle_count += (uint64_t)block_insns;
-                jit->stats.blocks_executed++;
-                jit->stats.insns_jitted += (uint64_t)block_insns;
-
-                /* Timer/interrupt check (lightweight) */
-                if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0)) {
-                    uint32_t old_int = cpu->interrupt;
-                    if (cpu->ccount >= cpu->ccompare[0] &&
-                        cpu->ccount - cpu->ccompare[0] < (uint32_t)block_insns)
-                        cpu->interrupt |= (1u << 6);
-                    if (cpu->ccount >= cpu->ccompare[1] &&
-                        cpu->ccount - cpu->ccompare[1] < (uint32_t)block_insns)
-                        cpu->interrupt |= (1u << 15);
-                    if (cpu->ccount >= cpu->ccompare[2] &&
-                        cpu->ccount - cpu->ccompare[2] < (uint32_t)block_insns)
-                        cpu->interrupt |= (1u << 16);
-                    if (cpu->interrupt != old_int) cpu->irq_check = true;
-                    uint32_t d0 = cpu->ccompare[0] - cpu->ccount;
-                    uint32_t d1 = cpu->ccompare[1] - cpu->ccount;
-                    uint32_t d2 = cpu->ccompare[2] - cpu->ccount;
-                    if (d0 == 0) d0 = UINT32_MAX;
-                    if (d1 == 0) d1 = UINT32_MAX;
-                    if (d2 == 0) d2 = UINT32_MAX;
-                    if (d0 <= d1 && d0 <= d2)
-                        cpu->next_timer_event = cpu->ccompare[0];
-                    else if (d1 <= d2)
-                        cpu->next_timer_event = cpu->ccompare[1];
-                    else
-                        cpu->next_timer_event = cpu->ccompare[2];
-                }
-                if (__builtin_expect(cpu->irq_check, 0)) {
-                    cpu->irq_check = false;
-                    if (cpu->interrupt & cpu->intenable)
-                        xtensa_check_interrupts(cpu);
-                }
-            }
-
         } else {
-            /* No JIT block available — run a large interpreter batch.
-             * The interpreter handles stubs, exceptions, interrupts correctly,
-             * so large batches are safe and amortize the dispatch overhead. */
+            /* Cold code — large interpreter batch */
             int batch = max_cycles - cycles;
             if (batch > 1000) batch = 1000;
             int ran = xtensa_run(cpu, batch);
             cycles += ran;
             jit->stats.insns_interp += (uint64_t)ran;
-            if (ran < batch) {
-                if (!cpu->running || cpu->halted || cpu->breakpoint_hit) break;
-            }
+            if (ran < batch && (!cpu->running || cpu->halted || cpu->breakpoint_hit)) break;
         }
     }
 

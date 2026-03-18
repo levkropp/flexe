@@ -933,6 +933,8 @@ int main(int argc, char *argv[]) {
             jit_set_verify(jit, true);
             fprintf(stderr, "[JIT] Differential verification enabled\n");
         }
+        /* JIT blocks are dispatched from jit_run's own loop.
+         * No hook installation needed — keeps interpreter baseline fast. */
     }
 #else
     (void)jit_enabled;
