@@ -167,6 +167,107 @@ TEST(insn_reads_periph) {
     teardown(&cpu);
 }
 
+/* ===== Interrupt matrix tests ===== */
+
+TEST(intr_matrix_default_disabled) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    /* All interrupt matrix entries should default to 16 (disabled) */
+    for (int ci = 0; ci < 32; ci++) {
+        ASSERT_EQ(periph_intr_matrix_get(p, 0, ci), 16);
+        ASSERT_EQ(periph_intr_matrix_get(p, 1, ci), 16);
+    }
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(intr_matrix_set_and_read) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    /* Set source 24 to CPU int 5 on core 0 */
+    periph_intr_matrix_set(p, 0, 5, 24);
+    ASSERT_EQ(periph_intr_matrix_get(p, 0, 5), 24);
+    /* Other entries unchanged */
+    ASSERT_EQ(periph_intr_matrix_get(p, 0, 4), 16);
+    ASSERT_EQ(periph_intr_matrix_get(p, 1, 5), 16);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(intr_matrix_dport_rw) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    /* Write source 30 to PRO_CPU int 3 via DPORT register (0x3FF00104 + 3*4) */
+    mem_write32(mem, 0x3FF00104 + 3 * 4, 30);
+    ASSERT_EQ(mem_read32(mem, 0x3FF00104 + 3 * 4), 30);
+    ASSERT_EQ(periph_intr_matrix_get(p, 0, 3), 30);
+    /* Write source 25 to APP_CPU int 7 via DPORT register (0x3FF00204 + 7*4) */
+    mem_write32(mem, 0x3FF00204 + 7 * 4, 25);
+    ASSERT_EQ(mem_read32(mem, 0x3FF00204 + 7 * 4), 25);
+    ASSERT_EQ(periph_intr_matrix_get(p, 1, 7), 25);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(intr_matrix_assert_source) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0, cpu1;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    xtensa_cpu_init(&cpu1); cpu1.mem = mem;
+    periph_attach_cpus(p, &cpu0, &cpu1);
+    /* Map source 24 → CPU int 5 on core 0 */
+    periph_intr_matrix_set(p, 0, 5, 24);
+    /* Assert source 24 */
+    periph_assert_interrupt(p, 24);
+    ASSERT_EQ(cpu0.interrupt & (1u << 5), (1u << 5));
+    ASSERT_EQ(cpu0.irq_check, true);
+    /* Core 1 should not be affected */
+    ASSERT_EQ(cpu1.interrupt & (1u << 5), 0);
+    /* Deassert */
+    periph_deassert_interrupt(p, 24);
+    ASSERT_EQ(cpu0.interrupt & (1u << 5), 0);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(cross_core_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0, cpu1;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    xtensa_cpu_init(&cpu1); cpu1.mem = mem;
+    periph_attach_cpus(p, &cpu0, &cpu1);
+    /* Map FROM_CPU_INTR0 (source 24) → CPU int 2 on core 1 */
+    periph_intr_matrix_set(p, 1, 2, 24);
+    /* Write 1 to DPORT_CPU_INTR_FROM_CPU_0_REG */
+    mem_write32(mem, 0x3FF000DC, 1);
+    ASSERT_EQ(cpu1.interrupt & (1u << 2), (1u << 2));
+    ASSERT_EQ(cpu1.irq_check, true);
+    /* Clear it */
+    mem_write32(mem, 0x3FF000DC, 0);
+    ASSERT_EQ(cpu1.interrupt & (1u << 2), 0);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(excmlevel3_masks_level3) {
+    /* With EXCMLEVEL=3, level-3 interrupts should be masked when EXCM=1 */
+    xtensa_cpu_t cpu;
+    setup_exc(&cpu);
+    cpu.ps = 0;
+    XT_PS_SET_EXCM(cpu.ps, 1);  /* EXCM=1 */
+    cpu.int_level[3] = 3;
+    cpu.interrupt = (1u << 3);
+    cpu.intenable = (1u << 3);
+    cpu.irq_check = true;
+    put_insn3(&cpu, BASE, INSN_NOP);
+    uint32_t pc_before = cpu.pc;
+    xtensa_step(&cpu);
+    /* Level-3 masked by EXCMLEVEL=3: should NOT dispatch */
+    ASSERT_EQ(cpu.pc, pc_before + 3);  /* NOP executed, no interrupt */
+}
+
 static void run_peripheral_tests(void) {
     TEST_SUITE("peripherals");
     RUN_TEST(mmio_hook_read32);
@@ -181,4 +282,10 @@ static void run_peripheral_tests(void) {
     RUN_TEST(gpio_set_clear);
     RUN_TEST(efuse_chip_info);
     RUN_TEST(insn_reads_periph);
+    RUN_TEST(intr_matrix_default_disabled);
+    RUN_TEST(intr_matrix_set_and_read);
+    RUN_TEST(intr_matrix_dport_rw);
+    RUN_TEST(intr_matrix_assert_source);
+    RUN_TEST(cross_core_interrupt);
+    RUN_TEST(excmlevel3_masks_level3);
 }

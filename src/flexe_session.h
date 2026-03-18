@@ -35,6 +35,7 @@ typedef struct {
     int         single_core;        /* 1 = no APP_CPU */
     int         window_trace;       /* Enable window spill/fill trace */
     int         spill_verify;       /* Enable spill/fill verification */
+    int         native_freertos;    /* -N: let firmware run real FreeRTOS */
 
     /* UART output callback (NULL = no UART output) */
     void      (*uart_cb)(void *ctx, uint8_t byte);
@@ -67,6 +68,7 @@ esp32_periph_t    *flexe_session_periph(flexe_session_t *s);
 esp32_rom_stubs_t *flexe_session_rom(flexe_session_t *s);
 freertos_stubs_t  *flexe_session_frt(flexe_session_t *s);
 display_stubs_t   *flexe_session_display(flexe_session_t *s);
+int                flexe_session_is_native_freertos(const flexe_session_t *s);
 
 /* Post-batch hook: call after each core 0 batch.
  * - Checks preempt on core 0

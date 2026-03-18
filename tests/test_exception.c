@@ -383,16 +383,17 @@ TEST(int_nested) {
     ASSERT_EQ(cpu.pc, TEST_VECBASE + VECOFS_KERNEL_EXC);
     ASSERT_EQ(cpu.exccause, EXCCAUSE_LEVEL1_INT);
 
-    /* Now in handler with EXCM=1. Trigger a level-3 interrupt which should preempt */
-    cpu.int_level[2] = 3;
+    /* Now in handler with EXCM=1. Trigger a level-4 interrupt which should preempt.
+     * ESP32 XCHAL_EXCM_LEVEL=3: levels 1-3 masked when EXCM=1, level 4+ can preempt. */
+    cpu.int_level[2] = 4;
     cpu.interrupt |= (1u << 2);
     /* Place a NOP at the handler address */
     put_insn3(&cpu, TEST_VECBASE + VECOFS_KERNEL_EXC, INSN_NOP);
     put_insn3(&cpu, TEST_VECBASE + VECOFS_KERNEL_EXC + 3, INSN_NOP);
     xtensa_step(&cpu);
-    /* Level-3 should preempt (> EXCMLEVEL=1) */
-    ASSERT_EQ(cpu.pc, TEST_VECBASE + VECOFS_LEVEL3_INT);
-    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 3);
+    /* Level-4 should preempt (> EXCMLEVEL=3) */
+    ASSERT_EQ(cpu.pc, TEST_VECBASE + VECOFS_LEVEL4_INT);
+    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 4);
     teardown(&cpu);
 }
 

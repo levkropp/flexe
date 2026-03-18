@@ -1,6 +1,7 @@
 #include "rom_stubs.h"
 #include "elf_symbols.h"
 #include "memory.h"
+#include "peripherals.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -50,6 +51,8 @@ struct esp32_rom_stubs {
     uint32_t         app_cpu_boot_addr;        /* Boot address for APP CPU (core 1) */
     bool             app_cpu_start_requested;  /* Core 0 requested core 1 start */
     bool             single_core_mode;         /* -1 flag: fake core 1 init variables */
+    bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
+    esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     struct {
         uint32_t addr;     /* 0 = empty */
         int      idx;      /* index into entries[] */
@@ -62,7 +65,16 @@ struct esp32_rom_stubs {
 
 static uint32_t rom_arg(xtensa_cpu_t *cpu, int n) {
     int ci = XT_PS_CALLINC(cpu->ps);
-    return ar_read(cpu, ci * 4 + 2 + n);
+    int reg = ci * 4 + 2 + n;
+    if (reg < 16) {
+        return ar_read(cpu, reg);
+    }
+    /* Overflow: arg doesn't fit in caller's 16-register window.
+     * Compiler stores overflow args on caller's stack at [SP + k*4].
+     * Caller's SP is a1 (ar[1] in current window). */
+    int overflow_idx = reg - 16;
+    uint32_t caller_sp = ar_read(cpu, 1);
+    return mem_read32(cpu->mem, caller_sp + overflow_idx * 4);
 }
 
 static void rom_return(xtensa_cpu_t *cpu, uint32_t retval) {
@@ -141,7 +153,13 @@ static void mini_printf(esp32_rom_stubs_t *s, xtensa_cpu_t *cpu) {
 
         /* Parse flags */
         char pad_char = ' ';
-        if (ch == '0') {
+        int left_justify = 0;
+        if (ch == '-') {
+            left_justify = 1;
+            ch = mem_read8(cpu->mem, fmt_addr++);
+            if (ch == 0) break;
+        }
+        if (ch == '0' && !left_justify) {
             pad_char = '0';
             ch = mem_read8(cpu->mem, fmt_addr++);
             if (ch == 0) break;
@@ -155,52 +173,106 @@ static void mini_printf(esp32_rom_stubs_t *s, xtensa_cpu_t *cpu) {
             if (ch == 0) goto done;
         }
 
-        /* Skip 'l' length modifier */
+        /* Parse precision (skip) */
+        if (ch == '.') {
+            ch = mem_read8(cpu->mem, fmt_addr++);
+            while (ch >= '0' && ch <= '9') {
+                ch = mem_read8(cpu->mem, fmt_addr++);
+            }
+            if (ch == 0) break;
+        }
+
+        /* Parse length modifier: l, ll, h, hh, z */
+        int is_long_long = 0;
         if (ch == 'l') {
+            ch = mem_read8(cpu->mem, fmt_addr++);
+            if (ch == 0) break;
+            if (ch == 'l') {
+                is_long_long = 1;
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
+            }
+        } else if (ch == 'h') {
+            ch = mem_read8(cpu->mem, fmt_addr++);
+            if (ch == 0) break;
+            if (ch == 'h') {
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
+            }
+        } else if (ch == 'z') {
             ch = mem_read8(cpu->mem, fmt_addr++);
             if (ch == 0) break;
         }
 
-        uint32_t val = rom_arg(cpu, argn++);
+        /* Read value — 64-bit for ll, 32-bit otherwise.
+         * On Xtensa, 64-bit args are passed in a register pair (even-aligned). */
+        uint64_t val64 = 0;
+        uint32_t val = 0;
+        if (is_long_long) {
+            /* 64-bit: align argn to even, then read two 32-bit halves */
+            if (argn % 2 != 0) argn++;
+            uint32_t lo = rom_arg(cpu, argn++);
+            uint32_t hi = rom_arg(cpu, argn++);
+            val64 = ((uint64_t)hi << 32) | lo;
+            val = (uint32_t)val64;
+        } else {
+            val = rom_arg(cpu, argn++);
+            val64 = val;
+        }
 
-        char numbuf[12];
+        char numbuf[24]; /* enough for 64-bit decimal */
         int numlen = 0;
 
         switch (ch) {
         case 'd':
         case 'i': {
-            int32_t sv = (int32_t)val;
             int neg = 0;
-            if (sv < 0) { neg = 1; sv = -sv; }
-            uint32_t uv = (uint32_t)sv;
+            uint64_t uv;
+            if (is_long_long) {
+                int64_t sv = (int64_t)val64;
+                if (sv < 0) { neg = 1; sv = -sv; }
+                uv = (uint64_t)sv;
+            } else {
+                int32_t sv = (int32_t)val;
+                if (sv < 0) { neg = 1; sv = -sv; }
+                uv = (uint32_t)sv;
+            }
             if (uv == 0) numbuf[numlen++] = '0';
-            else while (uv > 0) { numbuf[numlen++] = '0' + (uv % 10); uv /= 10; }
-            /* Pad */
+            else while (uv > 0) { numbuf[numlen++] = '0' + (int)(uv % 10); uv /= 10; }
             int total = numlen + neg;
-            while (total < width) { output_char(s, pad_char); total++; }
+            if (!left_justify)
+                while (total < width) { output_char(s, pad_char); total++; }
             if (neg) output_char(s, '-');
             for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+            if (left_justify)
+                while (total < width) { output_char(s, ' '); total++; }
             break;
         }
         case 'u': {
-            uint32_t uv = val;
+            uint64_t uv = is_long_long ? val64 : val;
             if (uv == 0) numbuf[numlen++] = '0';
-            else while (uv > 0) { numbuf[numlen++] = '0' + (uv % 10); uv /= 10; }
+            else while (uv > 0) { numbuf[numlen++] = '0' + (int)(uv % 10); uv /= 10; }
             int total = numlen;
-            while (total < width) { output_char(s, pad_char); total++; }
+            if (!left_justify)
+                while (total < width) { output_char(s, pad_char); total++; }
             for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+            if (left_justify)
+                while (total < width) { output_char(s, ' '); total++; }
             break;
         }
         case 'x':
         case 'X':
         case 'p': {
             const char *hexdig = (ch == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
-            uint32_t uv = val;
+            uint64_t uv = is_long_long ? val64 : val;
             if (uv == 0) numbuf[numlen++] = '0';
             else while (uv > 0) { numbuf[numlen++] = hexdig[uv & 0xF]; uv >>= 4; }
             int total = numlen;
-            while (total < width) { output_char(s, pad_char); total++; }
+            if (!left_justify)
+                while (total < width) { output_char(s, pad_char); total++; }
             for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+            if (left_justify)
+                while (total < width) { output_char(s, ' '); total++; }
             break;
         }
         case 's': {
@@ -210,12 +282,17 @@ static void mini_printf(esp32_rom_stubs_t *s, xtensa_cpu_t *cpu) {
             /* Count length first for padding */
             uint32_t tmp = saddr;
             while (mem_read8(cpu->mem, tmp) != 0) { slen++; tmp++; }
-            while (slen < width) { output_char(s, ' '); slen++; }
+            if (!left_justify)
+                while (slen < width) { output_char(s, ' '); slen++; }
+            int printed = 0;
             while (1) {
                 uint8_t c = mem_read8(cpu->mem, saddr++);
                 if (c == 0) break;
                 output_char(s, (char)c);
+                printed++;
             }
+            if (left_justify)
+                while (printed < width) { output_char(s, ' '); printed++; }
             break;
         }
         case 'c':
@@ -1681,108 +1758,137 @@ static void stub_esp_log_write(xtensa_cpu_t *cpu, void *ctx) {
     if (n > 0 && s->output_len + n < OUTPUT_BUF_SIZE)
         s->output_len += n;
 
-    /* Process format string and varargs (starting from arg 3) */
-    int argn = 3;  /* first variadic arg after format */
-    for (;;) {
-        uint8_t ch = mem_read8(cpu->mem, fmt_addr++);
-        if (ch == 0) break;
-
-        if (ch != '%') {
-            output_char(s, (char)ch);
-            continue;
-        }
-
-        /* Parse format specifier */
-        ch = mem_read8(cpu->mem, fmt_addr++);
-        if (ch == 0) break;
-
-        if (ch == '%') {
-            output_char(s, '%');
-            continue;
-        }
-
-        /* Parse flags */
-        char pad_char = ' ';
-        if (ch == '0') {
-            pad_char = '0';
+    /* Process format string and varargs (starting from arg 3),
+     * reusing the same format engine as mini_printf */
+    {
+        /* Temporarily adjust the CPU arg offset so mini_printf reads
+         * from arg 3 onwards.  We do this by saving fmt_addr in arg 0
+         * position and calling the shared engine. */
+        /* Inline format processing — same code as mini_printf
+         * but starting from argn=3 */
+        int argn = 3;
+        for (;;) {
+            uint8_t ch = mem_read8(cpu->mem, fmt_addr++);
+            if (ch == 0) break;
+            if (ch != '%') { output_char(s, (char)ch); continue; }
             ch = mem_read8(cpu->mem, fmt_addr++);
             if (ch == 0) break;
-        }
+            if (ch == '%') { output_char(s, '%'); continue; }
 
-        /* Parse width */
-        int width = 0;
-        while (ch >= '0' && ch <= '9') {
-            width = width * 10 + (ch - '0');
-            ch = mem_read8(cpu->mem, fmt_addr++);
-            if (ch == 0) goto done;
-        }
-
-        /* Skip 'l' length modifier */
-        if (ch == 'l') {
-            ch = mem_read8(cpu->mem, fmt_addr++);
-            if (ch == 0) break;
-        }
-
-        uint32_t val = rom_arg(cpu, argn++);
-
-        char numbuf[12];
-        int numlen = 0;
-
-        switch (ch) {
-        case 'd': {
-            int32_t ival = (int32_t)val;
-            int neg = ival < 0;
-            if (neg) ival = -ival;
-            do { numbuf[numlen++] = '0' + (ival % 10); ival /= 10; } while (ival);
-            if (neg) numbuf[numlen++] = '-';
-            while (numlen < width) numbuf[numlen++] = pad_char;
-            for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
-            break;
-        }
-        case 'u': {
-            uint32_t uval = val;
-            do { numbuf[numlen++] = '0' + (uval % 10); uval /= 10; } while (uval);
-            while (numlen < width) numbuf[numlen++] = pad_char;
-            for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
-            break;
-        }
-        case 'x':
-        case 'X': {
-            uint32_t uval = val;
-            const char *hex = (ch == 'x') ? "0123456789abcdef" : "0123456789ABCDEF";
-            do { numbuf[numlen++] = hex[uval & 0xF]; uval >>= 4; } while (uval);
-            while (numlen < width) numbuf[numlen++] = pad_char;
-            for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
-            break;
-        }
-        case 'p': {
-            uint32_t uval = val;
-            output_char(s, '0'); output_char(s, 'x');
-            for (int shift = 28; shift >= 0; shift -= 4) {
-                int digit = (uval >> shift) & 0xF;
-                output_char(s, "0123456789abcdef"[digit]);
+            /* Parse flags */
+            char pad_char = ' ';
+            int left_justify = 0;
+            if (ch == '-') {
+                left_justify = 1;
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
             }
-            break;
-        }
-        case 's': {
-            uint32_t str_addr = val;
-            for (int i = 0; i < 256; i++) {
-                uint8_t c = mem_read8(cpu->mem, str_addr + i);
-                if (c == 0) break;
-                output_char(s, (char)c);
+            if (ch == '0' && !left_justify) {
+                pad_char = '0';
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
             }
-            break;
-        }
-        case 'c':
-            output_char(s, (char)(val & 0xFF));
-            break;
-        default:
-            output_char(s, '%');
-            output_char(s, (char)ch);
-            break;
+
+            /* Parse width */
+            int width = 0;
+            while (ch >= '0' && ch <= '9') {
+                width = width * 10 + (ch - '0');
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) goto log_done;
+            }
+
+            /* Skip precision */
+            if (ch == '.') {
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                while (ch >= '0' && ch <= '9')
+                    ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
+            }
+
+            /* Length modifier */
+            int is_long_long = 0;
+            if (ch == 'l') {
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
+                if (ch == 'l') { is_long_long = 1; ch = mem_read8(cpu->mem, fmt_addr++); if (ch == 0) break; }
+            } else if (ch == 'h') {
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
+                if (ch == 'h') { ch = mem_read8(cpu->mem, fmt_addr++); if (ch == 0) break; }
+            } else if (ch == 'z') {
+                ch = mem_read8(cpu->mem, fmt_addr++);
+                if (ch == 0) break;
+            }
+
+            uint64_t val64 = 0;
+            uint32_t val = 0;
+            if (is_long_long) {
+                if (argn % 2 != 0) argn++;
+                uint32_t lo = rom_arg(cpu, argn++);
+                uint32_t hi = rom_arg(cpu, argn++);
+                val64 = ((uint64_t)hi << 32) | lo;
+                val = (uint32_t)val64;
+            } else {
+                val = rom_arg(cpu, argn++);
+                val64 = val;
+            }
+
+            char numbuf[24];
+            int numlen = 0;
+            switch (ch) {
+            case 'd': case 'i': {
+                int neg = 0;
+                uint64_t uv;
+                if (is_long_long) { int64_t sv = (int64_t)val64; if (sv < 0) { neg = 1; sv = -sv; } uv = (uint64_t)sv; }
+                else { int32_t sv = (int32_t)val; if (sv < 0) { neg = 1; sv = -sv; } uv = (uint32_t)sv; }
+                if (uv == 0) numbuf[numlen++] = '0';
+                else while (uv > 0) { numbuf[numlen++] = '0' + (int)(uv % 10); uv /= 10; }
+                int total = numlen + neg;
+                if (!left_justify) while (total < width) { output_char(s, pad_char); total++; }
+                if (neg) output_char(s, '-');
+                for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+                if (left_justify) while (total < width) { output_char(s, ' '); total++; }
+                break;
+            }
+            case 'u': {
+                uint64_t uv = is_long_long ? val64 : val;
+                if (uv == 0) numbuf[numlen++] = '0';
+                else while (uv > 0) { numbuf[numlen++] = '0' + (int)(uv % 10); uv /= 10; }
+                int total = numlen;
+                if (!left_justify) while (total < width) { output_char(s, pad_char); total++; }
+                for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+                if (left_justify) while (total < width) { output_char(s, ' '); total++; }
+                break;
+            }
+            case 'x': case 'X': case 'p': {
+                const char *hexdig = (ch == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+                uint64_t uv = is_long_long ? val64 : val;
+                if (uv == 0) numbuf[numlen++] = '0';
+                else while (uv > 0) { numbuf[numlen++] = hexdig[uv & 0xF]; uv >>= 4; }
+                int total = numlen;
+                if (!left_justify) while (total < width) { output_char(s, pad_char); total++; }
+                for (int i = numlen - 1; i >= 0; i--) output_char(s, numbuf[i]);
+                if (left_justify) while (total < width) { output_char(s, ' '); total++; }
+                break;
+            }
+            case 's': {
+                uint32_t saddr = val;
+                int slen = 0;
+                uint32_t tmp = saddr;
+                while (mem_read8(cpu->mem, tmp) != 0) { slen++; tmp++; }
+                if (!left_justify) while (slen < width) { output_char(s, ' '); slen++; }
+                int printed = 0;
+                while (1) { uint8_t c = mem_read8(cpu->mem, saddr++); if (c == 0) break; output_char(s, (char)c); printed++; }
+                if (left_justify) while (printed < width) { output_char(s, ' '); printed++; }
+                break;
+            }
+            case 'c': output_char(s, (char)(val & 0xFF)); break;
+            default: output_char(s, '%'); output_char(s, (char)ch); break;
+            }
         }
     }
-done:
+log_done:
+    (void)0;
 
     /* Add color end and newline */
     n = snprintf(s->output + s->output_len, OUTPUT_BUF_SIZE - s->output_len,
@@ -1802,6 +1908,18 @@ static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
 /* Generic void ROM stub: returns without a value */
 static void stub_void_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
+    rom_return_void(cpu);
+}
+
+/* Real intr_matrix_set(core, source, cpu_int): programs the interrupt matrix.
+ * In native FreeRTOS mode, this lets firmware configure interrupt routing. */
+static void stub_intr_matrix_set(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t core    = rom_arg(cpu, 0);
+    uint32_t source  = rom_arg(cpu, 1);
+    uint32_t cpu_int = rom_arg(cpu, 2);
+    if (s->periph && core <= 1 && cpu_int < 32)
+        periph_intr_matrix_set(s->periph, (int)core, (int)cpu_int, (int)source);
     rom_return_void(cpu);
 }
 
@@ -2355,8 +2473,11 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x400041c0, stub_unregistered,        "rom_i2c_readReg_Mask");
     rom_stubs_register(s, 0x400041fc, stub_void_unregistered,   "rom_i2c_writeReg_Mask");
 
-    /* Interrupt matrix */
-    rom_stubs_register(s, 0x4000681c, stub_void_unregistered,   "intr_matrix_set");
+    /* Interrupt matrix — real implementation if native mode, no-op otherwise */
+    if (s->native_freertos)
+        rom_stubs_register_ctx(s, 0x4000681c, stub_intr_matrix_set, "intr_matrix_set", s);
+    else
+        rom_stubs_register(s, 0x4000681c, stub_void_unregistered,   "intr_matrix_set");
 
     /* UART */
     rom_stubs_register(s, 0x40009200, stub_void_unregistered,   "uart_tx_one_char");
@@ -2430,7 +2551,9 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* Misc */
     rom_stubs_register(s, 0x40008208, stub_void_unregistered,   "set_rtc_memory_crc");
-    rom_stubs_register(s, 0x4000bfdc, stub_unregistered,        "_xtos_set_intlevel");
+    /* _xtos_set_intlevel: in native mode, let firmware's RSIL instruction run */
+    if (!s->native_freertos)
+        rom_stubs_register(s, 0x4000bfdc, stub_unregistered,   "_xtos_set_intlevel");
     rom_stubs_register(s, 0x400092d0, stub_unregistered,        "uart_rx_one_char");
     rom_stubs_register(s, 0x4000c728, stub_void_unregistered,   "__dummy_lock");
     rom_stubs_register(s, 0x4000c730, stub_unregistered,        "__dummy_lock_try");
@@ -2690,20 +2813,23 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* Interrupt allocation / management */
-    static const char *intr_fns[] = {
-        "esp_intr_alloc",
-        "esp_intr_alloc_intrstatus",
-        "esp_intr_free",
-        "esp_intr_disable",
-        "esp_intr_enable",
-        NULL
-    };
-    for (int i = 0; intr_fns[i]; i++) {
-        uint32_t addr;
-        if (elf_symbols_find(syms, intr_fns[i], &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_unregistered, intr_fns[i]);
-            hooked++;
+    /* Interrupt allocation / management — skip in native mode so firmware
+     * runs its own esp_intr_alloc, which programs the real interrupt matrix */
+    if (!stubs->native_freertos) {
+        static const char *intr_fns[] = {
+            "esp_intr_alloc",
+            "esp_intr_alloc_intrstatus",
+            "esp_intr_free",
+            "esp_intr_disable",
+            "esp_intr_enable",
+            NULL
+        };
+        for (int i = 0; intr_fns[i]; i++) {
+            uint32_t addr;
+            if (elf_symbols_find(syms, intr_fns[i], &addr) == 0) {
+                rom_stubs_register(stubs, addr, stub_unregistered, intr_fns[i]);
+                hooked++;
+            }
         }
     }
 
@@ -2898,21 +3024,24 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* Pthread stubs — single-threaded, all ops succeed (return 0) */
-    static const char *pthread_fns[] = {
-        "pthread_mutex_init",
-        "pthread_mutex_destroy",
-        "pthread_mutex_lock",
-        "pthread_mutex_unlock",
-        "pthread_mutex_lock_internal",
-        "pthread_mutex_init_if_static$part$3",
-        NULL
-    };
-    for (int i = 0; pthread_fns[i]; i++) {
-        uint32_t addr;
-        if (elf_symbols_find(syms, pthread_fns[i], &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_unregistered, pthread_fns[i]);
-            hooked++;
+    /* Pthread stubs — skip in native mode so firmware runs its own locking.
+     * In stub mode: single-threaded, all ops succeed (return 0). */
+    if (!stubs->native_freertos) {
+        static const char *pthread_fns[] = {
+            "pthread_mutex_init",
+            "pthread_mutex_destroy",
+            "pthread_mutex_lock",
+            "pthread_mutex_unlock",
+            "pthread_mutex_lock_internal",
+            "pthread_mutex_init_if_static$part$3",
+            NULL
+        };
+        for (int i = 0; pthread_fns[i]; i++) {
+            uint32_t addr;
+            if (elf_symbols_find(syms, pthread_fns[i], &addr) == 0) {
+                rom_stubs_register(stubs, addr, stub_unregistered, pthread_fns[i]);
+                hooked++;
+            }
         }
     }
 
@@ -3427,6 +3556,14 @@ int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs) {
 
 const uint64_t *rom_stubs_get_hook_bitmap(const esp32_rom_stubs_t *stubs) {
     return stubs ? stubs->hook_bitmap : NULL;
+}
+
+void rom_stubs_set_native_freertos(esp32_rom_stubs_t *stubs, bool native) {
+    if (stubs) stubs->native_freertos = native;
+}
+
+void rom_stubs_set_periph(esp32_rom_stubs_t *stubs, esp32_periph_t *periph) {
+    if (stubs) stubs->periph = periph;
 }
 
 void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core) {

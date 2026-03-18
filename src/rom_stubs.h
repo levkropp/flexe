@@ -5,6 +5,9 @@
 #include "elf_symbols.h"
 #include <stdint.h>
 
+/* Forward declarations */
+typedef struct esp32_periph esp32_periph_t;
+
 typedef struct esp32_rom_stubs esp32_rom_stubs_t;
 typedef void (*rom_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
 
@@ -69,6 +72,12 @@ typedef struct {
     void       *ctx;     /* context pointer */
     uint32_t   *call_count; /* pointer to entry's call_count for stats */
 } stub_direct_entry_t;
+
+/* Native FreeRTOS mode: skip interrupt/lock stubs */
+void rom_stubs_set_native_freertos(esp32_rom_stubs_t *stubs, bool native);
+
+/* Attach peripheral state (needed for intr_matrix_set in native mode) */
+void rom_stubs_set_periph(esp32_rom_stubs_t *stubs, esp32_periph_t *periph);
 
 /* Dual-core boot support */
 void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core);

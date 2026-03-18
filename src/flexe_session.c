@@ -43,6 +43,7 @@ struct flexe_session {
     aes_stubs_t       *astubs;
     mpi_stubs_t       *mstubs;
     int                single_core;
+    int                native_freertos;
 };
 
 flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
@@ -52,6 +53,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     flexe_session_t *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->single_core = cfg->single_core;
+    s->native_freertos = cfg->native_freertos;
 
     /* Load ELF symbols */
     if (cfg->elf_path) {
@@ -113,18 +115,26 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
         return NULL;
     }
     rom_stubs_set_single_core(s->rom, cfg->single_core);
+    rom_stubs_set_native_freertos(s->rom, cfg->native_freertos);
+    rom_stubs_set_periph(s->rom, s->periph);
     if (s->syms)
         rom_stubs_hook_symbols(s->rom, s->syms);
 
-    /* FreeRTOS stubs */
-    s->frt = freertos_stubs_create(&s->cpu[0]);
-    if (s->frt && s->syms)
-        freertos_stubs_hook_symbols(s->frt, s->syms);
+    /* FreeRTOS stubs — skip in native mode (firmware runs its own FreeRTOS) */
+    if (!cfg->native_freertos) {
+        s->frt = freertos_stubs_create(&s->cpu[0]);
+        if (s->frt && s->syms)
+            freertos_stubs_hook_symbols(s->frt, s->syms);
+    }
 
     /* esp_timer stubs */
     s->etimer = esp_timer_stubs_create(&s->cpu[0]);
-    if (s->etimer && s->syms)
-        esp_timer_stubs_hook_symbols(s->etimer, s->syms);
+    if (s->etimer) {
+        if (cfg->native_freertos)
+            esp_timer_stubs_set_virtual_time(s->etimer, 1);
+        if (s->syms)
+            esp_timer_stubs_hook_symbols(s->etimer, s->syms);
+    }
 
     /* Display stubs */
     s->dstubs = display_stubs_create(&s->cpu[0]);
@@ -212,6 +222,9 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     s->cpu[1].window_trace_active = false;
     s->cpu[1].spill_verify = cfg->spill_verify;
 
+    /* Attach CPUs to peripherals for interrupt delivery */
+    periph_attach_cpus(s->periph, &s->cpu[0], &s->cpu[1]);
+
     /* Attach core 1 to FreeRTOS */
     if (!cfg->single_core && s->frt)
         freertos_stubs_attach_cpu(s->frt, 1, &s->cpu[1]);
@@ -284,14 +297,21 @@ display_stubs_t *flexe_session_display(flexe_session_t *s)
     return s ? s->dstubs : NULL;
 }
 
+int flexe_session_is_native_freertos(const flexe_session_t *s)
+{
+    return s ? s->native_freertos : 0;
+}
+
 /* ===== Post-batch hook ===== */
 
 void flexe_session_post_batch(flexe_session_t *s, int batch_size)
 {
     if (!s) return;
 
-    /* Preemptive timeslice check for core 0 */
-    if (s->frt) freertos_stubs_check_preempt(s->frt);
+    /* Preemptive timeslice check for core 0 — skip in native mode
+     * where firmware's own tick ISR handles scheduling */
+    if (s->frt && !s->native_freertos)
+        freertos_stubs_check_preempt(s->frt);
 
     /* Dual-core: check if core 1 should start */
     if (!s->single_core && !s->cpu[1].running &&
@@ -306,18 +326,27 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     /* Dual-core: run core 1 batch */
     if (!s->single_core && s->cpu[1].running) {
         xtensa_run(&s->cpu[1], batch_size);
-        if (s->frt) freertos_stubs_check_preempt_core(s->frt, 1);
+        if (s->frt && !s->native_freertos)
+            freertos_stubs_check_preempt_core(s->frt, 1);
 
         /* Sync cycle counts: both cores share the same clock, so use the
-         * maximum of the two.  This preserves vTaskDelay fast-forward
-         * advances on either core while keeping them in sync. */
-        if (s->cpu[1].cycle_count > s->cpu[0].cycle_count) {
-            s->cpu[0].cycle_count = s->cpu[1].cycle_count;
-            s->cpu[0].virtual_time_us = s->cpu[1].cycle_count / 160;
+         * maximum of the two.  In native mode, no fast-forward — time
+         * advances only via ccount increments. */
+        if (s->native_freertos) {
+            /* Keep cores loosely in sync without fast-forward */
+            if (s->cpu[1].cycle_count > s->cpu[0].cycle_count)
+                s->cpu[0].cycle_count = s->cpu[1].cycle_count;
+            else
+                s->cpu[1].cycle_count = s->cpu[0].cycle_count;
         } else {
-            s->cpu[1].cycle_count = s->cpu[0].cycle_count;
+            if (s->cpu[1].cycle_count > s->cpu[0].cycle_count) {
+                s->cpu[0].cycle_count = s->cpu[1].cycle_count;
+                s->cpu[0].virtual_time_us = s->cpu[1].cycle_count / 160;
+            } else {
+                s->cpu[1].cycle_count = s->cpu[0].cycle_count;
+            }
+            s->cpu[1].virtual_time_us = s->cpu[0].virtual_time_us;
         }
-        s->cpu[1].virtual_time_us = s->cpu[0].virtual_time_us;
     }
 }
 
