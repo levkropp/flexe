@@ -62,6 +62,10 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc);
 /* Main JIT execution loop — replaces xtensa_run() when JIT is enabled */
 int          jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles);
 
+/* Install JIT as a pc_hook on the given CPU, chaining with the existing hook.
+ * After this, xtensa_run() will automatically dispatch to JIT blocks. */
+void         jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu);
+
 /* Statistics */
 const jit_stats_t *jit_get_stats(const jit_state_t *jit);
 void               jit_print_stats(const jit_state_t *jit);
