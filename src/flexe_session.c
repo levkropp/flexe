@@ -187,6 +187,9 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     if (s->bstubs && s->syms)
         bt_stubs_hook_symbols(s->bstubs, s->syms);
 
+    /* Pre-decode instruction memory for fast fetch */
+    xtensa_predecode_build(&s->cpu[0]);
+
     /* Set entry point */
     if (cfg->entry_override != 0)
         s->cpu[0].pc = cfg->entry_override;
@@ -201,6 +204,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     xtensa_cpu_init(&s->cpu[1]);
     xtensa_cpu_reset(&s->cpu[1]);
     s->cpu[1].mem = s->mem;
+    s->cpu[1].predecode = s->cpu[0].predecode;  /* Share predecode table */
     s->cpu[1].core_id = 1;
     s->cpu[1].prid = 0xABAB;
     s->cpu[1].running = false;
