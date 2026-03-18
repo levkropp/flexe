@@ -18,7 +18,7 @@
 #define JIT_HASH_MASK   (JIT_HASH_SIZE - 1)
 
 /* Compilation threshold: compile after N interpreter executions */
-#define JIT_HOT_THRESHOLD  8
+#define JIT_HOT_THRESHOLD  3
 
 /* Maximum guest instructions per block */
 #define JIT_MAX_BLOCK_INSNS  64
