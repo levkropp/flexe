@@ -54,6 +54,7 @@ void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     cpu->int_level[16] = 5;   /* CCOMPARE2 → level 5 */
 }
 
+
 void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
     xtensa_cpu_init(cpu);
 
@@ -1877,6 +1878,8 @@ static void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
     }
 }
 
+
+
 /* ===== Main step function (always-inlined into xtensa_run hot loop) ===== */
 /* Parameters local_cc/bitmap/hook are cached locals from xtensa_run to keep
  * them in registers instead of reloading from the cpu struct each iteration.
@@ -1960,16 +1963,13 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
         return 0;
     }
 
-    int op0 = XT_OP0(insn);
-    uint32_t next_pc = cpu->pc + (uint32_t)ilen;
     cpu->_pc_written = false;
+    cpu->pc += (uint32_t)ilen;
 
     if (ilen == 2) {
-        cpu->pc = next_pc;
         exec_narrow(cpu, insn);
     } else {
-        cpu->pc = next_pc;
-        switch (op0) {
+        switch (XT_OP0(insn)) {
         case 0: exec_qrst(cpu, insn); break;
         case 1: /* L32R */
             { int lt = XT_T(insn);
