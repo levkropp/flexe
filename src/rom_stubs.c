@@ -55,6 +55,7 @@ struct esp32_rom_stubs {
         int      idx;      /* index into entries[] */
     } ht[HOOK_HT_SIZE];
     uint64_t hook_bitmap[HOOK_BITMAP_WORDS];
+    stub_direct_entry_t *direct;  /* Direct dispatch table (heap-allocated, 64K entries) */
 };
 
 /* ===== Calling convention helpers ===== */
@@ -2110,13 +2111,37 @@ static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
             s->ht[slot].addr = addr;
             s->ht[slot].idx = idx;
             hook_bitmap_set(s, addr);
-            return;
+            break;
         }
+    }
+    /* Also insert into direct dispatch table (overwrite on collision —
+     * collisions fall back to hash via rom_pc_hook). */
+    if (s->direct) {
+        rom_stub_entry_t *e = &s->entries[idx];
+        uint32_t di = (addr >> 2) & STUB_DIRECT_MASK;
+        s->direct[di].tag = addr;
+        s->direct[di].fn = e->fn;
+        s->direct[di].ctx = e->user_ctx ? e->user_ctx : s;
+        s->direct[di].call_count = &e->call_count;
     }
 }
 
 static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
+
+    /* Fast path: direct dispatch table — single indexed lookup, no hash */
+    if (__builtin_expect(s->direct != NULL, 1)) {
+        uint32_t di = (pc >> 2) & STUB_DIRECT_MASK;
+        stub_direct_entry_t *de = &s->direct[di];
+        if (__builtin_expect(de->tag == pc, 1)) {
+            s->total_calls++;
+            (*de->call_count)++;
+            de->fn(cpu, de->ctx);
+            return 1;
+        }
+    }
+
+    /* Slow path: hash table lookup (handles collisions, spy mode, logging) */
     int idx = hook_ht_lookup(s, pc);
     if (idx >= 0) {
         s->entries[idx].call_count++;
@@ -2147,6 +2172,9 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     if (!s) return NULL;
     s->cpu = cpu;
     s->cpu_freq_mhz = 160;
+
+    /* Allocate direct dispatch table (64K entries × 24 bytes ≈ 1.5MB) */
+    s->direct = calloc(STUB_DIRECT_SIZE, sizeof(stub_direct_entry_t));
 
     /* Install PC hook */
     cpu->pc_hook = rom_pc_hook;
@@ -2310,6 +2338,7 @@ void rom_stubs_destroy(esp32_rom_stubs_t *stubs) {
         stubs->cpu->pc_hook_ctx = NULL;
         stubs->cpu->pc_hook_bitmap = NULL;
     }
+    free(stubs->direct);
     free(stubs);
 }
 
