@@ -7,15 +7,42 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Profile-guided optimization (PGO)
+# Usage:
+#   1. cmake -B build-pgo -DPGO=generate && cmake --build build-pgo
+#   2. ./build-pgo/xtensa-emu -q -c 100000000 -s firmware.elf firmware.bin
+#   3. cmake -B build-pgo -DPGO=use && cmake --build build-pgo
+option(PGO "PGO mode: 'generate' to collect profiles, 'use' to apply them" "")
+
 # LTO and native tuning for Release builds (GCC/Clang only)
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     include(CheckIPOSupported)
     check_ipo_supported(RESULT IPO_SUPPORTED)
-    if(IPO_SUPPORTED)
+    if(IPO_SUPPORTED AND NOT PGO)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
     endif()
     if(NOT MSVC)
         add_compile_options(-march=native)
+    endif()
+endif()
+
+if(PGO STREQUAL "generate")
+    message(STATUS "PGO: generating profile data")
+    add_compile_options(-fprofile-generate)
+    add_link_options(-fprofile-generate)
+    set(PGO_NOWARN "-Wno-error")
+    # Disable LTO during profile generation (conflicts with PGO on some GCC versions)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+elseif(PGO STREQUAL "use")
+    message(STATUS "PGO: using profile data for optimization")
+    add_compile_options(-fprofile-use -fprofile-correction)
+    add_link_options(-fprofile-use)
+    set(PGO_NOWARN "-Wno-error")
+    # Re-enable LTO for PGO use builds
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT IPO_SUPPORTED)
+    if(IPO_SUPPORTED)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
     endif()
 endif()
 
@@ -62,7 +89,7 @@ else()
     target_link_libraries(xtensa-emu-lib PUBLIC
         m z Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
     target_compile_options(xtensa-emu-lib PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter)
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
     # Disable stack protector on hot-path files (saves ~3-4% from canary checks)
     set_source_files_properties(src/xtensa.c src/memory.c
@@ -76,7 +103,7 @@ if(MSVC)
     target_compile_options(xtensa-emu PRIVATE /W4 /wd4100 /wd4244 /wd4267)
     target_compile_definitions(xtensa-emu PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
-    target_compile_options(xtensa-emu PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+    target_compile_options(xtensa-emu PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()
 
 # Test runner
@@ -86,7 +113,7 @@ if(MSVC)
     target_compile_options(xtensa-tests PRIVATE /W4 /wd4100 /wd4244 /wd4267)
     target_compile_definitions(xtensa-tests PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
-    target_compile_options(xtensa-tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+    target_compile_options(xtensa-tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()
 
 # Disassembler tool
@@ -96,7 +123,7 @@ if(MSVC)
     target_compile_options(xt-dis PRIVATE /W4 /wd4100)
     target_compile_definitions(xt-dis PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
-    target_compile_options(xt-dis PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+    target_compile_options(xt-dis PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()
 
 # Trace filter tool
@@ -105,5 +132,5 @@ if(MSVC)
     target_compile_options(trace-filter PRIVATE /W4 /wd4100)
     target_compile_definitions(trace-filter PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
-    target_compile_options(trace-filter PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+    target_compile_options(trace-filter PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

@@ -35,9 +35,11 @@ static inline void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
 
 /* Fire any matching ccompare timers and recompute next event */
 static inline void xtensa_fire_timers(xtensa_cpu_t *cpu) {
+    uint32_t old = cpu->interrupt;
     if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
     if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
     if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+    if (cpu->interrupt != old) cpu->irq_check = true;
     xtensa_recompute_next_timer(cpu);
 }
 
@@ -225,9 +227,9 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_EXCSAVE6:    cpu->excsave[5] = val; break;
     case XT_SR_EXCSAVE7:    cpu->excsave[6] = val; break;
     case XT_SR_CPENABLE:    cpu->cpenable = val; break;
-    case XT_SR_INTSET:   cpu->interrupt |= val; break;
+    case XT_SR_INTSET:   cpu->interrupt |= val; cpu->irq_check = true; break;
     case XT_SR_INTCLEAR: cpu->interrupt &= ~val; break;
-    case XT_SR_INTENABLE:   cpu->intenable = val; break;
+    case XT_SR_INTENABLE:   cpu->intenable = val; cpu->irq_check = true; break;
     case XT_SR_PS:          cpu->ps = val; break;
     case XT_SR_VECBASE:     cpu->vecbase = val; break;
     case XT_SR_EXCCAUSE:    cpu->exccause = val; break;
@@ -1897,10 +1899,6 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
         return cpu->exception ? -1 : 0;
     }
 
-    /* Record PC history for debugging */
-    cpu->pc_history[cpu->pc_history_idx] = cpu->pc;
-    cpu->pc_history_idx = (cpu->pc_history_idx + 1) & (PC_HISTORY_SIZE - 1);
-
     /* Invalid PC trap: catch jumps to unmapped/non-code regions.
      * Valid ESP32 code: 0x40000000-0x400BFFFF (ROM/IRAM), 0x400D0000-0x404FFFFF (flash) */
     if (__builtin_expect(cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u, 0)) {
@@ -1915,12 +1913,6 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
                     r+2, ar_read(cpu, r+2), r+3, ar_read(cpu, r+3));
         fprintf(stderr, "  EPC1=0x%08X EPC2=0x%08X EPC3=0x%08X\n",
                 cpu->epc[0], cpu->epc[1], cpu->epc[2]);
-        /* Dump PC history (newest first) */
-        fprintf(stderr, "  PC history (last %d instructions):\n", PC_HISTORY_SIZE);
-        for (int i = 0; i < PC_HISTORY_SIZE; i++) {
-            int idx = (cpu->pc_history_idx - 1 - i) & (PC_HISTORY_SIZE - 1);
-            fprintf(stderr, "    [-%02d] 0x%08X\n", i, cpu->pc_history[idx]);
-        }
         cpu->running = false;
         cpu->exception = true;
         return -1;
@@ -1948,10 +1940,14 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
             cpu->ccount++;
             ++*local_cc;
             cpu->cycle_count = *local_cc;
+            /* Stubs may advance time, so check timers unconditionally */
             if (cpu->ccount == cpu->next_timer_event)
                 xtensa_fire_timers(cpu);
-            if (cpu->interrupt & cpu->intenable)
-                xtensa_check_interrupts(cpu);
+            if (__builtin_expect(cpu->irq_check, 0)) {
+                cpu->irq_check = false;
+                if (cpu->interrupt & cpu->intenable)
+                    xtensa_check_interrupts(cpu);
+            }
             *local_cc = cpu->cycle_count;  /* reload (stub may advance time) */
             return cpu->exception ? -1 : 0;
         }
@@ -2029,20 +2025,30 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     cpu->ccount++;
     ++*local_cc;
 
-    if (cpu->ccount == cpu->next_timer_event)
+    if (__builtin_expect(cpu->ccount == cpu->next_timer_event, 0))
         xtensa_fire_timers(cpu);
 
-    if (cpu->interrupt & cpu->intenable)
-        xtensa_check_interrupts(cpu);
+    /* Interrupt check — only when interrupt state has changed
+     * (timer fired, INTSET/INTENABLE written, peripheral set a bit). */
+    if (__builtin_expect(cpu->irq_check, 0)) {
+        cpu->irq_check = false;
+        if (cpu->interrupt & cpu->intenable)
+            xtensa_check_interrupts(cpu);
+    }
 
     return cpu->exception ? -1 : 0;
 }
 
-/* External entry point (for single-step / trace callers) */
+/* External entry point (for single-step / trace callers).
+ * Always checks timers + interrupts unconditionally (no batching). */
 int xtensa_step(xtensa_cpu_t *cpu) {
     uint64_t cc = cpu->cycle_count;
     int r = xtensa_step_impl(cpu, &cc);
     cpu->cycle_count = cc;
+    if (cpu->ccount == cpu->next_timer_event)
+        xtensa_fire_timers(cpu);
+    if (cpu->interrupt & cpu->intenable)
+        xtensa_check_interrupts(cpu);
     return r;
 }
 

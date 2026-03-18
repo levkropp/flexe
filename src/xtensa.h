@@ -181,65 +181,113 @@ typedef enum {
  * CPU State
  */
 struct xtensa_cpu {
+    /* ================================================================
+     * HOT SECTION — fields accessed every instruction.
+     * Packed into first cache lines to minimize L1 misses.
+     * DO NOT add cold fields here without benchmarking.
+     * ================================================================ */
+
     /* General-purpose registers: 64 physical, 16 visible via window */
-    uint32_t ar[64];
+    uint32_t ar[64];                    /* offset 0, 256 bytes, CL 0-3 */
 
-    /* Program counter */
-    uint32_t pc;
+    /* --- CL 4: decode/execute critical path --- */
+    uint32_t pc;                        /* Program counter */
+    uint32_t ccount;                    /* SR 234: Cycle counter */
+    uint32_t next_timer_event;          /* Nearest ccompare value */
+    uint32_t windowbase;                /* SR 72: Window base (0-15) */
+    uint32_t ps;                        /* SR 230: Processor State */
+    uint32_t sar;                       /* SR 3:  Shift Amount Register (6-bit) */
+    uint32_t lbeg;                      /* SR 0:  Loop begin address */
+    uint32_t lend;                      /* SR 1:  Loop end address */
+    uint32_t lcount;                    /* SR 2:  Loop count */
+    uint32_t intenable;                 /* SR 228: Interrupt enable mask */
+    uint32_t interrupt;                 /* SR 226: Interrupt pending bits */
+    uint32_t br;                        /* SR 4: 16 boolean bits, b0-b15 */
+    bool     running;
+    bool     halted;                    /* WAITI halt state */
+    bool     exception;                 /* Exception pending flag */
+    bool     _pc_written;               /* Set when instruction modifies PC */
+    bool     irq_check;                 /* Set when interrupt/intenable changes */
+    int      breakpoint_count;
 
-    /* Special registers */
-    uint32_t sar;           /* SR 3:  Shift Amount Register (6-bit) */
-    uint32_t lbeg;          /* SR 0:  Loop begin address */
-    uint32_t lend;          /* SR 1:  Loop end address */
-    uint32_t lcount;        /* SR 2:  Loop count */
-    uint32_t windowbase;    /* SR 72: Window base (0-15) */
-    uint32_t windowstart;   /* SR 73: Bitmask of valid windows */
-    uint32_t ps;            /* SR 230: Processor State */
-    uint32_t vecbase;       /* SR 231: Exception vector base */
-    uint32_t exccause;      /* SR 232: Exception cause */
-    uint32_t excvaddr;      /* SR 238: Exception virtual address */
-    uint32_t epc[7];        /* SR 177-183: Exception PCs (levels 1-7) */
-    uint32_t eps[7];        /* SR 194-200: Exception PS (levels 2-7, index 0 unused) */
-    uint32_t excsave[7];    /* SR 209-215: Exception save regs */
-    uint32_t depc;          /* SR 192: Double exception PC */
-    uint32_t ccount;        /* SR 234: Cycle counter */
-    uint32_t ccompare[3];   /* SR 240-242: Cycle compare */
-    uint32_t next_timer_event; /* Nearest ccompare value (for batched timer check) */
-    uint32_t scompare1;     /* SR 12: Compare value for S32C1I */
-    uint32_t misc[4];       /* SR 244-247: Misc scratch registers */
-    uint32_t litbase;       /* SR 5:  Literal base (Extended L32R) */
-    uint32_t atomctl;       /* SR 99: Atomic operation control */
-    uint32_t memctl;        /* SR 97: Memory control */
-    uint32_t icount;        /* SR 236: Instruction count */
-    uint32_t icountlevel;   /* SR 237: Icount exception level */
-    uint32_t debugcause;    /* SR 233: Debug exception cause */
-    uint32_t ibreakenable;  /* SR 96: Instruction breakpoint enable */
-    uint32_t ibreaka[2];    /* SR 128-129: Instruction breakpoints */
-    uint32_t dbreaka[2];    /* SR 144-145: Data breakpoints */
-    uint32_t dbreakc[2];    /* SR 160-161: Data breakpoint control */
-    uint32_t configid0;     /* SR 176: Processor config ID 0 */
-    uint32_t configid1;     /* SR 208: Processor config ID 1 */
-    uint32_t prid;          /* SR 235: Processor ID */
-    int      core_id;       /* Core ID (0=PRO_CPU, 1=APP_CPU) */
-    uint32_t intenable;     /* SR 228: Interrupt enable mask */
-    uint32_t interrupt;     /* SR 226: Interrupt pending bits */
-    uint32_t cpenable;      /* SR 224: Coprocessor enable */
+    /* --- CL 5-6: pointers, cycle count, window --- */
+    uint64_t cycle_count;               /* Total emulated cycles */
+    xtensa_mem_t *mem;                  /* Memory subsystem */
+    xtensa_pc_hook_fn pc_hook;          /* PC hook (for ROM stubs etc.) */
+    void             *pc_hook_ctx;
+    const uint64_t   *pc_hook_bitmap;   /* Fast-path bitmap: skip hook if bit not set */
+    uint32_t windowstart;               /* SR 73: Bitmask of valid windows */
 
-    /* Boolean registers (Boolean Option) */
-    uint32_t br;            /* SR 4: 16 boolean bits, b0-b15 */
+    /* ================================================================
+     * WARM SECTION — accessed on branches, exceptions, some instructions
+     * ================================================================ */
+
+    /* Exception state */
+    uint32_t vecbase;           /* SR 231: Exception vector base */
+    uint32_t exccause;          /* SR 232: Exception cause */
+    uint32_t excvaddr;          /* SR 238: Exception virtual address */
+    uint32_t epc[7];            /* SR 177-183: Exception PCs (levels 1-7) */
+    uint32_t eps[7];            /* SR 194-200: Exception PS (levels 2-7, index 0 unused) */
+    uint32_t excsave[7];        /* SR 209-215: Exception save regs */
+    uint32_t depc;              /* SR 192: Double exception PC */
+
+    /* Timers */
+    uint32_t ccompare[3];       /* SR 240-242: Cycle compare */
+
+    /* Misc special registers */
+    uint32_t scompare1;         /* SR 12: Compare value for S32C1I */
+    uint32_t misc[4];           /* SR 244-247: Misc scratch registers */
+    uint32_t litbase;           /* SR 5:  Literal base (Extended L32R) */
+    uint32_t atomctl;           /* SR 99: Atomic operation control */
+    uint32_t memctl;            /* SR 97: Memory control */
+    uint32_t icount;            /* SR 236: Instruction count */
+    uint32_t icountlevel;       /* SR 237: Icount exception level */
+    uint32_t debugcause;        /* SR 233: Debug exception cause */
+    uint32_t ibreakenable;      /* SR 96: Instruction breakpoint enable */
+    uint32_t ibreaka[2];        /* SR 128-129: Instruction breakpoints */
+    uint32_t dbreaka[2];        /* SR 144-145: Data breakpoints */
+    uint32_t dbreakc[2];        /* SR 160-161: Data breakpoint control */
+    uint32_t configid0;         /* SR 176: Processor config ID 0 */
+    uint32_t configid1;         /* SR 208: Processor config ID 1 */
+    uint32_t prid;              /* SR 235: Processor ID */
+    int      core_id;           /* Core ID (0=PRO_CPU, 1=APP_CPU) */
+    uint32_t cpenable;          /* SR 224: Coprocessor enable */
 
     /* MAC16 Option state */
-    uint32_t acclo;         /* SR 16: Accumulator low */
-    uint32_t acchi;         /* SR 17: Accumulator high (8-bit) */
-    uint32_t mr[4];         /* SR 32-35: MAC16 data registers */
+    uint32_t acclo;             /* SR 16: Accumulator low */
+    uint32_t acchi;             /* SR 17: Accumulator high (8-bit) */
+    uint32_t mr[4];             /* SR 32-35: MAC16 data registers */
 
     /* Floating-point coprocessor */
-    uint32_t fcr;           /* Floating-point control */
-    uint32_t fsr;           /* Floating-point status */
-    float    fr[16];        /* Floating-point registers */
+    uint32_t fcr;               /* Floating-point control */
+    uint32_t fsr;               /* Floating-point status */
+    float    fr[16];            /* Floating-point registers */
+
+    /* Execution control */
+    bool     debug_break;       /* Debug break requested */
+    bool     window_trace;      /* Emit window spill/fill/ENTRY/RETW trace to stderr */
+    bool     window_trace_active; /* Set by main loop to gate window trace */
+    bool     spill_verify;      /* Enable spill/fill verification */
+    uint64_t virtual_time_us;   /* Simulated wall-clock microseconds */
 
     /* Interrupt configuration */
-    uint8_t  int_level[32]; /* Interrupt level per line (default: 1) */
+    uint8_t  int_level[32];     /* Interrupt level per line (default: 1) */
+
+    /* Breakpoints */
+#define MAX_BREAKPOINTS 16
+    uint32_t breakpoints[MAX_BREAKPOINTS];
+    bool     breakpoint_hit;
+    uint32_t breakpoint_hit_addr;
+
+    /* Debug: PC history ring buffer */
+#define PC_HISTORY_SIZE 32
+    uint32_t pc_history[PC_HISTORY_SIZE];
+    int      pc_history_idx;
+
+    /* ================================================================
+     * COLD SECTION — large arrays, rarely accessed per-instruction.
+     * Kept at end so they don't pollute cache lines of hot fields.
+     * ================================================================ */
 
     /* Window spill base stack: each window slot can be spilled multiple times
      * (when the window ring wraps around). We track all spill locations so
@@ -256,44 +304,12 @@ struct xtensa_cpu {
     } spill_stack[16];
     uint32_t spill_base[16]; /* legacy: most recent base per window (for -W trace) */
 
-    /* Spill verification: shadow copies to detect stack corruption between spill/fill */
+    /* Spill verification: shadow copies to detect stack corruption */
     struct {
         uint32_t regs[12];   /* saved register values (a0-a11 max) */
         uint32_t base;       /* base address used during spill */
         int count;           /* number of regs saved (4, 8, or 12) */
     } spill_shadow[16];
-    bool spill_verify;       /* Enable spill/fill verification */
-
-    /* Execution state */
-    bool     running;
-    bool     exception;     /* Exception pending flag */
-    bool     debug_break;   /* Debug break requested */
-    bool     halted;        /* WAITI halt state */
-    bool     _pc_written;   /* Set when instruction modifies PC (branch/call/ret) */
-    bool     window_trace;  /* Emit window spill/fill/ENTRY/RETW trace to stderr */
-    bool     window_trace_active; /* Set by main loop to gate window trace in trace windows */
-    uint64_t cycle_count;   /* Total emulated cycles */
-    uint64_t virtual_time_us; /* Simulated wall-clock microseconds (advanced by sleep stubs) */
-
-    /* Memory subsystem (set by caller) */
-    xtensa_mem_t *mem;
-
-    /* PC hook (for ROM stubs etc.) */
-    xtensa_pc_hook_fn pc_hook;
-    void             *pc_hook_ctx;
-    const uint64_t   *pc_hook_bitmap;  /* Fast-path bitmap: skip hook if bit not set */
-
-    /* Breakpoints */
-#define MAX_BREAKPOINTS 16
-    uint32_t breakpoints[MAX_BREAKPOINTS];
-    int      breakpoint_count;
-    bool     breakpoint_hit;
-    uint32_t breakpoint_hit_addr;
-
-    /* Debug: PC history ring buffer */
-#define PC_HISTORY_SIZE 32
-    uint32_t pc_history[PC_HISTORY_SIZE];
-    int      pc_history_idx;
 };
 
 /*
