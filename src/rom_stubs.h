@@ -55,6 +55,21 @@ static inline int rom_stubs_hook_bitmap_test(const uint64_t *bitmap, uint32_t pc
 /* Get the hook bitmap pointer (for use in hot path) */
 const uint64_t *rom_stubs_get_hook_bitmap(const esp32_rom_stubs_t *stubs);
 
+/* ---- Direct dispatch table (fast stub lookup) ----
+ * Replaces bitmap + hash for the hot path. Indexed by (pc >> 2) & MASK.
+ * On hit (fn != NULL and tag matches), call fn directly — no hash needed.
+ * On miss, falls through to normal rom_pc_hook for ROM range interception. */
+#define STUB_DIRECT_BITS  16            /* 64K entries */
+#define STUB_DIRECT_SIZE  (1u << STUB_DIRECT_BITS)
+#define STUB_DIRECT_MASK  (STUB_DIRECT_SIZE - 1)
+
+typedef struct {
+    uint32_t    tag;     /* full PC for collision detection */
+    rom_stub_fn fn;      /* stub function (NULL = empty slot) */
+    void       *ctx;     /* context pointer */
+    uint32_t   *call_count; /* pointer to entry's call_count for stats */
+} stub_direct_entry_t;
+
 /* Dual-core boot support */
 void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core);
 bool rom_stubs_app_cpu_start_requested(const esp32_rom_stubs_t *stubs);
