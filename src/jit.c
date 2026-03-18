@@ -73,24 +73,36 @@ struct jit_state {
 
 /* ===== Hash table operations ===== */
 
-static inline uint32_t jit_hash_pc(uint32_t pc) {
-    return (pc >> 2) & JIT_HASH_MASK;
+/* Hash key combines PC and windowbase so each (pc, wb) pair gets its own slot.
+ * This eliminates the runtime windowbase guard — blocks are compiled for a
+ * specific windowbase and only found when that windowbase is active. */
+static inline uint32_t jit_hash_key(uint32_t pc, uint32_t wb) {
+    return ((pc >> 2) ^ (wb * 2654435761u)) & JIT_HASH_MASK;
 }
 
-static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc) {
-    uint32_t idx = jit_hash_pc(pc);
+/* Combined tag for collision detection: pack wb into unused high bits of PC.
+ * ESP32 PCs are 0x4000xxxx-0x404xxxxx, so bits 31:27 = 01000. We can pack
+ * wb (0-15) into bits 31:28 safely by XORing. */
+static inline uint32_t jit_make_tag(uint32_t pc, uint32_t wb) {
+    return pc ^ (wb << 28);
+}
+
+static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb) {
+    uint32_t idx = jit_hash_key(pc, wb);
+    uint32_t tag = jit_make_tag(pc, wb);
     jit_block_t *b = &jit->hash[idx];
-    if (b->code && b->pc == pc)
+    if (b->code && b->pc == tag)
         return b;
     return NULL;
 }
 
-static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc) {
-    uint32_t idx = jit_hash_pc(pc);
+static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc, uint32_t wb) {
+    uint32_t idx = jit_hash_key(pc, wb);
+    uint32_t tag = jit_make_tag(pc, wb);
     jit_block_t *b = &jit->hash[idx];
-    if (b->pc != pc) {
-        /* Empty slot or collision with different PC — reset */
-        b->pc = pc;
+    if (b->pc != tag) {
+        /* Empty slot or collision with different PC/wb — reset */
+        b->pc = tag;
         b->code = NULL;
         b->exec_count = 0;
         b->guest_insns = 0;
@@ -330,6 +342,10 @@ static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
     uint32_t cur_pc = pc;
     uint32_t page_end = (pc & ~0xFFFu) + 0x1000;
 
+    /* If a zero-overhead loop is active, stop the block at lend so the
+     * loop-back check in jit_run fires between blocks. */
+    uint32_t lend = (cpu->lcount > 0) ? cpu->lend : 0;
+
     for (int i = 0; i < JIT_MAX_BLOCK_INSNS; i++) {
         /* Stop at page boundary */
         if (cur_pc >= page_end) break;
@@ -348,6 +364,10 @@ static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
         scan->ilens[i] = ilen;
         scan->count = i + 1;
         cur_pc += (uint32_t)ilen;
+
+        /* Stop at loop end boundary: the instruction AT lend is the last
+         * one before the loop-back fires, so include it then stop. */
+        if (lend && cur_pc >= lend) break;
 
         if (cls == 1) {
             /* Block terminator (branch) — include it, then stop */
@@ -1702,27 +1722,10 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     /* Load mem pointer */
     emit_load64_disp(&e, REG_MEM, REG_CPU, (int32_t)CPU_OFF_MEM);
 
-    /* Compute windowbase * 4 — constant for this block.
-     * Guard: check at runtime that windowbase hasn't changed since compilation.
-     * If it has, return 0 to bail to interpreter. */
+    /* Windowbase * 4 — compile-time constant per block.
+     * No runtime guard needed: blocks are keyed by (pc, windowbase) in the
+     * hash table, so this block is only found when windowbase matches. */
     int wb4 = (int)(cpu->windowbase * 4);
-    emit_load_cpu32(&e, RAX, (int32_t)CPU_OFF_WINDOWBASE);
-    emit_cmp_reg32_imm32(&e, RAX, (int32_t)cpu->windowbase);
-    int wb_mismatch = emit_jcc_rel32(&e, CC_NE);
-    /* Emit early exit for windowbase mismatch: return 0 */
-    {
-        int skip_bail = emit_jmp_rel32(&e);
-        emit_patch_rel32(&e, wb_mismatch);
-        emit_mov_reg_imm32(&e, RAX, 0);
-        emit_pop(&e, R13);
-        emit_pop(&e, R14);
-        emit_pop(&e, R15);
-        emit_pop(&e, RBP);
-        emit_pop(&e, RBX);
-        emit_pop(&e, R12);
-        emit_ret(&e);
-        emit_patch_rel32(&e, skip_bail);
-    }
 
     /* Compile each instruction */
     int last_compiled = 0;
@@ -1804,12 +1807,13 @@ void jit_flush(jit_state_t *jit) {
 }
 
 jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
-    jit_block_t *b = jit_lookup(jit, pc);
+    uint32_t wb = cpu->windowbase;
+    jit_block_t *b = jit_lookup(jit, pc, wb);
     if (b && b->code)
         return (jit_block_fn)b->code;
 
     /* Get or create entry */
-    b = jit_get_or_create(jit, pc);
+    b = jit_get_or_create(jit, pc, wb);
     b->exec_count++;
 
     if (b->exec_count < JIT_HOT_THRESHOLD)
@@ -1862,23 +1866,9 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
         /* Check PC hook (stubs) — must run through interpreter */
         if (cpu->pc_hook && (!cpu->pc_hook_bitmap ||
             rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, pc))) {
-            /* Single-step through interpreter for stub */
             int ran = xtensa_run(cpu, 1);
             cycles += ran;
             jit->stats.insns_interp += (uint64_t)ran;
-            continue;
-        }
-
-        /* Skip JIT when zero-overhead loop is active — the loop-back
-         * fires after each instruction at lend, which the JIT doesn't handle. */
-        if (cpu->lcount > 0) {
-            int batch = max_cycles - cycles;
-            if (batch > 64) batch = 64;
-            int ran = xtensa_run(cpu, batch);
-            cycles += ran;
-            jit->stats.insns_interp += (uint64_t)ran;
-            if (ran < batch && (!cpu->running || cpu->halted || cpu->breakpoint_hit))
-                break;
             continue;
         }
 
@@ -1894,6 +1884,12 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
             }
 
             int block_insns = fn(cpu);
+
+            /* Apply zero-overhead loop check immediately after block */
+            if (block_insns > 0 && cpu->lcount > 0 && cpu->pc == cpu->lend) {
+                cpu->lcount--;
+                cpu->pc = cpu->lbeg;
+            }
 
             if (verify_snap && block_insns > 0) {
                 /* Run interpreter on snapshot */
@@ -1985,22 +1981,16 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
                     xtensa_check_interrupts(cpu);
             }
 
-            /* Check zero-overhead loop */
-            if (cpu->lcount > 0 && cpu->pc == cpu->lend) {
-                cpu->lcount--;
-                cpu->pc = cpu->lbeg;
-            }
         } else {
-            /* Interpret a batch of instructions */
+            /* No JIT block available — run a large interpreter batch.
+             * The interpreter handles stubs, exceptions, interrupts correctly,
+             * so large batches are safe and amortize the dispatch overhead. */
             int batch = max_cycles - cycles;
-            if (batch > 64) batch = 64;  /* Small batches to re-check JIT */
+            if (batch > 1000) batch = 1000;
             int ran = xtensa_run(cpu, batch);
             cycles += ran;
             jit->stats.insns_interp += (uint64_t)ran;
             if (ran < batch) {
-                /* xtensa_run stops on exceptions (e.g., window overflow) which
-                 * are normally handled by the exception system. Only break if
-                 * the CPU actually stopped — otherwise continue the loop. */
                 if (!cpu->running || cpu->halted || cpu->breakpoint_hit) break;
             }
         }
