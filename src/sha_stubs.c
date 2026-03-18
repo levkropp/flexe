@@ -67,6 +67,18 @@ struct sha_stubs {
     bool engine_locked[SHA_NUM_ENGINES];
 
     int current_type;   /* last sha_type used */
+
+    /* mbedtls software crypto acceleration: native OpenSSL contexts
+     * indexed by guest mbedtls_sha256_context address. */
+#define MBED_CTX_SLOTS 32
+    struct {
+        uint32_t    guest_addr;  /* 0 = empty */
+        SHA256_CTX  ctx;
+    } mbed_sha256[MBED_CTX_SLOTS];
+    struct {
+        uint32_t    guest_addr;
+        SHA_CTX     ctx;
+    } mbed_sha1[MBED_CTX_SLOTS];
 };
 
 /* ===== SHA peripheral MMIO handler ===== */
@@ -129,15 +141,21 @@ static uint32_t sha_arg(xtensa_cpu_t *cpu, int n) {
     return ar_read(cpu, ci * 4 + 2 + n);
 }
 
-static void sha_return_void(xtensa_cpu_t *cpu) {
+static void sha_return(xtensa_cpu_t *cpu, uint32_t retval) {
     int ci = XT_PS_CALLINC(cpu->ps);
     if (ci > 0) {
+        ar_write(cpu, ci * 4 + 2, retval);
         uint32_t a0 = ar_read(cpu, ci * 4);
         cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
+        ar_write(cpu, 2, retval);
         cpu->pc = ar_read(cpu, 0);
     }
+}
+
+static void sha_return_void(xtensa_cpu_t *cpu) {
+    sha_return(cpu, 0);  /* return value ignored by caller */
 }
 
 /* ===== HAL stub implementations ===== */
@@ -370,6 +388,186 @@ void sha_stubs_destroy(sha_stubs_t *ss) {
     free(ss);
 }
 
+/* ===== mbedtls software SHA256 acceleration =====
+ * Replaces interpreted mbedtls SHA256 with native OpenSSL.
+ * These are GENERIC — they work with ANY ESP32 firmware using mbedtls. */
+
+static int mbed_sha256_find(sha_stubs_t *ss, uint32_t addr) {
+    for (int i = 0; i < MBED_CTX_SLOTS; i++)
+        if (ss->mbed_sha256[i].guest_addr == addr) return i;
+    return -1;
+}
+
+static int mbed_sha256_alloc(sha_stubs_t *ss, uint32_t addr) {
+    /* Reuse existing slot or find empty */
+    int idx = mbed_sha256_find(ss, addr);
+    if (idx >= 0) return idx;
+    for (int i = 0; i < MBED_CTX_SLOTS; i++) {
+        if (ss->mbed_sha256[i].guest_addr == 0) {
+            ss->mbed_sha256[i].guest_addr = addr;
+            return i;
+        }
+    }
+    return -1; /* full */
+}
+
+static void stub_mbedtls_sha256_starts(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    uint32_t is224 = sha_arg(cpu, 1);
+    int idx = mbed_sha256_alloc(ss, ctx_addr);
+    if (idx >= 0) {
+        if (is224)
+            SHA224_Init(&ss->mbed_sha256[idx].ctx);
+        else
+            SHA256_Init(&ss->mbed_sha256[idx].ctx);
+    }
+    sha_return(cpu, 0); /* 0 = success */
+}
+
+static void stub_mbedtls_sha256_update(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    uint32_t data_addr = sha_arg(cpu, 1);
+    uint32_t len = sha_arg(cpu, 2);
+    int idx = mbed_sha256_find(ss, ctx_addr);
+    if (idx >= 0 && len > 0) {
+        /* Read data from emulated memory in page-sized chunks */
+        uint8_t tmp[4096];
+        uint32_t off = 0;
+        while (off < len) {
+            uint32_t chunk = len - off;
+            if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
+            const uint8_t *p = mem_get_ptr(cpu->mem, data_addr + off);
+            if (p) {
+                uint32_t page_rem = 0x1000 - ((data_addr + off) & 0xFFF);
+                if (chunk > page_rem) chunk = page_rem;
+                SHA256_Update(&ss->mbed_sha256[idx].ctx, p, chunk);
+            } else {
+                for (uint32_t i = 0; i < chunk; i++)
+                    tmp[i] = mem_read8(cpu->mem, data_addr + off + i);
+                SHA256_Update(&ss->mbed_sha256[idx].ctx, tmp, chunk);
+            }
+            off += chunk;
+        }
+    }
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_sha256_finish(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    uint32_t out_addr = sha_arg(cpu, 1);
+    int idx = mbed_sha256_find(ss, ctx_addr);
+    if (idx >= 0) {
+        unsigned char digest[32];
+        /* Use a copy so the context can be reused */
+        SHA256_CTX copy = ss->mbed_sha256[idx].ctx;
+        SHA256_Final(digest, &copy);
+        /* Write digest to emulated memory */
+        uint8_t *p = mem_get_ptr_w(cpu->mem, out_addr);
+        if (p && ((out_addr & 0xFFF) <= 0xFE0))  /* fits in page */
+            memcpy(p, digest, 32);
+        else
+            for (int i = 0; i < 32; i++)
+                mem_write8(cpu->mem, out_addr + i, digest[i]);
+    }
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_sha256_free(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    int idx = mbed_sha256_find(ss, ctx_addr);
+    if (idx >= 0)
+        ss->mbed_sha256[idx].guest_addr = 0; /* release slot */
+    sha_return_void(cpu);
+}
+
+/* ===== mbedtls software SHA1 acceleration ===== */
+
+static int mbed_sha1_find(sha_stubs_t *ss, uint32_t addr) {
+    for (int i = 0; i < MBED_CTX_SLOTS; i++)
+        if (ss->mbed_sha1[i].guest_addr == addr) return i;
+    return -1;
+}
+
+static int mbed_sha1_alloc(sha_stubs_t *ss, uint32_t addr) {
+    int idx = mbed_sha1_find(ss, addr);
+    if (idx >= 0) return idx;
+    for (int i = 0; i < MBED_CTX_SLOTS; i++) {
+        if (ss->mbed_sha1[i].guest_addr == 0) {
+            ss->mbed_sha1[i].guest_addr = addr;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void stub_mbedtls_sha1_starts(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    int idx = mbed_sha1_alloc(ss, ctx_addr);
+    if (idx >= 0)
+        SHA1_Init(&ss->mbed_sha1[idx].ctx);
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_sha1_update(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    uint32_t data_addr = sha_arg(cpu, 1);
+    uint32_t len = sha_arg(cpu, 2);
+    int idx = mbed_sha1_find(ss, ctx_addr);
+    if (idx >= 0 && len > 0) {
+        uint32_t off = 0;
+        while (off < len) {
+            uint32_t chunk = len - off;
+            const uint8_t *p = mem_get_ptr(cpu->mem, data_addr + off);
+            if (p) {
+                uint32_t page_rem = 0x1000 - ((data_addr + off) & 0xFFF);
+                if (chunk > page_rem) chunk = page_rem;
+                SHA1_Update(&ss->mbed_sha1[idx].ctx, p, chunk);
+            } else {
+                uint8_t tmp[1];
+                tmp[0] = mem_read8(cpu->mem, data_addr + off);
+                SHA1_Update(&ss->mbed_sha1[idx].ctx, tmp, 1);
+                chunk = 1;
+            }
+            off += chunk;
+        }
+    }
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_sha1_finish(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    uint32_t out_addr = sha_arg(cpu, 1);
+    int idx = mbed_sha1_find(ss, ctx_addr);
+    if (idx >= 0) {
+        unsigned char digest[20];
+        SHA_CTX copy = ss->mbed_sha1[idx].ctx;
+        SHA1_Final(digest, &copy);
+        uint8_t *p = mem_get_ptr_w(cpu->mem, out_addr);
+        if (p && ((out_addr & 0xFFF) <= 0xFEC))
+            memcpy(p, digest, 20);
+        else
+            for (int i = 0; i < 20; i++)
+                mem_write8(cpu->mem, out_addr + i, digest[i]);
+    }
+    sha_return(cpu, 0);
+}
+
+static void stub_mbedtls_sha1_free(xtensa_cpu_t *cpu, void *ctx) {
+    sha_stubs_t *ss = ctx;
+    uint32_t ctx_addr = sha_arg(cpu, 0);
+    int idx = mbed_sha1_find(ss, ctx_addr);
+    if (idx >= 0)
+        ss->mbed_sha1[idx].guest_addr = 0;
+    sha_return_void(cpu);
+}
+
 int sha_stubs_hook_symbols(sha_stubs_t *ss, const elf_symbols_t *syms) {
     if (!ss || !syms) return 0;
 
@@ -397,6 +595,39 @@ int sha_stubs_hook_symbols(sha_stubs_t *ss, const elf_symbols_t *syms) {
         uint32_t addr;
         if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
             rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ss);
+            hooked++;
+        }
+    }
+
+    /* mbedtls software SHA acceleration — works with any ESP32 firmware.
+     * Replaces interpreted mbedtls SHA with native OpenSSL. */
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } mbed_hooks[] = {
+        /* SHA-256 (and SHA-224) */
+        { "mbedtls_sha256_starts_ret",  stub_mbedtls_sha256_starts },
+        { "mbedtls_sha256_starts",      stub_mbedtls_sha256_starts },
+        { "mbedtls_sha256_update_ret",  stub_mbedtls_sha256_update },
+        { "mbedtls_sha256_update",      stub_mbedtls_sha256_update },
+        { "mbedtls_sha256_finish_ret",  stub_mbedtls_sha256_finish },
+        { "mbedtls_sha256_finish",      stub_mbedtls_sha256_finish },
+        { "mbedtls_sha256_free",        stub_mbedtls_sha256_free },
+        /* SHA-1 */
+        { "mbedtls_sha1_starts_ret",    stub_mbedtls_sha1_starts },
+        { "mbedtls_sha1_starts",        stub_mbedtls_sha1_starts },
+        { "mbedtls_sha1_update_ret",    stub_mbedtls_sha1_update },
+        { "mbedtls_sha1_update",        stub_mbedtls_sha1_update },
+        { "mbedtls_sha1_finish_ret",    stub_mbedtls_sha1_finish },
+        { "mbedtls_sha1_finish",        stub_mbedtls_sha1_finish },
+        { "mbedtls_sha1_free",          stub_mbedtls_sha1_free },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; mbed_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, mbed_hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, mbed_hooks[i].fn, mbed_hooks[i].name, ss);
             hooked++;
         }
     }
