@@ -401,4 +401,12 @@ int  xtensa_set_breakpoint(xtensa_cpu_t *cpu, uint32_t addr);
 int  xtensa_clear_breakpoint(xtensa_cpu_t *cpu, uint32_t addr);
 void xtensa_clear_all_breakpoints(xtensa_cpu_t *cpu);
 
+/*
+ * JIT execution loop (defined in jit.c, used by main.c with -J flag).
+ * Runs hot blocks as compiled native code, falling back to interpreter
+ * for cold code and complex instructions.
+ */
+struct jit_state;
+int xtensa_run_jit(struct jit_state *jit, xtensa_cpu_t *cpu, int max_cycles);
+
 #endif /* XTENSA_H */
