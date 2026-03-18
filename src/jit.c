@@ -1684,13 +1684,13 @@ static void emit_block_exit(emit_t *e, uint32_t exit_pc, int insn_count) {
      * To avoid duplicating the epilogue, jump to a shared epilogue label.
      * But the simplest approach: just emit the epilogue inline since blocks are small.
      */
-    /* Epilogue: restore callee-saved, return eax */
+    /* Epilogue: restore callee-saved (reverse of prologue push order) */
+    emit_pop(e, R12);
     emit_pop(e, R13);
     emit_pop(e, R14);
     emit_pop(e, R15);
     emit_pop(e, RBP);
     emit_pop(e, RBX);
-    emit_pop(e, R12);
     emit_ret(e);
 }
 
@@ -1708,13 +1708,14 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     emit_t e;
     emit_init(&e, code_start, jit->code_capacity - jit->code_size);
 
-    /* Prologue: save callee-saved registers */
-    emit_push(&e, R12);
+    /* Prologue: save callee-saved registers.
+     * Push even number of regs to maintain 16-byte stack alignment. */
     emit_push(&e, RBX);
     emit_push(&e, RBP);
     emit_push(&e, R15);
     emit_push(&e, R14);
     emit_push(&e, R13);
+    emit_push(&e, R12);  /* alignment pad — not used, but keeps RSP 16-byte aligned */
 
     /* rdi = cpu pointer (System V ABI first arg) */
     emit_mov_reg_reg(&e, REG_CPU, RDI);  /* r15 = cpu */
@@ -1837,13 +1838,53 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
 }
 
 /* Main JIT execution loop */
+__attribute__((hot))
 int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
     int cycles = 0;
+    /* Cache hot pointers in locals for the dispatch loop */
+    const uint64_t *hook_bitmap = cpu->pc_hook_bitmap;
+    jit_block_t *hash = jit->hash;
 
-    while (cycles < max_cycles && cpu->running && !cpu->breakpoint_hit) {
-        /* Halted (WAITI): let interpreter handle — it advances ccount
-         * and checks for interrupts that can wake the CPU. */
-        if (cpu->halted) {
+    while (__builtin_expect(cycles < max_cycles, 1) &&
+           __builtin_expect(cpu->running, 1) &&
+           __builtin_expect(!cpu->breakpoint_hit, 1)) {
+
+        uint32_t pc = cpu->pc;
+
+        /* Fast path: most iterations hit either a stub or JIT block.
+         * Check stub bitmap first (most common case for stub-heavy firmware). */
+        if (__builtin_expect(hook_bitmap != NULL, 1)) {
+            uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
+            if (hook_bitmap[idx / 64] >> (idx & 63) & 1) {
+                /* Stub hit — batch through interpreter */
+                int batch = max_cycles - cycles;
+                if (batch > 32) batch = 32;
+                int ran = xtensa_run(cpu, batch);
+                cycles += ran;
+                jit->stats.insns_interp += (uint64_t)ran;
+                if (__builtin_expect(ran < batch, 0)) {
+                    if (!cpu->running || cpu->halted || cpu->breakpoint_hit)
+                        break;
+                }
+                continue;
+            }
+        } else if (cpu->pc_hook) {
+            /* No bitmap — always check hook */
+            int ran = xtensa_run(cpu, 1);
+            cycles += ran;
+            jit->stats.insns_interp += (uint64_t)ran;
+            continue;
+        }
+
+        /* Validate PC range (rare: only on invalid jumps) */
+        if (__builtin_expect(pc < 0x40000000u || pc >= 0x40500000u, 0)) {
+            int ran = xtensa_run(cpu, 1);
+            cycles += ran;
+            break;
+        }
+
+        /* Halted (WAITI) — rare during normal execution */
+        if (__builtin_expect(cpu->halted, 0)) {
             int batch = max_cycles - cycles;
             if (batch > 1000) batch = 1000;
             int ran = xtensa_run(cpu, batch);
@@ -1853,33 +1894,17 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
             continue;
         }
 
-        uint32_t pc = cpu->pc;
-
-        /* Validate PC range */
-        if (pc < 0x40000000u || pc >= 0x40500000u) {
-            /* Let interpreter handle the trap */
-            int ran = xtensa_run(cpu, 1);
-            cycles += ran;
-            break;
+        /* Try JIT: direct hash lookup (no function call) */
+        uint32_t wb = cpu->windowbase;
+        uint32_t hidx = ((pc >> 2) ^ (wb * 2654435761u)) & JIT_HASH_MASK;
+        uint32_t tag = pc ^ (wb << 28);
+        jit_block_t *b = &hash[hidx];
+        jit_block_fn fn;
+        if (__builtin_expect(b->code != NULL && b->pc == tag, 1)) {
+            fn = (jit_block_fn)b->code;
+        } else {
+            fn = jit_get_block(jit, cpu, pc);
         }
-
-        /* Check PC hook (stubs) — run through interpreter.
-         * Batch multiple instructions to amortize the dispatch overhead
-         * since stubs often cluster together. */
-        if (cpu->pc_hook && (!cpu->pc_hook_bitmap ||
-            rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, pc))) {
-            int batch = max_cycles - cycles;
-            if (batch > 32) batch = 32;
-            int ran = xtensa_run(cpu, batch);
-            cycles += ran;
-            jit->stats.insns_interp += (uint64_t)ran;
-            if (ran < batch && (!cpu->running || cpu->halted || cpu->breakpoint_hit))
-                break;
-            continue;
-        }
-
-        /* Try JIT */
-        jit_block_fn fn = jit_get_block(jit, cpu, pc);
         if (fn) {
             /* Execute compiled block */
             /* Optional differential verification: snapshot, run JIT, run interpreter, compare */
