@@ -1,6 +1,7 @@
 #include "display_stubs.h"
 #include "rom_stubs.h"
 #include "memory.h"
+#include "sandbox_events.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -2220,6 +2221,34 @@ static void stub_lv_flush_cb_spy(xtensa_cpu_t *cpu, void *ctx) {
                 }
                 pthread_mutex_unlock(ds->framebuf_mtx);
             }
+
+            /* Emit a sandbox event with the same patch so the
+             * litegraph ILI9341 display node can render LVGL output
+             * the moment LVGL's flush callback fires — without waiting
+             * for esp_lcd_panel_draw_bitmap which LVGL bypasses. */
+            int w = (int)(x2 - x1 + 1);
+            int h = (int)(y2 - y1 + 1);
+            int npix = w * h;
+            if (npix > 0 && (size_t)npix * 2 <= sizeof(((sbx_event_t *)0)->lcd_pixels) + (320*240*2)) {
+                /* Copy into a static scratch so the event sink can read it
+                 * synchronously without holding the framebuf mutex. */
+                static uint8_t scratch[320 * 240 * 2];
+                if ((size_t)npix * 2 <= sizeof(scratch)) {
+                    uint32_t src_ptr = color_ptr;
+                    for (int i = 0; i < npix; i++) {
+                        scratch[2*i + 0] = mem_read8(mem, src_ptr++);
+                        scratch[2*i + 1] = mem_read8(mem, src_ptr++);
+                    }
+                    sbx_event_t ev = { .kind = SBX_EV_LCD_PIXELS, .cycle = 0 };
+                    ev.lcd_pixels.x = (uint32_t)x1;
+                    ev.lcd_pixels.y = (uint32_t)y1;
+                    ev.lcd_pixels.w = (uint32_t)w;
+                    ev.lcd_pixels.h = (uint32_t)h;
+                    ev.lcd_pixels.bpp = 16;
+                    ev.lcd_pixels.pixels = scratch;
+                    sbx_events_emit(&ev);
+                }
+            }
         }
 
         /* Clear LVGL's flushing flags (replaces lv_disp_flush_ready).
@@ -2247,23 +2276,35 @@ static int scan_for_flush_callback(const char *name, uint32_t addr, uint32_t siz
     struct flush_scan_ctx *scan_ctx = ctx;
 
     /* Skip LVGL internal functions — we want to hook user flush callbacks,
-     * not LVGL's internal dispatcher or state management functions. */
+     * not LVGL's internal dispatcher or state management functions. The
+     * `*_flush` pattern was historically too broad (matched things like
+     * `draw_buf_flush` in lv_draw_buf.c), so we now require either the
+     * explicit `_flush_cb` / `_flush_callback` suffix or the function to
+     * be the canonical esp_lvgl_port helper.
+     *
+     * Also skip esp_lvgl_port's helper: it just calls
+     * esp_lcd_panel_draw_bitmap which we hook directly with proper
+     * panel-type detection (ILI9341 / SSD1306 / etc.). Letting it
+     * pass through gives us the correct bit depth automatically. */
     if (strcmp(name, "call_flush_cb") == 0 ||
+        strcmp(name, "draw_buf_flush") == 0 ||
+        strcmp(name, "lvgl_port_flush_callback") == 0 ||
         strncmp(name, "lv_refr_", 8) == 0 ||
+        strncmp(name, "lv_draw_", 8) == 0 ||
         strstr(name, "flush_ready") != NULL ||
         strncmp(name, "lv_disp_", 8) == 0 ||
         strncmp(name, "lv_display_", 11) == 0) {
         return 0;  /* skip */
     }
 
-    /* Pattern 1: ends with "_flush_cb" or "_flush" */
+    /* Pattern 1: ends with "_flush_cb" or "_flush_callback" */
     size_t len = strlen(name);
     if (len > 9 && strcmp(name + len - 9, "_flush_cb") == 0) {
         rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
         scan_ctx->hooked++;
-        return 0;  /* continue scanning */
+        return 0;
     }
-    if (len > 6 && strcmp(name + len - 6, "_flush") == 0) {
+    if (len > 15 && strcmp(name + len - 15, "_flush_callback") == 0) {
         rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
         scan_ctx->hooked++;
         return 0;

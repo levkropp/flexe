@@ -48,6 +48,9 @@ void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->core_id = 0;
     cpu->next_timer_event = UINT32_MAX;  /* No timer pending until ccompare is written */
+    /* First step counts as a control-flow transfer so the PC hook /
+     * AOT bitmap gates fire on the initial PC (entry vector). */
+    cpu->_pc_written = true;
 
     /* ESP32 CPU interrupt level table (matches hardware):
      * Level 1: 0-5, 8-10, 12-13, 17-18
@@ -961,7 +964,8 @@ static void exec_fp1(xtensa_cpu_t *cpu, uint32_t insn) {
 }
 
 /* Execute op0=0 (QRST) - the main RRR instruction group */
-static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline __attribute__((always_inline))
+void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
     int op1 = XT_OP1(insn);
     int op2 = XT_OP2(insn);
     int r = XT_R(insn);
@@ -1495,7 +1499,8 @@ static void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
 }
 
 /* Execute op0=2 (LSAI) - loads, stores, and ALU immediates */
-static void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline __attribute__((always_inline))
+void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
     int r = XT_R(insn);
     int s = XT_S(insn);
     int t = XT_T(insn);
@@ -1570,6 +1575,9 @@ static void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
 
 /* Execute narrow (16-bit) instructions */
 static inline __attribute__((always_inline))
+/* exec_narrow has external linkage (used by tests). The compiler will
+ * still inline it into xtensa_step_impl thanks to LTO + the call site
+ * being in the same TU. */
 void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
     int op0 = XT_OP0(insn);
     int t = XT_T(insn);
@@ -1654,7 +1662,8 @@ static const uint32_t b4constu[16] = {
 };
 
 /* Execute op0=5 (CALLN) - PC-relative calls */
-static void exec_calln(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline __attribute__((always_inline))
+void exec_calln(xtensa_cpu_t *cpu, uint32_t insn) {
     int nn = XT_N(insn);
     int32_t offset = sign_extend(XT_OFFSET18(insn), 18);
     /* target[31:2] = (original_pc[31:2] + offset + 1), target[1:0] = 00 */
@@ -1673,7 +1682,8 @@ static void exec_calln(xtensa_cpu_t *cpu, uint32_t insn) {
 }
 
 /* Execute op0=6 (SI) - J, BRI12, BRI8, LOOP, ENTRY */
-static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline __attribute__((always_inline))
+void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
     int nn = XT_N(insn);
     int m = XT_M(insn);
     int s = XT_S(insn);
@@ -1802,7 +1812,8 @@ static void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
 }
 
 /* Execute op0=7 (B) - RRI8 conditional branches */
-static void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline __attribute__((always_inline))
+void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
     int r = XT_R(insn);
     int s = XT_S(insn);
     int t = XT_T(insn);
@@ -1855,7 +1866,8 @@ static inline void mac16_set_acc(xtensa_cpu_t *cpu, int64_t val) {
     cpu->acchi = (uint32_t)((val >> 32) & 0xFF);
 }
 
-static void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline __attribute__((always_inline))
+void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
     int op1 = XT_OP1(insn);
     int op2 = XT_OP2(insn);
     int r = XT_R(insn);
@@ -1932,6 +1944,22 @@ static void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
  * local_cc accumulates cycle_count in a register; flushed to cpu->cycle_count
  * only before callbacks that may read it (pc_hook stubs). */
 
+static __attribute__((noinline, cold))
+void xtensa_invalid_pc_trap(xtensa_cpu_t *cpu) {
+    fprintf(stderr, "[TRAP] Invalid PC=0x%08X at cycle %llu (core %d, prid=0x%X)\n",
+            cpu->pc, (unsigned long long)cpu->cycle_count, cpu->core_id, cpu->prid);
+    fprintf(stderr, "  PS=0x%08X SAR=%u WindowBase=%u WindowStart=0x%X\n",
+            cpu->ps, cpu->sar, cpu->windowbase, cpu->windowstart);
+    for (int r = 0; r < 16; r += 4)
+        fprintf(stderr, "  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X\n",
+                r, ar_read(cpu, r), r+1, ar_read(cpu, r+1),
+                r+2, ar_read(cpu, r+2), r+3, ar_read(cpu, r+3));
+    fprintf(stderr, "  EPC1=0x%08X EPC2=0x%08X EPC3=0x%08X\n",
+            cpu->epc[0], cpu->epc[1], cpu->epc[2]);
+    cpu->running = false;
+    cpu->exception = true;
+}
+
 static inline __attribute__((always_inline))
 int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     uint32_t insn;
@@ -1948,22 +1976,11 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
         return cpu->exception ? -1 : 0;
     }
 
-    /* Invalid PC trap: catch jumps to unmapped/non-code regions.
-     * Valid ESP32 code: 0x40000000-0x400BFFFF (ROM/IRAM), 0x400D0000-0x404FFFFF (flash) */
+    /* Invalid PC trap. Slow-path body lives in a noinline helper so
+     * the hot-path branch is just a single range compare. */
     if (__builtin_expect(cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u, 0)) {
         cpu->cycle_count = *local_cc;
-        fprintf(stderr, "[TRAP] Invalid PC=0x%08X at cycle %llu (core %d, prid=0x%X)\n",
-                cpu->pc, (unsigned long long)*local_cc, cpu->core_id, cpu->prid);
-        fprintf(stderr, "  PS=0x%08X SAR=%u WindowBase=%u WindowStart=0x%X\n",
-                cpu->ps, cpu->sar, cpu->windowbase, cpu->windowstart);
-        for (int r = 0; r < 16; r += 4)
-            fprintf(stderr, "  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X  a%-2d=0x%08X\n",
-                    r, ar_read(cpu, r), r+1, ar_read(cpu, r+1),
-                    r+2, ar_read(cpu, r+2), r+3, ar_read(cpu, r+3));
-        fprintf(stderr, "  EPC1=0x%08X EPC2=0x%08X EPC3=0x%08X\n",
-                cpu->epc[0], cpu->epc[1], cpu->epc[2]);
-        cpu->running = false;
-        cpu->exception = true;
+        xtensa_invalid_pc_trap(cpu);
         return -1;
     }
 
@@ -1980,9 +1997,14 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     }
 
     /* PC hook: intercept execution at specific addresses (e.g. ROM stubs).
-     * Bitmap fast-path: skip the hook call entirely if the bit isn't set.
-     * Flush cycle_count before hook callback since stubs may read it. */
-    if (cpu->pc_hook && (!cpu->pc_hook_bitmap ||
+     * Hooks are always registered at function-entry PCs — reachable
+     * only via call/ret/branches/exceptions — so we only need to
+     * check after a control-flow transfer. `_pc_written` captures
+     * that exact condition (set by the previous step's branch/call/
+     * ret/exception handlers, cleared below at line 2073 unless the
+     * instruction writes PC again). On straight-line execution the
+     * bitmap load is skipped entirely. */
+    if (cpu->_pc_written && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
         if (cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
@@ -1999,6 +2021,50 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
             }
             *local_cc = cpu->cycle_count;  /* reload (stub may advance time) */
             return cpu->exception ? -1 : 0;
+        }
+    }
+
+    /* AOT fast path: try the statically-recompiled function for this PC.
+     * Skipped if the PC is in the ROM-stub bitmap — those functions
+     * (esp_chip_info, memcpy, ets_printf, ...) implement hardware
+     * behavior the AOT version can't fake, since the AOT function is
+     * just a literal translation of firmware code that would try to
+     * probe registers we don't model. */
+    /* AOT fast path: try the statically-recompiled function for this PC.
+     * Skipped if the PC is in the ROM-stub bitmap — those functions
+     * (esp_chip_info, memcpy, ets_printf, ...) implement hardware
+     * behavior the AOT version can't fake.
+     *
+     * STATUS: integration plumbing verified, but the translator in
+     * tools/aot_recompile.py has runtime correctness bugs that corrupt
+     * cpu state on real firmware. Until they're shaken out via
+     * differential testing (task #35), --aot is opt-in and prints a
+     * warning at startup. Pass --aot only on a verified-good dylib. */
+    /* AOT entry-point probing happens only after a control-flow
+     * transfer — straight-line execution can't land on a new
+     * translated function. `_pc_written` is set by branches/calls/
+     * returns/exceptions in the previous step and survives until the
+     * reset at line 2073 below. This cuts AOT probe cost from
+     * per-step to per-branch, typically 5-10x fewer probes. */
+    if (__builtin_expect(cpu->aot_bitmap != NULL && cpu->_pc_written, 0) &&
+        rom_stubs_hook_bitmap_test(cpu->aot_bitmap, cpu->pc) &&
+        !(cpu->pc_hook_bitmap &&
+          rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
+        typedef int (*aot_fn_t)(xtensa_cpu_t *);
+        aot_fn_t fn = (aot_fn_t)cpu->aot_lookup_fn(cpu->aot, cpu->pc);
+        if (fn) {
+            /* Flush local_cc so the AOT function's stub-flush path
+             * (cpu->cycle_count += insn_count) stacks on top of the
+             * current total rather than racing. */
+            cpu->cycle_count = *local_cc;
+            int n = fn(cpu);
+            if (n > 0) {
+                cpu->ccount += (uint32_t)n;
+                *local_cc = cpu->cycle_count + (uint64_t)n;
+                if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0))
+                    xtensa_fire_timers(cpu);
+                return cpu->exception ? -1 : 0;
+            }
         }
     }
 
@@ -2121,7 +2187,6 @@ int xtensa_step(xtensa_cpu_t *cpu) {
  * lives in this function body, eliminating per-instruction call overhead.
  * cycle_count is cached in a local to stay in a register across iterations
  * (avoids per-instruction 64-bit memory increment). */
-__attribute__((no_stack_protector))
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
     uint64_t cc = cpu->cycle_count;
     int i;

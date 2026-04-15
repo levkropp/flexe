@@ -358,6 +358,9 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
 
     struct sockaddr_in sa;
     read_emu_sockaddr_in(cpu, sa_addr, &sa);
+    /* Firmware lwIP may use a different sin_family numeric value than the
+     * host. Force AF_INET — we always create AF_INET host sockets. */
+    sa.sin_family = AF_INET;
 
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &sa.sin_addr, ip_str, sizeof(ip_str));
@@ -924,29 +927,119 @@ static void stub_lwip_bind(xtensa_cpu_t *cpu, void *ctx)
     struct sockaddr_in sa;
     read_emu_sockaddr_in(cpu, sa_addr, &sa);
 
-    /* Allow port reuse for bind */
+    /* The firmware-side sockaddr may have a different sin_family value
+     * than the host (ESP-IDF lwIP vs Linux/BSD). Always rewrite to the
+     * host's AF_INET and bind to localhost so we don't conflict with
+     * other host services. Also remap privileged ports (<1024) to an
+     * ephemeral port to avoid needing root. */
+    uint16_t requested_port = ntohs(sa.sin_port);
+    sa.sin_family      = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (requested_port < 1024)
+        sa.sin_port = 0;  /* let kernel pick a high port */
+
+    /* Allow port reuse for bind. Set both REUSEADDR and REUSEPORT so
+     * that re-running the firmware (esp_restart simulation) doesn't
+     * fail to re-bind a port still held by an earlier instance, and so
+     * concurrent emulator runs can coexist. */
     int reuse = 1;
     setsockopt(s->host_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(s->host_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
 
     int ret = bind(s->host_fd, (struct sockaddr *)&sa, sizeof(sa));
-    if (ret < 0)
+    if (ret < 0) {
         wifi_log(ws, "bind(slot %u) failed: %s\n", fd, strerror(errno));
-    else
-        wifi_log(ws, "bind(slot %u) port %d\n", fd, ntohs(sa.sin_port));
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
 
-    ws_return(cpu, (uint32_t)ret);
+    /* Look up the actual bound port for logging. */
+    struct sockaddr_in bound;
+    socklen_t blen = sizeof(bound);
+    if (getsockname(s->host_fd, (struct sockaddr *)&bound, &blen) == 0) {
+        wifi_log(ws, "bind(slot %u) firmware port %u → host 127.0.0.1:%u\n",
+                 fd, requested_port, ntohs(bound.sin_port));
+    } else {
+        wifi_log(ws, "bind(slot %u) firmware port %u\n", fd, requested_port);
+    }
+
+    ws_return(cpu, 0);
 }
 
 static void stub_lwip_listen(xtensa_cpu_t *cpu, void *ctx)
 {
-    (void)ctx;
-    ws_return(cpu, (uint32_t)-1);
+    wifi_stubs_t *ws = ctx;
+    uint32_t fd      = ws_arg(cpu, 0);
+    uint32_t backlog = ws_arg(cpu, 1);
+
+    emu_socket_t *s = slot_get(ws, (int)fd);
+    if (!s) {
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+    int bl = (int)backlog;
+    if (bl <= 0) bl = 4;
+    int ret = listen(s->host_fd, bl);
+    if (ret < 0) {
+        wifi_log(ws, "listen(slot %u) failed: %s\n", fd, strerror(errno));
+        set_firmware_errno(cpu, errno);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+    wifi_log(ws, "listen(slot %u, backlog=%d)\n", fd, bl);
+    ws_return(cpu, 0);
 }
 
 static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
 {
-    (void)ctx;
-    ws_return(cpu, (uint32_t)-1);
+    wifi_stubs_t *ws = ctx;
+    uint32_t fd       = ws_arg(cpu, 0);
+    uint32_t sa_addr  = ws_arg(cpu, 1);
+    uint32_t len_addr = ws_arg(cpu, 2);
+
+    emu_socket_t *s = slot_get(ws, (int)fd);
+    if (!s) {
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    /* Make the listening socket non-blocking with a short poll so the
+     * emulator's request loop doesn't stall forever waiting for clients. */
+    struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
+    int pr = poll(&pfd, 1, 50); /* 50ms */
+    if (pr <= 0) {
+        set_firmware_errno(cpu, NEWLIB_EAGAIN);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    struct sockaddr_in csa;
+    socklen_t clen = sizeof(csa);
+    int chfd = accept(s->host_fd, (struct sockaddr *)&csa, &clen);
+    if (chfd < 0) {
+        wifi_log(ws, "accept(slot %u) failed: %s\n", fd, strerror(errno));
+        set_firmware_errno(cpu, errno == EWOULDBLOCK ? NEWLIB_EAGAIN : errno);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    int cfd = slot_alloc(ws, chfd);
+    if (cfd < 0) {
+        close(chfd);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    if (sa_addr)
+        write_emu_sockaddr_in(cpu, sa_addr, &csa);
+    if (len_addr)
+        mem_write32(cpu->mem, len_addr, sizeof(struct sockaddr_in));
+
+    wifi_log(ws, "accept(slot %u) → client slot %d (host fd %d)\n",
+             fd, cfd, chfd);
+    ws_return(cpu, (uint32_t)cfd);
 }
 
 static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
@@ -975,6 +1068,7 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
         /* Unconnected UDP: read destination address from emulator memory */
         struct sockaddr_in sa;
         read_emu_sockaddr_in(cpu, sa_addr, &sa);
+        sa.sin_family = AF_INET;
         n = sendto(s->host_fd, tmp, len, MSG_NOSIGNAL,
                    (struct sockaddr *)&sa, sizeof(sa));
     } else {

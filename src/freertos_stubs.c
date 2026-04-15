@@ -67,6 +67,9 @@ typedef struct {
     } spill_stack[16];
     uint32_t     sar, lbeg, lend, lcount;
     uint32_t     stack_top;
+    /* Run-time accounting for uxTaskGetSystemState. Cumulative cycles
+     * spent in TASK_RUNNING on any core, updated at every sched_save_context. */
+    uint64_t     cumulative_cycles;
 } task_tcb_t;
 
 struct freertos_stubs {
@@ -94,6 +97,10 @@ struct freertos_stubs {
     int        current_task[2];       /* Per-core current task (-1 during boot) */
     bool       scheduler_started;
     uint64_t   last_switch_cycle[2];  /* Per-core cycle at last context switch */
+    /* Cycles spent with no runnable task, fast-forwarded through by
+     * sched_pick_next during deep sleeps. Keeps uxTaskGetSystemState's
+     * total_run_time monotonically advancing even when every task slept. */
+    uint64_t   idle_cycles;
 
     /* Thread safety */
     pthread_mutex_t lock;
@@ -154,6 +161,9 @@ static void sched_save_context(freertos_stubs_t *frt, int core_id) {
     xtensa_cpu_t *cpu = frt->cpu[core_id];
     int tidx = frt->current_task[core_id];
     task_tcb_t *t = &frt->tasks[tidx];
+    /* Accumulate time this task spent running since its last switch-in. */
+    if (cpu->cycle_count >= frt->last_switch_cycle[core_id])
+        t->cumulative_cycles += cpu->cycle_count - frt->last_switch_cycle[core_id];
     /* Trap: detect saving a corrupted PC */
     if (cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u) {
         fprintf(stderr, "[SAVE-TRAP] Saving task %d '%s' with bad PC=0x%08X on core %d (cycle %llu)\n",
@@ -254,6 +264,17 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
         uint64_t advance = nearest - cpu->cycle_count;
         cpu->cycle_count = nearest;
         cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
+        /* Credit the other core's currently-running task for this
+         * advancement: while this core idle-waits for a wake time, the
+         * other core is actively executing its task for that same wall-
+         * clock duration. This fixes uxTaskGetSystemState cumulative
+         * tracking for no-affinity tasks on dual-core where one core
+         * often fast-forwards while the other does the real work. */
+        int other = core_id ^ 1;
+        int other_cur = frt->current_task[other];
+        if (other_cur >= 0 && frt->tasks[other_cur].state == TASK_RUNNING)
+            frt->tasks[other_cur].cumulative_cycles += advance;
+        frt->idle_cycles += advance;
         /* Wake tasks at this time and find next nearest */
         nearest = sched_wake_sleepers(frt, core_id);
 
@@ -773,6 +794,108 @@ void stub_uxTaskGetStackHighWaterMark(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, 2048);
 }
 
+/* uxTaskGetNumberOfTasks() -> number of tracked tasks. */
+static void stub_uxTaskGetNumberOfTasks(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t n = 0;
+    for (int i = 0; i < frt->task_count; i++)
+        if (frt->tasks[i].state != TASK_UNUSED) n++;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, n);
+}
+
+/* uxTaskGetSystemState(TaskStatus_t *arr, UBaseType_t size, uint32_t *total_run_time)
+ *   ESP32 TaskStatus_t layout (40 bytes, configTASKLIST_INCLUDE_COREID=1, portSTACK_GROWTH<0):
+ *     0x00 xHandle, 0x04 pcTaskName, 0x08 xTaskNumber, 0x0C eCurrentState,
+ *     0x10 uxCurrentPriority, 0x14 uxBasePriority, 0x18 ulRunTimeCounter,
+ *     0x1C pxStackBase, 0x20 usStackHighWaterMark, 0x24 xCoreID.
+ *   Returns number of tasks written. */
+static void stub_uxTaskGetSystemState(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t arr_ptr     = frt_arg(cpu, 0);
+    uint32_t max_tasks   = frt_arg(cpu, 1);
+    uint32_t total_ptr   = frt_arg(cpu, 2);
+
+    pthread_mutex_lock(&frt->lock);
+    /* Realize in-flight time on both cores so cumulative_cycles reflects
+     * work done since the task's last switch-in, without waiting for a
+     * context-switch to actually credit it. */
+    for (int c = 0; c < 2; c++) {
+        if (!frt->cpu[c]) continue;
+        int cur = frt->current_task[c];
+        if (cur < 0) continue;
+        uint64_t now = frt->cpu[c]->cycle_count;
+        if (now >= frt->last_switch_cycle[c]) {
+            frt->tasks[cur].cumulative_cycles += now - frt->last_switch_cycle[c];
+            frt->last_switch_cycle[c] = now;
+        }
+    }
+
+    uint32_t written = 0;
+    /* Name pool: small region in PSRAM reused to store task-name strings
+     * so TaskStatus_t.pcTaskName points somewhere guest-readable. */
+    uint32_t name_pool = 0x3FB80000u;
+    for (int i = 0; i < frt->task_count && written < max_tasks; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->state == TASK_UNUSED) continue;
+
+        uint64_t run_cycles = t->cumulative_cycles;
+
+        /* Copy task name into guest memory (name pool entry = 16 bytes). */
+        uint32_t name_addr = name_pool + (uint32_t)i * 16;
+        for (int k = 0; k < 15; k++)
+            mem_write8(cpu->mem, name_addr + (uint32_t)k, (uint8_t)t->name[k]);
+        mem_write8(cpu->mem, name_addr + 15, 0);
+
+        uint32_t base = arr_ptr + written * 40u;
+        mem_write32(cpu->mem, base + 0x00, t->handle);
+        mem_write32(cpu->mem, base + 0x04, name_addr);
+        mem_write32(cpu->mem, base + 0x08, (uint32_t)i + 1);
+        /* eTaskState: 0=Running, 1=Ready, 2=Blocked, 3=Suspended, 4=Deleted */
+        uint32_t estate = 1;
+        switch (t->state) {
+            case TASK_RUNNING:       estate = 0; break;
+            case TASK_READY:         estate = 1; break;
+            case TASK_BLOCKED_QUEUE: estate = 2; break;
+            case TASK_SLEEPING:      estate = 2; break;
+            case TASK_UNUSED:        estate = 4; break;
+            default:                 estate = 1; break;
+        }
+        mem_write32(cpu->mem, base + 0x0C, estate);
+        mem_write32(cpu->mem, base + 0x10, t->priority);
+        mem_write32(cpu->mem, base + 0x14, t->priority);
+        /* Scale by 256 so real_time_stats's (task_elapsed * 100) multiply
+         * doesn't overflow uint32_t when tasks have accumulated hundreds
+         * of millions of cycles of wall-time credit. */
+        mem_write32(cpu->mem, base + 0x18, (uint32_t)(run_cycles >> 8));
+        mem_write32(cpu->mem, base + 0x1C, t->stack_top - TASK_STACK_SIZE);
+        mem_write32(cpu->mem, base + 0x20, 2048);  /* usStackHighWaterMark */
+        /* xCoreID: -1 for no affinity (per ESP-IDF tskNO_AFFINITY) */
+        int32_t core_id = (t->core_affinity < 0) ? -1 : t->core_affinity;
+        mem_write32(cpu->mem, base + 0x24, (uint32_t)core_id);
+        written++;
+    }
+
+    /* Total run time: sum_of_task_cycles / cores. The example computes
+     *   percentage = (task * 100) / (total * cores)
+     * so with total = sum/cores, percentages collapse to task/sum*100 —
+     * each task's share of total task work. Six equal tasks → ~16% each. */
+    if (total_ptr) {
+        uint64_t sum = 0;
+        for (int i = 0; i < frt->task_count; i++) {
+            task_tcb_t *t = &frt->tasks[i];
+            if (t->state == TASK_UNUSED) continue;
+            sum += t->cumulative_cycles;
+        }
+        uint64_t total = (sum / 2) >> 8;  /* match per-task scaling */
+        if (total == 0) total = 1; /* example bails on total==0 */
+        mem_write32(cpu->mem, total_ptr, (uint32_t)total);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, written);
+}
+
 /* disableCore0WDT / disableCore1WDT — no-op in emulator */
 static void stub_disableCoreWDT(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -852,7 +975,16 @@ static void stub_xPortGetCoreID(xtensa_cpu_t *cpu, void *ctx) {
 }
 
 /* esp_startup_start_app_other_cores — start core 1's scheduler portion.
- * Called by core 1's startup code after init. Picks first task for core 1. */
+ * Called by core 1's startup code after init. Picks first task for core 1.
+ *
+ * IMPORTANT: the real function never returns (it enters xPortStartScheduler's
+ * idle loop).  If we return via frt_return_void when no task is available,
+ * core 1 resumes executing the literal pool right after the call site, which
+ * crashes with PC=0 once the garbage bytes rotate the register window.
+ *
+ * When no task is ready yet, we park core 1 by halting it (running=false);
+ * the session post_batch loop re-checks via check_preempt_core and resumes
+ * core 1 as soon as a task becomes eligible for it. */
 static void stub_esp_startup_start_app_other_cores(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     int core_id = cpu->core_id;
@@ -867,9 +999,9 @@ static void stub_esp_startup_start_app_other_cores(xtensa_cpu_t *cpu, void *ctx)
         frt->last_switch_cycle[core_id] = cpu->cycle_count;
         sched_restore_context(frt, core_id);
     } else {
-        /* No tasks for this core yet — return from function and let core
-         * idle. check_preempt_core will pick up tasks when they appear. */
-        frt_return_void(cpu);
+        /* Park: halt core 1 and leave PC at the stub entry so re-entry here
+         * is a no-op once we're resumed.  check_preempt_core will wake us. */
+        cpu->running = false;
     }
     pthread_mutex_unlock(&frt->lock);
 }
@@ -1052,6 +1184,8 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xTaskGetCurrentTaskHandle",     stub_xTaskGetCurrentTaskHandle },
         { "vTaskSuspend",                  stub_vTaskSuspend },
         { "uxTaskGetStackHighWaterMark",   stub_uxTaskGetStackHighWaterMark },
+        { "uxTaskGetNumberOfTasks",        stub_uxTaskGetNumberOfTasks },
+        { "uxTaskGetSystemState",          stub_uxTaskGetSystemState },
         { "disableCore0WDT",               stub_disableCoreWDT },
         { "disableCore1WDT",               stub_disableCoreWDT },
         { "disableLoopWDT",                stub_disableCoreWDT },

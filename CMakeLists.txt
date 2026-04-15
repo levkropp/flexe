@@ -62,6 +62,7 @@ set(LIB_SOURCES
     src/touch_stubs.c
     src/sdcard_stubs.c
     src/wifi_stubs.c
+    src/vfs_stubs.c
     src/bt_stubs.c
     src/sha_stubs.c
     src/aes_stubs.c
@@ -69,6 +70,8 @@ set(LIB_SOURCES
     src/flexe_session.c
     src/savestate.c
     src/hierarchical_trace.c
+    src/sandbox_events.c
+    src/aot.c
 )
 
 # JIT compiler: x86-64 only, non-MSVC
@@ -76,7 +79,8 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     list(APPEND LIB_SOURCES src/jit.c)
     message(STATUS "JIT compiler enabled (x86-64)")
 else()
-    message(STATUS "JIT compiler disabled (requires x86-64, non-MSVC)")
+    list(APPEND LIB_SOURCES src/jit_stub.c)
+    message(STATUS "JIT compiler disabled (requires x86-64, non-MSVC) — using no-op stubs")
 endif()
 
 if(MSVC)
@@ -116,6 +120,12 @@ if(MSVC)
     target_compile_definitions(xtensa-emu PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xtensa-emu PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+endif()
+# AOT dlopen plugins call back into mem_read*/mem_write*; export them.
+if(APPLE)
+    target_link_options(xtensa-emu PRIVATE -Wl,-export_dynamic)
+elseif(NOT MSVC)
+    target_link_options(xtensa-emu PRIVATE -rdynamic)
 endif()
 
 # Test runner

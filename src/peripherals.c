@@ -1,4 +1,5 @@
 #include "peripherals.h"
+#include "sandbox_events.h"
 #include "xtensa.h"
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +100,10 @@ struct esp32_periph {
 
     /* Unhandled access counter */
     int unhandled_count;
+
+    /* ADC input shadow values driven from sandbox stdin. Reads by
+     * adc_oneshot_read / adc1_get_raw ROM-stubs pull from here. */
+    uint16_t adc_value[40];
 };
 
 /* ---- DPORT ---- */
@@ -238,6 +243,10 @@ static void uart0_write(void *ctx, uint32_t addr, uint32_t val) {
             p->uart_tx[p->uart_tx_len++] = byte;
         if (p->uart_cb)
             p->uart_cb(p->uart_cb_ctx, byte);
+        sbx_event_t ev = { .kind = SBX_EV_UART_TX, .cycle = 0 };
+        ev.uart_tx.uart_num = 0;
+        ev.uart_tx.byte = byte;
+        sbx_events_emit(&ev);
     } else {
         if (off / 4 < 64) p->uart_shadow[off / 4] = val;
     }
@@ -289,9 +298,23 @@ static uint32_t gpio_read(void *ctx, uint32_t addr) {
     return 0;
 }
 
+static void gpio_emit_changed(uint32_t prev, uint32_t now, int pin_base) {
+    uint32_t diff = prev ^ now;
+    while (diff) {
+        int bit = __builtin_ctz(diff);
+        diff &= ~(1u << bit);
+        sbx_event_t ev = { .kind = SBX_EV_GPIO_OUT, .cycle = 0 };
+        ev.gpio_out.pin = (uint8_t)(pin_base + bit);
+        ev.gpio_out.level = (now >> bit) & 1u;
+        sbx_events_emit(&ev);
+    }
+}
+
 static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - GPIO_BASE;
+    uint32_t prev_out = p->gpio.out;
+    uint32_t prev_out1 = p->gpio.out1;
 
     switch (off) {
     case 0x004: p->gpio.out = val; break;        /* GPIO_OUT_REG */
@@ -333,6 +356,12 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
         p->gpio.func_out_sel[n] = val;
         return;
     }
+
+    /* Fire sandbox events for any output pins that changed level. */
+    if (p->gpio.out != prev_out)
+        gpio_emit_changed(prev_out, p->gpio.out, 0);
+    if (p->gpio.out1 != prev_out1)
+        gpio_emit_changed(prev_out1, p->gpio.out1, 32);
 }
 
 /* ---- RTC_CNTL ---- */
@@ -650,4 +679,25 @@ void periph_intr_matrix_set(esp32_periph_t *p, int core, int cpu_int, int source
 int periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int) {
     if (!p || core < 0 || core > 1 || cpu_int < 0 || cpu_int > 31) return 16;
     return p->intr_matrix[core][cpu_int];
+}
+
+void periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw) {
+    if (!p || channel < 0 || channel >= 40) return;
+    p->adc_value[channel] = raw;
+}
+
+uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel) {
+    if (!p || channel < 0 || channel >= 40) return 0;
+    return p->adc_value[channel];
+}
+
+void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
+    if (!p || pin < 0 || pin > 39) return;
+    if (pin < 32) {
+        uint32_t mask = 1u << pin;
+        if (level) p->gpio.in  |=  mask; else p->gpio.in  &= ~mask;
+    } else {
+        uint32_t mask = 1u << (pin - 32);
+        if (level) p->gpio.in1 |=  mask; else p->gpio.in1 &= ~mask;
+    }
 }

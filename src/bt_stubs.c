@@ -39,7 +39,7 @@ typedef struct {
     uint8_t  addr_type;   /* 0=public, 1=random */
 } fake_ble_dev_t;
 
-static const fake_ble_dev_t fake_ble_devs[] = {
+__attribute__((used)) static const fake_ble_dev_t fake_ble_devs[] = {
     { "MI Band 6",     {0xDE,0x85,0x12,0x34,0x56,0x78}, -52, 1 },
     { "AirPods Pro",   {0x4C,0xAB,0xCD,0xEF,0x01,0x23}, -61, 0 },
     { "Tile Mate",     {0xF4,0x5E,0xAB,0x11,0x22,0x33}, -74, 1 },

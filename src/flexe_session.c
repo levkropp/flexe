@@ -17,6 +17,7 @@
 #include "touch_stubs.h"
 #include "sdcard_stubs.h"
 #include "wifi_stubs.h"
+#include "vfs_stubs.h"
 #include "bt_stubs.h"
 #include "sha_stubs.h"
 #include "aes_stubs.h"
@@ -38,6 +39,7 @@ struct flexe_session {
     touch_stubs_t     *tstubs;
     sdcard_stubs_t    *sstubs;
     wifi_stubs_t      *wstubs;
+    vfs_stubs_t       *vstubs;
     bt_stubs_t        *bstubs;
     sha_stubs_t       *shstubs;
     aes_stubs_t       *astubs;
@@ -192,6 +194,12 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     if (s->wstubs && s->syms)
         wifi_stubs_hook_symbols(s->wstubs, s->syms);
 
+    /* VFS / SPIFFS / FATFS stubs (host-backed file I/O).
+     * Hook AFTER rom_stubs so we override the rom_stubs ESP_FAIL stubs. */
+    s->vstubs = vfs_stubs_create(&s->cpu[0]);
+    if (s->vstubs && s->syms)
+        vfs_stubs_hook_symbols(s->vstubs, s->syms);
+
     /* Bluetooth / NimBLE stubs */
     s->bstubs = bt_stubs_create(&s->cpu[0]);
     if (s->bstubs && s->syms)
@@ -243,6 +251,7 @@ void flexe_session_destroy(flexe_session_t *s)
 {
     if (!s) return;
     bt_stubs_destroy(s->bstubs);
+    vfs_stubs_destroy(s->vstubs);
     wifi_stubs_destroy(s->wstubs);
     mpi_stubs_destroy(s->mstubs);
     aes_stubs_destroy(s->astubs);
@@ -323,11 +332,19 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
                 (unsigned long long)s->cpu[0].cycle_count, s->cpu[1].pc);
     }
 
-    /* Dual-core: run core 1 batch */
-    if (!s->single_core && s->cpu[1].running) {
-        xtensa_run(&s->cpu[1], batch_size);
-        if (s->frt && !s->native_freertos)
-            freertos_stubs_check_preempt_core(s->frt, 1);
+    /* Dual-core: run core 1 batch (or poll scheduler if parked) */
+    if (!s->single_core && s->cpu[1].pc != 0) {
+        if (s->cpu[1].running) {
+            xtensa_run(&s->cpu[1], batch_size);
+            if (s->frt && !s->native_freertos)
+                freertos_stubs_check_preempt_core(s->frt, 1);
+        } else if (s->frt && !s->native_freertos) {
+            /* Core 1 is parked at stub_esp_startup_start_app_other_cores
+             * waiting for an eligible task.  Poll the scheduler so it gets
+             * resumed once a core-1 task becomes ready. */
+            if (freertos_stubs_check_preempt_core(s->frt, 1))
+                s->cpu[1].running = true;
+        }
 
         /* Sync cycle counts: both cores share the same clock, so use the
          * maximum of the two.  In native mode, no fast-forward — time
@@ -348,6 +365,14 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
             s->cpu[1].virtual_time_us = s->cpu[0].virtual_time_us;
         }
     }
+
+    /* Dispatch any expired esp_timer callbacks (periodic + one-shot).
+     * Run after cycle_count / virtual_time_us have been advanced by both
+     * cores so the dispatcher sees the latest simulated time.  Without
+     * this, periodic timers registered via esp_timer_start_periodic would
+     * never fire during normal instruction execution — only when firmware
+     * explicitly calls usleep/delay. */
+    esp_timer_stubs_tick(s->etimer);
 }
 
 /* ===== Callback configuration ===== */

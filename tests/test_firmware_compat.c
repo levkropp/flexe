@@ -356,6 +356,181 @@ TEST(test_nvs_init_open_get_sequence) {
     teardown(&cpu);
 }
 
+/* ===== KV-store round trip: nvs_open + nvs_set_i32 + nvs_get_i32 ===== */
+
+TEST(test_nvs_set_get_i32_roundtrip) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    extern void stub_nvs_open(xtensa_cpu_t *, void *);
+    extern void stub_nvs_set_i32(xtensa_cpu_t *, void *);
+    extern void stub_nvs_get_i32(xtensa_cpu_t *, void *);
+
+    uint32_t open_addr = 0x400D5000;
+    uint32_t set_addr  = 0x400D5010;
+    uint32_t get_addr  = 0x400D5020;
+    rom_stubs_register_ctx(rom, open_addr, (rom_stub_fn)stub_nvs_open,    "nvs_open",    rom);
+    rom_stubs_register_ctx(rom, set_addr,  (rom_stub_fn)stub_nvs_set_i32, "nvs_set_i32", rom);
+    rom_stubs_register_ctx(rom, get_addr,  (rom_stub_fn)stub_nvs_get_i32, "nvs_get_i32", rom);
+
+    /* Write namespace + key strings into guest DRAM */
+    const char *ns  = "storage";
+    const char *key = "counter";
+    uint32_t ns_addr = 0x3FFB0000;
+    uint32_t key_addr = 0x3FFB0040;
+    for (int i = 0; ns[i];  i++) mem_write8(cpu.mem, ns_addr  + i, (uint8_t)ns[i]);
+    mem_write8(cpu.mem, ns_addr + (uint32_t)strlen(ns), 0);
+    for (int i = 0; key[i]; i++) mem_write8(cpu.mem, key_addr + i, (uint8_t)key[i]);
+    mem_write8(cpu.mem, key_addr + (uint32_t)strlen(key), 0);
+
+    /* Open */
+    uint32_t handle_out = 0x3FFB1000;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, ns_addr);
+    ar_write(&cpu, 3, 0);
+    ar_write(&cpu, 4, handle_out);
+    cpu.pc = open_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+    uint32_t handle = mem_read32(cpu.mem, handle_out);
+    ASSERT_TRUE(handle != 0);
+
+    /* Set i32 = 0xDEADBEEF */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, key_addr);
+    ar_write(&cpu, 4, 0xDEADBEEF);
+    cpu.pc = set_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+
+    /* Get i32 -> should return the stored value */
+    uint32_t value_out = 0x3FFB2000;
+    mem_write32(cpu.mem, value_out, 0);
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, key_addr);
+    ar_write(&cpu, 4, value_out);
+    cpu.pc = get_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+    ASSERT_EQ(mem_read32(cpu.mem, value_out), 0xDEADBEEF);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+/* ===== nvs_get_i32 on missing key returns ESP_ERR_NVS_NOT_FOUND ===== */
+
+TEST(test_nvs_get_i32_missing_key) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    extern void stub_nvs_open(xtensa_cpu_t *, void *);
+    extern void stub_nvs_get_i32(xtensa_cpu_t *, void *);
+
+    uint32_t open_addr = 0x400D6000;
+    uint32_t get_addr  = 0x400D6010;
+    rom_stubs_register_ctx(rom, open_addr, (rom_stub_fn)stub_nvs_open,    "nvs_open",    rom);
+    rom_stubs_register_ctx(rom, get_addr,  (rom_stub_fn)stub_nvs_get_i32, "nvs_get_i32", rom);
+
+    const char *ns  = "ns";
+    const char *key = "missing";
+    uint32_t ns_addr = 0x3FFB0000;
+    uint32_t key_addr = 0x3FFB0040;
+    for (int i = 0; ns[i];  i++) mem_write8(cpu.mem, ns_addr  + i, (uint8_t)ns[i]);
+    mem_write8(cpu.mem, ns_addr + (uint32_t)strlen(ns), 0);
+    for (int i = 0; key[i]; i++) mem_write8(cpu.mem, key_addr + i, (uint8_t)key[i]);
+    mem_write8(cpu.mem, key_addr + (uint32_t)strlen(key), 0);
+
+    uint32_t handle_out = 0x3FFB1000;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, ns_addr);
+    ar_write(&cpu, 3, 0);
+    ar_write(&cpu, 4, handle_out);
+    cpu.pc = open_addr;
+    xtensa_step(&cpu);
+    uint32_t handle = mem_read32(cpu.mem, handle_out);
+
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, key_addr);
+    ar_write(&cpu, 4, 0x3FFB2000);
+    cpu.pc = get_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0x1102); /* ESP_ERR_NVS_NOT_FOUND */
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+/* ===== VFS stubs round-trip ===== */
+#include "vfs_stubs.h"
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string.h>
+
+TEST(test_vfs_stubs_spiffs_host_roundtrip) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    cpu.pc_hook_ctx = rom;  /* vfs_stubs_hook_symbols looks at pc_hook_ctx */
+
+    vfs_stubs_t *v = vfs_stubs_create(&cpu);
+    ASSERT_TRUE(v != NULL);
+
+    /* Register a /spiffs mount backed by a tmp host dir */
+    const char *host_dir = "/tmp/flexe-spiffs-unit-test";
+    /* Wipe any prior contents so the test is hermetic */
+    char rm_cmd[256];
+    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", host_dir);
+    int rc1 = system(rm_cmd); (void)rc1;
+
+    vfs_stubs_set_spiffs_dir(v, host_dir);
+
+    /* The mount setter should have left a working host directory ready. */
+    char mk_cmd[256];
+    snprintf(mk_cmd, sizeof(mk_cmd), "mkdir -p '%s'", host_dir);
+    int rc2 = system(mk_cmd); (void)rc2;
+    struct stat st;
+    ASSERT_EQ(stat(host_dir, &st), 0);
+    ASSERT_TRUE(S_ISDIR(st.st_mode));
+
+    /* Round-trip: write a file under the host mount, read it back. This
+     * mirrors what stub_fwrite/stub_fread do once a guest fopen has
+     * been resolved through vfs_resolve_path. */
+    char path[256];
+    snprintf(path, sizeof(path), "%s/round.txt", host_dir);
+    FILE *fp = fopen(path, "w");
+    ASSERT_TRUE(fp != NULL);
+    const char msg[] = "Hello World!\n";
+    size_t wrote = fwrite(msg, 1, sizeof(msg) - 1, fp);
+    ASSERT_EQ(wrote, sizeof(msg) - 1);
+    fclose(fp);
+
+    fp = fopen(path, "r");
+    ASSERT_TRUE(fp != NULL);
+    char buf[64] = {0};
+    size_t got = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    ASSERT_EQ(got, sizeof(msg) - 1);
+    ASSERT_EQ(strcmp(buf, msg), 0);
+
+    /* Clean up */
+    int rc3 = system(rm_cmd); (void)rc3;
+
+    vfs_stubs_destroy(v);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 /* ===== Suite runner ===== */
 
 static void run_firmware_compat_tests(void) {
@@ -379,4 +554,8 @@ static void run_firmware_compat_tests(void) {
     RUN_TEST(test_software_reset_cpu_stops);
     /* Integration */
     RUN_TEST(test_nvs_init_open_get_sequence);
+    RUN_TEST(test_nvs_set_get_i32_roundtrip);
+    RUN_TEST(test_nvs_get_i32_missing_key);
+    /* VFS host-backed mount round-trip */
+    RUN_TEST(test_vfs_stubs_spiffs_host_roundtrip);
 }

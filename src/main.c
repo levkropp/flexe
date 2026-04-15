@@ -11,6 +11,8 @@
 #include "freertos_stubs.h"
 #include "savestate.h"
 #include "hierarchical_trace.h"
+#include "sandbox_events.h"
+#include "aot.h"
 #ifndef _MSC_VER
 #include "jit.h"
 #endif
@@ -402,9 +404,10 @@ static void check_assertions(const trace_assert_t *asserts, int count,
 
 /* ===== UART stdout callback ===== */
 
+static int g_suppress_uart_stdout = 0;
 static void uart_stdout_cb(void *ctx, uint8_t byte) {
     (void)ctx;
-    putchar(byte);
+    if (!g_suppress_uart_stdout) putchar(byte);
 }
 
 /* ===== Exception cause names ===== */
@@ -592,6 +595,201 @@ static const char *detect_vector(uint32_t pc, uint32_t vecbase) {
     }
 }
 
+/* ===== Sandbox touch state =====
+ * Driven by the browser tapping inside the in-canvas ILI9341 node. The
+ * frontend posts {t:'touch_in',x,y,pressed}; sandbox_drain_stdin() updates
+ * these globals; touch_stubs's get_state callback reads them when
+ * firmware calls touch_read()/touch_wait_tap(). */
+static volatile int g_touch_x = 0;
+static volatile int g_touch_y = 0;
+static volatile int g_touch_pressed = 0;
+
+__attribute__((unused))
+static int sandbox_touch_state_fn(int *x, int *y, void *ctx) {
+    (void)ctx;
+    if (x) *x = g_touch_x;
+    if (y) *y = g_touch_y;
+    return g_touch_pressed;
+}
+
+/* ===== Sandbox stdin command reader =====
+ * When --sandbox-events is active, the Node bridge may push commands
+ * (button presses, firmware reloads, GPIO input drives, touch taps) to
+ * flexe's stdin as NDJSON lines. We set stdin non-blocking once and
+ * drain it at the top of every run-loop batch. Recognised commands:
+ *   {"t":"gpio_in","pin":0,"lvl":1}
+ *   {"t":"touch_in","x":120,"y":80,"pressed":1}
+ * Unknown shapes are silently ignored. */
+#include <fcntl.h>
+#include <unistd.h>
+
+static char   g_stdin_buf[4096];
+static size_t g_stdin_len = 0;
+
+static void sandbox_stdin_init(void) {
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0) fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int json_int_field(const char *s, const char *key, long *out) {
+    /* Tiny scanner: find "\"key\":" then parse the integer that follows. */
+    char pat[32];
+    int n = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (n <= 0) return 0;
+    const char *p = strstr(s, pat);
+    if (!p) return 0;
+    p += n;
+    while (*p && (*p == ' ' || *p == ':')) p++;
+    if (!*p) return 0;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p) return 0;
+    *out = v;
+    return 1;
+}
+
+static void sandbox_process_line(esp32_periph_t *periph, const char *line) {
+    if (!line || !*line) return;
+    const char *t = strstr(line, "\"t\"");
+    if (!t) return;
+    if (strstr(line, "\"gpio_in\"")) {
+        long pin = -1, lvl = -1;
+        if (json_int_field(line, "pin", &pin) && json_int_field(line, "lvl", &lvl)) {
+            periph_gpio_set_input(periph, (int)pin, (int)lvl);
+        }
+    } else if (strstr(line, "\"touch_in\"")) {
+        long x = 0, y = 0, pressed = 0;
+        json_int_field(line, "x", &x);
+        json_int_field(line, "y", &y);
+        json_int_field(line, "pressed", &pressed);
+        g_touch_x = (int)x;
+        g_touch_y = (int)y;
+        g_touch_pressed = (int)pressed;
+    } else if (strstr(line, "\"adc_in\"")) {
+        long ch = -1, raw = 0;
+        if (json_int_field(line, "ch", &ch) &&
+            json_int_field(line, "raw", &raw)) {
+            if (raw < 0) raw = 0;
+            if (raw > 0xFFFF) raw = 0xFFFF;
+            periph_set_adc_value(periph, (int)ch, (uint16_t)raw);
+        }
+    }
+}
+
+static void sandbox_drain_stdin(esp32_periph_t *periph) {
+    for (;;) {
+        if (g_stdin_len >= sizeof(g_stdin_buf) - 1) g_stdin_len = 0;
+        ssize_t n = read(STDIN_FILENO, g_stdin_buf + g_stdin_len,
+                         sizeof(g_stdin_buf) - 1 - g_stdin_len);
+        if (n <= 0) break;
+        g_stdin_len += (size_t)n;
+        g_stdin_buf[g_stdin_len] = '\0';
+        /* Split on newlines and process complete lines. */
+        char *start = g_stdin_buf;
+        for (;;) {
+            char *nl = strchr(start, '\n');
+            if (!nl) break;
+            *nl = '\0';
+            sandbox_process_line(periph, start);
+            start = nl + 1;
+        }
+        /* Move any tail back to the front */
+        size_t tail = (size_t)(g_stdin_buf + g_stdin_len - start);
+        memmove(g_stdin_buf, start, tail);
+        g_stdin_len = tail;
+        g_stdin_buf[g_stdin_len] = '\0';
+        if (n < 1024) break;  /* avoid starving the main loop */
+    }
+}
+
+/* ===== Sandbox event JSON sink =====
+ * When --sandbox-events is passed, every peripheral event is serialised as
+ * one NDJSON line to stdout so the litegraph.js frontend (running in a
+ * Node.js parent process) can proxy them over a WebSocket to the browser.
+ * stdout is LINE-buffered after the first write so the parent sees events
+ * without having to wait for the pipe buffer to fill. */
+static xtensa_cpu_t *g_sbx_cpu = NULL;
+
+/* Minimal base64 encoder (RFC 4648, no newlines). Used for LCD pixel blobs. */
+static void b64_encode(const uint8_t *in, size_t n, char *out) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0, o = 0;
+    while (i + 3 <= n) {
+        uint32_t v = (uint32_t)in[i] << 16 | (uint32_t)in[i+1] << 8 | in[i+2];
+        out[o++] = tbl[(v >> 18) & 0x3f];
+        out[o++] = tbl[(v >> 12) & 0x3f];
+        out[o++] = tbl[(v >> 6) & 0x3f];
+        out[o++] = tbl[v & 0x3f];
+        i += 3;
+    }
+    if (i < n) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i+1] << 8;
+        out[o++] = tbl[(v >> 18) & 0x3f];
+        out[o++] = tbl[(v >> 12) & 0x3f];
+        out[o++] = (i + 1 < n) ? tbl[(v >> 6) & 0x3f] : '=';
+        out[o++] = '=';
+    }
+    out[o] = '\0';
+}
+
+static void sbx_json_sink(const sbx_event_t *ev, void *ctx) {
+    (void)ctx;
+    uint64_t cycle = g_sbx_cpu ? g_sbx_cpu->cycle_count : 0;
+    switch (ev->kind) {
+    case SBX_EV_GPIO_OUT:
+        fprintf(stdout, "{\"t\":\"gpio\",\"c\":%llu,\"pin\":%u,\"lvl\":%u}\n",
+                (unsigned long long)cycle, ev->gpio_out.pin, ev->gpio_out.level);
+        break;
+    case SBX_EV_UART_TX:
+        fprintf(stdout, "{\"t\":\"uart\",\"c\":%llu,\"u\":%u,\"b\":%u}\n",
+                (unsigned long long)cycle, ev->uart_tx.uart_num, ev->uart_tx.byte);
+        break;
+    case SBX_EV_LCD_PIXELS: {
+        /* Compute payload size from bit depth. 1bpp uses page-col packing
+         * (8 vertical pixels per byte → w * (h/8) bytes); ≥8bpp uses
+         * row-major bytes per pixel (w * h * bytes). */
+        size_t nbytes;
+        if (ev->lcd_pixels.bpp == 1) {
+            nbytes = (size_t)ev->lcd_pixels.w * ((ev->lcd_pixels.h + 7) / 8);
+        } else {
+            nbytes = (size_t)ev->lcd_pixels.w * ev->lcd_pixels.h * (ev->lcd_pixels.bpp / 8);
+        }
+        /* Cap at 240x320 RGB565 = 153600 bytes → 204800 base64 chars. */
+        static char b64[256 * 1024];
+        b64_encode(ev->lcd_pixels.pixels, nbytes, b64);
+        fprintf(stdout,
+                "{\"t\":\"lcd\",\"c\":%llu,\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u,\"bpp\":%u,\"px\":\"%s\"}\n",
+                (unsigned long long)cycle,
+                ev->lcd_pixels.x, ev->lcd_pixels.y,
+                ev->lcd_pixels.w, ev->lcd_pixels.h,
+                ev->lcd_pixels.bpp, b64);
+        break;
+    }
+    default:
+        break;
+    }
+    fflush(stdout);
+}
+
+/* ===== Unhooked-audit helpers (hoisted; clang has no nested functions) ===== */
+typedef struct { const char *name; uint32_t addr; uint32_t size; } audit_fsym_t;
+typedef struct { audit_fsym_t *buf; int n, cap; esp32_rom_stubs_t *rom; } audit_iter_ctx_t;
+
+static int audit_collect_fn(const char *name, uint32_t addr, uint32_t size, void *vctx) {
+    audit_iter_ctx_t *c = vctx;
+    if (c->n >= c->cap) return 0;
+    if (addr < 0x40080000u || addr >= 0x40500000u) return 0; /* skip ROM */
+    if (size == 0) return 0;
+    for (int i = 0; i < rom_stubs_stub_count(c->rom); i++) {
+        const char *rn; uint32_t ra, rc;
+        rom_stubs_get_stats(c->rom, i, &rn, &ra, &rc);
+        if (ra == addr) return 0;
+    }
+    c->buf[c->n++] = (audit_fsym_t){name, addr, size};
+    return 0;
+}
+
 /* ===== Main ===== */
 
 int main(int argc, char *argv[]) {
@@ -630,6 +828,10 @@ int main(int argc, char *argv[]) {
     const char *checkpoint_dir = NULL;
     uint64_t checkpoint_interval = 0;
     const char *restore_file = NULL;
+    /* Sandbox event stream (litegraph.js frontend) */
+    int sandbox_events = 0;
+    /* AOT statically-recompiled firmware dylib */
+    const char *aot_dylib_path = NULL;
 
     /* Manual parsing for long options (--checkpoint-*, --restore) */
     int i = 1;
@@ -661,6 +863,16 @@ int main(int argc, char *argv[]) {
             jit_verify = 1;
             memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(char *));
             argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--sandbox-events") == 0) {
+            sandbox_events = 1;
+            memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--aot") == 0 && i + 1 < argc) {
+            aot_dylib_path = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
             continue;
         }
         i++;
@@ -803,6 +1015,12 @@ int main(int argc, char *argv[]) {
         .window_trace = window_trace,
         .spill_verify = spill_verify,
         .uart_cb = uart_stdout_cb,
+        /* Sandbox touch hand-off — get_state callback reads volatiles
+         * mutated by sandbox_drain_stdin() each batch. Always installed,
+         * not gated on --sandbox-events, since the function is harmless
+         * in CLI mode (just reports "not pressed"). */
+        .touch_fn = sandbox_touch_state_fn,
+        .touch_ctx = NULL,
     };
     flexe_session_t *session = flexe_session_create(&sess_cfg);
     if (!session) {
@@ -818,6 +1036,36 @@ int main(int argc, char *argv[]) {
     esp32_periph_t *periph = flexe_session_periph(session);
     esp32_rom_stubs_t *rom = flexe_session_rom(session);
     freertos_stubs_t *frt = flexe_session_frt(session);
+
+    if (sandbox_events) {
+        g_sbx_cpu = cpu;
+        g_suppress_uart_stdout = 1;
+        sbx_events_set_sink(sbx_json_sink, NULL);
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        sandbox_stdin_init();
+    }
+
+    /* Wire up AOT dispatch on the cpu if --aot was passed. The lookup
+     * function pointer goes through xtensa.h's opaque (void *) interface
+     * to keep the interpreter free of dlopen + JSON dependencies. */
+    aot_state_t *aot_state = NULL;
+    if (aot_dylib_path) {
+        aot_state = aot_load(aot_dylib_path);
+        if (aot_state) {
+            const uint64_t *aot_bm = aot_get_bitmap(aot_state);
+            cpu->aot = aot_state;
+            cpu->aot_lookup_fn = (void *(*)(void *, uint32_t))aot_lookup;
+            cpu->aot_bitmap = aot_bm;
+            cpu->_pc_written = true;  /* force first-step AOT probe */
+            xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
+            if (cpu1) {
+                cpu1->aot = aot_state;
+                cpu1->aot_lookup_fn = (void *(*)(void *, uint32_t))aot_lookup;
+                cpu1->aot_bitmap = aot_bm;
+                cpu1->_pc_written = true;
+            }
+        }
+    }
 
     if (native_freertos)
         fprintf(stderr, "Native FreeRTOS mode (-N): firmware runs its own scheduler\n");
@@ -979,9 +1227,15 @@ int main(int argc, char *argv[]) {
      * NOTE: g_htrace uses PC hook instead of single-step, so not listed here */
     int need_step = trace || call_trace || assert_count;
 
-    /* Unified execution loop */
+    /* Unified execution loop.
+     * Keep running as long as either core 0 or core 1 is alive — otherwise a
+     * core 0 task exit (e.g. main_task returning after vTaskDelete) would
+     * terminate the whole session, starving core 1 of the periodic esp_timer
+     * ticks that drive LVGL tick subsystems. */
+    xtensa_cpu_t *cpu1_any = single_core ? NULL : flexe_session_cpu(session, 1);
     int batch = 10000;
-    while (cycles < max_cycles_u64 && cpu->running && !cpu->halted && !cpu->breakpoint_hit) {
+    while (cycles < max_cycles_u64 && (cpu->running || (cpu1_any && cpu1_any->running)) && !cpu->halted && !cpu->breakpoint_hit) {
+        if (sandbox_events) sandbox_drain_stdin(periph);
         /* Are we in a trace window?
          * Use cpu->cycle_count (virtual time including FreeRTOS skips)
          * so trace windows match event log timestamps. */
@@ -1152,6 +1406,11 @@ int main(int argc, char *argv[]) {
             else
 #endif
                 ran = xtensa_run(cpu, n);
+            /* If core 0 is stopped but core 1 is still running, count budget
+             * against core 1's batch (which will run inside post_batch). */
+            if (ran == 0 && !cpu->running && cpu1_any && cpu1_any->running) {
+                ran = n;
+            }
             cycles += ran;
 
             /* Event log: check exception after batch */
@@ -1167,8 +1426,12 @@ int main(int argc, char *argv[]) {
             }
 
             if (ran < n) {
-                /* Check if we stopped for a good reason, or exception loop */
-                if (cpu->breakpoint_hit || cpu->halted || !cpu->running) break;
+                /* Check if we stopped for a good reason, or exception loop.
+                 * Only break on !running if core 1 is also dead — otherwise
+                 * keep the outer loop alive so core 1 can continue executing
+                 * via flexe_session_post_batch(). */
+                if (cpu->breakpoint_hit || cpu->halted ||
+                    (!cpu->running && !(cpu1_any && cpu1_any->running))) break;
             }
             if (cpu->pc == pc_before && frt && !native_freertos) {
                 uint32_t param;
@@ -1373,26 +1636,10 @@ int main(int argc, char *argv[]) {
         /* For a proper PC profile, use: -t -c N then post-process the trace.
          * Here we just list all ELF functions in the instruction space that
          * could potentially be stubbed, with their address for reference. */
-        typedef struct { const char *name; uint32_t addr; uint32_t size; } fsym_t;
-        fsym_t fbuf[1024];
-        typedef struct { fsym_t *buf; int n, cap; } iter_ctx_t;
-        iter_ctx_t ictx = { fbuf, 0, 1024 };
-
-        int collect_fn(const char *name, uint32_t addr, uint32_t size, void *vctx) {
-            iter_ctx_t *c = vctx;
-            if (c->n >= c->cap) return 0;
-            if (addr < 0x40080000u || addr >= 0x40500000u) return 0; /* skip ROM */
-            if (size == 0) return 0;
-            /* Skip if already stubbed */
-            for (int i = 0; i < rom_stubs_stub_count(rom); i++) {
-                const char *rn; uint32_t ra, rc;
-                rom_stubs_get_stats(rom, i, &rn, &ra, &rc);
-                if (ra == addr) return 0; /* already hooked */
-            }
-            c->buf[c->n++] = (fsym_t){name, addr, size};
-            return 0;
-        }
-        elf_symbols_iterate(syms, collect_fn, &ictx);
+        audit_fsym_t fbuf[1024];
+        audit_iter_ctx_t ictx = { fbuf, 0, 1024, rom };
+        elf_symbols_iterate(syms, audit_collect_fn, &ictx);
+        typedef audit_fsym_t fsym_t;
 
         /* Sort by size descending (larger = more potential savings) */
         for (int a = 0; a < ictx.n - 1; a++)
