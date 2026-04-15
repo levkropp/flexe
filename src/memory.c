@@ -67,7 +67,11 @@ static void page_table_init(xtensa_mem_t *mem) {
     page_table_map(mem, RTC_IRAM_BASE, RTC_IRAM_END, mem->rtc_dram);
     page_table_map(mem, PSRAM_BASE, PSRAM_END, mem->psram);
     page_table_map(mem, RTC_FAST_BASE, RTC_FAST_END, mem->rtc_fast);
-    page_table_map(mem, RTC_SLOW_BASE, RTC_SLOW_END, mem->rtc_slow);
+    /* RTC slow: skip page 0x60000000 — it is the UART0 AHB FIFO alias used by
+     * ESP-IDF's uart_ll_write_txfifo(). Leaving the second page at 0x60001000
+     * available preserves any rtc_slow scratch use, while the first page
+     * falls through to MMIO dispatch (translate_ahb_alias → UART0 handler). */
+    page_table_map(mem, RTC_SLOW_BASE + PAGE_SIZE, RTC_SLOW_END, mem->rtc_slow + PAGE_SIZE);
 }
 
 xtensa_mem_t *mem_create(void) {
@@ -115,8 +119,23 @@ void mem_reset(xtensa_mem_t *mem) {
     memset(mem->rtc_slow, 0, RTC_SLOW_SIZE);
 }
 
+/* Translate ESP32 AHB peripheral aliases into their APB equivalents so
+ * MMIO dispatch can reach the same handler.
+ *  UART0 AHB 0x6000_0000 -> APB 0x3FF4_0000
+ *  UART1 AHB 0x6001_0000 -> APB 0x3FF5_0000
+ *  UART2 AHB 0x6002_E000 -> APB 0x3FF6_E000
+ * ESP-IDF's uart_ll_write_txfifo() writes via the AHB alias, so without
+ * this translation printf() through newlib/VFS never reaches UART. */
+static inline uint32_t translate_ahb_alias(uint32_t addr) {
+    if (addr >= 0x60000000u && addr < 0x60001000u) return addr - 0x60000000u + 0x3FF40000u;
+    if (addr >= 0x60010000u && addr < 0x60011000u) return addr - 0x60010000u + 0x3FF50000u;
+    if (addr >= 0x6002e000u && addr < 0x6002f000u) return addr - 0x6002e000u + 0x3FF6e000u;
+    return addr;
+}
+
 /* MMIO dispatch helper */
 static mmio_handler_t *mmio_lookup(xtensa_mem_t *mem, uint32_t addr) {
+    addr = translate_ahb_alias(addr);
     if (addr >= PERIPH_BASE && addr < PERIPH_END) {
         int page = (addr - PERIPH_BASE) / PAGE_SIZE;
         mmio_handler_t *h = &mem->mmio[page];
@@ -129,36 +148,42 @@ static mmio_handler_t *mmio_lookup(xtensa_mem_t *mem, uint32_t addr) {
 /* MMIO slow-path functions (called from inline fast paths on page table miss) */
 
 uint8_t mem_read8_slow(xtensa_mem_t *mem, uint32_t addr) {
-    mmio_handler_t *h = mmio_lookup(mem, addr);
-    if (h && h->read) return (uint8_t)h->read(h->ctx, addr);
+    uint32_t xaddr = translate_ahb_alias(addr);
+    mmio_handler_t *h = mmio_lookup(mem, xaddr);
+    if (h && h->read) return (uint8_t)h->read(h->ctx, xaddr);
     return 0;
 }
 
 uint16_t mem_read16_slow(xtensa_mem_t *mem, uint32_t addr) {
-    mmio_handler_t *h = mmio_lookup(mem, addr);
-    if (h && h->read) return (uint16_t)h->read(h->ctx, addr);
+    uint32_t xaddr = translate_ahb_alias(addr);
+    mmio_handler_t *h = mmio_lookup(mem, xaddr);
+    if (h && h->read) return (uint16_t)h->read(h->ctx, xaddr);
     return 0;
 }
 
 uint32_t mem_read32_slow(xtensa_mem_t *mem, uint32_t addr) {
-    mmio_handler_t *h = mmio_lookup(mem, addr);
-    if (h && h->read) return h->read(h->ctx, addr);
+    uint32_t xaddr = translate_ahb_alias(addr);
+    mmio_handler_t *h = mmio_lookup(mem, xaddr);
+    if (h && h->read) return h->read(h->ctx, xaddr);
     return 0;
 }
 
 void mem_write8_slow(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
-    mmio_handler_t *h = mmio_lookup(mem, addr);
-    if (h && h->write) h->write(h->ctx, addr, val);
+    uint32_t xaddr = translate_ahb_alias(addr);
+    mmio_handler_t *h = mmio_lookup(mem, xaddr);
+    if (h && h->write) h->write(h->ctx, xaddr, val);
 }
 
 void mem_write16_slow(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
-    mmio_handler_t *h = mmio_lookup(mem, addr);
-    if (h && h->write) h->write(h->ctx, addr, val);
+    uint32_t xaddr = translate_ahb_alias(addr);
+    mmio_handler_t *h = mmio_lookup(mem, xaddr);
+    if (h && h->write) h->write(h->ctx, xaddr, val);
 }
 
 void mem_write32_slow(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
-    mmio_handler_t *h = mmio_lookup(mem, addr);
-    if (h && h->write) h->write(h->ctx, addr, val);
+    uint32_t xaddr = translate_ahb_alias(addr);
+    mmio_handler_t *h = mmio_lookup(mem, xaddr);
+    if (h && h->write) h->write(h->ctx, xaddr, val);
 }
 
 int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len) {

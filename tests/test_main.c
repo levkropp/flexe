@@ -25,7 +25,11 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_freertos.c"
 #include "test_esp_timer.c"
 #include "test_firmware_compat.c"
+#if defined(__x86_64__) || defined(_M_X64)
 #include "test_jit.c"
+#else
+static void run_jit_tests(void) { printf("JIT tests skipped (x86-64 only)\n"); }
+#endif
 
 int main(void) {
     printf("Running xtensa-emulator tests...\n\n");

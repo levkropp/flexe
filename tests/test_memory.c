@@ -74,8 +74,9 @@ TEST(mem_rw32_rtc_fast) {
 
 TEST(mem_rw32_rtc_slow) {
     xtensa_mem_t *mem = mem_create();
-    mem_write32(mem, 0x60000000, 0x22222222);
-    ASSERT_EQ(mem_read32(mem, 0x60000000), 0x22222222);
+    /* 0x60000000 is the UART0 AHB FIFO alias — use the second rtc_slow page */
+    mem_write32(mem, 0x60001000, 0x22222222);
+    ASSERT_EQ(mem_read32(mem, 0x60001000), 0x22222222);
     mem_destroy(mem);
 }
 

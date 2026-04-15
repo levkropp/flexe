@@ -249,6 +249,13 @@ struct xtensa_cpu {
     void             *pc_hook_ctx;
     const uint64_t   *pc_hook_bitmap;   /* Fast-path bitmap: skip hook if bit not set */
     uint32_t         *predecode;        /* Pre-decoded instruction table (heap, 20MB) */
+    /* AOT static-recompiled function table.
+     * `aot` is opaque to xtensa.c; xtensa_step_impl just calls
+     * `aot_lookup_fn(aot, pc)` which returns a function pointer or NULL.
+     * Hits run native C; misses fall through to the interpreter. */
+    void             *aot;
+    void           *(*aot_lookup_fn)(void *aot, uint32_t pc);
+    const uint64_t   *aot_bitmap;       /* Fast-path: skip aot_lookup if bit not set */
     uint32_t windowstart;               /* SR 73: Bitmask of valid windows */
 
     /* ================================================================

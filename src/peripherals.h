@@ -37,4 +37,15 @@ void periph_deassert_interrupt(esp32_periph_t *p, int source);
 void periph_intr_matrix_set(esp32_periph_t *p, int core, int cpu_int, int source);
 int  periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int);
 
+/* Drive a GPIO input pin to a level from outside the emulator (sandbox
+ * frontend, host-side tests). Updates GPIO_IN_REG / GPIO_IN1_REG so the
+ * firmware's gpio_get_level() returns the new value on its next read. */
+void periph_gpio_set_input(esp32_periph_t *p, int pin, int level);
+
+/* ADC input injection. Channels 0-39 cover both ADC1 (0-9) and ADC2 (0-9)
+ * plus the GPIO-number oriented indexing used by some APIs; we over-allocate
+ * to 40 slots for simplicity. Default value is 0. */
+void     periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw);
+uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel);
+
 #endif /* PERIPHERALS_H */

@@ -2,6 +2,7 @@
 #include "elf_symbols.h"
 #include "memory.h"
 #include "peripherals.h"
+#include "sandbox_events.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -59,6 +60,23 @@ struct esp32_rom_stubs {
     } ht[HOOK_HT_SIZE];
     uint64_t hook_bitmap[HOOK_BITMAP_WORDS];
     stub_direct_entry_t *direct;  /* Direct dispatch table (heap-allocated, 64K entries) */
+
+    /* In-memory NVS key/value store (see stub_nvs_* functions) */
+    struct nvs_kv_entry {
+        int      used;
+        char     ns[16];
+        char     key[16];
+        int      type;       /* 1=i32, 2=u32, 3=blob, 4=str */
+        union {
+            int32_t  i;
+            uint32_t u;
+            uint8_t  blob[256];
+        } value;
+        uint32_t blob_len;
+    } nvs_kv[64];
+    /* Open-handle table: index 1..N stores namespace string for that handle */
+    char     nvs_handle_ns[16][16];   /* up to 16 open handles */
+    int      nvs_handle_count;        /* next handle index = count + 1 */
 };
 
 /* ===== Calling convention helpers ===== */
@@ -548,6 +566,57 @@ static void stub_ets_printf(xtensa_cpu_t *cpu, void *ctx) {
     mini_printf(s, cpu);
     int written = s->output_len - before;
     rom_return(cpu, (uint32_t)written);
+}
+
+/* Newlib printf(fmt, ...) — same calling convention as ets_printf.
+ * Bypasses newlib's buffered stdio (which never flushes in the emulator
+ * because stdout is fully-buffered), writing directly to UART through
+ * the mini_printf format engine + UART FIFO hook. */
+static void stub_newlib_printf(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    int before = s->output_len;
+    mini_printf(s, cpu);
+    int written = s->output_len - before;
+    rom_return(cpu, (uint32_t)written);
+}
+
+/* puts(const char *s) — write string + newline to UART. */
+static void stub_newlib_puts(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t str_addr = rom_arg(cpu, 0);
+    int count = 0;
+    for (;;) {
+        uint8_t c = mem_read8(cpu->mem, str_addr + (uint32_t)count);
+        if (c == 0) break;
+        output_char(s, (char)c);
+        count++;
+        if (count > 4096) break;
+    }
+    output_char(s, '\n');
+    rom_return(cpu, (uint32_t)(count + 1));
+}
+
+/* putchar(int c) -> c */
+static void stub_newlib_putchar(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t c = rom_arg(cpu, 0);
+    output_char(s, (char)c);
+    rom_return(cpu, c);
+}
+
+/* fputs(const char *s, FILE *fp) — ignore fp, route to UART. */
+static void stub_newlib_fputs(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t str_addr = rom_arg(cpu, 0);
+    int count = 0;
+    for (;;) {
+        uint8_t c = mem_read8(cpu->mem, str_addr + (uint32_t)count);
+        if (c == 0) break;
+        output_char(s, (char)c);
+        count++;
+        if (count > 4096) break;
+    }
+    rom_return(cpu, (uint32_t)count);
 }
 
 static void stub_ets_install_putc1(xtensa_cpu_t *cpu, void *ctx) {
@@ -1137,6 +1206,127 @@ static void stub_esp_chip_info(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+/* ===== esp_lcd panel stubs =====
+ * Intercept esp_lcd_new_panel_*() to return fake panel handles tagged
+ * with a 4-byte type code, then esp_lcd_panel_draw_bitmap() reads the
+ * tag and emits SBX_EV_LCD_PIXELS with the right bit depth + pixel
+ * layout for the panel kind.
+ *
+ * Handle layout: each fake handle is a small struct in DRAM at a
+ * fixed address. Byte 0..3 = type tag, bytes 4..7 = width, 8..11 =
+ * height. Two flavours so far:
+ *   ILI9341  ('L','C','D','1') — 240x320 RGB565 row-major (16bpp)
+ *   SSD1306  ('O','L','E','D') — 128x64  monochrome page-col   (1bpp)
+ */
+#define LCD_FAKE_ILI9341_ADDR 0x3FFFE200u
+#define LCD_FAKE_SSD1306_ADDR 0x3FFFE220u
+
+static void lcd_write_panel(xtensa_cpu_t *cpu, uint32_t addr,
+                            const char *tag, uint32_t w, uint32_t h) {
+    mem_write8(cpu->mem, addr + 0, (uint8_t)tag[0]);
+    mem_write8(cpu->mem, addr + 1, (uint8_t)tag[1]);
+    mem_write8(cpu->mem, addr + 2, (uint8_t)tag[2]);
+    mem_write8(cpu->mem, addr + 3, (uint8_t)tag[3]);
+    mem_write32(cpu->mem, addr + 4, w);
+    mem_write32(cpu->mem, addr + 8, h);
+}
+
+static void stub_esp_lcd_new_panel_ili9341(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t ret_handle = rom_arg(cpu, 2);  /* esp_lcd_panel_handle_t *ret_panel */
+    lcd_write_panel(cpu, LCD_FAKE_ILI9341_ADDR, "LCD1", 240, 320);
+    if (ret_handle)
+        mem_write32(cpu->mem, ret_handle, LCD_FAKE_ILI9341_ADDR);
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_lcd_new_panel_ssd1306(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* esp_lcd_new_panel_ssd1306(io, *panel_dev_config, ret_panel)
+     * — same shape as ili9341, ret_panel is arg 2. */
+    uint32_t ret_handle = rom_arg(cpu, 2);
+    lcd_write_panel(cpu, LCD_FAKE_SSD1306_ADDR, "OLED", 128, 64);
+    if (ret_handle)
+        mem_write32(cpu->mem, ret_handle, LCD_FAKE_SSD1306_ADDR);
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_lcd_panel_noop_ok(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, 0);  /* ESP_OK */
+}
+
+/* esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, color_data)
+ *
+ * Reads the panel tag at the handle address to figure out the panel
+ * type, then emits a SBX_EV_LCD_PIXELS event with the right bit-depth
+ * and pixel layout. The display node on the litegraph side decodes the
+ * payload according to its own renderer (RGB565 row-major for ILI9341,
+ * column-major-page 1bpp for SSD1306). */
+static void stub_esp_lcd_panel_draw_bitmap(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t panel  = rom_arg(cpu, 0);
+    uint32_t x0     = rom_arg(cpu, 1);
+    uint32_t y0     = rom_arg(cpu, 2);
+    uint32_t x1     = rom_arg(cpu, 3);
+    uint32_t y1     = rom_arg(cpu, 4);
+    uint32_t data_p = rom_arg(cpu, 5);
+
+    if (x1 <= x0 || y1 <= y0 || !panel) { rom_return(cpu, 0); return; }
+
+    uint8_t tag[4] = {
+        mem_read8(cpu->mem, panel + 0),
+        mem_read8(cpu->mem, panel + 1),
+        mem_read8(cpu->mem, panel + 2),
+        mem_read8(cpu->mem, panel + 3),
+    };
+    int is_ssd1306 = (tag[0] == 'O' && tag[1] == 'L' && tag[2] == 'E' && tag[3] == 'D');
+    int is_ili9341 = (tag[0] == 'L' && tag[1] == 'C' && tag[2] == 'D' && tag[3] == '1');
+    if (!is_ssd1306 && !is_ili9341) { rom_return(cpu, 0); return; }
+
+    static uint8_t scratch[256 * 256 * 2];
+    uint32_t w = x1 - x0;
+    uint32_t h = y1 - y0;
+    uint32_t bytes;
+    uint32_t bpp;
+    if (is_ssd1306) {
+        /* SSD1306 page-col format: each byte = 8 vertical pixels at one
+         * column. Buffer size = w * (h/8) bytes; round up h to a page. */
+        uint32_t pages = (h + 7) / 8;
+        bytes = w * pages;
+        bpp = 1;
+    } else {
+        /* RGB565 row-major */
+        bytes = w * h * 2;
+        bpp = 16;
+    }
+    if (bytes > sizeof(scratch)) bytes = sizeof(scratch);
+    for (uint32_t i = 0; i < bytes; i++)
+        scratch[i] = mem_read8(cpu->mem, data_p + i);
+
+    sbx_event_t ev = { .kind = SBX_EV_LCD_PIXELS, .cycle = 0 };
+    ev.lcd_pixels.x = x0;
+    ev.lcd_pixels.y = y0;
+    ev.lcd_pixels.w = w;
+    ev.lcd_pixels.h = h;
+    ev.lcd_pixels.bpp = (uint16_t)bpp;
+    ev.lcd_pixels.pixels = scratch;
+    sbx_events_emit(&ev);
+
+    rom_return(cpu, 0);
+}
+
+/* esp_flash_get_size(esp_flash_t *chip, uint32_t *out_size) -> ESP_OK, reports 4 MiB.
+ * The underlying SPI flash chip isn't modeled, so probing via the real function
+ * returns ESP_ERR_NOT_SUPPORTED. Report a conventional 4 MiB image instead. */
+static void stub_esp_flash_get_size(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t out_ptr = rom_arg(cpu, 1);
+    if (out_ptr)
+        mem_write32(cpu->mem, out_ptr, 4u * 1024u * 1024u);
+    rom_return(cpu, 0);  /* ESP_OK */
+}
+
 /* esp_err_to_name(err) — return pointer to static string */
 static void stub_esp_err_to_name(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -1304,33 +1494,155 @@ static void stub_do_system_init_fn(xtensa_cpu_t *cpu, void *ctx) {
 #define ESP_OK              0
 #define ESP_ERR_NVS_NOT_FOUND 0x1102
 
+/* ----- In-memory KV store helpers -----
+ *
+ * The NVS implementation provides a tiny key/value table that lives entirely
+ * in the host. ESP-IDF apps that round-trip through nvs_open / nvs_set_* /
+ * nvs_get_* see real values across calls within a single emulator run.
+ * Restart wipes the store; we do not persist to disk. */
+
+static void nvs_copy_guest_string(xtensa_cpu_t *cpu, uint32_t guest_addr,
+                                  char *dst, size_t cap) {
+    if (!guest_addr || cap == 0) {
+        if (cap) dst[0] = '\0';
+        return;
+    }
+    size_t i = 0;
+    for (; i < cap - 1; i++) {
+        uint8_t c = mem_read8(cpu->mem, guest_addr + (uint32_t)i);
+        if (!c) break;
+        dst[i] = (char)c;
+    }
+    dst[i] = '\0';
+}
+
+static struct nvs_kv_entry *nvs_find(esp32_rom_stubs_t *s, const char *ns,
+                                     const char *key) {
+    for (int i = 0; i < 64; i++) {
+        if (s->nvs_kv[i].used &&
+            strcmp(s->nvs_kv[i].ns, ns) == 0 &&
+            strcmp(s->nvs_kv[i].key, key) == 0) {
+            return &s->nvs_kv[i];
+        }
+    }
+    return NULL;
+}
+
+static struct nvs_kv_entry *nvs_alloc(esp32_rom_stubs_t *s, const char *ns,
+                                      const char *key) {
+    struct nvs_kv_entry *e = nvs_find(s, ns, key);
+    if (e) return e;
+    for (int i = 0; i < 64; i++) {
+        if (!s->nvs_kv[i].used) {
+            s->nvs_kv[i].used = 1;
+            strncpy(s->nvs_kv[i].ns,  ns,  sizeof(s->nvs_kv[i].ns)  - 1);
+            s->nvs_kv[i].ns[sizeof(s->nvs_kv[i].ns) - 1] = '\0';
+            strncpy(s->nvs_kv[i].key, key, sizeof(s->nvs_kv[i].key) - 1);
+            s->nvs_kv[i].key[sizeof(s->nvs_kv[i].key) - 1] = '\0';
+            return &s->nvs_kv[i];
+        }
+    }
+    return NULL;
+}
+
+/* Look up the namespace string associated with an open handle (1..N). */
+static const char *nvs_handle_ns(esp32_rom_stubs_t *s, uint32_t handle) {
+    if (handle == 0 || handle > 16) return "";
+    return s->nvs_handle_ns[handle - 1];
+}
+
 /* nvs_flash_init / nvs_flash_init_partition -> ESP_OK */
 void stub_nvs_flash_init(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_return(cpu, ESP_OK);
 }
 
-/* nvs_flash_erase -> ESP_OK */
+/* nvs_flash_erase -> ESP_OK (also clears the in-memory KV store) */
 void stub_nvs_flash_erase(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
+    if (s) {
+        memset(s->nvs_kv, 0, sizeof(s->nvs_kv));
+    }
     rom_return(cpu, ESP_OK);
 }
 
-/* nvs_open(name, mode, *handle_out) -> ESP_OK, handle=1 */
+/* Allocate a new handle that remembers `ns_addr`'s namespace string.
+ *
+ * For the C path we just return a small integer (1..16) — callers treat the
+ * handle as opaque and our nvs_get/set stubs translate it via nvs_handle_ns.
+ *
+ * The C++ path also needs a "this" pointer that survives a vtable dispatch
+ * (NVSHandle::commit is a virtual call: `[this+0][40] -> callx8`). For that
+ * we additionally write a fake object into DRAM whose first slot points at
+ * the real NVSHandleSimple vtable in flash. The fake-object pointer encodes
+ * the handle index in its low bits so per-call stubs can recover the
+ * namespace via nvs_object_to_handle below. */
+#define NVS_FAKE_OBJ_BASE   0x3FFFE000u   /* DRAM scratch area */
+#define NVS_FAKE_OBJ_STRIDE 16u
+#define NVS_FAKE_VTABLE     0x3FFFE100u   /* DRAM scratch: fake vtable */
+#define NVS_FAKE_VTABLE_SLOTS 32
+/* Address of the real NVSHandleSimple::commit symbol in flash; we hook this
+ * PC to short-circuit any virtual call that lands on it. By filling our
+ * fake vtable with this address in every slot, *any* virtual dispatch from
+ * a fake handle ends up returning ESP_OK without touching real C++ code. */
+#define NVS_COMMIT_TRAMPOLINE 0x400D8E14u
+
+static uint32_t nvs_handle_to_object(uint32_t handle) {
+    return NVS_FAKE_OBJ_BASE + (handle - 1) * NVS_FAKE_OBJ_STRIDE;
+}
+
+static uint32_t nvs_object_to_handle(uint32_t obj) {
+    if (obj < NVS_FAKE_OBJ_BASE) return obj; /* already a small int */
+    uint32_t idx = (obj - NVS_FAKE_OBJ_BASE) / NVS_FAKE_OBJ_STRIDE;
+    if (idx >= 16) return 0;
+    return idx + 1;
+}
+
+static uint32_t nvs_open_alloc_handle(esp32_rom_stubs_t *s, xtensa_cpu_t *cpu,
+                                      uint32_t ns_addr) {
+    int idx;
+    if (s->nvs_handle_count >= 16) {
+        /* Reuse slot 0 as a sane fallback. */
+        idx = 0;
+    } else {
+        idx = s->nvs_handle_count++;
+    }
+    nvs_copy_guest_string(cpu, ns_addr, s->nvs_handle_ns[idx],
+                          sizeof(s->nvs_handle_ns[idx]));
+    /* Lazily build a fake vtable: every slot points at the hooked
+     * NVSHandleSimple::commit trampoline so any virtual dispatch through
+     * a fake C++ NVSHandle lands on a stub that returns ESP_OK. */
+    if (mem_read32(cpu->mem, NVS_FAKE_VTABLE) != NVS_COMMIT_TRAMPOLINE) {
+        for (int i = 0; i < NVS_FAKE_VTABLE_SLOTS; i++) {
+            mem_write32(cpu->mem, NVS_FAKE_VTABLE + (uint32_t)i * 4,
+                        NVS_COMMIT_TRAMPOLINE);
+        }
+    }
+    /* Stamp the fake C++ object with our fake vtable pointer. */
+    uint32_t obj = NVS_FAKE_OBJ_BASE + (uint32_t)idx * NVS_FAKE_OBJ_STRIDE;
+    mem_write32(cpu->mem, obj + 0, NVS_FAKE_VTABLE);
+    return (uint32_t)(idx + 1);
+}
+
+/* nvs_open(name, mode, *handle_out) -> ESP_OK */
 void stub_nvs_open(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t name_addr  = rom_arg(cpu, 0);
     uint32_t handle_out = rom_arg(cpu, 2);
+    uint32_t handle = s ? nvs_open_alloc_handle(s, cpu, name_addr) : 1;
     if (handle_out)
-        mem_write32(cpu->mem, handle_out, 1);
+        mem_write32(cpu->mem, handle_out, handle);
     rom_return(cpu, ESP_OK);
 }
 
 /* nvs_open_from_partition(part, name, mode, *handle_out) -> ESP_OK */
 void stub_nvs_open_from_partition(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t name_addr  = rom_arg(cpu, 1);
     uint32_t handle_out = rom_arg(cpu, 3);
+    uint32_t handle = s ? nvs_open_alloc_handle(s, cpu, name_addr) : 1;
     if (handle_out)
-        mem_write32(cpu->mem, handle_out, 1);
+        mem_write32(cpu->mem, handle_out, handle);
     rom_return(cpu, ESP_OK);
 }
 
@@ -1340,14 +1652,229 @@ void stub_nvs_close(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
-/* nvs_get_* -> ESP_ERR_NVS_NOT_FOUND */
+/* nvs_get_* fallback -> ESP_ERR_NVS_NOT_FOUND (kept for legacy callers/tests) */
 void stub_nvs_get_notfound(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_return(cpu, ESP_ERR_NVS_NOT_FOUND);
 }
 
-/* nvs_set_* / nvs_commit -> ESP_OK */
+/* nvs_set_* / nvs_commit fallback -> ESP_OK (kept for legacy callers/tests) */
 void stub_nvs_set_ok(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_get_i32(handle, key, *out) */
+void stub_nvs_get_i32(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t out_a   = rom_arg(cpu, 2);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    struct nvs_kv_entry *e = s ? nvs_find(s, nvs_handle_ns(s, handle), key) : NULL;
+    if (!e) { rom_return(cpu, ESP_ERR_NVS_NOT_FOUND); return; }
+    if (out_a) mem_write32(cpu->mem, out_a, (uint32_t)e->value.i);
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_get_u32(handle, key, *out) */
+void stub_nvs_get_u32(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t out_a   = rom_arg(cpu, 2);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    struct nvs_kv_entry *e = s ? nvs_find(s, nvs_handle_ns(s, handle), key) : NULL;
+    if (!e) { rom_return(cpu, ESP_ERR_NVS_NOT_FOUND); return; }
+    if (out_a) mem_write32(cpu->mem, out_a, e->value.u);
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_set_i32(handle, key, value) */
+void stub_nvs_set_i32(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t val     = rom_arg(cpu, 2);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    if (!s) { rom_return(cpu, ESP_OK); return; }
+    struct nvs_kv_entry *e = nvs_alloc(s, nvs_handle_ns(s, handle), key);
+    if (!e) { rom_return(cpu, ESP_OK); return; }
+    e->type = 1;
+    e->value.i = (int32_t)val;
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_set_u32(handle, key, value) */
+void stub_nvs_set_u32(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t val     = rom_arg(cpu, 2);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    if (!s) { rom_return(cpu, ESP_OK); return; }
+    struct nvs_kv_entry *e = nvs_alloc(s, nvs_handle_ns(s, handle), key);
+    if (!e) { rom_return(cpu, ESP_OK); return; }
+    e->type = 2;
+    e->value.u = val;
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_set_blob(handle, key, blob, length) */
+void stub_nvs_set_blob(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t blob_a  = rom_arg(cpu, 2);
+    uint32_t len     = rom_arg(cpu, 3);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    if (!s) { rom_return(cpu, ESP_OK); return; }
+    struct nvs_kv_entry *e = nvs_alloc(s, nvs_handle_ns(s, handle), key);
+    if (!e) { rom_return(cpu, ESP_OK); return; }
+    e->type = 3;
+    if (len > sizeof(e->value.blob)) len = sizeof(e->value.blob);
+    for (uint32_t i = 0; i < len; i++)
+        e->value.blob[i] = mem_read8(cpu->mem, blob_a + i);
+    e->blob_len = len;
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_set_str(handle, key, str) */
+void stub_nvs_set_str(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t str_a   = rom_arg(cpu, 2);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    if (!s) { rom_return(cpu, ESP_OK); return; }
+    struct nvs_kv_entry *e = nvs_alloc(s, nvs_handle_ns(s, handle), key);
+    if (!e) { rom_return(cpu, ESP_OK); return; }
+    e->type = 4;
+    uint32_t i = 0;
+    for (; i < sizeof(e->value.blob) - 1; i++) {
+        uint8_t c = mem_read8(cpu->mem, str_a + i);
+        e->value.blob[i] = c;
+        if (!c) break;
+    }
+    e->value.blob[sizeof(e->value.blob) - 1] = 0;
+    e->blob_len = i;
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_get_blob(handle, key, *out_buf, *inout_len) */
+void stub_nvs_get_blob(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t out_a   = rom_arg(cpu, 2);
+    uint32_t lenp_a  = rom_arg(cpu, 3);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    struct nvs_kv_entry *e = s ? nvs_find(s, nvs_handle_ns(s, handle), key) : NULL;
+    if (!e) { rom_return(cpu, ESP_ERR_NVS_NOT_FOUND); return; }
+    if (lenp_a) mem_write32(cpu->mem, lenp_a, e->blob_len);
+    if (out_a) {
+        for (uint32_t i = 0; i < e->blob_len; i++)
+            mem_write8(cpu->mem, out_a + i, e->value.blob[i]);
+    }
+    rom_return(cpu, ESP_OK);
+}
+
+/* nvs_get_str(handle, key, *out_buf, *inout_len) */
+void stub_nvs_get_str(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t handle  = rom_arg(cpu, 0);
+    uint32_t key_a   = rom_arg(cpu, 1);
+    uint32_t out_a   = rom_arg(cpu, 2);
+    uint32_t lenp_a  = rom_arg(cpu, 3);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    struct nvs_kv_entry *e = s ? nvs_find(s, nvs_handle_ns(s, handle), key) : NULL;
+    if (!e) { rom_return(cpu, ESP_ERR_NVS_NOT_FOUND); return; }
+    if (lenp_a) mem_write32(cpu->mem, lenp_a, e->blob_len + 1);
+    if (out_a) {
+        for (uint32_t i = 0; i < e->blob_len; i++)
+            mem_write8(cpu->mem, out_a + i, e->value.blob[i]);
+        mem_write8(cpu->mem, out_a + e->blob_len, 0);
+    }
+    rom_return(cpu, ESP_OK);
+}
+
+/* ----- C++ wrapper stubs (nvs::open_nvs_handle and NVSHandle::{get,set}_item) -----
+ *
+ * The nvs_rw_value_cxx example never goes through the C nvs_open path; it
+ * calls the C++ entry points directly. We mirror them here so the namespace
+ * and value tracking still funnels into the same KV store. */
+
+/* nvs::open_nvs_handle(unique_ptr_sret*, name, mode, esp_err_t*) */
+void stub_cxx_open_nvs_handle(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t sret_a   = rom_arg(cpu, 0);
+    uint32_t name_a   = rom_arg(cpu, 1);
+    /* arg2 = mode (ignored) */
+    uint32_t err_a    = rom_arg(cpu, 3);
+    uint32_t handle = s ? nvs_open_alloc_handle(s, cpu, name_a) : 1;
+    uint32_t obj    = nvs_handle_to_object(handle);
+    /* unique_ptr layout: { NVSHandle* ptr; } at offset 0 */
+    if (sret_a) mem_write32(cpu->mem, sret_a, obj);
+    if (err_a)  mem_write32(cpu->mem, err_a, ESP_OK);
+    /* C++ ABI: sret functions return the sret pointer in a2 */
+    rom_return(cpu, sret_a);
+}
+
+/* nvs::open_nvs_handle_from_partition(sret*, part, name, mode, err*) */
+void stub_cxx_open_nvs_handle_from_partition(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t sret_a   = rom_arg(cpu, 0);
+    uint32_t name_a   = rom_arg(cpu, 2);
+    uint32_t err_a    = rom_arg(cpu, 4);
+    uint32_t handle = s ? nvs_open_alloc_handle(s, cpu, name_a) : 1;
+    uint32_t obj    = nvs_handle_to_object(handle);
+    if (sret_a) mem_write32(cpu->mem, sret_a, obj);
+    if (err_a)  mem_write32(cpu->mem, err_a, ESP_OK);
+    rom_return(cpu, sret_a);
+}
+
+/* NVSHandle::get_item<long/int32>(this, key, T& value) */
+void stub_cxx_nvshandle_get_item_i32(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t this_a = rom_arg(cpu, 0);
+    uint32_t key_a  = rom_arg(cpu, 1);
+    uint32_t ref_a  = rom_arg(cpu, 2);
+    uint32_t handle = nvs_object_to_handle(this_a);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    struct nvs_kv_entry *e = s ? nvs_find(s, nvs_handle_ns(s, handle), key) : NULL;
+    if (!e) { rom_return(cpu, ESP_ERR_NVS_NOT_FOUND); return; }
+    if (ref_a) mem_write32(cpu->mem, ref_a, (uint32_t)e->value.i);
+    rom_return(cpu, ESP_OK);
+}
+
+/* NVSHandle::set_item<long/int32>(this, key, T value) */
+void stub_cxx_nvshandle_set_item_i32(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t this_a = rom_arg(cpu, 0);
+    uint32_t key_a  = rom_arg(cpu, 1);
+    uint32_t val    = rom_arg(cpu, 2);
+    uint32_t handle = nvs_object_to_handle(this_a);
+    char key[16];
+    nvs_copy_guest_string(cpu, key_a, key, sizeof(key));
+    if (!s) { rom_return(cpu, ESP_OK); return; }
+    struct nvs_kv_entry *e = nvs_alloc(s, nvs_handle_ns(s, handle), key);
+    if (!e) { rom_return(cpu, ESP_OK); return; }
+    e->type = 1;
+    e->value.i = (int32_t)val;
+    rom_return(cpu, ESP_OK);
+}
+
+/* NVSHandleSimple::commit() — reached via vtable from NVSHandle::commit() */
+void stub_cxx_nvshandle_commit(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_return(cpu, ESP_OK);
 }
@@ -1407,6 +1934,26 @@ void stub_gpio_get_level(xtensa_cpu_t *cpu, void *ctx) {
     else if (pin < 40)
         level = (mem_read32(cpu->mem, 0x3FF44040u) >> (pin - 32)) & 1;
     rom_return(cpu, level);
+}
+
+/* adc1_get_raw(channel) -> int: read programmable ADC value from periph */
+static void stub_adc1_get_raw(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t ch = rom_arg(cpu, 0);
+    uint16_t raw = s->periph ? periph_get_adc_value(s->periph, (int)ch) : 0;
+    rom_return(cpu, raw);
+}
+
+/* adc_oneshot_read(handle, channel, int *out_raw) -> ESP_OK */
+static void stub_adc_oneshot_read(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    /* arg0 = handle (ignored), arg1 = channel, arg2 = out_raw pointer */
+    uint32_t ch      = rom_arg(cpu, 1);
+    uint32_t out_ptr = rom_arg(cpu, 2);
+    uint16_t raw = s->periph ? periph_get_adc_value(s->periph, (int)ch) : 0;
+    if (out_ptr)
+        mem_write32(cpu->mem, out_ptr, (uint32_t)raw);
+    rom_return(cpu, ESP_OK);
 }
 
 /* gpio_reset_pin(pin) -> ESP_OK */
@@ -2633,33 +3180,60 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         { "nvs_open",                   stub_nvs_open },
         { "nvs_open_from_partition",    stub_nvs_open_from_partition },
         { "nvs_close",                  stub_nvs_close },
-        { "nvs_get_i8",                 stub_nvs_get_notfound },
-        { "nvs_get_u8",                 stub_nvs_get_notfound },
-        { "nvs_get_i16",                stub_nvs_get_notfound },
-        { "nvs_get_u16",                stub_nvs_get_notfound },
-        { "nvs_get_i32",                stub_nvs_get_notfound },
-        { "nvs_get_u32",                stub_nvs_get_notfound },
+        { "nvs_get_i8",                 stub_nvs_get_i32 },
+        { "nvs_get_u8",                 stub_nvs_get_u32 },
+        { "nvs_get_i16",                stub_nvs_get_i32 },
+        { "nvs_get_u16",                stub_nvs_get_u32 },
+        { "nvs_get_i32",                stub_nvs_get_i32 },
+        { "nvs_get_u32",                stub_nvs_get_u32 },
         { "nvs_get_i64",                stub_nvs_get_notfound },
         { "nvs_get_u64",                stub_nvs_get_notfound },
-        { "nvs_get_str",                stub_nvs_get_notfound },
-        { "nvs_get_blob",               stub_nvs_get_notfound },
-        { "nvs_set_i8",                 stub_nvs_set_ok },
-        { "nvs_set_u8",                 stub_nvs_set_ok },
-        { "nvs_set_i16",                stub_nvs_set_ok },
-        { "nvs_set_u16",                stub_nvs_set_ok },
-        { "nvs_set_i32",                stub_nvs_set_ok },
-        { "nvs_set_u32",                stub_nvs_set_ok },
+        { "nvs_get_str",                stub_nvs_get_str },
+        { "nvs_get_blob",               stub_nvs_get_blob },
+        { "nvs_set_i8",                 stub_nvs_set_i32 },
+        { "nvs_set_u8",                 stub_nvs_set_u32 },
+        { "nvs_set_i16",                stub_nvs_set_i32 },
+        { "nvs_set_u16",                stub_nvs_set_u32 },
+        { "nvs_set_i32",                stub_nvs_set_i32 },
+        { "nvs_set_u32",                stub_nvs_set_u32 },
         { "nvs_set_i64",                stub_nvs_set_ok },
         { "nvs_set_u64",                stub_nvs_set_ok },
-        { "nvs_set_str",                stub_nvs_set_ok },
-        { "nvs_set_blob",               stub_nvs_set_ok },
+        { "nvs_set_str",                stub_nvs_set_str },
+        { "nvs_set_blob",               stub_nvs_set_blob },
         { "nvs_commit",                 stub_nvs_set_ok },
+        /* C++ wrappers used by nvs_handle_cxx.cpp / nvs_rw_value_cxx */
+        { "_ZN3nvs15open_nvs_handleEPKc15nvs_open_mode_tPi",
+          stub_cxx_open_nvs_handle },
+        { "_ZN3nvs30open_nvs_handle_from_partitionEPKcS1_15nvs_open_mode_tPi",
+          stub_cxx_open_nvs_handle_from_partition },
+        { "_ZN3nvs9NVSHandle8get_itemIlEEiPKcRT_",
+          stub_cxx_nvshandle_get_item_i32 },
+        { "_ZN3nvs9NVSHandle8set_itemIlEEiPKcT_",
+          stub_cxx_nvshandle_set_item_i32 },
+        { "_ZN3nvs9NVSHandle8get_itemIiEEiPKcRT_",
+          stub_cxx_nvshandle_get_item_i32 },
+        { "_ZN3nvs9NVSHandle8set_itemIiEEiPKcT_",
+          stub_cxx_nvshandle_set_item_i32 },
+        /* Real NVSHandleSimple::commit — reached via vtable dispatch from
+         * NVSHandle::commit(). The vtable in flash is unmodified, so
+         * `[this+0][40] -> callx8` lands on this real symbol address; we
+         * intercept it and short-circuit to ESP_OK. */
+        { "_ZN3nvs15NVSHandleSimple6commitEv",  stub_cxx_nvshandle_commit },
+        /* unique_ptr<NVSHandle> destruction routes through these destructors;
+         * they would otherwise touch un-initialised C++ state in our fake
+         * object. Treat them as no-ops. */
+        { "_ZN3nvs15NVSHandleSimpleD0Ev",       stub_cxx_nvshandle_commit },
+        { "_ZN3nvs15NVSHandleSimpleD1Ev",       stub_cxx_nvshandle_commit },
+        { "_ZN3nvs15NVSHandleSimpleD2Ev",       stub_cxx_nvshandle_commit },
+        { "_ZN3nvs19NVSPartitionManager12close_handleEPNS_15NVSHandleSimpleE",
+          stub_cxx_nvshandle_commit },
         { NULL, NULL }
     };
     for (int i = 0; nvs_hooks[i].name; i++) {
         uint32_t addr;
         if (elf_symbols_find(syms, nvs_hooks[i].name, &addr) == 0) {
-            rom_stubs_register(stubs, addr, nvs_hooks[i].fn, nvs_hooks[i].name);
+            rom_stubs_register_ctx(stubs, addr, nvs_hooks[i].fn,
+                                   nvs_hooks[i].name, stubs);
             hooked++;
         }
     }
@@ -2688,6 +3262,22 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         uint32_t addr;
         if (elf_symbols_find(syms, gpio_hooks[i].name, &addr) == 0) {
             rom_stubs_register(stubs, addr, gpio_hooks[i].fn, gpio_hooks[i].name);
+            hooked++;
+        }
+    }
+
+    /* ADC oneshot / legacy stubs. These need context (periph) to read the
+     * sandbox-injected analog values, so we use register_ctx with `stubs`. */
+    struct { const char *name; rom_stub_fn fn; } adc_hooks[] = {
+        { "adc_oneshot_read",   stub_adc_oneshot_read },
+        { "adc1_get_raw",       stub_adc1_get_raw },
+        { NULL, NULL }
+    };
+    for (int i = 0; adc_hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, adc_hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(stubs, addr, adc_hooks[i].fn,
+                                   adc_hooks[i].name, stubs);
             hooked++;
         }
     }
@@ -2843,6 +3433,60 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         if (elf_symbols_find(syms, "esp_err_to_name", &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_esp_err_to_name, "esp_err_to_name");
             hooked++;
+        }
+        if (elf_symbols_find(syms, "esp_flash_get_size", &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_esp_flash_get_size, "esp_flash_get_size");
+            hooked++;
+        }
+    }
+
+    /* esp_lcd panel driver: fake the panel handle so ILI9341 / i80 / RGB
+     * firmware can proceed through init() / reset() / disp_on_off() and
+     * reach draw_bitmap(), where we capture pixel data for the sandbox. */
+    {
+        uint32_t addr;
+        const struct { const char *name; rom_stub_fn fn; } lcd_hooks[] = {
+            { "esp_lcd_new_panel_ili9341", stub_esp_lcd_new_panel_ili9341 },
+            { "esp_lcd_new_panel_ssd1306", stub_esp_lcd_new_panel_ssd1306 },
+            { "esp_lcd_panel_reset",       stub_esp_lcd_panel_noop_ok },
+            { "esp_lcd_panel_init",        stub_esp_lcd_panel_noop_ok },
+            { "esp_lcd_panel_disp_on_off", stub_esp_lcd_panel_noop_ok },
+            { "esp_lcd_panel_mirror",      stub_esp_lcd_panel_noop_ok },
+            { "esp_lcd_panel_swap_xy",     stub_esp_lcd_panel_noop_ok },
+            { "esp_lcd_panel_set_gap",     stub_esp_lcd_panel_noop_ok },
+            { "esp_lcd_panel_invert_color",stub_esp_lcd_panel_noop_ok },
+            { "esp_lcd_panel_draw_bitmap", stub_esp_lcd_panel_draw_bitmap },
+        };
+        for (size_t i = 0; i < sizeof(lcd_hooks)/sizeof(lcd_hooks[0]); i++) {
+            if (elf_symbols_find(syms, lcd_hooks[i].name, &addr) == 0) {
+                rom_stubs_register(stubs, addr, lcd_hooks[i].fn, lcd_hooks[i].name);
+                hooked++;
+            }
+        }
+    }
+
+    /* Newlib stdio: printf/puts/etc. In the emulator stdout's FILE* is
+     * fully-buffered by newlib and never flushes (the _write path through
+     * esp_vfs_write returns -1 for fd=1). Intercept these at symbol level
+     * and route the format engine directly to UART, same as ets_printf. */
+    {
+        uint32_t addr;
+        const struct { const char *name; rom_stub_fn fn; } printf_hooks[] = {
+            { "printf",    stub_newlib_printf },
+            { "_printf_r", stub_newlib_printf },
+            { "iprintf",   stub_newlib_printf },
+            { "puts",      stub_newlib_puts },
+            { "_puts_r",   stub_newlib_puts },
+            { "putchar",   stub_newlib_putchar },
+            { "putchar_unlocked", stub_newlib_putchar },
+            { "fputs",     stub_newlib_fputs },
+            { "fputs_unlocked", stub_newlib_fputs },
+        };
+        for (size_t i = 0; i < sizeof(printf_hooks)/sizeof(printf_hooks[0]); i++) {
+            if (elf_symbols_find(syms, printf_hooks[i].name, &addr) == 0) {
+                rom_stubs_register(stubs, addr, printf_hooks[i].fn, printf_hooks[i].name);
+                hooked++;
+            }
         }
     }
 

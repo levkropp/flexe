@@ -95,12 +95,17 @@ static uint64_t host_elapsed_us(const esp_timer_stubs_t *et) {
     return (uint64_t)sec * 1000000ULL + (uint64_t)nsec / 1000ULL;
 }
 
-/* Virtual time for internal timer dispatch (includes fast-forwarded idle). */
+/* Monotonic clock used for scheduling esp_timer alarms.
+ *
+ * We intentionally derive this from cpu->cycle_count (raw instruction count)
+ * rather than cpu->virtual_time_us, because vTaskDelay in non-native mode
+ * fast-forwards virtual_time_us by huge amounts. If alarm_us captured that
+ * fast-forwarded time, it would sit far in the future and the periodic
+ * callback (e.g. LVGL tick) would never fire during normal execution. Using
+ * cycle_count gives us a real wall-clock for dispatch that matches the rate
+ * at which the firmware actually executes instructions. */
 static uint64_t current_time_us(esp_timer_stubs_t *et) {
-    /* Virtual wall-clock = accumulated sleep time + instruction-driven time.
-     * ccount only advances per-instruction (stays small), so inlined
-     * 64-bit divisions complete in reasonable iterations. */
-    return et->cpu->virtual_time_us + (uint64_t)et->cpu->ccount / et->cpu_freq_mhz;
+    return et->cpu->cycle_count / et->cpu_freq_mhz;
 }
 
 /* ===== Find timer by handle ===== */
@@ -146,13 +151,19 @@ static void dispatch_expired_timers(esp_timer_stubs_t *et) {
 
         et->cpu->pc = t->callback_addr;
 
-        /* Run callback: execute up to 100000 instructions or until sentinel hit */
+        /* Run callback: execute up to 100000 instructions or until sentinel hit.
+         * Force running=true during callback execution: the dispatcher may be
+         * invoked after core 0 has been marked stopped (e.g. main_task exited
+         * via vTaskDelete), but periodic timers still need to fire to drive
+         * LVGL / tick subsystems running on core 1. */
+        int save_running = et->cpu->running;
+        et->cpu->running = 1;
         int max_cb_cycles = 100000;
         for (int c = 0; c < max_cb_cycles; c++) {
             if (et->cpu->pc == CALLBACK_SENTINEL) break;
-            if (!et->cpu->running) break;
             xtensa_step(et->cpu);
         }
+        et->cpu->running = save_running;
 
         /* Restore entire CPU register state */
         memcpy(et->cpu->ar, save_ar, sizeof(save_ar));
@@ -212,11 +223,16 @@ void stub_esp_timer_create(xtensa_cpu_t *cpu, void *ctx) {
     et_return(cpu, ESP_OK);
 }
 
-/* esp_timer_start_periodic(handle, period_us) */
+/* esp_timer_start_periodic(handle, uint64_t period_us).
+ * The 64-bit period_us must occupy an even-aligned register pair under the
+ * Xtensa windowed ABI: handle is arg0 (a2/ar[ci*4+2]), and period_us occupies
+ * arg2/arg3 (a4/a5) — arg1 (a3) is the padding slot. */
 void stub_esp_timer_start_periodic(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
     uint32_t handle = et_arg(cpu, 0);
-    uint32_t period = et_arg(cpu, 1);
+    uint32_t lo = et_arg(cpu, 2);
+    uint32_t hi = et_arg(cpu, 3);
+    uint64_t period = ((uint64_t)hi << 32) | lo;
 
     emu_timer_t *t = find_timer(et, handle);
     if (!t) { et_return(cpu, -1); return; }
@@ -229,11 +245,14 @@ void stub_esp_timer_start_periodic(xtensa_cpu_t *cpu, void *ctx) {
     et_return(cpu, ESP_OK);
 }
 
-/* esp_timer_start_once(handle, timeout_us) */
+/* esp_timer_start_once(handle, uint64_t timeout_us). Same 64-bit alignment
+ * rules as esp_timer_start_periodic. */
 void stub_esp_timer_start_once(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint32_t handle  = et_arg(cpu, 0);
-    uint32_t timeout = et_arg(cpu, 1);
+    uint32_t handle = et_arg(cpu, 0);
+    uint32_t lo = et_arg(cpu, 2);
+    uint32_t hi = et_arg(cpu, 3);
+    uint64_t timeout = ((uint64_t)hi << 32) | lo;
 
     emu_timer_t *t = find_timer(et, handle);
     if (!t) { et_return(cpu, -1); return; }
@@ -414,4 +433,18 @@ int esp_timer_stubs_timer_count(const esp_timer_stubs_t *et) {
 
 void esp_timer_stubs_set_virtual_time(esp_timer_stubs_t *et, int enable) {
     if (et) et->use_virtual_time = enable;
+}
+
+void esp_timer_stubs_tick(esp_timer_stubs_t *et) {
+    if (!et) return;
+    /* Fast path: bail out before touching the timer table if nothing is
+     * active. This keeps the common-case cost to a few comparisons per
+     * batch.  Without a fast-path check here, flexe_session_post_batch
+     * would pay O(MAX_TIMERS) on every batch regardless. */
+    int any_active = 0;
+    for (int i = 0; i < et->timer_count; i++) {
+        if (et->timers[i].active) { any_active = 1; break; }
+    }
+    if (!any_active) return;
+    dispatch_expired_timers(et);
 }
