@@ -6,7 +6,8 @@
 /* Parse an ESP32 image header at the given file offset, loading segments into memory.
  * The image header (24 bytes) is also written to flash_hdr_out if non-NULL. */
 static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
-                              load_result_t *res, uint8_t *flash_hdr_out) {
+                              load_result_t *res, uint8_t *flash_hdr_out,
+                              int skip_drom) {
     if (fseek(f, offset, SEEK_SET) != 0) {
         snprintf(res->error, sizeof(res->error), "Seek to 0x%lX failed", offset);
         return -1;
@@ -76,7 +77,12 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
             res->segments[i].size = data_len;
         }
 
-        if (mem_load(mem, load_addr, buf, data_len) != 0) {
+        /* Factory mode: DROM segments live in the whole-flash image already
+         * (and the DROM cache window is remapped onto it), so don't load
+         * them again at their cache vaddrs — that would clobber the
+         * partition table and other sub-0x10000 regions. */
+        int is_drom = (load_addr >= 0x3F400000u && load_addr < 0x3F800000u);
+        if (!(skip_drom && is_drom) && mem_load(mem, load_addr, buf, data_len) != 0) {
             snprintf(res->error, sizeof(res->error),
                      "Segment %d load failed at 0x%08X (%u bytes, region: %s)",
                      i, load_addr, data_len, loader_region_name(load_addr));
@@ -170,9 +176,20 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
         mem_load_flash(mem, flash_buf, flash_len);
         free(flash_buf);
 
-        /* Parse the app image at 0x10000 for SRAM segment loading */
+        /* Remap the DROM cache window (0x3F400000-0x3F800000) onto the app
+         * at flash offset 0x10000 — this is what the ESP32 flash MMU does
+         * for an app flashed at 0x10000. Bootloader and partition table
+         * stay at their raw offsets for SPI (esp_flash_read) access. */
+        for (uint32_t page = 0x3F400000u; page < 0x3F800000u; page += 4096) {
+            uint32_t off = 0x10000u + (page - 0x3F400000u);
+            if (off + 4096 <= (4u * 1024 * 1024))
+                mem->page_table[page >> 12] = mem->flash_data + off;
+        }
+
+        /* Parse the app image at 0x10000 for SRAM segment loading;
+         * skip DROM segments (already in the raw image, now remapped) */
         uint8_t hdr[24];
-        if (loader_parse_image(mem, f, 0x10000, &res, hdr) != 0) {
+        if (loader_parse_image(mem, f, 0x10000, &res, hdr, 1) != 0) {
             res.result = -1;
             fclose(f);
             return res;
@@ -188,7 +205,7 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
 
     /* Standalone app image — parse from offset 0 */
     uint8_t hdr[24];
-    if (loader_parse_image(mem, f, 0, &res, hdr) != 0) {
+    if (loader_parse_image(mem, f, 0, &res, hdr, 0) != 0) {
         res.result = -1;
         fclose(f);
         return res;
