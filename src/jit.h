@@ -9,8 +9,8 @@
  * Translates hot basic blocks to native machine code, falling back
  * to the interpreter for cold code and complex instructions. */
 
-/* Code cache: 32MB mmap'd executable region */
-#define JIT_CODE_CACHE_SIZE  (32u * 1024 * 1024)
+/* Code cache: 128MB mmap'd executable region (lazily committed) */
+#define JIT_CODE_CACHE_SIZE  (128u * 1024 * 1024)
 
 /* Block lookup hash table: 64K entries */
 #define JIT_HASH_BITS   16
@@ -36,12 +36,16 @@ typedef struct {
 /* Block chaining: max pending chain slots */
 #define MAX_CHAIN_SLOTS  131072
 
-/* Chain slot: records a jmp site that targets a specific guest (pc, wb) */
+/* Pending chain sites for one (pc, wb): exits of blocks that branched here
+ * before the target was compiled. Patched (to the target's chain_entry)
+ * when it compiles. Collisions evict — a lost chain just costs an epilogue
+ * round-trip, never correctness. */
+#define CHAIN_PENDING_MAX 4
 typedef struct {
-    uint32_t  target_pc;   /* guest PC this exit targets (0 = inactive) */
-    uint32_t  target_wb;   /* windowbase expected at target */
-    uint8_t  *jmp_site;    /* address of the 0xE9 byte to patch */
-} chain_slot_t;
+    uint32_t  tag;                    /* pc ^ (wb<<28), 0 = empty */
+    uint32_t  n;                      /* sites used (≤ CHAIN_PENDING_MAX) */
+    uint8_t  *site[CHAIN_PENDING_MAX];
+} chain_pending_t;
 
 /* JIT statistics */
 typedef struct {

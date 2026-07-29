@@ -405,9 +405,27 @@ static void check_assertions(const trace_assert_t *asserts, int count,
 /* ===== UART stdout callback ===== */
 
 static int g_suppress_uart_stdout = 0;
+
+/* UART TX bytes arrive one at a time from the MMIO handler. Writing each
+ * with putchar() pays a flockfile/funlockfile mutex pair per byte, which
+ * dominates wall-clock on log-heavy firmware. Buffer a line at a time and
+ * emit with a single unlocked fwrite instead. */
+static char   g_uart_out_buf[4096];
+static size_t g_uart_out_len = 0;
+
+static void uart_out_flush(void) {
+    if (g_uart_out_len) {
+        fwrite(g_uart_out_buf, 1, g_uart_out_len, stdout);
+        g_uart_out_len = 0;
+    }
+}
+
 static void uart_stdout_cb(void *ctx, uint8_t byte) {
     (void)ctx;
-    if (!g_suppress_uart_stdout) putchar(byte);
+    if (g_suppress_uart_stdout) return;
+    g_uart_out_buf[g_uart_out_len++] = (char)byte;
+    if (byte == '\n' || g_uart_out_len == sizeof(g_uart_out_buf))
+        uart_out_flush();
 }
 
 /* ===== Exception cause names ===== */
@@ -551,6 +569,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "                  Ideal for debugging crashes in multi-billion cycle runs\n");
     fprintf(stderr, "  -N              Native FreeRTOS: let firmware run its own scheduler\n");
     fprintf(stderr, "                  Removes FreeRTOS stubs, enables interrupt matrix hardware\n");
+    fprintf(stderr, "  -J              Enable JIT (default: on where supported)\n");
+    fprintf(stderr, "  --no-jit        Disable JIT, run fully interpreted\n");
+    fprintf(stderr, "  --jit-stats     Print JIT block/coverage statistics on exit\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -793,6 +814,7 @@ static int audit_collect_fn(const char *name, uint32_t addr, uint32_t size, void
 /* ===== Main ===== */
 
 int main(int argc, char *argv[]) {
+    atexit(uart_out_flush);   /* drain buffered UART output on every exit path */
     long long max_cycles = 10000000;
     int trace = 0;
     int verbose_trace = 0;
@@ -819,7 +841,13 @@ int main(int argc, char *argv[]) {
     int htrace_enabled = 0;
     int audit_unhooked = 0;
     int native_freertos = 0;
+    /* JIT is on by default where supported (arm64, x86-64) — -J is accepted
+     * for backwards compatibility and --no-jit opts out. */
+#ifdef FLEXE_HAS_JIT
+    int jit_enabled = 1;
+#else
     int jit_enabled = 0;
+#endif
     int jit_stats_enabled = 0;
     int jit_verify = 0;
     uint64_t heartbeat_interval = 0;
@@ -854,6 +882,11 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--jit-stats") == 0) {
             jit_stats_enabled = 1;
+            memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--no-jit") == 0) {
+            jit_enabled = 0;
             memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(char *));
             argc -= 1;
             continue;
@@ -1193,6 +1226,9 @@ int main(int argc, char *argv[]) {
          * transparently. Hot PCs get compiled and executed via the hook;
          * cold code runs at full interpreter speed (1000-insn batches). */
         jit_install_hook(jit, cpu);
+        /* Core 1 executes via flexe_session_post_batch — hook it too. */
+        xtensa_cpu_t *cpu1_jit = flexe_session_cpu(session, 1);
+        if (cpu1_jit) jit_install_hook(jit, cpu1_jit);
     }
 #else
     (void)jit_enabled;
@@ -1234,6 +1270,12 @@ int main(int argc, char *argv[]) {
      * ticks that drive LVGL tick subsystems. */
     xtensa_cpu_t *cpu1_any = single_core ? NULL : flexe_session_cpu(session, 1);
     int batch = 10000;
+    /* Core 1 executes inside flexe_session_post_batch() and its instructions
+     * would otherwise go uncounted against the -c budget (and understated
+     * in throughput metrics). Track its ccount delta per iteration. The
+     * delta is clamped: firmware can xwsr/reset ccount, which would wrap
+     * the subtraction. */
+    uint32_t prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
     while (cycles < max_cycles_u64 && (cpu->running || (cpu1_any && cpu1_any->running)) && !cpu->halted && !cpu->breakpoint_hit) {
         if (sandbox_events) sandbox_drain_stdin(periph);
         /* Are we in a trace window?
@@ -1447,6 +1489,14 @@ int main(int argc, char *argv[]) {
 
         /* Preemptive timeslice + core 1 management */
         flexe_session_post_batch(session, batch);
+
+        /* Charge core 1's executed instructions against the budget */
+        if (cpu1_any) {
+            uint32_t d1 = cpu1_any->ccount - prev_cc1;
+            prev_cc1 = cpu1_any->ccount;
+            if (d1 <= (uint32_t)batch * 4)   /* clamps ccount resets/xwsr */
+                cycles += d1;
+        }
 
         /* Progress heartbeat */
         if (heartbeat_interval > 0 &&

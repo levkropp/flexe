@@ -21,17 +21,22 @@ if [ "${1:-}" = "--jit" ]; then
     JIT_FLAG="-J"
 fi
 
-EMU="$(dirname "$0")/build/xtensa-emu"
+# Override with EMU=path to bench another binary (e.g. the PGO build).
+EMU="${EMU:-$(dirname "$0")/build/xtensa-emu}"
 if [ ! -x "$EMU" ]; then
     echo "build flexe first: cmake --build build -j" >&2
     exit 1
 fi
 
 # (name, elf, bin, cycles)
+# NOTE: the -c budget counts executed instructions across BOTH cores, so
+# dual-core workloads (rts) report aggregate dual-core throughput.
+# blink was dropped: its -c budget burns entirely in the printf/vTaskDelay
+# fast-forward path, which measures the log stub, not the emulator core.
 WORKLOADS=(
     "tjpgd     $HOME/esp/tjpgd/build/lcd_tjpgd.elf            $HOME/esp/tjpgd/build/lcd_tjpgd.bin            500000000"
     "rts       $HOME/esp/rts/build/real_time_stats.elf        $HOME/esp/rts/build/real_time_stats.bin        500000000"
-    "blink     $HOME/esp/blink/build/blink.elf                $HOME/esp/blink/build/blink.bin                500000000"
+    "cpu_bench $HOME/esp/cpu_bench/build/cpu_bench.elf        $HOME/esp/cpu_bench/build/cpu_bench.bin        1000000000"
 )
 
 printf '%-12s %12s %10s %10s %10s\n' "workload" "cycles" "wall(s)" "MIPS" "real-time"
