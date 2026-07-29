@@ -2469,6 +2469,44 @@ log_done:
 }
 
 /* Generic no-op ROM stub: returns 0 for unregistered ROM calls */
+/* _xtos_set_intlevel(level) — emulate the ROM function: return the current
+ * PS, then set PS.INTLEVEL = level (what the ROM's RSIL does). */
+static void stub_xtos_set_intlevel(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t old_ps = cpu->ps;
+    uint32_t level = rom_arg(cpu, 0);
+    cpu->ps = (cpu->ps & ~0xFu) | (level & 0xFu);
+    cpu->irq_check = true;
+    rom_return(cpu, old_ps);
+}
+
+/* cache_flash_mmu_set(cpu_no, pid, vaddr, paddr, psize, num) — emulate the
+ * ESP32 flash cache MMU: map `num` 64 KB flash pages starting at paddr
+ * (64 KB units) into the cache window starting at vaddr (64 KB units:
+ * 0-63 = DROM 0x3F400000, 64-127 = IROM 0x400C2000). Returns 0.
+ * spi_flash_mmap() resolves to this on ESP32. */
+static void stub_cache_flash_mmu_set(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t vaddr = rom_arg(cpu, 2);
+    uint32_t paddr = rom_arg(cpu, 3);
+    uint32_t num   = rom_arg(cpu, 5);
+    xtensa_mem_t *mem = cpu->mem;
+    if (getenv("FLEXE_DBG_FLASH"))
+        fprintf(stderr, "[MMU] vaddr=%u paddr=%u psize=%u num=%u\n",
+                vaddr, paddr, (unsigned)rom_arg(cpu, 4), num);
+    for (uint32_t i = 0; i < num; i++) {
+        uint32_t vp = vaddr + i;
+        uint32_t pp = (paddr + i) << 16;         /* 64 KB units -> bytes */
+        if (pp + 0x10000 > (4u * 1024 * 1024)) continue;
+        if (vp < 64) {                            /* DROM window */
+            mem->page_table[(0x3F400000u >> 12) + vp] = mem->flash_data + pp;
+        } else if (vp < 128) {                    /* IROM window */
+            mem->page_table[(0x400C2000u >> 12) + (vp - 64)] = mem->flash_insn + pp;
+        }
+    }
+    rom_return(cpu, 0);
+}
+
 static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_return(cpu, 0);
@@ -3042,11 +3080,11 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x400041c0, stub_unregistered,        "rom_i2c_readReg_Mask");
     rom_stubs_register(s, 0x400041fc, stub_void_unregistered,   "rom_i2c_writeReg_Mask");
 
-    /* Interrupt matrix — real implementation if native mode, no-op otherwise */
-    if (s->native_freertos)
-        rom_stubs_register_ctx(s, 0x4000681c, stub_intr_matrix_set, "intr_matrix_set", s);
-    else
-        rom_stubs_register(s, 0x4000681c, stub_void_unregistered,   "intr_matrix_set");
+    /* Interrupt matrix — always program it. Firmware running real
+     * FreeRTOS (symbol-less binaries without ELF hooks) needs working
+     * FROM_CPU yield interrupts; without them portYIELD never switches
+     * context and SMP kernel lists get corrupted by repeated blocking. */
+    rom_stubs_register_ctx(s, 0x4000681c, stub_intr_matrix_set, "intr_matrix_set", s);
 
     /* UART */
     rom_stubs_register(s, 0x40009200, stub_void_unregistered,   "uart_tx_one_char");
@@ -3060,7 +3098,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* MMU/Cache */
     rom_stubs_register(s, 0x400095a4, stub_void_unregistered,   "mmu_init");
-    rom_stubs_register(s, 0x400095e0, stub_unregistered,        "cache_flash_mmu_set");
+    rom_stubs_register(s, 0x400095e0, stub_cache_flash_mmu_set, "cache_flash_mmu_set");
 
     /* C library functions */
     rom_stubs_register(s, 0x40056424, stub_qsort,              "qsort");
@@ -3123,9 +3161,11 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* Misc */
     rom_stubs_register(s, 0x40008208, stub_void_unregistered,   "set_rtc_memory_crc");
-    /* _xtos_set_intlevel: in native mode, let firmware's RSIL instruction run */
-    if (!s->native_freertos)
-        rom_stubs_register(s, 0x4000bfdc, stub_unregistered,   "_xtos_set_intlevel");
+    /* _xtos_set_intlevel: real implementation in ALL modes — does the RSIL
+     * the ROM function would do. Firmware running real FreeRTOS calls this
+     * to enable/restore interrupts; a no-op here leaves PS.INTLEVEL stuck
+     * high forever, so yields and ticks can never fire. Returns old PS. */
+    rom_stubs_register(s, 0x4000bfdc, stub_xtos_set_intlevel,   "_xtos_set_intlevel");
     rom_stubs_register(s, 0x400092d0, stub_unregistered,        "uart_rx_one_char");
     rom_stubs_register(s, 0x4000c728, stub_void_unregistered,   "__dummy_lock");
     rom_stubs_register(s, 0x4000c730, stub_unregistered,        "__dummy_lock_try");

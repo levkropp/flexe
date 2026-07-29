@@ -718,14 +718,12 @@ static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
 
 static uint32_t default_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    (void)addr;
     p->unhandled_count++;
     return 0;
 }
 
 static void default_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
-    (void)addr; (void)val;
     p->unhandled_count++;
 }
 

@@ -1276,7 +1276,7 @@ int main(int argc, char *argv[]) {
      * delta is clamped: firmware can xwsr/reset ccount, which would wrap
      * the subtraction. */
     uint32_t prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
-    while (cycles < max_cycles_u64 && (cpu->running || (cpu1_any && cpu1_any->running)) && !cpu->halted && !cpu->breakpoint_hit) {
+    while (cycles < max_cycles_u64 && (cpu->running || (cpu1_any && cpu1_any->running)) && !cpu->breakpoint_hit) {
         if (sandbox_events) sandbox_drain_stdin(periph);
         /* Are we in a trace window?
          * Use cpu->cycle_count (virtual time including FreeRTOS skips)

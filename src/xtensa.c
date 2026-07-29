@@ -14,32 +14,38 @@
 #define BRANCH_TO(cpu, addr) do { (cpu)->pc = (addr); (cpu)->_pc_written = true; } while(0)
 
 /* Recompute the nearest ccompare value for timer batching.
- * We pick the ccompare that will fire soonest AFTER current ccount.
- * If none are ahead, we use 0 (which means "check every cycle" is impossible
- * since ccount is 0 only once in 2^32 cycles — effectively a no-op). */
+ * A ccompare in the past (wrapped distance >= 2^31) is due NOW — give it
+ * distance 0 so it is picked and fired at the next opportunity. A ccompare
+ * of 0 is treated as disarmed (matches init / no-timer state). */
 static inline void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
-    /* Distance from ccount to each ccompare (wrapping arithmetic).
-     * 0 distance means "just matched" (already fired) — treat as max. */
-    uint32_t d0 = cpu->ccompare[0] - cpu->ccount;
-    uint32_t d1 = cpu->ccompare[1] - cpu->ccount;
-    uint32_t d2 = cpu->ccompare[2] - cpu->ccount;
-    if (d0 == 0) d0 = UINT32_MAX;
-    if (d1 == 0) d1 = UINT32_MAX;
-    if (d2 == 0) d2 = UINT32_MAX;
+    uint32_t d0 = cpu->ccompare[0] ? cpu->ccompare[0] - cpu->ccount : UINT32_MAX;
+    uint32_t d1 = cpu->ccompare[1] ? cpu->ccompare[1] - cpu->ccount : UINT32_MAX;
+    uint32_t d2 = cpu->ccompare[2] ? cpu->ccompare[2] - cpu->ccount : UINT32_MAX;
+    if (d0 >= 0x80000000u && d0 != UINT32_MAX) d0 = 0;
+    if (d1 >= 0x80000000u && d1 != UINT32_MAX) d1 = 0;
+    if (d2 >= 0x80000000u && d2 != UINT32_MAX) d2 = 0;
     if (d0 <= d1 && d0 <= d2)
         cpu->next_timer_event = cpu->ccompare[0];
     else if (d1 <= d2)
         cpu->next_timer_event = cpu->ccompare[1];
     else
         cpu->next_timer_event = cpu->ccompare[2];
+    if (!cpu->ccompare[0] && !cpu->ccompare[1] && !cpu->ccompare[2])
+        cpu->next_timer_event = UINT32_MAX;
 }
 
-/* Fire any matching ccompare timers and recompute next event */
+/* Fire any ccompare timers whose time has arrived, hardware semantics:
+ * the interrupt is raised when ccount >= ccompare (not exact equality),
+ * so overshooting the target (stubs advancing time, batch accounting)
+ * can never lose a tick. ccompare == 0 means disarmed. */
 static inline void xtensa_fire_timers(xtensa_cpu_t *cpu) {
     uint32_t old = cpu->interrupt;
-    if (cpu->ccount == cpu->ccompare[0]) cpu->interrupt |= (1u << 6);
-    if (cpu->ccount == cpu->ccompare[1]) cpu->interrupt |= (1u << 15);
-    if (cpu->ccount == cpu->ccompare[2]) cpu->interrupt |= (1u << 16);
+    if (cpu->ccompare[0] && (int32_t)(cpu->ccount - cpu->ccompare[0]) >= 0)
+        cpu->interrupt |= (1u << 6);
+    if (cpu->ccompare[1] && (int32_t)(cpu->ccount - cpu->ccompare[1]) >= 0)
+        cpu->interrupt |= (1u << 15);
+    if (cpu->ccompare[2] && (int32_t)(cpu->ccount - cpu->ccompare[2]) >= 0)
+        cpu->interrupt |= (1u << 16);
     if (cpu->interrupt != old) cpu->irq_check = true;
     xtensa_recompute_next_timer(cpu);
 }
@@ -280,7 +286,8 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_INTSET:   cpu->interrupt |= val; cpu->irq_check = true; break;
     case XT_SR_INTCLEAR: cpu->interrupt &= ~val; break;
     case XT_SR_INTENABLE:   cpu->intenable = val; cpu->irq_check = true; break;
-    case XT_SR_PS:          cpu->ps = val; break;
+    case XT_SR_PS:          cpu->ps = val;
+                            break;
     case XT_SR_VECBASE:     cpu->vecbase = val; break;
     case XT_SR_EXCCAUSE:    cpu->exccause = val; break;
     case XT_SR_DEBUGCAUSE:  cpu->debugcause = val; break;
@@ -364,7 +371,7 @@ void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
 
     if (best_level == 1) {
         /* Level-1: dispatched as exception */
-        xtensa_raise_exception(cpu, EXCCAUSE_LEVEL1_INT, cpu->pc, 0);
+            xtensa_raise_exception(cpu, EXCCAUSE_LEVEL1_INT, cpu->pc, 0);
     } else {
         /* High-priority (levels 2-7) */
         int idx = best_level - 1;
@@ -1966,7 +1973,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     if (__builtin_expect(cpu->halted, 0)) {
         cpu->ccount++;
         ++*local_cc;
-        if (cpu->ccount == cpu->next_timer_event)
+        if (cpu->ccount >= cpu->next_timer_event)
             xtensa_fire_timers(cpu);
         uint32_t pending = cpu->interrupt & cpu->intenable;
         if (pending) {
@@ -2012,7 +2019,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
             ++*local_cc;
             cpu->cycle_count = *local_cc;
             /* Stubs may advance time, so check timers unconditionally */
-            if (cpu->ccount == cpu->next_timer_event)
+            if (cpu->ccount >= cpu->next_timer_event)
                 xtensa_fire_timers(cpu);
             if (__builtin_expect(cpu->irq_check, 0)) {
                 cpu->irq_check = false;
@@ -2156,7 +2163,7 @@ have_insn:
     cpu->ccount++;
     ++*local_cc;
 
-    if (__builtin_expect(cpu->ccount == cpu->next_timer_event, 0))
+    if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0))
         xtensa_fire_timers(cpu);
 
     /* Interrupt check — only when interrupt state has changed
@@ -2176,7 +2183,7 @@ int xtensa_step(xtensa_cpu_t *cpu) {
     uint64_t cc = cpu->cycle_count;
     int r = xtensa_step_impl(cpu, &cc);
     cpu->cycle_count = cc;
-    if (cpu->ccount == cpu->next_timer_event)
+    if (cpu->ccount >= cpu->next_timer_event)
         xtensa_fire_timers(cpu);
     if (cpu->interrupt & cpu->intenable)
         xtensa_check_interrupts(cpu);
