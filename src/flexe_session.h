@@ -50,6 +50,13 @@ typedef struct {
     /* Touch input callback (NULL = no touch) */
     int       (*touch_fn)(int *x, int *y, void *ctx);
     void       *touch_ctx;
+
+    /* Raw SPI display/touch capture pins (0 = use CYD 2432S028R defaults,
+     * -1 = disable raw SPI sniffing) */
+    int         spi_dc_pin;
+    int         spi_display_cs_pin;
+    int         spi_touch_cs_pin;
+    int         spi_sd_cs_pin;
 } flexe_session_config_t;
 
 /* Create a fully-initialized emulator session.

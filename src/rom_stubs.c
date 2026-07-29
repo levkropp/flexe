@@ -3405,9 +3405,11 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* ESP-IDF SPI + LCD panel stubs (no-ops, display handled at higher level) */
+    /* ESP-IDF SPI + LCD panel stubs (no-ops, display handled at higher level).
+     * NOTE: spi_bus_initialize is deliberately NOT stubbed — the real driver
+     * must run so GP-SPI transactions reach the raw SPI2/SPI3 sniffer
+     * (spi_display.c), which is what renders symbol-less firmware. */
     static const char *lcd_noop_fns[] = {
-        "spi_bus_initialize",
         "esp_lcd_new_panel_io_spi",
         "esp_lcd_new_panel_st7789",
         "esp_lcd_panel_reset",

@@ -54,6 +54,7 @@ set(LIB_SOURCES
     src/memory.c
     src/loader.c
     src/peripherals.c
+    src/spi_display.c
     src/rom_stubs.c
     src/elf_symbols.c
     src/freertos_stubs.c
