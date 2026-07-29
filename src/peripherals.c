@@ -56,6 +56,21 @@ typedef struct {
     uint32_t func_out_sel[40];   /* GPIO_FUNC_OUT_SEL_CFG_REG */
 } gpio_state_t;
 
+/* SPI0 (cache flash controller) / SPI1 (memspi host) state.
+ * Enough of the register file is modelled for ESP-IDF's esp_flash probe
+ * (memspi_host_driver.c) plus NVS/SPIFFS read/write/erase traffic. */
+typedef struct {
+    uint32_t addr;       /* SPI_ADDR_REG */
+    uint32_t user;       /* SPI_USER_REG */
+    uint32_t user1;      /* SPI_USER1_REG (addr/dummy bit lengths) */
+    uint32_t user2;      /* SPI_USER2_REG (command value/bitlen) */
+    uint32_t mosi_dlen;  /* SPI_MOSI_DLEN_REG */
+    uint32_t miso_dlen;  /* SPI_MISO_DLEN_REG */
+    uint32_t rd_status;  /* SPI_RD_STATUS_REG (ROM-style RDSR result) */
+    uint32_t w[16];      /* SPI_W0..W15 data buffer */
+    uint8_t  sr[3];      /* emulated flash status registers SR1/SR2/SR3 */
+} spi_state_t;
+
 /* RTC calibration state machine per timer group */
 typedef struct {
     int      cal_started;    /* write to RTCCALICFG detected */
@@ -104,6 +119,9 @@ struct esp32_periph {
     /* ADC input shadow values driven from sandbox stdin. Reads by
      * adc_oneshot_read / adc1_get_raw ROM-stubs pull from here. */
     uint16_t adc_value[40];
+
+    /* SPI flash controllers: [0] = SPI0 (cache), [1] = SPI1 (memspi) */
+    spi_state_t spi[2];
 };
 
 /* ---- DPORT ---- */
@@ -475,27 +493,179 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
     }
 }
 
-/* ---- SPI0 (flash controller) ---- */
+/* ---- SPI0/SPI1 (flash controllers) ---- */
 
 #define SPI_CMD_REG      0x00
-#define SPI_STATUS_REG   0x10
-#define SPI_CTRL_REG     0x08
-#define SPI0_SHADOW_SIZE 64
+#define SPI_ADDR_REG     0x04
+#define SPI_STATUS_REG   0x10   /* SPI_RD_STATUS_REG */
+#define SPI_USER_REG     0x1C
+#define SPI_USER1_REG    0x20
+#define SPI_USER2_REG    0x24
+#define SPI_MOSI_DLEN_REG 0x28
+#define SPI_MISO_DLEN_REG 0x2C
+#define SPI_W0_REG       0x80
+
+/* SPI_CMD_REG bits */
+#define SPI_CMD_USR        (1u << 18)
+#define SPI_CMD_FLASH_CE   (1u << 22)
+#define SPI_CMD_FLASH_BE   (1u << 23)
+#define SPI_CMD_FLASH_SE   (1u << 24)
+#define SPI_CMD_FLASH_PP   (1u << 25)
+#define SPI_CMD_FLASH_WRSR (1u << 26)
+#define SPI_CMD_FLASH_RDSR (1u << 27)
+#define SPI_CMD_FLASH_RDID (1u << 28)
+#define SPI_CMD_FLASH_READ (1u << 31)
+
+/* SPI_USER_REG bits */
+#define SPI_USER_USR_MOSI  (1u << 27)
+#define SPI_USER_USR_MISO  (1u << 28)
+#define SPI_USER_USR_ADDR  (1u << 30)
+
+#define EMU_FLASH_SIZE   (4 * 1024 * 1024)
+
+/* JEDEC ID of a GigaDevice GD25Q32 (4 MB) — matches ESP-IDF's GD chip
+ * table (mfg 0xC8, type 0x40, capacity 0x16). First byte on the wire is
+ * the manufacturer ID, so it sits in the low byte of W0. */
+#define EMU_FLASH_JEDEC_ID 0x001640C8u
+
+static uint32_t spi_flash_offset(const spi_state_t *s) {
+    int bitlen = (int)((s->user1 >> 26) & 0x3F) + 1;
+    if (bitlen >= 32) return s->addr;
+    return s->addr >> (32 - bitlen);
+}
+
+static int spi_data_bytes(uint32_t dlen_reg) {
+    int bits = (int)(dlen_reg & 0xFFFFFF) + 1;
+    int bytes = (bits + 7) / 8;
+    return bytes > 64 ? 64 : bytes;
+}
+
+static void spi_flash_read_data(esp32_periph_t *p, spi_state_t *s,
+                                uint32_t off, int bytes) {
+    memset(s->w, 0xFF, sizeof(s->w));   /* erased flash reads as 0xFF */
+    if (off < EMU_FLASH_SIZE && p->mem->flash_data) {
+        uint32_t avail = EMU_FLASH_SIZE - off;
+        if ((uint32_t)bytes > avail) bytes = (int)avail;
+        memcpy(s->w, p->mem->flash_data + off, (size_t)bytes);
+    }
+}
+
+/* Program: real flash can only clear bits, model with AND */
+static void spi_flash_program(esp32_periph_t *p, spi_state_t *s,
+                              uint32_t off, int bytes) {
+    if (off >= EMU_FLASH_SIZE || !p->mem->flash_data) return;
+    uint32_t avail = EMU_FLASH_SIZE - off;
+    if ((uint32_t)bytes > avail) bytes = (int)avail;
+    const uint8_t *src = (const uint8_t *)s->w;
+    for (int i = 0; i < bytes; i++)
+        p->mem->flash_data[off + i] &= src[i];
+}
+
+static void spi_flash_erase(esp32_periph_t *p, uint32_t off, uint32_t len) {
+    if (off >= EMU_FLASH_SIZE || !p->mem->flash_data) return;
+    if (len > EMU_FLASH_SIZE - off) len = EMU_FLASH_SIZE - off;
+    memset(p->mem->flash_data + off, 0xFF, len);
+}
+
+/* Execute a flash command started via SPI_CMD_REG. The emulated controller
+ * completes instantly: SPI_CMD_REG always reads back 0 (not busy) and
+ * SPI_EXT2_REG reads 0 (state machine idle). */
+static void spi_flash_execute(esp32_periph_t *p, spi_state_t *s, uint32_t cmd) {
+    if (cmd & SPI_CMD_USR) {
+        uint8_t fc = (uint8_t)(s->user2 & 0xFF);  /* SPI_USR_COMMAND_VALUE */
+        uint32_t off = spi_flash_offset(s);
+        int mosi = spi_data_bytes(s->mosi_dlen);
+        int miso = spi_data_bytes(s->miso_dlen);
+        switch (fc) {
+        case 0x9F:                      /* RDID */
+        case 0x90:                      /* REMID */
+        case 0xAB:                      /* RES / release power-down */
+            s->w[0] = EMU_FLASH_JEDEC_ID;
+            break;
+        case 0x05: s->w[0] = s->sr[0]; break;   /* RDSR1 */
+        case 0x35: s->w[0] = s->sr[1]; break;   /* RDSR2 */
+        case 0x15: s->w[0] = s->sr[2]; break;   /* RDSR3 */
+        case 0x01:                              /* WRSR */
+            s->sr[0] = (uint8_t)(s->w[0] & 0xFF);
+            if (mosi >= 2) s->sr[1] = (uint8_t)((s->w[0] >> 8) & 0xFF);
+            break;
+        case 0x31: s->sr[1] = (uint8_t)(s->w[0] & 0xFF); break;  /* WRSR2 */
+        case 0x11: s->sr[2] = (uint8_t)(s->w[0] & 0xFF); break;  /* WRSR3 */
+        case 0x06: case 0x04: break;            /* WREN / WRDI */
+        case 0x03: case 0x0B: case 0x3B:        /* READ / FAST_READ / DUAL */
+        case 0x6B: case 0xBB: case 0xEB:        /* QUAD variants */
+            spi_flash_read_data(p, s, off, miso);
+            break;
+        case 0x02: case 0x32:                   /* PP / quad PP */
+            spi_flash_program(p, s, off, mosi);
+            break;
+        case 0x20: spi_flash_erase(p, off & ~0xFFFu, 0x1000);  break; /* SE */
+        case 0x52: spi_flash_erase(p, off & ~0x7FFFu, 0x8000); break; /* BE32 */
+        case 0xD8: spi_flash_erase(p, off & ~0xFFFFu, 0x10000); break; /* BE64 */
+        case 0x60: case 0xC7:                   /* chip erase */
+            spi_flash_erase(p, 0, EMU_FLASH_SIZE);
+            break;
+        default: break;
+        }
+        return;
+    }
+
+    /* ROM-style dedicated command bits (ROM functions are mostly hooked,
+     * but handle them anyway for unhooked paths) */
+    if (cmd & SPI_CMD_FLASH_RDID) s->w[0] = EMU_FLASH_JEDEC_ID;
+    if (cmd & SPI_CMD_FLASH_RDSR) s->rd_status = s->sr[0] | (s->sr[1] << 8) | (s->sr[2] << 16);
+    if (cmd & SPI_CMD_FLASH_WRSR) {
+        s->sr[0] = (uint8_t)(s->w[0] & 0xFF);
+        s->sr[1] = (uint8_t)((s->w[0] >> 8) & 0xFF);
+    }
+    if (cmd & SPI_CMD_FLASH_READ)
+        spi_flash_read_data(p, s, s->addr, spi_data_bytes(s->miso_dlen));
+    if (cmd & SPI_CMD_FLASH_PP)
+        spi_flash_program(p, s, s->addr, spi_data_bytes(s->mosi_dlen));
+    if (cmd & SPI_CMD_FLASH_SE) spi_flash_erase(p, s->addr & ~0xFFFu, 0x1000);
+    if (cmd & SPI_CMD_FLASH_BE) spi_flash_erase(p, s->addr & ~0xFFFFu, 0x10000);
+    if (cmd & SPI_CMD_FLASH_CE) spi_flash_erase(p, 0, EMU_FLASH_SIZE);
+}
 
 static uint32_t spi_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    (void)p;
+    spi_state_t *s = &p->spi[(addr >= SPI0_BASE) ? 0 : 1];
     uint32_t base = (addr >= SPI0_BASE) ? SPI0_BASE : SPI1_BASE;
     uint32_t off = addr - base;
     switch (off) {
-    case SPI_CMD_REG:    return 0;       /* Command done (not busy) */
-    case SPI_STATUS_REG: return 0;       /* Status: ready */
-    default:             return 0;
+    case SPI_CMD_REG:      return 0;           /* command done (not busy) */
+    case SPI_ADDR_REG:     return s->addr;
+    case SPI_STATUS_REG:   return s->rd_status;
+    case SPI_USER_REG:     return s->user;
+    case SPI_USER1_REG:    return s->user1;
+    case SPI_USER2_REG:    return s->user2;
+    case SPI_MOSI_DLEN_REG: return s->mosi_dlen;
+    case SPI_MISO_DLEN_REG: return s->miso_dlen;
+    default:
+        if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))
+            return s->w[(off - SPI_W0_REG) / 4];
+        return 0;   /* incl. SPI_EXT2_REG (0xF8): state machine idle */
     }
 }
 
 static void spi_write(void *ctx, uint32_t addr, uint32_t val) {
-    (void)ctx; (void)addr; (void)val;
+    esp32_periph_t *p = ctx;
+    spi_state_t *s = &p->spi[(addr >= SPI0_BASE) ? 0 : 1];
+    uint32_t base = (addr >= SPI0_BASE) ? SPI0_BASE : SPI1_BASE;
+    uint32_t off = addr - base;
+    switch (off) {
+    case SPI_CMD_REG:      spi_flash_execute(p, s, val); break;
+    case SPI_ADDR_REG:     s->addr = val; break;
+    case SPI_USER_REG:     s->user = val; break;
+    case SPI_USER1_REG:    s->user1 = val; break;
+    case SPI_USER2_REG:    s->user2 = val; break;
+    case SPI_MOSI_DLEN_REG: s->mosi_dlen = val; break;
+    case SPI_MISO_DLEN_REG: s->miso_dlen = val; break;
+    default:
+        if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))
+            s->w[(off - SPI_W0_REG) / 4] = val;
+        break;
+    }
 }
 
 /* ---- SYSCON ---- */

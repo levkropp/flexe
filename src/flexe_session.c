@@ -229,6 +229,9 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     s->cpu[1].window_trace = cfg->window_trace;
     s->cpu[1].window_trace_active = false;
     s->cpu[1].spill_verify = cfg->spill_verify;
+    /* Core 1 needs a valid stack before its boot entry runs (on hardware
+     * the ROM startup provides one). Give it 16 KB below core 0's stack. */
+    ar_write(&s->cpu[1], 1, sp - 0x4000);
 
     /* Attach CPUs to peripherals for interrupt delivery */
     periph_attach_cpus(s->periph, &s->cpu[0], &s->cpu[1]);
