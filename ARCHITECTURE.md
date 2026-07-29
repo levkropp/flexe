@@ -530,11 +530,7 @@ compare traces) without copying any code.
 
 ```
 xtensa-emulator/
-  PLAN.md                    # High-level plan and milestones overview
-  MILESTONES.md              # Detailed milestone acceptance criteria
   ARCHITECTURE.md            # This file
-  CLAUDE.md                  # Project context for AI assistants
-  TASKS-M0.md                # Granular tasks for milestone 0
   CMakeLists.txt             # Build system
   src/
     xtensa.h                 # Public API + CPU state

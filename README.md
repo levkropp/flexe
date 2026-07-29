@@ -2,17 +2,31 @@
 
 **f**ree **l**ittle **x**tensa **e**mulator
 
-a lightweight xtensa lx6 (esp32) emulator written in c. boots real esp-idf firmware binaries. no dependencies beyond a c11 compiler and cmake.
+a lightweight xtensa lx6 (esp32) emulator written in c. boots real esp-idf firmware binaries. no dependencies beyond a c11 compiler, cmake, and openssl.
 
-## what it does
+oh, and it's **fast**. like, stupidly fast. there's a jit in here now.
 
-flexe interprets the xtensa lx6 instruction set well enough to boot unmodified esp-idf applications. it handles the full init sequence — from reset vector through bootloader setup to `app_main`.
+## the numbers
+
+a real esp32 lx6 hums along at 240 mhz. that's the bar. here's flexe on apple silicon (pgo build, 500M-1B cycle workloads):
+
+| workload | interpreter | jit (default) | vs real esp32 |
+|---|---:|---:|---:|
+| tjpgd (jpeg decode) | 330 mips | **693 mips** | 2.9× faster |
+| real_time_stats (dual-core freertos) | 334 mips | **499 mips** | 2.1× faster |
+| cpu_bench (alu/mem loops) | 318 mips | **2476 mips** | 10.3× faster |
+
+so yeah — flexe emulates an esp32 at 2–10× the speed of an actual esp32. the jit traces hot basic blocks through branches, chains them into long native runs, and constant-folds literal loads. cold code falls back to the interpreter, which itself is already above real-time.
 
 ```
 $ ./build/xtensa-emu -q -s build/hello_world.elf -c 5000000 build/hello_world.bin
 I (0) cpu_start: Starting scheduler on PRO CPU.
 Hello world!
 ```
+
+## what it does
+
+flexe interprets (and now jits) the xtensa lx6 instruction set well enough to boot unmodified esp-idf applications. it handles the full init sequence — from reset vector through bootloader setup to `app_main`.
 
 ### implemented
 
@@ -27,14 +41,17 @@ Hello world!
 - nvs flash stubs
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
-- 459 tests
+- jit compiler: hot blocks → native code (arm64 + x86-64), on by default
+- 468 tests
 
 ## building
 
 ```
 cmake -S . -B build
-cmake --build build
+cmake --build build -j
 ```
+
+(macOS: point cmake at homebrew openssl with `-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)`)
 
 produces two binaries:
 - `build/xtensa-emu` — the emulator
@@ -43,14 +60,17 @@ produces two binaries:
 ## usage
 
 ```
-# basic run
+# basic run (jit is on by default)
 ./build/xtensa-emu firmware.bin
 
 # with elf symbols and cycle limit
 ./build/xtensa-emu -s app.elf -c 10000000 firmware.bin
 
-# quiet mode (suppress boot info)
+# quiet mode (suppress emulator info, show only firmware output)
 ./build/xtensa-emu -q -s app.elf -c 5000000 firmware.bin
+
+# interpreter-only mode (the slow lane, for comparison or debugging)
+./build/xtensa-emu --no-jit -s app.elf -c 10000000 firmware.bin
 
 # verbose trace to stderr
 ./build/xtensa-emu -T -s app.elf -c 1000000 firmware.bin 2>/tmp/trace.log
@@ -60,8 +80,11 @@ produces two binaries:
 
 | flag | description |
 |------|-------------|
+| `-J` | enable jit (default: on where supported) |
+| `--no-jit` | disable jit, run fully interpreted |
+| `--jit-stats` | print jit block/coverage statistics on exit |
 | `-s ELF` | load elf for symbols and firmware hooks |
-| `-c N` | stop after N cycles |
+| `-c N` | stop after N executed instructions (both cores counted) |
 | `-q` | quiet (suppress emulator info, show only firmware output) |
 | `-T` | verbose execution trace to stderr |
 | `-b ADDR` | set breakpoint at address |
@@ -82,12 +105,15 @@ a post-processing tool for verbose trace output:
 
 ## architecture
 
-switch-based interpreter. each step: fetch → decode → execute → loop check → interrupt check → advance ccount.
+switch-based interpreter core + a tracing jit on top. interpreter: fetch → decode → execute → loop check → interrupt check → advance ccount. the jit watches hot pcs, compiles basic blocks (continuing through conditional branches as traces), chains blocks together natively, and folds flash literal loads into immediates. anything it can't handle simply runs interpreted — no correctness cliff.
 
 ```
 src/
   xtensa.c           interpreter core (~3500 lines, every isa instruction)
   xtensa.h           cpu state struct
+  jit.c              tracing jit: scan, compile, chain, dispatch
+  jit_emit_arm64.h   arm64 machine code emitters
+  jit_emit_x64.h     x86-64 machine code emitters
   memory.c           address space: sram, rom, flash, psram, peripheral dispatch
   peripherals.c      mmio handlers for esp32 peripherals
   rom_stubs.c        pc-hook mechanism for rom + firmware function interception
@@ -99,20 +125,20 @@ src/
   main.c             cli frontend
 ```
 
-~15k lines of c total. see [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design notes.
+~20k lines of c total. see [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design notes.
 
 ## testing
 
 ```
 ./build/xtensa-tests
-# 459 tests, 774 passed, 0 failed
+# 468 tests, 869 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
 
 ## status
 
-boots `hello_world`, `blink`, and `esp_timer` example apps from esp-idf. good enough for simple firmware. doesn't model timing, caches, or multicore.
+boots `hello_world`, `blink`, `tjpgd`, `real_time_stats`, `spi_lcd_touch` (lvgl!), and friends from esp-idf. runs them 2–10× faster than the real chip. doesn't model timing, caches, or multicore cache-coherence (both cores run, though).
 
 ## license
 

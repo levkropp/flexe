@@ -64,6 +64,10 @@ enum {
  * calls). X9 is a caller-saved temp reserved for codegen; jit.c's
  * register allocator never picks it. */
 #define ARM64_SCRATCH 9
+/* Second scratch (X10) for two-temp sequences (e.g. store-imm far-disp).
+ * Neither X9 nor X10 appear in the RAX..R15 compat enum (0-7, 19-26),
+ * so jit.c body code can never hold live values in them. */
+#define ARM64_SCRATCH2 10
 #define ARM64_SP_ENC  31  /* encoding used by LDR/STR when base==SP */
 
 /* Emitter context — identical layout to the x64 version. */
@@ -356,11 +360,23 @@ static inline void emit_store16_disp(emit_t *e, int src, int base, int32_t disp)
     }
 }
 
-/* store imm32 at [base+disp]: materialize then store. */
+/* store imm32 at [base+disp]: materialize then store. Cannot route
+ * through emit_store32_disp: its far-disp path uses ARM64_SCRATCH for
+ * the displacement, which would clobber the value held there. */
 static inline void emit_store32_disp_imm(emit_t *e, int base, int32_t disp, uint32_t imm) {
-    /* Scratch must not collide with base; ARM64_SCRATCH=X9 is never a base. */
-    emit_mov_reg_imm32(e, ARM64_SCRATCH, imm);
-    emit_store32_disp(e, ARM64_SCRATCH, base, disp);
+    emit_mov_reg_imm32(e, ARM64_SCRATCH, imm);   /* W9 = value */
+    if (disp >= 0 && disp <= 16380 && (disp & 3) == 0) {
+        uint32_t u = (uint32_t)(disp >> 2) & 0xFFFu;
+        emit32(e, 0xB9000000u | (u << 10)
+                 | ((uint32_t)(base & 31) << 5) | (uint32_t)ARM64_SCRATCH);
+    } else if (disp >= -256 && disp <= 255) {
+        emit_arm64_stur32(e, ARM64_SCRATCH, base, disp);
+    } else {
+        emit_mov_reg_imm64(e, ARM64_SCRATCH2, (uint64_t)(int64_t)disp);
+        /* STR W9, [Xbase, X10] */
+        emit32(e, 0xB8206800u | ((uint32_t)ARM64_SCRATCH2 << 16)
+                 | ((uint32_t)(base & 31) << 5) | (uint32_t)ARM64_SCRATCH);
+    }
 }
 
 /* ===== ALU reg-reg (32-bit W-form) =====
@@ -775,24 +791,146 @@ static inline void emit_not_reg32(emit_t *e, int reg) {
              | (uint32_t)(reg & 31));
 }
 
-/*
- * popcnt on ARM64 does not exist as a scalar integer op; the idiomatic
- * sequence is FMOV to a SIMD reg, CNT.8B, ADDV. For the JIT we stub
- * this as "load zero then BRK" so any Xtensa opcode that still reaches
- * for it aborts compilation and falls back to the interpreter. None of
- * the integer fast-paths jit.c currently emits uses it.
- */
+/* popcnt — ARM64 has no scalar popcount; the NEON sequence (FMOV/CNT/
+ * ADDV) is overkill for jit.c's only use: POPCNT(windowstart) where the
+ * value is ≤ 16 bits. SWAR in W registers instead. Result in dst. */
 static inline void emit_popcnt(emit_t *e, int dst, int src) {
-    (void)src;
-    /* BRK #0xDEAD — traps. Also zero the dst so static analysis is happy. */
-    emit_mov_reg_imm32(e, dst, 0);
-    emit32(e, 0xD43BDAA0u); /* BRK #0xDEAD */
+    if (dst != src) emit_mov_reg32_reg32(e, dst, src);
+    /* dst = dst - ((dst >> 1) & 0x5555) */
+    emit_mov_reg32_reg32(e, ARM64_SCRATCH, dst);
+    emit_shr_reg32_imm(e, ARM64_SCRATCH, 1);
+    emit_and_reg32_imm32(e, ARM64_SCRATCH, 0x5555);
+    emit_sub_reg32(e, dst, ARM64_SCRATCH);
+    /* dst = (dst & 0x3333) + ((dst >> 2) & 0x3333) */
+    emit_mov_reg32_reg32(e, ARM64_SCRATCH, dst);
+    emit_shr_reg32_imm(e, ARM64_SCRATCH, 2);
+    emit_and_reg32_imm32(e, ARM64_SCRATCH, 0x3333);
+    emit_and_reg32_imm32(e, dst, 0x3333);
+    emit_add_reg32(e, dst, ARM64_SCRATCH);
+    /* nibbles now hold 0-4; dst = dst + (dst>>4); dst = dst + (dst>>8); & 0xF */
+    emit_mov_reg32_reg32(e, ARM64_SCRATCH, dst);
+    emit_shr_reg32_imm(e, ARM64_SCRATCH, 4);
+    emit_add_reg32(e, dst, ARM64_SCRATCH);
+    emit_mov_reg32_reg32(e, ARM64_SCRATCH, dst);
+    emit_shr_reg32_imm(e, ARM64_SCRATCH, 8);
+    emit_add_reg32(e, dst, ARM64_SCRATCH);
+    emit_and_reg32_imm32(e, dst, 0xF);
 }
 
-/* bt reg, bit_reg — Xtensa BBS/BBC lowerings. Stubbed as trap for now. */
+/* bt reg, bit_reg — sets Z=1 iff bit `bit_reg` of `reg` is CLEAR.
+ * Sequence: W9 = 1 << (bit_reg & 31); TST Wreg, W9.
+ * LSLV masks the shift count to 31, matching x86 BT's modulo behavior.
+ * Callers that want "branch if bit clear" use CC_E; "branch if bit set"
+ * use CC_NE. (The x64 version sets CF=bit and uses CC_AE/CC_B instead.) */
 static inline void emit_bt_reg_reg(emit_t *e, int reg, int bit_reg) {
-    (void)reg; (void)bit_reg;
-    emit32(e, 0xD43BDAC0u); /* BRK #0xDEAD+1 */
+    /* MOV W9, #1 */
+    emit32(e, 0x52800029u);
+    /* LSLV W9, W9, Wbit */
+    emit32(e, 0x1AC02000u | ((uint32_t)(bit_reg & 31) << 16)
+             | (9u << 5) | 9u);
+    /* TST Wreg, W9 — ANDS WZR, Wreg, W9 */
+    emit32(e, 0x6A00001Fu | (9u << 16) | ((uint32_t)(reg & 31) << 5));
+}
+
+/* TST Xn, Xm (64-bit) — ANDS XZR, Xn, Xm. For pointer null checks. */
+static inline void emit_test_reg64(emit_t *e, int a, int b) {
+    emit32(e, 0xEA00001Fu | ((uint32_t)(b & 31) << 16)
+             | ((uint32_t)(a & 31) << 5));
+}
+
+/* TST Wn, #imm32 — materialize mask in W9, then TST. Sets Z=1 iff
+ * (Wn & imm) == 0, same flag semantics as x86 TEST reg, imm. */
+static inline void emit_test_reg32_imm32(emit_t *e, int reg, uint32_t imm) {
+    emit_mov_reg_imm32(e, ARM64_SCRATCH, imm);
+    emit32(e, 0x6A00001Fu | ((uint32_t)ARM64_SCRATCH << 16)
+             | ((uint32_t)(reg & 31) << 5));
+}
+
+/* W9 = 1 << (bit_reg & 31) — bit-mask materialization for BBC/BBS. */
+static inline void emit_bt_mask(emit_t *e, int bit_reg) {
+    emit32(e, 0x52800029u); /* MOV W9, #1 */
+    emit32(e, 0x1AC02000u | ((uint32_t)(bit_reg & 31) << 16)
+             | (9u << 5) | 9u); /* LSLV W9, W9, Wbit */
+}
+
+/* CSET Wd, cc — Wd = cc ? 1 : 0. Alias of CSINC Wd, WZR, WZR, !cc. */
+static inline void emit_cset_reg32(emit_t *e, uint8_t cc, int dst) {
+    emit32(e, 0x1A9F07E0u | ((uint32_t)((cc ^ 1) & 0xF) << 12)
+             | (uint32_t)(dst & 31));
+}
+
+/* ORR Xd, Xd, Xm (64-bit OR) */
+static inline void emit_or_reg64(emit_t *e, int dst, int src) {
+    emit32(e, 0xAA000000u | ((uint32_t)(src & 31) << 16)
+             | ((uint32_t)(dst & 31) << 5) | (uint32_t)(dst & 31));
+}
+
+/* ASR Xd, Xn, #sh — alias of SBFM Xd, Xn, #sh, #63. */
+static inline void emit_sar_reg64_imm(emit_t *e, int reg, uint8_t sh) {
+    sh &= 63;
+    emit32(e, 0x93407C00u | ((uint32_t)sh << 16)
+             | ((uint32_t)(reg & 31) << 5) | (uint32_t)(reg & 31));
+}
+
+/* (uint32)a * (uint32)b >> 32 — UMULL Xd, Wa, Wb; LSR Xd, #32. */
+static inline void emit_umulh32(emit_t *e, int dst, int a, int b) {
+    emit32(e, 0x9BA07C00u | ((uint32_t)(b & 31) << 16)
+             | ((uint32_t)(a & 31) << 5) | (uint32_t)(dst & 31));
+    emit_shr_reg64_imm(e, dst, 32);
+}
+
+/* (int32)a * (int32)b >> 32 — SMULL Xd, Wa, Wb; ASR Xd, #32. */
+static inline void emit_smulh32(emit_t *e, int dst, int a, int b) {
+    emit32(e, 0x9B207C00u | ((uint32_t)(b & 31) << 16)
+             | ((uint32_t)(a & 31) << 5) | (uint32_t)(dst & 31));
+    emit_sar_reg64_imm(e, dst, 32);
+}
+
+/* 64-bit load from a table of pointers: dst = *(base + disp + idx32*8).
+ * idx32 is a 32-bit register (upper bits guaranteed zero by W ops). */
+static inline void emit_load64_index(emit_t *e, int dst, int base,
+                                     int idx32, int32_t disp) {
+    if (disp >= 0 && disp < 4096) {
+        emit_arm64_add_imm12(e, 1, ARM64_SCRATCH, base, (uint32_t)disp, 0);
+    } else {
+        emit_mov_reg_imm64(e, ARM64_SCRATCH, (uint64_t)(int64_t)disp);
+        emit32(e, 0x8B000000u | ((uint32_t)ARM64_SCRATCH << 16)
+                 | ((uint32_t)(base & 31) << 5) | (uint32_t)ARM64_SCRATCH);
+    }
+    /* LDR Xt, [Xscratch, Widx, UXTW #3] — 0xF8605800 */
+    emit32(e, 0xF8605800u | ((uint32_t)(idx32 & 31) << 16)
+             | ((uint32_t)ARM64_SCRATCH << 5) | (uint32_t)(dst & 31));
+}
+
+/* Guest-width loads/stores at [base64 + off64] (register offset, no shift) */
+static inline void emit_load32_rof(emit_t *e, int dst, int base, int idx) {
+    emit32(e, 0xB8606800u | ((uint32_t)(idx & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(dst & 31));
+}
+static inline void emit_store32_rof(emit_t *e, int src, int base, int idx) {
+    emit32(e, 0xB8206800u | ((uint32_t)(idx & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(src & 31));
+}
+static inline void emit_load8u_rof(emit_t *e, int dst, int base, int idx) {
+    emit32(e, 0x38606800u | ((uint32_t)(idx & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(dst & 31));
+}
+static inline void emit_store8_rof(emit_t *e, int src, int base, int idx) {
+    emit32(e, 0x38206800u | ((uint32_t)(idx & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(src & 31));
+}
+static inline void emit_load16u_rof(emit_t *e, int dst, int base, int idx) {
+    emit32(e, 0x78606800u | ((uint32_t)(idx & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(dst & 31));
+}
+static inline void emit_load16s_rof(emit_t *e, int dst, int base, int idx) {
+    /* LDRSH Wt, [Xn, Xm] — sign-extend 16→32 */
+    emit32(e, 0x78A06800u | ((uint32_t)(idx & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(dst & 31));
+}
+static inline void emit_store16_rof(emit_t *e, int src, int base, int idx) {
+    emit32(e, 0x78206800u | ((uint32_t)(idx & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(src & 31));
 }
 
 /* or [base + disp], src  — load, or, store. */

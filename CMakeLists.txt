@@ -74,17 +74,22 @@ set(LIB_SOURCES
     src/aot.c
 )
 
-# JIT compiler: x86-64 only, non-MSVC
-if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+# JIT compiler: x86-64 and ARM64, non-MSVC
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|arm64|aarch64")
     list(APPEND LIB_SOURCES src/jit.c)
-    message(STATUS "JIT compiler enabled (x86-64)")
+    message(STATUS "JIT compiler enabled (${CMAKE_SYSTEM_PROCESSOR})")
+    set(FLEXE_HAS_JIT TRUE)
 else()
     list(APPEND LIB_SOURCES src/jit_stub.c)
-    message(STATUS "JIT compiler disabled (requires x86-64, non-MSVC) — using no-op stubs")
+    message(STATUS "JIT compiler disabled (requires x86-64/ARM64, non-MSVC) — using no-op stubs")
 endif()
 
 if(MSVC)
     list(APPEND LIB_SOURCES src/msvc_compat.c)
+endif()
+
+if(FLEXE_HAS_JIT)
+    add_compile_definitions(FLEXE_HAS_JIT=1)
 endif()
 
 add_library(xtensa-emu-lib STATIC ${LIB_SOURCES})

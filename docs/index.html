@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>flexe — free little xtensa emulator</title>
+  <meta name="description" content="a fast, dependency-free xtensa lx6 (esp32) emulator in c. boots real esp-idf firmware 2–10× faster than the real chip.">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #0a0a1e;
+      color: #c0c0d0;
+      font-family: "Comic Neue", "Comic Sans MS", "Chalkboard SE", "Segoe Print", cursive;
+      line-height: 1.6;
+    }
+
+    /* grid background — borrowed from the clawscad aesthetic */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        linear-gradient(rgba(80, 200, 120, 0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(80, 200, 120, 0.05) 1px, transparent 1px);
+      background-size: 48px 48px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 0 24px;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* everything lowercase around here. it's the law. */
+    h1, h2, h3, .btn, .stat-num, .tagline { text-transform: lowercase; }
+
+    .hero {
+      text-align: center;
+      padding: 80px 0 48px;
+    }
+
+    .hero h1 {
+      font-size: 64px;
+      font-weight: 700;
+      color: #50fa7b;
+      letter-spacing: 2px;
+      margin-bottom: 8px;
+      text-shadow: 0 0 32px rgba(80, 250, 123, 0.35);
+    }
+
+    .hero .tagline {
+      font-size: 20px;
+      color: #8888bb;
+      max-width: 640px;
+      margin: 0 auto 32px;
+    }
+
+    .hero-buttons {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 28px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 700;
+      text-decoration: none;
+      transition: all 0.15s;
+    }
+
+    .btn-primary {
+      background: #50fa7b;
+      color: #0a1a10;
+    }
+
+    .btn-primary:hover {
+      background: #6bff90;
+      transform: translateY(-2px) rotate(-1deg);
+      box-shadow: 0 6px 24px rgba(80, 250, 123, 0.35);
+    }
+
+    .btn-secondary {
+      background: rgba(80, 250, 123, 0.08);
+      color: #50fa7b;
+      border: 1px solid rgba(80, 250, 123, 0.25);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(80, 250, 123, 0.14);
+      border-color: rgba(80, 250, 123, 0.45);
+      transform: translateY(-2px) rotate(1deg);
+    }
+
+    /* terminal window — the only screenshot a cli emulator needs */
+    .term {
+      max-width: 760px;
+      margin: 0 auto 64px;
+      background: #0d0d2a;
+      border: 1px solid #1a1a3a;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 16px 64px rgba(0, 0, 0, 0.5);
+      text-align: left;
+    }
+
+    .term-bar {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px;
+      background: #12122e;
+      border-bottom: 1px solid #1a1a3a;
+    }
+
+    .term-dot { width: 12px; height: 12px; border-radius: 50%; }
+    .term-dot.r { background: #ff5f56; }
+    .term-dot.y { background: #ffbd2e; }
+    .term-dot.g { background: #27c93f; }
+
+    .term pre {
+      padding: 20px 24px;
+      font-family: "JetBrains Mono", Menlo, Monaco, monospace;
+      font-size: 13px;
+      line-height: 1.7;
+      color: #b0b0d0;
+      overflow-x: auto;
+    }
+
+    .term .p { color: #50fa7b; }   /* prompt */
+    .term .c { color: #44447a; }   /* comment */
+    .term .g { color: #6bff90; }   /* good output */
+
+    /* big silly speed stats */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 24px;
+      padding: 0 0 64px;
+      text-align: center;
+    }
+
+    .stat-num {
+      font-size: 44px;
+      font-weight: 700;
+      color: #50fa7b;
+      display: block;
+    }
+
+    .stat-label {
+      font-size: 14px;
+      color: #7777aa;
+    }
+
+    .features {
+      padding: 48px 0 64px;
+    }
+
+    .features h2, .install h2 {
+      font-size: 34px;
+      color: #c0c0e0;
+      text-align: center;
+      margin-bottom: 48px;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 24px;
+    }
+
+    .feature-card {
+      background: rgba(15, 15, 35, 0.8);
+      border: 1px solid #1a1a3a;
+      border-radius: 12px;
+      padding: 28px;
+      transition: transform 0.15s, border-color 0.15s;
+    }
+
+    .feature-card:hover {
+      border-color: #2a5a3a;
+      transform: rotate(-0.5deg) scale(1.01);
+    }
+
+    .feature-card h3 {
+      font-size: 19px;
+      color: #50fa7b;
+      margin-bottom: 8px;
+    }
+
+    .feature-card p {
+      font-size: 14px;
+      color: #7777aa;
+      line-height: 1.7;
+    }
+
+    .install {
+      padding: 48px 0 64px;
+      text-align: center;
+    }
+
+    .code-block {
+      display: inline-block;
+      text-align: left;
+      background: #0d0d2a;
+      border: 1px solid #1a1a3a;
+      border-radius: 12px;
+      padding: 24px 32px;
+      font-family: "JetBrains Mono", Menlo, Monaco, monospace;
+      font-size: 14px;
+      color: #b0b0d0;
+      line-height: 1.8;
+      max-width: 100%;
+      overflow-x: auto;
+    }
+
+    .code-block .comment { color: #44447a; }
+    .code-block .cmd { color: #50fa7b; }
+
+    .prereqs {
+      margin-top: 32px;
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .prereq {
+      padding: 8px 16px;
+      border-radius: 6px;
+      background: rgba(80, 250, 123, 0.08);
+      border: 1px solid rgba(80, 250, 123, 0.18);
+      font-size: 13px;
+      color: #66bb88;
+    }
+
+    .bench-note {
+      font-size: 13px;
+      color: #55558a;
+      max-width: 560px;
+      margin: 16px auto 0;
+    }
+
+    .footer {
+      padding: 48px 0;
+      text-align: center;
+      border-top: 1px solid #1a1a3a;
+      color: #444466;
+      font-size: 13px;
+    }
+
+    .footer a {
+      color: #5566aa;
+      text-decoration: none;
+    }
+
+    .footer a:hover { color: #50fa7b; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <!-- hero -->
+    <section class="hero">
+      <h1>flexe</h1>
+      <p class="tagline">free little xtensa emulator. boots real esp-idf firmware. emulates an esp32 at 2–10× the speed of an actual esp32, because why not.</p>
+      <div class="hero-buttons">
+        <a href="https://github.com/levkropp/flexe" class="btn btn-primary">view on github</a>
+        <a href="#benchmarks" class="btn btn-secondary">see the numbers</a>
+      </div>
+    </section>
+
+    <!-- terminal -->
+    <section>
+      <div class="term">
+        <div class="term-bar">
+          <span class="term-dot r"></span>
+          <span class="term-dot y"></span>
+          <span class="term-dot g"></span>
+        </div>
+        <pre><span class="p">$</span> cmake -S . -B build && cmake --build build -j
+<span class="c"># done. that's the whole build. no runtime deps.</span>
+
+<span class="p">$</span> ./build/xtensa-emu -q -s hello_world.elf -c 5000000 hello_world.bin
+<span class="g">I (0) cpu_start: Starting scheduler on PRO CPU.</span>
+<span class="g">Hello world!</span>
+
+<span class="p">$</span> ./bench.sh
+<span class="c"># 500M–1B executed instructions per workload, pgo build:</span>
+tjpgd        693 mips   <span class="g">2.9× real-time</span>
+rts          499 mips   <span class="g">2.1× real-time</span>
+cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
+      </div>
+    </section>
+
+    <!-- stats -->
+    <section class="stats" id="benchmarks">
+      <div>
+        <span class="stat-num">2476</span>
+        <span class="stat-label">mips on alu/memory loops<br>(10.3× a real esp32)</span>
+      </div>
+      <div>
+        <span class="stat-num">2.9×</span>
+        <span class="stat-label">real-time on jpeg decode<br>(693 mips, jit tracing)</span>
+      </div>
+      <div>
+        <span class="stat-num">0</span>
+        <span class="stat-label">dependencies<br>(c11 + cmake + openssl. that's it)</span>
+      </div>
+      <div>
+        <span class="stat-num">468</span>
+        <span class="stat-label">tests, all passing<br>(869 assertions, 0 failures)</span>
+      </div>
+    </section>
+
+    <!-- features -->
+    <section class="features">
+      <h2>what's in the box</h2>
+      <div class="feature-grid">
+        <div class="feature-card">
+          <h3>a jit that actually jit</h3>
+          <p>traces hot basic blocks through conditional branches, chains them into long native runs (arm64 + x86-64), and constant-folds flash literal loads. cold code stays interpreted. no correctness cliff — unhandled instructions just run in the interpreter.</p>
+        </div>
+        <div class="feature-card">
+          <h3>full lx6 isa</h3>
+          <p>every instruction: alu, shifts, branches, zero-overhead loops, mac16, fpu, windowed registers with synthesized spill/fill, exceptions and interrupts (levels 1–7, ccompare timers, waiti).</p>
+        </div>
+        <div class="feature-card">
+          <h3>dual core, like the real thing</h3>
+          <p>pro cpu + app cpu, synchronized cycle counts, freertos preemption on both. the benchmark counts instructions executed on <em>both</em> cores — no funny accounting.</p>
+        </div>
+        <div class="feature-card">
+          <h3>stub superpowers</h3>
+          <p>rom functions (ets_printf, memcpy, sha/aes), freertos tasks/queues/semaphores, esp_timer callbacks, nvs, vfs/spiffs with host file backing, even lwip sockets bridged to the host network.</p>
+        </div>
+        <div class="feature-card">
+          <h3>debugging arsenal</h3>
+          <p>elf symbols, breakpoints, verbose + windowed traces, function-call trees, hierarchical traces for billion-cycle runs, checkpoints you can save and resume later.</p>
+        </div>
+        <div class="feature-card">
+          <h3>tiny and boring (on purpose)</h3>
+          <p>~20k lines of c11. no frameworks, no runtime, no drama. just a switch-based interpreter and a hand-rolled jit. reads like a textbook, runs like a rocket.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- install -->
+    <section class="install">
+      <h2>get it</h2>
+      <div class="code-block">
+        <span class="cmd">git clone</span> https://github.com/levkropp/flexe.git<br>
+        <span class="cmd">cd</span> flexe<br>
+        <span class="cmd">cmake</span> -S . -B build<br>
+        <span class="cmd">cmake</span> --build build -j<br>
+        <span class="comment"># then feed it an esp-idf .bin</span><br>
+        <span class="cmd">./build/xtensa-emu</span> -s app.elf -c 10000000 app.bin
+      </div>
+      <div class="prereqs">
+        <span class="prereq">c11 compiler</span>
+        <span class="prereq">cmake</span>
+        <span class="prereq">openssl</span>
+        <span class="prereq">an esp-idf firmware .bin to play with</span>
+      </div>
+      <p class="bench-note">benchmarks measured on apple silicon with the pgo build. jit is on by default; <code>--no-jit</code> takes the scenic route. real esp32 = 240 mips, for scale.</p>
+    </section>
+
+    <!-- footer -->
+    <footer class="footer">
+      <p>mit license &middot; <a href="https://github.com/levkropp/flexe">github</a> &middot; made with excessive respect for a little cpu</p>
+    </footer>
+  </div>
+
+</body>
+</html>
