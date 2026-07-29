@@ -358,8 +358,7 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     if (off >= 0x088 && off < 0x088 + 40 * 4) {
         int n = (int)(off - 0x088) / 4;
         p->gpio.pin[n] = val;
-        return;
-    }
+        return;    }
 
     /* GPIO_FUNC_IN_SEL_CFG_REG */
     if (off >= 0x130 && off < 0x130 + 256 * 4) {
@@ -797,8 +796,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     return p;
 }
 
-void periph_destroy(esp32_periph_t *p) {
-    free(p);
+xtensa_mem_t *periph_mem(esp32_periph_t *p) { return p ? p->mem : NULL; }
+
+int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
+    if (!p || pin < 0 || pin > 39) return -1;
+    if (pin < 32) return (int)((p->gpio.out >> pin) & 1u);
+    return (int)((p->gpio.out1 >> (pin - 32)) & 1u);
+}
+
+void periph_destroy(esp32_periph_t *p) {    free(p);
 }
 
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx) {

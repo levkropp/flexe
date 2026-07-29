@@ -15,6 +15,7 @@
 #include "esp_timer_stubs.h"
 #include "display_stubs.h"
 #include "touch_stubs.h"
+#include "spi_display.h"
 #include "sdcard_stubs.h"
 #include "wifi_stubs.h"
 #include "vfs_stubs.h"
@@ -157,10 +158,29 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     /* Touch stubs */
     s->tstubs = touch_stubs_create(&s->cpu[0]);
     if (s->tstubs) {
-        if (cfg->touch_fn)
-            touch_stubs_set_state_fn(s->tstubs, cfg->touch_fn, cfg->touch_ctx);
+        if (cfg->touch_fn)            touch_stubs_set_state_fn(s->tstubs, cfg->touch_fn, cfg->touch_ctx);
         if (s->syms)
             touch_stubs_hook_symbols(s->tstubs, s->syms);
+    }
+
+    /* Raw SPI display/touch capture (SPI2/SPI3 sniffing for symbol-less
+     * firmware). Pins default to CYD 2432S028R; -1 disables. */
+    {
+        spi_display_config_t scfg = {
+            .dc_pin         = cfg->spi_dc_pin         ? cfg->spi_dc_pin         : 2,
+            .display_cs_pin = cfg->spi_display_cs_pin ? cfg->spi_display_cs_pin : 15,
+            .touch_cs_pin   = cfg->spi_touch_cs_pin   ? cfg->spi_touch_cs_pin   : 33,
+            .sd_cs_pin      = cfg->spi_sd_cs_pin      ? cfg->spi_sd_cs_pin      : 5,
+            .sdcard_path    = cfg->sdcard_path,
+            .framebuf       = cfg->framebuf,
+            .framebuf_mtx   = cfg->framebuf_mutex,
+            .fb_w           = cfg->framebuf_w,
+            .fb_h           = cfg->framebuf_h,
+            .touch_fn       = cfg->touch_fn,
+            .touch_ctx      = cfg->touch_ctx,
+        };
+        if (scfg.dc_pin >= 0)
+            periph_enable_spi_display(s->periph, &scfg);
     }
 
     /* SD card stubs */

@@ -27,6 +27,13 @@ bool periph_app_cpu_released(const esp32_periph_t *p);
 /* Attach CPU pointers for interrupt delivery (call after cpu init) */
 void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1);
 
+/* Access the backing memory object (used by spi_display) */
+xtensa_mem_t *periph_mem(esp32_periph_t *p);
+
+/* Current GPIO output level of a pin (0/1, -1 if invalid). Used by the
+ * GP-SPI display/touch sniffer to sample CS and D/C lines. */
+int periph_gpio_pin_level(const esp32_periph_t *p, int pin);
+
 /* Assert/deassert a peripheral interrupt source (0-70).
  * Scans the interrupt matrix to find mapped CPU interrupt lines and
  * sets/clears the corresponding bits in cpu->interrupt. */
