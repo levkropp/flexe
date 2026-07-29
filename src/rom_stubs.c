@@ -1143,8 +1143,30 @@ static void stub_ashldi3(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t hi = rom_arg(cpu, 1);
     uint32_t sh = rom_arg(cpu, 2);
     uint64_t val = ((uint64_t)hi << 32) | lo;
-    val <<= (sh & 63);
+    val = (sh >= 64) ? 0 : (val << sh);
     rom_return64(cpu, val);
+}
+
+/* __lshrdi3: 64-bit logical right shift. (a2,a3) >> a4, result in (a2,a3) */
+static void stub_lshrdi3(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t lo = rom_arg(cpu, 0);
+    uint32_t hi = rom_arg(cpu, 1);
+    uint32_t sh = rom_arg(cpu, 2);
+    uint64_t val = ((uint64_t)hi << 32) | lo;
+    val = (sh >= 64) ? 0 : (val >> sh);
+    rom_return64(cpu, val);
+}
+
+/* __ashrdi3: 64-bit arithmetic right shift. (a2,a3) >> a4, result in (a2,a3) */
+static void stub_ashrdi3(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t lo = rom_arg(cpu, 0);
+    uint32_t hi = rom_arg(cpu, 1);
+    uint32_t sh = rom_arg(cpu, 2);
+    int64_t val = (int64_t)(((uint64_t)hi << 32) | lo);
+    if (sh >= 64) { val = (val < 0) ? -1 : 0; sh = 0; }
+    rom_return64(cpu, (uint64_t)(val >> sh));
 }
 
 /* CRC32 table (standard CRC-32/ISO-HDLC polynomial 0xEDB88320) */
@@ -3080,6 +3102,8 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* Byte-swap and 64-bit shift */
     rom_stubs_register(s, 0x40064AE0, stub_bswapsi2,            "__bswapsi2");
     rom_stubs_register(s, 0x4000C818, stub_ashldi3,             "__ashldi3");
+    rom_stubs_register(s, 0x4000C830, stub_ashrdi3,             "__ashrdi3");
+    rom_stubs_register(s, 0x4000C84C, stub_lshrdi3,             "__lshrdi3");
 
     /* CRC */
     rom_stubs_register(s, 0x4005CFEC, stub_crc32_le,            "esp_rom_crc32_le");
@@ -3094,7 +3118,8 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x40008264, stub_software_reset,      "software_reset_cpu");
 
     /* GPIO */
-    rom_stubs_register(s, 0x4000C84C, stub_void_unregistered,   "gpio_output_set");
+    rom_stubs_register(s, 0x40009B24, stub_void_unregistered,   "gpio_output_set");
+    rom_stubs_register(s, 0x40009B5C, stub_void_unregistered,   "gpio_output_set_high");
 
     /* Misc */
     rom_stubs_register(s, 0x40008208, stub_void_unregistered,   "set_rtc_memory_crc");
