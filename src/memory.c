@@ -95,6 +95,18 @@ xtensa_mem_t *mem_create(void) {
 
     page_table_init(mem);
 
+    /* Pre-populate the ESP32 ROM spiflash chip struct (ROM BSS, fixed
+     * address 0x3FFAE270). On hardware the boot ROM fills this during its
+     * flash setup; flexe skips the boot ROM, and firmware built with
+     * CONFIG_SPI_FLASH_ROM_IMPL reads rom_spiflash_chip.chip_size from
+     * here (spi_flash_mmap validates mappings against it). */
+    mem_write32(mem, 0x3FFAE270, 0x00C84016u);  /* device_id: GD25Q32 */
+    mem_write32(mem, 0x3FFAE274, 0x00400000u);  /* chip_size: 4 MB */
+    mem_write32(mem, 0x3FFAE278, 0x00010000u);  /* block_size: 64 KB */
+    mem_write32(mem, 0x3FFAE27C, 0x00001000u);  /* sector_size: 4 KB */
+    mem_write32(mem, 0x3FFAE280, 0x00000100u);  /* page_size: 256 B */
+    mem_write32(mem, 0x3FFAE284, 0x0000FFFFu);  /* status_mask */
+
     return mem;
 }
 

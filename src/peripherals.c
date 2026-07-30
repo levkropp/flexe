@@ -41,6 +41,22 @@ typedef struct {
     uint32_t protect;    /* write protect key */
 } wdt_state_t;
 
+/* TG LACT (low-alarm-counter) state — the esp_timer hardware timebase.
+ * The 64-bit counter ticks at ccount/DIVIDER (DIVIDER from LACTCONFIG);
+ * when the counter reaches the 64-bit alarm with ALARM_EN set, the
+ * TGn_LACT_LEVEL interrupt source asserts (level). */
+typedef struct {
+    uint32_t config;        /* LACTCONFIG */
+    uint32_t rtc;           /* LACTRTC */
+    uint64_t alarm;         /* LACTALARMHI:LO */
+    uint64_t load;          /* LACTLOADHI:LO pending value */
+    uint64_t load_ccount;   /* cpu0 ccount when LACTLOAD fired */
+    uint32_t int_ena;       /* TIMG_INT_ENA_TIMERS */
+    uint32_t int_raw;       /* TIMG_INT_RAW_TIMERS */
+    bool     loaded;        /* a LACTLOAD has occurred */
+    bool     level;         /* interrupt level currently asserted */
+} lact_state_t;
+
 /* GPIO shadow state */
 typedef struct {
     uint32_t out;
@@ -93,6 +109,9 @@ struct esp32_periph {
     /* Timer groups WDT */
     wdt_state_t timg_wdt[2];
 
+    /* Timer groups LACT (low-alarm-counter, esp_timer hardware timebase) */
+    lact_state_t lact[2];
+
     /* RTC calibration state */
     rtc_cal_state_t rtc_cal[2];
 
@@ -113,6 +132,11 @@ struct esp32_periph {
     /* Cross-core interrupt pending state */
     uint32_t from_cpu_intr[4]; /* FROM_CPU_INTR0..3 registers */
 
+    /* BT low-power clock registers: DPORT_BT_LPCK_DIV_INT (0xD4) and
+     * DPORT_BT_LPCK_DIV_FRAC (0xD8) — the BT lpclk select/div code writes
+     * these and reads them back to verify, so they must persist. */
+    uint32_t bt_lpck[2];
+
     /* Unhandled access counter */
     int unhandled_count;
 
@@ -122,15 +146,39 @@ struct esp32_periph {
 
     /* SPI flash controllers: [0] = SPI0 (cache), [1] = SPI1 (memspi) */
     spi_state_t spi[2];
+
+    /* Flash cache MMU table shadows (DPORT_PRO/APP_FLASH_MMU_TABLE).
+     * Entry i (0-63 = DROM 0x3F400000+, 64-127 = IROM 0x400C2000+) holds
+     * the 64 KB flash page mapped into that vaddr slot. */
+    uint32_t flash_mmu_pro[256];
+    uint32_t flash_mmu_app[256];
 };
+
+/* Bootloader-style initial flash MMU contents for an app at flash 0x10000:
+ * DROM slot S -> page S+1 (vaddr 0x3F400000 maps flash 0x10000), IROM
+ * slots for app text at 0x400D0000+ -> pages 5+ (flash 0x50000+, matching
+ * the contiguous app image layout). Without this, esp_mm's init computes
+ * app paddrs from zeroed tables and believes the app sits at paddr 0. */
+/* Reset state of the DPORT flash MMU tables: all entries invalid
+ * (SOC_MMU_INVALID = 0x100, i.e. free). The loader marks the app's own
+ * DROM pages used once it knows the image layout (loader_seed_flash_mmu);
+ * everything else must stay free or esp_mmu_map / ROM spi_flash_mmap find
+ * no free vaddr slot and fail with ESP_ERR_NO_MEM (seen as
+ * "load_partitions returned 0x101"). */
+static void flash_mmu_init_bootloader(esp32_periph_t *p) {
+    for (uint32_t s = 0; s < 256; s++) {
+        p->flash_mmu_pro[s] = 0x100;
+        p->flash_mmu_app[s] = 0x100;
+    }
+}
 
 /* ---- DPORT ---- */
 
 /* ESP32 peripheral interrupt source numbers for cross-core interrupts */
 #define FROM_CPU_INTR0_SOURCE 24
 #define FROM_CPU_INTR1_SOURCE 25
-#define FROM_CPU_INTR2_SOURCE 28
-#define FROM_CPU_INTR3_SOURCE 29
+#define FROM_CPU_INTR2_SOURCE 26
+#define FROM_CPU_INTR3_SOURCE 27
 
 /* DPORT offsets for cross-core interrupt registers */
 #define DPORT_CPU_INTR_FROM_CPU_0_OFF 0x0DC
@@ -155,13 +203,49 @@ static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert
     }
 }
 
+/* Map one flash MMU table entry into the CPU page table (shared for both
+ * cores; firmware writes identical mappings per core in practice).
+ * Entry layout (real hardware / IDF mmu_ll): 0-63 = DROM0 window
+ * (0x3F400000+), 64-127 = IRAM0 cache window (0x40080000+). */
+static void flash_mmu_map_entry(esp32_periph_t *p, uint32_t entry, uint32_t val) {
+    if (getenv("FLEXE_DBG_FLASH"))
+        fprintf(stderr, "[MMUTBL] entry=%u val=0x%X (pp=0x%X)\n", entry, val, val << 16);
+    if (entry >= 128) return;
+    uint32_t pp = val << 16;                 /* 64 KB units -> bytes */
+    if (pp + 0x10000 > (4u * 1024 * 1024)) return;
+    xtensa_mem_t *mem = p->mem;
+    if (entry < 64) {                        /* DROM window */
+        for (uint32_t off = 0; off < 0x10000; off += 4096)
+            mem->page_table[(0x3F400000u >> 12) + (entry << 4) + (off >> 12)] =
+                mem->flash_data + pp + off;
+    } else {                                 /* IROM window */
+        /* Real entry layout (IDF mmu_ll): entry 64 ↔ vaddr 0x40000000,
+         * so the flash text window 0x400D0000-0x40400000 maps to entries
+         * 77-127. Only remap pages in the emulator's flash instruction
+         * window — lower vaddrs alias ROM/internal IRAM. */
+        uint32_t vbase = 0x40000000u + (entry - 64) * 0x10000u;
+        if (vbase >= 0x400C2000u) {
+            for (uint32_t off = 0; off < 0x10000; off += 4096)
+                mem->page_table[(vbase >> 12) + (off >> 12)] =
+                    mem->flash_insn + pp + off;
+        }
+    }
+}
+
 static uint32_t dport_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - DPORT_BASE;
+    /* Flash MMU tables: PRO 0x3FF10000-0x3FF103FF, APP 0x3FF12000-0x3FF123FF */
+    if (off >= 0x10000 && off < 0x10400)
+        return p->flash_mmu_pro[(off - 0x10000) >> 2];
+    if (off >= 0x12000 && off < 0x12400)
+        return p->flash_mmu_app[(off - 0x12000) >> 2];
     switch (off) {
     case 0x018: return p->app_cpu_in_reset ? 1 : 0; /* APPCPU_CTRL_D: reset state */
     case 0x02C: return p->app_cpu_in_reset ? 0 : 1; /* APPCPU_CTRL_A: clock gate */
     case 0x030: return p->app_cpu_in_reset ? 0 : 1; /* APPCPU_CTRL_B: clock enable */
+    case 0x0D4: return p->bt_lpck[0];   /* DPORT_BT_LPCK_DIV_INT */
+    case 0x0D8: return p->bt_lpck[1];   /* DPORT_BT_LPCK_DIV_FRAC */
     case 0x040: return 0x0A;        /* PRO_CACHE_CTRL: cache enabled */
     case 0x044: return 0x0A;        /* PRO_CACHE_CTRL1 */
     case 0x058: return 0x0A;        /* APP_CACHE_CTRL: cache enabled */
@@ -197,7 +281,25 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
 static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - DPORT_BASE;
+    /* Flash MMU tables: PRO 0x3FF10000-0x3FF103FF, APP 0x3FF12000-0x3FF123FF.
+     * Entry value = 64 KB flash page mapped into that vaddr slot; entries
+     * 0-63 = DROM (0x3F400000+), 64-127 = IROM (0x400C2000+) — the same
+     * model as stub_cache_flash_mmu_set. */
+    if (off >= 0x10000 && off < 0x10400) {
+        uint32_t entry = (off - 0x10000) >> 2;
+        p->flash_mmu_pro[entry] = val;
+        flash_mmu_map_entry(p, entry, val);
+        return;
+    }
+    if (off >= 0x12000 && off < 0x12400) {
+        uint32_t entry = (off - 0x12000) >> 2;
+        p->flash_mmu_app[entry] = val;
+        flash_mmu_map_entry(p, entry, val);
+        return;
+    }
     switch (off) {
+    case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
+    case 0x0D8: p->bt_lpck[1] = val; break;  /* DPORT_BT_LPCK_DIV_FRAC */
     case 0x02C: /* APPCPU_CTRL_A: writing 1 releases APP_CPU from reset */
         if (val & 1) p->app_cpu_in_reset = false;
         break;
@@ -434,6 +536,77 @@ static void efuse_write(void *ctx, uint32_t addr, uint32_t val) {
     (void)ctx; (void)addr; (void)val;
 }
 
+/* ---- TIMG LACT (esp_timer hardware timebase) ---- */
+
+#define LACT_CFG_EN        (1u << 31)   /* TIMG_LACT_EN */
+#define LACT_CFG_ALARM_EN  (1u << 10)   /* TIMG_LACT_ALARM_EN */
+#define LACT_INT_BIT       (1u << 3)    /* TIMG_LACT_INT_ENA/RAW/ST/CLR */
+#define TG_LACT_LEVEL_SRC(g) ((g) == 0 ? 17 : 21)  /* ETS_TGn_LACT_LEVEL */
+
+static uint32_t lact_divider(const lact_state_t *l) {
+    uint32_t d = (l->config >> 13) & 0xFFFF;
+    return d ? d : 1;
+}
+
+/* Live 64-bit LACT counter in timer ticks (cpu0 ccount / DIVIDER). */
+static uint64_t lact_counter(const esp32_periph_t *p, int group) {
+    const lact_state_t *l = &p->lact[group];
+    uint64_t cc = p->cpu[0] ? p->cpu[0]->ccount : 0;
+    uint32_t div = lact_divider(l);
+    uint64_t ticks = cc / div;
+    if (l->loaded) {
+        uint64_t base = l->load_ccount / div;
+        ticks = ticks - base + l->load;
+    }
+    return ticks;
+}
+
+/* Re-evaluate the alarm condition and drive the level interrupt source.
+ * Hardware: INT_RAW sets when counter >= alarm with ALARM_EN; the source
+ * line asserts while (INT_RAW & INT_ENA). */
+static void lact_eval_irq(esp32_periph_t *p, int group) {
+    lact_state_t *l = &p->lact[group];
+    if ((l->config & LACT_CFG_ALARM_EN) && lact_counter(p, group) >= l->alarm)
+        l->int_raw |= LACT_INT_BIT;
+    bool level = (l->int_raw & l->int_ena & LACT_INT_BIT) != 0;
+    if (level != l->level) {
+        l->level = level;
+        intr_matrix_update_source(p, TG_LACT_LEVEL_SRC(group), level);
+    }
+}
+
+/* Next cpu ccount at which a LACT alarm will fire (for next_timer_event). */
+static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    uint64_t best = UINT32_MAX;
+    for (int group = 0; group < 2; group++) {
+        lact_state_t *l = &p->lact[group];
+        if (!(l->config & LACT_CFG_ALARM_EN)) continue;
+        uint64_t now = lact_counter(p, group);
+        if (now >= l->alarm) return cpu->ccount;   /* fire now */
+        uint64_t cycles = (l->alarm - now) * lact_divider(l);
+        uint64_t event = (uint64_t)cpu->ccount + cycles;
+        if (event > UINT32_MAX) event = UINT32_MAX;
+        if (event < best) best = event;
+    }
+    return (uint32_t)best;
+}
+
+/* CPU hooks (registered on both cores, wired into next_timer_event). */
+static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
+    return lact_next_fire((esp32_periph_t *)cpu->periph_event_ctx, cpu);
+}
+static void periph_event_hook(xtensa_cpu_t *cpu) {
+    esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
+    for (int group = 0; group < 2; group++)
+        lact_eval_irq(p, group);
+}
+
+/* Recompute both cores' next_timer_event after LACT state changes. */
+static void lact_kick(esp32_periph_t *p) {
+    for (int core = 0; core < 2; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
 /* ---- TIMG WDT (shared for TIMG0 and TIMG1) ---- */
 
 static uint32_t timg_read(void *ctx, uint32_t addr) {
@@ -442,6 +615,7 @@ static uint32_t timg_read(void *ctx, uint32_t addr) {
     uint32_t base = group ? TIMG1_BASE : TIMG0_BASE;
     uint32_t off = addr - base;
     wdt_state_t *w = &p->timg_wdt[group];
+    lact_state_t *l = &p->lact[group];
 
     switch (off) {
     case 0x048: return w->config0;   /* TIMG_WDTCONFIG0_REG */
@@ -462,6 +636,19 @@ static uint32_t timg_read(void *ctx, uint32_t addr) {
         return 0x00008000;           /* RDY bit 15 set */
     }
     case 0x06C: return (267 << 7);   /* TIMG_RTCCALICFG1_REG: ~267 XTAL cycles per slow_clk */
+    /* LACT (low-alarm-counter) — esp_timer hardware timebase */
+    case 0x070: return l->config;
+    case 0x074: return l->rtc;
+    case 0x078: return (uint32_t)lact_counter(p, group);           /* LACTLO */
+    case 0x07C: return (uint32_t)(lact_counter(p, group) >> 32);   /* LACTHI */
+    case 0x080: return 0;                                          /* LACTUPDATE */
+    case 0x084: return (uint32_t)l->alarm;                         /* LACTALARMLO */
+    case 0x088: return (uint32_t)(l->alarm >> 32);                 /* LACTALARMHI */
+    case 0x08C: return (uint32_t)l->load;                          /* LACTLOADLO */
+    case 0x090: return (uint32_t)(l->load >> 32);                  /* LACTLOADHI */
+    case 0x098: return l->int_ena;                                 /* INT_ENA_TIMERS */
+    case 0x09C: lact_eval_irq(p, group); return l->int_raw;        /* INT_RAW_TIMERS */
+    case 0x0A0: lact_eval_irq(p, group); return l->int_raw & l->int_ena; /* INT_ST_TIMERS */
     default: return 0;
     }
 }
@@ -472,6 +659,7 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
     uint32_t base = group ? TIMG1_BASE : TIMG0_BASE;
     uint32_t off = addr - base;
     wdt_state_t *w = &p->timg_wdt[group];
+    lact_state_t *l = &p->lact[group];
 
     switch (off) {
     case 0x048: w->config0 = val; break;
@@ -488,6 +676,23 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
         cal->reads_since = 0;
         break;
     }
+    /* LACT (low-alarm-counter) — esp_timer hardware timebase */
+    case 0x070: l->config = val; lact_eval_irq(p, group); lact_kick(p); break;
+    case 0x074: l->rtc = val; break;
+    case 0x080: break;               /* LACTUPDATE: reads are live, no latch needed */
+    case 0x084: l->alarm = (l->alarm & 0xFFFFFFFF00000000ull) | val;
+               lact_eval_irq(p, group); lact_kick(p); break;
+    case 0x088: l->alarm = (l->alarm & 0xFFFFFFFFull) | ((uint64_t)val << 32);
+               lact_eval_irq(p, group); lact_kick(p); break;
+    case 0x08C: l->load = (l->load & 0xFFFFFFFF00000000ull) | val; break;
+    case 0x090: l->load = (l->load & 0xFFFFFFFFull) | ((uint64_t)val << 32); break;
+    case 0x094:                    /* LACTLOAD: counter := load value */
+        l->loaded = true;
+        l->load_ccount = p->cpu[0] ? p->cpu[0]->ccount : 0;
+        lact_eval_irq(p, group); lact_kick(p);
+        break;
+    case 0x098: l->int_ena = val; lact_eval_irq(p, group); break;  /* INT_ENA_TIMERS */
+    case 0x0A4: l->int_raw &= ~val; lact_eval_irq(p, group); break; /* INT_CLR_TIMERS */
     default: break;
     }
 }
@@ -546,6 +751,11 @@ static void spi_flash_read_data(esp32_periph_t *p, spi_state_t *s,
         uint32_t avail = EMU_FLASH_SIZE - off;
         if ((uint32_t)bytes > avail) bytes = (int)avail;
         memcpy(s->w, p->mem->flash_data + off, (size_t)bytes);
+    }
+    if (getenv("FLEXE_SPIDBG") && off < 0x20000) {
+        fprintf(stderr, "[SPIRD] off=0x%X bytes=%d w0=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                off, bytes, s->w[0], s->w[1], s->w[2], s->w[3],
+                s->w[4], s->w[5], s->w[6], s->w[7]);
     }
 }
 
@@ -719,12 +929,16 @@ static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
 static uint32_t default_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     p->unhandled_count++;
+    if (getenv("FLEXE_PERIPHDBG"))
+        fprintf(stderr, "[PERIPH] unhandled read  0x%08X pc=0x%08X\n", addr, g_dbg_pc);
     return 0;
 }
 
 static void default_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
     p->unhandled_count++;
+    if (getenv("FLEXE_PERIPHDBG"))
+        fprintf(stderr, "[PERIPH] unhandled write 0x%08X <- 0x%08X pc=0x%08X\n", addr, val, g_dbg_pc);
 }
 
 /* ---- Public API ---- */
@@ -738,6 +952,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Initialize interrupt matrix: all lines disabled (source 16 = none) */
     memset(p->intr_matrix, 16, sizeof(p->intr_matrix));
 
+    /* Bootloader-style initial flash MMU contents (app at flash 0x10000) */
+    flash_mmu_init_bootloader(p);
+
     /* Register default handler on all 128 peripheral pages */
     for (int i = 0; i < 128; i++)
         mem_register_mmio(mem, i, default_read, default_write, p);
@@ -746,6 +963,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* DPORT: pages 0-4 (0x3FF00000 - 0x3FF04FFF) */
     for (int i = 0; i <= 4; i++)
         mem_register_mmio(mem, (int)PAGE_OF(DPORT_BASE) + i, dport_read, dport_write, p);
+    /* DPORT flash MMU tables: PRO 0x3FF10000, APP 0x3FF12000 */
+    mem_register_mmio(mem, (int)PAGE_OF(0x3FF10000u), dport_read, dport_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(0x3FF12000u), dport_read, dport_write, p);
 
     /* UART0 */
     mem_register_mmio(mem, (int)PAGE_OF(UART0_BASE), uart0_read, uart0_write, p);
@@ -831,6 +1051,15 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     if (!p) return;
     p->cpu[0] = cpu0;
     p->cpu[1] = cpu1;
+    /* Wire the TIMG LACT timer-event hooks into both cores so esp_timer
+     * alarms fire on time (and can wake the cores from WAITI). */
+    for (int i = 0; i < 2; i++) {
+        xtensa_cpu_t *c = i == 0 ? cpu0 : cpu1;
+        if (!c) continue;
+        c->periph_event_ctx = p;
+        c->periph_next_event = periph_next_event_hook;
+        c->periph_event = periph_event_hook;
+    }
 }
 
 void periph_assert_interrupt(esp32_periph_t *p, int source) {

@@ -120,6 +120,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     rom_stubs_set_single_core(s->rom, cfg->single_core);
     rom_stubs_set_native_freertos(s->rom, cfg->native_freertos);
     rom_stubs_set_periph(s->rom, s->periph);
+    rom_stubs_hook_firmware_addrs(s->rom, res.entry_point);
     if (s->syms)
         rom_stubs_hook_symbols(s->rom, s->syms);
 
@@ -227,6 +228,17 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
 
     /* Pre-decode instruction memory for fast fetch */
     xtensa_predecode_build(&s->cpu[0]);
+
+    if (getenv("FLEXE_PDCHK")) {
+        uint32_t a = (uint32_t)strtoul(getenv("FLEXE_PDCHK"), NULL, 0);
+        uint32_t pk = s->cpu[0].predecode[a - PREDECODE_BASE];
+        uint32_t insn;
+        int il = xtensa_fetch(&s->cpu[0], a, &insn);
+        fprintf(stderr, "[PDCHK] 0x%08X: predecode=%06X/%u fetch=%06X/%d page=%p flash_insn=%p off=0x%lX\n",
+                a, PREDECODE_INSN(pk), PREDECODE_ILEN(pk), insn, il,
+                (void *)s->mem->page_table[a >> 12], (void *)s->mem->flash_insn,
+                s->mem->page_table[a >> 12] ? (long)(s->mem->page_table[a >> 12] - s->mem->flash_insn) : -1L);
+    }
 
     /* Set entry point */
     if (cfg->entry_override != 0)

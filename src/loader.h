@@ -9,6 +9,7 @@
 typedef struct {
     uint32_t addr;
     uint32_t size;
+    uint32_t image_off;  /* file offset of segment data within its image */
 } segment_info_t;
 
 typedef struct {

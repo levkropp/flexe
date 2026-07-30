@@ -13,11 +13,22 @@
 /* Set PC from instruction handler (branch/call/ret/exception) and mark it */
 #define BRANCH_TO(cpu, addr) do { (cpu)->pc = (addr); (cpu)->_pc_written = true; } while(0)
 
+/* TEMP DEBUG: window-ops trace + forward decls (definitions near bottom) */
+extern int g_dbg_winlog;
+extern int g_dbg_c1ilog;
+extern uint32_t g_dbg_watch_addr;
+extern uint32_t g_dbg_watch_addr2;
+extern uint32_t g_dbg_watch_val;
+#define WINLOG(cpu, fmt, ...) do { if (g_dbg_winlog) \
+    fprintf(stderr, "[W%d] %s pc=0x%08X wb=%d ws=%04X " fmt, \
+            (cpu)->core_id, __func__, (cpu)->pc, (cpu)->windowbase, \
+            (cpu)->windowstart, ##__VA_ARGS__); } while (0)
+
 /* Recompute the nearest ccompare value for timer batching.
  * A ccompare in the past (wrapped distance >= 2^31) is due NOW — give it
  * distance 0 so it is picked and fired at the next opportunity. A ccompare
  * of 0 is treated as disarmed (matches init / no-timer state). */
-static inline void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
+static inline void xtensa_recompute_next_timer_impl(xtensa_cpu_t *cpu) {
     uint32_t d0 = cpu->ccompare[0] ? cpu->ccompare[0] - cpu->ccount : UINT32_MAX;
     uint32_t d1 = cpu->ccompare[1] ? cpu->ccompare[1] - cpu->ccount : UINT32_MAX;
     uint32_t d2 = cpu->ccompare[2] ? cpu->ccompare[2] - cpu->ccount : UINT32_MAX;
@@ -32,6 +43,15 @@ static inline void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
         cpu->next_timer_event = cpu->ccompare[2];
     if (!cpu->ccompare[0] && !cpu->ccompare[1] && !cpu->ccompare[2])
         cpu->next_timer_event = UINT32_MAX;
+    /* Fold in peripheral timer events (TIMG LACT alarms) */
+    if (cpu->periph_next_event) {
+        uint32_t e = cpu->periph_next_event(cpu);
+        if (e < cpu->next_timer_event) cpu->next_timer_event = e;
+    }
+}
+
+void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
+    xtensa_recompute_next_timer_impl(cpu);
 }
 
 /* Fire any ccompare timers whose time has arrived, hardware semantics:
@@ -47,7 +67,9 @@ static inline void xtensa_fire_timers(xtensa_cpu_t *cpu) {
     if (cpu->ccompare[2] && (int32_t)(cpu->ccount - cpu->ccompare[2]) >= 0)
         cpu->interrupt |= (1u << 16);
     if (cpu->interrupt != old) cpu->irq_check = true;
-    xtensa_recompute_next_timer(cpu);
+    /* Peripheral timer events (TIMG LACT alarms) */
+    if (cpu->periph_event) cpu->periph_event(cpu);
+    xtensa_recompute_next_timer_impl(cpu);
 }
 
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
@@ -91,6 +113,9 @@ void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
     /* Window registers */
     cpu->windowbase = 0;
     cpu->windowstart = 1;   /* Window 0 is valid */
+    /* Default every slot to call8 (the near-universal IDF/GCC call size);
+     * ENTRY records the real callsize as windows are created. */
+    memset(cpu->window_callsize, 2, sizeof(cpu->window_callsize));
 
     /* SAR undefined, set to 0 */
     cpu->sar = 0;
@@ -349,6 +374,34 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
 
 #define EXCMLEVEL 3  /* ESP32 XCHAL_EXCM_LEVEL=3: when EXCM=1, levels 1-3 masked */
 
+static void synth_spill_window(xtensa_cpu_t *cpu, int widx);
+
+/*
+ * SPILL_ALL_WINDOWS emulation.
+ *
+ * On real hardware, every interrupt entry runs _xt_context_save, which executes
+ * SPILL_ALL_WINDOWS: all live register windows of the interrupted context are
+ * flushed to its stack via WindowOverflow exceptions, and their WindowStart
+ * bits are cleared. flexe does not deliver window exceptions, so the flush is
+ * done here, at interrupt delivery. Without it, an outgoing task's caller
+ * windows stay marked valid in the register file; after a context switch the
+ * incoming task's first RETW can then consume a foreign task's window data
+ * (wrong stack, wrong task), corrupting the task context permanently.
+ *
+ * The spill bases are computed from each window's own a1 chain (intact at
+ * delivery), so the flush also establishes a consistent spill_stack state for
+ * the ISR and for the eventually-restored task: post-interrupt underflow
+ * fills pop the flush's entries in LIFO order, which is correct both when
+ * returning to the same task and after a context switch.
+ */
+void xtensa_flush_windows(xtensa_cpu_t *cpu) {
+    for (int w = 1; w < 16; w++) {
+        int idx = (cpu->windowbase + w) & 0xF;
+        if (cpu->windowstart & (1u << idx))
+            synth_spill_window(cpu, idx);
+    }
+}
+
 void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
     uint32_t pending = cpu->interrupt & cpu->intenable;
     if (!pending) return;
@@ -368,6 +421,8 @@ void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
         tmp &= tmp - 1;  /* clear lowest set bit */
     }
     if (best_level == 0) return;
+
+    xtensa_flush_windows(cpu);
 
     if (best_level == 1) {
         /* Level-1: dispatched as exception */
@@ -420,19 +475,39 @@ static inline void phys_write(xtensa_cpu_t *cpu, int widx, int reg, uint32_t val
  * This avoids the bug where searching via WindowStart skips spilled
  * intermediate windows and lands on a distant window sharing the same SP base.
  */
+/* Resolve a window slot's callsize: prefer the per-slot value recorded at
+ * ENTRY (a window's callsize is a property of its creation call, not of
+ * its a0 — tail-called frames can have a0=0); fall back to a0's top bits,
+ * then to call8 (the IDF/GCC default). */
+static int window_callsize_of(const xtensa_cpu_t *cpu, int widx) {
+    int cs = cpu->window_callsize[widx & 0xF];
+    if (cs == 0) cs = (phys_read(cpu, widx, 0) >> 30) & 3;
+    if (cs == 0) cs = 2;
+    return cs;
+}
+
+/* Find the callee window for widx: the window widx called. The live call
+ * chain is uniquely determined by each window's creation callsize (the
+ * distance to its caller), so walk backward from the current windowbase:
+ * the first window whose backward step lands on widx is its callee. This
+ * is exact for mixed call4/call8/call12 chains — a naive "smallest d with
+ * matching callsize" search misfires on intermediate slots and picks the
+ * wrong callee, skewing the spill area one frame away from the fill. */
 static int find_callee_window(xtensa_cpu_t *cpu, int widx) {
-    uint32_t a0 = phys_read(cpu, widx, 0);
-    int callsize = (a0 >> 30) & 3;
-    if (callsize == 0) {
-        /* callsize=0 not valid for windowed calls; search fallback */
-        for (int i = 1; i < 16; i++) {
-            int w = (widx + i) & 0xF;
-            if (cpu->windowstart & (1u << w))
-                return w;
-        }
-        return widx;
+    int w = cpu->windowbase;
+    for (int steps = 0; steps < 16; steps++) {
+        int caller = (w - window_callsize_of(cpu, w)) & 0xF;
+        if (caller == widx) return w;
+        w = caller;
+        if (w == (int)cpu->windowbase) break;
     }
-    return (widx + callsize) & 0xF;
+    /* Fallback: next valid window up the ring */
+    for (int i = 1; i < 16; i++) {
+        int c = (widx + i) & 0xF;
+        if (cpu->windowstart & (1u << c))
+            return c;
+    }
+    return widx;
 }
 
 /*
@@ -441,11 +516,12 @@ static int find_callee_window(xtensa_cpu_t *cpu, int widx) {
  * and records the base in spill_base[] for underflow restore.
  */
 static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
-    uint32_t a0 = phys_read(cpu, widx, 0);
-    int callsize = (a0 >> 30) & 3;
-
-    /* Use callee's SP as base (matches real hardware overflow handler) */
+    /* The callee's SP is the base pointer (hardware overflow convention),
+     * and the callee's creation callsize gates how many of the spilled
+     * window's registers go to the stack (call4: a0-a3, call8: +a4-a7,
+     * call12: +a8-a11) — NOT the spilled window's own callsize. */
     int callee = find_callee_window(cpu, widx);
+    int callsize = window_callsize_of(cpu, callee);
     uint32_t base = phys_read(cpu, callee, 1);
 
     if (cpu->window_trace && cpu->window_trace_active) {
@@ -483,10 +559,20 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
     }
 
     int nregs = 4;
-    /* Always save base 4 regs: a0-a3 at base-16 (on stack for firmware compat)
-     * AND to CPU-side buffer (for correct restore immune to stack overwrites) */
+    /* Save to the stack at the hardware spill-area addresses: a0-a3 at
+     * [base-16] always; a4-a7 at [base-32] for call8+; a8-a11 at [base-48]
+     * for call12 only. The remaining registers are preserved transitively
+     * through the window ring (they are shared with neighbouring windows
+     * whose own spills cover them), exactly like the hardware overflow
+     * handlers — writing them unconditionally would trash live frames. */
     for (int i = 0; i < 4; i++)
         mem_write32(cpu->mem, base - 16 + i * 4, phys_read(cpu, widx, i));
+    if (callsize >= 2)
+        for (int i = 0; i < 4; i++)
+            mem_write32(cpu->mem, base - 32 + i * 4, phys_read(cpu, widx, 4 + i));
+    if (callsize == 3)
+        for (int i = 0; i < 4; i++)
+            mem_write32(cpu->mem, base - 48 + i * 4, phys_read(cpu, widx, 8 + i));
     {
         int si0 = widx & 0xF;
         int d0 = cpu->spill_stack[si0].depth - 1; /* depth was already incremented */
@@ -498,25 +584,23 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
 
     if (callsize >= 2) {
         nregs = 8;
-        /* CALL8+: save a4-a7 to CPU-side buffer (not stack).
-         * On real hardware these go to grandparent_sp - 32, but computing
-         * the grandparent requires a chain of stack links.  Storing in a
-         * CPU buffer avoids corruption when deeper calls overwrite stack. */
-        int si2 = widx & 0xF;
-        int d2 = cpu->spill_stack[si2].depth - 1; /* depth was already incremented */
-        if (d2 >= 0 && d2 < SPILL_STACK_DEPTH) {
-            for (int i = 0; i < 4; i++)
-                cpu->spill_stack[si2].extra[d2][i] = phys_read(cpu, widx, 4 + i);
-        }
     }
     if (callsize == 3) {
         nregs = 12;
-        /* CALL12: also save a8-a11 to CPU-side buffer */
+    }
+    /* Always save a4-a11 to the CPU-side buffer for every spill, regardless
+     * of callsize (not stack: on real hardware these go to grandparent/outer
+     * frames, but computing those requires a chain of stack links; the CPU
+     * buffer avoids corruption when deeper calls overwrite stack).
+     * Saving unconditionally matters: a window's callsize as seen at fill
+     * time (from the restored a0) can differ from what it was at spill time,
+     * and a fill that finds no saved extras would restore stale garbage. */
+    {
         int si2 = widx & 0xF;
-        int d2 = cpu->spill_stack[si2].depth - 1;
+        int d2 = cpu->spill_stack[si2].depth - 1; /* depth was already incremented */
         if (d2 >= 0 && d2 < SPILL_STACK_DEPTH) {
-            for (int i = 0; i < 4; i++)
-                cpu->spill_stack[si2].extra[d2][4 + i] = phys_read(cpu, widx, 8 + i);
+            for (int i = 0; i < 8; i++)
+                cpu->spill_stack[si2].extra[d2][i] = phys_read(cpu, widx, 4 + i);
         }
     }
 
@@ -540,6 +624,9 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
 
     /* Clear windowstart bit for this window */
     cpu->windowstart &= ~(1u << (widx & 0xF));
+    WINLOG(cpu, "SPILL w%d callee=w%d base=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
+           widx, callee, base, phys_read(cpu, widx, 0), phys_read(cpu, widx, 1),
+           phys_read(cpu, widx, 2), phys_read(cpu, widx, 3));
 }
 
 /*
@@ -575,67 +662,64 @@ static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
 /*
  * Underflow fill: called during RETW when the caller's windowstart
  * bit is clear (registers were spilled and need restoration).
- * Uses the recorded spill_base (where overflow actually saved the data).
+ *
+ * Source selection: the hardware underflow handler fills from the stack at
+ * [callee_sp-16] — per-context memory that is always task-correct. flexe's
+ * CPU-side spill buffer is only authoritative when its recorded base matches
+ * the current callee SP (same execution context, e.g. MOVSP between spill
+ * and fill); a LIFO top entry from a *different* context (interrupts, task
+ * switches) must never be used, so buffer entries are matched by base rather
+ * than popped blindly.
  */
-static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
-    /* Pop from the spill stack to get the correct base for this nesting level.
-     * Window slots can be spilled multiple times when the ring wraps, and each
-     * spill pushes onto the stack. The innermost (most recent) spill is on top
-     * and corresponds to the next RETW that needs filling. */
-    int si = ret_wb & 0xF;
-    uint32_t callee_sp = phys_read(cpu, owb, 1);
-    uint32_t base;
-    int fill_depth = -1; /* depth index used for CPU buffer restore */
-    if (cpu->spill_stack[si].depth > 0) {
-        cpu->spill_stack[si].depth--;
-        int d = cpu->spill_stack[si].depth;
-        fill_depth = d;
-        base = (d < SPILL_STACK_DEPTH) ? cpu->spill_stack[si].base[d] : callee_sp;
-        /* Sanity check: base must be in valid data memory range.
-         * If depth tracking is out of sync, we may pop a stale/wrong entry. */
-        if (base < 0x3F800000 || base > 0x3FFFFFFF) {
-            base = callee_sp;
-            fill_depth = -1; /* don't trust CPU buffer either */
+static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int callsize) {
+    uint32_t base = phys_read(cpu, owb, 1);  /* callee SP (hardware convention) */
+
+    /* Find the innermost spill record whose base matches the current callee
+     * SP. Records are pushed per physical window slot, but a logical window's
+     * slot shifts when windowbase changes across exception/dispatch paths, so
+     * the match must search every slot's stack by base (the base is derived
+     * from the window's own a1 chain and is stable across slot moves).
+     * Entries above the match (if any) are stale leftovers and are discarded. */
+    int m_si = -1, m_d = -1;
+    for (int s = 0; s < 16 && m_d < 0; s++) {
+        for (int d = cpu->spill_stack[s].depth - 1; d >= 0; d--) {
+            if (cpu->spill_stack[s].base[d] == base) { m_si = s; m_d = d; break; }
         }
-    } else {
-        base = callee_sp;
+    }
+    if (m_si >= 0) {
+        cpu->spill_stack[m_si].depth = m_d;  /* consume match + stale above */
     }
 
-    /* Restore a0-a3 from CPU-side buffer (immune to stack overwrites),
-     * falling back to stack memory if buffer unavailable */
-    if (fill_depth >= 0 && fill_depth < SPILL_STACK_DEPTH) {
+    /* Restore from the stack at the hardware spill-area addresses: a0-a3 at
+     * [base-16] always; a4-a7 at [base-32] for call8+; a8-a11 at [base-48]
+     * for call12 only. The stack is per-context memory (each task's own
+     * stack), so a fill can never pick up a foreign context's values —
+     * unlike the CPU-side records, whose base matching collided across
+     * interrupts/task switches and restored the wrong window's registers
+     * (see -V SPILL_CORRUPT reports). The gating callsize is the rotation n
+     * from exec_retw, derived from the returning window's a0 — always valid
+     * at retw (retw itself needs a0 for the PC) and always local to this
+     * context, unlike the per-slot window_callsize[] ENTRY records which a
+     * context switch leaves holding a foreign task's values. */
+    for (int i = 0; i < 4; i++)
+        phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, base - 16 + i * 4));
+
+    /* Self-heal the per-slot callsize record from the just-restored a0:
+     * after a context switch the ENTRY-era record belongs to a foreign
+     * context, but a0's top bits always encode this window's true creation
+     * callsize, refreshing the record for later callee-resolution walks. */
+    {
+        int healed = (int)(phys_read(cpu, ret_wb, 0) >> 30);
+        if (healed)
+            cpu->window_callsize[ret_wb & 0xF] = (uint8_t)healed;
+    }
+
+    if (callsize >= 2)
         for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, i, cpu->spill_stack[si].core[fill_depth][i]);
-    } else {
+            phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, base - 32 + i * 4));
+    if (callsize == 3)
         for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, base - 16 + i * 4));
-    }
-
-    /* Check restored a0 for call size to determine extra regs */
-    uint32_t a0 = phys_read(cpu, ret_wb, 0);
-    int callsize = (a0 >> 30) & 3;
-
-    if (callsize >= 2) {
-        /* Restore a4-a7 from CPU-side buffer */
-        if (fill_depth >= 0 && fill_depth < SPILL_STACK_DEPTH) {
-            for (int i = 0; i < 4; i++)
-                phys_write(cpu, ret_wb, 4 + i, cpu->spill_stack[si].extra[fill_depth][i]);
-        } else {
-            for (int i = 0; i < 4; i++)
-                phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, base - 32 + i * 4));
-        }
-    }
-    if (callsize == 3) {
-        /* Restore a8-a11 from CPU-side buffer */
-        int d = fill_depth;
-        if (d >= 0 && d < SPILL_STACK_DEPTH) {
-            for (int i = 0; i < 4; i++)
-                phys_write(cpu, ret_wb, 8 + i, cpu->spill_stack[si].extra[d][4 + i]);
-        } else {
-            for (int i = 0; i < 4; i++)
-                phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
-        }
-    }
+            phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
 
     /* Verify restored values match what was originally spilled */
     if (cpu->spill_verify) {
@@ -662,6 +746,8 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
     }
 
     if (cpu->window_trace && cpu->window_trace_active) {
+        uint32_t a0 = phys_read(cpu, ret_wb, 0);
+        int callsize = (a0 >> 30) & 3;
         fprintf(stderr, "     [WIN] FILL  w%d (call%d) base=0x%08X [spill_base={",
                 ret_wb, callsize * 4, base);
         for (int _i = 0; _i < 16; _i++)
@@ -682,6 +768,10 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
 
     /* Set windowstart bit */
     cpu->windowstart |= (1u << (ret_wb & 0xF));
+    WINLOG(cpu, "FILL w%d base=%08X match=%d/%d a0=%08X a1=%08X a2=%08X a3=%08X\n",
+           ret_wb, base, m_si, m_d, phys_read(cpu, ret_wb, 0),
+           phys_read(cpu, ret_wb, 1), phys_read(cpu, ret_wb, 2),
+           phys_read(cpu, ret_wb, 3));
 }
 
 /*
@@ -693,7 +783,14 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb) {
 static void exec_retw(xtensa_cpu_t *cpu) {
     uint32_t a0 = ar_read(cpu, 0);
     int n = (a0 >> 30) & 3;
-    if (n == 0) n = 4;  /* n=0 encoding not used; safety fallback */
+    if (n == 0) {
+        /* a0's top bits are 0 — tail-called/entry-created window where a0
+         * does not encode the creation callsize; use the value tracked at
+         * ENTRY. Hardware rotates by a0's bits (0) here, but a live frame
+         * that is actually returned through always has a tracked callsize. */
+        n = cpu->window_callsize[cpu->windowbase];
+        if (n == 0) n = 4;
+    }
 
     uint32_t next_pc = (cpu->pc & 0xC0000000) | (a0 & 0x3FFFFFFF);
 
@@ -705,10 +802,14 @@ static void exec_retw(xtensa_cpu_t *cpu) {
         fprintf(stderr, "     [WIN] RETW wb=%d->%d (n=%d) UNDERFLOW WS=0x%04X\n",
                 owb, ret_wb, n, cpu->windowstart);
     }
+    WINLOG(cpu, "RETW n=%d owb=%d ret_wb=%d a0=%08X a1=%08X fill=%d\n",
+           n, owb, ret_wb, a0, ar_read(cpu, 1), (int)need_fill);
 
     if (need_fill) {
-        /* Caller's window was spilled — fill it back */
-        synth_underflow_fill(cpu, ret_wb, owb);
+        /* Caller's window was spilled — fill it back. n (from the returning
+         * window's a0) is the fill width, matching the hardware underflow
+         * vector selection and immune to cross-context metadata staleness. */
+        synth_underflow_fill(cpu, ret_wb, owb, n);
     }
 
     /* Clear current window's WS bit */
@@ -1063,16 +1164,20 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 case 0: /* RFET: RFE, RFWO, RFWU */
                     switch (s) {
                     case 0: /* RFE */
+                        WINLOG(cpu, "RFE epc=%08X ps=%08X a1=%08X\n",
+                               cpu->epc[0], cpu->ps, ar_read(cpu, 1));
                         XT_PS_SET_EXCM(cpu->ps, 0);
                         BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     case 4: /* RFWO */
+                        WINLOG(cpu, "RFWO epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
                         cpu->windowstart &= ~(1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
                         BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     case 5: /* RFWU */
+                        WINLOG(cpu, "RFWU epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
                         cpu->windowstart |= (1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
@@ -1551,6 +1656,12 @@ void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
     case 0xE: /* S32C1I (conditional store) */
         { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 2);
           uint32_t old = mem_read32(cpu->mem, addr);
+          if (__builtin_expect(g_dbg_c1ilog && old != 0xB33FFFFFu
+                  && old != 0x0000CDCDu && old != 0x0001CDCDu
+                  && addr < 0x40000000u, 0)) {
+              fprintf(stderr, "[C1I] garbage read pc=0x%08X addr=0x%08X old=0x%08X core%d\n",
+                      cpu->pc, addr, old, cpu->core_id);
+          }
           if (old == cpu->scompare1)
               mem_write32(cpu->mem, addr, ar_read(cpu, t));
           ar_write(cpu, t, old);
@@ -1749,8 +1860,11 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
               uint32_t owb = cpu->windowbase;
               cpu->windowbase = (owb + callinc) & 0xF;
               cpu->windowstart |= (1u << cpu->windowbase);
+              cpu->window_callsize[cpu->windowbase] = (uint8_t)callinc;
               XT_PS_SET_OWB(cpu->ps, owb);
               XT_PS_SET_CALLINC(cpu->ps, 0);
+              WINLOG(cpu, "ENTRY callinc=%d owb=%d nwb=%d a1=%08X\n",
+                     callinc, owb, cpu->windowbase, ar_read(cpu, 1));
           } break;
           case 1: /* B1: BF, BT, LOOP, LOOPNEZ, LOOPGTZ */
               switch (r) {
@@ -1953,8 +2067,9 @@ void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
 
 static __attribute__((noinline, cold))
 void xtensa_invalid_pc_trap(xtensa_cpu_t *cpu) {
-    fprintf(stderr, "[TRAP] Invalid PC=0x%08X at cycle %llu (core %d, prid=0x%X)\n",
-            cpu->pc, (unsigned long long)cpu->cycle_count, cpu->core_id, cpu->prid);
+    fprintf(stderr, "[TRAP] Invalid PC=0x%08X at cycle %llu (core %d, prid=0x%X) prev_pc=0x%08X\n",
+            cpu->pc, (unsigned long long)cpu->cycle_count, cpu->core_id, cpu->prid,
+            cpu->dbg_prev_pc);
     fprintf(stderr, "  PS=0x%08X SAR=%u WindowBase=%u WindowStart=0x%X\n",
             cpu->ps, cpu->sar, cpu->windowbase, cpu->windowstart);
     for (int r = 0; r < 16; r += 4)
@@ -1967,9 +2082,73 @@ void xtensa_invalid_pc_trap(xtensa_cpu_t *cpu) {
     cpu->exception = true;
 }
 
+/* TEMP DEBUG */
+uint32_t g_dbg_pc;
+int g_dbg_core;
+int g_dbg_watch_en = 1;
+int g_dbg_pcwatch_en = 1;
+uint32_t g_dbg_pcwatch;
+uint32_t g_dbg_pcwatch2;
+uint32_t g_dbg_watch_addr;
+uint32_t g_dbg_watch_addr2;
+uint32_t g_dbg_watch_val;
+/* PC-armed instruction trace: fires when PC hits arm address, then logs N insns */
+uint32_t g_dbg_tarm;
+int g_dbg_tn = 200;
+int g_dbg_tcore = -1;
+int g_dbg_tcount;          /* remaining insns in current fire */
+int g_dbg_tfires = 3;      /* max fires */
+int g_dbg_winlog;          /* FLEXE_WINLOG: window-ops trace */
+int g_dbg_c1ilog;          /* FLEXE_C1ILOG: log garbage s32c1i reads */
+
+__attribute__((constructor))
+static void g_dbg_watch_init(void) {
+    const char *e = getenv("FLEXE_WATCH");
+    if (e) g_dbg_watch_addr = (uint32_t)strtoul(e, NULL, 0);
+    e = getenv("FLEXE_WATCH2");
+    if (e) g_dbg_watch_addr2 = (uint32_t)strtoul(e, NULL, 0);
+    if (!g_dbg_watch_addr && !g_dbg_watch_addr2) g_dbg_watch_en = 0;
+    e = getenv("FLEXE_PCWATCH");
+    if (e) g_dbg_pcwatch = (uint32_t)strtoul(e, NULL, 0);
+    e = getenv("FLEXE_PCWATCH2");
+    if (e) g_dbg_pcwatch2 = (uint32_t)strtoul(e, NULL, 0);
+    if (!g_dbg_pcwatch && !g_dbg_pcwatch2) g_dbg_pcwatch_en = 0;
+    e = getenv("FLEXE_TARM");
+    if (e) g_dbg_tarm = (uint32_t)strtoul(e, NULL, 0);
+    e = getenv("FLEXE_TN");
+    if (e) g_dbg_tn = atoi(e);
+    e = getenv("FLEXE_TCORE");
+    if (e) g_dbg_tcore = atoi(e);
+    e = getenv("FLEXE_TFIRES");
+    if (e) g_dbg_tfires = atoi(e);
+    e = getenv("FLEXE_WINLOG");
+    if (e) g_dbg_winlog = atoi(e);
+    e = getenv("FLEXE_C1ILOG");
+    if (e) g_dbg_c1ilog = atoi(e);
+    e = getenv("FLEXE_WATCHVAL");
+    if (e) g_dbg_watch_val = (uint32_t)strtoul(e, NULL, 0);
+}
+
 static inline __attribute__((always_inline))
 int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     uint32_t insn;
+    cpu->dbg_prev_pc = g_dbg_pc;
+    g_dbg_pc = cpu->pc;
+    g_dbg_core = cpu->core_id;
+    if (__builtin_expect(g_dbg_tarm && cpu->pc == g_dbg_tarm && g_dbg_tfires > 0
+                         && (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore), 0)) {
+        g_dbg_tfires--;
+        g_dbg_tcount = g_dbg_tn;
+        fprintf(stderr, "[TARM] fire at pc=0x%08X core%d\n", cpu->pc, cpu->core_id);
+    }
+    if (__builtin_expect(g_dbg_tcount > 0
+                         && (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore), 0)) {
+        g_dbg_tcount--;
+        fprintf(stderr, "[T%d] pc=0x%08X a0=%08X a1=%08X a2=%08X a3=%08X a4=%08X a5=%08X a8=%08X a10=%08X ps=%08X wb=%u ws=%08X\n",
+                cpu->core_id, cpu->pc, ar_read(cpu,0), ar_read(cpu,1),
+                ar_read(cpu,2), ar_read(cpu,3), ar_read(cpu,4), ar_read(cpu,5),
+                ar_read(cpu,8), ar_read(cpu,10), cpu->ps, cpu->windowbase, cpu->windowstart);
+    }
     if (__builtin_expect(cpu->halted, 0)) {
         cpu->ccount++;
         ++*local_cc;

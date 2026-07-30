@@ -784,7 +784,225 @@ TEST(factorial_windowed) {
     teardown(&cpu);
 }
 
-/* ===== Test suite runner ===== */
+/* ===== Interrupt flush + deep handler wrap + fill round-trip ===== */
+
+static void phys_wr(xtensa_cpu_t *cpu, int w, int r, uint32_t v) {
+    cpu->ar[((w * 4) + r) & 63] = v;
+}
+static uint32_t phys_rd(xtensa_cpu_t *cpu, int w, int r) {
+    return cpu->ar[((w * 4) + r) & 63];
+}
+
+/* Reproduces the context-switch register corruption scenario: a live call
+ * chain (w0-w6) holds distinctive values in ancestor windows, an interrupt
+ * flushes all non-current windows to the stack (SPILL_ALL_WINDOWS), the
+ * handler runs 20 nested calls (wrapping the 16-window ring and reusing
+ * slots), and after RFE the ancestor windows must underflow-fill their
+ * original values back from the stack. */
+TEST(interrupt_flush_round_trip) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    uint32_t sp = BASE + 0x8000;
+    ar_write(&cpu, 1, sp);
+
+    /* Chain of 3 nested call8+entry(32): w0 → w2 → w4 → w6 */
+    int32_t off1 = (int32_t)((BASE + 0x100) / 4 - (BASE / 4 + 1));
+    put_insn3(&cpu, BASE, calln_insn(2, off1));
+    put_insn3(&cpu, BASE + 0x100, entry_insn(1, 32));
+    int32_t off2 = (int32_t)((BASE + 0x200) / 4 - ((BASE + 0x103) / 4 + 1));
+    put_insn3(&cpu, BASE + 0x103, calln_insn(2, off2));
+    put_insn3(&cpu, BASE + 0x200, entry_insn(1, 32));
+    int32_t off3 = (int32_t)((BASE + 0x300) / 4 - ((BASE + 0x203) / 4 + 1));
+    put_insn3(&cpu, BASE + 0x203, calln_insn(2, off3));
+    put_insn3(&cpu, BASE + 0x300, entry_insn(1, 32));
+
+    /* w0's distinctive values (a2-a7: the window's own spill-covered regs) */
+    phys_wr(&cpu, 0, 2, 0xA0000002); phys_wr(&cpu, 0, 3, 0xA0000003);
+    phys_wr(&cpu, 0, 4, 0xA0000004); phys_wr(&cpu, 0, 5, 0xA0000005);
+    phys_wr(&cpu, 0, 6, 0xA0000006); phys_wr(&cpu, 0, 7, 0xA0000007);
+
+    xtensa_step(&cpu);          /* call8 → L1 (w2) */
+    phys_wr(&cpu, 2, 2, 0xB0000002); phys_wr(&cpu, 2, 3, 0xB0000003);
+    phys_wr(&cpu, 2, 4, 0xB0000004); phys_wr(&cpu, 2, 5, 0xB0000005);
+    phys_wr(&cpu, 2, 6, 0xB0000006); phys_wr(&cpu, 2, 7, 0xB0000007);
+    xtensa_step(&cpu);          /* entry */
+
+    xtensa_step(&cpu);          /* call8 → L2 (w4) */
+    phys_wr(&cpu, 4, 2, 0xC0000002); phys_wr(&cpu, 4, 3, 0xC0000003);
+    phys_wr(&cpu, 4, 4, 0xC0000004); phys_wr(&cpu, 4, 5, 0xC0000005);
+    phys_wr(&cpu, 4, 6, 0xC0000006); phys_wr(&cpu, 4, 7, 0xC0000007);
+    xtensa_step(&cpu);          /* entry */
+
+    xtensa_step(&cpu);          /* call8 → L3 (w6) */
+    xtensa_step(&cpu);          /* entry */
+    ASSERT_EQ(cpu.windowbase, 6);
+
+    /* INTERRUPT: flush all non-current windows (SPILL_ALL_WINDOWS) */
+    xtensa_flush_windows(&cpu);
+    ASSERT_EQ(cpu.windowstart, (1u << 6));
+
+    /* HANDLER: 20 nested levels from w6 (entry; call8 down; retw on the
+     * way back), wrapping the 16-window ring. Deepest level: entry; nop. */
+    /* At BASE+0x303 (w6's frame): call8 → handler level 1 (BASE+0x400). */
+    {
+        int32_t off = (int32_t)((BASE + 0x400) / 4 - ((BASE + 0x303) / 4 + 1));
+        put_insn3(&cpu, BASE + 0x303, calln_insn(2, off));
+        put_insn3(&cpu, BASE + 0x306, retw_insn());      /* w6 → w4 */
+    }
+    for (int i = 1; i <= 19; i++) {
+        uint32_t addr = BASE + 0x400 + (i - 1) * 0x40;
+        uint32_t next = BASE + 0x400 + i * 0x40;
+        int32_t off = (int32_t)(next / 4 - ((addr + 3) / 4 + 1));
+        put_insn3(&cpu, addr, entry_insn(1, 32));
+        put_insn3(&cpu, addr + 3, calln_insn(2, off));
+        put_insn3(&cpu, addr + 6, retw_insn());
+    }
+    put_insn3(&cpu, BASE + 0x400 + 19 * 0x40, entry_insn(1, 32));
+    put_insn3(&cpu, BASE + 0x400 + 19 * 0x40 + 3, nop_insn());
+    put_insn3(&cpu, BASE + 0x400 + 19 * 0x40 + 6, retw_insn());
+
+    /* Original chain continuation (return addresses after the handler). */
+    put_insn3(&cpu, BASE + 0x206, retw_insn());      /* w4 → w2 */
+    put_insn3(&cpu, BASE + 0x106, retw_insn());      /* w2 → w0 */
+
+    /* Descend: call8(w6→L1), then entry+call8 per level, entry, nop */
+    for (int i = 0; i < 41; i++)
+        xtensa_step(&cpu);
+    ASSERT_EQ(cpu.windowbase, (6 + 2 * 20) & 0xF);
+
+    /* Unwind: 20 handler retws → back to BASE+0x306 */
+    for (int i = 0; i < 20; i++)
+        xtensa_step(&cpu);
+    ASSERT_EQ(cpu.windowbase, 6);
+    ASSERT_EQ(cpu.pc, BASE + 0x306);
+
+    /* After the handler unwound, we're back at w6. Now unwind the original
+     * chain w6 → w4 → w2 → w0 and verify every ancestor's registers. */
+    xtensa_step(&cpu);          /* retw w6 → w4 */
+    ASSERT_EQ(cpu.windowbase, 4);
+    ASSERT_EQ(phys_rd(&cpu, 4, 2), 0xC0000002);
+    ASSERT_EQ(phys_rd(&cpu, 4, 3), 0xC0000003);
+    ASSERT_EQ(phys_rd(&cpu, 4, 4), 0xC0000004);
+    ASSERT_EQ(phys_rd(&cpu, 4, 5), 0xC0000005);
+    ASSERT_EQ(phys_rd(&cpu, 4, 6), 0xC0000006);
+    ASSERT_EQ(phys_rd(&cpu, 4, 7), 0xC0000007);
+
+    xtensa_step(&cpu);          /* retw w4 → w2 */
+    ASSERT_EQ(cpu.windowbase, 2);
+    ASSERT_EQ(phys_rd(&cpu, 2, 2), 0xB0000002);
+    ASSERT_EQ(phys_rd(&cpu, 2, 3), 0xB0000003);
+    ASSERT_EQ(phys_rd(&cpu, 2, 4), 0xB0000004);
+    ASSERT_EQ(phys_rd(&cpu, 2, 5), 0xB0000005);
+    ASSERT_EQ(phys_rd(&cpu, 2, 6), 0xB0000006);
+    ASSERT_EQ(phys_rd(&cpu, 2, 7), 0xB0000007);
+
+    xtensa_step(&cpu);          /* retw w2 → w0 */
+    ASSERT_EQ(cpu.windowbase, 0);
+    ASSERT_EQ(phys_rd(&cpu, 0, 2), 0xA0000002);
+    ASSERT_EQ(phys_rd(&cpu, 0, 3), 0xA0000003);
+    ASSERT_EQ(phys_rd(&cpu, 0, 4), 0xA0000004);
+    ASSERT_EQ(phys_rd(&cpu, 0, 5), 0xA0000005);
+    ASSERT_EQ(phys_rd(&cpu, 0, 6), 0xA0000006);
+    ASSERT_EQ(phys_rd(&cpu, 0, 7), 0xA0000007);
+
+    teardown(&cpu);
+}
+
+/* ===== Fill width must come from a0, not stale per-slot callsize ===== */
+
+/* Reproduces the exact SMP corruption seen in firmware: after the flush
+ * spills the chain, a foreign context (other task / interrupt handler)
+ * reuses the physical register ring AND overwrites the per-slot
+ * window_callsize records with its own call4 values. On unwind, the
+ * underflow fills must derive their width from the returning window's a0
+ * (call8 here) — not from the stale per-slot records — or the ancestors'
+ * a4-a7 never get restored and come back as garbage. */
+TEST(interrupt_flush_stale_callsize) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    uint32_t sp = BASE + 0x8000;
+    ar_write(&cpu, 1, sp);
+
+    /* Chain of 3 nested call8+entry(32): w0 → w2 → w4 → w6 */
+    int32_t off1 = (int32_t)((BASE + 0x100) / 4 - (BASE / 4 + 1));
+    put_insn3(&cpu, BASE, calln_insn(2, off1));
+    put_insn3(&cpu, BASE + 0x100, entry_insn(1, 32));
+    int32_t off2 = (int32_t)((BASE + 0x200) / 4 - ((BASE + 0x103) / 4 + 1));
+    put_insn3(&cpu, BASE + 0x103, calln_insn(2, off2));
+    put_insn3(&cpu, BASE + 0x200, entry_insn(1, 32));
+    int32_t off3 = (int32_t)((BASE + 0x300) / 4 - ((BASE + 0x203) / 4 + 1));
+    put_insn3(&cpu, BASE + 0x203, calln_insn(2, off3));
+    put_insn3(&cpu, BASE + 0x300, entry_insn(1, 32));
+
+    phys_wr(&cpu, 0, 2, 0xA0000002); phys_wr(&cpu, 0, 3, 0xA0000003);
+    phys_wr(&cpu, 0, 4, 0xA0000004); phys_wr(&cpu, 0, 5, 0xA0000005);
+    phys_wr(&cpu, 0, 6, 0xA0000006); phys_wr(&cpu, 0, 7, 0xA0000007);
+
+    xtensa_step(&cpu);          /* call8 → L1 (w2) */
+    phys_wr(&cpu, 2, 2, 0xB0000002); phys_wr(&cpu, 2, 3, 0xB0000003);
+    phys_wr(&cpu, 2, 4, 0xB0000004); phys_wr(&cpu, 2, 5, 0xB0000005);
+    phys_wr(&cpu, 2, 6, 0xB0000006); phys_wr(&cpu, 2, 7, 0xB0000007);
+    xtensa_step(&cpu);          /* entry */
+
+    xtensa_step(&cpu);          /* call8 → L2 (w4) */
+    phys_wr(&cpu, 4, 2, 0xC0000002); phys_wr(&cpu, 4, 3, 0xC0000003);
+    phys_wr(&cpu, 4, 4, 0xC0000004); phys_wr(&cpu, 4, 5, 0xC0000005);
+    phys_wr(&cpu, 4, 6, 0xC0000006); phys_wr(&cpu, 4, 7, 0xC0000007);
+    xtensa_step(&cpu);          /* entry */
+
+    xtensa_step(&cpu);          /* call8 → L3 (w6) */
+    xtensa_step(&cpu);          /* entry */
+    ASSERT_EQ(cpu.windowbase, 6);
+
+    /* INTERRUPT: flush all non-current windows (SPILL_ALL_WINDOWS) */
+    xtensa_flush_windows(&cpu);
+    ASSERT_EQ(cpu.windowstart, (1u << 6));
+
+    /* FOREIGN CONTEXT: reuses the whole physical ring except the current
+     * window (its registers become garbage), and its own call4 entries
+     * leave stale window_callsize records behind on every slot. */
+    for (int w = 0; w < 16; w++) {
+        cpu.window_callsize[w] = 1;   /* stale "call4" records */
+        if (w == 6) continue;         /* current window survives */
+        for (int r = 0; r < 4; r++)
+            phys_wr(&cpu, w, r, 0xDEAD0000 | ((uint32_t)w << 4) | (uint32_t)r);
+    }
+
+    /* Unwind the original chain w6 → w4 → w2 → w0 and verify every
+     * ancestor's a2-a7 (a4-a7 live in slots the foreign context clobbered,
+     * so only a correct call8-width fill can bring them back). PC is at
+     * BASE+0x303 (the instruction after w6's entry). */
+    put_insn3(&cpu, BASE + 0x303, retw_insn());      /* w6 → w4 */
+    put_insn3(&cpu, BASE + 0x206, retw_insn());      /* w4 → w2 */
+    put_insn3(&cpu, BASE + 0x106, retw_insn());      /* w2 → w0 */
+
+    xtensa_step(&cpu);          /* retw w6 → w4 */
+    ASSERT_EQ(cpu.windowbase, 4);
+    ASSERT_EQ(phys_rd(&cpu, 4, 2), 0xC0000002);
+    ASSERT_EQ(phys_rd(&cpu, 4, 3), 0xC0000003);
+    ASSERT_EQ(phys_rd(&cpu, 4, 4), 0xC0000004);
+    ASSERT_EQ(phys_rd(&cpu, 4, 5), 0xC0000005);
+    ASSERT_EQ(phys_rd(&cpu, 4, 6), 0xC0000006);
+    ASSERT_EQ(phys_rd(&cpu, 4, 7), 0xC0000007);
+
+    xtensa_step(&cpu);          /* retw w4 → w2 */
+    ASSERT_EQ(cpu.windowbase, 2);
+    ASSERT_EQ(phys_rd(&cpu, 2, 2), 0xB0000002);
+    ASSERT_EQ(phys_rd(&cpu, 2, 3), 0xB0000003);
+    ASSERT_EQ(phys_rd(&cpu, 2, 4), 0xB0000004);
+    ASSERT_EQ(phys_rd(&cpu, 2, 5), 0xB0000005);
+    ASSERT_EQ(phys_rd(&cpu, 2, 6), 0xB0000006);
+    ASSERT_EQ(phys_rd(&cpu, 2, 7), 0xB0000007);
+
+    xtensa_step(&cpu);          /* retw w2 → w0 */
+    ASSERT_EQ(cpu.windowbase, 0);
+    ASSERT_EQ(phys_rd(&cpu, 0, 2), 0xA0000002);
+    ASSERT_EQ(phys_rd(&cpu, 0, 3), 0xA0000003);
+    ASSERT_EQ(phys_rd(&cpu, 0, 4), 0xA0000004);
+    ASSERT_EQ(phys_rd(&cpu, 0, 5), 0xA0000005);
+    ASSERT_EQ(phys_rd(&cpu, 0, 6), 0xA0000006);
+    ASSERT_EQ(phys_rd(&cpu, 0, 7), 0xA0000007);
+
+    teardown(&cpu);
+}
 
 static void run_window_tests(void) {
     TEST_SUITE("Window Registers (M5)");
@@ -807,4 +1025,6 @@ static void run_window_tests(void) {
     RUN_TEST(rfwu_basic);
     RUN_TEST(retw_n_basic);
     RUN_TEST(factorial_windowed);
+    RUN_TEST(interrupt_flush_round_trip);
+    RUN_TEST(interrupt_flush_stale_callsize);
 }

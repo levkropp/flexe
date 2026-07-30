@@ -350,6 +350,20 @@ struct xtensa_cpu {
         uint32_t base;       /* base address used during spill */
         int count;           /* number of regs saved (4, 8, or 12) */
     } spill_shadow[16];
+
+    /* Per-slot callsize of the window currently occupying it (1=call4,
+     * 2=call8, 3=call12), recorded at ENTRY. A window's callsize is a
+     * property of its creation call, not of its a0 (tail-called frames can
+     * have a0=0), so it must be tracked here for correct spill/fill gating. */
+    uint8_t window_callsize[16];
+    uint32_t dbg_prev_pc;   /* previous step PC, for trap diagnosis */
+
+    /* Peripheral timer-event hooks (TIMG LACT): fold peripheral alarms into
+     * the next_timer_event mechanism so alarm interrupts fire on time and
+     * can wake the core from WAITI. */
+    void *periph_event_ctx;
+    uint32_t (*periph_next_event)(xtensa_cpu_t *cpu);
+    void (*periph_event)(xtensa_cpu_t *cpu);
 };
 
 /*
@@ -400,6 +414,8 @@ int  xtensa_disasm(const xtensa_cpu_t *cpu, uint32_t addr, char *buf, int bufsiz
  */
 void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr);
 void xtensa_check_interrupts(xtensa_cpu_t *cpu);
+void xtensa_flush_windows(xtensa_cpu_t *cpu);
+void xtensa_recompute_next_timer(xtensa_cpu_t *cpu);
 
 /*
  * Breakpoint support

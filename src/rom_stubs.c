@@ -330,6 +330,7 @@ done:;
 static void stub_ets_set_appcpu_boot_addr(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
     uint32_t addr = rom_arg(cpu, 0);
+    fprintf(stderr, "[APPCPU] boot addr = 0x%08X (from pc=0x%08X)\n", addr, cpu->pc);
     s->app_cpu_boot_addr = addr;
 
     /* Always set s_cpu_up[1] = 1 (tells core 0 that core 1 is alive) */
@@ -3193,6 +3194,38 @@ void rom_stubs_destroy(esp32_rom_stubs_t *stubs) {
     }
     free(stubs->direct);
     free(stubs);
+}
+
+/* Address-based hooks for symbol-less popular firmwares. These stub the
+ * driver-init entry points whose real implementations would spawn driver
+ * tasks that crash on null contexts (no radio/hardware attached). Keyed by
+ * the firmware's entry point (unique per build). */
+typedef struct {
+    uint32_t addr;
+    rom_stub_fn fn;
+    const char *name;
+} fw_addr_hook_t;
+
+static const fw_addr_hook_t fw_marauder_hooks[] = {
+    { 0x401540A0, stub_unregistered, "esp_bt_controller_init" },
+    { 0x4010F65C, stub_unregistered, "ble_hs_init" },
+    { 0, NULL, NULL }
+};
+
+int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
+    const fw_addr_hook_t *tbl = NULL;
+    if (entry_point == 0x400831D8)      /* ESP32 Marauder v1.14 CYD 2432S028 */
+        tbl = fw_marauder_hooks;
+    if (!tbl) return 0;
+    int n = 0;
+    for (const fw_addr_hook_t *h = tbl; h->fn; h++) {
+        rom_stubs_register(stubs, h->addr, h->fn, h->name);
+        n++;
+    }
+    if (n)
+        fprintf(stderr, "[flexe] hooked %d firmware driver stub(s) at entry 0x%08X\n",
+                n, entry_point);
+    return n;
 }
 
 /* Hook firmware functions by symbol name from ELF.

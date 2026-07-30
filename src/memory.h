@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdio.h>
 
 #ifdef _MSC_VER
 #include "msvc_compat.h"
@@ -131,7 +132,34 @@ static inline void mem_write16(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
     mem_write16_slow(mem, addr, val);
 }
 
+extern uint32_t g_dbg_pc;
+extern int g_dbg_core;
+extern int g_dbg_watch_en;
+extern uint32_t g_dbg_watch_addr;
+extern int g_dbg_pcwatch_en;
+extern uint32_t g_dbg_pcwatch;
+extern uint32_t g_dbg_pcwatch2;
+extern uint32_t g_dbg_watch_addr2;
+extern uint32_t g_dbg_watch_val;
+
 static inline void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
+    /* TEMP DEBUG: watch writes to up to two addresses (env FLEXE_WATCH/2) */
+    if (__builtin_expect(g_dbg_watch_en &&
+        (addr == g_dbg_watch_addr || addr == g_dbg_watch_addr2), 0)) {
+        uint32_t old = mem_read32(mem, addr);
+        fprintf(stderr, "[W] 0x%08X: 0x%08X -> 0x%08X  pc=0x%08X core%d\n",
+                addr, old, val, g_dbg_pc, g_dbg_core);
+    }
+    if (__builtin_expect(g_dbg_watch_val && val == g_dbg_watch_val, 0)) {
+        fprintf(stderr, "[WV] 0x%08X <- 0x%08X  pc=0x%08X core%d\n",
+                addr, val, g_dbg_pc, g_dbg_core);
+    }
+    /* TEMP DEBUG: log stores issued from specific PCs (env FLEXE_PCWATCH/2) */
+    if (__builtin_expect(g_dbg_pcwatch_en &&
+        (g_dbg_pc == g_dbg_pcwatch || g_dbg_pc == g_dbg_pcwatch2), 0)) {
+        fprintf(stderr, "[PW] pc=0x%08X store 0x%08X <- 0x%08X core%d\n",
+                g_dbg_pc, addr, val, g_dbg_core);
+    }
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         memcpy(page + (addr & 0xFFF), &val, 4);
