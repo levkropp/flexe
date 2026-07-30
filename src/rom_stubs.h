@@ -37,6 +37,7 @@ int rom_stubs_get_stats(const esp32_rom_stubs_t *stubs, int index,
 
 /* Hook known firmware functions by symbol name (e.g. newlib locks) */
 int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs, const elf_symbols_t *syms);
+int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point);
 
 /* Total stub calls (running counter across all stubs) */
 uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs);
