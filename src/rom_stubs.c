@@ -100,7 +100,9 @@ static void rom_return(xtensa_cpu_t *cpu, uint32_t retval) {
     if (ci > 0) {
         ar_write(cpu, ci * 4 + 2, retval);
         uint32_t a0 = ar_read(cpu, ci * 4);
-        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        /* 0x40000000 base (not pc & 0xC0000000): every hooked address is in
+         * 0x4xxxxxxx, and this also covers the pc==0 null-call hook. */
+        cpu->pc = 0x40000000u | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, retval);
@@ -114,7 +116,7 @@ static void rom_return64(xtensa_cpu_t *cpu, uint64_t retval) {
         ar_write(cpu, ci * 4 + 2, (uint32_t)retval);
         ar_write(cpu, ci * 4 + 3, (uint32_t)(retval >> 32));
         uint32_t a0 = ar_read(cpu, ci * 4);
-        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        cpu->pc = 0x40000000u | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, (uint32_t)retval);
@@ -127,7 +129,7 @@ static void rom_return_void(xtensa_cpu_t *cpu) {
     int ci = XT_PS_CALLINC(cpu->ps);
     if (ci > 0) {
         uint32_t a0 = ar_read(cpu, ci * 4);
-        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        cpu->pc = 0x40000000u | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         cpu->pc = ar_read(cpu, 0);
@@ -2973,11 +2975,14 @@ static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
 static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
 
-    /* Fast path: direct dispatch table — single indexed lookup, no hash */
+    /* Fast path: direct dispatch table — single indexed lookup, no hash.
+     * A calloc'd empty slot has tag==0 and must NOT match pc==0 (its fn and
+     * call_count are NULL — dereferencing them crashes the host). Require
+     * fn to be set, so only real registrations match. */
     if (__builtin_expect(s->direct != NULL, 1)) {
         uint32_t di = (pc >> 2) & STUB_DIRECT_MASK;
         stub_direct_entry_t *de = &s->direct[di];
-        if (__builtin_expect(de->tag == pc, 1)) {
+        if (__builtin_expect(de->tag == pc && de->fn != NULL, 1)) {
             s->total_calls++;
             (*de->call_count)++;
             de->fn(cpu, de->ctx);
@@ -3206,9 +3211,72 @@ typedef struct {
     const char *name;
 } fw_addr_hook_t;
 
+/* NULL-handler-table remediation for symbol-less firmwares.  With the BT/WiFi
+ * init functions stubbed out, the driver event-handler tables never get
+ * populated, and every event dispatch (callxN through mem[mem[tbl]+ofs])
+ * jumps to NULL.  Fabricate a table whose slots all point at a guest no-op
+ * function ("entry a1,32; retw.n") so any dispatch returns cleanly, and
+ * point the table-holding global at it.  The fake tables live in RTC Fast
+ * RAM (0x50000000+): the firmware's heap init zeroes the free DRAM region
+ * (0x3FFB0000+), and nothing touches RTC Fast after early startup. */
+#define FW_NOOP_FN        0x401DBFC4u  /* Marauder: entry a1,32; retw.n */
+#define FW_FAKE_TBL_BT    0x50000400u  /* 256 slots -> FW_NOOP_FN */
+#define FW_FAKE_TBL_WIFI  0x50000800u
+
+/* One { table_global, fake_table_addr } pair per firmware, keyed by entry. */
+typedef struct {
+    uint32_t global_addr;
+    uint32_t fake_tbl;
+} fw_tbl_patch_t;
+
+static void fw_patch_handler_tables(esp32_rom_stubs_t *stubs,
+                                    const fw_tbl_patch_t *patches, int n) {
+    xtensa_mem_t *mem = stubs->cpu->mem;
+    for (int i = 0; i < n; i++) {
+        for (int s = 0; s < 256; s++)
+            mem_write32(mem, patches[i].fake_tbl + s * 4, FW_NOOP_FN);
+        mem_write32(mem, patches[i].global_addr, patches[i].fake_tbl);
+        fprintf(stderr, "[flexe] fabricated handler table 0x%08X -> global 0x%08X\n",
+                patches[i].fake_tbl, patches[i].global_addr);
+    }
+}
+
+/* Marauder table patches, applied from the BT-host "clear" hook below.  The
+ * clear runs at BT-host task start — after the btdm clear (which zeroes the
+ * wifi tables and must run real, or the btdm task's event flow breaks) and
+ * before the first event dispatch on either task.  The real re-population
+ * never happens without a radio, so write the fabricated tables instead of
+ * the NULL the clear would store. */
+static const fw_tbl_patch_t fw_marauder_ble_tbls[] = {
+    { 0x3FFCD974, FW_FAKE_TBL_BT },   /* NimBLE host handler table */
+    { 0x3FFD0544, FW_FAKE_TBL_WIFI }, /* btdm controller handler table */
+    { 0x3FFD0548, FW_FAKE_TBL_WIFI }, /* btdm second handler table */
+};
+
+static void stub_fw_marauder_ble_clear(xtensa_cpu_t *cpu, void *ctx) {
+    fw_patch_handler_tables(ctx, fw_marauder_ble_tbls,
+                            sizeof(fw_marauder_ble_tbls) / sizeof(fw_marauder_ble_tbls[0]));
+    rom_return(cpu, 0);
+}
+
 static const fw_addr_hook_t fw_marauder_hooks[] = {
     { 0x401540A0, stub_unregistered, "esp_bt_controller_init" },
     { 0x4010F65C, stub_unregistered, "ble_hs_init" },
+    { 0x401BDE2C, stub_fw_marauder_ble_clear, "ble_handler_table_clear" },
+    /* btdm event handler called from the dispatcher (0x4015F3BC): reads a
+     * NULL handler from the stack event struct the stubbed-out init never
+     * filled.  Return ESP_OK so the dispatcher loop continues. */
+    { 0x40171278, stub_unregistered, "btdm_event_handler" },
+    /* esp_vhci_host_register_callback: btdm-side registration path fails
+     * (ESP_FAIL) without the BT controller's flash config partition.
+     * Stub it so esp_nimble_hci_init completes; the host callback stays
+     * unregistered, which the null-call backstop covers. */
+    { 0x40171E18, stub_unregistered, "esp_vhci_host_register_callback" },
+    /* Universal backstop: any remaining callxN through a NULL function
+     * pointer (half-initialized driver handler structs) returns 0 to the
+     * caller instead of trapping.  Requires the pc==0 hook to run before
+     * the invalid-PC trap (see xtensa_step_impl). */
+    { 0x00000000, stub_unregistered, "null_fn_ptr" },
     { 0, NULL, NULL }
 };
 

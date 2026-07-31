@@ -395,6 +395,13 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx);
  * returning to the same task and after a context switch.
  */
 void xtensa_flush_windows(xtensa_cpu_t *cpu) {
+    /* Spill ALL non-current windows (wb+1..wb+15). The FreeRTOS context
+     * switch requires a clean register file: the incoming task restores its
+     * own windowbase/windowstart and must never inherit the outgoing task's
+     * live frames. Spilling only wb+1..wb+13 (leaving wb-1/wb-2 live) was
+     * tried and deadlocks the esp_ipc cross-core handshake at boot, because
+     * the ipc task then resumes into a register file still holding the idle
+     * task's predecessor frames. */
     for (int w = 1; w < 16; w++) {
         int idx = (cpu->windowbase + w) & 0xF;
         if (cpu->windowstart & (1u << idx))
@@ -690,19 +697,24 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int cal
         cpu->spill_stack[m_si].depth = m_d;  /* consume match + stale above */
     }
 
-    /* Restore from the stack at the hardware spill-area addresses: a0-a3 at
-     * [base-16] always; a4-a7 at [base-32] for call8+; a8-a11 at [base-48]
-     * for call12 only. The stack is per-context memory (each task's own
-     * stack), so a fill can never pick up a foreign context's values —
-     * unlike the CPU-side records, whose base matching collided across
-     * interrupts/task switches and restored the wrong window's registers
-     * (see -V SPILL_CORRUPT reports). The gating callsize is the rotation n
-     * from exec_retw, derived from the returning window's a0 — always valid
-     * at retw (retw itself needs a0 for the PC) and always local to this
-     * context, unlike the per-slot window_callsize[] ENTRY records which a
-     * context switch leaves holding a foreign task's values. */
+    /* Restore the window. Prefer the matched CPU-side spill record over the
+     * stack: the record is written once at spill time and never clobbered,
+     * whereas the stack spill areas ALIAS when an intermediate frame is only
+     * 16 bytes — a deeper window's a4-a7 at [callee_sp-32] then land on the
+     * shallower window's a0-a3 at [callee_sp-16] (two frames 16 bytes apart),
+     * so the stack copy of a0-a3 can hold a neighbour's a4-a7 (seen in
+     * NerdMiner as a retw jumping to a data pointer). The record is matched
+     * by callee-SP base and consumed in LIFO order, so it is always this
+     * context's own most recent spill; fall back to the stack when no record
+     * matches. The gating callsize is the rotation n from exec_retw, derived
+     * from the returning window's a0 — always valid at retw (retw itself
+     * needs a0 for the PC) and always local to this context, unlike the
+     * per-slot window_callsize[] ENTRY records which a context switch leaves
+     * holding a foreign task's values. */
+    int use_rec = (m_si >= 0);
     for (int i = 0; i < 4; i++)
-        phys_write(cpu, ret_wb, i, mem_read32(cpu->mem, base - 16 + i * 4));
+        phys_write(cpu, ret_wb, i, use_rec ? cpu->spill_stack[m_si].core[m_d][i]
+                                           : mem_read32(cpu->mem, base - 16 + i * 4));
 
     /* Self-heal the per-slot callsize record from the just-restored a0:
      * after a context switch the ENTRY-era record belongs to a foreign
@@ -716,10 +728,12 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int cal
 
     if (callsize >= 2)
         for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, 4 + i, mem_read32(cpu->mem, base - 32 + i * 4));
+            phys_write(cpu, ret_wb, 4 + i, use_rec ? cpu->spill_stack[m_si].extra[m_d][i]
+                                                   : mem_read32(cpu->mem, base - 32 + i * 4));
     if (callsize == 3)
         for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, 8 + i, mem_read32(cpu->mem, base - 48 + i * 4));
+            phys_write(cpu, ret_wb, 8 + i, use_rec ? cpu->spill_stack[m_si].extra[m_d][4 + i]
+                                                   : mem_read32(cpu->mem, base - 48 + i * 4));
 
     /* Verify restored values match what was originally spilled */
     if (cpu->spill_verify) {
@@ -2162,26 +2176,6 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
         return cpu->exception ? -1 : 0;
     }
 
-    /* Invalid PC trap. Slow-path body lives in a noinline helper so
-     * the hot-path branch is just a single range compare. */
-    if (__builtin_expect(cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u, 0)) {
-        cpu->cycle_count = *local_cc;
-        xtensa_invalid_pc_trap(cpu);
-        return -1;
-    }
-
-    /* Breakpoint check */
-    if (__builtin_expect(cpu->breakpoint_count > 0, 0)) {
-        cpu->breakpoint_hit = false;
-        for (int i = 0; i < cpu->breakpoint_count; i++) {
-            if (cpu->breakpoints[i] == cpu->pc) {
-                cpu->breakpoint_hit = true;
-                cpu->breakpoint_hit_addr = cpu->pc;
-                return -1;
-            }
-        }
-    }
-
     /* PC hook: intercept execution at specific addresses (e.g. ROM stubs).
      * Hooks are always registered at function-entry PCs — reachable
      * only via call/ret/branches/exceptions — so we only need to
@@ -2189,7 +2183,9 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
      * that exact condition (set by the previous step's branch/call/
      * ret/exception handlers, cleared below at line 2073 unless the
      * instruction writes PC again). On straight-line execution the
-     * bitmap load is skipped entirely. */
+     * bitmap load is skipped entirely.  Runs BEFORE the invalid-PC
+     * trap so a hook at 0x00000000 can turn callxN-through-NULL into
+     * a benign return-0 (symbol-less firmware driver tables). */
     if (cpu->_pc_written && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
@@ -2207,6 +2203,26 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
             }
             *local_cc = cpu->cycle_count;  /* reload (stub may advance time) */
             return cpu->exception ? -1 : 0;
+        }
+    }
+
+    /* Invalid PC trap. Slow-path body lives in a noinline helper so
+     * the hot-path branch is just a single range compare. */
+    if (__builtin_expect(cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u, 0)) {
+        cpu->cycle_count = *local_cc;
+        xtensa_invalid_pc_trap(cpu);
+        return -1;
+    }
+
+    /* Breakpoint check */
+    if (__builtin_expect(cpu->breakpoint_count > 0, 0)) {
+        cpu->breakpoint_hit = false;
+        for (int i = 0; i < cpu->breakpoint_count; i++) {
+            if (cpu->breakpoints[i] == cpu->pc) {
+                cpu->breakpoint_hit = true;
+                cpu->breakpoint_hit_addr = cpu->pc;
+                return -1;
+            }
         }
     }
 
