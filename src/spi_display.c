@@ -138,8 +138,11 @@ static int data_bytes(uint32_t dlen_reg) {
 }
 
 /* Map panel-native (x, y) to framebuffer coordinates.
- * Panel RAM is 240x320 portrait; the emulator window is 320x240
- * landscape, so portrait content is presented rotated 90° CW. */
+ * Panel RAM is 240x320 portrait; the emulator window is 320x240 landscape.
+ * With MADCTL MV clear the app streams 240x320 portrait content, which must
+ * be rotated 90° to fill the landscape window. With MV set the app streams
+ * 320x240 landscape content directly (the panel scans axes-swapped), so no
+ * further rotation is applied — only the MX/MY flips. */
 static void fb_write_pixel(spi_display_t *s, uint16_t x, uint16_t y, uint16_t rgb565) {
     if (!s->cfg.framebuf) return;
     uint32_t fx, fy;
@@ -148,9 +151,9 @@ static void fb_write_pixel(spi_display_t *s, uint16_t x, uint16_t y, uint16_t rg
     else                  rot = (s->madctl & 0x40) ? 2 : 0;
     switch (rot) {
     case 0:  fx = 319 - y;  fy = x;        break;  /* portrait, rotated CW */
-    case 1:  fx = y;        fy = 239 - x;  break;  /* landscape */
-    case 2:  fx = y;        fy = 239 - x;  break;  /* portrait flipped */
-    default: fx = 319 - y;  fy = x;        break;  /* landscape flipped */
+    case 1:  fx = x;        fy = y;        break;  /* MV: landscape stream */
+    case 2:  fx = y;        fy = 239 - x;  break;  /* portrait, rotated CCW */
+    default: fx = 319 - x;  fy = y;        break;  /* MV + MX: landscape, col flip */
     }
     if (fx >= (uint32_t)s->cfg.fb_w || fy >= (uint32_t)s->cfg.fb_h) return;
     if (s->cfg.framebuf_mtx) pthread_mutex_lock(s->cfg.framebuf_mtx);
@@ -171,16 +174,25 @@ static void ili9341_param(spi_display_t *s, uint8_t b) {
         if (s->param_cnt == 4) {
             s->xs = (uint16_t)((s->params[0] << 8) | s->params[1]);
             s->xe = (uint16_t)((s->params[2] << 8) | s->params[3]);
+            if (getenv("FLEXE_DISPG"))
+                fprintf(stderr, "[DISPG] CASET xs=%u xe=%u (w=%u)\n", s->xs, s->xe, s->xe - s->xs + 1);
         }
         break;
     case ILI_PASET:
         if (s->param_cnt == 4) {
             s->ys = (uint16_t)((s->params[0] << 8) | s->params[1]);
             s->ye = (uint16_t)((s->params[2] << 8) | s->params[3]);
+            if (getenv("FLEXE_DISPG"))
+                fprintf(stderr, "[DISPG] PASET ys=%u ye=%u (h=%u)\n", s->ys, s->ye, s->ye - s->ys + 1);
         }
         break;
     case ILI_MADCTL:
-        if (s->param_cnt == 1) s->madctl = b;
+        if (s->param_cnt == 1) {
+            s->madctl = b;
+            if (getenv("FLEXE_DISPG"))
+                fprintf(stderr, "[DISPG] MADCTL=0x%02X (MY=%d MX=%d MV=%d BGR=%d)\n",
+                        b, !!(b & 0x80), !!(b & 0x40), !!(b & 0x20), !!(b & 0x08));
+        }
         break;
     default:
         break;   /* everything else: state we don't need */
@@ -196,12 +208,19 @@ static void ili9341_pixel_byte(spi_display_t *s, uint8_t b) {
     s->pixel_phase = 0;
     uint16_t rgb = (uint16_t)((s->pixel_hi << 8) | b);
     fb_write_pixel(s, s->cx, s->cy, rgb);
-    /* Auto-increment with window wrap (panel behavior) */
+    /* Auto-increment with window wrap (panel behavior). The column/page RAM
+     * bounds depend on MADCTL MV: with MV clear the panel scans 240 columns x
+     * 320 pages (portrait); with MV set the axes swap, so a landscape window
+     * legitimately addresses 320 columns x 240 pages. Hardcoding 240/320
+     * truncates a 320-wide landscape row at column 240 and shears every
+     * following row into vertical stripes. */
+    uint16_t cmax = (s->madctl & 0x20) ? 320 : 240;   /* column RAM count */
+    uint16_t pmax = (s->madctl & 0x20) ? 240 : 320;   /* page RAM count */
     s->cx++;
-    if (s->cx > s->xe || s->cx >= 240) {
+    if (s->cx > s->xe || s->cx >= cmax) {
         s->cx = s->xs;
         s->cy++;
-        if (s->cy > s->ye || s->cy >= 320) s->cy = s->ys;
+        if (s->cy > s->ye || s->cy >= pmax) s->cy = s->ys;
     }
 }
 

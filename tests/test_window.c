@@ -798,7 +798,8 @@ static uint32_t phys_rd(xtensa_cpu_t *cpu, int w, int r) {
  * flushes all non-current windows to the stack (SPILL_ALL_WINDOWS), the
  * handler runs 20 nested calls (wrapping the 16-window ring and reusing
  * slots), and after RFE the ancestor windows must underflow-fill their
- * original values back from the stack. */
+ * original values back. The fill prefers the CPU-side spill record, which
+ * is immune to the stack spill-area aliasing of 16-byte frames. */
 TEST(interrupt_flush_round_trip) {
     xtensa_cpu_t cpu; setup_windowed(&cpu);
     uint32_t sp = BASE + 0x8000;
@@ -915,7 +916,9 @@ TEST(interrupt_flush_round_trip) {
  * window_callsize records with its own call4 values. On unwind, the
  * underflow fills must derive their width from the returning window's a0
  * (call8 here) — not from the stale per-slot records — or the ancestors'
- * a4-a7 never get restored and come back as garbage. */
+ * a4-a7 never get restored and come back as garbage. The register data
+ * itself comes from the CPU-side spill record, immune to the register-ring
+ * clobbering. */
 TEST(interrupt_flush_stale_callsize) {
     xtensa_cpu_t cpu; setup_windowed(&cpu);
     uint32_t sp = BASE + 0x8000;
