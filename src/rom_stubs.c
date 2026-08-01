@@ -3760,16 +3760,27 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
      * esp_startup_start_app (called at the end of start_cpu0) redirects
      * to app_main instead of starting the FreeRTOS scheduler. */
 
-    /* SPI flash init stubs — skip actual SPI communication, flash data is
-     * already memory-mapped.  Return ESP_OK (0). */
+    /* SPI flash op-lock stubs — no-op the operation locking (single-emulated
+     * CPU; the real lock/unlock is unnecessary and can wedge on it).  The
+     * flash INIT path (esp_flash_init_main, esp_flash_init_default_chip,
+     * spi_flash_init_chip_state, esp_flash_read_chip_id) is deliberately NOT
+     * stubbed: the emulated SPI flash controller answers RDID with a valid
+     * JEDEC ID (EMU_FLASH_JEDEC_ID, GD25Q32/4MB), and the guest's spi_flash
+     * size probe needs the real init + RDID to detect the flash size.
+     * Stubbing the init path made the probe report "Detected size(0k)" and
+     * abort the boot. */
+    /* Also no-op the cross-core cache-disable handshake
+     * (spi_flash_disable_interrupts_caches_and_other_cpu and its enable
+     * counterpart): it raises a high-priority interrupt on the other core and
+     * spins waiting for it to pause, which deadlocks when the other core is
+     * still in its startup loop.  In the emulator flash ops are memory-mapped,
+     * so pausing the other core is unnecessary. */
     static const char *flash_init_fns[] = {
-        "esp_flash_init_main",
-        "esp_flash_init_default_chip",
-        "esp_flash_read_chip_id",
-        "spi_flash_init_chip_state",
         "spi_flash_op_lock",
         "spi_flash_op_unlock",
         "spi_flash_op_block_func",
+        "spi_flash_disable_interrupts_caches_and_other_cpu",
+        "spi_flash_enable_interrupts_caches_and_other_cpu",
         NULL
     };
     for (int i = 0; flash_init_fns[i]; i++) {
