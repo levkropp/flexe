@@ -66,7 +66,7 @@ static void et_return(xtensa_cpu_t *cpu, uint32_t retval) {
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, retval);
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -77,7 +77,7 @@ static void et_return_void(xtensa_cpu_t *cpu) {
         cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -303,7 +303,7 @@ void stub_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     } else {
         ar_write(cpu, 2, (uint32_t)us);
         ar_write(cpu, 3, (uint32_t)(us >> 32));
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 

@@ -72,6 +72,9 @@ typedef struct {
     rom_stub_fn fn;      /* stub function (NULL = empty slot) */
     void       *ctx;     /* context pointer */
     uint32_t   *call_count; /* pointer to entry's call_count for stats */
+    int         spy;     /* spy hook: run fn, then let the real instruction
+                          * execute (fast path must return 0, like the slow
+                          * path does) */
 } stub_direct_entry_t;
 
 /* Native FreeRTOS mode: skip interrupt/lock stubs */

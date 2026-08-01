@@ -320,20 +320,37 @@ static const uint8_t SD_CSD[16] = {
     0x1F, 0xFF, 0x80, 0x80, 0x0A, 0xC0, 0x40, 0x00
 };
 
+/* CRC16-CCITT (poly 0x1021, init 0) as used for SD data blocks */
+static uint16_t sd_crc16(const uint8_t *data, int len) {
+    uint16_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+    }
+    return crc;
+}
+
 static void sd_queue_block_read(spi_display_t *s, uint32_t lba) {
     uint8_t tok = 0xFE;
     sd_queue(s, &tok, 1);
     uint8_t blk[512];
     sd_read_sector(s, lba, blk);
+    if (getenv("FLEXE_SDDBG"))
+        fprintf(stderr, "[SD] read lba=%u data=%02X %02X %02X %02X\n",
+                lba, blk[0], blk[1], blk[2], blk[3]);
     sd_queue(s, blk, 512);
-    uint8_t crc[2] = {0xFF, 0xFF};
-    sd_queue(s, crc, 2);
+    uint16_t crc = sd_crc16(blk, 512);
+    uint8_t crcb[2] = { (uint8_t)(crc >> 8), (uint8_t)crc };
+    sd_queue(s, crcb, 2);
 }
 
 static void sd_execute(spi_display_t *s) {
     uint8_t cmd = s->sd_cmd[0] & 0x3F;
     uint32_t arg = ((uint32_t)s->sd_cmd[1] << 24) | ((uint32_t)s->sd_cmd[2] << 16) |
                    ((uint32_t)s->sd_cmd[3] << 8) | s->sd_cmd[4];
+    if (getenv("FLEXE_SDDBG"))
+        fprintf(stderr, "[SD] cmd%u arg=0x%08X\n", cmd, arg);
     s->sd_resp_pos = 0;
     s->sd_resp_len = 0;
     switch (cmd) {
@@ -470,6 +487,13 @@ static void gp_spi_transact(spi_display_t *s) {
         uint8_t miso[64];
         for (int i = 0; i < total; i++)
             miso[i] = sd_byte(s, i < n ? mosi[i] : 0xFF);
+        if (getenv("FLEXE_SDDBG2")) {
+            fprintf(stderr, "[SD2] txn n=%d m=%d mosi=", n, m);
+            for (int i = 0; i < total && i < 8; i++) fprintf(stderr, "%02X ", i < n ? mosi[i] : 0xFF);
+            fprintf(stderr, "| miso=");
+            for (int i = 0; i < total && i < 8; i++) fprintf(stderr, "%02X ", miso[i]);
+            fprintf(stderr, "\n");
+        }
         memcpy(s->w, miso, (size_t)total);
         return;
     }

@@ -46,7 +46,7 @@ static void sd_return(xtensa_cpu_t *cpu, uint32_t retval) {
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, retval);
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -61,7 +61,7 @@ static void sd_return64(xtensa_cpu_t *cpu, uint64_t retval) {
     } else {
         ar_write(cpu, 2, (uint32_t)retval);
         ar_write(cpu, 3, (uint32_t)(retval >> 32));
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -72,7 +72,7 @@ static void sd_return_void(xtensa_cpu_t *cpu) {
         cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 

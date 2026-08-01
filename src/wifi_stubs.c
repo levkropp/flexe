@@ -197,7 +197,7 @@ static void ws_return(xtensa_cpu_t *cpu, uint32_t retval)
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, retval);
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
