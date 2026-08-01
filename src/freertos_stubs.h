@@ -34,6 +34,10 @@ void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, vo
 /* Current task name for a specific core (for heartbeat display) */
 const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt, int core_id);
 
+/* Dump the task table (name, state, saved PC/regs) into buf for debugging.
+ * Returns number of bytes written (excluding NUL). */
+int freertos_stubs_dump_tasks(const freertos_stubs_t *frt, char *buf, int buflen);
+
 /* Returns true if the cooperative scheduler is running (multi-task mode) */
 bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
 

@@ -106,7 +106,12 @@ static void rom_return(xtensa_cpu_t *cpu, uint32_t retval) {
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, retval);
-        cpu->pc = ar_read(cpu, 0);
+        /* Mask off the window/call-size bits in a0 exactly like the ci>0 path.
+         * A stubbed function reached via a tail `j` (after the caller's `entry`
+         * cleared PS.CALLINC) still has a0 = retaddr | (callinc<<30); using it
+         * raw yields an invalid PC with the top bits set. All ESP32 code lives
+         * in 0x4xxxxxxx, so forcing bit 30 and stripping [31:30] is correct. */
+        cpu->pc = 0x40000000u | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -121,7 +126,7 @@ static void rom_return64(xtensa_cpu_t *cpu, uint64_t retval) {
     } else {
         ar_write(cpu, 2, (uint32_t)retval);
         ar_write(cpu, 3, (uint32_t)(retval >> 32));
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = 0x40000000u | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -132,7 +137,7 @@ static void rom_return_void(xtensa_cpu_t *cpu) {
         cpu->pc = 0x40000000u | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = 0x40000000u | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -1064,6 +1069,46 @@ static void stub_floatunsidf(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_floatsidf(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_return_double(cpu, (double)(int32_t)rom_arg(cpu, 0));
+}
+
+/* __floatundidf: unsigned long long → double */
+static void stub_floatundidf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint64_t v = ((uint64_t)rom_arg(cpu, 1) << 32) | rom_arg(cpu, 0);
+    rom_return_double(cpu, (double)v);
+}
+
+/* __floatdidf: signed long long → double */
+static void stub_floatdidf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    int64_t v = (int64_t)(((uint64_t)rom_arg(cpu, 1) << 32) | rom_arg(cpu, 0));
+    rom_return_double(cpu, (double)v);
+}
+
+/* __floatundisf: unsigned long long → float */
+static void stub_floatundisf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint64_t v = ((uint64_t)rom_arg(cpu, 1) << 32) | rom_arg(cpu, 0);
+    float f = (float)v;
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    rom_return(cpu, bits);
+}
+
+/* __floatdisf: signed long long → float */
+static void stub_floatdisf(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    int64_t v = (int64_t)(((uint64_t)rom_arg(cpu, 1) << 32) | rom_arg(cpu, 0));
+    float f = (float)v;
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    rom_return(cpu, bits);
+}
+
+/* __fixdfdi: double → signed long long (truncate toward zero) */
+static void stub_fixdfdi(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return64(cpu, (uint64_t)(int64_t)rom_read_double(cpu, 0));
 }
 
 /* __fixdfsi: double → signed int (truncate toward zero) */
@@ -2552,6 +2597,15 @@ static void stub_ret_wl_connected(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 3);  /* WL_CONNECTED */
 }
 
+/* Return the second argument unchanged (arg1 passthrough).  Used for the
+ * xEventGroupWaitBits wrapper (0x4011dab4) so the caller sees the requested
+ * event-group bits set. */
+static void stub_ret_arg1(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    int ci = XT_PS_CALLINC(cpu->ps);
+    rom_return(cpu, ar_read(cpu, ci * 4 + 3));
+}
+
 /* digitalRead returns HIGH (1) — prevents firmware from thinking
  * buttons are pressed (most buttons are active-low). */
 static void stub_digital_read_high(xtensa_cpu_t *cpu, void *ctx) {
@@ -2969,6 +3023,7 @@ static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
         s->direct[di].fn = e->fn;
         s->direct[di].ctx = e->user_ctx ? e->user_ctx : s;
         s->direct[di].call_count = &e->call_count;
+        s->direct[di].spy = e->spy;
     }
 }
 
@@ -2986,6 +3041,8 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             s->total_calls++;
             (*de->call_count)++;
             de->fn(cpu, de->ctx);
+            if (de->spy)
+                return 0; /* spy: let original instruction execute */
             return 1;
         }
     }
@@ -3130,6 +3187,11 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* Soft-float double conversions */
     rom_stubs_register(s, 0x4000C938, stub_floatunsidf,         "__floatunsidf");
     rom_stubs_register(s, 0x4000C944, stub_floatsidf,           "__floatsidf");
+    rom_stubs_register(s, 0x4000C978, stub_floatundidf,         "__floatundidf");
+    rom_stubs_register(s, 0x4000C988, stub_floatdidf,           "__floatdidf");
+    rom_stubs_register(s, 0x4000C8B0, stub_floatundisf,         "__floatundisf");
+    rom_stubs_register(s, 0x4000C8C0, stub_floatdisf,           "__floatdisf");
+    rom_stubs_register(s, 0x40002AC4, stub_fixdfdi,             "__fixdfdi");
     rom_stubs_register(s, 0x40002A78, stub_fixdfsi,             "__fixdfsi");
     rom_stubs_register(s, 0x40002B30, stub_fixunsdfsi,          "__fixunsdfsi");
     rom_stubs_register(s, 0x40002B90, stub_truncdfsf2,          "__truncdfsf2");
@@ -3209,6 +3271,8 @@ typedef struct {
     uint32_t addr;
     rom_stub_fn fn;
     const char *name;
+    int spy;                /* nonzero: run fn as side effect, then execute
+                             * the real instruction (rom_stubs_register_spy) */
 } fw_addr_hook_t;
 
 /* NULL-handler-table remediation for symbol-less firmwares.  With the BT/WiFi
@@ -3259,35 +3323,205 @@ static void stub_fw_marauder_ble_clear(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
+/* NimBLEDevice::init() sync-wait: WiFiScan::RunSetup() -> NimBLEDevice::init()
+ * brings up the (stubbed-out) BT controller, then parks in
+ * "while (!host_synced) delay(1);" waiting for the NimBLE host task to set a
+ * synced flag — which never happens without a real controller, so setup()
+ * dies before wifi init and the menu draw.  The loop head is
+ * "l8ui a4, [a2]" with a2 = &synced_flag.  Spy hook: plant 1 through a2 and
+ * let the l8ui execute, so the loop exits via its own epilogue (no window
+ * juggling — a consuming rom_return mid-function would mishandle PS.CALLINC=0
+ * and jump at the unmasked a0). */
+static void stub_fw_marauder_ble_synced(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    mem_write8(cpu->mem, ar_read(cpu, 2), 1);
+}
+
+/* ROM tag/handler table accessor (0x40046058): the firmware's WiFi/BT init
+ * calls this ROM routine to get a {u16 tag, u32 handler} fixup table, but the
+ * emulator leaves that ROM region zeroed, so the unregistered-ROM backstop
+ * returns 0.  The caller (fixup loop at 0x401687e0) then walks the table
+ * pointer from address 0 (ptr += 8 each pass) hunting a tag==5 terminator that
+ * never exists — pinning CPU0 and starving loopTask before the menu draw.
+ * Fabricate a minimal table in RTC Fast RAM carrying the tags the loop matches
+ * (0x104, 0x807, 0x101) plus the tag==5 terminator, and return its address so
+ * the fixup fills in the handlers and exits. */
+#define FW_MARAUDER_WTBL  0x50000C00u
+static void stub_fw_marauder_wtbl(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = { 0x104, 0x807, 0x101, 0x0005 };
+    xtensa_mem_t *mem = cpu->mem;
+    for (unsigned i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
+        mem_write16(mem, FW_MARAUDER_WTBL + i * 8 + 0, tags[i]);
+        mem_write32(mem, FW_MARAUDER_WTBL + i * 8 + 4, 0);
+    }
+    rom_return(cpu, FW_MARAUDER_WTBL);
+}
+
+/* Two more ROM tag/handler table accessors (0x4005425C / 0x40054268), called
+ * via callx8 by the fixup loops at 0x40170464 / 0x401704e4 (themselves called
+ * back-to-back from 0x4017052c in the WiFi/BT blob init chain).  Same
+ * {u16 tag@+0, u32 handler@+4} 8-byte-entry contract as rom_wtbl_accessor,
+ * but DIFFERENT terminator tags: the first loop exits on tag 0x1804, the
+ * second on tag 0x40B — so the wtbl stub's tag==5 table never terminates
+ * these, and the loops walk the table pointer from address 0 hunting it
+ * (writing handlers into low RAM on stray tag matches along the way).
+ * Fabricate per-accessor tables in RTC Fast scratch carrying the tags each
+ * loop matches (so it fills the handlers in and exits) plus that loop's own
+ * terminator tag. */
+#define FW_MARAUDER_FTBL1 0x50000C40u
+#define FW_MARAUDER_FTBL2 0x50000C80u
+static void fw_marauder_make_tbl(xtensa_cpu_t *cpu, uint32_t addr,
+                                 const uint16_t *tags, unsigned n) {
+    xtensa_mem_t *mem = cpu->mem;
+    for (unsigned i = 0; i < n; i++) {
+        mem_write16(mem, addr + i * 8 + 0, tags[i]);
+        mem_write32(mem, addr + i * 8 + 4, 0);
+    }
+    rom_return(cpu, addr);
+}
+static void stub_fw_marauder_ftbl1(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* fixup loop 0x40170464: matches 0x408, 0xC35, 0xC1A, 0xC3F, 0x1407;
+     * terminates on 0x1804 */
+    static const uint16_t tags[] = { 0x0408, 0x0C35, 0x0C1A, 0x0C3F, 0x1407, 0x1804 };
+    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL1, tags,
+                         sizeof(tags) / sizeof(tags[0]));
+}
+static void stub_fw_marauder_ftbl2(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* fixup loop 0x401704e4: matches 0x401, 0x403, 0x404; terminates on 0x40B */
+    static const uint16_t tags[] = { 0x0401, 0x0403, 0x0404, 0x040B };
+    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL2, tags,
+                         sizeof(tags) / sizeof(tags[0]));
+}
+#define FW_MARAUDER_FTBL3 0x50000CC0u
+static void stub_fw_marauder_ftbl3(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* fixup loop 0x40167c20: matches 0x2013, 0x406, 0xC2D, 0x201B, 0x2020,
+     * 0x2016; terminates on 0xFC43 (movi a9,-957 + extui 16) */
+    static const uint16_t tags[] = { 0x2013, 0x0406, 0x0C2D, 0x201B, 0x2020,
+                                     0x2016, 0xFC43 };
+    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL3, tags,
+                         sizeof(tags) / sizeof(tags[0]));
+}
+#define FW_MARAUDER_FTBL4 0x50000D00u
+static void stub_fw_marauder_ftbl4(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* fixup loop 0x4016f1a8: matches 0x9, 0x200, 0x1; terminates on 0x805 */
+    static const uint16_t tags[] = { 0x0009, 0x0200, 0x0001, 0x0805 };
+    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL4, tags,
+                         sizeof(tags) / sizeof(tags[0]));
+}
+
+/* ble_hs_sync (0x4010463C): waits on the host-controller sync semaphore,
+ * which is never given because the BT controller is stubbed out — the host
+ * reset path ("Resetting state; reason=19") fires instead, and loopTask
+ * blocks forever inside NimBLEDevice::init.  Replicate the successful-sync
+ * epilogue: plant both synced-flag bytes (0x3FFC9528 / 0x3FFC9534, the same
+ * bytes the real function's epilogue stores via literals 0x400d27e4 /
+ * 0x400d2878) and return 0. */
+static void stub_fw_marauder_ble_hs_sync(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    mem_write8(cpu->mem, 0x3FFC9528, 1);
+    mem_write8(cpu->mem, 0x3FFC9534, 1);
+    rom_return(cpu, 0);
+}
+
 static const fw_addr_hook_t fw_marauder_hooks[] = {
-    { 0x401540A0, stub_unregistered, "esp_bt_controller_init" },
-    { 0x4010F65C, stub_unregistered, "ble_hs_init" },
-    { 0x401BDE2C, stub_fw_marauder_ble_clear, "ble_handler_table_clear" },
+    { 0x401540A0, stub_unregistered, "esp_bt_controller_init", 0 },
+    /* ble_hs_init is NOT stubbed: it creates ble_hs_mutex and zeroes the
+     * host state; stubbing it left the mutex handle NULL and the first
+     * ble_hs_lock() (NimBLEDevice::setDeviceName during init) hit
+     * "assert failed: npl_freertos_mutex_pend (mu->handle)" → core dump →
+     * reboot loop.  It now runs for real (the ROM fixup-table stubs below
+     * cover what used to hang). */
+    { 0x401BDE2C, stub_fw_marauder_ble_clear, "ble_handler_table_clear", 0 },
     /* btdm event handler called from the dispatcher (0x4015F3BC): reads a
      * NULL handler from the stack event struct the stubbed-out init never
      * filled.  Return ESP_OK so the dispatcher loop continues. */
-    { 0x40171278, stub_unregistered, "btdm_event_handler" },
+    { 0x40171278, stub_unregistered, "btdm_event_handler", 0 },
     /* esp_vhci_host_register_callback: btdm-side registration path fails
      * (ESP_FAIL) without the BT controller's flash config partition.
      * Stub it so esp_nimble_hci_init completes; the host callback stays
      * unregistered, which the null-call backstop covers. */
-    { 0x40171E18, stub_unregistered, "esp_vhci_host_register_callback" },
+    { 0x40171E18, stub_unregistered, "esp_vhci_host_register_callback", 0 },
+    /* ledc timer/duty config (0x4012871C): Marauder's backlight setup passes
+     * a garbage speed_mode (0x2D0) whose source is an emulation-side read,
+     * so the firmware's speed_mode<2 validation fails (ESP_ERR 258/259) and
+     * loopTask retries it forever in setup() instead of reaching the menu.
+     * Stub to ESP_OK so setup() proceeds; the panel still renders via SPI. */
+    { 0x4012871C, stub_unregistered, "ledc_timer_config", 0 },
+    /* NimBLE bond/security restore (0x4011624C = ble_store restore iterator,
+     * "entry a1,48"): on an empty NVS store it loops forever reading
+     * our_sec/peer_sec/cccd records that never exist (each sub-read returns
+     * non-zero so the loop's `beqz a10,done` never fires).  Called from
+     * 0x40115a5c (store init), which ignores the return value.  Stub the whole
+     * restore to return 0 ("0 bonds") so NimBLEDevice::init() proceeds.
+     *
+     * NOTE: three earlier stubs here were mis-placed and removed —
+     * 0x40104418 is a small error-code helper (NOT NimBLEDevice::init), and
+     * 0x40115D8E / 0x4011629B are return-address targets (the instruction
+     * after a call8), so hooking them hijacked normal returns into a
+     * self-loop.  The real restore entry is 0x4011624C. */
+    { 0x4011624C, stub_unregistered, "nimble_bond_restore", 0 },
+    /* NimBLE host-synced flag: never set with the controller stubbed out.
+     * Plant it at the wait-loop head so NimBLEDevice::init() returns. */
+    { 0x40104595, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
+    /* ble_hs_sync: block-forever on the sync sem with the controller
+     * stubbed; plant the synced flags and return success. */
+    { 0x4010463C, stub_fw_marauder_ble_hs_sync, "ble_hs_sync", 0 },
+    /* ROM tag/handler table accessor: returns a fabricated tag==5-terminated
+     * table so the WiFi/BT fixup loop (0x401687e0) stops walking from NULL. */
+    { 0x40046058, stub_fw_marauder_wtbl, "rom_wtbl_accessor", 0 },
+    /* Two more ROM table accessors with different terminator tags (0x1804 /
+     * 0x40B), called by the fixup loops at 0x40170464 / 0x401704e4. */
+    { 0x4005425C, stub_fw_marauder_ftbl1, "rom_ftbl1_accessor", 0 },
+    { 0x40054268, stub_fw_marauder_ftbl2, "rom_ftbl2_accessor", 0 },
+    /* Fixup loop at 0x40167c20; terminator tag 0xFC43. */
+    { 0x40042358, stub_fw_marauder_ftbl3, "rom_ftbl3_accessor", 0 },
+    /* Fixup loop at 0x4016f1a8; terminator tag 0x805. */
+    { 0x4004E718, stub_fw_marauder_ftbl4, "rom_ftbl4_accessor", 0 },
     /* Universal backstop: any remaining callxN through a NULL function
      * pointer (half-initialized driver handler structs) returns 0 to the
      * caller instead of trapping.  Requires the pc==0 hook to run before
      * the invalid-PC trap (see xtensa_step_impl). */
-    { 0x00000000, stub_unregistered, "null_fn_ptr" },
-    { 0, NULL, NULL }
+    { 0x00000000, stub_unregistered, "null_fn_ptr", 0 },
+    { 0, NULL, NULL, 0 }
+};
+
+/* NerdMiner v2 (CYD 2432S028, entry 0x40089268). */
+static const fw_addr_hook_t fw_nerdminer_hooks[] = {
+    /* xEventGroupWaitBits wrapper (0x4011dab4): the Arduino WiFi
+     * wait-for-connect path calls this (→ xEventGroupWaitBits) to wait for
+     * the WiFi-connected event-group bit, which is never set with no radio.
+     * Return the requested bits (arg1) so the caller sees "connected". */
+    { 0x4011DAB4, stub_ret_arg1, "wifi_egwait", 0 },
+    /* WiFi.status() getter (0x400eecb0): the post-connect check in NerdMiner's
+     * WiFi setup (0x400dde8f: call8 0x400eecb0; beqi a10,3) gates the mining
+     * transition.  Return WL_CONNECTED (3) so it passes. */
+    { 0x400EECB0, stub_ret_wl_connected, "wifi_status", 0 },
+    /* esp_wifi connect-command executor (0x4010a9f4, entry a1,80): the
+     * driver's connect path waits on the connect semaphore (portMAX_DELAY at
+     * 0x4010aad7) for a MAC connect-complete that never comes with no radio —
+     * parks loopTask forever.  Return ESP_OK (0) so the connect proceeds. */
+    { 0x4010A9F4, stub_unregistered, "esp_wifi_connect_exec", 0 },
+    { 0, NULL, NULL, 0 }
 };
 
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
     if (entry_point == 0x400831D8)      /* ESP32 Marauder v1.14 CYD 2432S028 */
         tbl = fw_marauder_hooks;
+    if (entry_point == 0x40089268)      /* NerdMiner v2 CYD 2432S028 */
+        tbl = fw_nerdminer_hooks;
     if (!tbl) return 0;
     int n = 0;
     for (const fw_addr_hook_t *h = tbl; h->fn; h++) {
-        rom_stubs_register(stubs, h->addr, h->fn, h->name);
+        if (h->spy)
+            rom_stubs_register_spy(stubs, h->addr, h->fn, h->name, NULL);
+        else
+            rom_stubs_register(stubs, h->addr, h->fn, h->name);
         n++;
     }
     if (n)
@@ -4284,9 +4518,23 @@ int rom_stubs_register(esp32_rom_stubs_t *stubs, uint32_t addr,
 
 int rom_stubs_register_spy(esp32_rom_stubs_t *stubs, uint32_t addr,
                             rom_stub_fn fn, const char *name, void *user_ctx) {
+    int first = stubs->count;
     int rc = rom_stubs_register_ctx(stubs, addr, fn, name, user_ctx);
-    if (rc == 0)
-        stubs->entries[stubs->count - 1].spy = 1;
+    if (rc == 0) {
+        /* Mark every entry this call added (register_ctx may append a second
+         * hook at a scanned ENTRY address), and refresh any direct-dispatch
+         * slot: hook_ht_insert copies e->spy before the flag is set here, so
+         * without this the fast path would consume the hooked instruction
+         * instead of letting it execute. */
+        for (int i = first; i < stubs->count; i++) {
+            stubs->entries[i].spy = 1;
+            if (stubs->direct) {
+                uint32_t di = (stubs->entries[i].addr >> 2) & STUB_DIRECT_MASK;
+                if (stubs->direct[di].tag == stubs->entries[i].addr)
+                    stubs->direct[di].spy = 1;
+            }
+        }
+    }
     return rc;
 }
 

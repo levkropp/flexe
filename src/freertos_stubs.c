@@ -128,7 +128,7 @@ static void frt_return(xtensa_cpu_t *cpu, uint32_t retval) {
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, retval);
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -139,7 +139,7 @@ static void frt_return_void(xtensa_cpu_t *cpu) {
         cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -1142,6 +1142,31 @@ const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt, int co
     if (!frt || core_id < 0 || core_id > 1) return NULL;
     if (frt->current_task[core_id] < 0) return NULL;
     return frt->tasks[frt->current_task[core_id]].name;
+}
+
+int freertos_stubs_dump_tasks(const freertos_stubs_t *frt, char *buf, int buflen) {
+    static const char *state_names[] = {
+        "UNUSED", "READY", "RUNNING", "SLEEPING", "BLOCKED_QUEUE"
+    };
+    if (!frt || !buf || buflen <= 0) return 0;
+    int n = 0;
+    n += snprintf(buf + n, buflen - n,
+                  "scheduler=%d task_count=%d cur0=%d cur1=%d\n",
+                  frt->scheduler_started, frt->task_count,
+                  frt->current_task[0], frt->current_task[1]);
+    for (int i = 0; i < MAX_TASKS && n < buflen; i++) {
+        const task_tcb_t *t = &frt->tasks[i];
+        if (t->state == TASK_UNUSED) continue;
+        uint32_t a0 = t->ar[(t->windowbase * 4 + 0) & 63];
+        uint32_t a1 = t->ar[(t->windowbase * 4 + 1) & 63];
+        n += snprintf(buf + n, buflen - n,
+                      "[%d] %-12s st=%-13s pc=0x%08X a0=0x%08X a1=0x%08X "
+                      "entry=0x%08X wake=%llu q=0x%08X\n",
+                      i, t->name, state_names[t->state & 7],
+                      t->pc, a0, a1, t->entry_fn,
+                      (unsigned long long)t->wake_cycle, t->blocked_queue);
+    }
+    return n;
 }
 
 int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms) {

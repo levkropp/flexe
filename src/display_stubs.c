@@ -525,7 +525,7 @@ static void ds_return_void(xtensa_cpu_t *cpu) {
         cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
@@ -538,7 +538,7 @@ static void ds_return(xtensa_cpu_t *cpu, uint32_t val) {
         XT_PS_SET_CALLINC(cpu->ps, 0);
     } else {
         ar_write(cpu, 2, val);
-        cpu->pc = ar_read(cpu, 0);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
     }
 }
 
