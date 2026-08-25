@@ -43,6 +43,12 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point);
 /* Snapshot host-network and virtual-radio activity for integration gates. */
 void wifi_stubs_get_stats(const wifi_stubs_t *ws, wifi_stubs_stats_t *stats);
 
+/* Resolve a firmware-side bound port to the loopback port selected by the
+ * host.  `datagram` distinguishes UDP from TCP when both use the same port. */
+int wifi_stubs_get_bound_host_port(const wifi_stubs_t *ws,
+                                   uint16_t firmware_port, bool datagram,
+                                   uint16_t *host_port_out);
+
 /* Enable event log mode: prefix wifi output with [cycle] WIFI format */
 void wifi_stubs_set_event_log(wifi_stubs_t *ws, bool enabled);
 

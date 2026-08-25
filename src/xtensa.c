@@ -573,20 +573,25 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
     }
 
     int nregs = 4;
-    /* Save to the stack at the hardware spill-area addresses: a0-a3 at
-     * [base-16] always; a4-a7 at [base-32] for call8+; a8-a11 at [base-48]
-     * for call12 only. The remaining registers are preserved transitively
-     * through the window ring (they are shared with neighbouring windows
-     * whose own spills cover them), exactly like the hardware overflow
-     * handlers — writing them unconditionally would trash live frames. */
+    /* Save to the exact ABI locations used by the ESP32 overflow vectors.
+     * a0-a3 live immediately below the callee SP.  For call8/call12, the
+     * remaining registers do NOT live below that same SP: the vector follows
+     * the caller's base-save-area link at [caller_sp-12], then stores them
+     * below that linked top.  Treating them as [callee_sp-32/-48] overlaps a
+     * solicited FreeRTOS yield frame and corrupts suspended callers. */
     for (int i = 0; i < 4; i++)
         mem_write32(cpu->mem, base - 16 + i * 4, phys_read(cpu, widx, i));
-    if (callsize >= 2)
+    if (callsize >= 2) {
+        uint32_t caller_sp = phys_read(cpu, widx, 1);
+        uint32_t extra_top = mem_read32(cpu->mem, caller_sp - 12);
         for (int i = 0; i < 4; i++)
-            mem_write32(cpu->mem, base - 32 + i * 4, phys_read(cpu, widx, 4 + i));
-    if (callsize == 3)
-        for (int i = 0; i < 4; i++)
-            mem_write32(cpu->mem, base - 48 + i * 4, phys_read(cpu, widx, 8 + i));
+            mem_write32(cpu->mem, extra_top - (callsize == 3 ? 48 : 32) + i * 4,
+                        phys_read(cpu, widx, 4 + i));
+        if (callsize == 3)
+            for (int i = 0; i < 4; i++)
+                mem_write32(cpu->mem, extra_top - 32 + i * 4,
+                            phys_read(cpu, widx, 8 + i));
+    }
     {
         int si0 = widx & 0xF;
         int d0 = cpu->spill_stack[si0].depth - 1; /* depth was already incremented */
@@ -733,14 +738,20 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int cal
             cpu->window_callsize[ret_wb & 0xF] = (uint8_t)healed;
     }
 
-    if (callsize >= 2)
+    if (callsize >= 2) {
+        uint32_t caller_sp = phys_read(cpu, ret_wb, 1);
+        uint32_t extra_top = mem_read32(cpu->mem, caller_sp - 12);
         for (int i = 0; i < 4; i++)
             phys_write(cpu, ret_wb, 4 + i, use_rec ? cpu->spill_stack[m_si].extra[m_d][i]
-                                                   : mem_read32(cpu->mem, base - 32 + i * 4));
-    if (callsize == 3)
-        for (int i = 0; i < 4; i++)
-            phys_write(cpu, ret_wb, 8 + i, use_rec ? cpu->spill_stack[m_si].extra[m_d][4 + i]
-                                                   : mem_read32(cpu->mem, base - 48 + i * 4));
+                                                   : mem_read32(cpu->mem,
+                                                       extra_top - (callsize == 3 ? 48 : 32) + i * 4));
+        if (callsize == 3)
+            for (int i = 0; i < 4; i++)
+                phys_write(cpu, ret_wb, 8 + i,
+                           use_rec ? cpu->spill_stack[m_si].extra[m_d][4 + i]
+                                   : mem_read32(cpu->mem,
+                                                extra_top - 32 + i * 4));
+    }
 
     /* Verify restored values match what was originally spilled */
     if (cpu->spill_verify) {

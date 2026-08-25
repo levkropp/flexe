@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,6 +51,17 @@ typedef struct {
     char log[4096];
     size_t log_len;
 } uart_state_t;
+
+typedef struct {
+    int tcp_fd;
+    int udp_fd;
+    uint16_t tcp_port;
+    uint16_t udp_port;
+    uint8_t http_response[8192];
+    size_t http_len;
+    uint8_t dns_response[512];
+    size_t dns_len;
+} nerd_network_probe_t;
 
 #define MAX_UNREGISTERED_ROM_ADDRS 32
 typedef struct {
@@ -371,6 +385,139 @@ static int run_until_nerd_network(flexe_session_t *session,
     return 1;
 }
 
+static void nerd_probe_close(nerd_network_probe_t *probe)
+{
+    if (probe->tcp_fd >= 0) close(probe->tcp_fd);
+    if (probe->udp_fd >= 0) close(probe->udp_fd);
+    probe->tcp_fd = -1;
+    probe->udp_fd = -1;
+}
+
+static int nerd_probe_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags < 0 ? -1 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int nerd_probe_send_all(int fd, const void *data, size_t len)
+{
+    const uint8_t *src = data;
+    while (len > 0) {
+        ssize_t sent = send(fd, src, len, 0);
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent <= 0) return -1;
+        src += sent;
+        len -= (size_t)sent;
+    }
+    return 0;
+}
+
+static int nerd_probe_open(wifi_stubs_t *wifi, nerd_network_probe_t *probe)
+{
+    static const char http_request[] =
+        "GET / HTTP/1.0\r\nHost: 192.168.4.1\r\nConnection: close\r\n\r\n";
+    static const uint8_t dns_query[] = {
+        0x46, 0x58, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+        0x03, 'c', 'o', 'm', 0x00,
+        0x00, 0x01, 0x00, 0x01,
+    };
+
+    memset(probe, 0, sizeof(*probe));
+    probe->tcp_fd = -1;
+    probe->udp_fd = -1;
+    if (wifi_stubs_get_bound_host_port(wifi, 80, false,
+                                       &probe->tcp_port) != 0 ||
+        wifi_stubs_get_bound_host_port(wifi, 53, true,
+                                       &probe->udp_port) != 0)
+        return -1;
+
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    probe->tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (probe->tcp_fd < 0) goto fail;
+    peer.sin_port = htons(probe->tcp_port);
+    if (connect(probe->tcp_fd, (struct sockaddr *)&peer, sizeof(peer)) != 0 ||
+        nerd_probe_send_all(probe->tcp_fd, http_request,
+                            sizeof(http_request) - 1) != 0 ||
+        nerd_probe_nonblocking(probe->tcp_fd) != 0)
+        goto fail;
+
+    probe->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe->udp_fd < 0) goto fail;
+    peer.sin_port = htons(probe->udp_port);
+    if (sendto(probe->udp_fd, dns_query, sizeof(dns_query), 0,
+               (struct sockaddr *)&peer, sizeof(peer)) !=
+            (ssize_t)sizeof(dns_query) ||
+        nerd_probe_nonblocking(probe->udp_fd) != 0)
+        goto fail;
+    return 0;
+
+fail:
+    nerd_probe_close(probe);
+    return -1;
+}
+
+static void nerd_probe_receive(nerd_network_probe_t *probe)
+{
+    if (probe->tcp_fd >= 0 && probe->http_len < sizeof(probe->http_response)) {
+        ssize_t n = recv(probe->tcp_fd,
+                         probe->http_response + probe->http_len,
+                         sizeof(probe->http_response) - probe->http_len,
+                         MSG_DONTWAIT);
+        if (n > 0) probe->http_len += (size_t)n;
+    }
+    if (probe->udp_fd >= 0 && probe->dns_len < sizeof(probe->dns_response)) {
+        ssize_t n = recv(probe->udp_fd,
+                         probe->dns_response + probe->dns_len,
+                         sizeof(probe->dns_response) - probe->dns_len,
+                         MSG_DONTWAIT);
+        if (n > 0) probe->dns_len += (size_t)n;
+    }
+}
+
+static int run_until_nerd_services(flexe_session_t *session,
+                                   nerd_network_probe_t *probe,
+                                   uint64_t max_cycles,
+                                   wifi_stubs_stats_t *stats_out,
+                                   uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    uint64_t start = cpu0->cycle_count;
+    wifi_stubs_stats_t stats = {0};
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        nerd_probe_receive(probe);
+        wifi_stubs_get_stats(wifi, &stats);
+
+        bool http_ok = probe->http_len >= 5 &&
+                       memcmp(probe->http_response, "HTTP/", 5) == 0;
+        bool dns_ok = probe->dns_len >= 12 &&
+                      probe->dns_response[0] == 0x46 &&
+                      probe->dns_response[1] == 0x58 &&
+                      (probe->dns_response[2] & 0x80) != 0;
+        if (http_ok && dns_ok && stats.accept_successes >= 1 &&
+            stats.recv_bytes > 0 && stats.send_bytes > 0 &&
+            stats.recvfrom_bytes > 0 && stats.sendto_bytes > 0) {
+            *stats_out = stats;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    nerd_probe_receive(probe);
+    wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
@@ -474,6 +621,8 @@ int main(int argc, char **argv)
     int spiffs_blocks = 0;
     wifi_stubs_stats_t wifi_stats = {0};
     uint64_t network_cycles = 0;
+    uint64_t service_cycles = 0;
+    nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
     if (is_nerdminer) {
         if (strstr(uart.log, "sdcard_mount(): f_mount failed") != NULL) {
             fprintf(stderr,
@@ -518,6 +667,41 @@ int main(int argc, char **argv)
                     (unsigned long long)wifi_stats.bind_calls,
                     (unsigned long long)wifi_stats.listen_successes,
                     (unsigned long long)wifi_stats.listen_calls);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        if (nerd_probe_open(flexe_session_wifi(session), &network_probe) != 0) {
+            fprintf(stderr,
+                    "FAIL profile=nerdminer reason=host-network-probe-open\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        int service_result = run_until_nerd_services(
+                session, &network_probe, 1500000000ull, &wifi_stats,
+                &service_cycles);
+        if (service_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=nerdminer reason=%s service_cycles=%llu "
+                    "http_bytes=%zu dns_bytes=%zu accepts=%llu "
+                    "tcp_rx=%llu tcp_tx=%llu udp_rx=%llu udp_tx=%llu\n",
+                    service_result < 0 ? "cpus-stopped" : "service-timeout",
+                    (unsigned long long)service_cycles,
+                    network_probe.http_len, network_probe.dns_len,
+                    (unsigned long long)wifi_stats.accept_successes,
+                    (unsigned long long)wifi_stats.recv_bytes,
+                    (unsigned long long)wifi_stats.send_bytes,
+                    (unsigned long long)wifi_stats.recvfrom_bytes,
+                    (unsigned long long)wifi_stats.sendto_bytes);
+            nerd_probe_close(&network_probe);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -602,6 +786,7 @@ int main(int argc, char **argv)
                     rom_audit.count[i]);
         }
         fputc('\n', stderr);
+        nerd_probe_close(&network_probe);
         flexe_session_destroy(session);
         pthread_mutex_destroy(&framebuffer_mutex);
         unlink(sd_path);
@@ -615,6 +800,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "FAIL profile=%s reason=unhandled-mmio accesses=%d\n",
                 profile, unhandled_mmio);
+        nerd_probe_close(&network_probe);
         flexe_session_destroy(session);
         pthread_mutex_destroy(&framebuffer_mutex);
         unlink(sd_path);
@@ -637,13 +823,23 @@ int main(int argc, char **argv)
         printf(" touch_changed=%d sd_fat=mounted sd_write=SCRIPTS", touch_changed);
     if (is_nerdminer)
         printf(" spiffs_blocks=%d sd_fat=mounted network_cycles=%llu "
-               "tcp_udp_sockets=%llu binds=%llu listens=%llu",
+               "service_cycles=%llu tcp_udp_sockets=%llu binds=%llu "
+               "listens=%llu accepts=%llu http_bytes=%zu dns_bytes=%zu "
+               "tcp_rx=%llu tcp_tx=%llu udp_rx=%llu udp_tx=%llu",
                spiffs_blocks, (unsigned long long)network_cycles,
+               (unsigned long long)service_cycles,
                (unsigned long long)wifi_stats.socket_successes,
                (unsigned long long)wifi_stats.bind_successes,
-               (unsigned long long)wifi_stats.listen_successes);
+               (unsigned long long)wifi_stats.listen_successes,
+               (unsigned long long)wifi_stats.accept_successes,
+               network_probe.http_len, network_probe.dns_len,
+               (unsigned long long)wifi_stats.recv_bytes,
+               (unsigned long long)wifi_stats.send_bytes,
+               (unsigned long long)wifi_stats.recvfrom_bytes,
+               (unsigned long long)wifi_stats.sendto_bytes);
     putchar('\n');
 
+    nerd_probe_close(&network_probe);
     flexe_session_destroy(session);
     pthread_mutex_destroy(&framebuffer_mutex);
     unlink(sd_path);

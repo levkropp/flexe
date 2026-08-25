@@ -793,6 +793,81 @@ static uint32_t phys_rd(xtensa_cpu_t *cpu, int w, int r) {
     return cpu->ar[((w * 4) + r) & 63];
 }
 
+/* ESP32's call8/call12 overflow vectors store a0-a3 below the callee SP,
+ * then follow the caller's base-save-area link at [caller_sp-12] for the
+ * remaining registers.  FreeRTOS yield frames occupy the tempting but wrong
+ * [callee_sp-32/-48] locations, so using one flat area corrupts suspended
+ * callers.  Exercise both the spill and the stack-only underflow fallback. */
+static void linked_spill_round_trip(int callsize) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    const int callee = callsize;
+    const uint32_t caller_sp = BASE + 0x7800;
+    const uint32_t callee_sp = BASE + 0x7000;
+    const uint32_t extra_top = BASE + 0x6400;
+    const uint32_t sentinel = 0x5A5A0000u | (uint32_t)callsize;
+    uint32_t expected[12];
+
+    cpu.windowbase = (uint32_t)callee;
+    cpu.windowstart = (1u << 0) | (1u << callee);
+    cpu.window_callsize[callee] = (uint8_t)callsize;
+
+    for (int i = 0; i < callsize * 4; i++) {
+        expected[i] = 0xA5000000u | ((uint32_t)callsize << 16) | (uint32_t)i;
+        phys_wr(&cpu, 0, i, expected[i]);
+    }
+    phys_wr(&cpu, 0, 1, caller_sp);
+    expected[1] = caller_sp;
+    phys_wr(&cpu, callee, 0,
+            ((uint32_t)callsize << 30) | ((BASE + 3) & 0x3FFFFFFFu));
+    phys_wr(&cpu, callee, 1, callee_sp);
+    mem_write32(cpu.mem, caller_sp - 12, extra_top);
+
+    /* Mark the flat callee-relative areas.  Correct call8/call12 spills must
+     * leave them untouched; a0-a3 use the adjacent [callee_sp-16] area. */
+    for (int off = 20; off <= callsize * 16; off += 4)
+        mem_write32(cpu.mem, callee_sp - (uint32_t)off, sentinel);
+
+    xtensa_flush_windows(&cpu);
+    ASSERT_FALSE(cpu.windowstart & 1u);
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16 + (uint32_t)i * 4),
+                  expected[i]);
+
+    uint32_t a4_top = extra_top - (callsize == 3 ? 48u : 32u);
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(mem_read32(cpu.mem, a4_top + (uint32_t)i * 4), expected[4 + i]);
+    if (callsize == 3) {
+        for (int i = 0; i < 4; i++)
+            ASSERT_EQ(mem_read32(cpu.mem, extra_top - 32 + (uint32_t)i * 4),
+                      expected[8 + i]);
+    }
+    for (int off = 20; off <= callsize * 16; off += 4)
+        ASSERT_EQ(mem_read32(cpu.mem, callee_sp - (uint32_t)off), sentinel);
+
+    /* Force the underflow path to use guest stack memory, then destroy the
+     * physical caller registers so a successful return proves the ABI layout
+     * itself is sufficient. */
+    memset(cpu.spill_stack, 0, sizeof(cpu.spill_stack));
+    for (int i = 0; i < callsize * 4; i++)
+        phys_wr(&cpu, 0, i, 0xDEAD0000u | (uint32_t)i);
+    put_insn3(&cpu, BASE, retw_insn());
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.windowbase, 0);
+    for (int i = 0; i < callsize * 4; i++)
+        ASSERT_EQ(phys_rd(&cpu, 0, i), expected[i]);
+
+    teardown(&cpu);
+}
+
+TEST(call8_linked_spill_area) {
+    linked_spill_round_trip(2);
+}
+
+TEST(call12_linked_spill_area) {
+    linked_spill_round_trip(3);
+}
+
 /* Reproduces the context-switch register corruption scenario: a live call
  * chain (w0-w6) holds distinctive values in ancestor windows, an interrupt
  * flushes all non-current windows to the stack (SPILL_ALL_WINDOWS), the
@@ -1028,6 +1103,8 @@ static void run_window_tests(void) {
     RUN_TEST(rfwu_basic);
     RUN_TEST(retw_n_basic);
     RUN_TEST(factorial_windowed);
+    RUN_TEST(call8_linked_spill_area);
+    RUN_TEST(call12_linked_spill_area);
     RUN_TEST(interrupt_flush_round_trip);
     RUN_TEST(interrupt_flush_stale_callsize);
 }

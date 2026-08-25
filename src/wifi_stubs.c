@@ -87,6 +87,9 @@ static inline int fcntl(int fd, int cmd, ...)
 
 typedef struct {
     int      host_fd;            /* real host socket fd, or -1 if unused */
+    int      socket_type;        /* SOCK_STREAM/SOCK_DGRAM */
+    uint16_t firmware_port;      /* requested bind port, host byte order */
+    uint16_t host_port;          /* actual loopback port, host byte order */
     bool     nonblocking;
     uint64_t total_received;     /* bytes received so far (for timeout policy) */
     bool     awaiting_response;  /* true after send(), cleared after recv() */
@@ -187,7 +190,12 @@ struct wifi_stubs {
 static uint32_t ws_arg(xtensa_cpu_t *cpu, int n)
 {
     int ci = XT_PS_CALLINC(cpu->ps);
-    return ar_read(cpu, ci * 4 + 2 + n);
+    int reg = ci * 4 + 2 + n;
+    if (reg < 16)
+        return ar_read(cpu, reg);
+    int overflow_idx = reg - 16;
+    uint32_t caller_sp = ar_read(cpu, 1);
+    return mem_read32(cpu->mem, caller_sp + (uint32_t)overflow_idx * 4u);
 }
 
 static void ws_return(xtensa_cpu_t *cpu, uint32_t retval)
@@ -232,6 +240,9 @@ static int slot_alloc(wifi_stubs_t *ws, int host_fd)
     for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
         if (ws->sockets[i].host_fd == -1) {
             ws->sockets[i].host_fd = host_fd;
+            ws->sockets[i].socket_type = 0;
+            ws->sockets[i].firmware_port = 0;
+            ws->sockets[i].host_port = 0;
             ws->sockets[i].nonblocking = false;
             ws->sockets[i].total_received = 0;
             ws->sockets[i].awaiting_response = false;
@@ -262,6 +273,9 @@ static void slot_free(wifi_stubs_t *ws, int fd)
         if (ws->sockets[idx].ssl_ctx)
             SSL_CTX_free(ws->sockets[idx].ssl_ctx);
         ws->sockets[idx].host_fd = -1;
+        ws->sockets[idx].socket_type = 0;
+        ws->sockets[idx].firmware_port = 0;
+        ws->sockets[idx].host_port = 0;
         ws->sockets[idx].nonblocking = false;
         ws->sockets[idx].total_received = 0;
         ws->sockets[idx].awaiting_response = false;
@@ -337,6 +351,10 @@ static void stub_lwip_socket(xtensa_cpu_t *cpu, void *ctx)
         ws_return(cpu, (uint32_t)-1);
         return;
     }
+
+    emu_socket_t *s = slot_get(ws, idx);
+    if (s)
+        s->socket_type = (int)type;
 
     wifi_log(ws, "socket() → slot %d (host fd %d)\n", idx, hfd);
     ws->stats.socket_successes++;
@@ -975,8 +993,10 @@ static void stub_lwip_bind(xtensa_cpu_t *cpu, void *ctx)
     struct sockaddr_in bound;
     socklen_t blen = sizeof(bound);
     if (getsockname(s->host_fd, (struct sockaddr *)&bound, &blen) == 0) {
+        s->firmware_port = requested_port;
+        s->host_port = ntohs(bound.sin_port);
         wifi_log(ws, "bind(slot %u) firmware port %u → host 127.0.0.1:%u\n",
-                 fd, requested_port, ntohs(bound.sin_port));
+                 fd, requested_port, s->host_port);
     } else {
         wifi_log(ws, "bind(slot %u) firmware port %u\n", fd, requested_port);
     }
@@ -1051,6 +1071,9 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
         ws_return(cpu, (uint32_t)-1);
         return;
     }
+    emu_socket_t *client = slot_get(ws, cfd);
+    if (client)
+        client->socket_type = SOCK_STREAM;
 
     if (sa_addr)
         write_emu_sockaddr_in(cpu, sa_addr, &csa);
@@ -1122,6 +1145,8 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
     uint32_t fd   = ws_arg(cpu, 0);
     uint32_t buf  = ws_arg(cpu, 1);
     uint32_t len  = ws_arg(cpu, 2);
+    uint32_t sa_addr = ws_arg(cpu, 4);
+    uint32_t len_addr = ws_arg(cpu, 5);
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
@@ -1132,12 +1157,19 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
     uint8_t *tmp = malloc(len);
     if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
 
-    ssize_t n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
+    struct sockaddr_in source;
+    socklen_t source_len = sizeof(source);
+    ssize_t n = recvfrom(s->host_fd, tmp, len, MSG_DONTWAIT,
+                         (struct sockaddr *)&source, &source_len);
 
     if (n > 0) {
         ws->stats.recvfrom_bytes += (uint64_t)n;
         for (ssize_t i = 0; i < n; i++)
             mem_write8(cpu->mem, buf + (uint32_t)i, tmp[i]);
+        if (sa_addr)
+            write_emu_sockaddr_in(cpu, sa_addr, &source);
+        if (len_addr)
+            mem_write32(cpu->mem, len_addr, sizeof(struct sockaddr_in));
     }
     free(tmp);
 
@@ -1245,7 +1277,13 @@ static void stub_start_ssl_client(xtensa_cpu_t *cpu, void *ctx)
         return;
     }
 
-    emu_socket_t *s = &ws->sockets[slot];
+    emu_socket_t *s = slot_get(ws, slot);
+    if (!s) {
+        close(hfd);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+    s->socket_type = SOCK_STREAM;
 
     /* Attempt host-side TLS handshake */
     SSL_CTX *sctx = SSL_CTX_new(TLS_client_method());
@@ -2129,4 +2167,20 @@ void wifi_stubs_get_stats(const wifi_stubs_t *ws, wifi_stubs_stats_t *stats) {
         *stats = ws->stats;
     else
         memset(stats, 0, sizeof(*stats));
+}
+
+int wifi_stubs_get_bound_host_port(const wifi_stubs_t *ws,
+                                   uint16_t firmware_port, bool datagram,
+                                   uint16_t *host_port_out) {
+    if (!ws || !host_port_out) return -1;
+    int wanted_type = datagram ? SOCK_DGRAM : SOCK_STREAM;
+    for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
+        const emu_socket_t *s = &ws->sockets[i];
+        if (s->host_fd >= 0 && s->socket_type == wanted_type &&
+            s->firmware_port == firmware_port && s->host_port != 0) {
+            *host_port_out = s->host_port;
+            return 0;
+        }
+    }
+    return -1;
 }
