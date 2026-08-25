@@ -514,6 +514,70 @@ TEST(waiti_wakes_on_interrupt) {
     teardown(&cpu);
 }
 
+TEST(waiti_run_fast_forwards_idle_budget) {
+    xtensa_cpu_t cpu;
+    setup_exc(&cpu);
+    cpu.ps = 0;
+    cpu.ccount = 10;
+    cpu.cycle_count = 123;
+    cpu.running = true;
+    put_insn3(&cpu, BASE, INSN_WAITI(0));
+    xtensa_step(&cpu);
+    ASSERT_TRUE(cpu.halted);
+    uint32_t wait_pc = cpu.pc;
+
+    int ran = xtensa_run(&cpu, 1000000);
+    ASSERT_EQ(ran, 1000000);
+    ASSERT_EQ(cpu.ccount, 1000011);
+    ASSERT_EQ(cpu.cycle_count, 1000124);
+    ASSERT_EQ(cpu.pc, wait_pc);
+    ASSERT_TRUE(cpu.halted);
+    teardown(&cpu);
+}
+
+TEST(waiti_run_fast_forwards_to_timer) {
+    xtensa_cpu_t cpu;
+    setup_exc(&cpu);
+    cpu.ps = 0;
+    cpu.ccount = 10;
+    cpu.running = true;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 1000010);
+    cpu.intenable = (1u << 6);
+    put_insn3(&cpu, BASE, INSN_WAITI(0));
+    xtensa_step(&cpu); /* ccount = 11 */
+    ASSERT_TRUE(cpu.halted);
+
+    int ran = xtensa_run(&cpu, 999999);
+    ASSERT_EQ(ran, 999999);
+    ASSERT_EQ(cpu.ccount, 1000010);
+    ASSERT_FALSE(cpu.halted);
+    ASSERT_EQ(cpu.pc, TEST_VECBASE + VECOFS_KERNEL_EXC);
+    ASSERT_EQ(cpu.exccause, EXCCAUSE_LEVEL1_INT);
+    teardown(&cpu);
+}
+
+TEST(waiti_latched_compare_does_not_hide_later_timer) {
+    xtensa_cpu_t cpu;
+    setup_exc(&cpu);
+    cpu.ps = 0;
+    cpu.ccount = 98;
+    cpu.running = true;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 100);
+    sr_write(&cpu, XT_SR_CCOMPARE1, 1000);
+    cpu.intenable = (1u << 15); /* CCOMPARE0 latches but cannot wake us */
+    put_insn3(&cpu, BASE, INSN_WAITI(0));
+    xtensa_step(&cpu); /* ccount = 99 */
+
+    int ran = xtensa_run(&cpu, 901);
+    ASSERT_EQ(ran, 901);
+    ASSERT_EQ(cpu.ccount, 1000);
+    ASSERT_TRUE(cpu.interrupt & (1u << 6));
+    ASSERT_TRUE(cpu.interrupt & (1u << 15));
+    ASSERT_FALSE(cpu.halted);
+    ASSERT_EQ(cpu.pc, TEST_VECBASE + VECOFS_LEVEL3_INT);
+    teardown(&cpu);
+}
+
 /* ===== NMI test ===== */
 
 TEST(exc_nmi_dispatch) {
@@ -587,4 +651,7 @@ void run_exception_tests(void) {
     TEST_SUITE("WAITI");
     RUN_TEST(waiti_halts);
     RUN_TEST(waiti_wakes_on_interrupt);
+    RUN_TEST(waiti_run_fast_forwards_idle_budget);
+    RUN_TEST(waiti_run_fast_forwards_to_timer);
+    RUN_TEST(waiti_latched_compare_does_not_hide_later_timer);
 }

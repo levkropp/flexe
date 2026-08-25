@@ -15,6 +15,7 @@
 #include "freertos_stubs.h"
 #include "display_stubs.h"
 #include "peripherals.h"
+#include "jit.h"
 #include <stdint.h>
 #include <pthread.h>
 
@@ -36,6 +37,7 @@ typedef struct {
     int         window_trace;       /* Enable window spill/fill trace */
     int         spill_verify;       /* Enable spill/fill verification */
     int         native_freertos;    /* -N: let firmware run real FreeRTOS */
+    int         disable_jit;        /* 1 = interpreter only; default is native JIT */
 
     /* UART output callback (NULL = no UART output) */
     void      (*uart_cb)(void *ctx, uint8_t byte);
@@ -55,8 +57,12 @@ typedef struct {
      * -1 = disable raw SPI sniffing) */
     int         spi_dc_pin;
     int         spi_display_cs_pin;
+    int         spi_display_sck_pin;
     int         spi_touch_cs_pin;
+    int         spi_touch_sck_pin;
+    int         spi_touch_irq_pin;
     int         spi_sd_cs_pin;
+    int         spi_sd_sck_pin;
 } flexe_session_config_t;
 
 /* Create a fully-initialized emulator session.
@@ -76,6 +82,12 @@ esp32_rom_stubs_t *flexe_session_rom(flexe_session_t *s);
 freertos_stubs_t  *flexe_session_frt(flexe_session_t *s);
 display_stubs_t   *flexe_session_display(flexe_session_t *s);
 int                flexe_session_is_native_freertos(const flexe_session_t *s);
+jit_state_t       *flexe_session_jit(flexe_session_t *s);
+
+/* Execute up to max_cycles on one core using the session's configured
+ * engine.  Native JIT is the default on supported hosts; disable_jit falls
+ * back to the interpreter.  Returns the guest instruction-count advance. */
+int flexe_session_run_core(flexe_session_t *s, int core, int max_cycles);
 
 /* Post-batch hook: call after each core 0 batch.
  * - Checks preempt on core 0

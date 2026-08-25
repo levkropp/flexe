@@ -34,6 +34,12 @@ xtensa_mem_t *periph_mem(esp32_periph_t *p);
  * GP-SPI display/touch sniffer to sample CS and D/C lines. */
 int periph_gpio_pin_level(const esp32_periph_t *p, int pin);
 
+/* GPIO-matrix output signal selected for a pin (bits OUT_SEL[8:0] of
+ * GPIO_FUNCn_OUT_SEL_CFG_REG), or -1 for an invalid pin.  GP-SPI device
+ * emulation uses this to distinguish SPI2 and SPI3 wiring even when a chip
+ * select is controlled by the peripheral instead of the GPIO output latch. */
+int periph_gpio_out_signal(const esp32_periph_t *p, int pin);
+
 /* Assert/deassert a peripheral interrupt source (0-70).
  * Scans the interrupt matrix to find mapped CPU interrupt lines and
  * sets/clears the corresponding bits in cpu->interrupt. */

@@ -1,6 +1,8 @@
 #include "peripherals.h"
+#include "spi_display.h"
 #include "sandbox_events.h"
 #include "xtensa.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -14,16 +16,28 @@
 #define SPI1_BASE       0x3FF42000u
 #define SPI0_BASE       0x3FF43000u
 #define GPIO_BASE       0x3FF44000u
+#define FE2_BASE        0x3FF45000u
+#define FE_BASE         0x3FF46000u
+#define PHY_BASE        0x3FF4E000u  /* undocumented WiFi PHY calibration window */
 #define RTC_CNTL_BASE   0x3FF48000u
 #define SENS_BASE       0x3FF48800u
 #define IO_MUX_BASE     0x3FF49000u
+#define BT_BASE         0x3FF51000u
 #define EFUSE_BASE      0x3FF5A000u
+#define NRX_PRIVATE_BASE 0x3FF5C000u /* includes documented NRX at +0xC00 */
+#define BB_BASE         0x3FF5D000u
+#define I2S0_BASE       0x3FF4F000u
+#define LEDC_BASE       0x3FF59000u
 #define TIMG0_BASE      0x3FF5F000u
 #define TIMG1_BASE      0x3FF60000u
+#define I2S1_BASE       0x3FF6D000u
 #define SYSCON_BASE     0x3FF66000u
+#define BT_PRIVATE_BASE 0x3FF71000u
 #define WIFI_MAC_BASE   0x3FF73000u  /* WiFi MAC/BB control registers */
+#define WIFI_MAC_SIZE   0x2000u
 #define WDEV_BASE       0x3FF75000u  /* WiFi device (contains RNG register) */
 #define PAGE_SIZE       4096
+#define PAGE_WORDS      (PAGE_SIZE / sizeof(uint32_t))
 
 /* Page index from absolute address */
 #define PAGE_OF(addr) (((addr) - PERIPH_BASE) / PAGE_SIZE)
@@ -36,6 +50,17 @@
 #define UART_TXFIFO_EMPTY_INT    (1u << 1)
 #define UART_TX_DONE_INT         (1u << 14)
 #define UART_INT_VALID_MASK      0x7FFFFu
+
+/* LEDC register offsets and interrupt source (ESP32, not S2/S3). */
+#define LEDC_INT_RAW_OFF         0x180u
+#define LEDC_INT_ST_OFF          0x184u
+#define LEDC_INT_ENA_OFF         0x188u
+#define LEDC_INT_CLR_OFF         0x18Cu
+#define LEDC_DATE_OFF            0x1FCu
+#define LEDC_INTR_SOURCE         43
+
+static uint32_t default_read(void *ctx, uint32_t addr);
+static void default_write(void *ctx, uint32_t addr, uint32_t val);
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -100,6 +125,25 @@ typedef struct {
     int      reads_since;    /* reads since cal_started */
 } rtc_cal_state_t;
 
+/* The ESP32 WiFi/BT binary blobs directly program several undocumented RF,
+ * PHY, baseband, and controller windows while calibrating the radio. Most of
+ * this traffic is ordinary read/modify/write configuration. Retain an
+ * independent register file for each page so updates are visible to the HAL;
+ * command/status registers with active behavior stay explicit in the handler
+ * (currently the WiFi MAC reset/ready handshake and WDEV RNG). */
+typedef struct {
+    uint32_t fe2[PAGE_WORDS];
+    uint32_t fe[PAGE_WORDS];
+    uint32_t phy[PAGE_WORDS];
+    uint32_t bt[PAGE_WORDS];
+    uint32_t nrx[PAGE_WORDS];
+    uint32_t bb[PAGE_WORDS];
+    uint32_t bt_private[PAGE_WORDS];
+    uint32_t wifi_mac[WIFI_MAC_SIZE / sizeof(uint32_t)];
+    uint32_t wdev[PAGE_WORDS];
+    uint64_t rng_state;
+} radio_state_t;
+
 struct esp32_periph {
     xtensa_mem_t *mem;
 
@@ -156,8 +200,17 @@ struct esp32_periph {
     /* SPI flash controllers: [0] = SPI0 (cache), [1] = SPI1 (memspi) */
     spi_state_t spi[2];
 
-    /* WiFi MAC reset/ready handshake used by the closed-source HAL. */
-    uint32_t wifi_mac_init_ctrl;
+    /* Radio/PHY register state used by the closed-source WiFi/BT HAL. */
+    radio_state_t radio;
+
+    /* LEDC register file. Channel duty updates complete synchronously, while
+     * interrupt raw/status/enable/clear retain their hardware distinctions. */
+    uint32_t ledc_regs[0x200 / sizeof(uint32_t)];
+
+    /* The IDF clock initializer reads these values back before any I2S DMA is
+     * active. Keep only that explicitly modelled register visible so future
+     * audio traffic still reports as an unimplemented hardware gap. */
+    uint32_t i2s_clkm_conf[2];
 
     /* Flash cache MMU table shadows (DPORT_PRO/APP_FLASH_MMU_TABLE).
      * Entry i (0-63 = DROM 0x3F400000+, 64-127 = IROM 0x400C2000+) holds
@@ -743,6 +796,7 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     for (int group = 0; group < 2; group++) {
         lact_state_t *l = &p->lact[group];
         if (!(l->config & LACT_CFG_ALARM_EN)) continue;
+        if (l->int_raw & LACT_INT_BIT) continue; /* event already latched */
         uint64_t now = lact_counter(p, group);
         if (now >= l->alarm) return cpu->ccount;   /* fire now */
         uint64_t cycles = (l->alarm - now) * lact_divider(l);
@@ -903,6 +957,45 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
  * the manufacturer ID, so it sits in the low byte of W0. */
 #define EMU_FLASH_JEDEC_ID 0x001640C8u
 
+/* FLEXE_SPIDBG is deliberately range-filtered: filesystem probes can issue
+ * thousands of reads, so an unconditional transaction dump is rarely useful.
+ * Accepted values are "all", a single offset, or START-END (base 0).  The
+ * historical bare setting keeps tracing the boot/partition area below 128 KB.
+ */
+static bool spi_debug_offset(uint32_t off) {
+    const char *spec = getenv("FLEXE_SPIDBG");
+    if (!spec) return false;
+    if (*spec == '\0') return off < 0x20000u;
+    if (strcmp(spec, "all") == 0) return true;
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long first = strtoul(spec, &end, 0);
+    if (errno || end == spec) return off < 0x20000u;
+    unsigned long last = first;
+    if (*end == '-') {
+        const char *tail = end + 1;
+        errno = 0;
+        last = strtoul(tail, &end, 0);
+        if (errno || end == tail) return off < 0x20000u;
+    }
+    if (*end != '\0') return off < 0x20000u;
+    return (unsigned long)off >= first && (unsigned long)off <= last;
+}
+
+static void spi_debug_command(const esp32_periph_t *p, const spi_state_t *s,
+                              uint8_t opcode, uint32_t off, int mosi, int miso) {
+    if (!spi_debug_offset(off)) return;
+    int host = s == &p->spi[0] ? 0 : 1;
+    fprintf(stderr,
+            "[SPI%d] op=%02X off=0x%06X mosi=%d miso=%d pc=%08X/%08X "
+            "user=%08X user1=%08X addr=%08X\n",
+            host, opcode, off, mosi, miso,
+            p->cpu[0] ? p->cpu[0]->pc : 0,
+            p->cpu[1] ? p->cpu[1]->pc : 0,
+            s->user, s->user1, s->addr);
+}
+
 static uint32_t spi_flash_offset(const spi_state_t *s) {
     int bitlen = (int)((s->user1 >> 26) & 0x3F) + 1;
     /* ESP32 appends dual/quad-I/O mode bits to USER1.USR_ADDR_BITLEN.  The
@@ -931,7 +1024,7 @@ static void spi_flash_read_data(esp32_periph_t *p, spi_state_t *s,
         memcpy(s->w, p->mem->flash_data + off, (size_t)bytes);
     }
     const uint8_t *dst = (const uint8_t *)s->w;
-    if (getenv("FLEXE_SPIDBG") && off < 0x20000) {
+    if (spi_debug_offset(off)) {
         fprintf(stderr, "[SPIRD] off=0x%X bytes=%d w0=%02X %02X %02X %02X %02X %02X %02X %02X\n",
                 off, bytes, dst[0], dst[1], dst[2], dst[3],
                 dst[4], dst[5], dst[6], dst[7]);
@@ -945,6 +1038,12 @@ static void spi_flash_program(esp32_periph_t *p, spi_state_t *s,
     uint32_t avail = EMU_FLASH_SIZE - off;
     if ((uint32_t)bytes > avail) bytes = (int)avail;
     const uint8_t *src = (const uint8_t *)s->w;
+    if (spi_debug_offset(off)) {
+        fprintf(stderr,
+                "[SPIWR] off=0x%X bytes=%d w0=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                off, bytes, src[0], src[1], src[2], src[3],
+                src[4], src[5], src[6], src[7]);
+    }
     for (int i = 0; i < bytes; i++)
         p->mem->flash_data[off + i] &= src[i];
 }
@@ -952,6 +1051,8 @@ static void spi_flash_program(esp32_periph_t *p, spi_state_t *s,
 static void spi_flash_erase(esp32_periph_t *p, uint32_t off, uint32_t len) {
     if (off >= EMU_FLASH_SIZE || !p->mem->flash_data) return;
     if (len > EMU_FLASH_SIZE - off) len = EMU_FLASH_SIZE - off;
+    if (spi_debug_offset(off))
+        fprintf(stderr, "[SPIERASE] off=0x%X bytes=%u\n", off, len);
     memset(p->mem->flash_data + off, 0xFF, len);
 }
 
@@ -964,6 +1065,7 @@ static void spi_flash_execute(esp32_periph_t *p, spi_state_t *s, uint32_t cmd) {
         uint32_t off = spi_flash_offset(s);
         int mosi = spi_data_bytes(s->mosi_dlen);
         int miso = spi_data_bytes(s->miso_dlen);
+        spi_debug_command(p, s, fc, off, mosi, miso);
         switch (fc) {
         case 0x9F:                      /* RDID */
         case 0x90:                      /* REMID */
@@ -1133,32 +1235,190 @@ static void uart_other_write(void *ctx, uint32_t addr, uint32_t val) {
     (void)ctx; (void)addr; (void)val;
 }
 
-/* ---- WDEV (WiFi device — RNG register) ---- */
+/* ---- WiFi/BT RF, PHY, baseband, and controller register files ---- */
 
+#define WIFI_MAC_INIT_CTRL 0x3FF73D24u
+#define WDEV_RND_REG       0x3FF75144u
+#define PHY_CAL_COMMAND    0x3FF4E0C4u
+
+static uint32_t *radio_reg_ptr(esp32_periph_t *p, uint32_t addr) {
+    uint32_t page = addr & ~(PAGE_SIZE - 1u);
+    uint32_t word = (addr & (PAGE_SIZE - 1u)) / sizeof(uint32_t);
+
+    switch (page) {
+    case FE2_BASE:         return &p->radio.fe2[word];
+    case FE_BASE:          return &p->radio.fe[word];
+    case PHY_BASE:         return &p->radio.phy[word];
+    case BT_BASE:          return &p->radio.bt[word];
+    case NRX_PRIVATE_BASE: return &p->radio.nrx[word];
+    case BB_BASE:          return &p->radio.bb[word];
+    case BT_PRIVATE_BASE:  return &p->radio.bt_private[word];
+    case WIFI_MAC_BASE:
+    case WIFI_MAC_BASE + PAGE_SIZE:
+        return &p->radio.wifi_mac[(addr - WIFI_MAC_BASE) /
+                                  sizeof(uint32_t)];
+    default:
+        return NULL;
+    }
+}
+
+static uint32_t radio_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    if (addr == PHY_CAL_COMMAND)
+        return 0; /* indexed calibration command completes synchronously */
+    uint32_t *reg = radio_reg_ptr(p, addr);
+    return reg ? *reg : default_read(ctx, addr);
+}
+
+static void radio_write(void *ctx, uint32_t addr, uint32_t val) {
+    esp32_periph_t *p = ctx;
+    uint32_t *reg = radio_reg_ptr(p, addr);
+    if (!reg) {
+        default_write(ctx, addr, val);
+        return;
+    }
+
+    if (addr == WIFI_MAC_INIT_CTRL) {
+        /* hal_init sets bit 1, then spins until the MAC reports ready in
+         * bit 0. Hardware completes this short reset synchronously from the
+         * guest's perspective, so expose ready immediately. */
+        *reg = val | ((val & (1u << 1)) ? 1u : 0u);
+        return;
+    }
+    *reg = val;
+}
+
+/* WDEV is distinct from the MAC register window. Its timestamp/control words
+ * are ordinary RMW registers; the random source is active on every read. */
 static uint32_t wdev_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    if (addr == 0x3FF73D24u)
-        return p->wifi_mac_init_ctrl;
-    if (addr == 0x3FF75144u) {
-        /* WDEV_RND_REG — return random data */
-        static uint64_t rng_state = 0x12345678ABCDEF01ULL;
-        /* xorshift64 PRNG — fast, good enough for TLS nonces */
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        return (uint32_t)rng_state;
+    if (addr == WDEV_RND_REG) {
+        /* Per-session xorshift64 stream. It is deterministic for reproducible
+         * firmware tests while still changing on every hardware read. */
+        p->radio.rng_state ^= p->radio.rng_state << 13;
+        p->radio.rng_state ^= p->radio.rng_state >> 7;
+        p->radio.rng_state ^= p->radio.rng_state << 17;
+        return (uint32_t)p->radio.rng_state;
     }
-    return 0;
+    return p->radio.wdev[(addr - WDEV_BASE) / sizeof(uint32_t)];
 }
 
 static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
-    if (addr == 0x3FF73D24u) {
-        /* hal_init sets bit 1, then spins until the MAC reports ready in
-         * bit 0.  Hardware completes this short reset synchronously from
-         * the guest's perspective, so expose ready immediately. */
-        p->wifi_mac_init_ctrl = val | ((val & (1u << 1)) ? 1u : 0u);
+    p->radio.wdev[(addr - WDEV_BASE) / sizeof(uint32_t)] = val;
+}
+
+/* ---- LEDC PWM controller ---- */
+
+static void ledc_update_irq(esp32_periph_t *p) {
+    uint32_t raw = p->ledc_regs[LEDC_INT_RAW_OFF / 4];
+    uint32_t ena = p->ledc_regs[LEDC_INT_ENA_OFF / 4];
+    uint32_t mask = 1u << (LEDC_INTR_SOURCE % 32);
+    if (raw & ena)
+        p->pending_sources[LEDC_INTR_SOURCE / 32] |= mask;
+    else
+        p->pending_sources[LEDC_INTR_SOURCE / 32] &= ~mask;
+    intr_matrix_update_source(p, LEDC_INTR_SOURCE, (raw & ena) != 0);
+}
+
+static int ledc_channel_from_offset(uint32_t off, uint32_t *channel_base,
+                                    int *low_speed) {
+    if (off < 0x0A0u) {
+        int channel = (int)(off / 0x14u);
+        if (channel < 8) {
+            *channel_base = (uint32_t)channel * 0x14u;
+            *low_speed = 0;
+            return channel;
+        }
+    } else if (off < 0x140u) {
+        int channel = (int)((off - 0x0A0u) / 0x14u);
+        if (channel < 8) {
+            *channel_base = 0x0A0u + (uint32_t)channel * 0x14u;
+            *low_speed = 1;
+            return channel;
+        }
     }
+    return -1;
+}
+
+static uint32_t ledc_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - LEDC_BASE;
+    if ((off & 3u) || off > LEDC_DATE_OFF)
+        return default_read(ctx, addr);
+
+    if (off == LEDC_INT_ST_OFF)
+        return p->ledc_regs[LEDC_INT_RAW_OFF / 4] &
+               p->ledc_regs[LEDC_INT_ENA_OFF / 4];
+    if (off == LEDC_INT_CLR_OFF)
+        return 0; /* write-only */
+
+    uint32_t channel_base = 0;
+    int low_speed = 0;
+    if (ledc_channel_from_offset(off, &channel_base, &low_speed) >= 0 &&
+        off - channel_base == 0x10u) {
+        (void)low_speed;
+        return p->ledc_regs[(channel_base + 0x08u) / 4] & 0x01FFFFFFu;
+    }
+
+    return p->ledc_regs[off / 4];
+}
+
+static void ledc_write(void *ctx, uint32_t addr, uint32_t val) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - LEDC_BASE;
+    if ((off & 3u) || off > LEDC_DATE_OFF) {
+        default_write(ctx, addr, val);
+        return;
+    }
+
+    if (off == LEDC_INT_CLR_OFF) {
+        p->ledc_regs[LEDC_INT_RAW_OFF / 4] &= ~val;
+        ledc_update_irq(p);
+        return;
+    }
+    if (off == LEDC_INT_RAW_OFF || off == LEDC_INT_ST_OFF)
+        return; /* read-only */
+
+    uint32_t channel_base = 0;
+    int low_speed = 0;
+    int channel = ledc_channel_from_offset(off, &channel_base, &low_speed);
+    if (channel >= 0 && off - channel_base == 0x0Cu) {
+        /* Duty ramps are not wall-clock asynchronous in the emulator. Latch
+         * the programmed duty immediately, self-clear DUTY_START, and expose
+         * the corresponding change-complete interrupt bit. */
+        p->ledc_regs[off / 4] = val & ~(1u << 31);
+        if (val & (1u << 31)) {
+            unsigned bit = (unsigned)channel + (low_speed ? 16u : 8u);
+            p->ledc_regs[LEDC_INT_RAW_OFF / 4] |= 1u << bit;
+        }
+        ledc_update_irq(p);
+        return;
+    }
+
+    p->ledc_regs[off / 4] = val;
+    if (off == LEDC_INT_ENA_OFF)
+        ledc_update_irq(p);
+}
+
+/* ---- I2S clock configuration ---- */
+
+static uint32_t i2s_clock_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    uint32_t base = addr >= I2S1_BASE ? I2S1_BASE : I2S0_BASE;
+    if (addr - base == 0x0ACu)
+        return p->i2s_clkm_conf[base == I2S1_BASE ? 1 : 0];
+    return default_read(ctx, addr);
+}
+
+static void i2s_clock_write(void *ctx, uint32_t addr, uint32_t val) {
+    esp32_periph_t *p = ctx;
+    uint32_t base = addr >= I2S1_BASE ? I2S1_BASE : I2S0_BASE;
+    if (addr - base == 0x0ACu) {
+        p->i2s_clkm_conf[base == I2S1_BASE ? 1 : 0] = val;
+        return;
+    }
+    default_write(ctx, addr, val);
 }
 
 /* ---- Default handler (unhandled peripherals) ---- */
@@ -1185,6 +1445,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     if (!p) return NULL;
     p->mem = mem;
     p->app_cpu_in_reset = true;
+    p->radio.rng_state = 0x12345678ABCDEF01ULL;
 
     /* Strapping-pin idle levels: GPIO0/5/15 have pull-ups enabled at reset
      * (GPIO2/12 pull-downs read low). Firmware reads GPIO_IN for buttons
@@ -1195,6 +1456,12 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Initialize interrupt matrix: all lines disabled (source 16 = none) */
     memset(p->intr_matrix, 16, sizeof(p->intr_matrix));
 
+    /* LEDC reset state: all eight timers begin held in reset, and DATE is
+     * the ESP32 peripheral version value from the vendor register map. */
+    for (uint32_t off = 0x140u; off <= 0x178u; off += 8u)
+        p->ledc_regs[off / 4] = 1u << 24;
+    p->ledc_regs[LEDC_DATE_OFF / 4] = 0x16031700u;
+
     /* Bootloader-style initial flash MMU contents (app at flash 0x10000) */
     flash_mmu_init_bootloader(p);
 
@@ -1203,9 +1470,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         mem_register_mmio(mem, i, default_read, default_write, p);
 
     /* Override specific peripherals */
-    /* DPORT: pages 0-4 (0x3FF00000 - 0x3FF04FFF) */
-    for (int i = 0; i <= 4; i++)
-        mem_register_mmio(mem, (int)PAGE_OF(DPORT_BASE) + i, dport_read, dport_write, p);
+    /* DPORT control registers occupy page 0. Pages 1/2/3 are the independent
+     * AES/RSA/SHA accelerators and must not be silently swallowed by this
+     * handler (SHA installs its own MMIO model during session creation). */
+    mem_register_mmio(mem, (int)PAGE_OF(DPORT_BASE),
+                      dport_read, dport_write, p);
     /* DPORT flash MMU tables: PRO 0x3FF10000, APP 0x3FF12000 */
     mem_register_mmio(mem, (int)PAGE_OF(0x3FF10000u), dport_read, dport_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(0x3FF12000u), dport_read, dport_write, p);
@@ -1242,6 +1511,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* EFUSE */
     mem_register_mmio(mem, (int)PAGE_OF(EFUSE_BASE), efuse_read, efuse_write, p);
 
+    /* LEDC PWM controller */
+    mem_register_mmio(mem, (int)PAGE_OF(LEDC_BASE), ledc_read, ledc_write, p);
+
+    /* I2S clock-control readback used during peripheral clock init. Other I2S
+     * registers deliberately remain visible as unhandled until DMA/audio is
+     * modelled. */
+    mem_register_mmio(mem, (int)PAGE_OF(I2S0_BASE), i2s_clock_read, i2s_clock_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(I2S1_BASE), i2s_clock_read, i2s_clock_write, p);
+
     /* TIMG0 */
     mem_register_mmio(mem, (int)PAGE_OF(TIMG0_BASE), timg_read, timg_write, p);
 
@@ -1251,9 +1529,22 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* SYSCON */
     mem_register_mmio(mem, (int)PAGE_OF(SYSCON_BASE), syscon_read, syscon_write, p);
 
-    /* WiFi MAC/BB reset handshake and WDEV RNG. */
-    mem_register_mmio(mem, (int)PAGE_OF(WIFI_MAC_BASE), wdev_read, wdev_write, p);
+    /* WiFi/BT RF calibration and controller register files. The WiFi MAC
+     * spans two pages; WDEV is a separate page containing the RNG source. */
+    mem_register_mmio(mem, (int)PAGE_OF(FE2_BASE), radio_read, radio_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(FE_BASE), radio_read, radio_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(PHY_BASE), radio_read, radio_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(BT_BASE), radio_read, radio_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(NRX_PRIVATE_BASE),
+                      radio_read, radio_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(BB_BASE), radio_read, radio_write, p);
+    mem_register_mmio_range(mem, WIFI_MAC_BASE, WIFI_MAC_SIZE,
+                            radio_read, radio_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(WDEV_BASE), wdev_read, wdev_write, p);
+
+    /* Bluetooth controller private register page. */
+    mem_register_mmio(mem, (int)PAGE_OF(BT_PRIVATE_BASE),
+                      radio_read, radio_write, p);
 
     return p;
 }
@@ -1266,7 +1557,14 @@ int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
     return (int)((p->gpio.out1 >> (pin - 32)) & 1u);
 }
 
-void periph_destroy(esp32_periph_t *p) {    free(p);
+int periph_gpio_out_signal(const esp32_periph_t *p, int pin) {
+    if (!p || pin < 0 || pin > 39) return -1;
+    return (int)(p->gpio.func_out_sel[pin] & 0x1FFu);
+}
+
+void periph_destroy(esp32_periph_t *p) {
+    periph_disable_spi_display(p);
+    free(p);
 }
 
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx) {

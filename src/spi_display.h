@@ -16,8 +16,11 @@
 typedef struct {
     int      dc_pin;          /* ILI9341 D/C GPIO (default 2 on 2432S028R) */
     int      display_cs_pin;  /* ILI9341 CS GPIO (default 15) */
+    int      display_sck_pin; /* ILI9341 SCLK GPIO (default 14) */
     int      touch_cs_pin;    /* XPT2046 CS GPIO (default 33) */
+    int      touch_sck_pin;   /* XPT2046 SCLK GPIO (default 25) */
     int      sd_cs_pin;       /* SD card CS GPIO (default 5) */
+    int      sd_sck_pin;      /* SD card SCLK GPIO (default 18) */
     const char *sdcard_path;  /* SD card backing image (NULL = zeros) */
 
     /* Framebuffer to render into (NULL = capture but don't render) */
@@ -33,5 +36,8 @@ typedef struct {
 /* Register MMIO handlers for SPI2 (0x3FF64000) and SPI3 (0x3FF65000).
  * Called from flexe_session_create after periph_create. */
 void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cfg);
+
+/* Release raw-SPI backing resources owned by a peripheral instance. */
+void periph_disable_spi_display(esp32_periph_t *p);
 
 #endif /* SPI_DISPLAY_H */

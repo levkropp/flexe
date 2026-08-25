@@ -1,0 +1,588 @@
+/*
+ * Headless end-to-end smoke test for external production CYD ROMs.
+ *
+ * This deliberately lives outside the always-on unit suite: the firmware
+ * images are redistributable artifacts supplied by the caller, not fixtures
+ * checked into Flexe. It exercises the same flexe_session API as GUI clients,
+ * including dual-core execution, raw SPI display capture, and touch input.
+ */
+
+#include "flexe_session.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FB_W 320
+#define FB_H 240
+#define FB_PIXELS (FB_W * FB_H)
+#define RUN_BATCH 10000
+
+#define NERDMINER_SPIFFS_OFFSET 0x310000u
+#define NERDMINER_SPIFFS_SIZE   0x0E0000u
+#define NERDMINER_SPIFFS_BLOCK  0x1000u
+#define NERDMINER_SPIFFS_PAGE   0x0100u
+#define SPIFFS_MAGIC             0x0529u
+#define STOCK_SD_BYTES           (16u * 1024u * 1024u)
+#define STOCK_SD_SECTORS         (STOCK_SD_BYTES / 512u)
+#define STOCK_SD_ROOT_SECTOR     65u
+
+/* touch_stubs uses the frontend's lifetime flag while servicing blocking
+ * touch APIs. Standalone main and the SDL frontend provide the same symbol. */
+volatile int emu_app_running = 1;
+
+typedef struct {
+    int pressed;
+    int x;
+    int y;
+} touch_state_t;
+
+typedef struct {
+    uint64_t count;
+    char log[4096];
+    size_t log_len;
+} uart_state_t;
+
+#define MAX_UNREGISTERED_ROM_ADDRS 32
+typedef struct {
+    uint32_t addr[MAX_UNREGISTERED_ROM_ADDRS];
+    uint32_t caller[MAX_UNREGISTERED_ROM_ADDRS];
+    uint32_t count[MAX_UNREGISTERED_ROM_ADDRS];
+    int used;
+} rom_audit_t;
+
+static int touch_read(int *x, int *y, void *ctx)
+{
+    touch_state_t *touch = ctx;
+    *x = touch->x;
+    *y = touch->y;
+    return touch->pressed;
+}
+
+static void uart_count(void *ctx, uint8_t byte)
+{
+    uart_state_t *uart = ctx;
+    uart->count++;
+    if (uart->log_len + 1 < sizeof(uart->log)) {
+        uart->log[uart->log_len++] = (char)byte;
+        uart->log[uart->log_len] = '\0';
+    }
+}
+
+static void audit_rom_call(void *ctx, uint32_t addr, const char *name,
+                           const xtensa_cpu_t *cpu)
+{
+    (void)cpu;
+    rom_audit_t *audit = ctx;
+    if (strcmp(name, "UNREGISTERED") != 0)
+        return;
+    for (int i = 0; i < audit->used; i++) {
+        if (audit->addr[i] == addr) {
+            audit->count[i]++;
+            return;
+        }
+    }
+    if (audit->used < MAX_UNREGISTERED_ROM_ADDRS) {
+        audit->addr[audit->used] = addr;
+        int callinc = XT_PS_CALLINC(cpu->ps);
+        audit->caller[audit->used] =
+                (cpu->pc & 0xC0000000u) |
+                (ar_read(cpu, callinc * 4) & 0x3FFFFFFFu);
+        audit->count[audit->used] = 1;
+        audit->used++;
+    }
+}
+
+static void put_le16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+}
+
+static void put_le32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static int write_all_at(int fd, const void *buf, size_t len, off_t offset)
+{
+    const uint8_t *src = buf;
+    while (len > 0) {
+        ssize_t wrote = pwrite(fd, src, len, offset);
+        if (wrote < 0 && errno == EINTR) continue;
+        if (wrote <= 0) return -1;
+        src += wrote;
+        len -= (size_t)wrote;
+        offset += wrote;
+    }
+    return 0;
+}
+
+/* Build a deterministic, empty FAT16 superfloppy.  Supplying a valid medium
+ * makes the production-ROM gate exercise SD command/sector reads and FatFs
+ * mounting instead of merely confirming the expected error for an all-zero
+ * virtual card. */
+static int create_stock_sd_image(char path[64])
+{
+    strcpy(path, "/tmp/flexe-stock-sd-XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, STOCK_SD_BYTES) != 0) goto fail;
+
+    uint8_t boot[512] = {0};
+    boot[0] = 0xEB;
+    boot[1] = 0x3C;
+    boot[2] = 0x90;
+    memcpy(boot + 3, "FLEXE   ", 8);
+    put_le16(boot + 11, 512);                    /* bytes per sector */
+    boot[13] = 4;                                /* sectors per cluster */
+    put_le16(boot + 14, 1);                      /* reserved sectors */
+    boot[16] = 2;                                /* FAT copies */
+    put_le16(boot + 17, 512);                    /* root entries */
+    put_le16(boot + 19, STOCK_SD_SECTORS);       /* total sectors */
+    boot[21] = 0xF8;                             /* fixed disk */
+    put_le16(boot + 22, 32);                     /* sectors per FAT */
+    put_le16(boot + 24, 63);                     /* sectors per track */
+    put_le16(boot + 26, 255);                    /* heads */
+    boot[36] = 0x80;
+    boot[38] = 0x29;
+    put_le32(boot + 39, 0x46584C45u);
+    memcpy(boot + 43, "FLEXE SD   ", 11);
+    memcpy(boot + 54, "FAT16   ", 8);
+    put_le16(boot + 510, 0xAA55);
+    if (write_all_at(fd, boot, sizeof(boot), 0) != 0) goto fail;
+
+    uint8_t fat[32 * 512] = {0};
+    put_le16(fat + 0, 0xFFF8);
+    put_le16(fat + 2, 0xFFFF);
+    if (write_all_at(fd, fat, sizeof(fat), 1 * 512) != 0 ||
+        write_all_at(fd, fat, sizeof(fat), 33 * 512) != 0)
+        goto fail;
+
+    if (close(fd) != 0) {
+        unlink(path);
+        return -1;
+    }
+    return 0;
+
+fail:
+    close(fd);
+    unlink(path);
+    return -1;
+}
+
+static int fat16_root_has_directory(const char *path, const char name[11])
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    uint8_t root[512];
+    ssize_t got;
+    do {
+        got = pread(fd, root, sizeof(root),
+                    (off_t)STOCK_SD_ROOT_SECTOR * 512);
+    } while (got < 0 && errno == EINTR);
+    close(fd);
+    if (got != (ssize_t)sizeof(root)) return -1;
+    for (size_t off = 0; off < sizeof(root); off += 32) {
+        if (root[off] == 0x00) break;
+        if (root[off] == 0xE5 || root[off + 11] == 0x0F) continue;
+        if ((root[off + 11] & 0x10) && memcmp(root + off, name, 11) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int framebuffer_nonblack(const uint16_t *fb, pthread_mutex_t *mutex)
+{
+    int count = 0;
+    pthread_mutex_lock(mutex);
+    for (int i = 0; i < FB_PIXELS; i++)
+        count += fb[i] != 0;
+    pthread_mutex_unlock(mutex);
+    return count;
+}
+
+static int framebuffer_diff(const uint16_t *a, const uint16_t *b,
+                            pthread_mutex_t *mutex)
+{
+    int count = 0;
+    pthread_mutex_lock(mutex);
+    for (int i = 0; i < FB_PIXELS; i++)
+        count += a[i] != b[i];
+    pthread_mutex_unlock(mutex);
+    return count;
+}
+
+static void framebuffer_copy(uint16_t *dst, const uint16_t *src,
+                             pthread_mutex_t *mutex)
+{
+    pthread_mutex_lock(mutex);
+    memcpy(dst, src, FB_PIXELS * sizeof(*dst));
+    pthread_mutex_unlock(mutex);
+}
+
+static int session_alive(flexe_session_t *session)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
+    return (cpu0 && cpu0->running) || (cpu1 && cpu1->running);
+}
+
+/* NerdMiner's factory image intentionally leaves its SPIFFS partition erased.
+ * Its `SPIFFS.begin(false) || SPIFFS.begin(true)` path must therefore format
+ * the real emulated flash before the UI is useful.  Verify every block magic,
+ * rather than treating the expected first-mount error message as a failure or
+ * papering the operation over with a high-level VFS hook. */
+static int nerdminer_spiffs_formatted(flexe_session_t *session)
+{
+    xtensa_mem_t *mem = flexe_session_mem(session);
+    if (!mem || !mem->flash_data) return -1;
+
+    const uint32_t blocks = NERDMINER_SPIFFS_SIZE / NERDMINER_SPIFFS_BLOCK;
+    for (uint32_t block = 0; block < blocks; block++) {
+        uint32_t marker_offset = NERDMINER_SPIFFS_OFFSET +
+                                 block * NERDMINER_SPIFFS_BLOCK +
+                                 NERDMINER_SPIFFS_PAGE - sizeof(uint16_t) * 2;
+        uint16_t actual;
+        memcpy(&actual, mem->flash_data + marker_offset, sizeof(actual));
+        uint16_t expected = (uint16_t)((blocks - block) ^
+                                       NERDMINER_SPIFFS_PAGE ^ SPIFFS_MAGIC);
+        if (actual != expected)
+            return (int)block;
+    }
+    return (int)blocks;
+}
+
+static void run_one_batch(flexe_session_t *session)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    if (cpu0 && cpu0->running)
+        (void)flexe_session_run_core(session, 0, RUN_BATCH);
+    flexe_session_post_batch(session, RUN_BATCH);
+}
+
+static int run_for_virtual_cycles(flexe_session_t *session, uint64_t cycles)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t target = cpu0->cycle_count + cycles;
+    while (cpu0->cycle_count < target) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+    }
+    return 0;
+}
+
+static int run_until_screen(flexe_session_t *session, const uint16_t *fb,
+                            pthread_mutex_t *mutex, int min_nonblack,
+                            uint64_t max_cycles, int *nonblack_out,
+                            uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+    unsigned batches = 0;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        if (++batches % 100 == 0) {
+            int nonblack = framebuffer_nonblack(fb, mutex);
+            if (nonblack >= min_nonblack) {
+                *nonblack_out = nonblack;
+                *cycles_out = cpu0->cycle_count - start;
+                return 0;
+            }
+        }
+    }
+
+    *nonblack_out = framebuffer_nonblack(fb, mutex);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+static int run_until_changed(flexe_session_t *session, const uint16_t *before,
+                             const uint16_t *fb, pthread_mutex_t *mutex,
+                             int min_changed, uint64_t max_cycles,
+                             int *changed_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+    unsigned batches = 0;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        if (++batches % 100 == 0) {
+            int changed = framebuffer_diff(before, fb, mutex);
+            if (changed >= min_changed) {
+                *changed_out = changed;
+                return 0;
+            }
+        }
+    }
+
+    *changed_out = framebuffer_diff(before, fb, mutex);
+    return 1;
+}
+
+static void usage(const char *argv0)
+{
+    fprintf(stderr,
+            "Usage: %s [--no-jit] marauder|nerdminer <firmware.bin>\n",
+            argv0);
+}
+
+int main(int argc, char **argv)
+{
+    int disable_jit = 0;
+    int argi = 1;
+    if (argi < argc && strcmp(argv[argi], "--no-jit") == 0) {
+        disable_jit = 1;
+        argi++;
+    }
+    if (argc - argi != 2) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    const char *profile = argv[argi++];
+    const char *rom_path = argv[argi];
+    int is_marauder = strcmp(profile, "marauder") == 0;
+    int is_nerdminer = strcmp(profile, "nerdminer") == 0;
+    if (!is_marauder && !is_nerdminer) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    uint16_t *framebuf = calloc(FB_PIXELS, sizeof(*framebuf));
+    uint16_t *before = calloc(FB_PIXELS, sizeof(*before));
+    if (!framebuf || !before) {
+        fprintf(stderr, "error: framebuffer allocation failed\n");
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
+    char sd_path[64];
+    if (create_stock_sd_image(sd_path) != 0) {
+        fprintf(stderr, "error: failed to create FAT16 SD fixture\n");
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
+    pthread_mutex_t framebuffer_mutex;
+    pthread_mutex_init(&framebuffer_mutex, NULL);
+    touch_state_t touch = {0, 50, 139};
+    uart_state_t uart = {0};
+    rom_audit_t rom_audit = {0};
+    flexe_session_config_t cfg = {
+        .bin_path = rom_path,
+        .initial_sp = 0x3FFF8000u,
+        .disable_jit = disable_jit,
+        .sdcard_path = sd_path,
+        .sdcard_size = STOCK_SD_BYTES,
+        .uart_cb = uart_count,
+        .uart_ctx = &uart,
+        .framebuf = framebuf,
+        .framebuf_mutex = &framebuffer_mutex,
+        .framebuf_w = FB_W,
+        .framebuf_h = FB_H,
+        .touch_fn = touch_read,
+        .touch_ctx = &touch,
+    };
+
+    uint64_t wall_start = monotonic_ns();
+    flexe_session_t *session = flexe_session_create(&cfg);
+    if (!session) {
+        fprintf(stderr, "error: failed to create stock-ROM session\n");
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+    flexe_session_set_rom_log_cb(session, audit_rom_call, &rom_audit);
+
+    int min_nonblack = is_marauder ? 8000 : 20000;
+    uint64_t boot_limit = is_marauder ? 8000000000ull : 2000000000ull;
+    int nonblack = 0;
+    uint64_t boot_cycles = 0;
+    int screen_result = run_until_screen(session, framebuf, &framebuffer_mutex,
+                                         min_nonblack, boot_limit, &nonblack,
+                                         &boot_cycles);
+    if (screen_result != 0) {
+        fprintf(stderr,
+                "FAIL profile=%s reason=%s nonblack=%d virtual_cycles=%llu\n",
+                profile, screen_result < 0 ? "cpus-stopped" : "screen-timeout",
+                nonblack, (unsigned long long)boot_cycles);
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
+    int touch_changed = 0;
+    int spiffs_blocks = 0;
+    if (is_nerdminer) {
+        if (strstr(uart.log, "sdcard_mount(): f_mount failed") != NULL) {
+            fprintf(stderr,
+                    "FAIL profile=nerdminer reason=sd-fat-mount-failed\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        spiffs_blocks = nerdminer_spiffs_formatted(session);
+        int expected_blocks = NERDMINER_SPIFFS_SIZE / NERDMINER_SPIFFS_BLOCK;
+        if (spiffs_blocks != expected_blocks) {
+            fprintf(stderr,
+                    "FAIL profile=nerdminer reason=spiffs-not-formatted "
+                    "first_bad_block=%d\n",
+                    spiffs_blocks);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+    }
+
+    if (is_marauder) {
+        if (strstr(uart.log, "Failed to mount SD Card") != NULL) {
+            fprintf(stderr, "FAIL profile=marauder reason=sd-fat-mount-failed\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        static const char scripts_dir[] = "SCRIPTS    ";
+        if (fat16_root_has_directory(sd_path, scripts_dir) != 1) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=sd-directory-write-failed\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        /* An inserted SD card adds asynchronous setup work.  The coarse pixel
+         * threshold can be reached while that redraw is still in flight, so
+         * let the production UI settle before taking the touch baseline. */
+        if (run_for_virtual_cycles(session, 240000000ull) != 0) {
+            fprintf(stderr, "FAIL profile=marauder reason=cpus-stopped-before-touch\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        framebuffer_copy(before, framebuf, &framebuffer_mutex);
+        touch.pressed = 1;
+        if (run_for_virtual_cycles(session, 24000000ull) != 0) {
+            fprintf(stderr, "FAIL profile=marauder reason=cpus-stopped-during-touch\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        touch.pressed = 0;
+        int touch_result = run_until_changed(session, before, framebuf,
+                                             &framebuffer_mutex, 2500,
+                                             1000000000ull, &touch_changed);
+        if (touch_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=%s changed_pixels=%d\n",
+                    touch_result < 0 ? "cpus-stopped" : "touch-timeout",
+                    touch_changed);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+    }
+
+    int unregistered_rom = rom_stubs_unregistered_count(
+            flexe_session_rom(session));
+    if (unregistered_rom != 0) {
+        fprintf(stderr,
+                "FAIL profile=%s reason=unregistered-rom calls=%d addresses=",
+                profile, unregistered_rom);
+        for (int i = 0; i < rom_audit.used; i++) {
+            fprintf(stderr, "%s0x%08X@0x%08X(x%u)", i ? "," : "",
+                    rom_audit.addr[i], rom_audit.caller[i],
+                    rom_audit.count[i]);
+        }
+        fputc('\n', stderr);
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
+    int unhandled_mmio = periph_unhandled_count(flexe_session_periph(session));
+    if (unhandled_mmio != 0) {
+        fprintf(stderr,
+                "FAIL profile=%s reason=unhandled-mmio accesses=%d\n",
+                profile, unhandled_mmio);
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
+    uint64_t wall_ns = monotonic_ns() - wall_start;
+    const char *engine = flexe_session_jit(session) ? "jit" : "interp";
+    printf("PASS profile=%s engine=%s wall=%.3fs virtual_cycles=%llu "
+           "nonblack=%d uart_bytes=%llu",
+           profile, engine, (double)wall_ns / 1e9,
+           (unsigned long long)boot_cycles, nonblack,
+           (unsigned long long)uart.count);
+    printf(" mmio_unhandled=%d rom_unregistered=%d",
+           unhandled_mmio, unregistered_rom);
+    if (is_marauder)
+        printf(" touch_changed=%d sd_fat=mounted sd_write=SCRIPTS", touch_changed);
+    if (is_nerdminer)
+        printf(" spiffs_blocks=%d sd_fat=mounted", spiffs_blocks);
+    putchar('\n');
+
+    flexe_session_destroy(session);
+    pthread_mutex_destroy(&framebuffer_mutex);
+    unlink(sd_path);
+    free(before);
+    free(framebuf);
+    return 0;
+}

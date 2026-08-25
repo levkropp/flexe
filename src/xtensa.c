@@ -29,9 +29,16 @@ extern uint32_t g_dbg_watch_val;
  * distance 0 so it is picked and fired at the next opportunity. A ccompare
  * of 0 is treated as disarmed (matches init / no-timer state). */
 static inline void xtensa_recompute_next_timer_impl(xtensa_cpu_t *cpu) {
-    uint32_t d0 = cpu->ccompare[0] ? cpu->ccompare[0] - cpu->ccount : UINT32_MAX;
-    uint32_t d1 = cpu->ccompare[1] ? cpu->ccompare[1] - cpu->ccount : UINT32_MAX;
-    uint32_t d2 = cpu->ccompare[2] ? cpu->ccompare[2] - cpu->ccount : UINT32_MAX;
+    /* Once a compare interrupt is latched it is no longer a future event.
+     * Firmware clears it by writing CCOMPAREn, which recomputes this cache.
+     * Keeping an already-latched compare here made a WAITI core revisit the
+     * same event on every idle cycle and hid later enabled timers. */
+    uint32_t d0 = cpu->ccompare[0] && !(cpu->interrupt & (1u << 6))
+                    ? cpu->ccompare[0] - cpu->ccount : UINT32_MAX;
+    uint32_t d1 = cpu->ccompare[1] && !(cpu->interrupt & (1u << 15))
+                    ? cpu->ccompare[1] - cpu->ccount : UINT32_MAX;
+    uint32_t d2 = cpu->ccompare[2] && !(cpu->interrupt & (1u << 16))
+                    ? cpu->ccompare[2] - cpu->ccount : UINT32_MAX;
     if (d0 >= 0x80000000u && d0 != UINT32_MAX) d0 = 0;
     if (d1 >= 0x80000000u && d1 != UINT32_MAX) d1 = 0;
     if (d2 >= 0x80000000u && d2 != UINT32_MAX) d2 = 0;
@@ -1161,7 +1168,8 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                                         i, old_sp, new_sp, cpu->windowbase);
                             cpu->spill_base[i] = new_sp;
                         }
-                        for (int j = 0; j < cpu->spill_stack[i].depth && j < 8; j++) {
+                        for (int j = 0; j < cpu->spill_stack[i].depth &&
+                                            j < SPILL_STACK_DEPTH; j++) {
                             if (cpu->spill_stack[i].base[j] == old_sp)
                                 cpu->spill_stack[i].base[j] = new_sp;
                         }
@@ -2158,10 +2166,17 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     if (__builtin_expect(g_dbg_tcount > 0
                          && (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore), 0)) {
         g_dbg_tcount--;
-        fprintf(stderr, "[T%d] pc=0x%08X a0=%08X a1=%08X a2=%08X a3=%08X a4=%08X a5=%08X a8=%08X a10=%08X ps=%08X wb=%u ws=%08X\n",
-                cpu->core_id, cpu->pc, ar_read(cpu,0), ar_read(cpu,1),
-                ar_read(cpu,2), ar_read(cpu,3), ar_read(cpu,4), ar_read(cpu,5),
-                ar_read(cpu,8), ar_read(cpu,10), cpu->ps, cpu->windowbase, cpu->windowstart);
+        fprintf(stderr,
+                "[T%d] pc=0x%08X a0=%08X a1=%08X a2=%08X a3=%08X "
+                "a4=%08X a5=%08X a6=%08X a7=%08X a8=%08X a9=%08X "
+                "a10=%08X a11=%08X a12=%08X a13=%08X a14=%08X a15=%08X "
+                "ps=%08X wb=%u ws=%08X\n",
+                cpu->core_id, cpu->pc,
+                ar_read(cpu, 0), ar_read(cpu, 1), ar_read(cpu, 2), ar_read(cpu, 3),
+                ar_read(cpu, 4), ar_read(cpu, 5), ar_read(cpu, 6), ar_read(cpu, 7),
+                ar_read(cpu, 8), ar_read(cpu, 9), ar_read(cpu, 10), ar_read(cpu, 11),
+                ar_read(cpu, 12), ar_read(cpu, 13), ar_read(cpu, 14), ar_read(cpu, 15),
+                cpu->ps, cpu->windowbase, cpu->windowstart);
     }
     if (__builtin_expect(cpu->halted, 0)) {
         cpu->ccount++;
@@ -2189,7 +2204,13 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     if (cpu->_pc_written && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
-        if (cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx)) {
+        int hook_insns = cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx);
+        if (hook_insns) {
+            /* Native hooks may account a whole block, while time-oriented
+             * stubs may fast-forward cycle_count.  Pull that advancement
+             * back into the cached counter before charging the dispatching
+             * instruction; writing local_cc first used to discard it. */
+            *local_cc = cpu->cycle_count;
             cpu->ccount++;
             ++*local_cc;
             cpu->cycle_count = *local_cc;
@@ -2202,7 +2223,9 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
                     xtensa_check_interrupts(cpu);
             }
             *local_cc = cpu->cycle_count;  /* reload (stub may advance time) */
-            return cpu->exception ? -1 : 0;
+            /* Positive values are internal batch-accounting metadata: the
+             * public xtensa_step() API still maps successful execution to 0. */
+            return cpu->exception ? -1 : (hook_insns > 1 ? hook_insns : 0);
         }
     }
 
@@ -2382,7 +2405,53 @@ int xtensa_step(xtensa_cpu_t *cpu) {
         xtensa_fire_timers(cpu);
     if (cpu->interrupt & cpu->intenable)
         xtensa_check_interrupts(cpu);
-    return r;
+    return r < 0 ? -1 : 0;
+}
+
+/* Advance a WAITI core directly to its next observable event. No guest code
+ * can run while halted, so visiting every intervening ccount value is both
+ * unnecessary and extremely expensive for production firmware. The event
+ * boundary is still exact: timers fire at the same ccount and an already
+ * pending enabled interrupt wakes the core after one idle cycle, matching
+ * xtensa_step_impl(). */
+static inline int xtensa_run_halted(xtensa_cpu_t *cpu, uint64_t *local_cc,
+                                    int max_cycles) {
+    int executed = 0;
+
+    while (cpu->halted && cpu->running && executed < max_cycles) {
+        int remaining = max_cycles - executed;
+        int advance = remaining;
+        bool fire_event = false;
+
+        if (cpu->interrupt & cpu->intenable) {
+            advance = 1;
+        } else if (cpu->next_timer_event != UINT32_MAX) {
+            uint32_t distance;
+            if ((int32_t)(cpu->ccount - cpu->next_timer_event) >= 0)
+                distance = 1;  /* already due: step once, then fire */
+            else
+                distance = cpu->next_timer_event - cpu->ccount;
+
+            if (distance <= (uint32_t)remaining) {
+                advance = (int)distance;
+                fire_event = true;
+            }
+        }
+
+        cpu->ccount += (uint32_t)advance;
+        *local_cc += (uint64_t)advance;
+        executed += advance;
+
+        if (fire_event)
+            xtensa_fire_timers(cpu);
+
+        if (cpu->interrupt & cpu->intenable) {
+            cpu->halted = false;
+            xtensa_check_interrupts(cpu);
+        }
+    }
+
+    return executed;
 }
 
 /* Batch execution: step_impl is always_inline → entire decode/execute loop
@@ -2391,6 +2460,38 @@ int xtensa_step(xtensa_cpu_t *cpu) {
  * (avoids per-instruction 64-bit memory increment). */
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
     uint64_t cc = cpu->cycle_count;
+    int idle_executed = 0;
+
+    if (__builtin_expect(cpu->halted, 0)) {
+        idle_executed = xtensa_run_halted(cpu, &cc, max_cycles);
+        if (idle_executed >= max_cycles || cpu->halted || !cpu->running) {
+            cpu->cycle_count = cc;
+            return idle_executed;
+        }
+        max_cycles -= idle_executed;
+    }
+
+    /* A native hook can execute hundreds of guest instructions during one
+     * xtensa_step_impl() dispatch.  Bound and report the batch in guest
+     * instructions rather than hook invocations so embedded frontends keep
+     * timer/preemption cadence and throughput accounting honest. */
+    if (__builtin_expect(cpu->accelerated_blocks, 0)) {
+        int executed;
+        for (executed = 0; executed < max_cycles; executed++) {
+            int step_result = xtensa_step_impl(cpu, &cc);
+            if (__builtin_expect(step_result != 0, 0)) {
+                if (step_result < 0) break;
+                executed += step_result - 1;
+            }
+            if (__builtin_expect(!cpu->running, 0)) {
+                executed++; /* include the dispatch that stopped the CPU */
+                break;
+            }
+        }
+        cpu->cycle_count = cc;
+        return idle_executed + executed;
+    }
+
     int i;
     for (i = 0; i < max_cycles; i++) {
         if (__builtin_expect(xtensa_step_impl(cpu, &cc) != 0, 0))
@@ -2399,7 +2500,7 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
             break;
     }
     cpu->cycle_count = cc;
-    return i;
+    return idle_executed + i;
 }
 
 /* ===== Breakpoint API ===== */

@@ -9,7 +9,9 @@
 typedef struct xtensa_mem xtensa_mem_t;
 typedef struct xtensa_cpu xtensa_cpu_t;
 
-/* PC hook: return non-zero to skip normal fetch/execute for this cycle */
+/* PC hook: return zero to execute normally, or the number of guest
+ * instructions handled. Ordinary ROM stubs return 1; accelerated blocks may
+ * return more so the batch runner can account without rereading CCOUNT. */
 typedef int (*xtensa_pc_hook_fn)(xtensa_cpu_t *cpu, uint32_t pc, void *ctx);
 
 /* Pre-decoded instruction table: entire firmware decoded at load time.
@@ -308,6 +310,7 @@ struct xtensa_cpu {
     bool     window_trace;      /* Emit window spill/fill/ENTRY/RETW trace to stderr */
     bool     window_trace_active; /* Set by main loop to gate window trace */
     bool     spill_verify;      /* Enable spill/fill verification */
+    bool     accelerated_blocks; /* PC hook/AOT may execute >1 guest insn */
     uint64_t virtual_time_us;   /* Simulated wall-clock microseconds */
 
     /* Interrupt configuration */
@@ -335,7 +338,7 @@ struct xtensa_cpu {
      * Extra registers (a4-a7 for CALL8, a4-a11 for CALL12) are stored in
      * CPU-side buffers rather than on the stack, to avoid corruption when
      * deeper calls overwrite the stack memory. */
-#define SPILL_STACK_DEPTH 8
+#define SPILL_STACK_DEPTH 32
     struct {
         uint32_t base[SPILL_STACK_DEPTH];        /* stack of spill bases */
         uint32_t core[SPILL_STACK_DEPTH][4];     /* core[depth][0..3] = a0-a3 values */

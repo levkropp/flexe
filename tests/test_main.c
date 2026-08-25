@@ -25,10 +25,10 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_freertos.c"
 #include "test_esp_timer.c"
 #include "test_firmware_compat.c"
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)
 #include "test_jit.c"
 #else
-static void run_jit_tests(void) { printf("JIT tests skipped (x86-64 only)\n"); }
+static void run_jit_tests(void) { printf("JIT tests skipped (no native backend)\n"); }
 #endif
 
 int main(void) {

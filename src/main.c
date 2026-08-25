@@ -1051,6 +1051,7 @@ int main(int argc, char *argv[]) {
         .entry_override = has_entry_override ? entry_override : 0,
         .single_core = single_core,
         .native_freertos = native_freertos,
+        .disable_jit = !jit_enabled,
         .window_trace = window_trace,
         .spill_verify = spill_verify,
         .uart_cb = uart_stdout_cb,
@@ -1218,30 +1219,16 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Initialize JIT if requested */
-#ifndef _MSC_VER
-    jit_state_t *jit = NULL;
-    if (jit_enabled) {
-        jit = jit_init();
-        if (!jit) {
-            fprintf(stderr, "Failed to initialize JIT compiler\n");
-            jit_enabled = 0;
-        } else if (jit_verify) {
-            jit_set_verify(jit, true);
-            fprintf(stderr, "[JIT] Differential verification enabled\n");
-        }
-        /* Install JIT as pc_hook so the interpreter dispatches JIT blocks
-         * transparently. Hot PCs get compiled and executed via the hook;
-         * cold code runs at full interpreter speed (1000-insn batches). */
-        jit_install_hook(jit, cpu);
-        /* Core 1 executes via flexe_session_post_batch — hook it too. */
-        xtensa_cpu_t *cpu1_jit = flexe_session_cpu(session, 1);
-        if (cpu1_jit) jit_install_hook(jit, cpu1_jit);
+    /* The shared session owns the execution engine so library frontends and
+     * this CLI cannot drift onto different JIT/interpreter paths. */
+    jit_state_t *jit = flexe_session_jit(session);
+    if (jit_enabled && !jit) {
+        fprintf(stderr, "Native JIT unavailable; using interpreter\n");
+        jit_enabled = 0;
+    } else if (jit && jit_verify) {
+        jit_set_verify(jit, true);
+        fprintf(stderr, "[JIT] Differential verification enabled\n");
     }
-#else
-    (void)jit_enabled;
-    (void)jit_stats_enabled;
-#endif
 
     /* ===== Execute ===== */
     uint64_t cycles = 0;
@@ -1449,13 +1436,7 @@ int main(int argc, char *argv[]) {
                 uint64_t to_window = trace_start - cpu->cycle_count;
                 if (to_window < (uint64_t)n) n = (int)to_window;
             }
-            int ran;
-#ifndef _MSC_VER
-            if (jit)
-                ran = jit_run(jit, cpu, n);
-            else
-#endif
-                ran = xtensa_run(cpu, n);
+            int ran = flexe_session_run_core(session, 0, n);
             /* If core 0 is stopped but core 1 is still running, count budget
              * against core 1's batch (which will run inside post_batch). */
             if (ran == 0 && !cpu->running && cpu1_any && cpu1_any->running) {
@@ -1739,14 +1720,8 @@ int main(int argc, char *argv[]) {
         htrace_print_stats(g_htrace, stderr);
     }
 
-    /* JIT cleanup and stats */
-#ifndef _MSC_VER
-    if (jit) {
-        if (jit_stats_enabled)
-            jit_print_stats(jit);
-        jit_destroy(jit);
-    }
-#endif
+    if (jit && jit_stats_enabled)
+        jit_print_stats(jit);
 
     /* Cleanup */
     ring_destroy(g_ring);

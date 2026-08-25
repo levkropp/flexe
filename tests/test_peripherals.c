@@ -1,5 +1,9 @@
 #include "peripherals.h"
 #include "spi_display.h"
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 /* ===== MMIO callback framework ===== */
 
@@ -243,6 +247,51 @@ TEST(wifi_mac_init_ready_handshake) {
     mem_destroy(mem);
 }
 
+TEST(radio_phy_calibration_register_files) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    static const struct {
+        uint32_t addr;
+        uint32_t value;
+    } registers[] = {
+        {0x3FF450F0u, 0x00000600u}, /* FE2 TX interpolation control */
+        {0x3FF46090u, 0x00000030u}, /* FE general control */
+        {0x3FF4E0C8u, 0x00000200u}, /* private PHY calibration data */
+        {0x3FF51020u, 0x10203040u}, /* BT controller */
+        {0x3FF5CC04u, 0x50607080u}, /* NRX private register space */
+        {0x3FF5D040u, 0x90A0B0C0u}, /* WiFi baseband */
+        {0x3FF7120Cu, 0xA5A5A5A4u}, /* BT private reference control */
+        {0x3FF740B8u, 0xCAFEBABEu}, /* second WiFi MAC page */
+    };
+
+    for (size_t i = 0; i < sizeof(registers) / sizeof(registers[0]); i++)
+        mem_write32(mem, registers[i].addr, registers[i].value);
+    for (size_t i = 0; i < sizeof(registers) / sizeof(registers[0]); i++)
+        ASSERT_EQ(mem_read32(mem, registers[i].addr), registers[i].value);
+
+    /* Same offsets in distinct hardware blocks must not alias. */
+    mem_write32(mem, 0x3FF45004u, 0x11111111u);
+    mem_write32(mem, 0x3FF46004u, 0x22222222u);
+    mem_write32(mem, 0x3FF75020u, 0x98000000u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF45004u), 0x11111111u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF46004u), 0x22222222u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF75020u), 0x98000000u);
+
+    /* The indexed calibration command is a self-clearing trigger. */
+    mem_write32(mem, 0x3FF4E0C4u, 0x200u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF4E0C4u), 0u);
+
+    /* The WDEV random source advances independently of the shadow files. */
+    uint32_t random_a = mem_read32(mem, 0x3FF75144u);
+    uint32_t random_b = mem_read32(mem, 0x3FF75144u);
+    ASSERT_TRUE(random_a != random_b);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 typedef struct {
     int down;
     int x;
@@ -265,6 +314,61 @@ static uint16_t test_spi_transfer16(xtensa_mem_t *mem, uint8_t next_cmd) {
     mem_write32(mem, spi + 0x00, 1u << 18);           /* CMD.USR */
     uint16_t fifo = (uint16_t)mem_read32(mem, spi + 0x80);
     return (uint16_t)((fifo << 8) | (fifo >> 8));
+}
+
+static void test_gp_spi_bytes(xtensa_mem_t *mem, uint32_t spi,
+                              const uint8_t *tx, uint8_t *rx, int len) {
+    mem_write32(mem, spi + 0x1C, (1u << 27) | (1u << 28)); /* MOSI+MISO */
+    mem_write32(mem, spi + 0x28, (uint32_t)(len * 8 - 1));
+    mem_write32(mem, spi + 0x2C, (uint32_t)(len * 8 - 1));
+    for (int off = 0; off < len; off += 4) {
+        uint32_t word = 0;
+        for (int byte = 0; byte < 4 && off + byte < len; byte++)
+            word |= (uint32_t)(tx ? tx[off + byte] : 0xFF) << (byte * 8);
+        mem_write32(mem, spi + 0x80 + (uint32_t)off, word);
+    }
+    mem_write32(mem, spi + 0x00, 1u << 18);           /* CMD.USR */
+    if (rx) {
+        for (int off = 0; off < len; off += 4) {
+            uint32_t word = mem_read32(mem, spi + 0x80 + (uint32_t)off);
+            for (int byte = 0; byte < 4 && off + byte < len; byte++)
+                rx[off + byte] = (uint8_t)(word >> (byte * 8));
+        }
+    }
+}
+
+static void test_gpio_level(xtensa_mem_t *mem, int pin, int high) {
+    const uint32_t gpio = 0x3FF44000u;
+    uint32_t bit = 1u << (pin < 32 ? pin : pin - 32);
+    uint32_t set = pin < 32 ? 0x08u : 0x14u;
+    uint32_t clear = pin < 32 ? 0x0Cu : 0x18u;
+    mem_write32(mem, gpio + (high ? set : clear), bit);
+}
+
+static void test_gpio_route(xtensa_mem_t *mem, int pin, int signal) {
+    mem_write32(mem, 0x3FF44000u + 0x530u + (uint32_t)pin * 4,
+                (uint32_t)signal);
+}
+
+static void test_sd_command_bytes(uint8_t out[6], uint8_t command,
+                                  uint32_t argument) {
+    out[0] = 0x40u | command;
+    out[1] = (uint8_t)(argument >> 24);
+    out[2] = (uint8_t)(argument >> 16);
+    out[3] = (uint8_t)(argument >> 8);
+    out[4] = (uint8_t)argument;
+    out[5] = 0x01;
+}
+
+static uint8_t test_sd_command(xtensa_mem_t *mem, uint32_t spi,
+                               uint8_t command, uint32_t argument) {
+    uint8_t packet[6];
+    uint8_t idle = 0xFF;
+    uint8_t response = 0xFF;
+    test_sd_command_bytes(packet, command, argument);
+    test_gp_spi_bytes(mem, spi, packet, NULL, sizeof(packet));
+    test_gp_spi_bytes(mem, spi, &idle, &response, 1);
+    return response;
 }
 
 TEST(xpt2046_pipelined_conversions) {
@@ -319,6 +423,167 @@ TEST(xpt2046_pipelined_conversions) {
 
     periph_destroy(p);
     mem_destroy(mem);
+}
+
+TEST(gp_spi_matrix_routing_and_hardware_cs) {
+    const uint32_t spi2 = 0x3FF64000u;
+    uint16_t framebuffer[320 * 240] = {0};
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .display_sck_pin = 14,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .sd_cs_pin = 5,
+        .sd_sck_pin = 18,
+        .framebuf = framebuffer,
+        .fb_w = 320,
+        .fb_h = 240,
+    };
+    periph_enable_spi_display(p, &cfg);
+
+    /* Marauder's panel and SD card both use SPI2, while touch uses SPI3.
+     * First let the software-controlled CS pins be observed inactive. */
+    test_gpio_route(mem, 14, 8);       /* HSPICLK -> display SCLK */
+    test_gpio_route(mem, 18, 8);       /* HSPICLK -> SD SCLK */
+    test_gpio_route(mem, 25, 63);      /* VSPICLK -> touch SCLK */
+    test_gpio_route(mem, 15, 256);     /* display CS is plain GPIO */
+    test_gpio_route(mem, 5, 256);      /* SD CS initially plain GPIO */
+    test_gpio_level(mem, 15, 1);
+    test_gpio_level(mem, 5, 1);
+    const uint8_t idle = 0xFF;
+    test_gp_spi_bytes(mem, spi2, &idle, NULL, 1);
+
+    /* The SD stack then hands GPIO5 to SPI2 CS0.  Its stale GPIO latch is
+     * low, but PIN.CS0_DIS says this panel transfer must not select SD. */
+    test_gpio_route(mem, 5, 11);       /* HSPICS0 -> SD CS */
+    test_gpio_level(mem, 15, 0);
+    test_gpio_level(mem, 5, 0);
+    mem_write32(mem, spi2 + 0x34, 0x7); /* all hardware CS lines disabled */
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x34), 0x7);
+
+    const uint8_t caset_cmd[] = {0x2A};
+    const uint8_t paset_cmd[] = {0x2B};
+    const uint8_t ramwr_cmd[] = {0x2C};
+    const uint8_t origin[] = {0, 0, 0, 0};
+    const uint8_t red[] = {0xF8, 0x00};
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, caset_cmd, NULL, sizeof(caset_cmd));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, origin, NULL, sizeof(origin));
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, paset_cmd, NULL, sizeof(paset_cmd));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, origin, NULL, sizeof(origin));
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, ramwr_cmd, NULL, sizeof(ramwr_cmd));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, red, NULL, sizeof(red));
+    ASSERT_EQ(framebuffer[319], 0xF800);
+
+    /* Enabling hardware CS0 selects the SD model even though GPIO5's output
+     * latch is high.  CMD0 must return its idle-state R1 response. */
+    test_gpio_level(mem, 15, 1);
+    test_gpio_level(mem, 5, 1);
+    mem_write32(mem, spi2 + 0x34, 0x6); /* CS0 enabled, CS1/2 disabled */
+    const uint8_t cmd0[] = {0x40, 0, 0, 0, 0, 0x95};
+    uint8_t response = 0xFF;
+    test_gp_spi_bytes(mem, spi2, cmd0, NULL, sizeof(cmd0));
+    test_gp_spi_bytes(mem, spi2, &idle, &response, 1);
+    ASSERT_EQ(response, 0x01);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(raw_sd_multiblock_read_write) {
+    const uint32_t spi2 = 0x3FF64000u;
+    char path[] = "/tmp/flexe-sd-unit-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    if (fd < 0) return;
+    ASSERT_EQ(ftruncate(fd, 4 * 512), 0);
+
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .display_sck_pin = 14,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .sd_cs_pin = 5,
+        .sd_sck_pin = 18,
+        .sdcard_path = path,
+    };
+    periph_enable_spi_display(p, &cfg);
+    test_gpio_route(mem, 18, 8);       /* HSPICLK */
+    test_gpio_route(mem, 5, 11);       /* HSPICS0 */
+    mem_write32(mem, spi2 + 0x34, 0x6); /* hardware CS0 selected */
+
+    /* Arduino's multi-write flow uses ACMD23, CMD25, 0xFC data tokens and
+     * a final 0xFD stop token. */
+    ASSERT_EQ(test_sd_command(mem, spi2, 55, 0), 0x01);
+    ASSERT_EQ(test_sd_command(mem, spi2, 23, 2), 0x00);
+    ASSERT_EQ(test_sd_command(mem, spi2, 25, 1), 0x00);
+
+    uint8_t block[2][512];
+    for (int i = 0; i < 512; i++) {
+        block[0][i] = (uint8_t)(i ^ 0x5A);
+        block[1][i] = (uint8_t)(i ^ 0xA5);
+    }
+    const uint8_t data_token = 0xFC;
+    const uint8_t crc[2] = {0xFF, 0xFF};
+    const uint8_t idle = 0xFF;
+    for (int which = 0; which < 2; which++) {
+        test_gp_spi_bytes(mem, spi2, &data_token, NULL, 1);
+        for (int off = 0; off < 512; off += 64)
+            test_gp_spi_bytes(mem, spi2, block[which] + off, NULL, 64);
+        test_gp_spi_bytes(mem, spi2, crc, NULL, sizeof(crc));
+        uint8_t response = 0xFF;
+        test_gp_spi_bytes(mem, spi2, &idle, &response, 1);
+        ASSERT_EQ(response & 0x1F, 0x05);
+        do {
+            test_gp_spi_bytes(mem, spi2, &idle, &response, 1);
+        } while (response == 0x00);
+        ASSERT_EQ(response, 0xFF);
+    }
+    const uint8_t stop_token = 0xFD;
+    test_gp_spi_bytes(mem, spi2, &stop_token, NULL, 1);
+
+    uint8_t disk[1024] = {0};
+    ASSERT_EQ(pread(fd, disk, sizeof(disk), 512), sizeof(disk));
+    ASSERT_TRUE(memcmp(disk, block, sizeof(disk)) == 0);
+
+    /* CMD18 streams consecutive sectors.  CMD12 includes a seventh stuff
+     * byte, which must not consume the R1 response returned to the driver. */
+    ASSERT_EQ(test_sd_command(mem, spi2, 18, 1), 0x00);
+    uint8_t readback[1024] = {0};
+    for (int which = 0; which < 2; which++) {
+        uint8_t token = 0xFF;
+        test_gp_spi_bytes(mem, spi2, &idle, &token, 1);
+        ASSERT_EQ(token, 0xFE);
+        for (int off = 0; off < 512; off += 64)
+            test_gp_spi_bytes(mem, spi2, NULL, readback + which * 512 + off, 64);
+        uint8_t ignored_crc[2];
+        test_gp_spi_bytes(mem, spi2, NULL, ignored_crc, sizeof(ignored_crc));
+    }
+    ASSERT_TRUE(memcmp(readback, block, sizeof(readback)) == 0);
+
+    uint8_t stop_cmd[7];
+    test_sd_command_bytes(stop_cmd, 12, 0);
+    stop_cmd[6] = 0xFF;
+    test_gp_spi_bytes(mem, spi2, stop_cmd, NULL, sizeof(stop_cmd));
+    uint8_t stop_response = 0xFF;
+    test_gp_spi_bytes(mem, spi2, &idle, &stop_response, 1);
+    ASSERT_EQ(stop_response, 0x00);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+    close(fd);
+    unlink(path);
 }
 
 TEST(dport_safe_defaults) {
@@ -573,6 +838,55 @@ TEST(cross_core_interrupt) {
     mem_destroy(mem);
 }
 
+TEST(ledc_register_and_duty_completion) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 4, 43); /* LEDC -> CPU interrupt 4 */
+
+    const uint32_t base = 0x3FF59000u;
+    ASSERT_EQ(mem_read32(mem, base + 0x140), 1u << 24); /* timer reset */
+    mem_write32(mem, base + 0x140, 0x0207D00Au);
+    ASSERT_EQ(mem_read32(mem, base + 0x140), 0x0207D00Au);
+
+    mem_write32(mem, base + 0x008, 0x00123400u); /* HS channel 0 duty */
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 0x00123400u);
+    mem_write32(mem, base + 0x188, 1u << 8);     /* duty-end interrupt enable */
+    mem_write32(mem, base + 0x00C, 1u << 31);    /* start update */
+    ASSERT_EQ(mem_read32(mem, base + 0x00C) & (1u << 31), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & (1u << 8), 1u << 8);
+    ASSERT_EQ(mem_read32(mem, base + 0x184) & (1u << 8), 1u << 8);
+    ASSERT_EQ(cpu0.interrupt & (1u << 4), 1u << 4);
+
+    mem_write32(mem, base + 0x18C, 1u << 8);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & (1u << 8), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 4), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x1FC), 0x16031700u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(i2s_clock_and_bt_private_readback) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    mem_write32(mem, 0x3FF4F0ACu, 0x00200000u);
+    mem_write32(mem, 0x3FF6D0ACu, 0x00400000u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF4F0ACu), 0x00200000u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF6D0ACu), 0x00400000u);
+
+    mem_write32(mem, 0x3FF7120Cu, 0xA5A5A5A4u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF7120Cu), 0xA5A5A5A4u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(excmlevel3_masks_level3) {
     /* With EXCMLEVEL=3, level-3 interrupts should be masked when EXCM=1 */
     xtensa_cpu_t cpu;
@@ -604,7 +918,10 @@ static void run_peripheral_tests(void) {
     RUN_TEST(spi_flash_program_erase_require_write_enable);
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);
     RUN_TEST(wifi_mac_init_ready_handshake);
+    RUN_TEST(radio_phy_calibration_register_files);
     RUN_TEST(xpt2046_pipelined_conversions);
+    RUN_TEST(gp_spi_matrix_routing_and_hardware_cs);
+    RUN_TEST(raw_sd_multiblock_read_write);
     RUN_TEST(dport_safe_defaults);
     RUN_TEST(wdt_disable);
     RUN_TEST(rtc_reset_cause);
@@ -619,5 +936,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(intr_matrix_dport_rw);
     RUN_TEST(intr_matrix_assert_source);
     RUN_TEST(cross_core_interrupt);
+    RUN_TEST(ledc_register_and_duty_completion);
+    RUN_TEST(i2s_clock_and_bt_private_readback);
     RUN_TEST(excmlevel3_masks_level3);
 }

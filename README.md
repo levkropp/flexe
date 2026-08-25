@@ -42,7 +42,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 468 tests
+- 528 tests
 
 ## building
 
@@ -131,10 +131,33 @@ src/
 
 ```
 ./build/xtensa-tests
-# 468 tests, 869 passed, 0 failed
+# 528 tests, 1210 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
+
+Production ROMs are kept outside the repository. Run the sustained stock-ROM
+correctness/performance gate by supplying either image (or both):
+
+```bash
+MARAUDER_BIN=/path/to/marauder.bin \
+NERDMINER_BIN=/path/to/nerdminer.bin \
+./bench-stock-roms.sh
+```
+
+The gate uses Flexe's reported per-core virtual cycles to compare elapsed
+simulated time with wall time, so dual-core workloads are not mistakenly
+credited twice. It rejects traps and early stops and defaults to requiring at
+least 1.0× real-time averaged over three 1.2-billion-cycle runs. `EMU`,
+`CYCLES`, `REPS`, `ENGINE`, `MIN_REALTIME`, and `ESP_HZ` are configurable.
+
+The headless integration runner exercises display output and, for Marauder,
+touch navigation without requiring the SDL frontend:
+
+```bash
+./build/flexe-stock-rom-test nerdminer /path/to/nerdminer.bin
+./build/flexe-stock-rom-test marauder /path/to/marauder.bin
+```
 
 ## status
 

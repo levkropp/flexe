@@ -23,6 +23,7 @@
 #include "sha_stubs.h"
 #include "aes_stubs.h"
 #include "mpi_stubs.h"
+#include "jit.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,8 +46,13 @@ struct flexe_session {
     sha_stubs_t       *shstubs;
     aes_stubs_t       *astubs;
     mpi_stubs_t       *mstubs;
+    jit_state_t       *jit;
     int                single_core;
     int                native_freertos;
+    int              (*touch_fn)(int *x, int *y, void *ctx);
+    void              *touch_ctx;
+    int                touch_irq_pin;
+    int                touch_irq_level;
 };
 
 flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
@@ -57,6 +63,10 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     if (!s) return NULL;
     s->single_core = cfg->single_core;
     s->native_freertos = cfg->native_freertos;
+    s->touch_fn = cfg->touch_fn;
+    s->touch_ctx = cfg->touch_ctx;
+    s->touch_irq_pin = cfg->spi_touch_irq_pin ? cfg->spi_touch_irq_pin : 36;
+    s->touch_irq_level = 1;
 
     /* Load ELF symbols */
     if (cfg->elf_path) {
@@ -86,6 +96,8 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     }
     if (cfg->uart_cb)
         periph_set_uart_callback(s->periph, cfg->uart_cb, cfg->uart_ctx);
+    if (s->touch_fn && s->touch_irq_pin >= 0)
+        periph_gpio_set_input(s->periph, s->touch_irq_pin, 1);
 
     /* Load firmware */
     load_result_t res = loader_load_bin(s->mem, cfg->bin_path);
@@ -170,8 +182,11 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
         spi_display_config_t scfg = {
             .dc_pin         = cfg->spi_dc_pin         ? cfg->spi_dc_pin         : 2,
             .display_cs_pin = cfg->spi_display_cs_pin ? cfg->spi_display_cs_pin : 15,
+            .display_sck_pin = cfg->spi_display_sck_pin ? cfg->spi_display_sck_pin : 14,
             .touch_cs_pin   = cfg->spi_touch_cs_pin   ? cfg->spi_touch_cs_pin   : 33,
+            .touch_sck_pin  = cfg->spi_touch_sck_pin  ? cfg->spi_touch_sck_pin  : 25,
             .sd_cs_pin      = cfg->spi_sd_cs_pin      ? cfg->spi_sd_cs_pin      : 5,
+            .sd_sck_pin     = cfg->spi_sd_sck_pin     ? cfg->spi_sd_sck_pin     : 18,
             .sdcard_path    = cfg->sdcard_path,
             .framebuf       = cfg->framebuf,
             .framebuf_mtx   = cfg->framebuf_mutex,
@@ -279,12 +294,27 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
         s->cpu[1].pc_hook_bitmap = s->cpu[0].pc_hook_bitmap;
     }
 
+    /* Keep execution-engine ownership in the shared session so the CLI and
+     * embedded frontends run identical code.  JIT is the default wherever a
+     * backend exists; jit_init() returns NULL on unsupported hosts. */
+    /* FLEXE_DISABLE_JIT is an operational escape hatch for embedded
+     * frontends that do not expose the config flag on their own CLI. */
+    if (!cfg->disable_jit && getenv("FLEXE_DISABLE_JIT") == NULL) {
+        s->jit = jit_init();
+        if (s->jit) {
+            jit_install_hook(s->jit, &s->cpu[0]);
+            if (!cfg->single_core)
+                jit_install_hook(s->jit, &s->cpu[1]);
+        }
+    }
+
     return s;
 }
 
 void flexe_session_destroy(flexe_session_t *s)
 {
     if (!s) return;
+    jit_destroy(s->jit);
     bt_stubs_destroy(s->bstubs);
     vfs_stubs_destroy(s->vstubs);
     wifi_stubs_destroy(s->wstubs);
@@ -346,11 +376,46 @@ int flexe_session_is_native_freertos(const flexe_session_t *s)
     return s ? s->native_freertos : 0;
 }
 
+jit_state_t *flexe_session_jit(flexe_session_t *s)
+{
+    return s ? s->jit : NULL;
+}
+
+int flexe_session_run_core(flexe_session_t *s, int core, int max_cycles)
+{
+    if (!s || core < 0 || core > 1 || max_cycles <= 0) return 0;
+    if (core == 1 && s->single_core) return 0;
+    if (s->jit)
+        return jit_run(s->jit, &s->cpu[core], max_cycles);
+    return xtensa_run(&s->cpu[core], max_cycles);
+}
+
 /* ===== Post-batch hook ===== */
 
 void flexe_session_post_batch(flexe_session_t *s, int batch_size)
 {
     if (!s) return;
+
+    /* XPT2046 PENIRQ is active-low.  Sampling the frontend's touch callback
+     * at batch boundaries turns a newly pressed host touch into the falling
+     * GPIO edge expected by interrupt-gated production drivers.  Previously
+     * each embedding had to remember to mirror this wire separately, and a
+     * driver which sampled "released" once would never ask for SPI data
+     * again. */
+    if (s->touch_fn && s->touch_irq_pin >= 0) {
+        int x = 0, y = 0;
+        int level = s->touch_fn(&x, &y, s->touch_ctx) ? 0 : 1;
+        if (level != s->touch_irq_level) {
+            periph_gpio_set_input(s->periph, s->touch_irq_pin, level);
+            s->touch_irq_level = level;
+        }
+    }
+
+    /* Compatibility for frontends built against the older API which still
+     * call xtensa_run(core0) directly.  Sample the batch boundary just like
+     * jit_run() so hot core-0 PCs become native after the normal threshold. */
+    if (s->jit && s->cpu[0].pc >= 0x40070000u && s->cpu[0].pc < 0x40500000u)
+        (void)jit_get_block(s->jit, &s->cpu[0], s->cpu[0].pc);
 
     /* Preemptive timeslice check for core 0 — skip in native mode
      * where firmware's own tick ISR handles scheduling */
@@ -370,7 +435,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     /* Dual-core: run core 1 batch (or poll scheduler if parked) */
     if (!s->single_core && s->cpu[1].pc != 0) {
         if (s->cpu[1].running) {
-            xtensa_run(&s->cpu[1], batch_size);
+            flexe_session_run_core(s, 1, batch_size);
             if (s->frt && !s->native_freertos)
                 freertos_stubs_check_preempt_core(s->frt, 1);
         } else if (s->frt && !s->native_freertos) {

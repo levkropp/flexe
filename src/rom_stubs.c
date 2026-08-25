@@ -2566,6 +2566,130 @@ static void stub_void_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+/* ESP32 rev-0 Bluetooth controller ROM exports return pointers to private
+ * controller tables. The ROM bytes are not executed by Flexe, but the IDF
+ * binary blob still calls these accessors and then writes through the
+ * returned pointers. Give it isolated RTC-fast scratch structures instead
+ * of the old unregistered-ROM fallback (which returned NULL and made reset
+ * loops walk low memory looking for terminators). */
+#define ROM_BT_PLF_PTR_SLOT       0x50000DFCu
+#define ROM_BT_RF_PHY_FUNCS       0x50000E00u
+#define ROM_BT_IP_FUNCS           0x50000E40u
+#define ROM_BT_MODULES_FUNCS      0x50001000u /* blob writes through +0x19C */
+#define ROM_BT_OPTION_DATA        0x50001200u
+#define ROM_BT_LC_DEFAULT_TABLE   0x50001300u
+#define ROM_BT_LC_HCI_TABLE       0x50001320u
+#define ROM_BT_LLCP_STATE_TABLE   0x50001400u /* 22 indexed handler slots */
+#define ROM_BT_LLM_HCI_TABLE      0x50001500u /* 37 entries, eight bytes each */
+#define ROM_BT_LLC_DEFAULT_TABLE  0x50000C00u
+#define ROM_BT_LM_HCI_TABLE       0x50000C40u
+#define ROM_BT_LM_DEFAULT_TABLE   0x50000C80u
+#define ROM_BT_LLC_HCI_TABLE      0x50000CC0u
+#define ROM_BT_LLM_DEFAULT_TABLE  0x50000D00u
+
+static void stub_bt_rom_rf_phy_funcs_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ROM_BT_RF_PHY_FUNCS);
+}
+
+static void stub_bt_rom_ip_funcs_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ROM_BT_IP_FUNCS);
+}
+
+static void stub_bt_rom_modules_funcs_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ROM_BT_MODULES_FUNCS);
+}
+
+static void stub_bt_rom_plf_funcs_set(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    mem_write32(cpu->mem, ROM_BT_PLF_PTR_SLOT, rom_arg(cpu, 0));
+    rom_return(cpu, 0);
+}
+
+static void stub_bt_rom_option_data_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ROM_BT_OPTION_DATA);
+}
+
+static void bt_rom_make_terminated_table(xtensa_cpu_t *cpu, uint32_t addr,
+                                         uint16_t terminator) {
+    mem_write16(cpu->mem, addr, terminator);
+    mem_write16(cpu->mem, addr + 2, 0);
+    mem_write32(cpu->mem, addr + 4, 0);
+    rom_return(cpu, addr);
+}
+
+static void stub_bt_rom_lc_default_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    bt_rom_make_terminated_table(cpu, ROM_BT_LC_DEFAULT_TABLE, 0x0522u);
+}
+
+static void stub_bt_rom_lc_hci_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    bt_rom_make_terminated_table(cpu, ROM_BT_LC_HCI_TABLE, 0x0C7Cu);
+}
+
+static void stub_bt_rom_llcp_state_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ROM_BT_LLCP_STATE_TABLE);
+}
+
+static void stub_bt_rom_llm_hci_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ROM_BT_LLM_HCI_TABLE);
+}
+
+static void bt_rom_make_tagged_table(xtensa_cpu_t *cpu, uint32_t addr,
+                                     const uint16_t *tags, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        mem_write16(cpu->mem, addr + (uint32_t)i * 8u, tags[i]);
+        mem_write16(cpu->mem, addr + (uint32_t)i * 8u + 2u, 0);
+        mem_write32(cpu->mem, addr + (uint32_t)i * 8u + 4u, 0);
+    }
+    rom_return(cpu, addr);
+}
+
+static void stub_bt_rom_llc_default_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = {0x0104, 0x0807, 0x0101, 0x0005};
+    bt_rom_make_tagged_table(cpu, ROM_BT_LLC_DEFAULT_TABLE, tags,
+                             sizeof(tags) / sizeof(tags[0]));
+}
+
+static void stub_bt_rom_lm_hci_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = {
+        0x0408, 0x0C35, 0x0C1A, 0x0C3F, 0x1407, 0x1804
+    };
+    bt_rom_make_tagged_table(cpu, ROM_BT_LM_HCI_TABLE, tags,
+                             sizeof(tags) / sizeof(tags[0]));
+}
+
+static void stub_bt_rom_lm_default_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = {0x0401, 0x0403, 0x0404, 0x040B};
+    bt_rom_make_tagged_table(cpu, ROM_BT_LM_DEFAULT_TABLE, tags,
+                             sizeof(tags) / sizeof(tags[0]));
+}
+
+static void stub_bt_rom_llc_hci_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = {
+        0x2013, 0x0406, 0x0C2D, 0x201B, 0x2020, 0x2016, 0xFC43
+    };
+    bt_rom_make_tagged_table(cpu, ROM_BT_LLC_HCI_TABLE, tags,
+                             sizeof(tags) / sizeof(tags[0]));
+}
+
+static void stub_bt_rom_llm_default_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = {0x0009, 0x0200, 0x0001, 0x0805};
+    bt_rom_make_tagged_table(cpu, ROM_BT_LLM_DEFAULT_TABLE, tags,
+                             sizeof(tags) / sizeof(tags[0]));
+}
+
 /* Real intr_matrix_set(core, source, cpu_int): programs the interrupt matrix.
  * In native FreeRTOS mode, this lets firmware configure interrupt routing. */
 static void stub_intr_matrix_set(xtensa_cpu_t *cpu, void *ctx) {
@@ -3143,6 +3267,51 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x400041c0, stub_unregistered,        "rom_i2c_readReg_Mask");
     rom_stubs_register(s, 0x400041fc, stub_void_unregistered,   "rom_i2c_writeReg_Mask");
 
+    /* Private ESP32 Bluetooth-controller ROM table accessors. The IDF binary
+     * blob expects writable pointer targets even when the host radio backend
+     * is virtualized. */
+    rom_stubs_register(s, 0x40054298, stub_bt_rom_rf_phy_funcs_get,
+                       "btdm_r_import_rf_phy_func_p_get");
+    rom_stubs_register(s, 0x40019AF0, stub_bt_rom_ip_funcs_get,
+                       "btdm_r_ip_func_p_get");
+    rom_stubs_register(s, 0x4005427C, stub_bt_rom_modules_funcs_get,
+                       "btdm_r_modules_func_p_get");
+    rom_stubs_register(s, 0x40054288, stub_bt_rom_plf_funcs_set,
+                       "btdm_r_plf_func_p_set");
+    rom_stubs_register(s, 0x40010004, stub_bt_rom_option_data_get,
+                       "btdm_r_btdm_option_data_p_get");
+    rom_stubs_register(s, 0x4002F494, stub_bt_rom_lc_default_table_get,
+                       "lc_default_state_tab_p_get");
+    rom_stubs_register(s, 0x4002F488, stub_bt_rom_lc_hci_table_get,
+                       "lc_hci_cmd_handler_tab_p_get");
+    rom_stubs_register(s, 0x40043F64, stub_bt_rom_llcp_state_table_get,
+                       "llcp_pdu_handler_tab_p_get");
+    rom_stubs_register(s, 0x4004C920, stub_bt_rom_llm_hci_table_get,
+                       "llm_hci_cmd_handler_tab_p_get");
+    rom_stubs_register(s, 0x40046058, stub_bt_rom_llc_default_table_get,
+                       "llc_default_state_tab_p_get");
+    rom_stubs_register(s, 0x4005425C, stub_bt_rom_lm_hci_table_get,
+                       "lm_hci_cmd_handler_tab_p_get");
+    rom_stubs_register(s, 0x40054268, stub_bt_rom_lm_default_table_get,
+                       "lm_default_state_tab_p_get");
+    rom_stubs_register(s, 0x40042358, stub_bt_rom_llc_hci_table_get,
+                       "llc_hci_cmd_handler_tab_p_get");
+    rom_stubs_register(s, 0x4004E718, stub_bt_rom_llm_default_table_get,
+                       "llm_default_state_tab_p_get");
+    /* Controller operations reached while the virtual BT host is starting.
+     * They have no physical link-layer peer, but are deliberate supported
+     * outcomes rather than unknown-ROM fallbacks. */
+    rom_stubs_register(s, 0x4003617C, stub_unregistered,
+                       "r_ld_acl_sniff");
+    rom_stubs_register(s, 0x400185BC, stub_void_unregistered,
+                       "r_hci_send_2_host");
+    rom_stubs_register(s, 0x4001CD54, stub_void_unregistered,
+                       "r_lc_auth_cmp");
+    rom_stubs_register(s, 0x400542C4, stub_void_unregistered,
+                       "nvds_read");
+    rom_stubs_register(s, 0x40054358, stub_void_unregistered,
+                       "nvds_init_memory");
+
     /* Interrupt matrix — always program it. Firmware running real
      * FreeRTOS (symbol-less binaries without ELF hooks) needs working
      * FROM_CPU yield interrupts; without them portYIELD never switches
@@ -3275,19 +3444,14 @@ typedef struct {
                              * the real instruction (rom_stubs_register_spy) */
 } fw_addr_hook_t;
 
-/* NULL-handler-table remediation for symbol-less firmwares.  With the BT/WiFi
- * init functions stubbed out, the driver event-handler tables never get
- * populated, and every event dispatch (callxN through mem[mem[tbl]+ofs])
- * jumps to NULL.  Fabricate a table whose slots all point at a guest no-op
- * function ("entry a1,32; retw.n") so any dispatch returns cleanly, and
- * point the table-holding global at it.  The fake tables live in RTC Fast
- * RAM (0x50000000+): the firmware's heap init zeroes the free DRAM region
- * (0x3FFB0000+), and nothing touches RTC Fast after early startup. */
-#define FW_NOOP_FN        0x401DBFC4u  /* Marauder: entry a1,32; retw.n */
-#define FW_FAKE_TBL_BT    0x50000400u  /* 256 slots -> FW_NOOP_FN */
+/* The symbol-less Marauder image clears three private BT/WiFi dispatch-table
+ * globals after its controller setup. A hardware HCI task would repopulate
+ * them asynchronously; the virtual controller instead points them at a
+ * bounded table of guest return stubs before the first dispatch. */
+#define FW_NOOP_FN        0x401DBFC4u
+#define FW_FAKE_TBL_BT    0x50000400u
 #define FW_FAKE_TBL_WIFI  0x50000800u
 
-/* One { table_global, fake_table_addr } pair per firmware, keyed by entry. */
 typedef struct {
     uint32_t global_addr;
     uint32_t fake_tbl;
@@ -3297,130 +3461,38 @@ static void fw_patch_handler_tables(esp32_rom_stubs_t *stubs,
                                     const fw_tbl_patch_t *patches, int n) {
     xtensa_mem_t *mem = stubs->cpu->mem;
     for (int i = 0; i < n; i++) {
-        for (int s = 0; s < 256; s++)
-            mem_write32(mem, patches[i].fake_tbl + s * 4, FW_NOOP_FN);
+        for (int slot = 0; slot < 256; slot++)
+            mem_write32(mem, patches[i].fake_tbl + (uint32_t)slot * 4u,
+                        FW_NOOP_FN);
         mem_write32(mem, patches[i].global_addr, patches[i].fake_tbl);
-        fprintf(stderr, "[flexe] fabricated handler table 0x%08X -> global 0x%08X\n",
-                patches[i].fake_tbl, patches[i].global_addr);
     }
 }
 
-/* Marauder table patches, applied from the BT-host "clear" hook below.  The
- * clear runs at BT-host task start — after the btdm clear (which zeroes the
- * wifi tables and must run real, or the btdm task's event flow breaks) and
- * before the first event dispatch on either task.  The real re-population
- * never happens without a radio, so write the fabricated tables instead of
- * the NULL the clear would store. */
 static const fw_tbl_patch_t fw_marauder_ble_tbls[] = {
-    { 0x3FFCD974, FW_FAKE_TBL_BT },   /* NimBLE host handler table */
-    { 0x3FFD0544, FW_FAKE_TBL_WIFI }, /* btdm controller handler table */
-    { 0x3FFD0548, FW_FAKE_TBL_WIFI }, /* btdm second handler table */
+    {0x3FFCD974u, FW_FAKE_TBL_BT},
+    {0x3FFD0544u, FW_FAKE_TBL_WIFI},
+    {0x3FFD0548u, FW_FAKE_TBL_WIFI},
 };
 
 static void stub_fw_marauder_ble_clear(xtensa_cpu_t *cpu, void *ctx) {
     fw_patch_handler_tables(ctx, fw_marauder_ble_tbls,
-                            sizeof(fw_marauder_ble_tbls) / sizeof(fw_marauder_ble_tbls[0]));
+                            (int)(sizeof(fw_marauder_ble_tbls) /
+                                  sizeof(fw_marauder_ble_tbls[0])));
     rom_return(cpu, 0);
 }
 
-/* NimBLEDevice::init() sync-wait: WiFiScan::RunSetup() -> NimBLEDevice::init()
- * brings up the (stubbed-out) BT controller, then parks in
- * "while (!host_synced) delay(1);" waiting for the NimBLE host task to set a
- * synced flag — which never happens without a real controller, so setup()
- * dies before wifi init and the menu draw.  The loop head is
- * "l8ui a4, [a2]" with a2 = &synced_flag.  Spy hook: plant 1 through a2 and
- * let the l8ui execute, so the loop exits via its own epilogue (no window
- * juggling — a consuming rom_return mid-function would mishandle PS.CALLINC=0
- * and jump at the unmasked a0). */
+/* The virtual HCI controller has no asynchronous transport thread to emit
+ * NimBLE's initial host-sync event. Plant the event's completion flag at the
+ * firmware wait-loop head, then let the original load/branch execute. */
 static void stub_fw_marauder_ble_synced(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     mem_write8(cpu->mem, ar_read(cpu, 2), 1);
 }
 
-/* ROM tag/handler table accessor (0x40046058): the firmware's WiFi/BT init
- * calls this ROM routine to get a {u16 tag, u32 handler} fixup table, but the
- * emulator leaves that ROM region zeroed, so the unregistered-ROM backstop
- * returns 0.  The caller (fixup loop at 0x401687e0) then walks the table
- * pointer from address 0 (ptr += 8 each pass) hunting a tag==5 terminator that
- * never exists — pinning CPU0 and starving loopTask before the menu draw.
- * Fabricate a minimal table in RTC Fast RAM carrying the tags the loop matches
- * (0x104, 0x807, 0x101) plus the tag==5 terminator, and return its address so
- * the fixup fills in the handlers and exits. */
-#define FW_MARAUDER_WTBL  0x50000C00u
-static void stub_fw_marauder_wtbl(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    static const uint16_t tags[] = { 0x104, 0x807, 0x101, 0x0005 };
-    xtensa_mem_t *mem = cpu->mem;
-    for (unsigned i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
-        mem_write16(mem, FW_MARAUDER_WTBL + i * 8 + 0, tags[i]);
-        mem_write32(mem, FW_MARAUDER_WTBL + i * 8 + 4, 0);
-    }
-    rom_return(cpu, FW_MARAUDER_WTBL);
-}
-
-/* Two more ROM tag/handler table accessors (0x4005425C / 0x40054268), called
- * via callx8 by the fixup loops at 0x40170464 / 0x401704e4 (themselves called
- * back-to-back from 0x4017052c in the WiFi/BT blob init chain).  Same
- * {u16 tag@+0, u32 handler@+4} 8-byte-entry contract as rom_wtbl_accessor,
- * but DIFFERENT terminator tags: the first loop exits on tag 0x1804, the
- * second on tag 0x40B — so the wtbl stub's tag==5 table never terminates
- * these, and the loops walk the table pointer from address 0 hunting it
- * (writing handlers into low RAM on stray tag matches along the way).
- * Fabricate per-accessor tables in RTC Fast scratch carrying the tags each
- * loop matches (so it fills the handlers in and exits) plus that loop's own
- * terminator tag. */
-#define FW_MARAUDER_FTBL1 0x50000C40u
-#define FW_MARAUDER_FTBL2 0x50000C80u
-static void fw_marauder_make_tbl(xtensa_cpu_t *cpu, uint32_t addr,
-                                 const uint16_t *tags, unsigned n) {
-    xtensa_mem_t *mem = cpu->mem;
-    for (unsigned i = 0; i < n; i++) {
-        mem_write16(mem, addr + i * 8 + 0, tags[i]);
-        mem_write32(mem, addr + i * 8 + 4, 0);
-    }
-    rom_return(cpu, addr);
-}
-static void stub_fw_marauder_ftbl1(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    /* fixup loop 0x40170464: matches 0x408, 0xC35, 0xC1A, 0xC3F, 0x1407;
-     * terminates on 0x1804 */
-    static const uint16_t tags[] = { 0x0408, 0x0C35, 0x0C1A, 0x0C3F, 0x1407, 0x1804 };
-    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL1, tags,
-                         sizeof(tags) / sizeof(tags[0]));
-}
-static void stub_fw_marauder_ftbl2(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    /* fixup loop 0x401704e4: matches 0x401, 0x403, 0x404; terminates on 0x40B */
-    static const uint16_t tags[] = { 0x0401, 0x0403, 0x0404, 0x040B };
-    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL2, tags,
-                         sizeof(tags) / sizeof(tags[0]));
-}
-#define FW_MARAUDER_FTBL3 0x50000CC0u
-static void stub_fw_marauder_ftbl3(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    /* fixup loop 0x40167c20: matches 0x2013, 0x406, 0xC2D, 0x201B, 0x2020,
-     * 0x2016; terminates on 0xFC43 (movi a9,-957 + extui 16) */
-    static const uint16_t tags[] = { 0x2013, 0x0406, 0x0C2D, 0x201B, 0x2020,
-                                     0x2016, 0xFC43 };
-    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL3, tags,
-                         sizeof(tags) / sizeof(tags[0]));
-}
-#define FW_MARAUDER_FTBL4 0x50000D00u
-static void stub_fw_marauder_ftbl4(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    /* fixup loop 0x4016f1a8: matches 0x9, 0x200, 0x1; terminates on 0x805 */
-    static const uint16_t tags[] = { 0x0009, 0x0200, 0x0001, 0x0805 };
-    fw_marauder_make_tbl(cpu, FW_MARAUDER_FTBL4, tags,
-                         sizeof(tags) / sizeof(tags[0]));
-}
-
-/* ble_hs_sync (0x4010463C): waits on the host-controller sync semaphore,
- * which is never given because the BT controller is stubbed out — the host
- * reset path ("Resetting state; reason=19") fires instead, and loopTask
- * blocks forever inside NimBLEDevice::init.  Replicate the successful-sync
- * epilogue: plant both synced-flag bytes (0x3FFC9528 / 0x3FFC9534, the same
- * bytes the real function's epilogue stores via literals 0x400d27e4 /
- * 0x400d2878) and return 0. */
+/* Complete the synchronous half of virtual HCI startup. A physical
+ * controller would give this semaphore after its reset event; the virtual
+ * transport has no independent producer, so publish the same two host flags
+ * and return success. */
 static void stub_fw_marauder_ble_hs_sync(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     mem_write8(cpu->mem, 0x3FFC9528, 1);
@@ -3429,7 +3501,6 @@ static void stub_fw_marauder_ble_hs_sync(xtensa_cpu_t *cpu, void *ctx) {
 }
 
 static const fw_addr_hook_t fw_marauder_hooks[] = {
-    { 0x401540A0, stub_unregistered, "esp_bt_controller_init", 0 },
     /* ble_hs_init is NOT stubbed: it creates ble_hs_mutex and zeroes the
      * host state; stubbing it left the mutex handle NULL and the first
      * ble_hs_lock() (NimBLEDevice::setDeviceName during init) hit
@@ -3437,56 +3508,8 @@ static const fw_addr_hook_t fw_marauder_hooks[] = {
      * reboot loop.  It now runs for real (the ROM fixup-table stubs below
      * cover what used to hang). */
     { 0x401BDE2C, stub_fw_marauder_ble_clear, "ble_handler_table_clear", 0 },
-    /* btdm event handler called from the dispatcher (0x4015F3BC): reads a
-     * NULL handler from the stack event struct the stubbed-out init never
-     * filled.  Return ESP_OK so the dispatcher loop continues. */
-    { 0x40171278, stub_unregistered, "btdm_event_handler", 0 },
-    /* esp_vhci_host_register_callback: btdm-side registration path fails
-     * (ESP_FAIL) without the BT controller's flash config partition.
-     * Stub it so esp_nimble_hci_init completes; the host callback stays
-     * unregistered, which the null-call backstop covers. */
-    { 0x40171E18, stub_unregistered, "esp_vhci_host_register_callback", 0 },
-    /* ledc timer/duty config (0x4012871C): Marauder's backlight setup passes
-     * a garbage speed_mode (0x2D0) whose source is an emulation-side read,
-     * so the firmware's speed_mode<2 validation fails (ESP_ERR 258/259) and
-     * loopTask retries it forever in setup() instead of reaching the menu.
-     * Stub to ESP_OK so setup() proceeds; the panel still renders via SPI. */
-    { 0x4012871C, stub_unregistered, "ledc_timer_config", 0 },
-    /* NimBLE bond/security restore (0x4011624C = ble_store restore iterator,
-     * "entry a1,48"): on an empty NVS store it loops forever reading
-     * our_sec/peer_sec/cccd records that never exist (each sub-read returns
-     * non-zero so the loop's `beqz a10,done` never fires).  Called from
-     * 0x40115a5c (store init), which ignores the return value.  Stub the whole
-     * restore to return 0 ("0 bonds") so NimBLEDevice::init() proceeds.
-     *
-     * NOTE: three earlier stubs here were mis-placed and removed —
-     * 0x40104418 is a small error-code helper (NOT NimBLEDevice::init), and
-     * 0x40115D8E / 0x4011629B are return-address targets (the instruction
-     * after a call8), so hooking them hijacked normal returns into a
-     * self-loop.  The real restore entry is 0x4011624C. */
-    { 0x4011624C, stub_unregistered, "nimble_bond_restore", 0 },
-    /* NimBLE host-synced flag: never set with the controller stubbed out.
-     * Plant it at the wait-loop head so NimBLEDevice::init() returns. */
     { 0x40104595, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
-    /* ble_hs_sync: block-forever on the sync sem with the controller
-     * stubbed; plant the synced flags and return success. */
     { 0x4010463C, stub_fw_marauder_ble_hs_sync, "ble_hs_sync", 0 },
-    /* ROM tag/handler table accessor: returns a fabricated tag==5-terminated
-     * table so the WiFi/BT fixup loop (0x401687e0) stops walking from NULL. */
-    { 0x40046058, stub_fw_marauder_wtbl, "rom_wtbl_accessor", 0 },
-    /* Two more ROM table accessors with different terminator tags (0x1804 /
-     * 0x40B), called by the fixup loops at 0x40170464 / 0x401704e4. */
-    { 0x4005425C, stub_fw_marauder_ftbl1, "rom_ftbl1_accessor", 0 },
-    { 0x40054268, stub_fw_marauder_ftbl2, "rom_ftbl2_accessor", 0 },
-    /* Fixup loop at 0x40167c20; terminator tag 0xFC43. */
-    { 0x40042358, stub_fw_marauder_ftbl3, "rom_ftbl3_accessor", 0 },
-    /* Fixup loop at 0x4016f1a8; terminator tag 0x805. */
-    { 0x4004E718, stub_fw_marauder_ftbl4, "rom_ftbl4_accessor", 0 },
-    /* Universal backstop: any remaining callxN through a NULL function
-     * pointer (half-initialized driver handler structs) returns 0 to the
-     * caller instead of trapping.  Requires the pc==0 hook to run before
-     * the invalid-PC trap (see xtensa_step_impl). */
-    { 0x00000000, stub_unregistered, "null_fn_ptr", 0 },
     { 0, NULL, NULL, 0 }
 };
 

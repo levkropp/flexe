@@ -37,6 +37,7 @@
 #define SPI_USER2_REG     0x24
 #define SPI_MOSI_DLEN_REG 0x28
 #define SPI_MISO_DLEN_REG 0x2C
+#define SPI_PIN_REG       0x34
 #define SPI_SLAVE_REG     0x38
 #define SPI_W0_REG        0x80
 
@@ -53,6 +54,16 @@
 #define ILI_RAMWR 0x2C
 #define ILI_MADCTL 0x36
 
+/* Original ESP32 GPIO-matrix signal indices. */
+#define HSPICLK_OUT_IDX  8
+#define HSPICS0_OUT_IDX 11
+#define HSPICS1_OUT_IDX 61
+#define HSPICS2_OUT_IDX 62
+#define VSPICLK_OUT_IDX 63
+#define VSPICS0_OUT_IDX 68
+#define VSPICS1_OUT_IDX 69
+#define VSPICS2_OUT_IDX 70
+
 typedef struct {
     xtensa_mem_t *mem;
     esp32_periph_t *periph;      /* for GPIO CS/D-C sampling */
@@ -60,6 +71,7 @@ typedef struct {
 
     /* Register shadow */
     uint32_t addr, user, user1, user2, mosi_dlen, miso_dlen;
+    uint32_t pin;                /* SPI_PIN_REG: active hardware CS line */
     uint32_t slave;              /* SPI_SLAVE_REG shadow (config bits) */
     int      trans_done;         /* SPI_TRANS_DONE flag (slave reg bit 4) */
     uint32_t w[16];
@@ -80,6 +92,9 @@ typedef struct {
     uint8_t  touch_cmd;
 
     int      dc_seen;            /* D/C pin observed high on this host */
+    int      host_num;           /* 2 = HSPI, 3 = VSPI */
+    uint64_t route_snapshot;
+    int      route_reported;
 
     /* Raw SPI SD card state (SDHC, SPI mode) */
     int      sd_fd;              /* backing image fd, -1 = not open */
@@ -111,14 +126,92 @@ static int gpio_level(const spi_display_t *s, int pin) {
  * the app never configures it). */
 static uint64_t g_cs_seen_high;   /* bit per GPIO number */
 
+static int cs_seen_high(int pin) {
+    return pin >= 0 && pin <= 39 &&
+           (g_cs_seen_high & (1ULL << pin)) != 0;
+}
+
 static int cs_asserted(spi_display_t *s, int pin) {
     if (pin < 0 || pin > 39) return 0;
     int lvl = gpio_level(s, pin);
     if (lvl == 1) g_cs_seen_high |= (1ULL << pin);
-    int asserted = lvl == 0 && (g_cs_seen_high & (1ULL << pin)) != 0;
+    int asserted = lvl == 0 && cs_seen_high(pin);
     if (asserted && getenv("FLEXE_CSDBG"))
         fprintf(stderr, "[CS] pin=%d asserted (touch_cs=%d sd_cs=%d)\n", pin, s->cfg.touch_cs_pin, s->cfg.sd_cs_pin);
     return asserted;
+}
+
+/* Return 1 when a device's configured clock pin is routed from this host,
+ * 0 when it is explicitly routed from the other GP-SPI host, and -1 when
+ * the firmware has not exposed enough matrix state to tell.  Treating an
+ * unknown route as compatible preserves direct-register/native-IOMUX users;
+ * an explicit route always prevents a GPIO asserted on SPI2 from stealing a
+ * transaction running on SPI3 (and vice versa). */
+static int clock_route(const spi_display_t *s, int pin) {
+    int signal = periph_gpio_out_signal(s->periph, pin);
+    int expected = s->host_num == 2 ? HSPICLK_OUT_IDX : VSPICLK_OUT_IDX;
+    int other = s->host_num == 2 ? VSPICLK_OUT_IDX : HSPICLK_OUT_IDX;
+    if (signal == expected) return 1;
+    if (signal == other) return 0;
+    return -1;
+}
+
+static int route_allows_host(const spi_display_t *s, int clock_pin) {
+    return clock_route(s, clock_pin) != 0;
+}
+
+/* If GPIO-matrix routing hands a configured CS pin to this host's CS0/1/2
+ * output, the GPIO output latch no longer describes its electrical level.
+ * SPI_PIN_REG selects exactly one hardware CS for each spi_master transfer;
+ * return that state here, or -1 for a software-controlled/unknown CS. */
+static int hardware_cs_state(const spi_display_t *s, int pin) {
+    int signal = periph_gpio_out_signal(s->periph, pin);
+    int cs = -1;
+    if (s->host_num == 2) {
+        if (signal == HSPICS0_OUT_IDX) cs = 0;
+        else if (signal == HSPICS1_OUT_IDX) cs = 1;
+        else if (signal == HSPICS2_OUT_IDX) cs = 2;
+        else if (signal == VSPICS0_OUT_IDX || signal == VSPICS1_OUT_IDX ||
+                 signal == VSPICS2_OUT_IDX)
+            return 0;
+    } else {
+        if (signal == VSPICS0_OUT_IDX) cs = 0;
+        else if (signal == VSPICS1_OUT_IDX) cs = 1;
+        else if (signal == VSPICS2_OUT_IDX) cs = 2;
+        else if (signal == HSPICS0_OUT_IDX || signal == HSPICS1_OUT_IDX ||
+                 signal == HSPICS2_OUT_IDX)
+            return 0;
+    }
+    return cs < 0 ? -1 : ((s->pin & (1u << cs)) == 0);
+}
+
+static int device_cs_state(spi_display_t *s, int pin) {
+    int state = hardware_cs_state(s, pin);
+    return state >= 0 ? state : cs_asserted(s, pin);
+}
+
+static void report_routes(spi_display_t *s) {
+    if (!getenv("FLEXE_SPIROUTEDBG")) return;
+    int display_clk = periph_gpio_out_signal(s->periph, s->cfg.display_sck_pin);
+    int touch_clk = periph_gpio_out_signal(s->periph, s->cfg.touch_sck_pin);
+    int sd_clk = periph_gpio_out_signal(s->periph, s->cfg.sd_sck_pin);
+    int display_cs = periph_gpio_out_signal(s->periph, s->cfg.display_cs_pin);
+    int touch_cs = periph_gpio_out_signal(s->periph, s->cfg.touch_cs_pin);
+    int sd_cs = periph_gpio_out_signal(s->periph, s->cfg.sd_cs_pin);
+    uint64_t snapshot = (uint64_t)(display_clk & 0x1FF) |
+                        (uint64_t)(touch_clk & 0x1FF) << 9 |
+                        (uint64_t)(sd_clk & 0x1FF) << 18 |
+                        (uint64_t)(display_cs & 0x1FF) << 27 |
+                        (uint64_t)(touch_cs & 0x1FF) << 36 |
+                        (uint64_t)(sd_cs & 0x1FF) << 45;
+    if (s->route_reported && snapshot == s->route_snapshot) return;
+    s->route_reported = 1;
+    s->route_snapshot = snapshot;
+    fprintf(stderr,
+            "[SPIROUTE] SPI%d clk(display=%d touch=%d sd=%d) "
+            "cs(display=%d touch=%d sd=%d) pin=0x%08X\n",
+            s->host_num, display_clk, touch_clk, sd_clk,
+            display_cs, touch_cs, sd_cs, s->pin);
 }
 
 /* Display CS is often driven by the SPI hardware (spi_master spics_io_num),
@@ -381,6 +474,7 @@ static void sd_execute(spi_display_t *s) {
     s->sd_resp_len = 0;
     switch (cmd) {
     case 0:  sd_queue_byte(s, 0x01); break;                       /* GO_IDLE */
+    case 1:  s->sd_ready = 1; sd_queue_byte(s, 0x00); break;      /* SEND_OP_COND */
     case 8:  {                                                    /* SEND_IF_COND */
         static const uint8_t r7[] = {0x01, 0x00, 0x00, 0x01, 0xAA};
         sd_queue(s, r7, sizeof(r7));
@@ -391,7 +485,9 @@ static void sd_execute(spi_display_t *s) {
     case 10: sd_queue_byte(s, 0x00); sd_queue_byte(s, 0xFE);      /* SEND_CID */
              { uint8_t cid[16] = {0}; sd_queue(s, cid, 16); }
              sd_queue_byte(s, 0xFF); sd_queue_byte(s, 0xFF); break;
-    case 12: sd_queue_byte(s, 0x00); s->sd_multi = 0; break;      /* STOP_TRANS */
+    case 12: /* STOP_TRANS has one stuff byte before its R1 response. */
+             sd_queue_byte(s, 0xFF); sd_queue_byte(s, 0x00);
+             s->sd_multi = 0; break;
     case 13: { uint8_t r2[2] = {0x00, 0x00}; sd_queue(s, r2, 2); break; }
     case 16: sd_queue_byte(s, 0x00); break;                       /* SET_BLOCKLEN */
     case 17: sd_queue_byte(s, 0x00);                              /* READ_SINGLE */
@@ -399,6 +495,7 @@ static void sd_execute(spi_display_t *s) {
     case 18: sd_queue_byte(s, 0x00);                              /* READ_MULTI */
              s->sd_multi = 1; s->sd_multi_sector = arg;
              sd_queue_block_read(s, arg); break;
+    case 23: sd_queue_byte(s, 0x00); break;                       /* ACMD23 */
     case 24: sd_queue_byte(s, 0x00);                              /* WRITE_SINGLE */
              s->sd_write_sector = arg; s->sd_write_pos = -1;
              break;
@@ -406,7 +503,7 @@ static void sd_execute(spi_display_t *s) {
              s->sd_multi = 2; s->sd_multi_sector = arg;
              s->sd_write_sector = arg; s->sd_write_pos = -1;
              break;
-    case 55: sd_queue_byte(s, 0x01); break;                       /* APP_CMD */
+    case 55: sd_queue_byte(s, s->sd_ready ? 0x00 : 0x01); break; /* APP_CMD */
     case 41: s->sd_ready = 1;                                   /* ACMD41: ready */
              sd_queue_byte(s, 0x00); break;
     case 42: sd_queue_byte(s, 0x00); break;                       /* APP_CLR_CD */
@@ -425,13 +522,22 @@ static void sd_execute(spi_display_t *s) {
 static uint8_t sd_byte(spi_display_t *s, uint8_t mosi) {
     /* MISO: next queued response byte, 0xFF when idle */
     uint8_t miso = 0xFF;
-    if (s->sd_resp_pos < s->sd_resp_len)
+    int response_was_pending = s->sd_resp_pos < s->sd_resp_len;
+    if (response_was_pending)
         miso = s->sd_resp[s->sd_resp_pos++];
 
     /* Write-block data capture (after CMD24/25 R1) */
     if (s->sd_write_pos >= -1 && s->sd_write_sector != UINT32_MAX) {
         if (s->sd_write_pos < 0) {
-            if (mosi == 0xFE) s->sd_write_pos = 0;   /* data token */
+            /* CMD24 uses the single-block 0xFE token.  CMD25 uses 0xFC for
+             * every data block and terminates the stream with 0xFD. */
+            if (mosi == 0xFE || (s->sd_multi == 2 && mosi == 0xFC)) {
+                s->sd_write_pos = 0;
+            } else if (s->sd_multi == 2 && mosi == 0xFD) {
+                s->sd_multi = 0;
+                s->sd_write_sector = UINT32_MAX;
+                s->sd_write_pos = 0;
+            }
             return miso;
         }
         if (s->sd_write_pos < 512) {
@@ -457,7 +563,8 @@ static uint8_t sd_byte(spi_display_t *s, uint8_t mosi) {
     }
 
     /* Multiblock read continuation: keep serving sectors until CMD12 */
-    if (s->sd_multi == 1 && s->sd_resp_pos >= s->sd_resp_len &&
+    if (s->sd_multi == 1 && !response_was_pending &&
+        s->sd_resp_pos >= s->sd_resp_len &&
         s->sd_cmd_len == 0 && mosi == 0xFF) {
         s->sd_multi_sector++;
         s->sd_resp_pos = 0; s->sd_resp_len = 0;
@@ -489,9 +596,19 @@ static void gp_spi_transact(spi_display_t *s) {
      * poll SPI_SLAVE_REG (spi_device_polling_end / spi_hal_usr_is_done) */
     s->trans_done = 1;
 
-    int cs_touch = cs_asserted(s, s->cfg.touch_cs_pin);
-    int cs_sd = cs_asserted(s, s->cfg.sd_cs_pin);
-    int cs_disp = display_active(s) && !cs_touch && !cs_sd;
+    report_routes(s);
+
+    int cs_touch = route_allows_host(s, s->cfg.touch_sck_pin) &&
+                   device_cs_state(s, s->cfg.touch_cs_pin);
+    int cs_sd = route_allows_host(s, s->cfg.sd_sck_pin) &&
+                device_cs_state(s, s->cfg.sd_cs_pin);
+    int display_cs = route_allows_host(s, s->cfg.display_sck_pin) ?
+                     device_cs_state(s, s->cfg.display_cs_pin) : 0;
+    int cs_disp = display_cs ||
+                  (display_cs == 0 &&
+                   !cs_seen_high(s->cfg.display_cs_pin) &&
+                   route_allows_host(s, s->cfg.display_sck_pin) &&
+                   display_active(s));
 
     if (cs_touch) {
         /* XPT2046 conversions are pipelined.  The MISO bits clocked during
@@ -523,6 +640,27 @@ static void gp_spi_transact(spi_display_t *s) {
         return;
     }
 
+    /* A software-selected panel takes precedence over a stale hardware-CS
+     * configuration left by ESP-IDF's SD driver on the shared host.  The SD
+     * path is selected whenever the panel CS is inactive. */
+    if (cs_disp) {
+        int dc = (gpio_level(s, s->cfg.dc_pin) == 1);
+
+        /* Command phase (8 bits) if USR_COMMAND set */
+        if (s->user & SPI_USER_USR_CMD) {
+            uint8_t cmd = (uint8_t)(s->user2 & 0xFF);
+            ili9341_feed(s, 0, &cmd, 1);
+        }
+        /* Address phase — display drivers don't use it; ignore */
+        /* Data phase */
+        if (s->user & SPI_USER_USR_MOSI) {
+            int n = data_bytes(s->mosi_dlen);
+            if (n > 0) ili9341_feed(s, dc, (const uint8_t *)s->w, n);
+        }
+        /* Read commands (RDID 0x04 etc.): leave W as-is (zeros read as 0) */
+        return;
+    }
+
     if (cs_sd) {
         /* Byte-at-a-time SD protocol exchange; write MISO back to W */
         int n = data_bytes(s->mosi_dlen);
@@ -544,22 +682,6 @@ static void gp_spi_transact(spi_display_t *s) {
         return;
     }
 
-    if (!cs_disp) return;
-
-    int dc = (gpio_level(s, s->cfg.dc_pin) == 1);
-
-    /* Command phase (8 bits) if USR_COMMAND set */
-    if (s->user & SPI_USER_USR_CMD) {
-        uint8_t cmd = (uint8_t)(s->user2 & 0xFF);
-        ili9341_feed(s, 0, &cmd, 1);
-    }
-    /* Address phase — display drivers don't use it; ignore */
-    /* Data phase */
-    if (s->user & SPI_USER_USR_MOSI) {
-        int n = data_bytes(s->mosi_dlen);
-        if (n > 0) ili9341_feed(s, dc, (const uint8_t *)s->w, n);
-    }
-    /* Read commands (RDID 0x04 etc.): leave W as-is (zeros read as 0) */
 }
 
 static uint32_t gp_spi_read(void *ctx, uint32_t addr) {
@@ -574,6 +696,7 @@ static uint32_t gp_spi_read(void *ctx, uint32_t addr) {
     case SPI_USER2_REG:    return s->user2;
     case SPI_MOSI_DLEN_REG: return s->mosi_dlen;
     case SPI_MISO_DLEN_REG: return s->miso_dlen;
+    case SPI_PIN_REG:      return s->pin;
     case SPI_SLAVE_REG:    return s->slave | (s->trans_done ? SPI_TRANS_DONE : 0);
     default:
         if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))
@@ -596,6 +719,7 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
     case SPI_USER2_REG:    s->user2 = val; break;
     case SPI_MOSI_DLEN_REG: s->mosi_dlen = val; break;
     case SPI_MISO_DLEN_REG: s->miso_dlen = val; break;
+    case SPI_PIN_REG:      s->pin = val; break;
     case SPI_SLAVE_REG:
         s->slave = val & ~SPI_TRANS_DONE;
         if (!(val & SPI_TRANS_DONE)) s->trans_done = 0;  /* clear_intr */
@@ -609,10 +733,21 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
 
 /* ---- public API ---- */
 
+void periph_disable_spi_display(esp32_periph_t *p) {
+    if (!p) return;
+    for (int i = 0; i < 2; i++) {
+        spi_display_t *s = &g_host[i];
+        if (s->periph != p) continue;
+        if (s->sd_fd >= 0) close(s->sd_fd);
+        memset(s, 0, sizeof(*s));
+    }
+}
+
 void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cfg) {
     if (!p || !cfg) return;
     xtensa_mem_t *mem = periph_mem(p);
 
+    periph_disable_spi_display(p);
     g_cs_seen_high = 0;
     for (int i = 0; i < 2; i++) {
         spi_display_t *s = &g_host[i];
@@ -620,6 +755,8 @@ void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cf
         s->mem = mem;
         s->periph = p;
         s->cfg = *cfg;
+        s->host_num = i + 2;
+        s->pin = 0x7;           /* reset: CS0/1/2 outputs all disabled */
         /* Power-on defaults matching a reset panel */
         s->xe = 239;
         s->ye = 319;

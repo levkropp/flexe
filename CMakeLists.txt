@@ -162,3 +162,12 @@ if(MSVC)
 else()
     target_compile_options(trace-filter PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()
+
+# Optional POSIX external-ROM integration runner. The ROM images themselves
+# are supplied at runtime and are not part of the normal unit-test fixtures.
+if(UNIX)
+    add_executable(flexe-stock-rom-test tools/stock_rom_test.c)
+    target_link_libraries(flexe-stock-rom-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-stock-rom-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+endif()

@@ -743,11 +743,15 @@ static inline void emit_nop(emit_t *e) {
     emit32(e, 0xD503201Fu);
 }
 
-/* cmov cc, dst, src — ARM64 CSEL Wd, Wsrc, Wdst, cc */
+/* cmov cc, dst, src — ARM64 CSEL Wd, Wsrc, Wdst, cc.
+ * CSEL chooses Rn when the condition is true and Rm otherwise, so src
+ * belongs in Rn (bits 9:5) and the old destination belongs in Rm
+ * (bits 20:16).  Reversing those operands turns every MIN/MAX and
+ * conditional move into its opposite on ARM64. */
 static inline void emit_cmov_reg32(emit_t *e, uint8_t cc, int dst, int src) {
-    emit32(e, 0x1A800000u | ((uint32_t)(src & 31) << 16)
+    emit32(e, 0x1A800000u | ((uint32_t)(dst & 31) << 16)
              | ((uint32_t)(cc & 0xFu) << 12)
-             | ((uint32_t)(dst & 31) << 5) | (uint32_t)(dst & 31));
+             | ((uint32_t)(src & 31) << 5) | (uint32_t)(dst & 31));
 }
 
 /* movsx Wd, Wn (16->32) — SXTH alias of SBFM Wd, Wn, #0, #15 */
@@ -981,6 +985,19 @@ static inline void emit_store32_sib(emit_t *e, int src, int base, int index, int
     }
     /* STR Wt, [Xn, Xm, LSL #2]  — 0xB8207800 */
     emit32(e, 0xB8207800u | ((uint32_t)(index & 31) << 16)
+             | ((uint32_t)(base & 31) << 5) | (uint32_t)(src & 31));
+}
+
+/* STRB Wt, [Xn, Xm] with an optional structure-field displacement. */
+static inline void emit_store8_index(emit_t *e, int src, int base, int index,
+                                     int32_t disp) {
+    if (disp != 0) {
+        emit_mov_reg_imm64(e, ARM64_SCRATCH, (uint64_t)(int64_t)disp);
+        emit32(e, 0x8B000000u | ((uint32_t)ARM64_SCRATCH << 16)
+                 | ((uint32_t)(base & 31) << 5) | (uint32_t)ARM64_SCRATCH);
+        base = ARM64_SCRATCH;
+    }
+    emit32(e, 0x38206800u | ((uint32_t)(index & 31) << 16)
              | ((uint32_t)(base & 31) << 5) | (uint32_t)(src & 31));
 }
 

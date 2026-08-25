@@ -368,6 +368,71 @@ TEST(test_stub_memcpy) {
     teardown(&cpu);
 }
 
+static uint32_t call_builtin_rom0(xtensa_cpu_t *cpu, uint32_t addr,
+                                  uint32_t arg0) {
+    cpu->pc = addr;
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, BASE);
+    ar_write(cpu, 2, arg0);
+    xtensa_step(cpu);
+    return ar_read(cpu, 2);
+}
+
+TEST(test_bt_rom_table_accessors_use_bounded_scratch) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    uint32_t rf = call_builtin_rom0(&cpu, 0x40054298u, 0);
+    uint32_t ip = call_builtin_rom0(&cpu, 0x40019AF0u, 0);
+    uint32_t modules = call_builtin_rom0(&cpu, 0x4005427Cu, 0);
+    uint32_t options = call_builtin_rom0(&cpu, 0x40010004u, 0);
+    ASSERT_TRUE(rf >= 0x50000000u && rf < 0x50002000u);
+    ASSERT_TRUE(ip >= 0x50000000u && ip < 0x50002000u);
+    ASSERT_TRUE(modules >= 0x50000000u && modules + 0x19Cu < 0x50002000u);
+    ASSERT_TRUE(options >= 0x50000000u && options + 0x1Cu < 0x50002000u);
+
+    /* Pointer targets are writable and independent. */
+    mem_write32(cpu.mem, rf, 0x11111111u);
+    mem_write32(cpu.mem, modules + 0x19Cu, 0x22222222u);
+    ASSERT_EQ(mem_read32(cpu.mem, rf), 0x11111111u);
+    ASSERT_EQ(mem_read32(cpu.mem, modules + 0x19Cu), 0x22222222u);
+
+    uint32_t lc_default = call_builtin_rom0(&cpu, 0x4002F494u, 0);
+    uint32_t lc_hci = call_builtin_rom0(&cpu, 0x4002F488u, 0);
+    ASSERT_EQ(mem_read16(cpu.mem, lc_default), 0x0522u);
+    ASSERT_EQ(mem_read16(cpu.mem, lc_hci), 0x0C7Cu);
+
+    uint32_t llcp = call_builtin_rom0(&cpu, 0x40043F64u, 0);
+    uint32_t llm = call_builtin_rom0(&cpu, 0x4004C920u, 0);
+    ASSERT_TRUE(llcp >= 0x50000000u && llcp + 171u < 0x50002000u);
+    ASSERT_TRUE(llm >= 0x50000000u && llm + 37u * 8u <= 0x50002000u);
+
+    static const struct {
+        uint32_t accessor;
+        uint16_t first_tag;
+    } tagged_tables[] = {
+        {0x40046058u, 0x0104u}, /* LLC default-state table */
+        {0x4005425Cu, 0x0408u}, /* LM HCI command table */
+        {0x40054268u, 0x0401u}, /* LM default-state table */
+        {0x40042358u, 0x2013u}, /* LLC HCI command table */
+        {0x4004E718u, 0x0009u}, /* LLM default-state table */
+    };
+    for (size_t i = 0;
+         i < sizeof(tagged_tables) / sizeof(tagged_tables[0]); i++) {
+        uint32_t table = call_builtin_rom0(&cpu, tagged_tables[i].accessor, 0);
+        ASSERT_TRUE(table >= 0x50000000u && table + 8u < 0x50002000u);
+        ASSERT_EQ(mem_read16(cpu.mem, table), tagged_tables[i].first_tag);
+    }
+
+    call_builtin_rom0(&cpu, 0x40054288u, 0x3FFB1234u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x50000DFCu), 0x3FFB1234u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 /* ===== Run all ===== */
 
 static void run_rom_stub_tests(void) {
@@ -384,4 +449,5 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_delay_us);
     RUN_TEST(test_stub_cache_noop);
     RUN_TEST(test_stub_memcpy);
+    RUN_TEST(test_bt_rom_table_accessors_use_bounded_scratch);
 }

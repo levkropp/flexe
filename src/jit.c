@@ -68,6 +68,7 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 #define CPU_OFF_HOOK_BITMAP offsetof(xtensa_cpu_t, pc_hook_bitmap)
 #define CPU_OFF_PREDECODE   offsetof(xtensa_cpu_t, predecode)
 #define CPU_OFF_WINDOWSTART offsetof(xtensa_cpu_t, windowstart)
+#define CPU_OFF_WINDOW_CALLSIZE offsetof(xtensa_cpu_t, window_callsize)
 #define CPU_OFF_MISC        offsetof(xtensa_cpu_t, misc)
 #define CPU_OFF_EPC         offsetof(xtensa_cpu_t, epc)
 #define CPU_OFF_EXCSAVE     offsetof(xtensa_cpu_t, excsave)
@@ -587,14 +588,6 @@ static void ra_flush(emit_t *e, regalloc_t *ra, int wb4) {
     }
     /* NOTE: do NOT clear ra->dirty here. Multiple block exits (both sides of a
      * branch) need to emit stores independently. Dirty bits reset at block start. */
-}
-
-/* Unconditionally flush ALL allocated regs (ignores dirty tracking).
- * Used on fallback paths where the compile-time dirty bits are unreliable. */
-static void ra_flush_all(emit_t *e, int wb4) {
-    for (int n = 1; n <= RA_COUNT; n++) {
-        emit_store32_disp(e, RA_MAP[n], REG_CPU, ar_offset(wb4, n));
-    }
 }
 
 /* (ra_preload removed — regs are loaded lazily on first use) */
@@ -1557,39 +1550,42 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 return 1;
             }
             case 8: { /* MOVEQZ: if (at == 0) ar = as */
-                ra_load_ar(e, ra,RBX, wb4, t);
-                emit_test_reg32(e, RBX, RBX);
-                int skip_patch = emit_jcc_rel32(e, CC_NE);
-                ra_load_ar(e, ra,RAX, wb4, s);
+                /* Always give the register allocator one deterministic
+                 * destination value.  Branching around ra_store_ar() leaves
+                 * its compile-time dirty mapping live on the untaken path. */
+                ra_load_ar(e, ra,RAX, wb4, r);
+                ra_load_ar(e, ra,RBX, wb4, s);
+                ra_load_ar(e, ra,RCX, wb4, t);
+                emit_test_reg32(e, RCX, RCX);
+                emit_cmov_reg32(e, CC_E, RAX, RBX);
                 ra_store_ar(e, ra,RAX, wb4, r);
-                emit_patch_rel32(e, skip_patch);
                 return 1;
             }
             case 9: { /* MOVNEZ: if (at != 0) ar = as */
-                ra_load_ar(e, ra,RBX, wb4, t);
-                emit_test_reg32(e, RBX, RBX);
-                int skip_patch = emit_jcc_rel32(e, CC_E);
-                ra_load_ar(e, ra,RAX, wb4, s);
+                ra_load_ar(e, ra,RAX, wb4, r);
+                ra_load_ar(e, ra,RBX, wb4, s);
+                ra_load_ar(e, ra,RCX, wb4, t);
+                emit_test_reg32(e, RCX, RCX);
+                emit_cmov_reg32(e, CC_NE, RAX, RBX);
                 ra_store_ar(e, ra,RAX, wb4, r);
-                emit_patch_rel32(e, skip_patch);
                 return 1;
             }
             case 10: { /* MOVLTZ: if ((int32)at < 0) ar = as */
-                ra_load_ar(e, ra,RBX, wb4, t);
-                emit_test_reg32(e, RBX, RBX);
-                int skip_patch = emit_jcc_rel32(e, CC_NS);
-                ra_load_ar(e, ra,RAX, wb4, s);
+                ra_load_ar(e, ra,RAX, wb4, r);
+                ra_load_ar(e, ra,RBX, wb4, s);
+                ra_load_ar(e, ra,RCX, wb4, t);
+                emit_test_reg32(e, RCX, RCX);
+                emit_cmov_reg32(e, CC_S, RAX, RBX);
                 ra_store_ar(e, ra,RAX, wb4, r);
-                emit_patch_rel32(e, skip_patch);
                 return 1;
             }
             case 11: { /* MOVGEZ: if ((int32)at >= 0) ar = as */
-                ra_load_ar(e, ra,RBX, wb4, t);
-                emit_test_reg32(e, RBX, RBX);
-                int skip_patch = emit_jcc_rel32(e, CC_S);
-                ra_load_ar(e, ra,RAX, wb4, s);
+                ra_load_ar(e, ra,RAX, wb4, r);
+                ra_load_ar(e, ra,RBX, wb4, s);
+                ra_load_ar(e, ra,RCX, wb4, t);
+                emit_test_reg32(e, RCX, RCX);
+                emit_cmov_reg32(e, CC_NS, RAX, RBX);
                 ra_store_ar(e, ra,RAX, wb4, r);
-                emit_patch_rel32(e, skip_patch);
                 return 1;
             }
             case 12: { /* MOVF: if (!bt) ar = as */
@@ -1754,23 +1750,30 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         }
     } /* end LSAI */
 
-    case 5: { /* CALLN: CALL4/CALL8/CALL12 */
+    case 5: { /* CALLN: CALL0/CALL4/CALL8/CALL12 */
         int call_nn = XT_N(insn);
         int32_t call_off = sign_extend(XT_OFFSET18(insn), 18);
         uint32_t call_target = (((pc >> 2) + (uint32_t)call_off + 1) << 2);
-        uint32_t ret_addr = ((uint32_t)call_nn << 30) | (next_pc & 0x3FFFFFFFu);
+        uint32_t ret_addr = call_nn == 0
+                          ? next_pc
+                          : ((uint32_t)call_nn << 30) |
+                            (next_pc & 0x3FFFFFFFu);
         int32_t ret_ar_off = (int32_t)(CPU_OFF_AR + (((uint32_t)(wb4 + call_nn*4)) & 63) * 4);
 
-        /* 1. PS.CALLINC = nn */
-        emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
-        emit_and_reg32_imm32(e, RAX, (int32_t)(~(3u << 16)));
-        emit_or_reg32_imm32(e, RAX, (int32_t)((uint32_t)call_nn << 16));
-        emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+        /* Windowed calls select the ENTRY rotation. CALL0 neither rotates nor
+         * changes CALLINC, and stores an ordinary full-width return address. */
+        if (call_nn != 0) {
+            emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+            emit_and_reg32_imm32(e, RAX, (int32_t)(~(3u << 16)));
+            emit_or_reg32_imm32(e, RAX,
+                                (int32_t)((uint32_t)call_nn << 16));
+            emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+        }
 
-        /* 2. Write return address to callee's a0 slot (bypasses regalloc — cross-window) */
+        /* Write return address to a0/current or the callee's future a0 slot. */
         emit_store32_disp_imm(e, REG_CPU, ret_ar_off, ret_addr);
 
-        /* 3. Block exit to callee */
+        /* Block exit to callee. */
         emit_block_exit_ra(e, ra, wb4, call_target, insn_idx + 1, jit);
         return 1;
     }
@@ -1866,11 +1869,15 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 int entry_s = XT_S(insn);
                 uint32_t frame_size = (uint32_t)XT_IMM12(insn) << 3;
 
-                /* Overflow guard: if POPCNT(windowstart) >= 14, fallback */
+                /* ENTRY's interpreter path spills every live window that the
+                 * new frame could overlap.  The native fast path is safe when
+                 * only the current window is live; defer more complex window
+                 * rings to that exact spill implementation. */
                 emit_load_cpu32(e, RDX, (int32_t)CPU_OFF_WINDOWSTART);
-                emit_popcnt(e, RDX, RDX);
-                emit_cmp_reg32_imm32(e, RDX, 14);
-                int overflow_fb = emit_jcc_rel32(e, CC_AE);
+                emit_and_reg32_imm32(e, RDX,
+                                     (int32_t)~(1u << ((unsigned)wb4 >> 2)));
+                emit_test_reg32(e, RDX, RDX);
+                int overflow_fb = emit_jcc_rel32(e, CC_NE);
 
                 /* Load PS → RAX; extract CALLINC → RCX */
                 emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
@@ -1906,6 +1913,11 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 /* Store new_wb → WINDOWBASE */
                 emit_store_cpu32(e, RDX, (int32_t)CPU_OFF_WINDOWBASE);
 
+                /* ENTRY records how far this frame rotated. RETW needs this
+                 * when a tail-call frame has an a0 whose high bits are zero. */
+                emit_store8_index(e, RCX, REG_CPU, RDX,
+                                  (int32_t)CPU_OFF_WINDOW_CALLSIZE);
+
                 /* Set WS[new_wb]: mov eax,1; shl eax,cl; or [ws], eax */
                 emit_mov_reg_imm32(e, RAX, 1);
                 emit_mov_reg32_reg32(e, RCX, RDX);  /* cl = new_wb */
@@ -1929,7 +1941,10 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
 
                 /* Overflow fallback: interpreter handles it */
                 emit_patch_rel32(e, overflow_fb);
-                ra_flush_all(e, wb4);
+                /* Dirty bits deliberately survive the main-path ra_flush(),
+                 * so this emits the same valid writeback without storing
+                 * host registers that were never loaded on the fallback. */
+                ra_flush(e, ra, wb4);
                 emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc);
                 emit_acc_add(e, insn_idx);  /* ENTRY itself didn't run */
                 emit_jmp_to_epilogue(e, jit);
@@ -2052,6 +2067,12 @@ compile_retw: ;
         emit_shr_reg32_imm(e, RCX, 30);
         emit_and_reg32_imm32(e, RCX, 3);
 
+        /* Tail-called frames do not encode their creation callsize in a0.
+         * The interpreter resolves those through window_callsize[]; leave
+         * this uncommon case to it instead of rotating by zero. */
+        emit_test_reg32(e, RCX, RCX);
+        int callsize_fb = emit_jcc_rel32(e, CC_E);
+
         /* 3. Compute return_pc = (a0 & 0x3FFFFFFF) */
         emit_and_reg32_imm32(e, RAX, 0x3FFFFFFF);
         /* Add high bits from current PC */
@@ -2082,15 +2103,8 @@ compile_retw: ;
         /* 8. Store ret_wb → WINDOWBASE */
         emit_store_cpu32(e, RDX, (int32_t)CPU_OFF_WINDOWBASE);
 
-        /* 9. Update PS: OWB = ret_wb, CALLINC = 0 */
-        emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
-        emit_and_reg32_imm32(e, RAX, (int32_t)(~((3u << 16) | (0xFu << 8))));
-        emit_mov_reg32_reg32(e, RCX, RDX);  /* ret_wb */
-        emit_shl_reg32_imm(e, RCX, 8);
-        emit_or_reg32(e, RAX, RCX);
-        emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
-
-        /* 10. Store return_pc → cpu->pc, exit with insn_count */
+        /* 9. Store return_pc → cpu->pc, exit with insn_count. RETW does
+         * not change PS.OWB; that field belongs to exception/window traps. */
         emit_store_cpu32(e, RSI, (int32_t)CPU_OFF_PC);
         emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
         emit_acc_add(e, insn_idx + 1);
@@ -2099,9 +2113,10 @@ compile_retw: ;
 
         /* Fill fallback: interpreter handles it */
         emit_patch_rel32(e, fill_fb);
-        /* Unconditionally flush all regs (compile-time dirty bits already cleared
-         * by the main path's ra_flush, but at runtime this path is taken instead) */
-        ra_flush_all(e, wb4);
+        emit_patch_rel32(e, callsize_fb);
+        /* Dirty bits survive the main-path ra_flush(), allowing this side exit
+         * to write back exactly the guest registers touched by the prefix. */
+        ra_flush(e, ra, wb4);
         emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc);
         emit_acc_add(e, insn_idx);  /* RETW itself didn't run */
         emit_jmp_to_epilogue(e, jit);
@@ -2508,7 +2523,7 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             if (__builtin_expect(npc >= 0x40070000u && npc < 0x40500000u, 1))
                 jit_get_block(jit, cpu, npc);
 
-            return 1; /* Handled */
+            return block_insns; /* Handled; expose exact guest work */
         }
     }
 
@@ -2545,6 +2560,7 @@ void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) {
     /* Install JIT hook */
     cpu->pc_hook = jit_pc_hook;
     cpu->pc_hook_ctx = jit;
+    cpu->accelerated_blocks = true;
 
     /* The bitmap stays the same — JIT bits are added on top of ROM stub bits.
      * The interpreter's bitmap test will fire for both stubs and JIT blocks. */
@@ -2662,10 +2678,10 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
 
 /* Main JIT execution loop.
  * With jit_install_hook, the interpreter's pc_hook dispatches compiled JIT
- * blocks transparently via the bitmap. jit_run uses 1000-instruction
- * interpreter batches (no cold-code regression). After each batch, it
- * hot-counts the current PC to trigger compilation. Once compiled, the
- * bitmap ensures the hook fires on every subsequent visit. */
+ * blocks transparently via the bitmap. The native chain cap and interpreter
+ * timer checks already bound latency, so consume the caller's whole batch;
+ * subdividing it into 1000-instruction slices caused ten times more sampling
+ * and compilation work in mostly-cold production firmware. */
 __attribute__((hot))
 int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
     uint32_t ccount_start = cpu->ccount;
@@ -2679,11 +2695,17 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
         int remaining = max_cycles - done;
 
         if (__builtin_expect(cpu->halted, 0)) {
-            xtensa_run(cpu, 1);
+            /* xtensa_step_impl already advances halted time and checks the
+             * wake interrupt on every cycle. Running one dispatch per outer
+             * iteration turned WAITI-heavy firmware into thousands of tiny C
+             * calls per frontend batch, more than doubling NerdMiner's wall
+             * time. Let the tight runner consume the remaining batch; if an
+             * interrupt wakes the core it naturally resumes guest code. */
+            xtensa_run(cpu, remaining);
             continue;
         }
 
-        int batch = remaining < 1000 ? remaining : 1000;
+        int batch = remaining;
         int ran = xtensa_run(cpu, batch);
 
         /* Hot-counting: check if current PC is a JIT candidate.

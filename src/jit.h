@@ -18,7 +18,10 @@
 #define JIT_HASH_MASK   (JIT_HASH_SIZE - 1)
 
 /* Compilation threshold: compile after N interpreter executions */
-#define JIT_HOT_THRESHOLD  3
+/* Production firmware crosses thousands of cold control-flow targets during
+ * startup. Compiling after only three observations spends more time toggling
+ * W^X and emitting code than it saves; genuinely hot loops reach 16 quickly. */
+#define JIT_HOT_THRESHOLD  16
 
 /* Maximum guest instructions per block */
 #define JIT_MAX_BLOCK_INSNS  64

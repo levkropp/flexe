@@ -580,6 +580,19 @@ static inline void emit_store32_sib(emit_t *e, int src, int base, int index, int
     emit32(e, (uint32_t)disp);
 }
 
+/* mov byte [base + index + disp32], reg8 */
+static inline void emit_store8_index(emit_t *e, int src, int base, int index,
+                                     int32_t disp) {
+    uint8_t r = (uint8_t)(0x40 | ((src >> 3) << 2) |
+                          ((index >> 3) << 1) | (base >> 3));
+    /* A REX prefix is also required for SPL/BPL/SIL/DIL byte registers. */
+    if (r != 0x40 || (src & 7) >= 4) emit8(e, r);
+    emit8(e, 0x88);
+    emit8(e, modrm(2, src, 4));
+    emit8(e, sib(0, index, base));
+    emit32(e, (uint32_t)disp);
+}
+
 /* ===== Additional helpers for block chaining / regalloc / window ops ===== */
 
 /* cmp reg32, [base64 + disp32] */

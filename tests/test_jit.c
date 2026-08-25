@@ -63,6 +63,25 @@ static int compare_state(const xtensa_cpu_t *a, const xtensa_cpu_t *b,
                 test_name, a->br, b->br);
         diffs++;
     }
+    if (a->windowbase != b->windowbase) {
+        fprintf(stderr, "  DIFF %s: windowbase interp=%u jit=%u\n",
+                test_name, a->windowbase, b->windowbase);
+        diffs++;
+    }
+    if (a->windowstart != b->windowstart) {
+        fprintf(stderr, "  DIFF %s: windowstart interp=0x%04X jit=0x%04X\n",
+                test_name, a->windowstart, b->windowstart);
+        diffs++;
+    }
+    for (int i = 0; i < 16; i++) {
+        if (a->window_callsize[i] != b->window_callsize[i]) {
+            fprintf(stderr,
+                    "  DIFF %s: window_callsize[%d] interp=%u jit=%u\n",
+                    test_name, i, a->window_callsize[i],
+                    b->window_callsize[i]);
+            diffs++;
+        }
+    }
 
     return diffs;
 }
@@ -70,10 +89,29 @@ static int compare_state(const xtensa_cpu_t *a, const xtensa_cpu_t *b,
 /* Run a block: first via interpreter, then via JIT, compare results */
 static void test_block_differential(xtensa_cpu_t *template_cpu, int num_insns,
                                     const char *test_name) {
+    /* The production JIT deliberately rejects blocks shorter than four
+     * instructions because dispatch overhead would dominate.  Most of
+     * these differential cases isolate one instruction, so pad their
+     * straight-line tail with NOP.N instead of silently treating a refused
+     * compilation as a passing test. */
+    uint32_t pad_pc = template_cpu->pc;
+    for (int i = 0; i < num_insns; i++) {
+        uint32_t insn;
+        int ilen = xtensa_fetch(template_cpu, pad_pc, &insn);
+        ASSERT_TRUE(ilen == 2 || ilen == 3);
+        pad_pc += (uint32_t)ilen;
+    }
+    int padded_insns = num_insns;
+    while (padded_insns < 4) {
+        put_insn2(template_cpu, pad_pc, narrow(0xD, 15, 0, 3));
+        pad_pc += 2;
+        padded_insns++;
+    }
+
     /* Interpreter run */
     xtensa_cpu_t interp_cpu;
     memcpy(&interp_cpu, template_cpu, sizeof(xtensa_cpu_t));
-    run_interp(&interp_cpu, num_insns);
+    run_interp(&interp_cpu, padded_insns);
 
     /* JIT run */
     xtensa_cpu_t jit_cpu;
@@ -92,10 +130,9 @@ static void test_block_differential(xtensa_cpu_t *template_cpu, int num_insns,
         jit_cpu.ccount += (uint32_t)ran;
         jit_cpu.cycle_count += (uint64_t)ran;
     } else {
-        /* JIT couldn't compile — fall back to interpreter for comparison */
-        fprintf(stderr, "  NOTE %s: JIT couldn't compile, skipping differential\n", test_name);
+        fprintf(stderr, "  FAIL %s: JIT refused padded differential block\n", test_name);
         jit_destroy(jit);
-        test_passes++;
+        test_failures++;
         return;
     }
 
@@ -105,6 +142,48 @@ static void test_block_differential(xtensa_cpu_t *template_cpu, int num_insns,
     } else {
         test_failures += diffs;
     }
+
+    jit_destroy(jit);
+}
+
+/* Differential path for blocks that deliberately side-exit before a complex
+ * instruction. xtensa_run() must execute the native prefix and then resume in
+ * the interpreter without exposing the split to its caller. */
+static void test_run_differential(xtensa_cpu_t *template_cpu, int num_insns,
+                                  const char *test_name) {
+    xtensa_cpu_t interp_cpu;
+    memcpy(&interp_cpu, template_cpu, sizeof(interp_cpu));
+    interp_cpu.running = true;
+    run_interp(&interp_cpu, num_insns);
+
+    xtensa_cpu_t jit_cpu;
+    memcpy(&jit_cpu, template_cpu, sizeof(jit_cpu));
+    jit_cpu.running = true;
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &jit_cpu);
+
+    uint32_t pc = jit_cpu.pc;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &jit_cpu, pc);
+    ASSERT_TRUE(jit_get_block(jit, &jit_cpu, pc) != NULL);
+
+    jit_cpu._pc_written = true;
+    int ran = xtensa_run(&jit_cpu, num_insns);
+    if (ran != num_insns) {
+        fprintf(stderr,
+                "  DIAG %s: ran=%d pc=0x%08X running=%d halted=%d "
+                "exception=%d cause=%u _pc_written=%d\n",
+                test_name, ran, jit_cpu.pc, jit_cpu.running, jit_cpu.halted,
+                jit_cpu.exception, jit_cpu.exccause, jit_cpu._pc_written);
+    }
+    ASSERT_EQ(ran, num_insns);
+
+    int diffs = compare_state(&interp_cpu, &jit_cpu, test_name);
+    if (diffs == 0)
+        test_passes++;
+    else
+        test_failures += diffs;
 
     jit_destroy(jit);
 }
@@ -264,7 +343,7 @@ TEST(test_jit_mov_n) {
     setup(&cpu);
     ar_write(&cpu, 3, 0x12345678);
     /* MOV.N a2, a3: op0=0xD, r=0, s=3, t=2 */
-    put_insn2(&cpu, BASE, narrow(0xD, 2, 3, 0));
+    put_insn2(&cpu, BASE, narrow(0xD, 0, 3, 2));
     test_block_differential(&cpu, 1, "mov.n");
     teardown(&cpu);
 }
@@ -452,17 +531,164 @@ TEST(test_jit_flush) {
     jit_destroy(jit);
 }
 
+TEST(test_jit_xtensa_run_counts_guest_instructions) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    put_insn2(&cpu, BASE,     narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 2, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 4, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 6, narrow(0xD, 15, 0, 3));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+
+    cpu._pc_written = true;
+    uint32_t ccount_before = cpu.ccount;
+    uint64_t cycles_before = cpu.cycle_count;
+    int ran = xtensa_run(&cpu, 1);
+    ASSERT_EQ(ran, 4);
+    ASSERT_EQ(cpu.ccount - ccount_before, 4);
+    ASSERT_EQ64(cpu.cycle_count - cycles_before, 4);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_rsr_wsr_sar) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     ar_write(&cpu, 2, 17);
-    /* WSR SAR, a2: op0=0, op1=3, op2=1, r=s_low, s=sr_high, t=2 */
-    /* sr = XT_SR_SAR = 3. sr = s:r in insn → s=0, r=3 */
-    /* WSR: op0=0, t=2, s=0, r=3, op1=3, op2=1 */
-    put_insn3(&cpu, BASE, rrr(1, 3, 3, 0, 2));  /* WSR SAR, a2 */
-    /* RSR a5, SAR: op0=0, op1=3, op2=0, r=3, s=0, t=5 */
-    put_insn3(&cpu, BASE + 3, rrr(0, 3, 3, 0, 5));  /* RSR a5, SAR */
+    /* sr occupies bits 15:8. SAR=3 therefore encodes r=0, s=3. */
+    put_insn3(&cpu, BASE, rrr(1, 3, 0, 3, 2));  /* WSR SAR, a2 */
+    put_insn3(&cpu, BASE + 3, rrr(0, 3, 0, 3, 5));  /* RSR a5, SAR */
     test_block_differential(&cpu, 2, "rsr_wsr_sar");
+    teardown(&cpu);
+}
+
+/* Keep these builders local to the JIT suite: test_main.c includes every
+ * test source into one translation unit, and test_window.c has equivalents. */
+static uint32_t jit_calln_insn(int nn, int32_t offset) {
+    uint32_t off18 = (uint32_t)offset & 0x3FFFF;
+    return (off18 << 6) | ((nn & 3) << 4) | 5;
+}
+
+static uint32_t jit_entry_insn(int s, uint32_t framesize) {
+    uint32_t imm12 = (framesize >> 3) & 0xFFF;
+    return (imm12 << 12) | ((uint32_t)s << 8) | (3u << 4) | 6u;
+}
+
+static uint32_t jit_retw_insn(void) {
+    return rrr(0, 0, 0, 0, (2 << 2) | 1);
+}
+
+static uint16_t jit_retw_n_insn(void) {
+    return narrow(0xD, 15, 0, 1);
+}
+
+static void jit_put_three_nops(xtensa_cpu_t *cpu) {
+    put_insn2(cpu, BASE,     narrow(0xD, 15, 0, 3));
+    put_insn2(cpu, BASE + 2, narrow(0xD, 15, 0, 3));
+    put_insn2(cpu, BASE + 4, narrow(0xD, 15, 0, 3));
+}
+
+TEST(test_jit_call4_windowed) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 2;
+    cpu.windowstart = 1u << 2;
+    jit_put_three_nops(&cpu);
+    put_insn3(&cpu, BASE + 6, jit_calln_insn(1, 0));
+    test_block_differential(&cpu, 4, "call4_windowed");
+    teardown(&cpu);
+}
+
+TEST(test_jit_call0_full_return_address) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = (1u << 18) | (1u << 4) | (2u << 16);
+    cpu.windowbase = 2;
+    cpu.windowstart = 1u << 2;
+    jit_put_three_nops(&cpu);
+    put_insn3(&cpu, BASE + 6, jit_calln_insn(0, 0));
+    test_block_differential(&cpu, 4, "call0_full_return_address");
+    teardown(&cpu);
+}
+
+TEST(test_jit_entry_windowed) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = (1u << 18) | (1u << 4) | (1u << 16); /* WOE + EXCM + CALLINC=1 */
+    cpu.windowbase = 2;
+    cpu.windowstart = 1u << 2;
+    ar_write(&cpu, 1, BASE + 0x2000);
+    ar_write(&cpu, 4, (1u << 30) | ((BASE + 0x80) & 0x3FFFFFFFu));
+    jit_put_three_nops(&cpu);
+    put_insn3(&cpu, BASE + 6, jit_entry_insn(1, 32));
+    test_block_differential(&cpu, 4, "entry_windowed");
+    teardown(&cpu);
+}
+
+TEST(test_jit_retw_windowed) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 3;
+    cpu.windowstart = (1u << 2) | (1u << 3);
+    ar_write(&cpu, 0, (1u << 30) | ((BASE + 0x80) & 0x3FFFFFFFu));
+    jit_put_three_nops(&cpu);
+    put_insn3(&cpu, BASE + 6, jit_retw_insn());
+    test_block_differential(&cpu, 4, "retw_windowed");
+    teardown(&cpu);
+}
+
+TEST(test_jit_retw_n_windowed) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 3;
+    cpu.windowstart = (1u << 2) | (1u << 3);
+    ar_write(&cpu, 0, (1u << 30) | ((BASE + 0x80) & 0x3FFFFFFFu));
+    jit_put_three_nops(&cpu);
+    put_insn2(&cpu, BASE + 6, jit_retw_n_insn());
+    test_block_differential(&cpu, 4, "retw_n_windowed");
+    teardown(&cpu);
+}
+
+TEST(test_jit_retw_tail_call_fallback) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 3;
+    cpu.windowstart = (1u << 2) | (1u << 3);
+    cpu.window_callsize[3] = 1;
+    ar_write(&cpu, 0, (BASE + 0x80) & 0x3FFFFFFFu); /* no callsize bits */
+    jit_put_three_nops(&cpu);
+    put_insn2(&cpu, BASE + 6, narrow(0xD, 15, 0, 3));
+    put_insn3(&cpu, BASE + 8, jit_retw_insn());
+    test_run_differential(&cpu, 5, "retw_tail_call_fallback");
+    teardown(&cpu);
+}
+
+TEST(test_jit_entry_overflow_fallback) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = (1u << 18) | (1u << 4) | (1u << 16); /* WOE + EXCM + CALLINC=1 */
+    cpu.windowbase = 2;
+    cpu.windowstart = (1u << 2) | (1u << 3);
+    ar_write(&cpu, 1, BASE + 0x2000);
+    /* Values belonging to the endangered physical window. */
+    cpu.ar[3 * 4 + 0] = (1u << 30) | ((BASE + 0x100) & 0x3FFFFFFFu);
+    cpu.ar[3 * 4 + 1] = BASE + 0x2100;
+    cpu.ar[3 * 4 + 2] = 0xA5A5A5A5u;
+    cpu.ar[3 * 4 + 3] = 0x5A5A5A5Au;
+    jit_put_three_nops(&cpu);
+    put_insn2(&cpu, BASE + 6, narrow(0xD, 15, 0, 3));
+    put_insn3(&cpu, BASE + 8, jit_entry_insn(1, 32));
+    test_run_differential(&cpu, 5, "entry_overflow_fallback");
     teardown(&cpu);
 }
 
@@ -473,6 +699,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_init_destroy);
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_flush);
+    RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);
     RUN_TEST(test_jit_nop);
     RUN_TEST(test_jit_movi);
     RUN_TEST(test_jit_add);
@@ -500,6 +727,13 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_addx2);
     RUN_TEST(test_jit_rsil);
     RUN_TEST(test_jit_rsr_wsr_sar);
+    RUN_TEST(test_jit_call4_windowed);
+    RUN_TEST(test_jit_call0_full_return_address);
+    RUN_TEST(test_jit_entry_windowed);
+    RUN_TEST(test_jit_retw_windowed);
+    RUN_TEST(test_jit_retw_n_windowed);
+    RUN_TEST(test_jit_retw_tail_call_fallback);
+    RUN_TEST(test_jit_entry_overflow_fallback);
 }
 
 #else /* _MSC_VER */
