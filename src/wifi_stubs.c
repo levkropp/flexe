@@ -116,6 +116,7 @@ typedef struct {
 
 /* Event handler table */
 #define MAX_EVENT_HANDLERS 16
+#define WIFI_RAW_FRAME_MAX 4095u
 
 typedef struct {
     uint32_t handler_addr;   /* firmware callback address */
@@ -155,6 +156,8 @@ struct wifi_stubs {
     uint32_t           hostent_buf;  /* emulator address of scratch area */
     bool               event_log;    /* use [cycle] WIFI prefix instead of [wifi] */
     wifi_stubs_stats_t  stats;
+    wifi_raw_tx_cb      raw_tx_cb;
+    void               *raw_tx_ctx;
 
     /* WiFi subsystem state */
     uint32_t           wifi_mode;       /* WIFI_MODE_NULL/STA/AP/APSTA */
@@ -1797,15 +1800,33 @@ static void stub_esp_wifi_set_promiscuous_filter(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_80211_tx(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
-    ws->stats.raw_tx_frames++;
-    /* uint32_t iface = ws_arg(cpu, 0); */
+    uint32_t iface = ws_arg(cpu, 0);
     uint32_t buf = ws_arg(cpu, 1);
     uint32_t len = ws_arg(cpu, 2);
-    /* Read frame type from first byte */
-    uint8_t frame_type = 0;
-    if (buf && len > 0)
-        frame_type = mem_read8(cpu->mem, buf);
-    wifi_log(ws, "esp_wifi_80211_tx(len=%u, type=0x%02x) — NO-OP\n", len, frame_type);
+    bool en_sys_seq = ws_arg(cpu, 3) != 0;
+    if (!buf || len == 0 || len > WIFI_RAW_FRAME_MAX) {
+        ws->stats.raw_tx_failures++;
+        ws_return(cpu, 0x102); /* ESP_ERR_INVALID_ARG */
+        return;
+    }
+
+    uint8_t frame_type = mem_read8(cpu->mem, buf);
+    if (ws->raw_tx_cb) {
+        uint8_t *frame = malloc(len);
+        if (!frame) {
+            ws->stats.raw_tx_failures++;
+            ws_return(cpu, 0x101); /* ESP_ERR_NO_MEM */
+            return;
+        }
+        for (uint32_t i = 0; i < len; i++)
+            frame[i] = mem_read8(cpu->mem, buf + i);
+        ws->raw_tx_cb(ws->raw_tx_ctx, iface, frame, len, en_sys_seq);
+        free(frame);
+    }
+    ws->stats.raw_tx_frames++;
+    ws->stats.raw_tx_bytes += len;
+    wifi_log(ws, "esp_wifi_80211_tx(len=%u, type=0x%02x) — virtual\n",
+             len, frame_type);
     ws_return(cpu, 0);
 }
 
@@ -2228,6 +2249,13 @@ int wifi_stubs_get_bound_host_port(const wifi_stubs_t *ws,
         }
     }
     return -1;
+}
+
+void wifi_stubs_set_raw_tx_callback(wifi_stubs_t *ws, wifi_raw_tx_cb cb,
+                                    void *ctx) {
+    if (!ws) return;
+    ws->raw_tx_cb = cb;
+    ws->raw_tx_ctx = ctx;
 }
 
 int wifi_stubs_inject_promiscuous_frame(wifi_stubs_t *ws,

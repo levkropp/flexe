@@ -42,6 +42,7 @@
 #define MARAUDER_BEACON_FRAMES_ADDR 0x3FFC8CA0u
 #define MARAUDER_SCAN_MODE_ADDR     0x3FFC9384u
 #define MARAUDER_RAW_SCAN_MODE      25u
+#define MARAUDER_RICKROLL_MODE      9u
 
 /* touch_stubs uses the frontend's lifetime flag while servicing blocking
  * touch APIs. Standalone main and the SDL frontend provide the same symbol. */
@@ -70,6 +71,15 @@ typedef struct {
     size_t dns_len;
 } nerd_network_probe_t;
 
+typedef struct {
+    uint64_t frames;
+    uint64_t bytes;
+    uint64_t beacon_frames;
+    uint32_t last_iface;
+    size_t last_len;
+    bool last_en_sys_seq;
+} raw_tx_probe_t;
+
 #define MAX_UNREGISTERED_ROM_ADDRS 32
 typedef struct {
     uint32_t addr[MAX_UNREGISTERED_ROM_ADDRS];
@@ -94,6 +104,19 @@ static void uart_count(void *ctx, uint8_t byte)
         uart->log[uart->log_len++] = (char)byte;
         uart->log[uart->log_len] = '\0';
     }
+}
+
+static void capture_raw_tx(void *ctx, uint32_t iface, const uint8_t *frame,
+                           size_t len, bool en_sys_seq)
+{
+    raw_tx_probe_t *probe = ctx;
+    probe->frames++;
+    probe->bytes += len;
+    if (len >= 24 && frame[0] == 0x80)
+        probe->beacon_frames++;
+    probe->last_iface = iface;
+    probe->last_len = len;
+    probe->last_en_sys_seq = en_sys_seq;
 }
 
 static void audit_rom_call(void *ctx, uint32_t addr, const char *name,
@@ -408,6 +431,60 @@ static int run_until_marauder_sniffer(flexe_session_t *session,
     return 1;
 }
 
+static int run_until_marauder_stopped(flexe_session_t *session,
+                                      const uart_state_t *uart,
+                                      uint64_t max_cycles,
+                                      uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        if (uart_contains(uart, "#stopscan") &&
+            mem_read8(flexe_session_mem(session),
+                      MARAUDER_SCAN_MODE_ADDR) == 0) {
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+static int run_until_marauder_tx(flexe_session_t *session,
+                                 const uart_state_t *uart,
+                                 const wifi_stubs_stats_t *before,
+                                 uint64_t max_cycles,
+                                 wifi_stubs_stats_t *stats_out,
+                                 uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    uint64_t start = cpu0->cycle_count;
+    wifi_stubs_stats_t stats = {0};
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        wifi_stubs_get_stats(wifi, &stats);
+        if (uart_contains(uart, "#attack -t rickroll") &&
+            stats.raw_tx_frames > before->raw_tx_frames &&
+            mem_read8(flexe_session_mem(session),
+                      MARAUDER_SCAN_MODE_ADDR) == MARAUDER_RICKROLL_MODE) {
+            *stats_out = stats;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
 static int run_until_nerd_network(flexe_session_t *session,
                                   uint64_t max_cycles,
                                   wifi_stubs_stats_t *stats_out,
@@ -622,6 +699,7 @@ int main(int argc, char **argv)
     pthread_mutex_init(&framebuffer_mutex, NULL);
     touch_state_t touch = {0, 50, 139};
     uart_state_t uart = {0};
+    raw_tx_probe_t raw_tx_probe = {0};
     rom_audit_t rom_audit = {0};
     flexe_session_config_t cfg = {
         .bin_path = rom_path,
@@ -650,6 +728,9 @@ int main(int argc, char **argv)
         return 1;
     }
     flexe_session_set_rom_log_cb(session, audit_rom_call, &rom_audit);
+    if (is_marauder)
+        wifi_stubs_set_raw_tx_callback(flexe_session_wifi(session),
+                                       capture_raw_tx, &raw_tx_probe);
 
     int min_nonblack = is_marauder ? 8000 : 20000;
     uint64_t boot_limit = is_marauder ? 8000000000ull : 2000000000ull;
@@ -677,7 +758,14 @@ int main(int argc, char **argv)
     uint64_t network_cycles = 0;
     uint64_t service_cycles = 0;
     uint64_t cli_cycles = 0;
+    uint64_t stop_cycles = 0;
+    uint64_t tx_cycles = 0;
     size_t cli_rx_bytes = 0;
+    size_t tx_cli_rx_bytes = 0;
+    uint64_t marauder_raw_tx_frames = 0;
+    uint64_t marauder_raw_tx_bytes = 0;
+    uint64_t marauder_host_tx_frames = 0;
+    uint64_t marauder_host_beacons = 0;
     uint32_t marauder_mgmt_frames = 0;
     uint32_t marauder_beacon_frames = 0;
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
@@ -916,6 +1004,104 @@ int main(int argc, char **argv)
             free(framebuf);
             return 1;
         }
+
+        /* Leave capture mode through the firmware command path, then start a
+         * production Rick Roll attack and require real raw 802.11 TX calls. */
+        static const uint8_t stop_command[] = "stopscan\n";
+        size_t stop_rx_bytes = periph_uart_rx_inject(
+                flexe_session_periph(session), stop_command,
+                sizeof(stop_command) - 1);
+        if (stop_rx_bytes != sizeof(stop_command) - 1) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=uart-stop-fifo accepted=%zu\n",
+                    stop_rx_bytes);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        int stop_result = run_until_marauder_stopped(
+                session, &uart, 500000000ull, &stop_cycles);
+        if (stop_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=%s stop_cycles=%llu "
+                    "mode=%u pending_rx=%zu marker=%d uart_log_len=%zu "
+                    "uart_bytes=%llu raw=0x%08x ena=0x%08x conf1=0x%08x\n",
+                    stop_result < 0 ? "cpus-stopped-during-stop" :
+                                      "stop-timeout",
+                    (unsigned long long)stop_cycles,
+                    mem_read8(flexe_session_mem(session),
+                              MARAUDER_SCAN_MODE_ADDR),
+                    periph_uart_rx_pending(flexe_session_periph(session)),
+                    uart_contains(&uart, "#stopscan"), uart.log_len,
+                    (unsigned long long)uart.count,
+                    mem_read32(flexe_session_mem(session), 0x3FF40004u),
+                    mem_read32(flexe_session_mem(session), 0x3FF4000Cu),
+                    mem_read32(flexe_session_mem(session), 0x3FF40024u));
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        static const uint8_t attack_command[] = "attack -t rickroll\n";
+        wifi_stubs_stats_t wifi_before_tx = {0};
+        wifi_stubs_get_stats(flexe_session_wifi(session), &wifi_before_tx);
+        uint64_t host_tx_before = raw_tx_probe.frames;
+        uint64_t host_beacons_before = raw_tx_probe.beacon_frames;
+        tx_cli_rx_bytes = periph_uart_rx_inject(
+                flexe_session_periph(session), attack_command,
+                sizeof(attack_command) - 1);
+        if (tx_cli_rx_bytes != sizeof(attack_command) - 1) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=uart-attack-fifo "
+                    "accepted=%zu\n", tx_cli_rx_bytes);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        int tx_result = run_until_marauder_tx(
+                session, &uart, &wifi_before_tx, 500000000ull, &wifi_stats,
+                &tx_cycles);
+        if (tx_result != 0 || raw_tx_probe.frames <= host_tx_before ||
+            raw_tx_probe.beacon_frames <= host_beacons_before) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=%s tx_cycles=%llu "
+                    "mode=%u raw_tx=%llu/%llu host_tx=%llu/%llu "
+                    "host_beacons=%llu/%llu pending_rx=%zu\n",
+                    tx_result < 0 ? "cpus-stopped-during-attack" :
+                    tx_result > 0 ? "attack-timeout" : "raw-tx-boundary",
+                    (unsigned long long)tx_cycles,
+                    mem_read8(flexe_session_mem(session),
+                              MARAUDER_SCAN_MODE_ADDR),
+                    (unsigned long long)wifi_stats.raw_tx_frames,
+                    (unsigned long long)wifi_before_tx.raw_tx_frames,
+                    (unsigned long long)raw_tx_probe.frames,
+                    (unsigned long long)host_tx_before,
+                    (unsigned long long)raw_tx_probe.beacon_frames,
+                    (unsigned long long)host_beacons_before,
+                    periph_uart_rx_pending(flexe_session_periph(session)));
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        marauder_raw_tx_frames = wifi_stats.raw_tx_frames -
+                                 wifi_before_tx.raw_tx_frames;
+        marauder_raw_tx_bytes = wifi_stats.raw_tx_bytes -
+                                wifi_before_tx.raw_tx_bytes;
+        marauder_host_tx_frames = raw_tx_probe.frames - host_tx_before;
+        marauder_host_beacons = raw_tx_probe.beacon_frames -
+                                host_beacons_before;
     }
 
     int unregistered_rom = rom_stubs_unregistered_count(
@@ -967,14 +1153,22 @@ int main(int argc, char **argv)
         printf(" touch_changed=%d sd_fat=mounted sd_write=SCRIPTS "
                "uart_rx=%zu cli=sniffraw cli_cycles=%llu wifi_init=%llu "
                "wifi_start=%llu promisc=%llu promisc_cb=%llu raw_rx=%llu "
-               "mgmt_frames=%u beacon_frames=%u",
+               "mgmt_frames=%u beacon_frames=%u stop_cycles=%llu "
+               "tx_uart_rx=%zu tx_cli=rickroll tx_cycles=%llu raw_tx=%llu "
+               "raw_tx_bytes=%llu host_tx=%llu host_beacons=%llu",
                touch_changed, cli_rx_bytes, (unsigned long long)cli_cycles,
                (unsigned long long)wifi_stats.wifi_init_calls,
                (unsigned long long)wifi_stats.wifi_start_calls,
                (unsigned long long)wifi_stats.promisc_enable_calls,
                (unsigned long long)wifi_stats.promisc_callback_calls,
                (unsigned long long)wifi_stats.raw_rx_frames,
-               marauder_mgmt_frames, marauder_beacon_frames);
+               marauder_mgmt_frames, marauder_beacon_frames,
+               (unsigned long long)stop_cycles, tx_cli_rx_bytes,
+               (unsigned long long)tx_cycles,
+               (unsigned long long)marauder_raw_tx_frames,
+               (unsigned long long)marauder_raw_tx_bytes,
+               (unsigned long long)marauder_host_tx_frames,
+               (unsigned long long)marauder_host_beacons);
     if (is_nerdminer)
         printf(" spiffs_blocks=%d sd_fat=mounted network_cycles=%llu "
                "service_cycles=%llu tcp_udp_sockets=%llu binds=%llu "

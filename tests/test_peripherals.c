@@ -146,11 +146,24 @@ TEST(uart_rx_fifo_injection) {
     ASSERT_EQ(periph_uart_rx_inject(p, input, sizeof(input)), sizeof(input));
     ASSERT_EQ(periph_uart_rx_pending(p), sizeof(input));
     ASSERT_EQ(mem_read32(mem, 0x3FF4001C) & 0xFFu, sizeof(input));
+    ASSERT_EQ((mem_read32(mem, 0x3FF40060) >> 2) & 0x7FFu, 0u);
+    ASSERT_EQ((mem_read32(mem, 0x3FF40060) >> 13) & 0x7FFu, sizeof(input));
     ASSERT_EQ(mem_read32(mem, 0x3FF40000), 'O');
     ASSERT_EQ(mem_read32(mem, 0x3FF40000), 'K');
     ASSERT_EQ(mem_read32(mem, 0x3FF40000), '\n');
     ASSERT_EQ(mem_read32(mem, 0x3FF40000), 0u);
     ASSERT_EQ(periph_uart_rx_pending(p), 0u);
+    ASSERT_EQ((mem_read32(mem, 0x3FF40060) >> 2) & 0x7FFu, sizeof(input));
+
+    static const uint8_t second[] = {'G', 'O', '\n'};
+    ASSERT_EQ(periph_uart_rx_inject(p, second, sizeof(second)),
+              sizeof(second));
+    ASSERT_EQ((mem_read32(mem, 0x3FF40060) >> 2) & 0x7FFu, sizeof(input));
+    ASSERT_EQ((mem_read32(mem, 0x3FF40060) >> 13) & 0x7FFu,
+              sizeof(input) + sizeof(second));
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), 'G');
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), 'O');
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), '\n');
 
     periph_destroy(p);
     mem_destroy(mem);

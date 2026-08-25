@@ -7,6 +7,11 @@
 
 typedef struct wifi_stubs wifi_stubs_t;
 
+/* Host-side virtual-radio sink for raw frames emitted by esp_wifi_80211_tx. */
+typedef void (*wifi_raw_tx_cb)(void *ctx, uint32_t iface,
+                               const uint8_t *frame, size_t len,
+                               bool en_sys_seq);
+
 typedef struct {
     uint64_t socket_calls;
     uint64_t socket_successes;
@@ -36,6 +41,8 @@ typedef struct {
     uint64_t promisc_enable_calls;
     uint64_t promisc_callback_calls;
     uint64_t raw_tx_frames;
+    uint64_t raw_tx_bytes;
+    uint64_t raw_tx_failures;
     uint64_t raw_rx_frames;
     uint64_t raw_rx_callback_failures;
 } wifi_stubs_stats_t;
@@ -57,6 +64,10 @@ void wifi_stubs_get_stats(const wifi_stubs_t *ws, wifi_stubs_stats_t *stats);
 int wifi_stubs_get_bound_host_port(const wifi_stubs_t *ws,
                                    uint16_t firmware_port, bool datagram,
                                    uint16_t *host_port_out);
+
+/* Connect the firmware's raw 802.11 transmit path to a host radio backend. */
+void wifi_stubs_set_raw_tx_callback(wifi_stubs_t *ws, wifi_raw_tx_cb cb,
+                                    void *ctx);
 
 /* Deliver one host-supplied 802.11 frame through the firmware's registered
  * promiscuous callback. packet_type uses ESP-IDF's WIFI_PKT_* numeric values

@@ -470,6 +470,9 @@ static uint32_t uart0_read(void *ctx, uint32_t addr) {
     case 0x0C: return p->uart_int_ena;                 /* INT_ENA */
     case 0x10: return 0;            /* INT_CLR is write-only */
     case 0x1C: return p->uart_rx_count; /* STATUS: RX count; TX count is zero */
+    case 0x60:                      /* MEM_RX_STATUS */
+        return ((uint32_t)(p->uart_rx_tail & 0x7FFu) << 2) |
+               ((uint32_t)(p->uart_rx_head & 0x7FFu) << 13);
     default:
         if (off / 4 < 64) return p->uart_shadow[off / 4];
         return 0;
