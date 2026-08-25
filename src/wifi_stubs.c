@@ -1533,6 +1533,7 @@ static void stub_vfs_select(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_init(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.wifi_init_calls++;
     ws->wifi_inited = true;
     wifi_log(ws, "esp_wifi_init()\n");
     ws_return(cpu, 0); /* ESP_OK */
@@ -1550,6 +1551,7 @@ static void stub_esp_wifi_deinit(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_start(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.wifi_start_calls++;
     ws->wifi_started = true;
     wifi_log(ws, "esp_wifi_start()\n");
     ws_return(cpu, 0);
@@ -1566,6 +1568,7 @@ static void stub_esp_wifi_stop(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_set_mode(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.wifi_set_mode_calls++;
     ws->wifi_mode = ws_arg(cpu, 0);
     wifi_log(ws, "esp_wifi_set_mode(%u)\n", ws->wifi_mode);
     ws_return(cpu, 0);
@@ -1765,6 +1768,8 @@ static void stub_esp_wifi_set_promiscuous(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     ws->promisc_enabled = ws_arg(cpu, 0) != 0;
+    if (ws->promisc_enabled)
+        ws->stats.promisc_enable_calls++;
     wifi_log(ws, "esp_wifi_set_promiscuous(%s)\n",
              ws->promisc_enabled ? "true" : "false");
     ws_return(cpu, 0);
@@ -1774,6 +1779,7 @@ static void stub_esp_wifi_set_promiscuous_rx_cb(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     ws->promisc_cb_addr = ws_arg(cpu, 0);
+    ws->stats.promisc_callback_calls++;
     wifi_log(ws, "esp_wifi_set_promiscuous_rx_cb(0x%08x)\n", ws->promisc_cb_addr);
     ws_return(cpu, 0);
 }
@@ -1791,6 +1797,7 @@ static void stub_esp_wifi_set_promiscuous_filter(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_80211_tx(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.raw_tx_frames++;
     /* uint32_t iface = ws_arg(cpu, 0); */
     uint32_t buf = ws_arg(cpu, 1);
     uint32_t len = ws_arg(cpu, 2);
@@ -1922,6 +1929,15 @@ static void stub_esp_netif_create_default_wifi_ap(xtensa_cpu_t *cpu, void *ctx)
 /* Allocate a small region near the top of RTC-fast RAM for hostent data. */
 #define HOSTENT_SCRATCH_ADDR  0x50001F00u
 #define HOSTENT_SCRATCH_SIZE  64
+
+/* Dedicated radio callback resources. RTC slow page 1 is otherwise unused by
+ * Flexe and gives the synthetic WiFi task a private 4 KB stack. The packet
+ * buffer sits above the virtual PHY tables in RTC fast RAM. */
+#define PROMISC_PACKET_ADDR    0x50001D00u
+#define PROMISC_PACKET_SIZE    256u
+#define PROMISC_RX_CTRL_SIZE   28u
+#define PROMISC_STACK_TOP      0x60002000u
+#define PROMISC_SENTINEL       0x40001FF8u
 
 /* ===== Public API ===== */
 
@@ -2139,17 +2155,46 @@ static const wifi_fw_hook_t nerdminer_v2_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
+/* ESP32 Marauder v1.14 CYD 2432S028 production image. These entry points
+ * come from the matching reproducible ELF; its phy_get_romfunc_addr anchor
+ * is byte-for-byte at the production image's verified 0x401BDE2C address. */
+static const wifi_fw_hook_t marauder_v114_wifi_hooks[] = {
+    { 0x4013AD48u, stub_esp_wifi_init,                  "esp_wifi_init" },
+    { 0x4013ACE0u, stub_esp_wifi_deinit,                "esp_wifi_deinit" },
+    { 0x401988A8u, stub_esp_wifi_start,                 "esp_wifi_start" },
+    { 0x40198904u, stub_esp_wifi_stop,                  "esp_wifi_stop" },
+    { 0x40198844u, stub_esp_wifi_set_mode,              "esp_wifi_set_mode" },
+    { 0x40198880u, stub_esp_wifi_get_mode,              "esp_wifi_get_mode" },
+    { 0x40199004u, stub_esp_wifi_set_channel,           "esp_wifi_set_channel" },
+    { 0x40199048u, stub_esp_wifi_get_channel,           "esp_wifi_get_channel" },
+    { 0x40199114u, stub_esp_wifi_get_mac,               "esp_wifi_get_mac" },
+    { 0x401990ACu, stub_esp_wifi_set_mac,               "esp_wifi_set_mac" },
+    { 0x40199190u, stub_esp_wifi_set_promiscuous,       "esp_wifi_set_promiscuous" },
+    { 0x40199140u, stub_esp_wifi_set_promiscuous_filter,"esp_wifi_set_promiscuous_filter" },
+    { 0x401991FCu, stub_esp_wifi_set_promiscuous_rx_cb, "esp_wifi_set_promiscuous_rx_cb" },
+    { 0x40199214u, stub_esp_wifi_noop,                   "esp_wifi_set_storage" },
+    { 0x401A55CCu, stub_esp_wifi_80211_tx,              "esp_wifi_80211_tx" },
+    { 0, NULL, NULL },
+};
+
 int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
 {
-    if (!ws || entry_point != 0x40089268u)
+    if (!ws) return 0;
+    const wifi_fw_hook_t *hooks = NULL;
+    if (entry_point == 0x40089268u)
+        hooks = nerdminer_v2_wifi_hooks;
+    else if (entry_point == 0x400831D8u)
+        hooks = marauder_v114_wifi_hooks;
+    else
         return 0;
     esp32_rom_stubs_t *rom = ws->cpu->pc_hook_ctx;
     if (!rom) return 0;
     ws->rom = rom;
-    ws->firmware_status_addr = 0x3FFC5C78u;
+    if (entry_point == 0x40089268u)
+        ws->firmware_status_addr = 0x3FFC5C78u;
 
     int hooked = 0;
-    for (const wifi_fw_hook_t *h = nerdminer_v2_wifi_hooks; h->fn; h++) {
+    for (const wifi_fw_hook_t *h = hooks; h->fn; h++) {
         rom_stubs_register_ctx(rom, h->addr, h->fn, h->name, ws);
         hooked++;
     }
@@ -2183,4 +2228,138 @@ int wifi_stubs_get_bound_host_port(const wifi_stubs_t *ws,
         }
     }
     return -1;
+}
+
+int wifi_stubs_inject_promiscuous_frame(wifi_stubs_t *ws,
+                                        const uint8_t *frame, size_t len,
+                                        int8_t rssi, uint8_t channel,
+                                        uint32_t packet_type) {
+    if (!ws || !frame || len == 0 || packet_type > 3) return -1;
+    if (!ws->promisc_enabled || ws->promisc_cb_addr == 0) return -2;
+    if (len > PROMISC_PACKET_SIZE - PROMISC_RX_CTRL_SIZE || len + 4 > 0xFFF)
+        return -3;
+
+    xtensa_cpu_t *cpu = ws->cpu;
+    for (uint32_t i = 0; i < PROMISC_PACKET_SIZE; i++)
+        mem_write8(cpu->mem, PROMISC_PACKET_ADDR + i, 0);
+
+    /* wifi_pkt_rx_ctrl_t is 28 bytes on ESP32. Its first byte is RSSI,
+     * primary channel is the low nibble at +10, timestamp is at +12, and
+     * sig_len occupies the low 12 bits of the final word at +24. */
+    mem_write8(cpu->mem, PROMISC_PACKET_ADDR, (uint8_t)rssi);
+    mem_write8(cpu->mem, PROMISC_PACKET_ADDR + 10, channel & 0x0Fu);
+    mem_write32(cpu->mem, PROMISC_PACKET_ADDR + 12,
+                (uint32_t)cpu->virtual_time_us);
+    mem_write32(cpu->mem, PROMISC_PACKET_ADDR + 24,
+                (uint32_t)(len + 4)); /* hardware sig_len includes FCS */
+    for (size_t i = 0; i < len; i++)
+        mem_write8(cpu->mem, PROMISC_PACKET_ADDR + PROMISC_RX_CTRL_SIZE +
+                   (uint32_t)i, frame[i]);
+
+    /* Run the registered callback as a small synthetic WiFi task. A private
+     * RTC-slow stack prevents asynchronous delivery from overwriting the
+     * interrupted firmware task's stack. Architectural state is restored on
+     * return; guest heap/global writes performed by the callback remain. */
+    uint32_t save_ar[64];
+    uint32_t save_pc = cpu->pc;
+    uint32_t save_ps = cpu->ps;
+    uint32_t save_windowbase = cpu->windowbase;
+    uint32_t save_windowstart = cpu->windowstart;
+    uint32_t save_sar = cpu->sar;
+    uint32_t save_lbeg = cpu->lbeg;
+    uint32_t save_lend = cpu->lend;
+    uint32_t save_lcount = cpu->lcount;
+    uint32_t save_br = cpu->br;
+    uint32_t save_acclo = cpu->acclo;
+    uint32_t save_acchi = cpu->acchi;
+    uint32_t save_mr[4];
+    uint32_t save_fcr = cpu->fcr;
+    uint32_t save_fsr = cpu->fsr;
+    float save_fr[16];
+    uint8_t save_window_callsize[sizeof(cpu->window_callsize)];
+    uint8_t save_spill_stack[sizeof(cpu->spill_stack)];
+    uint8_t save_spill_base[sizeof(cpu->spill_base)];
+    uint8_t save_spill_shadow[sizeof(cpu->spill_shadow)];
+    bool save_running = cpu->running;
+    bool save_halted = cpu->halted;
+    bool save_exception = cpu->exception;
+    bool save_pc_written = cpu->_pc_written;
+    bool save_irq_check = cpu->irq_check;
+    bool save_accelerated = cpu->accelerated_blocks;
+
+    memcpy(save_ar, cpu->ar, sizeof(save_ar));
+    memcpy(save_mr, cpu->mr, sizeof(save_mr));
+    memcpy(save_fr, cpu->fr, sizeof(save_fr));
+    memcpy(save_window_callsize, cpu->window_callsize,
+           sizeof(save_window_callsize));
+    memcpy(save_spill_stack, cpu->spill_stack, sizeof(save_spill_stack));
+    memcpy(save_spill_base, cpu->spill_base, sizeof(save_spill_base));
+    memcpy(save_spill_shadow, cpu->spill_shadow, sizeof(save_spill_shadow));
+
+    memset(cpu->ar, 0, sizeof(cpu->ar));
+    memset(cpu->window_callsize, 0, sizeof(cpu->window_callsize));
+    memset(cpu->spill_stack, 0, sizeof(cpu->spill_stack));
+    memset(cpu->spill_base, 0, sizeof(cpu->spill_base));
+    memset(cpu->spill_shadow, 0, sizeof(cpu->spill_shadow));
+    cpu->windowbase = 0;
+    cpu->windowstart = 1;
+    cpu->ps = 1u << 18; /* WOE, kernel mode, interrupts masked below */
+    XT_PS_SET_INTLEVEL(cpu->ps, 15);
+    XT_PS_SET_CALLINC(cpu->ps, 2); /* callback is entered as CALL8 */
+    ar_write(cpu, 1, PROMISC_STACK_TOP);
+    ar_write(cpu, 8, (2u << 30) |
+                     (PROMISC_SENTINEL & 0x3FFFFFFFu));
+    ar_write(cpu, 10, PROMISC_PACKET_ADDR);
+    ar_write(cpu, 11, packet_type);
+    cpu->pc = ws->promisc_cb_addr;
+    cpu->running = true;
+    cpu->halted = false;
+    cpu->exception = false;
+    cpu->_pc_written = false;
+    cpu->irq_check = false;
+
+    bool completed = false;
+    for (int i = 0; i < 1000000; i++) {
+        if (cpu->pc == PROMISC_SENTINEL) {
+            completed = true;
+            break;
+        }
+        if (!cpu->running || cpu->exception) break;
+        xtensa_step(cpu);
+    }
+
+    memcpy(cpu->ar, save_ar, sizeof(save_ar));
+    memcpy(cpu->mr, save_mr, sizeof(save_mr));
+    memcpy(cpu->fr, save_fr, sizeof(save_fr));
+    memcpy(cpu->window_callsize, save_window_callsize,
+           sizeof(save_window_callsize));
+    memcpy(cpu->spill_stack, save_spill_stack, sizeof(save_spill_stack));
+    memcpy(cpu->spill_base, save_spill_base, sizeof(save_spill_base));
+    memcpy(cpu->spill_shadow, save_spill_shadow, sizeof(save_spill_shadow));
+    cpu->pc = save_pc;
+    cpu->ps = save_ps;
+    cpu->windowbase = save_windowbase;
+    cpu->windowstart = save_windowstart;
+    cpu->sar = save_sar;
+    cpu->lbeg = save_lbeg;
+    cpu->lend = save_lend;
+    cpu->lcount = save_lcount;
+    cpu->br = save_br;
+    cpu->acclo = save_acclo;
+    cpu->acchi = save_acchi;
+    cpu->fcr = save_fcr;
+    cpu->fsr = save_fsr;
+    cpu->running = save_running;
+    cpu->halted = save_halted;
+    cpu->exception = save_exception;
+    cpu->_pc_written = save_pc_written;
+    cpu->irq_check = save_irq_check;
+    cpu->accelerated_blocks = save_accelerated;
+
+    if (!completed) {
+        ws->stats.raw_rx_callback_failures++;
+        return -4;
+    }
+    ws->stats.raw_rx_frames++;
+    return 0;
 }

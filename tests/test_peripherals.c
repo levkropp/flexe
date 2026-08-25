@@ -138,6 +138,50 @@ TEST(uart_tx_done_interrupt) {
     mem_destroy(mem);
 }
 
+TEST(uart_rx_fifo_injection) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    static const uint8_t input[] = {'O', 'K', '\n'};
+
+    ASSERT_EQ(periph_uart_rx_inject(p, input, sizeof(input)), sizeof(input));
+    ASSERT_EQ(periph_uart_rx_pending(p), sizeof(input));
+    ASSERT_EQ(mem_read32(mem, 0x3FF4001C) & 0xFFu, sizeof(input));
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), 'O');
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), 'K');
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), '\n');
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), 0u);
+    ASSERT_EQ(periph_uart_rx_pending(p), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(uart_rx_timeout_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 5, 34); /* UART0 -> CPU interrupt 5 */
+
+    /* Enable RX timeout generation in CONF1 and its interrupt in INT_ENA. */
+    mem_write32(mem, 0x3FF40024, (1u << 31) | (10u << 24) | 2u);
+    mem_write32(mem, 0x3FF4000C, 1u << 8);
+    const uint8_t input = 'X';
+    ASSERT_EQ(periph_uart_rx_inject(p, &input, 1), 1u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF40004) & (1u << 8), 1u << 8);
+    ASSERT_EQ(mem_read32(mem, 0x3FF40008), 1u << 8);
+    ASSERT_EQ(cpu0.interrupt & (1u << 5), 1u << 5);
+
+    ASSERT_EQ(mem_read32(mem, 0x3FF40000), 'X');
+    mem_write32(mem, 0x3FF40010, 1u << 8);
+    ASSERT_EQ(mem_read32(mem, 0x3FF40008), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 5), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 /* ESP32 SPI1 flash-controller register subset used by ESP-IDF's memspi
  * driver. */
 #define TEST_SPI1_BASE       0x3FF42000u
@@ -914,6 +958,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(uart_status_tx_ready);
     RUN_TEST(uart_tx_empty_interrupt);
     RUN_TEST(uart_tx_done_interrupt);
+    RUN_TEST(uart_rx_fifo_injection);
+    RUN_TEST(uart_rx_timeout_interrupt);
     RUN_TEST(spi_flash_write_enable_latch);
     RUN_TEST(spi_flash_program_erase_require_write_enable);
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "memory.h"
 
 /* Forward declaration */
@@ -19,6 +20,12 @@ void periph_destroy(esp32_periph_t *p);
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx);
 int  periph_uart_tx_count(const esp32_periph_t *p);
 const uint8_t *periph_uart_tx_buf(const esp32_periph_t *p);
+/* Inject bytes arriving at UART0 from the host. Returns the number accepted
+ * by the 128-byte hardware RX FIFO; the normal ESP32 RX interrupt path then
+ * moves them into the firmware driver's ring buffer. */
+size_t periph_uart_rx_inject(esp32_periph_t *p, const uint8_t *data,
+                             size_t len);
+size_t periph_uart_rx_pending(const esp32_periph_t *p);
 int  periph_unhandled_count(const esp32_periph_t *p);
 
 /* Returns true once the APP_CPU has been released from reset (DPORT write) */

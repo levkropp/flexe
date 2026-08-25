@@ -20,6 +20,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_fp_arith.c"
 #include "test_peripherals.c"
 #include "test_crypto.c"
+#include "test_wifi_stubs.c"
 #include "test_rom_stubs.c"
 #include "test_debug.c"
 #include "test_memory_map.c"
@@ -53,6 +54,7 @@ int main(void) {
     run_fp_arith_tests();
     run_peripheral_tests();
     run_crypto_tests();
+    run_wifi_stub_tests();
     run_rom_stub_tests();
     run_debug_tests();
     run_memory_map_tests();

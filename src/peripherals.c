@@ -42,12 +42,15 @@
 /* Page index from absolute address */
 #define PAGE_OF(addr) (((addr) - PERIPH_BASE) / PAGE_SIZE)
 
-/* UART TX buffer */
+/* UART FIFOs / host capture. ESP32 UART hardware has 128-byte FIFOs. */
 #define UART_TX_BUF_SIZE 4096
+#define UART_RX_FIFO_SIZE 128
 
 /* UART0 interrupt registers/bits used by the ESP-IDF buffered TX driver. */
 #define UART0_INTR_SOURCE        34
+#define UART_RXFIFO_FULL_INT     (1u << 0)
 #define UART_TXFIFO_EMPTY_INT    (1u << 1)
+#define UART_RXFIFO_TOUT_INT     (1u << 8)
 #define UART_TX_DONE_INT         (1u << 14)
 #define UART_INT_VALID_MASK      0x7FFFFu
 
@@ -150,6 +153,10 @@ struct esp32_periph {
     /* UART0 */
     uint8_t  uart_tx[UART_TX_BUF_SIZE];
     int      uart_tx_len;
+    uint8_t  uart_rx[UART_RX_FIFO_SIZE];
+    uint16_t uart_rx_head;
+    uint16_t uart_rx_tail;
+    uint16_t uart_rx_count;
     uart_tx_cb uart_cb;
     void    *uart_cb_ctx;
     uint32_t uart_shadow[64];   /* shadow config registers */
@@ -451,12 +458,18 @@ static uint32_t uart0_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - UART0_BASE;
     switch (off) {
-    case 0x00: return 0;            /* FIFO read: no RX data */
+    case 0x00: {                    /* FIFO read */
+        if (p->uart_rx_count == 0) return 0;
+        uint8_t byte = p->uart_rx[p->uart_rx_tail];
+        p->uart_rx_tail = (uint16_t)((p->uart_rx_tail + 1) % UART_RX_FIFO_SIZE);
+        p->uart_rx_count--;
+        return byte;
+    }
     case 0x04: return p->uart_int_raw;                 /* INT_RAW */
     case 0x08: return p->uart_int_raw & p->uart_int_ena; /* INT_ST */
     case 0x0C: return p->uart_int_ena;                 /* INT_ENA */
     case 0x10: return 0;            /* INT_CLR is write-only */
-    case 0x1C: return 0;            /* STATUS: TX FIFO empty = ready */
+    case 0x1C: return p->uart_rx_count; /* STATUS: RX count; TX count is zero */
     default:
         if (off / 4 < 64) return p->uart_shadow[off / 4];
         return 0;
@@ -1579,6 +1592,34 @@ int periph_uart_tx_count(const esp32_periph_t *p) {
 
 const uint8_t *periph_uart_tx_buf(const esp32_periph_t *p) {
     return p ? p->uart_tx : NULL;
+}
+
+size_t periph_uart_rx_inject(esp32_periph_t *p, const uint8_t *data,
+                             size_t len) {
+    if (!p || (!data && len != 0)) return 0;
+    size_t accepted = 0;
+    while (accepted < len && p->uart_rx_count < UART_RX_FIFO_SIZE) {
+        p->uart_rx[p->uart_rx_head] = data[accepted++];
+        p->uart_rx_head = (uint16_t)((p->uart_rx_head + 1) % UART_RX_FIFO_SIZE);
+        p->uart_rx_count++;
+    }
+
+    /* CONF1: RXFIFO_FULL_THRHD[6:0], RX_TOUT_EN[31]. The host injection
+     * represents already-arrived bytes, so publish the timeout condition at
+     * once for short packets; larger bursts also assert the FIFO threshold. */
+    uint32_t conf1 = p->uart_shadow[0x24 / 4];
+    uint32_t full_threshold = conf1 & 0x7Fu;
+    if (accepted > 0 && full_threshold > 0 &&
+        p->uart_rx_count >= full_threshold)
+        p->uart_int_raw |= UART_RXFIFO_FULL_INT;
+    if (accepted > 0 && (conf1 & (1u << 31)))
+        p->uart_int_raw |= UART_RXFIFO_TOUT_INT;
+    uart0_intr_update(p);
+    return accepted;
+}
+
+size_t periph_uart_rx_pending(const esp32_periph_t *p) {
+    return p ? p->uart_rx_count : 0;
 }
 
 int periph_unhandled_count(const esp32_periph_t *p) {

@@ -45,7 +45,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 537 tests
+- 541 tests
 
 ## building
 
@@ -134,7 +134,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 537 tests, 1328 passed, 0 failed
+# 541 tests, 1373 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -161,10 +161,13 @@ Current Release-build results on Apple silicon (three default-length runs):
 | ESP32 Marauder v1.14 | **9.11× real-time** |
 | NerdMiner v2 | **5.99× real-time** |
 
-The headless integration runner exercises display output and storage; the
-Marauder profile also drives touch navigation. The NerdMiner profile connects
-to the stock ROM's captive portal through its remapped host sockets, issues a
-real HTTP request and DNS query, and requires valid responses from both:
+The headless integration runner exercises display output and storage. The
+Marauder profile drives touch navigation, submits `sniffraw` through the real
+UART0 FIFO/interrupt path, and delivers a beacon through the production ROM's
+registered promiscuous callback; Marauder's own frame counters must advance.
+The NerdMiner profile connects to the stock ROM's captive portal through its
+remapped host sockets, issues a real HTTP request and DNS query, and requires
+valid responses from both:
 
 ```bash
 ./build/flexe-stock-rom-test nerdminer /path/to/nerdminer.bin
