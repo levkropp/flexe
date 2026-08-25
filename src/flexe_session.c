@@ -222,13 +222,19 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
 
     /* MPI (RSA) hardware accelerator stubs */
     s->mstubs = mpi_stubs_create(&s->cpu[0]);
-    if (s->mstubs && s->syms)
-        mpi_stubs_hook_symbols(s->mstubs, s->syms);
+    if (s->mstubs) {
+        mpi_stubs_set_peripheral(s->mstubs, s->periph);
+        if (s->syms)
+            mpi_stubs_hook_symbols(s->mstubs, s->syms);
+    }
 
     /* WiFi / lwip socket bridge */
     s->wstubs = wifi_stubs_create(&s->cpu[0]);
-    if (s->wstubs && s->syms)
-        wifi_stubs_hook_symbols(s->wstubs, s->syms);
+    if (s->wstubs) {
+        wifi_stubs_hook_firmware_addrs(s->wstubs, res.entry_point);
+        if (s->syms)
+            wifi_stubs_hook_symbols(s->wstubs, s->syms);
+    }
 
     /* VFS / SPIFFS / FATFS stubs (host-backed file I/O).
      * Hook AFTER rom_stubs so we override the rom_stubs ESP_FAIL stubs. */
@@ -369,6 +375,11 @@ freertos_stubs_t *flexe_session_frt(flexe_session_t *s)
 display_stubs_t *flexe_session_display(flexe_session_t *s)
 {
     return s ? s->dstubs : NULL;
+}
+
+wifi_stubs_t *flexe_session_wifi(flexe_session_t *s)
+{
+    return s ? s->wstubs : NULL;
 }
 
 int flexe_session_is_native_freertos(const flexe_session_t *s)

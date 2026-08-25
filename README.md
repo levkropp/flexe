@@ -35,6 +35,9 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - exception/interrupt dispatch (levels 1–7, timer ccompare, waiti)
 - esp32 memory map (sram, rom, flash, rtc, psram, peripheral i/o)
 - mmio peripherals: uart, gpio, dport, rtc, efuse, watchdog, timers, spi, i2c, ledc, adc
+- raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
+- cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
+- host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
 - rom function stubs: ets_printf, memcpy, memset, strlen, cache ops
 - freertos stubs: tasks, queues, semaphores, delays
 - esp_timer stubs with callback dispatch
@@ -42,7 +45,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 528 tests
+- 535 tests
 
 ## building
 
@@ -131,7 +134,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 528 tests, 1210 passed, 0 failed
+# 535 tests, 1272 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -151,8 +154,16 @@ credited twice. It rejects traps and early stops and defaults to requiring at
 least 1.0× real-time averaged over three 1.2-billion-cycle runs. `EMU`,
 `CYCLES`, `REPS`, `ENGINE`, `MIN_REALTIME`, and `ESP_HZ` are configurable.
 
-The headless integration runner exercises display output and, for Marauder,
-touch navigation without requiring the SDL frontend:
+Current Release-build results on Apple silicon (three default-length runs):
+
+| stock CYD image | jit vs 240 MHz ESP32 |
+|---|---:|
+| ESP32 Marauder v1.14 | **9.11× real-time** |
+| NerdMiner v2 | **5.99× real-time** |
+
+The headless integration runner exercises display output and storage; the
+Marauder profile also drives touch navigation, while the NerdMiner profile
+requires its captive-portal TCP and UDP listeners to reach host-backed sockets:
 
 ```bash
 ./build/flexe-stock-rom-test nerdminer /path/to/nerdminer.bin

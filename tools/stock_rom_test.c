@@ -340,6 +340,37 @@ static int run_until_changed(flexe_session_t *session, const uint16_t *before,
     return 1;
 }
 
+static int run_until_nerd_network(flexe_session_t *session,
+                                  uint64_t max_cycles,
+                                  wifi_stubs_stats_t *stats_out,
+                                  uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    uint64_t start = cpu0->cycle_count;
+    unsigned batches = 0;
+    wifi_stubs_stats_t stats = {0};
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        if (++batches % 100 == 0) {
+            wifi_stubs_get_stats(wifi, &stats);
+            if (stats.socket_successes >= 2 &&
+                stats.bind_successes >= 2 &&
+                stats.listen_successes >= 1) {
+                *stats_out = stats;
+                *cycles_out = cpu0->cycle_count - start;
+                return 0;
+            }
+        }
+    }
+
+    wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
@@ -441,6 +472,8 @@ int main(int argc, char **argv)
 
     int touch_changed = 0;
     int spiffs_blocks = 0;
+    wifi_stubs_stats_t wifi_stats = {0};
+    uint64_t network_cycles = 0;
     if (is_nerdminer) {
         if (strstr(uart.log, "sdcard_mount(): f_mount failed") != NULL) {
             fprintf(stderr,
@@ -459,6 +492,32 @@ int main(int argc, char **argv)
                     "FAIL profile=nerdminer reason=spiffs-not-formatted "
                     "first_bad_block=%d\n",
                     spiffs_blocks);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        /* With erased factory settings NerdMiner enters its captive portal.
+         * Run far enough to prove that both its HTTP server (TCP/80) and DNS
+         * server (UDP/53) reached successful host-backed socket setup. */
+        int network_result = run_until_nerd_network(session, 1500000000ull,
+                                                    &wifi_stats,
+                                                    &network_cycles);
+        if (network_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=nerdminer reason=%s network_cycles=%llu "
+                    "sockets=%llu/%llu binds=%llu/%llu listens=%llu/%llu\n",
+                    network_result < 0 ? "cpus-stopped" : "network-timeout",
+                    (unsigned long long)network_cycles,
+                    (unsigned long long)wifi_stats.socket_successes,
+                    (unsigned long long)wifi_stats.socket_calls,
+                    (unsigned long long)wifi_stats.bind_successes,
+                    (unsigned long long)wifi_stats.bind_calls,
+                    (unsigned long long)wifi_stats.listen_successes,
+                    (unsigned long long)wifi_stats.listen_calls);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -565,18 +624,24 @@ int main(int argc, char **argv)
     }
 
     uint64_t wall_ns = monotonic_ns() - wall_start;
+    uint64_t total_cycles = flexe_session_cpu(session, 0)->cycle_count;
     const char *engine = flexe_session_jit(session) ? "jit" : "interp";
     printf("PASS profile=%s engine=%s wall=%.3fs virtual_cycles=%llu "
            "nonblack=%d uart_bytes=%llu",
            profile, engine, (double)wall_ns / 1e9,
-           (unsigned long long)boot_cycles, nonblack,
+           (unsigned long long)total_cycles, nonblack,
            (unsigned long long)uart.count);
     printf(" mmio_unhandled=%d rom_unregistered=%d",
            unhandled_mmio, unregistered_rom);
     if (is_marauder)
         printf(" touch_changed=%d sd_fat=mounted sd_write=SCRIPTS", touch_changed);
     if (is_nerdminer)
-        printf(" spiffs_blocks=%d sd_fat=mounted", spiffs_blocks);
+        printf(" spiffs_blocks=%d sd_fat=mounted network_cycles=%llu "
+               "tcp_udp_sockets=%llu binds=%llu listens=%llu",
+               spiffs_blocks, (unsigned long long)network_cycles,
+               (unsigned long long)wifi_stats.socket_successes,
+               (unsigned long long)wifi_stats.bind_successes,
+               (unsigned long long)wifi_stats.listen_successes);
     putchar('\n');
 
     flexe_session_destroy(session);

@@ -494,9 +494,17 @@ static void rom_log_call_cb(void *ctx, uint32_t addr, const char *name,
 
 static void rom_log_event_cb(void *ctx, uint32_t addr, const char *name,
                               const xtensa_cpu_t *cpu) {
-    (void)ctx; (void)addr;
-    fprintf(stderr, "[%10llu] STUB  %s\n",
-            (unsigned long long)cpu->cycle_count, name);
+    (void)ctx;
+    if (strcmp(name, "UNREGISTERED") == 0) {
+        int callinc = XT_PS_CALLINC(cpu->ps);
+        uint32_t caller = (cpu->pc & 0xC0000000u) |
+                          (ar_read(cpu, callinc * 4) & 0x3FFFFFFFu);
+        fprintf(stderr, "[%10llu] STUB  %s 0x%08X caller=0x%08X\n",
+                (unsigned long long)cpu->cycle_count, name, addr, caller);
+    } else {
+        fprintf(stderr, "[%10llu] STUB  %s\n",
+                (unsigned long long)cpu->cycle_count, name);
+    }
 }
 
 static void freertos_event_cb(const char *from, const char *to,

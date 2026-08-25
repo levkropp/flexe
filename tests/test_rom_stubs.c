@@ -378,6 +378,63 @@ static uint32_t call_builtin_rom0(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+static uint32_t encode_test_l32r(uint32_t pc, uint32_t literal, int reg) {
+    uint32_t base = (pc + 3u) & ~3u;
+    uint32_t delta = literal - base;
+    return 1u | ((uint32_t)reg << 4) |
+           (((delta >> 2) & 0xFFFFu) << 8);
+}
+
+TEST(test_firmware_phy_wrapper_installs_virtual_table) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    const uint32_t wrapper = 0x40189A2Cu;
+    const uint32_t rom_literal = wrapper - 0x104u;
+    const uint32_t global_literal = wrapper - 0x100u;
+    const uint32_t phy_global = 0x3FFB2000u;
+
+    /* Minimal version of the production wrapper's instruction pattern:
+     * NOP; L32R a8, phy_get_romfuncs; NOP; L32R a8, table_global. */
+    put_insn3(&cpu, wrapper, rom_nop_insn());
+    put_insn3(&cpu, wrapper + 3u,
+              encode_test_l32r(wrapper + 3u, rom_literal, 8));
+    put_insn3(&cpu, wrapper + 6u, rom_nop_insn());
+    put_insn3(&cpu, wrapper + 9u,
+              encode_test_l32r(wrapper + 9u, global_literal, 8));
+    mem_write32(cpu.mem, rom_literal, 0x40004100u);
+    mem_write32(cpu.mem, global_literal, phy_global);
+
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40089268u), 4);
+    cpu.pc = wrapper;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    xtensa_step(&cpu);
+
+    uint32_t phy = mem_read32(cpu.mem, phy_global);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(phy, 0x50001900u);
+    ASSERT_EQ(mem_read32(cpu.mem, phy), 0x4006FFF0u);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x11Cu), 0x4006FFF0u);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x120u), 0);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x180u), 0);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x1A4u), 0x4006FFF0u);
+
+    /* An indirect call through any populated slot is deterministic and is
+     * accounted as a known virtual operation, not an unknown ROM call. */
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, 0xDEADBEEFu);
+    cpu.pc = mem_read32(cpu.mem, phy);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_bt_rom_table_accessors_use_bounded_scratch) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -387,16 +444,29 @@ TEST(test_bt_rom_table_accessors_use_bounded_scratch) {
     uint32_t ip = call_builtin_rom0(&cpu, 0x40019AF0u, 0);
     uint32_t modules = call_builtin_rom0(&cpu, 0x4005427Cu, 0);
     uint32_t options = call_builtin_rom0(&cpu, 0x40010004u, 0);
+    uint32_t phy = call_builtin_rom0(&cpu, 0x40004100u, 0);
     ASSERT_TRUE(rf >= 0x50000000u && rf < 0x50002000u);
     ASSERT_TRUE(ip >= 0x50000000u && ip < 0x50002000u);
     ASSERT_TRUE(modules >= 0x50000000u && modules + 0x19Cu < 0x50002000u);
     ASSERT_TRUE(options >= 0x50000000u && options + 0x1Cu < 0x50002000u);
+    ASSERT_TRUE(phy >= 0x50000000u && phy + 0x1A4u < 0x50002000u);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x000u), 0x40002F6Cu);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x0A8u), 0x400041FCu);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x120u), 0);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x1A4u), 0x4000662Cu);
 
     /* Pointer targets are writable and independent. */
     mem_write32(cpu.mem, rf, 0x11111111u);
     mem_write32(cpu.mem, modules + 0x19Cu, 0x22222222u);
+    mem_write32(cpu.mem, phy + 0x1A4u, 0x33333333u);
     ASSERT_EQ(mem_read32(cpu.mem, rf), 0x11111111u);
     ASSERT_EQ(mem_read32(cpu.mem, modules + 0x19Cu), 0x22222222u);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x1A4u), 0x33333333u);
+
+    /* The ROM accessor returns the persistent table; it must not erase the
+     * function pointers which libphy patched after its first call. */
+    ASSERT_EQ(call_builtin_rom0(&cpu, 0x40004100u, 0), phy);
+    ASSERT_EQ(mem_read32(cpu.mem, phy + 0x1A4u), 0x33333333u);
 
     uint32_t lc_default = call_builtin_rom0(&cpu, 0x4002F494u, 0);
     uint32_t lc_hci = call_builtin_rom0(&cpu, 0x4002F488u, 0);
@@ -449,5 +519,6 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_delay_us);
     RUN_TEST(test_stub_cache_noop);
     RUN_TEST(test_stub_memcpy);
+    RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_bt_rom_table_accessors_use_bounded_scratch);
 }

@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "loader.h"
 #include "elf_symbols.h"
+#include "peripherals.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,6 +142,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* The image loader seeds the ESP32 flash-MMU tables through DPORT MMIO.
+     * Install the same DPORT model as the emulator before loading, otherwise
+     * cached IROM addresses still point at linear raw-flash offsets and the
+     * disassembler silently shows unrelated bytes for factory images. */
+    esp32_periph_t *periph = periph_create(cpu.mem);
+    if (!periph) {
+        fprintf(stderr, "Failed to create peripherals\n");
+        mem_destroy(cpu.mem);
+        return 1;
+    }
+
     uint32_t entry_point = raw_base;
 
     if (raw_mode) {
@@ -226,6 +238,7 @@ int main(int argc, char *argv[]) {
     disasm_range(&cpu, syms, dis_start, dis_end, max_insns);
 
     if (syms) elf_symbols_destroy(syms);
+    periph_destroy(periph);
     mem_destroy(cpu.mem);
     return 0;
 }

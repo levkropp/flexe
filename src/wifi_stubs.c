@@ -151,11 +151,14 @@ struct wifi_stubs {
      * struct hostent and associated data. */
     uint32_t           hostent_buf;  /* emulator address of scratch area */
     bool               event_log;    /* use [cycle] WIFI prefix instead of [wifi] */
+    wifi_stubs_stats_t  stats;
 
     /* WiFi subsystem state */
     uint32_t           wifi_mode;       /* WIFI_MODE_NULL/STA/AP/APSTA */
     bool               wifi_started;
     bool               wifi_inited;
+    bool               sta_connected;
+    uint32_t           firmware_status_addr;
     uint8_t            channel;         /* 1-14 */
     uint8_t            sta_mac[6];      /* STA MAC */
     uint8_t            ap_mac[6];       /* AP MAC */
@@ -313,6 +316,7 @@ static void write_emu_sockaddr_in(xtensa_cpu_t *cpu, uint32_t addr,
 static void stub_lwip_socket(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.socket_calls++;
     uint32_t domain   = ws_arg(cpu, 0);
     uint32_t type     = ws_arg(cpu, 1);
     uint32_t protocol = ws_arg(cpu, 2);
@@ -335,6 +339,7 @@ static void stub_lwip_socket(xtensa_cpu_t *cpu, void *ctx)
     }
 
     wifi_log(ws, "socket() → slot %d (host fd %d)\n", idx, hfd);
+    ws->stats.socket_successes++;
     ws_return(cpu, (uint32_t)idx);
 }
 
@@ -346,6 +351,7 @@ static void set_firmware_errno(xtensa_cpu_t *cpu, int eno)
 static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.connect_calls++;
     uint32_t fd      = ws_arg(cpu, 0);
     uint32_t sa_addr = ws_arg(cpu, 1);
     /* uint32_t addrlen = ws_arg(cpu, 2); */
@@ -410,12 +416,15 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
     }
 
     set_firmware_errno(cpu, ret < 0 ? errno : 0);
+    if (ret == 0)
+        ws->stats.connect_successes++;
     ws_return(cpu, (uint32_t)(ret < 0 ? -1 : 0));
 }
 
 static void stub_lwip_close(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.close_calls++;
     uint32_t fd = ws_arg(cpu, 0);
 
     emu_socket_t *s = slot_get(ws, (int)fd);
@@ -434,6 +443,7 @@ static void stub_lwip_close(xtensa_cpu_t *cpu, void *ctx)
 static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.send_calls++;
     uint32_t fd   = ws_arg(cpu, 0);
     uint32_t buf  = ws_arg(cpu, 1);
     uint32_t len  = ws_arg(cpu, 2);
@@ -457,6 +467,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
     if (n > 0) {
         wifi_log(ws, "send(slot %u, %zd bytes)\n", fd, n);
         s->awaiting_response = true;
+        ws->stats.send_bytes += (uint64_t)n;
     }
 
     free(tmp);
@@ -481,6 +492,7 @@ static void stub_lwip_send(xtensa_cpu_t *cpu, void *ctx)
 static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.recv_calls++;
     uint32_t fd   = ws_arg(cpu, 0);
     uint32_t buf  = ws_arg(cpu, 1);
     uint32_t len  = ws_arg(cpu, 2);
@@ -560,6 +572,7 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     }
 
     if (n > 0) {
+        ws->stats.recv_bytes += (uint64_t)n;
         for (ssize_t i = 0; i < n; i++)
             mem_write8(cpu->mem, buf + (uint32_t)i, tmp[i]);
     }
@@ -600,6 +613,7 @@ static void stub_lwip_recv(xtensa_cpu_t *cpu, void *ctx)
 static void stub_lwip_gethostbyname(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.dns_calls++;
     uint32_t name_addr = ws_arg(cpu, 0);
 
     char hostname[256];
@@ -663,6 +677,7 @@ static void stub_lwip_gethostbyname(xtensa_cpu_t *cpu, void *ctx)
 static void stub_dns_gethostbyname(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.dns_calls++;
     uint32_t name_addr = ws_arg(cpu, 0);
     uint32_t addr_ptr  = ws_arg(cpu, 1);
     /* uint32_t found_cb = ws_arg(cpu, 2); */
@@ -914,6 +929,7 @@ static void stub_lwip_getsockname(xtensa_cpu_t *cpu, void *ctx)
 static void stub_lwip_bind(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.bind_calls++;
     uint32_t fd      = ws_arg(cpu, 0);
     uint32_t sa_addr = ws_arg(cpu, 1);
     /* uint32_t addrlen = ws_arg(cpu, 2); */
@@ -965,12 +981,14 @@ static void stub_lwip_bind(xtensa_cpu_t *cpu, void *ctx)
         wifi_log(ws, "bind(slot %u) firmware port %u\n", fd, requested_port);
     }
 
+    ws->stats.bind_successes++;
     ws_return(cpu, 0);
 }
 
 static void stub_lwip_listen(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.listen_calls++;
     uint32_t fd      = ws_arg(cpu, 0);
     uint32_t backlog = ws_arg(cpu, 1);
 
@@ -989,12 +1007,14 @@ static void stub_lwip_listen(xtensa_cpu_t *cpu, void *ctx)
         return;
     }
     wifi_log(ws, "listen(slot %u, backlog=%d)\n", fd, bl);
+    ws->stats.listen_successes++;
     ws_return(cpu, 0);
 }
 
 static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.accept_calls++;
     uint32_t fd       = ws_arg(cpu, 0);
     uint32_t sa_addr  = ws_arg(cpu, 1);
     uint32_t len_addr = ws_arg(cpu, 2);
@@ -1039,12 +1059,14 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
 
     wifi_log(ws, "accept(slot %u) → client slot %d (host fd %d)\n",
              fd, cfd, chfd);
+    ws->stats.accept_successes++;
     ws_return(cpu, (uint32_t)cfd);
 }
 
 static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.sendto_calls++;
     uint32_t fd       = ws_arg(cpu, 0);
     uint32_t buf      = ws_arg(cpu, 1);
     uint32_t len      = ws_arg(cpu, 2);
@@ -1078,8 +1100,10 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
     int saved_errno = errno;
     free(tmp);
 
-    if (n > 0)
+    if (n > 0) {
         wifi_log(ws, "sendto(slot %u, %zd bytes)\n", fd, n);
+        ws->stats.sendto_bytes += (uint64_t)n;
+    }
 
     if (n < 0) {
         set_firmware_errno(cpu, saved_errno);
@@ -1094,6 +1118,7 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
 static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.recvfrom_calls++;
     uint32_t fd   = ws_arg(cpu, 0);
     uint32_t buf  = ws_arg(cpu, 1);
     uint32_t len  = ws_arg(cpu, 2);
@@ -1110,6 +1135,7 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
     ssize_t n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
 
     if (n > 0) {
+        ws->stats.recvfrom_bytes += (uint64_t)n;
         for (ssize_t i = 0; i < n; i++)
             mem_write8(cpu->mem, buf + (uint32_t)i, tmp[i]);
     }
@@ -1548,6 +1574,10 @@ static void stub_esp_wifi_get_config(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_connect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.wifi_connect_calls++;
+    ws->sta_connected = true;
+    if (ws->firmware_status_addr)
+        mem_write32(cpu->mem, ws->firmware_status_addr, 3); /* WL_CONNECTED */
     wifi_log(ws, "esp_wifi_connect()\n");
     ws_return(cpu, 0);
 }
@@ -1555,6 +1585,9 @@ static void stub_esp_wifi_connect(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_disconnect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->sta_connected = false;
+    if (ws->firmware_status_addr)
+        mem_write32(cpu->mem, ws->firmware_status_addr, 6); /* WL_DISCONNECTED */
     wifi_log(ws, "esp_wifi_disconnect()\n");
     ws_return(cpu, 0);
 }
@@ -1562,6 +1595,7 @@ static void stub_esp_wifi_disconnect(xtensa_cpu_t *cpu, void *ctx)
 static void stub_esp_wifi_scan_start(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
+    ws->stats.scan_start_calls++;
     ws->scan_active = true;
     ws->scan_done = true; /* results immediately available */
     wifi_log(ws, "esp_wifi_scan_start() — %zu synthetic APs\n", FAKE_AP_COUNT);
@@ -1847,9 +1881,8 @@ static void stub_esp_netif_create_default_wifi_ap(xtensa_cpu_t *cpu, void *ctx)
 
 /* ===== Scratch memory allocation ===== */
 
-/* Allocate a small region in emulator address space for hostent data.
- * We use the top of DRAM (0x3FFFFFFF area) — a 64-byte scratch. */
-#define HOSTENT_SCRATCH_ADDR  0x3FFBFF00u
+/* Allocate a small region near the top of RTC-fast RAM for hostent data. */
+#define HOSTENT_SCRATCH_ADDR  0x50001F00u
 #define HOSTENT_SCRATCH_SIZE  64
 
 /* ===== Public API ===== */
@@ -2026,6 +2059,74 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
     return hooked;
 }
 
+typedef struct {
+    uint32_t addr;
+    rom_stub_fn fn;
+    const char *name;
+} wifi_fw_hook_t;
+
+/* NerdMiner v2 ESP32-2432S028R production image.  These entries were
+ * signature-matched against the exact 2026 factory image; they are library
+ * routines, not guessed call sites. */
+static const wifi_fw_hook_t nerdminer_v2_wifi_hooks[] = {
+    { 0x4011DC24u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
+    { 0x4011F530u, stub_lwip_accept,        "lwip_accept" },
+    { 0x4011F740u, stub_lwip_bind,          "lwip_bind" },
+    { 0x4011F7F4u, stub_lwip_close,         "lwip_close" },
+    { 0x4011F92Cu, stub_lwip_connect,       "lwip_connect" },
+    { 0x4011F9ECu, stub_lwip_listen,        "lwip_listen" },
+    { 0x4011FA54u, stub_lwip_recvfrom,      "lwip_recvfrom" },
+    { 0x4011FB24u, stub_lwip_read,          "lwip_read" },
+    { 0x4011FB40u, stub_lwip_recv,          "lwip_recv" },
+    { 0x4011FB5Cu, stub_lwip_sendto,        "lwip_sendto" },
+    { 0x4011FCDCu, stub_lwip_send,          "lwip_send" },
+    { 0x4011FD68u, stub_lwip_socket,        "lwip_socket" },
+    { 0x4011FE14u, stub_lwip_write,         "lwip_write" },
+    { 0x4011FE2Cu, stub_lwip_select,        "lwip_select" },
+    { 0x40120190u, stub_lwip_getsockname,   "lwip_getsockname" },
+    { 0x401201A8u, stub_lwip_getsockopt,    "lwip_getsockopt" },
+    { 0x40120250u, stub_lwip_setsockopt,    "lwip_setsockopt" },
+    { 0x401202E4u, stub_lwip_ioctl,         "lwip_ioctl" },
+    { 0x4012038Cu, stub_lwip_fcntl,         "lwip_fcntl" },
+    { 0x401216E8u, stub_dns_gethostbyname,  "dns_gethostbyname" },
+    { 0x401156ACu, stub_vfs_select,         "esp_vfs_select" },
+    { 0x40134844u, stub_vfs_fcntl,          "fcntl" },
+    { 0x401643ECu, stub_esp_wifi_connect,   "esp_wifi_connect" },
+    { 0x401645ACu, stub_esp_wifi_scan_start,"esp_wifi_scan_start" },
+    { 0x40196404u, stub_start_ssl_client,   "start_ssl_client" },
+    { 0x40196D78u, stub_stop_ssl_socket,    "stop_ssl_socket" },
+    { 0x40196DF0u, stub_data_to_read,       "data_to_read" },
+    { 0x40196E24u, stub_send_ssl_data,      "send_ssl_data" },
+    { 0x40196E80u, stub_get_ssl_receive,    "get_ssl_receive" },
+    { 0, NULL, NULL },
+};
+
+int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
+{
+    if (!ws || entry_point != 0x40089268u)
+        return 0;
+    esp32_rom_stubs_t *rom = ws->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ws->rom = rom;
+    ws->firmware_status_addr = 0x3FFC5C78u;
+
+    int hooked = 0;
+    for (const wifi_fw_hook_t *h = nerdminer_v2_wifi_hooks; h->fn; h++) {
+        rom_stubs_register_ctx(rom, h->addr, h->fn, h->name, ws);
+        hooked++;
+    }
+    fprintf(stderr, "[wifi] hooked %d verified production-ROM entries\n", hooked);
+    return hooked;
+}
+
 void wifi_stubs_set_event_log(wifi_stubs_t *ws, bool enabled) {
     if (ws) ws->event_log = enabled;
+}
+
+void wifi_stubs_get_stats(const wifi_stubs_t *ws, wifi_stubs_stats_t *stats) {
+    if (!stats) return;
+    if (ws)
+        *stats = ws->stats;
+    else
+        memset(stats, 0, sizeof(*stats));
 }

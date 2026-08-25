@@ -10,11 +10,13 @@
 
 #include "xtensa.h"
 #include "elf_symbols.h"
+#include "peripherals.h"
 
 typedef struct mpi_stubs mpi_stubs_t;
 
 mpi_stubs_t *mpi_stubs_create(xtensa_cpu_t *cpu);
 void         mpi_stubs_destroy(mpi_stubs_t *ms);
+void         mpi_stubs_set_peripheral(mpi_stubs_t *ms, esp32_periph_t *periph);
 int          mpi_stubs_hook_symbols(mpi_stubs_t *ms, const elf_symbols_t *syms);
 
 #endif

@@ -13,6 +13,17 @@
 #define AES_MAX_ROUNDS   14
 #define AES_MAX_RK       60
 
+/* Original ESP32 AES accelerator register layout.  Unlike later ESP32
+ * variants, input and output share AES_TEXT_BASE. */
+#define AES_PERIPH_BASE  0x3FF01000u
+#define AES_PERIPH_PAGE  1
+#define AES_START_OFF    0x00u
+#define AES_IDLE_OFF     0x04u
+#define AES_MODE_OFF     0x08u
+#define AES_KEY_OFF      0x10u
+#define AES_TEXT_OFF     0x30u
+#define AES_ENDIAN_OFF   0x40u
+
 struct aes_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
@@ -21,6 +32,13 @@ struct aes_stubs {
     uint32_t round_key[2][AES_MAX_RK];
     int      nr[2];          /* number of rounds (10/12/14) */
     int      mode[2];        /* 0=decrypt, 1=encrypt */
+
+    /* The physical accelerator is shared by both CPUs.  Keep its raw MMIO
+     * register state separate from the per-core HAL-hook state above. */
+    uint32_t hw_key[8];
+    uint32_t hw_text[4];
+    uint32_t hw_mode;
+    uint32_t hw_endian;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -243,6 +261,95 @@ static void aes_decrypt_block(const uint8_t in[16], uint8_t out[16],
     memcpy(out, s, 16);
 }
 
+/* ===== AES peripheral MMIO ===== */
+
+static void aes_word_to_bytes(uint32_t word, uint8_t out[4]) {
+    out[0] = (uint8_t)word;
+    out[1] = (uint8_t)(word >> 8);
+    out[2] = (uint8_t)(word >> 16);
+    out[3] = (uint8_t)(word >> 24);
+}
+
+static uint32_t aes_bytes_to_word(const uint8_t in[4]) {
+    return (uint32_t)in[0] |
+           ((uint32_t)in[1] << 8) |
+           ((uint32_t)in[2] << 16) |
+           ((uint32_t)in[3] << 24);
+}
+
+static void aes_mmio_transform(aes_stubs_t *as) {
+    unsigned key_size_code = as->hw_mode & 3u;
+    if (key_size_code > 2u)
+        return; /* reserved hardware mode */
+
+    int key_bytes = 16 + (int)key_size_code * 8;
+    uint8_t key[32] = {0};
+    uint8_t in[16];
+    uint8_t out[16];
+    uint32_t round_key[AES_MAX_RK];
+
+    for (int i = 0; i < key_bytes / 4; i++)
+        aes_word_to_bytes(as->hw_key[i], &key[i * 4]);
+    for (int i = 0; i < 4; i++)
+        aes_word_to_bytes(as->hw_text[i], &in[i * 4]);
+
+    int nr = aes_key_expand(key, key_bytes, round_key);
+    if (as->hw_mode & 4u)
+        aes_decrypt_block(in, out, round_key, nr);
+    else
+        aes_encrypt_block(in, out, round_key, nr);
+
+    for (int i = 0; i < 4; i++)
+        as->hw_text[i] = aes_bytes_to_word(&out[i * 4]);
+}
+
+static uint32_t aes_mmio_read(void *ctx, uint32_t addr) {
+    aes_stubs_t *as = ctx;
+    uint32_t off = addr - AES_PERIPH_BASE;
+
+    if (off >= AES_KEY_OFF && off < AES_KEY_OFF + sizeof(as->hw_key))
+        return as->hw_key[(off - AES_KEY_OFF) / 4];
+    if (off >= AES_TEXT_OFF && off < AES_TEXT_OFF + sizeof(as->hw_text))
+        return as->hw_text[(off - AES_TEXT_OFF) / 4];
+
+    switch (off) {
+    case AES_START_OFF:  return 0;
+    case AES_IDLE_OFF:   return 1;
+    case AES_MODE_OFF:   return as->hw_mode;
+    case AES_ENDIAN_OFF: return as->hw_endian;
+    default:             return 0;
+    }
+}
+
+static void aes_mmio_write(void *ctx, uint32_t addr, uint32_t val) {
+    aes_stubs_t *as = ctx;
+    uint32_t off = addr - AES_PERIPH_BASE;
+
+    if (off >= AES_KEY_OFF && off < AES_KEY_OFF + sizeof(as->hw_key)) {
+        as->hw_key[(off - AES_KEY_OFF) / 4] = val;
+        return;
+    }
+    if (off >= AES_TEXT_OFF && off < AES_TEXT_OFF + sizeof(as->hw_text)) {
+        as->hw_text[(off - AES_TEXT_OFF) / 4] = val;
+        return;
+    }
+
+    switch (off) {
+    case AES_START_OFF:
+        if (val & 1u)
+            aes_mmio_transform(as);
+        break;
+    case AES_MODE_OFF:
+        as->hw_mode = val & 7u;
+        break;
+    case AES_ENDIAN_OFF:
+        as->hw_endian = val;
+        break;
+    default:
+        break;
+    }
+}
+
 /* ===== Hardware acquire/release stubs ===== */
 
 static void stub_aes_acquire_hardware(xtensa_cpu_t *cpu, void *ctx) {
@@ -322,6 +429,8 @@ aes_stubs_t *aes_stubs_create(xtensa_cpu_t *cpu) {
     as->cpu = cpu;
     as->nr[0] = as->nr[1] = 10;   /* default AES-128 */
     as->mode[0] = as->mode[1] = AES_MODE_ENCRYPT;
+    mem_register_mmio(cpu->mem, AES_PERIPH_PAGE,
+                      aes_mmio_read, aes_mmio_write, as);
     return as;
 }
 

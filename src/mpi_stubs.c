@@ -13,9 +13,27 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <openssl/bn.h>
 
 /* Maximum hardware words: ESP32 RSA supports up to 4096 bits = 128 uint32 */
 #define MPI_MAX_WORDS 128
+
+/* Original ESP32 RSA/MPI accelerator register layout. */
+#define RSA_PERIPH_BASE        0x3FF02000u
+#define RSA_PERIPH_PAGE        2
+#define RSA_M_WORD             (0x000u / 4)
+#define RSA_Z_WORD             (0x200u / 4)
+#define RSA_Y_WORD             (0x400u / 4)
+#define RSA_X_WORD             (0x600u / 4)
+#define RSA_MEMORY_WORDS       (0x800u / 4)
+#define RSA_M_DASH_OFF         0x800u
+#define RSA_MODEXP_MODE_OFF    0x804u
+#define RSA_MODEXP_START_OFF   0x808u
+#define RSA_MULT_MODE_OFF      0x80Cu
+#define RSA_MULT_START_OFF     0x810u
+#define RSA_INTERRUPT_OFF      0x814u
+#define RSA_QUERY_CLEAN_OFF    0x818u
+#define RSA_INTR_SOURCE        51
 
 /* mbedtls_mpi struct layout in emulator memory (32-bit platform):
  *   offset 0: int s        (sign, +1 or -1)
@@ -29,11 +47,20 @@
 struct mpi_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
+    esp32_periph_t    *periph;
 
     /* Per-core result buffer for async mul operations.
      * Each core gets its own buffer so interleaved batches don't corrupt. */
     uint32_t result[2][MPI_MAX_WORDS * 2];
     size_t   result_words[2];
+
+    /* Shared physical RSA accelerator state.  M/Z/Y/X are four contiguous
+     * 4096-bit little-endian memory blocks in the first 0x800 bytes. */
+    uint32_t hw_memory[RSA_MEMORY_WORDS];
+    uint32_t hw_m_dash;
+    uint32_t hw_modexp_mode;
+    uint32_t hw_mult_mode;
+    bool     hw_interrupt;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -187,6 +214,209 @@ static void montgomery_mul(const uint32_t *x, const uint32_t *y,
         memcpy(result, t, n * sizeof(uint32_t));
 
     free(t);
+}
+
+/* ===== RSA peripheral MMIO ===== */
+
+static int words_to_bn(BIGNUM *bn, const uint32_t *words, size_t count)
+{
+    uint8_t bytes[MPI_MAX_WORDS * 4];
+    if (count > MPI_MAX_WORDS) return 0;
+    for (size_t i = 0; i < count; i++) {
+        bytes[i * 4] = (uint8_t)words[i];
+        bytes[i * 4 + 1] = (uint8_t)(words[i] >> 8);
+        bytes[i * 4 + 2] = (uint8_t)(words[i] >> 16);
+        bytes[i * 4 + 3] = (uint8_t)(words[i] >> 24);
+    }
+    return BN_lebin2bn(bytes, (int)(count * 4), bn) != NULL;
+}
+
+static int bn_to_words(const BIGNUM *bn, uint32_t *words, size_t count)
+{
+    uint8_t bytes[MPI_MAX_WORDS * 4];
+    if (count > MPI_MAX_WORDS ||
+        BN_bn2lebinpad(bn, bytes, (int)(count * 4)) < 0)
+        return 0;
+    for (size_t i = 0; i < count; i++) {
+        words[i] = (uint32_t)bytes[i * 4] |
+                   ((uint32_t)bytes[i * 4 + 1] << 8) |
+                   ((uint32_t)bytes[i * 4 + 2] << 16) |
+                   ((uint32_t)bytes[i * 4 + 3] << 24);
+    }
+    return 1;
+}
+
+static void rsa_complete(mpi_stubs_t *ms)
+{
+    ms->hw_interrupt = true;
+    if (ms->periph)
+        periph_assert_interrupt(ms->periph, RSA_INTR_SOURCE);
+}
+
+static void rsa_zero_z(mpi_stubs_t *ms)
+{
+    memset(&ms->hw_memory[RSA_Z_WORD], 0,
+           MPI_MAX_WORDS * sizeof(uint32_t));
+}
+
+static void rsa_modexp(mpi_stubs_t *ms)
+{
+    /* MODEXP_MODE is N/512 - 1, for the eight supported lengths from
+     * 512 through 4096 bits. */
+    size_t words = ((size_t)ms->hw_modexp_mode + 1) * 16;
+
+    BN_CTX *ctx = BN_CTX_new();
+    if (!ctx) {
+        rsa_zero_z(ms);
+        rsa_complete(ms);
+        return;
+    }
+    BN_CTX_start(ctx);
+    BIGNUM *x = BN_CTX_get(ctx);
+    BIGNUM *y = BN_CTX_get(ctx);
+    BIGNUM *m = BN_CTX_get(ctx);
+    BIGNUM *z = BN_CTX_get(ctx);
+    int ok = z &&
+             words_to_bn(x, &ms->hw_memory[RSA_X_WORD], words) &&
+             words_to_bn(y, &ms->hw_memory[RSA_Y_WORD], words) &&
+             words_to_bn(m, &ms->hw_memory[RSA_M_WORD], words) &&
+             !BN_is_zero(m) && BN_mod_exp(z, x, y, m, ctx) &&
+             bn_to_words(z, &ms->hw_memory[RSA_Z_WORD], words);
+    if (!ok)
+        rsa_zero_z(ms);
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+    rsa_complete(ms);
+}
+
+static void rsa_montgomery_mul(mpi_stubs_t *ms, size_t words)
+{
+    BN_CTX *ctx = BN_CTX_new();
+    if (!ctx) {
+        rsa_zero_z(ms);
+        return;
+    }
+    BN_CTX_start(ctx);
+    BIGNUM *x = BN_CTX_get(ctx);
+    BIGNUM *y = BN_CTX_get(ctx);
+    BIGNUM *m = BN_CTX_get(ctx);
+    BIGNUM *r = BN_CTX_get(ctx);
+    BIGNUM *rinv = BN_CTX_get(ctx);
+    BIGNUM *product = BN_CTX_get(ctx);
+    BIGNUM *z = BN_CTX_get(ctx);
+    int ok = z &&
+             words_to_bn(x, &ms->hw_memory[RSA_X_WORD], words) &&
+             words_to_bn(y, &ms->hw_memory[RSA_Z_WORD], words) &&
+             words_to_bn(m, &ms->hw_memory[RSA_M_WORD], words) &&
+             !BN_is_zero(m) && BN_one(r) &&
+             BN_lshift(r, r, (int)(words * 32)) &&
+             BN_mod_inverse(rinv, r, m, ctx) != NULL &&
+             BN_mod_mul(product, x, y, m, ctx) &&
+             BN_mod_mul(z, product, rinv, m, ctx) &&
+             bn_to_words(z, &ms->hw_memory[RSA_Z_WORD], words);
+    if (!ok)
+        rsa_zero_z(ms);
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+}
+
+static void rsa_plain_mul(mpi_stubs_t *ms, size_t operand_words,
+                          size_t result_words)
+{
+    BN_CTX *ctx = BN_CTX_new();
+    if (!ctx) {
+        rsa_zero_z(ms);
+        return;
+    }
+    BN_CTX_start(ctx);
+    BIGNUM *x = BN_CTX_get(ctx);
+    BIGNUM *y = BN_CTX_get(ctx);
+    BIGNUM *z = BN_CTX_get(ctx);
+    int ok = z &&
+             words_to_bn(x, &ms->hw_memory[RSA_X_WORD], operand_words) &&
+             words_to_bn(y, &ms->hw_memory[RSA_Z_WORD + operand_words],
+                         operand_words) &&
+             BN_mul(z, x, y, ctx) &&
+             bn_to_words(z, &ms->hw_memory[RSA_Z_WORD], result_words);
+    if (!ok)
+        rsa_zero_z(ms);
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+}
+
+static void rsa_mult(mpi_stubs_t *ms)
+{
+    if (ms->hw_mult_mode <= 7) {
+        size_t words = ((size_t)ms->hw_mult_mode + 1) * 16;
+        rsa_montgomery_mul(ms, words);
+    } else {
+        /* ESP32's plain-multiply encoding stores a 2N-word result in Z and
+         * places the second N-word operand in the upper half of Z. */
+        size_t result_words = ((size_t)ms->hw_mult_mode - 7) * 16;
+        if (result_words > MPI_MAX_WORDS) result_words = MPI_MAX_WORDS;
+        rsa_plain_mul(ms, result_words / 2, result_words);
+    }
+    rsa_complete(ms);
+}
+
+static uint32_t rsa_mmio_read(void *ctx, uint32_t addr)
+{
+    mpi_stubs_t *ms = ctx;
+    uint32_t off = addr - RSA_PERIPH_BASE;
+    if (off < 0x800u)
+        return ms->hw_memory[off / 4];
+
+    switch (off) {
+    case RSA_M_DASH_OFF:       return ms->hw_m_dash;
+    case RSA_MODEXP_MODE_OFF:  return ms->hw_modexp_mode;
+    case RSA_MULT_MODE_OFF:    return ms->hw_mult_mode;
+    case RSA_INTERRUPT_OFF:    return ms->hw_interrupt ? 1u : 0u;
+    case RSA_QUERY_CLEAN_OFF:  return 1u;
+    default:                   return 0;
+    }
+}
+
+static void rsa_mmio_write(void *ctx, uint32_t addr, uint32_t val)
+{
+    mpi_stubs_t *ms = ctx;
+    uint32_t off = addr - RSA_PERIPH_BASE;
+    if (off < 0x800u) {
+        ms->hw_memory[off / 4] = val;
+        return;
+    }
+
+    switch (off) {
+    case RSA_M_DASH_OFF:
+        ms->hw_m_dash = val;
+        break;
+    case RSA_MODEXP_MODE_OFF:
+        ms->hw_modexp_mode = val & 7u;
+        break;
+    case RSA_MODEXP_START_OFF:
+        if (val & 1u) {
+            ms->hw_interrupt = false;
+            rsa_modexp(ms);
+        }
+        break;
+    case RSA_MULT_MODE_OFF:
+        ms->hw_mult_mode = val & 15u;
+        break;
+    case RSA_MULT_START_OFF:
+        if (val & 1u) {
+            ms->hw_interrupt = false;
+            rsa_mult(ms);
+        }
+        break;
+    case RSA_INTERRUPT_OFF:
+        if (val & 1u) {
+            ms->hw_interrupt = false;
+            if (ms->periph)
+                periph_deassert_interrupt(ms->periph, RSA_INTR_SOURCE);
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 /* ===== Stub implementations ===== */
@@ -378,12 +608,19 @@ mpi_stubs_t *mpi_stubs_create(xtensa_cpu_t *cpu)
     mpi_stubs_t *ms = calloc(1, sizeof(*ms));
     if (!ms) return NULL;
     ms->cpu = cpu;
+    mem_register_mmio(cpu->mem, RSA_PERIPH_PAGE,
+                      rsa_mmio_read, rsa_mmio_write, ms);
     return ms;
 }
 
 void mpi_stubs_destroy(mpi_stubs_t *ms)
 {
     free(ms);
+}
+
+void mpi_stubs_set_peripheral(mpi_stubs_t *ms, esp32_periph_t *periph)
+{
+    if (ms) ms->periph = periph;
 }
 
 int mpi_stubs_hook_symbols(mpi_stubs_t *ms, const elf_symbols_t *syms)

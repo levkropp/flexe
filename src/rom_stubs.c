@@ -2586,6 +2586,81 @@ static void stub_void_unregistered(xtensa_cpu_t *cpu, void *ctx) {
 #define ROM_BT_LM_DEFAULT_TABLE   0x50000C80u
 #define ROM_BT_LLC_HCI_TABLE      0x50000CC0u
 #define ROM_BT_LLM_DEFAULT_TABLE  0x50000D00u
+#define ROM_PHY_FUNCS              0x50001900u /* IDF patches through +0x1A4 */
+#define VIRTUAL_PHY_NOOP_FN        0x4006FFF0u
+
+/* Initial g_phyFuns_instance from Espressif's ESP32 rev-0 ROM.  Production
+ * libphy replaces the chip-specific entries it owns and continues to call
+ * the remaining ROM entries indirectly.  Preserve that ABI even though the
+ * analog/RF work itself is virtualized below. */
+static const uint32_t esp32_rev0_phy_romfuncs[] = {
+    0x40002F6Cu, 0x40002F88u, 0x40002FA4u, 0x40002FCCu,
+    0x40003000u, 0x4000302Cu, 0x40003044u, 0x40003E3Cu,
+    0x40003060u, 0x400030B8u, 0x400030F8u, 0x4000312Cu,
+    0x400031A4u, 0x4000348Cu, 0x4000351Cu, 0x40003564u,
+    0x40003594u, 0x400035D0u, 0x400036B4u, 0x40003F98u,
+    0x4000401Cu, 0x40003710u, 0x40003734u, 0x40003760u,
+    0x400037F0u, 0x40003AC8u, 0x40003B70u, 0x4000404Cu,
+    0x40003BACu, 0x400040B0u, 0x40003BDCu, 0x40003C2Cu,
+    0x40003C78u, 0x40003D48u, 0x40003D90u, 0x40003DB4u,
+    0x40003DF4u, 0x40004110u, 0x40004148u, 0x40004168u,
+    0x400041A4u, 0x400041C0u, 0x400041FCu, 0x40004270u,
+    0x40004334u, 0x40004374u, 0x400043C0u, 0x40004414u,
+    0x40004458u, 0x4000446Cu, 0x40004480u, 0x40004508u,
+    0x4000453Cu, 0x40004590u, 0x400045E0u, 0x40004638u,
+    0x40004680u, 0x400046E0u, 0x40004740u, 0x400047A8u,
+    0x400047F8u, 0x40004880u, 0x40004B44u, 0x40004CA8u,
+    0x40004CECu, 0x40004D18u, 0x40004D8Cu, 0x40004DC0u,
+    0x40004DF8u, 0x40004E10u, 0x40004EA4u, 0x4000506Cu,
+    0x00000000u, 0x4000510Cu, 0x40005154u, 0x400051C0u,
+    0x40005204u, 0x40005290u, 0x400052DCu, 0x4000538Cu,
+    0x400054F0u, 0x40005514u, 0x40005590u, 0x400055C8u,
+    0x40005620u, 0x400058E4u, 0x40005A00u, 0x40005A68u,
+    0x40005B4Cu, 0x40005BBCu, 0x40005CE0u, 0x40005D50u,
+    0x40005DECu, 0x40005F64u, 0x40005FC8u, 0x40006004u,
+    0x00000000u, 0x40006058u, 0x400061CCu, 0x40006268u,
+    0x40006290u, 0x400062A8u, 0x4000642Cu, 0x40006564u,
+    0x400065D4u, 0x4000662Cu,
+};
+
+/* phy_get_romfuncs() returns a persistent function table which libphy patches
+ * during initialization.  The actual ROM table cannot be executed by the
+ * emulator, but returning NULL lets those writes corrupt low memory.  Keep a
+ * dedicated, writable table in RTC-fast RAM; higher-level virtual WiFi/PHY
+ * hooks provide the operations which would otherwise live in its slots. */
+static void stub_phy_get_romfuncs(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, ROM_PHY_FUNCS);
+}
+
+static void init_phy_romfuncs(esp32_rom_stubs_t *s) {
+    for (size_t i = 0;
+         i < sizeof(esp32_rev0_phy_romfuncs) /
+                     sizeof(esp32_rev0_phy_romfuncs[0]); i++) {
+        uint32_t addr = esp32_rev0_phy_romfuncs[i];
+        mem_write32(s->cpu->mem, ROM_PHY_FUNCS + (uint32_t)i * 4u, addr);
+        if (addr != 0)
+            rom_stubs_register(s, addr, stub_unregistered,
+                               "virtual_phy_romfunc");
+    }
+    rom_stubs_register(s, VIRTUAL_PHY_NOOP_FN, stub_unregistered,
+                       "virtual_phy_operation");
+}
+
+/* A real ESP32's libphy replaces much of this table and then runs closed,
+ * chip-specific RF calibration code.  There is no analog radio behind the
+ * virtual CYD, so expose the same writable ABI while making every operation
+ * deterministic.  Keep the two NULL slots from the physical ROM intact. */
+static void virtualize_phy_romfuncs(esp32_rom_stubs_t *s) {
+    for (size_t i = 0;
+         i < sizeof(esp32_rev0_phy_romfuncs) /
+                     sizeof(esp32_rev0_phy_romfuncs[0]); i++) {
+        uint32_t fn = esp32_rev0_phy_romfuncs[i] != 0
+                          ? VIRTUAL_PHY_NOOP_FN
+                          : 0;
+        mem_write32(s->cpu->mem, ROM_PHY_FUNCS + (uint32_t)i * 4u, fn);
+    }
+}
 
 static void stub_bt_rom_rf_phy_funcs_get(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -3262,6 +3337,8 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x4000cd4c, stub_moddi3,             "__moddi3");
 
     /* I2C ROM functions (register read/write - return 0) */
+    rom_stubs_register(s, 0x40004100, stub_phy_get_romfuncs,     "phy_get_romfuncs");
+    init_phy_romfuncs(s);
     rom_stubs_register(s, 0x40004148, stub_unregistered,        "rom_i2c_readReg");
     rom_stubs_register(s, 0x400041a4, stub_void_unregistered,   "rom_i2c_writeReg");
     rom_stubs_register(s, 0x400041c0, stub_unregistered,        "rom_i2c_readReg_Mask");
@@ -3474,11 +3551,74 @@ static const fw_tbl_patch_t fw_marauder_ble_tbls[] = {
     {0x3FFD0548u, FW_FAKE_TBL_WIFI},
 };
 
-static void stub_fw_marauder_ble_clear(xtensa_cpu_t *cpu, void *ctx) {
-    fw_patch_handler_tables(ctx, fw_marauder_ble_tbls,
+/* Decode an L32R's literal and return it when it points to firmware DRAM.
+ * phy_get_romfunc_addr starts with two L32Rs: the first literal is the ROM
+ * accessor (0x40004100), while the second is the writable global into which
+ * libphy stores the returned table pointer. */
+static bool fw_find_phy_global(xtensa_cpu_t *cpu, uint32_t entry,
+                               uint32_t *global_out) {
+    uint32_t pc = entry;
+    for (int bytes = 0; bytes < 30;) {
+        uint32_t insn = 0;
+        int len = xtensa_fetch(cpu, pc, &insn);
+        if (len != 2 && len != 3)
+            break;
+        if (len == 3 && XT_OP0(insn) == 1 && XT_T(insn) == 8) {
+            uint32_t next_pc = pc + 3u;
+            uint32_t literal = (next_pc & ~3u) +
+                (0xFFFC0000u | ((uint32_t)XT_IMM16(insn) << 2));
+            uint32_t value = mem_read32(cpu->mem, literal);
+            if (value >= 0x3FFA0000u && value < 0x40000000u) {
+                *global_out = value;
+                return true;
+            }
+        }
+        pc += (uint32_t)len;
+        bytes += len;
+    }
+
+    /* Symbol-less stock-ROM profiles are fixed builds.  Keep their verified
+     * globals as a guarded fallback if instruction decoding ever encounters
+     * an image whose executable page is not readable through xtensa_fetch. */
+    if (entry == 0x40189A2Cu) {
+        *global_out = 0x3FFC87ECu;
+        return true;
+    }
+    if (entry == 0x401BDE2Cu) {
+        *global_out = 0x3FFCD99Cu;
+        return true;
+    }
+    return false;
+}
+
+static bool fw_virtualize_phy_table(xtensa_cpu_t *cpu,
+                                    esp32_rom_stubs_t *stubs) {
+    uint32_t global = 0;
+    if (!fw_find_phy_global(cpu, cpu->pc, &global)) {
+        fprintf(stderr,
+                "[flexe] virtual PHY: could not locate table global at "
+                "0x%08X\n", cpu->pc);
+        return false;
+    }
+    virtualize_phy_romfuncs(stubs);
+    mem_write32(cpu->mem, global, ROM_PHY_FUNCS);
+    return true;
+}
+
+static void stub_fw_virtual_phy_init(xtensa_cpu_t *cpu, void *ctx) {
+    fw_virtualize_phy_table(cpu, ctx);
+    rom_return_void(cpu);
+}
+
+/* Marauder's phy_get_romfunc_addr is also the earliest safe point at which
+ * its virtual HCI dispatch tables can be installed. */
+static void stub_fw_marauder_phy_init(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *stubs = ctx;
+    fw_virtualize_phy_table(cpu, stubs);
+    fw_patch_handler_tables(stubs, fw_marauder_ble_tbls,
                             (int)(sizeof(fw_marauder_ble_tbls) /
                                   sizeof(fw_marauder_ble_tbls[0])));
-    rom_return(cpu, 0);
+    rom_return_void(cpu);
 }
 
 /* The virtual HCI controller has no asynchronous transport thread to emit
@@ -3507,7 +3647,7 @@ static const fw_addr_hook_t fw_marauder_hooks[] = {
      * "assert failed: npl_freertos_mutex_pend (mu->handle)" → core dump →
      * reboot loop.  It now runs for real (the ROM fixup-table stubs below
      * cover what used to hang). */
-    { 0x401BDE2C, stub_fw_marauder_ble_clear, "ble_handler_table_clear", 0 },
+    { 0x401BDE2C, stub_fw_marauder_phy_init, "phy_get_romfunc_addr", 0 },
     { 0x40104595, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
     { 0x4010463C, stub_fw_marauder_ble_hs_sync, "ble_hs_sync", 0 },
     { 0, NULL, NULL, 0 }
@@ -3515,6 +3655,9 @@ static const fw_addr_hook_t fw_marauder_hooks[] = {
 
 /* NerdMiner v2 (CYD 2432S028, entry 0x40089268). */
 static const fw_addr_hook_t fw_nerdminer_hooks[] = {
+    /* Keep libphy's ABI but bypass physical RF calibration.  Higher-level
+     * WiFi/socket hooks model the observable network behavior. */
+    { 0x40189A2C, stub_fw_virtual_phy_init, "phy_get_romfunc_addr", 0 },
     /* xEventGroupWaitBits wrapper (0x4011dab4): the Arduino WiFi
      * wait-for-connect path calls this (→ xEventGroupWaitBits) to wait for
      * the WiFi-connected event-group bit, which is never set with no radio.
@@ -3561,6 +3704,16 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
     if (!stubs || !syms) return 0;
     stubs->syms = syms;
     int hooked = 0;
+
+    /* The closed-source PHY library's calibration routines require analog
+     * hardware.  Preserve its table contract and virtualize that boundary
+     * for any ELF which exposes the standard wrapper symbol. */
+    uint32_t phy_addr;
+    if (elf_symbols_find(syms, "phy_get_romfunc_addr", &phy_addr) == 0) {
+        rom_stubs_register_ctx(stubs, phy_addr, stub_fw_virtual_phy_init,
+                               "phy_get_romfunc_addr", stubs);
+        hooked++;
+    }
 
     /* Newlib lock functions — no-op in single-threaded emulator */
     static const char *lock_fns[] = {
