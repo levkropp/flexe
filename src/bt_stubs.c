@@ -1,12 +1,13 @@
 /*
  * bt_stubs.c — Bluetooth / NimBLE stubs for ESP32 emulator
  *
- * Provides ESP-IDF BT controller stubs and NimBLE API stubs.
- * BLE scans return synthetic device results; advertising and
- * raw TX operations are logged but no-op.
+ * Provides ESP-IDF BT controller stubs and NimBLE API stubs. Supported stock
+ * ROMs retain their real NimBLE scanner and receive synthetic controller
+ * events through the firmware's registered callback path.
  */
 
 #include "bt_stubs.h"
+#include "guest_call.h"
 #include "rom_stubs.h"
 #include "memory.h"
 
@@ -30,6 +31,24 @@
 #define FAKE_SERVER_PTR     0x3FFB0400u
 #define FAKE_ADVERTISING_PTR 0x3FFB0500u
 #define FAKE_CLIENT_PTR     0x3FFB0600u
+
+/* ESP32 Marauder v1.14 CYD production addresses, verified against its
+ * matching reproducible ELF and the stock image's instruction bytes. */
+#define MARAUDER_V114_ENTRY                    0x400831D8u
+#define MARAUDER_NIMBLE_SCAN_START             0x401048B4u
+#define MARAUDER_NIMBLE_SCAN_STOP              0x401049B4u
+#define MARAUDER_NIMBLE_SCAN_HANDLE_GAP        0x40104A9Cu
+#define MARAUDER_NIMBLE_SCAN_SET_CALLBACKS     0x401DA8D0u
+
+/* A ble_gap_event is 52 bytes in this ESP32 NimBLE build.  Its discovery
+ * descriptor begins at +4 and holds a pointer to the advertisement payload.
+ * This bounded RTC-fast gap lies between the virtual PHY and WiFi buffers. */
+#define BLE_EVENT_SCRATCH_ADDR 0x50001C00u
+#define BLE_EVENT_SCRATCH_SIZE 64u
+#define BLE_DATA_SCRATCH_ADDR  0x50001C40u
+#define BLE_DATA_MAX_LEN       31u
+#define BLE_GAP_EVENT_DISC     7u
+#define BLE_ADV_NONCONN_IND    3u
 
 /* Synthetic BLE devices */
 typedef struct {
@@ -63,6 +82,10 @@ struct bt_stubs {
     bool               ble_advertising;
     uint8_t            ble_addr[6];
     uint32_t           scan_cb_addr;
+    uint32_t           scan_obj_addr;
+    uint32_t           gap_handler_addr;
+    bool               production_observer;
+    bt_stubs_stats_t    stats;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -248,6 +271,38 @@ static void stub_nimble_scan_stop(xtensa_cpu_t *cpu, void *ctx)
     bt_return(cpu, 0);
 }
 
+/* Production-ROM observers.  Spies inspect the pre-ENTRY CALL8 register
+ * window and then allow the genuine NimBLE functions to execute. */
+static void spy_nimble_scan_set_callbacks(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    bt->scan_obj_addr = bt_arg(cpu, 0);
+    bt->scan_cb_addr = bt_arg(cpu, 1);
+    bt->stats.scan_callback_config_calls++;
+    bt_log(bt, "NimBLEScan::setAdvertisedDeviceCallbacks(scan=0x%08x, "
+               "cb=0x%08x)\n", bt->scan_obj_addr, bt->scan_cb_addr);
+}
+
+static void spy_nimble_scan_start(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    bt->scan_obj_addr = bt_arg(cpu, 0);
+    bt->ble_scanning = true;
+    bt->stats.scan_start_calls++;
+    bt_log(bt, "NimBLEScan::start(scan=0x%08x, duration=%u) — observed\n",
+           bt->scan_obj_addr, bt_arg(cpu, 1));
+}
+
+static void spy_nimble_scan_stop(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    bt->scan_obj_addr = bt_arg(cpu, 0);
+    bt->ble_scanning = false;
+    bt->stats.scan_stop_calls++;
+    bt_log(bt, "NimBLEScan::stop(scan=0x%08x) — observed\n",
+           bt->scan_obj_addr);
+}
+
 /* NimBLEScan::clearResults() */
 static void stub_nimble_clear_results(xtensa_cpu_t *cpu, void *ctx)
 {
@@ -329,6 +384,12 @@ void bt_stubs_destroy(bt_stubs_t *bt)
 int bt_stubs_hook_symbols(bt_stubs_t *bt, const elf_symbols_t *syms)
 {
     if (!bt || !syms) return 0;
+
+    /* The supported Marauder build runs its real NimBLE host.  Replacing the
+     * same functions merely because a companion ELF was supplied would make
+     * symbol-assisted runs less faithful than raw stock-ROM runs. */
+    if (bt->production_observer)
+        return 0;
 
     esp32_rom_stubs_t *rom = bt->cpu->pc_hook_ctx;
     if (!rom) return 0;
@@ -464,6 +525,85 @@ int bt_stubs_hook_symbols(bt_stubs_t *bt, const elf_symbols_t *syms)
         fprintf(stderr, "[bt] hooked %d BT/BLE symbols\n", hooked);
 
     return hooked;
+}
+
+int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
+{
+    if (!bt || entry_point != MARAUDER_V114_ENTRY)
+        return 0;
+    esp32_rom_stubs_t *rom = bt->cpu->pc_hook_ctx;
+    if (!rom)
+        return 0;
+
+    bt->rom = rom;
+    bt->production_observer = true;
+    bt->gap_handler_addr = MARAUDER_NIMBLE_SCAN_HANDLE_GAP;
+
+    /* Register at the first post-ENTRY byte. register_spy also discovers the
+     * preceding ENTRY itself, which guarantees pre-window arguments while
+     * avoiding accidental attachment to an adjacent tiny function. */
+    rom_stubs_register_spy(rom, MARAUDER_NIMBLE_SCAN_SET_CALLBACKS + 3u,
+                           spy_nimble_scan_set_callbacks,
+                           "NimBLEScan::setAdvertisedDeviceCallbacks", bt);
+    rom_stubs_register_spy(rom, MARAUDER_NIMBLE_SCAN_START + 3u,
+                           spy_nimble_scan_start, "NimBLEScan::start", bt);
+    rom_stubs_register_spy(rom, MARAUDER_NIMBLE_SCAN_STOP + 3u,
+                           spy_nimble_scan_stop, "NimBLEScan::stop", bt);
+    fprintf(stderr, "[bt] observing 3 verified production-ROM NimBLE entries\n");
+    return 3;
+}
+
+void bt_stubs_get_stats(const bt_stubs_t *bt, bt_stubs_stats_t *stats)
+{
+    if (!stats)
+        return;
+    if (bt)
+        *stats = bt->stats;
+    else
+        memset(stats, 0, sizeof(*stats));
+}
+
+int bt_stubs_inject_advertisement(bt_stubs_t *bt, const uint8_t addr[6],
+                                  uint8_t addr_type, int8_t rssi,
+                                  const uint8_t *data, size_t len)
+{
+    if (!bt || !addr || !data || len == 0 || addr_type > 1)
+        return -1;
+    if (!bt->ble_scanning || bt->scan_obj_addr == 0 ||
+        bt->scan_cb_addr == 0 || bt->gap_handler_addr == 0)
+        return -2;
+    if (len > BLE_DATA_MAX_LEN)
+        return -3;
+
+    xtensa_mem_t *mem = bt->cpu->mem;
+    for (uint32_t i = 0; i < BLE_EVENT_SCRATCH_SIZE; i++)
+        mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + i, 0);
+    for (size_t i = 0; i < len; i++)
+        mem_write8(mem, BLE_DATA_SCRATCH_ADDR + (uint32_t)i, data[i]);
+
+    /* ble_gap_event.type */
+    mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + 0u, BLE_GAP_EVENT_DISC);
+    /* ble_gap_event.disc starts at +4 in the 32-bit ABI. */
+    mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + 4u, BLE_ADV_NONCONN_IND);
+    mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + 5u, (uint8_t)len);
+    mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + 6u, addr_type);
+    for (uint32_t i = 0; i < 6; i++)
+        mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + 7u + i, addr[i]);
+    mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + 13u, (uint8_t)rssi);
+    mem_write32(mem, BLE_EVENT_SCRATCH_ADDR + 16u, BLE_DATA_SCRATCH_ADDR);
+
+    uint32_t args[] = {BLE_EVENT_SCRATCH_ADDR, bt->scan_obj_addr};
+    int result = guest_call8(bt->cpu, bt->gap_handler_addr, args, 2,
+                             2000000u, NULL);
+    if (result != 0) {
+        bt->stats.advertisement_callback_failures++;
+        return -4;
+    }
+
+    bt->stats.advertisement_frames++;
+    bt_log(bt, "BLE advertisement(name payload=%zu, rssi=%d) delivered\n",
+           len, rssi);
+    return 0;
 }
 
 void bt_stubs_set_event_log(bt_stubs_t *bt, bool enabled) {

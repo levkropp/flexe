@@ -244,8 +244,11 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
 
     /* Bluetooth / NimBLE stubs */
     s->bstubs = bt_stubs_create(&s->cpu[0]);
-    if (s->bstubs && s->syms)
-        bt_stubs_hook_symbols(s->bstubs, s->syms);
+    if (s->bstubs) {
+        bt_stubs_hook_firmware_addrs(s->bstubs, res.entry_point);
+        if (s->syms)
+            bt_stubs_hook_symbols(s->bstubs, s->syms);
+    }
 
     /* Pre-decode instruction memory for fast fetch */
     xtensa_predecode_build(&s->cpu[0]);
@@ -380,6 +383,11 @@ display_stubs_t *flexe_session_display(flexe_session_t *s)
 wifi_stubs_t *flexe_session_wifi(flexe_session_t *s)
 {
     return s ? s->wstubs : NULL;
+}
+
+bt_stubs_t *flexe_session_bt(flexe_session_t *s)
+{
+    return s ? s->bstubs : NULL;
 }
 
 int flexe_session_is_native_freertos(const flexe_session_t *s)

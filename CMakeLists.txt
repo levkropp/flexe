@@ -62,6 +62,7 @@ set(LIB_SOURCES
     src/display_stubs.c
     src/touch_stubs.c
     src/sdcard_stubs.c
+    src/guest_call.c
     src/wifi_stubs.c
     src/vfs_stubs.c
     src/bt_stubs.c

@@ -45,7 +45,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 542 tests
+- 543 tests
 
 ## building
 
@@ -134,7 +134,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 542 tests, 1394 passed, 0 failed
+# 543 tests, 1412 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -167,7 +167,9 @@ UART0 FIFO/interrupt path, and delivers a beacon through the production ROM's
 registered promiscuous callback; Marauder's own frame counters must advance.
 It then exits capture mode through a second UART command, launches the stock
 Rick Roll attack, and requires its raw beacon frames to cross Flexe's host
-virtual-radio transmit boundary.
+virtual-radio transmit boundary. Finally, it starts `sniffbt`, injects a BLE
+advertisement through the production NimBLE GAP handler, and requires
+Marauder's registered device callback to parse and print `Device: FlexeBLE`.
 The NerdMiner profile connects to the stock ROM's captive portal through its
 remapped host sockets, issues a real HTTP request and DNS query, and requires
 valid responses from both:

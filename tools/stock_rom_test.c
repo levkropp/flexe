@@ -43,6 +43,7 @@
 #define MARAUDER_SCAN_MODE_ADDR     0x3FFC9384u
 #define MARAUDER_RAW_SCAN_MODE      25u
 #define MARAUDER_RICKROLL_MODE      9u
+#define MARAUDER_BT_SCAN_MODE       10u
 
 /* touch_stubs uses the frontend's lifetime flag while servicing blocking
  * touch APIs. Standalone main and the SDL frontend provide the same symbol. */
@@ -396,6 +397,22 @@ static bool uart_contains(const uart_state_t *uart, const char *needle)
     return false;
 }
 
+static bool uart_contains_from(const uart_state_t *uart, size_t start,
+                               const char *needle)
+{
+    size_t needle_len = strlen(needle);
+    if (start > uart->log_len || needle_len == 0)
+        return needle_len == 0;
+    size_t available = uart->log_len - start;
+    if (needle_len > available)
+        return false;
+    for (size_t i = start; i <= uart->log_len - needle_len; i++) {
+        if (memcmp(uart->log + i, needle, needle_len) == 0)
+            return true;
+    }
+    return false;
+}
+
 static int run_until_marauder_sniffer(flexe_session_t *session,
                                       const uart_state_t *uart,
                                       const wifi_stubs_stats_t *before,
@@ -481,6 +498,37 @@ static int run_until_marauder_tx(flexe_session_t *session,
     }
 
     wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+static int run_until_marauder_bt_scan(flexe_session_t *session,
+                                      const uart_state_t *uart,
+                                      uint64_t max_cycles,
+                                      bt_stubs_stats_t *stats_out,
+                                      uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    bt_stubs_t *bt = flexe_session_bt(session);
+    uint64_t start = cpu0->cycle_count;
+    bt_stubs_stats_t stats = {0};
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        bt_stubs_get_stats(bt, &stats);
+        if (uart_contains(uart, "#sniffbt") &&
+            stats.scan_callback_config_calls > 0 &&
+            stats.scan_start_calls > 0 &&
+            mem_read8(flexe_session_mem(session),
+                      MARAUDER_SCAN_MODE_ADDR) == MARAUDER_BT_SCAN_MODE) {
+            *stats_out = stats;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    bt_stubs_get_stats(bt, stats_out);
     *cycles_out = cpu0->cycle_count - start;
     return 1;
 }
@@ -760,14 +808,18 @@ int main(int argc, char **argv)
     uint64_t cli_cycles = 0;
     uint64_t stop_cycles = 0;
     uint64_t tx_cycles = 0;
+    uint64_t bt_cycles = 0;
     size_t cli_rx_bytes = 0;
     size_t tx_cli_rx_bytes = 0;
+    size_t bt_cli_rx_bytes = 0;
     uint64_t marauder_raw_tx_frames = 0;
     uint64_t marauder_raw_tx_bytes = 0;
     uint64_t marauder_host_tx_frames = 0;
     uint64_t marauder_host_beacons = 0;
+    uint64_t marauder_bt_advertisements = 0;
     uint32_t marauder_mgmt_frames = 0;
     uint32_t marauder_beacon_frames = 0;
+    bt_stubs_stats_t bt_stats = {0};
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
     if (is_nerdminer) {
         if (strstr(uart.log, "sdcard_mount(): f_mount failed") != NULL) {
@@ -1102,6 +1154,94 @@ int main(int argc, char **argv)
         marauder_host_tx_frames = raw_tx_probe.frames - host_tx_before;
         marauder_host_beacons = raw_tx_probe.beacon_frames -
                                 host_beacons_before;
+
+        size_t stop_attack_rx = periph_uart_rx_inject(
+                flexe_session_periph(session), stop_command,
+                sizeof(stop_command) - 1);
+        if (stop_attack_rx != sizeof(stop_command) - 1 ||
+            run_until_marauder_stopped(session, &uart, 500000000ull,
+                                       &stop_cycles) != 0) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=stop-attack accepted=%zu "
+                    "mode=%u\n", stop_attack_rx,
+                    mem_read8(flexe_session_mem(session),
+                              MARAUDER_SCAN_MODE_ADDR));
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        static const uint8_t bt_command[] = "sniffbt\n";
+        bt_cli_rx_bytes = periph_uart_rx_inject(
+                flexe_session_periph(session), bt_command,
+                sizeof(bt_command) - 1);
+        int bt_result = bt_cli_rx_bytes == sizeof(bt_command) - 1 ?
+                run_until_marauder_bt_scan(session, &uart, 1000000000ull,
+                                           &bt_stats, &bt_cycles) : 1;
+        if (bt_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=%s accepted=%zu "
+                    "bt_cycles=%llu mode=%u pending_rx=%zu config=%llu "
+                    "starts=%llu\n",
+                    bt_result < 0 ? "cpus-stopped-during-bt" :
+                                    "bt-scan-timeout",
+                    bt_cli_rx_bytes, (unsigned long long)bt_cycles,
+                    mem_read8(flexe_session_mem(session),
+                              MARAUDER_SCAN_MODE_ADDR),
+                    periph_uart_rx_pending(flexe_session_periph(session)),
+                    (unsigned long long)
+                            bt_stats.scan_callback_config_calls,
+                    (unsigned long long)bt_stats.scan_start_calls);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        /* Send a standard legacy advertisement into the genuine static
+         * NimBLEScan::handleGapEvent function.  The stock callback must parse
+         * its complete local name and print the discovered device. */
+        static const uint8_t ble_addr[6] = {
+            0x45, 0x58, 0x45, 0x4C, 0x46, 0x02
+        };
+        static const uint8_t ble_advertisement[] = {
+            0x02, 0x01, 0x06,
+            0x09, 0x09, 'F', 'l', 'e', 'x', 'e', 'B', 'L', 'E',
+        };
+        size_t bt_uart_before = uart.log_len;
+        uint64_t bt_adv_before = bt_stats.advertisement_frames;
+        int bt_inject_result = bt_stubs_inject_advertisement(
+                flexe_session_bt(session), ble_addr, 1, -47,
+                ble_advertisement, sizeof(ble_advertisement));
+        bt_stubs_get_stats(flexe_session_bt(session), &bt_stats);
+        if (bt_inject_result != 0 ||
+            bt_stats.advertisement_frames != bt_adv_before + 1 ||
+            !uart_contains_from(&uart, bt_uart_before, "Device: FlexeBLE")) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=ble-advertisement result=%d "
+                    "adv=%llu/%llu failures=%llu uart_marker=%d "
+                    "uart_log_len=%zu\n",
+                    bt_inject_result,
+                    (unsigned long long)bt_stats.advertisement_frames,
+                    (unsigned long long)bt_adv_before,
+                    (unsigned long long)
+                            bt_stats.advertisement_callback_failures,
+                    uart_contains_from(&uart, bt_uart_before,
+                                       "Device: FlexeBLE"),
+                    uart.log_len);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        marauder_bt_advertisements = bt_stats.advertisement_frames;
     }
 
     int unregistered_rom = rom_stubs_unregistered_count(
@@ -1169,6 +1309,14 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_raw_tx_bytes,
                (unsigned long long)marauder_host_tx_frames,
                (unsigned long long)marauder_host_beacons);
+    if (is_marauder)
+        printf(" bt_uart_rx=%zu bt_cli=sniffbt bt_cycles=%llu "
+               "bt_config=%llu bt_starts=%llu bt_adv=%llu "
+               "bt_device=FlexeBLE",
+               bt_cli_rx_bytes, (unsigned long long)bt_cycles,
+               (unsigned long long)bt_stats.scan_callback_config_calls,
+               (unsigned long long)bt_stats.scan_start_calls,
+               (unsigned long long)marauder_bt_advertisements);
     if (is_nerdminer)
         printf(" spiffs_blocks=%d sd_fat=mounted network_cycles=%llu "
                "service_cycles=%llu tcp_udp_sockets=%llu binds=%llu "

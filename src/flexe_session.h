@@ -15,6 +15,7 @@
 #include "freertos_stubs.h"
 #include "display_stubs.h"
 #include "wifi_stubs.h"
+#include "bt_stubs.h"
 #include "peripherals.h"
 #include "jit.h"
 #include <stdint.h>
@@ -83,6 +84,7 @@ esp32_rom_stubs_t *flexe_session_rom(flexe_session_t *s);
 freertos_stubs_t  *flexe_session_frt(flexe_session_t *s);
 display_stubs_t   *flexe_session_display(flexe_session_t *s);
 wifi_stubs_t      *flexe_session_wifi(flexe_session_t *s);
+bt_stubs_t        *flexe_session_bt(flexe_session_t *s);
 int                flexe_session_is_native_freertos(const flexe_session_t *s);
 jit_state_t       *flexe_session_jit(flexe_session_t *s);
 

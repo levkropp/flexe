@@ -10,6 +10,7 @@
 #endif
 
 #include "wifi_stubs.h"
+#include "guest_call.h"
 #include "rom_stubs.h"
 #include "memory.h"
 
@@ -1825,8 +1826,10 @@ static void stub_esp_wifi_80211_tx(xtensa_cpu_t *cpu, void *ctx)
     }
     ws->stats.raw_tx_frames++;
     ws->stats.raw_tx_bytes += len;
-    wifi_log(ws, "esp_wifi_80211_tx(len=%u, type=0x%02x) — virtual\n",
-             len, frame_type);
+    if (ws->event_log || ws->stats.raw_tx_frames <= 3 ||
+        ws->stats.raw_tx_frames % 1000 == 0)
+        wifi_log(ws, "esp_wifi_80211_tx(len=%u, type=0x%02x) — virtual\n",
+                 len, frame_type);
     ws_return(cpu, 0);
 }
 
@@ -1957,8 +1960,6 @@ static void stub_esp_netif_create_default_wifi_ap(xtensa_cpu_t *cpu, void *ctx)
 #define PROMISC_PACKET_ADDR    0x50001D00u
 #define PROMISC_PACKET_SIZE    256u
 #define PROMISC_RX_CTRL_SIZE   28u
-#define PROMISC_STACK_TOP      0x60002000u
-#define PROMISC_SENTINEL       0x40001FF8u
 
 /* ===== Public API ===== */
 
@@ -2284,107 +2285,8 @@ int wifi_stubs_inject_promiscuous_frame(wifi_stubs_t *ws,
         mem_write8(cpu->mem, PROMISC_PACKET_ADDR + PROMISC_RX_CTRL_SIZE +
                    (uint32_t)i, frame[i]);
 
-    /* Run the registered callback as a small synthetic WiFi task. A private
-     * RTC-slow stack prevents asynchronous delivery from overwriting the
-     * interrupted firmware task's stack. Architectural state is restored on
-     * return; guest heap/global writes performed by the callback remain. */
-    uint32_t save_ar[64];
-    uint32_t save_pc = cpu->pc;
-    uint32_t save_ps = cpu->ps;
-    uint32_t save_windowbase = cpu->windowbase;
-    uint32_t save_windowstart = cpu->windowstart;
-    uint32_t save_sar = cpu->sar;
-    uint32_t save_lbeg = cpu->lbeg;
-    uint32_t save_lend = cpu->lend;
-    uint32_t save_lcount = cpu->lcount;
-    uint32_t save_br = cpu->br;
-    uint32_t save_acclo = cpu->acclo;
-    uint32_t save_acchi = cpu->acchi;
-    uint32_t save_mr[4];
-    uint32_t save_fcr = cpu->fcr;
-    uint32_t save_fsr = cpu->fsr;
-    float save_fr[16];
-    uint8_t save_window_callsize[sizeof(cpu->window_callsize)];
-    uint8_t save_spill_stack[sizeof(cpu->spill_stack)];
-    uint8_t save_spill_base[sizeof(cpu->spill_base)];
-    uint8_t save_spill_shadow[sizeof(cpu->spill_shadow)];
-    bool save_running = cpu->running;
-    bool save_halted = cpu->halted;
-    bool save_exception = cpu->exception;
-    bool save_pc_written = cpu->_pc_written;
-    bool save_irq_check = cpu->irq_check;
-    bool save_accelerated = cpu->accelerated_blocks;
-
-    memcpy(save_ar, cpu->ar, sizeof(save_ar));
-    memcpy(save_mr, cpu->mr, sizeof(save_mr));
-    memcpy(save_fr, cpu->fr, sizeof(save_fr));
-    memcpy(save_window_callsize, cpu->window_callsize,
-           sizeof(save_window_callsize));
-    memcpy(save_spill_stack, cpu->spill_stack, sizeof(save_spill_stack));
-    memcpy(save_spill_base, cpu->spill_base, sizeof(save_spill_base));
-    memcpy(save_spill_shadow, cpu->spill_shadow, sizeof(save_spill_shadow));
-
-    memset(cpu->ar, 0, sizeof(cpu->ar));
-    memset(cpu->window_callsize, 0, sizeof(cpu->window_callsize));
-    memset(cpu->spill_stack, 0, sizeof(cpu->spill_stack));
-    memset(cpu->spill_base, 0, sizeof(cpu->spill_base));
-    memset(cpu->spill_shadow, 0, sizeof(cpu->spill_shadow));
-    cpu->windowbase = 0;
-    cpu->windowstart = 1;
-    cpu->ps = 1u << 18; /* WOE, kernel mode, interrupts masked below */
-    XT_PS_SET_INTLEVEL(cpu->ps, 15);
-    XT_PS_SET_CALLINC(cpu->ps, 2); /* callback is entered as CALL8 */
-    ar_write(cpu, 1, PROMISC_STACK_TOP);
-    ar_write(cpu, 8, (2u << 30) |
-                     (PROMISC_SENTINEL & 0x3FFFFFFFu));
-    ar_write(cpu, 10, PROMISC_PACKET_ADDR);
-    ar_write(cpu, 11, packet_type);
-    cpu->pc = ws->promisc_cb_addr;
-    cpu->running = true;
-    cpu->halted = false;
-    cpu->exception = false;
-    cpu->_pc_written = false;
-    cpu->irq_check = false;
-
-    bool completed = false;
-    for (int i = 0; i < 1000000; i++) {
-        if (cpu->pc == PROMISC_SENTINEL) {
-            completed = true;
-            break;
-        }
-        if (!cpu->running || cpu->exception) break;
-        xtensa_step(cpu);
-    }
-
-    memcpy(cpu->ar, save_ar, sizeof(save_ar));
-    memcpy(cpu->mr, save_mr, sizeof(save_mr));
-    memcpy(cpu->fr, save_fr, sizeof(save_fr));
-    memcpy(cpu->window_callsize, save_window_callsize,
-           sizeof(save_window_callsize));
-    memcpy(cpu->spill_stack, save_spill_stack, sizeof(save_spill_stack));
-    memcpy(cpu->spill_base, save_spill_base, sizeof(save_spill_base));
-    memcpy(cpu->spill_shadow, save_spill_shadow, sizeof(save_spill_shadow));
-    cpu->pc = save_pc;
-    cpu->ps = save_ps;
-    cpu->windowbase = save_windowbase;
-    cpu->windowstart = save_windowstart;
-    cpu->sar = save_sar;
-    cpu->lbeg = save_lbeg;
-    cpu->lend = save_lend;
-    cpu->lcount = save_lcount;
-    cpu->br = save_br;
-    cpu->acclo = save_acclo;
-    cpu->acchi = save_acchi;
-    cpu->fcr = save_fcr;
-    cpu->fsr = save_fsr;
-    cpu->running = save_running;
-    cpu->halted = save_halted;
-    cpu->exception = save_exception;
-    cpu->_pc_written = save_pc_written;
-    cpu->irq_check = save_irq_check;
-    cpu->accelerated_blocks = save_accelerated;
-
-    if (!completed) {
+    uint32_t args[] = {PROMISC_PACKET_ADDR, packet_type};
+    if (guest_call8(cpu, ws->promisc_cb_addr, args, 2, 1000000, NULL) != 0) {
         ws->stats.raw_rx_callback_failures++;
         return -4;
     }
