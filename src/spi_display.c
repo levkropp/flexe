@@ -115,7 +115,10 @@ static int cs_asserted(spi_display_t *s, int pin) {
     if (pin < 0 || pin > 39) return 0;
     int lvl = gpio_level(s, pin);
     if (lvl == 1) g_cs_seen_high |= (1ULL << pin);
-    return lvl == 0 && (g_cs_seen_high & (1ULL << pin)) != 0;
+    int asserted = lvl == 0 && (g_cs_seen_high & (1ULL << pin)) != 0;
+    if (asserted && getenv("FLEXE_CSDBG"))
+        fprintf(stderr, "[CS] pin=%d asserted (touch_cs=%d sd_cs=%d)\n", pin, s->cfg.touch_cs_pin, s->cfg.sd_cs_pin);
+    return asserted;
 }
 
 /* Display CS is often driven by the SPI hardware (spi_master spics_io_num),
@@ -156,9 +159,7 @@ static void fb_write_pixel(spi_display_t *s, uint16_t x, uint16_t y, uint16_t rg
     default: fx = 319 - x;  fy = y;        break;  /* MV + MX: landscape, col flip */
     }
     if (fx >= (uint32_t)s->cfg.fb_w || fy >= (uint32_t)s->cfg.fb_h) return;
-    if (s->cfg.framebuf_mtx) pthread_mutex_lock(s->cfg.framebuf_mtx);
     s->cfg.framebuf[fy * s->cfg.fb_w + fx] = rgb565;
-    if (s->cfg.framebuf_mtx) pthread_mutex_unlock(s->cfg.framebuf_mtx);
     s->pixels_this_burst++;
 }
 
@@ -225,6 +226,12 @@ static void ili9341_pixel_byte(spi_display_t *s, uint8_t b) {
 }
 
 static void ili9341_feed(spi_display_t *s, int dc, const uint8_t *data, int len) {
+    /* A GP-SPI transaction carries up to 32 RGB565 pixels. Lock the shared
+     * framebuffer once for the whole burst instead of once per pixel: the
+     * per-pixel lock let a continuously-redrawing firmware starve the SDL
+     * render/control thread for minutes. */
+    int lock_fb = dc && s->pixel_mode && s->cfg.framebuf && s->cfg.framebuf_mtx;
+    if (lock_fb) pthread_mutex_lock(s->cfg.framebuf_mtx);
     for (int i = 0; i < len; i++) {
         if (!dc) {
             s->cur_cmd = data[i];
@@ -241,6 +248,7 @@ static void ili9341_feed(spi_display_t *s, int dc, const uint8_t *data, int len)
             ili9341_param(s, data[i]);
         }
     }
+    if (lock_fb) pthread_mutex_unlock(s->cfg.framebuf_mtx);
 }
 
 /* ---- XPT2046 touch ---- */
@@ -253,8 +261,23 @@ static void touch_sample(spi_display_t *s, int *rx, int *ry, int *pressed) {
     int x = 0, y = 0;
     if (!s->cfg.touch_fn(&x, &y, s->cfg.touch_ctx)) return;
     if (s->cfg.fb_w > 1 && s->cfg.fb_h > 1) {
-        *rx = x * 4095 / (s->cfg.fb_w - 1);
-        *ry = y * 4095 / (s->cfg.fb_h - 1);
+        if (x < 0) x = 0;
+        if (x >= s->cfg.fb_w) x = s->cfg.fb_w - 1;
+        if (y < 0) y = 0;
+        if (y >= s->cfg.fb_h) y = s->cfg.fb_h - 1;
+
+        /* The 2432S028's LCD/touch glass is 240x320 portrait, while Flexe's
+         * framebuffer presents that physical panel rotated clockwise as
+         * 320x240.  Convert the host cursor back to panel coordinates, then
+         * reproduce the raw ranges used by Marauder's CYD calibration.
+         *
+         * XPT command 0x91 (chan 1 below) supplies library p.x; 0xD1
+         * (chan 5) supplies p.y.  The rx/ry names retain the controller's
+         * electrical channel convention, which is opposite those names. */
+        int panel_x = y * 239 / (s->cfg.fb_h - 1);
+        int panel_y = (s->cfg.fb_w - 1 - x) * 319 / (s->cfg.fb_w - 1);
+        *ry = 200 + panel_x * (3700 - 200) / 239; /* library p.x */
+        *rx = 240 + panel_y * (3800 - 240) / 319; /* library p.y */
     }
     if (*rx < 0) *rx = 0; if (*rx > 4095) *rx = 4095;
     if (*ry < 0) *ry = 0; if (*ry > 4095) *ry = 4095;
@@ -270,9 +293,12 @@ static void xpt2046_respond(spi_display_t *s) {
     int chan = (s->touch_cmd >> 4) & 0x7;
     uint16_t val = 0;
     switch (chan) {
-    case 1: val = (uint16_t)ry; break;              /* Y */
-    case 5: val = (uint16_t)rx; break;              /* X */
-    case 3: case 4: val = pressed ? 600 : 0; break; /* Z1/Z2 */
+    case 1: val = (uint16_t)ry; break;              /* 0x91: library p.x */
+    case 5: val = (uint16_t)rx; break;              /* 0xD1: library p.y */
+    /* The driver computes pressure as Z1 + 4095 - Z2.  Open-circuit
+     * (released) values are therefore opposite rails, not both zero. */
+    case 3: val = pressed ? 600 : 0; break;       /* Z1 */
+    case 4: val = pressed ? 3500 : 4095; break;  /* Z2 */
     default: val = 0; break;
     }
     uint16_t frame = (uint16_t)(val << 3);
@@ -468,12 +494,32 @@ static void gp_spi_transact(spi_display_t *s) {
     int cs_disp = display_active(s) && !cs_touch && !cs_sd;
 
     if (cs_touch) {
-        /* First MOSI byte with bit7 set is the control byte */
-        const uint8_t *mosi = (const uint8_t *)s->w;
-        if ((s->user & SPI_USER_USR_MOSI) && data_bytes(s->mosi_dlen) >= 1 &&
-            (mosi[0] & 0x80))
-            s->touch_cmd = mosi[0];
+        /* XPT2046 conversions are pipelined.  The MISO bits clocked during
+         * this transaction belong to the command accepted previously; a
+         * new control byte in MOSI starts the conversion returned by the
+         * next transfer.  Paul Stoffregen's driver depends on this when it
+         * sends transfer16(next_command) while reading the prior result.
+         *
+         * ESP32's MSB-first transfer16 stores the on-wire bytes as 00,CMD
+         * in W0, so scan the complete MOSI phase rather than only byte 0.
+         * Preserve it before xpt2046_respond overwrites W0 with MISO. */
+        uint8_t mosi[64];
+        int n = 0;
+        if (s->user & SPI_USER_USR_MOSI) {
+            n = data_bytes(s->mosi_dlen);
+            memcpy(mosi, s->w, (size_t)n);
+        }
+        uint8_t reply_cmd = s->touch_cmd;
         xpt2046_respond(s);
+        for (int i = 0; i < n; i++) {
+            if (mosi[i] & 0x80)
+                s->touch_cmd = mosi[i];
+        }
+        if (getenv("FLEXE_TOUCHDBG")) {
+            int rx, ry, pr; touch_sample(s, &rx, &ry, &pr);
+            fprintf(stderr, "[TOUCH] reply=0x%02X next=0x%02X W0=0x%08X (rx=%d ry=%d pressed=%d)\n",
+                    reply_cmd, s->touch_cmd, s->w[0], rx, ry, pr);
+        }
         return;
     }
 
@@ -567,6 +613,7 @@ void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cf
     if (!p || !cfg) return;
     xtensa_mem_t *mem = periph_mem(p);
 
+    g_cs_seen_high = 0;
     for (int i = 0; i < 2; i++) {
         spi_display_t *s = &g_host[i];
         memset(s, 0, sizeof(*s));

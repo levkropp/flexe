@@ -21,6 +21,7 @@
 #define TIMG0_BASE      0x3FF5F000u
 #define TIMG1_BASE      0x3FF60000u
 #define SYSCON_BASE     0x3FF66000u
+#define WIFI_MAC_BASE   0x3FF73000u  /* WiFi MAC/BB control registers */
 #define WDEV_BASE       0x3FF75000u  /* WiFi device (contains RNG register) */
 #define PAGE_SIZE       4096
 
@@ -29,6 +30,12 @@
 
 /* UART TX buffer */
 #define UART_TX_BUF_SIZE 4096
+
+/* UART0 interrupt registers/bits used by the ESP-IDF buffered TX driver. */
+#define UART0_INTR_SOURCE        34
+#define UART_TXFIFO_EMPTY_INT    (1u << 1)
+#define UART_TX_DONE_INT         (1u << 14)
+#define UART_INT_VALID_MASK      0x7FFFFu
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -102,6 +109,8 @@ struct esp32_periph {
     uart_tx_cb uart_cb;
     void    *uart_cb_ctx;
     uint32_t uart_shadow[64];   /* shadow config registers */
+    uint32_t uart_int_raw;
+    uint32_t uart_int_ena;
 
     /* GPIO */
     gpio_state_t gpio;
@@ -147,6 +156,9 @@ struct esp32_periph {
     /* SPI flash controllers: [0] = SPI0 (cache), [1] = SPI1 (memspi) */
     spi_state_t spi[2];
 
+    /* WiFi MAC reset/ready handshake used by the closed-source HAL. */
+    uint32_t wifi_mac_init_ctrl;
+
     /* Flash cache MMU table shadows (DPORT_PRO/APP_FLASH_MMU_TABLE).
      * Entry i (0-63 = DROM 0x3F400000+, 64-127 = IROM 0x400C2000+) holds
      * the 64 KB flash page mapped into that vaddr slot. */
@@ -180,6 +192,17 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define FROM_CPU_INTR2_SOURCE 26
 #define FROM_CPU_INTR3_SOURCE 27
 
+/* ETS_GPIO_INTR_SOURCE */
+#define GPIO_INTR_SOURCE 22
+#define GPIO_NMI_SOURCE  23
+
+/* GPIO_PINn.INT_ENA field values (register bits 17:13). */
+#define GPIO_APP_CPU_INTR_ENA      (1u << 0)
+#define GPIO_APP_CPU_NMI_INTR_ENA  (1u << 1)
+#define GPIO_PRO_CPU_INTR_ENA      (1u << 2)
+#define GPIO_PRO_CPU_NMI_INTR_ENA  (1u << 3)
+#define GPIO_SDIO_EXT_INTR_ENA     (1u << 4)
+
 /* DPORT offsets for cross-core interrupt registers */
 #define DPORT_CPU_INTR_FROM_CPU_0_OFF 0x0DC
 #define DPORT_CPU_INTR_FROM_CPU_1_OFF 0x0E0
@@ -199,6 +222,22 @@ static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert
                     p->cpu[core]->interrupt &= ~(1u << ci);
                 }
             }
+        }
+    }
+}
+
+/* GPIO has per-pin CPU routing, so its normal/NMI sources may be asserted on
+ * one core without being asserted on the other. */
+static void intr_matrix_update_source_core(esp32_periph_t *p, int core,
+                                           int source, bool assert) {
+    if (core < 0 || core > 1 || !p->cpu[core]) return;
+    for (int ci = 0; ci < 32; ci++) {
+        if (p->intr_matrix[core][ci] != (uint8_t)source) continue;
+        if (assert) {
+            p->cpu[core]->interrupt |= (1u << ci);
+            p->cpu[core]->irq_check = true;
+        } else {
+            p->cpu[core]->interrupt &= ~(1u << ci);
         }
     }
 }
@@ -341,11 +380,29 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
 
 /* ---- UART0 ---- */
 
+/* Flexe drains each TX FIFO write immediately into the host callback.  Keep
+ * the hardware-visible FIFO empty while still presenting the level/edge
+ * interrupts that ESP-IDF's buffered UART driver relies on to dequeue its
+ * transmit ring buffer. */
+static void uart0_intr_update(esp32_periph_t *p) {
+    uint32_t mask = 1u << (UART0_INTR_SOURCE % 32);
+    bool active = (p->uart_int_raw & p->uart_int_ena) != 0;
+    if (active)
+        p->pending_sources[UART0_INTR_SOURCE / 32] |= mask;
+    else
+        p->pending_sources[UART0_INTR_SOURCE / 32] &= ~mask;
+    intr_matrix_update_source(p, UART0_INTR_SOURCE, active);
+}
+
 static uint32_t uart0_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - UART0_BASE;
     switch (off) {
     case 0x00: return 0;            /* FIFO read: no RX data */
+    case 0x04: return p->uart_int_raw;                 /* INT_RAW */
+    case 0x08: return p->uart_int_raw & p->uart_int_ena; /* INT_ST */
+    case 0x0C: return p->uart_int_ena;                 /* INT_ENA */
+    case 0x10: return 0;            /* INT_CLR is write-only */
     case 0x1C: return 0;            /* STATUS: TX FIFO empty = ready */
     default:
         if (off / 4 < 64) return p->uart_shadow[off / 4];
@@ -367,12 +424,91 @@ static void uart0_write(void *ctx, uint32_t addr, uint32_t val) {
         ev.uart_tx.uart_num = 0;
         ev.uart_tx.byte = byte;
         sbx_events_emit(&ev);
+        /* The byte has already left our zero-depth FIFO.  TXFIFO_EMPTY is a
+         * level condition; TX_DONE records completion of this byte. */
+        p->uart_int_raw |= UART_TXFIFO_EMPTY_INT | UART_TX_DONE_INT;
+        uart0_intr_update(p);
+    } else if (off == 0x0C) {       /* INT_ENA */
+        p->uart_int_ena = val & UART_INT_VALID_MASK;
+        /* Enabling TXFIFO_EMPTY while the FIFO is empty raises it at once. */
+        if (p->uart_int_ena & UART_TXFIFO_EMPTY_INT)
+            p->uart_int_raw |= UART_TXFIFO_EMPTY_INT;
+        uart0_intr_update(p);
+    } else if (off == 0x10) {       /* INT_CLR (W1TC) */
+        p->uart_int_raw &= ~(val & UART_INT_VALID_MASK);
+        /* TXFIFO_EMPTY is level-triggered.  It can only remain cleared while
+         * disabled; ESP-IDF deliberately disables it before acknowledging. */
+        if (p->uart_int_ena & UART_TXFIFO_EMPTY_INT)
+            p->uart_int_raw |= UART_TXFIFO_EMPTY_INT;
+        uart0_intr_update(p);
     } else {
         if (off / 4 < 64) p->uart_shadow[off / 4] = val;
     }
 }
 
 /* ---- GPIO ---- */
+
+/* Return the latched status bits routed to one INT_ENA destination. */
+static uint32_t gpio_routed_status(const esp32_periph_t *p, bool high,
+                                   uint32_t route) {
+    uint32_t status = high ? p->gpio.status1 : p->gpio.status;
+    uint32_t routed = 0;
+    int base = high ? 32 : 0;
+    int count = high ? 8 : 32;
+    for (int bit = 0; bit < count; bit++) {
+        uint32_t mask = 1u << bit;
+        if (!(status & mask)) continue;
+        uint32_t int_ena = (p->gpio.pin[base + bit] >> 13) & 0x1Fu;
+        if (int_ena & route) routed |= mask;
+    }
+    return routed;
+}
+
+/* An active level trigger immediately re-latches after a W1TC acknowledge.
+ * Edge-triggered bits remain latched until the guest clears them. */
+static void gpio_latch_active_levels(esp32_periph_t *p) {
+    for (int pin = 0; pin < 40; pin++) {
+        uint32_t cfg = p->gpio.pin[pin];
+        if (((cfg >> 13) & 0x1Fu) == 0) continue;
+        uint32_t int_type = (cfg >> 7) & 0x7u;
+        if (int_type != 4 && int_type != 5) continue;
+
+        uint32_t mask = pin < 32 ? (1u << pin) : (1u << (pin - 32));
+        uint32_t input = pin < 32 ? p->gpio.in : p->gpio.in1;
+        bool high = (input & mask) != 0;
+        if ((int_type == 4 && !high) || (int_type == 5 && high)) {
+            if (pin < 32) p->gpio.status |= mask;
+            else          p->gpio.status1 |= mask;
+        }
+    }
+}
+
+/* Raise/lower the GPIO normal and NMI sources for each CPU according to the
+ * latched status and each pin's INT_ENA routing field. */
+static void gpio_intr_update(esp32_periph_t *p) {
+    gpio_latch_active_levels(p);
+
+    bool app_intr = (gpio_routed_status(p, false, GPIO_APP_CPU_INTR_ENA) |
+                     gpio_routed_status(p, true, GPIO_APP_CPU_INTR_ENA)) != 0;
+    bool pro_intr = (gpio_routed_status(p, false, GPIO_PRO_CPU_INTR_ENA) |
+                     gpio_routed_status(p, true, GPIO_PRO_CPU_INTR_ENA)) != 0;
+    bool app_nmi = (gpio_routed_status(p, false, GPIO_APP_CPU_NMI_INTR_ENA) |
+                    gpio_routed_status(p, true, GPIO_APP_CPU_NMI_INTR_ENA)) != 0;
+    bool pro_nmi = (gpio_routed_status(p, false, GPIO_PRO_CPU_NMI_INTR_ENA) |
+                    gpio_routed_status(p, true, GPIO_PRO_CPU_NMI_INTR_ENA)) != 0;
+
+    uint32_t intr_mask = 1u << (GPIO_INTR_SOURCE % 32);
+    uint32_t nmi_mask = 1u << (GPIO_NMI_SOURCE % 32);
+    if (app_intr || pro_intr) p->pending_sources[0] |= intr_mask;
+    else                      p->pending_sources[0] &= ~intr_mask;
+    if (app_nmi || pro_nmi) p->pending_sources[0] |= nmi_mask;
+    else                    p->pending_sources[0] &= ~nmi_mask;
+
+    intr_matrix_update_source_core(p, 0, GPIO_INTR_SOURCE, pro_intr);
+    intr_matrix_update_source_core(p, 1, GPIO_INTR_SOURCE, app_intr);
+    intr_matrix_update_source_core(p, 0, GPIO_NMI_SOURCE, pro_nmi);
+    intr_matrix_update_source_core(p, 1, GPIO_NMI_SOURCE, app_nmi);
+}
 
 static uint32_t gpio_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
@@ -389,9 +525,26 @@ static uint32_t gpio_read(void *ctx, uint32_t addr) {
     case 0x03C: return p->gpio.in;          /* GPIO_IN_REG */
     case 0x040: return p->gpio.in1;         /* GPIO_IN1_REG */
     case 0x044: return p->gpio.status;      /* GPIO_STATUS_REG */
-    case 0x048: return 0;                   /* GPIO_STATUS_W1TS (write-only) */
-    case 0x04C: return 0;                   /* GPIO_STATUS_W1TC (write-only) */
     case 0x050: return p->gpio.status1;     /* GPIO_STATUS1_REG */
+    /* W1T registers read back the current status on real hardware; ISR
+     * dispatch code does read-modify-write acks on them. */
+    case 0x048: return p->gpio.status;      /* GPIO_STATUS_W1TS */
+    case 0x04C: return p->gpio.status;      /* GPIO_STATUS_W1TC */
+    case 0x054: return p->gpio.status1;     /* GPIO_STATUS1_W1TS */
+    case 0x058: return p->gpio.status1;     /* GPIO_STATUS1_W1TC */
+    /* ESP32 per-destination interrupt status mirrors.  Unlike the S2/S3,
+     * the original ESP32 groups all low-pin destinations first, followed
+     * by the GPIO32-39 mirrors at 0x74-0x84. */
+    case 0x060: return gpio_routed_status(p, false, GPIO_APP_CPU_INTR_ENA);
+    case 0x064: return gpio_routed_status(p, false, GPIO_APP_CPU_NMI_INTR_ENA);
+    case 0x068: return gpio_routed_status(p, false, GPIO_PRO_CPU_INTR_ENA);
+    case 0x06C: return gpio_routed_status(p, false, GPIO_PRO_CPU_NMI_INTR_ENA);
+    case 0x070: return gpio_routed_status(p, false, GPIO_SDIO_EXT_INTR_ENA);
+    case 0x074: return gpio_routed_status(p, true, GPIO_APP_CPU_INTR_ENA);
+    case 0x078: return gpio_routed_status(p, true, GPIO_APP_CPU_NMI_INTR_ENA);
+    case 0x07C: return gpio_routed_status(p, true, GPIO_PRO_CPU_INTR_ENA);
+    case 0x080: return gpio_routed_status(p, true, GPIO_PRO_CPU_NMI_INTR_ENA);
+    case 0x084: return gpio_routed_status(p, true, GPIO_SDIO_EXT_INTR_ENA);
     default: break;
     }
 
@@ -423,6 +576,8 @@ static void gpio_emit_changed(uint32_t prev, uint32_t now, int pin_base) {
     while (diff) {
         int bit = __builtin_ctz(diff);
         diff &= ~(1u << bit);
+        if (getenv("FLEXE_GPIODBG"))
+            fprintf(stderr, "[GPIO] pin%d -> %d\n", pin_base + bit, (now >> bit) & 1u);
         sbx_event_t ev = { .kind = SBX_EV_GPIO_OUT, .cycle = 0 };
         ev.gpio_out.pin = (uint8_t)(pin_base + bit);
         ev.gpio_out.level = (now >> bit) & 1u;
@@ -452,15 +607,22 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     case 0x044: p->gpio.status = val; break;      /* GPIO_STATUS_REG */
     case 0x048: p->gpio.status |= val; break;     /* GPIO_STATUS_W1TS */
     case 0x04C: p->gpio.status &= ~val; break;    /* GPIO_STATUS_W1TC */
-    case 0x050: p->gpio.status1 = val; break;     /* GPIO_STATUS1_REG */
+    case 0x050: p->gpio.status1 = val & 0xFFu; break;  /* GPIO_STATUS1_REG */
+    case 0x054: p->gpio.status1 |= val & 0xFFu; break; /* GPIO_STATUS1_W1TS */
+    case 0x058: p->gpio.status1 &= ~(val & 0xFFu); break; /* GPIO_STATUS1_W1TC */
     default: break;
     }
+    /* Interrupt source line follows the latched status registers */
+    if (off >= 0x044 && off <= 0x058)
+        gpio_intr_update(p);
 
     /* GPIO_PINn_REG */
     if (off >= 0x088 && off < 0x088 + 40 * 4) {
         int n = (int)(off - 0x088) / 4;
         p->gpio.pin[n] = val;
-        return;    }
+        gpio_intr_update(p);
+        return;
+    }
 
     /* GPIO_FUNC_IN_SEL_CFG_REG */
     if (off >= 0x130 && off < 0x130 + 256 * 4) {
@@ -718,6 +880,8 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
 #define SPI_CMD_FLASH_WRSR (1u << 26)
 #define SPI_CMD_FLASH_RDSR (1u << 27)
 #define SPI_CMD_FLASH_RDID (1u << 28)
+#define SPI_CMD_FLASH_WRDI (1u << 29)
+#define SPI_CMD_FLASH_WREN (1u << 30)
 #define SPI_CMD_FLASH_READ (1u << 31)
 
 /* SPI_USER_REG bits */
@@ -727,6 +891,13 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
 
 #define EMU_FLASH_SIZE   (4 * 1024 * 1024)
 
+/* Status-register bits managed by the flash itself.  In particular, ESP-IDF
+ * verifies every WREN/WRDI by reading SR1.WEL back before it attempts a
+ * program or erase.  Treating those commands as no-ops makes the generic
+ * flash driver return ESP_ERR_NOT_FOUND even though the chip was detected. */
+#define FLASH_SR_WIP       (1u << 0)
+#define FLASH_SR_WEL       (1u << 1)
+
 /* JEDEC ID of a GigaDevice GD25Q32 (4 MB) — matches ESP-IDF's GD chip
  * table (mfg 0xC8, type 0x40, capacity 0x16). First byte on the wire is
  * the manufacturer ID, so it sits in the low byte of W0. */
@@ -734,8 +905,15 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
 
 static uint32_t spi_flash_offset(const spi_state_t *s) {
     int bitlen = (int)((s->user1 >> 26) & 0x3F) + 1;
-    if (bitlen >= 32) return s->addr;
-    return s->addr >> (32 - bitlen);
+    /* ESP32 appends dual/quad-I/O mode bits to USER1.USR_ADDR_BITLEN.  The
+     * HAL still left-aligns only the whole-byte (24- or 32-bit) flash address
+     * in SPI_ADDR, then leaves the low padding bits high.  Round the wire
+     * phase down to its address bytes so those mode bits do not become a
+     * spurious low address nibble (for example 0x3100FC -> 0x3100FCF). */
+    int address_bits = bitlen & ~7;
+    if (address_bits <= 0) return 0;
+    if (address_bits >= 32) return s->addr;
+    return s->addr >> (32 - address_bits);
 }
 
 static int spi_data_bytes(uint32_t dlen_reg) {
@@ -752,10 +930,11 @@ static void spi_flash_read_data(esp32_periph_t *p, spi_state_t *s,
         if ((uint32_t)bytes > avail) bytes = (int)avail;
         memcpy(s->w, p->mem->flash_data + off, (size_t)bytes);
     }
+    const uint8_t *dst = (const uint8_t *)s->w;
     if (getenv("FLEXE_SPIDBG") && off < 0x20000) {
         fprintf(stderr, "[SPIRD] off=0x%X bytes=%d w0=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                off, bytes, s->w[0], s->w[1], s->w[2], s->w[3],
-                s->w[4], s->w[5], s->w[6], s->w[7]);
+                off, bytes, dst[0], dst[1], dst[2], dst[3],
+                dst[4], dst[5], dst[6], dst[7]);
     }
 }
 
@@ -795,24 +974,59 @@ static void spi_flash_execute(esp32_periph_t *p, spi_state_t *s, uint32_t cmd) {
         case 0x35: s->w[0] = s->sr[1]; break;   /* RDSR2 */
         case 0x15: s->w[0] = s->sr[2]; break;   /* RDSR3 */
         case 0x01:                              /* WRSR */
-            s->sr[0] = (uint8_t)(s->w[0] & 0xFF);
+            if (!(s->sr[0] & FLASH_SR_WEL)) break;
+            s->sr[0] = (uint8_t)((s->sr[0] & (FLASH_SR_WIP | FLASH_SR_WEL)) |
+                                 (s->w[0] & ~(FLASH_SR_WIP | FLASH_SR_WEL)));
             if (mosi >= 2) s->sr[1] = (uint8_t)((s->w[0] >> 8) & 0xFF);
+            s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
             break;
-        case 0x31: s->sr[1] = (uint8_t)(s->w[0] & 0xFF); break;  /* WRSR2 */
-        case 0x11: s->sr[2] = (uint8_t)(s->w[0] & 0xFF); break;  /* WRSR3 */
-        case 0x06: case 0x04: break;            /* WREN / WRDI */
+        case 0x31:                              /* WRSR2 */
+            if (s->sr[0] & FLASH_SR_WEL) {
+                s->sr[1] = (uint8_t)(s->w[0] & 0xFF);
+                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+            }
+            break;
+        case 0x11:                              /* WRSR3 */
+            if (s->sr[0] & FLASH_SR_WEL) {
+                s->sr[2] = (uint8_t)(s->w[0] & 0xFF);
+                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+            }
+            break;
+        case 0x06: s->sr[0] |= FLASH_SR_WEL; break;   /* WREN */
+        case 0x04: s->sr[0] &= (uint8_t)~FLASH_SR_WEL; break; /* WRDI */
         case 0x03: case 0x0B: case 0x3B:        /* READ / FAST_READ / DUAL */
         case 0x6B: case 0xBB: case 0xEB:        /* QUAD variants */
             spi_flash_read_data(p, s, off, miso);
             break;
         case 0x02: case 0x32:                   /* PP / quad PP */
-            spi_flash_program(p, s, off, mosi);
+            if (s->sr[0] & FLASH_SR_WEL) {
+                spi_flash_program(p, s, off, mosi);
+                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+            }
             break;
-        case 0x20: spi_flash_erase(p, off & ~0xFFFu, 0x1000);  break; /* SE */
-        case 0x52: spi_flash_erase(p, off & ~0x7FFFu, 0x8000); break; /* BE32 */
-        case 0xD8: spi_flash_erase(p, off & ~0xFFFFu, 0x10000); break; /* BE64 */
+        case 0x20:                              /* SE */
+            if (s->sr[0] & FLASH_SR_WEL) {
+                spi_flash_erase(p, off & ~0xFFFu, 0x1000);
+                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+            }
+            break;
+        case 0x52:                              /* BE32 */
+            if (s->sr[0] & FLASH_SR_WEL) {
+                spi_flash_erase(p, off & ~0x7FFFu, 0x8000);
+                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+            }
+            break;
+        case 0xD8:                              /* BE64 */
+            if (s->sr[0] & FLASH_SR_WEL) {
+                spi_flash_erase(p, off & ~0xFFFFu, 0x10000);
+                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+            }
+            break;
         case 0x60: case 0xC7:                   /* chip erase */
-            spi_flash_erase(p, 0, EMU_FLASH_SIZE);
+            if (s->sr[0] & FLASH_SR_WEL) {
+                spi_flash_erase(p, 0, EMU_FLASH_SIZE);
+                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+            }
             break;
         default: break;
         }
@@ -823,17 +1037,32 @@ static void spi_flash_execute(esp32_periph_t *p, spi_state_t *s, uint32_t cmd) {
      * but handle them anyway for unhooked paths) */
     if (cmd & SPI_CMD_FLASH_RDID) s->w[0] = EMU_FLASH_JEDEC_ID;
     if (cmd & SPI_CMD_FLASH_RDSR) s->rd_status = s->sr[0] | (s->sr[1] << 8) | (s->sr[2] << 16);
-    if (cmd & SPI_CMD_FLASH_WRSR) {
-        s->sr[0] = (uint8_t)(s->w[0] & 0xFF);
+    if (cmd & SPI_CMD_FLASH_WRDI) s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+    if (cmd & SPI_CMD_FLASH_WREN) s->sr[0] |= FLASH_SR_WEL;
+    if ((cmd & SPI_CMD_FLASH_WRSR) && (s->sr[0] & FLASH_SR_WEL)) {
+        s->sr[0] = (uint8_t)((s->sr[0] & (FLASH_SR_WIP | FLASH_SR_WEL)) |
+                             (s->w[0] & ~(FLASH_SR_WIP | FLASH_SR_WEL)));
         s->sr[1] = (uint8_t)((s->w[0] >> 8) & 0xFF);
+        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
     }
     if (cmd & SPI_CMD_FLASH_READ)
         spi_flash_read_data(p, s, s->addr, spi_data_bytes(s->miso_dlen));
-    if (cmd & SPI_CMD_FLASH_PP)
+    if ((cmd & SPI_CMD_FLASH_PP) && (s->sr[0] & FLASH_SR_WEL)) {
         spi_flash_program(p, s, s->addr, spi_data_bytes(s->mosi_dlen));
-    if (cmd & SPI_CMD_FLASH_SE) spi_flash_erase(p, s->addr & ~0xFFFu, 0x1000);
-    if (cmd & SPI_CMD_FLASH_BE) spi_flash_erase(p, s->addr & ~0xFFFFu, 0x10000);
-    if (cmd & SPI_CMD_FLASH_CE) spi_flash_erase(p, 0, EMU_FLASH_SIZE);
+        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+    }
+    if ((cmd & SPI_CMD_FLASH_SE) && (s->sr[0] & FLASH_SR_WEL)) {
+        spi_flash_erase(p, s->addr & ~0xFFFu, 0x1000);
+        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+    }
+    if ((cmd & SPI_CMD_FLASH_BE) && (s->sr[0] & FLASH_SR_WEL)) {
+        spi_flash_erase(p, s->addr & ~0xFFFFu, 0x10000);
+        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+    }
+    if ((cmd & SPI_CMD_FLASH_CE) && (s->sr[0] & FLASH_SR_WEL)) {
+        spi_flash_erase(p, 0, EMU_FLASH_SIZE);
+        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
+    }
 }
 
 static uint32_t spi_read(void *ctx, uint32_t addr) {
@@ -907,7 +1136,9 @@ static void uart_other_write(void *ctx, uint32_t addr, uint32_t val) {
 /* ---- WDEV (WiFi device — RNG register) ---- */
 
 static uint32_t wdev_read(void *ctx, uint32_t addr) {
-    (void)ctx;
+    esp32_periph_t *p = ctx;
+    if (addr == 0x3FF73D24u)
+        return p->wifi_mac_init_ctrl;
     if (addr == 0x3FF75144u) {
         /* WDEV_RND_REG — return random data */
         static uint64_t rng_state = 0x12345678ABCDEF01ULL;
@@ -921,7 +1152,13 @@ static uint32_t wdev_read(void *ctx, uint32_t addr) {
 }
 
 static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
-    (void)ctx; (void)addr; (void)val;
+    esp32_periph_t *p = ctx;
+    if (addr == 0x3FF73D24u) {
+        /* hal_init sets bit 1, then spins until the MAC reports ready in
+         * bit 0.  Hardware completes this short reset synchronously from
+         * the guest's perspective, so expose ready immediately. */
+        p->wifi_mac_init_ctrl = val | ((val & (1u << 1)) ? 1u : 0u);
+    }
 }
 
 /* ---- Default handler (unhandled peripherals) ---- */
@@ -948,6 +1185,12 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     if (!p) return NULL;
     p->mem = mem;
     p->app_cpu_in_reset = true;
+
+    /* Strapping-pin idle levels: GPIO0/5/15 have pull-ups enabled at reset
+     * (GPIO2/12 pull-downs read low). Firmware reads GPIO_IN for buttons
+     * tied to these pins (e.g. Marauder's BOOT-button on GPIO0) — leaving
+     * them low looks like a permanently held button. */
+    p->gpio.in = (1u << 0) | (1u << 5) | (1u << 15);
 
     /* Initialize interrupt matrix: all lines disabled (source 16 = none) */
     memset(p->intr_matrix, 16, sizeof(p->intr_matrix));
@@ -1008,7 +1251,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* SYSCON */
     mem_register_mmio(mem, (int)PAGE_OF(SYSCON_BASE), syscon_read, syscon_write, p);
 
-    /* WDEV (WiFi device — RNG register at 0x3FF75144) */
+    /* WiFi MAC/BB reset handshake and WDEV RNG. */
+    mem_register_mmio(mem, (int)PAGE_OF(WIFI_MAC_BASE), wdev_read, wdev_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(WDEV_BASE), wdev_read, wdev_write, p);
 
     return p;
@@ -1096,11 +1340,45 @@ uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel) {
 
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
     if (!p || pin < 0 || pin > 39) return;
-    if (pin < 32) {
-        uint32_t mask = 1u << pin;
-        if (level) p->gpio.in  |=  mask; else p->gpio.in  &= ~mask;
-    } else {
-        uint32_t mask = 1u << (pin - 32);
-        if (level) p->gpio.in1 |=  mask; else p->gpio.in1 &= ~mask;
+    uint32_t mask = (pin < 32) ? (1u << pin) : (1u << (pin - 32));
+    uint32_t *in = (pin < 32) ? &p->gpio.in : &p->gpio.in1;
+    int old = (*in & mask) ? 1 : 0;
+    int now = level ? 1 : 0;
+    if (now) *in |= mask; else *in &= ~mask;
+    if (now == old) return;
+
+    /* Edge/level-triggered pin interrupt, per GPIO_PINn_REG config:
+     * INT_TYPE [9:7]: 1=rise 2=fall 3=any 4=low 5=high; INT_ENA [17:13]. */
+    uint32_t cfg = p->gpio.pin[pin];
+    uint32_t int_type = (cfg >> 7) & 0x7;
+    bool fire = false;
+    if (cfg & (0x1Fu << 13)) {
+        switch (int_type) {
+        case 1: fire = (now == 1); break;
+        case 2: fire = (now == 0); break;
+        case 3: fire = true; break;
+        case 4: fire = (now == 0); break;
+        case 5: fire = (now == 1); break;
+        default: break;
+        }
+    }
+    if (fire) {
+        if (pin < 32) p->gpio.status  |= mask;
+        else          p->gpio.status1 |= mask;
+        if (getenv("FLEXE_GPIODBG"))
+            fprintf(stderr, "[GPIO] pin%d intr (type=%u ena=0x%X level=%d)\n",
+                    pin, int_type, (cfg >> 13) & 0x1Fu, now);
+    }
+    gpio_intr_update(p);
+    if (fire && getenv("FLEXE_GPIODBG")) {
+        fprintf(stderr,
+                "[GPIO] delivery cpu0=int:%08X ena:%08X ps:%08X "
+                "cpu1=int:%08X ena:%08X ps:%08X\n",
+                p->cpu[0] ? p->cpu[0]->interrupt : 0,
+                p->cpu[0] ? p->cpu[0]->intenable : 0,
+                p->cpu[0] ? p->cpu[0]->ps : 0,
+                p->cpu[1] ? p->cpu[1]->interrupt : 0,
+                p->cpu[1] ? p->cpu[1]->intenable : 0,
+                p->cpu[1] ? p->cpu[1]->ps : 0);
     }
 }

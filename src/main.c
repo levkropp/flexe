@@ -625,6 +625,11 @@ static volatile int g_touch_x = 0;
 static volatile int g_touch_y = 0;
 static volatile int g_touch_pressed = 0;
 
+/* ESP32-2432S028R XPT2046 PENIRQ. The controller holds this active-low
+ * while pressed; raw-SPI touch drivers use its falling edge to decide when
+ * to issue coordinate transactions. */
+#define CYD_TOUCH_IRQ_PIN 36
+
 __attribute__((unused))
 static int sandbox_touch_state_fn(int *x, int *y, void *ctx) {
     (void)ctx;
@@ -686,6 +691,7 @@ static void sandbox_process_line(esp32_periph_t *periph, const char *line) {
         g_touch_x = (int)x;
         g_touch_y = (int)y;
         g_touch_pressed = (int)pressed;
+        periph_gpio_set_input(periph, CYD_TOUCH_IRQ_PIN, pressed ? 0 : 1);
     } else if (strstr(line, "\"adc_in\"")) {
         long ch = -1, raw = 0;
         if (json_int_field(line, "ch", &ch) &&
@@ -1076,6 +1082,8 @@ int main(int argc, char *argv[]) {
         sbx_events_set_sink(sbx_json_sink, NULL);
         setvbuf(stdout, NULL, _IOLBF, 0);
         sandbox_stdin_init();
+        /* XPT2046 PENIRQ idles high so the first press is a falling edge. */
+        periph_gpio_set_input(periph, CYD_TOUCH_IRQ_PIN, 1);
     }
 
     /* Wire up AOT dispatch on the cpu if --aot was passed. The lookup

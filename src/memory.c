@@ -93,6 +93,13 @@ xtensa_mem_t *mem_create(void) {
         return NULL;
     }
 
+    /* NOR flash powers up erased outside the bytes supplied by an image.
+     * Factory images are commonly sparse/truncated before later data
+     * partitions (SPIFFS, coredump); leaving that tail calloc-zeroed makes
+     * programming impossible because NOR writes can only clear bits. */
+    memset(mem->flash_data, 0xFF, FLASH_SIZE);
+    memset(mem->flash_insn, 0xFF, FLASH_SIZE);
+
     page_table_init(mem);
 
     /* Pre-populate the ESP32 ROM spiflash chip struct (ROM BSS, fixed

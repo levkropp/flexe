@@ -51,6 +51,13 @@ TEST(mem_rw32_flash_data) {
     mem_destroy(mem);
 }
 
+TEST(mem_flash_erased_at_reset) {
+    xtensa_mem_t *mem = mem_create();
+    ASSERT_EQ(mem_read32(mem, 0x3F400000), 0xFFFFFFFFu);
+    ASSERT_EQ(mem_read32(mem, 0x400C2000), 0xFFFFFFFFu);
+    mem_destroy(mem);
+}
+
 TEST(mem_flash_alias) {
     xtensa_mem_t *mem = mem_create();
     /* Flash data and insn buses use separate backing arrays (like real MMU pages) */
@@ -138,6 +145,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw32_sram_data);
     RUN_TEST(mem_sram_alias);
     RUN_TEST(mem_rw32_flash_data);
+    RUN_TEST(mem_flash_erased_at_reset);
     RUN_TEST(mem_flash_alias);
     RUN_TEST(mem_rw32_rtc_fast);
     RUN_TEST(mem_rw32_rtc_slow);
