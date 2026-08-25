@@ -21,6 +21,12 @@ static uint32_t get_fr_bits(xtensa_cpu_t *cpu, int n) {
     uint32_t b; memcpy(&b, &cpu->fr[n], 4); return b;
 }
 
+static void step_fp(xtensa_cpu_t *cpu, uint32_t insn) {
+    cpu->pc = BASE;
+    put_insn3(cpu, BASE, insn);
+    xtensa_step(cpu);
+}
+
 /* ===== Basic Arithmetic ===== */
 
 TEST(exec_add_s_basic) {
@@ -77,6 +83,18 @@ TEST(exec_msub_s_basic) {
     put_insn3(&cpu, BASE, rrr(5, 10, 3, 1, 2));
     xtensa_step(&cpu);
     ASSERT_EQ(get_fr_bits(&cpu, 3), f2b(4.0f));
+    teardown(&cpu);
+}
+
+TEST(exec_maddn_s_basic) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    set_fr(&cpu, 3, 1.0f);
+    set_fr(&cpu, 1, 2.0f);
+    set_fr(&cpu, 2, 3.0f);
+    /* MADDN.S f3, f1, f2: f3 = 1.0 + 2.0*3.0 = 7.0 */
+    put_insn3(&cpu, BASE, rrr(6, 10, 3, 1, 2));
+    xtensa_step(&cpu);
+    ASSERT_EQ(get_fr_bits(&cpu, 3), f2b(7.0f));
     teardown(&cpu);
 }
 
@@ -522,6 +540,56 @@ TEST(exec_const_s) {
     teardown(&cpu);
 }
 
+TEST(exec_libgcc_divsf3_sequence) {
+    xtensa_cpu_t cpu; setup(&cpu);
+
+    /*
+     * ESP32 libgcc's complete __divsf3 sequence, with the same operands used
+     * by Marauder when converting MicroNMEA's fixed-point latitude to degrees.
+     */
+    set_fr(&cpu, 1, 48125000.0f);
+    set_fr(&cpu, 2, 1000000.0f);
+    step_fp(&cpu, rrr(15, 10, 3, 2, 7));  /* div0.s   f3, f2 */
+    step_fp(&cpu, rrr(15, 10, 4, 2, 11)); /* nexp01.s f4, f2 */
+    step_fp(&cpu, rrr(15, 10, 5, 1, 3));  /* const.s  f5, 1 */
+    step_fp(&cpu, rrr(6, 10, 5, 4, 3));   /* maddn.s  f5, f4, f3 */
+    step_fp(&cpu, rrr(15, 10, 6, 3, 0));  /* mov.s    f6, f3 */
+    step_fp(&cpu, rrr(15, 10, 7, 2, 0));  /* mov.s    f7, f2 */
+    step_fp(&cpu, rrr(15, 10, 2, 1, 11)); /* nexp01.s f2, f1 */
+    step_fp(&cpu, rrr(6, 10, 6, 5, 6));   /* maddn.s  f6, f5, f6 */
+    step_fp(&cpu, rrr(15, 10, 5, 1, 3));  /* const.s  f5, 1 */
+    step_fp(&cpu, rrr(15, 10, 0, 0, 3));  /* const.s  f0, 0 */
+    step_fp(&cpu, rrr(15, 10, 8, 2, 6));  /* neg.s    f8, f2 */
+    step_fp(&cpu, rrr(6, 10, 5, 4, 6));   /* maddn.s  f5, f4, f6 */
+    step_fp(&cpu, rrr(6, 10, 0, 8, 3));   /* maddn.s  f0, f8, f3 */
+    step_fp(&cpu, rrr(15, 10, 7, 1, 13)); /* mkdadj.s f7, f1 */
+    step_fp(&cpu, rrr(6, 10, 6, 5, 6));   /* maddn.s  f6, f5, f6 */
+    step_fp(&cpu, rrr(6, 10, 8, 4, 0));   /* maddn.s  f8, f4, f0 */
+    step_fp(&cpu, rrr(15, 10, 3, 1, 3));  /* const.s  f3, 1 */
+    step_fp(&cpu, rrr(6, 10, 3, 4, 6));   /* maddn.s  f3, f4, f6 */
+    step_fp(&cpu, rrr(6, 10, 0, 8, 6));   /* maddn.s  f0, f8, f6 */
+    step_fp(&cpu, rrr(15, 10, 2, 2, 6));  /* neg.s    f2, f2 */
+    step_fp(&cpu, rrr(6, 10, 6, 3, 6));   /* maddn.s  f6, f3, f6 */
+    step_fp(&cpu, rrr(6, 10, 2, 4, 0));   /* maddn.s  f2, f4, f0 */
+    step_fp(&cpu, rrr(15, 10, 0, 7, 15)); /* addexpm.s f0, f7 */
+    step_fp(&cpu, rrr(15, 10, 6, 7, 14)); /* addexp.s  f6, f7 */
+    step_fp(&cpu, rrr(7, 10, 0, 2, 6));   /* divn.s    f0, f2, f6 */
+
+    ASSERT_EQ(get_fr_bits(&cpu, 0), f2b(48.125f));
+    teardown(&cpu);
+}
+
+TEST(exec_mksadj_sequence_result) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    set_fr(&cpu, 1, 81.0f);
+    set_fr(&cpu, 7, 123.0f);
+    step_fp(&cpu, rrr(15, 10, 7, 1, 12)); /* mksadj.s f7, f1 */
+    step_fp(&cpu, rrr(15, 10, 0, 7, 15)); /* addexpm.s f0, f7 */
+    step_fp(&cpu, rrr(7, 10, 0, 2, 6));   /* divn.s f0, f2, f6 */
+    ASSERT_EQ(get_fr_bits(&cpu, 0), f2b(9.0f));
+    teardown(&cpu);
+}
+
 /* ===== Disassembly Spot Checks ===== */
 
 TEST(disasm_add_s) {
@@ -559,6 +627,7 @@ void run_fp_arith_tests(void) {
     RUN_TEST(exec_mul_s_basic);
     RUN_TEST(exec_madd_s_basic);
     RUN_TEST(exec_msub_s_basic);
+    RUN_TEST(exec_maddn_s_basic);
     RUN_TEST(exec_add_s_negative);
     RUN_TEST(exec_mul_s_zero);
     /* Data movement */
@@ -604,6 +673,8 @@ void run_fp_arith_tests(void) {
     RUN_TEST(exec_recip0_s);
     RUN_TEST(exec_sqrt0_s);
     RUN_TEST(exec_const_s);
+    RUN_TEST(exec_libgcc_divsf3_sequence);
+    RUN_TEST(exec_mksadj_sequence_result);
     /* Disassembly */
     RUN_TEST(disasm_add_s);
     RUN_TEST(disasm_oeq_s);

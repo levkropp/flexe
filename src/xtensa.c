@@ -905,12 +905,11 @@ static void exec_fp0(xtensa_cpu_t *cpu, uint32_t insn) {
     case 5: /* MSUB.S */
         cpu->fr[r] = cpu->fr[r] - (cpu->fr[s] * cpu->fr[t]);
         break;
-    case 6: /* MADDN.S (same as MSUB.S, forces round-to-nearest) */
-        cpu->fr[r] = cpu->fr[r] - (cpu->fr[s] * cpu->fr[t]);
+    case 6: /* MADDN.S: fused multiply-add, forced round-to-nearest */
+        cpu->fr[r] = fmaf(cpu->fr[s], cpu->fr[t], cpu->fr[r]);
         break;
-    case 7: { /* DIVN.S: fr[r] = fr[s] * fr[t] */
-        cpu->fr[r] = cpu->fr[s] * cpu->fr[t];
-    } break;
+    case 7: /* DIVN.S: final marker in the collapsed divide sequence */
+        break;
     case 8: { /* ROUND.S: ar[t] = (int32_t)roundf(fr[s] * 2^r) */
         float val = cpu->fr[s];
         if (r) val = val * (float)(1u << r);
@@ -997,23 +996,21 @@ static void exec_fp0(xtensa_cpu_t *cpu, uint32_t insn) {
             bits = (bits & 0x807FFFFFu) | (127u << 23);
             cpu->fr[r] = bits_to_float(bits);
         } break;
-        case 12: { /* MKSADJ.S: make sqrt exponent adjustment */
-            uint32_t bits = float_to_bits(cpu->fr[s]);
-            int exp = (int)((bits >> 23) & 0xFF);
-            int adj = 253 - exp; /* for sqrt: (253 - exp) */
-            if ((exp & 1) == 0) adj--; /* even exponent */
-            uint32_t result = ((uint32_t)(adj & 0xFF) << 23);
-            if (bits & 0x80000000u) result |= 0x80000000u;
-            cpu->fr[r] = bits_to_float(result);
-        } break;
-        case 13: { /* MKDADJ.S: make div exponent adjustment */
-            uint32_t bits = float_to_bits(cpu->fr[s]);
-            int exp = (int)((bits >> 23) & 0xFF);
-            int adj = 253 - exp;
-            uint32_t result = ((uint32_t)(adj & 0xFF) << 23);
-            if (bits & 0x80000000u) result |= 0x80000000u;
-            cpu->fr[r] = bits_to_float(result);
-        } break;
+        /*
+         * Xtensa emits DIV.S and SQRT.S as prescribed helper-instruction
+         * sequences.  Preserve their architectural result using the same
+         * sequence collapse used by QEMU: MK* computes the exact operation,
+         * ADDEXPM forwards it, and the trailing DIVN is a no-op.  This also
+         * handles IEEE-754 signs, infinities, NaNs and subnormals through the
+         * host single-precision operation instead of exposing the opaque
+         * intermediate exponent-adjust encoding.
+         */
+        case 12: /* MKSADJ.S: materialize the square-root result */
+            cpu->fr[r] = sqrtf(cpu->fr[s]);
+            break;
+        case 13: /* MKDADJ.S: materialize dividend / saved divisor */
+            cpu->fr[r] = cpu->fr[s] / cpu->fr[r];
+            break;
         case 14: { /* ADDEXP.S: add exponent of fr[s] to fr[r], XOR signs */
             uint32_t rbits = float_to_bits(cpu->fr[r]);
             uint32_t sbits = float_to_bits(cpu->fr[s]);
@@ -1026,18 +1023,9 @@ static void exec_fp0(xtensa_cpu_t *cpu, uint32_t insn) {
             rbits ^= (sbits & 0x80000000u);
             cpu->fr[r] = bits_to_float(rbits);
         } break;
-        case 15: { /* ADDEXPM.S: add exponent from mantissa bits of fr[s] */
-            uint32_t rbits = float_to_bits(cpu->fr[r]);
-            uint32_t sbits = float_to_bits(cpu->fr[s]);
-            int rexp = (int)((rbits >> 23) & 0xFF);
-            int mexp = (int)((sbits >> 14) & 0xFF);
-            int newexp = rexp + mexp - 127;
-            if (newexp < 0) newexp = 0;
-            if (newexp > 255) newexp = 255;
-            rbits = (rbits & 0x807FFFFFu) | ((uint32_t)(newexp & 0xFF) << 23);
-            rbits ^= ((sbits & (1u << 22)) << 9); /* XOR sign with mantissa bit 22 */
-            cpu->fr[r] = bits_to_float(rbits);
-        } break;
+        case 15: /* ADDEXPM.S: forward collapsed DIV.S/SQRT.S result */
+            cpu->fr[r] = cpu->fr[s];
+            break;
         default: break;
         }
         break;

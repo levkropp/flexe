@@ -80,6 +80,50 @@ TEST(uart_tx_capture) {
     mem_destroy(mem);
 }
 
+typedef struct {
+    int count;
+    uint8_t last;
+} uart_test_callback_t;
+
+static void uart_test_capture(void *ctx, uint8_t byte) {
+    uart_test_callback_t *capture = ctx;
+    capture->count++;
+    capture->last = byte;
+}
+
+TEST(uart_controllers_are_independent) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    uart_test_callback_t uart1_capture = {0};
+    uart_test_callback_t uart2_capture = {0};
+    periph_set_uart_callback_num(p, 1, uart_test_capture, &uart1_capture);
+    periph_set_uart_callback_num(p, 2, uart_test_capture, &uart2_capture);
+
+    /* Exercise both the APB register and ESP-IDF's AHB FIFO alias. */
+    mem_write32(mem, 0x3FF50000u, '1');
+    mem_write32(mem, 0x6002E000u, '2');
+
+    ASSERT_EQ(periph_uart_tx_count(p), 0);
+    ASSERT_EQ(periph_uart_tx_count_num(p, 1), 1);
+    ASSERT_EQ(periph_uart_tx_count_num(p, 2), 1);
+    ASSERT_EQ(periph_uart_tx_buf_num(p, 1)[0], '1');
+    ASSERT_EQ(periph_uart_tx_buf_num(p, 2)[0], '2');
+    ASSERT_EQ(uart1_capture.count, 1);
+    ASSERT_EQ(uart1_capture.last, '1');
+    ASSERT_EQ(uart2_capture.count, 1);
+    ASSERT_EQ(uart2_capture.last, '2');
+
+    /* Configuration shadows are per-controller as well. */
+    mem_write32(mem, 0x3FF50014u, 0x1111u);
+    mem_write32(mem, 0x3FF6E014u, 0x2222u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF50014u), 0x1111u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF6E014u), 0x2222u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF40014u), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(uart_status_tx_ready) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -190,6 +234,41 @@ TEST(uart_rx_timeout_interrupt) {
     mem_write32(mem, 0x3FF40010, 1u << 8);
     ASSERT_EQ(mem_read32(mem, 0x3FF40008), 0u);
     ASSERT_EQ(cpu0.interrupt & (1u << 5), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(uart2_rx_fifo_and_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 6, 36); /* UART2 -> CPU interrupt 6 */
+
+    const uint32_t base = 0x3FF6E000u;
+    mem_write32(mem, base + 0x24, (1u << 31) | (10u << 24) | 2u);
+    mem_write32(mem, base + 0x0C,
+                (1u << 0) | (1u << 8));
+    static const uint8_t nmea[] = "$GPRMC\r\n";
+    ASSERT_EQ(periph_uart_rx_inject_num(p, 2, nmea, sizeof(nmea) - 1),
+              sizeof(nmea) - 1);
+    ASSERT_EQ(periph_uart_rx_pending_num(p, 2), sizeof(nmea) - 1);
+    ASSERT_EQ(periph_uart_rx_pending(p), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x1C) & 0xFFu,
+              sizeof(nmea) - 1);
+    ASSERT_EQ(mem_read32(mem, base + 0x08) & ((1u << 0) | (1u << 8)),
+              (1u << 0) | (1u << 8));
+    ASSERT_EQ(cpu0.interrupt & (1u << 6), 1u << 6);
+    ASSERT_EQ(mem_read32(mem, base), '$');
+    ASSERT_EQ(periph_uart_rx_pending_num(p, 2), sizeof(nmea) - 2);
+
+    while (periph_uart_rx_pending_num(p, 2) != 0)
+        (void)mem_read32(mem, base);
+    mem_write32(mem, base + 0x10, (1u << 0) | (1u << 8));
+    ASSERT_EQ(mem_read32(mem, base + 0x08), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 6), 0u);
 
     periph_destroy(p);
     mem_destroy(mem);
@@ -968,11 +1047,13 @@ static void run_peripheral_tests(void) {
     RUN_TEST(mmio_range_registration);
     RUN_TEST(mmio_no_handler_returns_zero);
     RUN_TEST(uart_tx_capture);
+    RUN_TEST(uart_controllers_are_independent);
     RUN_TEST(uart_status_tx_ready);
     RUN_TEST(uart_tx_empty_interrupt);
     RUN_TEST(uart_tx_done_interrupt);
     RUN_TEST(uart_rx_fifo_injection);
     RUN_TEST(uart_rx_timeout_interrupt);
+    RUN_TEST(uart2_rx_fifo_and_interrupt);
     RUN_TEST(spi_flash_write_enable_latch);
     RUN_TEST(spi_flash_program_erase_require_write_enable);
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);

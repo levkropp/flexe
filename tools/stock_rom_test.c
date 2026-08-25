@@ -58,9 +58,24 @@ typedef struct {
 
 typedef struct {
     uint64_t count;
-    char log[4096];
+    char log[8192];
     size_t log_len;
 } uart_state_t;
+
+typedef struct {
+    bool enabled;
+    uint64_t next_cycle;
+    uint64_t sentences;
+    uint64_t bytes;
+    uint64_t fifo_busy;
+} gps_feed_state_t;
+
+/* A standards-conforming GGA fix for Marauder's production MicroNMEA parser.
+ * 200M cycles is roughly 0.8-1.0 seconds on the supported ESP32 clock modes,
+ * matching an ordinary external GPS receiver without flooding its UART ring. */
+static const uint8_t marauder_gps_sentence[] =
+    "$GPGGA,123519.00,4807.5000,N,01131.0000,E,1,08,0.9,545.4,M,46.9,M,,*67\r\n";
+static gps_feed_state_t marauder_gps_feed;
 
 typedef struct {
     int tcp_fd;
@@ -345,6 +360,26 @@ static void run_one_batch(flexe_session_t *session)
     if (cpu0 && cpu0->running)
         (void)flexe_session_run_core(session, 0, RUN_BATCH);
     flexe_session_post_batch(session, RUN_BATCH);
+
+    if (!marauder_gps_feed.enabled || !cpu0 ||
+        cpu0->cycle_count < marauder_gps_feed.next_cycle)
+        return;
+
+    do {
+        marauder_gps_feed.next_cycle += 200000000ull;
+    } while (cpu0->cycle_count >= marauder_gps_feed.next_cycle);
+
+    esp32_periph_t *periph = flexe_session_periph(session);
+    if (periph_uart_rx_pending_num(periph, 2) != 0) {
+        marauder_gps_feed.fifo_busy++;
+        return;
+    }
+    size_t accepted = periph_uart_rx_inject_num(
+            periph, 2, marauder_gps_sentence,
+            sizeof(marauder_gps_sentence) - 1);
+    marauder_gps_feed.bytes += accepted;
+    if (accepted == sizeof(marauder_gps_sentence) - 1)
+        marauder_gps_feed.sentences++;
 }
 
 static int run_for_virtual_cycles(flexe_session_t *session, uint64_t cycles)
@@ -469,6 +504,29 @@ static int run_until_marauder_sniffer(flexe_session_t *session,
     }
 
     wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+static int run_until_marauder_gps(flexe_session_t *session,
+                                  const uart_state_t *uart,
+                                  size_t uart_start,
+                                  uint64_t max_cycles,
+                                  uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        if (uart_contains_from(uart, uart_start, "#gps -g lat") &&
+            uart_contains_from(uart, uart_start, "Lat: 48.1250000")) {
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
     *cycles_out = cpu0->cycle_count - start;
     return 1;
 }
@@ -812,6 +870,7 @@ int main(int argc, char **argv)
     pthread_mutex_init(&framebuffer_mutex, NULL);
     touch_state_t touch = {0, 50, 139};
     uart_state_t uart = {0};
+    uart_state_t gps_uart = {0};
     raw_tx_probe_t raw_tx_probe = {0};
     bt_tx_probe_t bt_tx_probe = {0};
     rom_audit_t rom_audit = {0};
@@ -843,6 +902,10 @@ int main(int argc, char **argv)
     }
     flexe_session_set_rom_log_cb(session, audit_rom_call, &rom_audit);
     if (is_marauder) {
+        periph_set_uart_callback_num(flexe_session_periph(session), 2,
+                                     uart_count, &gps_uart);
+        marauder_gps_feed.enabled = true;
+        marauder_gps_feed.next_cycle = 50000000ull;
         wifi_stubs_set_raw_tx_callback(flexe_session_wifi(session),
                                        capture_raw_tx, &raw_tx_probe);
         bt_stubs_set_advertisement_tx_callback(
@@ -881,10 +944,12 @@ int main(int argc, char **argv)
     uint64_t bt_cycles = 0;
     uint64_t bt_stop_cycles = 0;
     uint64_t bt_tx_cycles = 0;
+    uint64_t gps_cycles = 0;
     size_t cli_rx_bytes = 0;
     size_t tx_cli_rx_bytes = 0;
     size_t bt_cli_rx_bytes = 0;
     size_t bt_tx_cli_rx_bytes = 0;
+    size_t gps_cli_rx_bytes = 0;
     uint64_t marauder_raw_tx_frames = 0;
     uint64_t marauder_raw_tx_bytes = 0;
     uint64_t marauder_host_tx_frames = 0;
@@ -1038,6 +1103,55 @@ int main(int argc, char **argv)
                     "FAIL profile=marauder reason=%s changed_pixels=%d\n",
                     touch_result < 0 ? "cpus-stopped" : "touch-timeout",
                     touch_changed);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        /* Prove the stock CYD build's external GPS path end to end: UART2
+         * interrupts feed the IDF ring buffer, MicroNMEA parses the fix, and
+         * Marauder's real CLI returns the resulting latitude. */
+        static const uint8_t gps_command[] = "gps -g lat\n";
+        size_t gps_uart0_start = uart.log_len;
+        gps_cli_rx_bytes = periph_uart_rx_inject(
+                flexe_session_periph(session), gps_command,
+                sizeof(gps_command) - 1);
+        int gps_result = run_until_marauder_gps(
+                session, &uart, gps_uart0_start, 500000000ull, &gps_cycles);
+        bool gps_config_tx = uart_contains(&gps_uart,
+                "$PSTMSETPAR,1201,0x00000042") &&
+                uart_contains(&gps_uart, "$PSTMSRR");
+        if (gps_cli_rx_bytes != sizeof(gps_command) - 1 || gps_result != 0 ||
+            marauder_gps_feed.sentences == 0 || !gps_config_tx ||
+            uart_contains(&uart, "GPS Not Found")) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=%s accepted=%zu "
+                    "gps_cycles=%llu nmea_sentences=%llu nmea_bytes=%llu "
+                    "nmea_fifo_busy=%llu uart2_tx=%llu gps_config_tx=%d "
+                    "gps_not_found=%d pending_uart2=%zu\n",
+                    gps_cli_rx_bytes != sizeof(gps_command) - 1 ?
+                            "gps-uart0-fifo" :
+                    gps_result < 0 ? "cpus-stopped-during-gps" :
+                    gps_result > 0 ? "gps-cli-timeout" :
+                    marauder_gps_feed.sentences == 0 ? "gps-no-nmea" :
+                    !gps_config_tx ? "gps-no-config-tx" : "gps-not-found",
+                    gps_cli_rx_bytes, (unsigned long long)gps_cycles,
+                    (unsigned long long)marauder_gps_feed.sentences,
+                    (unsigned long long)marauder_gps_feed.bytes,
+                    (unsigned long long)marauder_gps_feed.fifo_busy,
+                    (unsigned long long)gps_uart.count, gps_config_tx,
+                    uart_contains(&uart, "GPS Not Found"),
+                    periph_uart_rx_pending_num(
+                            flexe_session_periph(session), 2));
+            fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
+            fwrite(uart.log, 1, uart.log_len, stderr);
+            fputc('\n', stderr);
+            fprintf(stderr, "UART2 log (%zu bytes):\n", gps_uart.log_len);
+            fwrite(gps_uart.log, 1, gps_uart.log_len, stderr);
+            fputc('\n', stderr);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -1451,12 +1565,18 @@ int main(int argc, char **argv)
            unhandled_mmio, unregistered_rom);
     if (is_marauder)
         printf(" touch_changed=%d sd_fat=mounted sd_write=SCRIPTS "
+               "gps_uart_rx=%zu gps_cli=lat gps_cycles=%llu "
+               "gps_nmea=%llu gps_uart2_tx=%llu gps_fix=48.1250000 "
                "uart_rx=%zu cli=sniffraw cli_cycles=%llu wifi_init=%llu "
                "wifi_start=%llu promisc=%llu promisc_cb=%llu raw_rx=%llu "
                "mgmt_frames=%u beacon_frames=%u stop_cycles=%llu "
                "tx_uart_rx=%zu tx_cli=rickroll tx_cycles=%llu raw_tx=%llu "
                "raw_tx_bytes=%llu host_tx=%llu host_beacons=%llu",
-               touch_changed, cli_rx_bytes, (unsigned long long)cli_cycles,
+               touch_changed, gps_cli_rx_bytes,
+               (unsigned long long)gps_cycles,
+               (unsigned long long)marauder_gps_feed.sentences,
+               (unsigned long long)gps_uart.count,
+               cli_rx_bytes, (unsigned long long)cli_cycles,
                (unsigned long long)wifi_stats.wifi_init_calls,
                (unsigned long long)wifi_stats.wifi_start_calls,
                (unsigned long long)wifi_stats.promisc_enable_calls,

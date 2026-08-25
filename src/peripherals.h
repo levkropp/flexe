@@ -20,12 +20,23 @@ void periph_destroy(esp32_periph_t *p);
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx);
 int  periph_uart_tx_count(const esp32_periph_t *p);
 const uint8_t *periph_uart_tx_buf(const esp32_periph_t *p);
-/* Inject bytes arriving at UART0 from the host. Returns the number accepted
- * by the 128-byte hardware RX FIFO; the normal ESP32 RX interrupt path then
+/* Numbered variants expose all three ESP32 UART controllers.  The original
+ * functions above and below remain UART0 convenience wrappers for existing
+ * frontends. */
+void periph_set_uart_callback_num(esp32_periph_t *p, int uart_num,
+                                  uart_tx_cb cb, void *ctx);
+int  periph_uart_tx_count_num(const esp32_periph_t *p, int uart_num);
+const uint8_t *periph_uart_tx_buf_num(const esp32_periph_t *p, int uart_num);
+
+/* Inject bytes arriving from the host. Returns the number accepted by the
+ * selected 128-byte hardware RX FIFO; the normal ESP32 RX interrupt path then
  * moves them into the firmware driver's ring buffer. */
 size_t periph_uart_rx_inject(esp32_periph_t *p, const uint8_t *data,
                              size_t len);
 size_t periph_uart_rx_pending(const esp32_periph_t *p);
+size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
+                                 const uint8_t *data, size_t len);
+size_t periph_uart_rx_pending_num(const esp32_periph_t *p, int uart_num);
 int  periph_unhandled_count(const esp32_periph_t *p);
 
 /* Returns true once the APP_CPU has been released from reset (DPORT write) */
