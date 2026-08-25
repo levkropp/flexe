@@ -44,6 +44,7 @@
 #define MARAUDER_RAW_SCAN_MODE      25u
 #define MARAUDER_RICKROLL_MODE      9u
 #define MARAUDER_BT_SCAN_MODE       10u
+#define MARAUDER_BT_SWIFTPAIR_MODE  37u
 
 /* touch_stubs uses the frontend's lifetime flag while servicing blocking
  * touch APIs. Standalone main and the SDL frontend provide the same symbol. */
@@ -80,6 +81,15 @@ typedef struct {
     size_t last_len;
     bool last_en_sys_seq;
 } raw_tx_probe_t;
+
+typedef struct {
+    uint64_t frames;
+    uint64_t bytes;
+    uint8_t advertisement[31];
+    size_t advertisement_len;
+    uint8_t scan_response[31];
+    size_t scan_response_len;
+} bt_tx_probe_t;
 
 #define MAX_UNREGISTERED_ROM_ADDRS 32
 typedef struct {
@@ -118,6 +128,21 @@ static void capture_raw_tx(void *ctx, uint32_t iface, const uint8_t *frame,
     probe->last_iface = iface;
     probe->last_len = len;
     probe->last_en_sys_seq = en_sys_seq;
+}
+
+static void capture_bt_advertisement_tx(void *ctx,
+                                        const uint8_t *advertisement,
+                                        size_t advertisement_len,
+                                        const uint8_t *scan_response,
+                                        size_t scan_response_len)
+{
+    bt_tx_probe_t *probe = ctx;
+    probe->frames++;
+    probe->bytes += advertisement_len + scan_response_len;
+    probe->advertisement_len = advertisement_len;
+    probe->scan_response_len = scan_response_len;
+    memcpy(probe->advertisement, advertisement, advertisement_len);
+    memcpy(probe->scan_response, scan_response, scan_response_len);
 }
 
 static void audit_rom_call(void *ctx, uint32_t addr, const char *name,
@@ -533,6 +558,46 @@ static int run_until_marauder_bt_scan(flexe_session_t *session,
     return 1;
 }
 
+static int run_until_marauder_bt_tx(flexe_session_t *session,
+                                    const uart_state_t *uart,
+                                    const bt_tx_probe_t *probe,
+                                    uint64_t host_frames_before,
+                                    const bt_stubs_stats_t *before,
+                                    uint64_t max_cycles,
+                                    bt_stubs_stats_t *stats_out,
+                                    uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    bt_stubs_t *bt = flexe_session_bt(session);
+    uint64_t start = cpu0->cycle_count;
+    bt_stubs_stats_t stats = {0};
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        bt_stubs_get_stats(bt, &stats);
+        if (uart_contains(uart, "#blespam -t windows") &&
+            stats.advertising_data_calls >
+                    before->advertising_data_calls &&
+            stats.advertising_enable_calls >
+                    before->advertising_enable_calls &&
+            stats.advertisement_tx_frames >
+                    before->advertisement_tx_frames &&
+            probe->frames > host_frames_before &&
+            mem_read8(flexe_session_mem(session),
+                      MARAUDER_SCAN_MODE_ADDR) ==
+                    MARAUDER_BT_SWIFTPAIR_MODE) {
+            *stats_out = stats;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    bt_stubs_get_stats(bt, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
 static int run_until_nerd_network(flexe_session_t *session,
                                   uint64_t max_cycles,
                                   wifi_stubs_stats_t *stats_out,
@@ -748,6 +813,7 @@ int main(int argc, char **argv)
     touch_state_t touch = {0, 50, 139};
     uart_state_t uart = {0};
     raw_tx_probe_t raw_tx_probe = {0};
+    bt_tx_probe_t bt_tx_probe = {0};
     rom_audit_t rom_audit = {0};
     flexe_session_config_t cfg = {
         .bin_path = rom_path,
@@ -776,9 +842,13 @@ int main(int argc, char **argv)
         return 1;
     }
     flexe_session_set_rom_log_cb(session, audit_rom_call, &rom_audit);
-    if (is_marauder)
+    if (is_marauder) {
         wifi_stubs_set_raw_tx_callback(flexe_session_wifi(session),
                                        capture_raw_tx, &raw_tx_probe);
+        bt_stubs_set_advertisement_tx_callback(
+                flexe_session_bt(session), capture_bt_advertisement_tx,
+                &bt_tx_probe);
+    }
 
     int min_nonblack = is_marauder ? 8000 : 20000;
     uint64_t boot_limit = is_marauder ? 8000000000ull : 2000000000ull;
@@ -809,14 +879,19 @@ int main(int argc, char **argv)
     uint64_t stop_cycles = 0;
     uint64_t tx_cycles = 0;
     uint64_t bt_cycles = 0;
+    uint64_t bt_stop_cycles = 0;
+    uint64_t bt_tx_cycles = 0;
     size_t cli_rx_bytes = 0;
     size_t tx_cli_rx_bytes = 0;
     size_t bt_cli_rx_bytes = 0;
+    size_t bt_tx_cli_rx_bytes = 0;
     uint64_t marauder_raw_tx_frames = 0;
     uint64_t marauder_raw_tx_bytes = 0;
     uint64_t marauder_host_tx_frames = 0;
     uint64_t marauder_host_beacons = 0;
     uint64_t marauder_bt_advertisements = 0;
+    uint64_t marauder_bt_tx_frames = 0;
+    uint64_t marauder_bt_tx_bytes = 0;
     uint32_t marauder_mgmt_frames = 0;
     uint32_t marauder_beacon_frames = 0;
     bt_stubs_stats_t bt_stats = {0};
@@ -1242,6 +1317,91 @@ int main(int argc, char **argv)
             return 1;
         }
         marauder_bt_advertisements = bt_stats.advertisement_frames;
+
+        /* Stop discovery through the same UART command path, then exercise
+         * Marauder's Windows Swift Pair spam.  Its genuine NimBLE stack must
+         * push the manufacturer payload through HCI to the host backend. */
+        size_t stop_bt_rx = periph_uart_rx_inject(
+                flexe_session_periph(session), stop_command,
+                sizeof(stop_command) - 1);
+        if (stop_bt_rx != sizeof(stop_command) - 1 ||
+            run_until_marauder_stopped(session, &uart, 500000000ull,
+                                       &bt_stop_cycles) != 0) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=stop-bt-scan accepted=%zu "
+                    "mode=%u\n", stop_bt_rx,
+                    mem_read8(flexe_session_mem(session),
+                              MARAUDER_SCAN_MODE_ADDR));
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        static const uint8_t bt_tx_command[] = "blespam -t windows\n";
+        bt_stubs_stats_t bt_before_tx = bt_stats;
+        uint64_t host_bt_tx_before = bt_tx_probe.frames;
+        bt_tx_cli_rx_bytes = periph_uart_rx_inject(
+                flexe_session_periph(session), bt_tx_command,
+                sizeof(bt_tx_command) - 1);
+        int bt_tx_result = bt_tx_cli_rx_bytes ==
+                           sizeof(bt_tx_command) - 1 ?
+                run_until_marauder_bt_tx(
+                        session, &uart, &bt_tx_probe, host_bt_tx_before,
+                        &bt_before_tx, 1000000000ull, &bt_stats,
+                        &bt_tx_cycles) : 1;
+        static const uint8_t swiftpair_prefix[] = {
+            0xFF, 0x06, 0x00, 0x03, 0x00, 0x80
+        };
+        bool valid_swiftpair = bt_tx_probe.advertisement_len >= 8 &&
+                bt_tx_probe.advertisement[0] + 1u ==
+                        bt_tx_probe.advertisement_len &&
+                memcmp(bt_tx_probe.advertisement + 1,
+                       swiftpair_prefix, sizeof(swiftpair_prefix)) == 0;
+        if (bt_tx_result != 0 || !valid_swiftpair) {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=%s accepted=%zu "
+                    "bt_tx_cycles=%llu mode=%u data=%llu enable=%llu "
+                    "params=%llu tx=%llu host_tx=%llu len=%zu prefix=%d "
+                    "failures=%llu starts=%llu capacity=%llu identity=%llu "
+                    "own=%u conn=%u disc=%u high=%u duration=%d\n",
+                    bt_tx_result < 0 ? "cpus-stopped-during-bt-tx" :
+                    bt_tx_result > 0 ? "bt-tx-timeout" :
+                                       "swiftpair-payload",
+                    bt_tx_cli_rx_bytes, (unsigned long long)bt_tx_cycles,
+                    mem_read8(flexe_session_mem(session),
+                              MARAUDER_SCAN_MODE_ADDR),
+                    (unsigned long long)bt_stats.advertising_data_calls,
+                    (unsigned long long)bt_stats.advertising_enable_calls,
+                    (unsigned long long)bt_stats.advertising_parameters_calls,
+                    (unsigned long long)bt_stats.advertisement_tx_frames,
+                    (unsigned long long)bt_tx_probe.frames,
+                    bt_tx_probe.advertisement_len, valid_swiftpair,
+                    (unsigned long long)
+                            bt_stats.advertisement_tx_failures,
+                    (unsigned long long)
+                            bt_stats.gap_advertising_start_calls,
+                    (unsigned long long)
+                            bt_stats.connection_capacity_queries,
+                    (unsigned long long)bt_stats.identity_address_queries,
+                    bt_stats.last_advertising_own_addr_type,
+                    bt_stats.last_advertising_conn_mode,
+                    bt_stats.last_advertising_disc_mode,
+                    bt_stats.last_advertising_high_duty,
+                    (int32_t)bt_stats.last_advertising_duration_ms);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        marauder_bt_tx_frames = bt_stats.advertisement_tx_frames -
+                                bt_before_tx.advertisement_tx_frames;
+        marauder_bt_tx_bytes = bt_stats.advertisement_tx_bytes -
+                               bt_before_tx.advertisement_tx_bytes;
     }
 
     int unregistered_rom = rom_stubs_unregistered_count(
@@ -1317,6 +1477,15 @@ int main(int argc, char **argv)
                (unsigned long long)bt_stats.scan_callback_config_calls,
                (unsigned long long)bt_stats.scan_start_calls,
                (unsigned long long)marauder_bt_advertisements);
+    if (is_marauder)
+        printf(" bt_stop_cycles=%llu bt_tx_uart_rx=%zu "
+               "bt_tx_cli=windows bt_tx_cycles=%llu bt_tx=%llu "
+               "bt_tx_bytes=%llu host_bt_tx=%llu bt_payload=swiftpair",
+               (unsigned long long)bt_stop_cycles, bt_tx_cli_rx_bytes,
+               (unsigned long long)bt_tx_cycles,
+               (unsigned long long)marauder_bt_tx_frames,
+               (unsigned long long)marauder_bt_tx_bytes,
+               (unsigned long long)bt_tx_probe.frames);
     if (is_nerdminer)
         printf(" spiffs_blocks=%d sd_fat=mounted network_cycles=%llu "
                "service_cycles=%llu tcp_udp_sockets=%llu binds=%llu "

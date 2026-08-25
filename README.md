@@ -45,7 +45,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 543 tests
+- 544 tests
 
 ## building
 
@@ -134,7 +134,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 543 tests, 1412 passed, 0 failed
+# 544 tests, 1470 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -158,8 +158,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **9.11× real-time** |
-| NerdMiner v2 | **5.99× real-time** |
+| ESP32 Marauder v1.14 | **11.94× real-time** |
+| NerdMiner v2 | **5.96× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real
@@ -170,6 +170,9 @@ Rick Roll attack, and requires its raw beacon frames to cross Flexe's host
 virtual-radio transmit boundary. Finally, it starts `sniffbt`, injects a BLE
 advertisement through the production NimBLE GAP handler, and requires
 Marauder's registered device callback to parse and print `Device: FlexeBLE`.
+It then submits `blespam -t windows`, lets the genuine NimBLE advertising
+stack issue its controller HCI commands, and validates the emitted Microsoft
+Swift Pair payload at Flexe's host BLE-radio boundary.
 The NerdMiner profile connects to the stock ROM's captive portal through its
 remapped host sockets, issues a real HTTP request and DNS query, and requires
 valid responses from both:

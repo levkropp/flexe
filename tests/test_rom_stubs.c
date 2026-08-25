@@ -90,6 +90,52 @@ TEST(test_rom_stub_dispatch) {
     teardown(&cpu);
 }
 
+/* ===== Test: conditional hook can observe or consume ===== */
+
+typedef struct {
+    int calls;
+    uint32_t handled_pc;
+} conditional_hook_test_t;
+
+static int test_conditional_stub(xtensa_cpu_t *cpu, void *ctx)
+{
+    conditional_hook_test_t *test = ctx;
+    test->calls++;
+    if (ar_read(cpu, 2) == 0)
+        return 0;
+    cpu->pc = test->handled_pc;
+    return 1;
+}
+
+TEST(test_rom_conditional_stub) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    conditional_hook_test_t test = {0, BASE + 0x300u};
+    uint32_t hook_addr = BASE + 0x200u;
+    put_insn3(&cpu, hook_addr, rom_nop_insn());
+    ASSERT_EQ(rom_stubs_register_conditional_ctx(
+                      rom, hook_addr, test_conditional_stub,
+                      "conditional", &test), 0);
+
+    cpu.pc = hook_addr;
+    cpu._pc_written = true;
+    ar_write(&cpu, 2, 0);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, hook_addr + 3u);
+    ASSERT_EQ(test.calls, 1);
+
+    cpu.pc = hook_addr;
+    cpu._pc_written = true;
+    ar_write(&cpu, 2, 1);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, test.handled_pc);
+    ASSERT_EQ(test.calls, 2);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 /* ===== Test: rom_arg with CALL4 ===== */
 
 TEST(test_rom_arg_call4) {
@@ -510,6 +556,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_pc_hook_fires);
     RUN_TEST(test_pc_hook_skips_non_match);
     RUN_TEST(test_rom_stub_dispatch);
+    RUN_TEST(test_rom_conditional_stub);
     RUN_TEST(test_rom_arg_call4);
     RUN_TEST(test_rom_arg_call0);
     RUN_TEST(test_stub_write_char);

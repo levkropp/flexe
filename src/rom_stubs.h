@@ -10,6 +10,9 @@ typedef struct esp32_periph esp32_periph_t;
 
 typedef struct esp32_rom_stubs esp32_rom_stubs_t;
 typedef void (*rom_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
+/* Return nonzero after fully handling the call (including the guest return),
+ * or zero to observe it and let the firmware implementation execute. */
+typedef int (*rom_conditional_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
 
 esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);
 void rom_stubs_destroy(esp32_rom_stubs_t *stubs);
@@ -19,6 +22,10 @@ int  rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
                              rom_stub_fn fn, const char *name, void *user_ctx);
 int  rom_stubs_register_spy(esp32_rom_stubs_t *stubs, uint32_t addr,
                              rom_stub_fn fn, const char *name, void *user_ctx);
+int  rom_stubs_register_conditional_ctx(
+                             esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_conditional_stub_fn fn, const char *name,
+                             void *user_ctx);
 
 /* Output capture (ets_printf / ets_write_char go here) */
 int  rom_stubs_output_count(const esp32_rom_stubs_t *stubs);
@@ -70,6 +77,7 @@ const uint64_t *rom_stubs_get_hook_bitmap(const esp32_rom_stubs_t *stubs);
 typedef struct {
     uint32_t    tag;     /* full PC for collision detection */
     rom_stub_fn fn;      /* stub function (NULL = empty slot) */
+    rom_conditional_stub_fn conditional_fn;
     void       *ctx;     /* context pointer */
     uint32_t   *call_count; /* pointer to entry's call_count for stats */
     int         spy;     /* spy hook: run fn, then let the real instruction

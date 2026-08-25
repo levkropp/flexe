@@ -23,6 +23,7 @@
 typedef struct {
     uint32_t    addr;
     rom_stub_fn fn;
+    rom_conditional_stub_fn conditional_fn;
     const char *name;
     uint32_t    call_count;
     void       *user_ctx;   /* Per-entry context; NULL = use rom_stubs */
@@ -3220,6 +3221,7 @@ static void hook_ht_insert(esp32_rom_stubs_t *s, uint32_t addr, int idx) {
         uint32_t di = (addr >> 2) & STUB_DIRECT_MASK;
         s->direct[di].tag = addr;
         s->direct[di].fn = e->fn;
+        s->direct[di].conditional_fn = e->conditional_fn;
         s->direct[di].ctx = e->user_ctx ? e->user_ctx : s;
         s->direct[di].call_count = &e->call_count;
         s->direct[di].spy = e->spy;
@@ -3236,9 +3238,12 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     if (__builtin_expect(s->direct != NULL, 1)) {
         uint32_t di = (pc >> 2) & STUB_DIRECT_MASK;
         stub_direct_entry_t *de = &s->direct[di];
-        if (__builtin_expect(de->tag == pc && de->fn != NULL, 1)) {
+        if (__builtin_expect(de->tag == pc &&
+            (de->fn != NULL || de->conditional_fn != NULL), 1)) {
             s->total_calls++;
             (*de->call_count)++;
+            if (de->conditional_fn)
+                return de->conditional_fn(cpu, de->ctx) ? 1 : 0;
             de->fn(cpu, de->ctx);
             if (de->spy)
                 return 0; /* spy: let original instruction execute */
@@ -3254,6 +3259,8 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
         if (s->log_fn)
             s->log_fn(s->log_ctx, pc, s->entries[idx].name, cpu);
         void *ectx = s->entries[idx].user_ctx ? s->entries[idx].user_ctx : s;
+        if (s->entries[idx].conditional_fn)
+            return s->entries[idx].conditional_fn(cpu, ectx) ? 1 : 0;
         s->entries[idx].fn(cpu, ectx);
         if (s->entries[idx].spy)
             return 0; /* spy: let original function execute */
@@ -4725,11 +4732,14 @@ int rom_stubs_register_spy(esp32_rom_stubs_t *stubs, uint32_t addr,
     return rc;
 }
 
-int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
-                            rom_stub_fn fn, const char *name, void *user_ctx) {
+static int rom_stubs_register_any(esp32_rom_stubs_t *stubs, uint32_t addr,
+                                  rom_stub_fn fn,
+                                  rom_conditional_stub_fn conditional_fn,
+                                  const char *name, void *user_ctx) {
     if (stubs->count >= MAX_ROM_STUBS) return -1;
     stubs->entries[stubs->count].addr = addr;
     stubs->entries[stubs->count].fn = fn;
+    stubs->entries[stubs->count].conditional_fn = conditional_fn;
     stubs->entries[stubs->count].name = name;
     stubs->entries[stubs->count].user_ctx = user_ctx;
     stubs->count++;
@@ -4750,6 +4760,8 @@ int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
                 if (stubs->count < MAX_ROM_STUBS) {
                     stubs->entries[stubs->count].addr = ea;
                     stubs->entries[stubs->count].fn = fn;
+                    stubs->entries[stubs->count].conditional_fn =
+                            conditional_fn;
                     stubs->entries[stubs->count].name = name;
                     stubs->entries[stubs->count].user_ctx = user_ctx;
                     stubs->count++;
@@ -4760,6 +4772,19 @@ int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
         }
     }
     return 0;
+}
+
+int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
+                            rom_stub_fn fn, const char *name, void *user_ctx) {
+    return rom_stubs_register_any(stubs, addr, fn, NULL, name, user_ctx);
+}
+
+int rom_stubs_register_conditional_ctx(
+                            esp32_rom_stubs_t *stubs, uint32_t addr,
+                            rom_conditional_stub_fn fn, const char *name,
+                            void *user_ctx) {
+    if (!fn) return -1;
+    return rom_stubs_register_any(stubs, addr, NULL, fn, name, user_ctx);
 }
 
 int rom_stubs_output_count(const esp32_rom_stubs_t *stubs) {

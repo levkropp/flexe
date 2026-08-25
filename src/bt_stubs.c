@@ -39,6 +39,13 @@
 #define MARAUDER_NIMBLE_SCAN_STOP              0x401049B4u
 #define MARAUDER_NIMBLE_SCAN_HANDLE_GAP        0x40104A9Cu
 #define MARAUDER_NIMBLE_SCAN_SET_CALLBACKS     0x401DA8D0u
+#define MARAUDER_BLE_GAP_ADV_START              0x401096E0u
+#define MARAUDER_BLE_HS_HCI_CMD_TX              0x40110254u
+#define MARAUDER_BLE_HS_CONN_CAN_ALLOC           0x4010FC58u
+#define MARAUDER_BLE_HS_ID_USE_ADDR              0x40110CC0u
+#define MARAUDER_BLE_HS_ENABLED_STATE_LITERAL    0x4010B4A8u
+#define MARAUDER_BLE_HS_SYNC_STATE_LITERAL       0x4010B4B4u
+#define MARAUDER_BLE_HS_PUBLIC_ADDR_LITERAL      0x4010B5DCu
 
 /* A ble_gap_event is 52 bytes in this ESP32 NimBLE build.  Its discovery
  * descriptor begins at +4 and holds a pointer to the advertisement payload.
@@ -49,6 +56,15 @@
 #define BLE_DATA_MAX_LEN       31u
 #define BLE_GAP_EVENT_DISC     7u
 #define BLE_ADV_NONCONN_IND    3u
+
+/* Bluetooth Core legacy LE controller opcodes. */
+#define BLE_HCI_LE_SET_ADV_DATA      0x2008u
+#define BLE_HCI_LE_SET_SCAN_RSP_DATA 0x2009u
+#define BLE_HCI_LE_SET_ADV_ENABLE    0x200Au
+#define BLE_HCI_LE_SET_ADV_PARAMS    0x2006u
+#define BLE_HCI_LE_SET_SCAN_PARAMS   0x200Bu
+#define BLE_HCI_LE_SET_SCAN_ENABLE   0x200Cu
+#define BLE_HCI_ERR_INVALID_PARAMS   0x0012u
 
 /* Synthetic BLE devices */
 typedef struct {
@@ -85,6 +101,12 @@ struct bt_stubs {
     uint32_t           scan_obj_addr;
     uint32_t           gap_handler_addr;
     bool               production_observer;
+    uint8_t            advertisement_data[BLE_DATA_MAX_LEN];
+    uint8_t            advertisement_len;
+    uint8_t            scan_response_data[BLE_DATA_MAX_LEN];
+    uint8_t            scan_response_len;
+    bt_advertisement_tx_cb advertisement_tx_cb;
+    void              *advertisement_tx_ctx;
     bt_stubs_stats_t    stats;
 };
 
@@ -283,9 +305,43 @@ static void spy_nimble_scan_set_callbacks(xtensa_cpu_t *cpu, void *ctx)
                "cb=0x%08x)\n", bt->scan_obj_addr, bt->scan_cb_addr);
 }
 
+static void publish_nimble_controller_state(bt_stubs_t *bt)
+{
+    xtensa_mem_t *mem = bt->cpu->mem;
+    /* A real controller publishes these states and its public identity after
+     * host synchronization.  Do not replace an identity chosen by firmware. */
+    uint32_t sync_state = mem_read32(mem,
+                                     MARAUDER_BLE_HS_SYNC_STATE_LITERAL);
+    uint32_t enabled_state = mem_read32(
+            mem, MARAUDER_BLE_HS_ENABLED_STATE_LITERAL);
+    uint32_t public_addr_ptr = mem_read32(
+            mem, MARAUDER_BLE_HS_PUBLIC_ADDR_LITERAL);
+    if (sync_state >= 0x3FFB0000u && sync_state < 0x40000000u)
+        mem_write8(mem, sync_state, 2);
+    if (enabled_state >= 0x3FFB0000u && enabled_state < 0x40000000u)
+        mem_write8(mem, enabled_state, 2);
+    if (public_addr_ptr < 0x3FFB0000u || public_addr_ptr >= 0x40000000u)
+        return;
+    bool address_is_zero = true;
+    for (uint32_t i = 0; i < 6; i++) {
+        if (mem_read8(mem, public_addr_ptr + i) != 0) {
+            address_is_zero = false;
+            break;
+        }
+    }
+    if (address_is_zero) {
+        static const uint8_t default_public_addr[6] = {
+            0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE
+        };
+        for (uint32_t i = 0; i < sizeof(default_public_addr); i++)
+            mem_write8(mem, public_addr_ptr + i, default_public_addr[i]);
+    }
+}
+
 static void spy_nimble_scan_start(xtensa_cpu_t *cpu, void *ctx)
 {
     bt_stubs_t *bt = ctx;
+    publish_nimble_controller_state(bt);
     bt->scan_obj_addr = bt_arg(cpu, 0);
     bt->ble_scanning = true;
     bt->stats.scan_start_calls++;
@@ -301,6 +357,162 @@ static void spy_nimble_scan_stop(xtensa_cpu_t *cpu, void *ctx)
     bt->stats.scan_stop_calls++;
     bt_log(bt, "NimBLEScan::stop(scan=0x%08x) — observed\n",
            bt->scan_obj_addr);
+}
+
+static bool capture_hci_advertising_data(bt_stubs_t *bt, uint32_t cmd,
+                                         uint32_t cmd_len, bool scan_response)
+{
+    if (!cmd || cmd_len < 1)
+        return false;
+    uint8_t data_len = mem_read8(bt->cpu->mem, cmd);
+    if (data_len > BLE_DATA_MAX_LEN || (uint32_t)data_len + 1u > cmd_len)
+        return false;
+
+    uint8_t *dst = scan_response ? bt->scan_response_data :
+                                   bt->advertisement_data;
+    for (uint32_t i = 0; i < data_len; i++)
+        dst[i] = mem_read8(bt->cpu->mem, cmd + 1u + i);
+    if (scan_response)
+        bt->scan_response_len = data_len;
+    else
+        bt->advertisement_len = data_len;
+    return true;
+}
+
+/* Virtualize the controller-facing commands used by legacy scanning and
+ * advertising.  This is the lowest stable boundary shared by
+ * NimBLEAdvertising's structured and raw-data APIs. */
+static int conditional_ble_hs_hci_cmd_tx(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    uint32_t opcode = bt_arg(cpu, 0) & 0xFFFFu;
+    uint32_t cmd = bt_arg(cpu, 1);
+    uint32_t cmd_len = bt_arg(cpu, 2) & 0xFFu;
+    bt->stats.hci_command_calls++;
+
+    if (opcode == BLE_HCI_LE_SET_ADV_DATA) {
+        bt->stats.advertising_data_calls++;
+        uint32_t result = 0;
+        if (!capture_hci_advertising_data(bt, cmd, cmd_len, false)) {
+            bt->stats.advertisement_tx_failures++;
+            result = BLE_HCI_ERR_INVALID_PARAMS;
+        }
+        bt_return(cpu, result);
+        return 1;
+    }
+    if (opcode == BLE_HCI_LE_SET_SCAN_RSP_DATA) {
+        bt->stats.advertising_scan_response_calls++;
+        uint32_t result = 0;
+        if (!capture_hci_advertising_data(bt, cmd, cmd_len, true)) {
+            bt->stats.advertisement_tx_failures++;
+            result = BLE_HCI_ERR_INVALID_PARAMS;
+        }
+        bt_return(cpu, result);
+        return 1;
+    }
+    if (opcode == BLE_HCI_LE_SET_ADV_PARAMS) {
+        bt->stats.advertising_parameters_calls++;
+        uint32_t result = cmd && cmd_len >= 15 ? 0 :
+                                                   BLE_HCI_ERR_INVALID_PARAMS;
+        if (result != 0)
+            bt->stats.advertisement_tx_failures++;
+        bt_return(cpu, result);
+        return 1;
+    }
+    if (opcode == BLE_HCI_LE_SET_SCAN_PARAMS) {
+        bt->stats.hci_scan_parameters_calls++;
+        uint32_t result = cmd && cmd_len >= 7 ? 0 :
+                                                  BLE_HCI_ERR_INVALID_PARAMS;
+        bt_return(cpu, result);
+        return 1;
+    }
+    if (opcode == BLE_HCI_LE_SET_SCAN_ENABLE) {
+        uint32_t result = cmd && cmd_len >= 2 ? 0 :
+                                                  BLE_HCI_ERR_INVALID_PARAMS;
+        if (result == 0 && mem_read8(cpu->mem, cmd) != 0)
+            bt->stats.hci_scan_enable_calls++;
+        else if (result == 0)
+            bt->stats.hci_scan_disable_calls++;
+        bt_return(cpu, result);
+        return 1;
+    }
+    if (opcode != BLE_HCI_LE_SET_ADV_ENABLE)
+        return 0;
+    if (!cmd || cmd_len < 1) {
+        bt->stats.advertisement_tx_failures++;
+        bt_return(cpu, BLE_HCI_ERR_INVALID_PARAMS);
+        return 1;
+    }
+
+    bool enable = mem_read8(cpu->mem, cmd) != 0;
+    if (!enable) {
+        bt->stats.advertising_disable_calls++;
+        bt->ble_advertising = false;
+        bt_return(cpu, 0);
+        return 1;
+    }
+
+    bt->stats.advertising_enable_calls++;
+    bt->ble_advertising = true;
+    bt->stats.advertisement_tx_frames++;
+    bt->stats.advertisement_tx_bytes += bt->advertisement_len +
+                                         bt->scan_response_len;
+    if (bt->advertisement_tx_cb)
+        bt->advertisement_tx_cb(bt->advertisement_tx_ctx,
+                                bt->advertisement_data,
+                                bt->advertisement_len,
+                                bt->scan_response_data,
+                                bt->scan_response_len);
+    if (bt->event_log || bt->stats.advertisement_tx_frames <= 3 ||
+        bt->stats.advertisement_tx_frames % 1000 == 0)
+        bt_log(bt, "BLE advertising TX (%u-byte adv, %u-byte scan rsp)\n",
+               bt->advertisement_len, bt->scan_response_len);
+    bt_return(cpu, 0);
+    return 1;
+}
+
+/* NimBLE rejects connectable advertising when its controller-backed host
+ * pools have not been replenished.  Flexe's virtual controller has capacity
+ * for a connection, so publish that fact at the same boundary the genuine
+ * host uses while leaving the rest of ble_gap_adv_start intact. */
+static void stub_ble_hs_conn_can_alloc(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    bt->stats.connection_capacity_queries++;
+    bt_return(cpu, 1);
+}
+
+static void spy_ble_gap_adv_start(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    publish_nimble_controller_state(bt);
+    uint32_t params = bt_arg(cpu, 3);
+    bt->stats.gap_advertising_start_calls++;
+    bt->stats.last_advertising_own_addr_type = bt_arg(cpu, 0) & 0xFFu;
+    bt->stats.last_advertising_duration_ms = bt_arg(cpu, 2);
+    if (params) {
+        bt->stats.last_advertising_conn_mode = mem_read8(cpu->mem, params);
+        bt->stats.last_advertising_disc_mode = mem_read8(cpu->mem,
+                                                         params + 1u);
+        bt->stats.last_advertising_high_duty =
+                mem_read8(cpu->mem, params + 8u) & 1u;
+    }
+    if (bt->stats.gap_advertising_start_calls <= 3) {
+        bt_log(bt, "ble_gap_adv_start(own=%u, duration=%d, conn=%u, "
+                   "disc=%u, high_duty=%u) — observed\n",
+               bt->stats.last_advertising_own_addr_type,
+               (int32_t)bt->stats.last_advertising_duration_ms,
+               bt->stats.last_advertising_conn_mode,
+               bt->stats.last_advertising_disc_mode,
+               bt->stats.last_advertising_high_duty);
+    }
+}
+
+static void spy_ble_hs_id_use_addr(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    publish_nimble_controller_state(bt);
+    bt->stats.identity_address_queries++;
 }
 
 /* NimBLEScan::clearResults() */
@@ -549,8 +761,19 @@ int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
                            spy_nimble_scan_start, "NimBLEScan::start", bt);
     rom_stubs_register_spy(rom, MARAUDER_NIMBLE_SCAN_STOP + 3u,
                            spy_nimble_scan_stop, "NimBLEScan::stop", bt);
-    fprintf(stderr, "[bt] observing 3 verified production-ROM NimBLE entries\n");
-    return 3;
+    rom_stubs_register_spy(rom, MARAUDER_BLE_GAP_ADV_START + 3u,
+                           spy_ble_gap_adv_start, "ble_gap_adv_start", bt);
+    rom_stubs_register_conditional_ctx(
+            rom, MARAUDER_BLE_HS_HCI_CMD_TX + 3u,
+            conditional_ble_hs_hci_cmd_tx, "ble_hs_hci_cmd_tx", bt);
+    rom_stubs_register_ctx(rom, MARAUDER_BLE_HS_CONN_CAN_ALLOC + 3u,
+                           stub_ble_hs_conn_can_alloc,
+                           "ble_hs_conn_can_alloc", bt);
+    rom_stubs_register_spy(rom, MARAUDER_BLE_HS_ID_USE_ADDR + 3u,
+                           spy_ble_hs_id_use_addr,
+                           "ble_hs_id_use_addr", bt);
+    fprintf(stderr, "[bt] observing 7 verified production-ROM NimBLE entries\n");
+    return 7;
 }
 
 void bt_stubs_get_stats(const bt_stubs_t *bt, bt_stubs_stats_t *stats)
@@ -604,6 +827,16 @@ int bt_stubs_inject_advertisement(bt_stubs_t *bt, const uint8_t addr[6],
     bt_log(bt, "BLE advertisement(name payload=%zu, rssi=%d) delivered\n",
            len, rssi);
     return 0;
+}
+
+void bt_stubs_set_advertisement_tx_callback(bt_stubs_t *bt,
+                                             bt_advertisement_tx_cb cb,
+                                             void *ctx)
+{
+    if (!bt)
+        return;
+    bt->advertisement_tx_cb = cb;
+    bt->advertisement_tx_ctx = ctx;
 }
 
 void bt_stubs_set_event_log(bt_stubs_t *bt, bool enabled) {
