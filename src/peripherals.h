@@ -52,11 +52,20 @@ xtensa_mem_t *periph_mem(esp32_periph_t *p);
  * GP-SPI display/touch sniffer to sample CS and D/C lines. */
 int periph_gpio_pin_level(const esp32_periph_t *p, int pin);
 
+/* Whether the GPIO output driver is enabled for a pin. This distinguishes an
+ * intentionally driven-low software chip select from an untouched reset pin. */
+int periph_gpio_output_enabled(const esp32_periph_t *p, int pin);
+
 /* GPIO-matrix output signal selected for a pin (bits OUT_SEL[8:0] of
  * GPIO_FUNCn_OUT_SEL_CFG_REG), or -1 for an invalid pin.  GP-SPI device
  * emulation uses this to distinguish SPI2 and SPI3 wiring even when a chip
  * select is controlled by the peripheral instead of the GPIO output latch. */
 int periph_gpio_out_signal(const esp32_periph_t *p, int pin);
+
+/* Explicit IO_MUX function selected for a pin (MCU_SEL bits), or -1 when the
+ * firmware has not written that pin's mux register. Native HSPI/VSPI routing
+ * uses function 1 on the classic ESP32 pin sets. */
+int periph_iomux_function(const esp32_periph_t *p, int pin);
 
 /* Assert/deassert a peripheral interrupt source (0-70).
  * Scans the interrupt matrix to find mapped CPU interrupt lines and

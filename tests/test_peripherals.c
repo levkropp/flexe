@@ -473,6 +473,17 @@ static void test_gp_spi_bytes(xtensa_mem_t *mem, uint32_t spi,
     }
 }
 
+static void test_spi_dma_desc(xtensa_mem_t *mem, uint32_t desc,
+                              uint32_t buf, uint16_t size, uint16_t len,
+                              int eof, uint32_t next) {
+    uint32_t ctrl = (uint32_t)(size & 0x0FFFu) |
+                    ((uint32_t)(len & 0x0FFFu) << 12) |
+                    (eof ? 1u << 30 : 0) | (1u << 31);
+    mem_write32(mem, desc, ctrl);
+    mem_write32(mem, desc + 4u, buf);
+    mem_write32(mem, desc + 8u, next);
+}
+
 static void test_gpio_level(xtensa_mem_t *mem, int pin, int high) {
     const uint32_t gpio = 0x3FF44000u;
     uint32_t bit = 1u << (pin < 32 ? pin : pin - 32);
@@ -527,13 +538,11 @@ TEST(xpt2046_pipelined_conversions) {
     const uint32_t gpio = 0x3FF44000u;
     mem_write32(mem, spi + 0x1C, (1u << 27) | (1u << 28)); /* MOSI+MISO */
 
-    /* CS must first be observed inactive, then asserted. */
-    mem_write32(mem, gpio + 0x14, 1u << 1);           /* GPIO33 high */
-    mem_write32(mem, spi + 0x28, 7);
-    mem_write32(mem, spi + 0x2C, 7);
-    mem_write32(mem, spi + 0x80, 0);
-    mem_write32(mem, spi + 0x00, 1u << 18);
+    /* A configured output may be asserted before its first SPI transaction.
+     * Output-enable distinguishes that low CS from an untouched reset pin. */
+    mem_write32(mem, gpio + 0x30, 1u << 1);           /* GPIO33 output */
     mem_write32(mem, gpio + 0x18, 1u << 1);           /* GPIO33 low */
+    ASSERT_EQ(periph_gpio_output_enabled(p, 33), 1);
 
     /* transfer(0xB1) starts Z1. Each following transfer16 returns the
      * previous conversion and queues its command from W0's second byte. */
@@ -629,6 +638,202 @@ TEST(gp_spi_matrix_routing_and_hardware_cs) {
     test_gp_spi_bytes(mem, spi2, cmd0, NULL, sizeof(cmd0));
     test_gp_spi_bytes(mem, spi2, &idle, &response, 1);
     ASSERT_EQ(response, 0x01);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(gp_spi_native_iomux_routing_and_hardware_cs) {
+    const uint32_t spi2 = 0x3FF64000u;
+    uint16_t framebuffer[320 * 240] = {0};
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .display_sck_pin = 14,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .sd_cs_pin = 5,
+        .sd_sck_pin = 18,
+        .framebuf = framebuffer,
+        .fb_w = 320,
+        .fb_h = 240,
+    };
+    periph_enable_spi_display(p, &cfg);
+
+    /* ESP-IDF selects the native HSPI pins through IO_MUX function 1. It
+     * does not program GPIO_FUNC_OUT_SEL for SCLK or hardware CS0. */
+    mem_write32(mem, 0x3FF49030u, 1u << 12); /* GPIO14: HSPICLK */
+    mem_write32(mem, 0x3FF4903Cu, 1u << 12); /* GPIO15: HSPICS0 */
+    ASSERT_EQ(mem_read32(mem, 0x3FF49030u), 1u << 12);
+    ASSERT_EQ(mem_read32(mem, 0x3FF4903Cu), 1u << 12);
+    ASSERT_EQ(periph_iomux_function(p, 14), 1);
+    ASSERT_EQ(periph_iomux_function(p, 15), 1);
+    ASSERT_EQ(periph_iomux_function(p, 18), -1);
+    mem_write32(mem, spi2 + 0x34, 0x6); /* enable hardware CS0 */
+
+    const uint8_t caset[] = {0x2A};
+    const uint8_t paset[] = {0x2B};
+    const uint8_t ramwr[] = {0x2C};
+    const uint8_t origin[] = {0, 0, 0, 0};
+    const uint8_t green[] = {0x07, 0xE0};
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, caset, NULL, sizeof(caset));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, origin, NULL, sizeof(origin));
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, paset, NULL, sizeof(paset));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, origin, NULL, sizeof(origin));
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, ramwr, NULL, sizeof(ramwr));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, green, NULL, sizeof(green));
+    ASSERT_EQ(framebuffer[319], 0x07E0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(gp_spi_dma_descriptor_chain_and_interrupt) {
+    const uint32_t spi2 = 0x3FF64000u;
+    const uint32_t desc1 = 0x3FFB1000u;
+    const uint32_t desc2 = 0x3FFB1010u;
+    const uint32_t buf1 = 0x3FFB2000u;
+    const uint32_t buf2 = 0x3FFB2010u;
+    uint16_t framebuffer[320 * 240] = {0};
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 7, 30); /* SPI2 -> CPU interrupt 7 */
+
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .display_sck_pin = 14,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .sd_cs_pin = 5,
+        .sd_sck_pin = 18,
+        .framebuf = framebuffer,
+        .fb_w = 320,
+        .fb_h = 240,
+    };
+    periph_enable_spi_display(p, &cfg);
+    test_gpio_route(mem, 14, 8);       /* HSPICLK -> display SCLK */
+    test_gpio_route(mem, 15, 256);     /* software display CS */
+    test_gpio_level(mem, 15, 1);
+    const uint8_t idle = 0xFF;
+    test_gp_spi_bytes(mem, spi2, &idle, NULL, 1); /* observe CS inactive */
+    test_gpio_level(mem, 15, 0);
+
+    const uint8_t caset[] = {0x2A};
+    const uint8_t paset[] = {0x2B};
+    const uint8_t ramwr[] = {0x2C};
+    const uint8_t columns[] = {0, 0, 0, 1};
+    const uint8_t row[] = {0, 0, 0, 0};
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, caset, NULL, sizeof(caset));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, columns, NULL, sizeof(columns));
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, paset, NULL, sizeof(paset));
+    test_gpio_level(mem, 2, 1);
+    test_gp_spi_bytes(mem, spi2, row, NULL, sizeof(row));
+    test_gpio_level(mem, 2, 0);
+    test_gp_spi_bytes(mem, spi2, ramwr, NULL, sizeof(ramwr));
+    test_gpio_level(mem, 2, 1);
+
+    /* Two lldesc entries carry red and green RGB565 pixels. */
+    mem_write8(mem, buf1, 0xF8); mem_write8(mem, buf1 + 1u, 0x00);
+    mem_write8(mem, buf2, 0x07); mem_write8(mem, buf2 + 1u, 0xE0);
+    test_spi_dma_desc(mem, desc1, buf1, 2, 2, 0, desc2);
+    test_spi_dma_desc(mem, desc2, buf2, 2, 2, 1, 0);
+
+    mem_write32(mem, spi2 + 0x38, 1u << 9); /* TRANS_DONE interrupt enable */
+    mem_write32(mem, spi2 + 0x110, (1u << 8) | (1u << 7) | (1u << 6));
+    mem_write32(mem, spi2 + 0x1C, 1u << 27); /* MOSI data phase */
+    mem_write32(mem, spi2 + 0x28, 31);       /* four bytes */
+    mem_write32(mem, spi2 + 0x104,
+                (desc1 & 0x000FFFFFu) | (1u << 29));
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x10C), 2u);
+    mem_write32(mem, spi2, 1u << 18);        /* CMD.USR */
+
+    ASSERT_EQ(framebuffer[319], 0xF800u);
+    ASSERT_EQ(framebuffer[639], 0x07E0u);
+    ASSERT_EQ(mem_read32(mem, desc1) & (1u << 31), 0u);
+    ASSERT_EQ(mem_read32(mem, desc2) & (1u << 31), 0u);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x114) & 0x1C0u, 0x1C0u);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x118) & 0x1C0u, 0x1C0u);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x138), desc2);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x144), buf2);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x104) & (1u << 29), 0u);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x10C), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 7), 1u << 7);
+
+    mem_write32(mem, spi2 + 0x38, 1u << 9); /* clear TRANS_DONE */
+    mem_write32(mem, spi2 + 0x11C, 0x1C0u); /* clear DMA completion */
+    ASSERT_EQ(cpu0.interrupt & (1u << 7), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(gp_spi_dma_full_duplex_sd) {
+    const uint32_t spi2 = 0x3FF64000u;
+    const uint32_t tx_desc = 0x3FFB1100u;
+    const uint32_t rx_desc = 0x3FFB1110u;
+    const uint32_t tx_buf = 0x3FFB2100u;
+    const uint32_t rx_buf = 0x3FFB2200u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .display_sck_pin = 14,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .sd_cs_pin = 5,
+        .sd_sck_pin = 18,
+    };
+    periph_enable_spi_display(p, &cfg);
+    test_gpio_route(mem, 18, 8);       /* HSPICLK -> SD SCLK */
+    test_gpio_route(mem, 5, 11);       /* HSPICS0 -> SD CS */
+    mem_write32(mem, spi2 + 0x34, 0x6); /* hardware CS0 selected */
+
+    uint8_t cmd0[6];
+    test_sd_command_bytes(cmd0, 0, 0);
+    for (int i = 0; i < 6; i++) mem_write8(mem, tx_buf + (uint32_t)i, cmd0[i]);
+    test_spi_dma_desc(mem, tx_desc, tx_buf, 6, 6, 1, 0);
+    mem_write32(mem, spi2 + 0x1C, 1u << 27);
+    mem_write32(mem, spi2 + 0x28, 47);
+    mem_write32(mem, spi2 + 0x104,
+                (tx_desc & 0x000FFFFFu) | (1u << 29));
+    mem_write32(mem, spi2, 1u << 18);
+
+    /* Clock the queued R1 response through independent one-byte TX/RX DMA. */
+    mem_write8(mem, tx_buf, 0xFF);
+    mem_write8(mem, rx_buf, 0xAA);
+    test_spi_dma_desc(mem, tx_desc, tx_buf, 1, 1, 1, 0);
+    test_spi_dma_desc(mem, rx_desc, rx_buf, 1, 0, 1, 0);
+    mem_write32(mem, spi2 + 0x1C, (1u << 27) | (1u << 28));
+    mem_write32(mem, spi2 + 0x28, 7);
+    mem_write32(mem, spi2 + 0x2C, 7);
+    mem_write32(mem, spi2 + 0x104,
+                (tx_desc & 0x000FFFFFu) | (1u << 29));
+    mem_write32(mem, spi2 + 0x108,
+                (rx_desc & 0x000FFFFFu) | (1u << 29));
+    mem_write32(mem, spi2, 1u << 18);
+
+    ASSERT_EQ(mem_read8(mem, rx_buf), 0x01u);
+    ASSERT_EQ((mem_read32(mem, rx_desc) >> 12) & 0x0FFFu, 1u);
+    ASSERT_EQ(mem_read32(mem, rx_desc) & (1u << 31), 0u);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x124), rx_desc);
+    ASSERT_EQ(mem_read32(mem, spi2 + 0x114) & ((1u << 5) | (1u << 3)),
+              (1u << 5) | (1u << 3));
 
     periph_destroy(p);
     mem_destroy(mem);
@@ -1061,6 +1266,9 @@ static void run_peripheral_tests(void) {
     RUN_TEST(radio_phy_calibration_register_files);
     RUN_TEST(xpt2046_pipelined_conversions);
     RUN_TEST(gp_spi_matrix_routing_and_hardware_cs);
+    RUN_TEST(gp_spi_native_iomux_routing_and_hardware_cs);
+    RUN_TEST(gp_spi_dma_descriptor_chain_and_interrupt);
+    RUN_TEST(gp_spi_dma_full_duplex_sd);
     RUN_TEST(raw_sd_multiblock_read_write);
     RUN_TEST(dport_safe_defaults);
     RUN_TEST(wdt_disable);

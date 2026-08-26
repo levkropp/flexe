@@ -12,9 +12,9 @@
  *   - Bytes clocked while touch-CS is low are treated as XPT2046 requests;
  *     MISO is filled with coordinates derived from the session touch_fn.
  *
- * DMA transfers bypass the SPI FIFO and are not captured (documented
- * limitation); polling transfers — what TFT_eSPI and the Arduino SPI
- * drivers use by default — all pass through W0..W15 here.
+ * Polling transfers pass through W0..W15. DMA transfers walk the ESP32's
+ * native lldesc chains and enter the same device models, so queued SPI-master
+ * traffic behaves identically without requiring display-library hooks.
  */
 
 #include "spi_display.h"
@@ -40,13 +40,57 @@
 #define SPI_PIN_REG       0x34
 #define SPI_SLAVE_REG     0x38
 #define SPI_W0_REG        0x80
+#define SPI_DMA_CONF_REG      0x100
+#define SPI_DMA_OUT_LINK_REG  0x104
+#define SPI_DMA_IN_LINK_REG   0x108
+#define SPI_DMA_STATUS_REG    0x10C
+#define SPI_DMA_INT_ENA_REG   0x110
+#define SPI_DMA_INT_RAW_REG   0x114
+#define SPI_DMA_INT_ST_REG    0x118
+#define SPI_DMA_INT_CLR_REG   0x11C
+#define SPI_IN_ERR_EOF_DES_REG 0x120
+#define SPI_IN_SUC_EOF_DES_REG 0x124
+#define SPI_INLINK_DSCR_REG    0x128
+#define SPI_INLINK_DSCR_BF0_REG 0x12C
+#define SPI_INLINK_DSCR_BF1_REG 0x130
+#define SPI_OUT_EOF_BFR_DES_REG 0x134
+#define SPI_OUT_EOF_DES_REG     0x138
+#define SPI_OUTLINK_DSCR_REG     0x13C
+#define SPI_OUTLINK_DSCR_BF0_REG 0x140
+#define SPI_OUTLINK_DSCR_BF1_REG 0x144
+#define SPI_DATE_REG             0x3FC
 
 #define SPI_CMD_USR       (1u << 18)
 #define SPI_TRANS_DONE    (1u << 4)
+#define SPI_TRANS_INTEN   (1u << 9)
 #define SPI_USER_USR_MOSI (1u << 27)
 #define SPI_USER_USR_MISO (1u << 28)
 #define SPI_USER_USR_ADDR (1u << 30)
 #define SPI_USER_USR_CMD  (1u << 31)
+
+#define SPI_DMA_IN_RST          (1u << 2)
+#define SPI_DMA_OUT_RST         (1u << 3)
+#define SPI_DMA_LINK_ADDR_MASK  0x000FFFFFu
+#define SPI_DMA_LINK_STOP       (1u << 28)
+#define SPI_DMA_LINK_START      (1u << 29)
+#define SPI_DMA_INT_MASK        0x1FFu
+#define SPI_DMA_INLINK_EMPTY    (1u << 0)
+#define SPI_DMA_OUTLINK_ERROR   (1u << 1)
+#define SPI_DMA_INLINK_ERROR    (1u << 2)
+#define SPI_DMA_IN_DONE         (1u << 3)
+#define SPI_DMA_IN_ERR_EOF      (1u << 4)
+#define SPI_DMA_IN_SUC_EOF      (1u << 5)
+#define SPI_DMA_OUT_DONE        (1u << 6)
+#define SPI_DMA_OUT_EOF         (1u << 7)
+#define SPI_DMA_OUT_TOTAL_EOF   (1u << 8)
+
+#define SPI_DMA_DESC_OWNER      (1u << 31)
+#define SPI_DMA_DESC_EOF        (1u << 30)
+#define SPI_DMA_DESC_LENGTH_MASK 0x00FFF000u
+#define SPI_DMA_DESC_LENGTH_SHIFT 12
+#define SPI_DMA_DESC_SIZE_MASK  0x00000FFFu
+#define SPI_DMA_MAX_DESCRIPTORS 1024
+#define SPI_DMA_MAX_TRANSFER    (4u * 1024u * 1024u)
 
 /* ILI9341 commands */
 #define ILI_CASET 0x2A
@@ -64,6 +108,11 @@
 #define VSPICS1_OUT_IDX 69
 #define VSPICS2_OUT_IDX 70
 
+#define HSPI_IOMUX_CLK_PIN 14
+#define HSPI_IOMUX_CS0_PIN 15
+#define VSPI_IOMUX_CLK_PIN 18
+#define VSPI_IOMUX_CS0_PIN 5
+
 typedef struct {
     xtensa_mem_t *mem;
     esp32_periph_t *periph;      /* for GPIO CS/D-C sampling */
@@ -75,6 +124,23 @@ typedef struct {
     uint32_t slave;              /* SPI_SLAVE_REG shadow (config bits) */
     int      trans_done;         /* SPI_TRANS_DONE flag (slave reg bit 4) */
     uint32_t w[16];
+
+    /* Classic ESP32 GP-SPI DMA register file and descriptor progress. */
+    uint32_t dma_conf;
+    uint32_t dma_out_link;
+    uint32_t dma_in_link;
+    uint32_t dma_int_ena;
+    uint32_t dma_int_raw;
+    uint32_t dma_in_err_eof_desc;
+    uint32_t dma_in_suc_eof_desc;
+    uint32_t dma_inlink_dscr;
+    uint32_t dma_inlink_dscr_bf0;
+    uint32_t dma_inlink_dscr_bf1;
+    uint32_t dma_out_eof_bfr_desc;
+    uint32_t dma_out_eof_desc;
+    uint32_t dma_outlink_dscr;
+    uint32_t dma_outlink_dscr_bf0;
+    uint32_t dma_outlink_dscr_bf1;
 
     /* ILI9341 state */
     uint8_t  cur_cmd;
@@ -120,10 +186,8 @@ static int gpio_level(const spi_display_t *s, int pin) {
     return periph_gpio_pin_level(s->periph, pin);
 }
 
-/* A CS pin counts as "asserted" only if the firmware has driven it high at
- * least once. Undriven pins read 0 in the GPIO shadow, which would look
- * like a permanently-asserted chip select (e.g. touch CS on boards where
- * the app never configures it). */
+/* An inactive high level or an enabled output driver distinguishes a genuine
+ * software chip select from an untouched reset pin whose latch also reads 0. */
 static uint64_t g_cs_seen_high;   /* bit per GPIO number */
 
 static int cs_seen_high(int pin) {
@@ -135,7 +199,11 @@ static int cs_asserted(spi_display_t *s, int pin) {
     if (pin < 0 || pin > 39) return 0;
     int lvl = gpio_level(s, pin);
     if (lvl == 1) g_cs_seen_high |= (1ULL << pin);
-    int asserted = lvl == 0 && cs_seen_high(pin);
+    /* A driver may configure CS as an output and immediately assert it before
+     * the first SPI transaction, so the sniffer never observes it high. */
+    int asserted = lvl == 0 &&
+                   (cs_seen_high(pin) ||
+                    periph_gpio_output_enabled(s->periph, pin));
     if (asserted && getenv("FLEXE_CSDBG"))
         fprintf(stderr, "[CS] pin=%d asserted (touch_cs=%d sd_cs=%d)\n", pin, s->cfg.touch_cs_pin, s->cfg.sd_cs_pin);
     return asserted;
@@ -153,6 +221,13 @@ static int clock_route(const spi_display_t *s, int pin) {
     int other = s->host_num == 2 ? VSPICLK_OUT_IDX : HSPICLK_OUT_IDX;
     if (signal == expected) return 1;
     if (signal == other) return 0;
+    /* ESP-IDF selects the native pin set through IO_MUX function 1 and never
+     * writes GPIO_FUNC_OUT_SEL in that case. Recognize both classic host pin
+     * sets so a native route is just as explicit as a matrix route. */
+    if (periph_iomux_function(s->periph, pin) == 1) {
+        if (pin == HSPI_IOMUX_CLK_PIN) return s->host_num == 2;
+        if (pin == VSPI_IOMUX_CLK_PIN) return s->host_num == 3;
+    }
     return -1;
 }
 
@@ -182,6 +257,13 @@ static int hardware_cs_state(const spi_display_t *s, int pin) {
                  signal == HSPICS2_OUT_IDX)
             return 0;
     }
+    if (cs < 0 && periph_iomux_function(s->periph, pin) == 1) {
+        if (pin == HSPI_IOMUX_CS0_PIN)
+            cs = s->host_num == 2 ? 0 : -2;
+        else if (pin == VSPI_IOMUX_CS0_PIN)
+            cs = s->host_num == 3 ? 0 : -2;
+        if (cs == -2) return 0;
+    }
     return cs < 0 ? -1 : ((s->pin & (1u << cs)) == 0);
 }
 
@@ -197,6 +279,11 @@ static void report_routes(spi_display_t *s) {
     int sd_clk = periph_gpio_out_signal(s->periph, s->cfg.sd_sck_pin);
     int display_cs = periph_gpio_out_signal(s->periph, s->cfg.display_cs_pin);
     int touch_cs = periph_gpio_out_signal(s->periph, s->cfg.touch_cs_pin);
+    int display_iomux = periph_iomux_function(s->periph,
+                                               s->cfg.display_sck_pin);
+    int touch_iomux = periph_iomux_function(s->periph,
+                                             s->cfg.touch_sck_pin);
+    int sd_iomux = periph_iomux_function(s->periph, s->cfg.sd_sck_pin);
     int sd_cs = periph_gpio_out_signal(s->periph, s->cfg.sd_cs_pin);
     uint64_t snapshot = (uint64_t)(display_clk & 0x1FF) |
                         (uint64_t)(touch_clk & 0x1FF) << 9 |
@@ -208,10 +295,12 @@ static void report_routes(spi_display_t *s) {
     s->route_reported = 1;
     s->route_snapshot = snapshot;
     fprintf(stderr,
-            "[SPIROUTE] SPI%d clk(display=%d touch=%d sd=%d) "
-            "cs(display=%d touch=%d sd=%d) pin=0x%08X\n",
-            s->host_num, display_clk, touch_clk, sd_clk,
-            display_cs, touch_cs, sd_cs, s->pin);
+                "[SPIROUTE] SPI%d clk(display=%d touch=%d sd=%d) "
+                "iomux(display=%d touch=%d sd=%d) "
+                "cs(display=%d touch=%d sd=%d) pin=0x%08X\n",
+                s->host_num, display_clk, touch_clk, sd_clk,
+                display_iomux, touch_iomux, sd_iomux,
+                display_cs, touch_cs, sd_cs, s->pin);
 }
 
 /* Display CS is often driven by the SPI hardware (spi_master spics_io_num),
@@ -227,10 +316,178 @@ static int display_active(spi_display_t *s) {
 
 /* ---- helpers ---- */
 
-static int data_bytes(uint32_t dlen_reg) {
-    int bits = (int)(dlen_reg & 0xFFFFFF) + 1;
-    int bytes = (bits + 7) / 8;
-    return bytes > 64 ? 64 : bytes;
+static size_t phase_bytes(uint32_t dlen_reg) {
+    uint32_t bits = (dlen_reg & 0xFFFFFFu) + 1u;
+    return (bits + 7u) / 8u;
+}
+
+static void gp_spi_intr_update(spi_display_t *s) {
+    bool active = (s->trans_done && (s->slave & SPI_TRANS_INTEN)) ||
+                  ((s->dma_int_raw & s->dma_int_ena) != 0);
+    int source = s->host_num == 2 ? 30 : 31;
+    if (active)
+        periph_assert_interrupt(s->periph, source);
+    else
+        periph_deassert_interrupt(s->periph, source);
+}
+
+static int dma_range_mapped(spi_display_t *s, uint32_t addr, size_t len,
+                            bool writable) {
+    while (len > 0) {
+        size_t page_left = 0x1000u - (addr & 0xFFFu);
+        size_t chunk = len < page_left ? len : page_left;
+        const uint8_t *ptr = writable ? mem_get_ptr_w(s->mem, addr) :
+                                        mem_get_ptr(s->mem, addr);
+        if (!ptr) return 0;
+        addr += (uint32_t)chunk;
+        len -= chunk;
+    }
+    return 1;
+}
+
+static uint32_t dma_first_desc(uint32_t link) {
+    /* Classic ESP32 stores only descriptor address bits [19:0]; DMA-capable
+     * internal DRAM occupies the implicit 0x3FFxxxxx window. */
+    return 0x3FF00000u | (link & SPI_DMA_LINK_ADDR_MASK);
+}
+
+static uint32_t dma_next_desc(uint32_t next) {
+    /* lldesc.next normally contains a complete pointer. Accept the same
+     * 20-bit form as the link register as a defensive convenience. */
+    return next != 0 && next < 0x00100000u ? 0x3FF00000u | next : next;
+}
+
+static size_t gp_spi_dma_read_tx(spi_display_t *s, uint8_t *dst,
+                                 size_t wanted) {
+    uint32_t desc = dma_first_desc(s->dma_out_link);
+    size_t copied = 0;
+    bool saw_eof = false;
+    bool error = false;
+
+    for (int count = 0; count < SPI_DMA_MAX_DESCRIPTORS && copied < wanted;
+         count++) {
+        if (!dma_range_mapped(s, desc, 12, false)) {
+            if (getenv("FLEXE_SPIDMADBG"))
+                fprintf(stderr,
+                        "[SPIDMA] SPI%d TX descriptor 0x%08X is unmapped "
+                        "(OUT_LINK=0x%08X)\n",
+                        s->host_num, desc, s->dma_out_link);
+            error = true;
+            break;
+        }
+        uint32_t ctrl = mem_read32(s->mem, desc);
+        uint32_t buf = mem_read32(s->mem, desc + 4u);
+        uint32_t next = dma_next_desc(mem_read32(s->mem, desc + 8u));
+        size_t size = ctrl & SPI_DMA_DESC_SIZE_MASK;
+        size_t len = (ctrl & SPI_DMA_DESC_LENGTH_MASK) >>
+                     SPI_DMA_DESC_LENGTH_SHIFT;
+
+        s->dma_outlink_dscr = desc;
+        s->dma_outlink_dscr_bf0 = next;
+        s->dma_outlink_dscr_bf1 = buf;
+
+        if (!(ctrl & SPI_DMA_DESC_OWNER) || len > size ||
+            (len != 0 && !dma_range_mapped(s, buf, len, false))) {
+            if (getenv("FLEXE_SPIDMADBG"))
+                fprintf(stderr,
+                        "[SPIDMA] SPI%d invalid TX descriptor 0x%08X: "
+                        "ctrl=0x%08X buf=0x%08X next=0x%08X\n",
+                        s->host_num, desc, ctrl, buf, next);
+            error = true;
+            break;
+        }
+
+        size_t chunk = len;
+        if (chunk > wanted - copied) chunk = wanted - copied;
+        for (size_t i = 0; i < chunk; i++)
+            dst[copied + i] = mem_read8(s->mem, buf + (uint32_t)i);
+        copied += chunk;
+        mem_write32(s->mem, desc, ctrl & ~SPI_DMA_DESC_OWNER);
+        s->dma_int_raw |= SPI_DMA_OUT_DONE;
+
+        if (ctrl & SPI_DMA_DESC_EOF) {
+            saw_eof = true;
+            s->dma_out_eof_bfr_desc = buf;
+            s->dma_out_eof_desc = desc;
+            s->dma_int_raw |= SPI_DMA_OUT_EOF;
+        }
+        if (copied >= wanted || saw_eof) break;
+        if (next == 0 || next == desc) {
+            error = true;
+            break;
+        }
+        desc = next;
+    }
+
+    if (copied == wanted)
+        s->dma_int_raw |= SPI_DMA_OUT_TOTAL_EOF;
+    else
+        error = true;
+    if (error)
+        s->dma_int_raw |= SPI_DMA_OUTLINK_ERROR;
+    s->dma_out_link &= ~SPI_DMA_LINK_START;
+    return copied;
+}
+
+static size_t gp_spi_dma_write_rx(spi_display_t *s, const uint8_t *src,
+                                  size_t wanted) {
+    uint32_t desc = dma_first_desc(s->dma_in_link);
+    size_t copied = 0;
+    bool error = false;
+
+    for (int count = 0; count < SPI_DMA_MAX_DESCRIPTORS && copied < wanted;
+         count++) {
+        if (!dma_range_mapped(s, desc, 12, true)) {
+            s->dma_in_err_eof_desc = desc;
+            error = true;
+            break;
+        }
+        uint32_t ctrl = mem_read32(s->mem, desc);
+        uint32_t buf = mem_read32(s->mem, desc + 4u);
+        uint32_t next = dma_next_desc(mem_read32(s->mem, desc + 8u));
+        size_t size = ctrl & SPI_DMA_DESC_SIZE_MASK;
+
+        s->dma_inlink_dscr = desc;
+        s->dma_inlink_dscr_bf0 = next;
+        s->dma_inlink_dscr_bf1 = buf;
+
+        if (!(ctrl & SPI_DMA_DESC_OWNER) || size == 0 ||
+            !dma_range_mapped(s, buf, size, true)) {
+            s->dma_in_err_eof_desc = desc;
+            error = true;
+            break;
+        }
+
+        size_t chunk = size;
+        if (chunk > wanted - copied) chunk = wanted - copied;
+        for (size_t i = 0; i < chunk; i++)
+            mem_write8(s->mem, buf + (uint32_t)i, src[copied + i]);
+        copied += chunk;
+        ctrl &= ~(SPI_DMA_DESC_OWNER | SPI_DMA_DESC_LENGTH_MASK);
+        ctrl |= ((uint32_t)chunk << SPI_DMA_DESC_LENGTH_SHIFT) &
+                SPI_DMA_DESC_LENGTH_MASK;
+        mem_write32(s->mem, desc, ctrl);
+        s->dma_int_raw |= SPI_DMA_IN_DONE;
+
+        if (copied >= wanted) {
+            s->dma_in_suc_eof_desc = desc;
+            s->dma_int_raw |= SPI_DMA_IN_SUC_EOF;
+            break;
+        }
+        if ((ctrl & SPI_DMA_DESC_EOF) || next == 0 || next == desc) {
+            s->dma_in_err_eof_desc = desc;
+            if (next == 0) s->dma_int_raw |= SPI_DMA_INLINK_EMPTY;
+            error = true;
+            break;
+        }
+        desc = next;
+    }
+
+    if (copied != wanted) error = true;
+    if (error)
+        s->dma_int_raw |= SPI_DMA_INLINK_ERROR | SPI_DMA_IN_ERR_EOF;
+    s->dma_in_link &= ~SPI_DMA_LINK_START;
+    return copied;
 }
 
 /* Map panel-native (x, y) to framebuffer coordinates.
@@ -592,11 +849,51 @@ static uint8_t sd_byte(spi_display_t *s, uint8_t mosi) {
 /* ---- MMIO handlers ---- */
 
 static void gp_spi_transact(spi_display_t *s) {
-    /* Transaction completes instantly: raise TRANS_DONE for drivers that
-     * poll SPI_SLAVE_REG (spi_device_polling_end / spi_hal_usr_is_done) */
-    s->trans_done = 1;
+    s->trans_done = 0;
+    gp_spi_intr_update(s);
 
     report_routes(s);
+
+    size_t tx_requested = (s->user & SPI_USER_USR_MOSI) ?
+                          phase_bytes(s->mosi_dlen) : 0;
+    size_t rx_requested = (s->user & SPI_USER_USR_MISO) ?
+                          phase_bytes(s->miso_dlen) : 0;
+    bool tx_dma = tx_requested != 0 &&
+                  (s->dma_out_link & SPI_DMA_LINK_START) != 0;
+    bool rx_dma = rx_requested != 0 &&
+                  (s->dma_in_link & SPI_DMA_LINK_START) != 0;
+    uint8_t *tx_owned = NULL;
+    uint8_t *rx_owned = NULL;
+    const uint8_t *tx_data = (const uint8_t *)s->w;
+    uint8_t *rx_data = (uint8_t *)s->w;
+    size_t tx_len = tx_requested > sizeof(s->w) ? sizeof(s->w) : tx_requested;
+    size_t rx_len = rx_requested > sizeof(s->w) ? sizeof(s->w) : rx_requested;
+
+    if (tx_dma) {
+        tx_len = 0;
+        if (tx_requested <= SPI_DMA_MAX_TRANSFER)
+            tx_owned = malloc(tx_requested);
+        if (tx_owned) {
+            memset(tx_owned, 0xFF, tx_requested);
+            tx_len = gp_spi_dma_read_tx(s, tx_owned, tx_requested);
+            tx_data = tx_owned;
+        } else {
+            s->dma_out_link &= ~SPI_DMA_LINK_START;
+            s->dma_int_raw |= SPI_DMA_OUTLINK_ERROR;
+        }
+    }
+    if (rx_dma) {
+        rx_len = 0;
+        if (rx_requested <= SPI_DMA_MAX_TRANSFER)
+            rx_owned = calloc(rx_requested, 1);
+        if (rx_owned) {
+            rx_len = rx_requested;
+            rx_data = rx_owned;
+        } else {
+            s->dma_in_link &= ~SPI_DMA_LINK_START;
+            s->dma_int_raw |= SPI_DMA_INLINK_ERROR | SPI_DMA_IN_ERR_EOF;
+        }
+    }
 
     int cs_touch = route_allows_host(s, s->cfg.touch_sck_pin) &&
                    device_cs_state(s, s->cfg.touch_cs_pin);
@@ -621,29 +918,31 @@ static void gp_spi_transact(spi_display_t *s) {
          * in W0, so scan the complete MOSI phase rather than only byte 0.
          * Preserve it before xpt2046_respond overwrites W0 with MISO. */
         uint8_t mosi[64];
-        int n = 0;
-        if (s->user & SPI_USER_USR_MOSI) {
-            n = data_bytes(s->mosi_dlen);
-            memcpy(mosi, s->w, (size_t)n);
+        const uint8_t *touch_tx = tx_data;
+        size_t touch_tx_len = tx_len;
+        if (!tx_dma && touch_tx_len > 0) {
+            memcpy(mosi, s->w, touch_tx_len);
+            touch_tx = mosi;
         }
         uint8_t reply_cmd = s->touch_cmd;
         xpt2046_respond(s);
-        for (int i = 0; i < n; i++) {
-            if (mosi[i] & 0x80)
-                s->touch_cmd = mosi[i];
+        if (rx_dma && rx_data) {
+            size_t copy = rx_len < sizeof(s->w) ? rx_len : sizeof(s->w);
+            memcpy(rx_data, s->w, copy);
+        }
+        for (size_t i = 0; i < touch_tx_len; i++) {
+            if (touch_tx[i] & 0x80)
+                s->touch_cmd = touch_tx[i];
         }
         if (getenv("FLEXE_TOUCHDBG")) {
             int rx, ry, pr; touch_sample(s, &rx, &ry, &pr);
             fprintf(stderr, "[TOUCH] reply=0x%02X next=0x%02X W0=0x%08X (rx=%d ry=%d pressed=%d)\n",
                     reply_cmd, s->touch_cmd, s->w[0], rx, ry, pr);
         }
-        return;
-    }
-
-    /* A software-selected panel takes precedence over a stale hardware-CS
-     * configuration left by ESP-IDF's SD driver on the shared host.  The SD
-     * path is selected whenever the panel CS is inactive. */
-    if (cs_disp) {
+    } else if (cs_disp) {
+        /* A software-selected panel takes precedence over a stale hardware-CS
+         * configuration left by ESP-IDF's SD driver on the shared host.  The
+         * SD path is selected whenever the panel CS is inactive. */
         int dc = (gpio_level(s, s->cfg.dc_pin) == 1);
 
         /* Command phase (8 bits) if USR_COMMAND set */
@@ -653,35 +952,42 @@ static void gp_spi_transact(spi_display_t *s) {
         }
         /* Address phase — display drivers don't use it; ignore */
         /* Data phase */
-        if (s->user & SPI_USER_USR_MOSI) {
-            int n = data_bytes(s->mosi_dlen);
-            if (n > 0) ili9341_feed(s, dc, (const uint8_t *)s->w, n);
-        }
+        if (tx_len > 0)
+            ili9341_feed(s, dc, tx_data, (int)tx_len);
         /* Read commands (RDID 0x04 etc.): leave W as-is (zeros read as 0) */
-        return;
-    }
-
-    if (cs_sd) {
+    } else if (cs_sd) {
         /* Byte-at-a-time SD protocol exchange; write MISO back to W */
-        int n = data_bytes(s->mosi_dlen);
-        int m = data_bytes(s->miso_dlen);
-        int total = n > m ? n : m;
-        if (total > 64) total = 64;
-        const uint8_t *mosi = (const uint8_t *)s->w;
-        uint8_t miso[64];
-        for (int i = 0; i < total; i++)
-            miso[i] = sd_byte(s, i < n ? mosi[i] : 0xFF);
+        size_t total = tx_len > rx_len ? tx_len : rx_len;
+        for (size_t i = 0; i < total; i++) {
+            uint8_t miso = sd_byte(s, i < tx_len ? tx_data[i] : 0xFF);
+            if (i < rx_len) rx_data[i] = miso;
+        }
         if (getenv("FLEXE_SDDBG2")) {
-            fprintf(stderr, "[SD2] txn n=%d m=%d mosi=", n, m);
-            for (int i = 0; i < total && i < 8; i++) fprintf(stderr, "%02X ", i < n ? mosi[i] : 0xFF);
+            fprintf(stderr, "[SD2] txn n=%zu m=%zu mosi=", tx_len, rx_len);
+            for (size_t i = 0; i < total && i < 8; i++)
+                fprintf(stderr, "%02X ", i < tx_len ? tx_data[i] : 0xFF);
             fprintf(stderr, "| miso=");
-            for (int i = 0; i < total && i < 8; i++) fprintf(stderr, "%02X ", miso[i]);
+            for (size_t i = 0; i < rx_len && i < 8; i++)
+                fprintf(stderr, "%02X ", rx_data[i]);
             fprintf(stderr, "\n");
         }
-        memcpy(s->w, miso, (size_t)total);
-        return;
     }
 
+    size_t rx_written = 0;
+    if (rx_dma && rx_owned)
+        rx_written = gp_spi_dma_write_rx(s, rx_owned, rx_requested);
+    if ((tx_dma || rx_dma) && getenv("FLEXE_SPIDMADBG"))
+        fprintf(stderr,
+                "[SPIDMA] SPI%d tx=%zu/%zu rx=%zu/%zu raw=0x%03X\n",
+                s->host_num, tx_len, tx_requested, rx_written, rx_requested,
+                s->dma_int_raw);
+    free(rx_owned);
+    free(tx_owned);
+
+    /* Transaction completes instantly: raise TRANS_DONE for polling and
+     * interrupt-driven spi_master clients after all DMA writeback is visible. */
+    s->trans_done = 1;
+    gp_spi_intr_update(s);
 }
 
 static uint32_t gp_spi_read(void *ctx, uint32_t addr) {
@@ -698,6 +1004,27 @@ static uint32_t gp_spi_read(void *ctx, uint32_t addr) {
     case SPI_MISO_DLEN_REG: return s->miso_dlen;
     case SPI_PIN_REG:      return s->pin;
     case SPI_SLAVE_REG:    return s->slave | (s->trans_done ? SPI_TRANS_DONE : 0);
+    case SPI_DMA_CONF_REG: return s->dma_conf;
+    case SPI_DMA_OUT_LINK_REG: return s->dma_out_link;
+    case SPI_DMA_IN_LINK_REG: return s->dma_in_link;
+    case SPI_DMA_STATUS_REG:
+        return ((s->dma_out_link & SPI_DMA_LINK_START) ? 2u : 0u) |
+               ((s->dma_in_link & SPI_DMA_LINK_START) ? 1u : 0u);
+    case SPI_DMA_INT_ENA_REG: return s->dma_int_ena;
+    case SPI_DMA_INT_RAW_REG: return s->dma_int_raw;
+    case SPI_DMA_INT_ST_REG: return s->dma_int_raw & s->dma_int_ena;
+    case SPI_DMA_INT_CLR_REG: return 0;
+    case SPI_IN_ERR_EOF_DES_REG: return s->dma_in_err_eof_desc;
+    case SPI_IN_SUC_EOF_DES_REG: return s->dma_in_suc_eof_desc;
+    case SPI_INLINK_DSCR_REG: return s->dma_inlink_dscr;
+    case SPI_INLINK_DSCR_BF0_REG: return s->dma_inlink_dscr_bf0;
+    case SPI_INLINK_DSCR_BF1_REG: return s->dma_inlink_dscr_bf1;
+    case SPI_OUT_EOF_BFR_DES_REG: return s->dma_out_eof_bfr_desc;
+    case SPI_OUT_EOF_DES_REG: return s->dma_out_eof_desc;
+    case SPI_OUTLINK_DSCR_REG: return s->dma_outlink_dscr;
+    case SPI_OUTLINK_DSCR_BF0_REG: return s->dma_outlink_dscr_bf0;
+    case SPI_OUTLINK_DSCR_BF1_REG: return s->dma_outlink_dscr_bf1;
+    case SPI_DATE_REG: return 0x01604270u;
     default:
         if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))
             return s->w[(off - SPI_W0_REG) / 4];
@@ -723,6 +1050,40 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
     case SPI_SLAVE_REG:
         s->slave = val & ~SPI_TRANS_DONE;
         if (!(val & SPI_TRANS_DONE)) s->trans_done = 0;  /* clear_intr */
+        gp_spi_intr_update(s);
+        break;
+    case SPI_DMA_CONF_REG:
+        s->dma_conf = val;
+        if (val & SPI_DMA_OUT_RST)
+            s->dma_out_link &= ~SPI_DMA_LINK_START;
+        if (val & SPI_DMA_IN_RST)
+            s->dma_in_link &= ~SPI_DMA_LINK_START;
+        break;
+    case SPI_DMA_OUT_LINK_REG:
+        if (getenv("FLEXE_SPIDMADBG"))
+            fprintf(stderr, "[SPIDMA] SPI%d OUT_LINK <- 0x%08X\n",
+                    s->host_num, val);
+        s->dma_out_link = val &
+                (SPI_DMA_LINK_ADDR_MASK | SPI_DMA_LINK_START);
+        if (val & SPI_DMA_LINK_STOP)
+            s->dma_out_link &= ~SPI_DMA_LINK_START;
+        break;
+    case SPI_DMA_IN_LINK_REG:
+        if (getenv("FLEXE_SPIDMADBG"))
+            fprintf(stderr, "[SPIDMA] SPI%d IN_LINK <- 0x%08X\n",
+                    s->host_num, val);
+        s->dma_in_link = val &
+                (SPI_DMA_LINK_ADDR_MASK | SPI_DMA_LINK_START);
+        if (val & SPI_DMA_LINK_STOP)
+            s->dma_in_link &= ~SPI_DMA_LINK_START;
+        break;
+    case SPI_DMA_INT_ENA_REG:
+        s->dma_int_ena = val & SPI_DMA_INT_MASK;
+        gp_spi_intr_update(s);
+        break;
+    case SPI_DMA_INT_CLR_REG:
+        s->dma_int_raw &= ~(val & SPI_DMA_INT_MASK);
+        gp_spi_intr_update(s);
         break;
     default:
         if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))

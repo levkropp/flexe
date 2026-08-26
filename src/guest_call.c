@@ -1,5 +1,7 @@
 #include "guest_call.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* RTC-slow page 1 is intentionally left available by memory.c.  Keeping the
@@ -77,7 +79,8 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
 
     bool completed = false;
     uint32_t retval = 0;
-    for (uint32_t i = 0; i < instruction_limit; i++) {
+    uint32_t executed = 0;
+    for (; executed < instruction_limit; executed++) {
         if (cpu->pc == GUEST_CALL_SENTINEL) {
             completed = true;
             retval = ar_read(cpu, 10);
@@ -87,6 +90,18 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
             break;
         xtensa_step(cpu);
     }
+
+    if (!completed && getenv("FLEXE_GUESTCALLDBG"))
+        fprintf(stderr,
+                "[guest-call] entry=0x%08X stopped pc=0x%08X "
+                "instructions=%u/%u running=%d exception=%d ps=0x%08X "
+                "wb=%u ws=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X "
+                "a3=0x%08X a4=0x%08X a5=0x%08X\n",
+                entry, cpu->pc, executed, instruction_limit,
+                cpu->running, cpu->exception, cpu->ps, cpu->windowbase,
+                cpu->windowstart, ar_read(cpu, 0), ar_read(cpu, 1),
+                ar_read(cpu, 2), ar_read(cpu, 3), ar_read(cpu, 4),
+                ar_read(cpu, 5));
 
     memcpy(cpu->ar, save_ar, sizeof(save_ar));
     memcpy(cpu->mr, save_mr, sizeof(save_mr));

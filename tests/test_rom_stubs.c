@@ -436,7 +436,7 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
 
-    const uint32_t wrapper = 0x40189A2Cu;
+    const uint32_t wrapper = 0x40189A3Cu;
     const uint32_t rom_literal = wrapper - 0x104u;
     const uint32_t global_literal = wrapper - 0x100u;
     const uint32_t phy_global = 0x3FFB2000u;
@@ -452,7 +452,7 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     mem_write32(cpu.mem, rom_literal, 0x40004100u);
     mem_write32(cpu.mem, global_literal, phy_global);
 
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40089268u), 4);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40089268u), 3);
     cpu.pc = wrapper;
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE);
@@ -476,6 +476,68 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     ASSERT_EQ(cpu.pc, BASE);
     ASSERT_EQ(ar_read(&cpu, 2), 0);
     ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_marauder_nimble_deinit_preserves_cpp_lists) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    const uint32_t ignore_list = 0x3FFC9534u;
+    const uint32_t connected_list = 0x3FFC9540u;
+    const uint32_t synced = 0x3FFC9550u;
+    const uint32_t initialized = 0x3FFC955Cu;
+    mem_write32(cpu.mem, ignore_list, ignore_list);
+    mem_write32(cpu.mem, ignore_list + 4u, ignore_list);
+    mem_write32(cpu.mem, ignore_list + 8u, 0);
+    mem_write32(cpu.mem, connected_list, connected_list);
+    mem_write32(cpu.mem, connected_list + 4u, connected_list);
+    mem_write32(cpu.mem, connected_list + 8u, 0);
+    mem_write8(cpu.mem, synced, 1);
+    mem_write8(cpu.mem, initialized, 1);
+
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 5);
+    cpu.pc = 0x4010463Cu;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, 1);
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+    ASSERT_EQ(mem_read8(cpu.mem, synced), 1);
+    ASSERT_EQ(mem_read8(cpu.mem, initialized), 1);
+    ASSERT_EQ(mem_read32(cpu.mem, ignore_list), ignore_list);
+    ASSERT_EQ(mem_read32(cpu.mem, ignore_list + 4u), ignore_list);
+    ASSERT_EQ(mem_read32(cpu.mem, ignore_list + 8u), 0);
+    ASSERT_EQ(mem_read32(cpu.mem, connected_list), connected_list);
+    ASSERT_EQ(mem_read32(cpu.mem, connected_list + 4u), connected_list);
+    ASSERT_EQ(mem_read32(cpu.mem, connected_list + 8u), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_marauder_dport_cache_stall_is_coherent_noop) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 5);
+    static const uint32_t hook_pc[] = { 0x400816FCu, 0x40081760u };
+    for (size_t i = 0; i < sizeof(hook_pc) / sizeof(hook_pc[0]); i++) {
+        cpu.pc = hook_pc[i];
+        cpu._pc_written = true;
+        XT_PS_SET_CALLINC(cpu.ps, 0);
+        ar_write(&cpu, 0, BASE);
+        ar_write(&cpu, 2, 0xA5A5A5A5u);
+        xtensa_step(&cpu);
+        ASSERT_EQ(cpu.pc, BASE);
+        ASSERT_EQ(ar_read(&cpu, 2), 0xA5A5A5A5u);
+    }
 
     rom_stubs_destroy(rom);
     teardown(&cpu);
@@ -543,6 +605,9 @@ TEST(test_bt_rom_table_accessors_use_bounded_scratch) {
 
     call_builtin_rom0(&cpu, 0x40054288u, 0x3FFB1234u);
     ASSERT_EQ(mem_read32(cpu.mem, 0x50000DFCu), 0x3FFB1234u);
+    /* The virtual HCI host owns observable BLE state; the closed ROM link
+     * controller therefore initializes as a recognized no-op. */
+    call_builtin_rom0(&cpu, 0x4001C948u, 0);
     ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
 
     rom_stubs_destroy(rom);
@@ -567,5 +632,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_cache_noop);
     RUN_TEST(test_stub_memcpy);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
+    RUN_TEST(test_marauder_nimble_deinit_preserves_cpp_lists);
+    RUN_TEST(test_marauder_dport_cache_stall_is_coherent_noop);
     RUN_TEST(test_bt_rom_table_accessors_use_bounded_scratch);
 }

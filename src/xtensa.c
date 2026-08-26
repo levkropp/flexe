@@ -33,28 +33,37 @@ static inline void xtensa_recompute_next_timer_impl(xtensa_cpu_t *cpu) {
      * Firmware clears it by writing CCOMPAREn, which recomputes this cache.
      * Keeping an already-latched compare here made a WAITI core revisit the
      * same event on every idle cycle and hid later enabled timers. */
-    uint32_t d0 = cpu->ccompare[0] && !(cpu->interrupt & (1u << 6))
-                    ? cpu->ccompare[0] - cpu->ccount : UINT32_MAX;
-    uint32_t d1 = cpu->ccompare[1] && !(cpu->interrupt & (1u << 15))
-                    ? cpu->ccompare[1] - cpu->ccount : UINT32_MAX;
-    uint32_t d2 = cpu->ccompare[2] && !(cpu->interrupt & (1u << 16))
-                    ? cpu->ccompare[2] - cpu->ccount : UINT32_MAX;
-    if (d0 >= 0x80000000u && d0 != UINT32_MAX) d0 = 0;
-    if (d1 >= 0x80000000u && d1 != UINT32_MAX) d1 = 0;
-    if (d2 >= 0x80000000u && d2 != UINT32_MAX) d2 = 0;
-    if (d0 <= d1 && d0 <= d2)
-        cpu->next_timer_event = cpu->ccompare[0];
-    else if (d1 <= d2)
-        cpu->next_timer_event = cpu->ccompare[1];
-    else
-        cpu->next_timer_event = cpu->ccompare[2];
-    if (!cpu->ccompare[0] && !cpu->ccompare[1] && !cpu->ccompare[2])
-        cpu->next_timer_event = UINT32_MAX;
+    static const uint8_t int_bit[3] = { 6, 15, 16 };
+    bool have_event = false;
+    uint32_t best_distance = 0;
+    uint32_t best_event = UINT32_MAX;
+
+    for (int i = 0; i < 3; i++) {
+        if (!cpu->ccompare[i] || (cpu->interrupt & (1u << int_bit[i])))
+            continue;
+        uint32_t distance = cpu->ccompare[i] - cpu->ccount;
+        if ((int32_t)distance < 0)
+            distance = 0;
+        if (!have_event || distance < best_distance) {
+            have_event = true;
+            best_distance = distance;
+            best_event = cpu->ccompare[i];
+        }
+    }
     /* Fold in peripheral timer events (TIMG LACT alarms) */
     if (cpu->periph_next_event) {
         uint32_t e = cpu->periph_next_event(cpu);
-        if (e < cpu->next_timer_event) cpu->next_timer_event = e;
+        if (e != UINT32_MAX) {
+            uint32_t distance = e - cpu->ccount;
+            if ((int32_t)distance < 0)
+                distance = 0;
+            if (!have_event || distance < best_distance) {
+                have_event = true;
+                best_event = e;
+            }
+        }
     }
+    cpu->next_timer_event = have_event ? best_event : UINT32_MAX;
 }
 
 void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {

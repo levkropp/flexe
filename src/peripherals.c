@@ -171,6 +171,11 @@ struct esp32_periph {
     /* GPIO */
     gpio_state_t gpio;
 
+    /* IO_MUX pin configuration registers. Keep a written bitmap so reset
+     * defaults are not mistaken for an explicitly selected native function. */
+    uint32_t io_mux[64];
+    uint64_t io_mux_written;
+
     /* Timer groups WDT */
     wdt_state_t timg_wdt[2];
 
@@ -781,12 +786,23 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
 /* ---- IO_MUX ---- */
 
 static uint32_t io_mux_read(void *ctx, uint32_t addr) {
-    (void)ctx; (void)addr;
-    return 0x1800;   /* Default pin configuration */
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - IO_MUX_BASE;
+    uint32_t index = off / 4u;
+    if ((off & 3u) == 0 && index < 64u &&
+        (p->io_mux_written & (1ULL << index)))
+        return p->io_mux[index];
+    return 0x1800;   /* Reset/default pin configuration */
 }
 
 static void io_mux_write(void *ctx, uint32_t addr, uint32_t val) {
-    (void)ctx; (void)addr; (void)val;
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - IO_MUX_BASE;
+    uint32_t index = off / 4u;
+    if ((off & 3u) == 0 && index < 64u) {
+        p->io_mux[index] = val;
+        p->io_mux_written |= 1ULL << index;
+    }
 }
 
 /* ---- EFUSE ---- */
@@ -1597,9 +1613,31 @@ int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
     return (int)((p->gpio.out1 >> (pin - 32)) & 1u);
 }
 
+int periph_gpio_output_enabled(const esp32_periph_t *p, int pin) {
+    if (!p || pin < 0 || pin > 39) return 0;
+    if (pin < 32) return (int)((p->gpio.enable >> pin) & 1u);
+    return (int)((p->gpio.enable1 >> (pin - 32)) & 1u);
+}
+
 int periph_gpio_out_signal(const esp32_periph_t *p, int pin) {
     if (!p || pin < 0 || pin > 39) return -1;
     return (int)(p->gpio.func_out_sel[pin] & 0x1FFu);
+}
+
+int periph_iomux_function(const esp32_periph_t *p, int pin) {
+    /* Offsets from the classic ESP32 GPIO_PIN_MUX_REG table. GPIO28..31 are
+     * not bonded as general-purpose pins and therefore have no entries. */
+    static const uint8_t offsets[40] = {
+        0x44, 0x88, 0x40, 0x84, 0x48, 0x6C, 0x60, 0x64,
+        0x68, 0x54, 0x58, 0x5C, 0x34, 0x38, 0x30, 0x3C,
+        0x4C, 0x50, 0x70, 0x74, 0x78, 0x7C, 0x80, 0x8C,
+        0x90, 0x24, 0x28, 0x2C, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x1C, 0x20, 0x14, 0x18, 0x04, 0x08, 0x0C, 0x10,
+    };
+    if (!p || pin < 0 || pin > 39 || offsets[pin] == 0xFF) return -1;
+    uint32_t index = offsets[pin] / 4u;
+    if (!(p->io_mux_written & (1ULL << index))) return -1;
+    return (int)((p->io_mux[index] >> 12) & 7u);
 }
 
 void periph_destroy(esp32_periph_t *p) {

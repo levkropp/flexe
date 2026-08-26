@@ -36,11 +36,13 @@
 #define STOCK_SD_SECTORS         (STOCK_SD_BYTES / 512u)
 #define STOCK_SD_ROOT_SECTOR     65u
 
-/* Verified production v1.14 WiFiScan layout. */
-#define MARAUDER_MGMT_FRAMES_ADDR   0x3FFC8C98u
-#define MARAUDER_DATA_FRAMES_ADDR   0x3FFC8C9Cu
-#define MARAUDER_BEACON_FRAMES_ADDR 0x3FFC8CA0u
-#define MARAUDER_SCAN_MODE_ADDR     0x3FFC9384u
+/* Verified ESP32 Marauder v1.14 CYD WiFiScan layout. The object begins at
+ * 0x3FFC85F0; these offsets are also independently visible in the production
+ * ELF's DWARF member locations and StartScan's final S8I instruction. */
+#define MARAUDER_MGMT_FRAMES_ADDR   0x3FFC8CC0u
+#define MARAUDER_DATA_FRAMES_ADDR   0x3FFC8CC4u
+#define MARAUDER_BEACON_FRAMES_ADDR 0x3FFC8CC8u
+#define MARAUDER_SCAN_MODE_ADDR     0x3FFC93ACu
 #define MARAUDER_RAW_SCAN_MODE      25u
 #define MARAUDER_RICKROLL_MODE      9u
 #define MARAUDER_BT_SCAN_MODE       10u
@@ -391,6 +393,30 @@ static int run_for_virtual_cycles(flexe_session_t *session, uint64_t cycles)
         run_one_batch(session);
     }
     return 0;
+}
+
+static int run_until_nerd_spiffs(flexe_session_t *session,
+                                 uint64_t max_cycles, int *blocks_out,
+                                 uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+    int expected = NERDMINER_SPIFFS_SIZE / NERDMINER_SPIFFS_BLOCK;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        int blocks = nerdminer_spiffs_formatted(session);
+        if (blocks == expected) {
+            *blocks_out = blocks;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+        run_one_batch(session);
+    }
+
+    *blocks_out = nerdminer_spiffs_formatted(session);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
 }
 
 static int run_until_screen(flexe_session_t *session, const uint16_t *fb,
@@ -921,10 +947,30 @@ int main(int argc, char **argv)
                                          min_nonblack, boot_limit, &nonblack,
                                          &boot_cycles);
     if (screen_result != 0) {
+        xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+        xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
         fprintf(stderr,
-                "FAIL profile=%s reason=%s nonblack=%d virtual_cycles=%llu\n",
+                "FAIL profile=%s reason=%s nonblack=%d virtual_cycles=%llu "
+                "pc0=0x%08x pc1=0x%08x running=%d/%d halted=%d/%d "
+                "ccount=%u/%u next_timer=%u/%u int=0x%08x/0x%08x "
+                "ena=0x%08x/0x%08x ps=0x%08x/0x%08x "
+                "unhandled_mmio=%d unregistered_rom=%d\n",
                 profile, screen_result < 0 ? "cpus-stopped" : "screen-timeout",
-                nonblack, (unsigned long long)boot_cycles);
+                nonblack, (unsigned long long)boot_cycles,
+                cpu0 ? cpu0->pc : 0, cpu1 ? cpu1->pc : 0,
+                cpu0 ? cpu0->running : 0, cpu1 ? cpu1->running : 0,
+                cpu0 ? cpu0->halted : 0, cpu1 ? cpu1->halted : 0,
+                cpu0 ? cpu0->ccount : 0, cpu1 ? cpu1->ccount : 0,
+                cpu0 ? cpu0->next_timer_event : 0,
+                cpu1 ? cpu1->next_timer_event : 0,
+                cpu0 ? cpu0->interrupt : 0, cpu1 ? cpu1->interrupt : 0,
+                cpu0 ? cpu0->intenable : 0, cpu1 ? cpu1->intenable : 0,
+                cpu0 ? cpu0->ps : 0, cpu1 ? cpu1->ps : 0,
+                periph_unhandled_count(flexe_session_periph(session)),
+                rom_stubs_unregistered_count(flexe_session_rom(session)));
+        fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
+        fwrite(uart.log, 1, uart.log_len, stderr);
+        fputc('\n', stderr);
         flexe_session_destroy(session);
         pthread_mutex_destroy(&framebuffer_mutex);
         unlink(sd_path);
@@ -938,6 +984,7 @@ int main(int argc, char **argv)
     wifi_stubs_stats_t wifi_stats = {0};
     uint64_t network_cycles = 0;
     uint64_t service_cycles = 0;
+    uint64_t spiffs_cycles = 0;
     uint64_t cli_cycles = 0;
     uint64_t stop_cycles = 0;
     uint64_t tx_cycles = 0;
@@ -972,13 +1019,26 @@ int main(int argc, char **argv)
             free(framebuf);
             return 1;
         }
-        spiffs_blocks = nerdminer_spiffs_formatted(session);
         int expected_blocks = NERDMINER_SPIFFS_SIZE / NERDMINER_SPIFFS_BLOCK;
-        if (spiffs_blocks != expected_blocks) {
+        int spiffs_result = run_until_nerd_spiffs(
+                session, 1000000000ull, &spiffs_blocks, &spiffs_cycles);
+        if (spiffs_result != 0 || spiffs_blocks != expected_blocks) {
+            xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+            xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
             fprintf(stderr,
-                    "FAIL profile=nerdminer reason=spiffs-not-formatted "
-                    "first_bad_block=%d\n",
-                    spiffs_blocks);
+                    "FAIL profile=nerdminer reason=%s first_bad_block=%d "
+                    "spiffs_cycles=%llu pc0=0x%08x pc1=0x%08x "
+                    "running=%d/%d unhandled_mmio=%d unregistered_rom=%d\n",
+                    spiffs_result < 0 ? "cpus-stopped-during-spiffs" :
+                                        "spiffs-not-formatted",
+                    spiffs_blocks, (unsigned long long)spiffs_cycles,
+                    cpu0 ? cpu0->pc : 0, cpu1 ? cpu1->pc : 0,
+                    cpu0 ? cpu0->running : 0, cpu1 ? cpu1->running : 0,
+                    periph_unhandled_count(flexe_session_periph(session)),
+                    rom_stubs_unregistered_count(flexe_session_rom(session)));
+            fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
+            fwrite(uart.log, 1, uart.log_len, stderr);
+            fputc('\n', stderr);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -1183,13 +1243,29 @@ int main(int argc, char **argv)
                 session, &uart, &wifi_before_cli, 500000000ull, &wifi_stats,
                 &cli_cycles);
         if (cli_result != 0) {
+            uint8_t scan_mode = mem_read8(flexe_session_mem(session),
+                                           MARAUDER_SCAN_MODE_ADDR);
             fprintf(stderr,
                     "FAIL profile=marauder reason=%s cli_cycles=%llu "
-                    "uart_bytes=%llu pending_rx=%zu\n",
+                    "uart_bytes=%llu pending_rx=%zu command_echo=%d "
+                    "scan_mode=%u wifi_init=%llu/%llu wifi_start=%llu/%llu "
+                    "wifi_mode=%llu/%llu promisc_enable=%llu/%llu "
+                    "promisc_cb=%llu/%llu\n",
                     cli_result < 0 ? "cpus-stopped-during-cli" : "cli-timeout",
                     (unsigned long long)cli_cycles,
                     (unsigned long long)uart.count,
-                    periph_uart_rx_pending(flexe_session_periph(session)));
+                    periph_uart_rx_pending(flexe_session_periph(session)),
+                    uart_contains(&uart, "#sniffraw"), scan_mode,
+                    (unsigned long long)wifi_stats.wifi_init_calls,
+                    (unsigned long long)wifi_before_cli.wifi_init_calls,
+                    (unsigned long long)wifi_stats.wifi_start_calls,
+                    (unsigned long long)wifi_before_cli.wifi_start_calls,
+                    (unsigned long long)wifi_stats.wifi_set_mode_calls,
+                    (unsigned long long)wifi_before_cli.wifi_set_mode_calls,
+                    (unsigned long long)wifi_stats.promisc_enable_calls,
+                    (unsigned long long)wifi_before_cli.promisc_enable_calls,
+                    (unsigned long long)wifi_stats.promisc_callback_calls,
+                    (unsigned long long)wifi_before_cli.promisc_callback_calls);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -1607,11 +1683,13 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
     if (is_nerdminer)
-        printf(" spiffs_blocks=%d sd_fat=mounted network_cycles=%llu "
+        printf(" spiffs_blocks=%d spiffs_cycles=%llu sd_fat=mounted "
+               "network_cycles=%llu "
                "service_cycles=%llu tcp_udp_sockets=%llu binds=%llu "
                "listens=%llu accepts=%llu http_bytes=%zu dns_bytes=%zu "
                "tcp_rx=%llu tcp_tx=%llu udp_rx=%llu udp_tx=%llu",
-               spiffs_blocks, (unsigned long long)network_cycles,
+               spiffs_blocks, (unsigned long long)spiffs_cycles,
+               (unsigned long long)network_cycles,
                (unsigned long long)service_cycles,
                (unsigned long long)wifi_stats.socket_successes,
                (unsigned long long)wifi_stats.bind_successes,

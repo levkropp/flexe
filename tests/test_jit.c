@@ -523,6 +523,41 @@ TEST(test_jit_hot_threshold) {
     teardown(&cpu);
 }
 
+TEST(test_jit_short_backedge_loop_is_native) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* The production ESP-IDF IPC wait loop has this shape: one load and a
+     * backward BEQZ.  Its fallthrough RET makes the trace only three guest
+     * instructions long, but the taken path can self-chain very profitably. */
+    put_insn2(&cpu, BASE, narrow(0x8, 0, 2, 3)); /* L32I.N a3, a2, 0 */
+    uint32_t imm12 = (uint32_t)-6 & 0xFFFu;
+    put_insn3(&cpu, BASE + 2,
+              (imm12 << 12) | (3u << 8) | (1u << 4) | 6u); /* BEQZ a3, BASE */
+    put_insn2(&cpu, BASE + 5, narrow(0xD, 15, 0, 0));       /* RET.N */
+    ar_write(&cpu, 2, BASE + 0x1000);
+    mem_write32(cpu.mem, BASE + 0x1000, 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    int ran = xtensa_run(&cpu, 800);
+    const jit_stats_t *stats = jit_get_stats(jit);
+    ASSERT_TRUE(ran >= 800);
+    ASSERT_TRUE(stats->blocks_executed >= 1);
+    ASSERT_TRUE(stats->insns_jitted >= 400);
+    ASSERT_EQ(cpu.pc, BASE);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_flush) {
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -698,6 +733,7 @@ static void run_jit_tests(void) {
     TEST_SUITE("jit");
     RUN_TEST(test_jit_init_destroy);
     RUN_TEST(test_jit_hot_threshold);
+    RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);
     RUN_TEST(test_jit_nop);

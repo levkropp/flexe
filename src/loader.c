@@ -19,6 +19,9 @@
 #define PT_SUB_PHY       0x01u
 #define PT_SUB_NVS       0x02u
 #define PT_SUB_COREDUMP  0x03u
+#define PT_SUB_OTA0      0x10u
+#define PT_SUB_OTA1      0x11u
+#define PT_SUB_SPIFFS    0x82u
 
 static uint32_t pt_crc32_le(uint32_t crc, const uint8_t *buf, size_t len) {
     /* ESP-ROM crc32_le semantics: zlib CRC32 (poly 0xEDB88320, reflected) */
@@ -42,7 +45,8 @@ static void pt_entry(uint8_t *p, uint8_t type, uint8_t subtype,
     memset(p + 28, 0, 4);                   /* flags */
 }
 
-static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size) {
+static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
+                                              uint32_t entry_point) {
     /* Respect a pre-existing valid table (shouldn't happen for app-only
      * images, but cheap insurance against clobbering real data). */
     if (mem->flash_data[PT_OFFSET] == 0xAA && mem->flash_data[PT_OFFSET + 1] == 0x50)
@@ -54,24 +58,65 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size) 
     uint32_t factory_size = ((uint32_t)app_size + 0xFFFFu) & ~0xFFFFu;
     uint32_t off = 0x10000u;
     int n = 0;
-    pt_entry(pt, PT_TYPE_APP, PT_SUB_FACTORY, off, factory_size, "factory");
-    n++;
-    off += factory_size;
-    uint32_t nvs_off = 0, phy_off = 0, cd_off = 0;
-    if (off + 0x6000u <= PT_FLASH_SIZE) {
-        nvs_off = off;
-        pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_NVS, off, 0x6000u, "nvs");
-        n++; off += 0x6000u;
-    }
-    if (off + 0x1000u <= PT_FLASH_SIZE) {
-        phy_off = off;
-        pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_PHY, off, 0x1000u, "phy_init");
-        n++; off += 0x1000u;
-    }
-    if (off + 0x10000u <= PT_FLASH_SIZE) {
-        cd_off = off;
-        pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_COREDUMP, off, 0x10000u, "coredump");
-        n++; off += 0x10000u;
+    uint32_t nvs_off = 0, nvs_size = 0, phy_off = 0, cd_off = 0;
+    if (entry_point == 0x40089268u && app_size <= 0x300000l) {
+        /* NerdMiner v1.8.3 ESP32-2432S028R uses Arduino's huge_app.csv.
+         * Reconstruct it exactly so its unmodified SPIFFS mount/format path
+         * sees the same partition as it does on a flashed CYD. */
+        nvs_off = 0x9000u;
+        nvs_size = 0x5000u;
+        cd_off = 0x3F0000u;
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, PT_SUB_NVS,
+                 nvs_off, nvs_size, "nvs");
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, 0x00u,
+                 0xE000u, 0x2000u, "otadata");
+        pt_entry(pt + n++ * 32, PT_TYPE_APP, PT_SUB_OTA0,
+                 0x10000u, 0x300000u, "app0");
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, PT_SUB_SPIFFS,
+                 0x310000u, 0x0E0000u, "spiffs");
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, PT_SUB_COREDUMP,
+                 cd_off, 0x10000u, "coredump");
+    } else if (entry_point == 0x400831D8u && app_size <= 0x1E0000l) {
+        /* ESP32 Marauder v1.14 CYD production partition table. */
+        nvs_off = 0x9000u;
+        nvs_size = 0x5000u;
+        cd_off = 0x3F0000u;
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, PT_SUB_NVS,
+                 nvs_off, nvs_size, "nvs");
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, 0x00u,
+                 0xE000u, 0x2000u, "otadata");
+        pt_entry(pt + n++ * 32, PT_TYPE_APP, PT_SUB_OTA0,
+                 0x10000u, 0x1E0000u, "app0");
+        pt_entry(pt + n++ * 32, PT_TYPE_APP, PT_SUB_OTA1,
+                 0x1F0000u, 0x1E0000u, "app1");
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, PT_SUB_SPIFFS,
+                 0x3D0000u, 0x20000u, "spiffs");
+        pt_entry(pt + n++ * 32, PT_TYPE_DATA, PT_SUB_COREDUMP,
+                 cd_off, 0x10000u, "coredump");
+    } else {
+        pt_entry(pt, PT_TYPE_APP, PT_SUB_FACTORY, off, factory_size,
+                 "factory");
+        n++;
+        off += factory_size;
+        if (off + 0x6000u <= PT_FLASH_SIZE) {
+            nvs_off = off;
+            nvs_size = 0x6000u;
+            pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_NVS, off, nvs_size,
+                     "nvs");
+            n++; off += 0x6000u;
+        }
+        if (off + 0x1000u <= PT_FLASH_SIZE) {
+            phy_off = off;
+            pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_PHY, off, 0x1000u,
+                     "phy_init");
+            n++; off += 0x1000u;
+        }
+        if (off + 0x10000u <= PT_FLASH_SIZE) {
+            cd_off = off;
+            pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_COREDUMP, off,
+                     0x10000u, "coredump");
+            n++; off += 0x10000u;
+        }
     }
 
     /* MD5 entry: magic 0xEBEB, digest at +16 (ESP_PARTITION_MD5_OFFSET),
@@ -94,7 +139,7 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size) 
 
     memcpy(mem->flash_data + PT_OFFSET, pt, sizeof(pt));
     memcpy(mem->flash_insn + PT_OFFSET, pt, sizeof(pt));
-    if (nvs_off) memset(mem->flash_data + nvs_off, 0xFF, 0x6000u);
+    if (nvs_off) memset(mem->flash_data + nvs_off, 0xFF, nvs_size);
     if (phy_off) memset(mem->flash_data + phy_off, 0xFF, 0x1000u);
     if (cd_off)  memset(mem->flash_data + cd_off,  0xFF, 0x10000u);
     if (getenv("FLEXE_PTDBG")) {
@@ -431,7 +476,7 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
 
     /* Bare app images carry no partition table; synthesize one at 0x8000 */
     if (app_size > 0)
-        loader_synthesize_partition_table(mem, app_size);
+        loader_synthesize_partition_table(mem, app_size, res.entry_point);
 
     loader_seed_flash_mmu(mem, &res);
 

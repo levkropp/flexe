@@ -167,6 +167,40 @@ TEST(test_gpio_func_in_sel) {
     teardown(&cpu);
 }
 
+TEST(test_rom_gpio_matrix_helpers_program_registers) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_periph_t *periph = periph_create(cpu.mem);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    /* gpio_matrix_out(14, HSPICLK_OUT_IDX=8, true, true) */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 14);
+    ar_write(&cpu, 3, 8);
+    ar_write(&cpu, 4, 1);
+    ar_write(&cpu, 5, 1);
+    cpu.pc = 0x40009F0Cu;
+    xtensa_step(&cpu);
+    ASSERT_EQ(periph_gpio_out_signal(periph, 14), 8);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FF44530u + 14u * 4u),
+              8u | (1u << 9) | (1u << 11));
+
+    /* gpio_matrix_in(12, HSPID_IN_IDX=9, true) enables matrix routing. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 12);
+    ar_write(&cpu, 3, 9);
+    ar_write(&cpu, 4, 1);
+    cpu.pc = 0x40009EDCu;
+    xtensa_step(&cpu);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FF44130u + 9u * 4u),
+              12u | (1u << 6) | (1u << 7));
+
+    rom_stubs_destroy(rom);
+    periph_destroy(periph);
+    teardown(&cpu);
+}
+
 TEST(test_gpio_out1_w1ts_w1tc) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -246,6 +280,69 @@ TEST(test_gpio_set_level_stub) {
     teardown(&cpu);
 }
 
+TEST(test_arduino_gpio_wrappers_drive_register_model) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_periph_t *periph = periph_create(cpu.mem);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t pin_mode_addr = 0x400D3070u;
+    const uint32_t write_addr = 0x400D3080u;
+    extern void stub_arduino_pin_mode(xtensa_cpu_t *, void *);
+    extern void stub_arduino_digital_write(xtensa_cpu_t *, void *);
+    rom_stubs_register(rom, pin_mode_addr,
+                       (rom_stub_fn)stub_arduino_pin_mode, "pinMode");
+    rom_stubs_register(rom, write_addr,
+                       (rom_stub_fn)stub_arduino_digital_write,
+                       "digitalWrite");
+
+    /* OUTPUT (0x03) enables a low GPIO and digitalWrite changes its latch. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 2);
+    ar_write(&cpu, 3, 0x03);
+    cpu.pc = pin_mode_addr;
+    xtensa_step(&cpu);
+    ASSERT_TRUE(mem_read32(cpu.mem, 0x3FF44020u) & (1u << 2));
+
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 2);
+    ar_write(&cpu, 3, 1);
+    cpu.pc = write_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 2), 1);
+
+    /* GPIO32..39 use the OUT1/ENABLE1 register bank. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 33);
+    ar_write(&cpu, 3, 0x12); /* OUTPUT_OPEN_DRAIN */
+    cpu.pc = pin_mode_addr;
+    xtensa_step(&cpu);
+    ASSERT_TRUE(mem_read32(cpu.mem, 0x3FF4402Cu) & (1u << 1));
+
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 33);
+    ar_write(&cpu, 3, 1);
+    cpu.pc = write_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 33), 1);
+
+    /* Reconfiguring as INPUT clears the output-enable bit. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 33);
+    ar_write(&cpu, 3, 0x01);
+    cpu.pc = pin_mode_addr;
+    xtensa_step(&cpu);
+    ASSERT_FALSE(mem_read32(cpu.mem, 0x3FF4402Cu) & (1u << 1));
+
+    rom_stubs_destroy(rom);
+    periph_destroy(periph);
+    teardown(&cpu);
+}
+
 TEST(test_heap_size_stubs) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -269,6 +366,77 @@ TEST(test_heap_size_stubs) {
     cpu.pc = min_addr;
     xtensa_step(&cpu);
     ASSERT_TRUE(ar_read(&cpu, 2) > 0);  /* dynamic — returns actual remaining heap */
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_heap_caps_dma_uses_internal_dram) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    const uint32_t malloc_addr = 0x400D3040;
+    const uint32_t calloc_addr = 0x400D3050;
+    const uint32_t realloc_addr = 0x400D3060;
+    extern void stub_heap_caps_malloc(xtensa_cpu_t *, void *);
+    extern void stub_heap_caps_calloc(xtensa_cpu_t *, void *);
+    extern void stub_heap_caps_realloc(xtensa_cpu_t *, void *);
+    rom_stubs_register(rom, malloc_addr,
+                       (rom_stub_fn)stub_heap_caps_malloc,
+                       "heap_caps_malloc");
+    rom_stubs_register(rom, calloc_addr,
+                       (rom_stub_fn)stub_heap_caps_calloc,
+                       "heap_caps_calloc");
+    rom_stubs_register(rom, realloc_addr,
+                       (rom_stub_fn)stub_heap_caps_realloc,
+                       "heap_caps_realloc");
+
+    /* Ordinary 8-bit storage stays in the large emulated PSRAM arena. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 16);
+    ar_write(&cpu, 3, 1u << 2); /* MALLOC_CAP_8BIT */
+    cpu.pc = malloc_addr;
+    xtensa_step(&cpu);
+    uint32_t ordinary = ar_read(&cpu, 2);
+    ASSERT_TRUE(ordinary >= 0x3F800000u && ordinary < 0x3FC00000u);
+    mem_write32(cpu.mem, ordinary, 0x12345678u);
+
+    /* DMA descriptors must occupy internal DRAM on classic ESP32. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 12);
+    ar_write(&cpu, 3, 1u << 3); /* MALLOC_CAP_DMA */
+    cpu.pc = malloc_addr;
+    xtensa_step(&cpu);
+    uint32_t dma = ar_read(&cpu, 2);
+    ASSERT_TRUE(dma >= 0x3FFF4000u && dma < 0x40000000u);
+    ASSERT_TRUE(mem_get_ptr_w(cpu.mem, dma) != NULL);
+
+    /* Capability-aware calloc uses the same arena and clears every byte. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 4);
+    ar_write(&cpu, 3, 4);
+    ar_write(&cpu, 4, 1u << 11); /* MALLOC_CAP_INTERNAL */
+    cpu.pc = calloc_addr;
+    xtensa_step(&cpu);
+    uint32_t zeroed = ar_read(&cpu, 2);
+    ASSERT_TRUE(zeroed >= 0x3FFF4000u && zeroed < 0x40000000u);
+    for (uint32_t i = 0; i < 16; i++) ASSERT_EQ(mem_read8(cpu.mem, zeroed + i), 0);
+
+    /* Realloc may migrate an existing buffer to a newly requested arena. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, ordinary);
+    ar_write(&cpu, 3, 32);
+    ar_write(&cpu, 4, 1u << 3); /* MALLOC_CAP_DMA */
+    cpu.pc = realloc_addr;
+    xtensa_step(&cpu);
+    uint32_t migrated = ar_read(&cpu, 2);
+    ASSERT_TRUE(migrated >= 0x3FFF4000u && migrated < 0x40000000u);
+    ASSERT_EQ(mem_read32(cpu.mem, migrated), 0x12345678u);
 
     rom_stubs_destroy(rom);
     teardown(&cpu);
@@ -545,11 +713,14 @@ static void run_firmware_compat_tests(void) {
     RUN_TEST(test_gpio_status_w1tc_clear);
     RUN_TEST(test_gpio_func_out_sel);
     RUN_TEST(test_gpio_func_in_sel);
+    RUN_TEST(test_rom_gpio_matrix_helpers_program_registers);
     RUN_TEST(test_gpio_out1_w1ts_w1tc);
     /* Symbol hooks */
     RUN_TEST(test_esp_log_timestamp);
     RUN_TEST(test_gpio_set_level_stub);
+    RUN_TEST(test_arduino_gpio_wrappers_drive_register_model);
     RUN_TEST(test_heap_size_stubs);
+    RUN_TEST(test_heap_caps_dma_uses_internal_dram);
     /* software_reset_cpu */
     RUN_TEST(test_software_reset_cpu_stops);
     /* Integration */

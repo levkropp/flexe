@@ -46,6 +46,8 @@
 #define MARAUDER_BLE_HS_ENABLED_STATE_LITERAL    0x4010B4A8u
 #define MARAUDER_BLE_HS_SYNC_STATE_LITERAL       0x4010B4B4u
 #define MARAUDER_BLE_HS_PUBLIC_ADDR_LITERAL      0x4010B5DCu
+#define MARAUDER_NIMBLE_IGNORE_LIST              0x3FFC9534u
+#define MARAUDER_NIMBLE_CONNECTED_PEERS          0x3FFC9540u
 
 /* A ble_gap_event is 52 bytes in this ESP32 NimBLE build.  Its discovery
  * descriptor begins at +4 and holds a pointer to the advertisement payload.
@@ -100,6 +102,7 @@ struct bt_stubs {
     uint32_t           scan_cb_addr;
     uint32_t           scan_obj_addr;
     uint32_t           gap_handler_addr;
+    xtensa_cpu_t      *scan_cpu;
     bool               production_observer;
     uint8_t            advertisement_data[BLE_DATA_MAX_LEN];
     uint8_t            advertisement_len;
@@ -298,11 +301,13 @@ static void stub_nimble_scan_stop(xtensa_cpu_t *cpu, void *ctx)
 static void spy_nimble_scan_set_callbacks(xtensa_cpu_t *cpu, void *ctx)
 {
     bt_stubs_t *bt = ctx;
+    bt->scan_cpu = cpu;
     bt->scan_obj_addr = bt_arg(cpu, 0);
     bt->scan_cb_addr = bt_arg(cpu, 1);
     bt->stats.scan_callback_config_calls++;
-    bt_log(bt, "NimBLEScan::setAdvertisedDeviceCallbacks(scan=0x%08x, "
-               "cb=0x%08x)\n", bt->scan_obj_addr, bt->scan_cb_addr);
+    bt_log(bt, "NimBLEScan::setAdvertisedDeviceCallbacks(core=%u, "
+               "scan=0x%08x, cb=0x%08x)\n", cpu->core_id,
+               bt->scan_obj_addr, bt->scan_cb_addr);
 }
 
 static void publish_nimble_controller_state(bt_stubs_t *bt)
@@ -341,6 +346,7 @@ static void publish_nimble_controller_state(bt_stubs_t *bt)
 static void spy_nimble_scan_start(xtensa_cpu_t *cpu, void *ctx)
 {
     bt_stubs_t *bt = ctx;
+    bt->scan_cpu = cpu;
     publish_nimble_controller_state(bt);
     bt->scan_obj_addr = bt_arg(cpu, 0);
     bt->ble_scanning = true;
@@ -352,6 +358,7 @@ static void spy_nimble_scan_start(xtensa_cpu_t *cpu, void *ctx)
 static void spy_nimble_scan_stop(xtensa_cpu_t *cpu, void *ctx)
 {
     bt_stubs_t *bt = ctx;
+    bt->scan_cpu = cpu;
     bt->scan_obj_addr = bt_arg(cpu, 0);
     bt->ble_scanning = false;
     bt->stats.scan_stop_calls++;
@@ -798,7 +805,8 @@ int bt_stubs_inject_advertisement(bt_stubs_t *bt, const uint8_t addr[6],
     if (len > BLE_DATA_MAX_LEN)
         return -3;
 
-    xtensa_mem_t *mem = bt->cpu->mem;
+    xtensa_cpu_t *event_cpu = bt->scan_cpu ? bt->scan_cpu : bt->cpu;
+    xtensa_mem_t *mem = event_cpu->mem;
     for (uint32_t i = 0; i < BLE_EVENT_SCRATCH_SIZE; i++)
         mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + i, 0);
     for (size_t i = 0; i < len; i++)
@@ -815,8 +823,28 @@ int bt_stubs_inject_advertisement(bt_stubs_t *bt, const uint8_t addr[6],
     mem_write8(mem, BLE_EVENT_SCRATCH_ADDR + 13u, (uint8_t)rssi);
     mem_write32(mem, BLE_EVENT_SCRATCH_ADDR + 16u, BLE_DATA_SCRATCH_ADDR);
 
+    if (getenv("FLEXE_BTDBG"))
+        fprintf(stderr,
+                "[bt] inject scan=0x%08X cb=0x%08X handler=0x%08X "
+                "vector={0x%08X,0x%08X,0x%08X} ignore=%u\n",
+                bt->scan_obj_addr, bt->scan_cb_addr, bt->gap_handler_addr,
+                mem_read32(mem, bt->scan_obj_addr + 0x10u),
+                mem_read32(mem, bt->scan_obj_addr + 0x14u),
+                mem_read32(mem, bt->scan_obj_addr + 0x18u),
+                mem_read8(mem, bt->scan_obj_addr + 0x0Eu));
+    if (getenv("FLEXE_BTDBG"))
+        fprintf(stderr,
+                "[bt] ignore-list={0x%08X,0x%08X,%u} "
+                "connected={0x%08X,0x%08X,%u}\n",
+                mem_read32(mem, MARAUDER_NIMBLE_IGNORE_LIST),
+                mem_read32(mem, MARAUDER_NIMBLE_IGNORE_LIST + 4u),
+                mem_read32(mem, MARAUDER_NIMBLE_IGNORE_LIST + 8u),
+                mem_read32(mem, MARAUDER_NIMBLE_CONNECTED_PEERS),
+                mem_read32(mem, MARAUDER_NIMBLE_CONNECTED_PEERS + 4u),
+                mem_read32(mem, MARAUDER_NIMBLE_CONNECTED_PEERS + 8u));
+
     uint32_t args[] = {BLE_EVENT_SCRATCH_ADDR, bt->scan_obj_addr};
-    int result = guest_call8(bt->cpu, bt->gap_handler_addr, args, 2,
+    int result = guest_call8(event_cpu, bt->gap_handler_addr, args, 2,
                              2000000u, NULL);
     if (result != 0) {
         bt->stats.advertisement_callback_failures++;

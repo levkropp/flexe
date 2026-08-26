@@ -13,6 +13,29 @@
 #define HOOK_HT_SIZE  2048
 #define HOOK_HT_MASK  (HOOK_HT_SIZE - 1)
 
+/* Firmware heap hooks use PSRAM for ordinary allocations so stock images have
+ * ample room, but ESP32 DMA cannot access external SPI RAM. Reserve the top
+ * 48 KiB of data RAM (immediately above the FreeRTOS-stub handle arena) for
+ * allocations that explicitly request DMA/internal/exec capabilities. */
+#define HEAP_BASE          0x3F800000u
+#define HEAP_END           0x3FC00000u
+#define INTERNAL_HEAP_BASE 0x3FFF4000u
+#define INTERNAL_HEAP_END  0x40000000u
+#define HEAP_MAGIC         0x48454150u  /* "HEAP" */
+#define HEAP_FREE          0x46524545u  /* "FREE" */
+#define HEAP_HDR_SZ        8u
+
+#define MALLOC_CAP_DMA_BIT      (1u << 3)
+#define MALLOC_CAP_EXEC_BIT     (1u << 4)
+#define MALLOC_CAP_INTERNAL_BIT (1u << 11)
+
+typedef struct {
+    uint32_t base;
+    uint32_t end;
+    uint32_t ptr;
+    uint32_t free_list;
+} stub_heap_region_t;
+
 /* ROM address range: 0x40000000 - 0x4005FFFF */
 #define ROM_BASE 0x40000000u
 #define ROM_END  0x40070000u   /* includes SPI flash ROM at 0x4006xxxx */
@@ -55,6 +78,8 @@ struct esp32_rom_stubs {
     bool             single_core_mode;         /* -1 flag: fake core 1 init variables */
     bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
+    stub_heap_region_t heap;
+    stub_heap_region_t internal_heap;
     struct {
         uint32_t addr;     /* 0 = empty */
         int      idx;      /* index into entries[] */
@@ -1952,6 +1977,28 @@ void stub_cxx_nvshandle_commit(xtensa_cpu_t *cpu, void *ctx) {
 
 /* ===== GPIO driver stubs ===== */
 
+static void gpio_set_direction_registers(xtensa_cpu_t *cpu, uint32_t pin,
+                                         bool output) {
+    if (pin < 32u) {
+        uint32_t bit = 1u << pin;
+        mem_write32(cpu->mem, output ? 0x3FF44024u : 0x3FF44028u, bit);
+    } else if (pin < 40u) {
+        uint32_t bit = 1u << (pin - 32u);
+        mem_write32(cpu->mem, output ? 0x3FF44030u : 0x3FF44034u, bit);
+    }
+}
+
+static void gpio_set_output_level(xtensa_cpu_t *cpu, uint32_t pin,
+                                  uint32_t level) {
+    if (pin < 32u) {
+        uint32_t bit = 1u << pin;
+        mem_write32(cpu->mem, level ? 0x3FF44008u : 0x3FF4400Cu, bit);
+    } else if (pin < 40u) {
+        uint32_t bit = 1u << (pin - 32u);
+        mem_write32(cpu->mem, level ? 0x3FF44014u : 0x3FF44018u, bit);
+    }
+}
+
 /* gpio_config(config) -> ESP_OK */
 void stub_gpio_config(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -1963,12 +2010,8 @@ void stub_gpio_set_direction(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t pin  = rom_arg(cpu, 0);
     uint32_t mode = rom_arg(cpu, 1);
-    /* Update GPIO ENABLE register if output mode */
-    if (mode >= 2 && pin < 32) {  /* GPIO_MODE_OUTPUT = 2 */
-        uint32_t enable = mem_read32(cpu->mem, 0x3FF44020u);
-        enable |= (1u << pin);
-        mem_write32(cpu->mem, 0x3FF44020u, enable);
-    }
+    /* ESP-IDF GPIO modes are bit flags: bit 1 enables the output driver. */
+    gpio_set_direction_registers(cpu, pin, (mode & 2u) != 0);
     rom_return(cpu, ESP_OK);
 }
 
@@ -1977,22 +2020,27 @@ void stub_gpio_set_level(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t pin   = rom_arg(cpu, 0);
     uint32_t level = rom_arg(cpu, 1);
-    if (pin < 32) {
-        uint32_t out = mem_read32(cpu->mem, 0x3FF44004u);
-        if (level)
-            out |= (1u << pin);
-        else
-            out &= ~(1u << pin);
-        mem_write32(cpu->mem, 0x3FF44004u, out);
-    } else if (pin < 40) {
-        uint32_t out1 = mem_read32(cpu->mem, 0x3FF44010u);
-        if (level)
-            out1 |= (1u << (pin - 32));
-        else
-            out1 &= ~(1u << (pin - 32));
-        mem_write32(cpu->mem, 0x3FF44010u, out1);
-    }
+    gpio_set_output_level(cpu, pin, level);
     rom_return(cpu, ESP_OK);
+}
+
+/* Arduino-ESP32 wrappers are frequently placed in flash and reached without
+ * going through the separately hooked ESP-IDF driver symbols. Preserve their
+ * void ABI while driving the same GPIO register model. */
+void stub_arduino_pin_mode(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t pin = rom_arg(cpu, 0);
+    uint32_t mode = rom_arg(cpu, 1);
+    /* Arduino OUTPUT is 0x03 and OUTPUT_OPEN_DRAIN is 0x12. Both carry the
+     * same output-enable bit used by the ESP-IDF gpio_mode_t values. */
+    gpio_set_direction_registers(cpu, pin, (mode & 2u) != 0);
+    rom_return_void(cpu);
+}
+
+void stub_arduino_digital_write(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    gpio_set_output_level(cpu, rom_arg(cpu, 0), rom_arg(cpu, 1));
+    rom_return_void(cpu);
 }
 
 /* gpio_get_level(pin) -> 0 (no input) */
@@ -2164,28 +2212,16 @@ static void stub_tinfl_decompress(xtensa_cpu_t *cpu, void *ctx) {
 /* ===== Heap stubs ===== */
 
 /*
- * Heap allocator for firmware malloc/free/calloc/realloc.
- * Allocates from emulator PSRAM (4MB at 0x3F800000).
- * Each block has an 8-byte header: [size(4)] [magic(4)].
- * Free reclaims top-of-heap blocks and maintains a free list for reuse.
+ * Heap allocator for firmware malloc/free/calloc/realloc. Ordinary allocations
+ * use emulated PSRAM. Requests that explicitly require DMA/internal/exec memory
+ * use a separate internal-DRAM arena because classic ESP32 DMA cannot address
+ * external SPI RAM. Each block has an 8-byte [size, magic] header.
  */
-#define HEAP_BASE    0x3F800000u  /* PSRAM base — 4MB available */
-#define HEAP_END     0x3FC00000u  /* PSRAM end */
-#define HEAP_MAGIC   0x48454150u  /* "HEAP" */
-#define HEAP_FREE    0x46524545u  /* "FREE" */
-#define HEAP_HDR_SZ  8
 
-static uint32_t heap_ptr = HEAP_BASE;
-
-/* Free list: freed blocks stored as linked list via their header.
- * Header layout for free blocks: [size(4)] [HEAP_FREE(4)] [next_free(4)]
- * next_free is stored in the user data area (first 4 bytes after header). */
-static uint32_t free_list = 0;  /* head of free list (emulator address, 0=empty) */
-
-/* Try to find a free-list block >= requested size */
-static uint32_t freelist_alloc(xtensa_cpu_t *cpu, uint32_t size) {
+static uint32_t freelist_alloc(xtensa_cpu_t *cpu,
+                               stub_heap_region_t *region, uint32_t size) {
     uint32_t prev_addr = 0;
-    uint32_t cur = free_list;
+    uint32_t cur = region->free_list;
     while (cur) {
         uint32_t block_size = mem_read32(cpu->mem, cur);
         uint32_t next = mem_read32(cpu->mem, cur + HEAP_HDR_SZ);  /* next ptr in user area */
@@ -2194,7 +2230,7 @@ static uint32_t freelist_alloc(xtensa_cpu_t *cpu, uint32_t size) {
             if (prev_addr)
                 mem_write32(cpu->mem, prev_addr + HEAP_HDR_SZ, next);
             else
-                free_list = next;
+                region->free_list = next;
             /* Mark as allocated */
             mem_write32(cpu->mem, cur + 4, HEAP_MAGIC);
             return cur + HEAP_HDR_SZ;
@@ -2205,29 +2241,55 @@ static uint32_t freelist_alloc(xtensa_cpu_t *cpu, uint32_t size) {
     return 0;
 }
 
-static uint32_t heap_alloc(xtensa_cpu_t *cpu, uint32_t size) {
+static uint32_t heap_alloc(xtensa_cpu_t *cpu, stub_heap_region_t *region,
+                           uint32_t size) {
     if (size == 0) return 0;
-    /* Align size to 4 bytes */
+    /* A free block stores its next pointer in the first user word. */
+    if (size < 4) size = 4;
     size = (size + 3) & ~3u;
     /* Try free list first */
-    uint32_t ptr = freelist_alloc(cpu, size);
+    uint32_t ptr = freelist_alloc(cpu, region, size);
     if (ptr) return ptr;
     /* Bump allocate */
     uint32_t total = HEAP_HDR_SZ + size;
-    if (heap_ptr + total > HEAP_END) {
-        fprintf(stderr, "[heap] OOM: need %u, have %u free_list=%u\n",
-                total, HEAP_END - heap_ptr, free_list ? 1 : 0);
+    if (region->ptr > region->end || total > region->end - region->ptr) {
+        fprintf(stderr,
+                "[heap] OOM in %s arena: need %u, have %u free_list=%u\n",
+                region->base == INTERNAL_HEAP_BASE ? "internal" : "PSRAM",
+                total, region->ptr <= region->end ? region->end - region->ptr : 0,
+                region->free_list ? 1 : 0);
         return 0;
     }
-    uint32_t block = heap_ptr;
+    uint32_t block = region->ptr;
     mem_write32(cpu->mem, block, size);
     mem_write32(cpu->mem, block + 4, HEAP_MAGIC);
-    heap_ptr += total;
+    region->ptr += total;
     return block + HEAP_HDR_SZ;
 }
 
-static void heap_free(xtensa_cpu_t *cpu, uint32_t ptr) {
-    if (ptr == 0 || ptr < HEAP_BASE + HEAP_HDR_SZ || ptr >= HEAP_END) return;
+static stub_heap_region_t *heap_region_for_ptr(esp32_rom_stubs_t *s,
+                                               uint32_t ptr) {
+    if (ptr >= s->heap.base + HEAP_HDR_SZ && ptr < s->heap.end)
+        return &s->heap;
+    if (ptr >= s->internal_heap.base + HEAP_HDR_SZ &&
+        ptr < s->internal_heap.end)
+        return &s->internal_heap;
+    return NULL;
+}
+
+static stub_heap_region_t *heap_region_for_caps(esp32_rom_stubs_t *s,
+                                                uint32_t caps) {
+    if (caps & (MALLOC_CAP_DMA_BIT | MALLOC_CAP_EXEC_BIT |
+                MALLOC_CAP_INTERNAL_BIT))
+        return &s->internal_heap;
+    return &s->heap;
+}
+
+static void heap_free(xtensa_cpu_t *cpu, esp32_rom_stubs_t *s,
+                      uint32_t ptr) {
+    if (ptr == 0) return;
+    stub_heap_region_t *region = heap_region_for_ptr(s, ptr);
+    if (!region) return;
     uint32_t block = ptr - HEAP_HDR_SZ;
     uint32_t magic = mem_read32(cpu->mem, block + 4);
     if (magic != HEAP_MAGIC) return;  /* double free or corruption */
@@ -2235,37 +2297,41 @@ static void heap_free(xtensa_cpu_t *cpu, uint32_t ptr) {
     uint32_t total = HEAP_HDR_SZ + ((size + 3) & ~3u);
 
     /* If this is the topmost block, shrink the heap */
-    if (block + total == heap_ptr) {
+    if (block + total == region->ptr) {
         mem_write32(cpu->mem, block + 4, 0);  /* clear magic */
-        heap_ptr = block;
+        region->ptr = block;
         /* Single-block reclaim handles the common malloc-then-free pattern.
          * We can't walk backwards because block sizes vary. */
         return;
     }
     /* Otherwise, add to free list */
     mem_write32(cpu->mem, block + 4, HEAP_FREE);
-    mem_write32(cpu->mem, ptr, free_list);  /* store next ptr in user data */
-    free_list = block;
+    mem_write32(cpu->mem, ptr, region->free_list);  /* next in user data */
+    region->free_list = block;
 }
 
 /* malloc(size) -> pointer or NULL */
 static void stub_malloc(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
     uint32_t size = rom_arg(cpu, 0);
-    uint32_t ptr = heap_alloc(cpu, size);
+    uint32_t ptr = heap_alloc(cpu, &s->heap, size);
     if (size >= 1024)
         fprintf(stderr, "[heap] malloc(%u) -> 0x%08X (free=%u)\n",
-                size, ptr, HEAP_END - heap_ptr);
+                size, ptr, s->heap.end - s->heap.ptr);
     rom_return(cpu, ptr);
 }
 
 /* calloc(nmemb, size) -> pointer or NULL (zeroed) */
 static void stub_calloc(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
     uint32_t nmemb = rom_arg(cpu, 0);
     uint32_t size  = rom_arg(cpu, 1);
+    if (size != 0 && nmemb > UINT32_MAX / size) {
+        rom_return(cpu, 0);
+        return;
+    }
     uint32_t total = nmemb * size;
-    uint32_t ptr = heap_alloc(cpu, total);
+    uint32_t ptr = heap_alloc(cpu, &s->heap, total);
     if (ptr) {
         for (uint32_t i = 0; i < total; i++)
             mem_write8(cpu->mem, ptr + i, 0);
@@ -2275,45 +2341,105 @@ static void stub_calloc(xtensa_cpu_t *cpu, void *ctx) {
 
 /* free(ptr) -> void */
 static void stub_free(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
     uint32_t ptr = rom_arg(cpu, 0);
-    if (ptr >= HEAP_BASE && ptr < HEAP_END) {
+    if (heap_region_for_ptr(s, ptr)) {
         uint32_t size = mem_read32(cpu->mem, ptr - HEAP_HDR_SZ);
         if (size >= 1024)
             fprintf(stderr, "[heap] free(0x%08X) size=%u\n", ptr, size);
     }
-    heap_free(cpu, ptr);
+    heap_free(cpu, s, ptr);
     rom_return_void(cpu);
 }
 
 /* realloc(ptr, size) -> pointer or NULL */
+static uint32_t heap_realloc(xtensa_cpu_t *cpu, esp32_rom_stubs_t *s,
+                             stub_heap_region_t *target, uint32_t old_ptr,
+                             uint32_t new_size) {
+    if (new_size == 0) {
+        heap_free(cpu, s, old_ptr);
+        return 0;
+    }
+    uint32_t new_ptr = heap_alloc(cpu, target, new_size);
+    if (new_ptr && old_ptr) {
+        stub_heap_region_t *old_region = heap_region_for_ptr(s, old_ptr);
+        if (old_region) {
+            uint32_t old_size = mem_read32(cpu->mem,
+                                           old_ptr - HEAP_HDR_SZ);
+            uint32_t copy = old_size < new_size ? old_size : new_size;
+            for (uint32_t i = 0; i < copy; i++)
+                mem_write8(cpu->mem, new_ptr + i,
+                           mem_read8(cpu->mem, old_ptr + i));
+            heap_free(cpu, s, old_ptr);
+        }
+    }
+    return new_ptr;
+}
+
 static void stub_realloc(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
     uint32_t old_ptr = rom_arg(cpu, 0);
     uint32_t new_size = rom_arg(cpu, 1);
-    if (new_size == 0) { heap_free(cpu, old_ptr); rom_return(cpu, 0); return; }
-    uint32_t new_ptr = heap_alloc(cpu, new_size);
-    if (new_ptr && old_ptr) {
-        /* Copy old data — read old size from header */
-        uint32_t old_size = mem_read32(cpu->mem, old_ptr - HEAP_HDR_SZ);
-        uint32_t copy = old_size < new_size ? old_size : new_size;
-        for (uint32_t i = 0; i < copy; i++)
-            mem_write8(cpu->mem, new_ptr + i, mem_read8(cpu->mem, old_ptr + i));
-        heap_free(cpu, old_ptr);
-    }
+    stub_heap_region_t *target = old_ptr ? heap_region_for_ptr(s, old_ptr) : NULL;
+    if (!target) target = &s->heap;
+    uint32_t new_ptr = heap_realloc(cpu, s, target, old_ptr, new_size);
     rom_return(cpu, new_ptr);
+}
+
+/* heap_caps_malloc(size, caps) */
+void stub_heap_caps_malloc(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t size = rom_arg(cpu, 0);
+    uint32_t caps = rom_arg(cpu, 1);
+    stub_heap_region_t *region = heap_region_for_caps(s, caps);
+    uint32_t ptr = heap_alloc(cpu, region, size);
+    if (getenv("FLEXE_HEAPDBG"))
+        fprintf(stderr,
+                "[heap] heap_caps_malloc(%u, 0x%08X) -> 0x%08X (%s)\n",
+                size, caps, ptr,
+                region == &s->internal_heap ? "internal" : "PSRAM");
+    rom_return(cpu, ptr);
+}
+
+/* heap_caps_calloc(nmemb, size, caps) */
+void stub_heap_caps_calloc(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t nmemb = rom_arg(cpu, 0);
+    uint32_t size = rom_arg(cpu, 1);
+    uint32_t caps = rom_arg(cpu, 2);
+    if (size != 0 && nmemb > UINT32_MAX / size) {
+        rom_return(cpu, 0);
+        return;
+    }
+    uint32_t total = nmemb * size;
+    uint32_t ptr = heap_alloc(cpu, heap_region_for_caps(s, caps), total);
+    if (ptr) {
+        for (uint32_t i = 0; i < total; i++)
+            mem_write8(cpu->mem, ptr + i, 0);
+    }
+    rom_return(cpu, ptr);
+}
+
+/* heap_caps_realloc(ptr, size, caps) */
+void stub_heap_caps_realloc(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t old_ptr = rom_arg(cpu, 0);
+    uint32_t size = rom_arg(cpu, 1);
+    uint32_t caps = rom_arg(cpu, 2);
+    rom_return(cpu, heap_realloc(cpu, s, heap_region_for_caps(s, caps),
+                                 old_ptr, size));
 }
 
 /* esp_get_free_heap_size() -> remaining heap bytes */
 void stub_esp_get_free_heap_size(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    rom_return(cpu, HEAP_END - heap_ptr);
+    esp32_rom_stubs_t *s = ctx;
+    rom_return(cpu, s->heap.end - s->heap.ptr);
 }
 
 /* esp_get_minimum_free_heap_size() -> remaining heap bytes */
 void stub_esp_get_minimum_free_heap_size(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    rom_return(cpu, HEAP_END - heap_ptr);
+    esp32_rom_stubs_t *s = ctx;
+    rom_return(cpu, s->heap.end - s->heap.ptr);
 }
 
 /* esp_log_timestamp() -> ccount / (cpu_freq_mhz * 1000) */
@@ -2775,6 +2901,41 @@ static void stub_intr_matrix_set(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t cpu_int = rom_arg(cpu, 2);
     if (s->periph && core <= 1 && cpu_int < 32)
         periph_intr_matrix_set(s->periph, (int)core, (int)cpu_int, (int)source);
+    rom_return_void(cpu);
+}
+
+/* Classic ESP32 ROM GPIO-matrix helpers. ESP-IDF's peripheral drivers call
+ * these absolute ROM addresses instead of writing GPIO_FUNC_* directly, so
+ * dropping the calls leaves SPI/I2C/UART signals disconnected in the model. */
+static void stub_gpio_matrix_in(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t gpio = rom_arg(cpu, 0);
+    uint32_t signal = rom_arg(cpu, 1);
+    uint32_t invert = rom_arg(cpu, 2);
+    if (signal < 256u) {
+        uint32_t value = (gpio & 0x3Fu) | ((invert & 1u) << 6) | (1u << 7);
+        mem_write32(cpu->mem, 0x3FF44130u + signal * 4u, value);
+    }
+    rom_return_void(cpu);
+}
+
+static void stub_gpio_matrix_out(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t gpio = rom_arg(cpu, 0);
+    uint32_t signal = rom_arg(cpu, 1);
+    uint32_t out_invert = rom_arg(cpu, 2);
+    uint32_t oen_invert = rom_arg(cpu, 3);
+    if (getenv("FLEXE_GPIODBG"))
+        fprintf(stderr,
+                "[GPIO] gpio_matrix_out(gpio=%u signal=%u out_inv=%u "
+                "oen_inv=%u)\n",
+                gpio, signal, out_invert, oen_invert);
+    if (gpio < 40u) {
+        uint32_t value = (signal & 0x1FFu) |
+                         ((out_invert & 1u) << 9) |
+                         ((oen_invert & 1u) << 11);
+        mem_write32(cpu->mem, 0x3FF44530u + gpio * 4u, value);
+    }
     rom_return_void(cpu);
 }
 
@@ -3284,6 +3445,16 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     if (!s) return NULL;
     s->cpu = cpu;
     s->cpu_freq_mhz = 160;
+    s->heap = (stub_heap_region_t){
+        .base = HEAP_BASE,
+        .end = HEAP_END,
+        .ptr = HEAP_BASE,
+    };
+    s->internal_heap = (stub_heap_region_t){
+        .base = INTERNAL_HEAP_BASE,
+        .end = INTERNAL_HEAP_END,
+        .ptr = INTERNAL_HEAP_BASE,
+    };
 
     /* Allocate direct dispatch table (64K entries × 24 bytes ≈ 1.5MB) */
     s->direct = calloc(STUB_DIRECT_SIZE, sizeof(stub_direct_entry_t));
@@ -3391,6 +3562,8 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
                        "r_hci_send_2_host");
     rom_stubs_register(s, 0x4001CD54, stub_void_unregistered,
                        "r_lc_auth_cmp");
+    rom_stubs_register(s, 0x4001C948, stub_void_unregistered,
+                       "r_lc_init");
     rom_stubs_register(s, 0x400542C4, stub_void_unregistered,
                        "nvds_read");
     rom_stubs_register(s, 0x40054358, stub_void_unregistered,
@@ -3408,7 +3581,8 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x40009028, stub_void_unregistered,   "uart_tx_switch");
 
     /* GPIO */
-    rom_stubs_register(s, 0x40009edc, stub_void_unregistered,   "gpio_matrix_in");
+    rom_stubs_register(s, 0x40009edc, stub_gpio_matrix_in,      "gpio_matrix_in");
+    rom_stubs_register(s, 0x40009f0c, stub_gpio_matrix_out,     "gpio_matrix_out");
     rom_stubs_register(s, 0x40009fdc, stub_void_unregistered,   "gpio_pad_select_gpio");
     rom_stubs_register(s, 0x4000a22c, stub_void_unregistered,   "gpio_pad_pullup");
 
@@ -3473,7 +3647,8 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* Flash/boot helpers */
     rom_stubs_register(s, 0x40062BC8, stub_unregistered,        "spi_flash_clk_cfg");
-    rom_stubs_register(s, 0x40009F0C, stub_void_unregistered,   "spi_flash_attach");
+    rom_stubs_register(s, 0x40062A6C, stub_void_unregistered,
+                       "esp_rom_spiflash_attach");
     rom_stubs_register(s, 0x40008264, stub_software_reset,      "software_reset_cpu");
 
     /* GPIO */
@@ -3587,8 +3762,8 @@ static bool fw_find_phy_global(xtensa_cpu_t *cpu, uint32_t entry,
     /* Symbol-less stock-ROM profiles are fixed builds.  Keep their verified
      * globals as a guarded fallback if instruction decoding ever encounters
      * an image whose executable page is not readable through xtensa_fetch. */
-    if (entry == 0x40189A2Cu) {
-        *global_out = 0x3FFC87ECu;
+    if (entry == 0x40189A3Cu) {
+        *global_out = 0x3FFC8874u;
         return true;
     }
     if (entry == 0x401BDE2Cu) {
@@ -3636,18 +3811,27 @@ static void stub_fw_marauder_ble_synced(xtensa_cpu_t *cpu, void *ctx) {
     mem_write8(cpu->mem, ar_read(cpu, 2), 1);
 }
 
-/* Complete the synchronous half of virtual HCI startup. A physical
- * controller would give this semaphore after its reset event; the virtual
- * transport has no independent producer, so publish the same two host flags
- * and return success. */
-static void stub_fw_marauder_ble_hs_sync(xtensa_cpu_t *cpu, void *ctx) {
+/* Marauder suspends NimBLE while switching back to WiFi-only modes. The
+ * genuine deinit path first waits for the controller task to stop, but the
+ * virtual HCI transport deliberately has no asynchronous controller task.
+ * Keep the synchronized host instance alive and report success so a later BLE
+ * mode can resume it. In particular, do not write the neighboring C++ object
+ * storage: 0x3FFC9534 is the m_ignoreList std::list sentinel in v1.14. */
+static void stub_fw_marauder_nimble_deinit(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    mem_write8(cpu->mem, 0x3FFC9528, 1);
-    mem_write8(cpu->mem, 0x3FFC9534, 1);
     rom_return(cpu, 0);
 }
 
 static const fw_addr_hook_t fw_marauder_hooks[] = {
+    /* DPORT cache access normally pauses the peer CPU with a level-5 IPC
+     * interrupt while MMU/cache state changes.  Flexe's two cores share one
+     * coherent memory map, so the pause is unnecessary; executing the real
+     * handshake can deadlock when partition discovery nests a cache access
+     * while the peer is already parked in esp_ipc_isr_waiting_for_finish_cmd. */
+    { 0x400816FC, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_start", 0 },
+    { 0x40081760, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_end", 0 },
     /* ble_hs_init is NOT stubbed: it creates ble_hs_mutex and zeroes the
      * host state; stubbing it left the mutex handle NULL and the first
      * ble_hs_lock() (NimBLEDevice::setDeviceName during init) hit
@@ -3656,29 +3840,23 @@ static const fw_addr_hook_t fw_marauder_hooks[] = {
      * cover what used to hang). */
     { 0x401BDE2C, stub_fw_marauder_phy_init, "phy_get_romfunc_addr", 0 },
     { 0x40104595, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
-    { 0x4010463C, stub_fw_marauder_ble_hs_sync, "ble_hs_sync", 0 },
+    { 0x4010463C, stub_fw_marauder_nimble_deinit,
+      "NimBLEDevice::deinit", 0 },
     { 0, NULL, NULL, 0 }
 };
 
-/* NerdMiner v2 (CYD 2432S028, entry 0x40089268). */
+/* NerdMiner v1.8.3 (CYD 2432S028R, entry 0x40089268). */
 static const fw_addr_hook_t fw_nerdminer_hooks[] = {
     /* Keep libphy's ABI but bypass physical RF calibration.  Higher-level
      * WiFi/socket hooks model the observable network behavior. */
-    { 0x40189A2C, stub_fw_virtual_phy_init, "phy_get_romfunc_addr", 0 },
-    /* xEventGroupWaitBits wrapper (0x4011dab4): the Arduino WiFi
+    { 0x40189A3C, stub_fw_virtual_phy_init, "phy_get_romfunc_addr", 0 },
+    /* event_group_wait_bits_wrapper: the Arduino WiFi
      * wait-for-connect path calls this (→ xEventGroupWaitBits) to wait for
      * the WiFi-connected event-group bit, which is never set with no radio.
      * Return the requested bits (arg1) so the caller sees "connected". */
-    { 0x4011DAB4, stub_ret_arg1, "wifi_egwait", 0 },
-    /* WiFi.status() getter (0x400eecb0): the post-connect check in NerdMiner's
-     * WiFi setup (0x400dde8f: call8 0x400eecb0; beqi a10,3) gates the mining
-     * transition.  Return WL_CONNECTED (3) so it passes. */
-    { 0x400EECB0, stub_ret_wl_connected, "wifi_status", 0 },
-    /* esp_wifi connect-command executor (0x4010a9f4, entry a1,80): the
-     * driver's connect path waits on the connect semaphore (portMAX_DELAY at
-     * 0x4010aad7) for a MAC connect-complete that never comes with no radio —
-     * parks loopTask forever.  Return ESP_OK (0) so the connect proceeds. */
-    { 0x4010A9F4, stub_unregistered, "esp_wifi_connect_exec", 0 },
+    { 0x4011DAC4, stub_ret_arg1, "wifi_egwait", 0 },
+    /* WiFiSTAClass::status() gates the mining transition. */
+    { 0x400EECBC, stub_ret_wl_connected, "wifi_status", 0 },
     { 0, NULL, NULL, 0 }
 };
 
@@ -3686,7 +3864,7 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
     const fw_addr_hook_t *tbl = NULL;
     if (entry_point == 0x400831D8)      /* ESP32 Marauder v1.14 CYD 2432S028 */
         tbl = fw_marauder_hooks;
-    if (entry_point == 0x40089268)      /* NerdMiner v2 CYD 2432S028 */
+    if (entry_point == 0x40089268)      /* NerdMiner v1.8.3 CYD 2432S028R */
         tbl = fw_nerdminer_hooks;
     if (!tbl) return 0;
     int n = 0;
@@ -3871,12 +4049,12 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         { "calloc",                         stub_calloc },
         { "free",                           stub_free },
         { "realloc",                        stub_realloc },
-        { "heap_caps_malloc",               stub_malloc },
+        { "heap_caps_malloc",               stub_heap_caps_malloc },
         { "heap_caps_malloc_default",       stub_malloc },
         { "heap_caps_free",                 stub_free },
-        { "heap_caps_realloc",              stub_realloc },
+        { "heap_caps_realloc",              stub_heap_caps_realloc },
         { "heap_caps_realloc_default",      stub_realloc },
-        { "heap_caps_calloc",               stub_calloc },
+        { "heap_caps_calloc",               stub_heap_caps_calloc },
         { NULL, NULL }
     };
     for (int i = 0; alloc_hooks[i].name; i++) {
@@ -4457,11 +4635,25 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
      * __pinMode calls gpio_set_direction whose ENTRY instruction sits right
      * before the gpio_config symbol — instruction alignment means our
      * gpio_config hook is never hit.  Hook at the Arduino wrapper level. */
-    static const char *arduino_gpio_fns[] = {
-        "__pinMode",
-        "pinMode",
-        "__digitalWrite",
-        "digitalWrite",
+    static const struct {
+        const char *name;
+        rom_stub_fn fn;
+    } arduino_gpio_fns[] = {
+        { "__pinMode",      stub_arduino_pin_mode },
+        { "pinMode",        stub_arduino_pin_mode },
+        { "__digitalWrite", stub_arduino_digital_write },
+        { "digitalWrite",   stub_arduino_digital_write },
+        { NULL, NULL },
+    };
+    for (int i = 0; arduino_gpio_fns[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, arduino_gpio_fns[i].name, &addr) == 0) {
+            rom_stubs_register(stubs, addr, arduino_gpio_fns[i].fn,
+                               arduino_gpio_fns[i].name);
+            hooked++;
+        }
+    }
+    static const char *arduino_analog_fns[] = {
         "__analogRead",
         "analogRead",
         "analogWrite",
@@ -4470,10 +4662,11 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "ledcWrite",
         NULL
     };
-    for (int i = 0; arduino_gpio_fns[i]; i++) {
+    for (int i = 0; arduino_analog_fns[i]; i++) {
         uint32_t addr;
-        if (elf_symbols_find(syms, arduino_gpio_fns[i], &addr) == 0) {
-            rom_stubs_register(stubs, addr, stub_unregistered, arduino_gpio_fns[i]);
+        if (elf_symbols_find(syms, arduino_analog_fns[i], &addr) == 0) {
+            rom_stubs_register(stubs, addr, stub_unregistered,
+                               arduino_analog_fns[i]);
             hooked++;
         }
     }

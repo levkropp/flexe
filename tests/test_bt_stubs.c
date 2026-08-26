@@ -23,6 +23,7 @@
 
 typedef struct {
     uint64_t calls;
+    uint32_t core_id;
     uint32_t event_addr;
     uint32_t scan_addr;
     uint8_t type;
@@ -75,6 +76,7 @@ static void capture_gap_event(xtensa_cpu_t *cpu, void *ctx)
 {
     test_gap_capture_t *capture = ctx;
     capture->calls++;
+    capture->core_id = cpu->core_id;
     capture->event_addr = test_bt_arg(cpu, 0);
     capture->scan_addr = test_bt_arg(cpu, 1);
     capture->type = mem_read8(cpu->mem, capture->event_addr);
@@ -116,6 +118,13 @@ TEST(production_scan_delivers_nimble_gap_advertisement) {
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
     bt_stubs_t *bt = bt_stubs_create(&cpu);
+    xtensa_cpu_t cpu1;
+    xtensa_cpu_init(&cpu1);
+    cpu1.mem = cpu.mem;
+    cpu1.core_id = 1;
+    cpu1.pc_hook = cpu.pc_hook;
+    cpu1.pc_hook_ctx = cpu.pc_hook_ctx;
+    cpu1.pc_hook_bitmap = cpu.pc_hook_bitmap;
     test_gap_capture_t capture = {0};
     test_adv_tx_capture_t tx_capture = {0};
 
@@ -147,10 +156,13 @@ TEST(production_scan_delivers_nimble_gap_advertisement) {
     const uint32_t scan_addr = 0x3FFDF600u;
     const uint32_t callback_addr = 0x3FFE3F14u;
     uint32_t callback_args[] = {scan_addr, callback_addr, 0};
-    invoke_observed_call8(&cpu, TEST_SCAN_SET_CALLBACKS_ADDR,
+    /* Marauder owns the NimBLE scan object on APP CPU. Advertisement delivery
+     * must preserve that affinity because its callback can reacquire locks
+     * already held recursively by the owning core. */
+    invoke_observed_call8(&cpu1, TEST_SCAN_SET_CALLBACKS_ADDR,
                           callback_args, 3);
     uint32_t start_args[] = {scan_addr, 0, 0, 0};
-    invoke_observed_call8(&cpu, TEST_SCAN_START_ADDR, start_args, 4);
+    invoke_observed_call8(&cpu1, TEST_SCAN_START_ADDR, start_args, 4);
     ASSERT_EQ(mem_read8(cpu.mem, TEST_HS_SYNC_STATE_ADDR), 2);
     ASSERT_EQ(mem_read8(cpu.mem, TEST_HS_ENABLED_STATE_ADDR), 2);
     static const uint8_t expected_public_addr[6] = {
@@ -211,6 +223,7 @@ TEST(production_scan_delivers_nimble_gap_advertisement) {
     ASSERT_EQ64(stats.advertisement_frames, 1);
     ASSERT_EQ64(stats.advertisement_callback_failures, 0);
     ASSERT_EQ64(capture.calls, 1);
+    ASSERT_EQ(capture.core_id, 1);
     ASSERT_EQ(capture.event_addr, TEST_BLE_EVENT_ADDR);
     ASSERT_EQ(capture.scan_addr, scan_addr);
     ASSERT_EQ(capture.type, 7);

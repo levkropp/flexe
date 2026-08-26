@@ -413,6 +413,21 @@ TEST(timer_ccompare0_fires) {
     teardown(&cpu);
 }
 
+TEST(timer_latched_compare_is_not_rescheduled) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ccount = 99;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 100);
+    cpu.intenable = 0;
+    put_insn3(&cpu, BASE, INSN_NOP);
+
+    xtensa_step(&cpu);
+
+    ASSERT_TRUE(cpu.interrupt & (1u << 6));
+    ASSERT_EQ(cpu.next_timer_event, UINT32_MAX);
+    teardown(&cpu);
+}
+
 TEST(timer_ccompare_dispatch) {
     xtensa_cpu_t cpu;
     setup_exc(&cpu);
@@ -641,6 +656,7 @@ void run_exception_tests(void) {
 
     TEST_SUITE("Timer Interrupts");
     RUN_TEST(timer_ccompare0_fires);
+    RUN_TEST(timer_latched_compare_is_not_rescheduled);
     RUN_TEST(timer_ccompare_dispatch);
     RUN_TEST(timer_ccompare_write_clears);
 

@@ -14,6 +14,13 @@ static void put_le32(uint8_t *buf, uint32_t val) {
     buf[3] = (uint8_t)(val >> 24);
 }
 
+static uint32_t get_le32(const uint8_t *buf) {
+    return (uint32_t)buf[0] |
+           ((uint32_t)buf[1] << 8) |
+           ((uint32_t)buf[2] << 16) |
+           ((uint32_t)buf[3] << 24);
+}
+
 /* Helper: create a temp file with given contents, return path */
 static const char *write_temp(const uint8_t *data, size_t len) {
     static char path[256];
@@ -78,6 +85,36 @@ TEST(loader_multi_segment) {
     mem_destroy(mem);
 }
 
+TEST(loader_nerdminer_reconstructs_huge_app_partitions) {
+    uint8_t bin[64] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 1;
+    put_le32(&bin[4], 0x40089268u);
+    put_le32(&bin[24], 0x3FFB0000u);
+    put_le32(&bin[28], 4);
+    put_le32(&bin[32], 0xA5A55A5Au);
+
+    const char *path = write_temp(bin, 36);
+    ASSERT_TRUE(path != NULL);
+    xtensa_mem_t *mem = mem_create();
+    load_result_t res = loader_load_bin(mem, path);
+    ASSERT_EQ(res.result, 0);
+
+    const uint32_t table = 0x8000u;
+    ASSERT_EQ(mem->flash_data[table + 2u], 1);
+    ASSERT_EQ(mem->flash_data[table + 3u], 2);
+    ASSERT_EQ(get_le32(mem->flash_data + table + 4u), 0x9000u);
+    ASSERT_EQ(get_le32(mem->flash_data + table + 8u), 0x5000u);
+    const uint32_t spiffs = table + 3u * 32u;
+    ASSERT_EQ(mem->flash_data[spiffs + 2u], 1);
+    ASSERT_EQ(mem->flash_data[spiffs + 3u], 0x82);
+    ASSERT_EQ(get_le32(mem->flash_data + spiffs + 4u), 0x310000u);
+    ASSERT_EQ(get_le32(mem->flash_data + spiffs + 8u), 0x0E0000u);
+    ASSERT_EQ(memcmp(mem->flash_data + spiffs + 12u, "spiffs", 6), 0);
+    ASSERT_EQ(mem->flash_data[0x310000u], 0xFF);
+    mem_destroy(mem);
+}
+
 TEST(loader_bad_magic) {
     uint8_t bin[32];
     memset(bin, 0, sizeof(bin));
@@ -109,6 +146,7 @@ void run_loader_tests(void) {
 
     RUN_TEST(loader_single_segment);
     RUN_TEST(loader_multi_segment);
+    RUN_TEST(loader_nerdminer_reconstructs_huge_app_partitions);
     RUN_TEST(loader_bad_magic);
     RUN_TEST(loader_null_path);
     RUN_TEST(loader_null_mem);

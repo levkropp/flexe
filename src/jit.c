@@ -492,6 +492,60 @@ static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
     scan->end_pc = cur_pc;
 }
 
+/* Decode the fixed target of a control-flow instruction.  Dynamic returns
+ * and calls are intentionally excluded: this is used only to recognize
+ * short, native-chainable loops whose dispatch savings outweigh the normal
+ * four-instruction JIT profitability floor. */
+static int jit_static_branch_target(uint32_t insn, int ilen, uint32_t pc,
+                                    uint32_t *target_out) {
+    if (ilen != 3)
+        return 0;  /* narrow conditional branches are forward-only */
+
+    uint32_t next_pc = pc + 3;
+    int op0 = XT_OP0(insn);
+    if (op0 == 6) {
+        int nn = XT_N(insn);
+        int m = XT_M(insn);
+        if (nn == 0) {
+            *target_out = next_pc + (uint32_t)sign_extend(XT_OFFSET18(insn), 18) + 1;
+            return 1;
+        }
+        if (nn == 1) {
+            *target_out = next_pc + (uint32_t)sign_extend(XT_IMM12(insn), 12) + 1;
+            return 1;
+        }
+        if (nn == 2) {
+            *target_out = next_pc + (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1;
+            return 1;
+        }
+        if (nn == 3) {
+            int r = XT_R(insn);
+            if ((m == 1 && (r == 0 || r == 1)) || m == 2 || m == 3) {
+                *target_out = next_pc + (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (op0 == 7) {
+        *target_out = next_pc + (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int jit_short_block_has_backedge(const jit_scan_t *scan,
+                                        uint32_t block_pc) {
+    for (int i = 0; i < scan->count; i++) {
+        uint32_t target;
+        if (jit_static_branch_target(scan->insns[i], scan->ilens[i],
+                                     scan->pcs[i], &target) &&
+            target <= block_pc)
+            return 1;
+    }
+    return 0;
+}
+
 
 /* ===== Code generation ===== */
 
@@ -2611,8 +2665,8 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
 
     jit_scan_t scan;
     jit_scan_block(jit, cpu, pc, &scan);
-    if (scan.count < 4)
-        return;  /* too small — overhead dominates, leave to interpreter */
+    if (scan.count < 4 && !jit_short_block_has_backedge(&scan, pc))
+        return;  /* short straight-line block: dispatch overhead dominates */
 
     uint32_t saved_wb = cpu->windowbase;
     cpu->windowbase = wb;
