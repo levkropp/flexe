@@ -36,13 +36,12 @@
 #define STOCK_SD_SECTORS         (STOCK_SD_BYTES / 512u)
 #define STOCK_SD_ROOT_SECTOR     65u
 
-/* Verified ESP32 Marauder v1.14 CYD WiFiScan layout. The object begins at
- * 0x3FFC85F0; these offsets are also independently visible in the production
- * ELF's DWARF member locations and StartScan's final S8I instruction. */
-#define MARAUDER_MGMT_FRAMES_ADDR   0x3FFC8CC0u
-#define MARAUDER_DATA_FRAMES_ADDR   0x3FFC8CC4u
-#define MARAUDER_BEACON_FRAMES_ADDR 0x3FFC8CC8u
-#define MARAUDER_SCAN_MODE_ADDR     0x3FFC93ACu
+/* Verified production v1.14 CYD WiFiScan layout for the stock image accepted
+ * by this profile. */
+#define MARAUDER_MGMT_FRAMES_ADDR   0x3FFC8C98u
+#define MARAUDER_DATA_FRAMES_ADDR   0x3FFC8C9Cu
+#define MARAUDER_BEACON_FRAMES_ADDR 0x3FFC8CA0u
+#define MARAUDER_SCAN_MODE_ADDR     0x3FFC9384u
 #define MARAUDER_RAW_SCAN_MODE      25u
 #define MARAUDER_RICKROLL_MODE      9u
 #define MARAUDER_BT_SCAN_MODE       10u

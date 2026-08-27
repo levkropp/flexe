@@ -436,7 +436,7 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
 
-    const uint32_t wrapper = 0x40189A3Cu;
+    const uint32_t wrapper = 0x40189A2Cu;
     const uint32_t rom_literal = wrapper - 0x104u;
     const uint32_t global_literal = wrapper - 0x100u;
     const uint32_t phy_global = 0x3FFB2000u;
@@ -452,7 +452,7 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     mem_write32(cpu.mem, rom_literal, 0x40004100u);
     mem_write32(cpu.mem, global_literal, phy_global);
 
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40089268u), 3);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40089268u), 4);
     cpu.pc = wrapper;
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE);

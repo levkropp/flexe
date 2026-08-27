@@ -33,7 +33,13 @@ typedef struct {
         struct { uint8_t pin; uint8_t level; } gpio_out;
         struct { uint8_t uart_num; uint8_t byte; } uart_tx;
         struct { uint8_t host; uint16_t len; const uint8_t *data; } spi_xfer;
-        struct { uint8_t port; uint8_t addr; uint16_t len; const uint8_t *data; } i2c_xfer;
+        struct {
+            uint8_t port;
+            uint8_t addr;
+            uint8_t read;
+            uint16_t len;
+            const uint8_t *data;
+        } i2c_xfer;
         struct { uint32_t x, y, w, h; uint16_t bpp; const uint8_t *pixels; } lcd_pixels;
     };
 } sbx_event_t;

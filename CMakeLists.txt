@@ -171,4 +171,11 @@ if(UNIX)
     target_link_libraries(flexe-stock-rom-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-stock-rom-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    # Optional compiled-firmware gate. The .ino fixture is built separately
+    # by test-i2c-wire.sh so Arduino CLI remains outside the core build.
+    add_executable(flexe-i2c-wire-test tools/i2c_wire_test.c)
+    target_link_libraries(flexe-i2c-wire-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-i2c-wire-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

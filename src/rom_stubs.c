@@ -3,6 +3,7 @@
 #include "memory.h"
 #include "peripherals.h"
 #include "sandbox_events.h"
+#include "guest_call.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -53,6 +54,16 @@ typedef struct {
     int         spy;        /* If true: call fn, then let original execute */
 } rom_stub_entry_t;
 
+typedef struct {
+    xtensa_cpu_t *cpu;
+    uint32_t handler;
+    uint32_t arg;
+    uint32_t handle;
+    bool enabled;
+    bool dispatching;
+    bool pending;
+} stub_irq_t;
+
 struct esp32_rom_stubs {
     xtensa_cpu_t    *cpu;
     rom_stub_entry_t entries[MAX_ROM_STUBS];
@@ -78,6 +89,7 @@ struct esp32_rom_stubs {
     bool             single_core_mode;         /* -1 flag: fake core 1 init variables */
     bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
+    stub_irq_t irq[71];
     stub_heap_region_t heap;
     stub_heap_region_t internal_heap;
     struct {
@@ -2687,6 +2699,130 @@ static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
+/* Compatibility-mode interrupt bridge. FreeRTOS is replaced in this mode,
+ * but interrupt-driven IDF drivers still depend on their registered ISR to
+ * refill FIFOs and complete command queues. Invoke I2C handlers synchronously
+ * on a private guest stack. The pending loop prevents recursive ISR calls when
+ * a handler starts the next hardware command before returning. */
+#define STUB_INTR_HANDLE_BASE 0xF17E0000u
+
+static int stub_intr_source_from_handle(const esp32_rom_stubs_t *s,
+                                        uint32_t handle) {
+    for (int source = 0; source < 71; source++) {
+        if (s->irq[source].handle == handle && handle != 0)
+            return source;
+    }
+    return -1;
+}
+
+static void stub_dispatch_guest_irq(void *ctx, int source) {
+    esp32_rom_stubs_t *s = ctx;
+    if (!s || source < 0 || source >= 71)
+        return;
+    stub_irq_t *irq = &s->irq[source];
+    if (!irq->enabled || !irq->cpu || irq->handler == 0)
+        return;
+    irq->pending = true;
+    if (irq->dispatching)
+        return;
+
+    irq->dispatching = true;
+    unsigned iterations = 0;
+    while (irq->pending && iterations++ < 256) {
+        irq->pending = false;
+        uint32_t args[] = { irq->arg };
+        int result = guest_call8(irq->cpu, irq->handler, args, 1,
+                                 2000000u, NULL);
+        if (result != 0) {
+            fprintf(stderr,
+                    "[intr] guest ISR source=%d handler=0x%08X failed (%d)\n",
+                    source, irq->handler, result);
+            irq->enabled = false;
+            break;
+        }
+    }
+    if (iterations > 256) {
+        fprintf(stderr, "[intr] guest ISR source=%d did not quiesce\n", source);
+        irq->enabled = false;
+    }
+    irq->dispatching = false;
+}
+
+static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
+                                       esp32_rom_stubs_t *s,
+                                       bool has_status_args) {
+    int source = (int)rom_arg(cpu, 0);
+    int handler_arg = has_status_args ? 4 : 2;
+    int context_arg = has_status_args ? 5 : 3;
+    int output_arg = has_status_args ? 6 : 4;
+    uint32_t handler = rom_arg(cpu, handler_arg);
+    uint32_t arg = rom_arg(cpu, context_arg);
+    uint32_t output = rom_arg(cpu, output_arg);
+
+    /* Preserve the compatibility layer's historical no-op behavior for
+     * interrupt sources whose peripheral ISR path is not modeled yet.  Some
+     * production drivers use a non-NULL handle to select management paths
+     * that cannot work while their interrupt is intentionally stubbed. */
+    if (source != 49 && source != 50) {
+        rom_return(cpu, 0);
+        return;
+    }
+
+    if (source >= 0 && source < 71) {
+        uint32_t handle = STUB_INTR_HANDLE_BASE | (uint32_t)source;
+        s->irq[source].cpu = cpu;
+        s->irq[source].handler = handler;
+        s->irq[source].arg = arg;
+        s->irq[source].handle = handle;
+        s->irq[source].enabled = true;
+        s->irq[source].pending = false;
+        if (output)
+            mem_write32(cpu->mem, output, handle);
+
+        if (s->periph)
+            periph_set_irq_dispatch(s->periph, source,
+                                    stub_dispatch_guest_irq, s);
+    } else if (output) {
+        mem_write32(cpu->mem, output, 0);
+    }
+    rom_return(cpu, 0); /* ESP_OK */
+}
+
+static void stub_esp_intr_alloc(xtensa_cpu_t *cpu, void *ctx) {
+    stub_esp_intr_alloc_common(cpu, ctx, false);
+}
+
+static void stub_esp_intr_alloc_intrstatus(xtensa_cpu_t *cpu, void *ctx) {
+    stub_esp_intr_alloc_common(cpu, ctx, true);
+}
+
+static void stub_esp_intr_free(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    int source = stub_intr_source_from_handle(s, rom_arg(cpu, 0));
+    if (source >= 0) {
+        if (s->periph)
+            periph_set_irq_dispatch(s->periph, source, NULL, NULL);
+        memset(&s->irq[source], 0, sizeof(s->irq[source]));
+    }
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_intr_enable(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    int source = stub_intr_source_from_handle(s, rom_arg(cpu, 0));
+    if (source >= 0)
+        s->irq[source].enabled = true;
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_intr_disable(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    int source = stub_intr_source_from_handle(s, rom_arg(cpu, 0));
+    if (source >= 0)
+        s->irq[source].enabled = false;
+    rom_return(cpu, 0);
+}
+
 /* Generic void ROM stub: returns without a value */
 static void stub_void_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -3681,6 +3817,12 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
 void rom_stubs_destroy(esp32_rom_stubs_t *stubs) {
     if (!stubs) return;
+    if (stubs->periph) {
+        for (int source = 0; source < 71; source++) {
+            if (stubs->irq[source].handle != 0)
+                periph_set_irq_dispatch(stubs->periph, source, NULL, NULL);
+        }
+    }
     /* Unhook */
     if (stubs->cpu->pc_hook == rom_pc_hook) {
         stubs->cpu->pc_hook = NULL;
@@ -3762,8 +3904,8 @@ static bool fw_find_phy_global(xtensa_cpu_t *cpu, uint32_t entry,
     /* Symbol-less stock-ROM profiles are fixed builds.  Keep their verified
      * globals as a guarded fallback if instruction decoding ever encounters
      * an image whose executable page is not readable through xtensa_fetch. */
-    if (entry == 0x40189A3Cu) {
-        *global_out = 0x3FFC8874u;
+    if (entry == 0x40189A2Cu) {
+        *global_out = 0x3FFC87ECu;
         return true;
     }
     if (entry == 0x401BDE2Cu) {
@@ -3849,14 +3991,17 @@ static const fw_addr_hook_t fw_marauder_hooks[] = {
 static const fw_addr_hook_t fw_nerdminer_hooks[] = {
     /* Keep libphy's ABI but bypass physical RF calibration.  Higher-level
      * WiFi/socket hooks model the observable network behavior. */
-    { 0x40189A3C, stub_fw_virtual_phy_init, "phy_get_romfunc_addr", 0 },
+    { 0x40189A2C, stub_fw_virtual_phy_init, "phy_get_romfunc_addr", 0 },
     /* event_group_wait_bits_wrapper: the Arduino WiFi
      * wait-for-connect path calls this (→ xEventGroupWaitBits) to wait for
      * the WiFi-connected event-group bit, which is never set with no radio.
      * Return the requested bits (arg1) so the caller sees "connected". */
-    { 0x4011DAC4, stub_ret_arg1, "wifi_egwait", 0 },
+    { 0x4011DAB4, stub_ret_arg1, "wifi_egwait", 0 },
     /* WiFiSTAClass::status() gates the mining transition. */
-    { 0x400EECBC, stub_ret_wl_connected, "wifi_status", 0 },
+    { 0x400EECB0, stub_ret_wl_connected, "wifi_status", 0 },
+    /* The virtual MAC has no asynchronous connect-complete producer, so the
+     * driver's otherwise unbounded command wait completes synchronously. */
+    { 0x4010A9F4, stub_unregistered, "esp_wifi_connect_exec", 0 },
     { 0, NULL, NULL, 0 }
 };
 
@@ -4180,18 +4325,22 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
     /* Interrupt allocation / management — skip in native mode so firmware
      * runs its own esp_intr_alloc, which programs the real interrupt matrix */
     if (!stubs->native_freertos) {
-        static const char *intr_fns[] = {
-            "esp_intr_alloc",
-            "esp_intr_alloc_intrstatus",
-            "esp_intr_free",
-            "esp_intr_disable",
-            "esp_intr_enable",
-            NULL
+        static const struct {
+            const char *name;
+            rom_stub_fn fn;
+        } intr_fns[] = {
+            { "esp_intr_alloc", stub_esp_intr_alloc },
+            { "esp_intr_alloc_intrstatus", stub_esp_intr_alloc_intrstatus },
+            { "esp_intr_free", stub_esp_intr_free },
+            { "esp_intr_disable", stub_esp_intr_disable },
+            { "esp_intr_enable", stub_esp_intr_enable },
+            { NULL, NULL }
         };
-        for (int i = 0; intr_fns[i]; i++) {
+        for (int i = 0; intr_fns[i].name; i++) {
             uint32_t addr;
-            if (elf_symbols_find(syms, intr_fns[i], &addr) == 0) {
-                rom_stubs_register(stubs, addr, stub_unregistered, intr_fns[i]);
+            if (elf_symbols_find(syms, intr_fns[i].name, &addr) == 0) {
+                rom_stubs_register(stubs, addr, intr_fns[i].fn,
+                                   intr_fns[i].name);
                 hooked++;
             }
         }

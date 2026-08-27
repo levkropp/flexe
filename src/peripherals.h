@@ -14,6 +14,22 @@ typedef struct esp32_periph esp32_periph_t;
 /* UART TX callback: called for each byte written to UART FIFO */
 typedef void (*uart_tx_cb)(void *ctx, uint8_t byte);
 
+/* Virtual I2C target. A registered address ACKs on the bus; Flexe invokes the
+ * callback when a write ends or when a read needs data. For a repeated-start
+ * register read, write_data contains the bytes sent before the restart and
+ * read_data is the response buffer. Return 0 to ACK the transfer or nonzero
+ * to report a target-side NACK/error. */
+typedef int (*periph_i2c_device_fn)(void *ctx, int port, uint8_t address,
+                                    const uint8_t *write_data,
+                                    size_t write_len, uint8_t *read_data,
+                                    size_t read_len);
+
+/* Compatibility-mode firmware still registers real ESP-IDF peripheral ISRs,
+ * even though Flexe replaces the FreeRTOS scheduler. A source callback lets
+ * the ROM-stub layer dispatch those guest handlers when a modelled interrupt
+ * makes a low-to-high transition. */
+typedef void (*periph_irq_dispatch_fn)(void *ctx, int source);
+
 esp32_periph_t *periph_create(xtensa_mem_t *mem);
 void periph_destroy(esp32_periph_t *p);
 
@@ -38,6 +54,17 @@ size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
                                  const uint8_t *data, size_t len);
 size_t periph_uart_rx_pending_num(const esp32_periph_t *p, int uart_num);
 int  periph_unhandled_count(const esp32_periph_t *p);
+
+/* Attach/detach a 7-bit target address on either classic ESP32 I2C master.
+ * Passing NULL as fn detaches the address. */
+int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
+                             periph_i2c_device_fn fn, void *ctx);
+
+/* Observe rising edges for an ESP32 peripheral source (0-70). Passing NULL
+ * detaches the observer. This is separate from the hardware interrupt matrix:
+ * native-FreeRTOS sessions continue to use the emulated CPU interrupt lines. */
+int periph_set_irq_dispatch(esp32_periph_t *p, int source,
+                            periph_irq_dispatch_fn fn, void *ctx);
 
 /* Returns true once the APP_CPU has been released from reset (DPORT write) */
 bool periph_app_cpu_released(const esp32_periph_t *p);

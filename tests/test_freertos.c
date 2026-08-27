@@ -203,6 +203,100 @@ TEST(test_queue_receive_empty_returns_false) {
     frt_teardown(&cpu, rom, frt);
 }
 
+TEST(test_queue_overwrite_and_reset) {
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    uint32_t create_addr = 0x400D0030;
+    uint32_t send_addr = 0x400D0040;
+    uint32_t recv_addr = 0x400D0050;
+    uint32_t reset_addr = 0x400D0060;
+    extern void stub_xQueueCreate(xtensa_cpu_t *, void *);
+    extern void stub_xQueueGenericSendFromISR(xtensa_cpu_t *, void *);
+    extern void stub_xQueueReceive(xtensa_cpu_t *, void *);
+    extern void stub_xQueueGenericReset(xtensa_cpu_t *, void *);
+    rom_stubs_register_ctx(rom, create_addr, stub_xQueueCreate,
+                           "xQueueCreate", frt);
+    rom_stubs_register_ctx(rom, send_addr, stub_xQueueGenericSendFromISR,
+                           "xQueueGenericSendFromISR", frt);
+    rom_stubs_register_ctx(rom, recv_addr, stub_xQueueReceive,
+                           "xQueueReceive", frt);
+    rom_stubs_register_ctx(rom, reset_addr, stub_xQueueGenericReset,
+                           "xQueueGenericReset", frt);
+
+    /* The IDF I2C completion queue has length one. Its ISR first publishes
+     * ALIVE, then overwrites that entry with DONE before the task runs. */
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 1);
+    ar_write(&cpu, 3, 4);
+    cpu.pc = create_addr;
+    xtensa_step(&cpu);
+    uint32_t handle = ar_read(&cpu, 2);
+    ASSERT_TRUE(handle != 0);
+
+    uint32_t item_addr = 0x3FFB2000;
+    mem_write32(cpu.mem, item_addr, 0x11111111u);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, item_addr);
+    ar_write(&cpu, 4, 0); /* pxHigherPriorityTaskWoken */
+    ar_write(&cpu, 5, 0); /* queueSEND_TO_BACK */
+    cpu.pc = send_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
+
+    mem_write32(cpu.mem, item_addr, 0x22222222u);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, item_addr);
+    ar_write(&cpu, 4, 0);
+    ar_write(&cpu, 5, 2); /* queueOVERWRITE */
+    cpu.pc = send_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
+
+    uint32_t recv_buf = 0x3FFB2010;
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, recv_buf);
+    ar_write(&cpu, 4, 0);
+    cpu.pc = recv_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
+    ASSERT_EQ(mem_read32(cpu.mem, recv_buf), 0x22222222u);
+
+    /* Reset discards a queued entry, matching xQueueReset between IDF bus
+     * transactions. */
+    mem_write32(cpu.mem, item_addr, 0x33333333u);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, item_addr);
+    ar_write(&cpu, 4, 0);
+    ar_write(&cpu, 5, 0);
+    cpu.pc = send_addr;
+    xtensa_step(&cpu);
+
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, 0);
+    cpu.pc = reset_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
+
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, recv_buf);
+    ar_write(&cpu, 4, 0);
+    cpu.pc = recv_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_semaphore_create_take_give) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -352,6 +446,7 @@ static void run_freertos_tests(void) {
     RUN_TEST(test_xTaskGetTickCount);
     RUN_TEST(test_queue_send_receive);
     RUN_TEST(test_queue_receive_empty_returns_false);
+    RUN_TEST(test_queue_overwrite_and_reset);
     RUN_TEST(test_semaphore_create_take_give);
     RUN_TEST(test_bump_allocator);
     RUN_TEST(test_vTaskDelay_caps_large_ticks);

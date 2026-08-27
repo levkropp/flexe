@@ -2141,39 +2141,39 @@ typedef struct {
     const char *name;
 } wifi_fw_hook_t;
 
-/* NerdMiner v1.8.3 ESP32-2432S028R production image. These entries match the
- * released app and its reproducible ELF; they are library routine entries,
- * not guessed call sites. */
-static const wifi_fw_hook_t nerdminer_v183_wifi_hooks[] = {
-    { 0x4011DC34u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
-    { 0x4011F540u, stub_lwip_accept,        "lwip_accept" },
-    { 0x4011F750u, stub_lwip_bind,          "lwip_bind" },
-    { 0x4011F804u, stub_lwip_close,         "lwip_close" },
-    { 0x4011F93Cu, stub_lwip_connect,       "lwip_connect" },
-    { 0x4011F9FCu, stub_lwip_listen,        "lwip_listen" },
-    { 0x4011FA64u, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x4011FB34u, stub_lwip_read,          "lwip_read" },
-    { 0x4011FB50u, stub_lwip_recv,          "lwip_recv" },
-    { 0x4011FB6Cu, stub_lwip_sendto,        "lwip_sendto" },
-    { 0x4011FCECu, stub_lwip_send,          "lwip_send" },
-    { 0x4011FD78u, stub_lwip_socket,        "lwip_socket" },
-    { 0x4011FE24u, stub_lwip_write,         "lwip_write" },
-    { 0x4011FE3Cu, stub_lwip_select,        "lwip_select" },
-    { 0x401201A0u, stub_lwip_getsockname,   "lwip_getsockname" },
-    { 0x401201B8u, stub_lwip_getsockopt,    "lwip_getsockopt" },
-    { 0x40120260u, stub_lwip_setsockopt,    "lwip_setsockopt" },
-    { 0x401202F4u, stub_lwip_ioctl,         "lwip_ioctl" },
-    { 0x4012039Cu, stub_lwip_fcntl,         "lwip_fcntl" },
-    { 0x401216F8u, stub_dns_gethostbyname,  "dns_gethostbyname" },
-    { 0x401156BCu, stub_vfs_select,         "esp_vfs_select" },
-    { 0x40134854u, stub_vfs_fcntl,          "fcntl" },
-    { 0x401643FCu, stub_esp_wifi_connect,   "esp_wifi_connect" },
-    { 0x401645BCu, stub_esp_wifi_scan_start,"esp_wifi_scan_start" },
-    { 0x40196414u, stub_start_ssl_client,   "start_ssl_client" },
-    { 0x40196D88u, stub_stop_ssl_socket,    "stop_ssl_socket" },
-    { 0x40196E00u, stub_data_to_read,       "data_to_read" },
-    { 0x40196E34u, stub_send_ssl_data,      "send_ssl_data" },
-    { 0x40196E90u, stub_get_ssl_receive,    "get_ssl_receive" },
+/* NerdMiner ESP32-2432S028R production image. These entries are
+ * signature-matched library routine entries for the stock factory image used
+ * by the integration profile. */
+static const wifi_fw_hook_t nerdminer_wifi_hooks[] = {
+    { 0x4011DC24u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
+    { 0x4011F530u, stub_lwip_accept,        "lwip_accept" },
+    { 0x4011F740u, stub_lwip_bind,          "lwip_bind" },
+    { 0x4011F7F4u, stub_lwip_close,         "lwip_close" },
+    { 0x4011F92Cu, stub_lwip_connect,       "lwip_connect" },
+    { 0x4011F9ECu, stub_lwip_listen,        "lwip_listen" },
+    { 0x4011FA54u, stub_lwip_recvfrom,      "lwip_recvfrom" },
+    { 0x4011FB24u, stub_lwip_read,          "lwip_read" },
+    { 0x4011FB40u, stub_lwip_recv,          "lwip_recv" },
+    { 0x4011FB5Cu, stub_lwip_sendto,        "lwip_sendto" },
+    { 0x4011FCDCu, stub_lwip_send,          "lwip_send" },
+    { 0x4011FD68u, stub_lwip_socket,        "lwip_socket" },
+    { 0x4011FE14u, stub_lwip_write,         "lwip_write" },
+    { 0x4011FE2Cu, stub_lwip_select,        "lwip_select" },
+    { 0x40120190u, stub_lwip_getsockname,   "lwip_getsockname" },
+    { 0x401201A8u, stub_lwip_getsockopt,    "lwip_getsockopt" },
+    { 0x40120250u, stub_lwip_setsockopt,    "lwip_setsockopt" },
+    { 0x401202E4u, stub_lwip_ioctl,         "lwip_ioctl" },
+    { 0x4012038Cu, stub_lwip_fcntl,         "lwip_fcntl" },
+    { 0x401216E8u, stub_dns_gethostbyname,  "dns_gethostbyname" },
+    { 0x401156ACu, stub_vfs_select,         "esp_vfs_select" },
+    { 0x40134844u, stub_vfs_fcntl,          "fcntl" },
+    { 0x401643ECu, stub_esp_wifi_connect,   "esp_wifi_connect" },
+    { 0x401645ACu, stub_esp_wifi_scan_start,"esp_wifi_scan_start" },
+    { 0x40196404u, stub_start_ssl_client,   "start_ssl_client" },
+    { 0x40196D78u, stub_stop_ssl_socket,    "stop_ssl_socket" },
+    { 0x40196DF0u, stub_data_to_read,       "data_to_read" },
+    { 0x40196E24u, stub_send_ssl_data,      "send_ssl_data" },
+    { 0x40196E80u, stub_get_ssl_receive,    "get_ssl_receive" },
     { 0, NULL, NULL },
 };
 
@@ -2204,7 +2204,7 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
     if (!ws) return 0;
     const wifi_fw_hook_t *hooks = NULL;
     if (entry_point == 0x40089268u)
-        hooks = nerdminer_v183_wifi_hooks;
+        hooks = nerdminer_wifi_hooks;
     else if (entry_point == 0x400831D8u)
         hooks = marauder_v114_wifi_hooks;
     else
@@ -2213,7 +2213,7 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
     if (!rom) return 0;
     ws->rom = rom;
     if (entry_point == 0x40089268u)
-        ws->firmware_status_addr = 0x3FFBDC08u;
+        ws->firmware_status_addr = 0x3FFC5C78u;
 
     int hooked = 0;
     for (const wifi_fw_hook_t *h = hooks; h->fn; h++) {

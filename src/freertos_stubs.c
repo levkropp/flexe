@@ -605,9 +605,8 @@ static queue_t *find_queue(freertos_stubs_t *frt, uint32_t handle) {
     return NULL;
 }
 
-/* xQueueSend(queue, item, timeout) -> pdTRUE */
-void stub_xQueueSend(xtensa_cpu_t *cpu, void *ctx) {
-    freertos_stubs_t *frt = ctx;
+static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                            uint32_t copy_position) {
     uint32_t handle = frt_arg(cpu, 0);
     uint32_t item_ptr = frt_arg(cpu, 1);
 
@@ -618,18 +617,31 @@ void stub_xQueueSend(xtensa_cpu_t *cpu, void *ctx) {
         frt_return(cpu, pdTRUE);
         return;
     }
-    if (q->count >= q->max_items) {
+    bool overwrite = copy_position == 2u && q->max_items == 1;
+    if (q->count >= q->max_items && !overwrite) {
         pthread_mutex_unlock(&frt->lock);
         frt_return(cpu, pdFALSE);
         return;
     }
 
     /* Copy item from emulator memory into queue buffer */
-    int offset = q->tail * q->item_size;
+    int slot;
+    if (overwrite && q->count != 0) {
+        slot = q->head;
+    } else if (copy_position == 1u) { /* queueSEND_TO_FRONT */
+        q->head = (q->head + q->max_items - 1) % q->max_items;
+        slot = q->head;
+    } else {
+        slot = q->tail;
+    }
+    int offset = slot * q->item_size;
     for (int i = 0; i < q->item_size; i++)
         q->buf[offset + i] = mem_read8(cpu->mem, item_ptr + (uint32_t)i);
-    q->tail = (q->tail + 1) % q->max_items;
-    q->count++;
+    if (!overwrite || q->count == 0) {
+        if (copy_position != 1u)
+            q->tail = (q->tail + 1) % q->max_items;
+        q->count++;
+    }
 
     /* Wake one task blocked on this queue */
     if (frt->scheduler_started) {
@@ -646,9 +658,14 @@ void stub_xQueueSend(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, pdTRUE);
 }
 
+/* xQueueSend(queue, item, timeout) -> pdTRUE */
+void stub_xQueueSend(xtensa_cpu_t *cpu, void *ctx) {
+    stub_queue_send(cpu, ctx, 0); /* queueSEND_TO_BACK */
+}
+
 /* xQueueSendFromISR — same as xQueueSend but with extra arg */
 void stub_xQueueSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
-    stub_xQueueSend(cpu, ctx);
+    stub_queue_send(cpu, ctx, 0); /* queueSEND_TO_BACK */
 }
 
 /* xQueueReceive(queue, buf, timeout) -> pdTRUE/pdFALSE */
@@ -960,12 +977,29 @@ void stub_xQueueGenericCreate(xtensa_cpu_t *cpu, void *ctx) {
 
 /* xQueueGenericSend (underlying implementation) */
 void stub_xQueueGenericSend(xtensa_cpu_t *cpu, void *ctx) {
-    stub_xQueueSend(cpu, ctx);
+    stub_queue_send(cpu, ctx, frt_arg(cpu, 3));
 }
 
 /* xQueueGenericSendFromISR */
 void stub_xQueueGenericSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
-    stub_xQueueSend(cpu, ctx);
+    stub_queue_send(cpu, ctx, frt_arg(cpu, 3));
+}
+
+/* xQueueGenericReset(queue, new_queue) empties a queue. Semaphore handles in
+ * compatibility mode are not backed by queue_t and retain their permissive
+ * success behavior. */
+void stub_xQueueGenericReset(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q) {
+        q->count = 0;
+        q->head = 0;
+        q->tail = 0;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdTRUE);
 }
 
 /* xPortGetCoreID() -> cpu->core_id */
@@ -1203,7 +1237,7 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xSemaphoreTake",                stub_xSemaphoreTake },
         { "xQueueSemaphoreTake",           stub_xSemaphoreTake },
         { "xSemaphoreGive",                stub_xSemaphoreGive },
-        { "xQueueGenericReset",            stub_xSemaphoreGive },
+        { "xQueueGenericReset",            stub_xQueueGenericReset },
         { "pvPortMalloc",                  stub_pvPortMalloc },
         { "vPortFree",                     stub_vPortFree },
         { "xTaskGetCurrentTaskHandle",     stub_xTaskGetCurrentTaskHandle },

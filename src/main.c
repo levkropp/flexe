@@ -780,6 +780,17 @@ static void sbx_json_sink(const sbx_event_t *ev, void *ctx) {
         fprintf(stdout, "{\"t\":\"uart\",\"c\":%llu,\"u\":%u,\"b\":%u}\n",
                 (unsigned long long)cycle, ev->uart_tx.uart_num, ev->uart_tx.byte);
         break;
+    case SBX_EV_I2C_XFER: {
+        static char b64[88 * 1024];
+        b64_encode(ev->i2c_xfer.data, ev->i2c_xfer.len, b64);
+        fprintf(stdout,
+                "{\"t\":\"i2c\",\"c\":%llu,\"port\":%u,\"addr\":%u,"
+                "\"dir\":\"%c\",\"len\":%u,\"data\":\"%s\"}\n",
+                (unsigned long long)cycle, ev->i2c_xfer.port,
+                ev->i2c_xfer.addr, ev->i2c_xfer.read ? 'r' : 'w',
+                ev->i2c_xfer.len, b64);
+        break;
+    }
     case SBX_EV_LCD_PIXELS: {
         /* Compute payload size from bit depth. 1bpp uses page-col packing
          * (8 vertical pixels per byte → w * (h/8) bytes); ≥8bpp uses

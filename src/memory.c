@@ -143,11 +143,15 @@ void mem_reset(xtensa_mem_t *mem) {
  *  UART0 AHB 0x6000_0000 -> APB 0x3FF4_0000
  *  UART1 AHB 0x6001_0000 -> APB 0x3FF5_0000
  *  UART2 AHB 0x6002_E000 -> APB 0x3FF6_E000
- * ESP-IDF's uart_ll_write_txfifo() writes via the AHB alias, so without
- * this translation printf() through newlib/VFS never reaches UART. */
+ *  I2C0  AHB 0x6001_3000 -> APB 0x3FF5_3000
+ *  I2C1  AHB 0x6002_7000 -> APB 0x3FF6_7000
+ * ESP-IDF's LL FIFO helpers use these aliases, so they must reach the same
+ * controller state as ordinary APB register accesses. */
 static inline uint32_t translate_ahb_alias(uint32_t addr) {
     if (addr >= 0x60000000u && addr < 0x60001000u) return addr - 0x60000000u + 0x3FF40000u;
     if (addr >= 0x60010000u && addr < 0x60011000u) return addr - 0x60010000u + 0x3FF50000u;
+    if (addr >= 0x60013000u && addr < 0x60014000u) return addr - 0x60013000u + 0x3FF53000u;
+    if (addr >= 0x60027000u && addr < 0x60028000u) return addr - 0x60027000u + 0x3FF67000u;
     if (addr >= 0x6002e000u && addr < 0x6002f000u) return addr - 0x6002e000u + 0x3FF6e000u;
     return addr;
 }

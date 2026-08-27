@@ -274,6 +274,245 @@ TEST(uart2_rx_fifo_and_interrupt) {
     mem_destroy(mem);
 }
 
+/* Classic ESP32 I2C master command encoding: byte count [7:0], ACK check
+ * enable [8], expected ACK [9], master ACK value [10], opcode [13:11]. */
+#define TEST_I2C0_BASE 0x3FF53000u
+#define TEST_I2C1_BASE 0x3FF67000u
+
+static uint32_t test_i2c_cmd(unsigned opcode, unsigned count, int ack_check) {
+    return ((opcode & 7u) << 11) | (count & 0xFFu) |
+           (ack_check ? 1u << 8 : 0);
+}
+
+typedef struct {
+    int calls;
+    int last_port;
+    uint8_t last_address;
+    uint8_t last_write[64];
+    size_t last_write_len;
+    size_t last_read_len;
+    uint8_t cursor;
+    uint8_t regs[256];
+    int fail;
+} test_i2c_device_t;
+
+static int test_i2c_device(void *ctx, int port, uint8_t address,
+                           const uint8_t *write_data, size_t write_len,
+                           uint8_t *read_data, size_t read_len) {
+    test_i2c_device_t *device = ctx;
+    device->calls++;
+    device->last_port = port;
+    device->last_address = address;
+    device->last_write_len = write_len;
+    device->last_read_len = read_len;
+    size_t capture = write_len < sizeof(device->last_write) ?
+                     write_len : sizeof(device->last_write);
+    if (capture != 0)
+        memcpy(device->last_write, write_data, capture);
+    if (write_len != 0) {
+        device->cursor = write_data[0];
+        for (size_t index = 1; index < write_len; index++)
+            device->regs[device->cursor++] = write_data[index];
+    }
+    for (size_t index = 0; index < read_len; index++)
+        read_data[index] = device->regs[device->cursor++];
+    return device->fail;
+}
+
+TEST(i2c_master_repeated_start_read_and_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 7, 49); /* I2C0 -> CPU interrupt 7 */
+
+    test_i2c_device_t device = {0};
+    device.regs[0x10] = 0xA5;
+    device.regs[0x11] = 0x5A;
+    ASSERT_EQ(periph_i2c_attach_device(p, 0, 0x34,
+                                       test_i2c_device, &device), 0);
+
+    /* Write register pointer 0x10, repeated-start into a two-byte read. Use
+     * ESP-IDF's AHB FIFO alias for the three transmitted bytes. */
+    mem_write32(mem, 0x6001301Cu, 0x34u << 1);
+    mem_write32(mem, 0x6001301Cu, 0x10u);
+    mem_write32(mem, 0x6001301Cu, (0x34u << 1) | 1u);
+    const uint32_t commands[] = {
+        test_i2c_cmd(0, 0, 0),
+        test_i2c_cmd(1, 2, 1),
+        test_i2c_cmd(0, 0, 0),
+        test_i2c_cmd(1, 1, 1),
+        test_i2c_cmd(2, 2, 0),
+        test_i2c_cmd(3, 0, 0),
+    };
+    for (size_t index = 0; index < sizeof(commands) / sizeof(commands[0]);
+         index++)
+        mem_write32(mem, TEST_I2C0_BASE + 0x58u + (uint32_t)index * 4u,
+                    commands[index]);
+    mem_write32(mem, TEST_I2C0_BASE + 0x28u, 1u << 7);
+    mem_write32(mem, TEST_I2C0_BASE + 0x04u, (1u << 4) | (1u << 5));
+
+    ASSERT_EQ(device.calls, 1);
+    ASSERT_EQ(device.last_port, 0);
+    ASSERT_EQ(device.last_address, 0x34);
+    ASSERT_EQ(device.last_write_len, 1u);
+    ASSERT_EQ(device.last_write[0], 0x10u);
+    ASSERT_EQ(device.last_read_len, 2u);
+    ASSERT_EQ((mem_read32(mem, TEST_I2C0_BASE + 0x08u) >> 8) & 0x3Fu,
+              2u);
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x1Cu), 0xA5u);
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x1Cu), 0x5Au);
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x1Cu), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x20u) & (1u << 7),
+              1u << 7);
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x2Cu), 1u << 7);
+    ASSERT_EQ(cpu0.interrupt & (1u << 7), 1u << 7);
+    for (size_t index = 0; index < sizeof(commands) / sizeof(commands[0]);
+         index++)
+        ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x58u +
+                               (uint32_t)index * 4u) & (1u << 31));
+
+    mem_write32(mem, TEST_I2C0_BASE + 0x24u, 1u << 7);
+    ASSERT_EQ(cpu0.interrupt & (1u << 7), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0xF8u), 0x16042000u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(i2c_end_command_streams_fifo_chunks_until_stop) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_i2c_device_t device = {0};
+    ASSERT_EQ(periph_i2c_attach_device(p, 0, 0x20,
+                                       test_i2c_device, &device), 0);
+
+    /* Burst 1: START + address/register pointer, then END without STOP. */
+    mem_write32(mem, TEST_I2C0_BASE + 0x1Cu, 0x20u << 1);
+    mem_write32(mem, TEST_I2C0_BASE + 0x1Cu, 0x30u);
+    mem_write32(mem, TEST_I2C0_BASE + 0x58u, test_i2c_cmd(0, 0, 0));
+    mem_write32(mem, TEST_I2C0_BASE + 0x5Cu, test_i2c_cmd(1, 2, 1));
+    mem_write32(mem, TEST_I2C0_BASE + 0x60u, test_i2c_cmd(4, 0, 0));
+    mem_write32(mem, TEST_I2C0_BASE + 0x04u, (1u << 4) | (1u << 5));
+    ASSERT_EQ(device.calls, 0);
+    ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x08u) & (1u << 4));
+    ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x20u) & (1u << 3));
+    mem_write32(mem, TEST_I2C0_BASE + 0x24u, 0x1FFFu);
+
+    /* Burst 2: the IDF driver refills FIFO while retaining bus/address state. */
+    mem_write32(mem, TEST_I2C0_BASE + 0x1Cu, 0xDEu);
+    mem_write32(mem, TEST_I2C0_BASE + 0x1Cu, 0xADu);
+    mem_write32(mem, TEST_I2C0_BASE + 0x58u, test_i2c_cmd(1, 2, 1));
+    mem_write32(mem, TEST_I2C0_BASE + 0x5Cu, test_i2c_cmd(4, 0, 0));
+    mem_write32(mem, TEST_I2C0_BASE + 0x04u, (1u << 4) | (1u << 5));
+    ASSERT_EQ(device.calls, 0);
+    ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x08u) & (1u << 4));
+    mem_write32(mem, TEST_I2C0_BASE + 0x24u, 0x1FFFu);
+
+    /* Burst 3: STOP commits the complete write atomically to the target. */
+    mem_write32(mem, TEST_I2C0_BASE + 0x58u, test_i2c_cmd(3, 0, 0));
+    mem_write32(mem, TEST_I2C0_BASE + 0x04u, (1u << 4) | (1u << 5));
+    ASSERT_EQ(device.calls, 1);
+    ASSERT_EQ(device.last_write_len, 3u);
+    ASSERT_EQ(device.last_write[0], 0x30u);
+    ASSERT_EQ(device.last_write[1], 0xDEu);
+    ASSERT_EQ(device.last_write[2], 0xADu);
+    ASSERT_EQ(device.regs[0x30], 0xDEu);
+    ASSERT_EQ(device.regs[0x31], 0xADu);
+    ASSERT_FALSE(mem_read32(mem, TEST_I2C0_BASE + 0x08u) & (1u << 4));
+    ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x20u) & (1u << 7));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(i2c_dual_port_ahb_alias_and_address_nack) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 8, 50); /* I2C1 */
+    periph_intr_matrix_set(p, 0, 9, 49); /* I2C0 */
+
+    test_i2c_device_t device = {0};
+    ASSERT_EQ(periph_i2c_attach_device(p, 1, 0x50,
+                                       test_i2c_device, &device), 0);
+    mem_write32(mem, 0x6002701Cu, 0x50u << 1);
+    mem_write32(mem, 0x6002701Cu, 0x01u);
+    mem_write32(mem, 0x6002701Cu, 0xCCu);
+    mem_write32(mem, TEST_I2C1_BASE + 0x58u, test_i2c_cmd(0, 0, 0));
+    mem_write32(mem, TEST_I2C1_BASE + 0x5Cu, test_i2c_cmd(1, 3, 1));
+    mem_write32(mem, TEST_I2C1_BASE + 0x60u, test_i2c_cmd(3, 0, 0));
+    mem_write32(mem, TEST_I2C1_BASE + 0x28u, 1u << 7);
+    mem_write32(mem, TEST_I2C1_BASE + 0x04u, (1u << 4) | (1u << 5));
+    ASSERT_EQ(device.calls, 1);
+    ASSERT_EQ(device.last_port, 1);
+    ASSERT_EQ(device.regs[1], 0xCCu);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
+
+    /* An unattached address NACKs during the address WRITE and raises the
+     * controller's ACK_ERR source instead of silently succeeding. */
+    mem_write32(mem, 0x6001301Cu, 0x51u << 1);
+    mem_write32(mem, TEST_I2C0_BASE + 0x58u, test_i2c_cmd(0, 0, 0));
+    mem_write32(mem, TEST_I2C0_BASE + 0x5Cu, test_i2c_cmd(1, 1, 1));
+    mem_write32(mem, TEST_I2C0_BASE + 0x60u, test_i2c_cmd(3, 0, 0));
+    mem_write32(mem, TEST_I2C0_BASE + 0x28u, 1u << 10);
+    mem_write32(mem, TEST_I2C0_BASE + 0x04u, (1u << 4) | (1u << 5));
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x20u) & (1u << 10),
+              1u << 10);
+    ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x2Cu), 1u << 10);
+    ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x08u) & 1u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 9), 1u << 9);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+typedef struct {
+    int count;
+    int last_source;
+} test_irq_dispatch_t;
+
+static void test_irq_dispatch(void *ctx, int source) {
+    test_irq_dispatch_t *dispatch = ctx;
+    dispatch->count++;
+    dispatch->last_source = source;
+}
+
+TEST(irq_dispatch_observes_only_rising_edges) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_irq_dispatch_t dispatch = {0};
+
+    ASSERT_EQ(periph_set_irq_dispatch(p, 49, test_irq_dispatch, &dispatch),
+              0);
+    periph_assert_interrupt(p, 49);
+    ASSERT_EQ(dispatch.count, 1);
+    ASSERT_EQ(dispatch.last_source, 49);
+    periph_assert_interrupt(p, 49);
+    ASSERT_EQ(dispatch.count, 1);
+    periph_deassert_interrupt(p, 49);
+    periph_assert_interrupt(p, 49);
+    ASSERT_EQ(dispatch.count, 2);
+
+    ASSERT_EQ(periph_set_irq_dispatch(p, 49, NULL, NULL), 0);
+    periph_deassert_interrupt(p, 49);
+    periph_assert_interrupt(p, 49);
+    ASSERT_EQ(dispatch.count, 2);
+    ASSERT_EQ(periph_set_irq_dispatch(p, -1, test_irq_dispatch, &dispatch),
+              -1);
+    ASSERT_EQ(periph_set_irq_dispatch(p, 71, test_irq_dispatch, &dispatch),
+              -1);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 /* ESP32 SPI1 flash-controller register subset used by ESP-IDF's memspi
  * driver. */
 #define TEST_SPI1_BASE       0x3FF42000u
@@ -1259,6 +1498,10 @@ static void run_peripheral_tests(void) {
     RUN_TEST(uart_rx_fifo_injection);
     RUN_TEST(uart_rx_timeout_interrupt);
     RUN_TEST(uart2_rx_fifo_and_interrupt);
+    RUN_TEST(i2c_master_repeated_start_read_and_interrupt);
+    RUN_TEST(i2c_end_command_streams_fifo_chunks_until_stop);
+    RUN_TEST(i2c_dual_port_ahb_alias_and_address_nack);
+    RUN_TEST(irq_dispatch_observes_only_rising_edges);
     RUN_TEST(spi_flash_write_enable_latch);
     RUN_TEST(spi_flash_program_erase_require_write_enable);
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);
