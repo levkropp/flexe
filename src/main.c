@@ -791,6 +791,12 @@ static void sbx_json_sink(const sbx_event_t *ev, void *ctx) {
                 ev->i2c_xfer.len, b64);
         break;
     }
+    case SBX_EV_DAC_OUT:
+        fprintf(stdout,
+                "{\"t\":\"dac\",\"c\":%llu,\"ch\":%u,\"en\":%u,\"value\":%u}\n",
+                (unsigned long long)cycle, ev->dac_out.channel,
+                ev->dac_out.enabled, ev->dac_out.value);
+        break;
     case SBX_EV_LCD_PIXELS: {
         /* Compute payload size from bit depth. 1bpp uses page-col packing
          * (8 vertical pixels per byte → w * (h/8) bytes); ≥8bpp uses

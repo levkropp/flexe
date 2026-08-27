@@ -34,7 +34,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - windowed registers with synthesized spill/fill (call4/8/12, entry, retw)
 - exception/interrupt dispatch (levels 1–7, timer ccompare, waiti)
 - esp32 memory map (sram, rom, flash, rtc, psram, peripheral i/o)
-- mmio peripherals: all three uarts, gpio, dport, rtc, efuse, watchdog, timers, GP-SPI2/3 DMA, classic I2C0/1 master, ledc, adc
+- mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog, timers, GP-SPI2/3 DMA, classic I2C0/1 master, ledc, ADC1/2, DAC1/2
 - raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
 - host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
@@ -45,7 +45,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 565 tests
+- 567 tests
 
 ## building
 
@@ -134,7 +134,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 565 tests, 1652 passed, 0 failed
+# 567 tests, 1685 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -151,6 +151,18 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-i2c-wire.sh
 It has been verified with Arduino-ESP32 2.0.11; `ARDUINO_CLI`,
 `FLEXE_ARDUINO_FQBN`, `FLEXE_BUILD_DIR`, and `FLEXE_I2C_BUILD_DIR` are
 configurable.
+
+The analog gate builds an unmodified Arduino sketch using `analogRead()`,
+`analogReadResolution()`, `dacWrite()`, and `dacDisable()`. It verifies ADC1
+and ADC2 at 12- and 9-bit widths, RTCIO-backed DAC state/events, and zero
+unhandled MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-analog-dac.sh
+# stage=0xADC0DAC0 adc=2645/1450/85/426 dac=0:0x35/1:0xCA ... unhandled=0 unregistered=0
+```
+
+`FLEXE_ANALOG_BUILD_DIR` optionally preserves its Arduino build directory.
 
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
@@ -171,8 +183,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **7.70× real-time** |
-| NerdMiner v1.8.3 | **6.10× real-time** |
+| ESP32 Marauder v1.14 | **6.64× real-time** |
+| NerdMiner v1.8.3 | **6.13× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

@@ -2072,7 +2072,27 @@ static void stub_adc1_get_raw(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
     uint32_t ch = rom_arg(cpu, 0);
     uint16_t raw = s->periph ? periph_get_adc_value(s->periph, (int)ch) : 0;
+    /* adc1_config_width() programs SENS_SAR1_BIT_WIDTH as 0=9 ... 3=12. */
+    uint32_t width = mem_read32(cpu->mem, 0x3FF4882Cu) & 3u;
+    raw &= (uint16_t)((1u << (9u + width)) - 1u);
     rom_return(cpu, raw);
+}
+
+/* adc2_get_raw(channel, width, int *out_raw) -> ESP_OK. ADC2 occupies the
+ * second ten-entry bank in the host-injected channel table. */
+static void stub_adc2_get_raw(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t ch = rom_arg(cpu, 0);
+    uint32_t width = rom_arg(cpu, 1);
+    uint32_t out_ptr = rom_arg(cpu, 2);
+    uint16_t raw = 0;
+    if (s->periph && ch < 10u)
+        raw = periph_get_adc_value(s->periph, 10 + (int)ch);
+    if (width > 3u) width = 3u;
+    raw &= (uint16_t)((1u << (9u + width)) - 1u);
+    if (out_ptr)
+        mem_write32(cpu->mem, out_ptr, raw);
+    rom_return(cpu, ESP_OK);
 }
 
 /* adc_oneshot_read(handle, channel, int *out_raw) -> ESP_OK */
@@ -4177,6 +4197,7 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
     struct { const char *name; rom_stub_fn fn; } adc_hooks[] = {
         { "adc_oneshot_read",   stub_adc_oneshot_read },
         { "adc1_get_raw",       stub_adc1_get_raw },
+        { "adc2_get_raw",       stub_adc2_get_raw },
         { NULL, NULL }
     };
     for (int i = 0; adc_hooks[i].name; i++) {
@@ -4802,20 +4823,18 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
             hooked++;
         }
     }
-    static const char *arduino_analog_fns[] = {
-        "__analogRead",
-        "analogRead",
+    static const char *arduino_pwm_fns[] = {
         "analogWrite",
         "ledcSetup",
         "ledcAttachPin",
         "ledcWrite",
         NULL
     };
-    for (int i = 0; arduino_analog_fns[i]; i++) {
+    for (int i = 0; arduino_pwm_fns[i]; i++) {
         uint32_t addr;
-        if (elf_symbols_find(syms, arduino_analog_fns[i], &addr) == 0) {
+        if (elf_symbols_find(syms, arduino_pwm_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered,
-                               arduino_analog_fns[i]);
+                               arduino_pwm_fns[i]);
             hooked++;
         }
     }

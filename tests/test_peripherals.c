@@ -1,4 +1,5 @@
 #include "peripherals.h"
+#include "sandbox_events.h"
 #include "spi_display.h"
 #include <fcntl.h>
 #include <stdlib.h>
@@ -1208,6 +1209,115 @@ TEST(rtc_reset_cause) {
     mem_destroy(mem);
 }
 
+TEST(sens_adc_single_conversions) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t sens = 0x3FF48800u;
+
+    periph_set_adc_value(p, 6, 0x0A55u);  /* ADC1 channel 6 / GPIO34 */
+    periph_set_adc_value(p, 10, 0x05AAu); /* ADC2 channel 0 / GPIO4 */
+
+    /* Reset width is 12 bits. The driver's low/high START sequence clears
+     * DONE and then synchronously latches the selected one-hot channel. */
+    ASSERT_EQ(mem_read32(mem, sens + 0x2Cu) & 0xFu, 0xFu);
+    uint32_t adc1_cfg = (1u << 31) | (1u << (19 + 6)) | (1u << 18);
+    mem_write32(mem, sens + 0x54u, adc1_cfg);
+    ASSERT_EQ(mem_read32(mem, sens + 0x54u) & (1u << 16), 0u);
+    mem_write32(mem, sens + 0x54u, adc1_cfg | (1u << 17));
+    uint32_t adc1 = mem_read32(mem, sens + 0x54u);
+    ASSERT_EQ(adc1 & (1u << 16), 1u << 16);
+    ASSERT_EQ(adc1 & 0xFFFFu, 0x0A55u);
+    ASSERT_EQ(adc1 & 0xFFFE0000u, adc1_cfg | (1u << 17));
+
+    /* ADC2 has an independent width field and channel bank. At nine bits,
+     * the injected 0x5AA sample is truncated to 0x1AA. */
+    mem_write32(mem, sens + 0x2Cu, 0x3u);
+    uint32_t adc2_cfg = (1u << 31) | (1u << 19) | (1u << 18);
+    mem_write32(mem, sens + 0x94u, adc2_cfg);
+    mem_write32(mem, sens + 0x94u, adc2_cfg | (1u << 17));
+    uint32_t adc2 = mem_read32(mem, sens + 0x94u);
+    ASSERT_EQ(adc2 & (1u << 16), 1u << 16);
+    ASSERT_EQ(adc2 & 0xFFFFu, 0x01AAu);
+
+    /* Non-conversion SENS registers retain normal R/W state. */
+    mem_write32(mem, sens + 0x34u, 0xDEADBEEFu);
+    ASSERT_EQ(mem_read32(mem, sens + 0x34u), 0xDEADBEEFu);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+typedef struct {
+    unsigned count;
+    uint8_t channel;
+    uint8_t enabled;
+    uint8_t value;
+} dac_event_capture_t;
+
+static void capture_dac_event(const sbx_event_t *ev, void *ctx) {
+    if (ev->kind != SBX_EV_DAC_OUT) return;
+    dac_event_capture_t *capture = ctx;
+    capture->count++;
+    capture->channel = ev->dac_out.channel;
+    capture->enabled = ev->dac_out.enabled;
+    capture->value = ev->dac_out.value;
+}
+
+TEST(rtcio_dac_state_and_events) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t rtcio = 0x3FF48400u;
+    dac_event_capture_t capture = {0};
+    sbx_events_set_sink(capture_dac_event, &capture);
+
+    ASSERT_EQ(mem_read32(mem, rtcio + 0x84u), 2u << 30);
+    ASSERT_EQ(mem_read32(mem, rtcio + 0x88u), 2u << 30);
+    ASSERT_EQ(periph_dac_enabled(p, 0), 0);
+    ASSERT_EQ(periph_dac_value(p, 0), 0);
+
+    uint32_t dac1 = (2u << 30) | (0x35u << 19) |
+                    (1u << 18) | (1u << 10);
+    mem_write32(mem, rtcio + 0x84u, dac1);
+    ASSERT_EQ(mem_read32(mem, rtcio + 0x84u), dac1);
+    ASSERT_EQ(periph_dac_enabled(p, 0), 1);
+    ASSERT_EQ(periph_dac_value(p, 0), 0x35u);
+    ASSERT_EQ(capture.count, 1u);
+    ASSERT_EQ(capture.channel, 0u);
+    ASSERT_EQ(capture.enabled, 1u);
+    ASSERT_EQ(capture.value, 0x35u);
+
+    mem_write32(mem, rtcio + 0x84u,
+                (dac1 & ~(0xFFu << 19)) | (0xCAu << 19));
+    ASSERT_EQ(periph_dac_value(p, 0), 0xCAu);
+    ASSERT_EQ(capture.count, 2u);
+    ASSERT_EQ(capture.value, 0xCAu);
+
+    mem_write32(mem, rtcio + 0x84u,
+                mem_read32(mem, rtcio + 0x84u) & ~(1u << 10));
+    ASSERT_EQ(periph_dac_enabled(p, 0), 0);
+    ASSERT_EQ(capture.count, 3u);
+    ASSERT_EQ(capture.enabled, 0u);
+
+    uint32_t dac2 = (2u << 30) | (0x7Eu << 19) |
+                    (1u << 18) | (1u << 10);
+    mem_write32(mem, rtcio + 0x88u, dac2);
+    ASSERT_EQ(periph_dac_enabled(p, 1), 1);
+    ASSERT_EQ(periph_dac_value(p, 1), 0x7Eu);
+    ASSERT_EQ(capture.channel, 1u);
+
+    /* RTC GPIO W1 aliases update their backing state and remain write-only. */
+    mem_write32(mem, rtcio + 0x04u, 1u << 14);
+    ASSERT_EQ(mem_read32(mem, rtcio + 0x00u), 1u << 14);
+    ASSERT_EQ(mem_read32(mem, rtcio + 0x04u), 0u);
+    mem_write32(mem, rtcio + 0x08u, 1u << 14);
+    ASSERT_EQ(mem_read32(mem, rtcio + 0x00u), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    sbx_events_set_sink(NULL, NULL);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(gpio_set_clear) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -1516,6 +1626,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(dport_safe_defaults);
     RUN_TEST(wdt_disable);
     RUN_TEST(rtc_reset_cause);
+    RUN_TEST(sens_adc_single_conversions);
+    RUN_TEST(rtcio_dac_state_and_events);
     RUN_TEST(gpio_set_clear);
     RUN_TEST(gpio_high_pin_falling_edge_interrupt);
     RUN_TEST(gpio_interrupt_routes_to_selected_core);

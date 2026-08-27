@@ -24,6 +24,7 @@ typedef enum {
     SBX_EV_SPI_XFER   = 3,  /* a SPI half-duplex transfer completed */
     SBX_EV_I2C_XFER   = 4,  /* an I²C transaction completed */
     SBX_EV_LCD_PIXELS = 5,  /* framebuffer bytes pushed to an LCD panel */
+    SBX_EV_DAC_OUT    = 6,  /* DAC channel enable/value changed */
 } sbx_event_kind_t;
 
 typedef struct {
@@ -41,6 +42,7 @@ typedef struct {
             const uint8_t *data;
         } i2c_xfer;
         struct { uint32_t x, y, w, h; uint16_t bpp; const uint8_t *pixels; } lcd_pixels;
+        struct { uint8_t channel; uint8_t enabled; uint8_t value; } dac_out;
     };
 } sbx_event_t;
 

@@ -115,4 +115,9 @@ void periph_gpio_set_input(esp32_periph_t *p, int pin, int level);
 void     periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw);
 uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel);
 
+/* Current classic-ESP32 DAC state. Channels 0/1 correspond to GPIO25/26.
+ * Invalid channels return -1 for enabled and 0 for value. */
+int     periph_dac_enabled(const esp32_periph_t *p, int channel);
+uint8_t periph_dac_value(const esp32_periph_t *p, int channel);
+
 #endif /* PERIPHERALS_H */

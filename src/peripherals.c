@@ -22,6 +22,7 @@
 #define FE_BASE         0x3FF46000u
 #define PHY_BASE        0x3FF4E000u  /* undocumented WiFi PHY calibration window */
 #define RTC_CNTL_BASE   0x3FF48000u
+#define RTCIO_BASE      0x3FF48400u
 #define SENS_BASE       0x3FF48800u
 #define IO_MUX_BASE     0x3FF49000u
 #define BT_BASE         0x3FF51000u
@@ -40,6 +41,24 @@
 #define WDEV_BASE       0x3FF75000u  /* WiFi device (contains RNG register) */
 #define PAGE_SIZE       4096
 #define PAGE_WORDS      (PAGE_SIZE / sizeof(uint32_t))
+
+/* RTC-domain analog register geometry (classic ESP32). RTCIO and SENS share
+ * RTC_CNTL's 4 KiB MMIO page, at offsets 0x400 and 0x800 respectively. */
+#define RTCIO_REG_FILE_SIZE         0x100u
+#define RTCIO_DAC1_OFF              0x084u
+#define RTCIO_DAC2_OFF              0x088u
+#define RTCIO_DAC_VALUE_MASK        (0xFFu << 19)
+#define RTCIO_DAC_XPD               (1u << 18)
+#define RTCIO_DAC_XPD_FORCE         (1u << 10)
+
+#define SENS_REG_FILE_SIZE          0x100u
+#define SENS_SAR_START_FORCE_OFF    0x02Cu
+#define SENS_SAR_MEAS_START1_OFF    0x054u
+#define SENS_SAR_MEAS_START2_OFF    0x094u
+#define SENS_SAR_EN_PAD_MASK        (0xFFFu << 19)
+#define SENS_SAR_START              (1u << 17)
+#define SENS_SAR_DONE               (1u << 16)
+#define SENS_SAR_CONFIG_MASK        0xFFFE0000u
 
 /* Page index from absolute address */
 #define PAGE_OF(addr) (((addr) - PERIPH_BASE) / PAGE_SIZE)
@@ -300,6 +319,13 @@ struct esp32_periph {
     /* ADC input shadow values driven from sandbox stdin. Reads by
      * adc_oneshot_read / adc1_get_raw ROM-stubs pull from here. */
     uint16_t adc_value[40];
+
+    /* RTC-domain pin and sensor register files. The two SAR measurement
+     * registers additionally expose synchronous single-conversion state. */
+    uint32_t rtcio_regs[RTCIO_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t sens_regs[SENS_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint16_t sens_adc_result[2];
+    bool sens_adc_done[2];
 
     /* SPI flash controllers: [0] = SPI0 (cache), [1] = SPI1 (memspi) */
     spi_state_t spi[2];
@@ -853,11 +879,133 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
 
 /* ---- RTC_CNTL ---- */
 
+static bool rtcio_dac_is_enabled(uint32_t reg) {
+    return (reg & (RTCIO_DAC_XPD | RTCIO_DAC_XPD_FORCE)) ==
+           (RTCIO_DAC_XPD | RTCIO_DAC_XPD_FORCE);
+}
+
+static uint8_t rtcio_dac_value(uint32_t reg) {
+    return (uint8_t)((reg & RTCIO_DAC_VALUE_MASK) >> 19);
+}
+
+static void rtcio_emit_dac_change(int channel, uint32_t before,
+                                  uint32_t after) {
+    bool old_enabled = rtcio_dac_is_enabled(before);
+    bool new_enabled = rtcio_dac_is_enabled(after);
+    uint8_t old_value = rtcio_dac_value(before);
+    uint8_t new_value = rtcio_dac_value(after);
+    if (old_enabled == new_enabled && old_value == new_value)
+        return;
+
+    sbx_event_t ev = { .kind = SBX_EV_DAC_OUT, .cycle = 0 };
+    ev.dac_out.channel = (uint8_t)channel;
+    ev.dac_out.enabled = new_enabled ? 1u : 0u;
+    ev.dac_out.value = new_value;
+    sbx_events_emit(&ev);
+}
+
+static uint32_t rtcio_read(esp32_periph_t *p, uint32_t off) {
+    if ((off & 3u) != 0 || off >= RTCIO_REG_FILE_SIZE)
+        return 0;
+    /* W1TS/W1TC registers are write-only. */
+    switch (off) {
+    case 0x004u:
+    case 0x008u:
+    case 0x010u:
+    case 0x014u:
+    case 0x01Cu:
+    case 0x020u:
+        return 0;
+    default:
+        return p->rtcio_regs[off / 4u];
+    }
+}
+
+static void rtcio_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
+    if ((off & 3u) != 0 || off >= RTCIO_REG_FILE_SIZE)
+        return;
+
+    switch (off) {
+    case 0x004u: p->rtcio_regs[0x000u / 4u] |= val; return;
+    case 0x008u: p->rtcio_regs[0x000u / 4u] &= ~val; return;
+    case 0x010u: p->rtcio_regs[0x00Cu / 4u] |= val; return;
+    case 0x014u: p->rtcio_regs[0x00Cu / 4u] &= ~val; return;
+    case 0x01Cu: p->rtcio_regs[0x018u / 4u] |= val; return;
+    case 0x020u: p->rtcio_regs[0x018u / 4u] &= ~val; return;
+    case 0x024u: return; /* RTC_GPIO_IN is read-only. */
+    default: break;
+    }
+
+    uint32_t before = p->rtcio_regs[off / 4u];
+    p->rtcio_regs[off / 4u] = val;
+    if (off == RTCIO_DAC1_OFF)
+        rtcio_emit_dac_change(0, before, val);
+    else if (off == RTCIO_DAC2_OFF)
+        rtcio_emit_dac_change(1, before, val);
+}
+
+static int sens_measure_unit(uint32_t off) {
+    if (off == SENS_SAR_MEAS_START1_OFF) return 0;
+    if (off == SENS_SAR_MEAS_START2_OFF) return 1;
+    return -1;
+}
+
+static uint32_t sens_read(esp32_periph_t *p, uint32_t off) {
+    if ((off & 3u) != 0 || off >= SENS_REG_FILE_SIZE)
+        return 0;
+    int unit = sens_measure_unit(off);
+    uint32_t val = p->sens_regs[off / 4u];
+    if (unit >= 0) {
+        val &= SENS_SAR_CONFIG_MASK;
+        if (p->sens_adc_done[unit])
+            val |= SENS_SAR_DONE;
+        val |= p->sens_adc_result[unit];
+    }
+    return val;
+}
+
+static void sens_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
+    if ((off & 3u) != 0 || off >= SENS_REG_FILE_SIZE)
+        return;
+    int unit = sens_measure_unit(off);
+    if (unit < 0) {
+        p->sens_regs[off / 4u] = val;
+        return;
+    }
+
+    /* DONE and DATA are read-only. A low START phase clears DONE; the rising
+     * phase completes immediately and latches the host-injected channel. */
+    p->sens_regs[off / 4u] = val & SENS_SAR_CONFIG_MASK;
+    if ((val & SENS_SAR_START) == 0) {
+        p->sens_adc_done[unit] = false;
+        return;
+    }
+
+    uint32_t enabled = (val & SENS_SAR_EN_PAD_MASK) >> 19;
+    unsigned channel = 0;
+    while (channel < 12u && (enabled & (1u << channel)) == 0)
+        channel++;
+
+    uint16_t raw = 0;
+    if (channel < 10u)
+        raw = p->adc_value[unit * 10 + channel];
+    unsigned width_code =
+        (p->sens_regs[SENS_SAR_START_FORCE_OFF / 4u] >> (unit * 2)) & 3u;
+    unsigned bits = 9u + width_code;
+    raw &= (uint16_t)((1u << bits) - 1u);
+    p->sens_adc_result[unit] = raw;
+    p->sens_adc_done[unit] = true;
+}
+
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
-    (void)ctx;
+    esp32_periph_t *p = ctx;
     uint32_t off = addr - RTC_CNTL_BASE;
-    /* SENS registers start at offset 0x800 within this page */
-    if (off >= 0x800) return 0;  /* SENS: return 0 for all */
+    if (addr >= SENS_BASE && addr < SENS_BASE + SENS_REG_FILE_SIZE)
+        return sens_read(p, addr - SENS_BASE);
+    if (addr >= RTCIO_BASE && addr < RTCIO_BASE + RTCIO_REG_FILE_SIZE)
+        return rtcio_read(p, addr - RTCIO_BASE);
+    /* Reserved RTCIO/SENS portions of the shared page read as zero. */
+    if (off >= 0x400u) return 0;
     switch (off) {
     case 0x00C: return (1u << 30);   /* TIME_UPDATE: time-valid bit always set */
     case 0x010: return 0;           /* TIME_LOW0: RTC timer low word */
@@ -873,7 +1021,15 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
 }
 
 static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
-    (void)ctx; (void)addr; (void)val;
+    esp32_periph_t *p = ctx;
+    if (addr >= SENS_BASE && addr < SENS_BASE + SENS_REG_FILE_SIZE) {
+        sens_write(p, addr - SENS_BASE, val);
+        return;
+    }
+    if (addr >= RTCIO_BASE && addr < RTCIO_BASE + RTCIO_REG_FILE_SIZE) {
+        rtcio_write(p, addr - RTCIO_BASE, val);
+        return;
+    }
 }
 
 /* ---- IO_MUX ---- */
@@ -1962,6 +2118,12 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     for (int port = 0; port < I2C_PORT_COUNT; port++)
         p->i2c[port].regs[I2C_DATE_OFF / 4u] = 0x16042000u;
 
+    /* Both SAR units reset to 12-bit conversion width. RTC DAC pads reset
+     * disabled at code zero with their documented drive-strength value. */
+    p->sens_regs[SENS_SAR_START_FORCE_OFF / 4u] = 0xFu;
+    p->rtcio_regs[RTCIO_DAC1_OFF / 4u] = 2u << 30;
+    p->rtcio_regs[RTCIO_DAC2_OFF / 4u] = 2u << 30;
+
     /* Strapping-pin idle levels: GPIO0/5/15 have pull-ups enabled at reset
      * (GPIO2/12 pull-downs read low). Firmware reads GPIO_IN for buttons
      * tied to these pins (e.g. Marauder's BOOT-button on GPIO0) — leaving
@@ -2248,6 +2410,18 @@ void periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw) {
 uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel) {
     if (!p || channel < 0 || channel >= 40) return 0;
     return p->adc_value[channel];
+}
+
+int periph_dac_enabled(const esp32_periph_t *p, int channel) {
+    if (!p || channel < 0 || channel > 1) return -1;
+    uint32_t off = channel == 0 ? RTCIO_DAC1_OFF : RTCIO_DAC2_OFF;
+    return rtcio_dac_is_enabled(p->rtcio_regs[off / 4u]) ? 1 : 0;
+}
+
+uint8_t periph_dac_value(const esp32_periph_t *p, int channel) {
+    if (!p || channel < 0 || channel > 1) return 0;
+    uint32_t off = channel == 0 ? RTCIO_DAC1_OFF : RTCIO_DAC2_OFF;
+    return rtcio_dac_value(p->rtcio_regs[off / 4u]);
 }
 
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
