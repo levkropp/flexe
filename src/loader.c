@@ -256,22 +256,27 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
  * stay invalid (0x100 = free) so esp_mmu_map / ROM spi_flash_mmap can find
  * free vaddr slots for partition-table and NVS mappings.
  *
- * Entry layout (IDF mmu_ll_get_entry_id, ESP32): 0-63 = DROM0
- * (0x3F400000+), 64-127 = IRAM0 cache window (0x400D0000+; entry 64 covers
- * vaddr 0x40000000). Entry e maps its 64 KB vaddr page to flash page =
- * value. Flash offsets follow the emulator's layout (app image at flash
- * 0x10000). Correct IROM entries matter for spi_flash_cache2phys(), which
- * esp_ota_get_running_partition() uses to locate the running app partition
- * by its own code address.
+ * Entry layout (IDF mmu_ll_get_entry_id, ESP32): 0-63 = DROM0; 64-127,
+ * 128-191, and 192-255 = IRAM0, IRAM1, and IROM0. Entry e maps its 64 KB
+ * virtual page to the physical flash page in its value. Flash offsets follow
+ * the emulator's layout (app image at flash 0x10000). Correct IRAM0 entries
+ * matter for spi_flash_cache2phys(), which esp_ota_get_running_partition()
+ * uses to locate the running app partition by its own code address.
  *
  * BOTH the PRO and APP tables must be written: the IDF startup contains a
  * table-consistency sweep (seen at 0x40081D41) that invalidates any entry
  * whose PRO and APP values differ — PRO-only seeding is wiped out by it.
  *
- * The mem_write32 path also remaps the corresponding cache window pages
- * (flash_mmu_map_entry) — for DROM that is identical to the loader's own
- * remap, so no conflict. */
+ * The mem_write32 path also remaps the corresponding cache window pages. */
 static void loader_seed_flash_mmu(xtensa_mem_t *mem, const load_result_t *res) {
+    /* mem_create supplies temporary linear cache mappings so loader_parse_image
+     * can copy segments before their physical offsets are known. Remove every
+     * temporary page now, then install only the bootloader's active entries. */
+    for (uint32_t e = 0; e < 256u; e++) {
+        mem_write32(mem, 0x3FF10000u + e * 4u, 0x100u); /* PRO invalid */
+        mem_write32(mem, 0x3FF12000u + e * 4u, 0x100u); /* APP invalid */
+    }
+
     uint32_t drom_pages = 0;
     for (int i = 0; i < res->segment_count && i < MAX_SEGMENTS; i++) {
         uint32_t a = res->segments[i].addr;
@@ -493,7 +498,7 @@ const char *loader_region_name(uint32_t addr) {
     if (addr >= 0x40000000u && addr < 0x40060000u) return "rom";
     if (addr >= 0x40070000u && addr < 0x400C0000u) return "sram_insn";
     if (addr >= 0x400C0000u && addr < 0x400C2000u) return "rtc_iram";
-    if (addr >= 0x400C2000u && addr < 0x40400000u) return "flash_insn";
+    if (addr >= 0x400D0000u && addr < 0x40C00000u) return "flash_insn";
     if (addr >= 0x50000000u && addr < 0x50002000u) return "rtc_fast";
     if (addr >= 0x60000000u && addr < 0x60002000u) return "rtc_slow";
     return "unmapped";

@@ -3,6 +3,7 @@
  * PC hook mechanism, calling convention, and built-in ROM stubs.
  */
 #include "test_helpers.h"
+#include "peripherals.h"
 #include "rom_stubs.h"
 #include <string.h>
 
@@ -377,6 +378,74 @@ TEST(test_stub_cache_noop) {
     teardown(&cpu);
 }
 
+static uint32_t call_cache_flash_mmu_set0(xtensa_cpu_t *cpu,
+                                          uint32_t core, uint32_t pid,
+                                          uint32_t vaddr, uint32_t paddr,
+                                          uint32_t psize, uint32_t num) {
+    cpu->pc = 0x400095E0u;
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, BASE);
+    ar_write(cpu, 2, core);
+    ar_write(cpu, 3, pid);
+    ar_write(cpu, 4, vaddr);
+    ar_write(cpu, 5, paddr);
+    ar_write(cpu, 6, psize);
+    ar_write(cpu, 7, num);
+    xtensa_step(cpu);
+    return ar_read(cpu, 2);
+}
+
+TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_periph_t *periph = periph_create(cpu.mem);
+    periph_attach_cpus(periph, &cpu, NULL);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    rom_stubs_set_periph(rom, periph);
+
+    cpu.mem->flash_data[0x20000u] = 0x21;
+    cpu.mem->flash_data[0x2F234u] = 0x43;
+    ASSERT_EQ(call_cache_flash_mmu_set0(&cpu, 0, 0, 0x3F500000u,
+                                        0x20000u, 64u, 1u), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FF10000u + 16u * 4u), 2u);
+    ASSERT_EQ(mem_read8(cpu.mem, 0x3F500000u), 0x21);
+    ASSERT_EQ(mem_read8(cpu.mem, 0x3F50F234u), 0x43);
+
+    cpu.mem->flash_insn[0x30000u] = 0x65;
+    cpu.mem->flash_insn[0x3FFFFu] = 0x87;
+    ASSERT_EQ(call_cache_flash_mmu_set0(&cpu, 0, 0, 0x40400000u,
+                                        0x30000u, 64u, 1u), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FF10000u + 128u * 4u), 3u);
+    ASSERT_EQ(mem_read8(cpu.mem, 0x40400000u), 0x65);
+    ASSERT_EQ(mem_read8(cpu.mem, 0x4040FFFFu), 0x87);
+
+    ASSERT_EQ(call_cache_flash_mmu_set0(&cpu, 0, 0, 0x3F500001u,
+                                        0x20000u, 64u, 1u), 1u);
+    ASSERT_EQ(call_cache_flash_mmu_set0(&cpu, 0, 0, 0x3F500000u,
+                                        0x20000u, 32u, 1u), 3u);
+    ASSERT_EQ(call_cache_flash_mmu_set0(&cpu, 0, 0, 0x3F7F0000u,
+                                        0x20000u, 64u, 2u), 4u);
+    ASSERT_EQ(call_cache_flash_mmu_set0(&cpu, 0, 0, 0x400C0000u,
+                                        0x20000u, 64u, 1u), 5u);
+    ASSERT_EQ(call_cache_flash_mmu_set0(&cpu, 0, 0, 0x3F500000u,
+                                        0xFF0000u, 64u, 2u), 4u);
+
+    /* mmu_init is modeled as a functional unmap because Flexe does not
+     * otherwise expose the real cache-disable bus mask around this ROM call. */
+    cpu.pc = 0x400095A4u;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, 0u);
+    xtensa_step(&cpu);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FF10000u + 16u * 4u), 0x100u);
+    ASSERT_TRUE(mem_get_ptr(cpu.mem, 0x3F500000u) == NULL);
+    ASSERT_TRUE(mem_get_ptr(cpu.mem, 0x40400000u) == NULL);
+
+    rom_stubs_destroy(rom);
+    periph_destroy(periph);
+    teardown(&cpu);
+}
+
 /* ===== Test: stub_memcpy ===== */
 
 TEST(test_stub_memcpy) {
@@ -630,6 +699,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_printf_string);
     RUN_TEST(test_stub_delay_us);
     RUN_TEST(test_stub_cache_noop);
+    RUN_TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses);
     RUN_TEST(test_stub_memcpy);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_marauder_nimble_deinit_preserves_cpp_lists);

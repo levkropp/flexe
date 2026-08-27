@@ -3,6 +3,7 @@
  */
 #include "test_helpers.h"
 #include "loader.h"
+#include "peripherals.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -115,6 +116,37 @@ TEST(loader_nerdminer_reconstructs_huge_app_partitions) {
     mem_destroy(mem);
 }
 
+TEST(loader_replaces_temporary_flash_maps_with_boot_mmu) {
+    uint8_t bin[64] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 1;
+    put_le32(&bin[4], 0x40080000u);
+    put_le32(&bin[24], 0x3FFB0000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x12345678u);
+
+    const char *path = write_temp(bin, 36);
+    ASSERT_TRUE(path != NULL);
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *periph = periph_create(mem);
+    load_result_t res = loader_load_bin(mem, path);
+    ASSERT_EQ(res.result, 0);
+
+    /* Only the header page remains live for this image. All linear mappings
+     * used while parsing must be gone before application startup. */
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3F400000u) == mem->flash_data + 0x10000u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3F410000u) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x400C2000u) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x400D0000u) == NULL);
+    ASSERT_EQ(mem_read32(mem, 0x3FF10000u), 1u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF12000u), 1u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF10004u), 0x100u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF10000u + 77u * 4u), 0x100u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(loader_bad_magic) {
     uint8_t bin[32];
     memset(bin, 0, sizeof(bin));
@@ -147,6 +179,7 @@ void run_loader_tests(void) {
     RUN_TEST(loader_single_segment);
     RUN_TEST(loader_multi_segment);
     RUN_TEST(loader_nerdminer_reconstructs_huge_app_partitions);
+    RUN_TEST(loader_replaces_temporary_flash_maps_with_boot_mmu);
     RUN_TEST(loader_bad_magic);
     RUN_TEST(loader_null_path);
     RUN_TEST(loader_null_mem);

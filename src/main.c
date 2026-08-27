@@ -842,7 +842,7 @@ typedef struct { audit_fsym_t *buf; int n, cap; esp32_rom_stubs_t *rom; } audit_
 static int audit_collect_fn(const char *name, uint32_t addr, uint32_t size, void *vctx) {
     audit_iter_ctx_t *c = vctx;
     if (c->n >= c->cap) return 0;
-    if (addr < 0x40080000u || addr >= 0x40500000u) return 0; /* skip ROM */
+    if (addr < 0x40080000u || addr >= ESP32_INSN_ADDR_HIGH) return 0; /* skip ROM */
     if (size == 0) return 0;
     for (int i = 0; i < rom_stubs_stub_count(c->rom); i++) {
         const char *rn; uint32_t ra, rc;

@@ -528,6 +528,19 @@ TEST(irq_dispatch_observes_only_rising_edges) {
 #define TEST_SPI_MISO_DLEN   (TEST_SPI1_BASE + 0x2C)
 #define TEST_SPI_W0_REG      (TEST_SPI1_BASE + 0x80)
 
+typedef struct {
+    int count;
+    uint32_t addr;
+    size_t len;
+} flash_code_invalidate_capture_t;
+
+static void test_flash_code_invalidate(void *ctx, uint32_t addr, size_t len) {
+    flash_code_invalidate_capture_t *capture = ctx;
+    capture->count++;
+    capture->addr = addr;
+    capture->len = len;
+}
+
 static uint8_t test_flash_status(xtensa_mem_t *mem) {
     mem_write32(mem, TEST_SPI_USER2_REG, 0x05);       /* RDSR1 */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 18);    /* USR */
@@ -562,9 +575,21 @@ TEST(spi_flash_write_enable_latch) {
 TEST(spi_flash_program_erase_require_write_enable) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    flash_code_invalidate_capture_t capture = {0};
+    cpu.code_invalidate = test_flash_code_invalidate;
+    cpu.code_invalidate_ctx = &capture;
+    periph_attach_cpus(p, &cpu, NULL);
     const uint32_t off = 0x9000;
 
     mem->flash_data[off] = 0xF0;
+    mem->flash_insn[off] = 0xF0;
+    /* IRAM0 entry 77 aliases physical flash page zero. Programming that
+     * page must invalidate translated code at its virtual address. */
+    mem_write32(mem, 0x3FF10000u + 77u * 4u, 0u);
+    capture.count = 0;
     mem_write32(mem, TEST_SPI_ADDR_REG, off);
     mem_write32(mem, TEST_SPI_MOSI_DLEN, 7);          /* one byte */
     mem_write32(mem, TEST_SPI_W0_REG, 0xAA);
@@ -572,19 +597,114 @@ TEST(spi_flash_program_erase_require_write_enable) {
     /* A page-program command without WEL is ignored. */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 25);     /* FLASH_PP */
     ASSERT_EQ(mem->flash_data[off], 0xF0);
+    ASSERT_EQ(mem->flash_insn[off], 0xF0);
+    ASSERT_EQ(capture.count, 0);
 
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 30);     /* FLASH_WREN */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 25);     /* FLASH_PP */
     ASSERT_EQ(mem->flash_data[off], 0xA0);            /* NOR: 0xF0 & 0xAA */
+    ASSERT_EQ(mem->flash_insn[off], 0xA0);
+    ASSERT_EQ(capture.count, 1);
+    ASSERT_EQ(capture.addr, 0x400D0000u);
+    ASSERT_EQ(capture.len, 0x10000u);
     ASSERT_EQ(test_flash_status(mem) & (1u << 1), 0u); /* PP clears WEL */
 
     /* Erase has the same WEL requirement and restores the sector to 0xFF. */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 24);     /* FLASH_SE, no WEL */
     ASSERT_EQ(mem->flash_data[off], 0xA0);
+    ASSERT_EQ(mem->flash_insn[off], 0xA0);
+    ASSERT_EQ(capture.count, 1);
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 30);     /* FLASH_WREN */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 24);     /* FLASH_SE */
     ASSERT_EQ(mem->flash_data[off], 0xFF);
+    ASSERT_EQ(mem->flash_insn[off], 0xFF);
+    ASSERT_EQ(capture.count, 2);
     ASSERT_EQ(test_flash_status(mem) & (1u << 1), 0u); /* erase clears WEL */
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(flash_mmu_maps_complete_pages_and_all_instruction_buses) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0, cpu1;
+    xtensa_cpu_init(&cpu0);
+    xtensa_cpu_init(&cpu1);
+    cpu0.mem = mem;
+    cpu1.mem = mem;
+    flash_code_invalidate_capture_t capture = {0};
+    cpu0.code_invalidate = test_flash_code_invalidate;
+    cpu0.code_invalidate_ctx = &capture;
+    cpu1.code_invalidate = test_flash_code_invalidate;
+    cpu1.code_invalidate_ctx = &capture;
+    periph_attach_cpus(p, &cpu0, &cpu1);
+
+    const uint32_t pro = 0x3FF10000u;
+    const uint32_t app = 0x3FF12000u;
+    const uint32_t data_entry = 5u;
+    const uint32_t data_vaddr = 0x3F450000u;
+    mem->flash_data[0x20000u] = 0x12;
+    mem->flash_data[0x21234u] = 0x34;
+    mem->flash_data[0x2FFFCu] = 0x56;
+    mem->flash_data[0x30000u] = 0xA1;
+    mem->flash_data[0x31234u] = 0xA2;
+
+    /* One hardware entry backs sixteen host pages, not just its first 4 KiB. */
+    mem_write32(mem, pro + data_entry * 4u, 2u);
+    ASSERT_EQ(mem_read32(mem, pro + data_entry * 4u), 2u);
+    ASSERT_EQ(mem_read8(mem, data_vaddr), 0x12);
+    ASSERT_EQ(mem_read8(mem, data_vaddr + 0x1234u), 0x34);
+    ASSERT_EQ(mem_read8(mem, data_vaddr + 0xFFFCu), 0x56);
+
+    /* The shared emulator map follows the latest valid core table, then
+     * falls back to the other core until both entries are invalid. */
+    mem_write32(mem, app + data_entry * 4u, 3u);
+    ASSERT_EQ(mem_read8(mem, data_vaddr), 0xA1);
+    ASSERT_EQ(mem_read8(mem, data_vaddr + 0x1234u), 0xA2);
+    mem_write32(mem, app + data_entry * 4u, 0x100u);
+    ASSERT_EQ(mem_read8(mem, data_vaddr), 0x12);
+    mem_write32(mem, pro + data_entry * 4u, 0x100u);
+    ASSERT_TRUE(mem_get_ptr(mem, data_vaddr) == NULL);
+
+    /* Entries below IRAM0's first usable page must not overwrite ROM/IRAM. */
+    const uint8_t *rom_page = mem_get_ptr(mem, 0x40000000u);
+    mem_write32(mem, pro + 64u * 4u, 2u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40000000u) == rom_page);
+
+    uint16_t nop_n = narrow(0xD, 15, 0, 3);
+    memcpy(mem->flash_insn + 0x30000u, &nop_n, sizeof(nop_n));
+    mem->flash_insn[0x3FFFFu] = 0xB1;
+    mem->flash_insn[0x40000u] = 0xC2;
+    mem->flash_insn[0x50000u] = 0xD3;
+    capture.count = 0;
+
+    mem_write32(mem, pro + 128u * 4u, 3u); /* IRAM1 */
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40400000u) == mem->flash_insn + 0x30000u);
+    ASSERT_EQ(mem_read8(mem, 0x4040FFFFu), 0xB1);
+    ASSERT_EQ(capture.count, 1); /* shared predecode/JIT invalidated once */
+    ASSERT_EQ(capture.addr, 0x40400000u);
+
+    /* The upper bus is executable, not merely addressable. */
+    cpu0.pc = 0x40400000u;
+    cpu0._pc_written = true;
+    ASSERT_EQ(xtensa_step(&cpu0), 0);
+    ASSERT_EQ(cpu0.pc, 0x40400002u);
+    ASSERT_FALSE(cpu0.exception);
+
+    mem_write32(mem, pro + 192u * 4u, 4u); /* IROM0 first page */
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40800000u) == mem->flash_insn + 0x40000u);
+    ASSERT_EQ(mem_read8(mem, 0x40800000u), 0xC2);
+    mem_write32(mem, pro + 255u * 4u, 5u); /* IROM0 final page */
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40BF0000u) == mem->flash_insn + 0x50000u);
+    ASSERT_EQ(mem_read8(mem, 0x40BF0000u), 0xD3);
+    ASSERT_EQ(capture.count, 3);
+
+    /* A syntactically valid physical page beyond the emulated 4 MiB chip
+     * remains visible in the raw table but cannot expose host memory. */
+    mem_write32(mem, pro + 128u * 4u, 0x40u);
+    ASSERT_EQ(mem_read32(mem, pro + 128u * 4u), 0x40u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40400000u) == NULL);
 
     periph_destroy(p);
     mem_destroy(mem);
@@ -1771,6 +1891,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(irq_dispatch_observes_only_rising_edges);
     RUN_TEST(spi_flash_write_enable_latch);
     RUN_TEST(spi_flash_program_erase_require_write_enable);
+    RUN_TEST(flash_mmu_maps_complete_pages_and_all_instruction_buses);
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);
     RUN_TEST(wifi_mac_init_ready_handshake);
     RUN_TEST(radio_phy_calibration_register_files);

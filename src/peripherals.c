@@ -41,6 +41,14 @@
 #define WDEV_BASE       0x3FF75000u  /* WiFi device (contains RNG register) */
 #define PAGE_SIZE       4096
 #define PAGE_WORDS      (PAGE_SIZE / sizeof(uint32_t))
+#define EMU_FLASH_SIZE  (4u * 1024u * 1024u)
+
+/* Classic ESP32 flash-cache MMU geometry. Each core owns a 256-entry table:
+ * DROM0, IRAM0, IRAM1, and IROM0 each consume 64 entries. */
+#define FLASH_MMU_ENTRY_COUNT 256u
+#define FLASH_MMU_PAGE_SIZE   0x10000u
+#define FLASH_MMU_INVALID     0x100u
+#define FLASH_MMU_VALUE_MASK  0x1FFu
 
 /* RTC-domain analog register geometry (classic ESP32). RTCIO and SENS share
  * RTC_CNTL's 4 KiB MMIO page, at offsets 0x400 and 0x800 respectively. */
@@ -424,10 +432,11 @@ struct esp32_periph {
     i2s_state_t i2s[I2S_PORT_COUNT];
 
     /* Flash cache MMU table shadows (DPORT_PRO/APP_FLASH_MMU_TABLE).
-     * Entry i (0-63 = DROM 0x3F400000+, 64-127 = IROM 0x400C2000+) holds
-     * the 64 KB flash page mapped into that vaddr slot. */
-    uint32_t flash_mmu_pro[256];
-    uint32_t flash_mmu_app[256];
+     * Entries 0-63 are DROM0; 64-127, 128-191, and 192-255 are the
+     * IRAM0, IRAM1, and IROM0 cache regions respectively. */
+    uint32_t flash_mmu_pro[FLASH_MMU_ENTRY_COUNT];
+    uint32_t flash_mmu_app[FLASH_MMU_ENTRY_COUNT];
+    uint16_t flash_mmu_effective[FLASH_MMU_ENTRY_COUNT];
 };
 
 /* Bootloader-style initial flash MMU contents for an app at flash 0x10000:
@@ -442,9 +451,12 @@ struct esp32_periph {
  * no free vaddr slot and fail with ESP_ERR_NO_MEM (seen as
  * "load_partitions returned 0x101"). */
 static void flash_mmu_init_bootloader(esp32_periph_t *p) {
-    for (uint32_t s = 0; s < 256; s++) {
-        p->flash_mmu_pro[s] = 0x100;
-        p->flash_mmu_app[s] = 0x100;
+    for (uint32_t s = 0; s < FLASH_MMU_ENTRY_COUNT; s++) {
+        p->flash_mmu_pro[s] = FLASH_MMU_INVALID;
+        p->flash_mmu_app[s] = FLASH_MMU_INVALID;
+        /* Force the first explicit invalid-table write to remove mem_create's
+         * temporary linear loader mappings from the guest page table. */
+        p->flash_mmu_effective[s] = UINT16_MAX;
     }
 }
 
@@ -512,32 +524,98 @@ static void intr_matrix_update_source_core(esp32_periph_t *p, int core,
     }
 }
 
-/* Map one flash MMU table entry into the CPU page table (shared for both
- * cores; firmware writes identical mappings per core in practice).
- * Entry layout (real hardware / IDF mmu_ll): 0-63 = DROM0 window
- * (0x3F400000+), 64-127 = IRAM0 cache window (0x40080000+). */
-static void flash_mmu_map_entry(esp32_periph_t *p, uint32_t entry, uint32_t val) {
+static void flash_mmu_invalidate_code(esp32_periph_t *p, uint32_t addr,
+                                      size_t len) {
+    xtensa_cpu_t *cpu0 = p->cpu[0];
+    xtensa_cpu_t *cpu1 = p->cpu[1];
+    if (cpu0) xtensa_invalidate_code(cpu0, addr, len);
+    if (!cpu1) return;
+
+    /* Flexe sessions share both predecode and JIT state between cores. Avoid
+     * clearing/flushing the same objects twice, while retaining correctness
+     * for embedders which attach independent execution engines. */
+    if (cpu0 && cpu1->predecode == cpu0->predecode &&
+        cpu1->code_invalidate == cpu0->code_invalidate &&
+        cpu1->code_invalidate_ctx == cpu0->code_invalidate_ctx)
+        return;
+    xtensa_invalidate_code(cpu1, addr, len);
+}
+
+static int flash_mmu_entry_vaddr(uint32_t entry, uint32_t *vbase,
+                                 bool *instruction) {
+    if (entry < 64u) {
+        *vbase = 0x3F400000u + entry * FLASH_MMU_PAGE_SIZE;
+        *instruction = false;
+        return 1;
+    }
+    if (entry < 77u || entry >= FLASH_MMU_ENTRY_COUNT)
+        return 0;  /* entries below IRAM0's 0x400D0000 low address are unused */
+    *vbase = 0x40000000u + (entry - 64u) * FLASH_MMU_PAGE_SIZE;
+    *instruction = true;
+    return 1;
+}
+
+/* Apply one effective table entry to Flexe's shared guest page table. Real
+ * hardware has one cache/MMU per core; ESP-IDF mirrors mappings between cores,
+ * which lets the emulator use the most recently written valid mapping. */
+static void flash_mmu_apply_entry(esp32_periph_t *p, uint32_t entry,
+                                  uint32_t val) {
+    uint32_t vbase;
+    bool instruction;
+    if (!flash_mmu_entry_vaddr(entry, &vbase, &instruction)) return;
+
+    uint32_t physical = (val & 0xFFu) * FLASH_MMU_PAGE_SIZE;
+    bool mapped = (val & FLASH_MMU_INVALID) == 0 &&
+                  physical <= EMU_FLASH_SIZE - FLASH_MMU_PAGE_SIZE;
+    uint8_t *backing = instruction ? p->mem->flash_insn : p->mem->flash_data;
+    for (uint32_t off = 0; off < FLASH_MMU_PAGE_SIZE; off += PAGE_SIZE) {
+        p->mem->page_table[(vbase + off) >> 12] =
+            mapped ? backing + physical + off : NULL;
+    }
+
     if (getenv("FLEXE_DBG_FLASH"))
-        fprintf(stderr, "[MMUTBL] entry=%u val=0x%X (pp=0x%X)\n", entry, val, val << 16);
-    if (entry >= 128) return;
-    uint32_t pp = val << 16;                 /* 64 KB units -> bytes */
-    if (pp + 0x10000 > (4u * 1024 * 1024)) return;
-    xtensa_mem_t *mem = p->mem;
-    if (entry < 64) {                        /* DROM window */
-        for (uint32_t off = 0; off < 0x10000; off += 4096)
-            mem->page_table[(0x3F400000u >> 12) + (entry << 4) + (off >> 12)] =
-                mem->flash_data + pp + off;
-    } else {                                 /* IROM window */
-        /* Real entry layout (IDF mmu_ll): entry 64 ↔ vaddr 0x40000000,
-         * so the flash text window 0x400D0000-0x40400000 maps to entries
-         * 77-127. Only remap pages in the emulator's flash instruction
-         * window — lower vaddrs alias ROM/internal IRAM. */
-        uint32_t vbase = 0x40000000u + (entry - 64) * 0x10000u;
-        if (vbase >= 0x400C2000u) {
-            for (uint32_t off = 0; off < 0x10000; off += 4096)
-                mem->page_table[(vbase >> 12) + (off >> 12)] =
-                    mem->flash_insn + pp + off;
-        }
+        fprintf(stderr,
+                "[MMUTBL] entry=%u vaddr=0x%08X val=0x%03X paddr=0x%06X %s\n",
+                entry, vbase, val, physical, mapped ? "mapped" : "invalid");
+    if (instruction)
+        flash_mmu_invalidate_code(p, vbase, FLASH_MMU_PAGE_SIZE);
+}
+
+static void flash_mmu_write_entry(esp32_periph_t *p, int core,
+                                  uint32_t entry, uint32_t val) {
+    if (entry >= FLASH_MMU_ENTRY_COUNT || core < 0 || core > 1) return;
+    val &= FLASH_MMU_VALUE_MASK;
+    uint32_t *own = core == 0 ? p->flash_mmu_pro : p->flash_mmu_app;
+    uint32_t *other = core == 0 ? p->flash_mmu_app : p->flash_mmu_pro;
+    own[entry] = val;
+
+    /* An invalidation on one core must not remove a mapping still active on
+     * the other core. Once both are invalid, remove all 4 KiB host pages. */
+    uint32_t effective = val;
+    if ((effective & FLASH_MMU_INVALID) &&
+        !(other[entry] & FLASH_MMU_INVALID))
+        effective = other[entry];
+    if (p->flash_mmu_effective[entry] == effective) return;
+    p->flash_mmu_effective[entry] = (uint16_t)effective;
+    flash_mmu_apply_entry(p, entry, effective);
+}
+
+/* Invalidate translated code for every instruction mapping which aliases a
+ * programmed/erased physical flash range. flash_insn itself is synchronized
+ * by the SPI controller before this helper is called. */
+static void flash_mmu_invalidate_physical(esp32_periph_t *p, uint32_t offset,
+                                          uint32_t len) {
+    if (len == 0) return;
+    uint32_t first = offset / FLASH_MMU_PAGE_SIZE;
+    uint32_t last = (offset + len - 1u) / FLASH_MMU_PAGE_SIZE;
+    for (uint32_t entry = 77u; entry < FLASH_MMU_ENTRY_COUNT; entry++) {
+        uint32_t val = p->flash_mmu_effective[entry];
+        if ((val & FLASH_MMU_INVALID) || (val & 0xFFu) < first ||
+            (val & 0xFFu) > last)
+            continue;
+        uint32_t vbase = 0x40000000u +
+                         (entry - 64u) * FLASH_MMU_PAGE_SIZE;
+        flash_mmu_invalidate_code(p, vbase, FLASH_MMU_PAGE_SIZE);
     }
 }
 
@@ -590,20 +668,15 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
 static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - DPORT_BASE;
-    /* Flash MMU tables: PRO 0x3FF10000-0x3FF103FF, APP 0x3FF12000-0x3FF123FF.
-     * Entry value = 64 KB flash page mapped into that vaddr slot; entries
-     * 0-63 = DROM (0x3F400000+), 64-127 = IROM (0x400C2000+) — the same
-     * model as stub_cache_flash_mmu_set. */
+    /* Flash MMU tables: PRO 0x3FF10000-0x3FF103FF, APP 0x3FF12000-0x3FF123FF. */
     if (off >= 0x10000 && off < 0x10400) {
         uint32_t entry = (off - 0x10000) >> 2;
-        p->flash_mmu_pro[entry] = val;
-        flash_mmu_map_entry(p, entry, val);
+        flash_mmu_write_entry(p, 0, entry, val);
         return;
     }
     if (off >= 0x12000 && off < 0x12400) {
         uint32_t entry = (off - 0x12000) >> 2;
-        p->flash_mmu_app[entry] = val;
-        flash_mmu_map_entry(p, entry, val);
+        flash_mmu_write_entry(p, 1, entry, val);
         return;
     }
     switch (off) {
@@ -1354,8 +1427,6 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
 #define SPI_USER_USR_MISO  (1u << 28)
 #define SPI_USER_USR_ADDR  (1u << 30)
 
-#define EMU_FLASH_SIZE   (4 * 1024 * 1024)
-
 /* Status-register bits managed by the flash itself.  In particular, ESP-IDF
  * verifies every WREN/WRDI by reading SR1.WEL back before it attempts a
  * program or erase.  Treating those commands as no-ops makes the generic
@@ -1455,8 +1526,11 @@ static void spi_flash_program(esp32_periph_t *p, spi_state_t *s,
                 off, bytes, src[0], src[1], src[2], src[3],
                 src[4], src[5], src[6], src[7]);
     }
-    for (int i = 0; i < bytes; i++)
+    for (int i = 0; i < bytes; i++) {
         p->mem->flash_data[off + i] &= src[i];
+        p->mem->flash_insn[off + i] &= src[i];
+    }
+    flash_mmu_invalidate_physical(p, off, (uint32_t)bytes);
 }
 
 static void spi_flash_erase(esp32_periph_t *p, uint32_t off, uint32_t len) {
@@ -1465,6 +1539,8 @@ static void spi_flash_erase(esp32_periph_t *p, uint32_t off, uint32_t len) {
     if (spi_debug_offset(off))
         fprintf(stderr, "[SPIERASE] off=0x%X bytes=%u\n", off, len);
     memset(p->mem->flash_data + off, 0xFF, len);
+    memset(p->mem->flash_insn + off, 0xFF, len);
+    flash_mmu_invalidate_physical(p, off, len);
 }
 
 /* Execute a flash command started via SPI_CMD_REG. The emulated controller

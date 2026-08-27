@@ -172,6 +172,11 @@ struct jit_state {
      * previously compiled blocks and chains keep executing. */
     bool          compile_disabled;
 
+    /* Flash-MMU writes can occur inside a native block's memory helper. Do
+     * not overwrite the code cache until that block has returned to C. */
+    unsigned      execution_depth;
+    bool          invalidate_pending;
+
     /* FLEXE_JIT_NOCHAIN debug: skip chain recording (all exits via epilogue) */
     int           no_chain;
 };
@@ -1688,11 +1693,12 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
     case 1: { /* L32R: at = mem32[pc_aligned + sext(imm16 << 2)] */
         uint16_t imm16 = (uint16_t)XT_IMM16(insn);
         uint32_t target = (next_pc & ~3u) + (0xFFFC0000u | ((uint32_t)imm16 << 2));
-        /* Constant-fold: literal pools live in flash/ROM, which is truly
-         * read-only for real firmware. Fold to an immediate move instead
-         * of a page-table load on every execution. */
-        if ((target >= 0x3F400000u && target < 0x3F800000u) ||
-            (target >= 0x40000000u && target < 0x40500000u)) {
+        /* Constant-fold literal pools in ROM or the instruction-flash buses.
+         * Flash-MMU and SPI writes flush translated code before these bytes
+         * can change. Internal IRAM and DROM stay as runtime loads. */
+        if ((target >= ESP32_INSN_ADDR_LOW && target < 0x40060000u) ||
+            (target >= ESP32_FLASH_INSN_ADDR_LOW &&
+             target < ESP32_INSN_ADDR_HIGH)) {
             uint32_t val = mem_read32(cpu->mem, target);
             emit_mov_reg_imm32(e, RBX, val);
             ra_store_ar(e, ra,RBX, wb4, t);
@@ -2544,7 +2550,11 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     }
 
     if (fn) {
+        jit->execution_depth++;
         int block_insns = fn(cpu);
+        jit->execution_depth--;
+        if (jit->invalidate_pending)
+            jit_flush(jit);
 
         if (block_insns > 0) {
             /* Apply zero-overhead loop */
@@ -2566,7 +2576,8 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
              * triggers on jit_run's 1-per-1000 batch sampling and chains
              * never form. */
             uint32_t npc = cpu->pc;
-            if (__builtin_expect(npc >= 0x40070000u && npc < 0x40500000u, 1))
+            if (__builtin_expect(npc >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
+                                 npc < ESP32_INSN_ADDR_HIGH, 1))
                 jit_get_block(jit, cpu, npc);
 
             return block_insns; /* Handled; expose exact guest work */
@@ -2579,6 +2590,12 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     }
 
     return 0;
+}
+
+static void jit_code_invalidate(void *ctx, uint32_t addr, size_t len) {
+    (void)addr;
+    (void)len;
+    jit_flush(ctx);
 }
 
 /* Install JIT as a pc_hook, chaining with the existing hook */
@@ -2607,6 +2624,8 @@ void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) {
     cpu->pc_hook = jit_pc_hook;
     cpu->pc_hook_ctx = jit;
     cpu->accelerated_blocks = true;
+    cpu->code_invalidate = jit_code_invalidate;
+    cpu->code_invalidate_ctx = jit;
 
     /* The bitmap stays the same — JIT bits are added on top of ROM stub bits.
      * The interpreter's bitmap test will fire for both stubs and JIT blocks. */
@@ -2622,7 +2641,26 @@ void jit_destroy(jit_state_t *jit) {
 
 void jit_flush(jit_state_t *jit) {
     if (!jit) return;
+    if (jit->execution_depth != 0) {
+        jit->invalidate_pending = true;
+        return;
+    }
     memset(jit->hash, 0, sizeof(jit->hash));
+    memset(jit->pend, 0, sizeof(jit->pend));
+    memset(jit->jit_bitmap, 0, sizeof(jit->jit_bitmap));
+    if (jit->merged_bitmap) {
+        if (jit->orig_bitmap)
+            memcpy(jit->merged_bitmap, jit->orig_bitmap,
+                   HOOK_BITMAP_WORDS * sizeof(uint64_t));
+        else
+            memset(jit->merged_bitmap, 0,
+                   HOOK_BITMAP_WORDS * sizeof(uint64_t));
+    }
+    jit->last_chain_entry = NULL;
+    jit->dt = NULL;
+    jit->dt_count = 0;
+    jit->compile_disabled = false;
+    jit->invalidate_pending = false;
     /* Reset code cache but preserve epilogue stub. Re-emit it to be safe. */
     jit_wx_write_begin();
     emit_t stub_e;
@@ -2758,7 +2796,8 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
          * Triggers compilation for frequently-visited firmware PCs.
          * Once compiled, the bitmap ensures the hook dispatches directly. */
         uint32_t pc = cpu->pc;
-        if (__builtin_expect(pc >= 0x40070000u && pc < 0x40500000u, 1)) {
+        if (__builtin_expect(pc >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
+                             pc < ESP32_INSN_ADDR_HIGH, 1)) {
             jit_get_block(jit, cpu, pc);
         }
 

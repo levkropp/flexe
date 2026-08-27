@@ -255,13 +255,20 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
 
     if (getenv("FLEXE_PDCHK")) {
         uint32_t a = (uint32_t)strtoul(getenv("FLEXE_PDCHK"), NULL, 0);
-        uint32_t pk = s->cpu[0].predecode[a - PREDECODE_BASE];
-        uint32_t insn;
-        int il = xtensa_fetch(&s->cpu[0], a, &insn);
-        fprintf(stderr, "[PDCHK] 0x%08X: predecode=%06X/%u fetch=%06X/%d page=%p flash_insn=%p off=0x%lX\n",
-                a, PREDECODE_INSN(pk), PREDECODE_ILEN(pk), insn, il,
-                (void *)s->mem->page_table[a >> 12], (void *)s->mem->flash_insn,
-                s->mem->page_table[a >> 12] ? (long)(s->mem->page_table[a >> 12] - s->mem->flash_insn) : -1L);
+        if (s->cpu[0].predecode && a >= PREDECODE_BASE &&
+            a < PREDECODE_END) {
+            uint32_t pk = s->cpu[0].predecode[a - PREDECODE_BASE];
+            uint32_t insn;
+            int il = xtensa_fetch(&s->cpu[0], a, &insn);
+            fprintf(stderr, "[PDCHK] 0x%08X: predecode=%06X/%u fetch=%06X/%d page=%p flash_insn=%p off=0x%lX\n",
+                    a, PREDECODE_INSN(pk), PREDECODE_ILEN(pk), insn, il,
+                    (void *)s->mem->page_table[a >> 12], (void *)s->mem->flash_insn,
+                    s->mem->page_table[a >> 12] ? (long)(s->mem->page_table[a >> 12] - s->mem->flash_insn) : -1L);
+        } else {
+            fprintf(stderr,
+                    "[PDCHK] 0x%08X is outside the active predecode table\n",
+                    a);
+        }
     }
 
     /* Set entry point */
@@ -324,6 +331,10 @@ void flexe_session_destroy(flexe_session_t *s)
 {
     if (!s) return;
     jit_destroy(s->jit);
+    /* Both cores share this large table; core 0 owns the allocation. */
+    free(s->cpu[0].predecode);
+    s->cpu[0].predecode = NULL;
+    s->cpu[1].predecode = NULL;
     bt_stubs_destroy(s->bstubs);
     vfs_stubs_destroy(s->vstubs);
     wifi_stubs_destroy(s->wstubs);
@@ -433,7 +444,8 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     /* Compatibility for frontends built against the older API which still
      * call xtensa_run(core0) directly.  Sample the batch boundary just like
      * jit_run() so hot core-0 PCs become native after the normal threshold. */
-    if (s->jit && s->cpu[0].pc >= 0x40070000u && s->cpu[0].pc < 0x40500000u)
+    if (s->jit && s->cpu[0].pc >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
+        s->cpu[0].pc < ESP32_INSN_ADDR_HIGH)
         (void)jit_get_block(s->jit, &s->cpu[0], s->cpu[0].pc);
 
     /* Preemptive timeslice check for core 0 — skip in native mode

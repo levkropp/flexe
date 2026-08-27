@@ -34,6 +34,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - windowed registers with synthesized spill/fill (call4/8/12, entry, retw)
 - exception/interrupt dispatch (levels 1–7, timer ccompare, waiti)
 - esp32 memory map (sram, rom, flash, rtc, psram, peripheral i/o)
+- hardware flash MMU: complete 64 KiB DROM0/IRAM0/IRAM1/IROM0 mappings,
+  dual-core table invalidation, flash programming coherence, and translated-code invalidation
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog, timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA, ledc, ADC1/2, DAC1/2
 - raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
@@ -45,7 +47,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 577 tests
+- 582 tests
 
 ## building
 
@@ -134,7 +136,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 577 tests, 1767 passed, 0 failed
+# 582 tests, 1854 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -200,8 +202,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **7.72× real-time** |
-| NerdMiner v1.8.3 | **6.12× real-time** |
+| ESP32 Marauder v1.14 | **7.68× real-time** |
+| NerdMiner v1.8.3 | **6.14× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real
@@ -230,7 +232,7 @@ valid responses from both:
 
 ## status
 
-boots `hello_world`, `blink`, `tjpgd`, `real_time_stats`, `spi_lcd_touch` (lvgl!), and friends from esp-idf. runs them 2–10× faster than the real chip. isn't cycle-accurate and doesn't model caches or multicore cache-coherence (both cores run, though).
+boots `hello_world`, `blink`, `tjpgd`, `real_time_stats`, `spi_lcd_touch` (lvgl!), and friends from esp-idf. runs them 2–10× faster than the real chip. isn't cycle-accurate and doesn't model cache timing or true simultaneous multicore cache coherence (both cores run, though).
 
 ## license
 

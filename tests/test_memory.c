@@ -54,7 +54,7 @@ TEST(mem_rw32_flash_data) {
 TEST(mem_flash_erased_at_reset) {
     xtensa_mem_t *mem = mem_create();
     ASSERT_EQ(mem_read32(mem, 0x3F400000), 0xFFFFFFFFu);
-    ASSERT_EQ(mem_read32(mem, 0x400C2000), 0xFFFFFFFFu);
+    ASSERT_EQ(mem_read32(mem, 0x400D0000), 0xFFFFFFFFu);
     mem_destroy(mem);
 }
 
@@ -63,8 +63,8 @@ TEST(mem_flash_alias) {
     /* Flash data and insn buses use separate backing arrays (like real MMU pages) */
     mem_write32(mem, 0x3F400000, 0xAAAABBBB);
     ASSERT_EQ(mem_read32(mem, 0x3F400000), 0xAAAABBBB);
-    mem_write32(mem, 0x400C2000, 0xCCCCDDDD);
-    ASSERT_EQ(mem_read32(mem, 0x400C2000), 0xCCCCDDDD);
+    mem_write32(mem, 0x400D0000, 0xCCCCDDDD);
+    ASSERT_EQ(mem_read32(mem, 0x400D0000), 0xCCCCDDDD);
     /* They are independent */
     ASSERT_EQ(mem_read32(mem, 0x3F400000), 0xAAAABBBB);
     mem_destroy(mem);
@@ -72,6 +72,8 @@ TEST(mem_flash_alias) {
 
 TEST(mem_flash_instruction_window_boundary) {
     xtensa_mem_t *mem = mem_create();
+    ASSERT_TRUE(mem_get_ptr(mem, 0x400CFFFFu) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x400D0000u) != NULL);
     ASSERT_TRUE(mem_get_ptr(mem, 0x403FFFFFu) != NULL);
     ASSERT_TRUE(mem_get_ptr(mem, 0x40400000u) == NULL);
     mem_destroy(mem);

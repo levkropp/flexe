@@ -224,6 +224,28 @@ void xtensa_predecode_build(xtensa_cpu_t *cpu) {
 #endif
 }
 
+void xtensa_invalidate_code(xtensa_cpu_t *cpu, uint32_t addr, size_t len) {
+    if (!cpu || len == 0) return;
+
+#if PREDECODE_SIZE > 0
+    if (cpu->predecode) {
+        uint64_t start = addr;
+        uint64_t end = start + (uint64_t)len;
+        uint64_t pd_start = PREDECODE_BASE;
+        uint64_t pd_end = PREDECODE_END;
+        if (start < pd_end && end > pd_start) {
+            uint64_t overlap_start = start > pd_start ? start : pd_start;
+            uint64_t overlap_end = end < pd_end ? end : pd_end;
+            memset(cpu->predecode + (size_t)(overlap_start - pd_start), 0,
+                   (size_t)(overlap_end - overlap_start) * sizeof(uint32_t));
+        }
+    }
+#endif
+
+    if (cpu->code_invalidate)
+        cpu->code_invalidate(cpu->code_invalidate_ctx, addr, len);
+}
+
 /* ===== Special Register Access ===== */
 
 uint32_t sr_read(const xtensa_cpu_t *cpu, int sr) {
@@ -376,7 +398,8 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
 
 void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr) {
     /* Trap: catch exceptions with out-of-range fault PC */
-    if (__builtin_expect(fault_pc < 0x40000000u || fault_pc >= 0x40500000u, 0)) {
+    if (__builtin_expect(fault_pc < ESP32_INSN_ADDR_LOW ||
+                         fault_pc >= ESP32_INSN_ADDR_HIGH, 0)) {
         fprintf(stderr, "[EXC-TRAP] cause=%d fault_pc=0x%08X vaddr=0x%08X cycle=%llu core=%d\n",
                 cause, fault_pc, vaddr, (unsigned long long)cpu->cycle_count, cpu->prid ? 1 : 0);
         fprintf(stderr, "  PS=0x%08X SAR=%u WB=%u WS=0x%X\n",
@@ -2261,7 +2284,8 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
 
     /* Invalid PC trap. Slow-path body lives in a noinline helper so
      * the hot-path branch is just a single range compare. */
-    if (__builtin_expect(cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u, 0)) {
+    if (__builtin_expect(cpu->pc < ESP32_INSN_ADDR_LOW ||
+                         cpu->pc >= ESP32_INSN_ADDR_HIGH, 0)) {
         cpu->cycle_count = *local_cc;
         xtensa_invalid_pc_trap(cpu);
         return -1;

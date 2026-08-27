@@ -4,6 +4,7 @@
  * that xtensa_disasm() produces the expected output.
  */
 #include "test_helpers.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* Helper: disasm and check result contains expected substring */
@@ -67,6 +68,75 @@ TEST(test_fetch_rejects_missing_boundary_page) {
 
     uint32_t insn = 0;
     ASSERT_EQ(xtensa_fetch(&cpu, addr, &insn), 0);
+    teardown(&cpu);
+}
+
+typedef struct {
+    int count;
+    uint32_t addr;
+    size_t len;
+} predecode_invalidate_capture_t;
+
+static void test_predecode_invalidate_cb(void *ctx, uint32_t addr,
+                                         size_t len) {
+    predecode_invalidate_capture_t *capture = ctx;
+    capture->count++;
+    capture->addr = addr;
+    capture->len = len;
+}
+
+TEST(test_predecode_invalidation_is_range_safe) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    predecode_invalidate_capture_t capture = {0};
+    cpu.code_invalidate = test_predecode_invalidate_cb;
+    cpu.code_invalidate_ctx = &capture;
+
+#if PREDECODE_SIZE > 0
+    cpu.predecode = calloc(PREDECODE_SIZE, sizeof(*cpu.predecode));
+    ASSERT_TRUE(cpu.predecode != NULL);
+    if (cpu.predecode) {
+        cpu.predecode[0] = 1;
+        cpu.predecode[1] = 2;
+        cpu.predecode[9] = 9;
+        cpu.predecode[10] = 10;
+        cpu.predecode[11] = 11;
+        cpu.predecode[12] = 12;
+        cpu.predecode[13] = 13;
+        cpu.predecode[PREDECODE_SIZE - 2u] = 14;
+        cpu.predecode[PREDECODE_SIZE - 1u] = 15;
+    }
+#endif
+
+    xtensa_invalidate_code(&cpu, PREDECODE_BASE + 10u, 3u);
+#if PREDECODE_SIZE > 0
+    if (cpu.predecode) {
+        ASSERT_EQ(cpu.predecode[9], 9);
+        ASSERT_EQ(cpu.predecode[10], 0);
+        ASSERT_EQ(cpu.predecode[11], 0);
+        ASSERT_EQ(cpu.predecode[12], 0);
+        ASSERT_EQ(cpu.predecode[13], 13);
+    }
+#endif
+
+    /* Both intersections cross a table edge. They must clear only the
+     * overlapping entries without unsigned-wrap or an oversized memset. */
+    xtensa_invalidate_code(&cpu, PREDECODE_BASE - 2u, 4u);
+    xtensa_invalidate_code(&cpu, PREDECODE_END - 2u, 8u);
+#if PREDECODE_SIZE > 0
+    if (cpu.predecode) {
+        ASSERT_EQ(cpu.predecode[0], 0);
+        ASSERT_EQ(cpu.predecode[1], 0);
+        ASSERT_EQ(cpu.predecode[PREDECODE_SIZE - 2u], 0);
+        ASSERT_EQ(cpu.predecode[PREDECODE_SIZE - 1u], 0);
+    }
+#endif
+    ASSERT_EQ(capture.count, 3);
+    ASSERT_EQ(capture.addr, PREDECODE_END - 2u);
+    ASSERT_EQ(capture.len, 8u);
+
+    free(cpu.predecode);
+    cpu.predecode = NULL;
     teardown(&cpu);
 }
 
@@ -619,6 +689,7 @@ void run_decode_tests(void) {
     RUN_TEST(test_fetch_cross_page_narrow);
     RUN_TEST(test_fetch_cross_page_wide);
     RUN_TEST(test_fetch_rejects_missing_boundary_page);
+    RUN_TEST(test_predecode_invalidation_is_range_safe);
     RUN_TEST(test_nop);
     RUN_TEST(test_add);
     RUN_TEST(test_sub);

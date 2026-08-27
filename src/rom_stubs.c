@@ -2687,30 +2687,85 @@ static void stub_xtos_set_intlevel(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, old_ps);
 }
 
-/* cache_flash_mmu_set(cpu_no, pid, vaddr, paddr, psize, num) — emulate the
- * ESP32 flash cache MMU: map `num` 64 KB flash pages starting at paddr
- * (64 KB units) into the cache window starting at vaddr (64 KB units:
- * 0-63 = DROM 0x3F400000, 64-127 = IROM 0x400C2000). Returns 0.
- * spi_flash_mmap() resolves to this on ESP32. */
+/* mmu_init(cpu_no) — invalidate the selected core's flash-MMU table. */
+static void stub_mmu_init(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t core = rom_arg(cpu, 0);
+    if (core <= 1u) {
+        uint32_t table = core == 0u ? 0x3FF10000u : 0x3FF12000u;
+        for (uint32_t entry = 0; entry < 256u; entry++)
+            mem_write32(cpu->mem, table + entry * 4u, 0x100u);
+    }
+    rom_return_void(cpu);
+}
+
+static int cache_flash_mmu_vaddr_entry(uint32_t vaddr, uint32_t num,
+                                       uint32_t *entry_out) {
+    static const struct {
+        uint32_t low;
+        uint32_t high;
+        uint32_t entry_base;
+    } regions[] = {
+        { 0x3F400000u, 0x3F800000u,   0u }, /* DROM0 */
+        { 0x400D0000u, 0x40400000u,  64u }, /* IRAM0 */
+        { 0x40400000u, 0x40800000u, 128u }, /* IRAM1 */
+        { 0x40800000u, 0x40C00000u, 192u }, /* IROM0 */
+    };
+    uint64_t end = (uint64_t)vaddr + (uint64_t)num * 0x10000u;
+    for (size_t i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
+        if (vaddr < regions[i].low || vaddr >= regions[i].high) continue;
+        if (end > regions[i].high) return 4;
+        *entry_out = regions[i].entry_base +
+                     ((vaddr & 0x3FFFFFu) >> 16);
+        return 0;
+    }
+    return 5;
+}
+
+/* cache_flash_mmu_set(cpu_no, pid, vaddr, paddr, psize, num) — model the
+ * classic ESP32 ROM API. vaddr/paddr are byte addresses (not page numbers),
+ * psize is in KiB, and each MMU table entry controls a complete 64 KiB page. */
 static void stub_cache_flash_mmu_set(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
+    uint32_t core  = rom_arg(cpu, 0);
+    uint32_t pid   = rom_arg(cpu, 1);
     uint32_t vaddr = rom_arg(cpu, 2);
     uint32_t paddr = rom_arg(cpu, 3);
+    uint32_t psize = rom_arg(cpu, 4);
     uint32_t num   = rom_arg(cpu, 5);
-    xtensa_mem_t *mem = cpu->mem;
     if (getenv("FLEXE_DBG_FLASH"))
-        fprintf(stderr, "[MMU] vaddr=%u paddr=%u psize=%u num=%u\n",
-                vaddr, paddr, (unsigned)rom_arg(cpu, 4), num);
-    for (uint32_t i = 0; i < num; i++) {
-        uint32_t vp = vaddr + i;
-        uint32_t pp = (paddr + i) << 16;         /* 64 KB units -> bytes */
-        if (pp + 0x10000 > (4u * 1024 * 1024)) continue;
-        if (vp < 64) {                            /* DROM window */
-            mem->page_table[(0x3F400000u >> 12) + vp] = mem->flash_data + pp;
-        } else if (vp < 128) {                    /* IROM window */
-            mem->page_table[(0x400C2000u >> 12) + (vp - 64)] = mem->flash_insn + pp;
-        }
+        fprintf(stderr,
+                "[MMU] core=%u pid=%u vaddr=0x%08X paddr=0x%08X "
+                "psize=%u num=%u\n",
+                core, pid, vaddr, paddr, psize, num);
+
+    if ((vaddr & 0xFFFFu) || (paddr & 0xFFFFu)) {
+        rom_return(cpu, 1);
+        return;
     }
+    if (psize != 64u) {
+        rom_return(cpu, 3);
+        return;
+    }
+    /* PID0/PID1 are the two hardware layouts used by ESP-IDF. The remaining
+     * legacy PID windows are not exposed in the ESP32 application map. */
+    if (core > 1u || pid > 1u) {
+        rom_return(cpu, 2);
+        return;
+    }
+
+    uint32_t entry;
+    int result = cache_flash_mmu_vaddr_entry(vaddr, num, &entry);
+    if (result != 0 || (uint64_t)paddr + (uint64_t)num * 0x10000u > 0x1000000ull) {
+        rom_return(cpu, result != 0 ? (uint32_t)result : 4u);
+        return;
+    }
+
+    uint32_t table = core == 0u ? 0x3FF10000u : 0x3FF12000u;
+    uint32_t physical_page = paddr >> 16;
+    for (uint32_t i = 0; i < num; i++)
+        mem_write32(cpu->mem, table + (entry + i) * 4u,
+                    physical_page + i);
     rom_return(cpu, 0);
 }
 
@@ -3749,7 +3804,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x4000a22c, stub_void_unregistered,   "gpio_pad_pullup");
 
     /* MMU/Cache */
-    rom_stubs_register(s, 0x400095a4, stub_void_unregistered,   "mmu_init");
+    rom_stubs_register(s, 0x400095a4, stub_mmu_init,            "mmu_init");
     rom_stubs_register(s, 0x400095e0, stub_cache_flash_mmu_set, "cache_flash_mmu_set");
 
     /* C library functions */

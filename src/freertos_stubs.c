@@ -165,7 +165,7 @@ static void sched_save_context(freertos_stubs_t *frt, int core_id) {
     if (cpu->cycle_count >= frt->last_switch_cycle[core_id])
         t->cumulative_cycles += cpu->cycle_count - frt->last_switch_cycle[core_id];
     /* Trap: detect saving a corrupted PC */
-    if (cpu->pc < 0x40000000u || cpu->pc >= 0x40500000u) {
+    if (cpu->pc < ESP32_INSN_ADDR_LOW || cpu->pc >= ESP32_INSN_ADDR_HIGH) {
         fprintf(stderr, "[SAVE-TRAP] Saving task %d '%s' with bad PC=0x%08X on core %d (cycle %llu)\n",
                 tidx, t->name, cpu->pc, core_id,
                 (unsigned long long)cpu->cycle_count);
@@ -188,7 +188,7 @@ static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
     int tidx = frt->current_task[core_id];
     task_tcb_t *t = &frt->tasks[tidx];
     /* Trap: detect task with corrupted saved PC */
-    if (t->pc < 0x40000000u || t->pc >= 0x40500000u) {
+    if (t->pc < ESP32_INSN_ADDR_LOW || t->pc >= ESP32_INSN_ADDR_HIGH) {
         fprintf(stderr, "[SCHED-TRAP] Restoring task %d '%s' with bad PC=0x%08X on core %d (cycle %llu)\n",
                 tidx, t->name, t->pc, core_id,
                 (unsigned long long)cpu->cycle_count);

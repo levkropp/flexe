@@ -9,6 +9,18 @@
 typedef struct xtensa_mem xtensa_mem_t;
 typedef struct xtensa_cpu xtensa_cpu_t;
 
+/* Classic ESP32 instruction-space geometry. The external cache has three
+ * instruction buses after internal IRAM: IRAM0, IRAM1, and IROM0. */
+#define ESP32_INSN_ADDR_LOW          0x40000000u
+#define ESP32_FIRMWARE_INSN_ADDR_LOW 0x40070000u
+#define ESP32_FLASH_INSN_ADDR_LOW    0x400D0000u
+#define ESP32_INSN_ADDR_HIGH         0x40C00000u
+
+/* Called when guest-visible instruction bytes change (flash-MMU remap,
+ * self-programming flash, etc.). Execution engines can discard translated
+ * code while the interpreter invalidates its predecode entries. */
+typedef void (*xtensa_code_invalidate_fn)(void *ctx, uint32_t addr, size_t len);
+
 /* PC hook: return zero to execute normally, or the number of guest
  * instructions handled. Ordinary ROM stubs return 1; accelerated blocks may
  * return more so the batch runner can account without rereading CCOUNT. */
@@ -367,6 +379,10 @@ struct xtensa_cpu {
     void *periph_event_ctx;
     uint32_t (*periph_next_event)(xtensa_cpu_t *cpu);
     void (*periph_event)(xtensa_cpu_t *cpu);
+
+    /* Optional execution-engine code-cache invalidation hook. */
+    xtensa_code_invalidate_fn code_invalidate;
+    void *code_invalidate_ctx;
 };
 
 /*
@@ -408,6 +424,7 @@ void     sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val);
 void xtensa_cpu_init(xtensa_cpu_t *cpu);
 void xtensa_cpu_reset(xtensa_cpu_t *cpu);
 void xtensa_predecode_build(xtensa_cpu_t *cpu);  /* Pre-decode instruction memory */
+void xtensa_invalidate_code(xtensa_cpu_t *cpu, uint32_t addr, size_t len);
 int  xtensa_step(xtensa_cpu_t *cpu);
 int  xtensa_run(xtensa_cpu_t *cpu, int max_cycles);
 int  xtensa_disasm(const xtensa_cpu_t *cpu, uint32_t addr, char *buf, int bufsize);

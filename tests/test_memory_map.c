@@ -124,8 +124,11 @@ TEST(test_loader_region_names) {
     ASSERT_TRUE(strcmp(loader_region_name(0x3FFB0000), "sram_data") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x40080000), "sram_insn") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x400C0000), "rtc_iram") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x400C2000), "unmapped") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x400D0000), "flash_insn") == 0);
-    ASSERT_TRUE(strcmp(loader_region_name(0x40400000), "unmapped") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x40400000), "flash_insn") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x40BFFFFF), "flash_insn") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x40C00000), "unmapped") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x3FF40000), "peripheral") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x10000000), "unmapped") == 0);
 }

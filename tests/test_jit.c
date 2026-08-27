@@ -5,6 +5,7 @@
 #ifndef _MSC_VER
 
 #include "jit.h"
+#include "peripherals.h"
 
 /* ===== Helpers ===== */
 
@@ -566,6 +567,55 @@ TEST(test_jit_flush) {
     jit_destroy(jit);
 }
 
+TEST(test_jit_flash_mmu_remap_flushes_upper_window) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_periph_t *periph = periph_create(cpu.mem);
+    periph_attach_cpus(periph, &cpu, NULL);
+    const uint32_t pc = 0x40400000u;
+    const uint32_t mmu_entry = 128u;
+    uint16_t nop_n = narrow(0xD, 15, 0, 3);
+    for (uint32_t i = 0; i < 4u; i++) {
+        memcpy(cpu.mem->flash_insn + 0x30000u + i * 2u,
+               &nop_n, sizeof(nop_n));
+        memcpy(cpu.mem->flash_insn + 0x40000u + i * 2u,
+               &nop_n, sizeof(nop_n));
+    }
+    mem_write32(cpu.mem, 0x3FF10000u + mmu_entry * 4u, 3u);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    cpu.pc = pc;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, pc);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, pc) != NULL);
+    ASSERT_EQ(jit_get_stats(jit)->blocks_compiled, 1u);
+
+    /* Remapping this executable page invalidates both the old native block
+     * and its hook bit. The replacement page must become independently hot. */
+    mem_write32(cpu.mem, 0x3FF10000u + mmu_entry * 4u, 4u);
+    ASSERT_EQ(jit_get_stats(jit)->cache_flushes, 1u);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, pc) == NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, pc);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, pc) != NULL);
+    ASSERT_EQ(jit_get_stats(jit)->blocks_compiled, 2u);
+
+    cpu.pc = pc;
+    cpu.running = true;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_run(&cpu, 1), 4u);
+    ASSERT_EQ(cpu.pc, pc + 8u);
+    ASSERT_TRUE(jit_get_stats(jit)->blocks_executed >= 1u);
+
+    jit_destroy(jit);
+    cpu.code_invalidate = NULL;
+    cpu.code_invalidate_ctx = NULL;
+    periph_destroy(periph);
+    teardown(&cpu);
+}
+
 TEST(test_jit_xtensa_run_counts_guest_instructions) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -735,6 +785,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_flush);
+    RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);
     RUN_TEST(test_jit_nop);
     RUN_TEST(test_jit_movi);
