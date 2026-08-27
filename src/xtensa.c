@@ -154,14 +154,36 @@ static inline __attribute__((always_inline))
 int xtensa_fetch_inline(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out) {
     uint8_t *page = cpu->mem->page_table[addr >> 12];
     if (__builtin_expect(!page, 0)) return 0;
-    const uint8_t *ptr = page + (addr & 0xFFF);
-    if (ptr[0] & 0x8) {
-        *insn_out = ptr[0] | ((uint32_t)ptr[1] << 8);
-        return 2;
-    } else {
-        *insn_out = ptr[0] | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16);
+    uint32_t page_off = addr & 0xFFFu;
+    const uint8_t *ptr = page + page_off;
+    uint32_t b0 = ptr[0];
+    uint32_t ilen = (b0 & 0x8u) ? 2u : 3u;
+
+    /* Nearly every instruction is wholly within its current page. Keep that
+     * path to one page-table lookup, but resolve boundary bytes separately:
+     * adjacent guest pages can be unmapped or backed by unrelated MMU pages. */
+    if (__builtin_expect(page_off + ilen <= 0x1000u, 1)) {
+        if (ilen == 2u) {
+            *insn_out = b0 | ((uint32_t)ptr[1] << 8);
+            return 2;
+        }
+        *insn_out = b0 | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16);
         return 3;
     }
+
+    if (__builtin_expect(addr > UINT32_MAX - (ilen - 1u), 0)) return 0;
+    uint8_t *page1 = cpu->mem->page_table[(addr + 1u) >> 12];
+    if (__builtin_expect(!page1, 0)) return 0;
+    uint32_t b1 = page1[(addr + 1u) & 0xFFFu];
+    if (ilen == 2u) {
+        *insn_out = b0 | (b1 << 8);
+        return 2;
+    }
+    uint8_t *page2 = cpu->mem->page_table[(addr + 2u) >> 12];
+    if (__builtin_expect(!page2, 0)) return 0;
+    uint32_t b2 = page2[(addr + 2u) & 0xFFFu];
+    *insn_out = b0 | (b1 << 8) | (b2 << 16);
+    return 3;
 }
 
 /* External version for disasm/trace callers (not performance-critical) */
@@ -1332,11 +1354,11 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
         case 6: /* RT0 */
             switch (s) {
             case 0: /* NEG */
-                ar_write(cpu, r, (uint32_t)(-(int32_t)ar_read(cpu, t)));
+                ar_write(cpu, r, 0u - ar_read(cpu, t));
                 break;
             case 1: /* ABS */
-                { int32_t val = (int32_t)ar_read(cpu, t);
-                  ar_write(cpu, r, (uint32_t)(val < 0 ? -val : val));
+                { uint32_t val = ar_read(cpu, t);
+                  ar_write(cpu, r, (val & 0x80000000u) ? 0u - val : val);
                 } break;
             default: break;
             }
@@ -1713,7 +1735,7 @@ void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
 
     case 0xD: /* ADDMI */
         { int32_t simm8 = sign_extend(imm8, 8);
-          ar_write(cpu, t, ar_read(cpu, s) + (uint32_t)(simm8 << 8));
+          ar_write(cpu, t, ar_read(cpu, s) + (uint32_t)(simm8 * 256));
         } break;
 
     default:

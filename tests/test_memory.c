@@ -70,6 +70,13 @@ TEST(mem_flash_alias) {
     mem_destroy(mem);
 }
 
+TEST(mem_flash_instruction_window_boundary) {
+    xtensa_mem_t *mem = mem_create();
+    ASSERT_TRUE(mem_get_ptr(mem, 0x403FFFFFu) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40400000u) == NULL);
+    mem_destroy(mem);
+}
+
 /* ===== RTC fast/slow ===== */
 
 TEST(mem_rw32_rtc_fast) {
@@ -147,6 +154,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw32_flash_data);
     RUN_TEST(mem_flash_erased_at_reset);
     RUN_TEST(mem_flash_alias);
+    RUN_TEST(mem_flash_instruction_window_boundary);
     RUN_TEST(mem_rw32_rtc_fast);
     RUN_TEST(mem_rw32_rtc_slow);
     RUN_TEST(mem_unmapped_read_zero);

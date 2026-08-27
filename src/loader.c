@@ -493,7 +493,7 @@ const char *loader_region_name(uint32_t addr) {
     if (addr >= 0x40000000u && addr < 0x40060000u) return "rom";
     if (addr >= 0x40070000u && addr < 0x400C0000u) return "sram_insn";
     if (addr >= 0x400C0000u && addr < 0x400C2000u) return "rtc_iram";
-    if (addr >= 0x400C2000u && addr < 0x40C00000u) return "flash_insn";
+    if (addr >= 0x400C2000u && addr < 0x40400000u) return "flash_insn";
     if (addr >= 0x50000000u && addr < 0x50002000u) return "rtc_fast";
     if (addr >= 0x60000000u && addr < 0x60002000u) return "rtc_slow";
     return "unmapped";

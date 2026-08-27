@@ -161,6 +161,15 @@ TEST(exec_neg_zero) {
     teardown(&cpu);
 }
 
+TEST(exec_neg_intmin) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    put_insn3(&cpu, BASE, rrr(6, 0, 3, 0, 5));
+    ar_write(&cpu, 5, 0x80000000u);
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 3), 0x80000000u);
+    teardown(&cpu);
+}
+
 TEST(exec_abs_positive) {
     xtensa_cpu_t cpu; setup(&cpu);
     /* ABS a3, a5: op2=6, op1=0, r=3, s=1, t=5 */
@@ -689,6 +698,7 @@ void run_alu_tests(void) {
     RUN_TEST(exec_neg_positive);
     RUN_TEST(exec_neg_negative);
     RUN_TEST(exec_neg_zero);
+    RUN_TEST(exec_neg_intmin);
     RUN_TEST(exec_abs_positive);
     RUN_TEST(exec_abs_negative);
     RUN_TEST(exec_abs_intmin);

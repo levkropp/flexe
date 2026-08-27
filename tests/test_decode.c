@@ -25,6 +25,51 @@ static int check_disasm(xtensa_cpu_t *cpu, uint32_t addr, const char *expected, 
 
 /* BASE defined in test_helpers.h */
 
+/* ===== Instruction Fetch Boundary Tests ===== */
+
+TEST(test_fetch_cross_page_narrow) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    uint32_t addr = BASE + 0xFFFu;
+    mem_write8(cpu.mem, addr, 0x08);  /* bit 3 selects a 16-bit instruction */
+
+    /* Use a deliberately unrelated backing page to exercise guest page-table
+     * translation instead of host-pointer contiguity. */
+    cpu.mem->page_table[(addr + 1u) >> 12] = cpu.mem->flash_data;
+    cpu.mem->flash_data[0] = 0xA5;
+
+    uint32_t insn = 0;
+    ASSERT_EQ(xtensa_fetch(&cpu, addr, &insn), 2);
+    ASSERT_EQ(insn, 0xA508u);
+    teardown(&cpu);
+}
+
+TEST(test_fetch_cross_page_wide) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    uint32_t addr = BASE + 0xFFEu;
+    mem_write8(cpu.mem, addr, 0x01);  /* bit 3 clear selects a 24-bit instruction */
+    mem_write8(cpu.mem, addr + 1u, 0x23);
+    cpu.mem->page_table[(addr + 2u) >> 12] = cpu.mem->flash_data;
+    cpu.mem->flash_data[0] = 0x45;
+
+    uint32_t insn = 0;
+    ASSERT_EQ(xtensa_fetch(&cpu, addr, &insn), 3);
+    ASSERT_EQ(insn, 0x452301u);
+    teardown(&cpu);
+}
+
+TEST(test_fetch_rejects_missing_boundary_page) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    uint32_t addr = 0x4005FFFFu;  /* final byte of the 384 KiB ESP32 ROM */
+    mem_write8(cpu.mem, addr, 0x00);  /* requests a 24-bit instruction */
+
+    uint32_t insn = 0;
+    ASSERT_EQ(xtensa_fetch(&cpu, addr, &insn), 0);
+    teardown(&cpu);
+}
+
 /* ===== RRR Format Tests ===== */
 
 TEST(test_nop) {
@@ -571,6 +616,9 @@ TEST(test_entry) {
 void run_decode_tests(void) {
     TEST_SUITE("Instruction Decode");
 
+    RUN_TEST(test_fetch_cross_page_narrow);
+    RUN_TEST(test_fetch_cross_page_wide);
+    RUN_TEST(test_fetch_rejects_missing_boundary_page);
     RUN_TEST(test_nop);
     RUN_TEST(test_add);
     RUN_TEST(test_sub);

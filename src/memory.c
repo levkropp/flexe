@@ -8,7 +8,7 @@
  *   SRAM:      0x3FFB0000-0x3FFFFFFF (data), 0x40070000-0x400BFFFF (instruction)
  *              Both are aliases for the same 520 KB physical SRAM.
  *   ROM:       0x40000000-0x4005FFFF (384 KB)
- *   Flash:     0x3F400000-0x3F7FFFFF (data), 0x400C2000-0x40BFFFFF (instruction)
+ *   Flash:     0x3F400000-0x3F7FFFFF (data), 0x400C2000-0x403FFFFF (instruction)
  *   RTC DRAM:  0x3FF80000-0x3FF81FFF (8 KB, data bus alias of RTC Fast)
  *   RTC IRAM:  0x400C0000-0x400C1FFF (8 KB, instruction bus alias of RTC Fast)
  *   RTC Fast:  0x50000000-0x50001FFF (8 KB)
@@ -31,7 +31,7 @@
 #define FLASH_DATA_BASE 0x3F400000u
 #define FLASH_DATA_END  0x3F800000u
 #define FLASH_INSN_BASE 0x400C2000u
-#define FLASH_INSN_END  0x40C00000u
+#define FLASH_INSN_END  0x40400000u
 #define PERIPH_BASE     0x3FF00000u
 #define PERIPH_END      0x3FF80000u
 #define RTC_DRAM_BASE   0x3FF80000u

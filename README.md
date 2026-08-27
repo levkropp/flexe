@@ -45,7 +45,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 569 tests
+- 577 tests
 
 ## building
 
@@ -134,10 +134,14 @@ src/
 
 ```
 ./build/xtensa-tests
-# 569 tests, 1741 passed, 0 failed
+# 577 tests, 1767 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
+
+For host-memory and undefined-behavior validation, build with
+`-fsanitize=address,undefined`; the default 4 MB predecode configuration is
+covered by both the unit suite and the compiled/stock-ROM integration runners.
 
 The optional compiled Arduino gate builds an unmodified `Wire` client, runs
 40-byte writes and repeated-start reads through the real ESP-IDF interrupt

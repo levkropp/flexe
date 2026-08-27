@@ -65,7 +65,7 @@ typedef struct {
  * Build a minimal valid ELF with FUNC symbols at /tmp/xt_test.elf
  * Symbols: app_main @ 0x40080000 size 0x100
  *          uart_init @ 0x40080100 size 0x40
- *          some_data (OBJECT, should be skipped) @ 0x3FFB0000 size 4
+ *          some_data (OBJECT) @ 0x3FFB0000 size 4
  */
 static const char *build_test_elf(void) {
     static const char *path = "/tmp/xt_test_debug.elf";
@@ -110,6 +110,8 @@ static const char *build_test_elf(void) {
      * [aligned] section headers (5 sections: null, .symtab, .strtab, .shstrtab, sentinel-free)
      */
     uint32_t strtab_off = 52;
+    /* This offset is intentionally unaligned. ELF section data has no host
+     * alignment guarantee, so the parser must copy records before reading. */
     uint32_t symtab_off = strtab_off + (uint32_t)strtab_size;
     uint32_t shstrtab_off = symtab_off + (uint32_t)symtab_size;
     uint32_t shdr_off = shstrtab_off + (uint32_t)shstrtab_size;
@@ -215,6 +217,63 @@ TEST(test_elf_load_bad_class) {
     buf[5] = 1;  /* ELFDATA2LSB */
     FILE *f = fopen(path, "wb");
     fwrite(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    elf_symbols_t *s = elf_symbols_load(path);
+    ASSERT_TRUE(s == NULL);
+}
+
+TEST(test_elf_rejects_section_table_out_of_bounds) {
+    const char *path = build_test_elf();
+    ASSERT_TRUE(path != NULL);
+
+    FILE *f = fopen(path, "r+b");
+    ASSERT_TRUE(f != NULL);
+    if (!f) return;
+    uint32_t bad_offset = UINT32_MAX;
+    ASSERT_EQ(fseek(f, (long)offsetof(test_ehdr_t, e_shoff), SEEK_SET), 0);
+    ASSERT_EQ(fwrite(&bad_offset, 1, sizeof(bad_offset), f), sizeof(bad_offset));
+    fclose(f);
+
+    elf_symbols_t *s = elf_symbols_load(path);
+    ASSERT_TRUE(s == NULL);
+}
+
+TEST(test_elf_rejects_symbol_table_out_of_bounds) {
+    const char *path = build_test_elf();
+    ASSERT_TRUE(path != NULL);
+
+    FILE *f = fopen(path, "r+b");
+    ASSERT_TRUE(f != NULL);
+    if (!f) return;
+    test_ehdr_t ehdr;
+    ASSERT_EQ(fread(&ehdr, 1, sizeof(ehdr), f), sizeof(ehdr));
+    uint32_t bad_offset = UINT32_MAX;
+    long field_offset = (long)ehdr.e_shoff + (long)sizeof(test_shdr_t) +
+                        (long)offsetof(test_shdr_t, sh_offset);
+    ASSERT_EQ(fseek(f, field_offset, SEEK_SET), 0);
+    ASSERT_EQ(fwrite(&bad_offset, 1, sizeof(bad_offset), f), sizeof(bad_offset));
+    fclose(f);
+
+    elf_symbols_t *s = elf_symbols_load(path);
+    ASSERT_TRUE(s == NULL);
+}
+
+TEST(test_elf_rejects_symbol_name_out_of_bounds) {
+    const char *path = build_test_elf();
+    ASSERT_TRUE(path != NULL);
+
+    FILE *f = fopen(path, "r+b");
+    ASSERT_TRUE(f != NULL);
+    if (!f) return;
+    test_ehdr_t ehdr;
+    ASSERT_EQ(fread(&ehdr, 1, sizeof(ehdr), f), sizeof(ehdr));
+    uint32_t truncated_size = 1;
+    long field_offset = (long)ehdr.e_shoff + 2L * (long)sizeof(test_shdr_t) +
+                        (long)offsetof(test_shdr_t, sh_size);
+    ASSERT_EQ(fseek(f, field_offset, SEEK_SET), 0);
+    ASSERT_EQ(fwrite(&truncated_size, 1, sizeof(truncated_size), f),
+              sizeof(truncated_size));
     fclose(f);
 
     elf_symbols_t *s = elf_symbols_load(path);
@@ -471,6 +530,9 @@ static void run_debug_tests(void) {
     RUN_TEST(test_elf_load_nonexistent);
     RUN_TEST(test_elf_load_bad_magic);
     RUN_TEST(test_elf_load_bad_class);
+    RUN_TEST(test_elf_rejects_section_table_out_of_bounds);
+    RUN_TEST(test_elf_rejects_symbol_table_out_of_bounds);
+    RUN_TEST(test_elf_rejects_symbol_name_out_of_bounds);
     RUN_TEST(test_elf_load_valid);
     RUN_TEST(test_elf_lookup_exact);
     RUN_TEST(test_elf_lookup_with_offset);

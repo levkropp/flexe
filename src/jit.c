@@ -232,17 +232,9 @@ static int jit_fetch(xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out) {
         }
     }
 #endif
-    /* Fall back to direct memory fetch */
-    uint8_t *page = cpu->mem->page_table[addr >> 12];
-    if (!page) return 0;
-    const uint8_t *ptr = page + (addr & 0xFFF);
-    if (ptr[0] & 0x8) {
-        *insn_out = ptr[0] | ((uint32_t)ptr[1] << 8);
-        return 2;
-    } else {
-        *insn_out = ptr[0] | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16);
-        return 3;
-    }
+    /* Block compilation is cold relative to execution; use the canonical
+     * fetch so page-boundary and unmapped-page behavior cannot diverge. */
+    return xtensa_fetch(cpu, addr, insn_out);
 }
 
 /* ===== Block scanning: determine block boundaries ===== */
@@ -1789,7 +1781,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         case 0xD: { /* ADDMI: at = as + sext8(imm8) << 8 */
             int32_t simm8 = sign_extend(imm8, 8);
             ra_load_ar(e, ra,RAX, wb4, s);
-            emit_add_reg32_imm32(e, RAX, simm8 << 8);
+            emit_add_reg32_imm32(e, RAX, simm8 * 256);
             ra_store_ar(e, ra,RAX, wb4, t);
             return 1;
         }
