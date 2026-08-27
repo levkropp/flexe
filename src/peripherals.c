@@ -109,6 +109,64 @@
 #define I2C_CMD_END          4u
 #define I2C_CMD_DONE         (1u << 31)
 
+/* Classic ESP32 dual I2S controller and circular lldesc DMA geometry. */
+#define I2S_PORT_COUNT            2
+#define I2S_REG_FILE_SIZE         0x100u
+#define I2S_RX_FIFO_SIZE          (64u * 1024u)
+#define I2S_DMA_MAX_DESCRIPTORS   128
+#define I2S_DMA_MAX_BUFFER        4095u
+
+#define I2S_CONF_OFF              0x008u
+#define I2S_INT_RAW_OFF           0x00Cu
+#define I2S_INT_ST_OFF            0x010u
+#define I2S_INT_ENA_OFF           0x014u
+#define I2S_INT_CLR_OFF           0x018u
+#define I2S_FIFO_CONF_OFF         0x020u
+#define I2S_RXEOF_NUM_OFF         0x024u
+#define I2S_OUT_LINK_OFF          0x030u
+#define I2S_IN_LINK_OFF           0x034u
+#define I2S_OUT_EOF_DESC_OFF      0x038u
+#define I2S_IN_EOF_DESC_OFF       0x03Cu
+#define I2S_OUT_EOF_BUF_OFF       0x040u
+#define I2S_INLINK_DSCR_OFF       0x048u
+#define I2S_INLINK_DSCR_BF0_OFF   0x04Cu
+#define I2S_INLINK_DSCR_BF1_OFF   0x050u
+#define I2S_OUTLINK_DSCR_OFF      0x054u
+#define I2S_OUTLINK_DSCR_BF0_OFF  0x058u
+#define I2S_OUTLINK_DSCR_BF1_OFF  0x05Cu
+#define I2S_LC_CONF_OFF           0x060u
+#define I2S_CLKM_CONF_OFF         0x0ACu
+#define I2S_SAMPLE_RATE_OFF       0x0B0u
+#define I2S_STATE_OFF             0x0BCu
+#define I2S_DATE_OFF              0x0FCu
+
+#define I2S_CONF_TX_START         (1u << 4)
+#define I2S_CONF_RX_START         (1u << 5)
+#define I2S_CONF_TX_MONO          (1u << 14)
+#define I2S_CONF_RX_MONO          (1u << 15)
+#define I2S_FIFO_DSCR_EN          (1u << 12)
+#define I2S_LINK_ADDR_MASK        0x000FFFFFu
+#define I2S_LINK_STOP             (1u << 28)
+#define I2S_LINK_START            (1u << 29)
+#define I2S_LINK_RESTART          (1u << 30)
+#define I2S_LINK_PARK             (1u << 31)
+
+#define I2S_INT_IN_DONE           (1u << 8)
+#define I2S_INT_IN_SUC_EOF        (1u << 9)
+#define I2S_INT_OUT_DONE          (1u << 11)
+#define I2S_INT_OUT_EOF           (1u << 12)
+#define I2S_INT_IN_DSCR_ERR       (1u << 13)
+#define I2S_INT_OUT_DSCR_ERR      (1u << 14)
+#define I2S_INT_IN_DSCR_EMPTY     (1u << 15)
+#define I2S_INT_OUT_TOTAL_EOF     (1u << 16)
+#define I2S_INT_VALID_MASK        0x1FFFFu
+
+#define I2S_DESC_SIZE_MASK        0x00000FFFu
+#define I2S_DESC_LENGTH_MASK      0x00FFF000u
+#define I2S_DESC_LENGTH_SHIFT     12
+#define I2S_DESC_EOF              (1u << 30)
+#define I2S_DESC_OWNER            (1u << 31)
+
 /* UART interrupt sources/register bits used by the ESP-IDF driver. */
 #define UART_RXFIFO_FULL_INT     (1u << 0)
 #define UART_TXFIFO_EMPTY_INT    (1u << 1)
@@ -127,6 +185,8 @@
 
 static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
+static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -258,6 +318,29 @@ typedef struct {
     i2c_device_t device[I2C_DEVICE_COUNT];
 } i2c_state_t;
 
+typedef struct {
+    uint32_t regs[I2S_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t int_raw;
+    uint32_t int_ena;
+    uint32_t tx_desc;
+    uint32_t rx_desc;
+    bool tx_link_running;
+    bool rx_link_running;
+    bool tx_active;
+    bool rx_active;
+    bool tx_event_armed;
+    bool rx_event_armed;
+    uint32_t next_tx_ccount;
+    uint32_t next_rx_ccount;
+
+    uint8_t rx_fifo[I2S_RX_FIFO_SIZE];
+    size_t rx_head;
+    size_t rx_len;
+
+    periph_i2s_tx_fn tx_cb;
+    void *tx_cb_ctx;
+} i2s_state_t;
+
 struct esp32_periph {
     xtensa_mem_t *mem;
 
@@ -337,10 +420,8 @@ struct esp32_periph {
      * interrupt raw/status/enable/clear retain their hardware distinctions. */
     uint32_t ledc_regs[0x200 / sizeof(uint32_t)];
 
-    /* The IDF clock initializer reads these values back before any I2S DMA is
-     * active. Keep only that explicitly modelled register visible so future
-     * audio traffic still reports as an unimplemented hardware gap. */
-    uint32_t i2s_clkm_conf[2];
+    /* Two independent classic ESP32 I2S controllers with circular DMA. */
+    i2s_state_t i2s[I2S_PORT_COUNT];
 
     /* Flash cache MMU table shadows (DPORT_PRO/APP_FLASH_MMU_TABLE).
      * Entry i (0-63 = DROM 0x3F400000+, 64-127 = IROM 0x400C2000+) holds
@@ -1129,12 +1210,22 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 
 /* CPU hooks (registered on both cores, wired into next_timer_event). */
 static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
-    return lact_next_fire((esp32_periph_t *)cpu->periph_event_ctx, cpu);
+    esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
+    uint32_t best = lact_next_fire(p, cpu);
+    uint32_t audio = i2s_next_fire(p, cpu);
+    if (audio == UINT32_MAX) return best;
+    if (best == UINT32_MAX) return audio;
+    uint32_t best_distance = best - cpu->ccount;
+    uint32_t audio_distance = audio - cpu->ccount;
+    if ((int32_t)best_distance < 0) best_distance = 0;
+    if ((int32_t)audio_distance < 0) audio_distance = 0;
+    return audio_distance < best_distance ? audio : best;
 }
 static void periph_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
     for (int group = 0; group < 2; group++)
         lact_eval_irq(p, group);
+    i2s_eval_events(p, cpu);
 }
 
 /* Recompute both cores' next_timer_event after LACT state changes. */
@@ -2070,24 +2161,481 @@ static void ledc_write(void *ctx, uint32_t addr, uint32_t val) {
         ledc_update_irq(p);
 }
 
-/* ---- I2S clock configuration ---- */
+/* ---- I2S0/I2S1 + circular lldesc DMA ---- */
 
-static uint32_t i2s_clock_read(void *ctx, uint32_t addr) {
-    esp32_periph_t *p = ctx;
-    uint32_t base = addr >= I2S1_BASE ? I2S1_BASE : I2S0_BASE;
-    if (addr - base == 0x0ACu)
-        return p->i2s_clkm_conf[base == I2S1_BASE ? 1 : 0];
-    return default_read(ctx, addr);
+static const int i2s_intr_sources[I2S_PORT_COUNT] = {32, 33};
+
+static int i2s_port_from_addr(uint32_t addr) {
+    if (addr >= I2S0_BASE && addr < I2S0_BASE + PAGE_SIZE) return 0;
+    if (addr >= I2S1_BASE && addr < I2S1_BASE + PAGE_SIZE) return 1;
+    return -1;
 }
 
-static void i2s_clock_write(void *ctx, uint32_t addr, uint32_t val) {
-    esp32_periph_t *p = ctx;
-    uint32_t base = addr >= I2S1_BASE ? I2S1_BASE : I2S0_BASE;
-    if (addr - base == 0x0ACu) {
-        p->i2s_clkm_conf[base == I2S1_BASE ? 1 : 0] = val;
+static uint32_t i2s_base(int port) {
+    return port == 0 ? I2S0_BASE : I2S1_BASE;
+}
+
+static bool i2s_dma_range_mapped(esp32_periph_t *p, uint32_t addr,
+                                 size_t len, bool writable) {
+    while (len > 0) {
+        size_t page_left = 0x1000u - (addr & 0xFFFu);
+        size_t chunk = len < page_left ? len : page_left;
+        const uint8_t *ptr = writable ? mem_get_ptr_w(p->mem, addr) :
+                                        mem_get_ptr(p->mem, addr);
+        if (!ptr) return false;
+        addr += (uint32_t)chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+static uint32_t i2s_first_desc(uint32_t link) {
+    return 0x3FF00000u | (link & I2S_LINK_ADDR_MASK);
+}
+
+static uint32_t i2s_next_desc(uint32_t next) {
+    return next != 0 && next < 0x00100000u ? 0x3FF00000u | next : next;
+}
+
+static uint8_t i2s_bits_per_sample(const i2s_state_t *s, bool tx) {
+    uint32_t rate = s->regs[I2S_SAMPLE_RATE_OFF / 4u];
+    uint32_t bits = tx ? ((rate >> 12) & 0x3Fu) : ((rate >> 18) & 0x3Fu);
+    if (bits == 0 || bits > 32) bits = 16;
+    return (uint8_t)bits;
+}
+
+static uint8_t i2s_channel_count(const i2s_state_t *s, bool tx) {
+    uint32_t conf = s->regs[I2S_CONF_OFF / 4u];
+    return conf & (tx ? I2S_CONF_TX_MONO : I2S_CONF_RX_MONO) ? 1u : 2u;
+}
+
+static uint32_t i2s_sample_rate(const i2s_state_t *s, bool tx) {
+    uint32_t clkm = s->regs[I2S_CLKM_CONF_OFF / 4u];
+    uint32_t num = clkm & 0xFFu;
+    uint32_t b = (clkm >> 8) & 0x3Fu;
+    uint32_t a = (clkm >> 14) & 0x3Fu;
+    if (num == 0) num = 4;
+    uint64_t divider_64 = (uint64_t)num * 64u;
+    if (a != 0) divider_64 += (uint64_t)b * 64u / a;
+    if (divider_64 == 0) divider_64 = 256u;
+    uint64_t module_hz = 160000000ull * 64u / divider_64;
+
+    uint32_t rate = s->regs[I2S_SAMPLE_RATE_OFF / 4u];
+    uint32_t bck_div = tx ? (rate & 0x3Fu) : ((rate >> 6) & 0x3Fu);
+    if (bck_div == 0) bck_div = 1;
+    uint32_t frame_bits = (uint32_t)i2s_bits_per_sample(s, tx) *
+                          i2s_channel_count(s, tx);
+    uint64_t sample_hz = module_hz / bck_div / frame_bits;
+    if (sample_hz == 0) sample_hz = 1;
+    if (sample_hz > UINT32_MAX) sample_hz = UINT32_MAX;
+    return (uint32_t)sample_hz;
+}
+
+static uint32_t i2s_descriptor_cycles(const i2s_state_t *s, bool tx,
+                                      size_t len) {
+    uint32_t bytes_per_frame =
+        ((uint32_t)i2s_bits_per_sample(s, tx) + 7u) / 8u;
+    bytes_per_frame *= i2s_channel_count(s, tx);
+    uint64_t bytes_per_second =
+        (uint64_t)i2s_sample_rate(s, tx) * bytes_per_frame;
+    uint64_t cycles = bytes_per_second ?
+        ((uint64_t)len * 240000000ull + bytes_per_second - 1u) /
+            bytes_per_second : 100000u;
+    if (cycles == 0) cycles = 1;
+    /* Event comparisons use signed modular ccount distances, so keep one
+     * descriptor deadline within the unambiguous half of the 32-bit range. */
+    if (cycles > INT32_MAX) cycles = INT32_MAX;
+    return (uint32_t)cycles;
+}
+
+static void i2s_irq_update(esp32_periph_t *p, int port) {
+    i2s_state_t *s = &p->i2s[port];
+    if (s->int_raw & s->int_ena & I2S_INT_VALID_MASK)
+        periph_assert_interrupt(p, i2s_intr_sources[port]);
+    else
+        periph_deassert_interrupt(p, i2s_intr_sources[port]);
+}
+
+static size_t i2s_rx_fifo_push(i2s_state_t *s, const uint8_t *data,
+                               size_t len) {
+    size_t accepted = len;
+    if (accepted > I2S_RX_FIFO_SIZE - s->rx_len)
+        accepted = I2S_RX_FIFO_SIZE - s->rx_len;
+    for (size_t i = 0; i < accepted; i++) {
+        size_t tail = (s->rx_head + s->rx_len) % I2S_RX_FIFO_SIZE;
+        s->rx_fifo[tail] = data[i];
+        s->rx_len++;
+    }
+    return accepted;
+}
+
+static uint8_t i2s_rx_fifo_pop(i2s_state_t *s) {
+    if (s->rx_len == 0) return 0;
+    uint8_t value = s->rx_fifo[s->rx_head];
+    s->rx_head = (s->rx_head + 1u) % I2S_RX_FIFO_SIZE;
+    s->rx_len--;
+    return value;
+}
+
+static void i2s_emit_tx(esp32_periph_t *p, int port, const uint8_t *data,
+                        size_t len) {
+    i2s_state_t *s = &p->i2s[port];
+    uint32_t sample_rate = i2s_sample_rate(s, true);
+    uint8_t bits = i2s_bits_per_sample(s, true);
+    uint8_t channels = i2s_channel_count(s, true);
+    if (s->tx_cb)
+        s->tx_cb(s->tx_cb_ctx, port, data, len, sample_rate, bits, channels);
+
+    sbx_event_t ev = { .kind = SBX_EV_I2S_TX, .cycle = 0 };
+    ev.i2s_tx.port = (uint8_t)port;
+    ev.i2s_tx.bits_per_sample = bits;
+    ev.i2s_tx.channels = channels;
+    ev.i2s_tx.len = (uint16_t)len;
+    ev.i2s_tx.sample_rate = sample_rate;
+    ev.i2s_tx.data = data;
+    sbx_events_emit(&ev);
+}
+
+static bool i2s_process_tx_descriptor(esp32_periph_t *p, int port) {
+    i2s_state_t *s = &p->i2s[port];
+    uint32_t desc = s->tx_desc;
+    if (!desc || !i2s_dma_range_mapped(p, desc, 12, false)) {
+        s->int_raw |= I2S_INT_OUT_DSCR_ERR;
+        s->tx_link_running = false;
+        s->tx_active = false;
+        i2s_irq_update(p, port);
+        return false;
+    }
+
+    uint32_t ctrl = mem_read32(p->mem, desc);
+    uint32_t buf = mem_read32(p->mem, desc + 4u);
+    uint32_t next = i2s_next_desc(mem_read32(p->mem, desc + 8u));
+    size_t size = ctrl & I2S_DESC_SIZE_MASK;
+    size_t len = (ctrl & I2S_DESC_LENGTH_MASK) >> I2S_DESC_LENGTH_SHIFT;
+    s->regs[I2S_OUTLINK_DSCR_OFF / 4u] = desc;
+    s->regs[I2S_OUTLINK_DSCR_BF0_OFF / 4u] = next;
+    s->regs[I2S_OUTLINK_DSCR_BF1_OFF / 4u] = buf;
+
+    if (!(ctrl & I2S_DESC_OWNER) || len > size || len > I2S_DMA_MAX_BUFFER ||
+        (len != 0 && !i2s_dma_range_mapped(p, buf, len, false))) {
+        s->int_raw |= I2S_INT_OUT_DSCR_ERR;
+        s->tx_link_running = false;
+        s->tx_active = false;
+        i2s_irq_update(p, port);
+        return false;
+    }
+
+    uint8_t audio[I2S_DMA_MAX_BUFFER];
+    for (size_t i = 0; i < len; i++)
+        audio[i] = mem_read8(p->mem, buf + (uint32_t)i);
+    if (len != 0)
+        i2s_emit_tx(p, port, audio, len);
+
+    s->regs[I2S_OUT_EOF_DESC_OFF / 4u] = desc;
+    s->regs[I2S_OUT_EOF_BUF_OFF / 4u] = buf;
+    s->int_raw |= I2S_INT_OUT_DONE;
+    if (ctrl & I2S_DESC_EOF)
+        s->int_raw |= I2S_INT_OUT_EOF;
+
+    if (next == 0) {
+        s->int_raw |= I2S_INT_OUT_TOTAL_EOF;
+        s->tx_link_running = false;
+        s->tx_active = false;
+        s->tx_desc = 0;
+    } else {
+        s->tx_desc = next;
+    }
+    i2s_irq_update(p, port);
+    return true;
+}
+
+static bool i2s_process_rx_descriptor(esp32_periph_t *p, int port) {
+    i2s_state_t *s = &p->i2s[port];
+    uint32_t desc = s->rx_desc;
+    if (!desc || !i2s_dma_range_mapped(p, desc, 12, true)) {
+        s->int_raw |= I2S_INT_IN_DSCR_ERR;
+        s->rx_link_running = false;
+        s->rx_active = false;
+        i2s_irq_update(p, port);
+        return false;
+    }
+
+    uint32_t ctrl = mem_read32(p->mem, desc);
+    uint32_t buf = mem_read32(p->mem, desc + 4u);
+    uint32_t next = i2s_next_desc(mem_read32(p->mem, desc + 8u));
+    size_t size = ctrl & I2S_DESC_SIZE_MASK;
+    size_t len = size;
+    uint32_t eof_num = s->regs[I2S_RXEOF_NUM_OFF / 4u];
+    /* Classic ESP32 RX_EOF_NUM counts 32-bit FIFO words, while lldesc size
+     * and length fields count bytes. ESP-IDF therefore programs 32 here for
+     * a 128-byte stereo/16-bit DMA buffer. */
+    uint64_t eof_bytes = (uint64_t)eof_num * sizeof(uint32_t);
+    if (eof_num != 0 && len > eof_bytes) len = (size_t)eof_bytes;
+    s->regs[I2S_INLINK_DSCR_OFF / 4u] = desc;
+    s->regs[I2S_INLINK_DSCR_BF0_OFF / 4u] = next;
+    s->regs[I2S_INLINK_DSCR_BF1_OFF / 4u] = buf;
+
+    if (!(ctrl & I2S_DESC_OWNER) || len == 0 || len > I2S_DMA_MAX_BUFFER ||
+        !i2s_dma_range_mapped(p, buf, len, true)) {
+        s->int_raw |= I2S_INT_IN_DSCR_ERR;
+        s->rx_link_running = false;
+        s->rx_active = false;
+        i2s_irq_update(p, port);
+        return false;
+    }
+
+    for (size_t i = 0; i < len; i++)
+        mem_write8(p->mem, buf + (uint32_t)i, i2s_rx_fifo_pop(s));
+    ctrl &= ~I2S_DESC_LENGTH_MASK;
+    ctrl |= ((uint32_t)len << I2S_DESC_LENGTH_SHIFT) &
+            I2S_DESC_LENGTH_MASK;
+    mem_write32(p->mem, desc, ctrl);
+
+    s->regs[I2S_IN_EOF_DESC_OFF / 4u] = desc;
+    s->int_raw |= I2S_INT_IN_DONE | I2S_INT_IN_SUC_EOF;
+    if (next == 0) {
+        s->int_raw |= I2S_INT_IN_DSCR_EMPTY;
+        s->rx_link_running = false;
+        s->rx_active = false;
+        s->rx_desc = 0;
+    } else {
+        s->rx_desc = next;
+    }
+    i2s_irq_update(p, port);
+    return true;
+}
+
+static int i2s_ring_descriptor_count(esp32_periph_t *p, uint32_t first) {
+    uint32_t desc = first;
+    for (int count = 1; count <= I2S_DMA_MAX_DESCRIPTORS; count++) {
+        if (!i2s_dma_range_mapped(p, desc, 12, false)) return 0;
+        uint32_t next = i2s_next_desc(mem_read32(p->mem, desc + 8u));
+        if (next == first) return count;
+        if (next == 0 || next == desc) return count;
+        desc = next;
+    }
+    return I2S_DMA_MAX_DESCRIPTORS;
+}
+
+static void i2s_kick(esp32_periph_t *p) {
+    if (p->cpu[0]) xtensa_recompute_next_timer(p->cpu[0]);
+}
+
+static void i2s_arm_event(esp32_periph_t *p, int port, bool tx) {
+    i2s_state_t *s = &p->i2s[port];
+    uint32_t desc = tx ? s->tx_desc : s->rx_desc;
+    bool active = tx ? s->tx_active : s->rx_active;
+    if (!active || !desc || !i2s_dma_range_mapped(p, desc, 4, false)) {
+        if (tx) s->tx_event_armed = false;
+        else s->rx_event_armed = false;
         return;
     }
-    default_write(ctx, addr, val);
+    uint32_t ctrl = mem_read32(p->mem, desc);
+    size_t len = tx ?
+        ((ctrl & I2S_DESC_LENGTH_MASK) >> I2S_DESC_LENGTH_SHIFT) :
+        (ctrl & I2S_DESC_SIZE_MASK);
+    uint32_t now = p->cpu[0] ? p->cpu[0]->ccount : 0;
+    uint32_t next = now + i2s_descriptor_cycles(s, tx, len ? len : 4u);
+    if (tx) {
+        s->next_tx_ccount = next;
+        s->tx_event_armed = true;
+    } else {
+        s->next_rx_ccount = next;
+        s->rx_event_armed = true;
+    }
+    i2s_kick(p);
+}
+
+static void i2s_seed_ring(esp32_periph_t *p, int port, bool tx) {
+    i2s_state_t *s = &p->i2s[port];
+    uint32_t first = tx ? s->tx_desc : s->rx_desc;
+    int count = i2s_ring_descriptor_count(p, first);
+    int completions = 1;
+    int source = i2s_intr_sources[port];
+    if (p->irq_dispatch[source] && count > 1)
+        completions = count - 1;
+    uint32_t eof_bit = tx ? I2S_INT_OUT_EOF : I2S_INT_IN_SUC_EOF;
+    for (int i = 0; i < completions; i++) {
+        bool ok = tx ? i2s_process_tx_descriptor(p, port) :
+                       i2s_process_rx_descriptor(p, port);
+        if (!ok) break;
+        /* Native IRQ delivery cannot consume a second completion until the
+         * first status bit has been acknowledged by guest code. */
+        if (s->int_raw & eof_bit) break;
+    }
+}
+
+static void i2s_refresh_active(esp32_periph_t *p, int port) {
+    i2s_state_t *s = &p->i2s[port];
+    uint32_t conf = s->regs[I2S_CONF_OFF / 4u];
+    bool dma = (s->regs[I2S_FIFO_CONF_OFF / 4u] & I2S_FIFO_DSCR_EN) != 0;
+    bool tx_active = dma && s->tx_link_running &&
+                     (conf & I2S_CONF_TX_START) != 0;
+    bool rx_active = dma && s->rx_link_running &&
+                     (conf & I2S_CONF_RX_START) != 0;
+
+    if (tx_active && !s->tx_active) {
+        s->tx_active = true;
+        i2s_seed_ring(p, port, true);
+        if (s->tx_active) i2s_arm_event(p, port, true);
+    } else if (!tx_active) {
+        s->tx_active = false;
+        s->tx_event_armed = false;
+    }
+    if (rx_active && !s->rx_active) {
+        s->rx_active = true;
+        i2s_seed_ring(p, port, false);
+        if (s->rx_active) i2s_arm_event(p, port, false);
+    } else if (!rx_active) {
+        s->rx_active = false;
+        s->rx_event_armed = false;
+    }
+    i2s_kick(p);
+}
+
+static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    bool have = false;
+    uint32_t best = UINT32_MAX;
+    uint32_t best_distance = 0;
+    for (int port = 0; port < I2S_PORT_COUNT; port++) {
+        i2s_state_t *s = &p->i2s[port];
+        uint32_t events[2] = {s->next_tx_ccount, s->next_rx_ccount};
+        bool armed[2] = {s->tx_event_armed, s->rx_event_armed};
+        for (int direction = 0; direction < 2; direction++) {
+            if (!armed[direction]) continue;
+            uint32_t distance = events[direction] - cpu->ccount;
+            if ((int32_t)distance < 0) distance = 0;
+            if (!have || distance < best_distance) {
+                have = true;
+                best = events[direction];
+                best_distance = distance;
+            }
+        }
+    }
+    return have ? best : UINT32_MAX;
+}
+
+static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return;
+    for (int port = 0; port < I2S_PORT_COUNT; port++) {
+        i2s_state_t *s = &p->i2s[port];
+        if (s->tx_event_armed &&
+            (int32_t)(cpu->ccount - s->next_tx_ccount) >= 0) {
+            s->tx_event_armed = false;
+            (void)i2s_process_tx_descriptor(p, port);
+            if (s->tx_active) i2s_arm_event(p, port, true);
+        }
+        if (s->rx_event_armed &&
+            (int32_t)(cpu->ccount - s->next_rx_ccount) >= 0) {
+            s->rx_event_armed = false;
+            (void)i2s_process_rx_descriptor(p, port);
+            if (s->rx_active) i2s_arm_event(p, port, false);
+        }
+    }
+}
+
+static uint32_t i2s_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    int port = i2s_port_from_addr(addr);
+    if (port < 0) return default_read(ctx, addr);
+    uint32_t off = addr - i2s_base(port);
+    if ((off & 3u) != 0 || off >= I2S_REG_FILE_SIZE)
+        return default_read(ctx, addr);
+    i2s_state_t *s = &p->i2s[port];
+    switch (off) {
+    case I2S_INT_RAW_OFF: return s->int_raw;
+    case I2S_INT_ST_OFF: return s->int_raw & s->int_ena;
+    case I2S_INT_ENA_OFF: return s->int_ena;
+    case I2S_INT_CLR_OFF: return 0;
+    case I2S_OUT_LINK_OFF:
+        return (s->regs[off / 4u] & I2S_LINK_ADDR_MASK) |
+               (s->tx_link_running ? 0u : I2S_LINK_PARK);
+    case I2S_IN_LINK_OFF:
+        return (s->regs[off / 4u] & I2S_LINK_ADDR_MASK) |
+               (s->rx_link_running ? 0u : I2S_LINK_PARK);
+    case I2S_STATE_OFF:
+        return (1u << 2) | (1u << 1) | (s->tx_active ? 0u : 1u);
+    default:
+        return s->regs[off / 4u];
+    }
+}
+
+static void i2s_write(void *ctx, uint32_t addr, uint32_t val) {
+    esp32_periph_t *p = ctx;
+    int port = i2s_port_from_addr(addr);
+    if (port < 0) { default_write(ctx, addr, val); return; }
+    uint32_t off = addr - i2s_base(port);
+    if ((off & 3u) != 0 || off >= I2S_REG_FILE_SIZE) {
+        default_write(ctx, addr, val);
+        return;
+    }
+    i2s_state_t *s = &p->i2s[port];
+    switch (off) {
+    case I2S_INT_RAW_OFF:
+    case I2S_INT_ST_OFF:
+    case I2S_OUT_EOF_DESC_OFF:
+    case I2S_IN_EOF_DESC_OFF:
+    case I2S_OUT_EOF_BUF_OFF:
+    case I2S_INLINK_DSCR_OFF:
+    case I2S_INLINK_DSCR_BF0_OFF:
+    case I2S_INLINK_DSCR_BF1_OFF:
+    case I2S_OUTLINK_DSCR_OFF:
+    case I2S_OUTLINK_DSCR_BF0_OFF:
+    case I2S_OUTLINK_DSCR_BF1_OFF:
+    case I2S_STATE_OFF:
+        return; /* read-only */
+    case I2S_INT_ENA_OFF:
+        s->int_ena = val & I2S_INT_VALID_MASK;
+        i2s_irq_update(p, port);
+        return;
+    case I2S_INT_CLR_OFF:
+        s->int_raw &= ~(val & I2S_INT_VALID_MASK);
+        i2s_irq_update(p, port);
+        return;
+    case I2S_OUT_LINK_OFF:
+        s->regs[off / 4u] = val & I2S_LINK_ADDR_MASK;
+        if (val & I2S_LINK_STOP) {
+            s->tx_link_running = false;
+        } else if (val & (I2S_LINK_START | I2S_LINK_RESTART)) {
+            s->tx_desc = i2s_first_desc(val);
+            s->tx_link_running = true;
+        }
+        i2s_refresh_active(p, port);
+        return;
+    case I2S_IN_LINK_OFF:
+        s->regs[off / 4u] = val & I2S_LINK_ADDR_MASK;
+        if (val & I2S_LINK_STOP) {
+            s->rx_link_running = false;
+        } else if (val & (I2S_LINK_START | I2S_LINK_RESTART)) {
+            s->rx_desc = i2s_first_desc(val);
+            s->rx_link_running = true;
+        }
+        i2s_refresh_active(p, port);
+        return;
+    case I2S_CONF_OFF:
+        s->regs[off / 4u] = val;
+        if (val & ((1u << 0) | (1u << 2)))
+            s->tx_desc = i2s_first_desc(s->regs[I2S_OUT_LINK_OFF / 4u]);
+        if (val & ((1u << 1) | (1u << 3)))
+            s->rx_desc = i2s_first_desc(s->regs[I2S_IN_LINK_OFF / 4u]);
+        i2s_refresh_active(p, port);
+        return;
+    case I2S_LC_CONF_OFF:
+        s->regs[off / 4u] = val;
+        if (val & (1u << 1))
+            s->tx_desc = i2s_first_desc(s->regs[I2S_OUT_LINK_OFF / 4u]);
+        if (val & 1u)
+            s->rx_desc = i2s_first_desc(s->regs[I2S_IN_LINK_OFF / 4u]);
+        return;
+    case I2S_FIFO_CONF_OFF:
+        s->regs[off / 4u] = val;
+        i2s_refresh_active(p, port);
+        return;
+    default:
+        s->regs[off / 4u] = val;
+        return;
+    }
 }
 
 /* ---- Default handler (unhandled peripherals) ---- */
@@ -2123,6 +2671,21 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     p->sens_regs[SENS_SAR_START_FORCE_OFF / 4u] = 0xFu;
     p->rtcio_regs[RTCIO_DAC1_OFF / 4u] = 2u << 30;
     p->rtcio_regs[RTCIO_DAC2_OFF / 4u] = 2u << 30;
+
+    for (int port = 0; port < I2S_PORT_COUNT; port++) {
+        i2s_state_t *i2s = &p->i2s[port];
+        i2s->regs[I2S_CONF_OFF / 4u] =
+            (1u << 17) | (1u << 16) | (1u << 9) | (1u << 8);
+        i2s->regs[I2S_FIFO_CONF_OFF / 4u] =
+            I2S_FIFO_DSCR_EN | (32u << 6) | 32u;
+        i2s->regs[I2S_RXEOF_NUM_OFF / 4u] = 64u;
+        i2s->regs[I2S_LC_CONF_OFF / 4u] = 1u << 8;
+        i2s->regs[0x074u / 4u] = (1u << 11) | 0x10u;
+        i2s->regs[I2S_CLKM_CONF_OFF / 4u] = 4u;
+        i2s->regs[I2S_SAMPLE_RATE_OFF / 4u] =
+            (16u << 18) | (16u << 12) | (6u << 6) | 6u;
+        i2s->regs[I2S_DATE_OFF / 4u] = 0x01604201u;
+    }
 
     /* Strapping-pin idle levels: GPIO0/5/15 have pull-ups enabled at reset
      * (GPIO2/12 pull-downs read low). Firmware reads GPIO_IN for buttons
@@ -2191,11 +2754,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* LEDC PWM controller */
     mem_register_mmio(mem, (int)PAGE_OF(LEDC_BASE), ledc_read, ledc_write, p);
 
-    /* I2S clock-control readback used during peripheral clock init. Other I2S
-     * registers deliberately remain visible as unhandled until DMA/audio is
-     * modelled. */
-    mem_register_mmio(mem, (int)PAGE_OF(I2S0_BASE), i2s_clock_read, i2s_clock_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(I2S1_BASE), i2s_clock_read, i2s_clock_write, p);
+    /* Two classic ESP32 I2S controllers, including circular lldesc DMA. */
+    mem_register_mmio(mem, (int)PAGE_OF(I2S0_BASE), i2s_read, i2s_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(I2S1_BASE), i2s_read, i2s_write, p);
 
     /* TIMG0 */
     mem_register_mmio(mem, (int)PAGE_OF(TIMG0_BASE), timg_read, timg_write, p);
@@ -2348,6 +2909,26 @@ int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
     return 0;
 }
 
+int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,
+                               periph_i2s_tx_fn fn, void *ctx) {
+    if (!p || port < 0 || port >= I2S_PORT_COUNT) return -1;
+    p->i2s[port].tx_cb = fn;
+    p->i2s[port].tx_cb_ctx = fn ? ctx : NULL;
+    return 0;
+}
+
+size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
+                            const uint8_t *data, size_t len) {
+    if (!p || port < 0 || port >= I2S_PORT_COUNT || (!data && len != 0))
+        return 0;
+    return i2s_rx_fifo_push(&p->i2s[port], data, len);
+}
+
+size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port) {
+    if (!p || port < 0 || port >= I2S_PORT_COUNT) return 0;
+    return p->i2s[port].rx_len;
+}
+
 int periph_set_irq_dispatch(esp32_periph_t *p, int source,
                             periph_irq_dispatch_fn fn, void *ctx) {
     if (!p || source < 0 || source >= 71)
@@ -2355,6 +2936,12 @@ int periph_set_irq_dispatch(esp32_periph_t *p, int source,
     p->irq_dispatch[source] = fn;
     p->irq_dispatch_ctx[source] = fn ? ctx : NULL;
     return 0;
+}
+
+bool periph_interrupt_pending(const esp32_periph_t *p, int source) {
+    if (!p || source < 0 || source >= 71) return false;
+    return (p->pending_sources[source / 32] &
+            (1u << (source % 32))) != 0;
 }
 
 int periph_unhandled_count(const esp32_periph_t *p) {

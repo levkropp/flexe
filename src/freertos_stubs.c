@@ -728,6 +728,47 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, pdTRUE);
 }
 
+/* ISR queue helpers used by ESP-IDF DMA drivers. Compatibility-mode queues
+ * are host-backed handles, so firmware's native FreeRTOS implementation must
+ * not dereference them as Queue_t objects. These operations are deliberately
+ * nonblocking, matching their FromISR contracts. */
+void stub_xQueueReceiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t buf_ptr = frt_arg(cpu, 1);
+    uint32_t woken_ptr = frt_arg(cpu, 2);
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q || q->count == 0) {
+        pthread_mutex_unlock(&frt->lock);
+        if (woken_ptr)
+            mem_write32(cpu->mem, woken_ptr, pdFALSE);
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+
+    int offset = q->head * q->item_size;
+    for (int i = 0; i < q->item_size; i++)
+        mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
+    q->head = (q->head + 1) % q->max_items;
+    q->count--;
+    pthread_mutex_unlock(&frt->lock);
+    if (woken_ptr)
+        mem_write32(cpu->mem, woken_ptr, pdFALSE);
+    frt_return(cpu, pdTRUE);
+}
+
+void stub_xQueueIsQueueFullFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    int full = q && q->count >= q->max_items;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, full ? pdTRUE : pdFALSE);
+}
+
 /* xSemaphoreCreateMutex() -> non-null handle */
 void stub_xSemaphoreCreateMutex(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
@@ -1231,6 +1272,8 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xQueueGenericSendFromISR",      stub_xQueueGenericSendFromISR },
         { "xQueueReceive",                stub_xQueueReceive },
         { "xQueueGenericReceive",          stub_xQueueReceive },
+        { "xQueueReceiveFromISR",          stub_xQueueReceiveFromISR },
+        { "xQueueIsQueueFullFromISR",      stub_xQueueIsQueueFullFromISR },
         { "xSemaphoreCreateMutex",         stub_xSemaphoreCreateMutex },
         { "xQueueCreateMutex",             stub_xSemaphoreCreateMutex },
         { "xSemaphoreCreateBinary",        stub_xSemaphoreCreateBinary },

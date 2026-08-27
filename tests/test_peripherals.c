@@ -495,9 +495,11 @@ TEST(irq_dispatch_observes_only_rising_edges) {
     periph_assert_interrupt(p, 49);
     ASSERT_EQ(dispatch.count, 1);
     ASSERT_EQ(dispatch.last_source, 49);
+    ASSERT_TRUE(periph_interrupt_pending(p, 49));
     periph_assert_interrupt(p, 49);
     ASSERT_EQ(dispatch.count, 1);
     periph_deassert_interrupt(p, 49);
+    ASSERT_FALSE(periph_interrupt_pending(p, 49));
     periph_assert_interrupt(p, 49);
     ASSERT_EQ(dispatch.count, 2);
 
@@ -1560,6 +1562,161 @@ TEST(ledc_register_and_duty_completion) {
     mem_destroy(mem);
 }
 
+typedef struct {
+    int count;
+    int port;
+    size_t len;
+    uint32_t sample_rate;
+    uint8_t bits_per_sample;
+    uint8_t channels;
+    uint8_t data[16];
+} i2s_test_capture_t;
+
+static void i2s_test_capture(void *ctx, int port, const uint8_t *data,
+                             size_t len, uint32_t sample_rate,
+                             uint8_t bits_per_sample, uint8_t channels) {
+    i2s_test_capture_t *capture = ctx;
+    capture->count++;
+    capture->port = port;
+    capture->len = len;
+    capture->sample_rate = sample_rate;
+    capture->bits_per_sample = bits_per_sample;
+    capture->channels = channels;
+    size_t copy_len = len < sizeof(capture->data) ? len : sizeof(capture->data);
+    memcpy(capture->data, data, copy_len);
+}
+
+TEST(i2s_tx_dma_descriptor_and_interrupt) {
+    const uint32_t i2s = 0x3FF4F000u;
+    const uint32_t desc = 0x3FFB1300u;
+    const uint32_t buf = 0x3FFB2300u;
+    static const uint8_t expected[8] = {
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE,
+    };
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0);
+    cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 8, 32); /* I2S0 -> CPU interrupt 8 */
+
+    i2s_test_capture_t capture = {0};
+    ASSERT_EQ(periph_set_i2s_tx_callback(p, 0, i2s_test_capture, &capture), 0);
+    for (size_t i = 0; i < sizeof(expected); i++)
+        mem_write8(mem, buf + (uint32_t)i, expected[i]);
+    test_spi_dma_desc(mem, desc, buf, sizeof(expected), sizeof(expected),
+                      1, desc);
+
+    mem_write32(mem, i2s + 0x14u, 1u << 12); /* OUT_EOF_INT_ENA */
+    mem_write32(mem, i2s + 0x30u,
+                (desc & 0xFFFFFu) | (1u << 29)); /* OUTLINK_START */
+    mem_write32(mem, i2s + 0x08u,
+                mem_read32(mem, i2s + 0x08u) | (1u << 4)); /* TX_START */
+
+    ASSERT_EQ(capture.count, 1);
+    ASSERT_EQ(capture.port, 0);
+    ASSERT_EQ(capture.len, sizeof(expected));
+    ASSERT_TRUE(capture.sample_rate > 0);
+    ASSERT_EQ(capture.bits_per_sample, 16);
+    ASSERT_EQ(capture.channels, 2);
+    ASSERT_TRUE(memcmp(capture.data, expected, sizeof(expected)) == 0);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x0Cu) & ((1u << 11) | (1u << 12)),
+              (1u << 11) | (1u << 12));
+    ASSERT_EQ(mem_read32(mem, i2s + 0x10u), 1u << 12);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x38u), desc);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x40u), buf);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x54u), desc);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x58u), desc);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x5Cu), buf);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
+
+    mem_write32(mem, i2s + 0x18u, 1u << 12); /* OUT_EOF_INT_CLR */
+    ASSERT_EQ(mem_read32(mem, i2s + 0x10u), 0);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0);
+
+    /* The circular descriptor remains armed and completes again at the
+     * sample-rate-derived peripheral timer deadline. */
+    ASSERT_TRUE(cpu0.periph_event != NULL);
+    ASSERT_TRUE(cpu0.next_timer_event != UINT32_MAX);
+    if (cpu0.periph_event && cpu0.next_timer_event != UINT32_MAX) {
+        cpu0.ccount = cpu0.next_timer_event;
+        cpu0.periph_event(&cpu0);
+    }
+    ASSERT_EQ(capture.count, 2);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x10u), 1u << 12);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
+    mem_write32(mem, i2s + 0x18u, 1u << 12);
+
+    mem_write32(mem, i2s + 0x30u, 1u << 28); /* OUTLINK_STOP */
+    ASSERT_TRUE(mem_read32(mem, i2s + 0x30u) & (1u << 31));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(i2s_rx_dma_injection_and_dual_port) {
+    const uint32_t i2s0 = 0x3FF4F000u;
+    const uint32_t i2s1 = 0x3FF6D000u;
+    const uint32_t desc = 0x3FFB1400u;
+    const uint32_t buf = 0x3FFB2400u;
+    static const uint8_t injected[8] = {
+        0x81, 0x72, 0x63, 0x54, 0x45, 0x36, 0x27, 0x18,
+    };
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0);
+    cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 9, 33); /* I2S1 -> CPU interrupt 9 */
+
+    ASSERT_EQ(periph_i2s_rx_inject(p, 1, injected, sizeof(injected)),
+              sizeof(injected));
+    ASSERT_EQ(periph_i2s_rx_pending(p, 1), sizeof(injected));
+    test_spi_dma_desc(mem, desc, buf, sizeof(injected), 0, 1, desc);
+    mem_write32(mem, i2s1 + 0x24u,
+                sizeof(injected) / sizeof(uint32_t)); /* RXEOF_NUM words */
+    mem_write32(mem, i2s1 + 0x14u, 1u << 9); /* IN_SUC_EOF_INT_ENA */
+    mem_write32(mem, i2s1 + 0x34u,
+                (desc & 0xFFFFFu) | (1u << 29)); /* INLINK_START */
+    mem_write32(mem, i2s1 + 0x08u,
+                mem_read32(mem, i2s1 + 0x08u) | (1u << 5)); /* RX_START */
+
+    uint8_t received[sizeof(injected)];
+    for (size_t i = 0; i < sizeof(received); i++)
+        received[i] = mem_read8(mem, buf + (uint32_t)i);
+    ASSERT_TRUE(memcmp(received, injected, sizeof(injected)) == 0);
+    ASSERT_EQ(periph_i2s_rx_pending(p, 1), 0);
+    ASSERT_EQ((mem_read32(mem, desc) >> 12) & 0xFFFu, sizeof(injected));
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0x0Cu) & ((1u << 8) | (1u << 9)),
+              (1u << 8) | (1u << 9));
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0x10u), 1u << 9);
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0x3Cu), desc);
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0x48u), desc);
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0x4Cu), desc);
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0x50u), buf);
+    ASSERT_EQ(cpu0.interrupt & (1u << 9), 1u << 9);
+
+    /* The two controller register files and host RX queues are independent. */
+    mem_write32(mem, i2s0 + 0xACu, 0x00200000u);
+    mem_write32(mem, i2s1 + 0xACu, 0x00400000u);
+    ASSERT_EQ(mem_read32(mem, i2s0 + 0xACu), 0x00200000u);
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0xACu), 0x00400000u);
+    ASSERT_EQ(periph_i2s_rx_pending(p, 0), 0);
+
+    mem_write32(mem, i2s1 + 0x18u, 1u << 9); /* IN_SUC_EOF_INT_CLR */
+    ASSERT_EQ(mem_read32(mem, i2s1 + 0x10u), 0);
+    ASSERT_EQ(cpu0.interrupt & (1u << 9), 0);
+    mem_write32(mem, i2s1 + 0x34u, 1u << 28); /* INLINK_STOP */
+    ASSERT_TRUE(mem_read32(mem, i2s1 + 0x34u) & (1u << 31));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(i2s_clock_and_bt_private_readback) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -1640,6 +1797,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(intr_matrix_assert_source);
     RUN_TEST(cross_core_interrupt);
     RUN_TEST(ledc_register_and_duty_completion);
+    RUN_TEST(i2s_tx_dma_descriptor_and_interrupt);
+    RUN_TEST(i2s_rx_dma_injection_and_dual_port);
     RUN_TEST(i2s_clock_and_bt_private_readback);
     RUN_TEST(excmlevel3_masks_level3);
 }

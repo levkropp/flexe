@@ -2721,9 +2721,9 @@ static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
 
 /* Compatibility-mode interrupt bridge. FreeRTOS is replaced in this mode,
  * but interrupt-driven IDF drivers still depend on their registered ISR to
- * refill FIFOs and complete command queues. Invoke I2C handlers synchronously
- * on a private guest stack. The pending loop prevents recursive ISR calls when
- * a handler starts the next hardware command before returning. */
+ * recycle I2S DMA buffers and complete I2C command queues. Invoke those
+ * handlers synchronously on a private guest stack. The pending loop prevents
+ * recursive ISR calls when a handler starts more hardware work. */
 #define STUB_INTR_HANDLE_BASE 0xF17E0000u
 
 static int stub_intr_source_from_handle(const esp32_rom_stubs_t *s,
@@ -2783,7 +2783,7 @@ static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
      * interrupt sources whose peripheral ISR path is not modeled yet.  Some
      * production drivers use a non-NULL handle to select management paths
      * that cannot work while their interrupt is intentionally stubbed. */
-    if (source != 49 && source != 50) {
+    if (source != 32 && source != 33 && source != 49 && source != 50) {
         rom_return(cpu, 0);
         return;
     }
@@ -2830,8 +2830,14 @@ static void stub_esp_intr_free(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_esp_intr_enable(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
     int source = stub_intr_source_from_handle(s, rom_arg(cpu, 0));
-    if (source >= 0)
+    if (source >= 0) {
         s->irq[source].enabled = true;
+        /* Level-triggered hardware may have asserted while the handle was
+         * disabled. Re-enabling must service that level even though there is
+         * no new low-to-high edge for the peripheral observer to report. */
+        if (s->periph && periph_interrupt_pending(s->periph, source))
+            stub_dispatch_guest_irq(s, source);
+    }
     rom_return(cpu, 0);
 }
 

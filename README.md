@@ -34,7 +34,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - windowed registers with synthesized spill/fill (call4/8/12, entry, retw)
 - exception/interrupt dispatch (levels 1–7, timer ccompare, waiti)
 - esp32 memory map (sram, rom, flash, rtc, psram, peripheral i/o)
-- mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog, timers, GP-SPI2/3 DMA, classic I2C0/1 master, ledc, ADC1/2, DAC1/2
+- mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog, timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA, ledc, ADC1/2, DAC1/2
 - raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
 - host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
@@ -45,7 +45,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 567 tests
+- 569 tests
 
 ## building
 
@@ -134,7 +134,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 567 tests, 1685 passed, 0 failed
+# 569 tests, 1741 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -164,6 +164,19 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-analog-dac.sh
 
 `FLEXE_ANALOG_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The I2S gate builds an unmodified Arduino sketch against ESP-IDF's public
+`driver/i2s.h` API. It installs the real full-duplex driver, exercises its
+circular `lldesc` rings and ISR queues, writes and reads exact 128-byte PCM
+buffers, restarts DMA, and validates the host TX callback/RX injection boundary
+at 16 kHz, 16-bit stereo with zero unhandled MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-i2s-dma.sh
+# stage=0x12D5DAA0 result=0/128/128/0x00000000 ... audio=16000/16/2 ... unhandled=0 unregistered=0
+```
+
+`FLEXE_I2S_BUILD_DIR` optionally preserves its Arduino build directory.
+
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
@@ -183,8 +196,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **6.64× real-time** |
-| NerdMiner v1.8.3 | **6.13× real-time** |
+| ESP32 Marauder v1.14 | **7.72× real-time** |
+| NerdMiner v1.8.3 | **6.12× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real
@@ -213,7 +226,7 @@ valid responses from both:
 
 ## status
 
-boots `hello_world`, `blink`, `tjpgd`, `real_time_stats`, `spi_lcd_touch` (lvgl!), and friends from esp-idf. runs them 2–10× faster than the real chip. doesn't model timing, caches, or multicore cache-coherence (both cores run, though).
+boots `hello_world`, `blink`, `tjpgd`, `real_time_stats`, `spi_lcd_touch` (lvgl!), and friends from esp-idf. runs them 2–10× faster than the real chip. isn't cycle-accurate and doesn't model caches or multicore cache-coherence (both cores run, though).
 
 ## license
 

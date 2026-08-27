@@ -122,9 +122,15 @@ TEST(test_queue_send_receive) {
     extern void stub_xQueueCreate(xtensa_cpu_t *, void *);
     extern void stub_xQueueSend(xtensa_cpu_t *, void *);
     extern void stub_xQueueReceive(xtensa_cpu_t *, void *);
+    extern void stub_xQueueReceiveFromISR(xtensa_cpu_t *, void *);
+    extern void stub_xQueueIsQueueFullFromISR(xtensa_cpu_t *, void *);
     rom_stubs_register_ctx(rom, create_addr, (rom_stub_fn)stub_xQueueCreate, "xQueueCreate", frt);
     rom_stubs_register_ctx(rom, send_addr, (rom_stub_fn)stub_xQueueSend, "xQueueSend", frt);
     rom_stubs_register_ctx(rom, recv_addr, (rom_stub_fn)stub_xQueueReceive, "xQueueReceive", frt);
+    rom_stubs_register_ctx(rom, 0x400D0060, stub_xQueueReceiveFromISR,
+                           "xQueueReceiveFromISR", frt);
+    rom_stubs_register_ctx(rom, 0x400D0070, stub_xQueueIsQueueFullFromISR,
+                           "xQueueIsQueueFullFromISR", frt);
 
     /* Create queue: length=4, item_size=4 */
     XT_PS_SET_CALLINC(cpu.ps, 0);
@@ -160,6 +166,53 @@ TEST(test_queue_send_receive) {
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 2), 1);  /* pdTRUE */
     ASSERT_EQ(mem_read32(cpu.mem, recv_buf), 0xDEADBEEF);
+
+    /* The I2S ISR checks fullness before replacing the oldest descriptor. */
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    cpu.pc = 0x400D0070;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+
+    mem_write32(cpu.mem, item_addr, 0x12345678u);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, item_addr);
+    ar_write(&cpu, 4, 0);
+    cpu.pc = send_addr;
+    xtensa_step(&cpu);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    cpu.pc = 0x400D0070;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0); /* capacity is four */
+    uint32_t woken = 0x3FFB2020u;
+    mem_write32(cpu.mem, woken, 0xFFFFFFFFu);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, recv_buf);
+    ar_write(&cpu, 4, woken);
+    cpu.pc = 0x400D0060;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
+    ASSERT_EQ(mem_read32(cpu.mem, recv_buf), 0x12345678u);
+    ASSERT_EQ(mem_read32(cpu.mem, woken), 0);
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        mem_write32(cpu.mem, item_addr, i);
+        ar_write(&cpu, 0, BASE + 0x100);
+        ar_write(&cpu, 2, handle);
+        ar_write(&cpu, 3, item_addr);
+        ar_write(&cpu, 4, 0);
+        cpu.pc = send_addr;
+        xtensa_step(&cpu);
+        ASSERT_EQ(ar_read(&cpu, 2), 1);
+    }
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    cpu.pc = 0x400D0070;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
 
     frt_teardown(&cpu, rom, frt);
 }

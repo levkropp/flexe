@@ -24,6 +24,12 @@ typedef int (*periph_i2c_device_fn)(void *ctx, int port, uint8_t address,
                                     size_t write_len, uint8_t *read_data,
                                     size_t read_len);
 
+/* Raw PCM bytes consumed by one classic ESP32 I2S TX DMA descriptor. The
+ * buffer is valid only for the duration of the callback. */
+typedef void (*periph_i2s_tx_fn)(void *ctx, int port, const uint8_t *data,
+                                 size_t len, uint32_t sample_rate,
+                                 uint8_t bits_per_sample, uint8_t channels);
+
 /* Compatibility-mode firmware still registers real ESP-IDF peripheral ISRs,
  * even though Flexe replaces the FreeRTOS scheduler. A source callback lets
  * the ROM-stub layer dispatch those guest handlers when a modelled interrupt
@@ -60,11 +66,21 @@ int  periph_unhandled_count(const esp32_periph_t *p);
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
                              periph_i2c_device_fn fn, void *ctx);
 
+/* Attach a TX audio sink and inject bytes for RX DMA. I2S ports 0/1 are
+ * independent; the RX FIFO accepts as many bytes as fit and zero-fills when
+ * firmware consumes faster than the host supplies. */
+int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,
+                               periph_i2s_tx_fn fn, void *ctx);
+size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
+                            const uint8_t *data, size_t len);
+size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port);
+
 /* Observe rising edges for an ESP32 peripheral source (0-70). Passing NULL
  * detaches the observer. This is separate from the hardware interrupt matrix:
  * native-FreeRTOS sessions continue to use the emulated CPU interrupt lines. */
 int periph_set_irq_dispatch(esp32_periph_t *p, int source,
                             periph_irq_dispatch_fn fn, void *ctx);
+bool periph_interrupt_pending(const esp32_periph_t *p, int source);
 
 /* Returns true once the APP_CPU has been released from reset (DPORT write) */
 bool periph_app_cpu_released(const esp32_periph_t *p);
