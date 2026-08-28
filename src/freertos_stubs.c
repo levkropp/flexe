@@ -15,6 +15,9 @@
 #define pdFALSE  0
 #define pdPASS   1
 
+#define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
+#define FLEXE_FREERTOS_HZ           1000u
+
 /* Queue storage */
 #define MAX_QUEUES       64
 #define MAX_QUEUE_ITEMS  32
@@ -79,7 +82,7 @@ struct freertos_stubs {
     /* Bump allocator */
     uint32_t bump_ptr;
 
-    /* Tick configuration: 160 MHz / 100 Hz = 1,600,000 cycles per tick */
+    /* Arduino-ESP32 / ESP-IDF production builds use a 1 kHz RTOS tick. */
     uint32_t cycles_per_tick;
     uint32_t cpu_freq_mhz;
 
@@ -111,6 +114,15 @@ struct freertos_stubs {
 };
 
 static void stub_deferred_task_trampoline(xtensa_cpu_t *cpu, void *ctx);
+
+static void frt_refresh_cpu_frequency(freertos_stubs_t *frt,
+                                      xtensa_cpu_t *cpu) {
+    uint32_t mhz = mem_read32(cpu->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    if (mhz >= 10u && mhz <= 240u && mhz != frt->cpu_freq_mhz) {
+        frt->cpu_freq_mhz = mhz;
+        frt->cycles_per_tick = mhz * (1000000u / FLEXE_FREERTOS_HZ);
+    }
+}
 
 /* ===== Calling convention helpers (same as rom_stubs.c) ===== */
 
@@ -263,6 +275,7 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
         xtensa_cpu_t *cpu = frt->cpu[core_id];
         uint64_t advance = nearest - cpu->cycle_count;
         cpu->cycle_count = nearest;
+        cpu->ccount += (uint32_t)advance;
         cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
         /* Credit the other core's currently-running task for this
          * advancement: while this core idle-waits for a wake time, the
@@ -410,6 +423,7 @@ static void sched_promote_legacy(freertos_stubs_t *frt) {
 /* vTaskDelay(ticks) — yield to scheduler or advance ccount */
 void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
+    frt_refresh_cpu_frequency(frt, cpu);
     uint32_t ticks = frt_arg(cpu, 0);
     uint64_t advance = (uint64_t)ticks * frt->cycles_per_tick;
     if (advance > 200000000ULL) advance = 200000000ULL;
@@ -430,6 +444,7 @@ void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
         /* Legacy: single-task mode */
         cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
         cpu->cycle_count += advance;
+        cpu->ccount += (uint32_t)advance;
         frt_return_void(cpu);
     }
 }
@@ -554,12 +569,15 @@ void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
     pthread_mutex_unlock(&frt->lock);
 }
 
-/* xTaskGetTickCount() -> virtual ticks (100 Hz) */
+/* xTaskGetTickCount() -> virtual ticks (1 kHz) */
 void stub_xTaskGetTickCount(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
-    /* Convert virtual_time_us to ticks: 1 tick = 10ms = 10000 us */
-    uint64_t total_us = cpu->virtual_time_us + (uint64_t)cpu->ccount / frt->cpu_freq_mhz;
-    uint32_t ticks = (uint32_t)(total_us / 10000);
+    frt_refresh_cpu_frequency(frt, cpu);
+    uint64_t cycle_us = (uint64_t)cpu->ccount / frt->cpu_freq_mhz;
+    uint64_t total_us = cpu->virtual_time_us > cycle_us ?
+                        cpu->virtual_time_us : cycle_us;
+    uint32_t ticks = (uint32_t)(total_us /
+                                (1000000u / FLEXE_FREERTOS_HZ));
     frt_return(cpu, ticks);
 }
 
@@ -671,6 +689,7 @@ void stub_xQueueSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
 /* xQueueReceive(queue, buf, timeout) -> pdTRUE/pdFALSE */
 void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
+    frt_refresh_cpu_frequency(frt, cpu);
     uint32_t handle = frt_arg(cpu, 0);
     uint32_t buf_ptr = frt_arg(cpu, 1);
     uint32_t timeout = frt_arg(cpu, 2);
@@ -712,6 +731,7 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
             uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
             if (advance > 200000000ULL) advance = 200000000ULL;
             cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
+            cpu->ccount += (uint32_t)advance;
         }
         frt_return(cpu, pdFALSE);
         return;
@@ -1189,7 +1209,7 @@ freertos_stubs_t *freertos_stubs_create(xtensa_cpu_t *cpu) {
     frt->cpu[1] = NULL;
     frt->bump_ptr = BUMP_BASE;
     frt->cpu_freq_mhz = 160;
-    frt->cycles_per_tick = 1600000;  /* 160 MHz / 100 Hz */
+    frt->cycles_per_tick = 160000;  /* 160 MHz / 1 kHz */
     frt->current_task[0] = -1;
     frt->current_task[1] = -1;
     pthread_mutex_init(&frt->lock, NULL);

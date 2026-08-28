@@ -30,6 +30,16 @@ typedef void (*periph_i2s_tx_fn)(void *ctx, int port, const uint8_t *data,
                                  size_t len, uint32_t sample_rate,
                                  uint8_t bits_per_sample, uint8_t channels);
 
+/* One completed portion of an ESP32 RMT transmission. Long writes can arrive
+ * in multiple chunks as the genuine driver refills the peripheral's shared
+ * RAM at threshold interrupts. `items` is valid only during the callback;
+ * tick_hz describes the duration fields and carrier_hz is zero when carrier
+ * modulation is disabled. */
+typedef void (*periph_rmt_tx_fn)(void *ctx, int channel,
+                                 const uint32_t *items, size_t count,
+                                 uint32_t tick_hz, uint32_t carrier_hz,
+                                 bool finished);
+
 /* Compatibility-mode firmware still registers real ESP-IDF peripheral ISRs,
  * even though Flexe replaces the FreeRTOS scheduler. A source callback lets
  * the ROM-stub layer dispatch those guest handlers when a modelled interrupt
@@ -74,6 +84,15 @@ int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,
 size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
                             const uint8_t *data, size_t len);
 size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port);
+
+/* Attach a host pulse sink to one of the eight classic ESP32 RMT channels.
+ * RX injection accepts already-decoded RMT items after firmware has enabled
+ * the channel, writes them through the hardware RAM/interrupt path, and
+ * returns the number accepted by the configured memory blocks. */
+int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
+                               periph_rmt_tx_fn fn, void *ctx);
+size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel,
+                            const uint32_t *items, size_t count);
 
 /* Observe rising edges for an ESP32 peripheral source (0-70). Passing NULL
  * detaches the observer. This is separate from the hardware interrupt matrix:

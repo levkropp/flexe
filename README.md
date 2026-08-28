@@ -36,7 +36,9 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - esp32 memory map (sram, rom, flash, rtc, psram, peripheral i/o)
 - hardware flash MMU: complete 64 KiB DROM0/IRAM0/IRAM1/IROM0 mappings,
   dual-core table invalidation, flash programming coherence, and translated-code invalidation
-- mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog, timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA, ledc, ADC1/2, DAC1/2
+- mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
+  timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA,
+  eight-channel classic RMT, ledc, ADC1/2, DAC1/2
 - raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
 - host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
@@ -47,7 +49,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 582 tests
+- 590 tests
 
 ## building
 
@@ -136,7 +138,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 582 tests, 1854 passed, 0 failed
+# 590 tests, 1935 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -183,6 +185,21 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-i2s-dma.sh
 
 `FLEXE_I2S_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The RMT gate builds an unmodified sketch against ESP-IDF's public
+`driver/rmt.h` API. It sends 96 exact pulse items through a one-block,
+64-word channel, forcing the production ISR to refill both 32-word halves.
+The gate validates pulse timing, DPORT module reset, TX threshold/end
+interrupts, the host pulse boundary, and zero unhandled MMIO or unregistered
+ROM calls under both the JIT and interpreter:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-rmt-tx.sh
+# engine=jit stage=0x524D54A0 ... chunks=4 items=96 pattern=1 ... unhandled=0 unregistered=0
+# engine=interp stage=0x524D54A0 ... chunks=4 items=96 pattern=1 ... unhandled=0 unregistered=0
+```
+
+`FLEXE_RMT_BUILD_DIR` optionally preserves its Arduino build directory.
+
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
@@ -202,8 +219,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **7.68× real-time** |
-| NerdMiner v1.8.3 | **6.14× real-time** |
+| ESP32 Marauder v1.14 | **7.92× real-time** |
+| NerdMiner v1.8.3 | **6.31× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

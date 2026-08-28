@@ -642,6 +642,45 @@ TEST(test_jit_xtensa_run_counts_guest_instructions) {
     teardown(&cpu);
 }
 
+static int jit_time_jump_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
+    (void)ctx;
+    if (pc != 0x40001000u) return 0;
+    cpu->ccount += 240000000u; /* delay(1000) at the ESP32's 240 MHz. */
+    cpu->pc = BASE;
+    return 1;
+}
+
+TEST(test_jit_run_does_not_count_delay_ccount_as_instructions) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    for (unsigned i = 0; i < 4; i++)
+        put_insn2(&cpu, BASE + i * 2u, narrow(0xD, 15, 0, 3));
+
+    cpu.pc = 0x40001000u;
+    cpu.running = true;
+    cpu._pc_written = true;
+    cpu.pc_hook = jit_time_jump_hook;
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    /* This synthetic hook has no ROM-stub bitmap entry.  Probe every control
+     * transfer for the test, as a symbol-registered production stub would be
+     * present in the merged bitmap. */
+    cpu.pc_hook_bitmap = NULL;
+
+    uint32_t ccount_before = cpu.ccount;
+    uint64_t cycles_before = cpu.cycle_count;
+    int ran = jit_run(jit, &cpu, 4);
+    ASSERT_EQ(ran, 4);
+    ASSERT_EQ(cpu.ccount - ccount_before, 240000004u);
+    ASSERT_EQ64(cpu.cycle_count - cycles_before, 4u);
+    ASSERT_EQ64(jit_get_stats(jit)->insns_interp, 4u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_rsr_wsr_sar) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -787,6 +826,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);
+    RUN_TEST(test_jit_run_does_not_count_delay_ccount_as_instructions);
     RUN_TEST(test_jit_nop);
     RUN_TEST(test_jit_movi);
     RUN_TEST(test_jit_add);

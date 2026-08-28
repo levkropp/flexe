@@ -2768,15 +2768,13 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
  * and compilation work in mostly-cold production firmware. */
 __attribute__((hot))
 int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
-    uint32_t ccount_start = cpu->ccount;
+    int executed = 0;
     uint64_t jit_insns_before = jit->stats.insns_jitted;
 
     while (__builtin_expect(cpu->running, 1) &&
-           __builtin_expect(!cpu->breakpoint_hit, 1)) {
-
-        int32_t done = (int32_t)(cpu->ccount - ccount_start);
-        if (done >= max_cycles) break;
-        int remaining = max_cycles - done;
+           __builtin_expect(!cpu->breakpoint_hit, 1) &&
+           executed < max_cycles) {
+        int remaining = max_cycles - executed;
 
         if (__builtin_expect(cpu->halted, 0)) {
             /* xtensa_step_impl already advances halted time and checks the
@@ -2785,12 +2783,16 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
              * calls per frontend batch, more than doubling NerdMiner's wall
              * time. Let the tight runner consume the remaining batch; if an
              * interrupt wakes the core it naturally resumes guest code. */
-            xtensa_run(cpu, remaining);
+            int ran = xtensa_run(cpu, remaining);
+            if (ran <= 0) break;
+            executed += ran;
             continue;
         }
 
         int batch = remaining;
         int ran = xtensa_run(cpu, batch);
+        if (ran > 0)
+            executed += ran;
 
         /* Hot-counting: check if current PC is a JIT candidate.
          * Triggers compilation for frequently-visited firmware PCs.
@@ -2803,20 +2805,18 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
 
         if (__builtin_expect(ran < batch, 0)) {
             if (!cpu->running || cpu->halted || cpu->breakpoint_hit) break;
+            if (ran <= 0) break;
         }
     }
 
-    uint32_t total_done = cpu->ccount - ccount_start;
-    /* Derive interp insns: total ccount advance minus JIT insns added by hook.
-     * Each hook execution: interpreter counts 1 step, hook adds block_insns-1
-     * to ccount. So ccount_delta = interp_steps + sum(block_insns_i - 1).
-     * And insns_jitted = sum(block_insns_i). Therefore:
-     * interp_steps = ccount_delta - (insns_jitted_delta - blocks_executed_delta) */
+    /* CCOUNT is hardware time, not an instruction-retirement counter: delay
+     * and scheduler stubs legitimately fast-forward it by millions of ticks.
+     * xtensa_run() already reports exact guest work, including native blocks,
+     * so use that value for batching and statistics. */
     uint64_t jit_insns_delta = jit->stats.insns_jitted - jit_insns_before;
-    if (total_done > jit_insns_delta) {
-        jit->stats.insns_interp += (uint64_t)total_done - jit_insns_delta;
-    }
-    return (int)total_done;
+    if ((uint64_t)executed > jit_insns_delta)
+        jit->stats.insns_interp += (uint64_t)executed - jit_insns_delta;
+    return executed;
 }
 
 const jit_stats_t *jit_get_stats(const jit_state_t *jit) {

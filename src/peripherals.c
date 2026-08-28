@@ -17,6 +17,7 @@
 #define SPI0_BASE       0x3FF43000u
 #define I2C0_BASE       0x3FF53000u
 #define I2C1_BASE       0x3FF67000u
+#define RMT_BASE        0x3FF56000u
 #define GPIO_BASE       0x3FF44000u
 #define FE2_BASE        0x3FF45000u
 #define FE_BASE         0x3FF46000u
@@ -175,6 +176,48 @@
 #define I2S_DESC_EOF              (1u << 30)
 #define I2S_DESC_OWNER            (1u << 31)
 
+/* Classic ESP32 RMT controller: eight channels share 512 32-bit pulse words.
+ * Register and RAM apertures occupy one 4 KiB peripheral page. */
+#define RMT_CHANNEL_COUNT          8u
+#define RMT_MEM_WORDS_PER_CHANNEL  64u
+#define RMT_MEM_WORD_COUNT         512u
+#define RMT_MEM_OFF                0x800u
+#define RMT_CONF0_OFF              0x020u
+#define RMT_CONF1_OFF              0x024u
+#define RMT_STATUS_OFF             0x060u
+#define RMT_ADDR_OFF               0x080u
+#define RMT_INT_RAW_OFF            0x0A0u
+#define RMT_INT_ST_OFF             0x0A4u
+#define RMT_INT_ENA_OFF            0x0A8u
+#define RMT_INT_CLR_OFF            0x0ACu
+#define RMT_CARRIER_DUTY_OFF       0x0B0u
+#define RMT_TX_LIMIT_OFF           0x0D0u
+#define RMT_APB_CONF_OFF           0x0F0u
+#define RMT_DATE_OFF               0x0FCu
+
+#define RMT_CONF1_TX_START         (1u << 0)
+#define RMT_CONF1_RX_EN            (1u << 1)
+#define RMT_CONF1_MEM_WR_RST       (1u << 2)
+#define RMT_CONF1_MEM_RD_RST       (1u << 3)
+#define RMT_CONF1_APB_MEM_RST      (1u << 4)
+#define RMT_CONF1_MEM_OWNER_RX     (1u << 5)
+#define RMT_CONF1_TX_CONTINUOUS    (1u << 6)
+#define RMT_CONF1_REF_APB          (1u << 17)
+#define RMT_APB_FIFO_MASK          (1u << 0)
+#define RMT_APB_TX_WRAP            (1u << 1)
+#define RMT_STATUS_MEM_EMPTY       (1u << 29)
+#define RMT_STATUS_MEM_FULL        (1u << 28)
+#define RMT_STATUS_MEM_OWNER_ERR   (1u << 27)
+#define RMT_STATUS_STATE_TX        (1u << 24)
+#define RMT_STATUS_STATE_RX        (3u << 24)
+#define RMT_INTR_SOURCE            47
+
+#define RMT_TX_END_INT(ch)         (1u << ((ch) * 3u))
+#define RMT_RX_END_INT(ch)         (1u << ((ch) * 3u + 1u))
+#define RMT_ERROR_INT(ch)          (1u << ((ch) * 3u + 2u))
+#define RMT_TX_THRESHOLD_INT(ch)   (1u << ((ch) + 24u))
+#define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
+
 /* UART interrupt sources/register bits used by the ESP-IDF driver. */
 #define UART_RXFIFO_FULL_INT     (1u << 0)
 #define UART_TXFIFO_EMPTY_INT    (1u << 1)
@@ -195,6 +238,9 @@ static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void rmt_reset_state(esp32_periph_t *p);
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -349,6 +395,49 @@ typedef struct {
     void *tx_cb_ctx;
 } i2s_state_t;
 
+typedef enum {
+    RMT_TX_EVENT_NONE = 0,
+    RMT_TX_EVENT_THRESHOLD,
+    RMT_TX_EVENT_END,
+    RMT_TX_EVENT_LOOP,
+    RMT_TX_EVENT_ERROR,
+} rmt_tx_event_kind_t;
+
+typedef struct {
+    uint32_t conf0;
+    uint32_t conf1;
+    uint32_t status_flags;
+    uint16_t apb_index;
+    uint16_t tx_index;
+    uint16_t rx_index;
+    uint16_t tx_since_threshold;
+
+    bool tx_active;
+    bool rx_active;
+    bool tx_event_armed;
+    uint32_t next_tx_ccount;
+
+    rmt_tx_event_kind_t pending_kind;
+    uint16_t pending_next_index;
+    uint16_t pending_next_threshold;
+    size_t pending_count;
+    uint32_t pending_items[RMT_MEM_WORD_COUNT];
+
+    periph_rmt_tx_fn tx_cb;
+    void *tx_cb_ctx;
+} rmt_channel_state_t;
+
+typedef struct {
+    rmt_channel_state_t channel[RMT_CHANNEL_COUNT];
+    uint32_t memory[RMT_MEM_WORD_COUNT];
+    uint32_t int_raw;
+    uint32_t int_ena;
+    uint32_t carrier_duty[RMT_CHANNEL_COUNT];
+    uint32_t tx_limit[RMT_CHANNEL_COUNT];
+    uint32_t apb_conf;
+    uint32_t date;
+} rmt_state_t;
+
 struct esp32_periph {
     xtensa_mem_t *mem;
 
@@ -378,6 +467,11 @@ struct esp32_periph {
 
     /* APP_CPU reset state for DPORT */
     bool app_cpu_in_reset;   /* true = core 1 held in reset */
+
+    /* DPORT peripheral clock/reset register shadows.  Individual modeled
+     * peripherals apply their reset semantics when their bit is asserted. */
+    uint32_t dport_perip_clk_en;
+    uint32_t dport_perip_rst_en;
 
     /* Interrupt matrix: maps each CPU interrupt line to a peripheral source.
      * intr_matrix[core][cpu_int] = peripheral source (0-70), 16 = disabled.
@@ -430,6 +524,9 @@ struct esp32_periph {
 
     /* Two independent classic ESP32 I2S controllers with circular DMA. */
     i2s_state_t i2s[I2S_PORT_COUNT];
+
+    /* Eight-channel classic ESP32 remote-control/pulse engine. */
+    rmt_state_t rmt;
 
     /* Flash cache MMU table shadows (DPORT_PRO/APP_FLASH_MMU_TABLE).
      * Entries 0-63 are DROM0; 64-127, 128-191, and 192-255 are the
@@ -484,6 +581,9 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_CPU_INTR_FROM_CPU_1_OFF 0x0E0
 #define DPORT_CPU_INTR_FROM_CPU_2_OFF 0x0E4
 #define DPORT_CPU_INTR_FROM_CPU_3_OFF 0x0E8
+#define DPORT_PERIP_CLK_EN_OFF         0x0C0
+#define DPORT_PERIP_RST_EN_OFF         0x0C4
+#define DPORT_RMT_MODULE_BIT           (1u << 9)
 
 /* Internal: scan matrix and set/clear CPU interrupt bits for a source */
 static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert) {
@@ -631,6 +731,8 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
     case 0x018: return p->app_cpu_in_reset ? 1 : 0; /* APPCPU_CTRL_D: reset state */
     case 0x02C: return p->app_cpu_in_reset ? 0 : 1; /* APPCPU_CTRL_A: clock gate */
     case 0x030: return p->app_cpu_in_reset ? 0 : 1; /* APPCPU_CTRL_B: clock enable */
+    case DPORT_PERIP_CLK_EN_OFF: return p->dport_perip_clk_en;
+    case DPORT_PERIP_RST_EN_OFF: return p->dport_perip_rst_en;
     case 0x0D4: return p->bt_lpck[0];   /* DPORT_BT_LPCK_DIV_INT */
     case 0x0D8: return p->bt_lpck[1];   /* DPORT_BT_LPCK_DIV_FRAC */
     case 0x040: return 0x0A;        /* PRO_CACHE_CTRL: cache enabled */
@@ -680,6 +782,14 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     }
     switch (off) {
+    case DPORT_PERIP_CLK_EN_OFF:
+        p->dport_perip_clk_en = val;
+        break;
+    case DPORT_PERIP_RST_EN_OFF:
+        p->dport_perip_rst_en = val;
+        if (val & DPORT_RMT_MODULE_BIT)
+            rmt_reset_state(p);
+        break;
     case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
     case 0x0D8: p->bt_lpck[1] = val; break;  /* DPORT_BT_LPCK_DIV_FRAC */
     case 0x02C: /* APPCPU_CTRL_A: writing 1 releases APP_CPU from reset */
@@ -1284,21 +1394,32 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 /* CPU hooks (registered on both cores, wired into next_timer_event). */
 static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
-    uint32_t best = lact_next_fire(p, cpu);
-    uint32_t audio = i2s_next_fire(p, cpu);
-    if (audio == UINT32_MAX) return best;
-    if (best == UINT32_MAX) return audio;
-    uint32_t best_distance = best - cpu->ccount;
-    uint32_t audio_distance = audio - cpu->ccount;
-    if ((int32_t)best_distance < 0) best_distance = 0;
-    if ((int32_t)audio_distance < 0) audio_distance = 0;
-    return audio_distance < best_distance ? audio : best;
+    uint32_t events[] = {
+        lact_next_fire(p, cpu),
+        i2s_next_fire(p, cpu),
+        rmt_next_fire(p, cpu),
+    };
+    bool have = false;
+    uint32_t best = UINT32_MAX;
+    uint32_t best_distance = 0;
+    for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); i++) {
+        if (events[i] == UINT32_MAX) continue;
+        uint32_t distance = events[i] - cpu->ccount;
+        if ((int32_t)distance < 0) distance = 0;
+        if (!have || distance < best_distance) {
+            have = true;
+            best = events[i];
+            best_distance = distance;
+        }
+    }
+    return have ? best : UINT32_MAX;
 }
 static void periph_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
     for (int group = 0; group < 2; group++)
         lact_eval_irq(p, group);
     i2s_eval_events(p, cpu);
+    rmt_eval_events(p, cpu);
 }
 
 /* Recompute both cores' next_timer_event after LACT state changes. */
@@ -2144,6 +2265,433 @@ static void i2c_write(void *ctx, uint32_t addr, uint32_t val) {
     }
 }
 
+/* ---- RMT remote-control / pulse engine ---- */
+
+static size_t rmt_channel_capacity(const rmt_state_t *rmt, unsigned channel) {
+    if (channel >= RMT_CHANNEL_COUNT) return 0;
+    uint32_t blocks = (rmt->channel[channel].conf0 >> 24) & 0xFu;
+    uint32_t available = RMT_CHANNEL_COUNT - channel;
+    if (blocks > available) blocks = available;
+    return (size_t)blocks * RMT_MEM_WORDS_PER_CHANNEL;
+}
+
+static uint32_t rmt_channel_tick_hz(const rmt_channel_state_t *channel) {
+    uint32_t divider = channel->conf0 & 0xFFu;
+    if (divider == 0) divider = 256u;
+    uint32_t source_hz =
+        channel->conf1 & RMT_CONF1_REF_APB ? 80000000u : 1000000u;
+    uint32_t tick_hz = source_hz / divider;
+    return tick_hz ? tick_hz : 1u;
+}
+
+static uint32_t rmt_channel_carrier_hz(const rmt_state_t *rmt,
+                                       unsigned channel) {
+    const rmt_channel_state_t *state = &rmt->channel[channel];
+    if (!(state->conf0 & (1u << 28))) return 0;
+    uint32_t duty = rmt->carrier_duty[channel];
+    uint32_t low = duty & 0xFFFFu;
+    uint32_t high = duty >> 16;
+    if (low == 0) low = 65536u;
+    if (high == 0) high = 65536u;
+    return 80000000u / (low + high);
+}
+
+static uint32_t rmt_item_cycles(const esp32_periph_t *p,
+                                const rmt_channel_state_t *channel,
+                                uint32_t item) {
+    uint32_t duration0 = item & 0x7FFFu;
+    uint32_t duration1 = (item >> 16) & 0x7FFFu;
+    uint32_t divider = channel->conf0 & 0xFFu;
+    if (divider == 0) divider = 256u;
+    uint32_t cpu_mhz = mem_read32(p->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    if (cpu_mhz < 10u || cpu_mhz > 240u) cpu_mhz = 240u;
+    uint32_t source_mhz =
+        channel->conf1 & RMT_CONF1_REF_APB ? 80u : 1u;
+    uint64_t numerator = (uint64_t)(duration0 + duration1) * divider *
+                         cpu_mhz;
+    uint64_t cycles = (numerator + source_mhz - 1u) / source_mhz;
+    return cycles > UINT32_MAX ? UINT32_MAX : (uint32_t)cycles;
+}
+
+static void rmt_irq_update(esp32_periph_t *p) {
+    if (p->rmt.int_raw & p->rmt.int_ena)
+        periph_assert_interrupt(p, RMT_INTR_SOURCE);
+    else
+        periph_deassert_interrupt(p, RMT_INTR_SOURCE);
+}
+
+static void rmt_kick(esp32_periph_t *p) {
+    for (int core = 0; core < 2; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void rmt_tx_cancel(rmt_channel_state_t *channel) {
+    channel->tx_active = false;
+    channel->tx_event_armed = false;
+    channel->pending_kind = RMT_TX_EVENT_NONE;
+    channel->pending_count = 0;
+    channel->conf1 &= ~RMT_CONF1_TX_START;
+}
+
+/* Snapshot the next immutable portion of the active memory ring. Threshold
+ * delivery happens before the following portion is sampled, so the genuine
+ * driver can safely refill the half which hardware has just consumed. */
+static void rmt_plan_tx_segment_at(esp32_periph_t *p, unsigned channel_index,
+                                   uint32_t start_ccount) {
+    rmt_state_t *rmt = &p->rmt;
+    rmt_channel_state_t *channel = &rmt->channel[channel_index];
+    if (!channel->tx_active || channel->tx_event_armed) return;
+
+    size_t capacity = rmt_channel_capacity(rmt, channel_index);
+    if (capacity == 0) {
+        channel->pending_kind = RMT_TX_EVENT_ERROR;
+        channel->pending_count = 0;
+        channel->pending_next_index = 0;
+        channel->pending_next_threshold = 0;
+        channel->next_tx_ccount = start_ccount + 1u;
+        channel->tx_event_armed = true;
+        return;
+    }
+
+    size_t base = channel_index * RMT_MEM_WORDS_PER_CHANNEL;
+    size_t index = channel->tx_index % capacity;
+    uint32_t since_threshold = channel->tx_since_threshold;
+    uint32_t threshold = rmt->tx_limit[channel_index] & 0x1FFu;
+    bool wrap = (rmt->apb_conf & RMT_APB_TX_WRAP) != 0;
+    bool continuous = (channel->conf1 & RMT_CONF1_TX_CONTINUOUS) != 0;
+    size_t scan_limit = threshold ?
+        (since_threshold < threshold ? threshold - since_threshold : 1u) :
+        capacity;
+    if (scan_limit == 0 || scan_limit > RMT_MEM_WORD_COUNT)
+        scan_limit = RMT_MEM_WORD_COUNT;
+
+    channel->pending_count = 0;
+    channel->pending_kind = RMT_TX_EVENT_NONE;
+    uint64_t cycles = 0;
+
+    for (size_t scanned = 0; scanned < scan_limit; scanned++) {
+        uint32_t item = rmt->memory[(base + index) % RMT_MEM_WORD_COUNT];
+        uint32_t duration0 = item & 0x7FFFu;
+        uint32_t duration1 = (item >> 16) & 0x7FFFu;
+
+        if (duration0 == 0) {
+            channel->pending_kind = continuous ? RMT_TX_EVENT_LOOP :
+                                                  RMT_TX_EVENT_END;
+            break;
+        }
+
+        channel->pending_items[channel->pending_count++] = item;
+        cycles += rmt_item_cycles(p, channel, item);
+        index++;
+        since_threshold++;
+
+        if (index >= capacity) {
+            if (wrap || continuous)
+                index = 0;
+            else if (duration1 != 0) {
+                channel->pending_kind = RMT_TX_EVENT_ERROR;
+                break;
+            }
+        }
+
+        if (duration1 == 0) {
+            channel->pending_kind = continuous ? RMT_TX_EVENT_LOOP :
+                                                  RMT_TX_EVENT_END;
+            break;
+        }
+        if (threshold && since_threshold >= threshold) {
+            since_threshold = 0;
+            channel->pending_kind = RMT_TX_EVENT_THRESHOLD;
+            break;
+        }
+    }
+
+    if (channel->pending_kind == RMT_TX_EVENT_NONE)
+        channel->pending_kind = RMT_TX_EVENT_ERROR;
+    if (channel->pending_kind == RMT_TX_EVENT_LOOP)
+        index = 0;
+
+    channel->pending_next_index = (uint16_t)index;
+    channel->pending_next_threshold = (uint16_t)since_threshold;
+    if (cycles == 0) cycles = 1;
+    if (cycles > INT32_MAX) cycles = INT32_MAX;
+    channel->next_tx_ccount = start_ccount + (uint32_t)cycles;
+    channel->tx_event_armed = true;
+}
+
+static void rmt_plan_tx_segment(esp32_periph_t *p, unsigned channel_index) {
+    uint32_t now = p->cpu[0] ? p->cpu[0]->ccount : 0;
+    rmt_plan_tx_segment_at(p, channel_index, now);
+}
+
+static void rmt_reset_state(esp32_periph_t *p) {
+    periph_rmt_tx_fn callbacks[RMT_CHANNEL_COUNT];
+    void *callback_contexts[RMT_CHANNEL_COUNT];
+    for (unsigned channel = 0; channel < RMT_CHANNEL_COUNT; channel++) {
+        callbacks[channel] = p->rmt.channel[channel].tx_cb;
+        callback_contexts[channel] = p->rmt.channel[channel].tx_cb_ctx;
+    }
+
+    memset(&p->rmt, 0, sizeof(p->rmt));
+    for (unsigned channel = 0; channel < RMT_CHANNEL_COUNT; channel++) {
+        /* Production ESP-IDF configures TX without clearing MEM_OWNER, so
+         * transmitter ownership is the observable silicon reset state. */
+        p->rmt.channel[channel].conf0 = 0x31100002u;
+        p->rmt.channel[channel].conf1 = 0x00000F00u;
+        p->rmt.channel[channel].tx_cb = callbacks[channel];
+        p->rmt.channel[channel].tx_cb_ctx = callback_contexts[channel];
+    }
+    p->rmt.date = 0x16022600u;
+    rmt_irq_update(p);
+    rmt_kick(p);
+}
+
+static uint32_t rmt_status_word(const esp32_periph_t *p, unsigned index) {
+    const rmt_channel_state_t *channel = &p->rmt.channel[index];
+    uint32_t base = index * RMT_MEM_WORDS_PER_CHANNEL;
+    uint32_t status = channel->status_flags;
+    if (channel->tx_active)
+        status |= RMT_STATUS_STATE_TX;
+    else if (channel->rx_active)
+        status |= RMT_STATUS_STATE_RX;
+    status |= ((base + channel->tx_index) & 0x3FFu) << 12;
+    status |= (base + channel->rx_index) & 0x3FFu;
+    return status;
+}
+
+static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    bool have = false;
+    uint32_t best = UINT32_MAX;
+    uint32_t best_distance = 0;
+    for (unsigned index = 0; index < RMT_CHANNEL_COUNT; index++) {
+        rmt_channel_state_t *channel = &p->rmt.channel[index];
+        if (!channel->tx_event_armed) continue;
+        uint32_t distance = channel->next_tx_ccount - cpu->ccount;
+        if ((int32_t)distance < 0) distance = 0;
+        if (!have || distance < best_distance) {
+            have = true;
+            best = channel->next_tx_ccount;
+            best_distance = distance;
+        }
+    }
+    return have ? best : UINT32_MAX;
+}
+
+static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return;
+    for (unsigned index = 0; index < RMT_CHANNEL_COUNT; index++) {
+        rmt_channel_state_t *channel = &p->rmt.channel[index];
+        /* A wait stub may advance CCOUNT across several RMT deadlines in one
+         * dispatch. Drain finite transfers completely, while bounding a
+         * continuously looping channel so it cannot monopolize the CPU. */
+        unsigned drained = 0;
+        while (channel->tx_event_armed &&
+               (int32_t)(cpu->ccount - channel->next_tx_ccount) >= 0 &&
+               drained++ < 4096u) {
+            uint32_t event_ccount = channel->next_tx_ccount;
+
+            channel->tx_event_armed = false;
+            channel->tx_index = channel->pending_next_index;
+            channel->tx_since_threshold = channel->pending_next_threshold;
+            rmt_tx_event_kind_t kind = channel->pending_kind;
+            channel->pending_kind = RMT_TX_EVENT_NONE;
+
+            if (channel->tx_cb &&
+                (channel->pending_count != 0 || kind == RMT_TX_EVENT_END ||
+                 kind == RMT_TX_EVENT_ERROR)) {
+                channel->tx_cb(channel->tx_cb_ctx, (int)index,
+                               channel->pending_items,
+                               channel->pending_count,
+                               rmt_channel_tick_hz(channel),
+                               rmt_channel_carrier_hz(&p->rmt, index),
+                               kind == RMT_TX_EVENT_END ||
+                                   kind == RMT_TX_EVENT_ERROR);
+            }
+            channel->pending_count = 0;
+
+            switch (kind) {
+            case RMT_TX_EVENT_THRESHOLD:
+                p->rmt.int_raw |= RMT_TX_THRESHOLD_INT(index);
+                /* The compatibility dispatcher runs the refill ISR inline. */
+                rmt_irq_update(p);
+                if (channel->tx_active)
+                    rmt_plan_tx_segment_at(p, index, event_ccount);
+                break;
+            case RMT_TX_EVENT_END:
+                rmt_tx_cancel(channel);
+                p->rmt.int_raw |= RMT_TX_END_INT(index);
+                rmt_irq_update(p);
+                break;
+            case RMT_TX_EVENT_LOOP:
+                channel->tx_index = 0;
+                if (channel->tx_active)
+                    rmt_plan_tx_segment_at(p, index, event_ccount);
+                break;
+            case RMT_TX_EVENT_ERROR:
+                channel->status_flags |= RMT_STATUS_MEM_EMPTY;
+                rmt_tx_cancel(channel);
+                p->rmt.int_raw |= RMT_ERROR_INT(index);
+                rmt_irq_update(p);
+                break;
+            case RMT_TX_EVENT_NONE:
+            default:
+                break;
+            }
+        }
+    }
+    rmt_kick(p);
+}
+
+static uint32_t rmt_fifo_read(rmt_state_t *rmt, unsigned index) {
+    rmt_channel_state_t *channel = &rmt->channel[index];
+    size_t capacity = rmt_channel_capacity(rmt, index);
+    if (capacity == 0 || channel->apb_index >= capacity) {
+        channel->status_flags |= 1u << 31; /* APB_MEM_RD_ERR */
+        return 0;
+    }
+    size_t word = index * RMT_MEM_WORDS_PER_CHANNEL + channel->apb_index++;
+    return rmt->memory[word];
+}
+
+static void rmt_fifo_write(rmt_state_t *rmt, unsigned index, uint32_t value) {
+    rmt_channel_state_t *channel = &rmt->channel[index];
+    size_t capacity = rmt_channel_capacity(rmt, index);
+    if (capacity == 0 || channel->apb_index >= capacity) {
+        channel->status_flags |= 1u << 30; /* APB_MEM_WR_ERR */
+        return;
+    }
+    size_t word = index * RMT_MEM_WORDS_PER_CHANNEL + channel->apb_index++;
+    rmt->memory[word] = value;
+}
+
+static uint32_t rmt_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    rmt_state_t *rmt = &p->rmt;
+    uint32_t off = addr - RMT_BASE;
+    if ((off & 3u) != 0 || off >= PAGE_SIZE)
+        return default_read(ctx, addr);
+
+    if (off >= RMT_MEM_OFF)
+        return rmt->memory[(off - RMT_MEM_OFF) / 4u];
+    if (off < RMT_CONF0_OFF)
+        return rmt_fifo_read(rmt, off / 4u);
+    if (off >= RMT_CONF0_OFF && off < RMT_STATUS_OFF) {
+        unsigned index = (off - RMT_CONF0_OFF) / 8u;
+        return ((off - RMT_CONF0_OFF) & 4u) ?
+            rmt->channel[index].conf1 : rmt->channel[index].conf0;
+    }
+    if (off >= RMT_STATUS_OFF && off < RMT_ADDR_OFF)
+        return rmt_status_word(p, (off - RMT_STATUS_OFF) / 4u);
+    if (off >= RMT_ADDR_OFF && off < RMT_INT_RAW_OFF)
+        return rmt->channel[(off - RMT_ADDR_OFF) / 4u].apb_index;
+    if (off == RMT_INT_RAW_OFF) return rmt->int_raw;
+    if (off == RMT_INT_ST_OFF) return rmt->int_raw & rmt->int_ena;
+    if (off == RMT_INT_ENA_OFF) return rmt->int_ena;
+    if (off == RMT_INT_CLR_OFF) return 0;
+    if (off >= RMT_CARRIER_DUTY_OFF && off < RMT_TX_LIMIT_OFF)
+        return rmt->carrier_duty[(off - RMT_CARRIER_DUTY_OFF) / 4u];
+    if (off >= RMT_TX_LIMIT_OFF && off < RMT_APB_CONF_OFF)
+        return rmt->tx_limit[(off - RMT_TX_LIMIT_OFF) / 4u];
+    if (off == RMT_APB_CONF_OFF) return rmt->apb_conf;
+    if (off == RMT_DATE_OFF) return rmt->date;
+    return 0;
+}
+
+static void rmt_write_conf1(esp32_periph_t *p, unsigned index,
+                            uint32_t value) {
+    rmt_channel_state_t *channel = &p->rmt.channel[index];
+    uint32_t old = channel->conf1;
+    channel->conf1 = value;
+
+    if (value & RMT_CONF1_MEM_WR_RST) {
+        channel->rx_index = 0;
+        channel->status_flags &= ~RMT_STATUS_MEM_FULL;
+    }
+    if (value & RMT_CONF1_MEM_RD_RST) {
+        channel->tx_index = 0;
+        channel->tx_since_threshold = 0;
+        channel->status_flags &= ~RMT_STATUS_MEM_EMPTY;
+    }
+    if (value & RMT_CONF1_APB_MEM_RST) {
+        channel->apb_index = 0;
+        channel->status_flags &= ~((1u << 31) | (1u << 30));
+    }
+
+    channel->rx_active = (value & RMT_CONF1_RX_EN) != 0;
+    if (!(value & RMT_CONF1_TX_START) && (old & RMT_CONF1_TX_START))
+        rmt_tx_cancel(channel);
+    if ((value & RMT_CONF1_TX_START) && !(old & RMT_CONF1_TX_START)) {
+        if (value & RMT_CONF1_MEM_OWNER_RX) {
+            channel->status_flags |= RMT_STATUS_MEM_OWNER_ERR;
+            channel->conf1 &= ~RMT_CONF1_TX_START;
+            p->rmt.int_raw |= RMT_ERROR_INT(index);
+            rmt_irq_update(p);
+        } else {
+            channel->status_flags &= ~(RMT_STATUS_MEM_EMPTY |
+                                       RMT_STATUS_MEM_OWNER_ERR);
+            channel->tx_active = true;
+            rmt_plan_tx_segment(p, index);
+        }
+    }
+    rmt_kick(p);
+}
+
+static void rmt_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    rmt_state_t *rmt = &p->rmt;
+    uint32_t off = addr - RMT_BASE;
+    if ((off & 3u) != 0 || off >= PAGE_SIZE) {
+        default_write(ctx, addr, value);
+        return;
+    }
+
+    if (off >= RMT_MEM_OFF) {
+        rmt->memory[(off - RMT_MEM_OFF) / 4u] = value;
+        return;
+    }
+    if (off < RMT_CONF0_OFF) {
+        rmt_fifo_write(rmt, off / 4u, value);
+        return;
+    }
+    if (off >= RMT_CONF0_OFF && off < RMT_STATUS_OFF) {
+        unsigned index = (off - RMT_CONF0_OFF) / 8u;
+        if ((off - RMT_CONF0_OFF) & 4u)
+            rmt_write_conf1(p, index, value);
+        else
+            rmt->channel[index].conf0 = value;
+        return;
+    }
+    if (off >= RMT_STATUS_OFF && off < RMT_INT_RAW_OFF)
+        return; /* STATUS/ADDR are read-only. */
+    if (off == RMT_INT_RAW_OFF || off == RMT_INT_ST_OFF)
+        return;
+    if (off == RMT_INT_ENA_OFF) {
+        rmt->int_ena = value;
+        rmt_irq_update(p);
+        return;
+    }
+    if (off == RMT_INT_CLR_OFF) {
+        rmt->int_raw &= ~value;
+        rmt_irq_update(p);
+        return;
+    }
+    if (off >= RMT_CARRIER_DUTY_OFF && off < RMT_TX_LIMIT_OFF) {
+        rmt->carrier_duty[(off - RMT_CARRIER_DUTY_OFF) / 4u] = value;
+        return;
+    }
+    if (off >= RMT_TX_LIMIT_OFF && off < RMT_APB_CONF_OFF) {
+        rmt->tx_limit[(off - RMT_TX_LIMIT_OFF) / 4u] = value & 0x1FFu;
+        return;
+    }
+    if (off == RMT_APB_CONF_OFF) {
+        rmt->apb_conf = value & (RMT_APB_FIFO_MASK | RMT_APB_TX_WRAP);
+        return;
+    }
+    if (off == RMT_DATE_OFF)
+        rmt->date = value;
+}
+
 /* ---- LEDC PWM controller ---- */
 
 static void ledc_update_irq(esp32_periph_t *p) {
@@ -2763,6 +3311,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         i2s->regs[I2S_DATE_OFF / 4u] = 0x01604201u;
     }
 
+    rmt_reset_state(p);
+
     /* Strapping-pin idle levels: GPIO0/5/15 have pull-ups enabled at reset
      * (GPIO2/12 pull-downs read low). Firmware reads GPIO_IN for buttons
      * tied to these pins (e.g. Marauder's BOOT-button on GPIO0) — leaving
@@ -2833,6 +3383,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Two classic ESP32 I2S controllers, including circular lldesc DMA. */
     mem_register_mmio(mem, (int)PAGE_OF(I2S0_BASE), i2s_read, i2s_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(I2S1_BASE), i2s_read, i2s_write, p);
+
+    /* Eight-channel RMT register file plus its shared 512-word pulse RAM. */
+    mem_register_mmio(mem, (int)PAGE_OF(RMT_BASE), rmt_read, rmt_write, p);
 
     /* TIMG0 */
     mem_register_mmio(mem, (int)PAGE_OF(TIMG0_BASE), timg_read, timg_write, p);
@@ -3003,6 +3556,46 @@ size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
 size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port) {
     if (!p || port < 0 || port >= I2S_PORT_COUNT) return 0;
     return p->i2s[port].rx_len;
+}
+
+int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
+                               periph_rmt_tx_fn fn, void *ctx) {
+    if (!p || channel < 0 || channel >= (int)RMT_CHANNEL_COUNT) return -1;
+    p->rmt.channel[channel].tx_cb = fn;
+    p->rmt.channel[channel].tx_cb_ctx = fn ? ctx : NULL;
+    return 0;
+}
+
+size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel_index,
+                            const uint32_t *items, size_t count) {
+    if (!p || channel_index < 0 ||
+        channel_index >= (int)RMT_CHANNEL_COUNT || (!items && count != 0))
+        return 0;
+
+    unsigned index = (unsigned)channel_index;
+    rmt_channel_state_t *channel = &p->rmt.channel[index];
+    if (!channel->rx_active || !(channel->conf1 & RMT_CONF1_RX_EN) ||
+        !(channel->conf1 & RMT_CONF1_MEM_OWNER_RX))
+        return 0;
+
+    size_t capacity = rmt_channel_capacity(&p->rmt, index);
+    size_t available = channel->rx_index < capacity ?
+        capacity - channel->rx_index : 0;
+    size_t accepted = count < available ? count : available;
+    size_t base = index * RMT_MEM_WORDS_PER_CHANNEL;
+    for (size_t i = 0; i < accepted; i++)
+        p->rmt.memory[base + channel->rx_index + i] = items[i];
+    channel->rx_index += (uint16_t)accepted;
+
+    if (accepted < count) {
+        channel->status_flags |= RMT_STATUS_MEM_FULL;
+        p->rmt.int_raw |= RMT_ERROR_INT(index);
+    }
+    /* Host injection represents a complete pulse train followed by the
+     * configured idle gap, so RX_END becomes visible even for an empty train. */
+    p->rmt.int_raw |= RMT_RX_END_INT(index);
+    rmt_irq_update(p);
+    return accepted;
 }
 
 int periph_set_irq_dispatch(esp32_periph_t *p, int source,

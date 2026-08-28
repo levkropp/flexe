@@ -11,6 +11,7 @@ extern void stub_esp_timer_start_once(xtensa_cpu_t *, void *);
 extern void stub_esp_timer_stop(xtensa_cpu_t *, void *);
 extern void stub_esp_timer_delete(xtensa_cpu_t *, void *);
 extern void stub_esp_timer_get_time(xtensa_cpu_t *, void *);
+extern void stub_delay(xtensa_cpu_t *, void *);
 
 static void et_setup(xtensa_cpu_t *cpu, esp32_rom_stubs_t **rom_out, esp_timer_stubs_t **et_out) {
     xtensa_cpu_init(cpu);
@@ -241,6 +242,31 @@ TEST(test_esp_timer_multiple_creates) {
     et_teardown(&cpu, rom, et);
 }
 
+TEST(test_delay_advances_virtual_time_and_ccount_at_runtime_frequency) {
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    esp_timer_stubs_t *et;
+    et_setup(&cpu, &rom, &et);
+
+    uint32_t delay_addr = 0x400D1060;
+    rom_stubs_register_ctx(rom, delay_addr, (rom_stub_fn)stub_delay,
+                           "delay", et);
+    mem_write32(cpu.mem, 0x3FFE01E0u, 240u);
+    uint32_t ccount_before = cpu.ccount;
+    uint64_t virtual_before = cpu.virtual_time_us;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, 3u);
+    cpu.pc = delay_addr;
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.virtual_time_us - virtual_before, 3000u);
+    ASSERT_EQ(cpu.ccount - ccount_before, 720001u);
+    ASSERT_EQ(cpu.pc, BASE + 0x100);
+
+    et_teardown(&cpu, rom, et);
+}
+
 static void run_esp_timer_tests(void) {
     TEST_SUITE("esp_timer_stubs");
     RUN_TEST(test_esp_timer_create_returns_ok);
@@ -249,4 +275,5 @@ static void run_esp_timer_tests(void) {
     RUN_TEST(test_esp_timer_get_time);
     RUN_TEST(test_esp_timer_start_once);
     RUN_TEST(test_esp_timer_multiple_creates);
+    RUN_TEST(test_delay_advances_virtual_time_and_ccount_at_runtime_frequency);
 }

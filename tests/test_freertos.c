@@ -36,6 +36,7 @@ TEST(test_vTaskDelay_advances_ccount) {
     rom_stubs_register_ctx(rom, vtd_addr, (rom_stub_fn)stub_vTaskDelay, "vTaskDelay", frt);
 
     uint64_t vtime_before = cpu.virtual_time_us;
+    uint32_t ccount_before = cpu.ccount;
     /* Set up call: a2 = ticks = 10 */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
@@ -45,8 +46,11 @@ TEST(test_vTaskDelay_advances_ccount) {
     /* Step to trigger the PC hook */
     xtensa_step(&cpu);
 
-    /* 10 ticks * 10,000 us/tick = 100,000 us */
-    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 100000);
+    /* Arduino-ESP32 uses a 1 kHz tick: ten ticks are ten milliseconds. */
+    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 10000);
+    /* Fast-forwarded wall time advances the architectural cycle counter;
+     * xtensa_step charges one additional cycle for dispatching the stub. */
+    ASSERT_EQ(cpu.ccount - ccount_before, 1600001u);
     /* PC should have returned */
     ASSERT_EQ(cpu.pc, BASE + 0x100);
 
@@ -99,7 +103,7 @@ TEST(test_xTaskGetTickCount) {
     extern void stub_xTaskGetTickCount(xtensa_cpu_t *, void *);
     rom_stubs_register_ctx(rom, addr, (rom_stub_fn)stub_xTaskGetTickCount, "xTaskGetTickCount", frt);
 
-    cpu.ccount = 16000000;  /* 10 ticks at 1.6M per tick */
+    cpu.ccount = 1600000;  /* 10 ticks at 160K cycles per tick */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
     cpu.pc = addr;
@@ -250,8 +254,8 @@ TEST(test_queue_receive_empty_returns_false) {
     cpu.pc = recv_addr;
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 2), 0);  /* pdFALSE */
-    /* virtual_time_us should advance by 10 ticks * 10,000 us/tick = 100,000 us */
-    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 100000);
+    /* Ten 1 kHz ticks advance virtual time by ten milliseconds. */
+    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 10000);
 
     frt_teardown(&cpu, rom, frt);
 }

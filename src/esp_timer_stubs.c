@@ -12,6 +12,7 @@
 
 #define ESP_OK    0
 #define MAX_TIMERS 16
+#define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
 
 /* Sentinel address for callback return interception */
 #define CALLBACK_SENTINEL 0x40001FFCu
@@ -95,17 +96,28 @@ static uint64_t host_elapsed_us(const esp_timer_stubs_t *et) {
     return (uint64_t)sec * 1000000ULL + (uint64_t)nsec / 1000ULL;
 }
 
-/* Monotonic clock used for scheduling esp_timer alarms.
- *
- * We intentionally derive this from cpu->cycle_count (raw instruction count)
- * rather than cpu->virtual_time_us, because vTaskDelay in non-native mode
- * fast-forwards virtual_time_us by huge amounts. If alarm_us captured that
- * fast-forwarded time, it would sit far in the future and the periodic
- * callback (e.g. LVGL tick) would never fire during normal execution. Using
- * cycle_count gives us a real wall-clock for dispatch that matches the rate
- * at which the firmware actually executes instructions. */
+/* Monotonic clock used for scheduling esp_timer alarms. Normal execution is
+ * represented by cycle_count, while delay/scheduler shims may explicitly move
+ * virtual_time_us ahead. The later value keeps timers progressing through
+ * either path without counting the same fast-forward twice. */
+static uint32_t current_cpu_freq_mhz(esp_timer_stubs_t *et) {
+    uint32_t mhz = mem_read32(et->cpu->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    if (mhz >= 10u && mhz <= 240u)
+        et->cpu_freq_mhz = mhz;
+    return et->cpu_freq_mhz;
+}
+
 static uint64_t current_time_us(esp_timer_stubs_t *et) {
-    return et->cpu->cycle_count / et->cpu_freq_mhz;
+    uint64_t cycle_us = et->cpu->cycle_count / current_cpu_freq_mhz(et);
+    return et->cpu->virtual_time_us > cycle_us ?
+           et->cpu->virtual_time_us : cycle_us;
+}
+
+static void advance_wait_time(esp_timer_stubs_t *et, xtensa_cpu_t *cpu,
+                              uint64_t us) {
+    uint64_t cycles = us * current_cpu_freq_mhz(et);
+    cpu->virtual_time_us += us;
+    cpu->ccount += (uint32_t)cycles;
 }
 
 /* ===== Find timer by handle ===== */
@@ -336,7 +348,7 @@ void stub_esp_timer_is_active(xtensa_cpu_t *cpu, void *ctx) {
 void stub_usleep(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
     uint32_t us = et_arg(cpu, 0);
-    cpu->virtual_time_us += us;
+    advance_wait_time(et, cpu, us);
     dispatch_expired_timers(et);
     et_return(cpu, 0);
 }
@@ -365,7 +377,7 @@ void stub_micros(xtensa_cpu_t *cpu, void *ctx) {
 void stub_delay(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
     uint32_t ms = et_arg(cpu, 0);
-    cpu->virtual_time_us += (uint64_t)ms * 1000;
+    advance_wait_time(et, cpu, (uint64_t)ms * 1000u);
     dispatch_expired_timers(et);
     et_return_void(cpu);
 }

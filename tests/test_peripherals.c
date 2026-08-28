@@ -1854,6 +1854,309 @@ TEST(i2s_clock_and_bt_private_readback) {
     mem_destroy(mem);
 }
 
+#define TEST_RMT_BASE 0x3FF56000u
+
+static uint32_t test_rmt_item(uint16_t duration0, bool level0,
+                              uint16_t duration1, bool level1) {
+    return (duration0 & 0x7FFFu) | (level0 ? 1u << 15 : 0u) |
+           ((uint32_t)(duration1 & 0x7FFFu) << 16) |
+           (level1 ? 1u << 31 : 0u);
+}
+
+typedef struct {
+    uint32_t items[32];
+    size_t count;
+    unsigned chunks;
+    unsigned finishes;
+    uint32_t tick_hz;
+    uint32_t carrier_hz;
+} rmt_capture_t;
+
+static void capture_rmt(void *ctx, int channel, const uint32_t *items,
+                        size_t count, uint32_t tick_hz,
+                        uint32_t carrier_hz, bool finished) {
+    rmt_capture_t *capture = ctx;
+    if (channel != 0) return;
+    capture->chunks++;
+    capture->tick_hz = tick_hz;
+    capture->carrier_hz = carrier_hz;
+    if (finished) capture->finishes++;
+    for (size_t i = 0; i < count && capture->count < 32u; i++)
+        capture->items[capture->count++] = items[i];
+}
+
+TEST(rmt_register_file_shared_ram_and_apb_fifo) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x20u), 0x31100002u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x24u), 0x00000F00u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xFCu), 0x16022600u);
+
+    /* Two allocated blocks make the channel-0 APB FIFO 128 words deep. */
+    mem_write32(mem, TEST_RMT_BASE + 0x20u, (2u << 24) | 80u);
+    uint32_t conf1 = mem_read32(mem, TEST_RMT_BASE + 0x24u);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, conf1 | (1u << 4));
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, conf1 & ~(1u << 4));
+    mem_write32(mem, TEST_RMT_BASE + 0x00u, 0x11223344u);
+    mem_write32(mem, TEST_RMT_BASE + 0x00u, 0x55667788u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x80u), 2u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x800u), 0x11223344u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x804u), 0x55667788u);
+
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, conf1 | (1u << 4));
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, conf1 & ~(1u << 4));
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x00u), 0x11223344u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x00u), 0x55667788u);
+
+    /* Direct RMTMEM covers all eight hardware blocks in the same page. */
+    mem_write32(mem, TEST_RMT_BASE + 0xFFCu, 0xA5A55A5Au);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xFFCu), 0xA5A55A5Au);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rmt_timed_tx_threshold_and_completion_interrupts) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    rmt_capture_t capture = {0};
+    ASSERT_EQ(periph_set_rmt_tx_callback(p, 0, capture_rmt, &capture), 0);
+    uint32_t words[] = {
+        test_rmt_item(1, true, 1, false),
+        test_rmt_item(1, false, 1, true),
+        test_rmt_item(1, true, 1, true),
+        test_rmt_item(1, false, 1, false),
+        0,
+    };
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+        mem_write32(mem, TEST_RMT_BASE + 0x800u + (uint32_t)i * 4u,
+                    words[i]);
+
+    /* One APB-clocked block, threshold every two items, 1 MHz carrier. */
+    mem_write32(mem, TEST_RMT_BASE + 0x20u,
+                (1u << 28) | (1u << 24) | 1u);
+    mem_write32(mem, TEST_RMT_BASE + 0xB0u, (40u << 16) | 40u);
+    mem_write32(mem, TEST_RMT_BASE + 0xD0u, 2u);
+    mem_write32(mem, TEST_RMT_BASE + 0xF0u, 1u << 1);
+    mem_write32(mem, TEST_RMT_BASE + 0xA8u,
+                (1u << 0) | (1u << 24));
+    uint32_t tx_conf = 1u << 17;
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, tx_conf | (1u << 3));
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, tx_conf);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, tx_conf | 1u);
+
+    /* Two two-tick items at APB/1 consume exactly 12 CPU cycles. */
+    cpu.ccount += 12u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 2u);
+    ASSERT_EQ(capture.chunks, 1u);
+    ASSERT_EQ(capture.finishes, 0u);
+    ASSERT_EQ(capture.tick_hz, 80000000u);
+    ASSERT_EQ(capture.carrier_hz, 1000000u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA0u), 1u << 24);
+    ASSERT_TRUE(periph_interrupt_pending(p, 47));
+    mem_write32(mem, TEST_RMT_BASE + 0xACu, 1u << 24);
+
+    cpu.ccount += 12u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 4u);
+    ASSERT_EQ(capture.chunks, 2u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA0u), 1u << 24);
+    mem_write32(mem, TEST_RMT_BASE + 0xACu, 1u << 24);
+
+    /* The zero-duration terminator follows at the next hardware event. */
+    cpu.ccount += 1u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.chunks, 3u);
+    ASSERT_EQ(capture.finishes, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA0u), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA4u), 1u);
+    ASSERT_TRUE(periph_interrupt_pending(p, 47));
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x60u) & (7u << 24), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x24u) & 1u, 0u);
+    mem_write32(mem, TEST_RMT_BASE + 0xACu, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 47));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rmt_large_time_jump_drains_all_due_tx_events) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    rmt_capture_t capture = {0};
+    ASSERT_EQ(periph_set_rmt_tx_callback(p, 0, capture_rmt, &capture), 0);
+    for (unsigned i = 0; i < 4u; i++)
+        mem_write32(mem, TEST_RMT_BASE + 0x800u + i * 4u,
+                    test_rmt_item(1, (i & 1u) != 0, 1,
+                                  (i & 1u) == 0));
+    mem_write32(mem, TEST_RMT_BASE + 0x810u, 0);
+
+    mem_write32(mem, TEST_RMT_BASE + 0x20u, (1u << 24) | 1u);
+    mem_write32(mem, TEST_RMT_BASE + 0xD0u, 2u);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, (1u << 17) | 1u);
+
+    /* Deadlines are 12, 24, and 25 CPU ticks. One overshooting delay must
+     * observe both thresholds and the terminator, not stretch the waveform. */
+    cpu.ccount = 25u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 4u);
+    ASSERT_EQ(capture.chunks, 3u);
+    ASSERT_EQ(capture.finishes, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA0u),
+              (1u << 24) | 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x24u) & 1u, 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rmt_tx_deadline_tracks_runtime_cpu_frequency) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    rmt_capture_t capture = {0};
+    ASSERT_EQ(periph_set_rmt_tx_callback(p, 0, capture_rmt, &capture), 0);
+    mem_write32(mem, 0x3FFE01E0u, 80u);
+    mem_write32(mem, TEST_RMT_BASE + 0x800u,
+                test_rmt_item(1, true, 1, false));
+    mem_write32(mem, TEST_RMT_BASE + 0x804u, 0u);
+    mem_write32(mem, TEST_RMT_BASE + 0x20u, (1u << 24) | 1u);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, (1u << 17) | 1u);
+
+    /* Two APB ticks are two CCOUNT ticks while the CPU runs at 80 MHz. */
+    cpu.ccount = 1u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 0u);
+    cpu.ccount = 2u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 1u);
+    ASSERT_EQ(capture.finishes, 1u);
+    ASSERT_EQ(capture.tick_hz, 80000000u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rmt_rx_injection_uses_channel_memory_and_interrupts) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const unsigned channel = 3u;
+    const uint32_t conf0 = TEST_RMT_BASE + 0x20u + channel * 8u;
+    const uint32_t conf1 = TEST_RMT_BASE + 0x24u + channel * 8u;
+    const uint32_t mem_base = TEST_RMT_BASE + 0x800u + channel * 0x100u;
+    uint32_t items[] = {
+        test_rmt_item(7, true, 9, false),
+        test_rmt_item(11, false, 13, true),
+        test_rmt_item(17, true, 19, false),
+    };
+
+    mem_write32(mem, conf0, (1u << 24) | 80u);
+    mem_write32(mem, TEST_RMT_BASE + 0xA8u,
+                (1u << (channel * 3u + 1u)) |
+                (1u << (channel * 3u + 2u)));
+    mem_write32(mem, conf1, (1u << 5) | (1u << 1));
+    ASSERT_EQ(periph_rmt_rx_inject(p, (int)channel, items, 3u), 3u);
+    ASSERT_EQ(mem_read32(mem, mem_base), items[0]);
+    ASSERT_EQ(mem_read32(mem, mem_base + 8u), items[2]);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x60u + channel * 4u) &
+              0x3FFu, channel * 64u + 3u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA0u),
+              1u << (channel * 3u + 1u));
+    ASSERT_TRUE(periph_interrupt_pending(p, 47));
+    mem_write32(mem, TEST_RMT_BASE + 0xACu, 1u << (channel * 3u + 1u));
+    ASSERT_FALSE(periph_interrupt_pending(p, 47));
+
+    /* Channel 7 cannot borrow a nonexistent ninth block. */
+    uint32_t many[70] = {0};
+    mem_write32(mem, TEST_RMT_BASE + 0x20u + 7u * 8u,
+                (2u << 24) | 80u);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u + 7u * 8u,
+                (1u << 5) | (1u << 1));
+    ASSERT_EQ(periph_rmt_rx_inject(p, 7, many, 70u), 64u);
+    ASSERT_TRUE(mem_read32(mem, TEST_RMT_BASE + 0xA0u) &
+                (1u << (7u * 3u + 2u)));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rmt_dport_module_reset_clears_hardware_and_preserves_endpoint) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    rmt_capture_t capture = {0};
+    ASSERT_EQ(periph_set_rmt_tx_callback(p, 0, capture_rmt, &capture), 0);
+
+    /* Dirty every class of state and assert the RMT interrupt through RX. */
+    uint32_t rx_item = test_rmt_item(7, true, 9, false);
+    mem_write32(mem, 0x3FF000C0u, 1u << 9);
+    mem_write32(mem, TEST_RMT_BASE + 0x20u, (1u << 24) | 80u);
+    mem_write32(mem, TEST_RMT_BASE + 0xA8u, 1u << 1);
+    mem_write32(mem, TEST_RMT_BASE + 0xB0u, 0x12345678u);
+    mem_write32(mem, TEST_RMT_BASE + 0xD0u, 31u);
+    mem_write32(mem, TEST_RMT_BASE + 0xF0u, 3u);
+    mem_write32(mem, TEST_RMT_BASE + 0xFFCu, 0xA5A55A5Au);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, (1u << 5) | (1u << 1));
+    ASSERT_EQ(periph_rmt_rx_inject(p, 0, &rx_item, 1u), 1u);
+    ASSERT_TRUE(periph_interrupt_pending(p, 47));
+
+    mem_write32(mem, 0x3FF000C4u, 1u << 9);
+    ASSERT_EQ(mem_read32(mem, 0x3FF000C0u), 1u << 9);
+    ASSERT_EQ(mem_read32(mem, 0x3FF000C4u), 1u << 9);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x20u), 0x31100002u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x24u), 0x00000F00u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA0u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xA8u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xB0u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xD0u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xF0u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xFFCu), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0xFCu), 0x16022600u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 47));
+    mem_write32(mem, 0x3FF000C4u, 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF000C4u), 0u);
+
+    /* Host wiring is outside the peripheral reset domain and remains bound. */
+    mem_write32(mem, TEST_RMT_BASE + 0x800u,
+                test_rmt_item(1, true, 1, false));
+    mem_write32(mem, TEST_RMT_BASE + 0x804u, 0u);
+    mem_write32(mem, TEST_RMT_BASE + 0x20u, (1u << 24) | 1u);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, (1u << 17) | 1u);
+    cpu.ccount += 6u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 1u);
+    ASSERT_EQ(capture.finishes, 1u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(excmlevel3_masks_level3) {
     /* With EXCMLEVEL=3, level-3 interrupts should be masked when EXCM=1 */
     xtensa_cpu_t cpu;
@@ -1921,5 +2224,11 @@ static void run_peripheral_tests(void) {
     RUN_TEST(i2s_tx_dma_descriptor_and_interrupt);
     RUN_TEST(i2s_rx_dma_injection_and_dual_port);
     RUN_TEST(i2s_clock_and_bt_private_readback);
+    RUN_TEST(rmt_register_file_shared_ram_and_apb_fifo);
+    RUN_TEST(rmt_timed_tx_threshold_and_completion_interrupts);
+    RUN_TEST(rmt_large_time_jump_drains_all_due_tx_events);
+    RUN_TEST(rmt_tx_deadline_tracks_runtime_cpu_frequency);
+    RUN_TEST(rmt_rx_injection_uses_channel_memory_and_interrupts);
+    RUN_TEST(rmt_dport_module_reset_clears_hardware_and_preserves_endpoint);
     RUN_TEST(excmlevel3_masks_level3);
 }

@@ -188,4 +188,9 @@ if(UNIX)
     target_link_libraries(flexe-i2s-dma-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-i2s-dma-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-rmt-tx-test tools/rmt_tx_test.c)
+    target_link_libraries(flexe-rmt-tx-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-rmt-tx-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()
