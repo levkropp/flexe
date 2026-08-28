@@ -38,7 +38,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
   dual-core table invalidation, flash programming coherence, and translated-code invalidation
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
   timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA,
-  eight-channel classic RMT, 16-channel classic LEDC PWM/fades, ADC1/2, DAC1/2
+  eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
+  eight-unit/two-channel classic PCNT, ADC1/2, DAC1/2
 - raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
 - host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
@@ -49,7 +50,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 593 tests
+- 595 tests
 
 ## building
 
@@ -138,7 +139,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 593 tests, 1995 passed, 0 failed
+# 595 tests, 2030 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -214,6 +215,22 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-ledc-pwm.sh
 ```
 
 `FLEXE_LEDC_BUILD_DIR` optionally preserves its Arduino build directory.
+
+The PCNT gate builds an unmodified sketch against ESP-IDF's public
+`driver/pcnt.h` API. Host GPIO transitions pass through the production GPIO
+matrix and ten-APB-cycle glitch filter into unit 0, while unit 7/channel 1
+checks the upper signal-index range. The gate verifies control-input direction
+reversal, pause/clear/resume, threshold and high-limit events, automatic limit
+reset, and the real shared PCNT ISR service with zero unhandled MMIO or
+unregistered ROM calls under both engines:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-pcnt-pulse.sh
+# engine=jit stage=0xC01A7E00 result=0/0/0/0/0/10/.../3/1/11/1/1/0/3/1/0 handled=1/1/1/1 unhandled=0 unregistered=0
+# engine=interp stage=0xC01A7E00 result=0/0/0/0/0/10/.../3/1/11/1/1/0/3/1/0 handled=1/1/1/1 unhandled=0 unregistered=0
+```
+
+`FLEXE_PCNT_BUILD_DIR` optionally preserves its Arduino build directory.
 
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):

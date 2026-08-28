@@ -2839,7 +2839,7 @@ static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
      * production drivers use a non-NULL handle to select management paths
      * that cannot work while their interrupt is intentionally stubbed. */
     if (source != 32 && source != 33 && source != 43 && source != 47 &&
-        source != 49 && source != 50) {
+        source != 48 && source != 49 && source != 50) {
         rom_return(cpu, 0);
         return;
     }

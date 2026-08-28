@@ -1650,6 +1650,176 @@ TEST(cross_core_interrupt) {
     mem_destroy(mem);
 }
 
+#define TEST_PCNT_BASE 0x3FF57000u
+
+static uint32_t test_pcnt_ctrl_running(unsigned unit) {
+    return (0x5555u & ~(1u << (unit * 2u))) | (1u << 16);
+}
+
+static void test_pcnt_route_input(xtensa_mem_t *mem, unsigned signal,
+                                  unsigned gpio, bool inverted) {
+    mem_write32(mem, 0x3FF44130u + signal * 4u,
+                (gpio & 0x3Fu) | (inverted ? 1u << 6 : 0u) | (1u << 7));
+}
+
+static void test_pcnt_pulse(esp32_periph_t *p, int gpio) {
+    periph_gpio_set_input(p, gpio, 1);
+    periph_gpio_set_input(p, gpio, 0);
+}
+
+TEST(pcnt_matrix_control_limits_events_and_reset) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 7, 48);
+    mem_write32(mem, 0x3FF000C0u, 1u << 10); /* PCNT module clock */
+
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x000u), 0x3C10u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x0B0u), 0x5555u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x0FCu), 0x14122600u);
+
+    /* Unit0 channel0: positive edges increment while control is low and
+     * reverse direction while control is high. Threshold0=2, limits +/-3. */
+    test_pcnt_route_input(mem, 39u, 18u, false); /* pulse0/unit0 */
+    test_pcnt_route_input(mem, 41u, 19u, false); /* ctrl0/unit0 */
+    uint32_t conf0 = (1u << 18) | (1u << 20) |
+                     (1u << 15) | (1u << 14) | (1u << 13) |
+                     (1u << 12) | (1u << 11);
+    mem_write32(mem, TEST_PCNT_BASE + 0x000u, conf0);
+    mem_write32(mem, TEST_PCNT_BASE + 0x004u,
+                ((uint32_t)(uint16_t)-1 << 16) | 2u);
+    mem_write32(mem, TEST_PCNT_BASE + 0x008u,
+                ((uint32_t)(uint16_t)-3 << 16) | 3u);
+    mem_write32(mem, TEST_PCNT_BASE + 0x0B0u,
+                test_pcnt_ctrl_running(0));
+    mem_write32(mem, TEST_PCNT_BASE + 0x088u, 1u);
+
+    test_pcnt_pulse(p, 18);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 1u);
+    test_pcnt_pulse(p, 18);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 2u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x080u), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x084u), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x090u) & (1u << 3),
+              1u << 3);
+    ASSERT_TRUE(periph_interrupt_pending(p, 48));
+    ASSERT_EQ(cpu.interrupt & (1u << 7), 1u << 7);
+    mem_write32(mem, TEST_PCNT_BASE + 0x08Cu, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 48));
+
+    /* Reaching the configured high limit raises its event and resets the
+     * hardware counter to zero even though ZERO is a distinct event. */
+    test_pcnt_pulse(p, 18);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x090u) & (1u << 5),
+              1u << 5);
+    mem_write32(mem, TEST_PCNT_BASE + 0x08Cu, 1u);
+
+    periph_gpio_set_input(p, 19, 1); /* reverse positive-edge action */
+    test_pcnt_pulse(p, 18);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 0xFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x090u) & (1u << 2),
+              1u << 2); /* threshold1=-1 */
+    mem_write32(mem, TEST_PCNT_BASE + 0x08Cu, 1u);
+    uint32_t ctrl = test_pcnt_ctrl_running(0) | (1u << 1);
+    mem_write32(mem, TEST_PCNT_BASE + 0x0B0u, ctrl); /* pause */
+    test_pcnt_pulse(p, 18);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 0xFFFFu);
+    mem_write32(mem, TEST_PCNT_BASE + 0x0B0u,
+                test_pcnt_ctrl_running(0));
+    test_pcnt_pulse(p, 18);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 0xFFFEu);
+
+    test_pcnt_pulse(p, 18);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x090u) & (1u << 4),
+              1u << 4); /* low-limit reset */
+    mem_write32(mem, TEST_PCNT_BASE + 0x08Cu, 1u);
+
+    /* A normal sign crossing has its own ZERO event and direction mode. */
+    test_pcnt_pulse(p, 18); /* reversed: -1 */
+    mem_write32(mem, TEST_PCNT_BASE + 0x08Cu, 1u);
+    periph_gpio_set_input(p, 19, 0);
+    test_pcnt_pulse(p, 18); /* keep: -1 -> 0 */
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x090u) & (1u << 6),
+              1u << 6);
+
+    mem_write32(mem, TEST_PCNT_BASE + 0x0B0u,
+                test_pcnt_ctrl_running(0) | 1u); /* unit reset */
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x060u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x090u), 0u);
+
+    /* DPORT module reset restores all units and clears the shared IRQ while
+     * leaving the external GPIO matrix wiring available for reconfiguration. */
+    mem_write32(mem, 0x3FF000C4u, 1u << 10);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x000u), 0x3C10u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x0B0u), 0x5555u);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x080u), 0u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 48));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(pcnt_filter_rejects_glitches_and_qualifies_edges) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 10); /* PCNT module clock */
+
+    /* Unit1 channel0 uses signal43. A ten-APB-cycle filter equals thirty
+     * CPU cycles at 240 MHz. Falling edges are disabled. */
+    test_pcnt_route_input(mem, 43u, 20u, false);
+    uint32_t base = TEST_PCNT_BASE + 0x0Cu;
+    mem_write32(mem, base + 0x00u,
+                (1u << 18) | (1u << 10) | 10u);
+    mem_write32(mem, base + 0x08u,
+                ((uint32_t)(uint16_t)-100 << 16) | 100u);
+    mem_write32(mem, TEST_PCNT_BASE + 0x0B0u,
+                test_pcnt_ctrl_running(1));
+
+    periph_gpio_set_input(p, 20, 1);
+    cpu.ccount += 29u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x064u), 0u);
+    periph_gpio_set_input(p, 20, 0); /* sub-threshold glitch */
+    cpu.ccount += 30u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x064u), 0u);
+
+    periph_gpio_set_input(p, 20, 1);
+    cpu.ccount += 30u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x064u), 1u);
+    periph_gpio_set_input(p, 20, 0);
+    cpu.ccount += 30u;
+    cpu.periph_event(&cpu); /* qualify low before another rising edge */
+    periph_gpio_set_input(p, 20, 1);
+    cpu.ccount += 30u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x064u), 2u);
+
+    /* Matrix inversion turns the physical falling transition into a logical
+     * positive edge and rebinds without creating a synthetic pulse. */
+    test_pcnt_route_input(mem, 43u, 20u, true);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x064u), 2u);
+    periph_gpio_set_input(p, 20, 0);
+    cpu.ccount += 30u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x064u), 3u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 typedef struct {
     unsigned calls;
     int speed_mode;
@@ -2421,6 +2591,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(intr_matrix_dport_rw);
     RUN_TEST(intr_matrix_assert_source);
     RUN_TEST(cross_core_interrupt);
+    RUN_TEST(pcnt_matrix_control_limits_events_and_reset);
+    RUN_TEST(pcnt_filter_rejects_glitches_and_qualifies_edges);
     RUN_TEST(ledc_timed_duty_update_and_gpio_output);
     RUN_TEST(ledc_fade_progress_and_completion_deadline);
     RUN_TEST(ledc_timer_overflow_pause_and_clear);

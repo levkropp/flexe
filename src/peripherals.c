@@ -18,6 +18,7 @@
 #define I2C0_BASE       0x3FF53000u
 #define I2C1_BASE       0x3FF67000u
 #define RMT_BASE        0x3FF56000u
+#define PCNT_BASE       0x3FF57000u
 #define GPIO_BASE       0x3FF44000u
 #define FE2_BASE        0x3FF45000u
 #define FE_BASE         0x3FF46000u
@@ -265,6 +266,28 @@
 #define LEDC_HS_SIGNAL_BASE      71u
 #define LEDC_LS_SIGNAL_BASE      79u
 
+/* Classic ESP32 pulse counter register file and shared interrupt source. */
+#define PCNT_UNIT_COUNT          8u
+#define PCNT_CHANNEL_COUNT       2u
+#define PCNT_UNIT_CONF_STRIDE    0x0Cu
+#define PCNT_CNT_OFF             0x060u
+#define PCNT_INT_RAW_OFF         0x080u
+#define PCNT_INT_ST_OFF          0x084u
+#define PCNT_INT_ENA_OFF         0x088u
+#define PCNT_INT_CLR_OFF         0x08Cu
+#define PCNT_STATUS_OFF          0x090u
+#define PCNT_CTRL_OFF            0x0B0u
+#define PCNT_DATE_OFF            0x0FCu
+#define PCNT_INTR_SOURCE         48
+#define PCNT_INT_VALID_MASK      0xFFu
+#define PCNT_CONF_FILTER_MASK    0x3FFu
+#define PCNT_CONF_FILTER_EN      (1u << 10)
+#define PCNT_EVT_ZERO            (1u << 6)
+#define PCNT_EVT_H_LIM           (1u << 5)
+#define PCNT_EVT_L_LIM           (1u << 4)
+#define PCNT_EVT_THRES0          (1u << 3)
+#define PCNT_EVT_THRES1          (1u << 2)
+
 static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -277,6 +300,11 @@ static void ledc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void ledc_reset_state(esp32_periph_t *p);
 static void ledc_gpio_route_changed(esp32_periph_t *p, int gpio,
                                     uint32_t before, uint32_t after);
+static uint32_t pcnt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void pcnt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void pcnt_reset_state(esp32_periph_t *p);
+static void pcnt_gpio_route_changed(esp32_periph_t *p, unsigned signal);
+static void pcnt_gpio_input_changed(esp32_periph_t *p, int gpio);
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -511,6 +539,27 @@ typedef struct {
     ledc_channel_state_t channel[LEDC_SPEED_MODE_COUNT][LEDC_CHANNEL_COUNT];
 } ledc_state_t;
 
+typedef struct {
+    bool pending;
+    bool level;
+    uint32_t deadline;
+} pcnt_filter_state_t;
+
+typedef struct {
+    int16_t count;
+    uint32_t status;
+    bool pulse_level[PCNT_CHANNEL_COUNT];
+    bool control_level[PCNT_CHANNEL_COUNT];
+    pcnt_filter_state_t pulse_filter[PCNT_CHANNEL_COUNT];
+    pcnt_filter_state_t control_filter[PCNT_CHANNEL_COUNT];
+} pcnt_unit_state_t;
+
+typedef struct {
+    uint32_t regs[0x100 / sizeof(uint32_t)];
+    pcnt_unit_state_t unit[PCNT_UNIT_COUNT];
+    uint32_t pending_filters;
+} pcnt_state_t;
+
 struct esp32_periph {
     xtensa_mem_t *mem;
 
@@ -597,6 +646,9 @@ struct esp32_periph {
     uint32_t ledc_last_ccount;
     bool ledc_time_valid;
 
+    /* Eight two-channel classic ESP32 pulse-counter units. */
+    pcnt_state_t pcnt;
+
     /* Two independent classic ESP32 I2S controllers with circular DMA. */
     i2s_state_t i2s[I2S_PORT_COUNT];
 
@@ -659,6 +711,7 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_PERIP_CLK_EN_OFF         0x0C0
 #define DPORT_PERIP_RST_EN_OFF         0x0C4
 #define DPORT_RMT_MODULE_BIT           (1u << 9)
+#define DPORT_PCNT_MODULE_BIT          (1u << 10)
 #define DPORT_LEDC_MODULE_BIT          (1u << 11)
 
 /* Internal: scan matrix and set/clear CPU interrupt bits for a source */
@@ -865,6 +918,8 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         p->dport_perip_rst_en = val;
         if (val & DPORT_RMT_MODULE_BIT)
             rmt_reset_state(p);
+        if (val & DPORT_PCNT_MODULE_BIT)
+            pcnt_reset_state(p);
         if (val & DPORT_LEDC_MODULE_BIT)
             ledc_reset_state(p);
         break;
@@ -1202,6 +1257,7 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     if (off >= 0x130 && off < 0x130 + 256 * 4) {
         int sig = (int)(off - 0x130) / 4;
         p->gpio.func_in_sel[sig] = val;
+        pcnt_gpio_route_changed(p, (unsigned)sig);
         return;
     }
 
@@ -1479,6 +1535,7 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
         i2s_next_fire(p, cpu),
         rmt_next_fire(p, cpu),
         ledc_next_fire(p, cpu),
+        pcnt_next_fire(p, cpu),
     };
     bool have = false;
     uint32_t best = UINT32_MAX;
@@ -1502,6 +1559,7 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
     i2s_eval_events(p, cpu);
     rmt_eval_events(p, cpu);
     ledc_eval_events(p, cpu);
+    pcnt_eval_events(p, cpu);
 }
 
 /* Recompute both cores' next_timer_event after LACT state changes. */
@@ -2774,6 +2832,425 @@ static void rmt_write(void *ctx, uint32_t addr, uint32_t value) {
         rmt->date = value;
 }
 
+/* ---- PCNT pulse counter ---- */
+
+static uint32_t pcnt_unit_conf_offset(unsigned unit) {
+    return unit * PCNT_UNIT_CONF_STRIDE;
+}
+
+static uint32_t pcnt_signal_base(unsigned unit) {
+    return unit < 5u ? 39u + unit * 4u : 71u + (unit - 5u) * 4u;
+}
+
+static uint32_t pcnt_filter_bit(unsigned unit, unsigned channel,
+                                bool control) {
+    return 1u << (unit * 4u + channel * 2u + (control ? 1u : 0u));
+}
+
+static bool pcnt_decode_signal(unsigned signal, unsigned *unit,
+                               unsigned *channel, bool *control) {
+    for (unsigned candidate = 0; candidate < PCNT_UNIT_COUNT; candidate++) {
+        unsigned base = pcnt_signal_base(candidate);
+        if (signal < base || signal >= base + 4u) continue;
+        unsigned relative = signal - base;
+        if (unit) *unit = candidate;
+        if (channel) *channel = relative & 1u;
+        if (control) *control = relative >= 2u;
+        return true;
+    }
+    return false;
+}
+
+static int pcnt_matrix_gpio(const esp32_periph_t *p, unsigned signal) {
+    uint32_t route = p->gpio.func_in_sel[signal];
+    if (!(route & (1u << 7))) return -1;
+    unsigned gpio = route & 0x3Fu;
+    return gpio < 40u ? (int)gpio : -1;
+}
+
+static bool pcnt_matrix_level(const esp32_periph_t *p, unsigned signal) {
+    uint32_t route = p->gpio.func_in_sel[signal];
+    bool level = false;
+    if (route & (1u << 7)) {
+        unsigned gpio = route & 0x3Fu;
+        if (gpio < 32u)
+            level = (p->gpio.in & (1u << gpio)) != 0;
+        else if (gpio < 40u)
+            level = (p->gpio.in1 & (1u << (gpio - 32u))) != 0;
+        else if (gpio == 0x38u)
+            level = true;  /* GPIO_MATRIX_CONST_ONE_INPUT */
+        /* GPIO_MATRIX_CONST_ZERO_INPUT (0x30) and other internal selectors
+         * default low in the host-facing GPIO model. */
+    }
+    if (route & (1u << 6)) level = !level;
+    return level;
+}
+
+static uint32_t pcnt_cpu_mhz(const esp32_periph_t *p) {
+    uint32_t mhz = mem_read32(p->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    return mhz >= 10u && mhz <= 240u ? mhz : 240u;
+}
+
+static void pcnt_kick(esp32_periph_t *p) {
+    for (int core = 0; core < 2; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void pcnt_update_irq(esp32_periph_t *p) {
+    uint32_t raw = p->pcnt.regs[PCNT_INT_RAW_OFF / 4u];
+    uint32_t ena = p->pcnt.regs[PCNT_INT_ENA_OFF / 4u];
+    if (raw & ena)
+        periph_assert_interrupt(p, PCNT_INTR_SOURCE);
+    else
+        periph_deassert_interrupt(p, PCNT_INTR_SOURCE);
+}
+
+static bool pcnt_unit_running(const esp32_periph_t *p, unsigned unit) {
+    uint32_t ctrl = p->pcnt.regs[PCNT_CTRL_OFF / 4u];
+    return (p->dport_perip_clk_en & DPORT_PCNT_MODULE_BIT) != 0 &&
+           (p->dport_perip_rst_en & DPORT_PCNT_MODULE_BIT) == 0 &&
+           (ctrl & (1u << (unit * 2u))) == 0 &&
+           (ctrl & (1u << (unit * 2u + 1u))) == 0;
+}
+
+static void pcnt_set_count_mode(pcnt_unit_state_t *state, int16_t before,
+                                int16_t after) {
+    uint32_t mode;
+    if (after > 0)
+        mode = 3u;
+    else if (after < 0)
+        mode = 2u;
+    else
+        mode = before < 0 ? 1u : 0u;
+    state->status = (state->status & ~3u) | mode;
+}
+
+static uint32_t pcnt_enabled_events(uint32_t conf0,
+                                    uint32_t event_flags) {
+    uint32_t enabled = 0;
+    for (unsigned bit = 2u; bit <= 6u; bit++) {
+        uint32_t event = 1u << bit;
+        uint32_t enable = 1u << (17u - bit);
+        if ((event_flags & event) && (conf0 & enable)) enabled |= event;
+    }
+    return enabled;
+}
+
+static void pcnt_latch_events(esp32_periph_t *p, unsigned unit,
+                              uint32_t event_flags) {
+    uint32_t conf0 = p->pcnt.regs[pcnt_unit_conf_offset(unit) / 4u];
+    uint32_t enabled = pcnt_enabled_events(conf0, event_flags);
+    if (!enabled) return;
+
+    pcnt_unit_state_t *state = &p->pcnt.unit[unit];
+    state->status = (state->status & 3u) | enabled;
+    p->pcnt.regs[PCNT_INT_RAW_OFF / 4u] |= 1u << unit;
+    pcnt_update_irq(p);
+}
+
+static unsigned pcnt_edge_action(uint32_t conf0, unsigned channel,
+                                 bool rising) {
+    unsigned shift = channel == 0u ? (rising ? 18u : 16u) :
+                                     (rising ? 26u : 24u);
+    return (conf0 >> shift) & 3u;
+}
+
+static unsigned pcnt_control_action(uint32_t conf0, unsigned channel,
+                                    bool high) {
+    unsigned shift = channel == 0u ? (high ? 20u : 22u) :
+                                     (high ? 28u : 30u);
+    return (conf0 >> shift) & 3u;
+}
+
+static void pcnt_count_edge(esp32_periph_t *p, unsigned unit,
+                            unsigned channel, bool rising) {
+    if (!pcnt_unit_running(p, unit)) return;
+
+    uint32_t base = pcnt_unit_conf_offset(unit);
+    uint32_t conf0 = p->pcnt.regs[base / 4u];
+    unsigned edge_action = pcnt_edge_action(conf0, channel, rising);
+    if (edge_action != 1u && edge_action != 2u) return;
+
+    unsigned control_action = pcnt_control_action(
+        conf0, channel, p->pcnt.unit[unit].control_level[channel]);
+    if (control_action >= 2u) return; /* hold/forbidden */
+
+    int delta = edge_action == 1u ? 1 : -1;
+    if (control_action == 1u) delta = -delta;
+
+    pcnt_unit_state_t *state = &p->pcnt.unit[unit];
+    int16_t before = state->count;
+    int32_t candidate = (int32_t)before + delta;
+    int16_t threshold0 = (int16_t)
+        (p->pcnt.regs[(base + 0x04u) / 4u] & 0xFFFFu);
+    int16_t threshold1 = (int16_t)
+        (p->pcnt.regs[(base + 0x04u) / 4u] >> 16);
+    int16_t high_limit = (int16_t)
+        (p->pcnt.regs[(base + 0x08u) / 4u] & 0xFFFFu);
+    int16_t low_limit = (int16_t)
+        (p->pcnt.regs[(base + 0x08u) / 4u] >> 16);
+    uint32_t events = 0;
+
+    if (candidate == threshold0) events |= PCNT_EVT_THRES0;
+    if (candidate == threshold1) events |= PCNT_EVT_THRES1;
+    if (candidate == 0) events |= PCNT_EVT_ZERO;
+
+    bool hit_high = delta > 0 && high_limit > 0 &&
+                    candidate >= high_limit;
+    bool hit_low = delta < 0 && low_limit < 0 && candidate <= low_limit;
+    if (hit_high) events |= PCNT_EVT_H_LIM;
+    if (hit_low) events |= PCNT_EVT_L_LIM;
+
+    int16_t after = hit_high || hit_low ? 0 : (int16_t)candidate;
+    state->count = after;
+    pcnt_set_count_mode(state, before, after);
+    pcnt_latch_events(p, unit, events);
+}
+
+static void pcnt_accept_level(esp32_periph_t *p, unsigned unit,
+                              unsigned channel, bool control, bool level) {
+    pcnt_unit_state_t *state = &p->pcnt.unit[unit];
+    bool *stable = control ? &state->control_level[channel] :
+                             &state->pulse_level[channel];
+    bool before = *stable;
+    *stable = level;
+    if (!control && before != level)
+        pcnt_count_edge(p, unit, channel, level);
+}
+
+static uint32_t pcnt_filter_cpu_cycles(const esp32_periph_t *p,
+                                       uint32_t threshold) {
+    uint64_t numerator = (uint64_t)threshold * pcnt_cpu_mhz(p);
+    uint32_t cycles = (uint32_t)((numerator + 79u) / 80u);
+    return cycles ? cycles : 1u;
+}
+
+static void pcnt_handle_signal_level(esp32_periph_t *p, unsigned unit,
+                                     unsigned channel, bool control) {
+    unsigned signal = pcnt_signal_base(unit) + channel +
+                      (control ? 2u : 0u);
+    bool level = pcnt_matrix_level(p, signal);
+    pcnt_unit_state_t *state = &p->pcnt.unit[unit];
+    bool stable = control ? state->control_level[channel] :
+                            state->pulse_level[channel];
+    pcnt_filter_state_t *filter = control ?
+        &state->control_filter[channel] : &state->pulse_filter[channel];
+    uint32_t conf0 =
+        p->pcnt.regs[pcnt_unit_conf_offset(unit) / 4u];
+    uint32_t threshold = conf0 & PCNT_CONF_FILTER_MASK;
+    uint32_t pending_bit = pcnt_filter_bit(unit, channel, control);
+
+    if (!(conf0 & PCNT_CONF_FILTER_EN) || threshold == 0u || !p->cpu[0]) {
+        filter->pending = false;
+        p->pcnt.pending_filters &= ~pending_bit;
+        if (level != stable)
+            pcnt_accept_level(p, unit, channel, control, level);
+        return;
+    }
+
+    if (level == stable) {
+        filter->pending = false; /* pulse returned before qualification */
+        p->pcnt.pending_filters &= ~pending_bit;
+    } else {
+        filter->pending = true;
+        p->pcnt.pending_filters |= pending_bit;
+        filter->level = level;
+        filter->deadline = p->cpu[0]->ccount +
+            pcnt_filter_cpu_cycles(p, threshold);
+    }
+    pcnt_kick(p);
+}
+
+static void pcnt_rebind_signal(esp32_periph_t *p, unsigned unit,
+                               unsigned channel, bool control) {
+    unsigned signal = pcnt_signal_base(unit) + channel +
+                      (control ? 2u : 0u);
+    pcnt_unit_state_t *state = &p->pcnt.unit[unit];
+    pcnt_filter_state_t *filter = control ?
+        &state->control_filter[channel] : &state->pulse_filter[channel];
+    filter->pending = false;
+    p->pcnt.pending_filters &= ~pcnt_filter_bit(unit, channel, control);
+    if (control)
+        state->control_level[channel] = pcnt_matrix_level(p, signal);
+    else
+        state->pulse_level[channel] = pcnt_matrix_level(p, signal);
+}
+
+static void pcnt_gpio_route_changed(esp32_periph_t *p, unsigned signal) {
+    unsigned unit;
+    unsigned channel;
+    bool control;
+    if (!pcnt_decode_signal(signal, &unit, &channel, &control)) return;
+    pcnt_rebind_signal(p, unit, channel, control);
+    pcnt_kick(p);
+}
+
+static void pcnt_gpio_input_changed(esp32_periph_t *p, int gpio) {
+    for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++) {
+        for (unsigned channel = 0; channel < PCNT_CHANNEL_COUNT; channel++) {
+            for (unsigned control = 0; control < 2u; control++) {
+                unsigned signal = pcnt_signal_base(unit) + channel +
+                                  (control ? 2u : 0u);
+                if (pcnt_matrix_gpio(p, signal) == gpio)
+                    pcnt_handle_signal_level(p, unit, channel,
+                                             control != 0u);
+            }
+        }
+    }
+}
+
+static uint32_t pcnt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    if (p->pcnt.pending_filters == 0) return UINT32_MAX;
+    bool have = false;
+    uint32_t best = UINT32_MAX;
+    uint32_t best_distance = 0;
+    for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++) {
+        pcnt_unit_state_t *state = &p->pcnt.unit[unit];
+        for (unsigned channel = 0; channel < PCNT_CHANNEL_COUNT; channel++) {
+            pcnt_filter_state_t *filters[2] = {
+                &state->pulse_filter[channel],
+                &state->control_filter[channel],
+            };
+            for (unsigned index = 0; index < 2u; index++) {
+                pcnt_filter_state_t *filter = filters[index];
+                if (!filter->pending) continue;
+                uint32_t distance = filter->deadline - cpu->ccount;
+                if ((int32_t)distance < 0) distance = 0;
+                if (!have || distance < best_distance) {
+                    have = true;
+                    best = cpu->ccount + distance;
+                    best_distance = distance;
+                }
+            }
+        }
+    }
+    return have ? best : UINT32_MAX;
+}
+
+static void pcnt_eval_filter(esp32_periph_t *p, unsigned unit,
+                             unsigned channel, bool control) {
+    pcnt_unit_state_t *state = &p->pcnt.unit[unit];
+    pcnt_filter_state_t *filter = control ?
+        &state->control_filter[channel] : &state->pulse_filter[channel];
+    if (!filter->pending ||
+        (int32_t)(p->cpu[0]->ccount - filter->deadline) < 0)
+        return;
+
+    unsigned signal = pcnt_signal_base(unit) + channel +
+                      (control ? 2u : 0u);
+    bool level = pcnt_matrix_level(p, signal);
+    bool accepted = level == filter->level;
+    filter->pending = false;
+    p->pcnt.pending_filters &= ~pcnt_filter_bit(unit, channel, control);
+    if (accepted)
+        pcnt_accept_level(p, unit, channel, control, level);
+}
+
+static void pcnt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return;
+    if (p->pcnt.pending_filters == 0) return;
+    for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++) {
+        for (unsigned channel = 0; channel < PCNT_CHANNEL_COUNT; channel++) {
+            /* Qualify control first so a pulse edge expiring at the same APB
+             * cycle observes the newly stable control level. */
+            pcnt_eval_filter(p, unit, channel, true);
+            pcnt_eval_filter(p, unit, channel, false);
+        }
+    }
+    pcnt_kick(p);
+}
+
+static void pcnt_reset_state(esp32_periph_t *p) {
+    memset(&p->pcnt, 0, sizeof(p->pcnt));
+    for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++) {
+        uint32_t base = pcnt_unit_conf_offset(unit);
+        p->pcnt.regs[base / 4u] = 0x00003C10u;
+    }
+    p->pcnt.regs[PCNT_CTRL_OFF / 4u] = 0x00005555u;
+    p->pcnt.regs[PCNT_DATE_OFF / 4u] = 0x14122600u;
+    for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++)
+        for (unsigned channel = 0; channel < PCNT_CHANNEL_COUNT; channel++) {
+            pcnt_rebind_signal(p, unit, channel, false);
+            pcnt_rebind_signal(p, unit, channel, true);
+        }
+    pcnt_update_irq(p);
+    pcnt_kick(p);
+}
+
+static uint32_t pcnt_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - PCNT_BASE;
+    if ((off & 3u) || off > PCNT_DATE_OFF)
+        return default_read(ctx, addr);
+    if (p->cpu[0]) pcnt_eval_events(p, p->cpu[0]);
+
+    if (off >= PCNT_CNT_OFF && off < PCNT_CNT_OFF + PCNT_UNIT_COUNT * 4u) {
+        unsigned unit = (off - PCNT_CNT_OFF) / 4u;
+        return (uint16_t)p->pcnt.unit[unit].count;
+    }
+    if (off == PCNT_INT_ST_OFF)
+        return p->pcnt.regs[PCNT_INT_RAW_OFF / 4u] &
+               p->pcnt.regs[PCNT_INT_ENA_OFF / 4u];
+    if (off == PCNT_INT_CLR_OFF) return 0;
+    if (off >= PCNT_STATUS_OFF &&
+        off < PCNT_STATUS_OFF + PCNT_UNIT_COUNT * 4u) {
+        unsigned unit = (off - PCNT_STATUS_OFF) / 4u;
+        return p->pcnt.unit[unit].status;
+    }
+    return p->pcnt.regs[off / 4u];
+}
+
+static void pcnt_write(void *ctx, uint32_t addr, uint32_t val) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - PCNT_BASE;
+    if ((off & 3u) || off > PCNT_DATE_OFF) {
+        default_write(ctx, addr, val);
+        return;
+    }
+    if (p->cpu[0]) pcnt_eval_events(p, p->cpu[0]);
+
+    if (off < PCNT_CNT_OFF) {
+        p->pcnt.regs[off / 4u] = val;
+        if (off % PCNT_UNIT_CONF_STRIDE == 0u) {
+            unsigned unit = off / PCNT_UNIT_CONF_STRIDE;
+            for (unsigned channel = 0; channel < PCNT_CHANNEL_COUNT;
+                 channel++) {
+                pcnt_handle_signal_level(p, unit, channel, false);
+                pcnt_handle_signal_level(p, unit, channel, true);
+            }
+        }
+        return;
+    }
+    if (off >= PCNT_CNT_OFF && off < PCNT_CNT_OFF + PCNT_UNIT_COUNT * 4u)
+        return; /* live counters are read-only */
+    if (off == PCNT_INT_RAW_OFF || off == PCNT_INT_ST_OFF ||
+        (off >= PCNT_STATUS_OFF &&
+         off < PCNT_STATUS_OFF + PCNT_UNIT_COUNT * 4u))
+        return;
+    if (off == PCNT_INT_ENA_OFF) {
+        p->pcnt.regs[off / 4u] = val & PCNT_INT_VALID_MASK;
+        pcnt_update_irq(p);
+        return;
+    }
+    if (off == PCNT_INT_CLR_OFF) {
+        p->pcnt.regs[PCNT_INT_RAW_OFF / 4u] &=
+            ~(val & PCNT_INT_VALID_MASK);
+        pcnt_update_irq(p);
+        return;
+    }
+    if (off == PCNT_CTRL_OFF) {
+        p->pcnt.regs[off / 4u] = val & 0x1FFFFu;
+        for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++) {
+            if (!(val & (1u << (unit * 2u)))) continue;
+            p->pcnt.unit[unit].count = 0;
+            p->pcnt.unit[unit].status = 0;
+        }
+        return;
+    }
+    p->pcnt.regs[off / 4u] = val;
+}
+
 /* ---- LEDC PWM controller ---- */
 
 static uint32_t ledc_cpu_mhz(const esp32_periph_t *p) {
@@ -4015,6 +4492,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     }
 
     rmt_reset_state(p);
+    pcnt_reset_state(p);
 
     /* Strapping-pin idle levels: GPIO0/5/15 have pull-ups enabled at reset
      * (GPIO2/12 pull-downs read low). Firmware reads GPIO_IN for buttons
@@ -4087,6 +4565,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     /* Eight-channel RMT register file plus its shared 512-word pulse RAM. */
     mem_register_mmio(mem, (int)PAGE_OF(RMT_BASE), rmt_read, rmt_write, p);
+
+    /* Eight two-channel pulse-counter units (interrupt source 48). */
+    mem_register_mmio(mem, (int)PAGE_OF(PCNT_BASE), pcnt_read, pcnt_write, p);
 
     /* TIMG0 */
     mem_register_mmio(mem, (int)PAGE_OF(TIMG0_BASE), timg_read, timg_write, p);
@@ -4405,6 +4886,10 @@ void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
     int now = level ? 1 : 0;
     if (now) *in |= mask; else *in &= ~mask;
     if (now == old) return;
+
+    /* GPIO-matrix consumers see the pad transition independently of the
+     * GPIO block's own edge/level interrupt configuration. */
+    pcnt_gpio_input_changed(p, pin);
 
     /* Edge/level-triggered pin interrupt, per GPIO_PINn_REG config:
      * INT_TYPE [9:7]: 1=rise 2=fall 3=any 4=low 5=high; INT_ENA [17:13]. */
