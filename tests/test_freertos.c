@@ -361,12 +361,15 @@ TEST(test_semaphore_create_take_give) {
     frt_setup(&cpu, &rom, &frt);
 
     uint32_t create_addr = 0x400D0060;
+    uint32_t binary_addr = 0x400D0064;
     uint32_t take_addr = 0x400D0070;
     uint32_t give_addr = 0x400D0080;
     extern void stub_xSemaphoreCreateMutex(xtensa_cpu_t *, void *);
+    extern void stub_xSemaphoreCreateBinary(xtensa_cpu_t *, void *);
     extern void stub_xSemaphoreTake(xtensa_cpu_t *, void *);
     extern void stub_xSemaphoreGive(xtensa_cpu_t *, void *);
     rom_stubs_register_ctx(rom, create_addr, (rom_stub_fn)stub_xSemaphoreCreateMutex, "xSemaphoreCreateMutex", frt);
+    rom_stubs_register_ctx(rom, binary_addr, (rom_stub_fn)stub_xSemaphoreCreateBinary, "xSemaphoreCreateBinary", frt);
     rom_stubs_register_ctx(rom, take_addr, (rom_stub_fn)stub_xSemaphoreTake, "xSemaphoreTake", frt);
     rom_stubs_register_ctx(rom, give_addr, (rom_stub_fn)stub_xSemaphoreGive, "xSemaphoreGive", frt);
 
@@ -394,6 +397,35 @@ TEST(test_semaphore_create_take_give) {
     cpu.pc = give_addr;
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 2), 1);  /* pdTRUE */
+
+    /* Binary semaphores begin empty and consume exactly one give token. */
+    ar_write(&cpu, 0, BASE + 0x100);
+    cpu.pc = binary_addr;
+    xtensa_step(&cpu);
+    uint32_t binary = ar_read(&cpu, 2);
+    ASSERT_TRUE(binary != 0);
+
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, binary);
+    ar_write(&cpu, 3, 0);
+    cpu.pc = take_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 0);
+
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, binary);
+    cpu.pc = give_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
+
+    for (int expected = 1; expected >= 0; expected--) {
+        ar_write(&cpu, 0, BASE + 0x100);
+        ar_write(&cpu, 2, binary);
+        ar_write(&cpu, 3, 0);
+        cpu.pc = take_addr;
+        xtensa_step(&cpu);
+        ASSERT_EQ(ar_read(&cpu, 2), (uint32_t)expected);
+    }
 
     frt_teardown(&cpu, rom, frt);
 }

@@ -38,7 +38,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
   dual-core table invalidation, flash programming coherence, and translated-code invalidation
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
   timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA,
-  eight-channel classic RMT, ledc, ADC1/2, DAC1/2
+  eight-channel classic RMT, 16-channel classic LEDC PWM/fades, ADC1/2, DAC1/2
 - raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
 - host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
@@ -49,7 +49,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 590 tests
+- 593 tests
 
 ## building
 
@@ -138,7 +138,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 590 tests, 1935 passed, 0 failed
+# 593 tests, 1995 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -200,6 +200,21 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-rmt-tx.sh
 
 `FLEXE_RMT_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The LEDC gate builds an unmodified sketch against ESP-IDF's public
+`driver/ledc.h` API. It configures a 5 kHz, 8-bit PWM output on GPIO21,
+validates boundary-latched duty updates from 64 to 192, then runs a blocking
+fade from 192 to 96 through the production driver's ISR and semaphore path.
+It also checks the host PWM boundary, output stop, and zero unhandled MMIO or
+unregistered ROM calls under both the JIT and interpreter:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-ledc-pwm.sh
+# engine=jit stage=0x1EDCC0DE result=0/0/5000/64/.../192/.../96/... events=9 ... valid=1 unhandled=0 unregistered=0
+# engine=interp stage=0x1EDCC0DE result=0/0/5000/64/.../192/.../96/... events=9 ... valid=1 unhandled=0 unregistered=0
+```
+
+`FLEXE_LEDC_BUILD_DIR` optionally preserves its Arduino build directory.
+
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
@@ -220,7 +235,7 @@ Current Release-build results on Apple silicon (three default-length runs):
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
 | ESP32 Marauder v1.14 | **7.92× real-time** |
-| NerdMiner v1.8.3 | **6.31× real-time** |
+| NerdMiner v1.8.3 | **6.24× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

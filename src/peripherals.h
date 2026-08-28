@@ -40,6 +40,16 @@ typedef void (*periph_rmt_tx_fn)(void *ctx, int channel,
                                  uint32_t tick_hz, uint32_t carrier_hz,
                                  bool finished);
 
+/* Aggregate output state for one classic ESP32 LEDC PWM channel. The GPIO is
+ * resolved through the live GPIO matrix (-1 while unrouted); duty and
+ * duty_max describe the hardware timer resolution, while frequency_hz is
+ * the configured PWM carrier. `inverted` reflects GPIO matrix output
+ * inversion rather than rewriting the programmed duty value. */
+typedef void (*periph_ledc_output_fn)(void *ctx, int speed_mode, int channel,
+                                     int gpio, uint32_t frequency_hz,
+                                     uint32_t duty, uint32_t duty_max,
+                                     bool enabled, bool inverted);
+
 /* Compatibility-mode firmware still registers real ESP-IDF peripheral ISRs,
  * even though Flexe replaces the FreeRTOS scheduler. A source callback lets
  * the ROM-stub layer dispatch those guest handlers when a modelled interrupt
@@ -93,6 +103,14 @@ int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
                                periph_rmt_tx_fn fn, void *ctx);
 size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel,
                             const uint32_t *items, size_t count);
+
+/* Attach a PWM sink to one of the 16 classic LEDC outputs. speed_mode 0 is
+ * the high-speed group and 1 is the low-speed group. The current aggregate
+ * state is delivered immediately, and subsequent timer/channel/GPIO-matrix
+ * changes produce another callback. */
+int periph_set_ledc_output_callback(esp32_periph_t *p, int speed_mode,
+                                    int channel, periph_ledc_output_fn fn,
+                                    void *ctx);
 
 /* Observe rising edges for an ESP32 peripheral source (0-70). Passing NULL
  * detaches the observer. This is separate from the hardware interrupt matrix:

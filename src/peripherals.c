@@ -227,12 +227,43 @@
 #define UART_INT_VALID_MASK      0x7FFFFu
 
 /* LEDC register offsets and interrupt source (ESP32, not S2/S3). */
+#define LEDC_SPEED_MODE_COUNT    2u
+#define LEDC_CHANNEL_COUNT       8u
+#define LEDC_TIMER_COUNT         4u
+#define LEDC_CHANNEL_STRIDE      0x14u
+#define LEDC_LS_CHANNEL_OFF      0x0A0u
+#define LEDC_TIMER_OFF           0x140u
+#define LEDC_LS_TIMER_OFF        0x160u
+#define LEDC_TIMER_STRIDE        0x008u
 #define LEDC_INT_RAW_OFF         0x180u
 #define LEDC_INT_ST_OFF          0x184u
 #define LEDC_INT_ENA_OFF         0x188u
 #define LEDC_INT_CLR_OFF         0x18Cu
+#define LEDC_CONF_OFF            0x190u
 #define LEDC_DATE_OFF            0x1FCu
 #define LEDC_INTR_SOURCE         43
+#define LEDC_INT_VALID_MASK      0x00FFFFFFu
+
+#define LEDC_CH_TIMER_SEL_MASK   0x00000003u
+#define LEDC_CH_SIG_OUT_EN       (1u << 2)
+#define LEDC_CH_IDLE_LEVEL       (1u << 3)
+#define LEDC_CH_DUTY_MASK        0x01FFFFFFu
+#define LEDC_CH_DUTY_START       (1u << 31)
+#define LEDC_CH_DUTY_INC         (1u << 30)
+#define LEDC_CH_DUTY_NUM_MASK    0x3FFu
+#define LEDC_CH_DUTY_NUM_SHIFT   20u
+#define LEDC_CH_DUTY_CYCLE_SHIFT 10u
+#define LEDC_CH_DUTY_SCALE_MASK  0x3FFu
+
+#define LEDC_TIMER_RES_MASK      0x1Fu
+#define LEDC_TIMER_DIV_SHIFT     5u
+#define LEDC_TIMER_DIV_MASK      0x3FFFFu
+#define LEDC_TIMER_PAUSE         (1u << 23)
+#define LEDC_TIMER_RESET         (1u << 24)
+#define LEDC_TIMER_TICK_SEL      (1u << 25)
+#define LEDC_TIMER_PARA_UP       (1u << 26)
+#define LEDC_HS_SIGNAL_BASE      71u
+#define LEDC_LS_SIGNAL_BASE      79u
 
 static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
@@ -241,6 +272,11 @@ static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void rmt_reset_state(esp32_periph_t *p);
+static uint32_t ledc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void ledc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void ledc_reset_state(esp32_periph_t *p);
+static void ledc_gpio_route_changed(esp32_periph_t *p, int gpio,
+                                    uint32_t before, uint32_t after);
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -438,6 +474,43 @@ typedef struct {
     uint32_t date;
 } rmt_state_t;
 
+typedef struct {
+    uint32_t active_conf;
+    uint32_t anchor_count;
+    uint64_t anchor_cycles;
+    uint64_t reported_wraps;
+} ledc_timer_state_t;
+
+typedef struct {
+    uint32_t active_duty;       /* hardware Q21.4 duty register value */
+    uint32_t update_old_duty;
+    uint32_t update_start_duty;
+    uint32_t update_target_duty;
+    uint32_t update_scale;
+    uint32_t update_steps;
+    uint64_t update_start_cycle;
+    uint64_t update_end_cycle;
+    uint64_t update_step_cycles;
+    bool update_active;
+    bool update_started;
+
+    periph_ledc_output_fn output_cb;
+    void *output_cb_ctx;
+    int last_gpio;
+    uint32_t last_frequency_hz;
+    uint32_t last_duty;
+    uint32_t last_duty_max;
+    bool last_enabled;
+    bool last_inverted;
+    bool output_reported;
+} ledc_channel_state_t;
+
+typedef struct {
+    uint32_t regs[0x200 / sizeof(uint32_t)];
+    ledc_timer_state_t timer[LEDC_SPEED_MODE_COUNT][LEDC_TIMER_COUNT];
+    ledc_channel_state_t channel[LEDC_SPEED_MODE_COUNT][LEDC_CHANNEL_COUNT];
+} ledc_state_t;
+
 struct esp32_periph {
     xtensa_mem_t *mem;
 
@@ -518,9 +591,11 @@ struct esp32_periph {
     /* Radio/PHY register state used by the closed-source WiFi/BT HAL. */
     radio_state_t radio;
 
-    /* LEDC register file. Channel duty updates complete synchronously, while
-     * interrupt raw/status/enable/clear retain their hardware distinctions. */
-    uint32_t ledc_regs[0x200 / sizeof(uint32_t)];
+    /* Classic ESP32 high/low-speed LEDC timers, channels, and timed fades. */
+    ledc_state_t ledc;
+    uint64_t ledc_time_cycles;
+    uint32_t ledc_last_ccount;
+    bool ledc_time_valid;
 
     /* Two independent classic ESP32 I2S controllers with circular DMA. */
     i2s_state_t i2s[I2S_PORT_COUNT];
@@ -584,6 +659,7 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_PERIP_CLK_EN_OFF         0x0C0
 #define DPORT_PERIP_RST_EN_OFF         0x0C4
 #define DPORT_RMT_MODULE_BIT           (1u << 9)
+#define DPORT_LEDC_MODULE_BIT          (1u << 11)
 
 /* Internal: scan matrix and set/clear CPU interrupt bits for a source */
 static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert) {
@@ -789,6 +865,8 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         p->dport_perip_rst_en = val;
         if (val & DPORT_RMT_MODULE_BIT)
             rmt_reset_state(p);
+        if (val & DPORT_LEDC_MODULE_BIT)
+            ledc_reset_state(p);
         break;
     case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
     case 0x0D8: p->bt_lpck[1] = val; break;  /* DPORT_BT_LPCK_DIV_FRAC */
@@ -1130,7 +1208,9 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     /* GPIO_FUNC_OUT_SEL_CFG_REG */
     if (off >= 0x530 && off < 0x530 + 40 * 4) {
         int n = (int)(off - 0x530) / 4;
+        uint32_t before = p->gpio.func_out_sel[n];
         p->gpio.func_out_sel[n] = val;
+        ledc_gpio_route_changed(p, n, before, val);
         return;
     }
 
@@ -1398,6 +1478,7 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
         lact_next_fire(p, cpu),
         i2s_next_fire(p, cpu),
         rmt_next_fire(p, cpu),
+        ledc_next_fire(p, cpu),
     };
     bool have = false;
     uint32_t best = UINT32_MAX;
@@ -1420,6 +1501,7 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
         lact_eval_irq(p, group);
     i2s_eval_events(p, cpu);
     rmt_eval_events(p, cpu);
+    ledc_eval_events(p, cpu);
 }
 
 /* Recompute both cores' next_timer_event after LACT state changes. */
@@ -2694,35 +2776,573 @@ static void rmt_write(void *ctx, uint32_t addr, uint32_t value) {
 
 /* ---- LEDC PWM controller ---- */
 
+static uint32_t ledc_cpu_mhz(const esp32_periph_t *p) {
+    uint32_t mhz = mem_read32(p->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    return mhz >= 10u && mhz <= 240u ? mhz : 240u;
+}
+
+static uint64_t ledc_now_cycles(esp32_periph_t *p) {
+    if (!p->cpu[0]) return p->ledc_time_cycles;
+
+    uint32_t now = p->cpu[0]->ccount;
+    if (!p->ledc_time_valid) {
+        p->ledc_last_ccount = now;
+        p->ledc_time_valid = true;
+        return p->ledc_time_cycles;
+    }
+
+    /* Peripherals advance with the hardware clock, including time skipped by
+     * delay()/WAITI. cycle_count deliberately measures executed guest work
+     * and therefore cannot be used as a peripheral timebase. Sampling at
+     * every peripheral event extends the 32-bit CCOUNT wrap into 64 bits. */
+    uint32_t elapsed = now - p->ledc_last_ccount;
+    if (elapsed < (uint32_t)INT32_MAX) {
+        if (p->ledc_time_cycles > UINT64_MAX - elapsed)
+            p->ledc_time_cycles = UINT64_MAX;
+        else
+            p->ledc_time_cycles += elapsed;
+    }
+    p->ledc_last_ccount = now;
+    return p->ledc_time_cycles;
+}
+
+/* floor(value * multiplier / divisor) without overflowing solely because of
+ * the intermediate product. LEDC's multiplier is at most 80 * 256. */
+static uint64_t ledc_mul_div_floor(uint64_t value, uint64_t multiplier,
+                                   uint64_t divisor) {
+    if (divisor == 0) return 0;
+    uint64_t quotient = value / divisor;
+    uint64_t remainder = value % divisor;
+    if (multiplier != 0 && quotient > UINT64_MAX / multiplier)
+        return UINT64_MAX;
+    uint64_t result = quotient * multiplier;
+    uint64_t tail = remainder * multiplier / divisor;
+    return result > UINT64_MAX - tail ? UINT64_MAX : result + tail;
+}
+
+static uint32_t ledc_channel_offset(unsigned speed_mode, unsigned channel) {
+    return (speed_mode ? LEDC_LS_CHANNEL_OFF : 0u) +
+           channel * LEDC_CHANNEL_STRIDE;
+}
+
+static uint32_t ledc_timer_offset(unsigned speed_mode, unsigned timer) {
+    return (speed_mode ? LEDC_LS_TIMER_OFF : LEDC_TIMER_OFF) +
+           timer * LEDC_TIMER_STRIDE;
+}
+
+static uint32_t ledc_timer_source_mhz(const esp32_periph_t *p,
+                                      unsigned speed_mode,
+                                      const ledc_timer_state_t *timer) {
+    if (!(timer->active_conf & LEDC_TIMER_TICK_SEL)) return 1u;
+    if (!speed_mode) return 80u;
+    return p->ledc.regs[LEDC_CONF_OFF / 4u] & 1u ? 80u : 8u;
+}
+
+static uint32_t ledc_timer_resolution(const ledc_timer_state_t *timer) {
+    uint32_t resolution = timer->active_conf & LEDC_TIMER_RES_MASK;
+    return resolution <= 20u ? resolution : 20u;
+}
+
+static uint64_t ledc_timer_period_counts(const ledc_timer_state_t *timer) {
+    return 1ull << ledc_timer_resolution(timer);
+}
+
+static bool ledc_timer_running(const ledc_timer_state_t *timer) {
+    uint32_t divider = (timer->active_conf >> LEDC_TIMER_DIV_SHIFT) &
+                       LEDC_TIMER_DIV_MASK;
+    return divider != 0 &&
+           !(timer->active_conf & (LEDC_TIMER_RESET | LEDC_TIMER_PAUSE));
+}
+
+static uint64_t ledc_timer_total_counts(esp32_periph_t *p,
+                                        unsigned speed_mode,
+                                        const ledc_timer_state_t *timer) {
+    if (!ledc_timer_running(timer)) return timer->anchor_count;
+    uint64_t now = ledc_now_cycles(p);
+    uint64_t elapsed = now >= timer->anchor_cycles ?
+                       now - timer->anchor_cycles : 0;
+    uint64_t multiplier =
+        (uint64_t)ledc_timer_source_mhz(p, speed_mode, timer) * 256u;
+    uint64_t divisor =
+        (uint64_t)ledc_cpu_mhz(p) *
+        ((timer->active_conf >> LEDC_TIMER_DIV_SHIFT) &
+         LEDC_TIMER_DIV_MASK);
+    uint64_t advanced = ledc_mul_div_floor(elapsed, multiplier, divisor);
+    return advanced > UINT64_MAX - timer->anchor_count ?
+           UINT64_MAX : advanced + timer->anchor_count;
+}
+
+static uint32_t ledc_timer_count(esp32_periph_t *p,
+                                 unsigned speed_mode, unsigned timer_index) {
+    const ledc_timer_state_t *timer =
+        &p->ledc.timer[speed_mode][timer_index];
+    return (uint32_t)(ledc_timer_total_counts(p, speed_mode, timer) %
+                      ledc_timer_period_counts(timer));
+}
+
+static uint64_t ledc_timer_counts_cpu_cycles(const esp32_periph_t *p,
+                                             unsigned speed_mode,
+                                             unsigned timer_index,
+                                             uint64_t counts) {
+    const ledc_timer_state_t *timer =
+        &p->ledc.timer[speed_mode][timer_index];
+    if (!ledc_timer_running(timer)) return 0;
+    uint64_t numerator = counts *
+        ((timer->active_conf >> LEDC_TIMER_DIV_SHIFT) &
+         LEDC_TIMER_DIV_MASK) * ledc_cpu_mhz(p);
+    uint64_t denominator =
+        (uint64_t)ledc_timer_source_mhz(p, speed_mode, timer) * 256u;
+    return (numerator + denominator - 1u) / denominator;
+}
+
+static uint64_t ledc_timer_period_cpu_cycles(const esp32_periph_t *p,
+                                             unsigned speed_mode,
+                                             unsigned timer_index) {
+    return ledc_timer_counts_cpu_cycles(
+        p, speed_mode, timer_index,
+        ledc_timer_period_counts(&p->ledc.timer[speed_mode][timer_index]));
+}
+
+static uint64_t ledc_timer_remaining_cpu_cycles(esp32_periph_t *p,
+                                                unsigned speed_mode,
+                                                unsigned timer_index) {
+    const ledc_timer_state_t *timer =
+        &p->ledc.timer[speed_mode][timer_index];
+    uint64_t period = ledc_timer_period_counts(timer);
+    uint32_t count = ledc_timer_count(p, speed_mode, timer_index);
+    return ledc_timer_counts_cpu_cycles(p, speed_mode, timer_index,
+                                        period - count);
+}
+
+static uint32_t ledc_timer_frequency_hz(const esp32_periph_t *p,
+                                        unsigned speed_mode,
+                                        unsigned timer_index) {
+    const ledc_timer_state_t *timer =
+        &p->ledc.timer[speed_mode][timer_index];
+    if (!ledc_timer_running(timer)) return 0;
+    uint64_t divider =
+        (timer->active_conf >> LEDC_TIMER_DIV_SHIFT) & LEDC_TIMER_DIV_MASK;
+    uint64_t denominator = divider * ledc_timer_period_counts(timer);
+    uint64_t numerator =
+        (uint64_t)ledc_timer_source_mhz(p, speed_mode, timer) *
+        1000000u * 256u;
+    return denominator ? (uint32_t)(numerator / denominator) : 0;
+}
+
+static uint32_t ledc_current_duty_raw(esp32_periph_t *p,
+                                      unsigned speed_mode,
+                                      unsigned channel_index) {
+    const ledc_channel_state_t *channel =
+        &p->ledc.channel[speed_mode][channel_index];
+    if (!channel->update_active) return channel->active_duty;
+
+    uint64_t now = ledc_now_cycles(p);
+    if (now < channel->update_start_cycle)
+        return channel->update_old_duty;
+    if (channel->update_scale == 0 || channel->update_steps == 0 ||
+        now >= channel->update_end_cycle)
+        return now >= channel->update_end_cycle ?
+               channel->update_target_duty : channel->update_start_duty;
+
+    uint64_t elapsed = now - channel->update_start_cycle;
+    uint64_t steps = channel->update_step_cycles ?
+        elapsed / channel->update_step_cycles : channel->update_steps;
+    if (steps > channel->update_steps) steps = channel->update_steps;
+    uint64_t delta = steps * channel->update_scale * 16u;
+    if (channel->update_target_duty >= channel->update_start_duty) {
+        uint64_t duty = (uint64_t)channel->update_start_duty + delta;
+        return duty > channel->update_target_duty ?
+               channel->update_target_duty : (uint32_t)duty;
+    }
+    return delta >= channel->update_start_duty -
+                    channel->update_target_duty ?
+           channel->update_target_duty :
+           channel->update_start_duty - (uint32_t)delta;
+}
+
+static int ledc_channel_gpio(const esp32_periph_t *p, unsigned speed_mode,
+                             unsigned channel, bool *inverted) {
+    uint32_t signal = (speed_mode ? LEDC_LS_SIGNAL_BASE :
+                                    LEDC_HS_SIGNAL_BASE) + channel;
+    for (int gpio = 0; gpio < 40; gpio++) {
+        uint32_t route = p->gpio.func_out_sel[gpio];
+        if ((route & 0x1FFu) == signal) {
+            if (inverted) *inverted = (route & (1u << 9)) != 0;
+            return gpio;
+        }
+    }
+    if (inverted) *inverted = false;
+    return -1;
+}
+
+static void ledc_emit_channel(esp32_periph_t *p, unsigned speed_mode,
+                              unsigned channel_index, bool force) {
+    ledc_channel_state_t *channel =
+        &p->ledc.channel[speed_mode][channel_index];
+    uint32_t base = ledc_channel_offset(speed_mode, channel_index);
+    uint32_t conf0 = p->ledc.regs[base / 4u];
+    unsigned timer_index = conf0 & LEDC_CH_TIMER_SEL_MASK;
+    const ledc_timer_state_t *timer =
+        &p->ledc.timer[speed_mode][timer_index];
+    bool inverted = false;
+    int gpio = ledc_channel_gpio(p, speed_mode, channel_index, &inverted);
+    uint32_t frequency = ledc_timer_frequency_hz(p, speed_mode, timer_index);
+    uint32_t duty = ledc_current_duty_raw(p, speed_mode, channel_index) >> 4;
+    uint32_t resolution = ledc_timer_resolution(timer);
+    uint32_t duty_max = resolution == 0 ? 0u :
+                        (uint32_t)((1ull << resolution) - 1u);
+    bool enabled = gpio >= 0 && (conf0 & LEDC_CH_SIG_OUT_EN) != 0 &&
+                   ledc_timer_running(timer);
+
+    bool changed = !channel->output_reported || gpio != channel->last_gpio ||
+        frequency != channel->last_frequency_hz ||
+        duty != channel->last_duty || duty_max != channel->last_duty_max ||
+        enabled != channel->last_enabled ||
+        inverted != channel->last_inverted;
+    if (!force && !changed) return;
+
+    channel->last_gpio = gpio;
+    channel->last_frequency_hz = frequency;
+    channel->last_duty = duty;
+    channel->last_duty_max = duty_max;
+    channel->last_enabled = enabled;
+    channel->last_inverted = inverted;
+    channel->output_reported = true;
+
+    if (channel->output_cb)
+        channel->output_cb(channel->output_cb_ctx, (int)speed_mode,
+                           (int)channel_index, gpio, frequency, duty,
+                           duty_max, enabled, inverted);
+
+    sbx_event_t event = { .kind = SBX_EV_PWM_OUT, .cycle = ledc_now_cycles(p) };
+    event.pwm_out.gpio = (int8_t)gpio;
+    event.pwm_out.speed_mode = (uint8_t)speed_mode;
+    event.pwm_out.channel = (uint8_t)channel_index;
+    event.pwm_out.enabled = enabled ? 1u : 0u;
+    event.pwm_out.inverted = inverted ? 1u : 0u;
+    event.pwm_out.frequency_hz = frequency;
+    event.pwm_out.duty = duty;
+    event.pwm_out.duty_max = duty_max;
+    sbx_events_emit(&event);
+}
+
+static void ledc_emit_timer_channels(esp32_periph_t *p, unsigned speed_mode,
+                                     unsigned timer_index) {
+    for (unsigned channel = 0; channel < LEDC_CHANNEL_COUNT; channel++) {
+        uint32_t base = ledc_channel_offset(speed_mode, channel);
+        if ((p->ledc.regs[base / 4u] & LEDC_CH_TIMER_SEL_MASK) == timer_index)
+            ledc_emit_channel(p, speed_mode, channel, false);
+    }
+}
+
 static void ledc_update_irq(esp32_periph_t *p) {
-    uint32_t raw = p->ledc_regs[LEDC_INT_RAW_OFF / 4];
-    uint32_t ena = p->ledc_regs[LEDC_INT_ENA_OFF / 4];
-    uint32_t mask = 1u << (LEDC_INTR_SOURCE % 32);
+    uint32_t raw = p->ledc.regs[LEDC_INT_RAW_OFF / 4u];
+    uint32_t ena = p->ledc.regs[LEDC_INT_ENA_OFF / 4u];
     if (raw & ena)
-        p->pending_sources[LEDC_INTR_SOURCE / 32] |= mask;
+        periph_assert_interrupt(p, LEDC_INTR_SOURCE);
     else
-        p->pending_sources[LEDC_INTR_SOURCE / 32] &= ~mask;
-    intr_matrix_update_source(p, LEDC_INTR_SOURCE, (raw & ena) != 0);
+        periph_deassert_interrupt(p, LEDC_INTR_SOURCE);
 }
 
 static int ledc_channel_from_offset(uint32_t off, uint32_t *channel_base,
                                     int *low_speed) {
-    if (off < 0x0A0u) {
-        int channel = (int)(off / 0x14u);
-        if (channel < 8) {
-            *channel_base = (uint32_t)channel * 0x14u;
+    if (off < LEDC_LS_CHANNEL_OFF) {
+        int channel = (int)(off / LEDC_CHANNEL_STRIDE);
+        if (channel < (int)LEDC_CHANNEL_COUNT) {
+            *channel_base = (uint32_t)channel * LEDC_CHANNEL_STRIDE;
             *low_speed = 0;
             return channel;
         }
-    } else if (off < 0x140u) {
-        int channel = (int)((off - 0x0A0u) / 0x14u);
-        if (channel < 8) {
-            *channel_base = 0x0A0u + (uint32_t)channel * 0x14u;
+    } else if (off < LEDC_TIMER_OFF) {
+        int channel = (int)((off - LEDC_LS_CHANNEL_OFF) /
+                            LEDC_CHANNEL_STRIDE);
+        if (channel < (int)LEDC_CHANNEL_COUNT) {
+            *channel_base = LEDC_LS_CHANNEL_OFF +
+                            (uint32_t)channel * LEDC_CHANNEL_STRIDE;
             *low_speed = 1;
             return channel;
         }
     }
     return -1;
+}
+
+static int ledc_timer_from_offset(uint32_t off, unsigned *speed_mode,
+                                  unsigned *timer_index,
+                                  uint32_t *timer_base) {
+    if (off >= LEDC_TIMER_OFF && off < LEDC_LS_TIMER_OFF) {
+        *speed_mode = 0;
+        *timer_index = (off - LEDC_TIMER_OFF) / LEDC_TIMER_STRIDE;
+    } else if (off >= LEDC_LS_TIMER_OFF && off < LEDC_INT_RAW_OFF) {
+        *speed_mode = 1;
+        *timer_index = (off - LEDC_LS_TIMER_OFF) / LEDC_TIMER_STRIDE;
+    } else {
+        return -1;
+    }
+    if (*timer_index >= LEDC_TIMER_COUNT) return -1;
+    *timer_base = ledc_timer_offset(*speed_mode, *timer_index);
+    return 0;
+}
+
+static void ledc_reanchor_timer(esp32_periph_t *p, unsigned speed_mode,
+                                unsigned timer_index, uint32_t conf) {
+    ledc_timer_state_t *timer =
+        &p->ledc.timer[speed_mode][timer_index];
+    uint32_t count = ledc_timer_count(p, speed_mode, timer_index);
+    timer->active_conf = conf;
+    timer->anchor_count = conf & LEDC_TIMER_RESET ? 0u : count;
+    timer->anchor_cycles = ledc_now_cycles(p);
+    timer->reported_wraps = 0;
+}
+
+static void ledc_sync_timer_overflows(esp32_periph_t *p) {
+    for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++) {
+        for (unsigned index = 0; index < LEDC_TIMER_COUNT; index++) {
+            ledc_timer_state_t *timer = &p->ledc.timer[speed][index];
+            if (!ledc_timer_running(timer)) continue;
+            uint64_t wraps = ledc_timer_total_counts(p, speed, timer) /
+                             ledc_timer_period_counts(timer);
+            if (wraps > timer->reported_wraps) {
+                timer->reported_wraps = wraps;
+                p->ledc.regs[LEDC_INT_RAW_OFF / 4u] |=
+                    1u << (index + speed * LEDC_TIMER_COUNT);
+            }
+        }
+    }
+}
+
+static void ledc_kick(esp32_periph_t *p) {
+    for (int core = 0; core < 2; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static uint64_t ledc_add_saturating(uint64_t value, uint64_t addend) {
+    return value > UINT64_MAX - addend ? UINT64_MAX : value + addend;
+}
+
+static void ledc_start_channel_update(esp32_periph_t *p,
+                                      unsigned speed_mode,
+                                      unsigned channel_index,
+                                      uint32_t conf1) {
+    ledc_channel_state_t *channel =
+        &p->ledc.channel[speed_mode][channel_index];
+    uint32_t base = ledc_channel_offset(speed_mode, channel_index);
+    unsigned timer_index =
+        p->ledc.regs[base / 4u] & LEDC_CH_TIMER_SEL_MASK;
+    uint64_t period_cycles =
+        ledc_timer_period_cpu_cycles(p, speed_mode, timer_index);
+    if (period_cycles == 0) {
+        channel->update_active = false;
+        channel->update_started = false;
+        return;
+    }
+
+    channel->update_old_duty =
+        ledc_current_duty_raw(p, speed_mode, channel_index);
+    channel->active_duty = channel->update_old_duty;
+    channel->update_start_duty =
+        p->ledc.regs[(base + 0x08u) / 4u] & LEDC_CH_DUTY_MASK;
+    channel->update_scale = conf1 & LEDC_CH_DUTY_SCALE_MASK;
+    uint32_t cycle_count =
+        (conf1 >> LEDC_CH_DUTY_CYCLE_SHIFT) & 0x3FFu;
+    channel->update_steps =
+        (conf1 >> LEDC_CH_DUTY_NUM_SHIFT) & LEDC_CH_DUTY_NUM_MASK;
+    if (cycle_count == 0) cycle_count = 1;
+
+    uint64_t step_cycles = period_cycles;
+    if (cycle_count > UINT64_MAX / step_cycles)
+        step_cycles = UINT64_MAX;
+    else
+        step_cycles *= cycle_count;
+    channel->update_step_cycles = step_cycles;
+
+    uint64_t delta =
+        (uint64_t)channel->update_scale * channel->update_steps * 16u;
+    uint64_t target;
+    if (conf1 & LEDC_CH_DUTY_INC) {
+        target = (uint64_t)channel->update_start_duty + delta;
+        if (target > LEDC_CH_DUTY_MASK) target = LEDC_CH_DUTY_MASK;
+    } else {
+        target = delta >= channel->update_start_duty ? 0u :
+                 channel->update_start_duty - delta;
+    }
+    channel->update_target_duty = (uint32_t)target;
+
+    uint64_t now = ledc_now_cycles(p);
+    uint64_t boundary_cycles =
+        ledc_timer_remaining_cpu_cycles(p, speed_mode, timer_index);
+    channel->update_start_cycle = ledc_add_saturating(now, boundary_cycles);
+    uint64_t fade_cycles = 0;
+    if (channel->update_scale != 0 && channel->update_steps != 0) {
+        fade_cycles = channel->update_steps > UINT64_MAX / step_cycles ?
+                      UINT64_MAX : channel->update_steps * step_cycles;
+    }
+    channel->update_end_cycle =
+        ledc_add_saturating(channel->update_start_cycle, fade_cycles);
+    channel->update_active = true;
+    channel->update_started = false;
+    ledc_kick(p);
+}
+
+static void ledc_finish_channel_update(esp32_periph_t *p,
+                                       unsigned speed_mode,
+                                       unsigned channel_index) {
+    ledc_channel_state_t *channel =
+        &p->ledc.channel[speed_mode][channel_index];
+    uint32_t base = ledc_channel_offset(speed_mode, channel_index);
+    channel->active_duty = channel->update_target_duty;
+    channel->update_active = false;
+    channel->update_started = false;
+    p->ledc.regs[(base + 0x0Cu) / 4u] &= ~LEDC_CH_DUTY_START;
+    p->ledc.regs[LEDC_INT_RAW_OFF / 4u] |=
+        1u << (8u + channel_index + speed_mode * LEDC_CHANNEL_COUNT);
+    ledc_emit_channel(p, speed_mode, channel_index, false);
+    ledc_update_irq(p);
+}
+
+static uint32_t ledc_deadline_ccount(esp32_periph_t *p,
+                                     const xtensa_cpu_t *cpu,
+                                     uint64_t deadline) {
+    uint64_t now = ledc_now_cycles(p);
+    if (deadline <= now) return cpu->ccount;
+    uint64_t distance = deadline - now;
+    if (distance >= (uint64_t)INT32_MAX)
+        distance = (uint64_t)INT32_MAX - 1u;
+    return cpu->ccount + (uint32_t)distance;
+}
+
+static uint32_t ledc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    bool have = false;
+    uint32_t best = UINT32_MAX;
+    uint32_t best_distance = 0;
+
+    for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++) {
+        for (unsigned channel_index = 0;
+             channel_index < LEDC_CHANNEL_COUNT; channel_index++) {
+            ledc_channel_state_t *channel =
+                &p->ledc.channel[speed][channel_index];
+            if (!channel->update_active) continue;
+            uint64_t deadline = channel->update_started ?
+                channel->update_end_cycle : channel->update_start_cycle;
+            uint32_t event = ledc_deadline_ccount(p, cpu, deadline);
+            uint32_t distance = event - cpu->ccount;
+            if (!have || distance < best_distance) {
+                have = true;
+                best = event;
+                best_distance = distance;
+            }
+        }
+    }
+
+    uint32_t raw = p->ledc.regs[LEDC_INT_RAW_OFF / 4u];
+    uint32_t ena = p->ledc.regs[LEDC_INT_ENA_OFF / 4u];
+    for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++) {
+        for (unsigned timer_index = 0;
+             timer_index < LEDC_TIMER_COUNT; timer_index++) {
+            unsigned bit = timer_index + speed * LEDC_TIMER_COUNT;
+            if (!(ena & (1u << bit)) || (raw & (1u << bit))) continue;
+            const ledc_timer_state_t *timer =
+                &p->ledc.timer[speed][timer_index];
+            if (!ledc_timer_running(timer)) continue;
+            uint64_t remaining_cycles =
+                ledc_timer_remaining_cpu_cycles(p, speed, timer_index);
+            uint32_t event = ledc_deadline_ccount(
+                p, cpu, ledc_add_saturating(ledc_now_cycles(p),
+                                             remaining_cycles));
+            uint32_t distance = event - cpu->ccount;
+            if (!have || distance < best_distance) {
+                have = true;
+                best = event;
+                best_distance = distance;
+            }
+        }
+    }
+    return have ? best : UINT32_MAX;
+}
+
+static void ledc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != p->cpu[0]) return;
+    ledc_sync_timer_overflows(p);
+
+    for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++) {
+        for (unsigned channel_index = 0;
+             channel_index < LEDC_CHANNEL_COUNT; channel_index++) {
+            unsigned drained = 0;
+            ledc_channel_state_t *channel =
+                &p->ledc.channel[speed][channel_index];
+            while (channel->update_active && drained++ < 1024u) {
+                uint64_t now = ledc_now_cycles(p);
+                if (!channel->update_started) {
+                    if (now < channel->update_start_cycle) break;
+                    channel->active_duty = channel->update_start_duty;
+                    channel->update_started = true;
+                    ledc_emit_channel(p, speed, channel_index, false);
+                    if (channel->update_end_cycle <= now)
+                        ledc_finish_channel_update(p, speed, channel_index);
+                } else {
+                    if (now < channel->update_end_cycle) break;
+                    ledc_finish_channel_update(p, speed, channel_index);
+                }
+            }
+        }
+    }
+    ledc_update_irq(p);
+    ledc_kick(p);
+}
+
+static void ledc_reset_state(esp32_periph_t *p) {
+    periph_ledc_output_fn callbacks[LEDC_SPEED_MODE_COUNT][LEDC_CHANNEL_COUNT];
+    void *contexts[LEDC_SPEED_MODE_COUNT][LEDC_CHANNEL_COUNT];
+    bool reported[LEDC_SPEED_MODE_COUNT][LEDC_CHANNEL_COUNT];
+    for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++) {
+        for (unsigned channel = 0; channel < LEDC_CHANNEL_COUNT; channel++) {
+            callbacks[speed][channel] =
+                p->ledc.channel[speed][channel].output_cb;
+            contexts[speed][channel] =
+                p->ledc.channel[speed][channel].output_cb_ctx;
+            reported[speed][channel] =
+                p->ledc.channel[speed][channel].output_reported;
+        }
+    }
+
+    memset(&p->ledc, 0, sizeof(p->ledc));
+    for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++) {
+        for (unsigned timer = 0; timer < LEDC_TIMER_COUNT; timer++) {
+            uint32_t off = ledc_timer_offset(speed, timer);
+            p->ledc.regs[off / 4u] = LEDC_TIMER_RESET;
+            p->ledc.timer[speed][timer].active_conf = LEDC_TIMER_RESET;
+            p->ledc.timer[speed][timer].anchor_cycles = ledc_now_cycles(p);
+        }
+        for (unsigned channel = 0; channel < LEDC_CHANNEL_COUNT; channel++) {
+            p->ledc.channel[speed][channel].output_cb =
+                callbacks[speed][channel];
+            p->ledc.channel[speed][channel].output_cb_ctx =
+                contexts[speed][channel];
+        }
+    }
+    p->ledc.regs[LEDC_DATE_OFF / 4u] = 0x16031700u;
+    ledc_update_irq(p);
+    ledc_kick(p);
+
+    for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++)
+        for (unsigned channel = 0; channel < LEDC_CHANNEL_COUNT; channel++)
+            if (reported[speed][channel] || callbacks[speed][channel])
+                ledc_emit_channel(p, speed, channel, true);
+}
+
+static void ledc_gpio_route_changed(esp32_periph_t *p, int gpio,
+                                    uint32_t before, uint32_t after) {
+    (void)gpio;
+    uint32_t routes[2] = {before & 0x1FFu, after & 0x1FFu};
+    for (unsigned i = 0; i < 2; i++) {
+        uint32_t route = routes[i];
+        if (route >= LEDC_HS_SIGNAL_BASE &&
+            route < LEDC_HS_SIGNAL_BASE + LEDC_CHANNEL_COUNT)
+            ledc_emit_channel(p, 0, route - LEDC_HS_SIGNAL_BASE, true);
+        else if (route >= LEDC_LS_SIGNAL_BASE &&
+                 route < LEDC_LS_SIGNAL_BASE + LEDC_CHANNEL_COUNT)
+            ledc_emit_channel(p, 1, route - LEDC_LS_SIGNAL_BASE, true);
+    }
 }
 
 static uint32_t ledc_read(void *ctx, uint32_t addr) {
@@ -2731,21 +3351,32 @@ static uint32_t ledc_read(void *ctx, uint32_t addr) {
     if ((off & 3u) || off > LEDC_DATE_OFF)
         return default_read(ctx, addr);
 
+    if (p->cpu[0]) ledc_eval_events(p, p->cpu[0]);
+
     if (off == LEDC_INT_ST_OFF)
-        return p->ledc_regs[LEDC_INT_RAW_OFF / 4] &
-               p->ledc_regs[LEDC_INT_ENA_OFF / 4];
+        return p->ledc.regs[LEDC_INT_RAW_OFF / 4u] &
+               p->ledc.regs[LEDC_INT_ENA_OFF / 4u];
     if (off == LEDC_INT_CLR_OFF)
         return 0; /* write-only */
 
     uint32_t channel_base = 0;
     int low_speed = 0;
-    if (ledc_channel_from_offset(off, &channel_base, &low_speed) >= 0 &&
-        off - channel_base == 0x10u) {
-        (void)low_speed;
-        return p->ledc_regs[(channel_base + 0x08u) / 4] & 0x01FFFFFFu;
+    int channel = ledc_channel_from_offset(off, &channel_base, &low_speed);
+    if (channel >= 0 && off - channel_base == 0x10u) {
+        return ledc_current_duty_raw(p, (unsigned)low_speed,
+                                     (unsigned)channel) & LEDC_CH_DUTY_MASK;
     }
 
-    return p->ledc_regs[off / 4];
+    unsigned speed_mode = 0;
+    unsigned timer_index = 0;
+    uint32_t timer_base = 0;
+    if (ledc_timer_from_offset(off, &speed_mode, &timer_index,
+                               &timer_base) == 0 &&
+        off - timer_base == 0x04u) {
+        return ledc_timer_count(p, speed_mode, timer_index);
+    }
+
+    return p->ledc.regs[off / 4u];
 }
 
 static void ledc_write(void *ctx, uint32_t addr, uint32_t val) {
@@ -2756,33 +3387,105 @@ static void ledc_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     }
 
+    if (p->cpu[0]) ledc_eval_events(p, p->cpu[0]);
+
     if (off == LEDC_INT_CLR_OFF) {
-        p->ledc_regs[LEDC_INT_RAW_OFF / 4] &= ~val;
+        p->ledc.regs[LEDC_INT_RAW_OFF / 4u] &=
+            ~(val & LEDC_INT_VALID_MASK);
         ledc_update_irq(p);
+        ledc_kick(p);
         return;
     }
     if (off == LEDC_INT_RAW_OFF || off == LEDC_INT_ST_OFF)
         return; /* read-only */
+    if (off == LEDC_INT_ENA_OFF) {
+        p->ledc.regs[off / 4u] = val & LEDC_INT_VALID_MASK;
+        ledc_update_irq(p);
+        ledc_kick(p);
+        return;
+    }
+
+    unsigned speed_mode = 0;
+    unsigned timer_index = 0;
+    uint32_t timer_base = 0;
+    if (ledc_timer_from_offset(off, &speed_mode, &timer_index,
+                               &timer_base) == 0) {
+        if (off - timer_base == 0x04u)
+            return; /* live timer counter is read-only */
+        p->ledc.regs[off / 4u] = val;
+        ledc_reanchor_timer(p, speed_mode, timer_index, val);
+        if (ledc_timer_running(&p->ledc.timer[speed_mode][timer_index])) {
+            for (unsigned channel = 0; channel < LEDC_CHANNEL_COUNT;
+                 channel++) {
+                uint32_t base = ledc_channel_offset(speed_mode, channel);
+                uint32_t conf0 = p->ledc.regs[base / 4u];
+                uint32_t conf1 = p->ledc.regs[(base + 0x0Cu) / 4u];
+                if ((conf0 & LEDC_CH_TIMER_SEL_MASK) == timer_index &&
+                    (conf1 & LEDC_CH_DUTY_START) &&
+                    !p->ledc.channel[speed_mode][channel].update_active)
+                    ledc_start_channel_update(p, speed_mode, channel, conf1);
+            }
+        }
+        ledc_emit_timer_channels(p, speed_mode, timer_index);
+        ledc_kick(p);
+        return;
+    }
 
     uint32_t channel_base = 0;
     int low_speed = 0;
     int channel = ledc_channel_from_offset(off, &channel_base, &low_speed);
-    if (channel >= 0 && off - channel_base == 0x0Cu) {
-        /* Duty ramps are not wall-clock asynchronous in the emulator. Latch
-         * the programmed duty immediately, self-clear DUTY_START, and expose
-         * the corresponding change-complete interrupt bit. */
-        p->ledc_regs[off / 4] = val & ~(1u << 31);
-        if (val & (1u << 31)) {
-            unsigned bit = (unsigned)channel + (low_speed ? 16u : 8u);
-            p->ledc_regs[LEDC_INT_RAW_OFF / 4] |= 1u << bit;
+    if (channel >= 0) {
+        uint32_t relative = off - channel_base;
+        if (relative == 0x10u)
+            return; /* live duty is read-only */
+        p->ledc.regs[off / 4u] = val;
+        if (relative == 0x0Cu) {
+            ledc_channel_state_t *state =
+                &p->ledc.channel[(unsigned)low_speed][(unsigned)channel];
+            if (val & LEDC_CH_DUTY_START) {
+                ledc_start_channel_update(p, (unsigned)low_speed,
+                                          (unsigned)channel, val);
+            } else {
+                state->active_duty = ledc_current_duty_raw(
+                    p, (unsigned)low_speed, (unsigned)channel);
+                state->update_active = false;
+                state->update_started = false;
+                ledc_emit_channel(p, (unsigned)low_speed,
+                                  (unsigned)channel, false);
+                ledc_kick(p);
+            }
+        } else if (relative == 0u) {
+            ledc_emit_channel(p, (unsigned)low_speed,
+                              (unsigned)channel, false);
         }
-        ledc_update_irq(p);
         return;
     }
 
-    p->ledc_regs[off / 4] = val;
-    if (off == LEDC_INT_ENA_OFF)
-        ledc_update_irq(p);
+    if (off == LEDC_CONF_OFF) {
+        uint32_t counts[LEDC_TIMER_COUNT];
+        for (unsigned timer = 0; timer < LEDC_TIMER_COUNT; timer++)
+            counts[timer] = ledc_timer_count(p, 1, timer);
+        p->ledc.regs[off / 4u] = val;
+        uint64_t now = ledc_now_cycles(p);
+        for (unsigned timer = 0; timer < LEDC_TIMER_COUNT; timer++) {
+            p->ledc.timer[1][timer].anchor_count = counts[timer];
+            p->ledc.timer[1][timer].anchor_cycles = now;
+            p->ledc.timer[1][timer].reported_wraps = 0;
+        }
+        for (unsigned channel = 0; channel < LEDC_CHANNEL_COUNT; channel++) {
+            ledc_channel_state_t *state = &p->ledc.channel[1][channel];
+            if (state->update_active && !state->update_started) {
+                uint32_t base = ledc_channel_offset(1, channel);
+                ledc_start_channel_update(
+                    p, 1, channel, p->ledc.regs[(base + 0x0Cu) / 4u]);
+            }
+        }
+        for (unsigned timer = 0; timer < LEDC_TIMER_COUNT; timer++)
+            ledc_emit_timer_channels(p, 1, timer);
+        ledc_kick(p);
+        return;
+    }
+    p->ledc.regs[off / 4u] = val;
 }
 
 /* ---- I2S0/I2S1 + circular lldesc DMA ---- */
@@ -3324,9 +4027,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     /* LEDC reset state: all eight timers begin held in reset, and DATE is
      * the ESP32 peripheral version value from the vendor register map. */
-    for (uint32_t off = 0x140u; off <= 0x178u; off += 8u)
-        p->ledc_regs[off / 4] = 1u << 24;
-    p->ledc_regs[LEDC_DATE_OFF / 4] = 0x16031700u;
+    ledc_reset_state(p);
 
     /* Bootloader-style initial flash MMU contents (app at flash 0x10000) */
     flash_mmu_init_bootloader(p);
@@ -3563,6 +4264,22 @@ int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
     if (!p || channel < 0 || channel >= (int)RMT_CHANNEL_COUNT) return -1;
     p->rmt.channel[channel].tx_cb = fn;
     p->rmt.channel[channel].tx_cb_ctx = fn ? ctx : NULL;
+    return 0;
+}
+
+int periph_set_ledc_output_callback(esp32_periph_t *p, int speed_mode,
+                                    int channel, periph_ledc_output_fn fn,
+                                    void *ctx) {
+    if (!p || speed_mode < 0 ||
+        speed_mode >= (int)LEDC_SPEED_MODE_COUNT || channel < 0 ||
+        channel >= (int)LEDC_CHANNEL_COUNT)
+        return -1;
+    ledc_channel_state_t *state = &p->ledc.channel[speed_mode][channel];
+    state->output_cb = fn;
+    state->output_cb_ctx = fn ? ctx : NULL;
+    state->output_reported = false;
+    if (fn)
+        ledc_emit_channel(p, (unsigned)speed_mode, (unsigned)channel, true);
     return 0;
 }
 

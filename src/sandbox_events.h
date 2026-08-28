@@ -26,6 +26,7 @@ typedef enum {
     SBX_EV_LCD_PIXELS = 5,  /* framebuffer bytes pushed to an LCD panel */
     SBX_EV_DAC_OUT    = 6,  /* DAC channel enable/value changed */
     SBX_EV_I2S_TX     = 7,  /* PCM bytes consumed by I2S TX DMA */
+    SBX_EV_PWM_OUT    = 8,  /* LEDC aggregate PWM state changed */
 } sbx_event_kind_t;
 
 typedef struct {
@@ -52,6 +53,16 @@ typedef struct {
             uint32_t sample_rate;
             const uint8_t *data;
         } i2s_tx;
+        struct {
+            int8_t gpio;
+            uint8_t speed_mode;
+            uint8_t channel;
+            uint8_t enabled;
+            uint8_t inverted;
+            uint32_t frequency_hz;
+            uint32_t duty;
+            uint32_t duty_max;
+        } pwm_out;
     };
 } sbx_event_t;
 

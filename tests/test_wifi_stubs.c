@@ -99,7 +99,9 @@ TEST(promiscuous_frame_runs_callback_and_restores_cpu) {
     cpu.lcount = 9;
     cpu.br = 0x55AAu;
     cpu.running = true;
-    cpu.halted = false;
+    /* Asynchronous callback delivery wakes a core that was in WAITI while
+     * preserving its architectural task context. */
+    cpu.halted = true;
     cpu.exception = false;
     cpu.irq_check = true;
     cpu.accelerated_blocks = true;

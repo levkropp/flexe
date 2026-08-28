@@ -8,8 +8,9 @@
 
 /* Run a firmware function synchronously using the Xtensa windowed CALL8 ABI.
  * The call uses a private guest stack and restores the interrupted task's
- * architectural state on return.  Guest memory writes and elapsed emulated
- * time remain visible, just as they would for an asynchronous device task.
+ * architectural state on return. Guest memory writes and elapsed emulated
+ * time remain visible, and a completed asynchronous call wakes WAITI just
+ * like interrupt entry.
  *
  * Returns 0 when the function returns normally, -1 for invalid arguments,
  * and -2 if the instruction limit is reached or the guest faults/stops.

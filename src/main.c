@@ -808,6 +808,17 @@ static void sbx_json_sink(const sbx_event_t *ev, void *ctx) {
                 ev->i2s_tx.channels, ev->i2s_tx.len, b64);
         break;
     }
+    case SBX_EV_PWM_OUT:
+        fprintf(stdout,
+                "{\"t\":\"pwm\",\"c\":%llu,\"gpio\":%d,\"speed\":%u,"
+                "\"ch\":%u,\"freq\":%u,\"duty\":%u,\"max\":%u,"
+                "\"en\":%u,\"inv\":%u}\n",
+                (unsigned long long)cycle, ev->pwm_out.gpio,
+                ev->pwm_out.speed_mode, ev->pwm_out.channel,
+                ev->pwm_out.frequency_hz, ev->pwm_out.duty,
+                ev->pwm_out.duty_max, ev->pwm_out.enabled,
+                ev->pwm_out.inverted);
+        break;
     case SBX_EV_LCD_PIXELS: {
         /* Compute payload size from bit depth. 1bpp uses page-col packing
          * (8 vertical pixels per byte → w * (h/8) bytes); ≥8bpp uses

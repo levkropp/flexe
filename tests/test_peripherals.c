@@ -1650,7 +1650,51 @@ TEST(cross_core_interrupt) {
     mem_destroy(mem);
 }
 
-TEST(ledc_register_and_duty_completion) {
+typedef struct {
+    unsigned calls;
+    int speed_mode;
+    int channel;
+    int gpio;
+    uint32_t frequency_hz;
+    uint32_t duty;
+    uint32_t duty_max;
+    bool enabled;
+    bool inverted;
+} ledc_capture_t;
+
+static void capture_ledc(void *ctx, int speed_mode, int channel, int gpio,
+                         uint32_t frequency_hz, uint32_t duty,
+                         uint32_t duty_max, bool enabled, bool inverted) {
+    ledc_capture_t *capture = ctx;
+    capture->calls++;
+    capture->speed_mode = speed_mode;
+    capture->channel = channel;
+    capture->gpio = gpio;
+    capture->frequency_hz = frequency_hz;
+    capture->duty = duty;
+    capture->duty_max = duty_max;
+    capture->enabled = enabled;
+    capture->inverted = inverted;
+}
+
+static void ledc_advance(xtensa_cpu_t *cpu, uint32_t cycles) {
+    cpu->ccount += cycles;
+    cpu->periph_event(cpu);
+}
+
+static uint32_t test_ledc_timer_conf(uint32_t resolution,
+                                     uint32_t divider_q8) {
+    return (1u << 25) | (divider_q8 << 5) | resolution;
+}
+
+static uint32_t test_ledc_update_conf(uint32_t scale, uint32_t cycle_count,
+                                      uint32_t steps, bool increase) {
+    return (1u << 31) | (increase ? 1u << 30 : 0u) |
+           ((steps & 0x3FFu) << 20) |
+           ((cycle_count & 0x3FFu) << 10) | (scale & 0x3FFu);
+}
+
+TEST(ledc_timed_duty_update_and_gpio_output) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
     xtensa_cpu_t cpu0;
@@ -1660,21 +1704,178 @@ TEST(ledc_register_and_duty_completion) {
 
     const uint32_t base = 0x3FF59000u;
     ASSERT_EQ(mem_read32(mem, base + 0x140), 1u << 24); /* timer reset */
-    mem_write32(mem, base + 0x140, 0x0207D00Au);
-    ASSERT_EQ(mem_read32(mem, base + 0x140), 0x0207D00Au);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    uint32_t timer_conf = test_ledc_timer_conf(8u, 16000u);
+    mem_write32(mem, base + 0x140, timer_conf); /* APB / 62.5 / 256 = 5 kHz */
+    ASSERT_EQ(mem_read32(mem, base + 0x140), timer_conf);
 
-    mem_write32(mem, base + 0x008, 0x00123400u); /* HS channel 0 duty */
-    ASSERT_EQ(mem_read32(mem, base + 0x010), 0x00123400u);
+    ledc_capture_t capture = {0};
+    ASSERT_EQ(periph_set_ledc_output_callback(p, 0, 0,
+                                               capture_ledc, &capture), 0);
+    mem_write32(mem, 0x3FF44584u, 71u); /* GPIO21 <- LEDC_HS_SIG_OUT0 */
+    mem_write32(mem, base + 0x000, 1u << 2); /* timer0 + signal enable */
+    mem_write32(mem, base + 0x008, 64u << 4); /* Q21.4 duty */
     mem_write32(mem, base + 0x188, 1u << 8);     /* duty-end interrupt enable */
-    mem_write32(mem, base + 0x00C, 1u << 31);    /* start update */
+    mem_write32(mem, base + 0x00C,
+                test_ledc_update_conf(0u, 1u, 1u, true));
+
+    /* Updates latch at the next PWM boundary, not in the programming write. */
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x00C) & (1u << 31), 1u << 31);
+    ledc_advance(&cpu0, 24000u);
+    ASSERT_EQ(mem_read32(mem, base + 0x144), 128u); /* live timer counter */
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 0u);
+    ledc_advance(&cpu0, 23999u);
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 0u);
+    ledc_advance(&cpu0, 1u);
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 64u << 4);
     ASSERT_EQ(mem_read32(mem, base + 0x00C) & (1u << 31), 0u);
     ASSERT_EQ(mem_read32(mem, base + 0x180) & (1u << 8), 1u << 8);
     ASSERT_EQ(mem_read32(mem, base + 0x184) & (1u << 8), 1u << 8);
     ASSERT_EQ(cpu0.interrupt & (1u << 4), 1u << 4);
+    ASSERT_TRUE(capture.calls >= 2u);
+    ASSERT_EQ(capture.speed_mode, 0);
+    ASSERT_EQ(capture.channel, 0);
+    ASSERT_EQ(capture.gpio, 21);
+    ASSERT_EQ(capture.frequency_hz, 5000u);
+    ASSERT_EQ(capture.duty, 64u);
+    ASSERT_EQ(capture.duty_max, 255u);
+    ASSERT_TRUE(capture.enabled);
+    ASSERT_FALSE(capture.inverted);
 
     mem_write32(mem, base + 0x18C, 1u << 8);
     ASSERT_EQ(mem_read32(mem, base + 0x180) & (1u << 8), 0u);
     ASSERT_EQ(cpu0.interrupt & (1u << 4), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x1FC), 0x16031700u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(ledc_fade_progress_and_completion_deadline) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    const uint32_t base = 0x3FF59000u;
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, base + 0x140, test_ledc_timer_conf(8u, 16000u));
+    mem_write32(mem, base + 0x000, 1u << 2);
+    mem_write32(mem, base + 0x008, 64u << 4);
+    mem_write32(mem, base + 0x00C,
+                test_ledc_update_conf(0u, 1u, 1u, true));
+    ledc_advance(&cpu, 48000u);
+    mem_write32(mem, base + 0x18C, 1u << 8);
+
+    /* Start at 64, then add two duty counts every three PWM periods ten
+     * times. Hardware exposes the intermediate duty through DUTY_R. */
+    mem_write32(mem, base + 0x008, 64u << 4);
+    mem_write32(mem, base + 0x188, 1u << 8);
+    mem_write32(mem, base + 0x00C,
+                test_ledc_update_conf(2u, 3u, 10u, true));
+    ledc_advance(&cpu, 48000u); /* starting duty latches */
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 64u << 4);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & (1u << 8), 0u);
+
+    ledc_advance(&cpu, 4u * 3u * 48000u);
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 72u << 4);
+    ASSERT_EQ(mem_read32(mem, base + 0x00C) & (1u << 31), 1u << 31);
+    ledc_advance(&cpu, 6u * 3u * 48000u);
+    ASSERT_EQ(mem_read32(mem, base + 0x010), 84u << 4);
+    ASSERT_EQ(mem_read32(mem, base + 0x00C) & (1u << 31), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & (1u << 8), 1u << 8);
+    ASSERT_TRUE(periph_interrupt_pending(p, 43));
+    mem_write32(mem, base + 0x18C, 1u << 8);
+    ASSERT_FALSE(periph_interrupt_pending(p, 43));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(ledc_timer_overflow_pause_and_clear) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 6, 43);
+    const uint32_t base = 0x3FF59000u;
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    uint32_t conf = test_ledc_timer_conf(8u, 16000u);
+    mem_write32(mem, base + 0x140, conf);
+    mem_write32(mem, base + 0x188, 1u); /* timer0 overflow */
+    ledc_advance(&cpu, 47999u);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & 1u, 0u);
+    ledc_advance(&cpu, 1u);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & 1u, 1u);
+    ASSERT_EQ(mem_read32(mem, base + 0x184) & 1u, 1u);
+    ASSERT_EQ(cpu.interrupt & (1u << 6), 1u << 6);
+    mem_write32(mem, base + 0x18C, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 43));
+
+    mem_write32(mem, base + 0x140, conf | (1u << 23)); /* pause */
+    uint32_t paused = mem_read32(mem, base + 0x144);
+    ledc_advance(&cpu, 96000u);
+    ASSERT_EQ(mem_read32(mem, base + 0x144), paused);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & 1u, 0u);
+    mem_write32(mem, base + 0x140, conf | (1u << 24)); /* reset */
+    ASSERT_EQ(mem_read32(mem, base + 0x144), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(ledc_low_speed_output_and_dport_reset_preserve_endpoint) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    const uint32_t base = 0x3FF59000u;
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+
+    ledc_capture_t capture = {0};
+    ASSERT_EQ(periph_set_ledc_output_callback(p, 1, 3,
+                                               capture_ledc, &capture), 0);
+    mem_write32(mem, 0x3FF44584u, 82u); /* GPIO21 <- LS channel3 */
+    mem_write32(mem, base + 0x0DC, (3u & 0x3u) | (1u << 2));
+    mem_write32(mem, base + 0x0E4, 200u << 4);
+    mem_write32(mem, base + 0x0E8,
+                test_ledc_update_conf(0u, 1u, 1u, true));
+    ASSERT_EQ(mem_read32(mem, base + 0x0EC), 0u);
+
+    /* DUTY_START waits for its selected timer. Start timer3 on RTC8M, then
+     * change the shared low-speed source to APB without discontinuity. */
+    mem_write32(mem, base + 0x178,
+                (1u << 26) | test_ledc_timer_conf(8u, 16000u));
+    ledc_advance(&cpu, 18750u);
+    ASSERT_EQ(mem_read32(mem, base + 0x17C), 10u);
+    mem_write32(mem, base + 0x190, 1u); /* low-speed slow_clk = APB */
+    ASSERT_EQ(mem_read32(mem, base + 0x17C), 10u);
+    ledc_advance(&cpu, 46124u);
+    ASSERT_EQ(mem_read32(mem, base + 0x0EC), 0u);
+    ledc_advance(&cpu, 1u);
+    ASSERT_EQ(mem_read32(mem, base + 0x0EC), 200u << 4);
+    ASSERT_EQ(capture.speed_mode, 1);
+    ASSERT_EQ(capture.channel, 3);
+    ASSERT_EQ(capture.gpio, 21);
+    ASSERT_EQ(capture.frequency_hz, 5000u);
+    ASSERT_EQ(capture.duty, 200u);
+    ASSERT_TRUE(capture.enabled);
+
+    unsigned before_reset = capture.calls;
+    mem_write32(mem, 0x3FF000C4u, 1u << 11);
+    ASSERT_TRUE(capture.calls > before_reset);
+    ASSERT_FALSE(capture.enabled);
+    ASSERT_EQ(capture.duty, 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x140), 1u << 24);
+    ASSERT_EQ(mem_read32(mem, base + 0x178), 1u << 24);
+    ASSERT_EQ(mem_read32(mem, base + 0x180), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x188), 0u);
     ASSERT_EQ(mem_read32(mem, base + 0x1FC), 0x16031700u);
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
@@ -2220,7 +2421,10 @@ static void run_peripheral_tests(void) {
     RUN_TEST(intr_matrix_dport_rw);
     RUN_TEST(intr_matrix_assert_source);
     RUN_TEST(cross_core_interrupt);
-    RUN_TEST(ledc_register_and_duty_completion);
+    RUN_TEST(ledc_timed_duty_update_and_gpio_output);
+    RUN_TEST(ledc_fade_progress_and_completion_deadline);
+    RUN_TEST(ledc_timer_overflow_pause_and_clear);
+    RUN_TEST(ledc_low_speed_output_and_dport_reset_preserve_endpoint);
     RUN_TEST(i2s_tx_dma_descriptor_and_interrupt);
     RUN_TEST(i2s_rx_dma_injection_and_dual_port);
     RUN_TEST(i2s_clock_and_bt_private_readback);

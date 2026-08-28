@@ -125,7 +125,11 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     cpu->fcr = save_fcr;
     cpu->fsr = save_fsr;
     cpu->running = save_running;
-    cpu->halted = save_halted;
+    /* A completed asynchronous guest callback represents interrupt/event
+     * delivery. Interrupt entry wakes WAITI, so do not reinstate a halted
+     * bit that the private callback stack intentionally cleared. On a failed
+     * synthetic call, restore the original execution state in full. */
+    cpu->halted = completed ? false : save_halted;
     cpu->exception = save_exception;
     cpu->_pc_written = save_pc_written;
     cpu->irq_check = save_irq_check;

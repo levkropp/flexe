@@ -316,12 +316,15 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
 }
 
 /* Context-switch on a specific core: save current, pick next, restore.
- * If no runnable task, halt CPU. */
+ * With no runnable task, enter an interruptible idle state. Hardware clocks
+ * continue and xtensa_run_halted() fast-forwards to the next peripheral or
+ * timer event; stopping the CPU outright would deadlock ISR-backed waits. */
 static void sched_switch(freertos_stubs_t *frt, int core_id) {
     int prev = frt->current_task[core_id];
     int next = sched_pick_next(frt, core_id);
     if (next < 0) {
-        frt->cpu[core_id]->running = false;
+        frt->cpu[core_id]->running = true;
+        frt->cpu[core_id]->halted = true;
         return;
     }
     frt->current_task[core_id] = next;
@@ -581,6 +584,37 @@ void stub_xTaskGetTickCount(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, ticks);
 }
 
+static uint32_t queue_create_locked(freertos_stubs_t *frt, uint32_t length,
+                                    uint32_t item_size, int initial_count,
+                                    uint32_t preferred_handle) {
+    if (item_size > MAX_ITEM_SIZE || length == 0 ||
+        length > MAX_QUEUE_ITEMS)
+        return 0;
+
+    int slot = -1;
+    for (int i = 0; i < frt->queue_count; i++) {
+        if (preferred_handle && frt->queues[i].handle == preferred_handle)
+            return preferred_handle;
+        if (slot < 0 && frt->queues[i].handle == 0) slot = i;
+    }
+    if (slot < 0) {
+        if (frt->queue_count >= MAX_QUEUES) return 0;
+        slot = frt->queue_count++;
+    }
+
+    queue_t *q = &frt->queues[slot];
+    uint32_t handle = preferred_handle ? preferred_handle :
+                                          bump_alloc(frt, 4);
+    if (!handle) return 0;
+
+    memset(q, 0, sizeof(*q));
+    q->handle = handle;
+    q->item_size = (int)item_size;
+    q->max_items = (int)length;
+    q->count = initial_count > (int)length ? (int)length : initial_count;
+    return handle;
+}
+
 /* xQueueCreate(length, item_size) -> handle */
 void stub_xQueueCreate(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
@@ -588,28 +622,7 @@ void stub_xQueueCreate(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t item_size = frt_arg(cpu, 1);
 
     pthread_mutex_lock(&frt->lock);
-    if (frt->queue_count >= MAX_QUEUES || item_size > MAX_ITEM_SIZE ||
-        length > MAX_QUEUE_ITEMS) {
-        pthread_mutex_unlock(&frt->lock);
-        frt_return(cpu, 0);
-        return;
-    }
-
-    queue_t *q = &frt->queues[frt->queue_count];
-    uint32_t handle = bump_alloc(frt, 4);
-    if (!handle) {
-        pthread_mutex_unlock(&frt->lock);
-        frt_return(cpu, 0);
-        return;
-    }
-
-    q->handle = handle;
-    q->item_size = (int)item_size;
-    q->max_items = (int)length;
-    q->count = 0;
-    q->head = 0;
-    q->tail = 0;
-    frt->queue_count++;
+    uint32_t handle = queue_create_locked(frt, length, item_size, 0, 0);
     pthread_mutex_unlock(&frt->lock);
 
     frt_return(cpu, handle);
@@ -621,6 +634,29 @@ static queue_t *find_queue(freertos_stubs_t *frt, uint32_t handle) {
         if (frt->queues[i].handle == handle)
             return &frt->queues[i];
     return NULL;
+}
+
+static bool wake_queue_waiter_locked(freertos_stubs_t *frt,
+                                     uint32_t handle) {
+    if (!frt->scheduler_started) return false;
+    for (int i = 0; i < frt->task_count; i++) {
+        if (frt->tasks[i].state != TASK_BLOCKED_QUEUE ||
+            frt->tasks[i].blocked_queue != handle)
+            continue;
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        frt->tasks[i].state = is_current ? TASK_RUNNING : TASK_READY;
+        frt->tasks[i].blocked_queue = 0;
+        return true;
+    }
+    return false;
 }
 
 static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
@@ -635,7 +671,16 @@ static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
         frt_return(cpu, pdTRUE);
         return;
     }
+    bool semaphore = q->item_size == 0;
+    bool woke_waiter = semaphore &&
+                       wake_queue_waiter_locked(frt, handle);
+
     bool overwrite = copy_position == 2u && q->max_items == 1;
+    if (woke_waiter) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
     if (q->count >= q->max_items && !overwrite) {
         pthread_mutex_unlock(&frt->lock);
         frt_return(cpu, pdFALSE);
@@ -661,16 +706,9 @@ static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
         q->count++;
     }
 
-    /* Wake one task blocked on this queue */
-    if (frt->scheduler_started) {
-        for (int i = 0; i < frt->task_count; i++) {
-            if (frt->tasks[i].state == TASK_BLOCKED_QUEUE &&
-                frt->tasks[i].blocked_queue == handle) {
-                frt->tasks[i].state = TASK_READY;
-                break;  /* wake only one */
-            }
-        }
-    }
+    /* Wake one task blocked on an ordinary data queue. Semaphore waiters
+     * consume the token directly above instead of leaving a surplus give. */
+    if (!semaphore) (void)wake_queue_waiter_locked(frt, handle);
     pthread_mutex_unlock(&frt->lock);
 
     frt_return(cpu, pdTRUE);
@@ -789,34 +827,93 @@ void stub_xQueueIsQueueFullFromISR(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, full ? pdTRUE : pdFALSE);
 }
 
-/* xSemaphoreCreateMutex() -> non-null handle */
+/* xSemaphoreCreateMutex() -> one-token host-backed queue. */
 void stub_xSemaphoreCreateMutex(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     pthread_mutex_lock(&frt->lock);
-    uint32_t handle = bump_alloc(frt, 4);
+    uint32_t handle = queue_create_locked(frt, 1, 0, 1, 0);
     pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, handle);
 }
 
-/* xSemaphoreCreateBinary() -> non-null handle */
+/* xSemaphoreCreateBinary() -> empty one-token host-backed queue. */
 void stub_xSemaphoreCreateBinary(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     pthread_mutex_lock(&frt->lock);
-    uint32_t handle = bump_alloc(frt, 4);
+    uint32_t handle = queue_create_locked(frt, 1, 0, 0, 0);
     pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, handle);
 }
 
-/* xSemaphoreTake(sem, timeout) -> pdTRUE */
+/* xSemaphoreTake(sem, timeout). A blocking waiter resumes after the give with
+ * pdTRUE already in its saved return register, matching the completed call. */
 void stub_xSemaphoreTake(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    frt_return(cpu, pdTRUE);
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t timeout = frt_arg(cpu, 1);
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE); /* retain compatibility for native handles */
+        return;
+    }
+    if (q->count > 0) {
+        q->count--;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    if (timeout != 0 && frt->scheduler_started &&
+        frt->current_task[core_id] >= 0) {
+        frt_return(cpu, pdTRUE);
+        sched_save_context(frt, core_id);
+        task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+        if (timeout == UINT32_MAX) {
+            t->state = TASK_BLOCKED_QUEUE;
+            t->blocked_queue = handle;
+        } else {
+            uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
+            if (advance > 200000000ULL) advance = 200000000ULL;
+            t->state = TASK_SLEEPING;
+            t->wake_cycle = cpu->cycle_count + advance;
+        }
+        sched_switch(frt, core_id);
+        pthread_mutex_unlock(&frt->lock);
+        return;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdFALSE);
 }
 
-/* xSemaphoreGive(sem) -> pdTRUE */
+/* xSemaphoreGive(sem) -> pdTRUE/pdFALSE */
 void stub_xSemaphoreGive(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    frt_return(cpu, pdTRUE);
+    stub_queue_send(cpu, ctx, 0);
+}
+
+/* xQueueGiveFromISR(queue, woken) is the semaphore-specific ISR give ABI. */
+void stub_xQueueGiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t woken_ptr = frt_arg(cpu, 1);
+    bool woke = false;
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q) {
+        pthread_mutex_unlock(&frt->lock);
+        if (woken_ptr) mem_write32(cpu->mem, woken_ptr, pdFALSE);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    woke = wake_queue_waiter_locked(frt, handle);
+    bool accepted = woke || q->count < q->max_items;
+    if (!woke && q->count < q->max_items) q->count++;
+    pthread_mutex_unlock(&frt->lock);
+    if (woken_ptr) mem_write32(cpu->mem, woken_ptr, woke ? pdTRUE : pdFALSE);
+    frt_return(cpu, accepted ? pdTRUE : pdFALSE);
 }
 
 /* pvPortMalloc(size) -> bump-allocated address */
@@ -992,6 +1089,14 @@ static void stub_xPortEnterCriticalTimeout(xtensa_cpu_t *cpu, void *ctx) {
     frt_return_void(cpu);
 }
 
+/* A FromISR give already made the compatibility task runnable and resumed
+ * its saved idle context. Do not enter the firmware's native scheduler with
+ * host-owned task state. */
+static void stub_vPortEvaluateYieldFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return_void(cpu);
+}
+
 /* xTaskGetSchedulerState() -> taskSCHEDULER_RUNNING (2) */
 static void stub_xTaskGetSchedulerState(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -1033,7 +1138,34 @@ static void stub_vPortYield(xtensa_cpu_t *cpu, void *ctx) {
 
 /* xQueueGenericCreate (underlying implementation xQueueCreate may alias) */
 void stub_xQueueGenericCreate(xtensa_cpu_t *cpu, void *ctx) {
-    stub_xQueueCreate(cpu, ctx);
+    freertos_stubs_t *frt = ctx;
+    uint32_t length = frt_arg(cpu, 0);
+    uint32_t item_size = frt_arg(cpu, 1);
+    uint32_t queue_type = frt_arg(cpu, 2);
+    int initial_count = item_size == 0 &&
+        (queue_type == 1u || queue_type == 4u) ? 1 : 0;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = queue_create_locked(frt, length, item_size,
+                                          initial_count, 0);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* Static queues use the caller-provided StaticQueue_t address as their
+ * stable handle while storage and synchronization remain host-backed. */
+void stub_xQueueGenericCreateStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t length = frt_arg(cpu, 0);
+    uint32_t item_size = frt_arg(cpu, 1);
+    uint32_t static_queue = frt_arg(cpu, 3);
+    uint32_t queue_type = frt_arg(cpu, 4);
+    int initial_count = item_size == 0 &&
+        (queue_type == 1u || queue_type == 4u) ? 1 : 0;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = queue_create_locked(frt, length, item_size,
+                                          initial_count, static_queue);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
 }
 
 /* xQueueGenericSend (underlying implementation) */
@@ -1046,9 +1178,7 @@ void stub_xQueueGenericSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
     stub_queue_send(cpu, ctx, frt_arg(cpu, 3));
 }
 
-/* xQueueGenericReset(queue, new_queue) empties a queue. Semaphore handles in
- * compatibility mode are not backed by queue_t and retain their permissive
- * success behavior. */
+/* xQueueGenericReset(queue, new_queue) empties a queue. */
 void stub_xQueueGenericReset(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     uint32_t handle = frt_arg(cpu, 0);
@@ -1061,6 +1191,16 @@ void stub_xQueueGenericReset(xtensa_cpu_t *cpu, void *ctx) {
     }
     pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, pdTRUE);
+}
+
+void stub_vQueueDelete(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q) memset(q, 0, sizeof(*q));
+    pthread_mutex_unlock(&frt->lock);
+    frt_return_void(cpu);
 }
 
 /* xPortGetCoreID() -> cpu->core_id */
@@ -1285,11 +1425,13 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xTaskGetTickCount",             stub_xTaskGetTickCount },
         { "xQueueCreate",                  stub_xQueueCreate },
         { "xQueueGenericCreate",           stub_xQueueGenericCreate },
+        { "xQueueGenericCreateStatic",     stub_xQueueGenericCreateStatic },
         { "xQueueSend",                    stub_xQueueSend },
         { "xQueueSendToBack",             stub_xQueueSend },
         { "xQueueGenericSend",             stub_xQueueGenericSend },
         { "xQueueSendFromISR",             stub_xQueueSendFromISR },
         { "xQueueGenericSendFromISR",      stub_xQueueGenericSendFromISR },
+        { "xQueueGiveFromISR",             stub_xQueueGiveFromISR },
         { "xQueueReceive",                stub_xQueueReceive },
         { "xQueueGenericReceive",          stub_xQueueReceive },
         { "xQueueReceiveFromISR",          stub_xQueueReceiveFromISR },
@@ -1301,6 +1443,7 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xQueueSemaphoreTake",           stub_xSemaphoreTake },
         { "xSemaphoreGive",                stub_xSemaphoreGive },
         { "xQueueGenericReset",            stub_xQueueGenericReset },
+        { "vQueueDelete",                  stub_vQueueDelete },
         { "pvPortMalloc",                  stub_pvPortMalloc },
         { "vPortFree",                     stub_vPortFree },
         { "xTaskGetCurrentTaskHandle",     stub_xTaskGetCurrentTaskHandle },
@@ -1318,6 +1461,7 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xPortEnterCriticalTimeout",     stub_xPortEnterCriticalTimeout },
         { "vPortExitCritical",             stub_xPortEnterCriticalTimeout },
         { "vPortEnterCritical",            stub_xPortEnterCriticalTimeout },
+        { "vPortEvaluateYieldFromISR",     stub_vPortEvaluateYieldFromISR },
         { "xTaskGetSchedulerState",        stub_xTaskGetSchedulerState },
         { "esp_ipc_call",                  stub_esp_ipc_noop },
         { "esp_ipc_call_blocking",         stub_esp_ipc_noop },
