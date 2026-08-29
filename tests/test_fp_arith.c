@@ -229,8 +229,8 @@ TEST(exec_float_s_scale) {
 TEST(exec_trunc_s_basic) {
     xtensa_cpu_t cpu; setup(&cpu);
     set_fr(&cpu, 2, 3.7f);
-    /* TRUNC.S a4, f2, 0: op2=9, op1=10, r=0, s=2, t=4 */
-    put_insn3(&cpu, BASE, rrr(9, 10, 0, 2, 4));
+    /* TRUNC.S a4, f2, 0: op2=9, op1=10, r=4, s=2, t=0 */
+    put_insn3(&cpu, BASE, rrr(9, 10, 4, 2, 0));
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 4), 3);
     teardown(&cpu);
@@ -239,7 +239,7 @@ TEST(exec_trunc_s_basic) {
 TEST(exec_trunc_s_negative) {
     xtensa_cpu_t cpu; setup(&cpu);
     set_fr(&cpu, 2, -3.7f);
-    put_insn3(&cpu, BASE, rrr(9, 10, 0, 2, 4));
+    put_insn3(&cpu, BASE, rrr(9, 10, 4, 2, 0));
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 4), (uint32_t)(int32_t)-3);
     teardown(&cpu);
@@ -248,8 +248,8 @@ TEST(exec_trunc_s_negative) {
 TEST(exec_round_s) {
     xtensa_cpu_t cpu; setup(&cpu);
     set_fr(&cpu, 2, 3.5f);
-    /* ROUND.S a4, f2, 0: op2=8, op1=10, r=0, s=2, t=4 */
-    put_insn3(&cpu, BASE, rrr(8, 10, 0, 2, 4));
+    /* ROUND.S a4, f2, 0: op2=8, op1=10, r=4, s=2, t=0 */
+    put_insn3(&cpu, BASE, rrr(8, 10, 4, 2, 0));
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 4), 4);
     teardown(&cpu);
@@ -258,8 +258,8 @@ TEST(exec_round_s) {
 TEST(exec_floor_s) {
     xtensa_cpu_t cpu; setup(&cpu);
     set_fr(&cpu, 2, 3.7f);
-    /* FLOOR.S a4, f2, 0: op2=10, op1=10, r=0, s=2, t=4 */
-    put_insn3(&cpu, BASE, rrr(10, 10, 0, 2, 4));
+    /* FLOOR.S a4, f2, 0: op2=10, op1=10, r=4, s=2, t=0 */
+    put_insn3(&cpu, BASE, rrr(10, 10, 4, 2, 0));
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 4), 3);
     teardown(&cpu);
@@ -268,8 +268,8 @@ TEST(exec_floor_s) {
 TEST(exec_ceil_s) {
     xtensa_cpu_t cpu; setup(&cpu);
     set_fr(&cpu, 2, 3.2f);
-    /* CEIL.S a4, f2, 0: op2=11, op1=10, r=0, s=2, t=4 */
-    put_insn3(&cpu, BASE, rrr(11, 10, 0, 2, 4));
+    /* CEIL.S a4, f2, 0: op2=11, op1=10, r=4, s=2, t=0 */
+    put_insn3(&cpu, BASE, rrr(11, 10, 4, 2, 0));
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 4), 4);
     teardown(&cpu);
@@ -288,10 +288,24 @@ TEST(exec_ufloat_s) {
 TEST(exec_utrunc_s) {
     xtensa_cpu_t cpu; setup(&cpu);
     set_fr(&cpu, 2, 100.5f);
-    /* UTRUNC.S a4, f2, 0: op2=14, op1=10, r=0, s=2, t=4 */
-    put_insn3(&cpu, BASE, rrr(14, 10, 0, 2, 4));
+    ar_write(&cpu, 0, 0x81234567u);
+    /* Use a high destination register, matching GCC's real MCPWM output. */
+    put_insn3(&cpu, BASE, rrr(14, 10, 10, 2, 0));
+    char disasm[64];
+    xtensa_disasm(&cpu, BASE, disasm, sizeof(disasm));
+    ASSERT_TRUE(strstr(disasm, "utrunc.s\ta10, f2, 0") != NULL);
     xtensa_step(&cpu);
-    ASSERT_EQ(ar_read(&cpu, 4), 100);
+    ASSERT_EQ(ar_read(&cpu, 10), 100);
+    ASSERT_EQ(ar_read(&cpu, 0), 0x81234567u);
+    teardown(&cpu);
+}
+
+TEST(exec_trunc_s_scale) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    set_fr(&cpu, 2, 3.75f);
+    put_insn3(&cpu, BASE, rrr(9, 10, 4, 2, 2));
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 4), 15);
     teardown(&cpu);
 }
 
@@ -644,6 +658,7 @@ void run_fp_arith_tests(void) {
     RUN_TEST(exec_float_s_scale);
     RUN_TEST(exec_trunc_s_basic);
     RUN_TEST(exec_trunc_s_negative);
+    RUN_TEST(exec_trunc_s_scale);
     RUN_TEST(exec_round_s);
     RUN_TEST(exec_floor_s);
     RUN_TEST(exec_ceil_s);

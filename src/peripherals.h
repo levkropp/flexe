@@ -50,6 +50,32 @@ typedef void (*periph_ledc_output_fn)(void *ctx, int speed_mode, int channel,
                                      uint32_t duty, uint32_t duty_max,
                                      bool enabled, bool inverted);
 
+/* Aggregate configuration for one classic ESP32 MCPWM generator output.
+ * `period_ticks` and `compare_ticks` use the selected operator timer's
+ * resolution. Dead-time delays use `deadtime_clock_hz`; carrier_duty_eighths
+ * is the hardware's 0/8..7/8 encoding. `forced_level` is -1 when neither a
+ * software force nor a fault action overrides the event generator. */
+typedef struct {
+    int gpio;
+    uint32_t frequency_hz;
+    uint32_t period_ticks;
+    uint32_t compare_ticks;
+    uint32_t rising_delay_ticks;
+    uint32_t falling_delay_ticks;
+    uint32_t deadtime_clock_hz;
+    uint32_t carrier_hz;
+    uint8_t carrier_duty_eighths;
+    uint8_t count_mode;
+    bool enabled;
+    bool inverted;
+    bool fault_active;
+    int8_t forced_level;
+} periph_mcpwm_output_info_t;
+
+typedef void (*periph_mcpwm_output_fn)(
+    void *ctx, int unit, int operator_index, int generator,
+    const periph_mcpwm_output_info_t *info);
+
 /* Compatibility-mode firmware still registers real ESP-IDF peripheral ISRs,
  * even though Flexe replaces the FreeRTOS scheduler. A source callback lets
  * the ROM-stub layer dispatch those guest handlers when a modelled interrupt
@@ -111,6 +137,14 @@ size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel,
 int periph_set_ledc_output_callback(esp32_periph_t *p, int speed_mode,
                                     int channel, periph_ledc_output_fn fn,
                                     void *ctx);
+
+/* Attach a motor-control PWM sink to either MCPWM unit, one of its three
+ * operators, and generator A/B. The current aggregate configuration is
+ * delivered immediately; later timer, generator, dead-time, carrier, fault,
+ * force, and GPIO-matrix changes produce another callback. */
+int periph_set_mcpwm_output_callback(esp32_periph_t *p, int unit,
+                                     int operator_index, int generator,
+                                     periph_mcpwm_output_fn fn, void *ctx);
 
 /* Observe rising edges for an ESP32 peripheral source (0-70). Passing NULL
  * detaches the observer. This is separate from the hardware interrupt matrix:

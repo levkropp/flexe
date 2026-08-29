@@ -426,13 +426,13 @@ static int disasm_qrst(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
         case 5: EMIT("msub.s\tf%d, f%d, f%d", r, s, t); break;
         case 6: EMIT("maddn.s\tf%d, f%d, f%d", r, s, t); break;
         case 7: EMIT("divn.s\tf%d, f%d, f%d", r, s, t); break;
-        case 8: EMIT("round.s\ta%d, f%d, %d", t, s, r); break;
-        case 9: EMIT("trunc.s\ta%d, f%d, %d", t, s, r); break;
-        case 10: EMIT("floor.s\ta%d, f%d, %d", t, s, r); break;
-        case 11: EMIT("ceil.s\ta%d, f%d, %d", t, s, r); break;
+        case 8: EMIT("round.s\ta%d, f%d, %d", r, s, t); break;
+        case 9: EMIT("trunc.s\ta%d, f%d, %d", r, s, t); break;
+        case 10: EMIT("floor.s\ta%d, f%d, %d", r, s, t); break;
+        case 11: EMIT("ceil.s\ta%d, f%d, %d", r, s, t); break;
         case 12: EMIT("float.s\tf%d, a%d, %d", r, s, t); break;
         case 13: EMIT("ufloat.s\tf%d, a%d, %d", r, s, t); break;
-        case 14: EMIT("utrunc.s\ta%d, f%d, %d", t, s, r); break;
+        case 14: EMIT("utrunc.s\ta%d, f%d, %d", r, s, t); break;
         case 15: /* FP1OP */
             switch (t) {
             case 0: EMIT("mov.s\tf%d, f%d", r, s); break;

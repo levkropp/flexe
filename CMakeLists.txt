@@ -203,4 +203,9 @@ if(UNIX)
     target_link_libraries(flexe-pcnt-pulse-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-pcnt-pulse-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-mcpwm-motor-test tools/mcpwm_motor_test.c)
+    target_link_libraries(flexe-mcpwm-motor-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-mcpwm-motor-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

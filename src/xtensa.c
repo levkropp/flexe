@@ -964,25 +964,25 @@ static void exec_fp0(xtensa_cpu_t *cpu, uint32_t insn) {
         break;
     case 7: /* DIVN.S: final marker in the collapsed divide sequence */
         break;
-    case 8: { /* ROUND.S: ar[t] = (int32_t)roundf(fr[s] * 2^r) */
+    case 8: { /* ROUND.S: ar[r] = (int32_t)roundf(fr[s] * 2^t) */
         float val = cpu->fr[s];
-        if (r) val = val * (float)(1u << r);
-        ar_write(cpu, t, (uint32_t)(int32_t)roundf(val));
+        if (t) val = val * (float)(1u << t);
+        ar_write(cpu, r, (uint32_t)(int32_t)roundf(val));
     } break;
-    case 9: { /* TRUNC.S: ar[t] = (int32_t)truncf(fr[s] * 2^r) */
+    case 9: { /* TRUNC.S: ar[r] = (int32_t)truncf(fr[s] * 2^t) */
         float val = cpu->fr[s];
-        if (r) val = val * (float)(1u << r);
-        ar_write(cpu, t, (uint32_t)(int32_t)truncf(val));
+        if (t) val = val * (float)(1u << t);
+        ar_write(cpu, r, (uint32_t)(int32_t)truncf(val));
     } break;
-    case 10: { /* FLOOR.S: ar[t] = (int32_t)floorf(fr[s] * 2^r) */
+    case 10: { /* FLOOR.S: ar[r] = (int32_t)floorf(fr[s] * 2^t) */
         float val = cpu->fr[s];
-        if (r) val = val * (float)(1u << r);
-        ar_write(cpu, t, (uint32_t)(int32_t)floorf(val));
+        if (t) val = val * (float)(1u << t);
+        ar_write(cpu, r, (uint32_t)(int32_t)floorf(val));
     } break;
-    case 11: { /* CEIL.S: ar[t] = (int32_t)ceilf(fr[s] * 2^r) */
+    case 11: { /* CEIL.S: ar[r] = (int32_t)ceilf(fr[s] * 2^t) */
         float val = cpu->fr[s];
-        if (r) val = val * (float)(1u << r);
-        ar_write(cpu, t, (uint32_t)(int32_t)ceilf(val));
+        if (t) val = val * (float)(1u << t);
+        ar_write(cpu, r, (uint32_t)(int32_t)ceilf(val));
     } break;
     case 12: { /* FLOAT.S: fr[r] = (float)(int32_t)ar[s] * 2^(-t) */
         float val = (float)(int32_t)ar_read(cpu, s);
@@ -994,10 +994,10 @@ static void exec_fp0(xtensa_cpu_t *cpu, uint32_t insn) {
         if (t) val = val / (float)(1u << t);
         cpu->fr[r] = val;
     } break;
-    case 14: { /* UTRUNC.S: ar[t] = (uint32_t)(fr[s] * 2^r) */
+    case 14: { /* UTRUNC.S: ar[r] = (uint32_t)(fr[s] * 2^t) */
         float val = cpu->fr[s];
-        if (r) val = val * (float)(1u << r);
-        ar_write(cpu, t, (uint32_t)val);
+        if (t) val = val * (float)(1u << t);
+        ar_write(cpu, r, (uint32_t)val);
     } break;
     case 15: /* FP1OP: sub-dispatch on t */
         switch (t) {

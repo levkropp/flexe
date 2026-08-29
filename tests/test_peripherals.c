@@ -1820,6 +1820,393 @@ TEST(pcnt_filter_rejects_glitches_and_qualifies_edges) {
     mem_destroy(mem);
 }
 
+#define TEST_MCPWM0_BASE 0x3FF5E000u
+#define TEST_MCPWM1_BASE 0x3FF6C000u
+
+typedef struct {
+    unsigned calls;
+    int unit;
+    int operator_index;
+    int generator;
+    periph_mcpwm_output_info_t info;
+} mcpwm_test_capture_t;
+
+static void capture_mcpwm(void *ctx, int unit, int operator_index,
+                          int generator,
+                          const periph_mcpwm_output_info_t *info) {
+    mcpwm_test_capture_t *capture = ctx;
+    capture->calls++;
+    capture->unit = unit;
+    capture->operator_index = operator_index;
+    capture->generator = generator;
+    capture->info = *info;
+}
+
+static void test_mcpwm_advance(xtensa_cpu_t *cpu, uint32_t cycles) {
+    cpu->ccount += cycles;
+    cpu->periph_event(cpu);
+}
+
+static void test_mcpwm_route_output(xtensa_mem_t *mem, unsigned gpio,
+                                    unsigned signal, bool inverted) {
+    mem_write32(mem, 0x3FF44530u + gpio * 4u,
+                signal | (inverted ? 1u << 9 : 0u));
+}
+
+static uint32_t test_mcpwm_timer_cfg(uint32_t prescale,
+                                     uint32_t period) {
+    return ((prescale - 1u) & 0xFFu) | ((period - 1u) << 8);
+}
+
+TEST(mcpwm_timed_waveform_shadow_force_and_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 6, 39); /* MCPWM0 -> CPU interrupt 6 */
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 17); /* MCPWM0 bus clock */
+
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x004u), 0x0000FF00u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x04Cu), 0x00000020u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x058u), 0x00018000u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x10Cu), 0x00000055u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x124u), 0x02107230u);
+
+    mcpwm_test_capture_t capture = {0};
+    ASSERT_EQ(periph_set_mcpwm_output_callback(
+                  p, 0, 0, 0, capture_mcpwm, &capture), 0);
+    ASSERT_EQ(periph_set_mcpwm_output_callback(
+                  p, 2, 0, 0, capture_mcpwm, &capture), -1);
+    test_mcpwm_route_output(mem, 18u, 32u, false);
+
+    /* 160 MHz / 16 / 10 / 1000 = 1 kHz. Generator A is high from TEZ
+     * through compare A=250, then low through the rest of the cycle. */
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x000u, 15u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x004u,
+                test_mcpwm_timer_cfg(10u, 1000u));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x040u, 250u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x050u,
+                (2u << 0) | (1u << 4));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x008u, 2u | (1u << 3));
+    ASSERT_EQ(capture.unit, 0);
+    ASSERT_EQ(capture.operator_index, 0);
+    ASSERT_EQ(capture.generator, 0);
+    ASSERT_EQ(capture.info.gpio, 18);
+    ASSERT_EQ(capture.info.frequency_hz, 1000u);
+    ASSERT_EQ(capture.info.period_ticks, 1000u);
+    ASSERT_EQ(capture.info.compare_ticks, 250u);
+    ASSERT_EQ(capture.info.count_mode, 1u);
+    ASSERT_TRUE(capture.info.enabled);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x11Cu, 0x3FFFFFFFu);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x110u, 1u << 15);
+    test_mcpwm_advance(&cpu, 59999u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x010u) & 0xFFFFu,
+              249u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+    ASSERT_EQ(cpu.interrupt & (1u << 6), 0u);
+    test_mcpwm_advance(&cpu, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x010u) & 0xFFFFu,
+              250u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x114u) & (1u << 15),
+              1u << 15);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x118u), 1u << 15);
+    ASSERT_EQ(cpu.interrupt & (1u << 6), 1u << 6);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x11Cu, 1u << 15);
+
+    /* A shadow compare update requested for TEZ leaves this cycle intact and
+     * becomes visible atomically at the next zero boundary. */
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x03Cu, 1u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x040u, 400u);
+    ASSERT_EQ(capture.info.compare_ticks, 250u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x03Cu) & (1u << 8),
+              1u << 8);
+    test_mcpwm_advance(&cpu, 180000u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x010u) & 0xFFFFu, 0u);
+    ASSERT_EQ(capture.info.compare_ticks, 400u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x03Cu) & (1u << 8), 0u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+    test_mcpwm_advance(&cpu, 96000u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+
+    /* Continuous software force supersedes the event generator, then
+     * releasing it exposes the live waveform again. */
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x04Cu, 2u << 6);
+    ASSERT_EQ(capture.info.forced_level, 1);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x04Cu, 1u << 6);
+    ASSERT_EQ(capture.info.forced_level, 0);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x04Cu, 0u);
+    ASSERT_EQ(capture.info.forced_level, -1);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+
+    test_mcpwm_route_output(mem, 18u, 32u, true);
+    ASSERT_TRUE(capture.info.inverted);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+
+    unsigned calls_before_reset = capture.calls;
+    mem_write32(mem, 0x3FF000C4u, 1u << 17);
+    ASSERT_TRUE(capture.calls > calls_before_reset);
+    ASSERT_FALSE(capture.info.enabled);
+    ASSERT_EQ(capture.info.compare_ticks, 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x004u), 0x0000FF00u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x114u), 0u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 39));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(mcpwm_units_and_upper_operators_are_independent) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, (1u << 17) | (1u << 20));
+
+    mcpwm_test_capture_t unit0 = {0};
+    mcpwm_test_capture_t unit1 = {0};
+    ASSERT_EQ(periph_set_mcpwm_output_callback(
+                  p, 0, 0, 0, capture_mcpwm, &unit0), 0);
+    ASSERT_EQ(periph_set_mcpwm_output_callback(
+                  p, 1, 2, 1, capture_mcpwm, &unit1), 0);
+    test_mcpwm_route_output(mem, 18u, 32u, false);
+    test_mcpwm_route_output(mem, 23u, 113u, false);
+
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x000u, 15u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x004u,
+                test_mcpwm_timer_cfg(10u, 1000u));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x040u, 250u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x050u,
+                (2u << 0) | (1u << 4));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x008u, 2u | (1u << 3));
+
+    /* Unit 1, operator 2/generator B runs from timer 2 through the upper
+     * register and GPIO-matrix signal ranges. */
+    mem_write32(mem, TEST_MCPWM1_BASE + 0x000u, 31u);
+    mem_write32(mem, TEST_MCPWM1_BASE + 0x038u, 2u << 4);
+    mem_write32(mem, TEST_MCPWM1_BASE + 0x024u,
+                test_mcpwm_timer_cfg(8u, 625u));
+    mem_write32(mem, TEST_MCPWM1_BASE + 0x0B4u, 312u);
+    mem_write32(mem, TEST_MCPWM1_BASE + 0x0C4u,
+                (2u << 0) | (1u << 6));
+    mem_write32(mem, TEST_MCPWM1_BASE + 0x028u, 2u | (1u << 3));
+
+    ASSERT_EQ(unit0.info.frequency_hz, 1000u);
+    ASSERT_EQ(unit0.info.gpio, 18);
+    ASSERT_EQ(unit1.unit, 1);
+    ASSERT_EQ(unit1.operator_index, 2);
+    ASSERT_EQ(unit1.generator, 1);
+    ASSERT_EQ(unit1.info.gpio, 23);
+    ASSERT_EQ(unit1.info.frequency_hz, 1000u);
+    ASSERT_EQ(unit1.info.period_ticks, 625u);
+    ASSERT_EQ(unit1.info.compare_ticks, 312u);
+    ASSERT_TRUE(unit0.info.enabled);
+    ASSERT_TRUE(unit1.info.enabled);
+
+    unsigned unit0_calls = unit0.calls;
+    mem_write32(mem, 0x3FF000C4u, 1u << 20);
+    ASSERT_TRUE(unit1.calls > 0u);
+    ASSERT_FALSE(unit1.info.enabled);
+    ASSERT_TRUE(unit0.info.enabled);
+    ASSERT_EQ(unit0.calls, unit0_calls);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM1_BASE + 0x024u), 0x0000FF00u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x004u),
+              test_mcpwm_timer_cfg(10u, 1000u));
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM1_BASE + 0x124u), 0x02107230u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(mcpwm_dual_core_clock_and_deferred_stop_boundary) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_t cpu1;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    xtensa_cpu_init(&cpu1); cpu1.mem = mem; cpu1.core_id = 1;
+    periph_attach_cpus(p, &cpu0, &cpu1);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 17);
+
+    mcpwm_test_capture_t capture = {0};
+    ASSERT_EQ(periph_set_mcpwm_output_callback(
+                  p, 0, 0, 0, capture_mcpwm, &capture), 0);
+    test_mcpwm_route_output(mem, 18u, 32u, false);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x000u, 15u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x004u,
+                test_mcpwm_timer_cfg(10u, 1000u));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x040u, 250u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x050u,
+                (2u << 0) | (1u << 4));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x008u, 2u | (1u << 3));
+    ASSERT_TRUE(capture.info.enabled);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+
+    /* Both emulated cores cover the same wall-clock interval. Their shared
+     * MCPWM clock takes the maximum progress instead of double-counting the
+     * sequential host execution of core 0 and core 1. */
+    cpu0.ccount += 60000u;
+    cpu1.ccount += 60000u;
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x010u) & 0xFFFFu,
+              250u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+
+    /* A driver task running only on APP CPU can update an operator and clock
+     * it through the next boundary while PRO CPU remains stationary. */
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x050u,
+                (2u << 0) | (2u << 2) | (2u << 4));
+    cpu1.ccount += 180000u;
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x010u) & 0xFFFFu, 0u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+
+    /* STOP_EMPTY needs a future TEZ even when no timer interrupt is enabled.
+     * It must therefore remain in the CPU deadline set until that boundary. */
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x008u, 1u << 3);
+    ASSERT_TRUE(cpu0.next_timer_event != UINT32_MAX);
+    cpu1.ccount += 240000u;
+    (void)mem_read32(mem, TEST_MCPWM0_BASE + 0x010u);
+    ASSERT_FALSE(capture.info.enabled);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(mcpwm_gpio_capture_sync_fault_deadtime_and_carrier) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 5, 39);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 17);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x000u, 15u);
+
+    /* Timer 1 runs at 1 MHz. GPIO SYNC0 reloads it to count 123, and a
+     * software-sync toggle subsequently reloads a different phase. */
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x014u,
+                test_mcpwm_timer_cfg(10u, 1000u));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x034u, 4u << 3);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x01Cu,
+                1u | (123u << 4));
+    test_pcnt_route_input(mem, 31u, 32u, false);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x018u, 2u | (1u << 3));
+    test_mcpwm_advance(&cpu, 24000u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x020u) & 0xFFFFu,
+              100u);
+    periph_gpio_set_input(p, 32, 1);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x020u) & 0xFFFFu,
+              123u);
+    periph_gpio_set_input(p, 32, 0);
+    /* An asynchronous GPIO edge first catches the timer up to the edge time,
+     * then applies the phase reload. Stale elapsed time must not be charged a
+     * second time after the synchronized count is installed. */
+    cpu.ccount += 24000u;
+    periph_gpio_set_input(p, 32, 1);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x020u) & 0xFFFFu,
+              123u);
+    periph_gpio_set_input(p, 32, 0);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x01Cu,
+                1u | (77u << 4) | (1u << 1));
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x020u) & 0xFFFFu,
+              77u);
+
+    /* The independent APB capture timer timestamps real matrix edges and
+     * reports both edge direction and source-39 interrupt state. */
+    test_pcnt_route_input(mem, 109u, 34u, false);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x0F0u,
+                1u | (1u << 1) | (1u << 2));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x0E8u, 1u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x110u, 1u << 27);
+    test_mcpwm_advance(&cpu, 300u);
+    periph_gpio_set_input(p, 34, 1);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x0FCu), 100u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x108u) & 1u, 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x118u), 1u << 27);
+    ASSERT_EQ(cpu.interrupt & (1u << 5), 1u << 5);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x11Cu, 1u << 27);
+    test_mcpwm_advance(&cpu, 150u);
+    periph_gpio_set_input(p, 34, 0);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x0FCu), 150u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x108u) & 1u, 1u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x11Cu, 1u << 27);
+    test_mcpwm_advance(&cpu, 60u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x0F0u,
+                1u | (1u << 1) | (1u << 2) | (1u << 12));
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x0FCu), 170u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x0F0u) & (1u << 12), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x108u) & 1u, 0u);
+
+    /* Operator 0 follows timer 1. Its endpoint reports dead-time/carrier
+     * configuration and fault actions while raw GPIO levels show override
+     * persistence for cycle-by-cycle and one-shot braking. */
+    mcpwm_test_capture_t output = {0};
+    ASSERT_EQ(periph_set_mcpwm_output_callback(
+                  p, 0, 0, 0, capture_mcpwm, &output), 0);
+    test_mcpwm_route_output(mem, 18u, 32u, false);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x038u, 1u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x04Cu, 2u << 6);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x05Cu, 7u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x060u, 11u);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x058u,
+                (1u << 15) | (1u << 16));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x064u,
+                1u | (3u << 1) | (5u << 5));
+    ASSERT_EQ(output.info.rising_delay_ticks, 11u);
+    ASSERT_EQ(output.info.falling_delay_ticks, 7u);
+    ASSERT_EQ(output.info.deadtime_clock_hz, 10000000u);
+    ASSERT_EQ(output.info.carrier_hz, 312500u);
+    ASSERT_EQ(output.info.carrier_duty_eighths, 5u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+
+    test_pcnt_route_input(mem, 34u, 35u, false);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x068u,
+                (1u << 3) | (1u << 8) | (1u << 10));
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x0E4u,
+                (1u << 0) | (1u << 3)); /* fault0 active high */
+    periph_gpio_set_input(p, 35, 1);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x0E4u) & (1u << 6),
+              1u << 6);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x070u) & 1u, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x114u) &
+              ((1u << 9) | (1u << 21)), (1u << 9) | (1u << 21));
+    ASSERT_TRUE(output.info.fault_active);
+    ASSERT_EQ(output.info.forced_level, 0);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+    periph_gpio_set_input(p, 35, 0);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x070u) & 1u, 0u);
+    ASSERT_FALSE(output.info.fault_active);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x068u,
+                (1u << 7) | (1u << 12) | (1u << 14));
+    periph_gpio_set_input(p, 35, 1);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x070u) & 2u, 2u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+    periph_gpio_set_input(p, 35, 0);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x070u) & 2u, 2u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 0);
+    mem_write32(mem, TEST_MCPWM0_BASE + 0x06Cu, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x070u), 0u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 typedef struct {
     unsigned calls;
     int speed_mode;
@@ -2593,6 +2980,10 @@ static void run_peripheral_tests(void) {
     RUN_TEST(cross_core_interrupt);
     RUN_TEST(pcnt_matrix_control_limits_events_and_reset);
     RUN_TEST(pcnt_filter_rejects_glitches_and_qualifies_edges);
+    RUN_TEST(mcpwm_timed_waveform_shadow_force_and_interrupt);
+    RUN_TEST(mcpwm_units_and_upper_operators_are_independent);
+    RUN_TEST(mcpwm_dual_core_clock_and_deferred_stop_boundary);
+    RUN_TEST(mcpwm_gpio_capture_sync_fault_deadtime_and_carrier);
     RUN_TEST(ledc_timed_duty_update_and_gpio_output);
     RUN_TEST(ledc_fade_progress_and_completion_deadline);
     RUN_TEST(ledc_timer_overflow_pause_and_clear);

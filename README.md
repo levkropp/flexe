@@ -39,7 +39,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
   timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA,
   eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
-  eight-unit/two-channel classic PCNT, ADC1/2, DAC1/2
+  eight-unit/two-channel classic PCNT, both classic MCPWM motor-control units
+  with sync/capture/fault/dead-time/carrier paths, ADC1/2, DAC1/2
 - raw hardware crypto: aes-128/192/256, sha, rsa modular math and interrupts
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
 - host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
@@ -50,7 +51,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 595 tests
+- 600 tests
 
 ## building
 
@@ -139,7 +140,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 595 tests, 2030 passed, 0 failed
+# 600 tests, 2147 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -232,6 +233,22 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-pcnt-pulse.sh
 
 `FLEXE_PCNT_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The MCPWM gate builds an unmodified sketch against ESP-IDF's public legacy
+`driver/mcpwm.h` API. Unit 0 drives complementary 20 kHz outputs through
+carrier and dead-time blocks while unit 1 independently drives operator 2 at
+1 kHz. The host exercises real GPIO-matrix sync, capture ISR callbacks,
+cycle-by-cycle fault actions, forced high/low generator modes, shadowed
+frequency/duty updates, and stop-at-TEZ behavior. Both engines must report all
+three outputs stopped with zero unhandled MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-mcpwm-motor.sh
+# engine=jit stage=0x4D435057 result=0/.../10000/7500/0/0 events=19/18/9 ... levels=1/1/1/1 unhandled=0 unregistered=0
+# engine=interp stage=0x4D435057 result=0/.../10000/7500/0/0 events=19/18/9 ... levels=1/1/1/1 unhandled=0 unregistered=0
+```
+
+`FLEXE_MCPWM_BUILD_DIR` optionally preserves its Arduino build directory.
+
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
@@ -251,8 +268,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **7.92× real-time** |
-| NerdMiner v1.8.3 | **6.24× real-time** |
+| ESP32 Marauder v1.14 | **7.85× real-time** |
+| NerdMiner v1.8.3 | **6.09× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real
