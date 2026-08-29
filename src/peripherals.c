@@ -369,6 +369,12 @@ static void pcnt_gpio_input_changed(esp32_periph_t *p, int gpio);
 static uint32_t mcpwm_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void mcpwm_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void mcpwm_reset_unit(esp32_periph_t *p, unsigned unit);
+static uint64_t timg_now_cycles(esp32_periph_t *p);
+static void timg_sync_all_to(esp32_periph_t *p, uint64_t now);
+static uint32_t timg_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void timg_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void timg_reset_group(esp32_periph_t *p, unsigned group);
+static void timg_kick(esp32_periph_t *p);
 static void mcpwm_gpio_output_route_changed(esp32_periph_t *p, int gpio,
                                              uint32_t before,
                                              uint32_t after);
@@ -387,6 +393,36 @@ typedef struct {
     uint32_t protect;    /* write protect key */
 } wdt_state_t;
 
+/* Each classic ESP32 timer group contains two independent 64-bit general
+ * purpose timers clocked from the 80 MHz APB domain.  The exposed LO/HI
+ * registers are software-captured snapshots; counter is the live value. */
+typedef struct {
+    uint32_t config;
+    uint64_t counter;
+    uint64_t latched;
+    uint64_t alarm;
+    uint64_t load;
+    uint64_t last_cycles;
+    uint64_t tick_remainder;
+} timg_timer_state_t;
+
+typedef struct {
+    timg_timer_state_t timer[2];
+    uint32_t int_ena;
+    uint32_t int_raw;
+    uint32_t date;
+    uint32_t regclk;
+} timg_group_state_t;
+
+/* A shared monotonic CPU-cycle timeline prevents sequential execution of the
+ * two emulated cores from advancing APB peripherals twice. */
+typedef struct {
+    uint64_t cycles;
+    uint64_t core_cycles[2];
+    uint32_t last_ccount[2];
+    bool valid[2];
+} timg_clock_state_t;
+
 /* TG LACT (low-alarm-counter) state — the esp_timer hardware timebase.
  * The 64-bit counter ticks at ccount/DIVIDER (DIVIDER from LACTCONFIG);
  * when the counter reaches the 64-bit alarm with ALARM_EN set, the
@@ -397,8 +433,6 @@ typedef struct {
     uint64_t alarm;         /* LACTALARMHI:LO */
     uint64_t load;          /* LACTLOADHI:LO pending value */
     uint64_t load_ccount;   /* cpu0 ccount when LACTLOAD fired */
-    uint32_t int_ena;       /* TIMG_INT_ENA_TIMERS */
-    uint32_t int_raw;       /* TIMG_INT_RAW_TIMERS */
     bool     loaded;        /* a LACTLOAD has occurred */
     bool     level;         /* interrupt level currently asserted */
 } lact_state_t;
@@ -709,6 +743,11 @@ struct esp32_periph {
     uint32_t io_mux[64];
     uint64_t io_mux_written;
 
+    /* Timer groups: two APB general-purpose timers plus WDT/LACT functions. */
+    timg_group_state_t timg[2];
+    timg_clock_state_t timg_clock;
+    bool timg_alarm_active;
+
     /* Timer groups WDT */
     wdt_state_t timg_wdt[2];
 
@@ -847,6 +886,8 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_RMT_MODULE_BIT           (1u << 9)
 #define DPORT_PCNT_MODULE_BIT          (1u << 10)
 #define DPORT_LEDC_MODULE_BIT          (1u << 11)
+#define DPORT_TIMG0_MODULE_BIT         (1u << 13)
+#define DPORT_TIMG1_MODULE_BIT         (1u << 15)
 #define DPORT_PWM0_MODULE_BIT          (1u << 17)
 #define DPORT_PWM1_MODULE_BIT          (1u << 20)
 
@@ -1048,9 +1089,12 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
     }
     switch (off) {
     case DPORT_PERIP_CLK_EN_OFF:
+        timg_sync_all_to(p, timg_now_cycles(p));
         p->dport_perip_clk_en = val;
+        timg_kick(p);
         break;
     case DPORT_PERIP_RST_EN_OFF:
+        timg_sync_all_to(p, timg_now_cycles(p));
         p->dport_perip_rst_en = val;
         if (val & DPORT_RMT_MODULE_BIT)
             rmt_reset_state(p);
@@ -1058,10 +1102,15 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
             pcnt_reset_state(p);
         if (val & DPORT_LEDC_MODULE_BIT)
             ledc_reset_state(p);
+        if (val & DPORT_TIMG0_MODULE_BIT)
+            timg_reset_group(p, 0);
+        if (val & DPORT_TIMG1_MODULE_BIT)
+            timg_reset_group(p, 1);
         if (val & DPORT_PWM0_MODULE_BIT)
             mcpwm_reset_unit(p, 0);
         if (val & DPORT_PWM1_MODULE_BIT)
             mcpwm_reset_unit(p, 1);
+        timg_kick(p);
         break;
     case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
     case 0x0D8: p->bt_lpck[1] = val; break;  /* DPORT_BT_LPCK_DIV_FRAC */
@@ -1613,12 +1662,346 @@ static void efuse_write(void *ctx, uint32_t addr, uint32_t val) {
     (void)ctx; (void)addr; (void)val;
 }
 
-/* ---- TIMG LACT (esp_timer hardware timebase) ---- */
+/* ---- TIMG general-purpose timers and LACT timebase ---- */
 
-#define LACT_CFG_EN        (1u << 31)   /* TIMG_LACT_EN */
-#define LACT_CFG_ALARM_EN  (1u << 10)   /* TIMG_LACT_ALARM_EN */
-#define LACT_INT_BIT       (1u << 3)    /* TIMG_LACT_INT_ENA/RAW/ST/CLR */
-#define TG_LACT_LEVEL_SRC(g) ((g) == 0 ? 17 : 21)  /* ETS_TGn_LACT_LEVEL */
+#define TIMG_TIMER_COUNT          2u
+#define TIMG_APB_CLOCK_MHZ        80u
+#define TIMG_TIMER_STRIDE         0x24u
+#define TIMG_TIMER_CONFIG_RESET   0x60002000u
+#define TIMG_TIMER_CONFIG_MASK    0xFFFFFC00u
+#define TIMG_TIMER_EN             (1u << 31)
+#define TIMG_TIMER_INCREASE       (1u << 30)
+#define TIMG_TIMER_AUTORELOAD     (1u << 29)
+#define TIMG_TIMER_EDGE_INT_EN    (1u << 12)
+#define TIMG_TIMER_LEVEL_INT_EN   (1u << 11)
+#define TIMG_TIMER_ALARM_EN       (1u << 10)
+#define TIMG_INT_VALID_MASK       0xFu
+#define TIMG_WDT_INT_BIT          (1u << 2)
+#define LACT_CFG_EN               (1u << 31) /* TIMG_LACT_EN */
+#define LACT_CFG_EDGE_INT_EN      (1u << 12)
+#define LACT_CFG_LEVEL_INT_EN     (1u << 11)
+#define LACT_CFG_ALARM_EN         (1u << 10) /* TIMG_LACT_ALARM_EN */
+#define LACT_INT_BIT              (1u << 3)  /* INT_ENA/RAW/ST/CLR */
+
+static int timg_timer_level_source(unsigned group, unsigned timer) {
+    return group == 0u ? 14 + (int)timer : 18 + (int)timer;
+}
+
+static int timg_timer_edge_source(unsigned group, unsigned timer) {
+    return group == 0u ? 58 + (int)timer : 62 + (int)timer;
+}
+
+static int timg_wdt_level_source(unsigned group) {
+    return group == 0u ? 16 : 20;
+}
+
+static int timg_wdt_edge_source(unsigned group) {
+    return group == 0u ? 60 : 64;
+}
+
+static int timg_lact_level_source(unsigned group) {
+    return group == 0u ? 17 : 21;
+}
+
+static int timg_lact_edge_source(unsigned group) {
+    return group == 0u ? 61 : 65;
+}
+
+static uint32_t timg_cpu_mhz(const esp32_periph_t *p) {
+    uint32_t mhz = mem_read32(p->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    return mhz >= 10u && mhz <= 240u ? mhz : 240u;
+}
+
+static uint64_t timg_now_cycles(esp32_periph_t *p) {
+    for (unsigned core = 0; core < 2u; core++) {
+        if (!p->cpu[core]) continue;
+        uint32_t now = p->cpu[core]->ccount;
+        if (!p->timg_clock.valid[core]) {
+            p->timg_clock.last_ccount[core] = now;
+            p->timg_clock.core_cycles[core] = p->timg_clock.cycles;
+            p->timg_clock.valid[core] = true;
+            continue;
+        }
+        uint32_t elapsed = now - p->timg_clock.last_ccount[core];
+        if (elapsed < (uint32_t)INT32_MAX) {
+            if (p->timg_clock.core_cycles[core] > UINT64_MAX - elapsed)
+                p->timg_clock.core_cycles[core] = UINT64_MAX;
+            else
+                p->timg_clock.core_cycles[core] += elapsed;
+        }
+        p->timg_clock.last_ccount[core] = now;
+        if (p->timg_clock.core_cycles[core] > p->timg_clock.cycles)
+            p->timg_clock.cycles = p->timg_clock.core_cycles[core];
+    }
+    return p->timg_clock.cycles;
+}
+
+static bool timg_group_clocked(const esp32_periph_t *p, unsigned group) {
+    uint32_t bit = group == 0u ? DPORT_TIMG0_MODULE_BIT :
+                                 DPORT_TIMG1_MODULE_BIT;
+    return (p->dport_perip_clk_en & bit) != 0u &&
+           (p->dport_perip_rst_en & bit) == 0u;
+}
+
+static uint32_t timg_timer_divider(const timg_timer_state_t *timer) {
+    uint32_t divider = (timer->config >> 13) & 0xFFFFu;
+    return divider != 0u ? divider : 65536u;
+}
+
+/* Interrupt-matrix updates scan both cores and can synchronously dispatch a
+ * compatibility ISR.  Only touch a source when its electrical level changes;
+ * timed peripherals call these helpers on every shared event-hook pass. */
+static void timg_drive_source(esp32_periph_t *p, int source, bool active) {
+    if (p->source_level[source] == active) return;
+    if (active)
+        periph_assert_interrupt(p, source);
+    else
+        periph_deassert_interrupt(p, source);
+}
+
+static void timg_update_timer_irq(esp32_periph_t *p, unsigned group,
+                                  unsigned timer) {
+    timg_group_state_t *state = &p->timg[group];
+    uint32_t bit = 1u << timer;
+    uint32_t active = state->int_raw & state->int_ena;
+    uint32_t config = state->timer[timer].config;
+    timg_drive_source(p, timg_timer_level_source(group, timer),
+                      (active & bit) != 0u &&
+                      (config & TIMG_TIMER_LEVEL_INT_EN) != 0u);
+
+    /* A compatibility ISR may synchronously clear RAW or alter CONFIG while
+     * the first source is asserted, so refresh before driving the other. */
+    active = state->int_raw & state->int_ena;
+    config = state->timer[timer].config;
+    timg_drive_source(p, timg_timer_edge_source(group, timer),
+                      (active & bit) != 0u &&
+                      (config & TIMG_TIMER_EDGE_INT_EN) != 0u);
+}
+
+static void timg_update_wdt_irq(esp32_periph_t *p, unsigned group) {
+    timg_group_state_t *state = &p->timg[group];
+    uint32_t active = state->int_raw & state->int_ena;
+    uint32_t wdt_config = p->timg_wdt[group].config0;
+    timg_drive_source(p, timg_wdt_level_source(group),
+                      (active & TIMG_WDT_INT_BIT) != 0u &&
+                      (wdt_config & (1u << 21)) != 0u);
+    active = state->int_raw & state->int_ena;
+    wdt_config = p->timg_wdt[group].config0;
+    timg_drive_source(p, timg_wdt_edge_source(group),
+                      (active & TIMG_WDT_INT_BIT) != 0u &&
+                      (wdt_config & (1u << 22)) != 0u);
+}
+
+static void timg_update_lact_irq(esp32_periph_t *p, unsigned group) {
+    timg_group_state_t *state = &p->timg[group];
+    lact_state_t *lact = &p->lact[group];
+    uint32_t active = state->int_raw & state->int_ena;
+    bool lact_level = (active & LACT_INT_BIT) != 0u &&
+                      (lact->config & LACT_CFG_LEVEL_INT_EN) != 0u;
+    lact->level = lact_level;
+    timg_drive_source(p, timg_lact_level_source(group), lact_level);
+    active = state->int_raw & state->int_ena;
+    timg_drive_source(p, timg_lact_edge_source(group),
+                      (active & LACT_INT_BIT) != 0u &&
+                      (lact->config & LACT_CFG_EDGE_INT_EN) != 0u);
+}
+
+static void timg_update_group_irqs(esp32_periph_t *p, unsigned group) {
+    for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++)
+        timg_update_timer_irq(p, group, timer);
+    timg_update_wdt_irq(p, group);
+    timg_update_lact_irq(p, group);
+}
+
+static void timg_refresh_alarm_active(esp32_periph_t *p) {
+    p->timg_alarm_active = false;
+    for (unsigned group = 0; group < 2u; group++) {
+        if (!timg_group_clocked(p, group)) continue;
+        timg_group_state_t *state = &p->timg[group];
+        for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++) {
+            uint32_t config = state->timer[timer].config;
+            uint32_t bit = 1u << timer;
+            if ((config & TIMG_TIMER_EN) != 0u &&
+                (config & TIMG_TIMER_ALARM_EN) != 0u &&
+                (config & (TIMG_TIMER_LEVEL_INT_EN |
+                           TIMG_TIMER_EDGE_INT_EN)) != 0u &&
+                (state->int_ena & bit) != 0u) {
+                p->timg_alarm_active = true;
+                return;
+            }
+        }
+    }
+}
+
+static void timg_fire_alarm(esp32_periph_t *p, unsigned group,
+                            unsigned timer_index) {
+    timg_group_state_t *state = &p->timg[group];
+    timg_timer_state_t *timer = &state->timer[timer_index];
+    bool autoreload = (timer->config & TIMG_TIMER_AUTORELOAD) != 0u;
+    timer->config &= ~TIMG_TIMER_ALARM_EN;
+    if (autoreload) {
+        timer->counter = timer->load;
+    }
+    state->int_raw |= 1u << timer_index;
+    /* Compatibility-mode interrupt dispatch is synchronous.  The genuine
+     * ESP-IDF ISR can clear RAW and re-arm the alarm before this returns. */
+    timg_update_timer_irq(p, group, timer_index);
+    timg_refresh_alarm_active(p);
+}
+
+static void timg_advance_timer_ticks(esp32_periph_t *p, unsigned group,
+                                     unsigned timer_index, uint64_t ticks) {
+    timg_timer_state_t *timer = &p->timg[group].timer[timer_index];
+    unsigned events = 0u;
+    while (ticks != 0u) {
+        bool increase = (timer->config & TIMG_TIMER_INCREASE) != 0u;
+        bool alarm_enabled =
+            (timer->config & TIMG_TIMER_ALARM_EN) != 0u;
+        uint64_t distance = increase ? timer->alarm - timer->counter :
+                                       timer->counter - timer->alarm;
+        /* Equality at the start is not a new edge; the alarm fires when a
+         * subsequent timer tick reaches the compare value.  A full 2^64
+         * wrap cannot fit in the finite tick count represented here. */
+        if (!alarm_enabled || distance == 0u || ticks < distance) {
+            timer->counter = increase ? timer->counter + ticks :
+                                        timer->counter - ticks;
+            break;
+        }
+
+        timer->counter = timer->alarm;
+        ticks -= distance;
+        timg_fire_alarm(p, group, timer_index);
+        if (++events > 1000000u) {
+            bool now_increase =
+                (timer->config & TIMG_TIMER_INCREASE) != 0u;
+            timer->counter = now_increase ? timer->counter + ticks :
+                                            timer->counter - ticks;
+            break;
+        }
+        if (!(timer->config & TIMG_TIMER_EN) ||
+            !timg_group_clocked(p, group))
+            break;
+    }
+}
+
+static void timg_sync_timer_to(esp32_periph_t *p, unsigned group,
+                               unsigned timer_index, uint64_t now) {
+    timg_timer_state_t *timer = &p->timg[group].timer[timer_index];
+    uint64_t elapsed = now >= timer->last_cycles ?
+                       now - timer->last_cycles : 0u;
+    timer->last_cycles = now;
+    if (!(timer->config & TIMG_TIMER_EN) ||
+        !timg_group_clocked(p, group))
+        return;
+
+    uint64_t denominator =
+        (uint64_t)timg_cpu_mhz(p) * timg_timer_divider(timer);
+    if (denominator == 0u) return;
+    uint64_t product = elapsed >
+        (UINT64_MAX - timer->tick_remainder) / TIMG_APB_CLOCK_MHZ ?
+        UINT64_MAX : timer->tick_remainder + elapsed * TIMG_APB_CLOCK_MHZ;
+    uint64_t ticks = product / denominator;
+    timer->tick_remainder = product % denominator;
+    if (ticks != 0u)
+        timg_advance_timer_ticks(p, group, timer_index, ticks);
+}
+
+static void timg_sync_group_to(esp32_periph_t *p, unsigned group,
+                               uint64_t now) {
+    for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++)
+        timg_sync_timer_to(p, group, timer, now);
+}
+
+static void timg_sync_all_to(esp32_periph_t *p, uint64_t now) {
+    for (unsigned group = 0; group < 2u; group++)
+        timg_sync_group_to(p, group, now);
+}
+
+static uint64_t timg_cycles_until_ticks(const esp32_periph_t *p,
+                                        const timg_timer_state_t *timer,
+                                        uint64_t ticks) {
+    uint64_t denominator =
+        (uint64_t)timg_cpu_mhz(p) * timg_timer_divider(timer);
+    uint64_t needed = ticks > UINT64_MAX / denominator ? UINT64_MAX :
+                      ticks * denominator;
+    if (needed <= timer->tick_remainder) return 1u;
+    needed -= timer->tick_remainder;
+    return needed / TIMG_APB_CLOCK_MHZ +
+           (needed % TIMG_APB_CLOCK_MHZ != 0u);
+}
+
+static uint32_t timg_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || !p->timg_alarm_active) return UINT32_MAX;
+    uint64_t now = timg_now_cycles(p);
+    timg_sync_all_to(p, now);
+    bool have = false;
+    uint64_t best_distance = 0u;
+    for (unsigned group = 0; group < 2u; group++) {
+        if (!timg_group_clocked(p, group)) continue;
+        timg_group_state_t *state = &p->timg[group];
+        for (unsigned timer_index = 0; timer_index < TIMG_TIMER_COUNT;
+             timer_index++) {
+            timg_timer_state_t *timer = &state->timer[timer_index];
+            uint32_t bit = 1u << timer_index;
+            if (!(timer->config & TIMG_TIMER_EN) ||
+                !(timer->config & TIMG_TIMER_ALARM_EN) ||
+                !(timer->config & (TIMG_TIMER_LEVEL_INT_EN |
+                                    TIMG_TIMER_EDGE_INT_EN)) ||
+                !(state->int_ena & bit))
+                continue;
+            bool increase =
+                (timer->config & TIMG_TIMER_INCREASE) != 0u;
+            uint64_t ticks = increase ? timer->alarm - timer->counter :
+                                        timer->counter - timer->alarm;
+            if (ticks == 0u) continue;
+            uint64_t distance = timg_cycles_until_ticks(p, timer, ticks);
+            if (!have || distance < best_distance) {
+                have = true;
+                best_distance = distance;
+            }
+        }
+    }
+    if (!have) return UINT32_MAX;
+    if (best_distance >= (uint64_t)INT32_MAX)
+        best_distance = (uint64_t)INT32_MAX - 1u;
+    return cpu->ccount + (uint32_t)best_distance;
+}
+
+static void timg_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    (void)cpu;
+    if (!p->timg_alarm_active) return;
+    uint64_t now = timg_now_cycles(p);
+    timg_sync_all_to(p, now);
+}
+
+static void timg_kick(esp32_periph_t *p) {
+    timg_refresh_alarm_active(p);
+    for (unsigned core = 0; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void timg_reset_group(esp32_periph_t *p, unsigned group) {
+    if (!p || group >= 2u) return;
+    for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++) {
+        periph_deassert_interrupt(p, timg_timer_level_source(group, timer));
+        periph_deassert_interrupt(p, timg_timer_edge_source(group, timer));
+    }
+    periph_deassert_interrupt(p, timg_wdt_level_source(group));
+    periph_deassert_interrupt(p, timg_wdt_edge_source(group));
+    periph_deassert_interrupt(p, timg_lact_level_source(group));
+    periph_deassert_interrupt(p, timg_lact_edge_source(group));
+
+    memset(&p->timg[group], 0, sizeof(p->timg[group]));
+    memset(&p->timg_wdt[group], 0, sizeof(p->timg_wdt[group]));
+    memset(&p->lact[group], 0, sizeof(p->lact[group]));
+    memset(&p->rtc_cal[group], 0, sizeof(p->rtc_cal[group]));
+    p->timg[group].date = 0x01604290u;
+    p->lact[group].config = 0x60002300u;
+    for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++) {
+        p->timg[group].timer[timer].config = TIMG_TIMER_CONFIG_RESET;
+        p->timg[group].timer[timer].last_cycles = p->timg_clock.cycles;
+    }
+}
 
 static uint32_t lact_divider(const lact_state_t *l) {
     uint32_t d = (l->config >> 13) & 0xFFFF;
@@ -1641,15 +2024,15 @@ static uint64_t lact_counter(const esp32_periph_t *p, int group) {
 /* Re-evaluate the alarm condition and drive the level interrupt source.
  * Hardware: INT_RAW sets when counter >= alarm with ALARM_EN; the source
  * line asserts while (INT_RAW & INT_ENA). */
-static void lact_eval_irq(esp32_periph_t *p, int group) {
+static void lact_latch_alarm(esp32_periph_t *p, int group) {
     lact_state_t *l = &p->lact[group];
     if ((l->config & LACT_CFG_ALARM_EN) && lact_counter(p, group) >= l->alarm)
-        l->int_raw |= LACT_INT_BIT;
-    bool level = (l->int_raw & l->int_ena & LACT_INT_BIT) != 0;
-    if (level != l->level) {
-        l->level = level;
-        intr_matrix_update_source(p, TG_LACT_LEVEL_SRC(group), level);
-    }
+        p->timg[group].int_raw |= LACT_INT_BIT;
+}
+
+static void lact_eval_irq(esp32_periph_t *p, int group) {
+    lact_latch_alarm(p, group);
+    timg_update_lact_irq(p, (unsigned)group);
 }
 
 /* Next cpu ccount at which a LACT alarm will fire (for next_timer_event). */
@@ -1658,9 +2041,13 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     for (int group = 0; group < 2; group++) {
         lact_state_t *l = &p->lact[group];
         if (!(l->config & LACT_CFG_ALARM_EN)) continue;
-        if (l->int_raw & LACT_INT_BIT) continue; /* event already latched */
+        if (p->timg[group].int_raw & LACT_INT_BIT) {
+            continue; /* event already latched */
+        }
         uint64_t now = lact_counter(p, group);
-        if (now >= l->alarm) return cpu->ccount;   /* fire now */
+        if (now >= l->alarm) {
+            return cpu->ccount;   /* fire now */
+        }
         uint64_t cycles = (l->alarm - now) * lact_divider(l);
         uint64_t event = (uint64_t)cpu->ccount + cycles;
         if (event > UINT32_MAX) event = UINT32_MAX;
@@ -1673,6 +2060,7 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
     uint32_t events[] = {
+        timg_next_fire(p, cpu),
         lact_next_fire(p, cpu),
         i2s_next_fire(p, cpu),
         rmt_next_fire(p, cpu),
@@ -1697,6 +2085,7 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
 }
 static void periph_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
+    timg_eval_events(p, cpu);
     for (int group = 0; group < 2; group++)
         lact_eval_irq(p, group);
     i2s_eval_events(p, cpu);
@@ -1712,15 +2101,37 @@ static void lact_kick(esp32_periph_t *p) {
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
 
-/* ---- TIMG WDT (shared for TIMG0 and TIMG1) ---- */
+/* ---- TIMG register file (GPTimer, WDT, calibration, and LACT) ---- */
 
 static uint32_t timg_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     int group = (addr >= TIMG1_BASE) ? 1 : 0;
     uint32_t base = group ? TIMG1_BASE : TIMG0_BASE;
     uint32_t off = addr - base;
+    timg_group_state_t *state = &p->timg[group];
     wdt_state_t *w = &p->timg_wdt[group];
     lact_state_t *l = &p->lact[group];
+
+    timg_sync_group_to(p, (unsigned)group, timg_now_cycles(p));
+    if (off < 0x048u) {
+        unsigned timer_index = off / TIMG_TIMER_STRIDE;
+        uint32_t relative = off % TIMG_TIMER_STRIDE;
+        if (timer_index < TIMG_TIMER_COUNT) {
+            timg_timer_state_t *timer = &state->timer[timer_index];
+            switch (relative) {
+            case 0x00: return timer->config;
+            case 0x04: return (uint32_t)timer->latched;
+            case 0x08: return (uint32_t)(timer->latched >> 32);
+            case 0x0C: return 0u;
+            case 0x10: return (uint32_t)timer->alarm;
+            case 0x14: return (uint32_t)(timer->alarm >> 32);
+            case 0x18: return (uint32_t)timer->load;
+            case 0x1C: return (uint32_t)(timer->load >> 32);
+            case 0x20: return 0u;
+            default: return 0u;
+            }
+        }
+    }
 
     switch (off) {
     case 0x048: return w->config0;   /* TIMG_WDTCONFIG0_REG */
@@ -1751,9 +2162,13 @@ static uint32_t timg_read(void *ctx, uint32_t addr) {
     case 0x088: return (uint32_t)(l->alarm >> 32);                 /* LACTALARMHI */
     case 0x08C: return (uint32_t)l->load;                          /* LACTLOADLO */
     case 0x090: return (uint32_t)(l->load >> 32);                  /* LACTLOADHI */
-    case 0x098: return l->int_ena;                                 /* INT_ENA_TIMERS */
-    case 0x09C: lact_eval_irq(p, group); return l->int_raw;        /* INT_RAW_TIMERS */
-    case 0x0A0: lact_eval_irq(p, group); return l->int_raw & l->int_ena; /* INT_ST_TIMERS */
+    case 0x098: return state->int_ena;                     /* INT_ENA_TIMERS */
+    case 0x09C: lact_eval_irq(p, group); return state->int_raw; /* INT_RAW_TIMERS */
+    case 0x0A0: lact_eval_irq(p, group);                   /* INT_ST_TIMERS */
+                return state->int_raw & state->int_ena;
+    case 0x0A4: return 0u;                                 /* INT_CLR_TIMERS */
+    case 0x0F8: return state->date;
+    case 0x0FC: return state->regclk;
     default: return 0;
     }
 }
@@ -1763,11 +2178,62 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
     int group = (addr >= TIMG1_BASE) ? 1 : 0;
     uint32_t base = group ? TIMG1_BASE : TIMG0_BASE;
     uint32_t off = addr - base;
+    timg_group_state_t *state = &p->timg[group];
     wdt_state_t *w = &p->timg_wdt[group];
     lact_state_t *l = &p->lact[group];
 
+    uint64_t now = timg_now_cycles(p);
+    timg_sync_group_to(p, (unsigned)group, now);
+    if (off < 0x048u) {
+        unsigned timer_index = off / TIMG_TIMER_STRIDE;
+        uint32_t relative = off % TIMG_TIMER_STRIDE;
+        if (timer_index < TIMG_TIMER_COUNT) {
+            timg_timer_state_t *timer = &state->timer[timer_index];
+            switch (relative) {
+            case 0x00: {
+                uint32_t old_config = timer->config;
+                timer->config = val & TIMG_TIMER_CONFIG_MASK;
+                if (((old_config ^ timer->config) &
+                     (0xFFFFu << 13)) != 0u)
+                    timer->tick_remainder = 0u;
+                timg_update_timer_irq(p, (unsigned)group, timer_index);
+                timg_kick(p);
+                return;
+            }
+            case 0x0C:
+                timer->latched = timer->counter;
+                return;
+            case 0x10:
+                timer->alarm = (timer->alarm & 0xFFFFFFFF00000000ull) |
+                               val;
+                timg_kick(p);
+                return;
+            case 0x14:
+                timer->alarm = (timer->alarm & 0xFFFFFFFFull) |
+                               ((uint64_t)val << 32);
+                timg_kick(p);
+                return;
+            case 0x18:
+                timer->load = (timer->load & 0xFFFFFFFF00000000ull) | val;
+                return;
+            case 0x1C:
+                timer->load = (timer->load & 0xFFFFFFFFull) |
+                              ((uint64_t)val << 32);
+                return;
+            case 0x20:
+                timer->counter = timer->load;
+                timer->tick_remainder = 0u;
+                timg_kick(p);
+                return;
+            default:
+                return;
+            }
+        }
+    }
+
     switch (off) {
-    case 0x048: w->config0 = val; break;
+    case 0x048: w->config0 = val;
+                timg_update_wdt_irq(p, (unsigned)group); break;
     case 0x04C: w->config1 = val; break;
     case 0x050: w->config2 = val; break;
     case 0x054: w->config3 = val; break;
@@ -1796,8 +2262,20 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
         l->load_ccount = p->cpu[0] ? p->cpu[0]->ccount : 0;
         lact_eval_irq(p, group); lact_kick(p);
         break;
-    case 0x098: l->int_ena = val; lact_eval_irq(p, group); break;  /* INT_ENA_TIMERS */
-    case 0x0A4: l->int_raw &= ~val; lact_eval_irq(p, group); break; /* INT_CLR_TIMERS */
+    case 0x098:
+        state->int_ena = val & TIMG_INT_VALID_MASK;
+        lact_latch_alarm(p, group);
+        timg_update_group_irqs(p, (unsigned)group);
+        timg_kick(p);
+        break;
+    case 0x0A4:
+        state->int_raw &= ~(val & TIMG_INT_VALID_MASK);
+        lact_latch_alarm(p, group);
+        timg_update_group_irqs(p, (unsigned)group);
+        timg_kick(p);
+        break;
+    case 0x0F8: state->date = val & 0x0FFFFFFFu; break;
+    case 0x0FC: state->regclk = val & (1u << 31); break;
     default: break;
     }
 }
@@ -6256,6 +6734,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Initialize interrupt matrix: all lines disabled (source 16 = none) */
     memset(p->intr_matrix, 16, sizeof(p->intr_matrix));
 
+    /* General-purpose timers reset with count-up and auto-reload selected,
+     * but remain stopped until firmware enables their group clock and Tx_EN. */
+    timg_reset_group(p, 0);
+    timg_reset_group(p, 1);
+
     /* LEDC reset state: all eight timers begin held in reset, and DATE is
      * the ESP32 peripheral version value from the vendor register map. */
     ledc_reset_state(p);
@@ -6621,12 +7104,15 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     p->cpu[1] = cpu1;
     for (unsigned core = 0; core < 2u; core++) {
         xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;
+        p->timg_clock.core_cycles[core] = p->timg_clock.cycles;
+        p->timg_clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
+        p->timg_clock.valid[core] = cpu != NULL;
         p->mcpwm.core_cycles[core] = p->mcpwm.time_cycles;
         p->mcpwm.last_ccount[core] = cpu ? cpu->ccount : 0u;
         p->mcpwm.time_valid[core] = cpu != NULL;
     }
-    /* Wire the TIMG LACT timer-event hooks into both cores so esp_timer
-     * alarms fire on time (and can wake the cores from WAITI). */
+    /* Wire Timer Group, LACT, and other timed-peripheral event hooks into
+     * both cores so alarms fire on time and can wake a core from WAITI. */
     for (int i = 0; i < 2; i++) {
         xtensa_cpu_t *c = i == 0 ? cpu0 : cpu1;
         if (!c) continue;

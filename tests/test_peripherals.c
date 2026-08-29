@@ -1305,6 +1305,237 @@ TEST(dport_safe_defaults) {
     mem_destroy(mem);
 }
 
+#define TEST_TIMG0_BASE 0x3FF5F000u
+#define TEST_TIMG1_BASE 0x3FF60000u
+#define TEST_TIMG_CONFIG(en, increase, autoreload, divider, level, edge, alarm) \
+    (((en) ? 1u << 31 : 0u) | ((increase) ? 1u << 30 : 0u) | \
+     ((autoreload) ? 1u << 29 : 0u) | (((divider) & 0xFFFFu) << 13) | \
+     ((edge) ? 1u << 12 : 0u) | ((level) ? 1u << 11 : 0u) | \
+     ((alarm) ? 1u << 10 : 0u))
+
+static uint32_t test_timg_timer_base(unsigned timer) {
+    return timer * 0x24u;
+}
+
+static uint64_t test_timg_capture(xtensa_mem_t *mem, uint32_t group_base,
+                                  unsigned timer) {
+    uint32_t base = group_base + test_timg_timer_base(timer);
+    mem_write32(mem, base + 0x0Cu, 1u);
+    return (uint64_t)mem_read32(mem, base + 0x04u) |
+           ((uint64_t)mem_read32(mem, base + 0x08u) << 32);
+}
+
+static void test_timg_load(xtensa_mem_t *mem, uint32_t group_base,
+                           unsigned timer, uint64_t value) {
+    uint32_t base = group_base + test_timg_timer_base(timer);
+    mem_write32(mem, base + 0x18u, (uint32_t)value);
+    mem_write32(mem, base + 0x1Cu, (uint32_t)(value >> 32));
+    mem_write32(mem, base + 0x20u, 1u);
+}
+
+TEST(timg_general_timers_count_capture_pause_and_reset) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x00u), 0x60002000u);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x24u), 0x60002000u);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG1_BASE + 0x00u), 0x60002000u);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG1_BASE + 0x24u), 0x60002000u);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0xF8u), 0x01604290u);
+
+    /* APB / 80 is 1 MHz.  At a 240 MHz CPU, 240 CCOUNT cycles advance
+     * the timer by exactly one tick. */
+    mem_write32(mem, 0x3FF000C0u, (1u << 13) | (1u << 15));
+    test_timg_load(mem, TEST_TIMG0_BASE, 0, 0x00000001FFFFFFF0ull);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x00u,
+                TEST_TIMG_CONFIG(1, 1, 0, 80, 0, 0, 0));
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0),
+              0x00000001FFFFFFF0ull);
+    cpu.ccount += 2400u;
+    /* LO/HI remain the previous software snapshot until UPDATE is written. */
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x04u), 0xFFFFFFF0u);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0),
+              0x00000001FFFFFFFAull);
+
+    /* Pausing freezes the counter; resuming preserves its 64-bit value. */
+    mem_write32(mem, TEST_TIMG0_BASE + 0x00u,
+                TEST_TIMG_CONFIG(0, 1, 0, 80, 0, 0, 0));
+    cpu.ccount += 24000u;
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0),
+              0x00000001FFFFFFFAull);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x00u,
+                TEST_TIMG_CONFIG(1, 1, 0, 80, 0, 0, 0));
+    cpu.ccount += 480u;
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0),
+              0x00000001FFFFFFFCull);
+
+    /* Timer 1 in the other group counts down independently. */
+    test_timg_load(mem, TEST_TIMG1_BASE, 1, 0x0000000100000002ull);
+    mem_write32(mem, TEST_TIMG1_BASE + 0x24u,
+                TEST_TIMG_CONFIG(1, 0, 0, 80, 0, 0, 0));
+    cpu.ccount += 480u;
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG1_BASE, 1),
+              0x0000000100000000ull);
+
+    /* Gating one module's APB clock pauses only that group. */
+    mem_write32(mem, 0x3FF000C0u, 1u << 15);
+    cpu.ccount += 2400u;
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0),
+              0x00000001FFFFFFFEull);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG1_BASE, 1),
+              0x00000000FFFFFFF6ull);
+    mem_write32(mem, 0x3FF000C0u, (1u << 13) | (1u << 15));
+
+    /* DPORT reset restores both timer register files in the selected group
+     * and leaves the other group's live counter untouched. */
+    uint64_t group1_before = test_timg_capture(mem, TEST_TIMG1_BASE, 1);
+    mem_write32(mem, 0x3FF000C4u, 1u << 13);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x00u), 0x60002000u);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x24u), 0x60002000u);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0), 0u);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG1_BASE, 1), group1_before);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(timg_alarm_autoreload_mask_clear_and_sources) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, (1u << 13) | (1u << 15));
+
+    test_irq_dispatch_t level_dispatch = {0};
+    ASSERT_EQ(periph_set_irq_dispatch(p, 14, test_irq_dispatch,
+                                      &level_dispatch), 0);
+    test_timg_load(mem, TEST_TIMG0_BASE, 0, 2u);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x10u, 5u);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x14u, 0u);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x98u, 1u);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x00u,
+                TEST_TIMG_CONFIG(1, 1, 1, 80, 1, 0, 1));
+    ASSERT_EQ(cpu.next_timer_event, cpu.ccount + 720u);
+    cpu.ccount += 960u; /* alarm at 5, reload to 2, then one further tick */
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x9Cu) & 1u, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0xA0u) & 1u, 1u);
+    ASSERT_EQ(level_dispatch.count, 1);
+    ASSERT_EQ(level_dispatch.last_source, 14);
+    ASSERT_TRUE(periph_interrupt_pending(p, 14));
+    ASSERT_FALSE(mem_read32(mem, TEST_TIMG0_BASE + 0x00u) & (1u << 10));
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0), 3u);
+
+    mem_write32(mem, TEST_TIMG0_BASE + 0xA4u, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 14));
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x9Cu) & 1u, 0u);
+
+    /* RAW latches even while masked, but neither level nor edge source does. */
+    test_timg_load(mem, TEST_TIMG0_BASE, 0, 0u);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x98u, 0u);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x00u,
+                TEST_TIMG_CONFIG(1, 1, 0, 80, 1, 0, 1));
+    cpu.ccount += 1200u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_TIMG0_BASE + 0x9Cu) & 1u, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 14));
+    ASSERT_EQ(level_dispatch.count, 1);
+    mem_write32(mem, TEST_TIMG0_BASE + 0xA4u, 1u);
+
+    /* Exercise the four distinct edge sources while counting down.  Their
+     * classic ESP32 source IDs are 58/59 for group 0 and 62/63 for group 1. */
+    const uint32_t edge_group_base[4] = {
+        TEST_TIMG0_BASE, TEST_TIMG0_BASE, TEST_TIMG1_BASE, TEST_TIMG1_BASE,
+    };
+    const unsigned edge_timer[4] = {0u, 1u, 0u, 1u};
+    const int edge_source[4] = {58, 59, 62, 63};
+    const int level_source[4] = {14, 15, 18, 19};
+    test_irq_dispatch_t edge_dispatch[4] = {{0}};
+    for (unsigned i = 0; i < 4u; i++)
+        ASSERT_EQ(periph_set_irq_dispatch(p, edge_source[i],
+                                          test_irq_dispatch,
+                                          &edge_dispatch[i]), 0);
+
+    for (unsigned i = 0; i < 4u; i++) {
+        uint32_t group_base = edge_group_base[i];
+        unsigned timer_index = edge_timer[i];
+        uint32_t timer_base = group_base + test_timg_timer_base(timer_index);
+        uint32_t bit = 1u << timer_index;
+        test_timg_load(mem, group_base, timer_index, 9u);
+        mem_write32(mem, timer_base + 0x10u, 4u);
+        mem_write32(mem, timer_base + 0x14u, 0u);
+        mem_write32(mem, group_base + 0x98u, bit);
+        mem_write32(mem, timer_base,
+                    TEST_TIMG_CONFIG(1, 0, 0, 80, 0, 1, 1));
+        cpu.ccount += 1200u;
+        cpu.periph_event(&cpu);
+
+        ASSERT_EQ(mem_read32(mem, group_base + 0x9Cu), bit);
+        ASSERT_EQ(edge_dispatch[i].count, 1);
+        ASSERT_EQ(edge_dispatch[i].last_source, edge_source[i]);
+        ASSERT_TRUE(periph_interrupt_pending(p, edge_source[i]));
+        ASSERT_FALSE(periph_interrupt_pending(p, level_source[i]));
+        ASSERT_EQ(test_timg_capture(mem, group_base, timer_index), 4u);
+        for (unsigned j = i + 1u; j < 4u; j++)
+            ASSERT_EQ(edge_dispatch[j].count, 0);
+
+        mem_write32(mem, group_base + 0xA4u, bit);
+        ASSERT_FALSE(periph_interrupt_pending(p, edge_source[i]));
+        mem_write32(mem, timer_base,
+                    TEST_TIMG_CONFIG(0, 0, 0, 80, 0, 1, 0));
+    }
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(timg_dual_core_time_uses_monotonic_maximum) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0, cpu1;
+    xtensa_cpu_init(&cpu0);
+    xtensa_cpu_init(&cpu1);
+    cpu0.mem = mem;
+    cpu1.mem = mem;
+    cpu1.core_id = 1;
+    periph_attach_cpus(p, &cpu0, &cpu1);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 13);
+    mem_write32(mem, TEST_TIMG0_BASE + 0x00u,
+                TEST_TIMG_CONFIG(1, 1, 0, 80, 0, 0, 0));
+
+    cpu0.ccount += 2400u;
+    cpu0.periph_event(&cpu0);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0), 10u);
+    cpu1.ccount += 2400u;
+    cpu1.periph_event(&cpu1);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0), 10u);
+    cpu1.ccount += 240u;
+    cpu1.periph_event(&cpu1);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0), 11u);
+
+    /* The timer remains sourced from the fixed 80 MHz APB clock when the
+     * emulated CPU frequency changes at runtime. */
+    mem_write32(mem, 0x3FFE01E0u, 80u);
+    cpu1.ccount += 80u;
+    cpu1.periph_event(&cpu1);
+    ASSERT_EQ(test_timg_capture(mem, TEST_TIMG0_BASE, 0), 12u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(wdt_disable) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -2963,6 +3194,9 @@ static void run_peripheral_tests(void) {
     RUN_TEST(gp_spi_dma_full_duplex_sd);
     RUN_TEST(raw_sd_multiblock_read_write);
     RUN_TEST(dport_safe_defaults);
+    RUN_TEST(timg_general_timers_count_capture_pause_and_reset);
+    RUN_TEST(timg_alarm_autoreload_mask_clear_and_sources);
+    RUN_TEST(timg_dual_core_time_uses_monotonic_maximum);
     RUN_TEST(wdt_disable);
     RUN_TEST(rtc_reset_cause);
     RUN_TEST(sens_adc_single_conversions);

@@ -208,4 +208,9 @@ if(UNIX)
     target_link_libraries(flexe-mcpwm-motor-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-mcpwm-motor-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-timer-group-test tools/timer_group_test.c)
+    target_link_libraries(flexe-timer-group-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-timer-group-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

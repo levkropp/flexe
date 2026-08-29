@@ -37,7 +37,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - hardware flash MMU: complete 64 KiB DROM0/IRAM0/IRAM1/IROM0 mappings,
   dual-core table invalidation, flash programming coherence, and translated-code invalidation
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
-  timers, GP-SPI2/3 DMA, classic I2C0/1 master, I2S0/1 circular DMA,
+  both timer groups with four 64-bit APB counters/alarms, GP-SPI2/3 DMA,
+  classic I2C0/1 master, I2S0/1 circular DMA,
   eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
   eight-unit/two-channel classic PCNT, both classic MCPWM motor-control units
   with sync/capture/fault/dead-time/carrier paths, ADC1/2, DAC1/2
@@ -51,7 +52,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 600 tests
+- 603 tests
 
 ## building
 
@@ -248,6 +249,21 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-mcpwm-motor.sh
 ```
 
 `FLEXE_MCPWM_BUILD_DIR` optionally preserves its Arduino build directory.
+
+The Timer Group gate builds an unmodified sketch against ESP-IDF's public
+legacy `driver/timer.h` API. It runs both timers in both groups concurrently,
+covering 64-bit capture/load, count-up and count-down modes, pause/resume,
+one-shot alarm rescheduling, auto-reload, DPORT clock/reset control, and the
+four genuine per-timer ISR callbacks. Both engines must finish with zero
+unhandled MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-timer-group.sh
+# engine=jit stage=0x54494D47 result=0/.../11/4/12/6/.../10000/66/305419896/0 unhandled=0 unregistered=0
+# engine=interp stage=0x54494D47 result=0/.../11/4/12/6/.../10000/66/305419896/0 unhandled=0 unregistered=0
+```
+
+`FLEXE_TIMER_GROUP_BUILD_DIR` optionally preserves its Arduino build directory.
 
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
