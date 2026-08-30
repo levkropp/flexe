@@ -24,6 +24,7 @@
 #define GPIO_BASE       0x3FF44000u
 #define FE2_BASE        0x3FF45000u
 #define FE_BASE         0x3FF46000u
+#define FRC_TIMER_BASE  0x3FF47000u
 #define PHY_BASE        0x3FF4E000u  /* undocumented WiFi PHY calibration window */
 #define RTC_CNTL_BASE   0x3FF48000u
 #define RTCIO_BASE      0x3FF48400u
@@ -423,6 +424,18 @@ typedef struct {
     bool valid[2];
 } timg_clock_state_t;
 
+/* The legacy FRC block predates the Timer Groups. FRC1 is a 23-bit
+ * down-counter; FRC2 is a 32-bit up-counter with a programmable compare. */
+typedef struct {
+    uint32_t load;
+    uint32_t counter;
+    uint32_t config;
+    uint32_t alarm;
+    uint64_t last_cycles;
+    uint64_t tick_remainder;
+    bool int_status;
+} frc_timer_state_t;
+
 /* TG LACT (low-alarm-counter) state — the esp_timer hardware timebase.
  * The 64-bit counter ticks at ccount/DIVIDER (DIVIDER from LACTCONFIG);
  * when the counter reaches the 64-bit alarm with ALARM_EN set, the
@@ -747,6 +760,10 @@ struct esp32_periph {
     timg_group_state_t timg[2];
     timg_clock_state_t timg_clock;
     bool timg_alarm_active;
+
+    /* Legacy APB timers: FRC1 countdown and FRC2 count-up/compare. */
+    frc_timer_state_t frc_timer[2];
+    bool frc_event_active;
 
     /* Timer groups WDT */
     wdt_state_t timg_wdt[2];
@@ -2056,12 +2073,308 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     return (uint32_t)best;
 }
 
+/* ---- FRC1/FRC2 legacy APB timers ---- */
+
+#define FRC_TIMER_COUNT          2u
+#define FRC_TIMER_STRIDE         0x20u
+#define FRC_CTRL_LEVEL_INT       (1u << 0)
+#define FRC_CTRL_PRESCALER_MASK  (7u << 1)
+#define FRC_CTRL_AUTOLOAD        (1u << 6)
+#define FRC_CTRL_ENABLE          (1u << 7)
+#define FRC_CTRL_INT_STATUS      (1u << 8)
+#define FRC_CTRL_CONFIG_MASK     (FRC_CTRL_LEVEL_INT | \
+                                  FRC_CTRL_PRESCALER_MASK | \
+                                  FRC_CTRL_AUTOLOAD | FRC_CTRL_ENABLE)
+#define FRC1_COUNT_MASK          0x007FFFFFu
+
+static uint32_t frc_count_mask(unsigned timer_index) {
+    return timer_index == 0u ? FRC1_COUNT_MASK : UINT32_MAX;
+}
+
+static uint32_t frc_prescaler(const frc_timer_state_t *timer) {
+    switch ((timer->config & FRC_CTRL_PRESCALER_MASK) >> 1) {
+    case 2u: return 16u;
+    case 4u: return 256u;
+    default: return 1u;
+    }
+}
+
+static void frc_update_irq(esp32_periph_t *p, unsigned timer_index) {
+    timg_drive_source(p, 56 + (int)timer_index,
+                      p->frc_timer[timer_index].int_status);
+}
+
+static void frc_refresh_event_active(esp32_periph_t *p) {
+    p->frc_event_active = false;
+    for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++) {
+        if ((p->frc_timer[timer].config & FRC_CTRL_ENABLE) != 0u &&
+            !p->frc_timer[timer].int_status) {
+            p->frc_event_active = true;
+            return;
+        }
+    }
+}
+
+static void frc_kick(esp32_periph_t *p) {
+    frc_refresh_event_active(p);
+    for (unsigned core = 0; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void frc_fire(esp32_periph_t *p, unsigned timer_index) {
+    frc_timer_state_t *timer = &p->frc_timer[timer_index];
+    if (timer_index == 0u &&
+        (timer->config & FRC_CTRL_AUTOLOAD) != 0u)
+        timer->counter = timer->load & FRC1_COUNT_MASK;
+    if ((timer->config & FRC_CTRL_LEVEL_INT) != 0u) {
+        timer->int_status = true;
+        /* Compatibility-mode dispatch is synchronous; the ISR may clear
+         * status, rewrite LOAD/ALARM, or disable the timer before return. */
+        frc_update_irq(p, timer_index);
+    } else {
+        /* Edge mode is an electrical pulse, not a latched STATUS condition.
+         * Assert first so compatibility ISRs run at the real event boundary. */
+        timer->int_status = false;
+        periph_assert_interrupt(p, 56 + (int)timer_index);
+        periph_deassert_interrupt(p, 56 + (int)timer_index);
+    }
+    frc_refresh_event_active(p);
+}
+
+static void frc_advance_frc1(esp32_periph_t *p, uint64_t ticks) {
+    frc_timer_state_t *timer = &p->frc_timer[0];
+    const uint64_t modulus = (uint64_t)FRC1_COUNT_MASK + 1u;
+    unsigned events = 0u;
+    while (ticks != 0u) {
+        if (timer->int_status) {
+            if ((timer->config & FRC_CTRL_AUTOLOAD) == 0u) {
+                timer->counter =
+                    (timer->counter - (uint32_t)(ticks % modulus)) &
+                    FRC1_COUNT_MASK;
+                break;
+            }
+
+            uint64_t first = timer->counter;
+            if (ticks < first) {
+                timer->counter -= (uint32_t)ticks;
+                break;
+            }
+            ticks -= first;
+            uint64_t period = timer->load & FRC1_COUNT_MASK;
+            if (period == 0u) period = modulus;
+            uint64_t remainder = ticks % period;
+            timer->counter = remainder == 0u ?
+                (timer->load & FRC1_COUNT_MASK) :
+                (uint32_t)(period - remainder) & FRC1_COUNT_MASK;
+            break;
+        }
+
+        uint64_t distance = timer->counter != 0u ?
+                            timer->counter : modulus;
+        if (ticks < distance) {
+            timer->counter =
+                (timer->counter - (uint32_t)ticks) & FRC1_COUNT_MASK;
+            break;
+        }
+
+        timer->counter = 0u;
+        ticks -= distance;
+        frc_fire(p, 0u);
+        if (++events > 1000000u ||
+            (timer->config & FRC_CTRL_ENABLE) == 0u)
+            break;
+    }
+}
+
+static void frc_advance_frc2(esp32_periph_t *p, uint64_t ticks) {
+    frc_timer_state_t *timer = &p->frc_timer[1];
+    const uint64_t modulus = (uint64_t)UINT32_MAX + 1u;
+    unsigned events = 0u;
+    while (ticks != 0u) {
+        if (timer->int_status) {
+            timer->counter += (uint32_t)(ticks % modulus);
+            break;
+        }
+
+        uint64_t distance = (uint32_t)(timer->alarm - timer->counter);
+        if (distance == 0u) distance = modulus;
+        if (ticks < distance) {
+            timer->counter += (uint32_t)ticks;
+            break;
+        }
+
+        timer->counter = timer->alarm;
+        ticks -= distance;
+        frc_fire(p, 1u);
+        if (++events > 1000000u ||
+            (timer->config & FRC_CTRL_ENABLE) == 0u)
+            break;
+    }
+}
+
+static void frc_sync_timer_to(esp32_periph_t *p, unsigned timer_index,
+                              uint64_t now) {
+    frc_timer_state_t *timer = &p->frc_timer[timer_index];
+    uint64_t elapsed = now >= timer->last_cycles ?
+                       now - timer->last_cycles : 0u;
+    timer->last_cycles = now;
+    if ((timer->config & FRC_CTRL_ENABLE) == 0u) return;
+
+    uint64_t denominator =
+        (uint64_t)timg_cpu_mhz(p) * frc_prescaler(timer);
+    uint64_t product = elapsed >
+        (UINT64_MAX - timer->tick_remainder) / TIMG_APB_CLOCK_MHZ ?
+        UINT64_MAX : timer->tick_remainder + elapsed * TIMG_APB_CLOCK_MHZ;
+    uint64_t ticks = product / denominator;
+    timer->tick_remainder = product % denominator;
+    if (ticks == 0u) return;
+    if (timer_index == 0u)
+        frc_advance_frc1(p, ticks);
+    else
+        frc_advance_frc2(p, ticks);
+}
+
+static void frc_sync_all_to(esp32_periph_t *p, uint64_t now) {
+    for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
+        frc_sync_timer_to(p, timer, now);
+}
+
+static uint64_t frc_cycles_until_ticks(const esp32_periph_t *p,
+                                       const frc_timer_state_t *timer,
+                                       uint64_t ticks) {
+    uint64_t denominator =
+        (uint64_t)timg_cpu_mhz(p) * frc_prescaler(timer);
+    uint64_t needed = ticks > UINT64_MAX / denominator ? UINT64_MAX :
+                      ticks * denominator;
+    if (needed <= timer->tick_remainder) return 1u;
+    needed -= timer->tick_remainder;
+    return needed / TIMG_APB_CLOCK_MHZ +
+           (needed % TIMG_APB_CLOCK_MHZ != 0u);
+}
+
+static uint32_t frc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || !p->frc_event_active) return UINT32_MAX;
+    uint64_t now = timg_now_cycles(p);
+    frc_sync_all_to(p, now);
+    bool have = false;
+    uint64_t best_distance = 0u;
+    for (unsigned timer_index = 0; timer_index < FRC_TIMER_COUNT;
+         timer_index++) {
+        frc_timer_state_t *timer = &p->frc_timer[timer_index];
+        if ((timer->config & FRC_CTRL_ENABLE) == 0u || timer->int_status)
+            continue;
+        uint64_t ticks;
+        if (timer_index == 0u) {
+            ticks = timer->counter != 0u ? timer->counter :
+                    (uint64_t)FRC1_COUNT_MASK + 1u;
+        } else {
+            ticks = (uint32_t)(timer->alarm - timer->counter);
+            if (ticks == 0u) ticks = (uint64_t)UINT32_MAX + 1u;
+        }
+        uint64_t distance = frc_cycles_until_ticks(p, timer, ticks);
+        if (!have || distance < best_distance) {
+            have = true;
+            best_distance = distance;
+        }
+    }
+    if (!have) return UINT32_MAX;
+    if (best_distance >= (uint64_t)INT32_MAX)
+        best_distance = (uint64_t)INT32_MAX - 1u;
+    return cpu->ccount + (uint32_t)best_distance;
+}
+
+static void frc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    (void)cpu;
+    if (!p->frc_event_active) return;
+    frc_sync_all_to(p, timg_now_cycles(p));
+}
+
+static uint32_t frc_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - FRC_TIMER_BASE;
+    unsigned timer_index = off / FRC_TIMER_STRIDE;
+    uint32_t relative = off % FRC_TIMER_STRIDE;
+    if (timer_index >= FRC_TIMER_COUNT || relative > 0x10u) return 0u;
+
+    frc_sync_timer_to(p, timer_index, timg_now_cycles(p));
+    frc_timer_state_t *timer = &p->frc_timer[timer_index];
+    switch (relative) {
+    case 0x00: return timer->load;
+    case 0x04: return timer->counter;
+    case 0x08: return timer->config |
+                      (timer->int_status ? FRC_CTRL_INT_STATUS : 0u);
+    case 0x0C: return 0u;
+    case 0x10: return timer_index == 1u ? timer->alarm : 0u;
+    default: return 0u;
+    }
+}
+
+static void frc_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - FRC_TIMER_BASE;
+    unsigned timer_index = off / FRC_TIMER_STRIDE;
+    uint32_t relative = off % FRC_TIMER_STRIDE;
+    if (timer_index >= FRC_TIMER_COUNT || relative > 0x10u) return;
+
+    frc_sync_timer_to(p, timer_index, timg_now_cycles(p));
+    frc_timer_state_t *timer = &p->frc_timer[timer_index];
+    uint32_t mask = frc_count_mask(timer_index);
+    switch (relative) {
+    case 0x00:
+        timer->load = value & mask;
+        timer->counter = timer->load;
+        timer->tick_remainder = 0u;
+        frc_kick(p);
+        break;
+    case 0x08: {
+        uint32_t old_config = timer->config;
+        timer->config = value & FRC_CTRL_CONFIG_MASK;
+        uint32_t prescaler = timer->config & FRC_CTRL_PRESCALER_MASK;
+        if (prescaler != 0u && prescaler != (2u << 1) &&
+            prescaler != (4u << 1))
+            timer->config &= ~FRC_CTRL_PRESCALER_MASK;
+        if ((old_config & FRC_CTRL_PRESCALER_MASK) !=
+            (timer->config & FRC_CTRL_PRESCALER_MASK))
+            timer->tick_remainder = 0u;
+        frc_update_irq(p, timer_index);
+        frc_kick(p);
+        break;
+    }
+    case 0x0C:
+        if ((value & 1u) != 0u) {
+            timer->int_status = false;
+            frc_update_irq(p, timer_index);
+            frc_kick(p);
+        }
+        break;
+    case 0x10:
+        if (timer_index == 1u) {
+            timer->alarm = value;
+            frc_kick(p);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void frc_reset(esp32_periph_t *p) {
+    if (!p) return;
+    for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
+        timg_drive_source(p, 56 + (int)timer, false);
+    memset(p->frc_timer, 0, sizeof(p->frc_timer));
+    for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
+        p->frc_timer[timer].last_cycles = p->timg_clock.cycles;
+    p->frc_event_active = false;
+}
+
 /* CPU hooks (registered on both cores, wired into next_timer_event). */
 static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
     uint32_t events[] = {
         timg_next_fire(p, cpu),
         lact_next_fire(p, cpu),
+        frc_next_fire(p, cpu),
         i2s_next_fire(p, cpu),
         rmt_next_fire(p, cpu),
         ledc_next_fire(p, cpu),
@@ -2088,6 +2401,7 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
     timg_eval_events(p, cpu);
     for (int group = 0; group < 2; group++)
         lact_eval_irq(p, group);
+    frc_eval_events(p, cpu);
     i2s_eval_events(p, cpu);
     rmt_eval_events(p, cpu);
     ledc_eval_events(p, cpu);
@@ -6739,6 +7053,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     timg_reset_group(p, 0);
     timg_reset_group(p, 1);
 
+    /* Both legacy FRC timers reset disabled with count/load/alarm at zero. */
+    frc_reset(p);
+
     /* LEDC reset state: all eight timers begin held in reset, and DATE is
      * the ESP32 peripheral version value from the vendor register map. */
     ledc_reset_state(p);
@@ -6782,6 +7099,10 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* GPIO: page 68 + page 69 (FUNC_OUT_SEL extends beyond 4096) */
     mem_register_mmio(mem, (int)PAGE_OF(GPIO_BASE), gpio_read, gpio_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(GPIO_BASE) + 1, gpio_read, gpio_write, p);
+
+    /* Legacy FRC1/FRC2 timers (interrupt sources 56/57). */
+    mem_register_mmio(mem, (int)PAGE_OF(FRC_TIMER_BASE),
+                      frc_read, frc_write, p);
 
     /* RTC_CNTL */
     mem_register_mmio(mem, (int)PAGE_OF(RTC_CNTL_BASE), rtc_cntl_read, rtc_cntl_write, p);
@@ -7111,6 +7432,8 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         p->mcpwm.last_ccount[core] = cpu ? cpu->ccount : 0u;
         p->mcpwm.time_valid[core] = cpu != NULL;
     }
+    for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
+        p->frc_timer[timer].last_cycles = p->timg_clock.cycles;
     /* Wire Timer Group, LACT, and other timed-peripheral event hooks into
      * both cores so alarms fire on time and can wake a core from WAITI. */
     for (int i = 0; i < 2; i++) {

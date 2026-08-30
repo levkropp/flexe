@@ -1305,6 +1305,170 @@ TEST(dport_safe_defaults) {
     mem_destroy(mem);
 }
 
+#define TEST_FRC_BASE          0x3FF47000u
+#define TEST_FRC_TIMER(n)      (TEST_FRC_BASE + (n) * 0x20u)
+#define TEST_FRC_LEVEL_INT     (1u << 0)
+#define TEST_FRC_PRESCALER_16  (2u << 1)
+#define TEST_FRC_PRESCALER_256 (4u << 1)
+#define TEST_FRC_AUTOLOAD      (1u << 6)
+#define TEST_FRC_ENABLE        (1u << 7)
+#define TEST_FRC_INT_STATUS    (1u << 8)
+
+TEST(frc1_countdown_reload_prescalers_and_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+
+    const uint32_t frc1 = TEST_FRC_TIMER(0);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x00u), 0u);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 0u);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x08u), 0u);
+    mem_write32(mem, frc1 + 0x00u, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x00u), 0x007FFFFFu);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 0x007FFFFFu);
+
+    test_irq_dispatch_t dispatch = {0};
+    ASSERT_EQ(periph_set_irq_dispatch(p, 56, test_irq_dispatch,
+                                      &dispatch), 0);
+    mem_write32(mem, frc1 + 0x00u, 10u);
+    mem_write32(mem, frc1 + 0x08u,
+                TEST_FRC_ENABLE | TEST_FRC_LEVEL_INT);
+    ASSERT_EQ(cpu.next_timer_event, cpu.ccount + 30u);
+    cpu.ccount += 15u;
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 5u);
+    cpu.ccount += 15u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 0u);
+    ASSERT_TRUE(mem_read32(mem, frc1 + 0x08u) & TEST_FRC_INT_STATUS);
+    ASSERT_EQ(dispatch.count, 1);
+    ASSERT_EQ(dispatch.last_source, 56);
+    ASSERT_TRUE(periph_interrupt_pending(p, 56));
+    mem_write32(mem, frc1 + 0x0Cu, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 56));
+    ASSERT_FALSE(mem_read32(mem, frc1 + 0x08u) & TEST_FRC_INT_STATUS);
+
+    /* Auto-load restores the programmed interval at each zero crossing.
+     * APB/16 takes 48 CPU cycles per timer tick at 240 MHz. */
+    mem_write32(mem, frc1 + 0x00u, 4u);
+    mem_write32(mem, frc1 + 0x08u,
+                TEST_FRC_ENABLE | TEST_FRC_AUTOLOAD |
+                TEST_FRC_PRESCALER_16 | TEST_FRC_LEVEL_INT);
+    ASSERT_EQ(cpu.next_timer_event, cpu.ccount + 192u);
+    cpu.ccount += 192u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 4u);
+    ASSERT_EQ(dispatch.count, 2);
+    mem_write32(mem, frc1 + 0x0Cu, 1u);
+    cpu.ccount += 96u;
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 2u);
+    cpu.ccount += 96u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 4u);
+    ASSERT_EQ(dispatch.count, 3);
+
+    /* Edge mode pulses without setting STATUS and repeats without INT_CLR. */
+    mem_write32(mem, frc1 + 0x08u, 0u);
+    mem_write32(mem, frc1 + 0x0Cu, 1u);
+    mem_write32(mem, frc1 + 0x00u, 4u);
+    mem_write32(mem, frc1 + 0x08u,
+                TEST_FRC_ENABLE | TEST_FRC_AUTOLOAD |
+                TEST_FRC_PRESCALER_16);
+    cpu.ccount += 192u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(dispatch.count, 4);
+    ASSERT_FALSE(periph_interrupt_pending(p, 56));
+    ASSERT_FALSE(mem_read32(mem, frc1 + 0x08u) & TEST_FRC_INT_STATUS);
+    cpu.ccount += 192u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(dispatch.count, 5);
+    ASSERT_FALSE(periph_interrupt_pending(p, 56));
+
+    mem_write32(mem, frc1 + 0x08u, 0u);
+    mem_write32(mem, frc1 + 0x0Cu, 1u);
+    cpu.ccount += 24000u;
+    ASSERT_EQ(mem_read32(mem, frc1 + 0x04u), 4u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(frc2_countup_wrap_compare_and_runtime_frequency) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+
+    const uint32_t frc2 = TEST_FRC_TIMER(1);
+    test_irq_dispatch_t dispatch = {0};
+    ASSERT_EQ(periph_set_irq_dispatch(p, 57, test_irq_dispatch,
+                                      &dispatch), 0);
+    mem_write32(mem, frc2 + 0x00u, 0xFFFFFFF0u);
+    mem_write32(mem, frc2 + 0x10u, 4u);
+    mem_write32(mem, frc2 + 0x08u,
+                TEST_FRC_ENABLE | TEST_FRC_LEVEL_INT);
+    ASSERT_EQ(cpu.next_timer_event, cpu.ccount + 60u);
+    cpu.ccount += 30u;
+    ASSERT_EQ(mem_read32(mem, frc2 + 0x04u), 0xFFFFFFFAu);
+    cpu.ccount += 30u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, frc2 + 0x04u), 4u);
+    ASSERT_EQ(mem_read32(mem, frc2 + 0x10u), 4u);
+    ASSERT_TRUE(mem_read32(mem, frc2 + 0x08u) & TEST_FRC_INT_STATUS);
+    ASSERT_EQ(dispatch.count, 1);
+    ASSERT_EQ(dispatch.last_source, 57);
+    ASSERT_TRUE(periph_interrupt_pending(p, 57));
+    mem_write32(mem, frc2 + 0x0Cu, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 57));
+
+    /* Edge mode uses the same legacy TIMER2 source. APB/256 takes 768 CPU
+     * cycles per timer tick, and FRC2 keeps counting after its compare. */
+    mem_write32(mem, frc2 + 0x00u, 100u);
+    mem_write32(mem, frc2 + 0x10u, 102u);
+    mem_write32(mem, frc2 + 0x08u,
+                TEST_FRC_ENABLE | TEST_FRC_AUTOLOAD |
+                TEST_FRC_PRESCALER_256);
+    ASSERT_EQ(cpu.next_timer_event, cpu.ccount + 1536u);
+    cpu.ccount += 1536u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, frc2 + 0x04u), 102u);
+    ASSERT_EQ(dispatch.count, 2);
+    ASSERT_FALSE(periph_interrupt_pending(p, 57));
+    ASSERT_FALSE(mem_read32(mem, frc2 + 0x08u) & TEST_FRC_INT_STATUS);
+
+    /* Reserved divider encodings select /1 and read back normalized. */
+    mem_write32(mem, frc2 + 0x08u, TEST_FRC_ENABLE | (1u << 1));
+    ASSERT_EQ(mem_read32(mem, frc2 + 0x08u) & (7u << 1), 0u);
+
+    /* The source remains the fixed 80 MHz APB clock when CPU frequency
+     * changes. At 80 MHz with /16, one timer tick is 16 CCOUNT cycles. */
+    mem_write32(mem, frc2 + 0x08u, 0u);
+    mem_write32(mem, 0x3FFE01E0u, 80u);
+    mem_write32(mem, frc2 + 0x00u, 0u);
+    mem_write32(mem, frc2 + 0x10u, 10u);
+    mem_write32(mem, frc2 + 0x08u,
+                TEST_FRC_ENABLE | TEST_FRC_PRESCALER_16 |
+                TEST_FRC_LEVEL_INT);
+    ASSERT_EQ(cpu.next_timer_event, cpu.ccount + 160u);
+    cpu.ccount += 160u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, frc2 + 0x04u), 10u);
+    ASSERT_EQ(dispatch.count, 3);
+    mem_write32(mem, frc2 + 0x08u, 0u);
+    mem_write32(mem, frc2 + 0x0Cu, 1u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 #define TEST_TIMG0_BASE 0x3FF5F000u
 #define TEST_TIMG1_BASE 0x3FF60000u
 #define TEST_TIMG_CONFIG(en, increase, autoreload, divider, level, edge, alarm) \
@@ -3194,6 +3358,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(gp_spi_dma_full_duplex_sd);
     RUN_TEST(raw_sd_multiblock_read_write);
     RUN_TEST(dport_safe_defaults);
+    RUN_TEST(frc1_countdown_reload_prescalers_and_interrupt);
+    RUN_TEST(frc2_countup_wrap_compare_and_runtime_frequency);
     RUN_TEST(timg_general_timers_count_capture_pause_and_reset);
     RUN_TEST(timg_alarm_autoreload_mask_clear_and_sources);
     RUN_TEST(timg_dual_core_time_uses_monotonic_maximum);
