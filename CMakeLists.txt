@@ -218,4 +218,9 @@ if(UNIX)
     target_link_libraries(flexe-frc-timer-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-frc-timer-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-uhci-dma-test tools/uhci_dma_test.c)
+    target_link_libraries(flexe-uhci-dma-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-uhci-dma-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

@@ -105,6 +105,9 @@ size_t periph_uart_rx_pending(const esp32_periph_t *p);
 size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
                                  const uint8_t *data, size_t len);
 size_t periph_uart_rx_pending_num(const esp32_periph_t *p, int uart_num);
+/* Signal a UART break condition to a UHCI receiver configured to use break
+ * as packet EOF. Returns true when an active controller consumed the event. */
+bool periph_uart_rx_break_num(esp32_periph_t *p, int uart_num);
 int  periph_unhandled_count(const esp32_periph_t *p);
 
 /* Attach/detach a 7-bit target address on either classic ESP32 I2C master.

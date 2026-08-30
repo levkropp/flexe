@@ -38,7 +38,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
   dual-core table invalidation, flash programming coherence, and translated-code invalidation
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
   legacy FRC1/FRC2 timers, both timer groups with four 64-bit APB
-  counters/alarms, GP-SPI2/3 DMA,
+  counters/alarms, dual UHCI UART DMA with H:5/SLIP framing, GP-SPI2/3 DMA,
   classic I2C0/1 master, I2S0/1 circular DMA,
   eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
   eight-unit/two-channel classic PCNT, both classic MCPWM motor-control units
@@ -53,7 +53,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 605 tests
+- 611 tests
 
 ## building
 
@@ -142,7 +142,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 605 tests, 2271 passed, 0 failed
+# 611 tests, 2412 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -283,6 +283,24 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-frc-timer.sh
 
 `FLEXE_FRC_TIMER_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The UHCI gate builds a sketch against Espressif's public `soc/uhci_reg.h`
+register definitions and genuine `lldesc` DMA structures. It verifies both
+independent UHCI controllers, transparent UART TX/RX descriptor chains,
+descriptor ownership/writeback and diagnostics, exact wire-time completion,
+real interrupt allocation, and host RX injection. Raw MMIO regressions also
+cover H:5 headers, checksum/sequence/CRC handling, configurable SLIP escaping,
+quick-send packets, idle/length/break EOF, DPORT reset domains, and malformed
+descriptor failures. Both execution engines must finish with zero unhandled
+MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-uhci-dma.sh
+# engine=jit stage=0x55484349 ... isr_raw=0x000021B0 ... unhandled=0 unregistered=0
+# engine=interp stage=0x55484349 ... isr_raw=0x000021B0 ... unhandled=0 unregistered=0
+```
+
+`FLEXE_UHCI_BUILD_DIR` optionally preserves its Arduino build directory.
+
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
@@ -302,8 +320,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **9.03× real-time** |
-| NerdMiner v1.8.3 | **5.43× real-time** |
+| ESP32 Marauder v1.14 | **9.47× real-time** |
+| NerdMiner v1.8.3 | **6.28× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

@@ -81,6 +81,432 @@ TEST(uart_tx_capture) {
     mem_destroy(mem);
 }
 
+#define TEST_UHCI0_BASE 0x3FF54000u
+#define TEST_UHCI1_BASE 0x3FF4C000u
+#define TEST_UHCI_CONF0_RESET 0x00370100u
+#define TEST_UHCI_CONF1_RESET 0x00000033u
+#define TEST_UHCI_LINK_START (1u << 29)
+#define TEST_UHCI_LINK_PARK (1u << 31)
+#define TEST_UHCI_DESC_EOF (1u << 30)
+#define TEST_UHCI_DESC_OWNER (1u << 31)
+
+static void test_spi_dma_desc(xtensa_mem_t *mem, uint32_t desc,
+                              uint32_t buf, uint16_t size, uint16_t len,
+                              int eof, uint32_t next);
+
+TEST(uhci_reset_register_file_dual_instance_and_dport) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    for (unsigned port = 0; port < 2u; port++) {
+        uint32_t base = port == 0u ? TEST_UHCI0_BASE : TEST_UHCI1_BASE;
+        ASSERT_EQ(mem_read32(mem, base + 0x00u), TEST_UHCI_CONF0_RESET);
+        ASSERT_EQ(mem_read32(mem, base + 0x14u), 2u);
+        ASSERT_EQ(mem_read32(mem, base + 0x1Cu), 2u);
+        ASSERT_EQ(mem_read32(mem, base + 0x24u), TEST_UHCI_LINK_PARK);
+        ASSERT_EQ(mem_read32(mem, base + 0x28u),
+                  TEST_UHCI_LINK_PARK | (1u << 20));
+        ASSERT_EQ(mem_read32(mem, base + 0x2Cu), TEST_UHCI_CONF1_RESET);
+        ASSERT_EQ(mem_read32(mem, base + 0x64u), 0x33u);
+        ASSERT_EQ(mem_read32(mem, base + 0x68u), 0x00810810u);
+        ASSERT_EQ(mem_read32(mem, base + 0xB0u), 0x00DCDBC0u);
+        ASSERT_EQ(mem_read32(mem, base + 0xB4u), 0x00DDDBDBu);
+        ASSERT_EQ(mem_read32(mem, base + 0xB8u), 0x00DEDB11u);
+        ASSERT_EQ(mem_read32(mem, base + 0xBCu), 0x00DFDB13u);
+        ASSERT_EQ(mem_read32(mem, base + 0xC0u), 0x80u);
+        ASSERT_EQ(mem_read32(mem, base + 0xFCu), 0x16041001u);
+    }
+
+    mem_write32(mem, TEST_UHCI0_BASE + 0x64u, 0xA5u);
+    mem_write32(mem, TEST_UHCI1_BASE + 0x64u, 0x5Au);
+    mem_write32(mem, 0x3FF000C0u, (1u << 8) | (1u << 12));
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x64u), 0xA5u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x64u), 0x5Au);
+
+    /* The two DPORT reset domains are independent. */
+    mem_write32(mem, 0x3FF000C4u, 1u << 12);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x64u), 0xA5u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x64u), 0x33u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x00u),
+              TEST_UHCI_CONF0_RESET);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(uhci_transparent_tx_dma_wire_timing_quick_send_and_interrupt) {
+    const uint32_t desc = 0x3FFB3000u;
+    const uint32_t buf = 0x3FFB3100u;
+    static const uint8_t expected[8] = {
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+    };
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 10, 12);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 8);
+
+    /* UART1: APB clock, 8-N-1, one megabaud. */
+    mem_write32(mem, 0x3FF50014u, 80u);
+    mem_write32(mem, 0x3FF50020u, (1u << 27) | (3u << 2));
+    for (size_t index = 0; index < sizeof(expected); index++)
+        mem_write8(mem, buf + (uint32_t)index, expected[index]);
+    test_spi_dma_desc(mem, desc, buf, sizeof(expected), sizeof(expected),
+                      1, 0u);
+
+    mem_write32(mem, TEST_UHCI0_BASE + 0x00u,
+                (1u << 22) | (1u << 10)); /* transparent, UART1 */
+    mem_write32(mem, TEST_UHCI0_BASE + 0x2Cu, 1u << 6); /* owner check */
+    mem_write32(mem, TEST_UHCI0_BASE + 0x0Cu,
+                (1u << 7) | (1u << 8) | (1u << 13));
+    mem_write32(mem, TEST_UHCI0_BASE + 0x24u,
+                (desc & 0xFFFFFu) | TEST_UHCI_LINK_START);
+
+    ASSERT_EQ(periph_uart_tx_count_num(p, 1), 0);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 19200u);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+
+    ASSERT_EQ(periph_uart_tx_count_num(p, 1), sizeof(expected));
+    ASSERT_TRUE(memcmp(periph_uart_tx_buf_num(p, 1), expected,
+                       sizeof(expected)) == 0);
+    ASSERT_FALSE(mem_read32(mem, desc) & TEST_UHCI_DESC_OWNER);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u) &
+              ((1u << 7) | (1u << 8) | (1u << 13)),
+              (1u << 7) | (1u << 8) | (1u << 13));
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x38u), desc);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x58u), desc);
+    ASSERT_TRUE(mem_read32(mem, TEST_UHCI0_BASE + 0x24u) &
+                TEST_UHCI_LINK_PARK);
+    ASSERT_TRUE(periph_interrupt_pending(p, 12));
+    ASSERT_EQ(cpu.interrupt & (1u << 10), 1u << 10);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x10u, 0x1FFFFu);
+    ASSERT_FALSE(periph_interrupt_pending(p, 12));
+
+    /* APB quick-send packets share the selected UART and its wire clock. */
+    mem_write32(mem, TEST_UHCI0_BASE + 0x78u, 0x44332211u);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x7Cu, 0x88776655u);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x0Cu, 1u << 14);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x74u, 1u << 3);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    static const uint8_t quick[8] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    };
+    ASSERT_EQ(periph_uart_tx_count_num(p, 1), 16u);
+    ASSERT_TRUE(memcmp(periph_uart_tx_buf_num(p, 1) + 8u, quick,
+                       sizeof(quick)) == 0);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x08u), 1u << 14);
+    ASSERT_TRUE(periph_interrupt_pending(p, 12));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(uhci_transparent_rx_descriptor_chain_idle_and_break_eof) {
+    const uint32_t desc0 = 0x3FFB3200u;
+    const uint32_t desc1 = 0x3FFB3210u;
+    const uint32_t desc2 = 0x3FFB3220u;
+    const uint32_t buf0 = 0x3FFB3300u;
+    const uint32_t buf1 = 0x3FFB3310u;
+    const uint32_t buf2 = 0x3FFB3320u;
+    static const uint8_t input[6] = {0x91, 0x82, 0x73, 0x64, 0x55, 0x46};
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 11, 13);
+    mem_write32(mem, 0x3FF000C0u, 1u << 12);
+
+    test_spi_dma_desc(mem, desc0, buf0, 4u, 0u, 0, desc1);
+    test_spi_dma_desc(mem, desc1, buf1, 8u, 0u, 0, 0u);
+    mem_write32(mem, TEST_UHCI1_BASE + 0x00u,
+                (1u << 22) | (1u << 19) | (1u << 11));
+    mem_write32(mem, TEST_UHCI1_BASE + 0x2Cu, 1u << 6);
+    mem_write32(mem, TEST_UHCI1_BASE + 0x0Cu,
+                (1u << 4) | (1u << 5));
+    mem_write32(mem, TEST_UHCI1_BASE + 0x28u,
+                (1u << 20) | (desc0 & 0xFFFFFu) |
+                TEST_UHCI_LINK_START);
+    ASSERT_EQ(periph_uart_rx_inject_num(p, 2, input, sizeof(input)),
+              sizeof(input));
+    ASSERT_EQ(periph_uart_rx_pending_num(p, 2), 0u);
+
+    ASSERT_EQ((mem_read32(mem, desc0) >> 12) & 0xFFFu, 4u);
+    ASSERT_FALSE(mem_read32(mem, desc0) & TEST_UHCI_DESC_EOF);
+    ASSERT_FALSE(mem_read32(mem, desc0) & TEST_UHCI_DESC_OWNER);
+    ASSERT_EQ((mem_read32(mem, desc1) >> 12) & 0xFFFu, 2u);
+    ASSERT_TRUE(mem_read32(mem, desc1) & TEST_UHCI_DESC_EOF);
+    ASSERT_FALSE(mem_read32(mem, desc1) & TEST_UHCI_DESC_OWNER);
+    for (unsigned index = 0; index < 4u; index++)
+        ASSERT_EQ(mem_read8(mem, buf0 + index), input[index]);
+    ASSERT_EQ(mem_read8(mem, buf1), input[4]);
+    ASSERT_EQ(mem_read8(mem, buf1 + 1u), input[5]);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x3Cu), desc1);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x4Cu), desc1);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x50u), desc0);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x04u) &
+              ((1u << 4) | (1u << 5)), (1u << 4) | (1u << 5));
+    ASSERT_TRUE(periph_interrupt_pending(p, 13));
+    mem_write32(mem, TEST_UHCI1_BASE + 0x20u, 1u << 16);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI1_BASE + 0x20u), input[0]);
+
+    /* Break EOF completes a partial transparent descriptor independently of
+     * the host-injection idle boundary. */
+    mem_write32(mem, TEST_UHCI1_BASE + 0x10u, 0x1FFFFu);
+    test_spi_dma_desc(mem, desc2, buf2, 8u, 0u, 0, 0u);
+    mem_write32(mem, TEST_UHCI1_BASE + 0x00u,
+                (1u << 22) | (1u << 23) | (1u << 11));
+    mem_write32(mem, TEST_UHCI1_BASE + 0x28u,
+                (desc2 & 0xFFFFFu) | TEST_UHCI_LINK_START);
+    ASSERT_EQ(periph_uart_rx_inject_num(p, 2, input, 3u), 3u);
+    ASSERT_TRUE(mem_read32(mem, desc2) & TEST_UHCI_DESC_OWNER);
+    ASSERT_TRUE(periph_uart_rx_break_num(p, 2));
+    ASSERT_EQ((mem_read32(mem, desc2) >> 12) & 0xFFFu, 3u);
+    ASSERT_TRUE(mem_read32(mem, desc2) & TEST_UHCI_DESC_EOF);
+    ASSERT_FALSE(mem_read32(mem, desc2) & TEST_UHCI_DESC_OWNER);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(uhci_h5_slip_receive_transmit_and_checksum_error) {
+    const uint32_t rx_desc = 0x3FFB3400u;
+    const uint32_t bad_desc = 0x3FFB3410u;
+    const uint32_t tx_desc = 0x3FFB3420u;
+    const uint32_t recovery_desc = 0x3FFB3430u;
+    const uint32_t rx_buf = 0x3FFB3500u;
+    const uint32_t bad_buf = 0x3FFB3510u;
+    const uint32_t tx_buf = 0x3FFB3520u;
+    const uint32_t recovery_buf = 0x3FFB3530u;
+    static const uint8_t payload[4] = {0xC0, 0xDB, 0x11, 0x13};
+    static const uint8_t wire[12] = {
+        0xC0, 0x00, 0x41, 0x00, 0xBE,
+        0xDB, 0xDC, 0xDB, 0xDD, 0x11, 0x13, 0xC0,
+    };
+    static const uint8_t bad_wire[12] = {
+        0xC0, 0x00, 0x41, 0x00, 0xBF,
+        0xDB, 0xDC, 0xDB, 0xDD, 0x11, 0x13, 0xC0,
+    };
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FF000C0u, 1u << 8);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF40014u, 80u);
+    mem_write32(mem, 0x3FF40020u, (1u << 27) | (3u << 2));
+
+    uint32_t framed_conf =
+        (TEST_UHCI_CONF0_RESET & ~(1u << 20)) | (1u << 22) | (1u << 9);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x00u, framed_conf);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x2Cu,
+                TEST_UHCI_CONF1_RESET | (1u << 6));
+    test_spi_dma_desc(mem, rx_desc, rx_buf, 16u, 0u, 0, 0u);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x28u,
+                (rx_desc & 0xFFFFFu) | TEST_UHCI_LINK_START);
+    ASSERT_EQ(periph_uart_rx_inject(p, wire, sizeof(wire)), sizeof(wire));
+    ASSERT_EQ((mem_read32(mem, rx_desc) >> 12) & 0xFFFu,
+              sizeof(payload));
+    ASSERT_TRUE(mem_read32(mem, rx_desc) & TEST_UHCI_DESC_EOF);
+    for (size_t index = 0; index < sizeof(payload); index++)
+        ASSERT_EQ(mem_read8(mem, rx_buf + (uint32_t)index), payload[index]);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x70u), 0xBE004100u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u) &
+              ((1u << 1) | (1u << 4) | (1u << 5)),
+              (1u << 1) | (1u << 4) | (1u << 5));
+
+    mem_write32(mem, TEST_UHCI0_BASE + 0x10u, 0x1FFFFu);
+    test_spi_dma_desc(mem, bad_desc, bad_buf, 16u, 0u, 0,
+                      recovery_desc);
+    test_spi_dma_desc(mem, recovery_desc, recovery_buf, 16u, 0u, 0, 0u);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x28u,
+                (bad_desc & 0xFFFFFu) | TEST_UHCI_LINK_START);
+    ASSERT_EQ(periph_uart_rx_inject(p, bad_wire, sizeof(bad_wire)),
+              sizeof(bad_wire));
+    ASSERT_EQ((mem_read32(mem, TEST_UHCI0_BASE + 0x1Cu) >> 4) & 7u, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u) &
+              ((1u << 5) | (1u << 6)), 1u << 6);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x40u), bad_desc);
+
+    /* Frame-local parser errors must not poison the next packet in the same
+     * descriptor chain. */
+    mem_write32(mem, TEST_UHCI0_BASE + 0x10u, 0x1FFFFu);
+    ASSERT_EQ(periph_uart_rx_inject(p, wire, sizeof(wire)), sizeof(wire));
+    ASSERT_EQ((mem_read32(mem, TEST_UHCI0_BASE + 0x1Cu) >> 4) & 7u, 0u);
+    ASSERT_EQ((mem_read32(mem, recovery_desc) >> 12) & 0xFFFu,
+              sizeof(payload));
+    ASSERT_TRUE(mem_read32(mem, recovery_desc) & TEST_UHCI_DESC_EOF);
+    for (size_t index = 0; index < sizeof(payload); index++)
+        ASSERT_EQ(mem_read8(mem, recovery_buf + (uint32_t)index),
+                  payload[index]);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x3Cu), recovery_desc);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u) & (1u << 5), 1u << 5);
+
+    /* The matching TX encoder replaces checksum/ACK fields and escapes the
+     * configured C0/DB octets back into the same H:5 wire representation. */
+    static const uint8_t packet[8] = {
+        0x00, 0x41, 0x00, 0x00, 0xC0, 0xDB, 0x11, 0x13,
+    };
+    for (size_t index = 0; index < sizeof(packet); index++)
+        mem_write8(mem, tx_buf + (uint32_t)index, packet[index]);
+    test_spi_dma_desc(mem, tx_desc, tx_buf, sizeof(packet), sizeof(packet),
+                      1, 0u);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x24u,
+                (tx_desc & 0xFFFFFu) | TEST_UHCI_LINK_START);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(periph_uart_tx_count(p), sizeof(wire));
+    ASSERT_TRUE(memcmp(periph_uart_tx_buf(p), wire, sizeof(wire)) == 0);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(uhci_h5_reliable_sequence_and_crc_validation) {
+    const uint32_t good_desc = 0x3FFB3800u;
+    const uint32_t seq_desc = 0x3FFB3810u;
+    const uint32_t crc_desc = 0x3FFB3820u;
+    const uint32_t good_buf = 0x3FFB3900u;
+    const uint32_t seq_buf = 0x3FFB3910u;
+    const uint32_t crc_buf = 0x3FFB3920u;
+    static const uint8_t payload[4] = {0xC0, 0xDB, 0x11, 0x13};
+    /* Reliable sequence zero, CRC-present H:5 frame. The logical CRC is
+     * 0x8EE2; C0/DB octets are escaped on the SLIP wire. */
+    static const uint8_t seq0_wire[15] = {
+        0xC0, 0xDB, 0xDC, 0x41, 0x00, 0xFE,
+        0xDB, 0xDC, 0xDB, 0xDD, 0x11, 0x13, 0x8E, 0xE2, 0xC0,
+    };
+    /* Sequence one has CRC 0x40DB; corrupt only the low CRC byte so header,
+     * checksum, length, and sequence validation all still succeed first. */
+    static const uint8_t seq1_bad_crc_wire[14] = {
+        0xC0, 0xC1, 0x41, 0x00, 0xFD,
+        0xDB, 0xDC, 0xDB, 0xDD, 0x11, 0x13, 0x40, 0xDA, 0xC0,
+    };
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    mem_write32(mem, 0x3FF000C0u, 1u << 8);
+
+    uint32_t framed_conf =
+        (TEST_UHCI_CONF0_RESET & ~(1u << 20)) | (1u << 22) | (1u << 9);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x00u, framed_conf);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x2Cu,
+                TEST_UHCI_CONF1_RESET | (1u << 6));
+    test_spi_dma_desc(mem, good_desc, good_buf, 16u, 0u, 0, seq_desc);
+    test_spi_dma_desc(mem, seq_desc, seq_buf, 16u, 0u, 0, crc_desc);
+    test_spi_dma_desc(mem, crc_desc, crc_buf, 16u, 0u, 0, 0u);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x28u,
+                (good_desc & 0xFFFFFu) | TEST_UHCI_LINK_START);
+
+    ASSERT_EQ(periph_uart_rx_inject(p, seq0_wire, sizeof(seq0_wire)),
+              sizeof(seq0_wire));
+    ASSERT_EQ((mem_read32(mem, good_desc) >> 12) & 0xFFFu,
+              sizeof(payload));
+    ASSERT_TRUE(mem_read32(mem, good_desc) & TEST_UHCI_DESC_EOF);
+    ASSERT_EQ((mem_read32(mem, TEST_UHCI0_BASE + 0x1Cu) >> 4) & 7u, 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x6Cu), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x3Cu), good_desc);
+    for (size_t index = 0; index < sizeof(payload); index++)
+        ASSERT_EQ(mem_read8(mem, good_buf + (uint32_t)index), payload[index]);
+
+    /* Replaying reliable sequence zero is a sequence error and must not
+     * advance the expected sequence/ACK counter. */
+    mem_write32(mem, TEST_UHCI0_BASE + 0x10u, 0x1FFFFu);
+    ASSERT_EQ(periph_uart_rx_inject(p, seq0_wire, sizeof(seq0_wire)),
+              sizeof(seq0_wire));
+    ASSERT_EQ((mem_read32(mem, TEST_UHCI0_BASE + 0x1Cu) >> 4) & 7u, 2u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x6Cu), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x40u), seq_desc);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u) & (1u << 6),
+              1u << 6);
+
+    mem_write32(mem, TEST_UHCI0_BASE + 0x10u, 0x1FFFFu);
+    ASSERT_EQ(periph_uart_rx_inject(p, seq1_bad_crc_wire,
+                                    sizeof(seq1_bad_crc_wire)),
+              sizeof(seq1_bad_crc_wire));
+    ASSERT_EQ((mem_read32(mem, TEST_UHCI0_BASE + 0x1Cu) >> 4) & 7u, 6u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x6Cu), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x40u), crc_desc);
+    ASSERT_EQ((mem_read32(mem, crc_desc) >> 12) & 0xFFFu,
+              sizeof(payload));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(uhci_malformed_descriptors_report_directional_errors) {
+    const uint32_t tx_desc = 0x3FFB3600u;
+    const uint32_t rx_desc = 0x3FFB3610u;
+    const uint32_t tx_buf = 0x3FFB3700u;
+    const uint32_t rx_buf = 0x3FFB3710u;
+    static const uint8_t input[2] = {0xCA, 0xFE};
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 12, 12);
+    mem_write32(mem, 0x3FF000C0u, 1u << 8);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x00u,
+                (1u << 22) | (1u << 9));
+    mem_write32(mem, TEST_UHCI0_BASE + 0x2Cu, 1u << 6);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x0Cu,
+                (1u << 9) | (1u << 10));
+
+    /* Owner remains software-owned: OUT DMA must park and identify the
+     * rejected descriptor without touching its payload. */
+    test_spi_dma_desc(mem, tx_desc, tx_buf, 4u, 4u, 1, 0u);
+    mem_write32(mem, tx_desc,
+                mem_read32(mem, tx_desc) & ~TEST_UHCI_DESC_OWNER);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x24u,
+                (tx_desc & 0xFFFFFu) | TEST_UHCI_LINK_START);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u) & (1u << 10),
+              1u << 10);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x44u), tx_desc);
+    ASSERT_TRUE(mem_read32(mem, TEST_UHCI0_BASE + 0x24u) &
+                TEST_UHCI_LINK_PARK);
+    ASSERT_TRUE(periph_interrupt_pending(p, 12));
+
+    /* The same ownership violation on IN DMA raises the directional error;
+     * bytes not accepted by UHCI remain available through the UART FIFO. */
+    mem_write32(mem, TEST_UHCI0_BASE + 0x10u, 0x1FFFFu);
+    test_spi_dma_desc(mem, rx_desc, rx_buf, 4u, 0u, 0, 0u);
+    mem_write32(mem, rx_desc,
+                mem_read32(mem, rx_desc) & ~TEST_UHCI_DESC_OWNER);
+    mem_write32(mem, TEST_UHCI0_BASE + 0x28u,
+                (rx_desc & 0xFFFFFu) | TEST_UHCI_LINK_START);
+    ASSERT_EQ(periph_uart_rx_inject(p, input, sizeof(input)), sizeof(input));
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u) & (1u << 9),
+              1u << 9);
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x40u), rx_desc);
+    ASSERT_EQ(periph_uart_rx_pending(p), sizeof(input));
+    ASSERT_TRUE(periph_interrupt_pending(p, 12));
+
+    mem_write32(mem, 0x3FF000C4u, 1u << 8);
+    ASSERT_FALSE(periph_interrupt_pending(p, 12));
+    ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 typedef struct {
     int count;
     uint8_t last;
@@ -3334,6 +3760,12 @@ static void run_peripheral_tests(void) {
     RUN_TEST(mmio_range_registration);
     RUN_TEST(mmio_no_handler_returns_zero);
     RUN_TEST(uart_tx_capture);
+    RUN_TEST(uhci_reset_register_file_dual_instance_and_dport);
+    RUN_TEST(uhci_transparent_tx_dma_wire_timing_quick_send_and_interrupt);
+    RUN_TEST(uhci_transparent_rx_descriptor_chain_idle_and_break_eof);
+    RUN_TEST(uhci_h5_slip_receive_transmit_and_checksum_error);
+    RUN_TEST(uhci_h5_reliable_sequence_and_crc_validation);
+    RUN_TEST(uhci_malformed_descriptors_report_directional_errors);
     RUN_TEST(uart_controllers_are_independent);
     RUN_TEST(uart_status_tx_ready);
     RUN_TEST(uart_tx_empty_interrupt);

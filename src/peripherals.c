@@ -13,6 +13,8 @@
 #define UART0_BASE      0x3FF40000u
 #define UART1_BASE      0x3FF50000u
 #define UART2_BASE      0x3FF6E000u
+#define UHCI0_BASE      0x3FF54000u
+#define UHCI1_BASE      0x3FF4C000u
 #define SPI1_BASE       0x3FF42000u
 #define SPI0_BASE       0x3FF43000u
 #define I2C0_BASE       0x3FF53000u
@@ -80,6 +82,126 @@
 #define UART_TX_BUF_SIZE 4096
 #define UART_RX_FIFO_SIZE 128
 #define UART_COUNT 3
+
+/* Classic ESP32 has two UART DMA (UHCI) controllers shared by UART0/1/2.
+ * Descriptor words use the same lldesc layout as the SPI/I2S DMA engines. */
+#define UHCI_PORT_COUNT             2
+#define UHCI_REG_FILE_SIZE          0x100u
+#define UHCI_DMA_MAX_DESCRIPTORS    256u
+#define UHCI_DMA_MAX_BUFFER         4095u
+#define UHCI_FRAME_MAX              (4u + UHCI_DMA_MAX_BUFFER + 2u)
+#define UHCI_DEBUG_FIFO_SIZE        128u
+
+#define UHCI_CONF0_OFF              0x000u
+#define UHCI_INT_RAW_OFF            0x004u
+#define UHCI_INT_ST_OFF             0x008u
+#define UHCI_INT_ENA_OFF            0x00Cu
+#define UHCI_INT_CLR_OFF            0x010u
+#define UHCI_DMA_OUT_STATUS_OFF     0x014u
+#define UHCI_DMA_OUT_PUSH_OFF       0x018u
+#define UHCI_DMA_IN_STATUS_OFF      0x01Cu
+#define UHCI_DMA_IN_POP_OFF         0x020u
+#define UHCI_DMA_OUT_LINK_OFF       0x024u
+#define UHCI_DMA_IN_LINK_OFF        0x028u
+#define UHCI_CONF1_OFF              0x02Cu
+#define UHCI_STATE0_OFF             0x030u
+#define UHCI_STATE1_OFF             0x034u
+#define UHCI_OUT_EOF_DESC_OFF       0x038u
+#define UHCI_IN_SUC_EOF_DESC_OFF    0x03Cu
+#define UHCI_IN_ERR_EOF_DESC_OFF    0x040u
+#define UHCI_OUT_EOF_BFR_DESC_OFF   0x044u
+#define UHCI_AHB_TEST_OFF           0x048u
+#define UHCI_IN_DSCR_OFF            0x04Cu
+#define UHCI_IN_DSCR_BF0_OFF        0x050u
+#define UHCI_IN_DSCR_BF1_OFF        0x054u
+#define UHCI_OUT_DSCR_OFF           0x058u
+#define UHCI_OUT_DSCR_BF0_OFF       0x05Cu
+#define UHCI_OUT_DSCR_BF1_OFF       0x060u
+#define UHCI_ESCAPE_CONF_OFF        0x064u
+#define UHCI_HUNG_CONF_OFF          0x068u
+#define UHCI_ACK_NUM_OFF            0x06Cu
+#define UHCI_RX_HEAD_OFF            0x070u
+#define UHCI_QUICK_SENT_OFF         0x074u
+#define UHCI_Q_DATA_FIRST_OFF       0x078u
+#define UHCI_Q_DATA_LAST_OFF        0x0ACu
+#define UHCI_ESC_CONF0_OFF          0x0B0u
+#define UHCI_ESC_CONF1_OFF          0x0B4u
+#define UHCI_ESC_CONF2_OFF          0x0B8u
+#define UHCI_ESC_CONF3_OFF          0x0BCu
+#define UHCI_PKT_THRES_OFF          0x0C0u
+#define UHCI_DATE_OFF               0x0FCu
+
+#define UHCI_CONF0_IN_RST           (1u << 0)
+#define UHCI_CONF0_OUT_RST          (1u << 1)
+#define UHCI_CONF0_AHB_FIFO_RST     (1u << 2)
+#define UHCI_CONF0_AHB_RST          (1u << 3)
+#define UHCI_CONF0_IN_LOOP_TEST     (1u << 4)
+#define UHCI_CONF0_OUT_LOOP_TEST    (1u << 5)
+#define UHCI_CONF0_OUT_AUTO_WRBACK  (1u << 6)
+#define UHCI_CONF0_OUT_EOF_MODE     (1u << 8)
+#define UHCI_CONF0_UART_CE_MASK     (7u << 9)
+#define UHCI_CONF0_SEPER_EN         (1u << 16)
+#define UHCI_CONF0_HEAD_EN          (1u << 17)
+#define UHCI_CONF0_CRC_REC_EN       (1u << 18)
+#define UHCI_CONF0_UART_IDLE_EOF_EN (1u << 19)
+#define UHCI_CONF0_LEN_EOF_EN       (1u << 20)
+#define UHCI_CONF0_ENCODE_CRC_EN    (1u << 21)
+#define UHCI_CONF0_UART_BRK_EOF_EN  (1u << 23)
+#define UHCI_CONF0_VALID_MASK       0x00FFFFFFu
+
+#define UHCI_CONF1_CHECK_SUM_EN     (1u << 0)
+#define UHCI_CONF1_CHECK_SEQ_EN     (1u << 1)
+#define UHCI_CONF1_CRC_DISABLE      (1u << 2)
+#define UHCI_CONF1_SAVE_HEAD        (1u << 3)
+#define UHCI_CONF1_TX_CHECK_SUM_RE  (1u << 4)
+#define UHCI_CONF1_TX_ACK_NUM_RE    (1u << 5)
+#define UHCI_CONF1_CHECK_OWNER      (1u << 6)
+#define UHCI_CONF1_WAIT_SW_START    (1u << 7)
+#define UHCI_CONF1_SW_START         (1u << 8)
+#define UHCI_CONF1_VALID_MASK       0x001FFFFFu
+
+#define UHCI_LINK_ADDR_MASK         0x000FFFFFu
+#define UHCI_INLINK_AUTO_RET        (1u << 20)
+#define UHCI_LINK_STOP              (1u << 28)
+#define UHCI_LINK_START             (1u << 29)
+#define UHCI_LINK_RESTART           (1u << 30)
+#define UHCI_LINK_PARK              (1u << 31)
+
+#define UHCI_INT_RX_START           (1u << 0)
+#define UHCI_INT_TX_START           (1u << 1)
+#define UHCI_INT_RX_HUNG            (1u << 2)
+#define UHCI_INT_TX_HUNG            (1u << 3)
+#define UHCI_INT_IN_DONE            (1u << 4)
+#define UHCI_INT_IN_SUC_EOF         (1u << 5)
+#define UHCI_INT_IN_ERR_EOF         (1u << 6)
+#define UHCI_INT_OUT_DONE           (1u << 7)
+#define UHCI_INT_OUT_EOF            (1u << 8)
+#define UHCI_INT_IN_DSCR_ERR        (1u << 9)
+#define UHCI_INT_OUT_DSCR_ERR       (1u << 10)
+#define UHCI_INT_IN_DSCR_EMPTY      (1u << 11)
+#define UHCI_INT_OUTLINK_EOF_ERR    (1u << 12)
+#define UHCI_INT_OUT_TOTAL_EOF      (1u << 13)
+#define UHCI_INT_SEND_S_Q           (1u << 14)
+#define UHCI_INT_SEND_A_Q           (1u << 15)
+#define UHCI_INT_IN_FIFO_FULL_WM    (1u << 16)
+#define UHCI_INT_VALID_MASK         0x0001FFFFu
+
+#define UHCI_DESC_SIZE_MASK         0x00000FFFu
+#define UHCI_DESC_LENGTH_MASK       0x00FFF000u
+#define UHCI_DESC_LENGTH_SHIFT      12u
+#define UHCI_DESC_EOF               (1u << 30)
+#define UHCI_DESC_OWNER             (1u << 31)
+
+#define UHCI_CONF0_RESET            0x00370100u
+#define UHCI_CONF1_RESET            0x00000033u
+#define UHCI_ESCAPE_CONF_RESET      0x00000033u
+#define UHCI_HUNG_CONF_RESET        0x00810810u
+#define UHCI_ESC_CONF0_RESET        0x00DCDBC0u
+#define UHCI_ESC_CONF1_RESET        0x00DDDBDBu
+#define UHCI_ESC_CONF2_RESET        0x00DEDB11u
+#define UHCI_ESC_CONF3_RESET        0x00DFDB13u
+#define UHCI_PKT_THRES_RESET        0x00000080u
+#define UHCI_DATE_RESET             0x16041001u
 
 /* Classic ESP32 I2C controller register/FIFO geometry. */
 #define I2C_PORT_COUNT       2
@@ -352,6 +474,14 @@
 
 static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
+static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void uhci_reset_state(esp32_periph_t *p, unsigned port);
+static void uhci_dport_update(esp32_periph_t *p);
+static size_t uhci_uart_rx_feed(esp32_periph_t *p, int uart_num,
+                                const uint8_t *data, size_t len,
+                                bool idle_after);
+static bool uhci_uart_rx_break(esp32_periph_t *p, int uart_num);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -518,6 +648,61 @@ typedef struct {
     uint32_t int_raw;
     uint32_t int_ena;
 } uart_state_t;
+
+typedef struct {
+    uint32_t regs[UHCI_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t int_raw;
+    uint32_t int_ena;
+
+    uint32_t tx_desc;
+    uint32_t rx_desc;
+    size_t rx_offset;
+    uint32_t rx_ctrl;
+    uint32_t rx_buf;
+    uint32_t rx_next;
+    size_t rx_size;
+    bool rx_desc_loaded;
+    unsigned tx_descriptors_seen;
+    unsigned rx_descriptors_seen;
+    bool tx_link_running;
+    bool rx_link_running;
+
+    /* TX descriptors complete at the selected UART's configured wire rate.
+     * Quick-send packets share the same ccount event source. */
+    bool tx_event_armed;
+    bool quick_event_armed;
+    uint8_t quick_event_kind; /* 1 = single, 2 = continuous */
+    uint32_t next_tx_ccount;
+    uint32_t next_quick_ccount;
+
+    /* The reset protocol is Bluetooth H:5: a four-byte header and optional
+     * CRC inside configurable SLIP framing. State spans descriptors. */
+    bool tx_frame_started;
+    uint8_t tx_header[4];
+    uint8_t tx_header_len;
+    uint32_t tx_payload_count;
+    uint16_t tx_crc;
+
+    bool rx_frame_active;
+    bool rx_escape_pending;
+    uint8_t rx_escape_prefix;
+    uint8_t rx_frame[UHCI_FRAME_MAX];
+    size_t rx_frame_len;
+    uint32_t rx_payload_count;
+    uint8_t expected_rx_sequence;
+    uint8_t rx_error_cause;
+    uint8_t rx_frame_error_cause;
+    uint8_t decode_state;
+    uint8_t encode_state;
+
+    /* APB debug FIFO access. DMA normally drains/fills these immediately,
+     * but retaining the receive side makes IN_POP and watermark behavior
+     * observable to low-level diagnostics. */
+    uint16_t debug_in_fifo[UHCI_DEBUG_FIFO_SIZE];
+    uint16_t debug_in_head;
+    uint16_t debug_in_count;
+    uint16_t debug_in_last;
+} uhci_state_t;
 
 typedef struct {
     periph_i2c_device_fn fn;
@@ -744,6 +929,10 @@ struct esp32_periph {
     /* Three independent ESP32 UART controllers. */
     uart_state_t uart[UART_COUNT];
 
+    /* Two classic UART DMA engines, each attachable to UART0, UART1, or
+     * UART2 through UHCI_CONF0.UARTx_CE. */
+    uhci_state_t uhci[UHCI_PORT_COUNT];
+
     /* Two independent classic ESP32 I2C controllers and their virtual bus
      * targets. */
     i2c_state_t i2c[I2C_PORT_COUNT];
@@ -900,9 +1089,11 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_CPU_INTR_FROM_CPU_3_OFF 0x0E8
 #define DPORT_PERIP_CLK_EN_OFF         0x0C0
 #define DPORT_PERIP_RST_EN_OFF         0x0C4
+#define DPORT_UHCI0_MODULE_BIT         (1u << 8)
 #define DPORT_RMT_MODULE_BIT           (1u << 9)
 #define DPORT_PCNT_MODULE_BIT          (1u << 10)
 #define DPORT_LEDC_MODULE_BIT          (1u << 11)
+#define DPORT_UHCI1_MODULE_BIT         (1u << 12)
 #define DPORT_TIMG0_MODULE_BIT         (1u << 13)
 #define DPORT_TIMG1_MODULE_BIT         (1u << 15)
 #define DPORT_PWM0_MODULE_BIT          (1u << 17)
@@ -1108,11 +1299,16 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
     case DPORT_PERIP_CLK_EN_OFF:
         timg_sync_all_to(p, timg_now_cycles(p));
         p->dport_perip_clk_en = val;
+        uhci_dport_update(p);
         timg_kick(p);
         break;
     case DPORT_PERIP_RST_EN_OFF:
         timg_sync_all_to(p, timg_now_cycles(p));
         p->dport_perip_rst_en = val;
+        if (val & DPORT_UHCI0_MODULE_BIT)
+            uhci_reset_state(p, 0);
+        if (val & DPORT_UHCI1_MODULE_BIT)
+            uhci_reset_state(p, 1);
         if (val & DPORT_RMT_MODULE_BIT)
             rmt_reset_state(p);
         if (val & DPORT_PCNT_MODULE_BIT)
@@ -1127,6 +1323,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
             mcpwm_reset_unit(p, 0);
         if (val & DPORT_PWM1_MODULE_BIT)
             mcpwm_reset_unit(p, 1);
+        uhci_dport_update(p);
         timg_kick(p);
         break;
     case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
@@ -1211,6 +1408,32 @@ static void uart_refresh_level_conditions(uart_state_t *uart) {
         uart->int_raw |= UART_TXFIFO_EMPTY_INT;
 }
 
+static void uart_emit_tx_byte(esp32_periph_t *p, int uart_num, uint8_t byte,
+                              bool apb_fifo_write) {
+    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return;
+    uart_state_t *uart = &p->uart[uart_num];
+    if (uart->tx_len < UART_TX_BUF_SIZE)
+        uart->tx[uart->tx_len++] = byte;
+    if (uart->cb)
+        uart->cb(uart->cb_ctx, byte);
+    sbx_event_t ev = { .kind = SBX_EV_UART_TX, .cycle = 0 };
+    ev.uart_tx.uart_num = (uint8_t)uart_num;
+    ev.uart_tx.byte = byte;
+    sbx_events_emit(&ev);
+
+    if (apb_fifo_write) {
+        /* The byte has already left Flexe's zero-depth FIFO. */
+        uart->int_raw |= UART_TXFIFO_EMPTY_INT | UART_TX_DONE_INT;
+        uart_intr_update(p, uart_num);
+    }
+}
+
+static void uart_dma_tx_done(esp32_periph_t *p, int uart_num) {
+    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return;
+    p->uart[uart_num].int_raw |= UART_TXFIFO_EMPTY_INT | UART_TX_DONE_INT;
+    uart_intr_update(p, uart_num);
+}
+
 static uint32_t uart_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     int uart_num = uart_num_from_addr(addr);
@@ -1248,18 +1471,7 @@ static void uart_write(void *ctx, uint32_t addr, uint32_t val) {
     if (off == 0x00) {
         /* FIFO write: TX byte */
         uint8_t byte = (uint8_t)(val & 0xFF);
-        if (uart->tx_len < UART_TX_BUF_SIZE)
-            uart->tx[uart->tx_len++] = byte;
-        if (uart->cb)
-            uart->cb(uart->cb_ctx, byte);
-        sbx_event_t ev = { .kind = SBX_EV_UART_TX, .cycle = 0 };
-        ev.uart_tx.uart_num = (uint8_t)uart_num;
-        ev.uart_tx.byte = byte;
-        sbx_events_emit(&ev);
-        /* The byte has already left our zero-depth FIFO.  TXFIFO_EMPTY is a
-         * level condition; TX_DONE records completion of this byte. */
-        uart->int_raw |= UART_TXFIFO_EMPTY_INT | UART_TX_DONE_INT;
-        uart_intr_update(p, uart_num);
+        uart_emit_tx_byte(p, uart_num, byte, true);
     } else if (off == 0x0C) {       /* INT_ENA */
         uart->int_ena = val & UART_INT_VALID_MASK;
         /* Enabling TXFIFO_EMPTY while the FIFO is empty raises it at once. */
@@ -2375,6 +2587,7 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
         timg_next_fire(p, cpu),
         lact_next_fire(p, cpu),
         frc_next_fire(p, cpu),
+        uhci_next_fire(p, cpu),
         i2s_next_fire(p, cpu),
         rmt_next_fire(p, cpu),
         ledc_next_fire(p, cpu),
@@ -2402,6 +2615,7 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
     for (int group = 0; group < 2; group++)
         lact_eval_irq(p, group);
     frc_eval_events(p, cpu);
+    uhci_eval_events(p, cpu);
     i2s_eval_events(p, cpu);
     rmt_eval_events(p, cpu);
     ledc_eval_events(p, cpu);
@@ -6510,6 +6724,1223 @@ static void ledc_write(void *ctx, uint32_t addr, uint32_t val) {
     p->ledc.regs[off / 4u] = val;
 }
 
+/* ---- UHCI0/UHCI1 UART DMA ---- */
+
+static const uint32_t uhci_bases[UHCI_PORT_COUNT] = {
+    UHCI0_BASE, UHCI1_BASE,
+};
+
+static const int uhci_intr_sources[UHCI_PORT_COUNT] = {12, 13};
+
+static int uhci_port_from_addr(uint32_t addr) {
+    for (int port = 0; port < UHCI_PORT_COUNT; port++) {
+        if (addr >= uhci_bases[port] && addr < uhci_bases[port] + PAGE_SIZE)
+            return port;
+    }
+    return -1;
+}
+
+static uint32_t uhci_dport_bit(unsigned port) {
+    return port == 0u ? DPORT_UHCI0_MODULE_BIT : DPORT_UHCI1_MODULE_BIT;
+}
+
+static bool uhci_clocked(const esp32_periph_t *p, unsigned port) {
+    uint32_t bit = uhci_dport_bit(port);
+    return (p->dport_perip_clk_en & bit) != 0u &&
+           (p->dport_perip_rst_en & bit) == 0u;
+}
+
+static int uhci_uart_num(const uhci_state_t *s) {
+    uint32_t selected =
+        (s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_UART_CE_MASK) >> 9;
+    for (int uart = 0; uart < UART_COUNT; uart++)
+        if (selected & (1u << uart)) return uart;
+    return -1;
+}
+
+static bool uhci_dma_range_mapped(esp32_periph_t *p, uint32_t addr,
+                                  size_t len, bool writable) {
+    while (len > 0) {
+        size_t page_left = 0x1000u - (addr & 0xFFFu);
+        size_t chunk = len < page_left ? len : page_left;
+        const uint8_t *ptr = writable ? mem_get_ptr_w(p->mem, addr) :
+                                        mem_get_ptr(p->mem, addr);
+        if (!ptr) return false;
+        addr += (uint32_t)chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+static uint32_t uhci_first_desc(uint32_t link) {
+    return 0x3FF00000u | (link & UHCI_LINK_ADDR_MASK);
+}
+
+static uint32_t uhci_next_desc(uint32_t next) {
+    return next != 0u && next < 0x00100000u ? 0x3FF00000u | next : next;
+}
+
+static void uhci_irq_update(esp32_periph_t *p, unsigned port) {
+    uhci_state_t *s = &p->uhci[port];
+    bool active = uhci_clocked(p, port) &&
+                  (s->int_raw & s->int_ena & UHCI_INT_VALID_MASK) != 0u;
+    if (active)
+        periph_assert_interrupt(p, uhci_intr_sources[port]);
+    else
+        periph_deassert_interrupt(p, uhci_intr_sources[port]);
+}
+
+static xtensa_cpu_t *uhci_event_cpu(esp32_periph_t *p) {
+    return p->cpu[0] ? p->cpu[0] : p->cpu[1];
+}
+
+static void uhci_kick(esp32_periph_t *p) {
+    for (int core = 0; core < 2; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static uint16_t uhci_crc16_update(uint16_t crc, uint8_t byte) {
+    crc ^= byte;
+    for (unsigned bit = 0; bit < 8u; bit++)
+        crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u) :
+                           (uint16_t)(crc >> 1);
+    return crc;
+}
+
+static uint16_t uhci_bit_reverse16(uint16_t value) {
+    value = (uint16_t)(((value & 0x5555u) << 1) |
+                       ((value >> 1) & 0x5555u));
+    value = (uint16_t)(((value & 0x3333u) << 2) |
+                       ((value >> 2) & 0x3333u));
+    value = (uint16_t)(((value & 0x0F0Fu) << 4) |
+                       ((value >> 4) & 0x0F0Fu));
+    return (uint16_t)((value << 8) | (value >> 8));
+}
+
+static uint32_t uhci_uart_cycles(const esp32_periph_t *p, int uart_num,
+                                 size_t wire_bytes) {
+    if (uart_num < 0 || uart_num >= UART_COUNT || wire_bytes == 0u) return 1u;
+    const uart_state_t *uart = &p->uart[uart_num];
+    uint32_t conf0 = uart->shadow[0x20u / 4u];
+    uint32_t clkdiv = uart->shadow[0x14u / 4u];
+    uint32_t divider16 = (clkdiv & 0xFFFFFu) * 16u +
+                         ((clkdiv >> 20) & 0xFu);
+    uint32_t source_hz = conf0 & (1u << 27) ? 80000000u : 1000000u;
+    uint32_t baud = divider16 ?
+        (uint32_t)(((uint64_t)source_hz * 16u) / divider16) : 115200u;
+    if (baud == 0u) baud = 1u;
+
+    uint32_t data_bits = ((conf0 >> 2) & 3u) + 5u;
+    uint32_t parity_bits = conf0 & (1u << 1) ? 1u : 0u;
+    uint32_t stop_mode = (conf0 >> 4) & 3u;
+    uint32_t stop_half_bits = stop_mode == 2u ? 3u :
+                              stop_mode == 3u ? 4u : 2u;
+    uint32_t frame_half_bits = 2u * (1u + data_bits + parity_bits) +
+                               stop_half_bits;
+    uint64_t numerator = (uint64_t)wire_bytes * frame_half_bits *
+                         timg_cpu_mhz(p) * 1000000ull;
+    uint64_t denominator = (uint64_t)baud * 2u;
+    uint64_t cycles = (numerator + denominator - 1u) / denominator;
+    if (cycles == 0u) cycles = 1u;
+    if (cycles > INT32_MAX) cycles = INT32_MAX;
+    return (uint32_t)cycles;
+}
+
+static void uhci_update_desc_history(uhci_state_t *s, bool tx,
+                                     uint32_t desc) {
+    uint32_t current_off = tx ? UHCI_OUT_DSCR_OFF : UHCI_IN_DSCR_OFF;
+    uint32_t previous_off = tx ? UHCI_OUT_DSCR_BF0_OFF : UHCI_IN_DSCR_BF0_OFF;
+    uint32_t older_off = tx ? UHCI_OUT_DSCR_BF1_OFF : UHCI_IN_DSCR_BF1_OFF;
+    s->regs[older_off / 4u] = s->regs[previous_off / 4u];
+    s->regs[previous_off / 4u] = s->regs[current_off / 4u];
+    s->regs[current_off / 4u] = desc;
+}
+
+static void uhci_reset_tx_frame(uhci_state_t *s) {
+    s->tx_frame_started = false;
+    s->tx_header_len = 0u;
+    s->tx_payload_count = 0u;
+    s->tx_crc = 0xFFFFu;
+    s->encode_state = 0u;
+}
+
+static void uhci_reset_rx_frame(uhci_state_t *s) {
+    s->rx_frame_active = false;
+    s->rx_escape_pending = false;
+    s->rx_escape_prefix = 0u;
+    s->rx_frame_len = 0u;
+    s->rx_payload_count = 0u;
+    s->rx_frame_error_cause = 0u;
+    s->decode_state = 0u;
+}
+
+static void uhci_reset_state(esp32_periph_t *p, unsigned port) {
+    if (!p || port >= UHCI_PORT_COUNT) return;
+    periph_deassert_interrupt(p, uhci_intr_sources[port]);
+    uhci_state_t *s = &p->uhci[port];
+    memset(s, 0, sizeof(*s));
+    s->regs[UHCI_CONF0_OFF / 4u] = UHCI_CONF0_RESET;
+    s->regs[UHCI_DMA_IN_LINK_OFF / 4u] = UHCI_INLINK_AUTO_RET;
+    s->regs[UHCI_CONF1_OFF / 4u] = UHCI_CONF1_RESET;
+    s->regs[UHCI_ESCAPE_CONF_OFF / 4u] = UHCI_ESCAPE_CONF_RESET;
+    s->regs[UHCI_HUNG_CONF_OFF / 4u] = UHCI_HUNG_CONF_RESET;
+    s->regs[UHCI_ESC_CONF0_OFF / 4u] = UHCI_ESC_CONF0_RESET;
+    s->regs[UHCI_ESC_CONF1_OFF / 4u] = UHCI_ESC_CONF1_RESET;
+    s->regs[UHCI_ESC_CONF2_OFF / 4u] = UHCI_ESC_CONF2_RESET;
+    s->regs[UHCI_ESC_CONF3_OFF / 4u] = UHCI_ESC_CONF3_RESET;
+    s->regs[UHCI_PKT_THRES_OFF / 4u] = UHCI_PKT_THRES_RESET;
+    s->regs[UHCI_DATE_OFF / 4u] = UHCI_DATE_RESET;
+    uhci_reset_tx_frame(s);
+    uhci_reset_rx_frame(s);
+}
+
+static bool uhci_tx_escape_pair(const uhci_state_t *s, uint8_t byte,
+                                uint8_t *first, uint8_t *second) {
+    if (!(s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_SEPER_EN)) return false;
+    uint32_t enable = s->regs[UHCI_ESCAPE_CONF_OFF / 4u];
+    static const uint32_t config_offsets[4] = {
+        UHCI_ESC_CONF0_OFF, UHCI_ESC_CONF1_OFF,
+        UHCI_ESC_CONF2_OFF, UHCI_ESC_CONF3_OFF,
+    };
+    for (unsigned index = 0; index < 4u; index++) {
+        if (!(enable & (1u << (index + 4u)))) continue;
+        uint32_t config = s->regs[config_offsets[index] / 4u];
+        if (byte != (uint8_t)config) continue;
+        *first = (uint8_t)(config >> 8);
+        *second = (uint8_t)(config >> 16);
+        return true;
+    }
+    return false;
+}
+
+static size_t uhci_emit_tx_octet(esp32_periph_t *p, unsigned port,
+                                 int uart_num, uint8_t byte) {
+    uhci_state_t *s = &p->uhci[port];
+    uint8_t first = 0u;
+    uint8_t second = 0u;
+    if (uhci_tx_escape_pair(s, byte, &first, &second)) {
+        uart_emit_tx_byte(p, uart_num, first, false);
+        uart_emit_tx_byte(p, uart_num, second, false);
+        return 2u;
+    }
+    uart_emit_tx_byte(p, uart_num, byte, false);
+    return 1u;
+}
+
+static void uhci_emit_separator(esp32_periph_t *p, unsigned port,
+                                int uart_num) {
+    uhci_state_t *s = &p->uhci[port];
+    uint8_t separator =
+        (uint8_t)s->regs[UHCI_ESC_CONF0_OFF / 4u];
+    uart_emit_tx_byte(p, uart_num, separator, false);
+}
+
+static bool uhci_tx_begin_frame(esp32_periph_t *p, unsigned port,
+                                int uart_num) {
+    uhci_state_t *s = &p->uhci[port];
+    if (s->tx_frame_started) return true;
+    if (s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_SEPER_EN) {
+        uhci_emit_separator(p, port, uart_num);
+        s->int_raw |= UHCI_INT_RX_START;
+    }
+    s->tx_frame_started = true;
+    s->tx_header_len = 0u;
+    s->tx_payload_count = 0u;
+    s->tx_crc = 0xFFFFu;
+    s->encode_state = 1u;
+    return true;
+}
+
+static void uhci_tx_emit_header(esp32_periph_t *p, unsigned port,
+                                int uart_num) {
+    uhci_state_t *s = &p->uhci[port];
+    uint32_t conf1 = s->regs[UHCI_CONF1_OFF / 4u];
+    if (conf1 & UHCI_CONF1_TX_ACK_NUM_RE) {
+        uint8_t ack = (uint8_t)(s->regs[UHCI_ACK_NUM_OFF / 4u] & 7u);
+        s->tx_header[0] = (uint8_t)((s->tx_header[0] & ~0x38u) |
+                                    (ack << 3));
+    }
+    if (conf1 & UHCI_CONF1_TX_CHECK_SUM_RE)
+        s->tx_header[3] = (uint8_t)~(s->tx_header[0] + s->tx_header[1] +
+                                     s->tx_header[2]);
+    for (unsigned index = 0; index < 4u; index++) {
+        s->tx_crc = uhci_crc16_update(s->tx_crc, s->tx_header[index]);
+        (void)uhci_emit_tx_octet(p, port, uart_num, s->tx_header[index]);
+    }
+}
+
+static void uhci_tx_emit_data(esp32_periph_t *p, unsigned port, int uart_num,
+                              const uint8_t *data, size_t len) {
+    uhci_state_t *s = &p->uhci[port];
+    bool header_mode =
+        (s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_HEAD_EN) != 0u;
+    for (size_t index = 0; index < len; index++) {
+        uint8_t byte = data[index];
+        if (header_mode && s->tx_header_len < 4u) {
+            s->tx_header[s->tx_header_len++] = byte;
+            if (s->tx_header_len == 4u)
+                uhci_tx_emit_header(p, port, uart_num);
+            continue;
+        }
+        if (header_mode) {
+            s->tx_crc = uhci_crc16_update(s->tx_crc, byte);
+            s->tx_payload_count++;
+        }
+        (void)uhci_emit_tx_octet(p, port, uart_num, byte);
+    }
+}
+
+static bool uhci_tx_end_frame(esp32_periph_t *p, unsigned port,
+                              int uart_num) {
+    uhci_state_t *s = &p->uhci[port];
+    uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+    uint32_t conf1 = s->regs[UHCI_CONF1_OFF / 4u];
+    bool valid = true;
+    if (conf0 & UHCI_CONF0_HEAD_EN) {
+        if (s->tx_header_len != 4u) {
+            valid = false;
+        } else {
+            uint32_t expected = ((uint32_t)s->tx_header[1] >> 4) |
+                                ((uint32_t)s->tx_header[2] << 4);
+            if (expected != s->tx_payload_count) valid = false;
+            if ((s->tx_header[0] & 0x40u) &&
+                (conf0 & UHCI_CONF0_ENCODE_CRC_EN) &&
+                !(conf1 & UHCI_CONF1_CRC_DISABLE)) {
+                uint16_t crc = uhci_bit_reverse16(s->tx_crc);
+                (void)uhci_emit_tx_octet(p, port, uart_num,
+                                         (uint8_t)(crc >> 8));
+                (void)uhci_emit_tx_octet(p, port, uart_num, (uint8_t)crc);
+            }
+        }
+    }
+    if (conf0 & UHCI_CONF0_SEPER_EN)
+        uhci_emit_separator(p, port, uart_num);
+    uhci_reset_tx_frame(s);
+    return valid;
+}
+
+static size_t uhci_tx_wire_estimate(esp32_periph_t *p, unsigned port,
+                                    uint32_t desc) {
+    uhci_state_t *s = &p->uhci[port];
+    if (!uhci_dma_range_mapped(p, desc, 12u, false)) return 1u;
+    uint32_t ctrl = mem_read32(p->mem, desc);
+    uint32_t buf = mem_read32(p->mem, desc + 4u);
+    size_t len = (ctrl & UHCI_DESC_LENGTH_MASK) >> UHCI_DESC_LENGTH_SHIFT;
+    if (len > UHCI_DMA_MAX_BUFFER ||
+        (len != 0u && !uhci_dma_range_mapped(p, buf, len, false)))
+        return 1u;
+    size_t wire = len;
+    uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+    if ((conf0 & UHCI_CONF0_SEPER_EN) && !s->tx_frame_started) wire++;
+    if ((ctrl & UHCI_DESC_EOF) && (conf0 & UHCI_CONF0_SEPER_EN)) wire++;
+    /* Escaping can at most double the descriptor body. Counting exact bytes
+     * keeps transparent-mode timing exact and framed timing conservative. */
+    if (conf0 & UHCI_CONF0_SEPER_EN) {
+        size_t escaped = 0u;
+        for (size_t index = 0; index < len; index++) {
+            uint8_t first = 0u, second = 0u;
+            escaped += uhci_tx_escape_pair(
+                s, mem_read8(p->mem, buf + (uint32_t)index),
+                &first, &second) ? 2u : 1u;
+        }
+        wire = escaped + (wire - len);
+    }
+    if ((ctrl & UHCI_DESC_EOF) && (conf0 & UHCI_CONF0_HEAD_EN) &&
+        s->tx_header_len == 4u && (s->tx_header[0] & 0x40u) &&
+        (conf0 & UHCI_CONF0_ENCODE_CRC_EN))
+        wire += 2u;
+    return wire ? wire : 1u;
+}
+
+static void uhci_arm_tx_event(esp32_periph_t *p, unsigned port) {
+    uhci_state_t *s = &p->uhci[port];
+    s->tx_event_armed = false;
+    if (!s->tx_link_running || !uhci_clocked(p, port)) return;
+    if ((s->regs[UHCI_CONF1_OFF / 4u] & UHCI_CONF1_WAIT_SW_START) &&
+        !(s->regs[UHCI_CONF1_OFF / 4u] & UHCI_CONF1_SW_START)) {
+        s->encode_state = 5u;
+        return;
+    }
+    int uart_num = uhci_uart_num(s);
+    if (uart_num < 0) {
+        s->int_raw |= UHCI_INT_TX_HUNG;
+        s->tx_link_running = false;
+        uhci_irq_update(p, port);
+        return;
+    }
+    xtensa_cpu_t *cpu = uhci_event_cpu(p);
+    if (!cpu) return;
+    size_t wire = uhci_tx_wire_estimate(p, port, s->tx_desc);
+    s->next_tx_ccount = cpu->ccount + uhci_uart_cycles(p, uart_num, wire);
+    s->tx_event_armed = true;
+    uhci_kick(p);
+}
+
+static void uhci_tx_descriptor_error(esp32_periph_t *p, unsigned port,
+                                     uint32_t desc, uint32_t interrupt) {
+    uhci_state_t *s = &p->uhci[port];
+    s->regs[UHCI_OUT_EOF_BFR_DESC_OFF / 4u] = desc;
+    s->int_raw |= interrupt;
+    s->tx_link_running = false;
+    s->tx_event_armed = false;
+    s->encode_state = 0u;
+    uhci_irq_update(p, port);
+    uhci_kick(p);
+}
+
+static bool uhci_complete_tx_descriptor(esp32_periph_t *p, unsigned port) {
+    uhci_state_t *s = &p->uhci[port];
+    uint32_t desc = s->tx_desc;
+    if (!s->tx_link_running) return false;
+    if (++s->tx_descriptors_seen > UHCI_DMA_MAX_DESCRIPTORS ||
+        (desc & 3u) != 0u ||
+        !uhci_dma_range_mapped(p, desc, 12u, true)) {
+        uhci_tx_descriptor_error(p, port, desc, UHCI_INT_OUT_DSCR_ERR);
+        return false;
+    }
+
+    uint32_t ctrl = mem_read32(p->mem, desc);
+    uint32_t buf = mem_read32(p->mem, desc + 4u);
+    uint32_t next = uhci_next_desc(mem_read32(p->mem, desc + 8u));
+    size_t size = ctrl & UHCI_DESC_SIZE_MASK;
+    size_t len = (ctrl & UHCI_DESC_LENGTH_MASK) >> UHCI_DESC_LENGTH_SHIFT;
+    uhci_update_desc_history(s, true, desc);
+
+    bool check_owner =
+        (s->regs[UHCI_CONF1_OFF / 4u] & UHCI_CONF1_CHECK_OWNER) != 0u;
+    if ((check_owner && !(ctrl & UHCI_DESC_OWNER)) || len > size ||
+        size > UHCI_DMA_MAX_BUFFER || (buf & 3u) != 0u ||
+        (size != 0u && (size & 3u) != 0u) ||
+        (len != 0u && !uhci_dma_range_mapped(p, buf, len, false))) {
+        uhci_tx_descriptor_error(p, port, desc, UHCI_INT_OUT_DSCR_ERR);
+        return false;
+    }
+    if (len == 0u && !(s->regs[UHCI_CONF0_OFF / 4u] &
+                       UHCI_CONF0_OUT_AUTO_WRBACK)) {
+        uhci_tx_descriptor_error(p, port, desc, UHCI_INT_OUT_DSCR_ERR);
+        return false;
+    }
+
+    int uart_num = uhci_uart_num(s);
+    if (uart_num < 0) {
+        uhci_tx_descriptor_error(p, port, desc, UHCI_INT_TX_HUNG);
+        return false;
+    }
+    (void)uhci_tx_begin_frame(p, port, uart_num);
+    uint8_t bytes[UHCI_DMA_MAX_BUFFER];
+    for (size_t index = 0; index < len; index++)
+        bytes[index] = mem_read8(p->mem, buf + (uint32_t)index);
+    uhci_tx_emit_data(p, port, uart_num, bytes, len);
+
+    mem_write32(p->mem, desc, ctrl & ~UHCI_DESC_OWNER);
+    s->int_raw |= UHCI_INT_OUT_DONE;
+    if (ctrl & UHCI_DESC_EOF) {
+        s->regs[UHCI_OUT_EOF_DESC_OFF / 4u] = desc;
+        s->regs[UHCI_OUT_EOF_BFR_DESC_OFF / 4u] =
+            s->regs[UHCI_OUT_DSCR_BF0_OFF / 4u];
+        s->int_raw |= UHCI_INT_OUT_EOF | UHCI_INT_OUT_TOTAL_EOF;
+        if (next != 0u) s->int_raw |= UHCI_INT_OUTLINK_EOF_ERR;
+        if (!uhci_tx_end_frame(p, port, uart_num))
+            s->int_raw |= UHCI_INT_OUTLINK_EOF_ERR;
+        s->tx_link_running = false;
+        s->tx_desc = 0u;
+        uart_dma_tx_done(p, uart_num);
+    } else if (next == 0u || next == desc) {
+        s->int_raw |= UHCI_INT_OUTLINK_EOF_ERR;
+        s->regs[UHCI_OUT_EOF_BFR_DESC_OFF / 4u] = desc;
+        s->tx_link_running = false;
+        s->tx_desc = 0u;
+        uhci_reset_tx_frame(s);
+    } else {
+        s->tx_desc = next;
+    }
+    uhci_irq_update(p, port);
+    if (s->tx_link_running) uhci_arm_tx_event(p, port);
+    else uhci_kick(p);
+    return true;
+}
+
+static void uhci_emit_quick_packet(esp32_periph_t *p, unsigned port,
+                                   unsigned packet) {
+    uhci_state_t *s = &p->uhci[port];
+    int uart_num = uhci_uart_num(s);
+    if (uart_num < 0 || packet >= 7u) {
+        s->int_raw |= UHCI_INT_TX_HUNG;
+        return;
+    }
+    uint32_t first = s->regs[(UHCI_Q_DATA_FIRST_OFF + packet * 8u) / 4u];
+    uint32_t second =
+        s->regs[(UHCI_Q_DATA_FIRST_OFF + packet * 8u + 4u) / 4u];
+    uint8_t data[8];
+    for (unsigned index = 0; index < 4u; index++) {
+        data[index] = (uint8_t)(first >> (index * 8u));
+        data[index + 4u] = (uint8_t)(second >> (index * 8u));
+    }
+    if (s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_SEPER_EN) {
+        uhci_emit_separator(p, port, uart_num);
+        s->int_raw |= UHCI_INT_RX_START;
+    }
+    for (unsigned index = 0; index < 8u; index++)
+        (void)uhci_emit_tx_octet(p, port, uart_num, data[index]);
+    if (s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_SEPER_EN)
+        uhci_emit_separator(p, port, uart_num);
+    uart_dma_tx_done(p, uart_num);
+}
+
+static void uhci_arm_quick_event(esp32_periph_t *p, unsigned port) {
+    uhci_state_t *s = &p->uhci[port];
+    s->quick_event_armed = false;
+    uint32_t quick = s->regs[UHCI_QUICK_SENT_OFF / 4u];
+    if (!uhci_clocked(p, port)) return;
+    if (quick & (1u << 3))
+        s->quick_event_kind = 1u;
+    else if (quick & (1u << 7))
+        s->quick_event_kind = 2u;
+    else
+        return;
+    int uart_num = uhci_uart_num(s);
+    if (uart_num < 0) {
+        s->int_raw |= UHCI_INT_TX_HUNG;
+        uhci_irq_update(p, port);
+        return;
+    }
+    xtensa_cpu_t *cpu = uhci_event_cpu(p);
+    if (!cpu) return;
+    size_t wire = 8u +
+        ((s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_SEPER_EN) ? 2u : 0u);
+    s->next_quick_ccount =
+        cpu->ccount + uhci_uart_cycles(p, uart_num, wire);
+    s->quick_event_armed = true;
+    uhci_kick(p);
+}
+
+static void uhci_complete_quick_event(esp32_periph_t *p, unsigned port) {
+    uhci_state_t *s = &p->uhci[port];
+    uint32_t quick = s->regs[UHCI_QUICK_SENT_OFF / 4u];
+    unsigned packet = s->quick_event_kind == 1u ? (quick & 7u) :
+                                                   ((quick >> 4) & 7u);
+    uhci_emit_quick_packet(p, port, packet);
+    if (s->quick_event_kind == 1u) {
+        s->int_raw |= UHCI_INT_SEND_S_Q;
+        s->regs[UHCI_QUICK_SENT_OFF / 4u] &= ~(1u << 3);
+    } else {
+        s->int_raw |= UHCI_INT_SEND_A_Q;
+    }
+    s->quick_event_armed = false;
+    uhci_irq_update(p, port);
+    if (s->regs[UHCI_QUICK_SENT_OFF / 4u] & (1u << 7))
+        uhci_arm_quick_event(p, port);
+}
+
+static void uhci_debug_rx_push(uhci_state_t *s, uint16_t value) {
+    if (s->debug_in_count < UHCI_DEBUG_FIFO_SIZE) {
+        unsigned tail = (s->debug_in_head + s->debug_in_count) %
+                        UHCI_DEBUG_FIFO_SIZE;
+        s->debug_in_fifo[tail] = value & 0x0FFFu;
+        s->debug_in_count++;
+    }
+    uint32_t threshold =
+        (s->regs[UHCI_CONF1_OFF / 4u] >> 9) & 0x0FFFu;
+    if (threshold != 0u && s->debug_in_count > threshold)
+        s->int_raw |= UHCI_INT_IN_FIFO_FULL_WM;
+}
+
+static void uhci_reset_tx_path(uhci_state_t *s) {
+    s->tx_desc = 0u;
+    s->tx_descriptors_seen = 0u;
+    s->tx_link_running = false;
+    s->tx_event_armed = false;
+    s->quick_event_armed = false;
+    s->quick_event_kind = 0u;
+    uhci_reset_tx_frame(s);
+}
+
+static void uhci_reset_rx_path(uhci_state_t *s) {
+    s->rx_desc = 0u;
+    s->rx_offset = 0u;
+    s->rx_ctrl = 0u;
+    s->rx_buf = 0u;
+    s->rx_next = 0u;
+    s->rx_size = 0u;
+    s->rx_desc_loaded = false;
+    s->rx_descriptors_seen = 0u;
+    s->rx_link_running = false;
+    s->rx_error_cause = 0u;
+    s->debug_in_head = 0u;
+    s->debug_in_count = 0u;
+    s->debug_in_last = 0u;
+    uhci_reset_rx_frame(s);
+}
+
+static void uhci_rx_descriptor_error(esp32_periph_t *p, unsigned port,
+                                     uint32_t desc, uint32_t interrupt) {
+    uhci_state_t *s = &p->uhci[port];
+    s->regs[UHCI_IN_ERR_EOF_DESC_OFF / 4u] = desc;
+    s->int_raw |= interrupt;
+    s->rx_link_running = false;
+    s->rx_desc_loaded = false;
+    s->decode_state = 0u;
+    uhci_irq_update(p, port);
+}
+
+static bool uhci_load_rx_descriptor(esp32_periph_t *p, unsigned port) {
+    uhci_state_t *s = &p->uhci[port];
+    if (s->rx_desc_loaded) return true;
+    uint32_t desc = s->rx_desc;
+    if (!s->rx_link_running || desc == 0u) return false;
+    if (++s->rx_descriptors_seen > UHCI_DMA_MAX_DESCRIPTORS ||
+        (desc & 3u) != 0u ||
+        !uhci_dma_range_mapped(p, desc, 12u, true)) {
+        uhci_rx_descriptor_error(p, port, desc, UHCI_INT_IN_DSCR_ERR);
+        return false;
+    }
+
+    uint32_t ctrl = mem_read32(p->mem, desc);
+    uint32_t buf = mem_read32(p->mem, desc + 4u);
+    uint32_t next = uhci_next_desc(mem_read32(p->mem, desc + 8u));
+    size_t size = ctrl & UHCI_DESC_SIZE_MASK;
+    bool check_owner =
+        (s->regs[UHCI_CONF1_OFF / 4u] & UHCI_CONF1_CHECK_OWNER) != 0u;
+    uhci_update_desc_history(s, false, desc);
+    if ((check_owner && !(ctrl & UHCI_DESC_OWNER)) || size == 0u ||
+        size > UHCI_DMA_MAX_BUFFER || (size & 3u) != 0u ||
+        (buf & 3u) != 0u ||
+        !uhci_dma_range_mapped(p, buf, size, true)) {
+        uhci_rx_descriptor_error(p, port, desc, UHCI_INT_IN_DSCR_ERR);
+        return false;
+    }
+
+    s->rx_ctrl = ctrl;
+    s->rx_buf = buf;
+    s->rx_next = next;
+    s->rx_size = size;
+    s->rx_offset = 0u;
+    s->rx_desc_loaded = true;
+    s->decode_state = 2u;
+    return true;
+}
+
+static bool uhci_complete_rx_descriptor(esp32_periph_t *p, unsigned port,
+                                        bool eof, bool success) {
+    uhci_state_t *s = &p->uhci[port];
+    if (!s->rx_desc_loaded) return false;
+    uint32_t desc = s->rx_desc;
+    uint32_t ctrl = s->rx_ctrl &
+        ~(UHCI_DESC_LENGTH_MASK | UHCI_DESC_EOF | UHCI_DESC_OWNER);
+    ctrl |= ((uint32_t)s->rx_offset << UHCI_DESC_LENGTH_SHIFT) &
+            UHCI_DESC_LENGTH_MASK;
+    if (eof) ctrl |= UHCI_DESC_EOF;
+    mem_write32(p->mem, desc, ctrl);
+    s->int_raw |= UHCI_INT_IN_DONE;
+    if (eof) {
+        if (success) {
+            s->regs[UHCI_IN_SUC_EOF_DESC_OFF / 4u] = desc;
+            s->int_raw |= UHCI_INT_IN_SUC_EOF;
+        } else {
+            s->regs[UHCI_IN_ERR_EOF_DESC_OFF / 4u] = desc;
+            s->int_raw |= UHCI_INT_IN_ERR_EOF;
+        }
+    }
+
+    uint32_t next = s->rx_next;
+    s->rx_desc_loaded = false;
+    s->rx_offset = 0u;
+    s->rx_ctrl = 0u;
+    s->rx_buf = 0u;
+    s->rx_next = 0u;
+    s->rx_size = 0u;
+    if (next != 0u && next != desc) {
+        s->rx_desc = next;
+    } else {
+        s->rx_desc = 0u;
+        s->rx_link_running = false;
+        if (!eof) s->int_raw |= UHCI_INT_IN_DSCR_EMPTY;
+    }
+    s->decode_state = s->rx_link_running ? 1u : 0u;
+    uhci_irq_update(p, port);
+    return true;
+}
+
+static size_t uhci_write_rx_payload(esp32_periph_t *p, unsigned port,
+                                    const uint8_t *data, size_t len,
+                                    bool eof, bool success) {
+    uhci_state_t *s = &p->uhci[port];
+    size_t accepted = 0u;
+    while (accepted < len) {
+        if (!uhci_load_rx_descriptor(p, port)) break;
+        size_t available = s->rx_size - s->rx_offset;
+        size_t chunk = len - accepted;
+        if (chunk > available) chunk = available;
+        for (size_t index = 0; index < chunk; index++) {
+            uint8_t byte = data[accepted + index];
+            mem_write8(p->mem, s->rx_buf + (uint32_t)s->rx_offset +
+                       (uint32_t)index, byte);
+            uhci_debug_rx_push(s, byte);
+        }
+        s->rx_offset += chunk;
+        accepted += chunk;
+        bool final = eof && accepted == len;
+        if (s->rx_offset == s->rx_size) {
+            if (!uhci_complete_rx_descriptor(p, port, final,
+                                             final ? success : true))
+                break;
+        }
+    }
+
+    if (eof && accepted == len) {
+        if (!s->rx_desc_loaded && len == 0u)
+            (void)uhci_load_rx_descriptor(p, port);
+        if (s->rx_desc_loaded)
+            (void)uhci_complete_rx_descriptor(p, port, true, success);
+    }
+    if (accepted < len && s->rx_link_running) {
+        s->int_raw |= UHCI_INT_IN_DSCR_EMPTY;
+        s->rx_link_running = false;
+    }
+    uhci_irq_update(p, port);
+    return accepted;
+}
+
+static bool uhci_rx_escape_mapping(const uhci_state_t *s, uint8_t first,
+                                   uint8_t second, uint8_t *decoded) {
+    uint32_t enable = s->regs[UHCI_ESCAPE_CONF_OFF / 4u];
+    static const uint32_t offsets[4] = {
+        UHCI_ESC_CONF0_OFF, UHCI_ESC_CONF1_OFF,
+        UHCI_ESC_CONF2_OFF, UHCI_ESC_CONF3_OFF,
+    };
+    for (unsigned index = 0; index < 4u; index++) {
+        if (!(enable & (1u << index))) continue;
+        uint32_t config = s->regs[offsets[index] / 4u];
+        if (first == (uint8_t)(config >> 8) &&
+            second == (uint8_t)(config >> 16)) {
+            *decoded = (uint8_t)config;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool uhci_rx_escape_prefix(const uhci_state_t *s, uint8_t byte) {
+    uint32_t enable = s->regs[UHCI_ESCAPE_CONF_OFF / 4u];
+    static const uint32_t offsets[4] = {
+        UHCI_ESC_CONF0_OFF, UHCI_ESC_CONF1_OFF,
+        UHCI_ESC_CONF2_OFF, UHCI_ESC_CONF3_OFF,
+    };
+    for (unsigned index = 0; index < 4u; index++) {
+        if (!(enable & (1u << index))) continue;
+        if (byte == (uint8_t)(s->regs[offsets[index] / 4u] >> 8))
+            return true;
+    }
+    return false;
+}
+
+static size_t uhci_rx_expected_frame(const uhci_state_t *s) {
+    uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+    uint32_t conf1 = s->regs[UHCI_CONF1_OFF / 4u];
+    if (!(conf0 & UHCI_CONF0_HEAD_EN) || s->rx_frame_len < 4u)
+        return 0u;
+    size_t payload = ((size_t)s->rx_frame[1] >> 4) |
+                     ((size_t)s->rx_frame[2] << 4);
+    bool crc = (s->rx_frame[0] & 0x40u) != 0u &&
+               (conf0 & UHCI_CONF0_CRC_REC_EN) != 0u &&
+               (conf1 & UHCI_CONF1_CRC_DISABLE) == 0u;
+    return 4u + payload + (crc ? 2u : 0u);
+}
+
+static bool uhci_finish_rx_frame(esp32_periph_t *p, unsigned port) {
+    uhci_state_t *s = &p->uhci[port];
+    uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+    uint32_t conf1 = s->regs[UHCI_CONF1_OFF / 4u];
+    bool head_mode = (conf0 & UHCI_CONF0_HEAD_EN) != 0u;
+    bool success = true;
+    uint8_t cause = s->rx_frame_error_cause;
+    const uint8_t *payload = s->rx_frame;
+    size_t payload_len = s->rx_frame_len;
+
+    if (head_mode) {
+        if (s->rx_frame_len < 4u) {
+            success = false;
+            if (cause == 0u) cause = 4u;
+            payload_len = 0u;
+        } else {
+            uint8_t *header = s->rx_frame;
+            uint32_t packed = (uint32_t)header[0] |
+                              ((uint32_t)header[1] << 8) |
+                              ((uint32_t)header[2] << 16) |
+                              ((uint32_t)header[3] << 24);
+            s->regs[UHCI_RX_HEAD_OFF / 4u] = packed;
+            size_t declared = ((size_t)header[1] >> 4) |
+                              ((size_t)header[2] << 4);
+            bool crc_present = (header[0] & 0x40u) != 0u &&
+                               (conf0 & UHCI_CONF0_CRC_REC_EN) != 0u &&
+                               (conf1 & UHCI_CONF1_CRC_DISABLE) == 0u;
+            size_t expected = 4u + declared + (crc_present ? 2u : 0u);
+            if (s->rx_frame_len != expected) {
+                success = false;
+                if (cause == 0u)
+                    cause = s->rx_frame_len < expected ? 4u : 5u;
+            }
+            if ((conf1 & UHCI_CONF1_CHECK_SUM_EN) &&
+                (uint8_t)(header[0] + header[1] + header[2] + header[3]) !=
+                    0xFFu) {
+                success = false;
+                if (cause == 0u) cause = 1u;
+            }
+            if ((conf1 & UHCI_CONF1_CHECK_SEQ_EN) &&
+                (header[0] & 0x80u) &&
+                (header[0] & 7u) != s->expected_rx_sequence) {
+                success = false;
+                if (cause == 0u) cause = 2u;
+            }
+            if (crc_present && s->rx_frame_len >= expected) {
+                uint16_t crc = 0xFFFFu;
+                for (size_t index = 0; index < 4u + declared; index++)
+                    crc = uhci_crc16_update(crc, s->rx_frame[index]);
+                crc = uhci_bit_reverse16(crc);
+                uint16_t received =
+                    ((uint16_t)s->rx_frame[4u + declared] << 8) |
+                    s->rx_frame[5u + declared];
+                if (crc != received) {
+                    success = false;
+                    if (cause == 0u) cause = 6u;
+                }
+            }
+            if (success && (header[0] & 0x80u)) {
+                s->expected_rx_sequence =
+                    (uint8_t)((s->expected_rx_sequence + 1u) & 7u);
+                s->regs[UHCI_ACK_NUM_OFF / 4u] = s->expected_rx_sequence;
+            }
+            if (conf1 & UHCI_CONF1_SAVE_HEAD) {
+                payload = s->rx_frame;
+                payload_len = 4u +
+                    (declared < s->rx_frame_len - 4u ? declared :
+                     s->rx_frame_len - 4u);
+            } else {
+                payload = s->rx_frame + 4u;
+                payload_len = declared < s->rx_frame_len - 4u ? declared :
+                              s->rx_frame_len - 4u;
+            }
+        }
+    }
+
+    s->rx_error_cause = cause;
+    s->decode_state = success ? 3u : 4u;
+    size_t written = uhci_write_rx_payload(p, port, payload, payload_len,
+                                           true, success);
+    bool accepted = written == payload_len;
+    uhci_reset_rx_frame(s);
+    uhci_irq_update(p, port);
+    return accepted;
+}
+
+static bool uhci_append_rx_frame(esp32_periph_t *p, unsigned port,
+                                 uint8_t byte) {
+    uhci_state_t *s = &p->uhci[port];
+    if (!s->rx_frame_active) {
+        s->rx_frame_active = true;
+        s->decode_state = 1u;
+    }
+    if (s->rx_frame_len >= sizeof(s->rx_frame)) {
+        s->rx_frame_error_cause = 5u;
+        (void)uhci_finish_rx_frame(p, port);
+        return false;
+    }
+    s->rx_frame[s->rx_frame_len++] = byte;
+    size_t expected = uhci_rx_expected_frame(s);
+    uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+    if ((conf0 & UHCI_CONF0_LEN_EOF_EN) && expected != 0u &&
+        s->rx_frame_len == expected)
+        return uhci_finish_rx_frame(p, port);
+    if (!(conf0 & UHCI_CONF0_HEAD_EN) &&
+        (conf0 & UHCI_CONF0_LEN_EOF_EN)) {
+        size_t threshold =
+            s->regs[UHCI_PKT_THRES_OFF / 4u] & 0x1FFFu;
+        if (threshold != 0u && s->rx_frame_len >= threshold)
+            return uhci_finish_rx_frame(p, port);
+    }
+    return true;
+}
+
+static size_t uhci_feed_framed_rx(esp32_periph_t *p, unsigned port,
+                                  const uint8_t *data, size_t len) {
+    uhci_state_t *s = &p->uhci[port];
+    uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+    uint8_t separator = (uint8_t)s->regs[UHCI_ESC_CONF0_OFF / 4u];
+    size_t accepted = 0u;
+    while (accepted < len && s->rx_link_running) {
+        uint8_t byte = data[accepted++];
+        if ((conf0 & UHCI_CONF0_SEPER_EN) && byte == separator) {
+            s->int_raw |= UHCI_INT_TX_START;
+            if (s->rx_escape_pending) {
+                s->rx_frame_error_cause = 4u;
+                s->rx_escape_pending = false;
+            }
+            if (s->rx_frame_active && s->rx_frame_len != 0u)
+                (void)uhci_finish_rx_frame(p, port);
+            s->rx_frame_active = true;
+            s->decode_state = 1u;
+            continue;
+        }
+        if ((conf0 & UHCI_CONF0_SEPER_EN) && s->rx_escape_pending) {
+            uint8_t decoded = 0u;
+            if (uhci_rx_escape_mapping(s, s->rx_escape_prefix, byte,
+                                       &decoded)) {
+                s->rx_escape_pending = false;
+                if (!uhci_append_rx_frame(p, port, decoded)) break;
+                continue;
+            }
+            uint8_t prefix = s->rx_escape_prefix;
+            s->rx_escape_pending = false;
+            if (!uhci_append_rx_frame(p, port, prefix) ||
+                !uhci_append_rx_frame(p, port, byte))
+                break;
+            continue;
+        }
+        if ((conf0 & UHCI_CONF0_SEPER_EN) &&
+            uhci_rx_escape_prefix(s, byte)) {
+            s->rx_escape_pending = true;
+            s->rx_escape_prefix = byte;
+            continue;
+        }
+        if (!uhci_append_rx_frame(p, port, byte)) break;
+    }
+    uhci_irq_update(p, port);
+    return accepted;
+}
+
+static size_t uhci_feed_transparent_rx(esp32_periph_t *p, unsigned port,
+                                       const uint8_t *data, size_t len,
+                                       bool idle_eof) {
+    uhci_state_t *s = &p->uhci[port];
+    size_t accepted = 0u;
+    uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+    size_t threshold =
+        s->regs[UHCI_PKT_THRES_OFF / 4u] & 0x1FFFu;
+    while (accepted < len && s->rx_link_running) {
+        size_t chunk = len - accepted;
+        if ((conf0 & UHCI_CONF0_LEN_EOF_EN) && threshold != 0u) {
+            /* A threshold lowered below an in-flight packet must not wrap the
+             * unsigned subtraction and effectively disable the next EOF.  The
+             * next received byte closes that packet, matching the peripheral's
+             * forward-only byte stream semantics. */
+            size_t remaining = s->rx_payload_count < threshold
+                ? threshold - s->rx_payload_count : 1u;
+            if (chunk > remaining) chunk = remaining;
+        }
+        bool eof = ((conf0 & UHCI_CONF0_LEN_EOF_EN) && threshold != 0u &&
+                    s->rx_payload_count + chunk >= threshold) ||
+                   (idle_eof && accepted + chunk == len);
+        size_t written = uhci_write_rx_payload(
+            p, port, data + accepted, chunk, eof, true);
+        accepted += written;
+        s->rx_payload_count += (uint32_t)written;
+        if (eof && written == chunk) s->rx_payload_count = 0u;
+        if (written < chunk || chunk == 0u) break;
+    }
+    return accepted;
+}
+
+static size_t uhci_uart_rx_feed(esp32_periph_t *p, int uart_num,
+                                const uint8_t *data, size_t len,
+                                bool idle_after) {
+    size_t consumed = 0u;
+    for (unsigned port = 0; port < UHCI_PORT_COUNT; port++) {
+        uhci_state_t *s = &p->uhci[port];
+        if (!uhci_clocked(p, port) || !s->rx_link_running ||
+            uhci_uart_num(s) != uart_num)
+            continue;
+        uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+        bool framed = (conf0 & (UHCI_CONF0_SEPER_EN |
+                                UHCI_CONF0_HEAD_EN)) != 0u;
+        size_t port_consumed = framed ?
+            uhci_feed_framed_rx(p, port, data, len) :
+            uhci_feed_transparent_rx(
+                p, port, data, len,
+                idle_after && (conf0 & UHCI_CONF0_UART_IDLE_EOF_EN));
+        if (port_consumed > consumed) consumed = port_consumed;
+
+        if (idle_after && port_consumed != 0u &&
+            (conf0 & UHCI_CONF0_UART_IDLE_EOF_EN)) {
+            if (framed) {
+                if (s->rx_frame_active && s->rx_frame_len != 0u)
+                    (void)uhci_finish_rx_frame(p, port);
+            }
+            if (!framed) s->rx_payload_count = 0u;
+        }
+        uhci_irq_update(p, port);
+    }
+    return consumed;
+}
+
+static bool uhci_uart_rx_break(esp32_periph_t *p, int uart_num) {
+    bool handled = false;
+    for (unsigned port = 0; port < UHCI_PORT_COUNT; port++) {
+        uhci_state_t *s = &p->uhci[port];
+        uint32_t conf0 = s->regs[UHCI_CONF0_OFF / 4u];
+        if (!uhci_clocked(p, port) || !s->rx_link_running ||
+            uhci_uart_num(s) != uart_num ||
+            !(conf0 & UHCI_CONF0_UART_BRK_EOF_EN))
+            continue;
+        bool framed = (conf0 & (UHCI_CONF0_SEPER_EN |
+                                UHCI_CONF0_HEAD_EN)) != 0u;
+        if (framed) {
+            if (s->rx_frame_active && s->rx_frame_len != 0u)
+                (void)uhci_finish_rx_frame(p, port);
+        } else if (s->rx_desc_loaded && s->rx_offset != 0u) {
+            (void)uhci_complete_rx_descriptor(p, port, true, true);
+            s->rx_payload_count = 0u;
+        }
+        handled = true;
+    }
+    return handled;
+}
+
+static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != uhci_event_cpu(p)) return UINT32_MAX;
+    bool have = false;
+    uint32_t best = UINT32_MAX;
+    uint32_t best_distance = 0u;
+    for (unsigned port = 0; port < UHCI_PORT_COUNT; port++) {
+        uhci_state_t *s = &p->uhci[port];
+        uint32_t events[2] = {s->next_tx_ccount, s->next_quick_ccount};
+        bool armed[2] = {s->tx_event_armed, s->quick_event_armed};
+        for (unsigned index = 0; index < 2u; index++) {
+            if (!armed[index] || !uhci_clocked(p, port)) continue;
+            uint32_t distance = events[index] - cpu->ccount;
+            if ((int32_t)distance < 0) distance = 0u;
+            if (!have || distance < best_distance) {
+                have = true;
+                best = events[index];
+                best_distance = distance;
+            }
+        }
+    }
+    return have ? best : UINT32_MAX;
+}
+
+static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != uhci_event_cpu(p)) return;
+    for (unsigned port = 0; port < UHCI_PORT_COUNT; port++) {
+        uhci_state_t *s = &p->uhci[port];
+        if (!uhci_clocked(p, port)) continue;
+        if (s->tx_event_armed &&
+            (int32_t)(cpu->ccount - s->next_tx_ccount) >= 0) {
+            s->tx_event_armed = false;
+            (void)uhci_complete_tx_descriptor(p, port);
+        }
+        if (s->quick_event_armed &&
+            (int32_t)(cpu->ccount - s->next_quick_ccount) >= 0) {
+            s->quick_event_armed = false;
+            uhci_complete_quick_event(p, port);
+        }
+    }
+}
+
+static void uhci_dport_update(esp32_periph_t *p) {
+    if (!p) return;
+    for (unsigned port = 0; port < UHCI_PORT_COUNT; port++) {
+        uhci_state_t *s = &p->uhci[port];
+        if (!uhci_clocked(p, port)) {
+            s->tx_event_armed = false;
+            s->quick_event_armed = false;
+            periph_deassert_interrupt(p, uhci_intr_sources[port]);
+            continue;
+        }
+        uhci_irq_update(p, port);
+        if (s->tx_link_running && !s->tx_event_armed)
+            uhci_arm_tx_event(p, port);
+        if (!s->quick_event_armed &&
+            (s->regs[UHCI_QUICK_SENT_OFF / 4u] & 0x88u))
+            uhci_arm_quick_event(p, port);
+    }
+    uhci_kick(p);
+}
+
+static uint32_t uhci_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    int port = uhci_port_from_addr(addr);
+    if (port < 0) return default_read(ctx, addr);
+    uint32_t off = addr - uhci_bases[port];
+    if ((off & 3u) != 0u || off >= UHCI_REG_FILE_SIZE)
+        return default_read(ctx, addr);
+    uhci_state_t *s = &p->uhci[port];
+    xtensa_cpu_t *cpu = uhci_event_cpu(p);
+    if (cpu) uhci_eval_events(p, cpu);
+    switch (off) {
+    case UHCI_INT_RAW_OFF: return s->int_raw & UHCI_INT_VALID_MASK;
+    case UHCI_INT_ST_OFF: return s->int_raw & s->int_ena &
+                                 UHCI_INT_VALID_MASK;
+    case UHCI_INT_ENA_OFF: return s->int_ena;
+    case UHCI_INT_CLR_OFF: return 0u;
+    case UHCI_DMA_OUT_STATUS_OFF: return 1u << 1;
+    case UHCI_DMA_IN_STATUS_OFF:
+        return ((uint32_t)(s->rx_error_cause & 7u) << 4) |
+               (s->debug_in_count == 0u ? (1u << 1) : 0u) |
+               (s->debug_in_count >= UHCI_DEBUG_FIFO_SIZE ? 1u : 0u);
+    case UHCI_DMA_IN_POP_OFF: return s->debug_in_last & 0x0FFFu;
+    case UHCI_DMA_OUT_LINK_OFF:
+        return (s->regs[off / 4u] & UHCI_LINK_ADDR_MASK) |
+               (s->tx_link_running ? 0u : UHCI_LINK_PARK);
+    case UHCI_DMA_IN_LINK_OFF:
+        return (s->regs[off / 4u] &
+                (UHCI_LINK_ADDR_MASK | UHCI_INLINK_AUTO_RET)) |
+               (s->rx_link_running ? 0u : UHCI_LINK_PARK);
+    case UHCI_STATE0_OFF:
+        return (uint32_t)s->decode_state |
+               ((uint32_t)(s->rx_error_cause & 7u) << 8);
+    case UHCI_STATE1_OFF: return s->encode_state;
+    default: return s->regs[off / 4u];
+    }
+}
+
+static void uhci_write_conf0(esp32_periph_t *p, unsigned port,
+                             uint32_t value) {
+    uhci_state_t *s = &p->uhci[port];
+    s->regs[UHCI_CONF0_OFF / 4u] = value & UHCI_CONF0_VALID_MASK;
+    if (value & UHCI_CONF0_AHB_RST) {
+        uhci_reset_tx_path(s);
+        uhci_reset_rx_path(s);
+    } else {
+        if (value & UHCI_CONF0_OUT_RST) uhci_reset_tx_path(s);
+        if (value & UHCI_CONF0_IN_RST) uhci_reset_rx_path(s);
+    }
+    if (value & UHCI_CONF0_AHB_FIFO_RST) {
+        s->debug_in_head = 0u;
+        s->debug_in_count = 0u;
+        s->debug_in_last = 0u;
+    }
+    uhci_irq_update(p, port);
+    if (s->tx_link_running) uhci_arm_tx_event(p, port);
+    uhci_kick(p);
+}
+
+static void uhci_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    int port_index = uhci_port_from_addr(addr);
+    if (port_index < 0) { default_write(ctx, addr, value); return; }
+    unsigned port = (unsigned)port_index;
+    uint32_t off = addr - uhci_bases[port];
+    if ((off & 3u) != 0u || off >= UHCI_REG_FILE_SIZE) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    uhci_state_t *s = &p->uhci[port];
+    switch (off) {
+    case UHCI_INT_RAW_OFF:
+    case UHCI_INT_ST_OFF:
+    case UHCI_DMA_OUT_STATUS_OFF:
+    case UHCI_DMA_IN_STATUS_OFF:
+    case UHCI_STATE0_OFF:
+    case UHCI_STATE1_OFF:
+    case UHCI_OUT_EOF_DESC_OFF:
+    case UHCI_IN_SUC_EOF_DESC_OFF:
+    case UHCI_IN_ERR_EOF_DESC_OFF:
+    case UHCI_OUT_EOF_BFR_DESC_OFF:
+    case UHCI_IN_DSCR_OFF:
+    case UHCI_IN_DSCR_BF0_OFF:
+    case UHCI_IN_DSCR_BF1_OFF:
+    case UHCI_OUT_DSCR_OFF:
+    case UHCI_OUT_DSCR_BF0_OFF:
+    case UHCI_OUT_DSCR_BF1_OFF:
+    case UHCI_RX_HEAD_OFF:
+        return;
+    case UHCI_CONF0_OFF:
+        uhci_write_conf0(p, port, value);
+        return;
+    case UHCI_INT_ENA_OFF:
+        s->int_ena = value & UHCI_INT_VALID_MASK;
+        uhci_irq_update(p, port);
+        return;
+    case UHCI_INT_CLR_OFF:
+        s->int_raw &= ~(value & UHCI_INT_VALID_MASK);
+        uhci_irq_update(p, port);
+        return;
+    case UHCI_DMA_OUT_PUSH_OFF:
+        s->regs[off / 4u] = value & 0x000101FFu;
+        if (value & (1u << 16)) {
+            int uart_num = uhci_uart_num(s);
+            if (uart_num >= 0)
+                uart_emit_tx_byte(p, uart_num, (uint8_t)value, false);
+            else
+                s->int_raw |= UHCI_INT_TX_HUNG;
+            uhci_irq_update(p, port);
+        }
+        return;
+    case UHCI_DMA_IN_POP_OFF:
+        if ((value & (1u << 16)) && s->debug_in_count != 0u) {
+            s->debug_in_last = s->debug_in_fifo[s->debug_in_head];
+            s->debug_in_head =
+                (uint16_t)((s->debug_in_head + 1u) % UHCI_DEBUG_FIFO_SIZE);
+            s->debug_in_count--;
+        }
+        return;
+    case UHCI_DMA_OUT_LINK_OFF:
+        s->regs[off / 4u] = value & UHCI_LINK_ADDR_MASK;
+        if (value & UHCI_LINK_STOP) {
+            s->tx_link_running = false;
+            s->tx_event_armed = false;
+            uhci_reset_tx_frame(s);
+        } else if (value & (UHCI_LINK_START | UHCI_LINK_RESTART)) {
+            s->tx_desc = uhci_first_desc(value);
+            s->tx_descriptors_seen = 0u;
+            s->tx_link_running = true;
+            uhci_reset_tx_frame(s);
+            uhci_arm_tx_event(p, port);
+        }
+        uhci_kick(p);
+        return;
+    case UHCI_DMA_IN_LINK_OFF:
+        s->regs[off / 4u] = value &
+            (UHCI_LINK_ADDR_MASK | UHCI_INLINK_AUTO_RET);
+        if (value & UHCI_LINK_STOP) {
+            s->rx_link_running = false;
+            s->rx_desc_loaded = false;
+            uhci_reset_rx_frame(s);
+        } else if (value & (UHCI_LINK_START | UHCI_LINK_RESTART)) {
+            s->rx_desc = uhci_first_desc(value);
+            s->rx_descriptors_seen = 0u;
+            s->rx_desc_loaded = false;
+            s->rx_link_running = true;
+            s->rx_error_cause = 0u;
+            uhci_reset_rx_frame(s);
+        }
+        uhci_kick(p);
+        return;
+    case UHCI_CONF1_OFF:
+        s->regs[off / 4u] = value & UHCI_CONF1_VALID_MASK;
+        if (s->tx_link_running) uhci_arm_tx_event(p, port);
+        return;
+    case UHCI_AHB_TEST_OFF:
+        s->regs[off / 4u] = value & 0x37u;
+        return;
+    case UHCI_ESCAPE_CONF_OFF:
+        s->regs[off / 4u] = value & 0xFFu;
+        return;
+    case UHCI_HUNG_CONF_OFF:
+        s->regs[off / 4u] = value & 0x00FFFFFFu;
+        return;
+    case UHCI_ACK_NUM_OFF:
+        s->regs[off / 4u] = value & 7u;
+        return;
+    case UHCI_QUICK_SENT_OFF:
+        s->regs[off / 4u] = value & 0xFFu;
+        uhci_arm_quick_event(p, port);
+        return;
+    case UHCI_ESC_CONF0_OFF:
+    case UHCI_ESC_CONF1_OFF:
+    case UHCI_ESC_CONF2_OFF:
+    case UHCI_ESC_CONF3_OFF:
+        s->regs[off / 4u] = value & 0x00FFFFFFu;
+        return;
+    case UHCI_PKT_THRES_OFF:
+        s->regs[off / 4u] = value & 0x1FFFu;
+        return;
+    default:
+        s->regs[off / 4u] = value;
+        return;
+    }
+}
+
 /* ---- I2S0/I2S1 + circular lldesc DMA ---- */
 
 static const int i2s_intr_sources[I2S_PORT_COUNT] = {32, 33};
@@ -7056,6 +8487,10 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Both legacy FRC timers reset disabled with count/load/alarm at zero. */
     frc_reset(p);
 
+    /* Both UART DMA controllers reset to the documented H:5 defaults. */
+    for (unsigned port = 0; port < UHCI_PORT_COUNT; port++)
+        uhci_reset_state(p, port);
+
     /* LEDC reset state: all eight timers begin held in reset, and DATE is
      * the ESP32 peripheral version value from the vendor register map. */
     ledc_reset_state(p);
@@ -7085,6 +8520,10 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     mem_register_mmio(mem, (int)PAGE_OF(UART0_BASE), uart_read, uart_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(UART1_BASE), uart_read, uart_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(UART2_BASE), uart_read, uart_write, p);
+
+    /* Dual UART DMA controllers (UHCI0/UHCI1, interrupt sources 12/13). */
+    mem_register_mmio(mem, (int)PAGE_OF(UHCI0_BASE), uhci_read, uhci_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(UHCI1_BASE), uhci_read, uhci_write, p);
 
     /* Two classic ESP32 I2C controllers (interrupt sources 49/50). */
     mem_register_mmio(mem, (int)PAGE_OF(I2C0_BASE), i2c_read, i2c_write, p);
@@ -7256,7 +8695,8 @@ size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
     if (!p || uart_num < 0 || uart_num >= UART_COUNT ||
         (!data && len != 0)) return 0;
     uart_state_t *uart = &p->uart[uart_num];
-    size_t accepted = 0;
+    size_t dma_accepted = uhci_uart_rx_feed(p, uart_num, data, len, true);
+    size_t accepted = dma_accepted;
     while (accepted < len && uart->rx_count < UART_RX_FIFO_SIZE) {
         uart->rx[uart->rx_head] = data[accepted++];
         uart->rx_head = (uint16_t)((uart->rx_head + 1) % UART_RX_FIFO_SIZE);
@@ -7268,12 +8708,17 @@ size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
      * once for short packets; larger bursts also assert the FIFO threshold. */
     uint32_t conf1 = uart->shadow[0x24 / 4];
     uart_refresh_level_conditions(uart);
-    if (accepted > 0 && (conf1 & (1u << 31)))
+    if (accepted > dma_accepted && (conf1 & (1u << 31)))
         uart->int_raw |= UART_RXFIFO_TOUT_INT;
     if (accepted < len)
         uart->int_raw |= UART_RXFIFO_OVF_INT;
     uart_intr_update(p, uart_num);
     return accepted;
+}
+
+bool periph_uart_rx_break_num(esp32_periph_t *p, int uart_num) {
+    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return false;
+    return uhci_uart_rx_break(p, uart_num);
 }
 
 size_t periph_uart_rx_inject(esp32_periph_t *p, const uint8_t *data,
@@ -7434,6 +8879,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     }
     for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
         p->frc_timer[timer].last_cycles = p->timg_clock.cycles;
+    uhci_dport_update(p);
     /* Wire Timer Group, LACT, and other timed-peripheral event hooks into
      * both cores so alarms fire on time and can wake a core from WAITI. */
     for (int i = 0; i < 2; i++) {
