@@ -24,6 +24,15 @@ typedef int (*periph_i2c_device_fn)(void *ctx, int port, uint8_t address,
                                     size_t write_len, uint8_t *read_data,
                                     size_t read_len);
 
+/* Native SDMMC cards expose 512-byte logical sectors to the two-slot host.
+ * Callbacks return zero on success and nonzero for a card-side I/O failure. */
+typedef int (*periph_sdmmc_read_blocks_fn)(void *ctx, uint32_t first_sector,
+                                           uint8_t *data, size_t count);
+typedef int (*periph_sdmmc_write_blocks_fn)(void *ctx,
+                                            uint32_t first_sector,
+                                            const uint8_t *data,
+                                            size_t count);
+
 /* Raw PCM bytes consumed by one classic ESP32 I2S TX DMA descriptor. The
  * buffer is valid only for the duration of the callback. */
 typedef void (*periph_i2s_tx_fn)(void *ctx, int port, const uint8_t *data,
@@ -114,6 +123,17 @@ int  periph_unhandled_count(const esp32_periph_t *p);
  * Passing NULL as fn detaches the address. */
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
                              periph_i2c_device_fn fn, void *ctx);
+
+/* Insert or remove an SDHC card in native SDMMC slot 0/1. sector_count is
+ * rounded down to the CSD-v2 capacity granularity (1024 sectors) when the
+ * card reports its geometry. A NULL read callback detaches the slot. */
+int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,
+                             uint32_t sector_count,
+                             periph_sdmmc_read_blocks_fn read_fn,
+                             periph_sdmmc_write_blocks_fn write_fn,
+                             void *ctx);
+int periph_sdmmc_set_write_protected(esp32_periph_t *p, int slot,
+                                     bool write_protected);
 
 /* Attach a TX audio sink and inject bytes for RX DMA. I2S ports 0/1 are
  * independent; the RX FIFO accepts as many bytes as fit and zero-fills when

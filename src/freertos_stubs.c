@@ -724,6 +724,61 @@ void stub_xQueueSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
     stub_queue_send(cpu, ctx, 0); /* queueSEND_TO_BACK */
 }
 
+static bool dispatch_peripherals_until_queue(freertos_stubs_t *frt,
+                                             xtensa_cpu_t *waiting_cpu,
+                                             uint32_t handle,
+                                             uint64_t budget,
+                                             uint64_t *advanced) {
+    uint64_t elapsed = 0u;
+    for (unsigned dispatched = 0;
+         dispatched < 1024u && elapsed < budget;
+         dispatched++) {
+        xtensa_cpu_t *event_cpu = NULL;
+        uint32_t event = UINT32_MAX;
+        uint32_t distance = UINT32_MAX;
+        for (unsigned core = 0; core < 2u; core++) {
+            xtensa_cpu_t *candidate = frt->cpu[core];
+            if (!candidate || !candidate->periph_next_event ||
+                !candidate->periph_event)
+                continue;
+            uint32_t candidate_event =
+                candidate->periph_next_event(candidate);
+            if (candidate_event == UINT32_MAX) continue;
+            uint32_t candidate_distance =
+                candidate_event - candidate->ccount;
+            if ((int32_t)candidate_distance < 0)
+                candidate_distance = 0u;
+            if (!event_cpu || candidate_distance < distance) {
+                event_cpu = candidate;
+                event = candidate_event;
+                distance = candidate_distance;
+            }
+        }
+        if (!event_cpu || (uint64_t)distance > budget - elapsed) break;
+
+        waiting_cpu->ccount += distance;
+        if (event_cpu != waiting_cpu) event_cpu->ccount += distance;
+        waiting_cpu->virtual_time_us +=
+            distance / frt->cpu_freq_mhz;
+        elapsed += distance;
+        event_cpu->periph_event(event_cpu);
+
+        pthread_mutex_lock(&frt->lock);
+        queue_t *q = find_queue(frt, handle);
+        bool ready = q && q->count != 0;
+        pthread_mutex_unlock(&frt->lock);
+        if (ready) {
+            if (advanced) *advanced = elapsed;
+            return true;
+        }
+        if (distance == 0u &&
+            event_cpu->periph_next_event(event_cpu) == event)
+            break;
+    }
+    if (advanced) *advanced = elapsed;
+    return false;
+}
+
 /* xQueueReceive(queue, buf, timeout) -> pdTRUE/pdFALSE */
 void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
@@ -742,6 +797,25 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
     }
 
     if (q->count == 0) {
+        uint64_t hardware_advance = 0u;
+        uint64_t timeout_cycles = 0u;
+        if (timeout > 0u && timeout != UINT32_MAX) {
+            timeout_cycles = (uint64_t)timeout * frt->cycles_per_tick;
+            if (timeout_cycles > 200000000ULL)
+                timeout_cycles = 200000000ULL;
+            pthread_mutex_unlock(&frt->lock);
+            bool ready = dispatch_peripherals_until_queue(
+                frt, cpu, handle, timeout_cycles, &hardware_advance);
+            pthread_mutex_lock(&frt->lock);
+            q = find_queue(frt, handle);
+            if (!q) {
+                pthread_mutex_unlock(&frt->lock);
+                frt_return(cpu, pdFALSE);
+                return;
+            }
+            if (ready && q->count != 0)
+                goto dequeue_locked;
+        }
         if (frt->scheduler_started && frt->current_task[core_id] >= 0 &&
             timeout > 0) {
             /* Block: unwind call (returning pdFALSE), save, sleep/block, switch */
@@ -764,17 +838,20 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
             return;
         }
         pthread_mutex_unlock(&frt->lock);
-        /* Legacy: advance virtual time and return pdFALSE */
+        /* Boot/compatibility calls do not own a schedulable TCB. Any part of
+         * the timeout not consumed by hardware deadlines advances virtually. */
         if (timeout > 0 && timeout != 0xFFFFFFFFu) {
-            uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
-            if (advance > 200000000ULL) advance = 200000000ULL;
-            cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
-            cpu->ccount += (uint32_t)advance;
+            uint64_t remaining = timeout_cycles > hardware_advance ?
+                timeout_cycles - hardware_advance : 0u;
+            cpu->virtual_time_us += remaining / frt->cpu_freq_mhz;
+            cpu->ccount += (uint32_t)remaining;
         }
         frt_return(cpu, pdFALSE);
         return;
     }
 
+dequeue_locked:
+    ;
     /* Dequeue: copy from queue buffer to emulator memory */
     int offset = q->head * q->item_size;
     for (int i = 0; i < q->item_size; i++)

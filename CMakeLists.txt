@@ -223,4 +223,9 @@ if(UNIX)
     target_link_libraries(flexe-uhci-dma-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-uhci-dma-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-sdmmc-host-test tools/sdmmc_host_test.c)
+    target_link_libraries(flexe-sdmmc-host-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-sdmmc-host-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

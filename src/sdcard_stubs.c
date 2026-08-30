@@ -5,6 +5,7 @@
 #include "sdcard_stubs.h"
 #include "rom_stubs.h"
 #include "memory.h"
+#include "peripherals.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -92,6 +93,35 @@ static int ensure_image_open(sdcard_stubs_t *ss) {
             ss->img_size = target;
     }
     return 0;
+}
+
+static int native_sdmmc_read(void *ctx, uint32_t first_sector,
+                             uint8_t *data, size_t count) {
+    sdcard_stubs_t *ss = ctx;
+    if (!ss || (!data && count != 0u) || ensure_image_open(ss) != 0)
+        return -1;
+    uint64_t end = ((uint64_t)first_sector + count) * 512u;
+    if (end > ss->img_size ||
+        fseek(ss->img_file, (long)first_sector * 512L, SEEK_SET) != 0)
+        return -1;
+    size_t bytes = count * 512u;
+    size_t got = fread(data, 1, bytes, ss->img_file);
+    if (got < bytes) memset(data + got, 0, bytes - got);
+    return 0;
+}
+
+static int native_sdmmc_write(void *ctx, uint32_t first_sector,
+                              const uint8_t *data, size_t count) {
+    sdcard_stubs_t *ss = ctx;
+    if (!ss || (!data && count != 0u) || ensure_image_open(ss) != 0)
+        return -1;
+    uint64_t end = ((uint64_t)first_sector + count) * 512u;
+    if (end > ss->img_size ||
+        fseek(ss->img_file, (long)first_sector * 512L, SEEK_SET) != 0)
+        return -1;
+    size_t bytes = count * 512u;
+    if (fwrite(data, 1, bytes, ss->img_file) != bytes) return -1;
+    return fflush(ss->img_file) == 0 ? 0 : -1;
 }
 
 /* ===== SD card stub implementations ===== */
@@ -484,6 +514,17 @@ void sdcard_stubs_set_image(sdcard_stubs_t *ss, const char *path) {
 void sdcard_stubs_set_size(sdcard_stubs_t *ss, uint64_t size_bytes) {
     if (!ss) return;
     ss->requested_size = size_bytes;
+}
+
+int sdcard_stubs_attach_sdmmc(sdcard_stubs_t *ss, esp32_periph_t *periph) {
+    if (!ss || !periph || !ss->img_path || ensure_image_open(ss) != 0)
+        return -1;
+    uint64_t sectors64 = ss->img_size / 512u;
+    if (sectors64 < 1024u) sectors64 = 1024u;
+    if (sectors64 > UINT32_MAX) sectors64 = UINT32_MAX;
+    return periph_sdmmc_attach_card(periph, 1, (uint32_t)sectors64,
+                                    native_sdmmc_read,
+                                    native_sdmmc_write, ss);
 }
 
 /* ===== FatFs disk I/O stubs (ff_sd_*) ===== */

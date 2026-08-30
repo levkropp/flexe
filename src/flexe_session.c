@@ -206,6 +206,8 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
             sdcard_stubs_set_image(s->sstubs, cfg->sdcard_path);
         if (cfg->sdcard_size > 0)
             sdcard_stubs_set_size(s->sstubs, cfg->sdcard_size);
+        if (cfg->sdcard_path)
+            sdcard_stubs_attach_sdmmc(s->sstubs, s->periph);
         if (s->syms)
             sdcard_stubs_hook_symbols(s->sstubs, s->syms);
     }

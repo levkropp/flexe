@@ -5,6 +5,7 @@
 #include "elf_symbols.h"
 
 typedef struct sdcard_stubs sdcard_stubs_t;
+typedef struct esp32_periph esp32_periph_t;
 
 sdcard_stubs_t *sdcard_stubs_create(xtensa_cpu_t *cpu);
 void sdcard_stubs_destroy(sdcard_stubs_t *ss);
@@ -15,5 +16,9 @@ int sdcard_stubs_hook_symbols(sdcard_stubs_t *ss, const elf_symbols_t *syms);
 /* Set the backing image file path and size (0 = auto-detect from file) */
 void sdcard_stubs_set_image(sdcard_stubs_t *ss, const char *path);
 void sdcard_stubs_set_size(sdcard_stubs_t *ss, uint64_t size_bytes);
+
+/* Expose the same backing image as a native slot-1 SDHC card so firmware
+ * using the real SDMMC host driver can bypass the compatibility hooks. */
+int sdcard_stubs_attach_sdmmc(sdcard_stubs_t *ss, esp32_periph_t *periph);
 
 #endif /* SDCARD_STUBS_H */

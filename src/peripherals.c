@@ -19,6 +19,7 @@
 #define SPI0_BASE       0x3FF43000u
 #define I2C0_BASE       0x3FF53000u
 #define I2C1_BASE       0x3FF67000u
+#define SDMMC_BASE      0x3FF68000u
 #define RMT_BASE        0x3FF56000u
 #define PCNT_BASE       0x3FF57000u
 #define MCPWM0_BASE     0x3FF5E000u
@@ -202,6 +203,128 @@
 #define UHCI_ESC_CONF3_RESET        0x00DFDB13u
 #define UHCI_PKT_THRES_RESET        0x00000080u
 #define UHCI_DATE_RESET             0x16041001u
+
+/* Classic ESP32 DesignWare SD/MMC host. Two logical slots share one command,
+ * FIFO, and internal-DMA engine. The register block extends through the clock
+ * register at +0x800 but remains inside one 4 KiB APB page. */
+#define SDMMC_SLOT_COUNT             2u
+#define SDMMC_REG_FILE_SIZE          0x804u
+#define SDMMC_FIFO_WORDS             32u
+#define SDMMC_INTR_SOURCE            37
+#define SDMMC_DMA_MAX_DESCRIPTORS    256u
+#define SDMMC_TRANSFER_MAX           (16u * 1024u * 1024u)
+
+#define SDMMC_CTRL_OFF               0x000u
+#define SDMMC_PWREN_OFF              0x004u
+#define SDMMC_CLKDIV_OFF             0x008u
+#define SDMMC_CLKSRC_OFF             0x00Cu
+#define SDMMC_CLKENA_OFF             0x010u
+#define SDMMC_TMOUT_OFF              0x014u
+#define SDMMC_CTYPE_OFF              0x018u
+#define SDMMC_BLKSIZ_OFF             0x01Cu
+#define SDMMC_BYTCNT_OFF             0x020u
+#define SDMMC_INTMASK_OFF            0x024u
+#define SDMMC_CMDARG_OFF             0x028u
+#define SDMMC_CMD_OFF                0x02Cu
+#define SDMMC_RESP0_OFF              0x030u
+#define SDMMC_RESP1_OFF              0x034u
+#define SDMMC_RESP2_OFF              0x038u
+#define SDMMC_RESP3_OFF              0x03Cu
+#define SDMMC_MINTSTS_OFF            0x040u
+#define SDMMC_RINTSTS_OFF            0x044u
+#define SDMMC_STATUS_OFF             0x048u
+#define SDMMC_FIFOTH_OFF             0x04Cu
+#define SDMMC_CDETECT_OFF            0x050u
+#define SDMMC_WRTPRT_OFF             0x054u
+#define SDMMC_GPIO_OFF               0x058u
+#define SDMMC_TCBCNT_OFF             0x05Cu
+#define SDMMC_TBBCNT_OFF             0x060u
+#define SDMMC_DEBNCE_OFF             0x064u
+#define SDMMC_USRID_OFF              0x068u
+#define SDMMC_VERID_OFF              0x06Cu
+#define SDMMC_HCON_OFF               0x070u
+#define SDMMC_UHS_OFF                0x074u
+#define SDMMC_RST_N_OFF              0x078u
+#define SDMMC_BMOD_OFF               0x080u
+#define SDMMC_PLDMND_OFF             0x084u
+#define SDMMC_DBADDR_OFF             0x088u
+#define SDMMC_IDSTS_OFF              0x08Cu
+#define SDMMC_IDINTEN_OFF            0x090u
+#define SDMMC_DSCADDR_OFF            0x094u
+#define SDMMC_BUFADDRL_OFF           0x0A0u
+#define SDMMC_CARDTHRCTL_OFF         0x100u
+#define SDMMC_BACK_END_POWER_OFF     0x104u
+#define SDMMC_UHS_EXT_OFF            0x108u
+#define SDMMC_EMMC_DDR_OFF           0x10Cu
+#define SDMMC_ENABLE_SHIFT_OFF       0x110u
+#define SDMMC_FIFO_OFF               0x200u
+#define SDMMC_CLOCK_OFF              0x800u
+
+#define SDMMC_CTRL_CONTROLLER_RESET  (1u << 0)
+#define SDMMC_CTRL_FIFO_RESET        (1u << 1)
+#define SDMMC_CTRL_DMA_RESET         (1u << 2)
+#define SDMMC_CTRL_INT_ENABLE        (1u << 4)
+#define SDMMC_CTRL_DMA_ENABLE        (1u << 5)
+#define SDMMC_CTRL_USE_INTERNAL_DMA  (1u << 25)
+#define SDMMC_CTRL_VALID_MASK        0x03FF0FFFu
+
+#define SDMMC_CMD_INDEX_MASK         0x3Fu
+#define SDMMC_CMD_RESPONSE_EXPECT    (1u << 6)
+#define SDMMC_CMD_RESPONSE_LONG      (1u << 7)
+#define SDMMC_CMD_DATA_EXPECTED      (1u << 9)
+#define SDMMC_CMD_WRITE              (1u << 10)
+#define SDMMC_CMD_SEND_AUTO_STOP     (1u << 12)
+#define SDMMC_CMD_CARD_SHIFT         16u
+#define SDMMC_CMD_CARD_MASK          (0x1Fu << SDMMC_CMD_CARD_SHIFT)
+#define SDMMC_CMD_UPDATE_CLOCK       (1u << 21)
+#define SDMMC_CMD_START              (1u << 31)
+
+#define SDMMC_INT_CARD_DETECT        (1u << 0)
+#define SDMMC_INT_RESP_ERROR         (1u << 1)
+#define SDMMC_INT_CMD_DONE           (1u << 2)
+#define SDMMC_INT_DATA_OVER          (1u << 3)
+#define SDMMC_INT_TXDR               (1u << 4)
+#define SDMMC_INT_RXDR               (1u << 5)
+#define SDMMC_INT_RESP_CRC           (1u << 6)
+#define SDMMC_INT_DATA_CRC           (1u << 7)
+#define SDMMC_INT_RESP_TIMEOUT       (1u << 8)
+#define SDMMC_INT_DATA_TIMEOUT       (1u << 9)
+#define SDMMC_INT_FIFO_RUN           (1u << 11)
+#define SDMMC_INT_HLE                (1u << 12)
+#define SDMMC_INT_AUTO_CMD_DONE      (1u << 14)
+#define SDMMC_INT_VALID_MASK         0xFFFFFFFFu
+
+#define SDMMC_IDSTS_TX               (1u << 0)
+#define SDMMC_IDSTS_RX               (1u << 1)
+#define SDMMC_IDSTS_FATAL_BUS        (1u << 2)
+#define SDMMC_IDSTS_DESC_UNAVAIL     (1u << 4)
+#define SDMMC_IDSTS_CARD_ERROR       (1u << 5)
+#define SDMMC_IDSTS_NORMAL_SUMMARY   (1u << 8)
+#define SDMMC_IDSTS_ABNORMAL_SUMMARY (1u << 9)
+#define SDMMC_IDSTS_VALID_MASK       0x00000337u
+
+#define SDMMC_BMOD_SW_RESET          (1u << 0)
+#define SDMMC_BMOD_ENABLE            (1u << 7)
+
+#define SDMMC_DESC_DIC               (1u << 1)
+#define SDMMC_DESC_LAST              (1u << 2)
+#define SDMMC_DESC_FIRST             (1u << 3)
+#define SDMMC_DESC_CHAINED           (1u << 4)
+#define SDMMC_DESC_END_RING          (1u << 5)
+#define SDMMC_DESC_CARD_ERROR        (1u << 30)
+#define SDMMC_DESC_OWNER             (1u << 31)
+#define SDMMC_DESC_SIZE_MASK         0x1FFFu
+#define SDMMC_DESC_SIZE2_SHIFT       13u
+
+#define SDMMC_STATUS_FIFO_EMPTY      (1u << 2)
+#define SDMMC_STATUS_FIFO_FULL       (1u << 3)
+#define SDMMC_STATUS_CARD_PRESENT    (1u << 8)
+#define SDMMC_STATUS_DATA_BUSY       (1u << 9)
+#define SDMMC_STATUS_DATA_FSM_BUSY   (1u << 10)
+#define SDMMC_STATUS_RESP_SHIFT      11u
+#define SDMMC_STATUS_FIFO_SHIFT      17u
+
+#define SDMMC_VERID_RESET            0x5342240Au
 
 /* Classic ESP32 I2C controller register/FIFO geometry. */
 #define I2C_PORT_COUNT       2
@@ -482,6 +605,10 @@ static size_t uhci_uart_rx_feed(esp32_periph_t *p, int uart_num,
                                 const uint8_t *data, size_t len,
                                 bool idle_after);
 static bool uhci_uart_rx_break(esp32_periph_t *p, int uart_num);
+static uint32_t sdmmc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void sdmmc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void sdmmc_reset_state(esp32_periph_t *p);
+static void sdmmc_dport_update(esp32_periph_t *p);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -703,6 +830,49 @@ typedef struct {
     uint16_t debug_in_count;
     uint16_t debug_in_last;
 } uhci_state_t;
+
+typedef struct {
+    bool attached;
+    bool write_protected;
+    bool ready;
+    bool selected;
+    bool app_cmd;
+    uint16_t rca;
+    uint32_t sector_count;
+    uint32_t block_len;
+    periph_sdmmc_read_blocks_fn read_fn;
+    periph_sdmmc_write_blocks_fn write_fn;
+    void *ctx;
+} sdmmc_card_state_t;
+
+typedef struct {
+    uint32_t regs[(SDMMC_REG_FILE_SIZE + 3u) / sizeof(uint32_t)];
+    uint32_t rintsts;
+    uint32_t idsts;
+    uint32_t fifo[SDMMC_FIFO_WORDS];
+    uint8_t fifo_head;
+    uint8_t fifo_count;
+
+    sdmmc_card_state_t card[SDMMC_SLOT_COUNT];
+
+    uint8_t *transfer;
+    size_t transfer_capacity;
+    size_t transfer_total;
+    size_t transfer_pos;
+    uint32_t transfer_lba;
+    uint32_t transfer_desc;
+    unsigned transfer_descriptors_seen;
+    uint8_t transfer_slot;
+    uint8_t transfer_cmd;
+    bool transfer_write;
+    bool transfer_block_io;
+    bool transfer_auto_stop;
+    bool transfer_dma;
+    bool transfer_active;
+    bool transfer_wait_command_ack;
+    bool transfer_event_armed;
+    uint32_t next_transfer_ccount;
+} sdmmc_state_t;
 
 typedef struct {
     periph_i2c_device_fn fn;
@@ -970,6 +1140,8 @@ struct esp32_periph {
      * peripherals apply their reset semantics when their bit is asserted. */
     uint32_t dport_perip_clk_en;
     uint32_t dport_perip_rst_en;
+    uint32_t dport_wifi_clk_en;
+    uint32_t dport_core_rst_en;
 
     /* Interrupt matrix: maps each CPU interrupt line to a peripheral source.
      * intr_matrix[core][cpu_int] = peripheral source (0-70), 16 = disabled.
@@ -1031,6 +1203,9 @@ struct esp32_periph {
     /* Two independent classic ESP32 I2S controllers with circular DMA. */
     i2s_state_t i2s[I2S_PORT_COUNT];
 
+    /* Dual-slot native SD/MMC host, FIFO, and DesignWare internal DMA. */
+    sdmmc_state_t sdmmc;
+
     /* Eight-channel classic ESP32 remote-control/pulse engine. */
     rmt_state_t rmt;
 
@@ -1089,6 +1264,10 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_CPU_INTR_FROM_CPU_3_OFF 0x0E8
 #define DPORT_PERIP_CLK_EN_OFF         0x0C0
 #define DPORT_PERIP_RST_EN_OFF         0x0C4
+#define DPORT_WIFI_CLK_EN_OFF          0x0CC
+#define DPORT_CORE_RST_EN_OFF          0x0D0
+#define DPORT_SDIO_HOST_CLK_BIT        (1u << 13)
+#define DPORT_SDIO_HOST_RST_BIT        (1u << 6)
 #define DPORT_UHCI0_MODULE_BIT         (1u << 8)
 #define DPORT_RMT_MODULE_BIT           (1u << 9)
 #define DPORT_PCNT_MODULE_BIT          (1u << 10)
@@ -1247,6 +1426,8 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
     case 0x030: return p->app_cpu_in_reset ? 0 : 1; /* APPCPU_CTRL_B: clock enable */
     case DPORT_PERIP_CLK_EN_OFF: return p->dport_perip_clk_en;
     case DPORT_PERIP_RST_EN_OFF: return p->dport_perip_rst_en;
+    case DPORT_WIFI_CLK_EN_OFF: return p->dport_wifi_clk_en;
+    case DPORT_CORE_RST_EN_OFF: return p->dport_core_rst_en;
     case 0x0D4: return p->bt_lpck[0];   /* DPORT_BT_LPCK_DIV_INT */
     case 0x0D8: return p->bt_lpck[1];   /* DPORT_BT_LPCK_DIV_FRAC */
     case 0x040: return 0x0A;        /* PRO_CACHE_CTRL: cache enabled */
@@ -1301,6 +1482,16 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         p->dport_perip_clk_en = val;
         uhci_dport_update(p);
         timg_kick(p);
+        break;
+    case DPORT_WIFI_CLK_EN_OFF:
+        p->dport_wifi_clk_en = val;
+        sdmmc_dport_update(p);
+        break;
+    case DPORT_CORE_RST_EN_OFF:
+        p->dport_core_rst_en = val;
+        if (val & DPORT_SDIO_HOST_RST_BIT)
+            sdmmc_reset_state(p);
+        sdmmc_dport_update(p);
         break;
     case DPORT_PERIP_RST_EN_OFF:
         timg_sync_all_to(p, timg_now_cycles(p));
@@ -2588,6 +2779,7 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
         lact_next_fire(p, cpu),
         frc_next_fire(p, cpu),
         uhci_next_fire(p, cpu),
+        sdmmc_next_fire(p, cpu),
         i2s_next_fire(p, cpu),
         rmt_next_fire(p, cpu),
         ledc_next_fire(p, cpu),
@@ -2616,6 +2808,7 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
         lact_eval_irq(p, group);
     frc_eval_events(p, cpu);
     uhci_eval_events(p, cpu);
+    sdmmc_eval_events(p, cpu);
     i2s_eval_events(p, cpu);
     rmt_eval_events(p, cpu);
     ledc_eval_events(p, cpu);
@@ -7941,6 +8134,797 @@ static void uhci_write(void *ctx, uint32_t addr, uint32_t value) {
     }
 }
 
+/* ---- Native SDMMC host + FIFO/IDMAC ---- */
+
+static bool sdmmc_clocked(const esp32_periph_t *p) {
+    return (p->dport_wifi_clk_en & DPORT_SDIO_HOST_CLK_BIT) != 0u &&
+           (p->dport_core_rst_en & DPORT_SDIO_HOST_RST_BIT) == 0u;
+}
+
+static xtensa_cpu_t *sdmmc_event_cpu(esp32_periph_t *p) {
+    return p->cpu[0] ? p->cpu[0] : p->cpu[1];
+}
+
+static void sdmmc_kick(esp32_periph_t *p) {
+    for (unsigned core = 0; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void sdmmc_irq_update(esp32_periph_t *p) {
+    sdmmc_state_t *s = &p->sdmmc;
+    uint32_t ctrl = s->regs[SDMMC_CTRL_OFF / 4u];
+    uint32_t normal = s->rintsts & s->regs[SDMMC_INTMASK_OFF / 4u];
+    uint32_t dma = s->idsts & s->regs[SDMMC_IDINTEN_OFF / 4u];
+    bool active = sdmmc_clocked(p) && (ctrl & SDMMC_CTRL_INT_ENABLE) &&
+                  (normal != 0u || dma != 0u);
+    if (active)
+        periph_assert_interrupt(p, SDMMC_INTR_SOURCE);
+    else
+        periph_deassert_interrupt(p, SDMMC_INTR_SOURCE);
+}
+
+static void sdmmc_cancel_transfer(sdmmc_state_t *s) {
+    s->transfer_total = 0u;
+    s->transfer_pos = 0u;
+    s->transfer_lba = 0u;
+    s->transfer_desc = 0u;
+    s->transfer_descriptors_seen = 0u;
+    s->transfer_slot = 0u;
+    s->transfer_cmd = 0u;
+    s->transfer_write = false;
+    s->transfer_block_io = false;
+    s->transfer_auto_stop = false;
+    s->transfer_dma = false;
+    s->transfer_active = false;
+    s->transfer_wait_command_ack = false;
+    s->transfer_event_armed = false;
+    s->next_transfer_ccount = 0u;
+}
+
+static void sdmmc_reset_state(esp32_periph_t *p) {
+    if (!p) return;
+    periph_deassert_interrupt(p, SDMMC_INTR_SOURCE);
+    sdmmc_state_t *s = &p->sdmmc;
+    sdmmc_card_state_t cards[SDMMC_SLOT_COUNT];
+    memcpy(cards, s->card, sizeof(cards));
+    uint8_t *transfer = s->transfer;
+    size_t transfer_capacity = s->transfer_capacity;
+    memset(s, 0, sizeof(*s));
+    memcpy(s->card, cards, sizeof(cards));
+    s->transfer = transfer;
+    s->transfer_capacity = transfer_capacity;
+    s->regs[SDMMC_TMOUT_OFF / 4u] = 0xFFFFFFFFu;
+    s->regs[SDMMC_BLKSIZ_OFF / 4u] = 0x200u;
+    s->regs[SDMMC_BYTCNT_OFF / 4u] = 0x200u;
+    s->regs[SDMMC_FIFOTH_OFF / 4u] = 0x00070008u;
+    s->regs[SDMMC_DEBNCE_OFF / 4u] = 0x00FFFFFFu;
+    s->regs[SDMMC_VERID_OFF / 4u] = SDMMC_VERID_RESET;
+    for (unsigned slot = 0; slot < SDMMC_SLOT_COUNT; slot++) {
+        s->card[slot].ready = false;
+        s->card[slot].selected = false;
+        s->card[slot].app_cmd = false;
+        s->card[slot].rca = (uint16_t)(slot + 1u);
+        s->card[slot].block_len = 512u;
+    }
+}
+
+static void sdmmc_dport_update(esp32_periph_t *p) {
+    if (!p) return;
+    if (!sdmmc_clocked(p)) {
+        p->sdmmc.transfer_event_armed = false;
+        periph_deassert_interrupt(p, SDMMC_INTR_SOURCE);
+    } else {
+        sdmmc_irq_update(p);
+    }
+    sdmmc_kick(p);
+}
+
+static uint32_t sdmmc_card_detect(const sdmmc_state_t *s) {
+    uint32_t value = 0u;
+    for (unsigned slot = 0; slot < SDMMC_SLOT_COUNT; slot++)
+        if (!s->card[slot].attached) value |= 1u << slot;
+    return value;
+}
+
+static uint32_t sdmmc_write_protect(const sdmmc_state_t *s) {
+    uint32_t value = 0u;
+    for (unsigned slot = 0; slot < SDMMC_SLOT_COUNT; slot++)
+        if (s->card[slot].write_protected ||
+            (s->card[slot].attached && !s->card[slot].write_fn))
+            value |= 1u << slot;
+    return value;
+}
+
+static uint32_t sdmmc_status(const sdmmc_state_t *s) {
+    uint32_t value = 0u;
+    if (s->fifo_count == 0u) value |= SDMMC_STATUS_FIFO_EMPTY;
+    if (s->fifo_count >= SDMMC_FIFO_WORDS) value |= SDMMC_STATUS_FIFO_FULL;
+    if (s->card[0].attached || s->card[1].attached)
+        value |= SDMMC_STATUS_CARD_PRESENT;
+    if (s->transfer_active)
+        value |= SDMMC_STATUS_DATA_BUSY | SDMMC_STATUS_DATA_FSM_BUSY;
+    value |= ((uint32_t)s->transfer_cmd & 0x3Fu) <<
+             SDMMC_STATUS_RESP_SHIFT;
+    value |= ((uint32_t)s->fifo_count & 0x1FFFu) <<
+             SDMMC_STATUS_FIFO_SHIFT;
+    uint32_t fifoth = s->regs[SDMMC_FIFOTH_OFF / 4u];
+    uint32_t tx_watermark = fifoth & 0xFFFu;
+    uint32_t rx_watermark = (fifoth >> 16) & 0xFFFu;
+    if (s->fifo_count <= tx_watermark) value |= 1u << 1;
+    if (s->fifo_count > rx_watermark) value |= 1u;
+    return value;
+}
+
+static void sdmmc_resp_set_bits(uint32_t response[4], unsigned start,
+                                unsigned len, uint32_t value) {
+    if (len == 0u || len > 32u || start >= 128u || start + len > 128u)
+        return;
+    uint32_t mask = len == 32u ? UINT32_MAX : (1u << len) - 1u;
+    value &= mask;
+    unsigned word = start / 32u;
+    unsigned shift = start % 32u;
+    response[word] &= ~(mask << shift);
+    response[word] |= value << shift;
+    if (shift + len > 32u) {
+        unsigned high_len = shift + len - 32u;
+        uint32_t high_mask = high_len == 32u ? UINT32_MAX :
+                             (1u << high_len) - 1u;
+        response[word + 1u] &= ~high_mask;
+        response[word + 1u] |= value >> (32u - shift);
+    }
+}
+
+static void sdmmc_set_response(sdmmc_state_t *s,
+                               const uint32_t response[4]) {
+    for (unsigned index = 0; index < 4u; index++)
+        s->regs[(SDMMC_RESP0_OFF / 4u) + index] = response[index];
+}
+
+static uint32_t sdmmc_r1_status(const sdmmc_card_state_t *card,
+                                bool app_cmd) {
+    uint32_t state = card->selected ? 4u : card->ready ? 3u : 0u;
+    return (state << 9) | (card->ready ? 1u << 8 : 0u) |
+           (app_cmd ? 1u << 5 : 0u);
+}
+
+static void sdmmc_csd_response(const sdmmc_card_state_t *card,
+                               uint32_t response[4]) {
+    memset(response, 0, 4u * sizeof(uint32_t));
+    uint32_t sectors = card->sector_count < 1024u ? 1024u :
+                       card->sector_count;
+    uint32_t c_size = sectors / 1024u - 1u;
+    if (c_size > 0x3FFFFFu) c_size = 0x3FFFFFu;
+    sdmmc_resp_set_bits(response, 126u, 2u, 1u);     /* CSD v2 */
+    sdmmc_resp_set_bits(response, 112u, 8u, 0x0Eu); /* TAAC */
+    sdmmc_resp_set_bits(response, 96u, 8u, 0x32u);  /* 25 MHz */
+    sdmmc_resp_set_bits(response, 84u, 12u, 0x5B5u);
+    sdmmc_resp_set_bits(response, 80u, 4u, 9u);     /* 512-byte block */
+    sdmmc_resp_set_bits(response, 48u, 22u, c_size);
+    sdmmc_resp_set_bits(response, 46u, 1u, 1u);     /* sector erase */
+    sdmmc_resp_set_bits(response, 39u, 7u, 0x7Fu);
+    sdmmc_resp_set_bits(response, 22u, 4u, 9u);
+}
+
+static void sdmmc_cid_response(unsigned slot, uint32_t response[4]) {
+    static const char name[5] = {'F', 'L', 'E', 'X', 'E'};
+    memset(response, 0, 4u * sizeof(uint32_t));
+    sdmmc_resp_set_bits(response, 120u, 8u, 0xF1u);
+    sdmmc_resp_set_bits(response, 104u, 16u, 0x4658u); /* FX */
+    for (unsigned index = 0; index < 5u; index++)
+        sdmmc_resp_set_bits(response, 96u - index * 8u, 8u,
+                            (uint8_t)name[index]);
+    sdmmc_resp_set_bits(response, 56u, 8u, 0x10u);
+    sdmmc_resp_set_bits(response, 24u, 32u, 0xF1E00000u | slot);
+    sdmmc_resp_set_bits(response, 8u, 12u, 0x1A8u);
+}
+
+static bool sdmmc_ensure_transfer(sdmmc_state_t *s, size_t size) {
+    if (size > SDMMC_TRANSFER_MAX) return false;
+    if (size <= s->transfer_capacity) return true;
+    uint8_t *next = realloc(s->transfer, size);
+    if (!next) return false;
+    s->transfer = next;
+    s->transfer_capacity = size;
+    return true;
+}
+
+static bool sdmmc_card_range_valid(const sdmmc_card_state_t *card,
+                                    uint32_t lba, size_t count) {
+    return card->attached && count <= card->sector_count &&
+           lba <= card->sector_count - count;
+}
+
+static void sdmmc_fill_scr(uint8_t *data, size_t len) {
+    uint64_t scr = (uint64_t)2u << 56 | (uint64_t)5u << 48 |
+                   (uint64_t)1u << 47 | (uint64_t)1u << 33;
+    memset(data, 0, len);
+    for (unsigned index = 0; index < 8u && index < len; index++)
+        data[index] = (uint8_t)(scr >> (56u - index * 8u));
+}
+
+static bool sdmmc_prepare_transfer(esp32_periph_t *p, unsigned slot,
+                                    unsigned command, uint32_t argument,
+                                    bool write, bool block_io) {
+    sdmmc_state_t *s = &p->sdmmc;
+    sdmmc_card_state_t *card = &s->card[slot];
+    size_t total = s->regs[SDMMC_BYTCNT_OFF / 4u];
+    if (total == 0u || !sdmmc_ensure_transfer(s, total)) return false;
+    memset(s->transfer, 0, total);
+
+    uint32_t lba = argument;
+    if (block_io) {
+        if ((total % 512u) != 0u) return false;
+        size_t blocks = total / 512u;
+        if (!sdmmc_card_range_valid(card, lba, blocks)) return false;
+        if (!write && (!card->read_fn ||
+            card->read_fn(card->ctx, lba, s->transfer, blocks) != 0))
+            return false;
+    } else if (!write) {
+        if (command == 51u) {
+            sdmmc_fill_scr(s->transfer, total);
+        } else if (command == 6u && total >= 64u) {
+            /* A zeroed SWITCH_FUNC status reports no optional high-speed
+             * functions while preserving mandatory default-speed operation. */
+            memset(s->transfer, 0, total);
+        } else if (command == 13u) {
+            memset(s->transfer, 0, total); /* SD status */
+        }
+    }
+
+    s->transfer_total = total;
+    s->transfer_pos = 0u;
+    s->transfer_lba = lba;
+    s->transfer_desc = s->regs[SDMMC_DBADDR_OFF / 4u];
+    s->transfer_descriptors_seen = 0u;
+    s->transfer_slot = (uint8_t)slot;
+    s->transfer_cmd = (uint8_t)command;
+    s->transfer_write = write;
+    s->transfer_block_io = block_io;
+    s->transfer_auto_stop =
+        (s->regs[SDMMC_CMD_OFF / 4u] & SDMMC_CMD_SEND_AUTO_STOP) != 0u;
+    s->transfer_dma =
+        (s->regs[SDMMC_CTRL_OFF / 4u] &
+         (SDMMC_CTRL_DMA_ENABLE | SDMMC_CTRL_USE_INTERNAL_DMA)) ==
+            (SDMMC_CTRL_DMA_ENABLE | SDMMC_CTRL_USE_INTERNAL_DMA) &&
+        (s->regs[SDMMC_BMOD_OFF / 4u] & SDMMC_BMOD_ENABLE) != 0u;
+    s->transfer_active = true;
+    s->transfer_wait_command_ack = s->transfer_dma;
+    s->transfer_event_armed = false;
+    s->fifo_head = 0u;
+    s->fifo_count = 0u;
+    return true;
+}
+
+static bool sdmmc_commit_write(sdmmc_state_t *s) {
+    if (!s->transfer_write || !s->transfer_block_io) return true;
+    sdmmc_card_state_t *card = &s->card[s->transfer_slot];
+    size_t blocks = s->transfer_total / 512u;
+    return card->write_fn && !card->write_protected &&
+           card->write_fn(card->ctx, s->transfer_lba,
+                          s->transfer, blocks) == 0;
+}
+
+static void sdmmc_finish_transfer(esp32_periph_t *p, bool success) {
+    sdmmc_state_t *s = &p->sdmmc;
+    if (success && !sdmmc_commit_write(s)) success = false;
+    if (success) {
+        s->rintsts |= SDMMC_INT_DATA_OVER;
+        if (s->transfer_auto_stop)
+            s->rintsts |= SDMMC_INT_AUTO_CMD_DONE;
+    } else {
+        s->rintsts |= SDMMC_INT_DATA_CRC;
+        s->idsts |= SDMMC_IDSTS_CARD_ERROR |
+                    SDMMC_IDSTS_ABNORMAL_SUMMARY;
+    }
+    s->transfer_active = false;
+    s->transfer_wait_command_ack = false;
+    s->transfer_event_armed = false;
+    s->regs[SDMMC_TCBCNT_OFF / 4u] = (uint32_t)s->transfer_pos;
+    s->regs[SDMMC_TBBCNT_OFF / 4u] = (uint32_t)s->transfer_pos;
+    sdmmc_irq_update(p);
+    sdmmc_kick(p);
+}
+
+static bool sdmmc_dma_range_mapped(esp32_periph_t *p, uint32_t addr,
+                                    size_t len, bool writable) {
+    while (len != 0u) {
+        size_t page_left = 0x1000u - (addr & 0xFFFu);
+        size_t chunk = len < page_left ? len : page_left;
+        const uint8_t *ptr = writable ? mem_get_ptr_w(p->mem, addr) :
+                                        mem_get_ptr(p->mem, addr);
+        if (!ptr) return false;
+        addr += (uint32_t)chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+static bool sdmmc_dma_copy_buffer(esp32_periph_t *p, uint32_t addr,
+                                   size_t size) {
+    sdmmc_state_t *s = &p->sdmmc;
+    size_t remaining = s->transfer_total - s->transfer_pos;
+    if (size > remaining) size = remaining;
+    if (size == 0u) return true;
+    if ((addr & 3u) != 0u ||
+        !sdmmc_dma_range_mapped(p, addr, size, !s->transfer_write))
+        return false;
+    for (size_t index = 0; index < size; index++) {
+        if (s->transfer_write)
+            s->transfer[s->transfer_pos + index] =
+                mem_read8(p->mem, addr + (uint32_t)index);
+        else
+            mem_write8(p->mem, addr + (uint32_t)index,
+                       s->transfer[s->transfer_pos + index]);
+    }
+    s->transfer_pos += size;
+    s->regs[SDMMC_BUFADDRL_OFF / 4u] = addr + (uint32_t)size;
+    s->regs[SDMMC_TCBCNT_OFF / 4u] = (uint32_t)s->transfer_pos;
+    s->regs[SDMMC_TBBCNT_OFF / 4u] = (uint32_t)s->transfer_pos;
+    return true;
+}
+
+static void sdmmc_dma_error(esp32_periph_t *p, uint32_t desc,
+                            uint32_t idsts) {
+    sdmmc_state_t *s = &p->sdmmc;
+    if ((desc & 3u) == 0u &&
+        sdmmc_dma_range_mapped(p, desc, 4u, true)) {
+        uint32_t ctrl = mem_read32(p->mem, desc);
+        mem_write32(p->mem, desc,
+                    (ctrl & ~SDMMC_DESC_OWNER) | SDMMC_DESC_CARD_ERROR);
+    }
+    s->regs[SDMMC_DSCADDR_OFF / 4u] = desc;
+    s->idsts |= idsts | SDMMC_IDSTS_ABNORMAL_SUMMARY;
+    s->rintsts |= SDMMC_INT_FIFO_RUN;
+    s->transfer_active = false;
+    s->transfer_event_armed = false;
+    sdmmc_irq_update(p);
+    sdmmc_kick(p);
+}
+
+static void sdmmc_arm_transfer(esp32_periph_t *p) {
+    sdmmc_state_t *s = &p->sdmmc;
+    xtensa_cpu_t *cpu = sdmmc_event_cpu(p);
+    if (!cpu || !sdmmc_clocked(p) || !s->transfer_active ||
+        !s->transfer_dma || s->transfer_wait_command_ack ||
+        s->transfer_event_armed)
+        return;
+    /* A 4 KiB descriptor needs about 65k CPU cycles on a 20 MHz, four-bit
+     * default-speed bus.  Keeping that wire-time lower bound matters for the
+     * stock ESP-IDF four-entry ring: its task refills a completed descriptor
+     * after the ISR reports RI/TI, before IDMAC can wrap back to it. */
+    uint32_t bytes = 0u;
+    uint32_t desc = s->transfer_desc;
+    if ((desc & 3u) == 0u &&
+        sdmmc_dma_range_mapped(p, desc, 16u, false)) {
+        uint32_t ctrl = mem_read32(p->mem, desc);
+        uint32_t sizes = mem_read32(p->mem, desc + 4u);
+        bytes = sizes & SDMMC_DESC_SIZE_MASK;
+        if (!(ctrl & SDMMC_DESC_CHAINED))
+            bytes += (sizes >> SDMMC_DESC_SIZE2_SHIFT) &
+                     SDMMC_DESC_SIZE_MASK;
+    }
+    uint32_t delay = bytes > UINT32_MAX / 16u ? UINT32_MAX : bytes * 16u;
+    if (delay < 2048u) delay = 2048u;
+    s->next_transfer_ccount = cpu->ccount + delay;
+    s->transfer_event_armed = true;
+    sdmmc_kick(p);
+}
+
+static void sdmmc_process_descriptor(esp32_periph_t *p) {
+    sdmmc_state_t *s = &p->sdmmc;
+    uint32_t desc = s->transfer_desc;
+    if (!s->transfer_active || !s->transfer_dma) return;
+    if (++s->transfer_descriptors_seen > SDMMC_DMA_MAX_DESCRIPTORS ||
+        (desc & 3u) != 0u ||
+        !sdmmc_dma_range_mapped(p, desc, 16u, true)) {
+        sdmmc_dma_error(p, desc, SDMMC_IDSTS_FATAL_BUS);
+        return;
+    }
+    uint32_t ctrl = mem_read32(p->mem, desc);
+    uint32_t sizes = mem_read32(p->mem, desc + 4u);
+    uint32_t buffer1 = mem_read32(p->mem, desc + 8u);
+    uint32_t fourth = mem_read32(p->mem, desc + 12u);
+    size_t size1 = sizes & SDMMC_DESC_SIZE_MASK;
+    size_t size2 = (sizes >> SDMMC_DESC_SIZE2_SHIFT) &
+                   SDMMC_DESC_SIZE_MASK;
+    s->regs[SDMMC_DSCADDR_OFF / 4u] = desc;
+    if (!(ctrl & SDMMC_DESC_OWNER) || (size1 == 0u && size2 == 0u)) {
+        sdmmc_dma_error(p, desc, SDMMC_IDSTS_DESC_UNAVAIL);
+        return;
+    }
+
+    bool ok = sdmmc_dma_copy_buffer(p, buffer1, size1);
+    if (ok && !(ctrl & SDMMC_DESC_CHAINED) && size2 != 0u)
+        ok = sdmmc_dma_copy_buffer(p, fourth, size2);
+    bool final = (ctrl & SDMMC_DESC_LAST) != 0u ||
+                 s->transfer_pos >= s->transfer_total;
+    uint32_t writeback = ctrl & ~SDMMC_DESC_OWNER;
+    if (!ok) writeback |= SDMMC_DESC_CARD_ERROR;
+    mem_write32(p->mem, desc, writeback);
+    if (!ok) {
+        sdmmc_dma_error(p, desc, SDMMC_IDSTS_FATAL_BUS);
+        return;
+    }
+
+    uint32_t completion = s->transfer_write ? SDMMC_IDSTS_TX :
+                                                  SDMMC_IDSTS_RX;
+    bool interrupt = (ctrl & SDMMC_DESC_DIC) == 0u || final;
+    if (interrupt)
+        s->idsts |= completion | SDMMC_IDSTS_NORMAL_SUMMARY;
+
+    if (final) {
+        if (s->transfer_pos != s->transfer_total) {
+            sdmmc_dma_error(p, desc, SDMMC_IDSTS_DESC_UNAVAIL);
+            return;
+        }
+        sdmmc_finish_transfer(p, true);
+        return;
+    }
+
+    uint32_t next;
+    if (ctrl & SDMMC_DESC_CHAINED) {
+        next = fourth;
+    } else if (ctrl & SDMMC_DESC_END_RING) {
+        next = s->regs[SDMMC_DBADDR_OFF / 4u];
+    } else {
+        uint32_t skip = (s->regs[SDMMC_BMOD_OFF / 4u] >> 2) & 0x1Fu;
+        next = desc + 16u + skip * 4u;
+    }
+    if (next == 0u || next == desc) {
+        sdmmc_dma_error(p, desc, SDMMC_IDSTS_DESC_UNAVAIL);
+        return;
+    }
+    s->transfer_desc = next;
+    if (!interrupt) sdmmc_arm_transfer(p);
+    sdmmc_irq_update(p);
+}
+
+static void sdmmc_fifo_fill_read(esp32_periph_t *p) {
+    sdmmc_state_t *s = &p->sdmmc;
+    while (s->fifo_count < SDMMC_FIFO_WORDS &&
+           s->transfer_pos < s->transfer_total) {
+        uint32_t word = 0u;
+        for (unsigned byte = 0; byte < 4u &&
+             s->transfer_pos < s->transfer_total; byte++)
+            word |= (uint32_t)s->transfer[s->transfer_pos++] << (byte * 8u);
+        unsigned tail = (s->fifo_head + s->fifo_count) % SDMMC_FIFO_WORDS;
+        s->fifo[tail] = word;
+        s->fifo_count++;
+    }
+    if (s->fifo_count != 0u) s->rintsts |= SDMMC_INT_RXDR;
+    sdmmc_irq_update(p);
+}
+
+static uint32_t sdmmc_fifo_read(esp32_periph_t *p) {
+    sdmmc_state_t *s = &p->sdmmc;
+    if (s->fifo_count == 0u) {
+        s->rintsts |= SDMMC_INT_FIFO_RUN;
+        sdmmc_irq_update(p);
+        return 0u;
+    }
+    uint32_t value = s->fifo[s->fifo_head];
+    s->fifo_head = (uint8_t)((s->fifo_head + 1u) % SDMMC_FIFO_WORDS);
+    s->fifo_count--;
+    if (s->fifo_count == 0u) {
+        s->rintsts &= ~SDMMC_INT_RXDR;
+        if (s->transfer_active && !s->transfer_dma &&
+            !s->transfer_write) {
+            if (s->transfer_pos < s->transfer_total)
+                sdmmc_fifo_fill_read(p);
+            else
+                sdmmc_finish_transfer(p, true);
+        }
+    }
+    return value;
+}
+
+static void sdmmc_fifo_write(esp32_periph_t *p, uint32_t value) {
+    sdmmc_state_t *s = &p->sdmmc;
+    if (!s->transfer_active || s->transfer_dma || !s->transfer_write) {
+        if (s->fifo_count >= SDMMC_FIFO_WORDS) {
+            s->rintsts |= SDMMC_INT_FIFO_RUN;
+            sdmmc_irq_update(p);
+            return;
+        }
+        unsigned tail = (s->fifo_head + s->fifo_count) % SDMMC_FIFO_WORDS;
+        s->fifo[tail] = value;
+        s->fifo_count++;
+        return;
+    }
+    for (unsigned byte = 0; byte < 4u &&
+         s->transfer_pos < s->transfer_total; byte++)
+        s->transfer[s->transfer_pos++] = (uint8_t)(value >> (byte * 8u));
+    if (s->transfer_pos >= s->transfer_total) {
+        s->rintsts &= ~SDMMC_INT_TXDR;
+        sdmmc_finish_transfer(p, true);
+    } else {
+        s->rintsts |= SDMMC_INT_TXDR;
+        sdmmc_irq_update(p);
+    }
+}
+
+static void sdmmc_execute_command(esp32_periph_t *p, uint32_t value) {
+    sdmmc_state_t *s = &p->sdmmc;
+    s->regs[SDMMC_CMD_OFF / 4u] = value & ~SDMMC_CMD_START;
+    if (!(value & SDMMC_CMD_START)) return;
+    if (value & SDMMC_CMD_UPDATE_CLOCK) {
+        sdmmc_irq_update(p);
+        return;
+    }
+
+    unsigned command = value & SDMMC_CMD_INDEX_MASK;
+    unsigned slot = (value & SDMMC_CMD_CARD_MASK) >> SDMMC_CMD_CARD_SHIFT;
+    uint32_t argument = s->regs[SDMMC_CMDARG_OFF / 4u];
+    s->transfer_cmd = (uint8_t)command;
+    uint32_t response[4] = {0u, 0u, 0u, 0u};
+    uint32_t status = SDMMC_INT_CMD_DONE;
+    bool data = (value & SDMMC_CMD_DATA_EXPECTED) != 0u;
+
+    if (slot >= SDMMC_SLOT_COUNT || !s->card[slot].attached) {
+        if (value & SDMMC_CMD_RESPONSE_EXPECT)
+            status |= SDMMC_INT_RESP_TIMEOUT;
+        s->rintsts |= status;
+        sdmmc_irq_update(p);
+        return;
+    }
+
+    sdmmc_card_state_t *card = &s->card[slot];
+    bool was_app = card->app_cmd;
+    if (command != 55u) card->app_cmd = false;
+
+    switch (command) {
+    case 0: /* GO_IDLE_STATE */
+        card->ready = false;
+        card->selected = false;
+        card->app_cmd = false;
+        card->block_len = 512u;
+        break;
+    case 1: /* MMC SEND_OP_COND compatibility */
+        card->ready = true;
+        response[0] = 0xC0FF8000u;
+        break;
+    case 2: /* ALL_SEND_CID */
+    case 10: /* SEND_CID */
+        sdmmc_cid_response(slot, response);
+        break;
+    case 3: /* SEND_RELATIVE_ADDR */
+        if ((argument >> 16) != 0u) card->rca = (uint16_t)(argument >> 16);
+        card->ready = true;
+        response[0] = (uint32_t)card->rca << 16 |
+                      sdmmc_r1_status(card, false);
+        break;
+    case 5: /* no SDIO functions on the attached memory card */
+        status |= SDMMC_INT_RESP_TIMEOUT;
+        break;
+    case 6:
+        response[0] = sdmmc_r1_status(card, false);
+        if (!was_app && data &&
+            !sdmmc_prepare_transfer(p, slot, command, argument, false, false))
+            status |= SDMMC_INT_DATA_TIMEOUT;
+        break;
+    case 7: /* SELECT/DESELECT_CARD */
+        card->selected = argument != 0u;
+        response[0] = sdmmc_r1_status(card, false);
+        break;
+    case 8: /* SEND_IF_COND (SD); EXT_CSD is not exposed by an SD card */
+        response[0] = argument & 0xFFFu;
+        break;
+    case 9: /* SEND_CSD */
+        sdmmc_csd_response(card, response);
+        break;
+    case 11: /* VOLTAGE_SWITCH */
+    case 12: /* STOP_TRANSMISSION */
+        response[0] = sdmmc_r1_status(card, false);
+        break;
+    case 13:
+        response[0] = sdmmc_r1_status(card, false);
+        if (was_app && data &&
+            !sdmmc_prepare_transfer(p, slot, command, argument, false, false))
+            status |= SDMMC_INT_DATA_TIMEOUT;
+        break;
+    case 16: /* SET_BLOCKLEN */
+        if (argument != 0u && argument <= 4096u) card->block_len = argument;
+        response[0] = sdmmc_r1_status(card, false);
+        break;
+    case 17: /* READ_SINGLE_BLOCK */
+    case 18: /* READ_MULTIPLE_BLOCK */
+        response[0] = sdmmc_r1_status(card, false);
+        if (!data || !sdmmc_prepare_transfer(p, slot, command, argument,
+                                              false, true))
+            status |= SDMMC_INT_DATA_TIMEOUT;
+        break;
+    case 23: /* SET_BLOCK_COUNT / ACMD23 */
+        response[0] = sdmmc_r1_status(card, false);
+        break;
+    case 24: /* WRITE_BLOCK */
+    case 25: /* WRITE_MULTIPLE_BLOCK */
+        response[0] = sdmmc_r1_status(card, false);
+        if (!data || card->write_protected || !card->write_fn ||
+            !sdmmc_prepare_transfer(p, slot, command, argument, true, true))
+            status |= SDMMC_INT_DATA_TIMEOUT;
+        break;
+    case 41: /* ACMD41 SD_SEND_OP_COND */
+        if (!was_app) {
+            status |= SDMMC_INT_RESP_ERROR;
+        } else {
+            card->ready = true;
+            response[0] = 0xC0FF8000u;
+        }
+        break;
+    case 42: /* ACMD42 SET_CLR_CARD_DETECT */
+        response[0] = sdmmc_r1_status(card, false);
+        break;
+    case 51: /* ACMD51 SEND_SCR */
+        response[0] = sdmmc_r1_status(card, false);
+        if (!was_app || !data ||
+            !sdmmc_prepare_transfer(p, slot, command, argument, false, false))
+            status |= SDMMC_INT_DATA_TIMEOUT;
+        break;
+    case 55: /* APP_CMD */
+        card->app_cmd = true;
+        response[0] = sdmmc_r1_status(card, true);
+        break;
+    default:
+        response[0] = sdmmc_r1_status(card, false) | (1u << 22);
+        status |= SDMMC_INT_RESP_ERROR;
+        break;
+    }
+
+    sdmmc_set_response(s, response);
+    if (status & SDMMC_INT_DATA_TIMEOUT) {
+        sdmmc_cancel_transfer(s);
+        status |= SDMMC_INT_DATA_OVER;
+    }
+    s->rintsts |= status;
+    if (s->transfer_active && !s->transfer_dma) {
+        s->transfer_wait_command_ack = false;
+        if (s->transfer_write)
+            s->rintsts |= SDMMC_INT_TXDR;
+        else
+            sdmmc_fifo_fill_read(p);
+    }
+    sdmmc_irq_update(p);
+    sdmmc_kick(p);
+}
+
+static uint32_t sdmmc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != sdmmc_event_cpu(p) || !sdmmc_clocked(p))
+        return UINT32_MAX;
+
+    sdmmc_state_t *s = &p->sdmmc;
+    if (!s->transfer_event_armed) return UINT32_MAX;
+    return s->next_transfer_ccount;
+}
+
+static void sdmmc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != sdmmc_event_cpu(p) || !sdmmc_clocked(p))
+        return;
+
+    sdmmc_state_t *s = &p->sdmmc;
+    if (!s->transfer_event_armed ||
+        (int32_t)(cpu->ccount - s->next_transfer_ccount) < 0)
+        return;
+    s->transfer_event_armed = false;
+    sdmmc_process_descriptor(p);
+}
+
+static uint32_t sdmmc_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    sdmmc_state_t *s = &p->sdmmc;
+    uint32_t off = addr - SDMMC_BASE;
+    xtensa_cpu_t *cpu = sdmmc_event_cpu(p);
+    if (cpu) sdmmc_eval_events(p, cpu);
+    if ((off & 3u) != 0u || off >= SDMMC_REG_FILE_SIZE)
+        return default_read(ctx, addr);
+    if (off >= SDMMC_FIFO_OFF && off < SDMMC_FIFO_OFF + 0x80u)
+        return sdmmc_fifo_read(p);
+    switch (off) {
+    case SDMMC_MINTSTS_OFF:
+        return s->rintsts & s->regs[SDMMC_INTMASK_OFF / 4u];
+    case SDMMC_RINTSTS_OFF: return s->rintsts;
+    case SDMMC_STATUS_OFF: return sdmmc_status(s);
+    case SDMMC_CDETECT_OFF: return sdmmc_card_detect(s);
+    case SDMMC_WRTPRT_OFF: return sdmmc_write_protect(s);
+    case SDMMC_IDSTS_OFF: return s->idsts;
+    default: return s->regs[off / 4u];
+    }
+}
+
+static void sdmmc_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    sdmmc_state_t *s = &p->sdmmc;
+    uint32_t off = addr - SDMMC_BASE;
+    xtensa_cpu_t *cpu = sdmmc_event_cpu(p);
+    if (cpu) sdmmc_eval_events(p, cpu);
+    if ((off & 3u) != 0u || off >= SDMMC_REG_FILE_SIZE) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    if (off >= SDMMC_FIFO_OFF && off < SDMMC_FIFO_OFF + 0x80u) {
+        sdmmc_fifo_write(p, value);
+        return;
+    }
+    switch (off) {
+    case SDMMC_CTRL_OFF: {
+        uint32_t reset = value & (SDMMC_CTRL_CONTROLLER_RESET |
+                                  SDMMC_CTRL_FIFO_RESET |
+                                  SDMMC_CTRL_DMA_RESET);
+        if (reset & SDMMC_CTRL_CONTROLLER_RESET) {
+            sdmmc_reset_state(p);
+            s = &p->sdmmc;
+        }
+        if (reset & SDMMC_CTRL_FIFO_RESET) {
+            s->fifo_head = 0u;
+            s->fifo_count = 0u;
+        }
+        if (reset & SDMMC_CTRL_DMA_RESET)
+            sdmmc_cancel_transfer(s);
+        s->regs[off / 4u] = value & SDMMC_CTRL_VALID_MASK & ~reset;
+        sdmmc_irq_update(p);
+        sdmmc_kick(p);
+        return;
+    }
+    case SDMMC_CMD_OFF:
+        s->regs[off / 4u] = value;
+        if (sdmmc_clocked(p)) sdmmc_execute_command(p, value);
+        return;
+    case SDMMC_RINTSTS_OFF: {
+        uint32_t cleared = value & SDMMC_INT_VALID_MASK;
+        s->rintsts &= ~cleared;
+        if (s->transfer_active && s->transfer_dma &&
+            s->transfer_wait_command_ack &&
+            (cleared & SDMMC_INT_CMD_DONE)) {
+            s->transfer_wait_command_ack = false;
+            sdmmc_arm_transfer(p);
+        }
+        sdmmc_irq_update(p);
+        return;
+    }
+    case SDMMC_IDSTS_OFF:
+        s->idsts &= ~(value & SDMMC_IDSTS_VALID_MASK);
+        if (s->transfer_active && s->transfer_dma &&
+            s->idsts == 0u)
+            sdmmc_arm_transfer(p);
+        sdmmc_irq_update(p);
+        return;
+    case SDMMC_INTMASK_OFF:
+        s->regs[off / 4u] = value;
+        sdmmc_irq_update(p);
+        return;
+    case SDMMC_IDINTEN_OFF:
+        s->regs[off / 4u] = value & SDMMC_IDSTS_VALID_MASK;
+        sdmmc_irq_update(p);
+        return;
+    case SDMMC_BMOD_OFF:
+        s->regs[off / 4u] = value & ~SDMMC_BMOD_SW_RESET;
+        if (value & SDMMC_BMOD_SW_RESET) s->idsts = 0u;
+        sdmmc_irq_update(p);
+        return;
+    case SDMMC_PLDMND_OFF:
+        s->regs[off / 4u] = value;
+        if (value != 0u) sdmmc_arm_transfer(p);
+        return;
+    case SDMMC_MINTSTS_OFF:
+    case SDMMC_STATUS_OFF:
+    case SDMMC_CDETECT_OFF:
+    case SDMMC_WRTPRT_OFF:
+    case SDMMC_RESP0_OFF:
+    case SDMMC_RESP1_OFF:
+    case SDMMC_RESP2_OFF:
+    case SDMMC_RESP3_OFF:
+    case SDMMC_TCBCNT_OFF:
+    case SDMMC_TBBCNT_OFF:
+    case SDMMC_VERID_OFF:
+    case SDMMC_HCON_OFF:
+    case SDMMC_DSCADDR_OFF:
+    case SDMMC_BUFADDRL_OFF:
+        return;
+    default:
+        s->regs[off / 4u] = value;
+        return;
+    }
+}
+
 /* ---- I2S0/I2S1 + circular lldesc DMA ---- */
 
 static const int i2s_intr_sources[I2S_PORT_COUNT] = {32, 33};
@@ -8442,6 +9426,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     if (!p) return NULL;
     p->mem = mem;
     p->app_cpu_in_reset = true;
+    p->dport_wifi_clk_en = 0xFFFCE030u;
     p->radio.rng_state = 0x12345678ABCDEF01ULL;
     for (int port = 0; port < I2C_PORT_COUNT; port++)
         p->i2c[port].regs[I2C_DATE_OFF / 4u] = 0x16042000u;
@@ -8491,6 +9476,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     for (unsigned port = 0; port < UHCI_PORT_COUNT; port++)
         uhci_reset_state(p, port);
 
+    /* Native SDMMC host reset state; cards can be attached after creation. */
+    sdmmc_reset_state(p);
+
     /* LEDC reset state: all eight timers begin held in reset, and DATE is
      * the ESP32 peripheral version value from the vendor register map. */
     ledc_reset_state(p);
@@ -8528,6 +9516,10 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Two classic ESP32 I2C controllers (interrupt sources 49/50). */
     mem_register_mmio(mem, (int)PAGE_OF(I2C0_BASE), i2c_read, i2c_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(I2C1_BASE), i2c_read, i2c_write, p);
+
+    /* Dual-slot native SD/MMC host (interrupt source 37). */
+    mem_register_mmio(mem, (int)PAGE_OF(SDMMC_BASE),
+                      sdmmc_read, sdmmc_write, p);
 
     /* SPI1 (general SPI) */
     mem_register_mmio(mem, (int)PAGE_OF(SPI1_BASE), spi_read, spi_write, p);
@@ -8657,7 +9649,46 @@ void periph_destroy(esp32_periph_t *p) {
     periph_disable_spi_display(p);
     for (int port = 0; port < I2C_PORT_COUNT; port++)
         free(p->i2c[port].pending_write);
+    free(p->sdmmc.transfer);
     free(p);
+}
+
+int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,
+                             uint32_t sector_count,
+                             periph_sdmmc_read_blocks_fn read_fn,
+                             periph_sdmmc_write_blocks_fn write_fn,
+                             void *ctx) {
+    if (!p || slot < 0 || slot >= (int)SDMMC_SLOT_COUNT ||
+        (read_fn && sector_count < 1024u))
+        return -1;
+    sdmmc_card_state_t *card = &p->sdmmc.card[slot];
+    bool was_attached = card->attached;
+    memset(card, 0, sizeof(*card));
+    if (read_fn) {
+        card->attached = true;
+        card->sector_count = sector_count;
+        card->read_fn = read_fn;
+        card->write_fn = write_fn;
+        card->ctx = ctx;
+        card->rca = (uint16_t)(slot + 1);
+        card->block_len = 512u;
+    }
+    if (p->sdmmc.transfer_active &&
+        p->sdmmc.transfer_slot == (uint8_t)slot)
+        sdmmc_cancel_transfer(&p->sdmmc);
+    if (was_attached != card->attached)
+        p->sdmmc.rintsts |= SDMMC_INT_CARD_DETECT;
+    sdmmc_irq_update(p);
+    return 0;
+}
+
+int periph_sdmmc_set_write_protected(esp32_periph_t *p, int slot,
+                                     bool write_protected) {
+    if (!p || slot < 0 || slot >= (int)SDMMC_SLOT_COUNT ||
+        !p->sdmmc.card[slot].attached)
+        return -1;
+    p->sdmmc.card[slot].write_protected = write_protected;
+    return 0;
 }
 
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx) {

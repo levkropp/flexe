@@ -39,7 +39,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
   legacy FRC1/FRC2 timers, both timer groups with four 64-bit APB
   counters/alarms, dual UHCI UART DMA with H:5/SLIP framing, GP-SPI2/3 DMA,
-  classic I2C0/1 master, I2S0/1 circular DMA,
+  classic I2C0/1 master, dual-slot native SDMMC with PIO/IDMAC DMA,
+  I2S0/1 circular DMA,
   eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
   eight-unit/two-channel classic PCNT, both classic MCPWM motor-control units
   with sync/capture/fault/dead-time/carrier paths, ADC1/2, DAC1/2
@@ -53,7 +54,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 611 tests
+- 616 tests
 
 ## building
 
@@ -142,7 +143,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 611 tests, 2412 passed, 0 failed
+# 616 tests, 4150 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -300,6 +301,25 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-uhci-dma.sh
 ```
 
 `FLEXE_UHCI_BUILD_DIR` optionally preserves its Arduino build directory.
+
+The native SDMMC gate builds a sketch against Espressif's public
+`driver/sdmmc_host.h` API and runs the genuine ESP-IDF host driver without
+intercepting `sdmmc_host_do_transaction`. It covers slot initialization and
+clock-update commands, SD command/short/long responses, single-block reads and
+writes, and 20 KiB multiblock transfers. The latter requires five 4 KiB
+descriptors and therefore forces the stock driver's four-entry IDMAC ring to
+recycle a descriptor through its real ISR and FreeRTOS queue path. Both engines
+must reproduce the host-backed card contents with zero unhandled MMIO or
+unregistered ROM calls. Raw regressions also verify that an existing backing
+image exposes its actual capacity rather than its configured minimum:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-sdmmc-host.sh
+# engine=jit stage=0x53444D4D ... reads=2/41 writes=2/41 media=1 unhandled=0 unregistered=0
+# engine=interp stage=0x53444D4D ... reads=2/41 writes=2/41 media=1 unhandled=0 unregistered=0
+```
+
+`FLEXE_SDMMC_BUILD_DIR` optionally preserves its Arduino build directory.
 
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):

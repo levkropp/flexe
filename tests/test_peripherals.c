@@ -1,5 +1,6 @@
 #include "peripherals.h"
 #include "sandbox_events.h"
+#include "sdcard_stubs.h"
 #include "spi_display.h"
 #include <fcntl.h>
 #include <stdlib.h>
@@ -89,6 +90,61 @@ TEST(uart_tx_capture) {
 #define TEST_UHCI_LINK_PARK (1u << 31)
 #define TEST_UHCI_DESC_EOF (1u << 30)
 #define TEST_UHCI_DESC_OWNER (1u << 31)
+
+#define TEST_SDMMC_BASE 0x3FF68000u
+#define TEST_SDMMC_CMD_RESP (1u << 6)
+#define TEST_SDMMC_CMD_DATA (1u << 9)
+#define TEST_SDMMC_CMD_WRITE (1u << 10)
+#define TEST_SDMMC_CMD_START (1u << 31)
+#define TEST_SDMMC_CTRL_INT (1u << 4)
+#define TEST_SDMMC_CTRL_DMA (1u << 5)
+#define TEST_SDMMC_CTRL_IDMAC (1u << 25)
+#define TEST_SDMMC_DESC_LAST (1u << 2)
+#define TEST_SDMMC_DESC_FIRST (1u << 3)
+#define TEST_SDMMC_DESC_CHAINED (1u << 4)
+#define TEST_SDMMC_DESC_OWNER (1u << 31)
+
+typedef struct {
+    uint8_t block[8][512];
+    unsigned reads;
+    unsigned writes;
+} test_sdmmc_card_t;
+
+static int test_sdmmc_read_blocks(void *ctx, uint32_t first,
+                                  uint8_t *data, size_t count) {
+    test_sdmmc_card_t *card = ctx;
+    if (!card || first > 8u || count > 8u - first) return -1;
+    memcpy(data, card->block[first], count * 512u);
+    card->reads++;
+    return 0;
+}
+
+static int test_sdmmc_write_blocks(void *ctx, uint32_t first,
+                                   const uint8_t *data, size_t count) {
+    test_sdmmc_card_t *card = ctx;
+    if (!card || first > 8u || count > 8u - first) return -1;
+    memcpy(card->block[first], data, count * 512u);
+    card->writes++;
+    return 0;
+}
+
+static void test_sdmmc_desc(xtensa_mem_t *mem, uint32_t desc,
+                            uint32_t ctrl, uint32_t size,
+                            uint32_t buffer, uint32_t next) {
+    mem_write32(mem, desc, ctrl);
+    mem_write32(mem, desc + 4u, size & 0x1FFFu);
+    mem_write32(mem, desc + 8u, buffer);
+    mem_write32(mem, desc + 12u, next);
+}
+
+static void test_sdmmc_command(xtensa_mem_t *mem, unsigned command,
+                               uint32_t argument, uint32_t flags,
+                               unsigned slot) {
+    mem_write32(mem, TEST_SDMMC_BASE + 0x28u, argument);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x2Cu,
+                TEST_SDMMC_CMD_START | flags | command |
+                ((uint32_t)slot << 16));
+}
 
 static void test_spi_dma_desc(xtensa_mem_t *mem, uint32_t desc,
                               uint32_t buf, uint16_t size, uint16_t len,
@@ -501,6 +557,325 @@ TEST(uhci_malformed_descriptors_report_directional_errors) {
     mem_write32(mem, 0x3FF000C4u, 1u << 8);
     ASSERT_FALSE(periph_interrupt_pending(p, 12));
     ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdmmc_reset_slots_dport_and_card_status) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_sdmmc_card_t card = {0};
+
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x14u), 0xFFFFFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x1Cu), 512u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x4Cu), 0x00070008u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x50u), 3u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x6Cu), 0x5342240Au);
+    ASSERT_TRUE(mem_read32(mem, 0x3FF000CCu) & (1u << 13));
+
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 0, 2048u,
+                                      test_sdmmc_read_blocks,
+                                      test_sdmmc_write_blocks, &card), 0);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x50u), 2u);
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x48u) & (1u << 8));
+    ASSERT_EQ(periph_sdmmc_set_write_protected(p, 0, true), 0);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x54u), 1u);
+    ASSERT_EQ(periph_sdmmc_set_write_protected(p, 0, false), 0);
+
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 1, 4096u,
+                                      test_sdmmc_read_blocks,
+                                      test_sdmmc_write_blocks, &card), 0);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x50u), 0u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x68u, 0x12345678u);
+    mem_write32(mem, 0x3FF000D0u, 1u << 6);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x68u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x50u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF000D0u), 1u << 6);
+    mem_write32(mem, 0x3FF000D0u, 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdmmc_native_image_uses_existing_capacity) {
+    char path[] = "/tmp/flexe-sdmmc-native-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    if (fd < 0) return;
+    ASSERT_EQ(ftruncate(fd, 2 * 1024 * 1024), 0);
+    ASSERT_EQ(close(fd), 0);
+
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    sdcard_stubs_t *stubs = sdcard_stubs_create(NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    ASSERT_TRUE(stubs != NULL);
+    if (!mem || !p || !stubs) {
+        sdcard_stubs_destroy(stubs);
+        periph_destroy(p);
+        mem_destroy(mem);
+        unlink(path);
+        return;
+    }
+
+    /* requested_size is a minimum. A larger existing image must retain its
+     * full capacity when exposed through the native host controller. */
+    sdcard_stubs_set_image(stubs, path);
+    sdcard_stubs_set_size(stubs, 1024u * 1024u);
+    ASSERT_EQ(sdcard_stubs_attach_sdmmc(stubs, p), 0);
+    ASSERT_FALSE(mem_read32(mem, TEST_SDMMC_BASE + 0x50u) & (1u << 1));
+
+    test_sdmmc_command(mem, 9u, 2u << 16, TEST_SDMMC_CMD_RESP, 1u);
+    uint32_t c_size = mem_read32(mem, TEST_SDMMC_BASE + 0x34u) >> 16;
+    c_size |= (mem_read32(mem, TEST_SDMMC_BASE + 0x38u) & 0x3Fu) << 16;
+    ASSERT_EQ(c_size, 3u); /* (C_SIZE + 1) * 1024 = 4096 sectors = 2 MiB */
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    sdcard_stubs_destroy(stubs);
+    periph_destroy(p);
+    mem_destroy(mem);
+    ASSERT_EQ(unlink(path), 0);
+}
+
+TEST(sdmmc_commands_responses_and_pio_fifo) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_sdmmc_card_t card = {0};
+    for (unsigned index = 0; index < 512u; index++)
+        card.block[1][index] = (uint8_t)(0xA5u ^ index);
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 0, 2048u,
+                                      test_sdmmc_read_blocks,
+                                      test_sdmmc_write_blocks, &card), 0);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x00u, TEST_SDMMC_CTRL_INT);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x24u, 0xFFFFFFFFu);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+
+    test_sdmmc_command(mem, 8u, 0x1AAu, TEST_SDMMC_CMD_RESP, 0u);
+    ASSERT_FALSE(mem_read32(mem, TEST_SDMMC_BASE + 0x2Cu) &
+                 TEST_SDMMC_CMD_START);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x30u), 0x1AAu);
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) & (1u << 2));
+    ASSERT_TRUE(periph_interrupt_pending(p, 37));
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+
+    test_sdmmc_command(mem, 55u, 0u, TEST_SDMMC_CMD_RESP, 0u);
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x30u) & (1u << 5));
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    test_sdmmc_command(mem, 41u, 0x40FF8000u,
+                       TEST_SDMMC_CMD_RESP, 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x30u), 0xC0FF8000u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    test_sdmmc_command(mem, 9u, 1u << 16, TEST_SDMMC_CMD_RESP, 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x3Cu) >> 30, 1u);
+
+    mem_write32(mem, TEST_SDMMC_BASE + 0x20u, 512u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x1Cu, 512u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    test_sdmmc_command(mem, 17u, 1u,
+                       TEST_SDMMC_CMD_RESP | TEST_SDMMC_CMD_DATA, 0u);
+    ASSERT_EQ(card.reads, 1u);
+    for (unsigned word_index = 0; word_index < 128u; word_index++) {
+        uint32_t expected = 0u;
+        for (unsigned byte = 0; byte < 4u; byte++)
+            expected |= (uint32_t)(uint8_t)(0xA5u ^
+                        (word_index * 4u + byte)) << (byte * 8u);
+        ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x200u), expected);
+    }
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) & (1u << 3));
+
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    test_sdmmc_command(mem, 24u, 2u,
+                       TEST_SDMMC_CMD_RESP | TEST_SDMMC_CMD_DATA |
+                       TEST_SDMMC_CMD_WRITE, 0u);
+    for (unsigned word_index = 0; word_index < 128u; word_index++) {
+        uint32_t value = 0u;
+        for (unsigned byte = 0; byte < 4u; byte++)
+            value |= (uint32_t)(uint8_t)(0x3Cu +
+                     word_index * 4u + byte) << (byte * 8u);
+        mem_write32(mem, TEST_SDMMC_BASE + 0x200u, value);
+    }
+    ASSERT_EQ(card.writes, 1u);
+    for (unsigned index = 0; index < 512u; index++)
+        ASSERT_EQ(card.block[2][index], (uint8_t)(0x3Cu + index));
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) & (1u << 3));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdmmc_idmac_chains_writeback_interrupts_and_errors) {
+    const uint32_t desc0 = 0x3FFB3A00u;
+    const uint32_t desc1 = 0x3FFB3A10u;
+    const uint32_t bad_desc = 0x3FFB3A20u;
+    const uint32_t buf0 = 0x3FFB3C00u;
+    const uint32_t buf1 = 0x3FFB3D00u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_sdmmc_card_t card = {0};
+    for (unsigned index = 0; index < 512u; index++)
+        card.block[3][index] = (uint8_t)(index ^ 0x6Du);
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 0, 2048u,
+                                      test_sdmmc_read_blocks,
+                                      test_sdmmc_write_blocks, &card), 0);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    mem_write32(mem, TEST_SDMMC_BASE + 0x00u,
+                TEST_SDMMC_CTRL_INT | TEST_SDMMC_CTRL_DMA |
+                TEST_SDMMC_CTRL_IDMAC);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x24u, (1u << 2) | (1u << 3));
+    mem_write32(mem, TEST_SDMMC_BASE + 0x80u, 1u << 7);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x90u,
+                (1u << 1) | (1u << 8) | (1u << 4) | (1u << 9));
+    test_sdmmc_desc(mem, desc0,
+                    TEST_SDMMC_DESC_OWNER | TEST_SDMMC_DESC_FIRST |
+                    TEST_SDMMC_DESC_CHAINED,
+                    256u, buf0, desc1);
+    test_sdmmc_desc(mem, desc1,
+                    TEST_SDMMC_DESC_OWNER | TEST_SDMMC_DESC_LAST,
+                    256u, buf1, 0u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x88u, desc0);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x20u, 512u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x1Cu, 512u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    test_sdmmc_command(mem, 17u, 3u,
+                       TEST_SDMMC_CMD_RESP | TEST_SDMMC_CMD_DATA, 0u);
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) & (1u << 2));
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 1u << 2);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_FALSE(mem_read32(mem, desc0) & TEST_SDMMC_DESC_OWNER);
+    ASSERT_TRUE(mem_read32(mem, desc1) & TEST_SDMMC_DESC_OWNER);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x8Cu) &
+              ((1u << 1) | (1u << 8)), (1u << 1) | (1u << 8));
+    for (unsigned index = 0; index < 256u; index++)
+        ASSERT_EQ(mem_read8(mem, buf0 + index), (uint8_t)(index ^ 0x6Du));
+
+    mem_write32(mem, TEST_SDMMC_BASE + 0x8Cu, 0xFFFFFFFFu);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_FALSE(mem_read32(mem, desc1) & TEST_SDMMC_DESC_OWNER);
+    for (unsigned index = 0; index < 256u; index++)
+        ASSERT_EQ(mem_read8(mem, buf1 + index),
+                  (uint8_t)((index + 256u) ^ 0x6Du));
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) & (1u << 3));
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x94u), desc1);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x5Cu), 512u);
+
+    /* A descriptor not owned by IDMAC reports DU/AIS and leaves its owner
+     * clear rather than silently consuming the transfer. */
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x8Cu, 0xFFFFFFFFu);
+    test_sdmmc_desc(mem, bad_desc, TEST_SDMMC_DESC_FIRST |
+                    TEST_SDMMC_DESC_LAST, 512u, buf0, 0u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x88u, bad_desc);
+    test_sdmmc_command(mem, 17u, 3u,
+                       TEST_SDMMC_CMD_RESP | TEST_SDMMC_CMD_DATA, 0u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 1u << 2);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x8Cu) &
+              ((1u << 4) | (1u << 9)), (1u << 4) | (1u << 9));
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) & (1u << 11));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdmmc_slot1_clock_gate_idmac_write_and_media_errors) {
+    const uint32_t desc = 0x3FFB3E00u;
+    const uint32_t buf0 = 0x3FFB4000u;
+    const uint32_t buf1 = 0x3FFB4100u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_sdmmc_card_t card = {0};
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 1, 4096u,
+                                      test_sdmmc_read_blocks,
+                                      test_sdmmc_write_blocks, &card), 0);
+    /* Rejecting an invalid replacement must leave the existing card wired. */
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 1, 512u,
+                                      test_sdmmc_read_blocks,
+                                      test_sdmmc_write_blocks, &card), -1);
+    ASSERT_FALSE(mem_read32(mem, TEST_SDMMC_BASE + 0x50u) & (1u << 1));
+
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    uint32_t clocks = mem_read32(mem, 0x3FF000CCu);
+    mem_write32(mem, 0x3FF000CCu, clocks & ~(1u << 13));
+    test_sdmmc_command(mem, 8u, 0x1AAu, TEST_SDMMC_CMD_RESP, 1u);
+    ASSERT_TRUE(mem_read32(mem, TEST_SDMMC_BASE + 0x2Cu) &
+                TEST_SDMMC_CMD_START);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x44u), 1u);
+    mem_write32(mem, 0x3FF000CCu, clocks | (1u << 13));
+    test_sdmmc_command(mem, 8u, 0x1AAu, TEST_SDMMC_CMD_RESP, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x30u), 0x1AAu);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+
+    for (unsigned index = 0; index < 256u; index++) {
+        mem_write8(mem, buf0 + index, (uint8_t)(0x27u + index));
+        mem_write8(mem, buf1 + index, (uint8_t)(0xD8u - index));
+    }
+    mem_write32(mem, desc,
+                TEST_SDMMC_DESC_OWNER | TEST_SDMMC_DESC_FIRST |
+                TEST_SDMMC_DESC_LAST);
+    mem_write32(mem, desc + 4u, 256u | (256u << 13));
+    mem_write32(mem, desc + 8u, buf0);
+    mem_write32(mem, desc + 12u, buf1);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x00u,
+                TEST_SDMMC_CTRL_INT | TEST_SDMMC_CTRL_DMA |
+                TEST_SDMMC_CTRL_IDMAC);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x80u, 1u << 7);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x90u, 0xFFFFFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x90u), 0x337u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x88u, desc);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x20u, 512u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x1Cu, 512u);
+    test_sdmmc_command(mem, 24u, 4u,
+                       TEST_SDMMC_CMD_RESP | TEST_SDMMC_CMD_DATA |
+                       TEST_SDMMC_CMD_WRITE, 1u);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 1u << 2);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_FALSE(mem_read32(mem, desc) & TEST_SDMMC_DESC_OWNER);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x8Cu) &
+              ((1u << 0) | (1u << 8)), (1u << 0) | (1u << 8));
+    ASSERT_EQ(card.writes, 1u);
+    for (unsigned index = 0; index < 256u; index++) {
+        ASSERT_EQ(card.block[4][index], (uint8_t)(0x27u + index));
+        ASSERT_EQ(card.block[4][index + 256u], (uint8_t)(0xD8u - index));
+    }
+
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x8Cu, 0xFFFFFFFFu);
+    ASSERT_EQ(periph_sdmmc_set_write_protected(p, 1, true), 0);
+    test_sdmmc_command(mem, 24u, 5u,
+                       TEST_SDMMC_CMD_RESP | TEST_SDMMC_CMD_DATA |
+                       TEST_SDMMC_CMD_WRITE, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) &
+              ((1u << 2) | (1u << 3) | (1u << 9)),
+              (1u << 2) | (1u << 3) | (1u << 9));
+    ASSERT_EQ(card.writes, 1u);
+
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 1, 0u, NULL, NULL, NULL), 0);
+    mem_write32(mem, TEST_SDMMC_BASE + 0x44u, 0xFFFFFFFFu);
+    test_sdmmc_command(mem, 8u, 0x1AAu, TEST_SDMMC_CMD_RESP, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) &
+              ((1u << 2) | (1u << 8)), (1u << 2) | (1u << 8));
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
     periph_destroy(p);
@@ -3766,6 +4141,11 @@ static void run_peripheral_tests(void) {
     RUN_TEST(uhci_h5_slip_receive_transmit_and_checksum_error);
     RUN_TEST(uhci_h5_reliable_sequence_and_crc_validation);
     RUN_TEST(uhci_malformed_descriptors_report_directional_errors);
+    RUN_TEST(sdmmc_reset_slots_dport_and_card_status);
+    RUN_TEST(sdmmc_native_image_uses_existing_capacity);
+    RUN_TEST(sdmmc_commands_responses_and_pio_fifo);
+    RUN_TEST(sdmmc_idmac_chains_writeback_interrupts_and_errors);
+    RUN_TEST(sdmmc_slot1_clock_gate_idmac_write_and_media_errors);
     RUN_TEST(uart_controllers_are_independent);
     RUN_TEST(uart_status_tx_ready);
     RUN_TEST(uart_tx_empty_interrupt);
