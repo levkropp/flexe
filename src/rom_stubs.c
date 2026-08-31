@@ -2842,7 +2842,7 @@ static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
         source != 18 && source != 19 &&
         source != 32 && source != 33 && source != 37 &&
         source != 39 && source != 40 &&
-        source != 43 && source != 47 && source != 48 && source != 49 &&
+        source != 43 && source != 45 && source != 47 && source != 48 && source != 49 &&
         source != 50 && source != 56 && source != 57 && source != 58 &&
         source != 59 && source != 62 && source != 63) {
         rom_return(cpu, 0);

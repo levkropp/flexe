@@ -228,4 +228,9 @@ if(UNIX)
     target_link_libraries(flexe-sdmmc-host-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-sdmmc-host-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-twai-bus-test tools/twai_bus_test.c)
+    target_link_libraries(flexe-twai-bus-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-twai-bus-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

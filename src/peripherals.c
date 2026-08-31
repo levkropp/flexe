@@ -20,6 +20,7 @@
 #define I2C0_BASE       0x3FF53000u
 #define I2C1_BASE       0x3FF67000u
 #define SDMMC_BASE      0x3FF68000u
+#define TWAI_BASE       0x3FF6B000u
 #define RMT_BASE        0x3FF56000u
 #define PCNT_BASE       0x3FF57000u
 #define MCPWM0_BASE     0x3FF5E000u
@@ -326,6 +327,68 @@
 
 #define SDMMC_VERID_RESET            0x5342240Au
 
+/* Classic ESP32 TWAI controller. The peripheral is an SJA1000-compatible
+ * PeliCAN core whose 8-bit registers occupy the low byte of 32-bit APB words. */
+#define TWAI_REG_FILE_SIZE            0x080u
+#define TWAI_INTR_SOURCE              45
+#define TWAI_RX_FIFO_BYTES            64u
+#define TWAI_RX_FIFO_FRAMES           32u
+
+#define TWAI_MODE_OFF                 0x000u
+#define TWAI_COMMAND_OFF              0x004u
+#define TWAI_STATUS_OFF               0x008u
+#define TWAI_INTERRUPT_OFF            0x00Cu
+#define TWAI_INTERRUPT_ENABLE_OFF     0x010u
+#define TWAI_BUS_TIMING_0_OFF         0x018u
+#define TWAI_BUS_TIMING_1_OFF         0x01Cu
+#define TWAI_ARB_LOST_CAPTURE_OFF     0x02Cu
+#define TWAI_ERROR_CODE_CAPTURE_OFF   0x030u
+#define TWAI_ERROR_WARNING_LIMIT_OFF  0x034u
+#define TWAI_RX_ERROR_COUNT_OFF       0x038u
+#define TWAI_TX_ERROR_COUNT_OFF       0x03Cu
+#define TWAI_BUFFER_OFF               0x040u
+#define TWAI_RX_MESSAGE_COUNT_OFF     0x074u
+#define TWAI_CLOCK_DIVIDER_OFF        0x07Cu
+
+#define TWAI_MODE_RESET               (1u << 0)
+#define TWAI_MODE_LISTEN_ONLY         (1u << 1)
+#define TWAI_MODE_SELF_TEST           (1u << 2)
+#define TWAI_MODE_SINGLE_FILTER       (1u << 3)
+#define TWAI_MODE_VALID_MASK          0x0Fu
+
+#define TWAI_COMMAND_TX               (1u << 0)
+#define TWAI_COMMAND_ABORT            (1u << 1)
+#define TWAI_COMMAND_RELEASE_RX       (1u << 2)
+#define TWAI_COMMAND_CLEAR_OVERRUN    (1u << 3)
+#define TWAI_COMMAND_SELF_RX          (1u << 4)
+
+#define TWAI_STATUS_RX_BUFFER         (1u << 0)
+#define TWAI_STATUS_DATA_OVERRUN      (1u << 1)
+#define TWAI_STATUS_TX_BUFFER         (1u << 2)
+#define TWAI_STATUS_TX_COMPLETE       (1u << 3)
+#define TWAI_STATUS_RECEIVING         (1u << 4)
+#define TWAI_STATUS_TRANSMITTING      (1u << 5)
+#define TWAI_STATUS_ERROR             (1u << 6)
+#define TWAI_STATUS_BUS_OFF           (1u << 7)
+
+#define TWAI_INT_RX                   (1u << 0)
+#define TWAI_INT_TX                   (1u << 1)
+#define TWAI_INT_ERROR                (1u << 2)
+#define TWAI_INT_DATA_OVERRUN         (1u << 3)
+#define TWAI_INT_ERROR_PASSIVE        (1u << 5)
+#define TWAI_INT_ARB_LOST             (1u << 6)
+#define TWAI_INT_BUS_ERROR            (1u << 7)
+#define TWAI_INT_VALID_MASK           0xEFu
+
+#define TWAI_FRAME_DLC_MASK           0x0Fu
+#define TWAI_FRAME_SELF_RX            (1u << 4)
+#define TWAI_FRAME_SINGLE_SHOT        (1u << 5)
+#define TWAI_FRAME_REMOTE             (1u << 6)
+#define TWAI_FRAME_EXTENDED           (1u << 7)
+
+#define TWAI_CLOCK_EXTENDED_LAYOUT    (1u << 7)
+#define TWAI_DEFAULT_EWL              96u
+
 /* Classic ESP32 I2C controller register/FIFO geometry. */
 #define I2C_PORT_COUNT       2
 #define I2C_DEVICE_COUNT     128
@@ -609,6 +672,10 @@ static uint32_t sdmmc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void sdmmc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void sdmmc_reset_state(esp32_periph_t *p);
 static void sdmmc_dport_update(esp32_periph_t *p);
+static uint32_t twai_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void twai_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void twai_reset_state(esp32_periph_t *p);
+static void twai_dport_update(esp32_periph_t *p);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -873,6 +940,48 @@ typedef struct {
     bool transfer_event_armed;
     uint32_t next_transfer_ccount;
 } sdmmc_state_t;
+
+typedef struct {
+    uint8_t bytes[13];
+    uint8_t storage_bytes;
+} twai_rx_entry_t;
+
+typedef struct {
+    uint8_t mode;
+    uint8_t int_raw;
+    uint8_t int_ena;
+    uint8_t bus_timing_0;
+    uint8_t bus_timing_1;
+    uint8_t arbitration_lost_capture;
+    uint8_t error_code_capture;
+    uint8_t error_warning_limit;
+    uint16_t rx_error_count;
+    uint16_t tx_error_count;
+    uint8_t acceptance_code[4];
+    uint8_t acceptance_mask[4];
+    uint8_t clock_divider;
+
+    uint8_t tx_buffer[13];
+    periph_twai_frame_t tx_frame;
+    bool tx_busy;
+    bool tx_complete;
+    bool tx_event_armed;
+    bool data_overrun;
+    bool bus_off;
+    uint32_t next_tx_ccount;
+
+    twai_rx_entry_t rx_fifo[TWAI_RX_FIFO_FRAMES];
+    uint8_t rx_head;
+    uint8_t rx_count;
+    uint8_t rx_bytes;
+
+    bool recovery_event_armed;
+    uint8_t recovery_phase;
+    uint32_t next_recovery_ccount;
+
+    periph_twai_tx_fn tx_cb;
+    void *tx_cb_ctx;
+} twai_state_t;
 
 typedef struct {
     periph_i2c_device_fn fn;
@@ -1206,6 +1315,9 @@ struct esp32_periph {
     /* Dual-slot native SD/MMC host, FIFO, and DesignWare internal DMA. */
     sdmmc_state_t sdmmc;
 
+    /* SJA1000-compatible classic ESP32 TWAI/CAN controller and RX FIFO. */
+    twai_state_t twai;
+
     /* Eight-channel classic ESP32 remote-control/pulse engine. */
     rmt_state_t rmt;
 
@@ -1276,6 +1388,7 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_TIMG0_MODULE_BIT         (1u << 13)
 #define DPORT_TIMG1_MODULE_BIT         (1u << 15)
 #define DPORT_PWM0_MODULE_BIT          (1u << 17)
+#define DPORT_TWAI_MODULE_BIT          (1u << 19)
 #define DPORT_PWM1_MODULE_BIT          (1u << 20)
 
 /* Internal: scan matrix and set/clear CPU interrupt bits for a source */
@@ -1481,6 +1594,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         timg_sync_all_to(p, timg_now_cycles(p));
         p->dport_perip_clk_en = val;
         uhci_dport_update(p);
+        twai_dport_update(p);
         timg_kick(p);
         break;
     case DPORT_WIFI_CLK_EN_OFF:
@@ -1512,9 +1626,12 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
             timg_reset_group(p, 1);
         if (val & DPORT_PWM0_MODULE_BIT)
             mcpwm_reset_unit(p, 0);
+        if (val & DPORT_TWAI_MODULE_BIT)
+            twai_reset_state(p);
         if (val & DPORT_PWM1_MODULE_BIT)
             mcpwm_reset_unit(p, 1);
         uhci_dport_update(p);
+        twai_dport_update(p);
         timg_kick(p);
         break;
     case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
@@ -2780,6 +2897,7 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
         frc_next_fire(p, cpu),
         uhci_next_fire(p, cpu),
         sdmmc_next_fire(p, cpu),
+        twai_next_fire(p, cpu),
         i2s_next_fire(p, cpu),
         rmt_next_fire(p, cpu),
         ledc_next_fire(p, cpu),
@@ -2809,6 +2927,7 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
     frc_eval_events(p, cpu);
     uhci_eval_events(p, cpu);
     sdmmc_eval_events(p, cpu);
+    twai_eval_events(p, cpu);
     i2s_eval_events(p, cpu);
     rmt_eval_events(p, cpu);
     ledc_eval_events(p, cpu);
@@ -8925,6 +9044,662 @@ static void sdmmc_write(void *ctx, uint32_t addr, uint32_t value) {
     }
 }
 
+/* ---- Classic ESP32 TWAI/CAN (SJA1000-compatible PeliCAN core) ---- */
+
+static bool twai_clocked(const esp32_periph_t *p) {
+    return (p->dport_perip_clk_en & DPORT_TWAI_MODULE_BIT) != 0u &&
+           (p->dport_perip_rst_en & DPORT_TWAI_MODULE_BIT) == 0u;
+}
+
+static xtensa_cpu_t *twai_event_cpu(esp32_periph_t *p) {
+    return p->cpu[0] ? p->cpu[0] : p->cpu[1];
+}
+
+static void twai_kick(esp32_periph_t *p) {
+    for (unsigned core = 0; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static uint8_t twai_status(const twai_state_t *s) {
+    uint8_t status = 0u;
+    if (s->rx_count != 0u) status |= TWAI_STATUS_RX_BUFFER;
+    if (s->data_overrun) status |= TWAI_STATUS_DATA_OVERRUN;
+    if (!s->tx_busy) status |= TWAI_STATUS_TX_BUFFER;
+    if (s->tx_complete) status |= TWAI_STATUS_TX_COMPLETE;
+    if (s->tx_busy) status |= TWAI_STATUS_TRANSMITTING;
+    if (s->tx_error_count >= s->error_warning_limit ||
+        s->rx_error_count >= s->error_warning_limit)
+        status |= TWAI_STATUS_ERROR;
+    if (s->bus_off) status |= TWAI_STATUS_BUS_OFF;
+    return status;
+}
+
+static void twai_irq_update(esp32_periph_t *p) {
+    twai_state_t *s = &p->twai;
+    bool active = twai_clocked(p) &&
+                  (s->int_raw & s->int_ena & TWAI_INT_VALID_MASK) != 0u;
+    if (active)
+        periph_assert_interrupt(p, TWAI_INTR_SOURCE);
+    else
+        periph_deassert_interrupt(p, TWAI_INTR_SOURCE);
+}
+
+static void twai_clear_rx_fifo(twai_state_t *s) {
+    memset(s->rx_fifo, 0, sizeof(s->rx_fifo));
+    s->rx_head = 0u;
+    s->rx_count = 0u;
+    s->rx_bytes = 0u;
+    s->int_raw &= (uint8_t)~TWAI_INT_RX;
+}
+
+static void twai_reset_state(esp32_periph_t *p) {
+    if (!p) return;
+    periph_deassert_interrupt(p, TWAI_INTR_SOURCE);
+    twai_state_t *s = &p->twai;
+    periph_twai_tx_fn tx_cb = s->tx_cb;
+    void *tx_cb_ctx = s->tx_cb_ctx;
+    memset(s, 0, sizeof(*s));
+    s->mode = TWAI_MODE_RESET;
+    s->tx_complete = true;
+    s->error_warning_limit = TWAI_DEFAULT_EWL;
+    memset(s->acceptance_mask, 0xFF, sizeof(s->acceptance_mask));
+    s->tx_cb = tx_cb;
+    s->tx_cb_ctx = tx_cb_ctx;
+    twai_kick(p);
+}
+
+static void twai_dport_update(esp32_periph_t *p) {
+    if (!p) return;
+    twai_state_t *s = &p->twai;
+    if (!twai_clocked(p)) {
+        s->tx_event_armed = false;
+        s->recovery_event_armed = false;
+        s->tx_busy = false;
+        s->tx_complete = true;
+        periph_deassert_interrupt(p, TWAI_INTR_SOURCE);
+    } else {
+        twai_irq_update(p);
+    }
+    twai_kick(p);
+}
+
+static bool twai_frame_valid(const periph_twai_frame_t *frame) {
+    if (!frame || frame->data_length_code > 15u) return false;
+    uint32_t mask = frame->extended ? 0x1FFFFFFFu : 0x7FFu;
+    return (frame->identifier & ~mask) == 0u;
+}
+
+static void twai_encode_frame(const periph_twai_frame_t *frame,
+                              uint8_t bytes[13]) {
+    memset(bytes, 0, 13u);
+    bytes[0] = frame->data_length_code & TWAI_FRAME_DLC_MASK;
+    if (frame->extended) bytes[0] |= TWAI_FRAME_EXTENDED;
+    if (frame->remote) bytes[0] |= TWAI_FRAME_REMOTE;
+    if (frame->single_shot) bytes[0] |= TWAI_FRAME_SINGLE_SHOT;
+    if (frame->self_reception) bytes[0] |= TWAI_FRAME_SELF_RX;
+
+    uint8_t data_off;
+    if (frame->extended) {
+        bytes[1] = (uint8_t)(frame->identifier >> 21);
+        bytes[2] = (uint8_t)(frame->identifier >> 13);
+        bytes[3] = (uint8_t)(frame->identifier >> 5);
+        bytes[4] = (uint8_t)(frame->identifier << 3);
+        data_off = 5u;
+    } else {
+        bytes[1] = (uint8_t)(frame->identifier >> 3);
+        bytes[2] = (uint8_t)(frame->identifier << 5);
+        data_off = 3u;
+    }
+    if (!frame->remote) {
+        uint8_t len = frame->data_length_code < 8u ?
+                      frame->data_length_code : 8u;
+        memcpy(&bytes[data_off], frame->data, len);
+    }
+}
+
+static void twai_decode_frame(const uint8_t bytes[13],
+                              periph_twai_frame_t *frame) {
+    memset(frame, 0, sizeof(*frame));
+    frame->data_length_code = bytes[0] & TWAI_FRAME_DLC_MASK;
+    frame->extended = (bytes[0] & TWAI_FRAME_EXTENDED) != 0u;
+    frame->remote = (bytes[0] & TWAI_FRAME_REMOTE) != 0u;
+    frame->single_shot = (bytes[0] & TWAI_FRAME_SINGLE_SHOT) != 0u;
+    frame->self_reception = (bytes[0] & TWAI_FRAME_SELF_RX) != 0u;
+
+    uint8_t data_off;
+    if (frame->extended) {
+        frame->identifier = ((uint32_t)bytes[1] << 21) |
+                            ((uint32_t)bytes[2] << 13) |
+                            ((uint32_t)bytes[3] << 5) |
+                            ((uint32_t)bytes[4] >> 3);
+        data_off = 5u;
+    } else {
+        frame->identifier = ((uint32_t)bytes[1] << 3) |
+                            ((uint32_t)bytes[2] >> 5);
+        data_off = 3u;
+    }
+    if (!frame->remote) {
+        uint8_t len = frame->data_length_code < 8u ?
+                      frame->data_length_code : 8u;
+        memcpy(frame->data, &bytes[data_off], len);
+    }
+}
+
+static uint8_t twai_frame_storage_bytes(const periph_twai_frame_t *frame) {
+    uint8_t data_bytes = frame->remote ? 0u :
+        (frame->data_length_code < 8u ? frame->data_length_code : 8u);
+    return (uint8_t)((frame->extended ? 5u : 3u) + data_bytes);
+}
+
+static bool twai_filter_match(const twai_state_t *s,
+                              const uint8_t frame[13]) {
+    uint8_t key[4] = {0};
+    bool extended = (frame[0] & TWAI_FRAME_EXTENDED) != 0u;
+    bool remote = (frame[0] & TWAI_FRAME_REMOTE) != 0u;
+    if (extended) {
+        memcpy(key, &frame[1], sizeof(key));
+        if (remote) key[3] |= 1u << 2;
+    } else {
+        key[0] = frame[1];
+        key[1] = (uint8_t)(frame[2] | (remote ? 1u << 4 : 0u));
+        if (!remote) {
+            key[2] = frame[3];
+            key[3] = frame[4];
+        }
+    }
+
+    if (s->mode & TWAI_MODE_SINGLE_FILTER) {
+        for (unsigned i = 0; i < 4u; i++)
+            if (((key[i] ^ s->acceptance_code[i]) &
+                 (uint8_t)~s->acceptance_mask[i]) != 0u)
+                return false;
+        return true;
+    }
+
+    /* Dual-filter mode compares two independent 16-bit prefixes. This is the
+     * SJA1000 layout used for standard-ID filters and the upper 16 ID bits of
+     * extended frames. */
+    bool first = true;
+    bool second = true;
+    for (unsigned i = 0; i < 2u; i++) {
+        if (((key[i] ^ s->acceptance_code[i]) &
+             (uint8_t)~s->acceptance_mask[i]) != 0u)
+            first = false;
+        if (((key[i] ^ s->acceptance_code[i + 2u]) &
+             (uint8_t)~s->acceptance_mask[i + 2u]) != 0u)
+            second = false;
+    }
+    return first || second;
+}
+
+static int twai_enqueue_rx(esp32_periph_t *p,
+                           const periph_twai_frame_t *frame,
+                           bool apply_filter) {
+    twai_state_t *s = &p->twai;
+    if (!twai_frame_valid(frame) || !twai_clocked(p) || s->bus_off ||
+        (s->mode & TWAI_MODE_RESET) != 0u)
+        return 0;
+
+    uint8_t encoded[13];
+    twai_encode_frame(frame, encoded);
+    encoded[0] &= (uint8_t)~(TWAI_FRAME_SELF_RX | TWAI_FRAME_SINGLE_SHOT);
+    if (apply_filter && !twai_filter_match(s, encoded)) return 0;
+
+    uint8_t storage = twai_frame_storage_bytes(frame);
+    if (s->rx_count >= TWAI_RX_FIFO_FRAMES ||
+        storage > TWAI_RX_FIFO_BYTES - s->rx_bytes) {
+        s->data_overrun = true;
+        s->int_raw |= TWAI_INT_DATA_OVERRUN;
+        twai_irq_update(p);
+        return 0;
+    }
+
+    unsigned tail = (s->rx_head + s->rx_count) % TWAI_RX_FIFO_FRAMES;
+    memcpy(s->rx_fifo[tail].bytes, encoded, sizeof(encoded));
+    s->rx_fifo[tail].storage_bytes = storage;
+    s->rx_count++;
+    s->rx_bytes = (uint8_t)(s->rx_bytes + storage);
+    s->int_raw |= TWAI_INT_RX;
+    twai_irq_update(p);
+    return 1;
+}
+
+static void twai_release_rx(esp32_periph_t *p) {
+    twai_state_t *s = &p->twai;
+    if (s->rx_count != 0u) {
+        s->rx_bytes = (uint8_t)(s->rx_bytes -
+            s->rx_fifo[s->rx_head].storage_bytes);
+        memset(&s->rx_fifo[s->rx_head], 0,
+               sizeof(s->rx_fifo[s->rx_head]));
+        s->rx_head = (uint8_t)((s->rx_head + 1u) % TWAI_RX_FIFO_FRAMES);
+        s->rx_count--;
+    }
+    if (s->rx_count == 0u) s->int_raw &= (uint8_t)~TWAI_INT_RX;
+    else s->int_raw |= TWAI_INT_RX;
+    twai_irq_update(p);
+}
+
+typedef struct {
+    uint32_t wire_bits;
+    uint16_t crc;
+    uint8_t last;
+    uint8_t run;
+    bool have_last;
+} twai_bit_stream_t;
+
+static void twai_stream_bit(twai_bit_stream_t *stream, unsigned bit,
+                            bool update_crc) {
+    bit &= 1u;
+    if (update_crc) {
+        unsigned feedback = ((stream->crc >> 14) & 1u) ^ bit;
+        stream->crc = (uint16_t)((stream->crc << 1) & 0x7FFFu);
+        if (feedback) stream->crc ^= 0x4599u;
+    }
+
+    stream->wire_bits++;
+    if (!stream->have_last || stream->last != bit) {
+        stream->last = (uint8_t)bit;
+        stream->run = 1u;
+        stream->have_last = true;
+    } else {
+        stream->run++;
+    }
+    if (stream->run == 5u) {
+        stream->wire_bits++;
+        stream->last ^= 1u;
+        stream->run = 1u;
+    }
+}
+
+static void twai_stream_field(twai_bit_stream_t *stream, uint32_t value,
+                              unsigned width) {
+    while (width-- != 0u)
+        twai_stream_bit(stream, value >> width, true);
+}
+
+static uint32_t twai_frame_wire_bits(const periph_twai_frame_t *frame) {
+    twai_bit_stream_t stream = {0};
+    twai_stream_bit(&stream, 0u, true); /* SOF */
+    if (frame->extended) {
+        twai_stream_field(&stream, frame->identifier >> 18, 11u);
+        twai_stream_bit(&stream, 1u, true); /* SRR */
+        twai_stream_bit(&stream, 1u, true); /* IDE */
+        twai_stream_field(&stream, frame->identifier, 18u);
+        twai_stream_bit(&stream, frame->remote, true);
+        twai_stream_bit(&stream, 0u, true); /* r1 */
+        twai_stream_bit(&stream, 0u, true); /* r0 */
+    } else {
+        twai_stream_field(&stream, frame->identifier, 11u);
+        twai_stream_bit(&stream, frame->remote, true);
+        twai_stream_bit(&stream, 0u, true); /* IDE */
+        twai_stream_bit(&stream, 0u, true); /* r0 */
+    }
+    twai_stream_field(&stream, frame->data_length_code, 4u);
+    if (!frame->remote) {
+        unsigned len = frame->data_length_code < 8u ?
+                       frame->data_length_code : 8u;
+        for (unsigned i = 0; i < len; i++)
+            twai_stream_field(&stream, frame->data[i], 8u);
+    }
+
+    uint16_t crc = stream.crc;
+    for (unsigned bit = 15u; bit-- != 0u;)
+        twai_stream_bit(&stream, crc >> bit, false);
+
+    /* CRC delimiter, ACK slot/delimiter, EOF, and intermission are outside
+     * the bit-stuffed region. */
+    return stream.wire_bits + 13u;
+}
+
+static uint32_t twai_bit_cycles(const esp32_periph_t *p) {
+    const twai_state_t *s = &p->twai;
+    uint32_t brp = 2u * ((s->bus_timing_0 & 0x3Fu) + 1u);
+    if (s->int_ena & (1u << 4)) brp *= 2u;
+    uint32_t tseg1 = (s->bus_timing_1 & 0x0Fu) + 1u;
+    uint32_t tseg2 = ((s->bus_timing_1 >> 4) & 0x07u) + 1u;
+    uint64_t numerator = (uint64_t)brp * (1u + tseg1 + tseg2) *
+                         timg_cpu_mhz((esp32_periph_t *)p);
+    uint32_t cycles = (uint32_t)((numerator + 79u) / 80u);
+    return cycles != 0u ? cycles : 1u;
+}
+
+static uint32_t twai_wire_cycles(const esp32_periph_t *p,
+                                 const periph_twai_frame_t *frame) {
+    uint64_t cycles = (uint64_t)twai_frame_wire_bits(frame) *
+                      twai_bit_cycles(p);
+    if (cycles == 0u) cycles = 1u;
+    if (cycles > INT32_MAX) cycles = INT32_MAX;
+    return (uint32_t)cycles;
+}
+
+static void twai_arm_tx(esp32_periph_t *p) {
+    twai_state_t *s = &p->twai;
+    xtensa_cpu_t *cpu = twai_event_cpu(p);
+    if (!cpu) return;
+    s->tx_event_armed = true;
+    s->next_tx_ccount = cpu->ccount + twai_wire_cycles(p, &s->tx_frame);
+    twai_kick(p);
+}
+
+static void twai_update_error_thresholds(twai_state_t *s,
+                                         uint16_t previous_tec,
+                                         uint16_t previous_rec) {
+    bool was_warning = previous_tec >= s->error_warning_limit ||
+                       previous_rec >= s->error_warning_limit;
+    bool now_warning = s->tx_error_count >= s->error_warning_limit ||
+                       s->rx_error_count >= s->error_warning_limit;
+    if (was_warning != now_warning) s->int_raw |= TWAI_INT_ERROR;
+
+    bool was_passive = previous_tec >= 128u || previous_rec >= 128u;
+    bool now_passive = s->tx_error_count >= 128u ||
+                       s->rx_error_count >= 128u;
+    if (was_passive != now_passive) s->int_raw |= TWAI_INT_ERROR_PASSIVE;
+}
+
+static void twai_finish_tx_attempt(esp32_periph_t *p) {
+    twai_state_t *s = &p->twai;
+    if (!s->tx_busy) return;
+
+    periph_twai_tx_result_t result = s->tx_cb ?
+        s->tx_cb(s->tx_cb_ctx, &s->tx_frame) : PERIPH_TWAI_TX_ACK;
+    if (result < PERIPH_TWAI_TX_ACK || result > PERIPH_TWAI_TX_BUS_ERROR)
+        result = PERIPH_TWAI_TX_BUS_ERROR;
+    if (result == PERIPH_TWAI_TX_NO_ACK &&
+        (s->mode & TWAI_MODE_SELF_TEST))
+        result = PERIPH_TWAI_TX_ACK;
+
+    if (result == PERIPH_TWAI_TX_ACK) {
+        uint16_t previous_tec = s->tx_error_count;
+        uint16_t previous_rec = s->rx_error_count;
+        if (s->tx_error_count != 0u) s->tx_error_count--;
+        twai_update_error_thresholds(s, previous_tec, previous_rec);
+        s->tx_busy = false;
+        s->tx_complete = true;
+        /* Latch TX completion before self-reception can assert RX. ESP-IDF's
+         * classic-ESP32 lost-TX-interrupt workaround treats TBS plus an
+         * occupied HAL buffer as completion even when TI is absent. Exposing
+         * RI in that transient state would therefore complete the same frame
+         * once for RI and again for the subsequently raised TI. */
+        s->int_raw |= TWAI_INT_TX;
+        if (s->tx_frame.self_reception)
+            (void)twai_enqueue_rx(p, &s->tx_frame, true);
+        twai_irq_update(p);
+        twai_kick(p);
+        return;
+    }
+
+    if (result == PERIPH_TWAI_TX_ARBITRATION_LOST) {
+        s->arbitration_lost_capture = 0u;
+        s->int_raw |= TWAI_INT_ARB_LOST;
+    } else {
+        uint16_t previous_tec = s->tx_error_count;
+        uint16_t previous_rec = s->rx_error_count;
+        if (s->tx_error_count <= 247u) s->tx_error_count += 8u;
+        else s->tx_error_count = 256u;
+        s->error_code_capture = result == PERIPH_TWAI_TX_NO_ACK ?
+            (uint8_t)((3u << 6) | 25u) : 10u;
+        s->int_raw |= TWAI_INT_BUS_ERROR;
+        twai_update_error_thresholds(s, previous_tec, previous_rec);
+        if (s->tx_error_count >= 256u) {
+            s->bus_off = true;
+            s->mode |= TWAI_MODE_RESET;
+            s->tx_error_count = 128u;
+            s->tx_busy = false;
+            s->tx_complete = false;
+            s->int_raw |= TWAI_INT_ERROR;
+            twai_irq_update(p);
+            twai_kick(p);
+            return;
+        }
+    }
+
+    if (s->tx_frame.single_shot) {
+        s->tx_busy = false;
+        s->tx_complete = false;
+        s->int_raw |= TWAI_INT_TX;
+    } else {
+        twai_arm_tx(p);
+    }
+    twai_irq_update(p);
+}
+
+static void twai_start_tx(esp32_periph_t *p, uint8_t command) {
+    twai_state_t *s = &p->twai;
+    bool self_rx = (command & TWAI_COMMAND_SELF_RX) != 0u;
+    if (!twai_clocked(p) || s->tx_busy || s->bus_off ||
+        (s->mode & (TWAI_MODE_RESET | TWAI_MODE_LISTEN_ONLY)) != 0u)
+        return;
+
+    twai_decode_frame(s->tx_buffer, &s->tx_frame);
+    s->tx_frame.single_shot = (command & TWAI_COMMAND_ABORT) != 0u;
+    s->tx_frame.self_reception = self_rx;
+    s->tx_busy = true;
+    s->tx_complete = false;
+    if (twai_event_cpu(p)) twai_arm_tx(p);
+    else twai_finish_tx_attempt(p);
+}
+
+static void twai_abort_tx(esp32_periph_t *p) {
+    twai_state_t *s = &p->twai;
+    if (!s->tx_busy) return;
+    s->tx_busy = false;
+    s->tx_complete = true;
+    s->tx_event_armed = false;
+    s->int_raw |= TWAI_INT_TX;
+    twai_irq_update(p);
+    twai_kick(p);
+}
+
+static void twai_start_recovery(esp32_periph_t *p) {
+    twai_state_t *s = &p->twai;
+    xtensa_cpu_t *cpu = twai_event_cpu(p);
+    if (!cpu || !s->bus_off || !twai_clocked(p)) return;
+    uint64_t delay = (uint64_t)twai_bit_cycles(p) * 64u * 11u;
+    if (delay == 0u) delay = 1u;
+    if (delay > INT32_MAX) delay = INT32_MAX;
+    s->recovery_phase = 1u;
+    s->recovery_event_armed = true;
+    s->next_recovery_ccount = cpu->ccount + (uint32_t)delay;
+    twai_kick(p);
+}
+
+static void twai_recovery_step(esp32_periph_t *p) {
+    twai_state_t *s = &p->twai;
+    xtensa_cpu_t *cpu = twai_event_cpu(p);
+    if (!s->bus_off || !cpu) return;
+    if (s->recovery_phase == 1u) {
+        s->tx_error_count = 0u;
+        s->rx_error_count = 0u;
+        s->int_raw |= TWAI_INT_ERROR;
+        uint64_t delay = (uint64_t)twai_bit_cycles(p) * 64u * 11u;
+        if (delay == 0u) delay = 1u;
+        if (delay > INT32_MAX) delay = INT32_MAX;
+        s->recovery_phase = 2u;
+        s->recovery_event_armed = true;
+        s->next_recovery_ccount = cpu->ccount + (uint32_t)delay;
+    } else {
+        s->bus_off = false;
+        s->recovery_phase = 0u;
+        s->tx_complete = true;
+        s->int_raw |= TWAI_INT_ERROR;
+    }
+    twai_irq_update(p);
+    twai_kick(p);
+}
+
+static uint32_t twai_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != twai_event_cpu(p) || !twai_clocked(p))
+        return UINT32_MAX;
+    const twai_state_t *s = &p->twai;
+    uint32_t event = UINT32_MAX;
+    uint32_t distance = UINT32_MAX;
+    if (s->tx_event_armed) {
+        event = s->next_tx_ccount;
+        distance = event - cpu->ccount;
+        if ((int32_t)distance < 0) distance = 0u;
+    }
+    if (s->recovery_event_armed) {
+        uint32_t recovery_distance = s->next_recovery_ccount - cpu->ccount;
+        if ((int32_t)recovery_distance < 0) recovery_distance = 0u;
+        if (event == UINT32_MAX || recovery_distance < distance)
+            event = s->next_recovery_ccount;
+    }
+    return event;
+}
+
+static void twai_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu || cpu != twai_event_cpu(p) || !twai_clocked(p))
+        return;
+    twai_state_t *s = &p->twai;
+    if (s->tx_event_armed &&
+        (int32_t)(cpu->ccount - s->next_tx_ccount) >= 0) {
+        s->tx_event_armed = false;
+        twai_finish_tx_attempt(p);
+    }
+    if (s->recovery_event_armed &&
+        (int32_t)(cpu->ccount - s->next_recovery_ccount) >= 0) {
+        s->recovery_event_armed = false;
+        twai_recovery_step(p);
+    }
+}
+
+static uint32_t twai_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    twai_state_t *s = &p->twai;
+    uint32_t off = addr - TWAI_BASE;
+    xtensa_cpu_t *cpu = twai_event_cpu(p);
+    if (cpu) twai_eval_events(p, cpu);
+    if ((off & 3u) != 0u || off >= TWAI_REG_FILE_SIZE)
+        return default_read(ctx, addr);
+
+    switch (off) {
+    case TWAI_MODE_OFF: return s->mode;
+    case TWAI_COMMAND_OFF: return 0u;
+    case TWAI_STATUS_OFF: return twai_status(s);
+    case TWAI_INTERRUPT_OFF: {
+        uint8_t value = s->int_raw;
+        s->int_raw &= TWAI_INT_RX;
+        if (s->rx_count == 0u) s->int_raw = 0u;
+        twai_irq_update(p);
+        return value;
+    }
+    case TWAI_INTERRUPT_ENABLE_OFF: return s->int_ena;
+    case TWAI_BUS_TIMING_0_OFF: return s->bus_timing_0;
+    case TWAI_BUS_TIMING_1_OFF: return s->bus_timing_1;
+    case TWAI_ARB_LOST_CAPTURE_OFF: return s->arbitration_lost_capture;
+    case TWAI_ERROR_CODE_CAPTURE_OFF: return s->error_code_capture;
+    case TWAI_ERROR_WARNING_LIMIT_OFF: return s->error_warning_limit;
+    case TWAI_RX_ERROR_COUNT_OFF: return (uint8_t)s->rx_error_count;
+    case TWAI_TX_ERROR_COUNT_OFF: return (uint8_t)s->tx_error_count;
+    case TWAI_RX_MESSAGE_COUNT_OFF: return s->rx_count;
+    case TWAI_CLOCK_DIVIDER_OFF: return s->clock_divider;
+    default:
+        if (off >= TWAI_BUFFER_OFF && off <= TWAI_BUFFER_OFF + 12u * 4u) {
+            unsigned index = (off - TWAI_BUFFER_OFF) / 4u;
+            if (s->mode & TWAI_MODE_RESET) {
+                if (index < 4u) return s->acceptance_code[index];
+                if (index < 8u) return s->acceptance_mask[index - 4u];
+                return 0u;
+            }
+            if (s->rx_count != 0u)
+                return s->rx_fifo[s->rx_head].bytes[index];
+            return s->tx_buffer[index];
+        }
+        return 0u;
+    }
+}
+
+static void twai_write_mode(esp32_periph_t *p, uint8_t value) {
+    twai_state_t *s = &p->twai;
+    bool was_reset = (s->mode & TWAI_MODE_RESET) != 0u;
+    bool now_reset = (value & TWAI_MODE_RESET) != 0u;
+    s->mode = value & TWAI_MODE_VALID_MASK;
+    if (!was_reset && now_reset) {
+        s->tx_busy = false;
+        s->tx_complete = true;
+        s->tx_event_armed = false;
+        s->recovery_event_armed = false;
+        twai_clear_rx_fifo(s);
+    } else if (was_reset && !now_reset && s->bus_off) {
+        twai_start_recovery(p);
+    }
+    twai_irq_update(p);
+    twai_kick(p);
+}
+
+static void twai_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    twai_state_t *s = &p->twai;
+    uint32_t off = addr - TWAI_BASE;
+    xtensa_cpu_t *cpu = twai_event_cpu(p);
+    if (cpu) twai_eval_events(p, cpu);
+    if ((off & 3u) != 0u || off >= TWAI_REG_FILE_SIZE) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    uint8_t byte = (uint8_t)value;
+
+    switch (off) {
+    case TWAI_MODE_OFF:
+        twai_write_mode(p, byte);
+        return;
+    case TWAI_COMMAND_OFF: {
+        if (byte & TWAI_COMMAND_RELEASE_RX) twai_release_rx(p);
+        if (byte & TWAI_COMMAND_CLEAR_OVERRUN) {
+            s->data_overrun = false;
+            s->int_raw &= (uint8_t)~TWAI_INT_DATA_OVERRUN;
+        }
+        if (byte & (TWAI_COMMAND_TX | TWAI_COMMAND_SELF_RX))
+            twai_start_tx(p, byte);
+        else if (byte & TWAI_COMMAND_ABORT)
+            twai_abort_tx(p);
+        twai_irq_update(p);
+        return;
+    }
+    case TWAI_INTERRUPT_ENABLE_OFF:
+        if (s->mode & TWAI_MODE_RESET) s->int_ena = byte;
+        twai_irq_update(p);
+        return;
+    case TWAI_BUS_TIMING_0_OFF:
+        if (s->mode & TWAI_MODE_RESET) s->bus_timing_0 = byte;
+        return;
+    case TWAI_BUS_TIMING_1_OFF:
+        if (s->mode & TWAI_MODE_RESET) s->bus_timing_1 = byte;
+        return;
+    case TWAI_ERROR_WARNING_LIMIT_OFF:
+        if (s->mode & TWAI_MODE_RESET) s->error_warning_limit = byte;
+        return;
+    case TWAI_RX_ERROR_COUNT_OFF:
+        if (s->mode & TWAI_MODE_RESET) s->rx_error_count = byte;
+        return;
+    case TWAI_TX_ERROR_COUNT_OFF:
+        if (s->mode & TWAI_MODE_RESET) s->tx_error_count = byte;
+        return;
+    case TWAI_CLOCK_DIVIDER_OFF:
+        if (s->mode & TWAI_MODE_RESET)
+            s->clock_divider = byte & 0x8Fu;
+        return;
+    case TWAI_STATUS_OFF:
+    case TWAI_INTERRUPT_OFF:
+    case TWAI_ARB_LOST_CAPTURE_OFF:
+    case TWAI_ERROR_CODE_CAPTURE_OFF:
+    case TWAI_RX_MESSAGE_COUNT_OFF:
+        return;
+    default:
+        if (off >= TWAI_BUFFER_OFF && off <= TWAI_BUFFER_OFF + 12u * 4u) {
+            unsigned index = (off - TWAI_BUFFER_OFF) / 4u;
+            if (s->mode & TWAI_MODE_RESET) {
+                if (index < 4u) s->acceptance_code[index] = byte;
+                else if (index < 8u)
+                    s->acceptance_mask[index - 4u] = byte;
+            } else if (!s->tx_busy) {
+                s->tx_buffer[index] = byte;
+            }
+        }
+        return;
+    }
+}
+
 /* ---- I2S0/I2S1 + circular lldesc DMA ---- */
 
 static const int i2s_intr_sources[I2S_PORT_COUNT] = {32, 33};
@@ -9479,6 +10254,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Native SDMMC host reset state; cards can be attached after creation. */
     sdmmc_reset_state(p);
 
+    /* Classic SJA1000-compatible TWAI controller starts in reset mode. */
+    twai_reset_state(p);
+
     /* LEDC reset state: all eight timers begin held in reset, and DATE is
      * the ESP32 peripheral version value from the vendor register map. */
     ledc_reset_state(p);
@@ -9520,6 +10298,10 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Dual-slot native SD/MMC host (interrupt source 37). */
     mem_register_mmio(mem, (int)PAGE_OF(SDMMC_BASE),
                       sdmmc_read, sdmmc_write, p);
+
+    /* Classic TWAI/CAN controller (interrupt source 45). */
+    mem_register_mmio(mem, (int)PAGE_OF(TWAI_BASE),
+                      twai_read, twai_write, p);
 
     /* SPI1 (general SPI) */
     mem_register_mmio(mem, (int)PAGE_OF(SPI1_BASE), spi_read, spi_write, p);
@@ -9689,6 +10471,24 @@ int periph_sdmmc_set_write_protected(esp32_periph_t *p, int slot,
         return -1;
     p->sdmmc.card[slot].write_protected = write_protected;
     return 0;
+}
+
+int periph_set_twai_tx_callback(esp32_periph_t *p, periph_twai_tx_fn fn,
+                                void *ctx) {
+    if (!p) return -1;
+    p->twai.tx_cb = fn;
+    p->twai.tx_cb_ctx = fn ? ctx : NULL;
+    return 0;
+}
+
+int periph_twai_rx_inject(esp32_periph_t *p,
+                          const periph_twai_frame_t *frame) {
+    if (!p) return 0;
+    return twai_enqueue_rx(p, frame, true);
+}
+
+size_t periph_twai_rx_pending(const esp32_periph_t *p) {
+    return p ? p->twai.rx_count : 0u;
 }
 
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx) {

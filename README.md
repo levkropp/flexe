@@ -39,7 +39,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
   legacy FRC1/FRC2 timers, both timer groups with four 64-bit APB
   counters/alarms, dual UHCI UART DMA with H:5/SLIP framing, GP-SPI2/3 DMA,
-  classic I2C0/1 master, dual-slot native SDMMC with PIO/IDMAC DMA,
+  classic I2C0/1 master, SJA1000-compatible TWAI/CAN,
+  dual-slot native SDMMC with PIO/IDMAC DMA,
   I2S0/1 circular DMA,
   eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
   eight-unit/two-channel classic PCNT, both classic MCPWM motor-control units
@@ -54,7 +55,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 616 tests
+- 618 tests
 
 ## building
 
@@ -143,7 +144,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 616 tests, 4150 passed, 0 failed
+# 618 tests, 4269 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -321,6 +322,24 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-sdmmc-host.sh
 
 `FLEXE_SDMMC_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The TWAI gate builds a sketch against Espressif's public `driver/twai.h` API
+and runs the genuine ESP-IDF driver, ISR, and FreeRTOS TX/RX queues. It covers
+500 kbit/s timing, queued standard and extended transmission, single-shot self
+reception, data and remote-frame host injection, alerts, counters, and clean
+driver shutdown. Raw regressions additionally cover acceptance filtering,
+64-byte FIFO overrun/release behavior, arbitration loss, automatic retry,
+error-warning/passive transitions, bus-off recovery, and the DPORT reset
+domain. Both engines must exchange the exact frames with zero unhandled MMIO
+or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-twai-bus.sh
+# engine=jit stage=0x54574149 ... tx=3 frames=1 inject=1/1 pending=0 unhandled=0 unregistered=0
+# engine=interp stage=0x54574149 ... tx=3 frames=1 inject=1/1 pending=0 unhandled=0 unregistered=0
+```
+
+`FLEXE_TWAI_BUILD_DIR` optionally preserves its Arduino build directory.
+
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
@@ -340,8 +359,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **9.47× real-time** |
-| NerdMiner v1.8.3 | **6.28× real-time** |
+| ESP32 Marauder v1.14 | **9.36× real-time** |
+| NerdMiner v1.8.3 | **6.09× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

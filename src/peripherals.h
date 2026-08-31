@@ -33,6 +33,31 @@ typedef int (*periph_sdmmc_write_blocks_fn)(void *ctx,
                                             const uint8_t *data,
                                             size_t count);
 
+/* One classic CAN 2.0A/B frame crossing the ESP32 TWAI controller's external
+ * bus boundary. DLC values 9-15 are preserved for non-compliant frames, but
+ * only the first eight data bytes exist in classic CAN hardware. */
+typedef struct {
+    uint32_t identifier;
+    uint8_t data_length_code;
+    uint8_t data[8];
+    bool extended;
+    bool remote;
+    bool single_shot;
+    bool self_reception;
+} periph_twai_frame_t;
+
+typedef enum {
+    PERIPH_TWAI_TX_ACK = 0,
+    PERIPH_TWAI_TX_NO_ACK,
+    PERIPH_TWAI_TX_ARBITRATION_LOST,
+    PERIPH_TWAI_TX_BUS_ERROR,
+} periph_twai_tx_result_t;
+
+/* Called once per physical transmit attempt. Returning a bus error lets a
+ * host model exercise automatic retry, error-passive, and bus-off behavior. */
+typedef periph_twai_tx_result_t (*periph_twai_tx_fn)(
+    void *ctx, const periph_twai_frame_t *frame);
+
 /* Raw PCM bytes consumed by one classic ESP32 I2S TX DMA descriptor. The
  * buffer is valid only for the duration of the callback. */
 typedef void (*periph_i2s_tx_fn)(void *ctx, int port, const uint8_t *data,
@@ -134,6 +159,16 @@ int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,
                              void *ctx);
 int periph_sdmmc_set_write_protected(esp32_periph_t *p, int slot,
                                      bool write_protected);
+
+/* Attach a virtual CAN bus peer and inject a received frame. With no transmit
+ * callback attached, a virtual peer ACKs valid transmissions by default.
+ * Injection returns 1 when accepted into the 64-byte hardware FIFO and 0 when
+ * filtered, inactive, invalid, or overrun. */
+int periph_set_twai_tx_callback(esp32_periph_t *p, periph_twai_tx_fn fn,
+                                void *ctx);
+int periph_twai_rx_inject(esp32_periph_t *p,
+                          const periph_twai_frame_t *frame);
+size_t periph_twai_rx_pending(const esp32_periph_t *p);
 
 /* Attach a TX audio sink and inject bytes for RX DMA. I2S ports 0/1 are
  * independent; the RX FIFO accepts as many bytes as fit and zero-fills when

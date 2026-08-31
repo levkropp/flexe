@@ -882,6 +882,294 @@ TEST(sdmmc_slot1_clock_gate_idmac_write_and_media_errors) {
     mem_destroy(mem);
 }
 
+#define TEST_TWAI_BASE 0x3FF6B000u
+#define TEST_TWAI_MODE_RESET (1u << 0)
+#define TEST_TWAI_MODE_SINGLE_FILTER (1u << 3)
+#define TEST_TWAI_STATUS_RBS (1u << 0)
+#define TEST_TWAI_STATUS_DOS (1u << 1)
+#define TEST_TWAI_STATUS_TBS (1u << 2)
+#define TEST_TWAI_STATUS_TCS (1u << 3)
+#define TEST_TWAI_STATUS_TS (1u << 5)
+#define TEST_TWAI_STATUS_ES (1u << 6)
+#define TEST_TWAI_STATUS_BS (1u << 7)
+#define TEST_TWAI_INT_RI (1u << 0)
+#define TEST_TWAI_INT_TI (1u << 1)
+#define TEST_TWAI_INT_EI (1u << 2)
+#define TEST_TWAI_INT_DOI (1u << 3)
+#define TEST_TWAI_INT_EPI (1u << 5)
+#define TEST_TWAI_INT_ALI (1u << 6)
+#define TEST_TWAI_INT_BEI (1u << 7)
+
+static void test_twai_configure(xtensa_mem_t *mem, uint8_t interrupts) {
+    /* 500 kbit/s from the 80 MHz APB clock: BRP=8, TSEG1=15, TSEG2=4. */
+    mem_write32(mem, TEST_TWAI_BASE + 0x00u,
+                TEST_TWAI_MODE_RESET | TEST_TWAI_MODE_SINGLE_FILTER);
+    mem_write32(mem, TEST_TWAI_BASE + 0x18u, 3u);
+    mem_write32(mem, TEST_TWAI_BASE + 0x1Cu, 0x3Eu);
+    mem_write32(mem, TEST_TWAI_BASE + 0x10u, interrupts);
+    mem_write32(mem, TEST_TWAI_BASE + 0x7Cu, 0x80u);
+}
+
+static void test_twai_write_frame(xtensa_mem_t *mem,
+                                  const periph_twai_frame_t *frame) {
+    uint8_t encoded[13] = {0};
+    encoded[0] = frame->data_length_code & 0x0Fu;
+    if (frame->extended) encoded[0] |= 1u << 7;
+    if (frame->remote) encoded[0] |= 1u << 6;
+    unsigned data_off;
+    if (frame->extended) {
+        encoded[1] = (uint8_t)(frame->identifier >> 21);
+        encoded[2] = (uint8_t)(frame->identifier >> 13);
+        encoded[3] = (uint8_t)(frame->identifier >> 5);
+        encoded[4] = (uint8_t)(frame->identifier << 3);
+        data_off = 5u;
+    } else {
+        encoded[1] = (uint8_t)(frame->identifier >> 3);
+        encoded[2] = (uint8_t)(frame->identifier << 5);
+        data_off = 3u;
+    }
+    if (!frame->remote) {
+        unsigned len = frame->data_length_code < 8u ?
+                       frame->data_length_code : 8u;
+        memcpy(&encoded[data_off], frame->data, len);
+    }
+    for (unsigned index = 0; index < 13u; index++)
+        mem_write32(mem, TEST_TWAI_BASE + 0x40u + index * 4u,
+                    encoded[index]);
+}
+
+static uint32_t test_twai_run_event(xtensa_cpu_t *cpu) {
+    uint32_t event = cpu->periph_next_event(cpu);
+    ASSERT_TRUE(event != UINT32_MAX);
+    uint32_t elapsed = event - cpu->ccount;
+    cpu->ccount = event;
+    cpu->periph_event(cpu);
+    return elapsed;
+}
+
+TEST(twai_reset_acceptance_fifo_overrun_interrupt_and_dport) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x00u),
+              TEST_TWAI_MODE_RESET);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x08u),
+              TEST_TWAI_STATUS_TBS | TEST_TWAI_STATUS_TCS);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x34u), 96u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x50u), 0xFFu);
+
+    mem_write32(mem, 0x3FF000C0u, 1u << 19);
+    test_twai_configure(mem, TEST_TWAI_INT_RI | TEST_TWAI_INT_DOI);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x7Cu), 0x80u);
+
+    /* Single-filter mode: accept standard ID 0x321, ignore RTR and data. */
+    mem_write32(mem, TEST_TWAI_BASE + 0x40u, 0x64u);
+    mem_write32(mem, TEST_TWAI_BASE + 0x44u, 0x20u);
+    mem_write32(mem, TEST_TWAI_BASE + 0x48u, 0u);
+    mem_write32(mem, TEST_TWAI_BASE + 0x4Cu, 0u);
+    mem_write32(mem, TEST_TWAI_BASE + 0x50u, 0u);
+    mem_write32(mem, TEST_TWAI_BASE + 0x54u, 0x1Fu);
+    mem_write32(mem, TEST_TWAI_BASE + 0x58u, 0xFFu);
+    mem_write32(mem, TEST_TWAI_BASE + 0x5Cu, 0xFFu);
+    mem_write32(mem, TEST_TWAI_BASE + 0x00u,
+                TEST_TWAI_MODE_SINGLE_FILTER);
+
+    periph_twai_frame_t frame = {
+        .identifier = 0x322u,
+        .data_length_code = 4u,
+        .data = {0xA0u, 0xA1u, 0xA2u, 0xA3u},
+    };
+    ASSERT_EQ(periph_twai_rx_inject(p, &frame), 0);
+    frame.identifier = 0x321u;
+    ASSERT_EQ(periph_twai_rx_inject(p, &frame), 1);
+    ASSERT_EQ(periph_twai_rx_pending(p), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x74u), 1u);
+    ASSERT_TRUE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                TEST_TWAI_STATUS_RBS);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x40u), 4u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x44u), 0x64u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x48u), 0x20u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x4Cu), 0xA0u);
+    ASSERT_TRUE(periph_interrupt_pending(p, 45));
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu), TEST_TWAI_INT_RI);
+    /* RI is level-like until the final receive buffer is released. */
+    ASSERT_TRUE(periph_interrupt_pending(p, 45));
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u << 2);
+    ASSERT_EQ(periph_twai_rx_pending(p), 0u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 45));
+
+    frame.remote = true;
+    frame.data_length_code = 0u;
+    for (unsigned index = 0; index < 21u; index++)
+        ASSERT_EQ(periph_twai_rx_inject(p, &frame), 1);
+    ASSERT_EQ(periph_twai_rx_inject(p, &frame), 0);
+    ASSERT_EQ(periph_twai_rx_pending(p), 21u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu),
+              TEST_TWAI_INT_RI | TEST_TWAI_INT_DOI);
+    ASSERT_TRUE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                TEST_TWAI_STATUS_DOS);
+    for (unsigned index = 0; index < 21u; index++)
+        mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u << 2);
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u << 3);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x08u),
+              TEST_TWAI_STATUS_TBS | TEST_TWAI_STATUS_TCS);
+
+    mem_write32(mem, 0x3FF000C4u, 1u << 19);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x00u),
+              TEST_TWAI_MODE_RESET);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x34u), 96u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 45));
+    mem_write32(mem, 0x3FF000C4u, 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+typedef struct {
+    unsigned calls;
+    unsigned arbitration_failures;
+    periph_twai_tx_result_t result;
+    periph_twai_frame_t last;
+} twai_test_capture_t;
+
+static periph_twai_tx_result_t test_twai_capture(
+    void *ctx, const periph_twai_frame_t *frame) {
+    twai_test_capture_t *capture = ctx;
+    capture->calls++;
+    capture->last = *frame;
+    if (capture->arbitration_failures != 0u) {
+        capture->arbitration_failures--;
+        return PERIPH_TWAI_TX_ARBITRATION_LOST;
+    }
+    return capture->result;
+}
+
+TEST(twai_wire_timing_self_reception_retry_busoff_and_recovery) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 19);
+    test_twai_configure(mem, TEST_TWAI_INT_RI | TEST_TWAI_INT_TI |
+                       TEST_TWAI_INT_EI | TEST_TWAI_INT_EPI |
+                       TEST_TWAI_INT_ALI | TEST_TWAI_INT_BEI);
+    /* Accept every standard or extended frame. */
+    for (unsigned index = 0; index < 4u; index++)
+        mem_write32(mem, TEST_TWAI_BASE + 0x50u + index * 4u, 0xFFu);
+    mem_write32(mem, TEST_TWAI_BASE + 0x00u,
+                TEST_TWAI_MODE_SINGLE_FILTER);
+
+    twai_test_capture_t capture = {.result = PERIPH_TWAI_TX_ACK};
+    ASSERT_EQ(periph_set_twai_tx_callback(p, test_twai_capture, &capture), 0);
+    periph_twai_frame_t frame = {
+        .identifier = 0x123u,
+        .data_length_code = 8u,
+        .data = {0x00u, 0xFFu, 0x55u, 0xAAu,
+                 0x11u, 0x22u, 0x33u, 0x44u},
+    };
+    test_twai_write_frame(mem, &frame);
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+              (TEST_TWAI_STATUS_TBS | TEST_TWAI_STATUS_TCS |
+               TEST_TWAI_STATUS_TS), TEST_TWAI_STATUS_TS);
+    uint32_t elapsed = test_twai_run_event(&cpu);
+    ASSERT_TRUE(elapsed > 40000u && elapsed < 100000u);
+    ASSERT_EQ(capture.calls, 1u);
+    ASSERT_EQ(capture.last.identifier, 0x123u);
+    ASSERT_EQ(capture.last.data_length_code, 8u);
+    ASSERT_EQ(capture.last.data[7], 0x44u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+              (TEST_TWAI_STATUS_TBS | TEST_TWAI_STATUS_TCS),
+              TEST_TWAI_STATUS_TBS | TEST_TWAI_STATUS_TCS);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu), TEST_TWAI_INT_TI);
+
+    frame.identifier = 0x1ABCDE3u;
+    frame.data_length_code = 3u;
+    frame.data[0] = 0xC1u;
+    frame.data[1] = 0xC2u;
+    frame.data[2] = 0xC3u;
+    frame.extended = true;
+    test_twai_write_frame(mem, &frame);
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u << 4);
+    test_twai_run_event(&cpu);
+    ASSERT_TRUE(capture.last.self_reception);
+    ASSERT_EQ(periph_twai_rx_pending(p), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu),
+              TEST_TWAI_INT_RI | TEST_TWAI_INT_TI);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x40u) & 0xCFu, 0x83u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x44u), 0x0Du);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x48u), 0x5Eu);
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u << 2);
+
+    capture.result = PERIPH_TWAI_TX_NO_ACK;
+    frame.identifier = 0x456u;
+    frame.extended = false;
+    frame.data_length_code = 1u;
+    frame.data[0] = 0x5Au;
+    test_twai_write_frame(mem, &frame);
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 0x03u);
+    test_twai_run_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+              (TEST_TWAI_STATUS_TBS | TEST_TWAI_STATUS_TCS),
+              TEST_TWAI_STATUS_TBS);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x3Cu), 8u);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu),
+              TEST_TWAI_INT_TI | TEST_TWAI_INT_BEI);
+
+    capture.result = PERIPH_TWAI_TX_ACK;
+    capture.arbitration_failures = 1u;
+    test_twai_write_frame(mem, &frame);
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u);
+    test_twai_run_event(&cpu);
+    ASSERT_TRUE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                TEST_TWAI_STATUS_TS);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu), TEST_TWAI_INT_ALI);
+    test_twai_run_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu), TEST_TWAI_INT_TI);
+
+    capture.result = PERIPH_TWAI_TX_NO_ACK;
+    test_twai_write_frame(mem, &frame);
+    mem_write32(mem, TEST_TWAI_BASE + 0x04u, 1u);
+    for (unsigned attempt = 0; attempt < 40u; attempt++) {
+        test_twai_run_event(&cpu);
+        (void)mem_read32(mem, TEST_TWAI_BASE + 0x0Cu);
+        if (mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+            TEST_TWAI_STATUS_BS)
+            break;
+    }
+    ASSERT_TRUE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                TEST_TWAI_STATUS_BS);
+    ASSERT_TRUE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                TEST_TWAI_STATUS_ES);
+    ASSERT_TRUE(mem_read32(mem, TEST_TWAI_BASE + 0x00u) &
+                TEST_TWAI_MODE_RESET);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x3Cu), 128u);
+
+    mem_write32(mem, TEST_TWAI_BASE + 0x00u, 0u);
+    test_twai_run_event(&cpu);
+    ASSERT_TRUE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                TEST_TWAI_STATUS_BS);
+    ASSERT_FALSE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                 TEST_TWAI_STATUS_ES);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu), TEST_TWAI_INT_EI);
+    test_twai_run_event(&cpu);
+    ASSERT_FALSE(mem_read32(mem, TEST_TWAI_BASE + 0x08u) &
+                 TEST_TWAI_STATUS_BS);
+    ASSERT_EQ(mem_read32(mem, TEST_TWAI_BASE + 0x0Cu), TEST_TWAI_INT_EI);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 typedef struct {
     int count;
     uint8_t last;
@@ -4146,6 +4434,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(sdmmc_commands_responses_and_pio_fifo);
     RUN_TEST(sdmmc_idmac_chains_writeback_interrupts_and_errors);
     RUN_TEST(sdmmc_slot1_clock_gate_idmac_write_and_media_errors);
+    RUN_TEST(twai_reset_acceptance_fifo_overrun_interrupt_and_dport);
+    RUN_TEST(twai_wire_timing_self_reception_retry_busoff_and_recovery);
     RUN_TEST(uart_controllers_are_independent);
     RUN_TEST(uart_status_tx_ready);
     RUN_TEST(uart_tx_empty_interrupt);
