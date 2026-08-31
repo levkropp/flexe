@@ -229,6 +229,11 @@ if(UNIX)
     target_compile_options(flexe-sdmmc-host-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-sdio-slave-test tools/sdio_slave_test.c)
+    target_link_libraries(flexe-sdio-slave-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-sdio-slave-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-twai-bus-test tools/twai_bus_test.c)
     target_link_libraries(flexe-twai-bus-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-twai-bus-test PRIVATE

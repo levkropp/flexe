@@ -2838,7 +2838,8 @@ static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
      * interrupt sources whose peripheral ISR path is not modeled yet.  Some
      * production drivers use a non-NULL handle to select management paths
      * that cannot work while their interrupt is intentionally stubbed. */
-    if (source != 12 && source != 13 && source != 14 && source != 15 &&
+    if (source != 10 && source != 11 &&
+        source != 12 && source != 13 && source != 14 && source != 15 &&
         source != 18 && source != 19 &&
         source != 32 && source != 33 && source != 37 && source != 38 &&
         source != 39 && source != 40 &&

@@ -601,8 +601,10 @@ void stub_xTaskGetTickCount(xtensa_cpu_t *cpu, void *ctx) {
 static uint32_t queue_create_locked(freertos_stubs_t *frt, uint32_t length,
                                     uint32_t item_size, int initial_count,
                                     uint32_t preferred_handle) {
+    /* Data queues need fixed host storage, but semaphores store only a count
+     * and ESP-IDF legitimately creates one with UINT32_MAX capacity. */
     if (item_size > MAX_ITEM_SIZE || length == 0 ||
-        length > MAX_QUEUE_ITEMS)
+        (item_size != 0 && length > MAX_QUEUE_ITEMS))
         return 0;
 
     int slot = -1;
@@ -624,8 +626,8 @@ static uint32_t queue_create_locked(freertos_stubs_t *frt, uint32_t length,
     memset(q, 0, sizeof(*q));
     q->handle = handle;
     q->item_size = (int)item_size;
-    q->max_items = (int)length;
-    q->count = initial_count > (int)length ? (int)length : initial_count;
+    q->max_items = length > 0x7FFFFFFFu ? 0x7FFFFFFF : (int)length;
+    q->count = initial_count > q->max_items ? q->max_items : initial_count;
     return handle;
 }
 
@@ -933,6 +935,39 @@ void stub_xSemaphoreCreateBinary(xtensa_cpu_t *cpu, void *ctx) {
     pthread_mutex_lock(&frt->lock);
     uint32_t handle = queue_create_locked(frt, 1, 0, 0, 0);
     pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* Native FreeRTOS implements counting-semaphore creation around
+ * xQueueGenericCreate and then mutates Queue_t fields directly. Flexe queue
+ * handles are intentionally host-backed, so intercept the public constructor
+ * as one atomic operation instead. Very large capacities require no storage. */
+void stub_xQueueCreateCountingSemaphore(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t maximum = frt_arg(cpu, 0);
+    uint32_t initial = frt_arg(cpu, 1);
+    uint32_t handle = 0u;
+    if (maximum != 0u && initial <= maximum && initial <= 0x7FFFFFFFu) {
+        pthread_mutex_lock(&frt->lock);
+        handle = queue_create_locked(frt, maximum, 0u, (int)initial, 0u);
+        pthread_mutex_unlock(&frt->lock);
+    }
+    frt_return(cpu, handle);
+}
+
+void stub_xQueueCreateCountingSemaphoreStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t maximum = frt_arg(cpu, 0);
+    uint32_t initial = frt_arg(cpu, 1);
+    uint32_t storage = frt_arg(cpu, 2);
+    uint32_t handle = 0u;
+    if (maximum != 0u && initial <= maximum && initial <= 0x7FFFFFFFu &&
+        storage != 0u) {
+        pthread_mutex_lock(&frt->lock);
+        handle = queue_create_locked(frt, maximum, 0u, (int)initial,
+                                     storage);
+        pthread_mutex_unlock(&frt->lock);
+    }
     frt_return(cpu, handle);
 }
 
@@ -1657,6 +1692,9 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xSemaphoreCreateMutex",         stub_xSemaphoreCreateMutex },
         { "xQueueCreateMutex",             stub_xSemaphoreCreateMutex },
         { "xSemaphoreCreateBinary",        stub_xSemaphoreCreateBinary },
+        { "xQueueCreateCountingSemaphore", stub_xQueueCreateCountingSemaphore },
+        { "xQueueCreateCountingSemaphoreStatic",
+                                             stub_xQueueCreateCountingSemaphoreStatic },
         { "xSemaphoreTake",                stub_xSemaphoreTake },
         { "xQueueSemaphoreTake",           stub_xSemaphoreTake },
         { "xSemaphoreGive",                stub_xSemaphoreGive },

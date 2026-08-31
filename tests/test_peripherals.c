@@ -91,6 +91,23 @@ TEST(uart_tx_capture) {
 #define TEST_UHCI_DESC_EOF (1u << 30)
 #define TEST_UHCI_DESC_OWNER (1u << 31)
 
+#define TEST_HINF_BASE 0x3FF4B000u
+#define TEST_SLCHOST_BASE 0x3FF55000u
+#define TEST_SLC_BASE 0x3FF58000u
+#define TEST_SLC_LINK_START (1u << 29)
+#define TEST_SLC_LINK_PARK (1u << 31)
+#define TEST_SLC_DESC_EOF (1u << 30)
+#define TEST_SLC_DESC_OWNER (1u << 31)
+#define TEST_SLC_INT_TX_OVF (1u << 11)
+#define TEST_SLC_INT_TOKEN1_EMPTY (1u << 13)
+#define TEST_SLC_INT_TX_DONE (1u << 14)
+#define TEST_SLC_INT_TX_SUC_EOF (1u << 15)
+#define TEST_SLC_INT_RX_DONE (1u << 16)
+#define TEST_SLC_INT_RX_EOF (1u << 17)
+#define TEST_SLC_INT_TOHOST (1u << 18)
+#define TEST_SLC_INT_TX_DSCR_ERR (1u << 19)
+#define TEST_SLC_INT_RX_DSCR_ERR (1u << 20)
+
 #define TEST_SDMMC_BASE 0x3FF68000u
 #define TEST_SDMMC_CMD_RESP (1u << 6)
 #define TEST_SDMMC_CMD_DATA (1u << 9)
@@ -144,6 +161,25 @@ static void test_sdmmc_command(xtensa_mem_t *mem, unsigned command,
     mem_write32(mem, TEST_SDMMC_BASE + 0x2Cu,
                 TEST_SDMMC_CMD_START | flags | command |
                 ((uint32_t)slot << 16));
+}
+
+static void test_slc_desc(xtensa_mem_t *mem, uint32_t desc,
+                          uint32_t buffer, uint16_t size, uint16_t length,
+                          bool eof, uint32_t next) {
+    uint32_t control = ((uint32_t)size & 0xFFFu) |
+                       (((uint32_t)length & 0xFFFu) << 12u) |
+                       TEST_SLC_DESC_OWNER;
+    if (eof) control |= TEST_SLC_DESC_EOF;
+    mem_write32(mem, desc, control);
+    mem_write32(mem, desc + 4u, buffer);
+    mem_write32(mem, desc + 8u, next);
+}
+
+static uint32_t test_slchost_shared_addr(unsigned position) {
+    uint32_t address = TEST_SLCHOST_BASE + 0x6Cu + position;
+    if (position > 23u) address += 4u;
+    if (position > 31u) address += 12u;
+    return address;
 }
 
 static void test_spi_dma_desc(xtensa_mem_t *mem, uint32_t desc,
@@ -557,6 +593,288 @@ TEST(uhci_malformed_descriptors_report_directional_errors) {
     mem_write32(mem, 0x3FF000C4u, 1u << 8);
     ASSERT_FALSE(periph_interrupt_pending(p, 12));
     ASSERT_EQ(mem_read32(mem, TEST_UHCI0_BASE + 0x04u), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdio_slave_reset_shared_interrupts_and_dport) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu); cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    periph_intr_matrix_set(p, 0, 10, 10);
+    periph_intr_matrix_set(p, 0, 11, 11);
+
+    ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x00u), 0x22226666u);
+    ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x04u), 0x01110011u);
+    ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x1Cu), 0x00020000u);
+    ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x20u), UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x40u), 0x33336666u);
+    ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0xFCu), 0x15030200u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x00u), 0xFF3CFF30u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x60u), 0x00300078u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x98u), 0x101B101Au);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x1F8u), 0x16022500u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x1FCu), 0x00000100u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLCHOST_BASE + 0x178u), 0x16022500u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLCHOST_BASE + 0x17Cu), 0x00000600u);
+    ASSERT_TRUE(mem_read32(mem, 0x3FF000CCu) & (1u << 4));
+    ASSERT_FALSE(periph_sdio_slave_host_ready(p));
+
+    mem_write32(mem, TEST_HINF_BASE + 0x04u,
+                mem_read32(mem, TEST_HINF_BASE + 0x04u) | (1u << 1));
+    ASSERT_TRUE(periph_sdio_slave_host_ready(p));
+
+    static const unsigned positions[] = {0u, 23u, 24u, 31u, 32u, 63u};
+    for (unsigned index = 0; index < sizeof(positions) / sizeof(positions[0]);
+         index++) {
+        unsigned position = positions[index];
+        uint8_t value = (uint8_t)(0x31u + index * 0x17u);
+        uint8_t observed = 0u;
+        ASSERT_EQ(periph_sdio_slave_host_write_reg(p, position, value), 0);
+        ASSERT_EQ(periph_sdio_slave_host_read_reg(p, position, &observed), 0);
+        ASSERT_EQ(observed, value);
+        uint32_t address = test_slchost_shared_addr(position);
+        ASSERT_EQ(mem_read8(mem, address), value);
+        ASSERT_EQ((mem_read32(mem, address & ~3u) >>
+                   ((address & 3u) * 8u)) & 0xFFu, value);
+
+        uint8_t guest_value = (uint8_t)(value ^ 0xFFu);
+        uint32_t word = mem_read32(mem, address & ~3u);
+        unsigned shift = (address & 3u) * 8u;
+        mem_write32(mem, address & ~3u,
+                    (word & ~(0xFFu << shift)) |
+                    ((uint32_t)guest_value << shift));
+        ASSERT_EQ(periph_sdio_slave_host_read_reg(p, position, &observed), 0);
+        ASSERT_EQ(observed, guest_value);
+    }
+    uint8_t ignored = 0u;
+    ASSERT_EQ(periph_sdio_slave_host_read_reg(p, 64u, &ignored), -1);
+    ASSERT_EQ(periph_sdio_slave_host_write_reg(p, 64u, 0u), -1);
+
+    /* Host-to-slave general interrupts occupy the low SLC raw bits and drive
+     * the real SLC0 interrupt source when the guest enables them. */
+    mem_write32(mem, TEST_SLC_BASE + 0x0Cu, 1u << 3);
+    ASSERT_EQ(periph_sdio_slave_host_interrupt(p, 1u << 3), 0);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x04u) & 0xFFu, 1u << 3);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x08u), 1u << 3);
+    ASSERT_TRUE(periph_interrupt_pending(p, 10));
+    ASSERT_EQ(cpu.interrupt & (1u << 10), 1u << 10);
+    mem_write32(mem, TEST_SLC_BASE + 0x10u, 1u << 3);
+    ASSERT_FALSE(periph_interrupt_pending(p, 10));
+
+    /* SLC1 is a separate source and its host vector occupies bits 16..23. */
+    mem_write32(mem, TEST_SLC_BASE + 0x1Cu, TEST_SLC_INT_RX_DSCR_ERR);
+    mem_write32(mem, TEST_SLC_BASE + 0x44u,
+                0xFFFFFu | TEST_SLC_LINK_START);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x14u) &
+              TEST_SLC_INT_RX_DSCR_ERR, TEST_SLC_INT_RX_DSCR_ERR);
+    ASSERT_TRUE(periph_interrupt_pending(p, 11));
+    mem_write32(mem, TEST_SLC_BASE + 0x20u, TEST_SLC_INT_RX_DSCR_ERR);
+    ASSERT_FALSE(periph_interrupt_pending(p, 11));
+
+    mem_write32(mem, TEST_SLCHOST_BASE + 0xDCu, 1u << 5);
+    mem_write32(mem, TEST_SLCHOST_BASE + 0xE0u, 1u << 6);
+    mem_write32(mem, TEST_SLC_BASE + 0x4Cu,
+                (1u << 5) | (1u << (16u + 6u)));
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x4Cu),
+              (1u << 5) | (1u << (16u + 6u)));
+    ASSERT_EQ(periph_sdio_slave_host_interrupt_raw(p) & (1u << 5),
+              1u << 5);
+    ASSERT_EQ(periph_sdio_slave_host_interrupt_pending(p), 1u << 5);
+    ASSERT_EQ(mem_read32(mem, TEST_SLCHOST_BASE + 0x54u) & (1u << 6),
+              1u << 6);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x14u) & TEST_SLC_INT_TOHOST,
+              TEST_SLC_INT_TOHOST);
+    periph_sdio_slave_host_interrupt_clear(p, 1u << 5);
+    mem_write32(mem, TEST_SLCHOST_BASE + 0xD8u, 1u << 6);
+    ASSERT_EQ(periph_sdio_slave_host_interrupt_raw(p) & (1u << 5), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLCHOST_BASE + 0x54u) & (1u << 6), 0u);
+
+    /* HINF masks delivery to the external host without destroying raw state. */
+    mem_write32(mem, TEST_SLC_BASE + 0x4Cu, 1u << 5);
+    mem_write32(mem, TEST_HINF_BASE + 0x04u,
+                mem_read32(mem, TEST_HINF_BASE + 0x04u) | (1u << 6));
+    ASSERT_EQ(periph_sdio_slave_host_interrupt_pending(p), 0u);
+    ASSERT_EQ(periph_sdio_slave_host_interrupt_raw(p) & (1u << 5),
+              1u << 5);
+
+    uint32_t clocks = mem_read32(mem, 0x3FF000CCu);
+    mem_write32(mem, 0x3FF000CCu, clocks & ~(1u << 4));
+    ASSERT_FALSE(periph_sdio_slave_host_ready(p));
+    ASSERT_EQ(periph_sdio_slave_host_interrupt(p, 1u), -1);
+    mem_write32(mem, 0x3FF000CCu, clocks);
+
+    periph_sdio_slave_host_write_reg(p, 0u, 0xA5u);
+    mem_write32(mem, 0x3FF000D0u, 1u << 5);
+    ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x04u), 0x01110011u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x04u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLCHOST_BASE + 0x6Cu), 0u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 10));
+    ASSERT_FALSE(periph_interrupt_pending(p, 11));
+    mem_write32(mem, 0x3FF000D0u, 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdio_slave_scatter_gather_packets_and_writeback) {
+    const uint32_t tx_desc0 = 0x3FFB5000u;
+    const uint32_t tx_desc1 = 0x3FFB5010u;
+    const uint32_t tx_buf0 = 0x3FFB5100u;
+    const uint32_t tx_buf1 = 0x3FFB5110u;
+    const uint32_t rx_desc0 = 0x3FFB5200u;
+    const uint32_t rx_desc1 = 0x3FFB5210u;
+    const uint32_t rx_buf0 = 0x3FFB5300u;
+    const uint32_t rx_buf1 = 0x3FFB5310u;
+    static const uint8_t host_packet[13] = {
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76,
+        0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC,
+    };
+    static const uint8_t slave_packet[13] = {
+        0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96,
+        0x87, 0x78, 0x69, 0x5A, 0x4B, 0x3C,
+    };
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    mem_write32(mem, TEST_HINF_BASE + 0x04u,
+                mem_read32(mem, TEST_HINF_BASE + 0x04u) | (1u << 1));
+    mem_write32(mem, TEST_SLC_BASE + 0x00u,
+                mem_read32(mem, TEST_SLC_BASE + 0x00u) | (1u << 6));
+    mem_write32(mem, TEST_SLC_BASE + 0x0Cu,
+                TEST_SLC_INT_TOKEN1_EMPTY | TEST_SLC_INT_TX_DONE |
+                TEST_SLC_INT_TX_SUC_EOF | TEST_SLC_INT_RX_DONE |
+                TEST_SLC_INT_RX_EOF);
+
+    /* The host writes one packet across two slave receive descriptors. */
+    test_slc_desc(mem, tx_desc0, tx_buf0, 8u, 0u, false, tx_desc1);
+    test_slc_desc(mem, tx_desc1, tx_buf1, 8u, 0u, false, 0u);
+    mem_write32(mem, TEST_SLC_BASE + 0x40u,
+                (tx_desc0 & 0xFFFFFu) | TEST_SLC_LINK_START);
+    mem_write32(mem, TEST_SLC_BASE + 0x54u, (1u << 14) | 2u);
+    ASSERT_EQ(periph_sdio_slave_host_send_buffers(p), 2u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLCHOST_BASE + 0x44u) >> 16u, 2u);
+    ASSERT_EQ(periph_sdio_slave_host_write_packet(
+                  p, host_packet, sizeof(host_packet)), 1);
+    for (unsigned index = 0; index < 8u; index++)
+        ASSERT_EQ(mem_read8(mem, tx_buf0 + index), host_packet[index]);
+    for (unsigned index = 0; index < 5u; index++)
+        ASSERT_EQ(mem_read8(mem, tx_buf1 + index), host_packet[index + 8u]);
+    ASSERT_EQ((mem_read32(mem, tx_desc0) >> 12u) & 0xFFFu, 8u);
+    ASSERT_EQ((mem_read32(mem, tx_desc1) >> 12u) & 0xFFFu, 5u);
+    ASSERT_FALSE(mem_read32(mem, tx_desc0) & TEST_SLC_DESC_EOF);
+    ASSERT_TRUE(mem_read32(mem, tx_desc1) & TEST_SLC_DESC_EOF);
+    ASSERT_FALSE(mem_read32(mem, tx_desc0) & TEST_SLC_DESC_OWNER);
+    ASSERT_FALSE(mem_read32(mem, tx_desc1) & TEST_SLC_DESC_OWNER);
+    ASSERT_EQ(periph_sdio_slave_host_send_buffers(p), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x7Cu), tx_desc1);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x80u), tx_desc0);
+    ASSERT_TRUE(mem_read32(mem, TEST_SLC_BASE + 0x40u) &
+                TEST_SLC_LINK_PARK);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x04u) &
+              (TEST_SLC_INT_TOKEN1_EMPTY | TEST_SLC_INT_TX_DONE |
+               TEST_SLC_INT_TX_SUC_EOF),
+              TEST_SLC_INT_TOKEN1_EMPTY | TEST_SLC_INT_TX_DONE |
+              TEST_SLC_INT_TX_SUC_EOF);
+    ASSERT_TRUE(periph_interrupt_pending(p, 10));
+    mem_write32(mem, TEST_SLC_BASE + 0x10u, 0x07FFFFFFu);
+
+    /* The host reads the cumulative packet length through two send
+     * descriptors. An undersized destination is reported before writeback. */
+    for (unsigned index = 0; index < 6u; index++)
+        mem_write8(mem, rx_buf0 + index, slave_packet[index]);
+    for (unsigned index = 0; index < 7u; index++)
+        mem_write8(mem, rx_buf1 + index, slave_packet[index + 6u]);
+    test_slc_desc(mem, rx_desc0, rx_buf0, 6u, 6u, false, rx_desc1);
+    test_slc_desc(mem, rx_desc1, rx_buf1, 7u, 7u, true, 0u);
+    mem_write32(mem, TEST_SLC_BASE + 0x3Cu,
+                (rx_desc0 & 0xFFFFFu) | TEST_SLC_LINK_START);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x04u) &
+              TEST_SLC_INT_RX_DONE, TEST_SLC_INT_RX_DONE);
+    mem_write32(mem, TEST_SLC_BASE + 0xE4u,
+                (1u << 20) | sizeof(slave_packet));
+    ASSERT_EQ(periph_sdio_slave_host_receive_bytes(p),
+              sizeof(slave_packet));
+
+    uint8_t received[13] = {0};
+    size_t received_len = 0u;
+    ASSERT_EQ(periph_sdio_slave_host_read_packet(
+                  p, received, sizeof(received) - 1u, &received_len), -1);
+    ASSERT_EQ(received_len, sizeof(slave_packet));
+    ASSERT_TRUE(mem_read32(mem, rx_desc0) & TEST_SLC_DESC_OWNER);
+    ASSERT_TRUE(mem_read32(mem, rx_desc1) & TEST_SLC_DESC_OWNER);
+    ASSERT_EQ(periph_sdio_slave_host_read_packet(
+                  p, received, sizeof(received), &received_len), 1);
+    ASSERT_EQ(received_len, sizeof(slave_packet));
+    ASSERT_TRUE(memcmp(received, slave_packet, sizeof(slave_packet)) == 0);
+    ASSERT_FALSE(mem_read32(mem, rx_desc0) & TEST_SLC_DESC_OWNER);
+    ASSERT_FALSE(mem_read32(mem, rx_desc1) & TEST_SLC_DESC_OWNER);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x78u), rx_desc1);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x80u), rx_desc0);
+    ASSERT_EQ(periph_sdio_slave_host_receive_bytes(p), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x04u) &
+              (TEST_SLC_INT_RX_DONE | TEST_SLC_INT_RX_EOF),
+              TEST_SLC_INT_RX_DONE | TEST_SLC_INT_RX_EOF);
+    ASSERT_TRUE(periph_sdio_slave_host_interrupt_raw(p) & (1u << 23));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdio_slave_malformed_dma_is_packet_atomic) {
+    const uint32_t tx_desc = 0x3FFB5400u;
+    const uint32_t tx_buf = 0x3FFB5500u;
+    const uint32_t rx_desc = 0x3FFB5410u;
+    const uint32_t rx_buf = 0x3FFB5510u;
+    static const uint8_t packet[5] = {1u, 2u, 3u, 4u, 5u};
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    mem_write32(mem, TEST_HINF_BASE + 0x04u,
+                mem_read32(mem, TEST_HINF_BASE + 0x04u) | (1u << 1));
+    for (unsigned index = 0; index < 4u; index++)
+        mem_write8(mem, tx_buf + index, 0xA5u);
+    test_slc_desc(mem, tx_desc, tx_buf, 4u, 0u, false, 0u);
+    mem_write32(mem, TEST_SLC_BASE + 0x40u,
+                (tx_desc & 0xFFFFFu) | TEST_SLC_LINK_START);
+    mem_write32(mem, TEST_SLC_BASE + 0x54u, 1u << 13);
+    ASSERT_EQ(periph_sdio_slave_host_write_packet(p, packet,
+                                                   sizeof(packet)), 0);
+    for (unsigned index = 0; index < 4u; index++)
+        ASSERT_EQ(mem_read8(mem, tx_buf + index), 0xA5u);
+    ASSERT_TRUE(mem_read32(mem, tx_desc) & TEST_SLC_DESC_OWNER);
+    ASSERT_EQ(periph_sdio_slave_host_send_buffers(p), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x04u) &
+              TEST_SLC_INT_TX_OVF, TEST_SLC_INT_TX_OVF);
+
+    /* A descriptor length larger than its capacity must neither copy bytes
+     * nor transfer ownership to the host. */
+    test_slc_desc(mem, rx_desc, rx_buf, 4u, 5u, true, 0u);
+    mem_write32(mem, TEST_SLC_BASE + 0x3Cu,
+                (rx_desc & 0xFFFFFu) | TEST_SLC_LINK_START);
+    mem_write32(mem, TEST_SLC_BASE + 0xE4u, (1u << 20) | 5u);
+    uint8_t output[5];
+    memset(output, 0xCC, sizeof(output));
+    size_t output_len = 0u;
+    ASSERT_EQ(periph_sdio_slave_host_read_packet(
+                  p, output, sizeof(output), &output_len), -1);
+    ASSERT_EQ(output_len, sizeof(output));
+    for (unsigned index = 0; index < sizeof(output); index++)
+        ASSERT_EQ(output[index], 0xCCu);
+    ASSERT_TRUE(mem_read32(mem, rx_desc) & TEST_SLC_DESC_OWNER);
+    ASSERT_EQ(mem_read32(mem, TEST_SLC_BASE + 0x04u) &
+              TEST_SLC_INT_RX_DSCR_ERR, TEST_SLC_INT_RX_DSCR_ERR);
+
+    uint32_t clocks = mem_read32(mem, 0x3FF000CCu);
+    mem_write32(mem, 0x3FF000CCu, clocks & ~(1u << 4));
+    ASSERT_EQ(periph_sdio_slave_host_write_packet(p, packet,
+                                                   sizeof(packet)), -1);
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
     periph_destroy(p);
@@ -4698,6 +5016,9 @@ static void run_peripheral_tests(void) {
     RUN_TEST(uhci_h5_slip_receive_transmit_and_checksum_error);
     RUN_TEST(uhci_h5_reliable_sequence_and_crc_validation);
     RUN_TEST(uhci_malformed_descriptors_report_directional_errors);
+    RUN_TEST(sdio_slave_reset_shared_interrupts_and_dport);
+    RUN_TEST(sdio_slave_scatter_gather_packets_and_writeback);
+    RUN_TEST(sdio_slave_malformed_dma_is_packet_atomic);
     RUN_TEST(sdmmc_reset_slots_dport_and_card_status);
     RUN_TEST(sdmmc_native_image_uses_existing_capacity);
     RUN_TEST(sdmmc_commands_responses_and_pio_fifo);

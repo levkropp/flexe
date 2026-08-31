@@ -15,6 +15,9 @@
 #define UART2_BASE      0x3FF6E000u
 #define UHCI0_BASE      0x3FF54000u
 #define UHCI1_BASE      0x3FF4C000u
+#define HINF_BASE       0x3FF4B000u
+#define SLCHOST_BASE    0x3FF55000u
+#define SLC_BASE        0x3FF58000u
 #define SPI1_BASE       0x3FF42000u
 #define SPI0_BASE       0x3FF43000u
 #define I2C0_BASE       0x3FF53000u
@@ -207,6 +210,163 @@
 #define UHCI_ESC_CONF3_RESET        0x00DFDB13u
 #define UHCI_PKT_THRES_RESET        0x00000080u
 #define UHCI_DATE_RESET             0x16041001u
+
+/* Classic ESP32 SDIO-slave interface. HINF exposes card identity/CCCR state,
+ * SLCHOST contains the shared-register and host-visible counter/interrupt
+ * windows, and SLC owns the two lldesc DMA channels. Espressif's naming is
+ * from the DMA's viewpoint: SLC RX is slave-to-host, while SLC TX is
+ * host-to-slave. */
+#define HINF_REG_FILE_SIZE           0x100u
+#define SLCHOST_REG_FILE_SIZE        0x200u
+#define SLC_REG_FILE_SIZE            0x200u
+#define SLC_CHANNEL_COUNT            2u
+#define SLC_DMA_MAX_DESCRIPTORS      256u
+#define SLC_INTR_SOURCE0             10
+#define SLC_INTR_SOURCE1             11
+
+#define SLC_CONF0_OFF                0x000u
+#define SLC_INT0_RAW_OFF             0x004u
+#define SLC_INT0_ST_OFF              0x008u
+#define SLC_INT0_ENA_OFF             0x00Cu
+#define SLC_INT0_CLR_OFF             0x010u
+#define SLC_INT1_RAW_OFF             0x014u
+#define SLC_INT1_ST_OFF              0x018u
+#define SLC_INT1_ENA_OFF             0x01Cu
+#define SLC_INT1_CLR_OFF             0x020u
+#define SLC_RX_LINK0_OFF             0x03Cu
+#define SLC_TX_LINK0_OFF             0x040u
+#define SLC_RX_LINK1_OFF             0x044u
+#define SLC_TX_LINK1_OFF             0x048u
+#define SLC_INTVEC_TOHOST_OFF        0x04Cu
+#define SLC_TOKEN0_0_OFF             0x050u
+#define SLC_TOKEN1_0_OFF             0x054u
+#define SLC_TOKEN0_1_OFF             0x058u
+#define SLC_TOKEN1_1_OFF             0x05Cu
+#define SLC_CONF1_OFF                0x060u
+#define SLC_TO_EOF_DESC0_OFF         0x078u
+#define SLC_TX_EOF_DESC0_OFF         0x07Cu
+#define SLC_TO_EOF_BFR_DESC0_OFF     0x080u
+#define SLC_TO_EOF_DESC1_OFF         0x084u
+#define SLC_TX_EOF_DESC1_OFF         0x088u
+#define SLC_TO_EOF_BFR_DESC1_OFF     0x08Cu
+#define SLC_RX_DSCR_CONF_OFF         0x098u
+#define SLC_TX_DSCR0_OFF             0x09Cu
+#define SLC_TX_DSCR0_BF0_OFF         0x0A0u
+#define SLC_TX_DSCR0_BF1_OFF         0x0A4u
+#define SLC_RX_DSCR0_OFF             0x0A8u
+#define SLC_RX_DSCR0_BF0_OFF         0x0ACu
+#define SLC_RX_DSCR0_BF1_OFF         0x0B0u
+#define SLC_TX_DSCR1_OFF             0x0B4u
+#define SLC_TX_DSCR1_BF0_OFF         0x0B8u
+#define SLC_TX_DSCR1_BF1_OFF         0x0BCu
+#define SLC_RX_DSCR1_OFF             0x0C0u
+#define SLC_RX_DSCR1_BF0_OFF         0x0C4u
+#define SLC_RX_DSCR1_BF1_OFF         0x0C8u
+#define SLC_TX_ERR_EOF_DESC0_OFF     0x0CCu
+#define SLC_TX_ERR_EOF_DESC1_OFF     0x0D0u
+#define SLC_LEN_CONF0_OFF            0x0E4u
+#define SLC_LENGTH0_OFF              0x0E8u
+#define SLC_DATE_OFF                 0x1F8u
+#define SLC_ID_OFF                   0x1FCu
+
+#define SLC_LINK_ADDR_MASK           0x000FFFFFu
+#define SLC_LINK_STOP                (1u << 28)
+#define SLC_LINK_START               (1u << 29)
+#define SLC_LINK_RESTART             (1u << 30)
+#define SLC_LINK_PARK                (1u << 31)
+#define SLC_DESC_SIZE_MASK           0x00000FFFu
+#define SLC_DESC_LENGTH_MASK         0x00FFF000u
+#define SLC_DESC_LENGTH_SHIFT        12u
+#define SLC_DESC_EOF                 (1u << 30)
+#define SLC_DESC_OWNER               (1u << 31)
+#define SLC_INT_FRHOST_MASK          0x000000FFu
+#define SLC_INT_RX_START             (1u << 8)
+#define SLC_INT_TX_START             (1u << 9)
+#define SLC_INT_RX_UDF               (1u << 10)
+#define SLC_INT_TX_OVF               (1u << 11)
+#define SLC_INT_TOKEN0_EMPTY         (1u << 12)
+#define SLC_INT_TOKEN1_EMPTY         (1u << 13)
+#define SLC_INT_TX_DONE              (1u << 14)
+#define SLC_INT_TX_SUC_EOF           (1u << 15)
+#define SLC_INT_RX_DONE              (1u << 16)
+#define SLC_INT_RX_EOF               (1u << 17)
+#define SLC_INT_TOHOST               (1u << 18)
+#define SLC_INT_TX_DSCR_ERR          (1u << 19)
+#define SLC_INT_RX_DSCR_ERR          (1u << 20)
+#define SLC_INT_TX_DSCR_EMPTY        (1u << 21)
+#define SLC_INT_VALID0_MASK          0x07FFFFFFu
+#define SLC_INT_VALID1_MASK          0x01FFFFFFu
+#define SLC_TOKEN_VALUE_MASK         0x00000FFFu
+#define SLC_TOKEN_WR                 (1u << 12)
+#define SLC_TOKEN_INC                (1u << 13)
+#define SLC_TOKEN_INC_MORE           (1u << 14)
+#define SLC_TOKEN_READ_SHIFT         16u
+#define SLC_LEN_VALUE_MASK           0x000FFFFFu
+#define SLC_LEN_WR                   (1u << 20)
+#define SLC_LEN_INC                  (1u << 21)
+#define SLC_LEN_INC_MORE             (1u << 22)
+
+#define SLCHOST_TOKEN_RDATA0_OFF     0x044u
+#define SLCHOST_INT0_RAW_OFF         0x050u
+#define SLCHOST_INT1_RAW_OFF         0x054u
+#define SLCHOST_INT0_ST_OFF          0x058u
+#define SLCHOST_INT1_ST_OFF          0x05Cu
+#define SLCHOST_PKT_LEN_OFF          0x060u
+#define SLCHOST_SHARED0_OFF          0x06Cu
+#define SLCHOST_TOKEN_RDATA1_OFF     0x0C4u
+#define SLCHOST_TOKEN_WDATA0_OFF     0x0C8u
+#define SLCHOST_TOKEN_WDATA1_OFF     0x0CCu
+#define SLCHOST_TOKEN_CON_OFF        0x0D0u
+#define SLCHOST_INT0_CLR_OFF         0x0D4u
+#define SLCHOST_INT1_CLR_OFF         0x0D8u
+#define SLCHOST_FUNC1_INT0_ENA_OFF   0x0DCu
+#define SLCHOST_FUNC1_INT1_ENA_OFF   0x0E0u
+#define SLCHOST_FUNC2_INT0_ENA_OFF   0x0E4u
+#define SLCHOST_FUNC2_INT1_ENA_OFF   0x0E8u
+#define SLCHOST_INT0_ENA_OFF         0x0ECu
+#define SLCHOST_INT1_ENA_OFF         0x0F0u
+#define SLCHOST_LEN_WDATA0_OFF       0x0FCu
+#define SLCHOST_DATE_OFF             0x178u
+#define SLCHOST_ID_OFF               0x17Cu
+#define SLCHOST_CONF_OFF             0x1F0u
+#define SLCHOST_INF_ST_OFF           0x1F4u
+#define SLCHOST_INT_VALID_MASK       0x03FFFFFFu
+#define SLCHOST_INT_TOHOST_MASK      0x000000FFu
+#define SLCHOST_INT_TOKEN0_EMPTY     (1u << 8)
+#define SLCHOST_INT_TOKEN1_EMPTY     (1u << 9)
+#define SLCHOST_INT_TOKEN0_READY     (1u << 10)
+#define SLCHOST_INT_TOKEN1_READY     (1u << 11)
+#define SLCHOST_INT_RX_SOF           (1u << 12)
+#define SLCHOST_INT_RX_EOF           (1u << 13)
+#define SLCHOST_INT_RX_START         (1u << 14)
+#define SLCHOST_INT_TX_START         (1u << 15)
+#define SLCHOST_INT_RX_UDF           (1u << 16)
+#define SLCHOST_INT_TX_OVF           (1u << 17)
+#define SLCHOST_INT_RX_NEW_PACKET    (1u << 23)
+
+#define HINF_CFG_DATA0_OFF           0x000u
+#define HINF_CFG_DATA1_OFF           0x004u
+#define HINF_CFG_DATA7_OFF           0x01Cu
+#define HINF_CIS_CONF0_OFF           0x020u
+#define HINF_CFG_DATA16_OFF          0x040u
+#define HINF_DATE_OFF                0x0FCu
+#define HINF_SDIO_ENABLE             (1u << 0)
+#define HINF_SDIO_IOREADY1           (1u << 1)
+#define HINF_SDIO_INT_MASK           (1u << 6)
+#define HINF_SDIO_RESET              (1u << 16)
+
+#define SLC_CONF0_RESET              0xFF3CFF30u
+#define SLC_CONF1_RESET              0x00300078u
+#define SLC_RX_DSCR_CONF_RESET       0x101B101Au
+#define SLC_DATE_RESET               0x16022500u
+#define SLC_ID_RESET                 0x00000100u
+#define SLCHOST_DATE_RESET           0x16022500u
+#define SLCHOST_ID_RESET             0x00000600u
+#define HINF_CFG_DATA0_RESET         0x22226666u
+#define HINF_CFG_DATA1_RESET         0x01110011u
+#define HINF_CFG_DATA7_RESET         0x00020000u
+#define HINF_CFG_DATA16_RESET        0x33336666u
+#define HINF_DATE_RESET              0x15030200u
 
 /* Classic ESP32 DesignWare SD/MMC host. Two logical slots share one command,
  * FIFO, and internal-DMA engine. The register block extends through the clock
@@ -795,6 +955,8 @@ static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_reset_state(esp32_periph_t *p, unsigned port);
 static void uhci_dport_update(esp32_periph_t *p);
+static void sdio_slave_reset_state(esp32_periph_t *p);
+static void sdio_slave_dport_update(esp32_periph_t *p);
 static size_t uhci_uart_rx_feed(esp32_periph_t *p, int uart_num,
                                 const uint8_t *data, size_t len,
                                 bool idle_after);
@@ -1030,6 +1192,27 @@ typedef struct {
     uint16_t debug_in_count;
     uint16_t debug_in_last;
 } uhci_state_t;
+
+typedef struct {
+    uint32_t slc[SLC_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t host[SLCHOST_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t hinf[HINF_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t int_raw[SLC_CHANNEL_COUNT];
+    uint32_t int_ena[SLC_CHANNEL_COUNT];
+    uint32_t host_int_raw[SLC_CHANNEL_COUNT];
+    uint16_t token[SLC_CHANNEL_COUNT][2];
+    uint32_t packet_len[SLC_CHANNEL_COUNT];
+    uint32_t host_consumed_len[SLC_CHANNEL_COUNT];
+
+    /* SLC RX pulls slave memory toward the host; SLC TX fills slave memory
+     * from host traffic. Addresses are full reconstructed DRAM addresses. */
+    uint32_t rx_desc[SLC_CHANNEL_COUNT];
+    uint32_t tx_desc[SLC_CHANNEL_COUNT];
+    uint32_t rx_last_desc[SLC_CHANNEL_COUNT];
+    uint32_t tx_last_desc[SLC_CHANNEL_COUNT];
+    bool rx_link_running[SLC_CHANNEL_COUNT];
+    bool tx_link_running[SLC_CHANNEL_COUNT];
+} sdio_slave_state_t;
 
 typedef struct {
     bool attached;
@@ -1363,6 +1546,9 @@ struct esp32_periph {
      * UART2 through UHCI_CONF0.UARTx_CE. */
     uhci_state_t uhci[UHCI_PORT_COUNT];
 
+    /* External SDIO card/slave endpoint: HINF + SLCHOST + dual-channel SLC. */
+    sdio_slave_state_t sdio_slave;
+
     /* Two independent classic ESP32 I2C controllers and their virtual bus
      * targets. */
     i2c_state_t i2c[I2C_PORT_COUNT];
@@ -1534,6 +1720,8 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_CORE_RST_EN_OFF          0x0D0
 #define DPORT_SDIO_HOST_CLK_BIT        (1u << 13)
 #define DPORT_SDIO_HOST_RST_BIT        (1u << 6)
+#define DPORT_SDIO_SLAVE_CLK_BIT       (1u << 4)
+#define DPORT_SDIO_SLAVE_RST_BIT       (1u << 5)
 #define DPORT_EMAC_CLK_BIT             (1u << 14)
 #define DPORT_EMAC_RST_BIT             (1u << 7)
 #define DPORT_UHCI0_MODULE_BIT         (1u << 8)
@@ -1755,15 +1943,19 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         break;
     case DPORT_WIFI_CLK_EN_OFF:
         p->dport_wifi_clk_en = val;
+        sdio_slave_dport_update(p);
         sdmmc_dport_update(p);
         emac_dport_update(p);
         break;
     case DPORT_CORE_RST_EN_OFF:
         p->dport_core_rst_en = val;
+        if (val & DPORT_SDIO_SLAVE_RST_BIT)
+            sdio_slave_reset_state(p);
         if (val & DPORT_SDIO_HOST_RST_BIT)
             sdmmc_reset_state(p);
         if (val & DPORT_EMAC_RST_BIT)
             emac_reset_state(p);
+        sdio_slave_dport_update(p);
         sdmmc_dport_update(p);
         emac_dport_update(p);
         break;
@@ -8413,6 +8605,715 @@ static void uhci_write(void *ctx, uint32_t addr, uint32_t value) {
     }
 }
 
+/* ---- SDIO slave (HINF + SLCHOST + SLC DMA) ---- */
+
+static bool sdio_slave_clocked(const esp32_periph_t *p) {
+    return p &&
+           (p->dport_wifi_clk_en & DPORT_SDIO_SLAVE_CLK_BIT) != 0u &&
+           (p->dport_core_rst_en & DPORT_SDIO_SLAVE_RST_BIT) == 0u;
+}
+
+static uint32_t slc_first_desc(uint32_t link) {
+    return 0x3FF00000u | (link & SLC_LINK_ADDR_MASK);
+}
+
+static uint32_t slc_next_desc(uint32_t next) {
+    return next != 0u && next < 0x00100000u ?
+           0x3FF00000u | next : next;
+}
+
+static uint32_t slc_valid_interrupts(unsigned channel) {
+    return channel == 0u ? SLC_INT_VALID0_MASK : SLC_INT_VALID1_MASK;
+}
+
+static void slc_irq_update(esp32_periph_t *p, unsigned channel) {
+    if (!p || channel >= SLC_CHANNEL_COUNT) return;
+    sdio_slave_state_t *s = &p->sdio_slave;
+    bool active = sdio_slave_clocked(p) &&
+                  (s->int_raw[channel] & s->int_ena[channel] &
+                   slc_valid_interrupts(channel)) != 0u;
+    int source = channel == 0u ? SLC_INTR_SOURCE0 : SLC_INTR_SOURCE1;
+    if (active)
+        periph_assert_interrupt(p, source);
+    else
+        periph_deassert_interrupt(p, source);
+}
+
+static void slc_set_interrupts(esp32_periph_t *p, unsigned channel,
+                               uint32_t bits) {
+    if (!p || channel >= SLC_CHANNEL_COUNT) return;
+    sdio_slave_state_t *s = &p->sdio_slave;
+    s->int_raw[channel] |= bits & slc_valid_interrupts(channel);
+    slc_irq_update(p, channel);
+}
+
+static void slchost_set_interrupts(sdio_slave_state_t *s, unsigned channel,
+                                   uint32_t bits) {
+    if (!s || channel >= SLC_CHANNEL_COUNT) return;
+    s->host_int_raw[channel] |= bits & SLCHOST_INT_VALID_MASK;
+}
+
+static void slc_update_desc_history(sdio_slave_state_t *s,
+                                    unsigned channel, bool rx,
+                                    uint32_t desc) {
+    uint32_t current;
+    if (channel == 0u)
+        current = rx ? SLC_RX_DSCR0_OFF : SLC_TX_DSCR0_OFF;
+    else
+        current = rx ? SLC_RX_DSCR1_OFF : SLC_TX_DSCR1_OFF;
+    uint32_t bf0 = current + 4u;
+    uint32_t bf1 = current + 8u;
+    s->slc[bf1 / 4u] = s->slc[bf0 / 4u];
+    s->slc[bf0 / 4u] = s->slc[current / 4u];
+    s->slc[current / 4u] = desc;
+}
+
+static void slc_reset_dma_path(esp32_periph_t *p, unsigned channel,
+                               bool rx) {
+    if (!p || channel >= SLC_CHANNEL_COUNT) return;
+    sdio_slave_state_t *s = &p->sdio_slave;
+    if (rx) {
+        s->rx_desc[channel] = 0u;
+        s->rx_last_desc[channel] = 0u;
+        s->rx_link_running[channel] = false;
+        s->int_raw[channel] &= ~(SLC_INT_RX_START | SLC_INT_RX_UDF |
+                                 SLC_INT_RX_DONE | SLC_INT_RX_EOF |
+                                 SLC_INT_RX_DSCR_ERR);
+    } else {
+        s->tx_desc[channel] = 0u;
+        s->tx_last_desc[channel] = 0u;
+        s->tx_link_running[channel] = false;
+        s->int_raw[channel] &= ~(SLC_INT_TX_START | SLC_INT_TX_OVF |
+                                 SLC_INT_TX_DONE | SLC_INT_TX_SUC_EOF |
+                                 SLC_INT_TX_DSCR_ERR |
+                                 SLC_INT_TX_DSCR_EMPTY);
+    }
+    slc_irq_update(p, channel);
+}
+
+static void sdio_slave_reset_state(esp32_periph_t *p) {
+    if (!p) return;
+    periph_deassert_interrupt(p, SLC_INTR_SOURCE0);
+    periph_deassert_interrupt(p, SLC_INTR_SOURCE1);
+    sdio_slave_state_t *s = &p->sdio_slave;
+    memset(s, 0, sizeof(*s));
+
+    s->slc[SLC_CONF0_OFF / 4u] = SLC_CONF0_RESET;
+    s->slc[SLC_CONF1_OFF / 4u] = SLC_CONF1_RESET;
+    s->slc[SLC_RX_DSCR_CONF_OFF / 4u] = SLC_RX_DSCR_CONF_RESET;
+    s->slc[SLC_DATE_OFF / 4u] = SLC_DATE_RESET;
+    s->slc[SLC_ID_OFF / 4u] = SLC_ID_RESET;
+
+    s->host[SLCHOST_DATE_OFF / 4u] = SLCHOST_DATE_RESET;
+    s->host[SLCHOST_ID_OFF / 4u] = SLCHOST_ID_RESET;
+
+    s->hinf[HINF_CFG_DATA0_OFF / 4u] = HINF_CFG_DATA0_RESET;
+    s->hinf[HINF_CFG_DATA1_OFF / 4u] = HINF_CFG_DATA1_RESET;
+    s->hinf[HINF_CFG_DATA7_OFF / 4u] = HINF_CFG_DATA7_RESET;
+    for (uint32_t off = HINF_CIS_CONF0_OFF; off < HINF_CFG_DATA16_OFF;
+         off += 4u)
+        s->hinf[off / 4u] = UINT32_MAX;
+    s->hinf[HINF_CFG_DATA16_OFF / 4u] = HINF_CFG_DATA16_RESET;
+    s->hinf[HINF_DATE_OFF / 4u] = HINF_DATE_RESET;
+}
+
+static void sdio_slave_dport_update(esp32_periph_t *p) {
+    if (!p) return;
+    slc_irq_update(p, 0u);
+    slc_irq_update(p, 1u);
+}
+
+static void slc_token_set(esp32_periph_t *p, unsigned channel,
+                          unsigned token_index, uint16_t value) {
+    if (!p || channel >= SLC_CHANNEL_COUNT || token_index > 1u) return;
+    sdio_slave_state_t *s = &p->sdio_slave;
+    uint16_t old = s->token[channel][token_index];
+    value &= SLC_TOKEN_VALUE_MASK;
+    s->token[channel][token_index] = value;
+    if (old == 0u && value != 0u) {
+        slchost_set_interrupts(
+            s, channel, token_index == 0u ? SLCHOST_INT_TOKEN0_READY :
+                                           SLCHOST_INT_TOKEN1_READY);
+    } else if (old != 0u && value == 0u) {
+        slchost_set_interrupts(
+            s, channel, token_index == 0u ? SLCHOST_INT_TOKEN0_EMPTY :
+                                           SLCHOST_INT_TOKEN1_EMPTY);
+        slc_set_interrupts(
+            p, channel, token_index == 0u ? SLC_INT_TOKEN0_EMPTY :
+                                           SLC_INT_TOKEN1_EMPTY);
+    }
+}
+
+static void slc_token_write(esp32_periph_t *p, unsigned channel,
+                            unsigned token_index, uint32_t value) {
+    sdio_slave_state_t *s = &p->sdio_slave;
+    uint16_t next = s->token[channel][token_index];
+    if (value & SLC_TOKEN_WR) {
+        next = (uint16_t)(value & SLC_TOKEN_VALUE_MASK);
+    } else if (value & SLC_TOKEN_INC_MORE) {
+        next = (uint16_t)((next + (value & SLC_TOKEN_VALUE_MASK)) &
+                          SLC_TOKEN_VALUE_MASK);
+    } else if (value & SLC_TOKEN_INC) {
+        next = (uint16_t)((next + 1u) & SLC_TOKEN_VALUE_MASK);
+    }
+    slc_token_set(p, channel, token_index, next);
+}
+
+static void slc_packet_length_set(sdio_slave_state_t *s, unsigned channel,
+                                  uint32_t value) {
+    if (!s || channel >= SLC_CHANNEL_COUNT) return;
+    value &= SLC_LEN_VALUE_MASK;
+    uint32_t old = s->packet_len[channel];
+    s->packet_len[channel] = value;
+    if (channel == 0u)
+        s->slc[SLC_LENGTH0_OFF / 4u] = value;
+    if (old != value)
+        slchost_set_interrupts(s, channel, SLCHOST_INT_RX_NEW_PACKET);
+}
+
+static void slc_packet_length_write(sdio_slave_state_t *s,
+                                    unsigned channel, uint32_t value) {
+    uint32_t next = s->packet_len[channel];
+    if (value & SLC_LEN_WR) {
+        next = value & SLC_LEN_VALUE_MASK;
+    } else if (value & SLC_LEN_INC_MORE) {
+        next = (next + (value & SLC_LEN_VALUE_MASK)) & SLC_LEN_VALUE_MASK;
+    } else if (value & SLC_LEN_INC) {
+        next = (next + 1u) & SLC_LEN_VALUE_MASK;
+    }
+    slc_packet_length_set(s, channel, next);
+}
+
+static bool slc_descriptor_valid(esp32_periph_t *p, uint32_t desc,
+                                 uint32_t *ctrl, uint32_t *buffer,
+                                 uint32_t *next) {
+    if ((desc & 3u) != 0u ||
+        !uhci_dma_range_mapped(p, desc, 12u, false)) return false;
+    *ctrl = mem_read32(p->mem, desc);
+    *buffer = mem_read32(p->mem, desc + 4u);
+    *next = slc_next_desc(mem_read32(p->mem, desc + 8u));
+    return true;
+}
+
+static void slc_link_start(esp32_periph_t *p, unsigned channel, bool rx,
+                           uint32_t value) {
+    sdio_slave_state_t *s = &p->sdio_slave;
+    uint32_t *current = rx ? &s->rx_desc[channel] : &s->tx_desc[channel];
+    uint32_t *last = rx ? &s->rx_last_desc[channel] :
+                          &s->tx_last_desc[channel];
+    bool *running = rx ? &s->rx_link_running[channel] :
+                         &s->tx_link_running[channel];
+
+    if (value & SLC_LINK_STOP) {
+        *running = false;
+        return;
+    }
+    if (value & SLC_LINK_START) {
+        *current = slc_first_desc(value);
+        *last = 0u;
+        *running = true;
+    } else if (value & SLC_LINK_RESTART) {
+        if (*current == 0u && *last != 0u &&
+            uhci_dma_range_mapped(p, *last + 8u, 4u, false))
+            *current = slc_next_desc(mem_read32(p->mem, *last + 8u));
+        *running = *current != 0u;
+    } else {
+        return;
+    }
+
+    if (*current == 0u || (*current & 3u) != 0u ||
+        !uhci_dma_range_mapped(p, *current, 12u, false)) {
+        *running = false;
+        slc_set_interrupts(p, channel,
+                           rx ? SLC_INT_RX_DSCR_ERR : SLC_INT_TX_DSCR_ERR);
+        return;
+    }
+    slc_update_desc_history(s, channel, rx, *current);
+    if (rx) {
+        /* Loading an RX descriptor into the SLC FIFO raises RX_DONE before
+         * the SDIO host drains it. The stock HAL intentionally keeps this
+         * raw latch high and toggles its enable bit as a software ISR doorbell. */
+        slc_set_interrupts(p, channel, SLC_INT_RX_START | SLC_INT_RX_DONE);
+    } else {
+        slc_set_interrupts(p, channel, SLC_INT_TX_START);
+    }
+}
+
+static uint32_t slc_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - SLC_BASE;
+    if ((off & 3u) != 0u || off >= SLC_REG_FILE_SIZE)
+        return default_read(ctx, addr);
+    sdio_slave_state_t *s = &p->sdio_slave;
+    switch (off) {
+    case SLC_INT0_RAW_OFF: return s->int_raw[0];
+    case SLC_INT0_ST_OFF: return s->int_raw[0] & s->int_ena[0];
+    case SLC_INT0_ENA_OFF: return s->int_ena[0];
+    case SLC_INT0_CLR_OFF: return 0u;
+    case SLC_INT1_RAW_OFF: return s->int_raw[1];
+    case SLC_INT1_ST_OFF: return s->int_raw[1] & s->int_ena[1];
+    case SLC_INT1_ENA_OFF: return s->int_ena[1];
+    case SLC_INT1_CLR_OFF: return 0u;
+    case SLC_RX_LINK0_OFF:
+        return (s->slc[off / 4u] & SLC_LINK_ADDR_MASK) |
+               (s->rx_link_running[0] ? 0u : SLC_LINK_PARK);
+    case SLC_TX_LINK0_OFF:
+        return (s->slc[off / 4u] & SLC_LINK_ADDR_MASK) |
+               (s->tx_link_running[0] ? 0u : SLC_LINK_PARK);
+    case SLC_RX_LINK1_OFF:
+        return (s->slc[off / 4u] & SLC_LINK_ADDR_MASK) |
+               (s->rx_link_running[1] ? 0u : SLC_LINK_PARK);
+    case SLC_TX_LINK1_OFF:
+        return (s->slc[off / 4u] & SLC_LINK_ADDR_MASK) |
+               (s->tx_link_running[1] ? 0u : SLC_LINK_PARK);
+    case SLC_TOKEN0_0_OFF:
+        return (uint32_t)s->token[0][0] << SLC_TOKEN_READ_SHIFT;
+    case SLC_TOKEN1_0_OFF:
+        return (uint32_t)s->token[0][1] << SLC_TOKEN_READ_SHIFT;
+    case SLC_TOKEN0_1_OFF:
+        return (uint32_t)s->token[1][0] << SLC_TOKEN_READ_SHIFT;
+    case SLC_TOKEN1_1_OFF:
+        return (uint32_t)s->token[1][1] << SLC_TOKEN_READ_SHIFT;
+    case SLC_LENGTH0_OFF: return s->packet_len[0];
+    default: return s->slc[off / 4u];
+    }
+}
+
+static void slc_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - SLC_BASE;
+    if ((off & 3u) != 0u || off >= SLC_REG_FILE_SIZE) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    sdio_slave_state_t *s = &p->sdio_slave;
+    switch (off) {
+    case SLC_CONF0_OFF:
+        s->slc[off / 4u] = value;
+        if (value & ((1u << 2) | (1u << 3))) {
+            for (unsigned channel = 0; channel < SLC_CHANNEL_COUNT;
+                 channel++) {
+                slc_reset_dma_path(p, channel, false);
+                slc_reset_dma_path(p, channel, true);
+            }
+        }
+        if (value & (1u << 0)) slc_reset_dma_path(p, 0u, false);
+        if (value & (1u << 1)) slc_reset_dma_path(p, 0u, true);
+        if (value & (1u << 16)) slc_reset_dma_path(p, 1u, false);
+        if (value & (1u << 17)) slc_reset_dma_path(p, 1u, true);
+        return;
+    case SLC_INT0_RAW_OFF:
+    case SLC_INT0_ST_OFF:
+    case SLC_INT1_RAW_OFF:
+    case SLC_INT1_ST_OFF:
+        return;
+    case SLC_INT0_ENA_OFF:
+        s->int_ena[0] = value & SLC_INT_VALID0_MASK;
+        slc_irq_update(p, 0u);
+        return;
+    case SLC_INT1_ENA_OFF:
+        s->int_ena[1] = value & SLC_INT_VALID1_MASK;
+        slc_irq_update(p, 1u);
+        return;
+    case SLC_INT0_CLR_OFF:
+        s->int_raw[0] &= ~(value & SLC_INT_VALID0_MASK);
+        slc_irq_update(p, 0u);
+        return;
+    case SLC_INT1_CLR_OFF:
+        s->int_raw[1] &= ~(value & SLC_INT_VALID1_MASK);
+        slc_irq_update(p, 1u);
+        return;
+    case SLC_RX_LINK0_OFF:
+    case SLC_TX_LINK0_OFF:
+    case SLC_RX_LINK1_OFF:
+    case SLC_TX_LINK1_OFF: {
+        unsigned channel = off >= SLC_RX_LINK1_OFF ? 1u : 0u;
+        bool rx = off == SLC_RX_LINK0_OFF || off == SLC_RX_LINK1_OFF;
+        s->slc[off / 4u] = value & SLC_LINK_ADDR_MASK;
+        slc_link_start(p, channel, rx, value);
+        return;
+    }
+    case SLC_INTVEC_TOHOST_OFF:
+        s->slc[off / 4u] = value & 0x00FF00FFu;
+        if (value & 0xFFu) {
+            slchost_set_interrupts(s, 0u, value & 0xFFu);
+            slc_set_interrupts(p, 0u, SLC_INT_TOHOST);
+        }
+        if (value & 0x00FF0000u) {
+            slchost_set_interrupts(s, 1u, (value >> 16u) & 0xFFu);
+            slc_set_interrupts(p, 1u, SLC_INT_TOHOST);
+        }
+        return;
+    case SLC_TOKEN0_0_OFF: slc_token_write(p, 0u, 0u, value); return;
+    case SLC_TOKEN1_0_OFF: slc_token_write(p, 0u, 1u, value); return;
+    case SLC_TOKEN0_1_OFF: slc_token_write(p, 1u, 0u, value); return;
+    case SLC_TOKEN1_1_OFF: slc_token_write(p, 1u, 1u, value); return;
+    case SLC_LEN_CONF0_OFF:
+        s->slc[off / 4u] = value;
+        slc_packet_length_write(s, 0u, value);
+        return;
+    case SLC_LENGTH0_OFF:
+    case SLC_TO_EOF_DESC0_OFF:
+    case SLC_TX_EOF_DESC0_OFF:
+    case SLC_TO_EOF_BFR_DESC0_OFF:
+    case SLC_TO_EOF_DESC1_OFF:
+    case SLC_TX_EOF_DESC1_OFF:
+    case SLC_TO_EOF_BFR_DESC1_OFF:
+    case SLC_TX_DSCR0_OFF:
+    case SLC_TX_DSCR0_BF0_OFF:
+    case SLC_TX_DSCR0_BF1_OFF:
+    case SLC_RX_DSCR0_OFF:
+    case SLC_RX_DSCR0_BF0_OFF:
+    case SLC_RX_DSCR0_BF1_OFF:
+    case SLC_TX_DSCR1_OFF:
+    case SLC_TX_DSCR1_BF0_OFF:
+    case SLC_TX_DSCR1_BF1_OFF:
+    case SLC_RX_DSCR1_OFF:
+    case SLC_RX_DSCR1_BF0_OFF:
+    case SLC_RX_DSCR1_BF1_OFF:
+    case SLC_TX_ERR_EOF_DESC0_OFF:
+    case SLC_TX_ERR_EOF_DESC1_OFF:
+        return;
+    default:
+        s->slc[off / 4u] = value;
+        return;
+    }
+}
+
+static uint32_t slchost_token_value(const sdio_slave_state_t *s,
+                                    unsigned channel) {
+    return (uint32_t)s->token[channel][0] |
+           ((uint32_t)s->token[channel][1] << 16u);
+}
+
+static uint32_t slchost_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - SLCHOST_BASE;
+    if (off >= SLCHOST_REG_FILE_SIZE)
+        return default_read(ctx, addr);
+    /* The public SDIO API intentionally reads shared registers through an
+     * 8-bit volatile pointer. MMIO callbacks receive that exact byte address,
+     * so select it from the containing hardware register here. */
+    if ((off & 3u) != 0u) {
+        uint32_t aligned = off & ~3u;
+        uint32_t word = slchost_read(ctx, SLCHOST_BASE + aligned);
+        return (word >> ((off & 3u) * 8u)) & 0xFFu;
+    }
+    sdio_slave_state_t *s = &p->sdio_slave;
+    switch (off) {
+    case SLCHOST_TOKEN_RDATA0_OFF: return slchost_token_value(s, 0u);
+    case SLCHOST_TOKEN_RDATA1_OFF: return slchost_token_value(s, 1u);
+    case SLCHOST_INT0_RAW_OFF: return s->host_int_raw[0];
+    case SLCHOST_INT1_RAW_OFF: return s->host_int_raw[1];
+    case SLCHOST_INT0_ST_OFF:
+        return s->host_int_raw[0] & s->host[SLCHOST_INT0_ENA_OFF / 4u];
+    case SLCHOST_INT1_ST_OFF:
+        return s->host_int_raw[1] & s->host[SLCHOST_INT1_ENA_OFF / 4u];
+    case SLCHOST_PKT_LEN_OFF: return s->packet_len[0];
+    case SLCHOST_INT0_CLR_OFF:
+    case SLCHOST_INT1_CLR_OFF:
+    case SLCHOST_TOKEN_CON_OFF:
+        return 0u;
+    default: return s->host[off / 4u];
+    }
+}
+
+static void slchost_apply_token_control(esp32_periph_t *p, uint32_t value) {
+    sdio_slave_state_t *s = &p->sdio_slave;
+    for (unsigned channel = 0; channel < SLC_CHANNEL_COUNT; channel++) {
+        uint32_t wdata = s->host[(channel == 0u ?
+                                 SLCHOST_TOKEN_WDATA0_OFF :
+                                 SLCHOST_TOKEN_WDATA1_OFF) / 4u];
+        unsigned shift = channel * 4u;
+        if (value & (1u << shift))
+            slc_token_set(p, channel, 0u,
+                          (uint16_t)((s->token[channel][0] - 1u) &
+                                     SLC_TOKEN_VALUE_MASK));
+        if (value & (2u << shift))
+            slc_token_set(p, channel, 1u,
+                          (uint16_t)((s->token[channel][1] - 1u) &
+                                     SLC_TOKEN_VALUE_MASK));
+        if (value & (4u << shift))
+            slc_token_set(p, channel, 0u,
+                          (uint16_t)(wdata & SLC_TOKEN_VALUE_MASK));
+        if (value & (8u << shift))
+            slc_token_set(p, channel, 1u,
+                          (uint16_t)((wdata >> 16u) & SLC_TOKEN_VALUE_MASK));
+    }
+    if (value & (1u << 8u))
+        slc_packet_length_set(
+            s, 0u, s->host[SLCHOST_LEN_WDATA0_OFF / 4u]);
+}
+
+static void slchost_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - SLCHOST_BASE;
+    if ((off & 3u) != 0u || off >= SLCHOST_REG_FILE_SIZE) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    sdio_slave_state_t *s = &p->sdio_slave;
+    switch (off) {
+    case SLCHOST_TOKEN_RDATA0_OFF:
+    case SLCHOST_TOKEN_RDATA1_OFF:
+    case SLCHOST_INT0_RAW_OFF:
+    case SLCHOST_INT1_RAW_OFF:
+    case SLCHOST_INT0_ST_OFF:
+    case SLCHOST_INT1_ST_OFF:
+    case SLCHOST_PKT_LEN_OFF:
+        return;
+    case SLCHOST_INT0_CLR_OFF:
+        s->host_int_raw[0] &= ~(value & SLCHOST_INT_VALID_MASK);
+        return;
+    case SLCHOST_INT1_CLR_OFF:
+        s->host_int_raw[1] &= ~(value & SLCHOST_INT_VALID_MASK);
+        return;
+    case SLCHOST_TOKEN_CON_OFF:
+        slchost_apply_token_control(p, value);
+        return;
+    case SLCHOST_FUNC1_INT0_ENA_OFF:
+    case SLCHOST_FUNC1_INT1_ENA_OFF:
+    case SLCHOST_FUNC2_INT0_ENA_OFF:
+    case SLCHOST_FUNC2_INT1_ENA_OFF:
+    case SLCHOST_INT0_ENA_OFF:
+    case SLCHOST_INT1_ENA_OFF:
+        s->host[off / 4u] = value & SLCHOST_INT_VALID_MASK;
+        return;
+    default:
+        s->host[off / 4u] = value;
+        return;
+    }
+}
+
+static uint32_t hinf_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - HINF_BASE;
+    if ((off & 3u) != 0u || off >= HINF_REG_FILE_SIZE)
+        return default_read(ctx, addr);
+    return p->sdio_slave.hinf[off / 4u];
+}
+
+static void hinf_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    uint32_t off = addr - HINF_BASE;
+    if ((off & 3u) != 0u || off >= HINF_REG_FILE_SIZE) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    if (off == HINF_CFG_DATA7_OFF && (value & HINF_SDIO_RESET)) {
+        sdio_slave_reset_state(p);
+        return;
+    }
+    p->sdio_slave.hinf[off / 4u] = value;
+}
+
+static int slchost_shared_offset(unsigned position, uint32_t *off,
+                                 unsigned *shift) {
+    if (position >= 64u || !off || !shift) return -1;
+    uint32_t byte_off = SLCHOST_SHARED0_OFF + position;
+    if (position > 23u) byte_off += 4u;
+    if (position > 31u) byte_off += 12u;
+    *off = byte_off & ~3u;
+    *shift = (byte_off & 3u) * 8u;
+    return 0;
+}
+
+bool periph_sdio_slave_host_ready(const esp32_periph_t *p) {
+    if (!sdio_slave_clocked(p)) return false;
+    uint32_t cfg = p->sdio_slave.hinf[HINF_CFG_DATA1_OFF / 4u];
+    return (cfg & (HINF_SDIO_ENABLE | HINF_SDIO_IOREADY1)) ==
+           (HINF_SDIO_ENABLE | HINF_SDIO_IOREADY1);
+}
+
+uint16_t periph_sdio_slave_host_send_buffers(const esp32_periph_t *p) {
+    return p ? p->sdio_slave.token[0][1] : 0u;
+}
+
+uint32_t periph_sdio_slave_host_receive_bytes(const esp32_periph_t *p) {
+    if (!p) return 0u;
+    const sdio_slave_state_t *s = &p->sdio_slave;
+    return (s->packet_len[0] - s->host_consumed_len[0]) &
+           SLC_LEN_VALUE_MASK;
+}
+
+int periph_sdio_slave_host_read_packet(esp32_periph_t *p, uint8_t *data,
+                                       size_t capacity, size_t *out_len) {
+    if (out_len) *out_len = 0u;
+    if (!p || !out_len) return -1;
+    sdio_slave_state_t *s = &p->sdio_slave;
+    uint32_t available = periph_sdio_slave_host_receive_bytes(p);
+    if (available == 0u) return 0;
+    *out_len = available;
+    if (!data || capacity < available || !periph_sdio_slave_host_ready(p) ||
+        !s->rx_link_running[0] || s->rx_desc[0] == 0u)
+        return -1;
+
+    uint32_t descriptors[SLC_DMA_MAX_DESCRIPTORS];
+    uint16_t lengths[SLC_DMA_MAX_DESCRIPTORS];
+    unsigned count = 0u;
+    size_t remaining = available;
+    uint32_t desc = s->rx_desc[0];
+    uint32_t next = 0u;
+    while (remaining != 0u && count < SLC_DMA_MAX_DESCRIPTORS) {
+        uint32_t ctrl, buffer;
+        if (!slc_descriptor_valid(p, desc, &ctrl, &buffer, &next) ||
+            !(ctrl & SLC_DESC_OWNER))
+            break;
+        size_t size = ctrl & SLC_DESC_SIZE_MASK;
+        size_t length = (ctrl & SLC_DESC_LENGTH_MASK) >>
+                        SLC_DESC_LENGTH_SHIFT;
+        if (length == 0u || length > size || length > remaining ||
+            !uhci_dma_range_mapped(p, buffer, length, false))
+            break;
+        descriptors[count] = desc;
+        lengths[count] = (uint16_t)length;
+        count++;
+        remaining -= length;
+        desc = next;
+    }
+    if (remaining != 0u) {
+        slc_set_interrupts(p, 0u, SLC_INT_RX_DSCR_ERR);
+        return -1;
+    }
+
+    size_t copied = 0u;
+    for (unsigned index = 0; index < count; index++) {
+        uint32_t item = descriptors[index];
+        uint32_t ctrl = mem_read32(p->mem, item);
+        uint32_t buffer = mem_read32(p->mem, item + 4u);
+        for (size_t byte = 0; byte < lengths[index]; byte++)
+            data[copied++] = mem_read8(p->mem, buffer + (uint32_t)byte);
+        if (s->slc[SLC_CONF0_OFF / 4u] & (1u << 6u))
+            mem_write32(p->mem, item, ctrl & ~SLC_DESC_OWNER);
+        slc_update_desc_history(s, 0u, true, item);
+        s->rx_last_desc[0] = item;
+    }
+    s->rx_desc[0] = next;
+    if (next == 0u) s->rx_link_running[0] = false;
+    s->slc[SLC_TO_EOF_BFR_DESC0_OFF / 4u] =
+        count > 1u ? descriptors[count - 2u] : 0u;
+    s->slc[SLC_TO_EOF_DESC0_OFF / 4u] = descriptors[count - 1u];
+    s->host_consumed_len[0] = s->packet_len[0];
+    slchost_set_interrupts(s, 0u,
+                           SLCHOST_INT_RX_START | SLCHOST_INT_RX_EOF);
+    slc_set_interrupts(p, 0u, SLC_INT_RX_EOF);
+    *out_len = copied;
+    return 1;
+}
+
+int periph_sdio_slave_host_write_packet(esp32_periph_t *p,
+                                        const uint8_t *data, size_t len) {
+    if (!p || !data || len == 0u || !periph_sdio_slave_host_ready(p))
+        return -1;
+    sdio_slave_state_t *s = &p->sdio_slave;
+    if (!s->tx_link_running[0] || s->tx_desc[0] == 0u ||
+        s->token[0][1] == 0u)
+        return 0;
+
+    uint32_t descriptors[SLC_DMA_MAX_DESCRIPTORS];
+    uint32_t buffers[SLC_DMA_MAX_DESCRIPTORS];
+    uint16_t lengths[SLC_DMA_MAX_DESCRIPTORS];
+    unsigned count = 0u;
+    size_t remaining = len;
+    uint32_t desc = s->tx_desc[0];
+    uint32_t next = 0u;
+    while (remaining != 0u && count < SLC_DMA_MAX_DESCRIPTORS &&
+           count < s->token[0][1]) {
+        uint32_t ctrl, buffer;
+        if (!slc_descriptor_valid(p, desc, &ctrl, &buffer, &next) ||
+            !(ctrl & SLC_DESC_OWNER))
+            break;
+        size_t size = ctrl & SLC_DESC_SIZE_MASK;
+        size_t chunk = remaining < size ? remaining : size;
+        if (size == 0u || !uhci_dma_range_mapped(p, buffer, chunk, true))
+            break;
+        descriptors[count] = desc;
+        buffers[count] = buffer;
+        lengths[count] = (uint16_t)chunk;
+        count++;
+        remaining -= chunk;
+        desc = next;
+    }
+    if (remaining != 0u) {
+        slchost_set_interrupts(s, 0u, SLCHOST_INT_TX_OVF);
+        slc_set_interrupts(p, 0u, SLC_INT_TX_OVF);
+        return 0;
+    }
+
+    size_t consumed = 0u;
+    for (unsigned index = 0; index < count; index++) {
+        uint32_t item = descriptors[index];
+        uint32_t ctrl = mem_read32(p->mem, item);
+        for (size_t byte = 0; byte < lengths[index]; byte++)
+            mem_write8(p->mem, buffers[index] + (uint32_t)byte,
+                       data[consumed++]);
+        ctrl &= ~(SLC_DESC_LENGTH_MASK | SLC_DESC_EOF | SLC_DESC_OWNER);
+        ctrl |= (uint32_t)lengths[index] << SLC_DESC_LENGTH_SHIFT;
+        if (index + 1u == count) ctrl |= SLC_DESC_EOF;
+        mem_write32(p->mem, item, ctrl);
+        slc_update_desc_history(s, 0u, false, item);
+        s->tx_last_desc[0] = item;
+        slc_token_set(p, 0u, 1u,
+                      (uint16_t)((s->token[0][1] - 1u) &
+                                 SLC_TOKEN_VALUE_MASK));
+    }
+    s->tx_desc[0] = next;
+    if (next == 0u) s->tx_link_running[0] = false;
+    s->slc[SLC_TO_EOF_BFR_DESC0_OFF / 4u] =
+        count > 1u ? descriptors[count - 2u] : 0u;
+    s->slc[SLC_TX_EOF_DESC0_OFF / 4u] = descriptors[count - 1u];
+    slchost_set_interrupts(s, 0u, SLCHOST_INT_TX_START);
+    slc_set_interrupts(p, 0u, SLC_INT_TX_DONE | SLC_INT_TX_SUC_EOF);
+    return 1;
+}
+
+int periph_sdio_slave_host_read_reg(const esp32_periph_t *p,
+                                    unsigned position, uint8_t *value) {
+    uint32_t off;
+    unsigned shift;
+    if (!p || !value || slchost_shared_offset(position, &off, &shift) != 0)
+        return -1;
+    *value = (uint8_t)(p->sdio_slave.host[off / 4u] >> shift);
+    return 0;
+}
+
+int periph_sdio_slave_host_write_reg(esp32_periph_t *p, unsigned position,
+                                     uint8_t value) {
+    uint32_t off;
+    unsigned shift;
+    if (!p || slchost_shared_offset(position, &off, &shift) != 0)
+        return -1;
+    uint32_t mask = 0xFFu << shift;
+    p->sdio_slave.host[off / 4u] =
+        (p->sdio_slave.host[off / 4u] & ~mask) |
+        ((uint32_t)value << shift);
+    return 0;
+}
+
+int periph_sdio_slave_host_interrupt(esp32_periph_t *p, uint8_t mask) {
+    if (!p || mask == 0u || !sdio_slave_clocked(p)) return -1;
+    slc_set_interrupts(p, 0u, mask);
+    return 0;
+}
+
+uint32_t periph_sdio_slave_host_interrupt_raw(const esp32_periph_t *p) {
+    return p ? p->sdio_slave.host_int_raw[0] : 0u;
+}
+
+uint32_t periph_sdio_slave_host_interrupt_pending(const esp32_periph_t *p) {
+    if (!p) return 0u;
+    const sdio_slave_state_t *s = &p->sdio_slave;
+    if (s->hinf[HINF_CFG_DATA1_OFF / 4u] & HINF_SDIO_INT_MASK) return 0u;
+    return s->host_int_raw[0] &
+           s->host[SLCHOST_FUNC1_INT0_ENA_OFF / 4u];
+}
+
+void periph_sdio_slave_host_interrupt_clear(esp32_periph_t *p,
+                                            uint32_t mask) {
+    if (!p) return;
+    p->sdio_slave.host_int_raw[0] &= ~(mask & SLCHOST_INT_VALID_MASK);
+}
+
 /* ---- Native SDMMC host + FIFO/IDMAC ---- */
 
 static bool sdmmc_clocked(const esp32_periph_t *p) {
@@ -11100,6 +12001,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     for (unsigned port = 0; port < UHCI_PORT_COUNT; port++)
         uhci_reset_state(p, port);
 
+    /* External SDIO-slave endpoint and its two SLC descriptor engines. */
+    sdio_slave_reset_state(p);
+
     /* Native SDMMC host reset state; cards can be attached after creation. */
     sdmmc_reset_state(p);
 
@@ -11142,6 +12046,12 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Dual UART DMA controllers (UHCI0/UHCI1, interrupt sources 12/13). */
     mem_register_mmio(mem, (int)PAGE_OF(UHCI0_BASE), uhci_read, uhci_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(UHCI1_BASE), uhci_read, uhci_write, p);
+
+    /* SDIO slave identity, shared host window, and SLC DMA (sources 10/11). */
+    mem_register_mmio(mem, (int)PAGE_OF(HINF_BASE), hinf_read, hinf_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(SLCHOST_BASE),
+                      slchost_read, slchost_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(SLC_BASE), slc_read, slc_write, p);
 
     /* Two classic ESP32 I2C controllers (interrupt sources 49/50). */
     mem_register_mmio(mem, (int)PAGE_OF(I2C0_BASE), i2c_read, i2c_write, p);

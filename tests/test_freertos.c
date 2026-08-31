@@ -430,6 +430,59 @@ TEST(test_semaphore_create_take_give) {
     frt_teardown(&cpu, rom, frt);
 }
 
+TEST(test_counting_semaphore_supports_idf_unbounded_capacity) {
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    uint32_t create_addr = 0x400D0060;
+    uint32_t take_addr = 0x400D0070;
+    uint32_t give_addr = 0x400D0080;
+    extern void stub_xQueueCreateCountingSemaphore(xtensa_cpu_t *, void *);
+    extern void stub_xSemaphoreTake(xtensa_cpu_t *, void *);
+    extern void stub_xSemaphoreGive(xtensa_cpu_t *, void *);
+    rom_stubs_register_ctx(rom, create_addr,
+                           stub_xQueueCreateCountingSemaphore,
+                           "xQueueCreateCountingSemaphore", frt);
+    rom_stubs_register_ctx(rom, take_addr, stub_xSemaphoreTake,
+                           "xSemaphoreTake", frt);
+    rom_stubs_register_ctx(rom, give_addr, stub_xSemaphoreGive,
+                           "xSemaphoreGive", frt);
+
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, UINT32_MAX);
+    ar_write(&cpu, 3, 2u);
+    cpu.pc = create_addr;
+    xtensa_step(&cpu);
+    uint32_t handle = ar_read(&cpu, 2);
+    ASSERT_TRUE(handle != 0u);
+
+    for (unsigned expected = 1u; expected <= 3u; expected++) {
+        ar_write(&cpu, 0, BASE + 0x100);
+        ar_write(&cpu, 2, handle);
+        ar_write(&cpu, 3, 0u);
+        cpu.pc = take_addr;
+        xtensa_step(&cpu);
+        ASSERT_EQ(ar_read(&cpu, 2), expected < 3u ? 1u : 0u);
+    }
+
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    cpu.pc = give_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ar_write(&cpu, 0, BASE + 0x100);
+    ar_write(&cpu, 2, handle);
+    ar_write(&cpu, 3, 0u);
+    cpu.pc = take_addr;
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 static uint32_t frt_create_sched_task(xtensa_cpu_t *cpu,
                                       freertos_stubs_t *frt,
                                       uint32_t entry, const char *name,
@@ -648,6 +701,7 @@ static void run_freertos_tests(void) {
     RUN_TEST(test_queue_receive_empty_returns_false);
     RUN_TEST(test_queue_overwrite_and_reset);
     RUN_TEST(test_semaphore_create_take_give);
+    RUN_TEST(test_counting_semaphore_supports_idf_unbounded_capacity);
     RUN_TEST(test_task_notify_isr_preempts_and_preserves_window_context);
     RUN_TEST(test_bump_allocator);
     RUN_TEST(test_vTaskDelay_caps_large_ticks);

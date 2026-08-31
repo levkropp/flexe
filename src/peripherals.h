@@ -174,6 +174,36 @@ int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,
 int periph_sdmmc_set_write_protected(esp32_periph_t *p, int slot,
                                      bool write_protected);
 
+/* Act as the external SDIO host connected to the classic ESP32 slave block.
+ * Packet helpers walk the guest's real SLC lldesc chains and drive source-10
+ * interrupts. `host_write_packet` is host-to-ESP32 and consumes TOKEN1 receive
+ * buffers; `host_read_packet` is ESP32-to-host and consumes the cumulative
+ * PKT_LEN delta. Packet calls return 1 on transfer, 0 when no packet/buffer is
+ * ready, and -1 for an invalid argument, undersized destination, or malformed
+ * descriptor chain. On an undersized read, out_len reports the required size.
+ * Shared register positions use the SDIO protocol's 0..63 numbering. */
+bool periph_sdio_slave_host_ready(const esp32_periph_t *p);
+uint16_t periph_sdio_slave_host_send_buffers(const esp32_periph_t *p);
+uint32_t periph_sdio_slave_host_receive_bytes(const esp32_periph_t *p);
+int periph_sdio_slave_host_write_packet(esp32_periph_t *p,
+                                        const uint8_t *data, size_t len);
+int periph_sdio_slave_host_read_packet(esp32_periph_t *p, uint8_t *data,
+                                       size_t capacity, size_t *out_len);
+int periph_sdio_slave_host_read_reg(const esp32_periph_t *p,
+                                    unsigned position, uint8_t *value);
+int periph_sdio_slave_host_write_reg(esp32_periph_t *p, unsigned position,
+                                     uint8_t value);
+
+/* General-purpose interrupts crossing the SDIO link. `host_interrupt`
+ * injects bits 0..7 toward the ESP32; raw/pending/clear operate on interrupts
+ * raised toward the host. Pending applies the guest-programmed function-1
+ * enable mask and HINF interrupt mask. */
+int periph_sdio_slave_host_interrupt(esp32_periph_t *p, uint8_t mask);
+uint32_t periph_sdio_slave_host_interrupt_raw(const esp32_periph_t *p);
+uint32_t periph_sdio_slave_host_interrupt_pending(const esp32_periph_t *p);
+void periph_sdio_slave_host_interrupt_clear(esp32_periph_t *p,
+                                            uint32_t mask);
+
 /* Attach a virtual CAN bus peer and inject a received frame. With no transmit
  * callback attached, a virtual peer ACKs valid transmissions by default.
  * Injection returns 1 when accepted into the 64-byte hardware FIFO and 0 when

@@ -41,7 +41,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
   counters/alarms, dual UHCI UART DMA with H:5/SLIP framing, GP-SPI2/3 DMA,
   classic I2C0/1 master, SJA1000-compatible TWAI/CAN,
   Synopsys-based classic Ethernet MAC with descriptor DMA and Clause-22 MDIO,
-  dual-slot native SDMMC with PIO/IDMAC DMA,
+  dual-slot native SDMMC with PIO/IDMAC DMA, classic SDIO slave
+  HINF/HOST/SLC with scatter/gather descriptor DMA,
   I2S0/1 circular DMA,
   eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
   eight-unit/two-channel classic PCNT, both classic MCPWM motor-control units
@@ -56,7 +57,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 622 tests
+- 626 tests
 
 ## building
 
@@ -145,7 +146,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 622 tests, 4412 passed, 0 failed
+# 626 tests, 4568 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -304,6 +305,25 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-uhci-dma.sh
 
 `FLEXE_UHCI_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The SDIO-slave gate builds a sketch against Espressif's public
+`driver/sdio_slave.h` API and runs the genuine driver, HAL/LL code, descriptor
+queues, and source-10 ISR. The virtual host reads a 21-byte slave packet,
+writes a 24-byte packet across two 16-byte receive descriptors, and exercises
+the cumulative packet-length and receive-token counters. It also verifies the
+HAL's RX-done software-ISR doorbell, IOREADY and DPORT reset/clock control, all
+shared-register addressing gaps, and interrupts in both directions. Both
+engines must complete with zero unhandled MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-sdio-slave.sh
+# engine=jit stage=0x5344494F ready=1 buffers=2 bytes=21 ... transfer=1/21/1/0 ... unhandled=0 unregistered=0
+# engine=interp stage=0x5344494F ready=1 buffers=2 bytes=21 ... transfer=1/21/1/0 ... unhandled=0 unregistered=0
+```
+
+The fixture is verified with Arduino-ESP32 2.0.11.
+`FLEXE_ARDUINO_CONFIG` selects an Arduino CLI configuration and
+`FLEXE_SDIO_SLAVE_BUILD_DIR` optionally preserves the fixture build.
+
 The native SDMMC gate builds a sketch against Espressif's public
 `driver/sdmmc_host.h` API and runs the genuine ESP-IDF host driver without
 intercepting `sdmmc_host_do_transaction`. It covers slot initialization and
@@ -382,8 +402,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **8.03× real-time** |
-| NerdMiner v1.8.3 | **5.51× real-time** |
+| ESP32 Marauder v1.14 | **5.72× real-time** |
+| NerdMiner v1.8.3 | **3.56× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real
