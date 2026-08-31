@@ -721,6 +721,11 @@ static void stub_ets_update_cpu_frequency(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+static void stub_ets_get_cpu_frequency(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    rom_return(cpu, s->cpu_freq_mhz);
+}
+
 static void stub_memcpy(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t dst = rom_arg(cpu, 0);
@@ -3714,6 +3719,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x4000689c, stub_ets_set_appcpu_boot_addr, "ets_set_appcpu_boot_addr");
     rom_stubs_register(s, 0x400081d4, stub_rtc_get_reset_reason, "rtc_get_reset_reason");
     rom_stubs_register(s, 0x40008550, stub_ets_update_cpu_frequency, "ets_update_cpu_frequency_rom");
+    rom_stubs_register(s, 0x4000855c, stub_ets_get_cpu_frequency, "ets_get_cpu_frequency");
     rom_stubs_register(s, 0x40007d28, stub_ets_install_uart_printf, "ets_install_uart_printf");
 
     /* String/memory functions */

@@ -148,7 +148,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 631 tests, 4676 passed, 0 failed
+# 633 tests, 4690 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.

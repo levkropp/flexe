@@ -493,6 +493,21 @@ static uint32_t call_builtin_rom0(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+TEST(test_cpu_frequency_rom_pair) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    ASSERT_EQ(call_builtin_rom0(&cpu, 0x4000855Cu, 0), 160u);
+    (void)call_builtin_rom0(&cpu, 0x40008550u, 240u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FFE01E0u), 240u);
+    ASSERT_EQ(call_builtin_rom0(&cpu, 0x4000855Cu, 0), 240u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static uint32_t encode_test_l32r(uint32_t pc, uint32_t literal, int reg) {
     uint32_t base = (pc + 3u) & ~3u;
     uint32_t delta = literal - base;
@@ -701,6 +716,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_cache_noop);
     RUN_TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses);
     RUN_TEST(test_stub_memcpy);
+    RUN_TEST(test_cpu_frequency_rom_pair);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_marauder_nimble_deinit_preserves_cpp_lists);
     RUN_TEST(test_marauder_dport_cache_stall_is_coherent_noop);
