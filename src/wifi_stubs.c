@@ -2199,20 +2199,48 @@ static const wifi_fw_hook_t marauder_v114_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
+/* Marauder v1.14.2/v1.14.3 rebuilt the same CYD target after adding
+ * application objects.  Its ESP image entry stayed constant, but the linked
+ * WiFi wrappers moved; keep a separately fingerprinted layout so an old hook
+ * can never attach to unrelated instructions. */
+static const wifi_fw_hook_t marauder_v11423_wifi_hooks[] = {
+    { 0x4013B518u, stub_esp_wifi_init,                  "esp_wifi_init" },
+    { 0x4013B4B0u, stub_esp_wifi_deinit,                "esp_wifi_deinit" },
+    { 0x401990A0u, stub_esp_wifi_start,                 "esp_wifi_start" },
+    { 0x401990FCu, stub_esp_wifi_stop,                  "esp_wifi_stop" },
+    { 0x4019903Cu, stub_esp_wifi_set_mode,              "esp_wifi_set_mode" },
+    { 0x40199078u, stub_esp_wifi_get_mode,              "esp_wifi_get_mode" },
+    { 0x401997FCu, stub_esp_wifi_set_channel,           "esp_wifi_set_channel" },
+    { 0x40199840u, stub_esp_wifi_get_channel,           "esp_wifi_get_channel" },
+    { 0x4019990Cu, stub_esp_wifi_get_mac,               "esp_wifi_get_mac" },
+    { 0x401998A4u, stub_esp_wifi_set_mac,               "esp_wifi_set_mac" },
+    { 0x40199988u, stub_esp_wifi_set_promiscuous,       "esp_wifi_set_promiscuous" },
+    { 0x40199938u, stub_esp_wifi_set_promiscuous_filter,"esp_wifi_set_promiscuous_filter" },
+    { 0x401999F4u, stub_esp_wifi_set_promiscuous_rx_cb, "esp_wifi_set_promiscuous_rx_cb" },
+    { 0x40199A0Cu, stub_esp_wifi_noop,                   "esp_wifi_set_storage" },
+    { 0x401A5DC4u, stub_esp_wifi_80211_tx,              "esp_wifi_80211_tx" },
+    { 0, NULL, NULL },
+};
+
 int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
 {
     if (!ws) return 0;
-    const wifi_fw_hook_t *hooks = NULL;
-    if (entry_point == 0x40089268u)
-        hooks = nerdminer_wifi_hooks;
-    else if (entry_point == 0x400831D8u)
-        hooks = marauder_v114_wifi_hooks;
-    else
-        return 0;
     esp32_rom_stubs_t *rom = ws->cpu->pc_hook_ctx;
     if (!rom) return 0;
     ws->rom = rom;
-    if (entry_point == 0x40089268u)
+
+    const wifi_fw_hook_t *hooks = NULL;
+    rom_firmware_profile_t profile = rom_stubs_identify_firmware(
+            rom, entry_point);
+    if (profile == ROM_FIRMWARE_NERDMINER_V183)
+        hooks = nerdminer_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
+        hooks = marauder_v114_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
+        hooks = marauder_v11423_wifi_hooks;
+    else
+        return 0;
+    if (profile == ROM_FIRMWARE_NERDMINER_V183)
         ws->firmware_status_addr = 0x3FFC5C78u;
 
     int hooked = 0;

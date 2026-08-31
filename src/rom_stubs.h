@@ -14,6 +14,13 @@ typedef void (*rom_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
  * or zero to observe it and let the firmware implementation execute. */
 typedef int (*rom_conditional_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
 
+typedef enum {
+    ROM_FIRMWARE_UNKNOWN = 0,
+    ROM_FIRMWARE_NERDMINER_V183,
+    ROM_FIRMWARE_MARAUDER_V1140_1,
+    ROM_FIRMWARE_MARAUDER_V1142_3,
+} rom_firmware_profile_t;
+
 esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);
 void rom_stubs_destroy(esp32_rom_stubs_t *stubs);
 int  rom_stubs_register(esp32_rom_stubs_t *stubs, uint32_t addr,
@@ -45,6 +52,10 @@ int rom_stubs_get_stats(const esp32_rom_stubs_t *stubs, int index,
 /* Hook known firmware functions by symbol name (e.g. newlib locks) */
 int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs, const elf_symbols_t *syms);
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point);
+rom_firmware_profile_t rom_stubs_identify_firmware(
+        esp32_rom_stubs_t *stubs, uint32_t entry_point);
+rom_firmware_profile_t rom_stubs_firmware_profile(
+        const esp32_rom_stubs_t *stubs);
 
 /* Total stub calls (running counter across all stubs) */
 uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs);

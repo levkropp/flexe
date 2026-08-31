@@ -36,12 +36,24 @@
 #define STOCK_SD_SECTORS         (STOCK_SD_BYTES / 512u)
 #define STOCK_SD_ROOT_SECTOR     65u
 
-/* Verified production v1.14 CYD WiFiScan layout for the stock image accepted
- * by this profile. */
-#define MARAUDER_MGMT_FRAMES_ADDR   0x3FFC8C98u
-#define MARAUDER_DATA_FRAMES_ADDR   0x3FFC8C9Cu
-#define MARAUDER_BEACON_FRAMES_ADDR 0x3FFC8CA0u
-#define MARAUDER_SCAN_MODE_ADDR     0x3FFC9384u
+/* Verified production CYD state for both v1.14 link layouts.  The release
+ * series retained one image entry point while v1.14.2 shifted DRAM by 16
+ * bytes, so the profile selected by rom_stubs is authoritative. */
+typedef struct {
+    uint32_t mgmt_frames_addr;
+    uint32_t data_frames_addr;
+    uint32_t beacon_frames_addr;
+    uint32_t scan_mode_addr;
+} marauder_state_layout_t;
+
+static const marauder_state_layout_t marauder_v11401_state = {
+    0x3FFC8C98u, 0x3FFC8C9Cu, 0x3FFC8CA0u, 0x3FFC9384u,
+};
+static const marauder_state_layout_t marauder_v11423_state = {
+    0x3FFC8CA8u, 0x3FFC8CACu, 0x3FFC8CB0u, 0x3FFC9394u,
+};
+static const marauder_state_layout_t *marauder_state =
+        &marauder_v11401_state;
 #define MARAUDER_RAW_SCAN_MODE      25u
 #define MARAUDER_RICKROLL_MODE      9u
 #define MARAUDER_BT_SCAN_MODE       10u
@@ -521,7 +533,7 @@ static int run_until_marauder_sniffer(flexe_session_t *session,
             stats.promisc_enable_calls > before->promisc_enable_calls &&
             stats.promisc_callback_calls > before->promisc_callback_calls &&
             mem_read8(flexe_session_mem(session),
-                      MARAUDER_SCAN_MODE_ADDR) == MARAUDER_RAW_SCAN_MODE) {
+                      marauder_state->scan_mode_addr) == MARAUDER_RAW_SCAN_MODE) {
             *stats_out = stats;
             *cycles_out = cpu0->cycle_count - start;
             return 0;
@@ -569,7 +581,7 @@ static int run_until_marauder_stopped(flexe_session_t *session,
         run_one_batch(session);
         if (uart_contains(uart, "#stopscan") &&
             mem_read8(flexe_session_mem(session),
-                      MARAUDER_SCAN_MODE_ADDR) == 0) {
+                      marauder_state->scan_mode_addr) == 0) {
             *cycles_out = cpu0->cycle_count - start;
             return 0;
         }
@@ -598,7 +610,7 @@ static int run_until_marauder_tx(flexe_session_t *session,
         if (uart_contains(uart, "#attack -t rickroll") &&
             stats.raw_tx_frames > before->raw_tx_frames &&
             mem_read8(flexe_session_mem(session),
-                      MARAUDER_SCAN_MODE_ADDR) == MARAUDER_RICKROLL_MODE) {
+                      marauder_state->scan_mode_addr) == MARAUDER_RICKROLL_MODE) {
             *stats_out = stats;
             *cycles_out = cpu0->cycle_count - start;
             return 0;
@@ -629,7 +641,7 @@ static int run_until_marauder_bt_scan(flexe_session_t *session,
             stats.scan_callback_config_calls > 0 &&
             stats.scan_start_calls > 0 &&
             mem_read8(flexe_session_mem(session),
-                      MARAUDER_SCAN_MODE_ADDR) == MARAUDER_BT_SCAN_MODE) {
+                      marauder_state->scan_mode_addr) == MARAUDER_BT_SCAN_MODE) {
             *stats_out = stats;
             *cycles_out = cpu0->cycle_count - start;
             return 0;
@@ -668,7 +680,7 @@ static int run_until_marauder_bt_tx(flexe_session_t *session,
                     before->advertisement_tx_frames &&
             probe->frames > host_frames_before &&
             mem_read8(flexe_session_mem(session),
-                      MARAUDER_SCAN_MODE_ADDR) ==
+                      marauder_state->scan_mode_addr) ==
                     MARAUDER_BT_SWIFTPAIR_MODE) {
             *stats_out = stats;
             *cycles_out = cpu0->cycle_count - start;
@@ -927,6 +939,22 @@ int main(int argc, char **argv)
     }
     flexe_session_set_rom_log_cb(session, audit_rom_call, &rom_audit);
     if (is_marauder) {
+        rom_firmware_profile_t firmware_profile =
+                rom_stubs_firmware_profile(flexe_session_rom(session));
+        if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1140_1)
+            marauder_state = &marauder_v11401_state;
+        else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1142_3)
+            marauder_state = &marauder_v11423_state;
+        else {
+            fprintf(stderr,
+                    "FAIL profile=marauder reason=unsupported-image-layout\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
         periph_set_uart_callback_num(flexe_session_periph(session), 2,
                                      uart_count, &gps_uart);
         marauder_gps_feed.enabled = true;
@@ -970,6 +998,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
         fwrite(uart.log, 1, uart.log_len, stderr);
         fputc('\n', stderr);
+        char task_dump[4096];
+        freertos_stubs_dump_tasks(flexe_session_frt(session), task_dump,
+                                  sizeof(task_dump));
+        fprintf(stderr, "FreeRTOS tasks:\n%s", task_dump);
         flexe_session_destroy(session);
         pthread_mutex_destroy(&framebuffer_mutex);
         unlink(sd_path);
@@ -1243,7 +1275,7 @@ int main(int argc, char **argv)
                 &cli_cycles);
         if (cli_result != 0) {
             uint8_t scan_mode = mem_read8(flexe_session_mem(session),
-                                           MARAUDER_SCAN_MODE_ADDR);
+                                           marauder_state->scan_mode_addr);
             fprintf(stderr,
                     "FAIL profile=marauder reason=%s cli_cycles=%llu "
                     "uart_bytes=%llu pending_rx=%zu command_echo=%d "
@@ -1276,9 +1308,9 @@ int main(int argc, char **argv)
         /* Feed a real beacon frame through Marauder's registered callback
          * and require its own raw-capture counters to consume it. */
         uint32_t mgmt_before = mem_read32(flexe_session_mem(session),
-                                          MARAUDER_MGMT_FRAMES_ADDR);
+                                          marauder_state->mgmt_frames_addr);
         uint32_t beacon_before = mem_read32(flexe_session_mem(session),
-                                            MARAUDER_BEACON_FRAMES_ADDR);
+                                            marauder_state->beacon_frames_addr);
         uint8_t beacon[49] = {0};
         static const uint8_t bssid[6] = {0x02, 0x46, 0x4C, 0x45, 0x58, 0x45};
         beacon[0] = 0x80; /* management beacon */
@@ -1295,9 +1327,9 @@ int main(int argc, char **argv)
                 flexe_session_wifi(session), beacon, sizeof(beacon), -42, 1, 0);
         wifi_stubs_get_stats(flexe_session_wifi(session), &wifi_stats);
         marauder_mgmt_frames = mem_read32(flexe_session_mem(session),
-                                          MARAUDER_MGMT_FRAMES_ADDR);
+                                          marauder_state->mgmt_frames_addr);
         marauder_beacon_frames = mem_read32(flexe_session_mem(session),
-                                            MARAUDER_BEACON_FRAMES_ADDR);
+                                            marauder_state->beacon_frames_addr);
         if (inject_result != 0 || marauder_mgmt_frames != mgmt_before + 1 ||
             marauder_beacon_frames != beacon_before + 1 ||
             wifi_stats.raw_rx_frames == 0) {
@@ -1307,10 +1339,10 @@ int main(int argc, char **argv)
                     "cb_fail=%llu\n",
                     inject_result, marauder_mgmt_frames, mgmt_before,
                     mem_read32(flexe_session_mem(session),
-                               MARAUDER_DATA_FRAMES_ADDR),
+                               marauder_state->data_frames_addr),
                     marauder_beacon_frames, beacon_before,
                     mem_read8(flexe_session_mem(session),
-                              MARAUDER_SCAN_MODE_ADDR),
+                              marauder_state->scan_mode_addr),
                     (unsigned long long)wifi_stats.raw_rx_frames,
                     (unsigned long long)wifi_stats.raw_rx_callback_failures);
             flexe_session_destroy(session);
@@ -1349,7 +1381,7 @@ int main(int argc, char **argv)
                                       "stop-timeout",
                     (unsigned long long)stop_cycles,
                     mem_read8(flexe_session_mem(session),
-                              MARAUDER_SCAN_MODE_ADDR),
+                              marauder_state->scan_mode_addr),
                     periph_uart_rx_pending(flexe_session_periph(session)),
                     uart_contains(&uart, "#stopscan"), uart.log_len,
                     (unsigned long long)uart.count,
@@ -1396,7 +1428,7 @@ int main(int argc, char **argv)
                     tx_result > 0 ? "attack-timeout" : "raw-tx-boundary",
                     (unsigned long long)tx_cycles,
                     mem_read8(flexe_session_mem(session),
-                              MARAUDER_SCAN_MODE_ADDR),
+                              marauder_state->scan_mode_addr),
                     (unsigned long long)wifi_stats.raw_tx_frames,
                     (unsigned long long)wifi_before_tx.raw_tx_frames,
                     (unsigned long long)raw_tx_probe.frames,
@@ -1429,7 +1461,7 @@ int main(int argc, char **argv)
                     "FAIL profile=marauder reason=stop-attack accepted=%zu "
                     "mode=%u\n", stop_attack_rx,
                     mem_read8(flexe_session_mem(session),
-                              MARAUDER_SCAN_MODE_ADDR));
+                              marauder_state->scan_mode_addr));
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -1454,7 +1486,7 @@ int main(int argc, char **argv)
                                     "bt-scan-timeout",
                     bt_cli_rx_bytes, (unsigned long long)bt_cycles,
                     mem_read8(flexe_session_mem(session),
-                              MARAUDER_SCAN_MODE_ADDR),
+                              marauder_state->scan_mode_addr),
                     periph_uart_rx_pending(flexe_session_periph(session)),
                     (unsigned long long)
                             bt_stats.scan_callback_config_calls,
@@ -1520,7 +1552,7 @@ int main(int argc, char **argv)
                     "FAIL profile=marauder reason=stop-bt-scan accepted=%zu "
                     "mode=%u\n", stop_bt_rx,
                     mem_read8(flexe_session_mem(session),
-                              MARAUDER_SCAN_MODE_ADDR));
+                              marauder_state->scan_mode_addr));
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -1561,7 +1593,7 @@ int main(int argc, char **argv)
                                        "swiftpair-payload",
                     bt_tx_cli_rx_bytes, (unsigned long long)bt_tx_cycles,
                     mem_read8(flexe_session_mem(session),
-                              MARAUDER_SCAN_MODE_ADDR),
+                              marauder_state->scan_mode_addr),
                     (unsigned long long)bt_stats.advertising_data_calls,
                     (unsigned long long)bt_stats.advertising_enable_calls,
                     (unsigned long long)bt_stats.advertising_parameters_calls,

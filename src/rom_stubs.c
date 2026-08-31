@@ -88,6 +88,7 @@ struct esp32_rom_stubs {
     bool             app_cpu_start_requested;  /* Core 0 requested core 1 start */
     bool             single_core_mode;         /* -1 flag: fake core 1 init variables */
     bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
+    rom_firmware_profile_t firmware_profile;  /* exact symbol-less ROM layout */
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     stub_irq_t irq[71];
     stub_heap_region_t heap;
@@ -3929,8 +3930,9 @@ void rom_stubs_destroy(esp32_rom_stubs_t *stubs) {
 
 /* Address-based hooks for symbol-less popular firmwares. These stub the
  * driver-init entry points whose real implementations would spawn driver
- * tasks that crash on null contexts (no radio/hardware attached). Keyed by
- * the firmware's entry point (unique per build). */
+ * tasks that crash on null contexts (no radio/hardware attached). Select an
+ * exact profile from the entry point plus verified instruction anchors before
+ * installing any build-specific addresses. */
 typedef struct {
     uint32_t addr;
     rom_stub_fn fn;
@@ -3939,11 +3941,64 @@ typedef struct {
                              * the real instruction (rom_stubs_register_spy) */
 } fw_addr_hook_t;
 
+static bool fw_signature_matches(xtensa_mem_t *mem, uint32_t addr,
+                                 const uint8_t *signature, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        if (mem_read8(mem, addr + (uint32_t)i) != signature[i])
+            return false;
+    }
+    return true;
+}
+
+rom_firmware_profile_t rom_stubs_identify_firmware(
+        esp32_rom_stubs_t *stubs, uint32_t entry_point) {
+    if (!stubs || !stubs->cpu || !stubs->cpu->mem)
+        return ROM_FIRMWARE_UNKNOWN;
+
+    rom_firmware_profile_t profile = ROM_FIRMWARE_UNKNOWN;
+    if (entry_point == 0x40089268u) {
+        profile = ROM_FIRMWARE_NERDMINER_V183;
+    } else if (entry_point == 0x400831D8u) {
+        static const uint8_t old_phy[] = {
+            0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
+            0x00, 0x81, 0xC5, 0xF0, 0xA9, 0x08, 0x3D, 0xF0,
+        };
+        static const uint8_t new_phy[] = {
+            0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
+            0x00, 0x81, 0xC4, 0xF0, 0xA9, 0x08, 0x3D, 0xF0,
+        };
+        static const uint8_t wifi_start[] = {
+            0x36, 0x41, 0x00, 0xA5, 0xAE, 0xFF, 0x21, 0x9B,
+            0xFE, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0x9B, 0xFE,
+        };
+        xtensa_mem_t *mem = stubs->cpu->mem;
+        if (fw_signature_matches(mem, 0x401BDE2Cu,
+                                 old_phy, sizeof(old_phy)) &&
+            fw_signature_matches(mem, 0x401988A8u,
+                                 wifi_start, sizeof(wifi_start)))
+            profile = ROM_FIRMWARE_MARAUDER_V1140_1;
+        else if (fw_signature_matches(mem, 0x401BE628u,
+                                      new_phy, sizeof(new_phy)) &&
+                 fw_signature_matches(mem, 0x401990A0u,
+                                      wifi_start, sizeof(wifi_start)))
+            profile = ROM_FIRMWARE_MARAUDER_V1142_3;
+    }
+
+    stubs->firmware_profile = profile;
+    return profile;
+}
+
+rom_firmware_profile_t rom_stubs_firmware_profile(
+        const esp32_rom_stubs_t *stubs) {
+    return stubs ? stubs->firmware_profile : ROM_FIRMWARE_UNKNOWN;
+}
+
 /* The symbol-less Marauder image clears three private BT/WiFi dispatch-table
  * globals after its controller setup. A hardware HCI task would repopulate
  * them asynchronously; the virtual controller instead points them at a
  * bounded table of guest return stubs before the first dispatch. */
-#define FW_NOOP_FN        0x401DBFC4u
+#define FW_NOOP_FN_V11401 0x401DBFC4u
+#define FW_NOOP_FN_V11423 0x401DC890u
 #define FW_FAKE_TBL_BT    0x50000400u
 #define FW_FAKE_TBL_WIFI  0x50000800u
 
@@ -3953,12 +4008,13 @@ typedef struct {
 } fw_tbl_patch_t;
 
 static void fw_patch_handler_tables(esp32_rom_stubs_t *stubs,
-                                    const fw_tbl_patch_t *patches, int n) {
+                                    const fw_tbl_patch_t *patches, int n,
+                                    uint32_t noop_fn) {
     xtensa_mem_t *mem = stubs->cpu->mem;
     for (int i = 0; i < n; i++) {
         for (int slot = 0; slot < 256; slot++)
             mem_write32(mem, patches[i].fake_tbl + (uint32_t)slot * 4u,
-                        FW_NOOP_FN);
+                        noop_fn);
         mem_write32(mem, patches[i].global_addr, patches[i].fake_tbl);
     }
 }
@@ -3967,6 +4023,12 @@ static const fw_tbl_patch_t fw_marauder_ble_tbls[] = {
     {0x3FFCD974u, FW_FAKE_TBL_BT},
     {0x3FFD0544u, FW_FAKE_TBL_WIFI},
     {0x3FFD0548u, FW_FAKE_TBL_WIFI},
+};
+
+static const fw_tbl_patch_t fw_marauder_v11423_ble_tbls[] = {
+    {0x3FFCD984u, FW_FAKE_TBL_BT},
+    {0x3FFD0554u, FW_FAKE_TBL_WIFI},
+    {0x3FFD0558u, FW_FAKE_TBL_WIFI},
 };
 
 /* Decode an L32R's literal and return it when it points to firmware DRAM.
@@ -4006,6 +4068,10 @@ static bool fw_find_phy_global(xtensa_cpu_t *cpu, uint32_t entry,
         *global_out = 0x3FFCD99Cu;
         return true;
     }
+    if (entry == 0x401BE628u) {
+        *global_out = 0x3FFCD9ACu;
+        return true;
+    }
     return false;
 }
 
@@ -4033,9 +4099,16 @@ static void stub_fw_virtual_phy_init(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_fw_marauder_phy_init(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *stubs = ctx;
     fw_virtualize_phy_table(cpu, stubs);
-    fw_patch_handler_tables(stubs, fw_marauder_ble_tbls,
-                            (int)(sizeof(fw_marauder_ble_tbls) /
-                                  sizeof(fw_marauder_ble_tbls[0])));
+    if (cpu->pc == 0x401BE628u)
+        fw_patch_handler_tables(stubs, fw_marauder_v11423_ble_tbls,
+                                (int)(sizeof(fw_marauder_v11423_ble_tbls) /
+                                      sizeof(fw_marauder_v11423_ble_tbls[0])),
+                                FW_NOOP_FN_V11423);
+    else
+        fw_patch_handler_tables(stubs, fw_marauder_ble_tbls,
+                                (int)(sizeof(fw_marauder_ble_tbls) /
+                                      sizeof(fw_marauder_ble_tbls[0])),
+                                FW_NOOP_FN_V11401);
     rom_return_void(cpu);
 }
 
@@ -4052,7 +4125,8 @@ static void stub_fw_marauder_ble_synced(xtensa_cpu_t *cpu, void *ctx) {
  * virtual HCI transport deliberately has no asynchronous controller task.
  * Keep the synchronized host instance alive and report success so a later BLE
  * mode can resume it. In particular, do not write the neighboring C++ object
- * storage: 0x3FFC9534 is the m_ignoreList std::list sentinel in v1.14. */
+ * storage: m_ignoreList starts at 0x3FFC9534 in v1.14.0/1 and 0x3FFC9544 in
+ * v1.14.2/3. */
 static void stub_fw_marauder_nimble_deinit(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_return(cpu, 0);
@@ -4081,6 +4155,18 @@ static const fw_addr_hook_t fw_marauder_hooks[] = {
     { 0, NULL, NULL, 0 }
 };
 
+static const fw_addr_hook_t fw_marauder_v11423_hooks[] = {
+    { 0x400816FC, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_start", 0 },
+    { 0x40081760, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_end", 0 },
+    { 0x401BE628, stub_fw_marauder_phy_init, "phy_get_romfunc_addr", 0 },
+    { 0x40104C7D, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
+    { 0x40104D24, stub_fw_marauder_nimble_deinit,
+      "NimBLEDevice::deinit", 0 },
+    { 0, NULL, NULL, 0 }
+};
+
 /* NerdMiner v1.8.3 (CYD 2432S028R, entry 0x40089268). */
 static const fw_addr_hook_t fw_nerdminer_hooks[] = {
     /* Keep libphy's ABI but bypass physical RF calibration.  Higher-level
@@ -4101,11 +4187,22 @@ static const fw_addr_hook_t fw_nerdminer_hooks[] = {
 
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
-    if (entry_point == 0x400831D8)      /* ESP32 Marauder v1.14 CYD 2432S028 */
+    rom_firmware_profile_t profile = rom_stubs_identify_firmware(
+            stubs, entry_point);
+    if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
         tbl = fw_marauder_hooks;
-    if (entry_point == 0x40089268)      /* NerdMiner v1.8.3 CYD 2432S028R */
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
+        tbl = fw_marauder_v11423_hooks;
+    else if (profile == ROM_FIRMWARE_NERDMINER_V183)
         tbl = fw_nerdminer_hooks;
-    if (!tbl) return 0;
+    if (!tbl) {
+        if (entry_point == 0x400831D8u)
+            fprintf(stderr,
+                    "[flexe] unsupported Marauder image signature at "
+                    "entry 0x%08X; refusing address-based hooks\n",
+                    entry_point);
+        return 0;
+    }
     int n = 0;
     for (const fw_addr_hook_t *h = tbl; h->fn; h++) {
         if (h->spy)

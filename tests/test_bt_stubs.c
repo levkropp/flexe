@@ -117,6 +117,7 @@ TEST(production_scan_delivers_nimble_gap_advertisement) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11401_profile(&cpu);
     bt_stubs_t *bt = bt_stubs_create(&cpu);
     xtensa_cpu_t cpu1;
     xtensa_cpu_init(&cpu1);
@@ -352,7 +353,48 @@ TEST(production_scan_delivers_nimble_gap_advertisement) {
     teardown(&cpu);
 }
 
+TEST(v11423_fingerprint_selects_shifted_nimble_entries) {
+    const uint32_t scan_start = 0x40104F9Cu;
+    const uint32_t enabled_literal = 0x4010B4DCu;
+    const uint32_t sync_literal = 0x4010B4E8u;
+    const uint32_t public_literal = 0x4010B60Cu;
+
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11423_profile(&cpu);
+    bt_stubs_t *bt = bt_stubs_create(&cpu);
+
+    put_insn3(&cpu, scan_start, 0x004136u);
+    put_insn2(&cpu, scan_start + 3u, 0xF01Du);
+    mem_write32(cpu.mem, enabled_literal, TEST_HS_ENABLED_STATE_ADDR);
+    mem_write32(cpu.mem, sync_literal, TEST_HS_SYNC_STATE_ADDR);
+    mem_write32(cpu.mem, public_literal, TEST_HS_PUBLIC_ADDR);
+
+    ASSERT_EQ(bt_stubs_hook_firmware_addrs(bt, TEST_MARAUDER_ENTRY), 7);
+    const uint32_t scan_args[] = {0x3FFDF600u, 0, 0, 0};
+    invoke_observed_call8(&cpu, scan_start, scan_args, 4);
+
+    ASSERT_EQ(mem_read8(cpu.mem, TEST_HS_SYNC_STATE_ADDR), 2);
+    ASSERT_EQ(mem_read8(cpu.mem, TEST_HS_ENABLED_STATE_ADDR), 2);
+    static const uint8_t expected_public_addr[6] = {
+        0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE
+    };
+    for (unsigned i = 0; i < sizeof(expected_public_addr); i++)
+        ASSERT_EQ(mem_read8(cpu.mem, TEST_HS_PUBLIC_ADDR + i),
+                  expected_public_addr[i]);
+
+    bt_stubs_stats_t stats = {0};
+    bt_stubs_get_stats(bt, &stats);
+    ASSERT_EQ64(stats.scan_start_calls, 1);
+
+    bt_stubs_destroy(bt);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static void run_bt_stub_tests(void) {
     TEST_SUITE("Bluetooth stubs");
     RUN_TEST(production_scan_delivers_nimble_gap_advertisement);
+    RUN_TEST(v11423_fingerprint_selects_shifted_nimble_entries);
 }

@@ -59,7 +59,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 629 tests
+- 639 tests
 
 ## building
 
@@ -148,7 +148,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 634 tests, 4696 passed, 0 failed
+# 639 tests, 4732 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -425,6 +425,20 @@ selects an Arduino CLI configuration, while `FLEXE_EMAC_BUILD_DIR` and
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
+The current official CYD baselines are pinned below. Flexe fingerprints two
+incompatible Marauder link layouts despite their shared `0x400831D8` entry
+point: v1.14.0/1 use the original layout and v1.14.2/3 use the shifted layout.
+An unknown image with that entry point is rejected instead of receiving unsafe
+address-based ROM, Wi-Fi, or NimBLE hooks.
+
+| release | official asset | SHA-256 |
+|---|---|---|
+| NerdMiner v1.8.3 | `ESP32-2432S028R_factory.bin` | `e7aece42f24ad7fd4146b94eeb28d04de7ce27f0c45e19be1bf38ad39ce0582c` |
+| Marauder v1.14.0 | `esp32_marauder_v1_14_0_20260731_cyd_2432S028.bin` | `f2d21c476be70b7525a0b7c3122b4917fb5bcbeda78b16316b84450342d77fe7` |
+| Marauder v1.14.1 | `esp32_marauder_v1_14_1_20260801_cyd_2432S028.bin` | `b3be0ff11ed4d67d8d763abb94eb22c2df2057adfdca58b780ac756ca20497d7` |
+| Marauder v1.14.2 | `esp32_marauder_v1_14_2_20260815_cyd_2432S028.bin` | `5965e59f0e6f599eae213941d5ccc9d8d1dab1ebd7faa12b694cdff1a5cd3047` |
+| Marauder v1.14.3 | `esp32_marauder_v1_14_3_20260816_cyd_2432S028.bin` | `ad91696012f407bf782826793edd509119acf00e4751cd0d30eddd6223d6bf2d` |
+
 ```bash
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
@@ -441,8 +455,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **6.03× real-time** |
-| NerdMiner v1.8.3 | **3.57× real-time** |
+| ESP32 Marauder v1.14.3 | **6.12× real-time** |
+| NerdMiner v1.8.3 | **4.92× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

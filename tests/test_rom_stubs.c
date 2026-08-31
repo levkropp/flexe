@@ -565,10 +565,67 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     teardown(&cpu);
 }
 
+TEST(test_marauder_same_entry_uses_instruction_fingerprint) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x400831D8u),
+              ROM_FIRMWARE_UNKNOWN);
+    seed_marauder_v11401_profile(&cpu);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x400831D8u),
+              ROM_FIRMWARE_MARAUDER_V1140_1);
+
+    /* Invalidate one legacy anchor before planting the newer layout. */
+    mem_write8(cpu.mem, 0x401BDE2Cu, 0u);
+    seed_marauder_v11423_profile(&cpu);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x400831D8u),
+              ROM_FIRMWARE_MARAUDER_V1142_3);
+
+    /* A reused entry with a near miss must not receive address hooks. */
+    mem_write8(cpu.mem, 0x401990A0u, 0u);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x400831D8u),
+              ROM_FIRMWARE_UNKNOWN);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_marauder_v11423_hooks_use_shifted_phy_and_data_layout) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11423_profile(&cpu);
+
+    const uint32_t old_table_global = 0x3FFCD974u;
+    const uint32_t phy_global = 0x3FFCD9ACu;
+    const uint32_t new_table_global = 0x3FFCD984u;
+    mem_write32(cpu.mem, old_table_global, 0xA5A5A5A5u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 5);
+
+    cpu.pc = 0x401BE628u;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(mem_read32(cpu.mem, phy_global), 0x50001900u);
+    ASSERT_EQ(mem_read32(cpu.mem, old_table_global), 0xA5A5A5A5u);
+    ASSERT_EQ(mem_read32(cpu.mem, new_table_global), 0x50000400u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FFD0554u), 0x50000800u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FFD0558u), 0x50000800u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x50000400u), 0x401DC890u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x50000800u), 0x401DC890u);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_marauder_nimble_deinit_preserves_cpp_lists) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11401_profile(&cpu);
 
     const uint32_t ignore_list = 0x3FFC9534u;
     const uint32_t connected_list = 0x3FFC9540u;
@@ -609,6 +666,7 @@ TEST(test_marauder_dport_cache_stall_is_coherent_noop) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11401_profile(&cpu);
 
     ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 5);
     static const uint32_t hook_pc[] = { 0x400816FCu, 0x40081760u };
@@ -718,6 +776,8 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_memcpy);
     RUN_TEST(test_cpu_frequency_rom_pair);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
+    RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);
+    RUN_TEST(test_marauder_v11423_hooks_use_shifted_phy_and_data_layout);
     RUN_TEST(test_marauder_nimble_deinit_preserves_cpp_lists);
     RUN_TEST(test_marauder_dport_cache_stall_is_coherent_noop);
     RUN_TEST(test_bt_rom_table_accessors_use_bounded_scratch);

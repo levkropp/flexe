@@ -32,22 +32,39 @@
 #define FAKE_ADVERTISING_PTR 0x3FFB0500u
 #define FAKE_CLIENT_PTR     0x3FFB0600u
 
-/* ESP32 Marauder v1.14 CYD production addresses, verified against its
- * matching reproducible ELF and the stock image's instruction bytes. */
-#define MARAUDER_V114_ENTRY                    0x400831D8u
-#define MARAUDER_NIMBLE_SCAN_START             0x401048B4u
-#define MARAUDER_NIMBLE_SCAN_STOP              0x401049B4u
-#define MARAUDER_NIMBLE_SCAN_HANDLE_GAP        0x40104A9Cu
-#define MARAUDER_NIMBLE_SCAN_SET_CALLBACKS     0x401DA8D0u
-#define MARAUDER_BLE_GAP_ADV_START              0x401096E0u
-#define MARAUDER_BLE_HS_HCI_CMD_TX              0x40110254u
-#define MARAUDER_BLE_HS_CONN_CAN_ALLOC           0x4010FC58u
-#define MARAUDER_BLE_HS_ID_USE_ADDR              0x40110CC0u
-#define MARAUDER_BLE_HS_ENABLED_STATE_LITERAL    0x4010B4A8u
-#define MARAUDER_BLE_HS_SYNC_STATE_LITERAL       0x4010B4B4u
-#define MARAUDER_BLE_HS_PUBLIC_ADDR_LITERAL      0x4010B5DCu
-#define MARAUDER_NIMBLE_IGNORE_LIST              0x3FFC9534u
-#define MARAUDER_NIMBLE_CONNECTED_PEERS          0x3FFC9540u
+/* ESP32 Marauder v1.14 CYD production addresses, verified against each
+ * release layout's instruction bytes.  v1.14.2 kept the same image entry but
+ * shifted both code and DRAM, so the entry point alone is not an identity. */
+#define MARAUDER_V114_ENTRY 0x400831D8u
+typedef struct {
+    uint32_t scan_start;
+    uint32_t scan_stop;
+    uint32_t scan_handle_gap;
+    uint32_t scan_set_callbacks;
+    uint32_t gap_adv_start;
+    uint32_t hci_cmd_tx;
+    uint32_t conn_can_alloc;
+    uint32_t id_use_addr;
+    uint32_t hs_enabled_literal;
+    uint32_t hs_sync_literal;
+    uint32_t hs_public_literal;
+    uint32_t ignore_list;
+    uint32_t connected_peers;
+} marauder_bt_layout_t;
+
+static const marauder_bt_layout_t marauder_v11401_bt = {
+    0x401048B4u, 0x401049B4u, 0x40104A9Cu, 0x401DA8D0u,
+    0x401096E0u, 0x40110254u, 0x4010FC58u, 0x40110CC0u,
+    0x4010B4A8u, 0x4010B4B4u, 0x4010B5DCu,
+    0x3FFC9534u, 0x3FFC9540u,
+};
+
+static const marauder_bt_layout_t marauder_v11423_bt = {
+    0x40104F9Cu, 0x4010509Cu, 0x40105184u, 0x401DB19Cu,
+    0x40109DC8u, 0x40110920u, 0x40110324u, 0x4011138Cu,
+    0x4010B4DCu, 0x4010B4E8u, 0x4010B60Cu,
+    0x3FFC9544u, 0x3FFC9550u,
+};
 
 /* A ble_gap_event is 52 bytes in this ESP32 NimBLE build.  Its discovery
  * descriptor begins at +4 and holds a pointer to the advertisement payload.
@@ -102,6 +119,11 @@ struct bt_stubs {
     uint32_t           scan_cb_addr;
     uint32_t           scan_obj_addr;
     uint32_t           gap_handler_addr;
+    uint32_t           hs_enabled_literal;
+    uint32_t           hs_sync_literal;
+    uint32_t           hs_public_literal;
+    uint32_t           ignore_list_addr;
+    uint32_t           connected_peers_addr;
     xtensa_cpu_t      *scan_cpu;
     bool               production_observer;
     uint8_t            advertisement_data[BLE_DATA_MAX_LEN];
@@ -315,12 +337,9 @@ static void publish_nimble_controller_state(bt_stubs_t *bt)
     xtensa_mem_t *mem = bt->cpu->mem;
     /* A real controller publishes these states and its public identity after
      * host synchronization.  Do not replace an identity chosen by firmware. */
-    uint32_t sync_state = mem_read32(mem,
-                                     MARAUDER_BLE_HS_SYNC_STATE_LITERAL);
-    uint32_t enabled_state = mem_read32(
-            mem, MARAUDER_BLE_HS_ENABLED_STATE_LITERAL);
-    uint32_t public_addr_ptr = mem_read32(
-            mem, MARAUDER_BLE_HS_PUBLIC_ADDR_LITERAL);
+    uint32_t sync_state = mem_read32(mem, bt->hs_sync_literal);
+    uint32_t enabled_state = mem_read32(mem, bt->hs_enabled_literal);
+    uint32_t public_addr_ptr = mem_read32(mem, bt->hs_public_literal);
     if (sync_state >= 0x3FFB0000u && sync_state < 0x40000000u)
         mem_write8(mem, sync_state, 2);
     if (enabled_state >= 0x3FFB0000u && enabled_state < 0x40000000u)
@@ -754,29 +773,44 @@ int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
     if (!rom)
         return 0;
 
+    const marauder_bt_layout_t *layout = NULL;
+    rom_firmware_profile_t profile = rom_stubs_identify_firmware(
+            rom, entry_point);
+    if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
+        layout = &marauder_v11401_bt;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
+        layout = &marauder_v11423_bt;
+    else
+        return 0;
+
     bt->rom = rom;
     bt->production_observer = true;
-    bt->gap_handler_addr = MARAUDER_NIMBLE_SCAN_HANDLE_GAP;
+    bt->gap_handler_addr = layout->scan_handle_gap;
+    bt->hs_enabled_literal = layout->hs_enabled_literal;
+    bt->hs_sync_literal = layout->hs_sync_literal;
+    bt->hs_public_literal = layout->hs_public_literal;
+    bt->ignore_list_addr = layout->ignore_list;
+    bt->connected_peers_addr = layout->connected_peers;
 
     /* Register at the first post-ENTRY byte. register_spy also discovers the
      * preceding ENTRY itself, which guarantees pre-window arguments while
      * avoiding accidental attachment to an adjacent tiny function. */
-    rom_stubs_register_spy(rom, MARAUDER_NIMBLE_SCAN_SET_CALLBACKS + 3u,
+    rom_stubs_register_spy(rom, layout->scan_set_callbacks + 3u,
                            spy_nimble_scan_set_callbacks,
                            "NimBLEScan::setAdvertisedDeviceCallbacks", bt);
-    rom_stubs_register_spy(rom, MARAUDER_NIMBLE_SCAN_START + 3u,
+    rom_stubs_register_spy(rom, layout->scan_start + 3u,
                            spy_nimble_scan_start, "NimBLEScan::start", bt);
-    rom_stubs_register_spy(rom, MARAUDER_NIMBLE_SCAN_STOP + 3u,
+    rom_stubs_register_spy(rom, layout->scan_stop + 3u,
                            spy_nimble_scan_stop, "NimBLEScan::stop", bt);
-    rom_stubs_register_spy(rom, MARAUDER_BLE_GAP_ADV_START + 3u,
+    rom_stubs_register_spy(rom, layout->gap_adv_start + 3u,
                            spy_ble_gap_adv_start, "ble_gap_adv_start", bt);
     rom_stubs_register_conditional_ctx(
-            rom, MARAUDER_BLE_HS_HCI_CMD_TX + 3u,
+            rom, layout->hci_cmd_tx + 3u,
             conditional_ble_hs_hci_cmd_tx, "ble_hs_hci_cmd_tx", bt);
-    rom_stubs_register_ctx(rom, MARAUDER_BLE_HS_CONN_CAN_ALLOC + 3u,
+    rom_stubs_register_ctx(rom, layout->conn_can_alloc + 3u,
                            stub_ble_hs_conn_can_alloc,
                            "ble_hs_conn_can_alloc", bt);
-    rom_stubs_register_spy(rom, MARAUDER_BLE_HS_ID_USE_ADDR + 3u,
+    rom_stubs_register_spy(rom, layout->id_use_addr + 3u,
                            spy_ble_hs_id_use_addr,
                            "ble_hs_id_use_addr", bt);
     fprintf(stderr, "[bt] observing 7 verified production-ROM NimBLE entries\n");
@@ -836,12 +870,12 @@ int bt_stubs_inject_advertisement(bt_stubs_t *bt, const uint8_t addr[6],
         fprintf(stderr,
                 "[bt] ignore-list={0x%08X,0x%08X,%u} "
                 "connected={0x%08X,0x%08X,%u}\n",
-                mem_read32(mem, MARAUDER_NIMBLE_IGNORE_LIST),
-                mem_read32(mem, MARAUDER_NIMBLE_IGNORE_LIST + 4u),
-                mem_read32(mem, MARAUDER_NIMBLE_IGNORE_LIST + 8u),
-                mem_read32(mem, MARAUDER_NIMBLE_CONNECTED_PEERS),
-                mem_read32(mem, MARAUDER_NIMBLE_CONNECTED_PEERS + 4u),
-                mem_read32(mem, MARAUDER_NIMBLE_CONNECTED_PEERS + 8u));
+                mem_read32(mem, bt->ignore_list_addr),
+                mem_read32(mem, bt->ignore_list_addr + 4u),
+                mem_read32(mem, bt->ignore_list_addr + 8u),
+                mem_read32(mem, bt->connected_peers_addr),
+                mem_read32(mem, bt->connected_peers_addr + 4u),
+                mem_read32(mem, bt->connected_peers_addr + 8u));
 
     uint32_t args[] = {BLE_EVENT_SCRATCH_ADDR, bt->scan_obj_addr};
     int result = guest_call8(event_cpu, bt->gap_handler_addr, args, 2,

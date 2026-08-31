@@ -76,6 +76,7 @@ TEST(promiscuous_frame_runs_callback_and_restores_cpu) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11401_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
 
     ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_MARAUDER_ENTRY), 15);
@@ -154,6 +155,7 @@ TEST(raw_tx_crosses_host_radio_boundary) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11401_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
     test_raw_tx_capture_t capture = {0};
 
@@ -196,9 +198,33 @@ TEST(raw_tx_crosses_host_radio_boundary) {
     teardown(&cpu);
 }
 
+TEST(v11423_fingerprint_selects_shifted_wifi_entries) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v11423_profile(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_MARAUDER_ENTRY), 15);
+    invoke_wifi_call0(&cpu, 0x4013B518u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+    invoke_wifi_call0(&cpu, 0x401990A0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.wifi_init_calls, 1u);
+    ASSERT_EQ64(stats.wifi_start_calls, 1u);
+
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);
     RUN_TEST(raw_tx_crosses_host_radio_boundary);
+    RUN_TEST(v11423_fingerprint_selects_shifted_wifi_entries);
 }
