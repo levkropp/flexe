@@ -27,6 +27,7 @@ typedef enum {
     SBX_EV_DAC_OUT    = 6,  /* DAC channel enable/value changed */
     SBX_EV_I2S_TX     = 7,  /* PCM bytes consumed by I2S TX DMA */
     SBX_EV_PWM_OUT    = 8,  /* LEDC aggregate PWM state changed */
+    SBX_EV_SIGMADELTA_OUT = 9, /* sigma-delta/PDM aggregate state changed */
 } sbx_event_kind_t;
 
 typedef struct {
@@ -63,6 +64,14 @@ typedef struct {
             uint32_t duty;
             uint32_t duty_max;
         } pwm_out;
+        struct {
+            int8_t gpio;
+            int8_t duty;
+            uint8_t channel;
+            uint8_t enabled;
+            uint8_t inverted;
+            uint32_t frequency_hz;
+        } sigmadelta_out;
     };
 } sbx_event_t;
 

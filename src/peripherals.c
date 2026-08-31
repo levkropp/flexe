@@ -32,6 +32,7 @@
 #define MCPWM0_BASE     0x3FF5E000u
 #define MCPWM1_BASE     0x3FF6C000u
 #define GPIO_BASE       0x3FF44000u
+#define GPIO_SD_BASE    0x3FF44F00u
 #define FE2_BASE        0x3FF45000u
 #define FE_BASE         0x3FF46000u
 #define FRC_TIMER_BASE  0x3FF47000u
@@ -82,6 +83,24 @@
 #define SENS_SAR_START              (1u << 17)
 #define SENS_SAR_DONE               (1u << 16)
 #define SENS_SAR_CONFIG_MASK        0xFFFE0000u
+
+#define RTC_CPU_PERIOD_CONF_MASK    0xE0000000u
+#define RTC_CLK_CONF_MASK           0xFFFFFFF0u
+
+/* The original ESP32 embeds its eight-channel sigma-delta/PDM block in the
+ * final 256 bytes of the GPIO page. Each channel adds a signed duty offset to
+ * the 50% midpoint, producing duty+128 high samples per 256-sample period. */
+#define SIGMADELTA_CHANNEL_COUNT     8u
+#define SIGMADELTA_SIGNAL_BASE       100u
+#define SIGMADELTA_CHANNEL_MASK      0x0000FFFFu
+#define SIGMADELTA_CG_OFF            0x020u
+#define SIGMADELTA_MISC_OFF          0x024u
+#define SIGMADELTA_VERSION_OFF       0x028u
+#define SIGMADELTA_CG_MASK           (1u << 31)
+#define SIGMADELTA_MISC_MASK         (1u << 31)
+#define SIGMADELTA_VERSION_MASK      0x0FFFFFFFu
+#define SIGMADELTA_VERSION_RESET     0x01506190u
+#define SIGMADELTA_APB_MHZ           80u
 
 /* Page index from absolute address */
 #define PAGE_OF(addr) (((addr) - PERIPH_BASE) / PAGE_SIZE)
@@ -981,6 +1000,12 @@ static void ledc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void ledc_reset_state(esp32_periph_t *p);
 static void ledc_gpio_route_changed(esp32_periph_t *p, int gpio,
                                     uint32_t before, uint32_t after);
+static void sigmadelta_reset_state(esp32_periph_t *p);
+static void sigmadelta_emit_channel(esp32_periph_t *p, unsigned channel,
+                                    bool force);
+static void sigmadelta_gpio_route_changed(esp32_periph_t *p,
+                                          uint32_t before, uint32_t after);
+static void sigmadelta_gpio_enable_changed(esp32_periph_t *p);
 static uint32_t pcnt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void pcnt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void pcnt_reset_state(esp32_periph_t *p);
@@ -1083,6 +1108,36 @@ typedef struct {
     uint32_t func_in_sel[256];   /* GPIO_FUNC_IN_SEL_CFG_REG */
     uint32_t func_out_sel[40];   /* GPIO_FUNC_OUT_SEL_CFG_REG */
 } gpio_state_t;
+
+typedef struct {
+    uint32_t config;              /* duty[7:0], prescaler[15:8] */
+    uint64_t anchor_cycles;
+    uint8_t anchor_accumulator;
+    bool anchor_level;
+
+    periph_sigmadelta_output_fn output_cb;
+    void *output_cb_ctx;
+    int last_gpio;
+    uint32_t last_frequency_hz;
+    int8_t last_duty;
+    bool last_enabled;
+    bool last_inverted;
+    bool output_reported;
+} sigmadelta_channel_state_t;
+
+typedef struct {
+    sigmadelta_channel_state_t channel[SIGMADELTA_CHANNEL_COUNT];
+    uint32_t cg;
+    uint32_t misc;
+    uint32_t version;
+
+    /* Shared monotonic CPU-cycle timeline. Sampling both cores and taking the
+     * maximum avoids advancing an always-on APB peripheral twice. */
+    uint64_t time_cycles;
+    uint64_t core_cycles[2];
+    uint32_t last_ccount[2];
+    bool time_valid[2];
+} sigmadelta_state_t;
 
 /* SPI0 (cache flash controller) / SPI1 (memspi host) state.
  * Enough of the register file is modelled for ESP-IDF's esp_flash probe
@@ -1556,6 +1611,9 @@ struct esp32_periph {
     /* GPIO */
     gpio_state_t gpio;
 
+    /* Eight always-on classic GPIO sigma-delta/PDM channels. */
+    sigmadelta_state_t sigmadelta;
+
     /* IO_MUX pin configuration registers. Keep a written bitmap so reset
      * defaults are not mistaken for an explicitly selected native function. */
     uint32_t io_mux[64];
@@ -1588,6 +1646,7 @@ struct esp32_periph {
     uint32_t dport_perip_rst_en;
     uint32_t dport_wifi_clk_en;
     uint32_t dport_core_rst_en;
+    uint32_t dport_cpu_per_conf;
 
     /* Interrupt matrix: maps each CPU interrupt line to a peripheral source.
      * intr_matrix[core][cpu_int] = peripheral source (0-70), 16 = disabled.
@@ -1625,6 +1684,8 @@ struct esp32_periph {
      * registers additionally expose synchronous single-conversion state. */
     uint32_t rtcio_regs[RTCIO_REG_FILE_SIZE / sizeof(uint32_t)];
     uint32_t sens_regs[SENS_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t rtc_cpu_period_conf;
+    uint32_t rtc_clk_conf;
     uint16_t sens_adc_result[2];
     bool sens_adc_done[2];
 
@@ -1885,6 +1946,7 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
     case DPORT_PERIP_RST_EN_OFF: return p->dport_perip_rst_en;
     case DPORT_WIFI_CLK_EN_OFF: return p->dport_wifi_clk_en;
     case DPORT_CORE_RST_EN_OFF: return p->dport_core_rst_en;
+    case 0x03C: return p->dport_cpu_per_conf; /* CPU_PER_CONF */
     case 0x0D4: return p->bt_lpck[0];   /* DPORT_BT_LPCK_DIV_INT */
     case 0x0D8: return p->bt_lpck[1];   /* DPORT_BT_LPCK_DIV_FRAC */
     case 0x040: return 0x0A;        /* PRO_CACHE_CTRL: cache enabled */
@@ -1934,6 +1996,9 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     }
     switch (off) {
+    case 0x03C:
+        p->dport_cpu_per_conf = val & 0xFu;
+        break;
     case DPORT_PERIP_CLK_EN_OFF:
         timg_sync_all_to(p, timg_now_cycles(p));
         p->dport_perip_clk_en = val;
@@ -2153,6 +2218,286 @@ static void uart_write(void *ctx, uint32_t addr, uint32_t val) {
     }
 }
 
+/* ---- GPIO sigma-delta / pulse-density modulator ---- */
+
+static uint32_t sigmadelta_cpu_mhz(const esp32_periph_t *p) {
+    uint32_t mhz = mem_read32(p->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    return mhz >= 10u && mhz <= 240u ? mhz : 240u;
+}
+
+static uint64_t sigmadelta_add_saturating(uint64_t value,
+                                          uint64_t addend) {
+    return value > UINT64_MAX - addend ? UINT64_MAX : value + addend;
+}
+
+static uint64_t sigmadelta_peek_cycles(const esp32_periph_t *p) {
+    uint64_t best = p->sigmadelta.time_cycles;
+    for (unsigned core = 0; core < 2u; core++) {
+        if (!p->cpu[core] || !p->sigmadelta.time_valid[core]) continue;
+        uint32_t elapsed = p->cpu[core]->ccount -
+                           p->sigmadelta.last_ccount[core];
+        if (elapsed >= (uint32_t)INT32_MAX) continue;
+        uint64_t candidate = sigmadelta_add_saturating(
+            p->sigmadelta.core_cycles[core], elapsed);
+        if (candidate > best) best = candidate;
+    }
+    return best;
+}
+
+static uint64_t sigmadelta_now_cycles(esp32_periph_t *p) {
+    for (unsigned core = 0; core < 2u; core++) {
+        if (!p->cpu[core]) continue;
+        uint32_t now = p->cpu[core]->ccount;
+        if (!p->sigmadelta.time_valid[core]) {
+            p->sigmadelta.last_ccount[core] = now;
+            p->sigmadelta.core_cycles[core] =
+                p->sigmadelta.time_cycles;
+            p->sigmadelta.time_valid[core] = true;
+            continue;
+        }
+        uint32_t elapsed = now - p->sigmadelta.last_ccount[core];
+        if (elapsed < (uint32_t)INT32_MAX) {
+            p->sigmadelta.core_cycles[core] = sigmadelta_add_saturating(
+                p->sigmadelta.core_cycles[core], elapsed);
+        }
+        p->sigmadelta.last_ccount[core] = now;
+        if (p->sigmadelta.core_cycles[core] >
+            p->sigmadelta.time_cycles) {
+            p->sigmadelta.time_cycles =
+                p->sigmadelta.core_cycles[core];
+        }
+    }
+    return p->sigmadelta.time_cycles;
+}
+
+static uint64_t sigmadelta_mul_div_floor(uint64_t value,
+                                         uint64_t multiplier,
+                                         uint64_t divisor) {
+    if (divisor == 0u) return 0u;
+    uint64_t quotient = value / divisor;
+    uint64_t remainder = value % divisor;
+    if (multiplier != 0u && quotient > UINT64_MAX / multiplier)
+        return UINT64_MAX;
+    uint64_t result = quotient * multiplier;
+    uint64_t tail = remainder * multiplier / divisor;
+    return sigmadelta_add_saturating(result, tail);
+}
+
+static unsigned sigmadelta_increment(
+    const sigmadelta_channel_state_t *channel) {
+    return (unsigned)((int)(int8_t)(channel->config & 0xFFu) + 128);
+}
+
+static void sigmadelta_phase_at(const esp32_periph_t *p, unsigned index,
+                                uint64_t now, uint8_t *accumulator,
+                                bool *level) {
+    const sigmadelta_channel_state_t *channel =
+        &p->sigmadelta.channel[index];
+    uint64_t elapsed = now >= channel->anchor_cycles ?
+                       now - channel->anchor_cycles : 0u;
+    uint32_t prescaler = (channel->config >> 8u) & 0xFFu;
+    uint64_t divisor = (uint64_t)sigmadelta_cpu_mhz(p) *
+                       (prescaler + 1u);
+    uint64_t ticks = sigmadelta_mul_div_floor(
+        elapsed, SIGMADELTA_APB_MHZ, divisor);
+    unsigned increment = sigmadelta_increment(channel);
+
+    if (accumulator) {
+        uint64_t advance = (ticks & 0xFFu) * increment;
+        *accumulator = (uint8_t)(channel->anchor_accumulator + advance);
+    }
+    if (!level) return;
+    if (ticks == 0u) {
+        *level = channel->anchor_level;
+        return;
+    }
+    unsigned previous = (unsigned)channel->anchor_accumulator +
+        (unsigned)(((ticks - 1u) & 0xFFu) * increment);
+    previous &= 0xFFu;
+    *level = previous + increment >= 0x100u;
+}
+
+static bool sigmadelta_channel_level(const esp32_periph_t *p,
+                                     unsigned channel) {
+    bool level = false;
+    sigmadelta_phase_at(p, channel, sigmadelta_peek_cycles(p), NULL,
+                        &level);
+    return level;
+}
+
+static void sigmadelta_sync_channel(esp32_periph_t *p, unsigned index) {
+    sigmadelta_channel_state_t *channel =
+        &p->sigmadelta.channel[index];
+    uint64_t now = sigmadelta_now_cycles(p);
+    uint8_t accumulator = 0u;
+    bool level = false;
+    sigmadelta_phase_at(p, index, now, &accumulator, &level);
+    channel->anchor_cycles = now;
+    channel->anchor_accumulator = accumulator;
+    channel->anchor_level = level;
+}
+
+static int sigmadelta_channel_gpio(const esp32_periph_t *p,
+                                   unsigned channel, bool *inverted) {
+    uint32_t signal = SIGMADELTA_SIGNAL_BASE + channel;
+    for (int gpio = 0; gpio < 40; gpio++) {
+        uint32_t route = p->gpio.func_out_sel[gpio];
+        if ((route & 0x1FFu) != signal) continue;
+        if (inverted) *inverted = (route & (1u << 9u)) != 0u;
+        return gpio;
+    }
+    if (inverted) *inverted = false;
+    return -1;
+}
+
+static bool sigmadelta_gpio_enabled(const esp32_periph_t *p, int gpio) {
+    if (gpio < 0 || gpio >= 40) return false;
+    if (gpio < 32) return (p->gpio.enable & (1u << gpio)) != 0u;
+    return (p->gpio.enable1 & (1u << (gpio - 32))) != 0u;
+}
+
+static uint32_t sigmadelta_frequency_hz(
+    const sigmadelta_channel_state_t *channel) {
+    uint32_t prescaler = (channel->config >> 8u) & 0xFFu;
+    return SIGMADELTA_APB_MHZ * 1000000u /
+           ((prescaler + 1u) * 256u);
+}
+
+static void sigmadelta_emit_channel(esp32_periph_t *p, unsigned index,
+                                    bool force) {
+    if (index >= SIGMADELTA_CHANNEL_COUNT) return;
+    sigmadelta_channel_state_t *channel =
+        &p->sigmadelta.channel[index];
+    bool inverted = false;
+    int gpio = sigmadelta_channel_gpio(p, index, &inverted);
+    uint32_t frequency = sigmadelta_frequency_hz(channel);
+    int8_t duty = (int8_t)(channel->config & 0xFFu);
+    bool enabled = sigmadelta_gpio_enabled(p, gpio);
+
+    bool changed = !channel->output_reported ||
+        channel->last_gpio != gpio ||
+        channel->last_frequency_hz != frequency ||
+        channel->last_duty != duty ||
+        channel->last_enabled != enabled ||
+        channel->last_inverted != inverted;
+    if (!force && !changed) return;
+
+    channel->last_gpio = gpio;
+    channel->last_frequency_hz = frequency;
+    channel->last_duty = duty;
+    channel->last_enabled = enabled;
+    channel->last_inverted = inverted;
+    channel->output_reported = true;
+
+    if (channel->output_cb) {
+        channel->output_cb(channel->output_cb_ctx, (int)index, gpio,
+                           frequency, duty, enabled, inverted);
+    }
+
+    sbx_event_t event = {
+        .kind = SBX_EV_SIGMADELTA_OUT,
+        .cycle = sigmadelta_now_cycles(p),
+    };
+    event.sigmadelta_out.gpio = (int8_t)gpio;
+    event.sigmadelta_out.duty = duty;
+    event.sigmadelta_out.channel = (uint8_t)index;
+    event.sigmadelta_out.enabled = enabled ? 1u : 0u;
+    event.sigmadelta_out.inverted = inverted ? 1u : 0u;
+    event.sigmadelta_out.frequency_hz = frequency;
+    sbx_events_emit(&event);
+}
+
+static void sigmadelta_reset_state(esp32_periph_t *p) {
+    periph_sigmadelta_output_fn callbacks[SIGMADELTA_CHANNEL_COUNT];
+    void *contexts[SIGMADELTA_CHANNEL_COUNT];
+    for (unsigned index = 0; index < SIGMADELTA_CHANNEL_COUNT; index++) {
+        callbacks[index] = p->sigmadelta.channel[index].output_cb;
+        contexts[index] = p->sigmadelta.channel[index].output_cb_ctx;
+    }
+
+    uint64_t now = sigmadelta_peek_cycles(p);
+    memset(&p->sigmadelta, 0, sizeof(p->sigmadelta));
+    p->sigmadelta.time_cycles = now;
+    p->sigmadelta.version = SIGMADELTA_VERSION_RESET;
+    for (unsigned core = 0; core < 2u; core++) {
+        p->sigmadelta.core_cycles[core] = now;
+        if (p->cpu[core]) {
+            p->sigmadelta.last_ccount[core] = p->cpu[core]->ccount;
+            p->sigmadelta.time_valid[core] = true;
+        }
+    }
+    for (unsigned index = 0; index < SIGMADELTA_CHANNEL_COUNT; index++) {
+        sigmadelta_channel_state_t *channel =
+            &p->sigmadelta.channel[index];
+        channel->config = 0x0000FF00u;
+        channel->anchor_cycles = now;
+        channel->output_cb = callbacks[index];
+        channel->output_cb_ctx = contexts[index];
+        if (callbacks[index]) sigmadelta_emit_channel(p, index, true);
+    }
+}
+
+static uint32_t sigmadelta_read(esp32_periph_t *p, uint32_t addr) {
+    uint32_t off = addr - GPIO_SD_BASE;
+    if ((off & 3u) != 0u || off >= 0x100u) return 0u;
+    if (off < SIGMADELTA_CHANNEL_COUNT * 4u)
+        return p->sigmadelta.channel[off / 4u].config;
+    switch (off) {
+    case SIGMADELTA_CG_OFF: return p->sigmadelta.cg;
+    case SIGMADELTA_MISC_OFF: return p->sigmadelta.misc;
+    case SIGMADELTA_VERSION_OFF: return p->sigmadelta.version;
+    default: return 0u;
+    }
+}
+
+static void sigmadelta_write(esp32_periph_t *p, uint32_t addr,
+                             uint32_t value) {
+    uint32_t off = addr - GPIO_SD_BASE;
+    if ((off & 3u) != 0u || off >= 0x100u) return;
+    if (off < SIGMADELTA_CHANNEL_COUNT * 4u) {
+        unsigned index = off / 4u;
+        sigmadelta_sync_channel(p, index);
+        p->sigmadelta.channel[index].config =
+            value & SIGMADELTA_CHANNEL_MASK;
+        sigmadelta_emit_channel(p, index, false);
+        return;
+    }
+    switch (off) {
+    case SIGMADELTA_CG_OFF:
+        /* ESP32's LL explicitly treats this generated register as absent;
+         * retain its documented bit for diagnostics without gating output. */
+        p->sigmadelta.cg = value & SIGMADELTA_CG_MASK;
+        return;
+    case SIGMADELTA_MISC_OFF:
+        p->sigmadelta.misc = value & SIGMADELTA_MISC_MASK;
+        return;
+    case SIGMADELTA_VERSION_OFF:
+        p->sigmadelta.version = value & SIGMADELTA_VERSION_MASK;
+        return;
+    default:
+        return;
+    }
+}
+
+static void sigmadelta_gpio_route_changed(esp32_periph_t *p,
+                                          uint32_t before,
+                                          uint32_t after) {
+    uint32_t routes[2] = {before & 0x1FFu, after & 0x1FFu};
+    for (unsigned which = 0; which < 2u; which++) {
+        uint32_t route = routes[which];
+        if (route >= SIGMADELTA_SIGNAL_BASE &&
+            route < SIGMADELTA_SIGNAL_BASE + SIGMADELTA_CHANNEL_COUNT) {
+            sigmadelta_emit_channel(p, route - SIGMADELTA_SIGNAL_BASE,
+                                    true);
+        }
+    }
+}
+
+static void sigmadelta_gpio_enable_changed(esp32_periph_t *p) {
+    for (unsigned index = 0; index < SIGMADELTA_CHANNEL_COUNT; index++)
+        sigmadelta_emit_channel(p, index, false);
+}
+
 /* ---- GPIO ---- */
 
 /* Return the latched status bits routed to one INT_ENA destination. */
@@ -2219,6 +2564,8 @@ static void gpio_intr_update(esp32_periph_t *p) {
 
 static uint32_t gpio_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
+    if (addr >= GPIO_SD_BASE && addr < GPIO_SD_BASE + 0x100u)
+        return sigmadelta_read(p, addr);
     uint32_t off = addr - GPIO_BASE;
 
     /* Basic registers */
@@ -2294,9 +2641,15 @@ static void gpio_emit_changed(uint32_t prev, uint32_t now, int pin_base) {
 
 static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
+    if (addr >= GPIO_SD_BASE && addr < GPIO_SD_BASE + 0x100u) {
+        sigmadelta_write(p, addr, val);
+        return;
+    }
     uint32_t off = addr - GPIO_BASE;
     uint32_t prev_out = p->gpio.out;
     uint32_t prev_out1 = p->gpio.out1;
+    uint32_t prev_enable = p->gpio.enable;
+    uint32_t prev_enable1 = p->gpio.enable1;
 
     switch (off) {
     case 0x004: p->gpio.out = val; break;        /* GPIO_OUT_REG */
@@ -2347,8 +2700,12 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
         p->gpio.func_out_sel[n] = val;
         ledc_gpio_route_changed(p, n, before, val);
         mcpwm_gpio_output_route_changed(p, n, before, val);
+        sigmadelta_gpio_route_changed(p, before, val);
         return;
     }
+
+    if (p->gpio.enable != prev_enable || p->gpio.enable1 != prev_enable1)
+        sigmadelta_gpio_enable_changed(p);
 
     /* Fire sandbox events for any output pins that changed level. */
     if (p->gpio.out != prev_out)
@@ -2493,7 +2850,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
     case 0x034: return 1;           /* RESET_STATE: POWERON */
     case 0x038: return 1;           /* STORE0: wakeup cause = power-on */
     case 0x080: return 0;           /* SLP_TIMER_BASE */
-    case 0x070: return 0x00000080;  /* RTC_CLK_CONF: bit7=fast_clk_sel, slow_clk active */
+    case 0x068: return p->rtc_cpu_period_conf;
+    case 0x070: return p->rtc_clk_conf;
     case 0x0A8: return 0x2210;      /* CLK_CONF: clocks ready */
     case 0x0B0: return 0x00280028;  /* RTC_XTAL_FREQ_REG: 40 MHz crystal (both halves) */
     default: return 0;
@@ -2508,6 +2866,17 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
     }
     if (addr >= RTCIO_BASE && addr < RTCIO_BASE + RTCIO_REG_FILE_SIZE) {
         rtcio_write(p, addr - RTCIO_BASE, val);
+        return;
+    }
+    uint32_t off = addr - RTC_CNTL_BASE;
+    switch (off) {
+    case 0x068u:
+        p->rtc_cpu_period_conf = val & RTC_CPU_PERIOD_CONF_MASK;
+        return;
+    case 0x070u:
+        p->rtc_clk_conf = val & RTC_CLK_CONF_MASK;
+        return;
+    default:
         return;
     }
 }
@@ -11952,6 +12321,13 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     p->mem = mem;
     p->app_cpu_in_reset = true;
     p->dport_wifi_clk_en = 0xFFFCE030u;
+    /* Flexe loads an application image directly, after the second-stage
+     * bootloader would have selected the SDK's default 160 MHz PLL clock.
+     * Exposing XTAL reset state here made genuine Arduino APIs derive a
+     * false 40 MHz APB clock even though g_ticks_per_us already held 160. */
+    p->dport_cpu_per_conf = 1u;       /* CPUPERIOD_SEL_160 */
+    p->rtc_cpu_period_conf = 1u << 30u;
+    p->rtc_clk_conf = (1u << 27u) | 0x00002210u; /* PLL + reset dividers */
     p->radio.rng_state = 0x12345678ABCDEF01ULL;
     for (int port = 0; port < I2C_PORT_COUNT; port++)
         p->i2c[port].regs[I2C_DATE_OFF / 4u] = 0x16042000u;
@@ -11977,6 +12353,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         i2s->regs[I2S_DATE_OFF / 4u] = 0x01604201u;
     }
 
+    sigmadelta_reset_state(p);
     rmt_reset_state(p);
     pcnt_reset_state(p);
 
@@ -12161,6 +12538,14 @@ int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
         bool level = mcpwm_generator_pin_level(
             p, unit, relative / 2u, relative & 1u);
         if (route & (1u << 9)) level = !level;
+        return level ? 1 : 0;
+    }
+
+    if (signal >= SIGMADELTA_SIGNAL_BASE &&
+        signal < SIGMADELTA_SIGNAL_BASE + SIGMADELTA_CHANNEL_COUNT) {
+        bool level = sigmadelta_channel_level(
+            p, signal - SIGMADELTA_SIGNAL_BASE);
+        if (route & (1u << 9u)) level = !level;
         return level ? 1 : 0;
     }
 
@@ -12427,6 +12812,21 @@ int periph_set_ledc_output_callback(esp32_periph_t *p, int speed_mode,
     return 0;
 }
 
+int periph_set_sigmadelta_output_callback(
+    esp32_periph_t *p, int channel, periph_sigmadelta_output_fn fn,
+    void *ctx) {
+    if (!p || channel < 0 ||
+        channel >= (int)SIGMADELTA_CHANNEL_COUNT)
+        return -1;
+    sigmadelta_channel_state_t *state =
+        &p->sigmadelta.channel[channel];
+    state->output_cb = fn;
+    state->output_cb_ctx = fn ? ctx : NULL;
+    state->output_reported = false;
+    if (fn) sigmadelta_emit_channel(p, (unsigned)channel, true);
+    return 0;
+}
+
 int periph_set_mcpwm_output_callback(esp32_periph_t *p, int unit,
                                      int operator_index, int generator,
                                      periph_mcpwm_output_fn fn, void *ctx) {
@@ -12514,6 +12914,9 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         p->mcpwm.core_cycles[core] = p->mcpwm.time_cycles;
         p->mcpwm.last_ccount[core] = cpu ? cpu->ccount : 0u;
         p->mcpwm.time_valid[core] = cpu != NULL;
+        p->sigmadelta.core_cycles[core] = p->sigmadelta.time_cycles;
+        p->sigmadelta.last_ccount[core] = cpu ? cpu->ccount : 0u;
+        p->sigmadelta.time_valid[core] = cpu != NULL;
     }
     for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
         p->frc_timer[timer].last_cycles = p->timg_clock.cycles;

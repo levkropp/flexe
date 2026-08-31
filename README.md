@@ -36,7 +36,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - esp32 memory map (sram, rom, flash, rtc, psram, peripheral i/o)
 - hardware flash MMU: complete 64 KiB DROM0/IRAM0/IRAM1/IROM0 mappings,
   dual-core table invalidation, flash programming coherence, and translated-code invalidation
-- mmio peripherals: all three uarts, gpio, dport, rtc/rtcio, efuse, watchdog,
+- mmio peripherals: all three uarts, gpio with eight-channel classic
+  sigma-delta/PDM, dport, rtc/rtcio, efuse, watchdog,
   legacy FRC1/FRC2 timers, both timer groups with four 64-bit APB
   counters/alarms, dual UHCI UART DMA with H:5/SLIP framing, GP-SPI2/3 DMA,
   classic I2C0/1 master, SJA1000-compatible TWAI/CAN,
@@ -57,7 +58,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 626 tests
+- 629 tests
 
 ## building
 
@@ -146,7 +147,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 626 tests, 4568 passed, 0 failed
+# 629 tests, 4608 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -222,6 +223,24 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-ledc-pwm.sh
 ```
 
 `FLEXE_LEDC_BUILD_DIR` optionally preserves its Arduino build directory.
+
+The sigma-delta gate builds an unmodified sketch through Arduino's public
+`sigmaDelta*` wrapper and ESP-IDF's public `driver/sigmadelta.h` API. It
+exercises channels 0 and 7, signed duty and prescale updates, GPIO-matrix
+routing, GPIO enable state, the host aggregate-output callback, and an exact
+192/256 live pulse-density period. It also guards the post-boot PLL/160 MHz
+clock selectors used by genuine ESP-IDF clock queries. Both engines must
+finish with zero unhandled MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-sigmadelta.sh
+# engine=jit stage=0x5349474D api=312500/192 regs=0040/07E0 routes=100/107 enable=00C40000 callbacks=11/1/1/1 density=192/256 unhandled=0 unregistered=0
+# engine=interp stage=0x5349474D api=312500/192 regs=0040/07E0 routes=100/107 enable=00C40000 callbacks=11/1/1/1 density=192/256 unhandled=0 unregistered=0
+```
+
+The fixture is verified with Arduino-ESP32 2.0.11.
+`FLEXE_ARDUINO_CONFIG` selects an Arduino CLI configuration and
+`FLEXE_SIGMADELTA_BUILD_DIR` optionally preserves the fixture build.
 
 The PCNT gate builds an unmodified sketch against ESP-IDF's public
 `driver/pcnt.h` API. Host GPIO transitions pass through the production GPIO
@@ -402,8 +421,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **5.72× real-time** |
-| NerdMiner v1.8.3 | **3.56× real-time** |
+| ESP32 Marauder v1.14 | **6.03× real-time** |
+| NerdMiner v1.8.3 | **3.57× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

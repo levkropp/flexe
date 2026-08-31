@@ -184,6 +184,11 @@ if(UNIX)
     target_compile_options(flexe-analog-dac-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-sigmadelta-test tools/sigmadelta_test.c)
+    target_link_libraries(flexe-sigmadelta-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-sigmadelta-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-i2s-dma-test tools/i2s_dma_test.c)
     target_link_libraries(flexe-i2s-dma-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-i2s-dma-test PRIVATE

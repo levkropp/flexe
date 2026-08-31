@@ -2981,6 +2981,34 @@ TEST(dport_safe_defaults) {
     mem_destroy(mem);
 }
 
+TEST(post_boot_cpu_clock_state_and_writes) {
+    const uint32_t dport_cpu_per_conf = 0x3FF0003Cu;
+    const uint32_t rtc_cpu_period_conf = 0x3FF48068u;
+    const uint32_t rtc_clk_conf = 0x3FF48070u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    /* Flexe starts at the application entry point, after the second-stage
+     * bootloader selected the SDK's default 160 MHz PLL clock. Keep all
+     * app-visible clock selectors consistent with g_ticks_per_us. */
+    ASSERT_EQ(mem_read32(mem, dport_cpu_per_conf), 1u);
+    ASSERT_EQ(mem_read32(mem, rtc_cpu_period_conf), 1u << 30u);
+    ASSERT_EQ(mem_read32(mem, rtc_clk_conf), 0x08002210u);
+    ASSERT_EQ((mem_read32(mem, rtc_clk_conf) >> 27u) & 3u, 1u);
+
+    /* Clock-management code uses read/modify/write on these registers. */
+    mem_write32(mem, dport_cpu_per_conf, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, dport_cpu_per_conf), 0xFu);
+    mem_write32(mem, rtc_cpu_period_conf, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, rtc_cpu_period_conf), 0xE0000000u);
+    mem_write32(mem, rtc_clk_conf, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, rtc_clk_conf), 0xFFFFFFF0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 #define TEST_FRC_BASE          0x3FF47000u
 #define TEST_FRC_TIMER(n)      (TEST_FRC_BASE + (n) * 0x20u)
 #define TEST_FRC_LEVEL_INT     (1u << 0)
@@ -3507,6 +3535,142 @@ TEST(rtcio_dac_state_and_events) {
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
     sbx_events_set_sink(NULL, NULL);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+typedef struct {
+    unsigned callback_count;
+    unsigned event_count;
+    int channel;
+    int gpio;
+    uint32_t frequency_hz;
+    int8_t duty;
+    bool enabled;
+    bool inverted;
+} sigmadelta_capture_t;
+
+static void capture_sigmadelta_output(void *ctx, int channel, int gpio,
+                                      uint32_t frequency_hz, int8_t duty,
+                                      bool enabled, bool inverted) {
+    sigmadelta_capture_t *capture = ctx;
+    capture->callback_count++;
+    capture->channel = channel;
+    capture->gpio = gpio;
+    capture->frequency_hz = frequency_hz;
+    capture->duty = duty;
+    capture->enabled = enabled;
+    capture->inverted = inverted;
+}
+
+static void capture_sigmadelta_event(const sbx_event_t *event, void *ctx) {
+    if (event->kind != SBX_EV_SIGMADELTA_OUT) return;
+    sigmadelta_capture_t *capture = ctx;
+    capture->event_count++;
+}
+
+TEST(sigmadelta_registers_matrix_and_aggregate_output) {
+    const uint32_t sd = 0x3FF44F00u;
+    const uint32_t gpio18_route = 0x3FF44530u + 18u * 4u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    sigmadelta_capture_t capture = {0};
+    sbx_events_set_sink(capture_sigmadelta_event, &capture);
+
+    ASSERT_EQ(mem_read32(mem, sd + 0x00u), 0x0000FF00u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x1Cu), 0x0000FF00u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x20u), 0u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x24u), 0u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x28u), 0x01506190u);
+
+    ASSERT_EQ(periph_set_sigmadelta_output_callback(
+                  p, 0, capture_sigmadelta_output, &capture), 0);
+    ASSERT_EQ(capture.callback_count, 1u);
+    ASSERT_EQ(capture.channel, 0);
+    ASSERT_EQ(capture.gpio, -1);
+    ASSERT_EQ(capture.frequency_hz, 1220u);
+    ASSERT_EQ(capture.duty, 0);
+    ASSERT_FALSE(capture.enabled);
+
+    /* Reserved channel bits read zero. Duty 0x40 is signed +64, yielding
+     * 192 high samples in each 256-sample modulation period. */
+    mem_write32(mem, sd + 0x00u, 0xDEAD0040u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x00u), 0x00000040u);
+    ASSERT_EQ(capture.frequency_hz, 312500u);
+    ASSERT_EQ(capture.duty, 64);
+
+    mem_write32(mem, gpio18_route, 100u | (1u << 9u));
+    ASSERT_EQ(capture.gpio, 18);
+    ASSERT_FALSE(capture.enabled);
+    ASSERT_TRUE(capture.inverted);
+    mem_write32(mem, 0x3FF44024u, 1u << 18u);
+    ASSERT_TRUE(capture.enabled);
+
+    mem_write32(mem, sd + 0x20u, UINT32_MAX);
+    mem_write32(mem, sd + 0x24u, UINT32_MAX);
+    mem_write32(mem, sd + 0x28u, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, sd + 0x20u), 1u << 31u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x24u), 1u << 31u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x28u), 0x0FFFFFFFu);
+    ASSERT_TRUE(capture.event_count >= capture.callback_count);
+    ASSERT_EQ(periph_set_sigmadelta_output_callback(
+                  p, 8, capture_sigmadelta_output, &capture), -1);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    sbx_events_set_sink(NULL, NULL);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sigmadelta_timed_density_prescaler_and_inversion) {
+    const uint32_t sd = 0x3FF44F00u;
+    const uint32_t gpio18_route = 0x3FF44530u + 18u * 4u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+
+    mem_write32(mem, sd + 0x00u, 0x00000040u); /* +64: 192/256 */
+    mem_write32(mem, gpio18_route, 100u);
+    mem_write32(mem, 0x3FF44024u, 1u << 18u);
+
+    unsigned high = 0u;
+    for (unsigned sample = 1u; sample <= 256u; sample++) {
+        cpu.ccount = sample * 3u; /* 80 MHz modulator on a 240 MHz CPU */
+        high += (unsigned)periph_gpio_pin_level(p, 18);
+    }
+    ASSERT_EQ(high, 192u);
+
+    /* Matrix inversion complements the pulse density without mutating the
+     * programmed signed duty. */
+    mem_write32(mem, gpio18_route, 100u | (1u << 9u));
+    high = 0u;
+    uint32_t base = cpu.ccount;
+    for (unsigned sample = 1u; sample <= 256u; sample++) {
+        cpu.ccount = base + sample * 3u;
+        high += (unsigned)periph_gpio_pin_level(p, 18);
+    }
+    ASSERT_EQ(high, 64u);
+
+    /* Prescale three divides the 80 MHz sample clock by four. Signed -64
+     * therefore emits 64 high samples, now twelve CPU cycles apart. */
+    mem_write32(mem, gpio18_route, 100u);
+    mem_write32(mem, sd + 0x00u, (3u << 8u) | 0xC0u);
+    high = 0u;
+    base = cpu.ccount;
+    for (unsigned sample = 1u; sample <= 256u; sample++) {
+        cpu.ccount = base + sample * 12u;
+        high += (unsigned)periph_gpio_pin_level(p, 18);
+    }
+    ASSERT_EQ(high, 64u);
+    ASSERT_EQ(mem_read32(mem, sd + 0x00u), 0x000003C0u);
+    ASSERT_EQ(periph_gpio_out_signal(p, 18), 100);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 18), 1);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
     periph_destroy(p);
     mem_destroy(mem);
 }
@@ -5053,6 +5217,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(gp_spi_dma_full_duplex_sd);
     RUN_TEST(raw_sd_multiblock_read_write);
     RUN_TEST(dport_safe_defaults);
+    RUN_TEST(post_boot_cpu_clock_state_and_writes);
     RUN_TEST(frc1_countdown_reload_prescalers_and_interrupt);
     RUN_TEST(frc2_countup_wrap_compare_and_runtime_frequency);
     RUN_TEST(timg_general_timers_count_capture_pause_and_reset);
@@ -5062,6 +5227,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(rtc_reset_cause);
     RUN_TEST(sens_adc_single_conversions);
     RUN_TEST(rtcio_dac_state_and_events);
+    RUN_TEST(sigmadelta_registers_matrix_and_aggregate_output);
+    RUN_TEST(sigmadelta_timed_density_prescaler_and_inversion);
     RUN_TEST(gpio_set_clear);
     RUN_TEST(gpio_high_pin_falling_edge_interrupt);
     RUN_TEST(gpio_interrupt_routes_to_selected_core);

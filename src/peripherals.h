@@ -98,6 +98,16 @@ typedef void (*periph_ledc_output_fn)(void *ctx, int speed_mode, int channel,
                                      uint32_t duty, uint32_t duty_max,
                                      bool enabled, bool inverted);
 
+/* Aggregate output state for one classic ESP32 sigma-delta channel. The
+ * signed duty has the hardware range -128..127 and therefore represents
+ * (duty + 128) high samples out of every 256 modulator samples. The reported
+ * frequency matches Arduino's sigmaDeltaSetup API: 80 MHz divided by the
+ * channel prescaler and the 256-sample modulation period. */
+typedef void (*periph_sigmadelta_output_fn)(void *ctx, int channel, int gpio,
+                                            uint32_t frequency_hz,
+                                            int8_t duty, bool enabled,
+                                            bool inverted);
+
 /* Aggregate configuration for one classic ESP32 MCPWM generator output.
  * `period_ticks` and `compare_ticks` use the selected operator timer's
  * resolution. Dead-time delays use `deadtime_clock_hz`; carrier_duty_eighths
@@ -255,6 +265,13 @@ size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel,
 int periph_set_ledc_output_callback(esp32_periph_t *p, int speed_mode,
                                     int channel, periph_ledc_output_fn fn,
                                     void *ctx);
+
+/* Attach a pulse-density sink to one of the eight classic GPIO sigma-delta
+ * channels. The current aggregate configuration is delivered immediately;
+ * later duty, prescaler, GPIO-enable, and matrix-routing changes produce
+ * another callback. */
+int periph_set_sigmadelta_output_callback(
+    esp32_periph_t *p, int channel, periph_sigmadelta_output_fn fn, void *ctx);
 
 /* Attach a motor-control PWM sink to either MCPWM unit, one of its three
  * operators, and generator A/B. The current aggregate configuration is

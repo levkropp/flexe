@@ -819,6 +819,17 @@ static void sbx_json_sink(const sbx_event_t *ev, void *ctx) {
                 ev->pwm_out.duty_max, ev->pwm_out.enabled,
                 ev->pwm_out.inverted);
         break;
+    case SBX_EV_SIGMADELTA_OUT:
+        fprintf(stdout,
+                "{\"t\":\"sigmadelta\",\"c\":%llu,\"gpio\":%d,"
+                "\"ch\":%u,\"freq\":%u,\"duty\":%d,\"en\":%u,"
+                "\"inv\":%u}\n",
+                (unsigned long long)cycle, ev->sigmadelta_out.gpio,
+                ev->sigmadelta_out.channel,
+                ev->sigmadelta_out.frequency_hz,
+                ev->sigmadelta_out.duty, ev->sigmadelta_out.enabled,
+                ev->sigmadelta_out.inverted);
+        break;
     case SBX_EV_LCD_PIXELS: {
         /* Compute payload size from bit depth. 1bpp uses page-col packing
          * (8 vertical pixels per byte → w * (h/8) bytes); ≥8bpp uses
