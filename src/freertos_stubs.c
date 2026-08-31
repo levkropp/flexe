@@ -136,7 +136,13 @@ static void frt_refresh_cpu_frequency(freertos_stubs_t *frt,
 
 static uint32_t frt_arg(xtensa_cpu_t *cpu, int n) {
     int ci = XT_PS_CALLINC(cpu->ps);
-    return ar_read(cpu, ci * 4 + 2 + n);
+    /* The Xtensa windowed ABI provides six argument registers.  Calls with
+     * more arguments place arg 6 onward at the caller's stack pointer.  The
+     * PC hook runs before the callee's ENTRY instruction, so a1 still names
+     * that caller stack. */
+    if (n < 6)
+        return ar_read(cpu, ci * 4 + 2 + n);
+    return mem_read32(cpu->mem, ar_read(cpu, 1) + (uint32_t)(n - 6) * 4u);
 }
 
 static void frt_return(xtensa_cpu_t *cpu, uint32_t retval) {
@@ -1660,9 +1666,9 @@ int freertos_stubs_dump_tasks(const freertos_stubs_t *frt, char *buf, int buflen
         uint32_t a0 = t->ar[(t->windowbase * 4 + 0) & 63];
         uint32_t a1 = t->ar[(t->windowbase * 4 + 1) & 63];
         n += snprintf(buf + n, buflen - n,
-                      "[%d] %-12s st=%-13s pc=0x%08X a0=0x%08X a1=0x%08X "
+                      "[%d] %-12s st=%-13s core=%d pc=0x%08X a0=0x%08X a1=0x%08X "
                       "entry=0x%08X wake=%llu q=0x%08X\n",
-                      i, t->name, state_names[t->state & 7],
+                      i, t->name, state_names[t->state & 7], t->core_affinity,
                       t->pc, a0, a1, t->entry_fn,
                       (unsigned long long)t->wake_cycle, t->blocked_queue);
     }

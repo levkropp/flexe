@@ -93,6 +93,73 @@ TEST(test_xTaskCreate_returns_pdPASS) {
     frt_teardown(&cpu, rom, frt);
 }
 
+TEST(test_pinned_task_reads_core_affinity_from_windowed_stack) {
+    xtensa_cpu_t cpu0, cpu1;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu0, &rom, &frt);
+    xtensa_cpu_init(&cpu1);
+    cpu1.mem = cpu0.mem;
+    cpu1.core_id = 1;
+    freertos_stubs_attach_cpu(frt, 1, &cpu1);
+
+    const uint32_t entry = 0x400D2000u;
+    const uint32_t name_addr = 0x3FFB2000u;
+    const uint32_t handle_addr = 0x3FFB2040u;
+    const uint32_t caller_sp = 0x3FFB2200u;
+    static const char name[] = "pinned1";
+    static const char dummy_name[] = "dummy";
+    for (size_t i = 0; i < sizeof(name); i++)
+        mem_write8(cpu0.mem, name_addr + (uint32_t)i, (uint8_t)name[i]);
+    for (size_t i = 0; i < sizeof(dummy_name); i++)
+        mem_write8(cpu0.mem, name_addr + 0x20u + (uint32_t)i,
+                   (uint8_t)dummy_name[i]);
+    mem_write32(cpu0.mem, handle_addr, 0u);
+
+    /* A first unpinned task represents the legacy task already executing on
+     * PRO_CPU.  Registering the second task promotes the compatibility
+     * scheduler and leaves the pinned task ready for APP_CPU. */
+    extern void stub_xTaskCreate(xtensa_cpu_t *, void *);
+    XT_PS_SET_CALLINC(cpu0.ps, 0);
+    ar_write(&cpu0, 0, BASE + 0x100u);
+    ar_write(&cpu0, 2, 0x400D1000u);
+    ar_write(&cpu0, 3, name_addr + 0x20u);
+    ar_write(&cpu0, 4, 2048u);
+    ar_write(&cpu0, 5, 0u);
+    ar_write(&cpu0, 6, 1u);
+    ar_write(&cpu0, 7, 0u);
+    stub_xTaskCreate(&cpu0, frt);
+
+    /* CALL8 supplies the six register arguments in a10..a15.  The seventh
+     * argument is at caller_sp; poison a16 with core 0 so the regression
+     * fails if the stub reads past the ABI's argument-register bank. */
+    XT_PS_SET_CALLINC(cpu0.ps, 2);
+    ar_write(&cpu0, 1, caller_sp);
+    ar_write(&cpu0, 8, BASE + 0x180u);
+    ar_write(&cpu0, 10, entry);
+    ar_write(&cpu0, 11, name_addr);
+    ar_write(&cpu0, 12, 2048u);
+    ar_write(&cpu0, 13, 0u);
+    ar_write(&cpu0, 14, 3u);
+    ar_write(&cpu0, 15, handle_addr);
+    ar_write(&cpu0, 16, 0u);
+    mem_write32(cpu0.mem, caller_sp, 1u);
+
+    extern void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *, void *);
+    stub_xTaskCreatePinnedToCore(&cpu0, frt);
+    ASSERT_EQ(ar_read(&cpu0, 10), 1u);
+    ASSERT_TRUE(mem_read32(cpu0.mem, handle_addr) != 0u);
+
+    ASSERT_TRUE(freertos_stubs_scheduler_active(frt));
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0),
+                       dummy_name) == 0);
+    ASSERT_TRUE(freertos_stubs_check_preempt_core(frt, 1));
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 1), name) == 0);
+    ASSERT_EQ(cpu1.pc, entry);
+
+    frt_teardown(&cpu0, rom, frt);
+}
+
 TEST(test_xTaskGetTickCount) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -728,6 +795,7 @@ static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
     RUN_TEST(test_vTaskDelay_advances_ccount);
     RUN_TEST(test_xTaskCreate_returns_pdPASS);
+    RUN_TEST(test_pinned_task_reads_core_affinity_from_windowed_stack);
     RUN_TEST(test_xTaskGetTickCount);
     RUN_TEST(test_scheduler_start_sets_dual_core_ready_flags);
     RUN_TEST(test_queue_send_receive);
