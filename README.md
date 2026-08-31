@@ -32,7 +32,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 
 - full xtensa lx6 isa: alu, shifts, branches, loops, mac16, fpu
 - windowed registers with synthesized spill/fill (call4/8/12, entry, retw)
-- exception/interrupt dispatch (levels 1–7, timer ccompare, waiti)
+- exception/interrupt dispatch (levels 1–7, timer ccompare, waiti), plus the
+  complete 69-source dual-core ESP32 interrupt matrix with fan-in and live remapping
 - esp32 memory map (sram, rom, flash, rtc, psram, peripheral i/o)
 - hardware flash MMU: complete 64 KiB DROM0/IRAM0/IRAM1/IROM0 mappings,
   dual-core table invalidation, flash programming coherence, and translated-code invalidation
@@ -59,7 +60,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 639 tests
+- 642 tests
 
 ## building
 
@@ -148,7 +149,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 639 tests, 4732 passed, 0 failed
+# 642 tests, 4904 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -455,8 +456,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14.3 | **6.12× real-time** |
-| NerdMiner v1.8.3 | **4.92× real-time** |
+| ESP32 Marauder v1.14.3 | **8.50× real-time** |
+| NerdMiner v1.8.3 | **5.86× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

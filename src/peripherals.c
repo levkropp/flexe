@@ -1715,17 +1715,19 @@ struct esp32_periph {
     uint32_t dport_core_rst_en;
     uint32_t dport_cpu_per_conf;
 
-    /* Interrupt matrix: maps each CPU interrupt line to a peripheral source.
-     * intr_matrix[core][cpu_int] = peripheral source (0-70), 16 = disabled.
-     * Mirrors DPORT_PRO_*_MAP_REG / DPORT_APP_*_MAP_REG hardware. */
-    uint8_t intr_matrix[2][32];
+    /* Interrupt matrix: each peripheral source owns one five-bit CPU interrupt
+     * selection register per core.  Multiple sources may feed the same CPU
+     * line, so store the hardware's source -> CPU-interrupt direction. */
+    uint8_t intr_matrix[2][71];
 
     /* Pending peripheral interrupt sources (level-triggered) */
     uint32_t pending_sources[3]; /* 71 sources in 3 words (0-31, 32-63, 64-70) */
 
     /* Compatibility-mode guest ISR dispatch. source_level supplies edge
-     * detection independently of interrupt-matrix routing. */
+     * detection independently of interrupt-matrix routing.  Per-core levels
+     * retain GPIO's asymmetric routing and make fan-in/remapping coherent. */
     bool source_level[71];
+    bool source_level_core[2][71];
     periph_irq_dispatch_fn irq_dispatch[71];
     void *irq_dispatch_ctx[71];
 
@@ -1866,24 +1868,69 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_TWAI_MODULE_BIT          (1u << 19)
 #define DPORT_PWM1_MODULE_BIT          (1u << 20)
 
-/* Internal: scan matrix and set/clear CPU interrupt bits for a source */
+#define DPORT_PRO_INTR_MAP_BASE_OFF    0x104u
+#define DPORT_APP_INTR_MAP_BASE_OFF    0x218u
+#define DPORT_INTR_MAP_SOURCE_COUNT    69u
+#define DPORT_INTR_MAP_RESET           16u
+
+/* Xtensa CPU interrupts 6/15/16 are internal CCOMPARE timers, 7/29 are
+ * software interrupts, and 11 is the profiling interrupt.  The DPORT map
+ * registers retain writes selecting those numbers, but peripheral sources
+ * cannot drive or clear the corresponding core-local lines.  ESP-IDF relies
+ * on this property and bulk-writes ETS_INVALID_INUM (6) to disconnect every
+ * source during interrupt allocator initialization. */
+static bool intr_matrix_cpu_line_is_routeable(int cpu_int) {
+    const uint32_t internal = (1u << 6) | (1u << 7) | (1u << 11) |
+                              (1u << 15) | (1u << 16) | (1u << 29);
+    return cpu_int >= 0 && cpu_int <= 31 &&
+           (internal & (1u << cpu_int)) == 0u;
+}
+
+static void intr_matrix_refresh_cpu_line(esp32_periph_t *p, int core,
+                                         int cpu_int) {
+    if (core < 0 || core > 1 ||
+        !intr_matrix_cpu_line_is_routeable(cpu_int) || !p->cpu[core])
+        return;
+
+    bool asserted = false;
+    for (int source = 0; source < 71; source++) {
+        if (p->intr_matrix[core][source] == (uint8_t)cpu_int &&
+            p->source_level_core[core][source]) {
+            asserted = true;
+            break;
+        }
+    }
+
+    uint32_t mask = 1u << cpu_int;
+    if (asserted) {
+        p->cpu[core]->interrupt |= mask;
+        p->cpu[core]->irq_check = true;
+    } else {
+        p->cpu[core]->interrupt &= ~mask;
+    }
+}
+
+static void intr_matrix_map_source(esp32_periph_t *p, int core, int source,
+                                   int cpu_int) {
+    if (core < 0 || core > 1 || source < 0 || source >= 71 ||
+        cpu_int < 0 || cpu_int > 31)
+        return;
+    int old_cpu_int = p->intr_matrix[core][source];
+    p->intr_matrix[core][source] = (uint8_t)cpu_int;
+    intr_matrix_refresh_cpu_line(p, core, old_cpu_int);
+    intr_matrix_refresh_cpu_line(p, core, cpu_int);
+}
+
+/* Internal: set/clear CPU interrupt bits for one peripheral source. */
 static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert) {
     if (source < 0 || source >= 71)
         return;
     bool rising = assert && !p->source_level[source];
     p->source_level[source] = assert;
     for (int core = 0; core < 2; core++) {
-        if (!p->cpu[core]) continue;
-        for (int ci = 0; ci < 32; ci++) {
-            if (p->intr_matrix[core][ci] == (uint8_t)source) {
-                if (assert) {
-                    p->cpu[core]->interrupt |= (1u << ci);
-                    p->cpu[core]->irq_check = true;
-                } else {
-                    p->cpu[core]->interrupt &= ~(1u << ci);
-                }
-            }
-        }
+        p->source_level_core[core][source] = assert;
+        intr_matrix_refresh_cpu_line(p, core,
+                                     p->intr_matrix[core][source]);
     }
     if (rising && p->irq_dispatch[source])
         p->irq_dispatch[source](p->irq_dispatch_ctx[source], source);
@@ -1893,16 +1940,9 @@ static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert
  * one core without being asserted on the other. */
 static void intr_matrix_update_source_core(esp32_periph_t *p, int core,
                                            int source, bool assert) {
-    if (core < 0 || core > 1 || !p->cpu[core]) return;
-    for (int ci = 0; ci < 32; ci++) {
-        if (p->intr_matrix[core][ci] != (uint8_t)source) continue;
-        if (assert) {
-            p->cpu[core]->interrupt |= (1u << ci);
-            p->cpu[core]->irq_check = true;
-        } else {
-            p->cpu[core]->interrupt &= ~(1u << ci);
-        }
-    }
+    if (core < 0 || core > 1 || source < 0 || source >= 71) return;
+    p->source_level_core[core][source] = assert;
+    intr_matrix_refresh_cpu_line(p, core, p->intr_matrix[core][source]);
 }
 
 static void flash_mmu_invalidate_code(esp32_periph_t *p, uint32_t addr,
@@ -2040,19 +2080,23 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
     case DPORT_CPU_INTR_FROM_CPU_2_OFF: return p->from_cpu_intr[2];
     case DPORT_CPU_INTR_FROM_CPU_3_OFF: return p->from_cpu_intr[3];
     default:
-        /* Interrupt matrix: PRO_CPU offsets 0x104-0x17C (32 regs),
-         *                   APP_CPU offsets 0x204-0x27C (32 regs) */
-        if (off >= 0x104 && off <= 0x17C && ((off - 0x104) % 4 == 0)) {
-            int cpu_int = (int)(off - 0x104) / 4;
-            return p->intr_matrix[0][cpu_int];
+        /* DPORT exposes one contiguous map register per source: 69 for PRO,
+         * followed immediately by 69 for APP.  Each register contains the
+         * selected CPU interrupt number, not a peripheral source number. */
+        if (off >= DPORT_PRO_INTR_MAP_BASE_OFF &&
+            off < DPORT_PRO_INTR_MAP_BASE_OFF +
+                  DPORT_INTR_MAP_SOURCE_COUNT * 4u &&
+            ((off - DPORT_PRO_INTR_MAP_BASE_OFF) & 3u) == 0u) {
+            uint32_t source = (off - DPORT_PRO_INTR_MAP_BASE_OFF) / 4u;
+            return p->intr_matrix[0][source];
         }
-        if (off >= 0x204 && off <= 0x27C && ((off - 0x204) % 4 == 0)) {
-            int cpu_int = (int)(off - 0x204) / 4;
-            return p->intr_matrix[1][cpu_int];
+        if (off >= DPORT_APP_INTR_MAP_BASE_OFF &&
+            off < DPORT_APP_INTR_MAP_BASE_OFF +
+                  DPORT_INTR_MAP_SOURCE_COUNT * 4u &&
+            ((off - DPORT_APP_INTR_MAP_BASE_OFF) & 3u) == 0u) {
+            uint32_t source = (off - DPORT_APP_INTR_MAP_BASE_OFF) / 4u;
+            return p->intr_matrix[1][source];
         }
-        /* Other interrupt matrix range (0x180-0x1FC, 0x280-0x2FC) — status/misc */
-        if (off >= 0x104 && off <= 0x2FC)
-            return 16;
         return 0;
     }
 }
@@ -2155,13 +2199,18 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         else         intr_matrix_update_source(p, FROM_CPU_INTR3_SOURCE, false);
         break;
     default:
-        /* Interrupt matrix writes: PRO_CPU 0x104-0x17C, APP_CPU 0x204-0x27C */
-        if (off >= 0x104 && off <= 0x17C && ((off - 0x104) % 4 == 0)) {
-            int cpu_int = (int)(off - 0x104) / 4;
-            p->intr_matrix[0][cpu_int] = (uint8_t)(val & 0x7F);
-        } else if (off >= 0x204 && off <= 0x27C && ((off - 0x204) % 4 == 0)) {
-            int cpu_int = (int)(off - 0x204) / 4;
-            p->intr_matrix[1][cpu_int] = (uint8_t)(val & 0x7F);
+        if (off >= DPORT_PRO_INTR_MAP_BASE_OFF &&
+            off < DPORT_PRO_INTR_MAP_BASE_OFF +
+                  DPORT_INTR_MAP_SOURCE_COUNT * 4u &&
+            ((off - DPORT_PRO_INTR_MAP_BASE_OFF) & 3u) == 0u) {
+            int source = (int)((off - DPORT_PRO_INTR_MAP_BASE_OFF) / 4u);
+            intr_matrix_map_source(p, 0, source, (int)(val & 0x1Fu));
+        } else if (off >= DPORT_APP_INTR_MAP_BASE_OFF &&
+                   off < DPORT_APP_INTR_MAP_BASE_OFF +
+                         DPORT_INTR_MAP_SOURCE_COUNT * 4u &&
+                   ((off - DPORT_APP_INTR_MAP_BASE_OFF) & 3u) == 0u) {
+            int source = (int)((off - DPORT_APP_INTR_MAP_BASE_OFF) / 4u);
+            intr_matrix_map_source(p, 1, source, (int)(val & 0x1Fu));
         }
         break;
     }
@@ -12622,8 +12671,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
      * them low looks like a permanently held button. */
     p->gpio.in = (1u << 0) | (1u << 5) | (1u << 15);
 
-    /* Initialize interrupt matrix: all lines disabled (source 16 = none) */
-    memset(p->intr_matrix, 16, sizeof(p->intr_matrix));
+    /* Initialize every source route to CPU interrupt 16 (disabled). */
+    memset(p->intr_matrix, DPORT_INTR_MAP_RESET, sizeof(p->intr_matrix));
 
     /* General-purpose timers reset with count-up and auto-reload selected,
      * but remain stopped until firmware enables their group clock and Tx_EN. */
@@ -13179,6 +13228,13 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         p->sigmadelta.core_cycles[core] = p->sigmadelta.time_cycles;
         p->sigmadelta.last_ccount[core] = cpu ? cpu->ccount : 0u;
         p->sigmadelta.time_valid[core] = cpu != NULL;
+        if (cpu) {
+            for (int source = 0; source < 71; source++) {
+                if (p->source_level_core[core][source])
+                    intr_matrix_refresh_cpu_line(
+                        p, (int)core, p->intr_matrix[core][source]);
+            }
+        }
     }
     for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
         p->frc_timer[timer].last_cycles = p->timg_clock.cycles;
@@ -13207,13 +13263,20 @@ void periph_deassert_interrupt(esp32_periph_t *p, int source) {
 }
 
 void periph_intr_matrix_set(esp32_periph_t *p, int core, int cpu_int, int source) {
-    if (!p || core < 0 || core > 1 || cpu_int < 0 || cpu_int > 31) return;
-    p->intr_matrix[core][cpu_int] = (uint8_t)(source & 0x7F);
+    if (!p || source < 0 || source >= 71) return;
+    intr_matrix_map_source(p, core, source, cpu_int);
 }
 
 int periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int) {
-    if (!p || core < 0 || core > 1 || cpu_int < 0 || cpu_int > 31) return 16;
-    return p->intr_matrix[core][cpu_int];
+    if (!p || core < 0 || core > 1 || cpu_int < 0 || cpu_int > 31)
+        return DPORT_INTR_MAP_RESET;
+    if (!intr_matrix_cpu_line_is_routeable(cpu_int))
+        return DPORT_INTR_MAP_RESET;
+    for (int source = 0; source < 71; source++) {
+        if (p->intr_matrix[core][source] == (uint8_t)cpu_int)
+            return source;
+    }
+    return DPORT_INTR_MAP_RESET;
 }
 
 void periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw) {

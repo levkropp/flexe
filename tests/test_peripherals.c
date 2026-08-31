@@ -315,7 +315,7 @@ TEST(uhci_transparent_rx_descriptor_chain_idle_and_break_eof) {
     xtensa_cpu_t cpu;
     xtensa_cpu_init(&cpu); cpu.mem = mem;
     periph_attach_cpus(p, &cpu, NULL);
-    periph_intr_matrix_set(p, 0, 11, 13);
+    periph_intr_matrix_set(p, 0, 12, 13);
     mem_write32(mem, 0x3FF000C0u, 1u << 12);
 
     test_spi_dma_desc(mem, desc0, buf0, 4u, 0u, 0, desc1);
@@ -606,7 +606,7 @@ TEST(sdio_slave_reset_shared_interrupts_and_dport) {
     xtensa_cpu_init(&cpu); cpu.mem = mem;
     periph_attach_cpus(p, &cpu, NULL);
     periph_intr_matrix_set(p, 0, 10, 10);
-    periph_intr_matrix_set(p, 0, 11, 11);
+    periph_intr_matrix_set(p, 0, 12, 11);
 
     ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x00u), 0x22226666u);
     ASSERT_EQ(mem_read32(mem, TEST_HINF_BASE + 0x04u), 0x01110011u);
@@ -1922,7 +1922,7 @@ TEST(uart2_rx_fifo_and_interrupt) {
     xtensa_cpu_t cpu0;
     xtensa_cpu_init(&cpu0); cpu0.mem = mem;
     periph_attach_cpus(p, &cpu0, NULL);
-    periph_intr_matrix_set(p, 0, 6, 36); /* UART2 -> CPU interrupt 6 */
+    periph_intr_matrix_set(p, 0, 8, 36); /* UART2 -> external CPU interrupt 8 */
 
     const uint32_t base = 0x3FF6E000u;
     mem_write32(mem, base + 0x24, (1u << 31) | (10u << 24) | 2u);
@@ -1937,7 +1937,7 @@ TEST(uart2_rx_fifo_and_interrupt) {
               sizeof(nmea) - 1);
     ASSERT_EQ(mem_read32(mem, base + 0x08) & ((1u << 0) | (1u << 8)),
               (1u << 0) | (1u << 8));
-    ASSERT_EQ(cpu0.interrupt & (1u << 6), 1u << 6);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
     ASSERT_EQ(mem_read32(mem, base), '$');
     ASSERT_EQ(periph_uart_rx_pending_num(p, 2), sizeof(nmea) - 2);
 
@@ -1945,7 +1945,7 @@ TEST(uart2_rx_fifo_and_interrupt) {
         (void)mem_read32(mem, base);
     mem_write32(mem, base + 0x10, (1u << 0) | (1u << 8));
     ASSERT_EQ(mem_read32(mem, base + 0x08), 0u);
-    ASSERT_EQ(cpu0.interrupt & (1u << 6), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0u);
 
     periph_destroy(p);
     mem_destroy(mem);
@@ -2004,7 +2004,7 @@ TEST(i2c_master_repeated_start_read_and_interrupt) {
     xtensa_cpu_t cpu0;
     xtensa_cpu_init(&cpu0); cpu0.mem = mem;
     periph_attach_cpus(p, &cpu0, NULL);
-    periph_intr_matrix_set(p, 0, 7, 49); /* I2C0 -> CPU interrupt 7 */
+    periph_intr_matrix_set(p, 0, 8, 49); /* I2C0 -> external CPU interrupt 8 */
 
     test_i2c_device_t device = {0};
     device.regs[0x10] = 0xA5;
@@ -2046,14 +2046,14 @@ TEST(i2c_master_repeated_start_read_and_interrupt) {
     ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x20u) & (1u << 7),
               1u << 7);
     ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x2Cu), 1u << 7);
-    ASSERT_EQ(cpu0.interrupt & (1u << 7), 1u << 7);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
     for (size_t index = 0; index < sizeof(commands) / sizeof(commands[0]);
          index++)
         ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x58u +
                                (uint32_t)index * 4u) & (1u << 31));
 
     mem_write32(mem, TEST_I2C0_BASE + 0x24u, 1u << 7);
-    ASSERT_EQ(cpu0.interrupt & (1u << 7), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0u);
     ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0xF8u), 0x16042000u);
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
@@ -2977,7 +2977,7 @@ TEST(gp_spi_dma_descriptor_chain_and_interrupt) {
     xtensa_cpu_t cpu0;
     xtensa_cpu_init(&cpu0); cpu0.mem = mem;
     periph_attach_cpus(p, &cpu0, NULL);
-    periph_intr_matrix_set(p, 0, 7, 30); /* SPI2 -> CPU interrupt 7 */
+    periph_intr_matrix_set(p, 0, 8, 30); /* SPI2 -> external CPU interrupt 8 */
 
     spi_display_config_t cfg = {
         .dc_pin = 2,
@@ -3041,11 +3041,11 @@ TEST(gp_spi_dma_descriptor_chain_and_interrupt) {
     ASSERT_EQ(mem_read32(mem, spi2 + 0x144), buf2);
     ASSERT_EQ(mem_read32(mem, spi2 + 0x104) & (1u << 29), 0u);
     ASSERT_EQ(mem_read32(mem, spi2 + 0x10C), 0u);
-    ASSERT_EQ(cpu0.interrupt & (1u << 7), 1u << 7);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
 
     mem_write32(mem, spi2 + 0x38, 1u << 9); /* clear TRANS_DONE */
     mem_write32(mem, spi2 + 0x11C, 0x1C0u); /* clear DMA completion */
-    ASSERT_EQ(cpu0.interrupt & (1u << 7), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0u);
 
     periph_destroy(p);
     mem_destroy(mem);
@@ -4062,14 +4062,132 @@ TEST(intr_matrix_set_and_read) {
 TEST(intr_matrix_dport_rw) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
-    /* Write source 30 to PRO_CPU int 3 via DPORT register (0x3FF00104 + 3*4) */
-    mem_write32(mem, 0x3FF00104 + 3 * 4, 30);
-    ASSERT_EQ(mem_read32(mem, 0x3FF00104 + 3 * 4), 30);
+    const uint32_t pro_map = 0x3FF00104u;
+    const uint32_t app_map = 0x3FF00218u;
+
+    /* Hardware owns one register per source, whose value selects the CPU
+     * interrupt. All 69 registers on both cores reset disabled. */
+    for (uint32_t source = 0; source < 69; source++) {
+        ASSERT_EQ(mem_read32(mem, pro_map + source * 4u), 16u);
+        ASSERT_EQ(mem_read32(mem, app_map + source * 4u), 16u);
+    }
+
+    /* Source 30 (SPI2) -> PRO CPU interrupt 3. */
+    mem_write32(mem, pro_map + 30u * 4u, 3u);
+    ASSERT_EQ(mem_read32(mem, pro_map + 30u * 4u), 3u);
     ASSERT_EQ(periph_intr_matrix_get(p, 0, 3), 30);
-    /* Write source 25 to APP_CPU int 7 via DPORT register (0x3FF00204 + 7*4) */
-    mem_write32(mem, 0x3FF00204 + 7 * 4, 25);
-    ASSERT_EQ(mem_read32(mem, 0x3FF00204 + 7 * 4), 25);
-    ASSERT_EQ(periph_intr_matrix_get(p, 1, 7), 25);
+
+    /* Source 25 (FROM_CPU1) -> APP CPU interrupt 8. */
+    mem_write32(mem, app_map + 25u * 4u, 8u);
+    ASSERT_EQ(mem_read32(mem, app_map + 25u * 4u), 8u);
+    ASSERT_EQ(periph_intr_matrix_get(p, 1, 8), 25);
+
+    /* Source 68 is the last real ESP32 matrix source. */
+    mem_write32(mem, pro_map + 68u * 4u, 9u);
+    mem_write32(mem, app_map + 68u * 4u, 10u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF00214u), 9u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF00328u), 10u);
+    ASSERT_EQ(periph_intr_matrix_get(p, 0, 9), 68);
+    ASSERT_EQ(periph_intr_matrix_get(p, 1, 10), 68);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(intr_matrix_fan_in_remap_and_disable) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    const uint32_t pro_map = 0x3FF00104u;
+
+    /* Two asserted sources may share one level-triggered CPU line. Removing
+     * either source must leave that line asserted until the other is gone. */
+    mem_write32(mem, pro_map + 24u * 4u, 5u);
+    mem_write32(mem, pro_map + 25u * 4u, 5u);
+    periph_assert_interrupt(p, 24);
+    periph_assert_interrupt(p, 25);
+    ASSERT_EQ(cpu0.interrupt & (1u << 5), 1u << 5);
+    periph_deassert_interrupt(p, 24);
+    ASSERT_EQ(cpu0.interrupt & (1u << 5), 1u << 5);
+
+    /* Remapping a live source transfers its level atomically. Selecting the
+     * matrix reset value 16 disconnects it. */
+    mem_write32(mem, pro_map + 25u * 4u, 8u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 5), 0u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
+    mem_write32(mem, pro_map + 25u * 4u, 16u);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(intr_matrix_internal_cpu_lines_are_isolated) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    const uint32_t pro_map = 0x3FF00104u;
+    static const uint8_t internal_lines[] = {6, 7, 11, 15, 16, 29};
+
+    for (uint32_t i = 0;
+         i < sizeof(internal_lines) / sizeof(internal_lines[0]); i++) {
+        int source = (int)i;
+        uint32_t line = internal_lines[i];
+        uint32_t mask = 1u << line;
+
+        /* The register retains the selector, but an asserted peripheral
+         * source cannot drive an internal timer/software/profiling line. */
+        mem_write32(mem, pro_map + i * 4u, line);
+        ASSERT_EQ(mem_read32(mem, pro_map + i * 4u), line);
+        periph_assert_interrupt(p, source);
+        ASSERT_EQ(cpu0.interrupt & mask, 0u);
+
+        /* Nor may deasserting that source clear an independently latched
+         * core-local interrupt on the same numeric line. */
+        cpu0.interrupt |= mask;
+        periph_deassert_interrupt(p, source);
+        ASSERT_EQ(cpu0.interrupt & mask, mask);
+        cpu0.interrupt &= ~mask;
+    }
+
+    /* This is ESP-IDF's exact allocator initialization pattern. Every source
+     * selects ETS_INVALID_INUM (CCOMPARE0 line 6), leaving the tick intact. */
+    for (uint32_t source = 0; source < 69; source++)
+        mem_write32(mem, pro_map + source * 4u, 6u);
+    cpu0.interrupt |= 1u << 6;
+    periph_deassert_interrupt(p, 43); /* LEDC regularly updates its level */
+    ASSERT_EQ(cpu0.interrupt & (1u << 6), 1u << 6);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(intr_matrix_dual_core_pending_route) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0, cpu1;
+    xtensa_cpu_init(&cpu0); cpu0.mem = mem;
+    xtensa_cpu_init(&cpu1); cpu1.mem = mem;
+    const uint32_t pro_map = 0x3FF00104u;
+    const uint32_t app_map = 0x3FF00218u;
+
+    /* RTC_CORE is source 46. Program both hardware register banks and assert
+     * it before attaching CPUs, as can happen during staged core startup. */
+    mem_write32(mem, pro_map + 46u * 4u, 9u);
+    mem_write32(mem, app_map + 46u * 4u, 10u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF001BCu), 9u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF002D0u), 10u);
+    periph_assert_interrupt(p, 46);
+    periph_attach_cpus(p, &cpu0, &cpu1);
+    ASSERT_EQ(cpu0.interrupt & (1u << 9), 1u << 9);
+    ASSERT_EQ(cpu1.interrupt & (1u << 10), 1u << 10);
+
+    periph_deassert_interrupt(p, 46);
+    ASSERT_EQ(cpu0.interrupt & (1u << 9), 0u);
+    ASSERT_EQ(cpu1.interrupt & (1u << 10), 0u);
     periph_destroy(p);
     mem_destroy(mem);
 }
@@ -4139,7 +4257,7 @@ TEST(pcnt_matrix_control_limits_events_and_reset) {
     xtensa_cpu_t cpu;
     xtensa_cpu_init(&cpu); cpu.mem = mem;
     periph_attach_cpus(p, &cpu, NULL);
-    periph_intr_matrix_set(p, 0, 7, 48);
+    periph_intr_matrix_set(p, 0, 8, 48);
     mem_write32(mem, 0x3FF000C0u, 1u << 10); /* PCNT module clock */
 
     ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x000u), 0x3C10u);
@@ -4171,7 +4289,7 @@ TEST(pcnt_matrix_control_limits_events_and_reset) {
     ASSERT_EQ(mem_read32(mem, TEST_PCNT_BASE + 0x090u) & (1u << 3),
               1u << 3);
     ASSERT_TRUE(periph_interrupt_pending(p, 48));
-    ASSERT_EQ(cpu.interrupt & (1u << 7), 1u << 7);
+    ASSERT_EQ(cpu.interrupt & (1u << 8), 1u << 8);
     mem_write32(mem, TEST_PCNT_BASE + 0x08Cu, 1u);
     ASSERT_FALSE(periph_interrupt_pending(p, 48));
 
@@ -4330,7 +4448,7 @@ TEST(mcpwm_timed_waveform_shadow_force_and_interrupt) {
     xtensa_cpu_t cpu;
     xtensa_cpu_init(&cpu); cpu.mem = mem;
     periph_attach_cpus(p, &cpu, NULL);
-    periph_intr_matrix_set(p, 0, 6, 39); /* MCPWM0 -> CPU interrupt 6 */
+    periph_intr_matrix_set(p, 0, 8, 39); /* MCPWM0 -> external CPU interrupt 8 */
     mem_write32(mem, 0x3FFE01E0u, 240u);
     mem_write32(mem, 0x3FF000C0u, 1u << 17); /* MCPWM0 bus clock */
 
@@ -4373,7 +4491,7 @@ TEST(mcpwm_timed_waveform_shadow_force_and_interrupt) {
     ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x010u) & 0xFFFFu,
               249u);
     ASSERT_EQ(periph_gpio_pin_level(p, 18), 1);
-    ASSERT_EQ(cpu.interrupt & (1u << 6), 0u);
+    ASSERT_EQ(cpu.interrupt & (1u << 8), 0u);
     test_mcpwm_advance(&cpu, 1u);
     ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x010u) & 0xFFFFu,
               250u);
@@ -4381,7 +4499,7 @@ TEST(mcpwm_timed_waveform_shadow_force_and_interrupt) {
     ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x114u) & (1u << 15),
               1u << 15);
     ASSERT_EQ(mem_read32(mem, TEST_MCPWM0_BASE + 0x118u), 1u << 15);
-    ASSERT_EQ(cpu.interrupt & (1u << 6), 1u << 6);
+    ASSERT_EQ(cpu.interrupt & (1u << 8), 1u << 8);
     mem_write32(mem, TEST_MCPWM0_BASE + 0x11Cu, 1u << 15);
 
     /* A shadow compare update requested for TEZ leaves this cycle intact and
@@ -4824,7 +4942,7 @@ TEST(ledc_timer_overflow_pause_and_clear) {
     xtensa_cpu_t cpu;
     xtensa_cpu_init(&cpu); cpu.mem = mem;
     periph_attach_cpus(p, &cpu, NULL);
-    periph_intr_matrix_set(p, 0, 6, 43);
+    periph_intr_matrix_set(p, 0, 8, 43);
     const uint32_t base = 0x3FF59000u;
     mem_write32(mem, 0x3FFE01E0u, 240u);
     uint32_t conf = test_ledc_timer_conf(8u, 16000u);
@@ -4835,7 +4953,7 @@ TEST(ledc_timer_overflow_pause_and_clear) {
     ledc_advance(&cpu, 1u);
     ASSERT_EQ(mem_read32(mem, base + 0x180) & 1u, 1u);
     ASSERT_EQ(mem_read32(mem, base + 0x184) & 1u, 1u);
-    ASSERT_EQ(cpu.interrupt & (1u << 6), 1u << 6);
+    ASSERT_EQ(cpu.interrupt & (1u << 8), 1u << 8);
     mem_write32(mem, base + 0x18C, 1u);
     ASSERT_FALSE(periph_interrupt_pending(p, 43));
 
@@ -5472,6 +5590,9 @@ static void run_peripheral_tests(void) {
     RUN_TEST(intr_matrix_default_disabled);
     RUN_TEST(intr_matrix_set_and_read);
     RUN_TEST(intr_matrix_dport_rw);
+    RUN_TEST(intr_matrix_fan_in_remap_and_disable);
+    RUN_TEST(intr_matrix_internal_cpu_lines_are_isolated);
+    RUN_TEST(intr_matrix_dual_core_pending_route);
     RUN_TEST(intr_matrix_assert_source);
     RUN_TEST(cross_core_interrupt);
     RUN_TEST(pcnt_matrix_control_limits_events_and_reset);

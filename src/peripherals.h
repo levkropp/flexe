@@ -325,13 +325,14 @@ int periph_gpio_out_signal(const esp32_periph_t *p, int pin);
  * uses function 1 on the classic ESP32 pin sets. */
 int periph_iomux_function(const esp32_periph_t *p, int pin);
 
-/* Assert/deassert a peripheral interrupt source (0-70).
- * Scans the interrupt matrix to find mapped CPU interrupt lines and
- * sets/clears the corresponding bits in cpu->interrupt. */
+/* Assert/deassert a peripheral interrupt source (0-70). Routes it through
+ * each core's source-indexed interrupt matrix and preserves shared-line
+ * fan-in when multiple sources select the same CPU interrupt. */
 void periph_assert_interrupt(esp32_periph_t *p, int source);
 void periph_deassert_interrupt(esp32_periph_t *p, int source);
 
-/* Direct interrupt matrix access (used by intr_matrix_set ROM stub) */
+/* Direct interrupt matrix access used by the intr_matrix_set ROM stub.
+ * The compatibility getter returns the first source selecting cpu_int. */
 void periph_intr_matrix_set(esp32_periph_t *p, int core, int cpu_int, int source);
 int  periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int);
 
