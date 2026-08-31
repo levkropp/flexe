@@ -40,6 +40,7 @@
 #define RTC_CNTL_BASE   0x3FF48000u
 #define RTCIO_BASE      0x3FF48400u
 #define SENS_BASE       0x3FF48800u
+#define RTC_I2C_BASE    0x3FF48C00u
 #define IO_MUX_BASE     0x3FF49000u
 #define BT_BASE         0x3FF51000u
 #define EFUSE_BASE      0x3FF5A000u
@@ -77,8 +78,19 @@
 
 #define SENS_REG_FILE_SIZE          0x100u
 #define SENS_SAR_START_FORCE_OFF    0x02Cu
+#define SENS_SAR_SLAVE_ADDR1_OFF    0x03Cu
+#define SENS_SAR_SLAVE_ADDR2_OFF    0x040u
+#define SENS_SAR_SLAVE_ADDR3_OFF    0x044u
+#define SENS_SAR_SLAVE_ADDR4_OFF    0x048u
+#define SENS_SAR_I2C_CTRL_OFF       0x050u
 #define SENS_SAR_MEAS_START1_OFF    0x054u
 #define SENS_SAR_MEAS_START2_OFF    0x094u
+#define SENS_I2C_ADDR_FIELDS_MASK   0x003FFFFFu
+#define SENS_I2C_RDATA_MASK         (0xFFu << 22)
+#define SENS_I2C_DONE               (1u << 30)
+#define SENS_I2C_CTRL_MASK          0x3FFFFFFFu
+#define SENS_I2C_START              (1u << 28)
+#define SENS_I2C_START_FORCE        (1u << 29)
 #define SENS_SAR_EN_PAD_MASK        (0xFFFu << 19)
 #define SENS_SAR_START              (1u << 17)
 #define SENS_SAR_DONE               (1u << 16)
@@ -86,6 +98,47 @@
 
 #define RTC_CPU_PERIOD_CONF_MASK    0xE0000000u
 #define RTC_CLK_CONF_MASK           0xFFFFFFF0u
+
+/* Classic RTC-domain I2C controller. Its raw interrupt event bitmap is one
+ * bit lower than the enable/status/clear bitmap, as documented by the TRM. */
+#define RTC_I2C_REG_FILE_SIZE       0x088u
+#define RTC_I2C_SCL_LOW_OFF         0x000u
+#define RTC_I2C_CTRL_OFF            0x004u
+#define RTC_I2C_DEBUG_STATUS_OFF    0x008u
+#define RTC_I2C_TIMEOUT_OFF         0x00Cu
+#define RTC_I2C_SLAVE_ADDR_OFF      0x010u
+#define RTC_I2C_DATA_OFF            0x01Cu
+#define RTC_I2C_INT_RAW_OFF         0x020u
+#define RTC_I2C_INT_CLR_OFF         0x024u
+#define RTC_I2C_INT_ENA_OFF         0x028u
+#define RTC_I2C_INT_ST_OFF          0x02Cu
+#define RTC_I2C_SDA_DUTY_OFF        0x030u
+#define RTC_I2C_SCL_HIGH_OFF        0x038u
+#define RTC_I2C_SCL_START_OFF       0x040u
+#define RTC_I2C_SCL_STOP_OFF        0x044u
+#define RTC_I2C_COMMAND0_OFF        0x048u
+#define RTC_I2C_COMMAND_COUNT       16u
+#define RTC_I2C_CTRL_MASK           0x000000F3u
+#define RTC_I2C_CTRL_TRANS_START    (1u << 5)
+#define RTC_I2C_CTRL_MASTER         (1u << 4)
+#define RTC_I2C_DEBUG_MASK          0x7E00007Fu
+#define RTC_I2C_DEBUG_BYTE_TRANS    (1u << 6)
+#define RTC_I2C_DEBUG_BUS_BUSY      (1u << 4)
+#define RTC_I2C_DEBUG_ARB_LOST      (1u << 3)
+#define RTC_I2C_DEBUG_TIMED_OUT     (1u << 2)
+#define RTC_I2C_DEBUG_ACK_VAL       (1u << 0)
+#define RTC_I2C_PERIOD19_MASK       0x0007FFFFu
+#define RTC_I2C_PERIOD20_MASK       0x000FFFFFu
+#define RTC_I2C_SLAVE_ADDR_MASK     0x80007FFFu
+#define RTC_I2C_INT_RAW_TIMEOUT     (1u << 7)
+#define RTC_I2C_INT_RAW_TRANS_DONE  (1u << 6)
+#define RTC_I2C_INT_RAW_MASTER_DONE (1u << 5)
+#define RTC_I2C_INT_RAW_ARB_LOST    (1u << 4)
+#define RTC_I2C_INT_RAW_SLAVE_DONE  (1u << 3)
+#define RTC_I2C_INT_RAW_MASK        0x000000F8u
+#define RTC_I2C_INT_SHIFTED_MASK    0x000001F0u
+#define RTC_I2C_INT_ENA_MASK        0x000001E0u
+#define RTC_I2C_COMMAND_MASK        0x80003FFFu
 
 /* The original ESP32 embeds its eight-channel sigma-delta/PDM block in the
  * final 256 bytes of the GPIO page. Each channel adds a signed duty offset to
@@ -1407,6 +1460,15 @@ typedef struct {
 } i2c_state_t;
 
 typedef struct {
+    uint32_t regs[RTC_I2C_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t int_raw;
+    uint32_t int_ena;
+    uint8_t data;
+    bool done;
+    i2c_device_t device[I2C_DEVICE_COUNT];
+} rtc_i2c_state_t;
+
+typedef struct {
     uint32_t regs[I2S_REG_FILE_SIZE / sizeof(uint32_t)];
     uint32_t int_raw;
     uint32_t int_ena;
@@ -1607,6 +1669,9 @@ struct esp32_periph {
     /* Two independent classic ESP32 I2C controllers and their virtual bus
      * targets. */
     i2c_state_t i2c[I2C_PORT_COUNT];
+
+    /* Always-on RTC-domain I2C is the ULP's independent third bus. */
+    rtc_i2c_state_t rtc_i2c;
 
     /* GPIO */
     gpio_state_t gpio;
@@ -2781,6 +2846,10 @@ static void rtcio_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
         rtcio_emit_dac_change(1, before, val);
 }
 
+static uint32_t rtc_i2c_read(esp32_periph_t *p, uint32_t off);
+static void rtc_i2c_write(esp32_periph_t *p, uint32_t off, uint32_t val);
+static void rtc_i2c_execute_sens(esp32_periph_t *p, uint32_t control);
+
 static int sens_measure_unit(uint32_t off) {
     if (off == SENS_SAR_MEAS_START1_OFF) return 0;
     if (off == SENS_SAR_MEAS_START2_OFF) return 1;
@@ -2792,6 +2861,12 @@ static uint32_t sens_read(esp32_periph_t *p, uint32_t off) {
         return 0;
     int unit = sens_measure_unit(off);
     uint32_t val = p->sens_regs[off / 4u];
+    if (off == SENS_SAR_SLAVE_ADDR4_OFF) {
+        val &= SENS_I2C_ADDR_FIELDS_MASK;
+        val |= (uint32_t)p->rtc_i2c.data << 22u;
+        if (p->rtc_i2c.done)
+            val |= SENS_I2C_DONE;
+    }
     if (unit >= 0) {
         val &= SENS_SAR_CONFIG_MASK;
         if (p->sens_adc_done[unit])
@@ -2806,6 +2881,24 @@ static void sens_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
         return;
     int unit = sens_measure_unit(off);
     if (unit < 0) {
+        if (off >= SENS_SAR_SLAVE_ADDR1_OFF &&
+            off <= SENS_SAR_SLAVE_ADDR4_OFF) {
+            p->sens_regs[off / 4u] = val & SENS_I2C_ADDR_FIELDS_MASK;
+            return;
+        }
+        if (off == SENS_SAR_I2C_CTRL_OFF) {
+            uint32_t before = p->sens_regs[off / 4u];
+            val &= SENS_I2C_CTRL_MASK;
+            p->sens_regs[off / 4u] = val;
+            bool rising_start = (before & SENS_I2C_START) == 0 &&
+                                (val & (SENS_I2C_START_FORCE |
+                                        SENS_I2C_START)) ==
+                                    (SENS_I2C_START_FORCE |
+                                     SENS_I2C_START);
+            if (rising_start)
+                rtc_i2c_execute_sens(p, val & 0x0FFFFFFFu);
+            return;
+        }
         p->sens_regs[off / 4u] = val;
         return;
     }
@@ -2837,6 +2930,9 @@ static void sens_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - RTC_CNTL_BASE;
+    if (addr >= RTC_I2C_BASE &&
+        addr < RTC_I2C_BASE + RTC_I2C_REG_FILE_SIZE)
+        return rtc_i2c_read(p, addr - RTC_I2C_BASE);
     if (addr >= SENS_BASE && addr < SENS_BASE + SENS_REG_FILE_SIZE)
         return sens_read(p, addr - SENS_BASE);
     if (addr >= RTCIO_BASE && addr < RTCIO_BASE + RTCIO_REG_FILE_SIZE)
@@ -2860,6 +2956,11 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
 
 static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
+    if (addr >= RTC_I2C_BASE &&
+        addr < RTC_I2C_BASE + RTC_I2C_REG_FILE_SIZE) {
+        rtc_i2c_write(p, addr - RTC_I2C_BASE, val);
+        return;
+    }
     if (addr >= SENS_BASE && addr < SENS_BASE + SENS_REG_FILE_SIZE) {
         sens_write(p, addr - SENS_BASE, val);
         return;
@@ -4320,6 +4421,154 @@ static void i2c_emit_transfer(int port, uint8_t address, bool read,
         sbx_events_emit(&ev);
         offset += chunk;
     } while (offset < len);
+}
+
+static bool rtc_i2c_selected_address(const esp32_periph_t *p,
+                                     unsigned selector,
+                                     uint8_t *address) {
+    if (selector >= 8u || !address)
+        return false;
+    uint32_t off = SENS_SAR_SLAVE_ADDR1_OFF + (selector / 2u) * 4u;
+    uint32_t value = p->sens_regs[off / 4u];
+    if ((selector & 1u) == 0)
+        value >>= 11u;
+    *address = (uint8_t)(value & 0x7Fu);
+    return true;
+}
+
+/* Execute the lower 28 bits of the classic ULP I2C instruction. The SENS
+ * software-start path exposes this same control word to either Xtensa core,
+ * which provides a useful main-CPU path even before Flexe grows a ULP FSM
+ * execution engine. Transactions are synchronous at the virtual bus edge. */
+static void rtc_i2c_execute_sens(esp32_periph_t *p, uint32_t control) {
+    rtc_i2c_state_t *rtc = &p->rtc_i2c;
+    uint32_t *debug = &rtc->regs[RTC_I2C_DEBUG_STATUS_OFF / 4u];
+    uint8_t subaddress = (uint8_t)control;
+    uint8_t value = (uint8_t)(control >> 8u);
+    unsigned low_bit = (control >> 16u) & 7u;
+    unsigned high_bit = (control >> 19u) & 7u;
+    unsigned selector = (control >> 22u) & 0xFu;
+    bool write = (control & (1u << 27u)) != 0;
+    uint8_t address = 0u;
+
+    rtc->done = false;
+    *debug &= ~(RTC_I2C_DEBUG_BYTE_TRANS | RTC_I2C_DEBUG_BUS_BUSY |
+                RTC_I2C_DEBUG_ARB_LOST | RTC_I2C_DEBUG_TIMED_OUT |
+                RTC_I2C_DEBUG_ACK_VAL);
+    *debug |= RTC_I2C_DEBUG_BUS_BUSY;
+
+    if ((rtc->regs[RTC_I2C_CTRL_OFF / 4u] & RTC_I2C_CTRL_MASTER) == 0) {
+        *debug &= ~RTC_I2C_DEBUG_BUS_BUSY;
+        *debug |= RTC_I2C_DEBUG_TIMED_OUT;
+        rtc->int_raw |= RTC_I2C_INT_RAW_TIMEOUT;
+        rtc->done = true;
+        return;
+    }
+
+    bool selected = rtc_i2c_selected_address(p, selector, &address);
+    i2c_device_t *device = selected ? &rtc->device[address] : NULL;
+    bool target_present = device && device->fn;
+    int result = -1;
+
+    if (write) {
+        unsigned width = high_bit >= low_bit ? high_bit - low_bit + 1u : 0u;
+        uint8_t field_mask = width >= 8u ? 0xFFu :
+                             width == 0u ? 0u :
+                             (uint8_t)((1u << width) - 1u);
+        uint8_t wire_value = (uint8_t)((value & field_mask) << low_bit);
+        uint8_t data[2] = {subaddress, wire_value};
+        if (target_present)
+            result = device->fn(device->ctx, PERIPH_I2C_PORT_RTC, address,
+                                data, sizeof(data), NULL, 0u);
+        i2c_emit_transfer(PERIPH_I2C_PORT_RTC, address, false,
+                          data, sizeof(data));
+    } else {
+        uint8_t read_value = 0xFFu;
+        if (target_present)
+            result = device->fn(device->ctx, PERIPH_I2C_PORT_RTC, address,
+                                &subaddress, 1u, &read_value, 1u);
+        i2c_emit_transfer(PERIPH_I2C_PORT_RTC, address, false,
+                          &subaddress, 1u);
+        i2c_emit_transfer(PERIPH_I2C_PORT_RTC, address, true,
+                          &read_value, 1u);
+        rtc->data = read_value;
+    }
+
+    *debug &= ~RTC_I2C_DEBUG_BUS_BUSY;
+    *debug |= RTC_I2C_DEBUG_BYTE_TRANS;
+    if (result != 0)
+        *debug |= RTC_I2C_DEBUG_ACK_VAL;
+    rtc->int_raw |= RTC_I2C_INT_RAW_TRANS_DONE |
+                    RTC_I2C_INT_RAW_MASTER_DONE;
+    rtc->done = true;
+}
+
+static uint32_t rtc_i2c_read(esp32_periph_t *p, uint32_t off) {
+    rtc_i2c_state_t *rtc = &p->rtc_i2c;
+    if ((off & 3u) != 0 || off >= RTC_I2C_REG_FILE_SIZE)
+        return 0u;
+
+    switch (off) {
+    case RTC_I2C_DATA_OFF:
+        return rtc->data;
+    case RTC_I2C_INT_RAW_OFF:
+        return rtc->int_raw & RTC_I2C_INT_RAW_MASK;
+    case RTC_I2C_INT_CLR_OFF:
+        return 0u;
+    case RTC_I2C_INT_ENA_OFF:
+        return rtc->int_ena;
+    case RTC_I2C_INT_ST_OFF:
+        return ((rtc->int_raw << 1u) & rtc->int_ena) &
+               RTC_I2C_INT_ENA_MASK;
+    default:
+        return rtc->regs[off / 4u];
+    }
+}
+
+static void rtc_i2c_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
+    rtc_i2c_state_t *rtc = &p->rtc_i2c;
+    if ((off & 3u) != 0 || off >= RTC_I2C_REG_FILE_SIZE)
+        return;
+
+    if (off >= RTC_I2C_COMMAND0_OFF &&
+        off < RTC_I2C_COMMAND0_OFF + RTC_I2C_COMMAND_COUNT * 4u) {
+        rtc->regs[off / 4u] = val & RTC_I2C_COMMAND_MASK;
+        return;
+    }
+
+    switch (off) {
+    case RTC_I2C_SCL_LOW_OFF:
+        rtc->regs[off / 4u] = val & RTC_I2C_PERIOD19_MASK;
+        break;
+    case RTC_I2C_CTRL_OFF:
+        rtc->regs[off / 4u] = val & RTC_I2C_CTRL_MASK;
+        break;
+    case RTC_I2C_DEBUG_STATUS_OFF:
+        rtc->regs[off / 4u] = val & RTC_I2C_DEBUG_MASK;
+        break;
+    case RTC_I2C_TIMEOUT_OFF:
+    case RTC_I2C_SDA_DUTY_OFF:
+    case RTC_I2C_SCL_HIGH_OFF:
+    case RTC_I2C_SCL_START_OFF:
+    case RTC_I2C_SCL_STOP_OFF:
+        rtc->regs[off / 4u] = val & RTC_I2C_PERIOD20_MASK;
+        break;
+    case RTC_I2C_SLAVE_ADDR_OFF:
+        rtc->regs[off / 4u] = val & RTC_I2C_SLAVE_ADDR_MASK;
+        break;
+    case RTC_I2C_DATA_OFF:
+    case RTC_I2C_INT_RAW_OFF:
+    case RTC_I2C_INT_ST_OFF:
+        break;
+    case RTC_I2C_INT_CLR_OFF:
+        rtc->int_raw &= ~((val & RTC_I2C_INT_SHIFTED_MASK) >> 1u);
+        break;
+    case RTC_I2C_INT_ENA_OFF:
+        rtc->int_ena = val & RTC_I2C_INT_ENA_MASK;
+        break;
+    default:
+        break;
+    }
 }
 
 static bool i2c_pending_append(i2c_state_t *i2c, uint8_t byte) {
@@ -12760,11 +13009,14 @@ size_t periph_uart_rx_pending(const esp32_periph_t *p) {
 
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
                              periph_i2c_device_fn fn, void *ctx) {
-    if (!p || port < 0 || port >= I2C_PORT_COUNT ||
+    if (!p || port < 0 || port > PERIPH_I2C_PORT_RTC ||
         address >= I2C_DEVICE_COUNT)
         return -1;
-    p->i2c[port].device[address].fn = fn;
-    p->i2c[port].device[address].ctx = fn ? ctx : NULL;
+    i2c_device_t *device = port == PERIPH_I2C_PORT_RTC ?
+                           &p->rtc_i2c.device[address] :
+                           &p->i2c[port].device[address];
+    device->fn = fn;
+    device->ctx = fn ? ctx : NULL;
     return 0;
 }
 

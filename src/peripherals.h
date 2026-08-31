@@ -24,6 +24,15 @@ typedef int (*periph_i2c_device_fn)(void *ctx, int port, uint8_t address,
                                     size_t write_len, uint8_t *read_data,
                                     size_t read_len);
 
+/* Host I2C bus identifiers. Ports 0/1 are the APB I2C controllers used by
+ * Wire and the ESP-IDF driver; port 2 is the independent RTC-domain master
+ * used by classic ESP32 ULP I2C_RD/I2C_WR transactions. */
+typedef enum {
+    PERIPH_I2C_PORT_0 = 0,
+    PERIPH_I2C_PORT_1 = 1,
+    PERIPH_I2C_PORT_RTC = 2,
+} periph_i2c_port_t;
+
 /* Native SDMMC cards expose 512-byte logical sectors to the two-slot host.
  * Callbacks return zero on success and nonzero for a card-side I/O failure. */
 typedef int (*periph_sdmmc_read_blocks_fn)(void *ctx, uint32_t first_sector,
@@ -168,8 +177,8 @@ size_t periph_uart_rx_pending_num(const esp32_periph_t *p, int uart_num);
 bool periph_uart_rx_break_num(esp32_periph_t *p, int uart_num);
 int  periph_unhandled_count(const esp32_periph_t *p);
 
-/* Attach/detach a 7-bit target address on either classic ESP32 I2C master.
- * Passing NULL as fn detaches the address. */
+/* Attach/detach a 7-bit target address on either APB I2C master or the
+ * RTC-domain I2C master. Passing NULL as fn detaches the address. */
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
                              periph_i2c_device_fn fn, void *ctx);
 

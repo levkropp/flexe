@@ -1955,6 +1955,8 @@ TEST(uart2_rx_fifo_and_interrupt) {
  * enable [8], expected ACK [9], master ACK value [10], opcode [13:11]. */
 #define TEST_I2C0_BASE 0x3FF53000u
 #define TEST_I2C1_BASE 0x3FF67000u
+#define TEST_RTC_I2C_BASE 0x3FF48C00u
+#define TEST_SENS_BASE 0x3FF48800u
 
 static uint32_t test_i2c_cmd(unsigned opcode, unsigned count, int ack_check) {
     return ((opcode & 7u) << 11) | (count & 0xFFu) |
@@ -2146,6 +2148,201 @@ TEST(i2c_dual_port_ahb_alias_and_address_nack) {
     ASSERT_EQ(cpu0.interrupt & (1u << 9), 1u << 9);
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rtc_i2c_register_masks_and_command_file) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x00u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x04u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x20u), 0u);
+
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x00u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x04u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x08u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x0Cu, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x10u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x1Cu, 0xA5u);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x20u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x28u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x30u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x38u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x40u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x44u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x48u, UINT32_MAX);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x84u, UINT32_MAX);
+
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x00u), 0x0007FFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x04u), 0x000000F3u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x08u), 0x7E00007Fu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x0Cu), 0x000FFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x10u), 0x80007FFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x1Cu), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x20u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x28u), 0x000001E0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x30u), 0x000FFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x38u), 0x000FFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x40u), 0x000FFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x44u), 0x000FFFFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x48u), 0x80003FFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x84u), 0x80003FFFu);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x34u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x3Cu), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+typedef struct {
+    unsigned count;
+    unsigned writes;
+    unsigned reads;
+    int last_port;
+    uint8_t last_address;
+    uint8_t last_data[2];
+    uint16_t last_len;
+} test_rtc_i2c_events_t;
+
+static void capture_rtc_i2c_event(const sbx_event_t *event, void *ctx) {
+    if (event->kind != SBX_EV_I2C_XFER)
+        return;
+    test_rtc_i2c_events_t *capture = ctx;
+    capture->count++;
+    capture->writes += event->i2c_xfer.read ? 0u : 1u;
+    capture->reads += event->i2c_xfer.read ? 1u : 0u;
+    capture->last_port = event->i2c_xfer.port;
+    capture->last_address = event->i2c_xfer.addr;
+    capture->last_len = event->i2c_xfer.len;
+    size_t count = event->i2c_xfer.len < sizeof(capture->last_data) ?
+                   event->i2c_xfer.len : sizeof(capture->last_data);
+    if (count != 0)
+        memcpy(capture->last_data, event->i2c_xfer.data, count);
+}
+
+static uint32_t test_rtc_i2c_control(bool write, unsigned selector,
+                                     uint8_t subaddress, uint8_t value,
+                                     unsigned low_bit, unsigned high_bit) {
+    return (uint32_t)subaddress | ((uint32_t)value << 8u) |
+           ((low_bit & 7u) << 16u) | ((high_bit & 7u) << 19u) |
+           ((selector & 0xFu) << 22u) | (write ? 1u << 27u : 0u);
+}
+
+static void test_rtc_i2c_start(xtensa_mem_t *mem, uint32_t control) {
+    mem_write32(mem, TEST_SENS_BASE + 0x50u, (1u << 29u) | control);
+    mem_write32(mem, TEST_SENS_BASE + 0x50u,
+                (1u << 29u) | (1u << 28u) | control);
+}
+
+TEST(rtc_i2c_sens_master_read_write_nack_and_timeout) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_i2c_device_t device = {0};
+    test_rtc_i2c_events_t events = {0};
+    sbx_events_set_sink(capture_rtc_i2c_event, &events);
+
+    ASSERT_EQ(periph_i2c_attach_device(p, PERIPH_I2C_PORT_RTC, 0x34u,
+                                       test_i2c_device, &device), 0);
+    ASSERT_EQ(periph_i2c_attach_device(p, 3, 0x34u,
+                                       test_i2c_device, &device), -1);
+    ASSERT_EQ(periph_i2c_attach_device(p, PERIPH_I2C_PORT_RTC, 0xFFu,
+                                       test_i2c_device, &device), -1);
+
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x04u, 1u << 4u);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x28u, 0x1E0u);
+
+    /* The four packed SENS registers expose all eight ULP address selectors. */
+    for (unsigned pair = 0u; pair < 4u; pair++)
+        mem_write32(mem, TEST_SENS_BASE + 0x3Cu + pair * 4u,
+                    (0x34u << 11u) | 0x34u);
+    for (unsigned selector = 0u; selector < 8u; selector++)
+        test_rtc_i2c_start(mem, test_rtc_i2c_control(
+            false, selector, 0u, 0u, 0u, 0u));
+    ASSERT_EQ(device.calls, 8);
+    ASSERT_EQ(events.count, 16u);
+    memset(&device, 0, sizeof(device));
+    memset(&events, 0, sizeof(events));
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x24u, 0x1F0u);
+    /* Selector 6 occupies bits 21:11; selector 7 occupies bits 10:0. */
+    mem_write32(mem, TEST_SENS_BASE + 0x48u,
+                (0x34u << 11u) | 0x55u);
+
+    uint32_t write_control = test_rtc_i2c_control(
+        true, 6u, 0x20u, 0xA5u, 0u, 7u);
+    test_rtc_i2c_start(mem, write_control);
+    ASSERT_EQ(device.calls, 1);
+    ASSERT_EQ(device.last_port, PERIPH_I2C_PORT_RTC);
+    ASSERT_EQ(device.last_address, 0x34u);
+    ASSERT_EQ(device.last_write_len, 2u);
+    ASSERT_EQ(device.last_write[0], 0x20u);
+    ASSERT_EQ(device.last_write[1], 0xA5u);
+    ASSERT_EQ(device.regs[0x20], 0xA5u);
+    ASSERT_EQ(events.count, 1u);
+    ASSERT_EQ(events.last_port, PERIPH_I2C_PORT_RTC);
+    ASSERT_EQ(events.last_address, 0x34u);
+    ASSERT_EQ(events.last_len, 2u);
+    ASSERT_EQ(mem_read32(mem, TEST_SENS_BASE + 0x48u) & (1u << 30u),
+              1u << 30u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x20u), 0x60u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x2Cu), 0xC0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x08u) & 0x51u, 0x40u);
+
+    uint32_t read_control = test_rtc_i2c_control(
+        false, 6u, 0x20u, 0u, 0u, 0u);
+    test_rtc_i2c_start(mem, read_control);
+    ASSERT_EQ(device.calls, 2);
+    ASSERT_EQ(device.last_write_len, 1u);
+    ASSERT_EQ(device.last_read_len, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x1Cu), 0xA5u);
+    ASSERT_EQ((mem_read32(mem, TEST_SENS_BASE + 0x48u) >> 22u) & 0xFFu,
+              0xA5u);
+    ASSERT_EQ(events.count, 3u);
+    ASSERT_EQ(events.writes, 2u);
+    ASSERT_EQ(events.reads, 1u);
+    ASSERT_EQ(events.last_data[0], 0xA5u);
+
+    /* Partial writes place the low bits of DATA into the selected range. */
+    test_rtc_i2c_start(mem, test_rtc_i2c_control(
+        true, 6u, 0x21u, 5u, 2u, 4u));
+    ASSERT_EQ(device.calls, 3);
+    ASSERT_EQ(device.regs[0x21], 0x14u);
+    ASSERT_EQ(device.last_write[1], 0x14u);
+    ASSERT_EQ(events.count, 4u);
+
+    /* Clear bits are shifted one position above the raw event bitmap. */
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x24u, 0xC0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x20u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x2Cu), 0u);
+
+    /* Selector 7 names an unattached address: data floats high and ACK_VAL
+     * reports the NACK while the fixed transaction still reaches STOP. */
+    test_rtc_i2c_start(mem, test_rtc_i2c_control(
+        false, 7u, 0x01u, 0u, 0u, 0u));
+    ASSERT_EQ(device.calls, 3);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x1Cu), 0xFFu);
+    ASSERT_TRUE(mem_read32(mem, TEST_RTC_I2C_BASE + 0x08u) & 1u);
+    ASSERT_TRUE(mem_read32(mem, TEST_SENS_BASE + 0x48u) & (1u << 30u));
+    ASSERT_EQ(events.count, 6u);
+    ASSERT_EQ(events.last_address, 0x55u);
+
+    /* A software launch while master mode is disabled times out without
+     * touching the external target; timeout raw bit 7 maps to status bit 8. */
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x24u, 0x1F0u);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x04u, 0u);
+    test_rtc_i2c_start(mem, read_control);
+    ASSERT_EQ(device.calls, 3);
+    ASSERT_EQ(events.count, 6u);
+    ASSERT_TRUE(mem_read32(mem, TEST_RTC_I2C_BASE + 0x08u) & (1u << 2u));
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x20u), 0x80u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x2Cu), 0x100u);
+    mem_write32(mem, TEST_RTC_I2C_BASE + 0x24u, 0x100u);
+    ASSERT_EQ(mem_read32(mem, TEST_RTC_I2C_BASE + 0x20u), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    sbx_events_set_sink(NULL, NULL);
     periph_destroy(p);
     mem_destroy(mem);
 }
@@ -5203,6 +5400,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(i2c_master_repeated_start_read_and_interrupt);
     RUN_TEST(i2c_end_command_streams_fifo_chunks_until_stop);
     RUN_TEST(i2c_dual_port_ahb_alias_and_address_nack);
+    RUN_TEST(rtc_i2c_register_masks_and_command_file);
+    RUN_TEST(rtc_i2c_sens_master_read_write_nack_and_timeout);
     RUN_TEST(irq_dispatch_observes_only_rising_edges);
     RUN_TEST(spi_flash_write_enable_latch);
     RUN_TEST(spi_flash_program_erase_require_write_enable);

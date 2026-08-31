@@ -40,7 +40,8 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
   sigma-delta/PDM, dport, rtc/rtcio, efuse, watchdog,
   legacy FRC1/FRC2 timers, both timer groups with four 64-bit APB
   counters/alarms, dual UHCI UART DMA with H:5/SLIP framing, GP-SPI2/3 DMA,
-  classic I2C0/1 master, SJA1000-compatible TWAI/CAN,
+  classic I2C0/1 masters, RTC-domain I2C/ULP transactions,
+  SJA1000-compatible TWAI/CAN,
   Synopsys-based classic Ethernet MAC with descriptor DMA and Clause-22 MDIO,
   dual-slot native SDMMC with PIO/IDMAC DMA, classic SDIO slave
   HINF/HOST/SLC with scatter/gather descriptor DMA,
@@ -147,7 +148,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 629 tests, 4608 passed, 0 failed
+# 631 tests, 4676 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -168,6 +169,25 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-i2c-wire.sh
 It has been verified with Arduino-ESP32 2.0.11; `ARDUINO_CLI`,
 `FLEXE_ARDUINO_FQBN`, `FLEXE_BUILD_DIR`, and `FLEXE_I2C_BUILD_DIR` are
 configurable.
+
+The independent RTC-domain I2C gate uses Espressif's real `rtc_i2c_reg.h`
+and `sens_reg.h` register macros. It executes the software-start form of the
+classic ULP `I2C_RD`/`I2C_WR` control word on host bus port 2, covering all
+eight slave selectors, single-byte register reads and writes, partial-bit
+writes, result/DONE latches, NACK and timeout diagnostics, the controller's
+shifted raw/status/clear bitmap, and the 16 command registers. Both engines
+must reach the attached virtual target with no fallback MMIO or ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli \
+FLEXE_ARDUINO_CONFIG=/path/to/arduino-cli.yaml \
+./test-rtc-i2c.sh
+# engine=jit stage=0x12C0C0DE timing=40/40/200 ... calls=4 bytes=6/2 memory=1 unhandled=0 unregistered=0
+# engine=interp stage=0x12C0C0DE timing=40/40/200 ... calls=4 bytes=6/2 memory=1 unhandled=0 unregistered=0
+```
+
+The fixture is verified with Arduino-ESP32 2.0.11.
+`FLEXE_RTC_I2C_BUILD_DIR` optionally preserves its Arduino build directory.
 
 The analog gate builds an unmodified Arduino sketch using `analogRead()`,
 `analogReadResolution()`, `dacWrite()`, and `dacDisable()`. It verifies ADC1

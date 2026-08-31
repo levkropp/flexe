@@ -179,6 +179,11 @@ if(UNIX)
     target_compile_options(flexe-i2c-wire-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-rtc-i2c-test tools/rtc_i2c_test.c)
+    target_link_libraries(flexe-rtc-i2c-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-rtc-i2c-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-analog-dac-test tools/analog_dac_test.c)
     target_link_libraries(flexe-analog-dac-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-analog-dac-test PRIVATE
