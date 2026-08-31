@@ -66,40 +66,68 @@ typedef struct {
  * Symbols: app_main @ 0x40080000 size 0x100
  *          uart_init @ 0x40080100 size 0x40
  *          some_data (OBJECT) @ 0x3FFB0000 size 4
+ *          minimal FreeRTOS startup symbols used by scheduler tests
  */
 static const char *build_test_elf(void) {
     static const char *path = "/tmp/xt_test_debug.elf";
 
-    /* String table: \0 app_main\0 uart_init\0 some_data\0 .symtab\0 .strtab\0 .shstrtab\0 */
-    const char strtab[] = "\0app_main\0uart_init\0some_data\0";
+    enum {
+        STR_APP_MAIN = 1,
+        STR_UART_INIT = STR_APP_MAIN + sizeof("app_main"),
+        STR_SOME_DATA = STR_UART_INIT + sizeof("uart_init"),
+        STR_START_SCHEDULER = STR_SOME_DATA + sizeof("some_data"),
+        STR_START_OTHER_CORES =
+            STR_START_SCHEDULER + sizeof("vTaskStartScheduler"),
+        STR_CORE_STARTUP_DONE =
+            STR_START_OTHER_CORES +
+            sizeof("esp_startup_start_app_other_cores"),
+    };
+    const char strtab[] =
+        "\0app_main\0uart_init\0some_data\0vTaskStartScheduler\0"
+        "esp_startup_start_app_other_cores\0port_uxCoreStartupDone\0";
     int strtab_size = sizeof(strtab);
 
     /* Section header string table */
     const char shstrtab[] = "\0.symtab\0.strtab\0.shstrtab\0";
     int shstrtab_size = sizeof(shstrtab);
 
-    /* Symbol table: null sym + 3 symbols */
-    test_sym_t syms[4];
+    /* Symbol table: null sym + 6 symbols */
+    test_sym_t syms[7];
     memset(syms, 0, sizeof(syms));
     /* [0] = null */
     /* [1] = app_main: name_idx=1, value=0x40080000, size=0x100, FUNC */
-    syms[1].st_name = 1;
+    syms[1].st_name = STR_APP_MAIN;
     syms[1].st_value = 0x40080000;
     syms[1].st_size = 0x100;
     syms[1].st_info = ELF_ST_INFO(STB_GLOBAL, STT_FUNC);
     syms[1].st_shndx = 1;
     /* [2] = uart_init: name_idx=10, value=0x40080100, size=0x40, FUNC */
-    syms[2].st_name = 10;
+    syms[2].st_name = STR_UART_INIT;
     syms[2].st_value = 0x40080100;
     syms[2].st_size = 0x40;
     syms[2].st_info = ELF_ST_INFO(STB_GLOBAL, STT_FUNC);
     syms[2].st_shndx = 1;
     /* [3] = some_data: name_idx=20, value=0x3FFB0000, size=4, OBJECT */
-    syms[3].st_name = 20;
+    syms[3].st_name = STR_SOME_DATA;
     syms[3].st_value = 0x3FFB0000;
     syms[3].st_size = 4;
     syms[3].st_info = ELF_ST_INFO(STB_GLOBAL, STT_OBJECT);
     syms[3].st_shndx = 2;
+    syms[4].st_name = STR_START_SCHEDULER;
+    syms[4].st_value = 0x40080200;
+    syms[4].st_size = 0x40;
+    syms[4].st_info = ELF_ST_INFO(STB_GLOBAL, STT_FUNC);
+    syms[4].st_shndx = 1;
+    syms[5].st_name = STR_START_OTHER_CORES;
+    syms[5].st_value = 0x40080300;
+    syms[5].st_size = 0x40;
+    syms[5].st_info = ELF_ST_INFO(STB_GLOBAL, STT_FUNC);
+    syms[5].st_shndx = 1;
+    syms[6].st_name = STR_CORE_STARTUP_DONE;
+    syms[6].st_value = 0x3FFB0100;
+    syms[6].st_size = 8;
+    syms[6].st_info = ELF_ST_INFO(STB_GLOBAL, STT_OBJECT);
+    syms[6].st_shndx = 2;
     int symtab_size = (int)sizeof(syms);
 
     /* Layout:
@@ -286,8 +314,8 @@ TEST(test_elf_load_valid) {
 
     elf_symbols_t *s = elf_symbols_load(path);
     ASSERT_TRUE(s != NULL);
-    /* Should have 3 symbols: 2 FUNC (app_main, uart_init) + 1 OBJECT (some_data) */
-    ASSERT_EQ(elf_symbols_count(s), 3);
+    /* Two basic symbols plus the four data/startup symbols used by tests. */
+    ASSERT_EQ(elf_symbols_count(s), 6);
 
     elf_symbols_destroy(s);
 }

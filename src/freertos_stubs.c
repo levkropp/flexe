@@ -106,6 +106,7 @@ struct freertos_stubs {
     int        task_count;
     int        current_task[2];       /* Per-core current task (-1 during boot) */
     bool       scheduler_started;
+    uint32_t   core_startup_done_addr; /* port_uxCoreStartupDone[] */
     uint64_t   last_switch_cycle[2];  /* Per-core cycle at last context switch */
     /* Cycles spent with no runnable task, fast-forwarded through by
      * sched_pick_next during deep sleeps. Keeps uxTaskGetSystemState's
@@ -396,6 +397,19 @@ static int sched_register_task(freertos_stubs_t *frt, uint32_t fn, uint32_t para
     return idx;
 }
 
+/* Publish the per-core state which ESP-IDF's real xPortStartScheduler writes
+ * immediately before entering task dispatch. The host scheduler replaces that
+ * port layer, so main_task must observe the equivalent transition. */
+static void sched_mark_cores_started(freertos_stubs_t *frt) {
+    if (!frt->core_startup_done_addr || !frt->cpu[0]) return;
+    for (int core = 0; core < 2; core++) {
+        if (frt->cpu[core])
+            mem_write32(frt->cpu[0]->mem,
+                        frt->core_startup_done_addr + (uint32_t)core * 4u,
+                        1u);
+    }
+}
+
 /* Start the scheduler: save boot context as implicit task 0 if needed,
  * then pick the highest-priority task to run. */
 static void sched_start(freertos_stubs_t *frt) {
@@ -403,6 +417,7 @@ static void sched_start(freertos_stubs_t *frt) {
     frt->scheduler_started = true;
     frt->current_task[0] = -1;
     frt->current_task[1] = -1;
+    sched_mark_cores_started(frt);
 
     /* Reset ccount so millis()/micros() start near zero when tasks begin.
      * Boot-time ets_delay_us() calls inflate ccount to billions, which
@@ -427,6 +442,7 @@ static void sched_promote_legacy(freertos_stubs_t *frt) {
     if (frt->scheduler_started || frt->task_count < 2)
         return;
     frt->scheduler_started = true;
+    sched_mark_cores_started(frt);
     /* The legacy task is tasks[0] — mark it as RUNNING and current on core 0 */
     frt->current_task[0] = 0;
     frt->tasks[0].state = TASK_RUNNING;
@@ -1662,6 +1678,11 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
     frt->rom = rom;
 
     int hooked = 0;
+    frt->core_startup_done_addr = 0u;
+    uint32_t startup_done_addr;
+    if (elf_symbols_find(syms, "port_uxCoreStartupDone",
+                         &startup_done_addr) == 0)
+        frt->core_startup_done_addr = startup_done_addr;
 
     struct {
         const char *name;

@@ -148,7 +148,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 633 tests, 4690 passed, 0 failed
+# 634 tests, 4696 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -186,7 +186,7 @@ FLEXE_ARDUINO_CONFIG=/path/to/arduino-cli.yaml \
 # engine=interp stage=0x12C0C0DE timing=40/40/200 ... calls=4 bytes=6/2 memory=1 unhandled=0 unregistered=0
 ```
 
-The fixture is verified with Arduino-ESP32 2.0.11.
+The fixture is verified with Arduino-ESP32 2.0.11 and 3.3.11.
 `FLEXE_RTC_I2C_BUILD_DIR` optionally preserves its Arduino build directory.
 
 The analog gate builds an unmodified Arduino sketch using `analogRead()`,

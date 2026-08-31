@@ -114,6 +114,38 @@ TEST(test_xTaskGetTickCount) {
     frt_teardown(&cpu, rom, frt);
 }
 
+TEST(test_scheduler_start_sets_dual_core_ready_flags) {
+    xtensa_cpu_t cpu0, cpu1;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu0, &rom, &frt);
+    xtensa_cpu_init(&cpu1);
+    cpu1.mem = cpu0.mem;
+    cpu1.core_id = 1;
+    freertos_stubs_attach_cpu(frt, 1, &cpu1);
+
+    const char *path = build_test_elf();
+    elf_symbols_t *syms = elf_symbols_load(path);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(freertos_stubs_hook_symbols(frt, syms) >= 2);
+
+    const uint32_t startup_done = 0x3FFB0100u;
+    mem_write32(cpu0.mem, startup_done, 0u);
+    mem_write32(cpu0.mem, startup_done + 4u, 0u);
+    XT_PS_SET_CALLINC(cpu0.ps, 0);
+    ar_write(&cpu0, 0, BASE + 0x100u);
+    cpu0.pc = 0x40080200u;
+    xtensa_step(&cpu0);
+
+    ASSERT_TRUE(freertos_stubs_scheduler_active(frt));
+    ASSERT_EQ(mem_read32(cpu0.mem, startup_done), 1u);
+    ASSERT_EQ(mem_read32(cpu0.mem, startup_done + 4u), 1u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    elf_symbols_destroy(syms);
+    frt_teardown(&cpu0, rom, frt);
+}
+
 TEST(test_queue_send_receive) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -697,6 +729,7 @@ static void run_freertos_tests(void) {
     RUN_TEST(test_vTaskDelay_advances_ccount);
     RUN_TEST(test_xTaskCreate_returns_pdPASS);
     RUN_TEST(test_xTaskGetTickCount);
+    RUN_TEST(test_scheduler_start_sets_dual_core_ready_flags);
     RUN_TEST(test_queue_send_receive);
     RUN_TEST(test_queue_receive_empty_returns_false);
     RUN_TEST(test_queue_overwrite_and_reset);
