@@ -233,4 +233,9 @@ if(UNIX)
     target_link_libraries(flexe-twai-bus-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-twai-bus-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-emac-hal-test tools/emac_hal_test.c)
+    target_link_libraries(flexe-emac-hal-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-emac-hal-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()

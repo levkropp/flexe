@@ -58,6 +58,20 @@ typedef enum {
 typedef periph_twai_tx_result_t (*periph_twai_tx_fn)(
     void *ctx, const periph_twai_frame_t *frame);
 
+/* One Ethernet frame leaving the classic ESP32 EMAC. The frame excludes the
+ * preamble and FCS, matching TAP/raw-socket host APIs. Return zero when the
+ * virtual link accepted the frame or nonzero to report a carrier/link error
+ * in the completed DMA descriptor. */
+typedef int (*periph_emac_tx_fn)(void *ctx, const uint8_t *frame,
+                                 size_t len);
+
+/* Clause-22 MDIO transaction at the MAC/PHY boundary. For a write, *value is
+ * the guest-provided register value; for a read, the callback fills *value.
+ * A nonzero return models an absent/unresponsive PHY (reads become 0xFFFF). */
+typedef int (*periph_emac_mdio_fn)(void *ctx, uint8_t phy_address,
+                                   uint8_t reg, bool write,
+                                   uint16_t *value);
+
 /* Raw PCM bytes consumed by one classic ESP32 I2S TX DMA descriptor. The
  * buffer is valid only for the duration of the callback. */
 typedef void (*periph_i2s_tx_fn)(void *ctx, int port, const uint8_t *data,
@@ -169,6 +183,22 @@ int periph_set_twai_tx_callback(esp32_periph_t *p, periph_twai_tx_fn fn,
 int periph_twai_rx_inject(esp32_periph_t *p,
                           const periph_twai_frame_t *frame);
 size_t periph_twai_rx_pending(const esp32_periph_t *p);
+
+/* Attach Ethernet wire/MDIO peers. RX injection is frame-atomic and returns
+ * one only when the running MAC accepted the destination filter and committed
+ * the complete frame through DMA-owned descriptors. The built-in Clause-22
+ * register bank is useful for simple PHY models when no callback is attached;
+ * setting any register marks that PHY address present. */
+int periph_set_emac_tx_callback(esp32_periph_t *p, periph_emac_tx_fn fn,
+                                void *ctx);
+int periph_set_emac_mdio_callback(esp32_periph_t *p,
+                                  periph_emac_mdio_fn fn, void *ctx);
+int periph_emac_phy_set_reg(esp32_periph_t *p, uint8_t phy_address,
+                            uint8_t reg, uint16_t value);
+int periph_emac_phy_get_reg(const esp32_periph_t *p, uint8_t phy_address,
+                            uint8_t reg, uint16_t *value);
+int periph_emac_rx_inject(esp32_periph_t *p, const uint8_t *frame,
+                          size_t len);
 
 /* Attach a TX audio sink and inject bytes for RX DMA. I2S ports 0/1 are
  * independent; the RX FIFO accepts as many bytes as fit and zero-fills when

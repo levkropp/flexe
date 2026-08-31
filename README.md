@@ -40,6 +40,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
   legacy FRC1/FRC2 timers, both timer groups with four 64-bit APB
   counters/alarms, dual UHCI UART DMA with H:5/SLIP framing, GP-SPI2/3 DMA,
   classic I2C0/1 master, SJA1000-compatible TWAI/CAN,
+  Synopsys-based classic Ethernet MAC with descriptor DMA and Clause-22 MDIO,
   dual-slot native SDMMC with PIO/IDMAC DMA,
   I2S0/1 circular DMA,
   eight-channel classic RMT, 16-channel classic LEDC PWM/fades,
@@ -49,13 +50,13 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - cyd devices: ili9341 display, xpt2046 touch, sd/fat and spiffs storage
 - host-backed lwip sockets plus virtual wifi, bluetooth, and phy boundaries
 - rom function stubs: ets_printf, memcpy, memset, strlen, cache ops
-- freertos stubs: tasks, queues, semaphores, delays
+- freertos stubs: tasks, queues, semaphores, notifications, delays
 - esp_timer stubs with callback dispatch
 - nvs flash stubs
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 618 tests
+- 622 tests
 
 ## building
 
@@ -144,7 +145,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 618 tests, 4269 passed, 0 failed
+# 622 tests, 4412 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -340,6 +341,28 @@ ARDUINO_CLI=/path/to/arduino-cli ./test-twai-bus.sh
 
 `FLEXE_TWAI_BUILD_DIR` optionally preserves its Arduino build directory.
 
+The Ethernet gates drive Flexe's classic ESP32 EMAC through two independent
+compiled paths. `test-emac-hal.sh` uses Espressif's genuine `emac_hal_*` and
+LL interrupt APIs; `test-emac-driver.sh` uses the public
+`esp_eth_mac_new_esp32` object, its real ISR and notification-backed RX task,
+mediator callbacks, and full init/link/deinit lifecycle. Together with the raw
+MMIO regressions, they cover enhanced chained descriptor rings, multi-buffer
+700-byte frames, exact TX capture, perfect and multicast RX filtering, FCS and
+descriptor writeback, source-38 interrupts, DMA unavailable/error states,
+DPORT clock/reset behavior, and Clause-22 PHY reads/writes. Both engines must
+finish with zero unhandled MMIO or unregistered ROM calls:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./test-emac-hal.sh
+ARDUINO_CLI=/path/to/arduino-cli ./test-emac-driver.sh
+# profile=hal engine=jit stage=0x454D4143 ... tx_ok=1 inject=1/1 irq=2 ... unhandled=0 unregistered=0
+# profile=driver engine=interp stage=0x454D4143 ... tx_ok=1 inject=1/1 irq=2 ... unhandled=0 unregistered=0
+```
+
+The fixtures are verified with Arduino-ESP32 2.0.11. `FLEXE_ARDUINO_CONFIG`
+selects an Arduino CLI configuration, while `FLEXE_EMAC_BUILD_DIR` and
+`FLEXE_EMAC_DRIVER_BUILD_DIR` optionally preserve the two fixture builds.
+
 Production ROMs are kept outside the repository. Run the sustained stock-ROM
 correctness/performance gate by supplying either image (or both):
 
@@ -359,8 +382,8 @@ Current Release-build results on Apple silicon (three default-length runs):
 
 | stock CYD image | jit vs 240 MHz ESP32 |
 |---|---:|
-| ESP32 Marauder v1.14 | **9.36× real-time** |
-| NerdMiner v1.8.3 | **6.09× real-time** |
+| ESP32 Marauder v1.14 | **8.03× real-time** |
+| NerdMiner v1.8.3 | **5.51× real-time** |
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

@@ -40,8 +40,11 @@ typedef enum {
     TASK_READY,
     TASK_RUNNING,
     TASK_SLEEPING,
-    TASK_BLOCKED_QUEUE
+    TASK_BLOCKED_QUEUE,
+    TASK_BLOCKED_NOTIFY
 } task_state_t;
+
+#define FRT_NOTIFY_SLOTS 4u
 
 #define MAX_TASKS        16
 #define TASK_STACK_SIZE  0x4000u      /* 16KB per task */
@@ -57,17 +60,21 @@ typedef struct {
     char         name[16];
     uint64_t     wake_cycle;     /* cycle_count threshold for SLEEPING */
     uint32_t     blocked_queue;  /* queue handle for BLOCKED_QUEUE */
+    uint32_t     notify_value[FRT_NOTIFY_SLOTS];
+    uint8_t      notify_wait_index;
+    bool         notify_waiting;
+    bool         notify_clear_on_exit;
     /* Saved CPU context */
     uint32_t     ar[64];
     uint32_t     pc, ps;
     uint32_t     windowbase, windowstart;
     uint32_t     spill_base[16];
-    struct {
-        uint32_t base[8];
-        uint32_t core[8][4];
-        uint32_t extra[8][8];
-        int depth;
-    } spill_stack[16];
+    /* Keep these opaque copies tied to xtensa_cpu_t's exact dimensions.
+     * The CPU spill depth grew from 8 to 32; mirroring the old dimensions
+     * here made sched_save_context() overwrite the following task's TCB. */
+    uint8_t      spill_stack[sizeof(((xtensa_cpu_t *)0)->spill_stack)];
+    uint8_t      spill_shadow[sizeof(((xtensa_cpu_t *)0)->spill_shadow)];
+    uint8_t      window_callsize[sizeof(((xtensa_cpu_t *)0)->window_callsize)];
     uint32_t     sar, lbeg, lend, lcount;
     uint32_t     stack_top;
     /* Run-time accounting for uxTaskGetSystemState. Cumulative cycles
@@ -189,6 +196,9 @@ static void sched_save_context(freertos_stubs_t *frt, int core_id) {
     t->windowstart = cpu->windowstart;
     memcpy(t->spill_base, cpu->spill_base, sizeof(cpu->spill_base));
     memcpy(t->spill_stack, cpu->spill_stack, sizeof(cpu->spill_stack));
+    memcpy(t->spill_shadow, cpu->spill_shadow, sizeof(cpu->spill_shadow));
+    memcpy(t->window_callsize, cpu->window_callsize,
+           sizeof(cpu->window_callsize));
     t->sar = cpu->sar;
     t->lbeg = cpu->lbeg;
     t->lend = cpu->lend;
@@ -217,6 +227,9 @@ static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
     cpu->windowstart = t->windowstart;
     memcpy(cpu->spill_base, t->spill_base, sizeof(cpu->spill_base));
     memcpy(cpu->spill_stack, t->spill_stack, sizeof(cpu->spill_stack));
+    memcpy(cpu->spill_shadow, t->spill_shadow, sizeof(cpu->spill_shadow));
+    memcpy(cpu->window_callsize, t->window_callsize,
+           sizeof(cpu->window_callsize));
     cpu->sar = t->sar;
     cpu->lbeg = t->lbeg;
     cpu->lend = t->lend;
@@ -232,6 +245,7 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
         task_tcb_t *t = &frt->tasks[i];
         if (t->state == TASK_SLEEPING) {
             if (now >= t->wake_cycle) {
+                t->notify_waiting = false;
                 t->state = TASK_READY;
             } else if (t->wake_cycle < nearest) {
                 nearest = t->wake_cycle;
@@ -993,6 +1007,124 @@ void stub_xQueueGiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, accepted ? pdTRUE : pdFALSE);
 }
 
+static task_tcb_t *find_task(freertos_stubs_t *frt, uint32_t handle,
+                             int *index_out) {
+    for (int index = 0; index < frt->task_count; index++) {
+        task_tcb_t *task = &frt->tasks[index];
+        if (task->state != TASK_UNUSED && task->handle == handle) {
+            if (index_out) *index_out = index;
+            return task;
+        }
+    }
+    return NULL;
+}
+
+static void stub_task_notify_give_from_isr(xtensa_cpu_t *cpu,
+                                           freertos_stubs_t *frt,
+                                           bool generic) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t slot = generic ? frt_arg(cpu, 1) : 0u;
+    uint32_t woken_ptr = frt_arg(cpu, generic ? 2 : 1);
+    bool woke = false;
+
+    pthread_mutex_lock(&frt->lock);
+    int task_index = -1;
+    task_tcb_t *task = slot < FRT_NOTIFY_SLOTS ?
+        find_task(frt, handle, &task_index) : NULL;
+    if (task) {
+        if (task->notify_value[slot] != UINT32_MAX)
+            task->notify_value[slot]++;
+        if (task->notify_waiting && task->notify_wait_index == slot) {
+            uint32_t result = task->notify_value[slot];
+            if (task->notify_clear_on_exit)
+                task->notify_value[slot] = 0u;
+            else if (task->notify_value[slot] != 0u)
+                task->notify_value[slot]--;
+            task->notify_waiting = false;
+            task->ar[(task->windowbase * 4u + 2u) & 63u] = result;
+
+            bool is_current = false;
+            for (int core = 0; core < 2; core++) {
+                if (frt->current_task[core] != task_index) continue;
+                is_current = true;
+                if (frt->cpu[core]) {
+                    frt->cpu[core]->running = true;
+                    frt->cpu[core]->halted = false;
+                }
+            }
+            task->state = is_current ? TASK_RUNNING : TASK_READY;
+            woke = true;
+        }
+    }
+    pthread_mutex_unlock(&frt->lock);
+    if (woken_ptr) mem_write32(cpu->mem, woken_ptr, woke ? pdTRUE : pdFALSE);
+    frt_return_void(cpu);
+}
+
+/* FreeRTOS task-notification give/take APIs used by ESP-IDF's EMAC RX task.
+ * IDF 4.x links the generic indexed symbols even when only slot zero exists. */
+void stub_vTaskGenericNotifyGiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_give_from_isr(cpu, ctx, true);
+}
+
+void stub_vTaskNotifyGiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_give_from_isr(cpu, ctx, false);
+}
+
+static void stub_task_notify_take(xtensa_cpu_t *cpu,
+                                  freertos_stubs_t *frt,
+                                  bool generic) {
+    uint32_t slot = generic ? frt_arg(cpu, 0) : 0u;
+    bool clear_on_exit = frt_arg(cpu, generic ? 1 : 0) != 0u;
+    uint32_t timeout = frt_arg(cpu, generic ? 2 : 1);
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    task_tcb_t *task = NULL;
+    if (slot < FRT_NOTIFY_SLOTS && frt->scheduler_started &&
+        frt->current_task[core_id] >= 0)
+        task = &frt->tasks[frt->current_task[core_id]];
+    if (task && task->notify_value[slot] != 0u) {
+        uint32_t result = task->notify_value[slot];
+        if (clear_on_exit) task->notify_value[slot] = 0u;
+        else task->notify_value[slot]--;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, result);
+        return;
+    }
+    if (!task || timeout == 0u) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0u);
+        return;
+    }
+
+    /* Resume after the call when a give arrives; the ISR patches the saved
+     * return register with the notification count before waking this TCB. */
+    frt_return(cpu, 0u);
+    sched_save_context(frt, core_id);
+    task->notify_wait_index = (uint8_t)slot;
+    task->notify_waiting = true;
+    task->notify_clear_on_exit = clear_on_exit;
+    if (timeout == UINT32_MAX) {
+        task->state = TASK_BLOCKED_NOTIFY;
+    } else {
+        uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
+        if (advance > 200000000ULL) advance = 200000000ULL;
+        task->state = TASK_SLEEPING;
+        task->wake_cycle = cpu->cycle_count + advance;
+    }
+    sched_switch(frt, core_id);
+    pthread_mutex_unlock(&frt->lock);
+}
+
+void stub_ulTaskGenericNotifyTake(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_take(cpu, ctx, true);
+}
+
+void stub_ulTaskNotifyTake(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_take(cpu, ctx, false);
+}
+
 /* pvPortMalloc(size) -> bump-allocated address */
 void stub_pvPortMalloc(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
@@ -1110,6 +1242,7 @@ static void stub_uxTaskGetSystemState(xtensa_cpu_t *cpu, void *ctx) {
             case TASK_RUNNING:       estate = 0; break;
             case TASK_READY:         estate = 1; break;
             case TASK_BLOCKED_QUEUE: estate = 2; break;
+            case TASK_BLOCKED_NOTIFY: estate = 2; break;
             case TASK_SLEEPING:      estate = 2; break;
             case TASK_UNUSED:        estate = 4; break;
             default:                 estate = 1; break;
@@ -1340,12 +1473,6 @@ bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id) {
         pthread_mutex_unlock(&frt->lock);
         return next >= 0;
     }
-    if (frt->cpu[core_id]->cycle_count - frt->last_switch_cycle[core_id] <
-        frt->cycles_per_tick) {
-        pthread_mutex_unlock(&frt->lock);
-        return false;
-    }
-
     int cur_prio = frt->tasks[frt->current_task[core_id]].priority;
 
     /* Wake any sleeping tasks whose delay has expired */
@@ -1379,6 +1506,15 @@ bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id) {
     /* For equal priority, round-robin: pick first READY at this priority
      * starting after current_task in array order */
     if (best_prio == cur_prio) {
+        /* A tick only gates round-robin scheduling between equal-priority
+         * tasks.  A task unblocked by an ISR at a higher priority must
+         * preempt immediately, even when the current time slice has barely
+         * begun. */
+        if (frt->cpu[core_id]->cycle_count -
+                frt->last_switch_cycle[core_id] < frt->cycles_per_tick) {
+            pthread_mutex_unlock(&frt->lock);
+            return false;
+        }
         next = -1;
         for (int j = 1; j < frt->task_count; j++) {
             int i = (frt->current_task[core_id] + j) % frt->task_count;
@@ -1458,7 +1594,8 @@ const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt, int co
 
 int freertos_stubs_dump_tasks(const freertos_stubs_t *frt, char *buf, int buflen) {
     static const char *state_names[] = {
-        "UNUSED", "READY", "RUNNING", "SLEEPING", "BLOCKED_QUEUE"
+        "UNUSED", "READY", "RUNNING", "SLEEPING", "BLOCKED_QUEUE",
+        "BLOCKED_NOTIFY"
     };
     if (!frt || !buf || buflen <= 0) return 0;
     int n = 0;
@@ -1509,6 +1646,10 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xQueueSendFromISR",             stub_xQueueSendFromISR },
         { "xQueueGenericSendFromISR",      stub_xQueueGenericSendFromISR },
         { "xQueueGiveFromISR",             stub_xQueueGiveFromISR },
+        { "vTaskGenericNotifyGiveFromISR", stub_vTaskGenericNotifyGiveFromISR },
+        { "vTaskNotifyGiveFromISR",        stub_vTaskNotifyGiveFromISR },
+        { "ulTaskGenericNotifyTake",       stub_ulTaskGenericNotifyTake },
+        { "ulTaskNotifyTake",              stub_ulTaskNotifyTake },
         { "xQueueReceive",                stub_xQueueReceive },
         { "xQueueGenericReceive",          stub_xQueueReceive },
         { "xQueueReceiveFromISR",          stub_xQueueReceiveFromISR },

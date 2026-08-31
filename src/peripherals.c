@@ -20,6 +20,9 @@
 #define I2C0_BASE       0x3FF53000u
 #define I2C1_BASE       0x3FF67000u
 #define SDMMC_BASE      0x3FF68000u
+#define EMAC_DMA_BASE   0x3FF69000u
+#define EMAC_EXT_BASE   0x3FF69800u
+#define EMAC_MAC_BASE   0x3FF6A000u
 #define TWAI_BASE       0x3FF6B000u
 #define RMT_BASE        0x3FF56000u
 #define PCNT_BASE       0x3FF57000u
@@ -389,6 +392,134 @@
 #define TWAI_CLOCK_EXTENDED_LAYOUT    (1u << 7)
 #define TWAI_DEFAULT_EWL              96u
 
+/* Classic ESP32 Ethernet MAC: Synopsys DesignWare GMAC, enhanced chained
+ * descriptors, and Espressif's RMII/MII clock-extension block. */
+#define EMAC_INTR_SOURCE               38
+#define EMAC_DMA_REG_FILE_SIZE         0x058u
+#define EMAC_EXT_REG_FILE_SIZE         0x100u
+#define EMAC_MAC_REG_FILE_SIZE         0x0E0u
+#define EMAC_MAX_FRAME_SIZE            16379u /* 14-bit length includes FCS */
+#define EMAC_DMA_MAX_DESCRIPTORS       256u
+
+#define EMAC_DMA_BUS_MODE_OFF          0x000u
+#define EMAC_DMA_TX_POLL_OFF           0x004u
+#define EMAC_DMA_RX_POLL_OFF           0x008u
+#define EMAC_DMA_RX_BASE_OFF           0x00Cu
+#define EMAC_DMA_TX_BASE_OFF           0x010u
+#define EMAC_DMA_STATUS_OFF            0x014u
+#define EMAC_DMA_OPMODE_OFF            0x018u
+#define EMAC_DMA_INT_ENA_OFF           0x01Cu
+#define EMAC_DMA_MISSED_OFF            0x020u
+#define EMAC_DMA_RX_WDT_OFF            0x024u
+#define EMAC_DMA_TX_CUR_DESC_OFF       0x048u
+#define EMAC_DMA_RX_CUR_DESC_OFF       0x04Cu
+#define EMAC_DMA_TX_CUR_BUF_OFF        0x050u
+#define EMAC_DMA_RX_CUR_BUF_OFF        0x054u
+
+#define EMAC_DMA_BUS_SW_RESET          (1u << 0)
+#define EMAC_DMA_BUS_DESC_SKIP_MASK    (0x1Fu << 2)
+#define EMAC_DMA_BUS_ENHANCED_DESC     (1u << 7)
+#define EMAC_DMA_OP_RX_START           (1u << 1)
+#define EMAC_DMA_OP_TX_START           (1u << 13)
+#define EMAC_DMA_OP_FLUSH_TX           (1u << 20)
+
+#define EMAC_DMA_ST_TX                 (1u << 0)
+#define EMAC_DMA_ST_TX_STOP            (1u << 1)
+#define EMAC_DMA_ST_TX_UNAVAILABLE     (1u << 2)
+#define EMAC_DMA_ST_TX_JABBER          (1u << 3)
+#define EMAC_DMA_ST_RX_OVERFLOW        (1u << 4)
+#define EMAC_DMA_ST_TX_UNDERFLOW       (1u << 5)
+#define EMAC_DMA_ST_RX                 (1u << 6)
+#define EMAC_DMA_ST_RX_UNAVAILABLE     (1u << 7)
+#define EMAC_DMA_ST_RX_STOP            (1u << 8)
+#define EMAC_DMA_ST_RX_WATCHDOG        (1u << 9)
+#define EMAC_DMA_ST_EARLY_TX           (1u << 10)
+#define EMAC_DMA_ST_FATAL_BUS          (1u << 13)
+#define EMAC_DMA_ST_EARLY_RX           (1u << 14)
+#define EMAC_DMA_ST_ABNORMAL_SUMMARY   (1u << 15)
+#define EMAC_DMA_ST_NORMAL_SUMMARY     (1u << 16)
+#define EMAC_DMA_ST_NORMAL_EVENTS      (EMAC_DMA_ST_TX | \
+                                        EMAC_DMA_ST_TX_UNAVAILABLE | \
+                                        EMAC_DMA_ST_RX | \
+                                        EMAC_DMA_ST_EARLY_RX)
+#define EMAC_DMA_ST_ABNORMAL_EVENTS    (EMAC_DMA_ST_TX_STOP | \
+                                        EMAC_DMA_ST_TX_JABBER | \
+                                        EMAC_DMA_ST_RX_OVERFLOW | \
+                                        EMAC_DMA_ST_TX_UNDERFLOW | \
+                                        EMAC_DMA_ST_RX_UNAVAILABLE | \
+                                        EMAC_DMA_ST_RX_STOP | \
+                                        EMAC_DMA_ST_RX_WATCHDOG | \
+                                        EMAC_DMA_ST_EARLY_TX | \
+                                        EMAC_DMA_ST_FATAL_BUS)
+#define EMAC_DMA_ST_EVENT_MASK         (EMAC_DMA_ST_NORMAL_EVENTS | \
+                                        EMAC_DMA_ST_ABNORMAL_EVENTS | \
+                                        EMAC_DMA_ST_NORMAL_SUMMARY | \
+                                        EMAC_DMA_ST_ABNORMAL_SUMMARY)
+#define EMAC_DMA_INT_ABNORMAL_SUMMARY  (1u << 15)
+#define EMAC_DMA_INT_NORMAL_SUMMARY    (1u << 16)
+
+#define EMAC_DESC_OWN                  (1u << 31)
+#define EMAC_TX_DESC_IOC               (1u << 30)
+#define EMAC_TX_DESC_LAST              (1u << 29)
+#define EMAC_TX_DESC_FIRST             (1u << 28)
+#define EMAC_TX_DESC_DISABLE_CRC       (1u << 27)
+#define EMAC_TX_DESC_DISABLE_PAD       (1u << 26)
+#define EMAC_TX_DESC_CHAINED           (1u << 20)
+#define EMAC_TX_DESC_END_RING          (1u << 21)
+#define EMAC_TX_DESC_ERROR             (1u << 15)
+#define EMAC_TX_DESC_NO_CARRIER        (1u << 10)
+#define EMAC_RX_DESC_DA_FILTER_FAIL    (1u << 30)
+#define EMAC_RX_DESC_FRAME_LEN_SHIFT   16u
+#define EMAC_RX_DESC_FRAME_LEN_MASK    (0x3FFFu << 16)
+#define EMAC_RX_DESC_ERROR             (1u << 15)
+#define EMAC_RX_DESC_VLAN              (1u << 10)
+#define EMAC_RX_DESC_FIRST             (1u << 9)
+#define EMAC_RX_DESC_LAST              (1u << 8)
+#define EMAC_RX_DESC_CHAINED           (1u << 14)
+#define EMAC_RX_DESC_END_RING          (1u << 15)
+#define EMAC_RX_DESC_DISABLE_IRQ       (1u << 31)
+#define EMAC_DESC_BUF1_SIZE_MASK       0x1FFFu
+#define EMAC_DESC_BUF2_SIZE_SHIFT      16u
+#define EMAC_DESC_BUF2_SIZE_MASK       (0x1FFFu << 16)
+
+#define EMAC_MAC_CONFIG_OFF            0x000u
+#define EMAC_MAC_FRAME_FILTER_OFF      0x004u
+#define EMAC_MAC_HASH_HIGH_OFF         0x008u
+#define EMAC_MAC_HASH_LOW_OFF          0x00Cu
+#define EMAC_MAC_MII_ADDR_OFF          0x010u
+#define EMAC_MAC_MII_DATA_OFF          0x014u
+#define EMAC_MAC_FLOW_CTRL_OFF         0x018u
+#define EMAC_MAC_DEBUG_OFF             0x024u
+#define EMAC_MAC_INT_STATUS_OFF        0x038u
+#define EMAC_MAC_INT_MASK_OFF          0x03Cu
+#define EMAC_MAC_ADDR0_HIGH_OFF        0x040u
+#define EMAC_MAC_ADDR0_LOW_OFF         0x044u
+#define EMAC_MAC_ADDR_LAST_OFF         0x07Cu
+#define EMAC_MAC_STATUS_OFF            0x0D8u
+#define EMAC_MAC_WATCHDOG_OFF          0x0DCu
+
+#define EMAC_MAC_CONFIG_RX             (1u << 2)
+#define EMAC_MAC_CONFIG_TX             (1u << 3)
+#define EMAC_MAC_CONFIG_LOOPBACK       (1u << 12)
+#define EMAC_MAC_CONFIG_DUPLEX         (1u << 11)
+#define EMAC_MAC_CONFIG_FAST_SPEED     (1u << 14)
+#define EMAC_MAC_CONFIG_MII            (1u << 15)
+#define EMAC_MAC_FILTER_PROMISCUOUS    (1u << 0)
+#define EMAC_MAC_FILTER_HASH_UNICAST   (1u << 1)
+#define EMAC_MAC_FILTER_HASH_MULTICAST (1u << 2)
+#define EMAC_MAC_FILTER_DA_INVERSE     (1u << 3)
+#define EMAC_MAC_FILTER_ALL_MULTICAST  (1u << 4)
+#define EMAC_MAC_FILTER_BLOCK_BCAST    (1u << 5)
+#define EMAC_MAC_FILTER_CTRL_MASK      (3u << 6)
+#define EMAC_MAC_FILTER_SA_INVERSE     (1u << 8)
+#define EMAC_MAC_FILTER_SA_ENABLE      (1u << 9)
+#define EMAC_MAC_FILTER_RECEIVE_ALL    (1u << 31)
+
+#define EMAC_MII_BUSY                  (1u << 0)
+#define EMAC_MII_WRITE                 (1u << 1)
+#define EMAC_MII_REG_SHIFT             6u
+#define EMAC_MII_PHY_SHIFT             11u
+
 /* Classic ESP32 I2C controller register/FIFO geometry. */
 #define I2C_PORT_COUNT       2
 #define I2C_DEVICE_COUNT     128
@@ -676,6 +807,8 @@ static uint32_t twai_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void twai_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void twai_reset_state(esp32_periph_t *p);
 static void twai_dport_update(esp32_periph_t *p);
+static void emac_reset_state(esp32_periph_t *p);
+static void emac_dport_update(esp32_periph_t *p);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -982,6 +1115,24 @@ typedef struct {
     periph_twai_tx_fn tx_cb;
     void *tx_cb_ctx;
 } twai_state_t;
+
+typedef struct {
+    uint32_t dma[EMAC_DMA_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t ext[EMAC_EXT_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t mac[EMAC_MAC_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t dma_status;
+    uint32_t tx_current_desc;
+    uint32_t rx_current_desc;
+
+    uint8_t tx_frame[EMAC_MAX_FRAME_SIZE];
+    uint16_t phy_regs[32][32];
+    uint32_t phy_present;
+
+    periph_emac_tx_fn tx_cb;
+    void *tx_cb_ctx;
+    periph_emac_mdio_fn mdio_cb;
+    void *mdio_cb_ctx;
+} emac_state_t;
 
 typedef struct {
     periph_i2c_device_fn fn;
@@ -1318,6 +1469,9 @@ struct esp32_periph {
     /* SJA1000-compatible classic ESP32 TWAI/CAN controller and RX FIFO. */
     twai_state_t twai;
 
+    /* Synopsys GMAC DMA/MAC plus Espressif's MII/RMII extension registers. */
+    emac_state_t emac;
+
     /* Eight-channel classic ESP32 remote-control/pulse engine. */
     rmt_state_t rmt;
 
@@ -1380,6 +1534,8 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_CORE_RST_EN_OFF          0x0D0
 #define DPORT_SDIO_HOST_CLK_BIT        (1u << 13)
 #define DPORT_SDIO_HOST_RST_BIT        (1u << 6)
+#define DPORT_EMAC_CLK_BIT             (1u << 14)
+#define DPORT_EMAC_RST_BIT             (1u << 7)
 #define DPORT_UHCI0_MODULE_BIT         (1u << 8)
 #define DPORT_RMT_MODULE_BIT           (1u << 9)
 #define DPORT_PCNT_MODULE_BIT          (1u << 10)
@@ -1600,12 +1756,16 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
     case DPORT_WIFI_CLK_EN_OFF:
         p->dport_wifi_clk_en = val;
         sdmmc_dport_update(p);
+        emac_dport_update(p);
         break;
     case DPORT_CORE_RST_EN_OFF:
         p->dport_core_rst_en = val;
         if (val & DPORT_SDIO_HOST_RST_BIT)
             sdmmc_reset_state(p);
+        if (val & DPORT_EMAC_RST_BIT)
+            emac_reset_state(p);
         sdmmc_dport_update(p);
+        emac_dport_update(p);
         break;
     case DPORT_PERIP_RST_EN_OFF:
         timg_sync_all_to(p, timg_now_cycles(p));
@@ -9700,6 +9860,695 @@ static void twai_write(void *ctx, uint32_t addr, uint32_t value) {
     }
 }
 
+/* ---- Classic ESP32 Ethernet MAC + enhanced descriptor DMA ---- */
+
+typedef struct {
+    uint32_t address;
+    uint32_t status;
+    uint32_t control;
+    uint32_t buffer1;
+    uint32_t buffer2_or_next;
+    uint32_t next;
+    uint16_t size1;
+    uint16_t size2;
+} emac_descriptor_t;
+
+static bool emac_clocked(const esp32_periph_t *p) {
+    return p && (p->dport_wifi_clk_en & DPORT_EMAC_CLK_BIT) != 0u &&
+           (p->dport_core_rst_en & DPORT_EMAC_RST_BIT) == 0u;
+}
+
+static bool emac_dma_range_mapped(esp32_periph_t *p, uint32_t addr,
+                                  size_t len, bool writable) {
+    while (len != 0u) {
+        size_t page_left = 0x1000u - (addr & 0xFFFu);
+        size_t chunk = len < page_left ? len : page_left;
+        const uint8_t *ptr = writable ? mem_get_ptr_w(p->mem, addr) :
+                                        mem_get_ptr(p->mem, addr);
+        if (!ptr) return false;
+        addr += (uint32_t)chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+static uint32_t emac_descriptor_stride(const emac_state_t *s) {
+    uint32_t bus_mode = s->dma[EMAC_DMA_BUS_MODE_OFF / 4u];
+    uint32_t base = (bus_mode & EMAC_DMA_BUS_ENHANCED_DESC) ? 32u : 16u;
+    return base + ((bus_mode & EMAC_DMA_BUS_DESC_SKIP_MASK) >> 2u) * 4u;
+}
+
+static uint32_t emac_next_descriptor(const emac_state_t *s,
+                                     uint32_t address, uint32_t status,
+                                     uint32_t control,
+                                     uint32_t buffer2_or_next, bool tx) {
+    uint32_t chained = tx ? EMAC_TX_DESC_CHAINED : EMAC_RX_DESC_CHAINED;
+    uint32_t end_ring = tx ? EMAC_TX_DESC_END_RING : EMAC_RX_DESC_END_RING;
+    uint32_t descriptor_control = tx ? status : control;
+    if (descriptor_control & chained) return buffer2_or_next & ~3u;
+    if (descriptor_control & end_ring) {
+        uint32_t off = tx ? EMAC_DMA_TX_BASE_OFF : EMAC_DMA_RX_BASE_OFF;
+        return s->dma[off / 4u] & ~3u;
+    }
+    return address + emac_descriptor_stride(s);
+}
+
+static bool emac_read_descriptor(esp32_periph_t *p, uint32_t address,
+                                 bool tx, emac_descriptor_t *desc) {
+    if (!desc || (address & 3u) != 0u ||
+        !emac_dma_range_mapped(p, address, 16u, true))
+        return false;
+    desc->address = address;
+    desc->status = mem_read32(p->mem, address);
+    desc->control = mem_read32(p->mem, address + 4u);
+    desc->buffer1 = mem_read32(p->mem, address + 8u);
+    desc->buffer2_or_next = mem_read32(p->mem, address + 12u);
+    desc->size1 = (uint16_t)(desc->control & EMAC_DESC_BUF1_SIZE_MASK);
+    desc->size2 = (uint16_t)((desc->control & EMAC_DESC_BUF2_SIZE_MASK) >>
+                             EMAC_DESC_BUF2_SIZE_SHIFT);
+    desc->next = emac_next_descriptor(&p->emac, address, desc->status,
+                                      desc->control,
+                                      desc->buffer2_or_next, tx);
+    return true;
+}
+
+static void emac_refresh_summaries(emac_state_t *s) {
+    uint32_t enabled = s->dma[EMAC_DMA_INT_ENA_OFF / 4u];
+    if ((enabled & EMAC_DMA_INT_NORMAL_SUMMARY) != 0u &&
+        (s->dma_status & enabled & EMAC_DMA_ST_NORMAL_EVENTS) != 0u)
+        s->dma_status |= EMAC_DMA_ST_NORMAL_SUMMARY;
+    if ((enabled & EMAC_DMA_INT_ABNORMAL_SUMMARY) != 0u &&
+        (s->dma_status & enabled & EMAC_DMA_ST_ABNORMAL_EVENTS) != 0u)
+        s->dma_status |= EMAC_DMA_ST_ABNORMAL_SUMMARY;
+}
+
+static void emac_irq_update(esp32_periph_t *p) {
+    emac_state_t *s = &p->emac;
+    uint32_t enabled = s->dma[EMAC_DMA_INT_ENA_OFF / 4u];
+    bool normal = (s->dma_status & EMAC_DMA_ST_NORMAL_SUMMARY) != 0u &&
+                  (enabled & EMAC_DMA_INT_NORMAL_SUMMARY) != 0u &&
+                  (s->dma_status & enabled &
+                   EMAC_DMA_ST_NORMAL_EVENTS) != 0u;
+    bool abnormal = (s->dma_status & EMAC_DMA_ST_ABNORMAL_SUMMARY) != 0u &&
+                    (enabled & EMAC_DMA_INT_ABNORMAL_SUMMARY) != 0u &&
+                    (s->dma_status & enabled &
+                     EMAC_DMA_ST_ABNORMAL_EVENTS) != 0u;
+    if (emac_clocked(p) && (normal || abnormal))
+        periph_assert_interrupt(p, EMAC_INTR_SOURCE);
+    else
+        periph_deassert_interrupt(p, EMAC_INTR_SOURCE);
+}
+
+static void emac_raise_status(esp32_periph_t *p, uint32_t status) {
+    p->emac.dma_status |= status & (EMAC_DMA_ST_NORMAL_EVENTS |
+                                    EMAC_DMA_ST_ABNORMAL_EVENTS);
+    emac_refresh_summaries(&p->emac);
+    emac_irq_update(p);
+}
+
+static void emac_reset_dma(esp32_periph_t *p) {
+    emac_state_t *s = &p->emac;
+    memset(s->dma, 0, sizeof(s->dma));
+    s->dma_status = 0u;
+    s->tx_current_desc = 0u;
+    s->rx_current_desc = 0u;
+    periph_deassert_interrupt(p, EMAC_INTR_SOURCE);
+}
+
+static void emac_reset_state(esp32_periph_t *p) {
+    if (!p) return;
+    emac_state_t *s = &p->emac;
+    periph_emac_tx_fn tx_cb = s->tx_cb;
+    void *tx_ctx = s->tx_cb_ctx;
+    periph_emac_mdio_fn mdio_cb = s->mdio_cb;
+    void *mdio_ctx = s->mdio_cb_ctx;
+    uint16_t phy_regs[32][32];
+    memcpy(phy_regs, s->phy_regs, sizeof(phy_regs));
+    uint32_t phy_present = s->phy_present;
+    memset(s, 0, sizeof(*s));
+    s->tx_cb = tx_cb;
+    s->tx_cb_ctx = tx_ctx;
+    s->mdio_cb = mdio_cb;
+    s->mdio_cb_ctx = mdio_ctx;
+    memcpy(s->phy_regs, phy_regs, sizeof(phy_regs));
+    s->phy_present = phy_present;
+    s->mac[EMAC_MAC_CONFIG_OFF / 4u] = EMAC_MAC_CONFIG_MII;
+    s->mac[EMAC_MAC_ADDR0_HIGH_OFF / 4u] = 1u << 31;
+    s->ext[(EMAC_EXT_REG_FILE_SIZE - 4u) / 4u] = 0x15040200u;
+    periph_deassert_interrupt(p, EMAC_INTR_SOURCE);
+}
+
+static void emac_dport_update(esp32_periph_t *p) {
+    if (!p) return;
+    if (!emac_clocked(p))
+        periph_deassert_interrupt(p, EMAC_INTR_SOURCE);
+    else
+        emac_irq_update(p);
+}
+
+static void emac_fatal_bus_error(esp32_periph_t *p) {
+    emac_raise_status(p, EMAC_DMA_ST_FATAL_BUS);
+}
+
+static uint32_t emac_dma_status_value(const emac_state_t *s) {
+    uint32_t value = s->dma_status;
+    uint32_t opmode = s->dma[EMAC_DMA_OPMODE_OFF / 4u];
+    uint32_t rx_state = 0u;
+    uint32_t tx_state = 0u;
+    if (opmode & EMAC_DMA_OP_RX_START)
+        rx_state = (s->dma_status & EMAC_DMA_ST_RX_UNAVAILABLE) ? 4u : 3u;
+    if (opmode & EMAC_DMA_OP_TX_START)
+        tx_state = (s->dma_status & EMAC_DMA_ST_TX_UNAVAILABLE) ? 6u : 3u;
+    value |= rx_state << 17u;
+    value |= tx_state << 20u;
+    return value;
+}
+
+static uint32_t emac_crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = UINT32_MAX;
+    for (size_t index = 0; index < len; index++) {
+        uint8_t byte = data[index];
+        for (unsigned bit = 0; bit < 8u; bit++) {
+            uint32_t mix = (crc ^ byte) & 1u;
+            crc >>= 1u;
+            if (mix) crc ^= 0xEDB88320u;
+            byte >>= 1u;
+        }
+    }
+    return ~crc;
+}
+
+static bool emac_address_is_broadcast(const uint8_t *address) {
+    for (unsigned index = 0; index < 6u; index++)
+        if (address[index] != 0xFFu) return false;
+    return true;
+}
+
+static bool emac_address_register_match(const emac_state_t *s,
+                                        unsigned slot,
+                                        const uint8_t *address,
+                                        bool source) {
+    uint32_t high_off = EMAC_MAC_ADDR0_HIGH_OFF + slot * 8u;
+    uint32_t low_off = high_off + 4u;
+    uint32_t high = s->mac[high_off / 4u];
+    uint32_t low = s->mac[low_off / 4u];
+    if (slot != 0u) {
+        if ((high & (1u << 31)) == 0u) return false;
+        if (((high & (1u << 30)) != 0u) != source) return false;
+    } else if (source) {
+        return false;
+    }
+    uint8_t expected[6] = {
+        (uint8_t)low, (uint8_t)(low >> 8u),
+        (uint8_t)(low >> 16u), (uint8_t)(low >> 24u),
+        (uint8_t)high, (uint8_t)(high >> 8u),
+    };
+    uint32_t mask = slot == 0u ? 0u : (high >> 24u) & 0x3Fu;
+    for (unsigned index = 0; index < 6u; index++)
+        if ((mask & (1u << index)) == 0u &&
+            expected[index] != address[index])
+            return false;
+    return true;
+}
+
+static bool emac_hash_match(const emac_state_t *s,
+                            const uint8_t *address) {
+    unsigned index = (unsigned)(emac_crc32(address, 6u) >> 26u);
+    uint32_t word = index < 32u ?
+        s->mac[EMAC_MAC_HASH_LOW_OFF / 4u] :
+        s->mac[EMAC_MAC_HASH_HIGH_OFF / 4u];
+    return (word & (1u << (index & 31u))) != 0u;
+}
+
+static bool emac_filter_frame(const emac_state_t *s, const uint8_t *frame,
+                              size_t len, bool *destination_failed) {
+    uint32_t filter = s->mac[EMAC_MAC_FRAME_FILTER_OFF / 4u];
+    bool receive_all = (filter & EMAC_MAC_FILTER_RECEIVE_ALL) != 0u;
+    if (destination_failed) *destination_failed = false;
+    if (filter & EMAC_MAC_FILTER_PROMISCUOUS) return true;
+    if (len < 12u) {
+        if (destination_failed) *destination_failed = true;
+        return receive_all;
+    }
+
+    const uint8_t *destination = frame;
+    bool broadcast = emac_address_is_broadcast(destination);
+    bool multicast = (destination[0] & 1u) != 0u && !broadcast;
+    bool match = false;
+    if (broadcast) {
+        match = (filter & EMAC_MAC_FILTER_BLOCK_BCAST) == 0u;
+    } else {
+        for (unsigned slot = 0; slot < 8u && !match; slot++)
+            match = emac_address_register_match(s, slot, destination,
+                                                false);
+        if (!match && multicast &&
+            (filter & EMAC_MAC_FILTER_ALL_MULTICAST) != 0u)
+            match = true;
+        uint32_t hash_enable = multicast ?
+            EMAC_MAC_FILTER_HASH_MULTICAST : EMAC_MAC_FILTER_HASH_UNICAST;
+        if (!match && (filter & hash_enable) != 0u)
+            match = emac_hash_match(s, destination);
+        if (filter & EMAC_MAC_FILTER_DA_INVERSE) match = !match;
+    }
+
+    bool source_match = true;
+    if (filter & EMAC_MAC_FILTER_SA_ENABLE) {
+        source_match = false;
+        for (unsigned slot = 1u; slot < 8u && !source_match; slot++)
+            source_match = emac_address_register_match(s, slot, frame + 6u,
+                                                       true);
+        if (filter & EMAC_MAC_FILTER_SA_INVERSE)
+            source_match = !source_match;
+    }
+
+    bool control_ok = true;
+    if (len >= 14u && frame[12] == 0x88u && frame[13] == 0x08u)
+        control_ok = (filter & EMAC_MAC_FILTER_CTRL_MASK) != 0u;
+    bool passed = match && source_match && control_ok;
+    if (destination_failed) *destination_failed = !match;
+    return passed || receive_all;
+}
+
+static void emac_record_missed_frame(esp32_periph_t *p) {
+    emac_state_t *s = &p->emac;
+    uint32_t missed = s->dma[EMAC_DMA_MISSED_OFF / 4u];
+    uint32_t count = missed & 0xFFFFu;
+    if (count == 0xFFFFu) {
+        missed |= 1u << 16;
+        count = 0u;
+    } else {
+        count++;
+    }
+    s->dma[EMAC_DMA_MISSED_OFF / 4u] = (missed & ~0xFFFFu) | count;
+}
+
+static int emac_receive_frame(esp32_periph_t *p, const uint8_t *frame,
+                              size_t len) {
+    if (!p || !frame || len == 0u || len > EMAC_MAX_FRAME_SIZE ||
+        !emac_clocked(p))
+        return 0;
+    emac_state_t *s = &p->emac;
+    uint32_t opmode = s->dma[EMAC_DMA_OPMODE_OFF / 4u];
+    uint32_t config = s->mac[EMAC_MAC_CONFIG_OFF / 4u];
+    if ((opmode & EMAC_DMA_OP_RX_START) == 0u ||
+        (config & EMAC_MAC_CONFIG_RX) == 0u ||
+        (s->dma_status & EMAC_DMA_ST_FATAL_BUS) != 0u)
+        return 0;
+
+    bool destination_failed = false;
+    if (!emac_filter_frame(s, frame, len, &destination_failed))
+        return 0;
+
+    emac_descriptor_t descriptors[EMAC_DMA_MAX_DESCRIPTORS];
+    size_t descriptor_count = 0u;
+    size_t remaining = len + 4u;
+    uint32_t address = s->rx_current_desc;
+    if (address == 0u)
+        address = s->dma[EMAC_DMA_RX_BASE_OFF / 4u] & ~3u;
+
+    while (remaining != 0u &&
+           descriptor_count < EMAC_DMA_MAX_DESCRIPTORS) {
+        emac_descriptor_t *desc = &descriptors[descriptor_count];
+        if (address == 0u || !emac_read_descriptor(p, address, false, desc)) {
+            emac_fatal_bus_error(p);
+            return 0;
+        }
+        if ((desc->status & EMAC_DESC_OWN) == 0u) {
+            emac_record_missed_frame(p);
+            emac_raise_status(p, EMAC_DMA_ST_RX_UNAVAILABLE);
+            return 0;
+        }
+
+        size_t capacity = desc->size1;
+        bool chained = (desc->control & EMAC_RX_DESC_CHAINED) != 0u;
+        if (!chained) capacity += desc->size2;
+        if (capacity == 0u ||
+            (desc->size1 != 0u &&
+             !emac_dma_range_mapped(p, desc->buffer1, desc->size1, true)) ||
+            (!chained && desc->size2 != 0u &&
+             !emac_dma_range_mapped(p, desc->buffer2_or_next,
+                                    desc->size2, true))) {
+            emac_fatal_bus_error(p);
+            return 0;
+        }
+        descriptor_count++;
+        if (capacity >= remaining) remaining = 0u;
+        else remaining -= capacity;
+        if (remaining != 0u) {
+            if (desc->next == 0u || desc->next == address) {
+                emac_fatal_bus_error(p);
+                return 0;
+            }
+            address = desc->next;
+        }
+    }
+    if (remaining != 0u || descriptor_count == 0u) {
+        emac_fatal_bus_error(p);
+        return 0;
+    }
+
+    uint32_t fcs = emac_crc32(frame, len);
+    size_t stream_pos = 0u;
+    size_t total = len + 4u;
+    for (size_t index = 0; index < descriptor_count; index++) {
+        emac_descriptor_t *desc = &descriptors[index];
+        uint32_t buffers[2] = {desc->buffer1, desc->buffer2_or_next};
+        uint16_t sizes[2] = {desc->size1, desc->size2};
+        unsigned buffer_count =
+            (desc->control & EMAC_RX_DESC_CHAINED) ? 1u : 2u;
+        for (unsigned buffer = 0; buffer < buffer_count; buffer++) {
+            for (uint16_t byte = 0;
+                 byte < sizes[buffer] && stream_pos < total;
+                 byte++, stream_pos++) {
+                uint8_t value;
+                if (stream_pos < len) value = frame[stream_pos];
+                else value = (uint8_t)(fcs >> ((stream_pos - len) * 8u));
+                mem_write8(p->mem, buffers[buffer] + byte, value);
+            }
+        }
+        uint32_t status = 0u;
+        if (index == 0u) status |= EMAC_RX_DESC_FIRST;
+        if (index + 1u == descriptor_count) {
+            status |= EMAC_RX_DESC_LAST;
+            status |= (uint32_t)(len + 4u) <<
+                      EMAC_RX_DESC_FRAME_LEN_SHIFT;
+            if (destination_failed) status |= EMAC_RX_DESC_DA_FILTER_FAIL;
+            if (len >= 14u && frame[12] == 0x81u && frame[13] == 0x00u)
+                status |= EMAC_RX_DESC_VLAN;
+        }
+        mem_write32(p->mem, desc->address, status);
+    }
+
+    emac_descriptor_t *last = &descriptors[descriptor_count - 1u];
+    s->rx_current_desc = last->next;
+    s->dma[EMAC_DMA_RX_CUR_DESC_OFF / 4u] = s->rx_current_desc;
+    s->dma[EMAC_DMA_RX_CUR_BUF_OFF / 4u] = last->buffer1;
+    if ((last->control & EMAC_RX_DESC_DISABLE_IRQ) == 0u)
+        emac_raise_status(p, EMAC_DMA_ST_RX);
+    return 1;
+}
+
+static bool emac_copy_tx_buffer(esp32_periph_t *p, uint32_t address,
+                                size_t len, size_t *frame_len,
+                                bool *too_large) {
+    if (len == 0u) return true;
+    if (!emac_dma_range_mapped(p, address, len, false)) return false;
+    size_t available = *frame_len < EMAC_MAX_FRAME_SIZE ?
+        EMAC_MAX_FRAME_SIZE - *frame_len : 0u;
+    size_t copy = len < available ? len : available;
+    for (size_t index = 0; index < copy; index++)
+        p->emac.tx_frame[*frame_len + index] =
+            mem_read8(p->mem, address + (uint32_t)index);
+    *frame_len += copy;
+    if (copy != len) *too_large = true;
+    return true;
+}
+
+static void emac_process_tx(esp32_periph_t *p) {
+    emac_state_t *s = &p->emac;
+    uint32_t opmode = s->dma[EMAC_DMA_OPMODE_OFF / 4u];
+    uint32_t config = s->mac[EMAC_MAC_CONFIG_OFF / 4u];
+    if (!emac_clocked(p) || (opmode & EMAC_DMA_OP_TX_START) == 0u ||
+        (config & EMAC_MAC_CONFIG_TX) == 0u ||
+        (s->dma_status & EMAC_DMA_ST_FATAL_BUS) != 0u)
+        return;
+
+    uint32_t current = s->tx_current_desc;
+    if (current == 0u)
+        current = s->dma[EMAC_DMA_TX_BASE_OFF / 4u] & ~3u;
+    unsigned total_seen = 0u;
+    while (current != 0u && total_seen < EMAC_DMA_MAX_DESCRIPTORS) {
+        emac_descriptor_t frame_desc[EMAC_DMA_MAX_DESCRIPTORS];
+        size_t frame_desc_count = 0u;
+        size_t frame_len = 0u;
+        bool too_large = false;
+        bool have_first = false;
+        bool complete = false;
+        bool interrupt_on_completion = false;
+        uint32_t address = current;
+
+        while (frame_desc_count < EMAC_DMA_MAX_DESCRIPTORS &&
+               total_seen + frame_desc_count < EMAC_DMA_MAX_DESCRIPTORS) {
+            emac_descriptor_t *desc = &frame_desc[frame_desc_count];
+            if (!emac_read_descriptor(p, address, true, desc)) {
+                emac_fatal_bus_error(p);
+                return;
+            }
+            if ((desc->status & EMAC_DESC_OWN) == 0u) {
+                if (frame_desc_count == 0u)
+                    emac_raise_status(p, EMAC_DMA_ST_TX_UNAVAILABLE);
+                return;
+            }
+            if (frame_desc_count == 0u)
+                have_first = (desc->status & EMAC_TX_DESC_FIRST) != 0u;
+            if (desc->status & EMAC_TX_DESC_IOC)
+                interrupt_on_completion = true;
+            if (!emac_copy_tx_buffer(p, desc->buffer1, desc->size1,
+                                     &frame_len, &too_large)) {
+                emac_fatal_bus_error(p);
+                return;
+            }
+            if ((desc->status & EMAC_TX_DESC_CHAINED) == 0u &&
+                !emac_copy_tx_buffer(p, desc->buffer2_or_next, desc->size2,
+                                     &frame_len, &too_large)) {
+                emac_fatal_bus_error(p);
+                return;
+            }
+            frame_desc_count++;
+            if (desc->status & EMAC_TX_DESC_LAST) {
+                complete = true;
+                break;
+            }
+            if (desc->next == 0u || desc->next == address) {
+                emac_fatal_bus_error(p);
+                return;
+            }
+            address = desc->next;
+        }
+
+        if (!complete) {
+            emac_raise_status(p, EMAC_DMA_ST_TX_UNDERFLOW);
+            return;
+        }
+
+        emac_descriptor_t *last = &frame_desc[frame_desc_count - 1u];
+        bool valid = have_first && !too_large && frame_len != 0u;
+        int wire_result = valid && s->tx_cb ?
+            s->tx_cb(s->tx_cb_ctx, s->tx_frame, frame_len) : 0;
+        for (size_t index = 0; index < frame_desc_count; index++) {
+            uint32_t status = frame_desc[index].status & ~EMAC_DESC_OWN;
+            if (index + 1u == frame_desc_count &&
+                (!valid || wire_result != 0)) {
+                status |= EMAC_TX_DESC_ERROR;
+                if (wire_result != 0) status |= EMAC_TX_DESC_NO_CARRIER;
+            }
+            mem_write32(p->mem, frame_desc[index].address, status);
+        }
+
+        s->tx_current_desc = last->next;
+        s->dma[EMAC_DMA_TX_CUR_DESC_OFF / 4u] = s->tx_current_desc;
+        s->dma[EMAC_DMA_TX_CUR_BUF_OFF / 4u] = last->buffer1;
+        if (interrupt_on_completion)
+            emac_raise_status(p, EMAC_DMA_ST_TX);
+        if (valid && wire_result == 0 &&
+            (config & EMAC_MAC_CONFIG_LOOPBACK) != 0u)
+            (void)emac_receive_frame(p, s->tx_frame, frame_len);
+
+        total_seen += (unsigned)frame_desc_count;
+        current = s->tx_current_desc;
+        if (current == 0u) return;
+        emac_descriptor_t next;
+        if (!emac_read_descriptor(p, current, true, &next)) {
+            emac_fatal_bus_error(p);
+            return;
+        }
+        if ((next.status & EMAC_DESC_OWN) == 0u) {
+            emac_raise_status(p, EMAC_DMA_ST_TX_UNAVAILABLE);
+            return;
+        }
+    }
+}
+
+static void emac_mdio_transaction(esp32_periph_t *p, uint32_t command) {
+    emac_state_t *s = &p->emac;
+    uint8_t reg = (uint8_t)((command >> EMAC_MII_REG_SHIFT) & 0x1Fu);
+    uint8_t phy = (uint8_t)((command >> EMAC_MII_PHY_SHIFT) & 0x1Fu);
+    bool write = (command & EMAC_MII_WRITE) != 0u;
+    uint16_t value = (uint16_t)s->mac[EMAC_MAC_MII_DATA_OFF / 4u];
+    int result = 0;
+    if (s->mdio_cb) {
+        result = s->mdio_cb(s->mdio_cb_ctx, phy, reg, write, &value);
+    } else if ((s->phy_present & (1u << phy)) != 0u) {
+        if (write) {
+            if (reg == 0u && (value & 0x8000u) != 0u)
+                value &= (uint16_t)~0x8000u;
+            s->phy_regs[phy][reg] = value;
+        } else {
+            value = s->phy_regs[phy][reg];
+        }
+    } else {
+        result = -1;
+    }
+    if (!write)
+        s->mac[EMAC_MAC_MII_DATA_OFF / 4u] =
+            result == 0 ? value : 0xFFFFu;
+    s->mac[EMAC_MAC_MII_ADDR_OFF / 4u] = command & ~EMAC_MII_BUSY;
+}
+
+static uint32_t emac_read(void *ctx, uint32_t addr) {
+    esp32_periph_t *p = ctx;
+    emac_state_t *s = &p->emac;
+    if ((addr & 3u) != 0u) return default_read(ctx, addr);
+
+    if (addr >= EMAC_DMA_BASE && addr < EMAC_EXT_BASE) {
+        uint32_t off = addr - EMAC_DMA_BASE;
+        if (off >= EMAC_DMA_REG_FILE_SIZE) return 0u;
+        switch (off) {
+        case EMAC_DMA_STATUS_OFF: return emac_dma_status_value(s);
+        case EMAC_DMA_MISSED_OFF: {
+            uint32_t value = s->dma[off / 4u];
+            s->dma[off / 4u] = 0u;
+            return value;
+        }
+        case EMAC_DMA_TX_CUR_DESC_OFF: return s->tx_current_desc;
+        case EMAC_DMA_RX_CUR_DESC_OFF: return s->rx_current_desc;
+        default: return s->dma[off / 4u];
+        }
+    }
+    if (addr >= EMAC_EXT_BASE && addr < EMAC_DMA_BASE + PAGE_SIZE) {
+        uint32_t off = addr - EMAC_EXT_BASE;
+        if (off >= EMAC_EXT_REG_FILE_SIZE) return 0u;
+        return s->ext[off / 4u];
+    }
+    if (addr >= EMAC_MAC_BASE && addr < EMAC_MAC_BASE + PAGE_SIZE) {
+        uint32_t off = addr - EMAC_MAC_BASE;
+        if (off >= EMAC_MAC_REG_FILE_SIZE) return 0u;
+        switch (off) {
+        case EMAC_MAC_DEBUG_OFF: return 0u;
+        case EMAC_MAC_ADDR0_HIGH_OFF:
+            return s->mac[off / 4u] | (1u << 31);
+        case EMAC_MAC_STATUS_OFF: {
+            uint32_t config = s->mac[EMAC_MAC_CONFIG_OFF / 4u];
+            uint32_t speed = (config & EMAC_MAC_CONFIG_FAST_SPEED) ? 1u : 0u;
+            return ((config & EMAC_MAC_CONFIG_DUPLEX) ? 1u : 0u) |
+                   (speed << 1u);
+        }
+        default: return s->mac[off / 4u];
+        }
+    }
+    return default_read(ctx, addr);
+}
+
+static void emac_dma_write(esp32_periph_t *p, uint32_t off,
+                           uint32_t value) {
+    emac_state_t *s = &p->emac;
+    switch (off) {
+    case EMAC_DMA_BUS_MODE_OFF:
+        if (value & EMAC_DMA_BUS_SW_RESET) {
+            emac_reset_dma(p);
+            return;
+        }
+        s->dma[off / 4u] = value & ~EMAC_DMA_BUS_SW_RESET;
+        return;
+    case EMAC_DMA_TX_POLL_OFF:
+        s->dma[off / 4u] = value;
+        emac_process_tx(p);
+        return;
+    case EMAC_DMA_RX_POLL_OFF:
+        s->dma[off / 4u] = value;
+        return;
+    case EMAC_DMA_RX_BASE_OFF:
+        s->dma[off / 4u] = value & ~3u;
+        s->rx_current_desc = value & ~3u;
+        s->dma[EMAC_DMA_RX_CUR_DESC_OFF / 4u] = s->rx_current_desc;
+        return;
+    case EMAC_DMA_TX_BASE_OFF:
+        s->dma[off / 4u] = value & ~3u;
+        s->tx_current_desc = value & ~3u;
+        s->dma[EMAC_DMA_TX_CUR_DESC_OFF / 4u] = s->tx_current_desc;
+        return;
+    case EMAC_DMA_STATUS_OFF:
+        s->dma_status &= ~(value & EMAC_DMA_ST_EVENT_MASK);
+        emac_refresh_summaries(s);
+        emac_irq_update(p);
+        return;
+    case EMAC_DMA_OPMODE_OFF: {
+        bool tx_was_stopped =
+            (s->dma[off / 4u] & EMAC_DMA_OP_TX_START) == 0u;
+        bool rx_was_stopped =
+            (s->dma[off / 4u] & EMAC_DMA_OP_RX_START) == 0u;
+        s->dma[off / 4u] = value & ~EMAC_DMA_OP_FLUSH_TX;
+        if (rx_was_stopped && (value & EMAC_DMA_OP_RX_START)) {
+            s->rx_current_desc = s->dma[EMAC_DMA_RX_BASE_OFF / 4u];
+            s->dma[EMAC_DMA_RX_CUR_DESC_OFF / 4u] = s->rx_current_desc;
+        }
+        if (tx_was_stopped && (value & EMAC_DMA_OP_TX_START)) {
+            s->tx_current_desc = s->dma[EMAC_DMA_TX_BASE_OFF / 4u];
+            s->dma[EMAC_DMA_TX_CUR_DESC_OFF / 4u] = s->tx_current_desc;
+            emac_process_tx(p);
+        }
+        return;
+    }
+    case EMAC_DMA_INT_ENA_OFF:
+        s->dma[off / 4u] = value & 0x0001E7FFu;
+        emac_refresh_summaries(s);
+        emac_irq_update(p);
+        return;
+    case EMAC_DMA_MISSED_OFF:
+    case EMAC_DMA_TX_CUR_DESC_OFF:
+    case EMAC_DMA_RX_CUR_DESC_OFF:
+    case EMAC_DMA_TX_CUR_BUF_OFF:
+    case EMAC_DMA_RX_CUR_BUF_OFF:
+        return;
+    default:
+        s->dma[off / 4u] = value;
+        return;
+    }
+}
+
+static void emac_write(void *ctx, uint32_t addr, uint32_t value) {
+    esp32_periph_t *p = ctx;
+    emac_state_t *s = &p->emac;
+    if ((addr & 3u) != 0u) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    if (addr >= EMAC_DMA_BASE && addr < EMAC_EXT_BASE) {
+        uint32_t off = addr - EMAC_DMA_BASE;
+        if (off < EMAC_DMA_REG_FILE_SIZE) emac_dma_write(p, off, value);
+        return;
+    }
+    if (addr >= EMAC_EXT_BASE && addr < EMAC_DMA_BASE + PAGE_SIZE) {
+        uint32_t off = addr - EMAC_EXT_BASE;
+        if (off < EMAC_EXT_REG_FILE_SIZE) s->ext[off / 4u] = value;
+        return;
+    }
+    if (addr >= EMAC_MAC_BASE && addr < EMAC_MAC_BASE + PAGE_SIZE) {
+        uint32_t off = addr - EMAC_MAC_BASE;
+        if (off >= EMAC_MAC_REG_FILE_SIZE) return;
+        switch (off) {
+        case EMAC_MAC_MII_ADDR_OFF:
+            s->mac[off / 4u] = value;
+            if (value & EMAC_MII_BUSY) emac_mdio_transaction(p, value);
+            return;
+        case EMAC_MAC_FLOW_CTRL_OFF:
+            s->mac[off / 4u] = value & ~1u;
+            return;
+        case EMAC_MAC_DEBUG_OFF:
+        case EMAC_MAC_INT_STATUS_OFF:
+        case EMAC_MAC_STATUS_OFF:
+            return;
+        case EMAC_MAC_ADDR0_HIGH_OFF:
+            s->mac[off / 4u] = value | (1u << 31);
+            return;
+        default:
+            s->mac[off / 4u] = value;
+            return;
+        }
+    }
+    default_write(ctx, addr, value);
+}
+
 /* ---- I2S0/I2S1 + circular lldesc DMA ---- */
 
 static const int i2s_intr_sources[I2S_PORT_COUNT] = {32, 33};
@@ -10257,6 +11106,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Classic SJA1000-compatible TWAI controller starts in reset mode. */
     twai_reset_state(p);
 
+    /* Classic DesignWare Ethernet MAC/DMA and RMII extension reset state. */
+    emac_reset_state(p);
+
     /* LEDC reset state: all eight timers begin held in reset, and DATE is
      * the ESP32 peripheral version value from the vendor register map. */
     ledc_reset_state(p);
@@ -10302,6 +11154,13 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Classic TWAI/CAN controller (interrupt source 45). */
     mem_register_mmio(mem, (int)PAGE_OF(TWAI_BASE),
                       twai_read, twai_write, p);
+
+    /* Ethernet DMA/EXT share one page; MAC registers occupy the next page
+     * (interrupt source 38). */
+    mem_register_mmio(mem, (int)PAGE_OF(EMAC_DMA_BASE),
+                      emac_read, emac_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(EMAC_MAC_BASE),
+                      emac_read, emac_write, p);
 
     /* SPI1 (general SPI) */
     mem_register_mmio(mem, (int)PAGE_OF(SPI1_BASE), spi_read, spi_write, p);
@@ -10489,6 +11348,44 @@ int periph_twai_rx_inject(esp32_periph_t *p,
 
 size_t periph_twai_rx_pending(const esp32_periph_t *p) {
     return p ? p->twai.rx_count : 0u;
+}
+
+int periph_set_emac_tx_callback(esp32_periph_t *p, periph_emac_tx_fn fn,
+                                void *ctx) {
+    if (!p) return -1;
+    p->emac.tx_cb = fn;
+    p->emac.tx_cb_ctx = fn ? ctx : NULL;
+    return 0;
+}
+
+int periph_set_emac_mdio_callback(esp32_periph_t *p,
+                                  periph_emac_mdio_fn fn, void *ctx) {
+    if (!p) return -1;
+    p->emac.mdio_cb = fn;
+    p->emac.mdio_cb_ctx = fn ? ctx : NULL;
+    return 0;
+}
+
+int periph_emac_phy_set_reg(esp32_periph_t *p, uint8_t phy_address,
+                            uint8_t reg, uint16_t value) {
+    if (!p || phy_address >= 32u || reg >= 32u) return -1;
+    p->emac.phy_regs[phy_address][reg] = value;
+    p->emac.phy_present |= 1u << phy_address;
+    return 0;
+}
+
+int periph_emac_phy_get_reg(const esp32_periph_t *p, uint8_t phy_address,
+                            uint8_t reg, uint16_t *value) {
+    if (!p || !value || phy_address >= 32u || reg >= 32u ||
+        (p->emac.phy_present & (1u << phy_address)) == 0u)
+        return -1;
+    *value = p->emac.phy_regs[phy_address][reg];
+    return 0;
+}
+
+int periph_emac_rx_inject(esp32_periph_t *p, const uint8_t *frame,
+                          size_t len) {
+    return emac_receive_frame(p, frame, len);
 }
 
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx) {

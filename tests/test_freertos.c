@@ -430,6 +430,117 @@ TEST(test_semaphore_create_take_give) {
     frt_teardown(&cpu, rom, frt);
 }
 
+static uint32_t frt_create_sched_task(xtensa_cpu_t *cpu,
+                                      freertos_stubs_t *frt,
+                                      uint32_t entry, const char *name,
+                                      uint32_t priority,
+                                      uint32_t name_addr,
+                                      uint32_t handle_addr) {
+    extern void stub_xTaskCreate(xtensa_cpu_t *, void *);
+    for (size_t index = 0; index <= strlen(name); index++)
+        mem_write8(cpu->mem, name_addr + (uint32_t)index,
+                   (uint8_t)name[index]);
+    mem_write32(cpu->mem, handle_addr, 0u);
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, BASE + 0x180u);
+    ar_write(cpu, 2, entry);
+    ar_write(cpu, 3, name_addr);
+    ar_write(cpu, 4, 2048u);
+    ar_write(cpu, 5, 0u);
+    ar_write(cpu, 6, priority);
+    ar_write(cpu, 7, handle_addr);
+    cpu->pc = BASE + 0x40u;
+    stub_xTaskCreate(cpu, frt);
+    ASSERT_EQ(ar_read(cpu, 2), 1u);
+    return mem_read32(cpu->mem, handle_addr);
+}
+
+TEST(test_task_notify_isr_preempts_and_preserves_window_context) {
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    const uint32_t low_entry = 0x400D3000u;
+    const uint32_t high_entry = 0x400D4000u;
+    uint32_t low_handle = frt_create_sched_task(
+        &cpu, frt, low_entry, "low", 1u, 0x3FFB3000u, 0x3FFB3040u);
+    uint32_t high_handle = frt_create_sched_task(
+        &cpu, frt, high_entry, "high", 5u, 0x3FFB3020u, 0x3FFB3044u);
+    ASSERT_TRUE(low_handle != 0u);
+    ASSERT_TRUE(high_handle != 0u);
+    ASSERT_TRUE(freertos_stubs_scheduler_active(frt));
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0), "low") == 0);
+
+    /* Preserve data in the part of the 32-deep spill history that the old
+     * eight-entry TCB copy could not hold.  Saving this task used to overwrite
+     * the following TCB before the higher-priority task was restored. */
+    cpu.pc = low_entry + 0x20u;
+    cpu.spill_stack[3].depth = SPILL_STACK_DEPTH;
+    cpu.spill_stack[3].base[SPILL_STACK_DEPTH - 1] = 0x3FFBEE00u;
+    cpu.spill_stack[3].core[SPILL_STACK_DEPTH - 1][2] = 0x12345678u;
+    cpu.spill_stack[3].extra[SPILL_STACK_DEPTH - 1][7] = 0x89ABCDEFu;
+    cpu.spill_shadow[3].regs[11] = 0xCAFEBABEu;
+    cpu.spill_shadow[3].base = 0x3FFBDD00u;
+    cpu.spill_shadow[3].count = 12;
+    cpu.window_callsize[3] = 3u;
+
+    /* Higher priorities preempt immediately; a tick is required only for an
+     * equal-priority round-robin switch. */
+    ASSERT_TRUE(freertos_stubs_check_preempt(frt));
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0), "high") == 0);
+    ASSERT_EQ(cpu.pc, high_entry);
+
+    extern void stub_ulTaskGenericNotifyTake(xtensa_cpu_t *, void *);
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, 0x400D4100u);
+    ar_write(&cpu, 2, 0u);          /* notification slot */
+    ar_write(&cpu, 3, 1u);          /* clear count on exit */
+    ar_write(&cpu, 4, UINT32_MAX);  /* wait indefinitely */
+    cpu.pc = 0x400D4080u;
+    stub_ulTaskGenericNotifyTake(&cpu, frt);
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0), "low") == 0);
+    ASSERT_EQ(cpu.pc, low_entry + 0x20u);
+    ASSERT_EQ(cpu.spill_stack[3].depth, SPILL_STACK_DEPTH);
+    ASSERT_EQ(cpu.spill_stack[3].base[SPILL_STACK_DEPTH - 1], 0x3FFBEE00u);
+    ASSERT_EQ(cpu.spill_stack[3].core[SPILL_STACK_DEPTH - 1][2], 0x12345678u);
+    ASSERT_EQ(cpu.spill_stack[3].extra[SPILL_STACK_DEPTH - 1][7], 0x89ABCDEFu);
+    ASSERT_EQ(cpu.spill_shadow[3].regs[11], 0xCAFEBABEu);
+    ASSERT_EQ(cpu.spill_shadow[3].base, 0x3FFBDD00u);
+    ASSERT_EQ(cpu.spill_shadow[3].count, 12);
+    ASSERT_EQ(cpu.window_callsize[3], 3u);
+
+    extern void stub_vTaskGenericNotifyGiveFromISR(xtensa_cpu_t *, void *);
+    uint32_t woken_addr = 0x3FFB3050u;
+    mem_write32(cpu.mem, woken_addr, 0u);
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, 0x400D3100u);
+    ar_write(&cpu, 2, high_handle);
+    ar_write(&cpu, 3, 0u);
+    ar_write(&cpu, 4, woken_addr);
+    cpu.pc = 0x400D3080u;
+    stub_vTaskGenericNotifyGiveFromISR(&cpu, frt);
+    ASSERT_EQ(mem_read32(cpu.mem, woken_addr), 1u);
+
+    /* The unblocked task must preempt even though zero cycles of the low
+     * priority task's current slice have elapsed. */
+    ASSERT_TRUE(freertos_stubs_check_preempt(frt));
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0), "high") == 0);
+    ASSERT_EQ(cpu.pc, 0x400D4100u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+
+    /* clear-on-exit consumed the notification count. */
+    ar_write(&cpu, 0, 0x400D4110u);
+    ar_write(&cpu, 2, 0u);
+    ar_write(&cpu, 3, 1u);
+    ar_write(&cpu, 4, 0u);
+    cpu.pc = 0x400D4080u;
+    stub_ulTaskGenericNotifyTake(&cpu, frt);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_bump_allocator) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -537,6 +648,7 @@ static void run_freertos_tests(void) {
     RUN_TEST(test_queue_receive_empty_returns_false);
     RUN_TEST(test_queue_overwrite_and_reset);
     RUN_TEST(test_semaphore_create_take_give);
+    RUN_TEST(test_task_notify_isr_preempts_and_preserves_window_context);
     RUN_TEST(test_bump_allocator);
     RUN_TEST(test_vTaskDelay_caps_large_ticks);
     RUN_TEST(test_vTaskDelete_noop);

@@ -1170,6 +1170,275 @@ TEST(twai_wire_timing_self_reception_retry_busoff_and_recovery) {
     mem_destroy(mem);
 }
 
+#define TEST_EMAC_DMA_BASE 0x3FF69000u
+#define TEST_EMAC_EXT_BASE 0x3FF69800u
+#define TEST_EMAC_MAC_BASE 0x3FF6A000u
+#define TEST_EMAC_OWN (1u << 31)
+#define TEST_EMAC_TX_IOC (1u << 30)
+#define TEST_EMAC_TX_LAST (1u << 29)
+#define TEST_EMAC_TX_FIRST (1u << 28)
+#define TEST_EMAC_TX_CHAINED (1u << 20)
+#define TEST_EMAC_TX_ERROR (1u << 15)
+#define TEST_EMAC_TX_NO_CARRIER (1u << 10)
+#define TEST_EMAC_RX_CHAINED (1u << 14)
+#define TEST_EMAC_RX_FIRST (1u << 9)
+#define TEST_EMAC_RX_LAST (1u << 8)
+#define TEST_EMAC_RX_DA_FAIL (1u << 30)
+#define TEST_EMAC_DMA_TX_INT (1u << 0)
+#define TEST_EMAC_DMA_TX_UNAVAILABLE (1u << 2)
+#define TEST_EMAC_DMA_RX_INT (1u << 6)
+#define TEST_EMAC_DMA_RX_UNAVAILABLE (1u << 7)
+#define TEST_EMAC_DMA_NORMAL_SUMMARY (1u << 16)
+
+typedef struct {
+    uint8_t frame[256];
+    size_t len;
+    unsigned count;
+    int result;
+} emac_test_capture_t;
+
+typedef struct {
+    unsigned calls;
+    uint8_t phy;
+    uint8_t reg;
+    bool write;
+    uint16_t value;
+} emac_test_mdio_t;
+
+static int test_emac_capture(void *ctx, const uint8_t *frame, size_t len) {
+    emac_test_capture_t *capture = ctx;
+    capture->count++;
+    capture->len = len;
+    if (len <= sizeof(capture->frame))
+        memcpy(capture->frame, frame, len);
+    return capture->result;
+}
+
+static int test_emac_mdio(void *ctx, uint8_t phy, uint8_t reg,
+                          bool write, uint16_t *value) {
+    emac_test_mdio_t *mdio = ctx;
+    mdio->calls++;
+    mdio->phy = phy;
+    mdio->reg = reg;
+    mdio->write = write;
+    if (write) mdio->value = *value;
+    else *value = mdio->value;
+    return 0;
+}
+
+static uint32_t test_emac_crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = UINT32_MAX;
+    for (size_t index = 0; index < len; index++) {
+        uint8_t byte = data[index];
+        for (unsigned bit = 0; bit < 8u; bit++) {
+            uint32_t mix = (crc ^ byte) & 1u;
+            crc >>= 1u;
+            if (mix) crc ^= 0xEDB88320u;
+            byte >>= 1u;
+        }
+    }
+    return ~crc;
+}
+
+static void test_emac_descriptor(xtensa_mem_t *mem, uint32_t descriptor,
+                                 uint32_t status, uint32_t control,
+                                 uint32_t buffer, uint32_t next) {
+    mem_write32(mem, descriptor, status);
+    mem_write32(mem, descriptor + 4u, control);
+    mem_write32(mem, descriptor + 8u, buffer);
+    mem_write32(mem, descriptor + 12u, next);
+    for (unsigned word = 4u; word < 8u; word++)
+        mem_write32(mem, descriptor + word * 4u, 0u);
+}
+
+TEST(emac_reset_clock_extension_and_clause22_mdio) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+
+    ASSERT_TRUE(mem_read32(mem, TEST_EMAC_MAC_BASE) & (1u << 15));
+    ASSERT_TRUE(mem_read32(mem, TEST_EMAC_MAC_BASE + 0x40u) & (1u << 31));
+    ASSERT_EQ(mem_read32(mem, TEST_EMAC_EXT_BASE + 0xFCu), 0x15040200u);
+    ASSERT_EQ(periph_emac_phy_set_reg(p, 3u, 2u, 0x2000u), 0);
+
+    uint32_t read_command = 1u | (2u << 6u) | (3u << 11u);
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x10u, read_command);
+    ASSERT_FALSE(mem_read32(mem, TEST_EMAC_MAC_BASE + 0x10u) & 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_EMAC_MAC_BASE + 0x14u), 0x2000u);
+
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x14u, 0x55AAu);
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x10u,
+                1u | (1u << 1u) | (4u << 6u) | (3u << 11u));
+    uint16_t phy_value = 0u;
+    ASSERT_EQ(periph_emac_phy_get_reg(p, 3u, 4u, &phy_value), 0);
+    ASSERT_EQ(phy_value, 0x55AAu);
+
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x10u,
+                1u | (2u << 6u) | (7u << 11u));
+    ASSERT_EQ(mem_read32(mem, TEST_EMAC_MAC_BASE + 0x14u), 0xFFFFu);
+
+    emac_test_mdio_t mdio = {.value = 0xBEEFu};
+    ASSERT_EQ(periph_set_emac_mdio_callback(p, test_emac_mdio, &mdio), 0);
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x10u,
+                1u | (5u << 6u) | (9u << 11u));
+    ASSERT_EQ(mdio.calls, 1u);
+    ASSERT_EQ(mdio.phy, 9u);
+    ASSERT_EQ(mdio.reg, 5u);
+    ASSERT_FALSE(mdio.write);
+    ASSERT_EQ(mem_read32(mem, TEST_EMAC_MAC_BASE + 0x14u), 0xBEEFu);
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x14u, 0x1234u);
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x10u,
+                1u | (1u << 1u) | (6u << 6u) | (9u << 11u));
+    ASSERT_EQ(mdio.calls, 2u);
+    ASSERT_EQ(mdio.reg, 6u);
+    ASSERT_TRUE(mdio.write);
+    ASSERT_EQ(mdio.value, 0x1234u);
+
+    mem_write32(mem, TEST_EMAC_MAC_BASE, 0xDEADBEEFu);
+    mem_write32(mem, 0x3FF000D0u, 1u << 7u);
+    ASSERT_EQ(mem_read32(mem, TEST_EMAC_MAC_BASE), 1u << 15u);
+    ASSERT_EQ(periph_emac_phy_get_reg(p, 3u, 4u, &phy_value), 0);
+    ASSERT_EQ(phy_value, 0x55AAu);
+    mem_write32(mem, 0x3FF000D0u, 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(emac_enhanced_chained_tx_completion_error_and_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    emac_test_capture_t capture = {0};
+    ASSERT_EQ(periph_set_emac_tx_callback(p, test_emac_capture, &capture), 0);
+
+    const uint32_t desc0 = 0x3FFB0000u;
+    const uint32_t desc1 = desc0 + 32u;
+    const uint32_t buffer0 = 0x3FFB1000u;
+    const uint32_t buffer1 = 0x3FFB1200u;
+    uint8_t expected[70];
+    for (unsigned index = 0; index < sizeof(expected); index++) {
+        expected[index] = (uint8_t)(0x30u + index);
+        mem_write8(mem, index < 40u ? buffer0 + index :
+                   buffer1 + index - 40u, expected[index]);
+    }
+    test_emac_descriptor(mem, desc0,
+                         TEST_EMAC_OWN | TEST_EMAC_TX_FIRST |
+                         TEST_EMAC_TX_IOC | TEST_EMAC_TX_CHAINED,
+                         40u, buffer0, desc1);
+    test_emac_descriptor(mem, desc1,
+                         TEST_EMAC_OWN | TEST_EMAC_TX_LAST |
+                         TEST_EMAC_TX_CHAINED,
+                         30u, buffer1, desc0);
+
+    mem_write32(mem, TEST_EMAC_DMA_BASE, 1u << 7u);
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x10u, desc0);
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x1Cu,
+                TEST_EMAC_DMA_TX_INT | TEST_EMAC_DMA_NORMAL_SUMMARY);
+    mem_write32(mem, TEST_EMAC_MAC_BASE, (1u << 15u) | (1u << 3u));
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x18u, 1u << 13u);
+
+    ASSERT_EQ(capture.count, 1u);
+    ASSERT_EQ(capture.len, sizeof(expected));
+    ASSERT_EQ(memcmp(capture.frame, expected, sizeof(expected)), 0);
+    ASSERT_FALSE(mem_read32(mem, desc0) & TEST_EMAC_OWN);
+    ASSERT_FALSE(mem_read32(mem, desc1) & TEST_EMAC_OWN);
+    uint32_t status = mem_read32(mem, TEST_EMAC_DMA_BASE + 0x14u);
+    ASSERT_TRUE(status & TEST_EMAC_DMA_TX_INT);
+    ASSERT_TRUE(status & TEST_EMAC_DMA_TX_UNAVAILABLE);
+    ASSERT_TRUE(status & TEST_EMAC_DMA_NORMAL_SUMMARY);
+    ASSERT_TRUE(periph_interrupt_pending(p, 38));
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x14u,
+                TEST_EMAC_DMA_TX_INT | TEST_EMAC_DMA_TX_UNAVAILABLE |
+                TEST_EMAC_DMA_NORMAL_SUMMARY);
+    ASSERT_FALSE(periph_interrupt_pending(p, 38));
+
+    capture.result = -1;
+    mem_write32(mem, desc0, mem_read32(mem, desc0) | TEST_EMAC_OWN);
+    mem_write32(mem, desc1, mem_read32(mem, desc1) | TEST_EMAC_OWN);
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x04u, 0u);
+    ASSERT_EQ(capture.count, 2u);
+    ASSERT_TRUE(mem_read32(mem, desc1) & TEST_EMAC_TX_ERROR);
+    ASSERT_TRUE(mem_read32(mem, desc1) & TEST_EMAC_TX_NO_CARRIER);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(emac_rx_filter_fcs_descriptor_chain_unavailable_and_receive_all) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t desc0 = 0x3FFB2000u;
+    const uint32_t desc1 = desc0 + 32u;
+    const uint32_t buffer0 = 0x3FFB3000u;
+    const uint32_t buffer1 = 0x3FFB3200u;
+    test_emac_descriptor(mem, desc0, TEST_EMAC_OWN,
+                         TEST_EMAC_RX_CHAINED | 32u,
+                         buffer0, desc1);
+    test_emac_descriptor(mem, desc1, TEST_EMAC_OWN,
+                         TEST_EMAC_RX_CHAINED | 32u,
+                         buffer1, desc0);
+
+    /* MAC address 02:11:22:33:44:55. */
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x44u, 0x33221102u);
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x40u, 0x00005544u);
+    mem_write32(mem, TEST_EMAC_DMA_BASE, 1u << 7u);
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x0Cu, desc0);
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x1Cu,
+                TEST_EMAC_DMA_RX_INT | TEST_EMAC_DMA_NORMAL_SUMMARY);
+    mem_write32(mem, TEST_EMAC_MAC_BASE,
+                (1u << 15u) | (1u << 2u));
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x18u, 1u << 1u);
+
+    uint8_t frame[60] = {
+        0x02, 0x11, 0x22, 0x33, 0x44, 0x55,
+        0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        0x08, 0x00,
+    };
+    for (unsigned index = 14u; index < sizeof(frame); index++)
+        frame[index] = (uint8_t)index;
+    ASSERT_EQ(periph_emac_rx_inject(p, frame, sizeof(frame)), 1);
+    ASSERT_TRUE(mem_read32(mem, desc0) & TEST_EMAC_RX_FIRST);
+    uint32_t last_status = mem_read32(mem, desc1);
+    ASSERT_TRUE(last_status & TEST_EMAC_RX_LAST);
+    ASSERT_EQ((last_status >> 16u) & 0x3FFFu, sizeof(frame) + 4u);
+    ASSERT_FALSE(last_status & TEST_EMAC_OWN);
+    for (unsigned index = 0; index < 32u; index++)
+        ASSERT_EQ(mem_read8(mem, buffer0 + index), frame[index]);
+    for (unsigned index = 32u; index < sizeof(frame); index++)
+        ASSERT_EQ(mem_read8(mem, buffer1 + index - 32u), frame[index]);
+    uint32_t expected_fcs = test_emac_crc32(frame, sizeof(frame));
+    for (unsigned index = 0; index < 4u; index++)
+        ASSERT_EQ(mem_read8(mem, buffer1 + 28u + index),
+                  (uint8_t)(expected_fcs >> (index * 8u)));
+    ASSERT_TRUE(mem_read32(mem, TEST_EMAC_DMA_BASE + 0x14u) &
+                TEST_EMAC_DMA_RX_INT);
+    ASSERT_TRUE(periph_interrupt_pending(p, 38));
+
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x14u,
+                TEST_EMAC_DMA_RX_INT | TEST_EMAC_DMA_NORMAL_SUMMARY);
+    ASSERT_EQ(periph_emac_rx_inject(p, frame, sizeof(frame)), 0);
+    ASSERT_TRUE(mem_read32(mem, TEST_EMAC_DMA_BASE + 0x14u) &
+                TEST_EMAC_DMA_RX_UNAVAILABLE);
+    ASSERT_EQ(mem_read32(mem, TEST_EMAC_DMA_BASE + 0x20u), 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_EMAC_DMA_BASE + 0x20u), 0u);
+    mem_write32(mem, TEST_EMAC_DMA_BASE + 0x14u,
+                TEST_EMAC_DMA_RX_UNAVAILABLE);
+
+    mem_write32(mem, desc0, TEST_EMAC_OWN);
+    mem_write32(mem, desc1, TEST_EMAC_OWN);
+    frame[0] = 0x06u;
+    ASSERT_EQ(periph_emac_rx_inject(p, frame, sizeof(frame)), 0);
+    ASSERT_TRUE(mem_read32(mem, desc0) & TEST_EMAC_OWN);
+    mem_write32(mem, TEST_EMAC_MAC_BASE + 0x04u, 1u << 31u);
+    ASSERT_EQ(periph_emac_rx_inject(p, frame, sizeof(frame)), 1);
+    ASSERT_TRUE(mem_read32(mem, desc1) & TEST_EMAC_RX_DA_FAIL);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 typedef struct {
     int count;
     uint8_t last;
@@ -4436,6 +4705,9 @@ static void run_peripheral_tests(void) {
     RUN_TEST(sdmmc_slot1_clock_gate_idmac_write_and_media_errors);
     RUN_TEST(twai_reset_acceptance_fifo_overrun_interrupt_and_dport);
     RUN_TEST(twai_wire_timing_self_reception_retry_busoff_and_recovery);
+    RUN_TEST(emac_reset_clock_extension_and_clause22_mdio);
+    RUN_TEST(emac_enhanced_chained_tx_completion_error_and_interrupt);
+    RUN_TEST(emac_rx_filter_fcs_descriptor_chain_unavailable_and_receive_all);
     RUN_TEST(uart_controllers_are_independent);
     RUN_TEST(uart_status_tx_ready);
     RUN_TEST(uart_tx_empty_interrupt);
