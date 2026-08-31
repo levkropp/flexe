@@ -60,12 +60,14 @@
 #define PAGE_WORDS      (PAGE_SIZE / sizeof(uint32_t))
 #define EMU_FLASH_SIZE  (4u * 1024u * 1024u)
 
-/* Classic ESP32 flash-cache MMU geometry. Each core owns a 256-entry table:
- * DROM0, IRAM0, IRAM1, and IROM0 each consume 64 entries. */
-#define FLASH_MMU_ENTRY_COUNT 256u
-#define FLASH_MMU_PAGE_SIZE   0x10000u
-#define FLASH_MMU_INVALID     0x100u
-#define FLASH_MMU_VALUE_MASK  0x1FFu
+/* Classic ESP32 flash-cache MMU geometry. Each core exposes an 8 KiB register
+ * window. The first 256 entries drive the four 64-entry DROM0/IRAM0/IRAM1/
+ * IROM0 XIP regions; later entries include reserved and PSRAM/PID banks. */
+#define FLASH_MMU_REGISTER_COUNT 2048u
+#define FLASH_MMU_ENTRY_COUNT    256u
+#define FLASH_MMU_PAGE_SIZE      0x10000u
+#define FLASH_MMU_INVALID        0x100u
+#define FLASH_MMU_VALUE_MASK     0x1FFu
 
 /* RTC-domain analog register geometry (classic ESP32). RTCIO and SENS share
  * RTC_CNTL's 4 KiB MMIO page, at offsets 0x400 and 0x800 respectively. */
@@ -1789,9 +1791,10 @@ struct esp32_periph {
 
     /* Flash cache MMU table shadows (DPORT_PRO/APP_FLASH_MMU_TABLE).
      * Entries 0-63 are DROM0; 64-127, 128-191, and 192-255 are the
-     * IRAM0, IRAM1, and IROM0 cache regions respectively. */
-    uint32_t flash_mmu_pro[FLASH_MMU_ENTRY_COUNT];
-    uint32_t flash_mmu_app[FLASH_MMU_ENTRY_COUNT];
+     * IRAM0, IRAM1, and IROM0 cache regions respectively. The full 2048-word
+     * register files remain readable and writable for startup-time mirroring. */
+    uint32_t flash_mmu_pro[FLASH_MMU_REGISTER_COUNT];
+    uint32_t flash_mmu_app[FLASH_MMU_REGISTER_COUNT];
     uint16_t flash_mmu_effective[FLASH_MMU_ENTRY_COUNT];
 };
 
@@ -1807,9 +1810,11 @@ struct esp32_periph {
  * no free vaddr slot and fail with ESP_ERR_NO_MEM (seen as
  * "load_partitions returned 0x101"). */
 static void flash_mmu_init_bootloader(esp32_periph_t *p) {
-    for (uint32_t s = 0; s < FLASH_MMU_ENTRY_COUNT; s++) {
+    for (uint32_t s = 0; s < FLASH_MMU_REGISTER_COUNT; s++) {
         p->flash_mmu_pro[s] = FLASH_MMU_INVALID;
         p->flash_mmu_app[s] = FLASH_MMU_INVALID;
+    }
+    for (uint32_t s = 0; s < FLASH_MMU_ENTRY_COUNT; s++) {
         /* Force the first explicit invalid-table write to remove mem_create's
          * temporary linear loader mappings from the guest page table. */
         p->flash_mmu_effective[s] = UINT16_MAX;
@@ -1959,11 +1964,16 @@ static void flash_mmu_apply_entry(esp32_periph_t *p, uint32_t entry,
 
 static void flash_mmu_write_entry(esp32_periph_t *p, int core,
                                   uint32_t entry, uint32_t val) {
-    if (entry >= FLASH_MMU_ENTRY_COUNT || core < 0 || core > 1) return;
+    if (entry >= FLASH_MMU_REGISTER_COUNT || core < 0 || core > 1) return;
     val &= FLASH_MMU_VALUE_MASK;
     uint32_t *own = core == 0 ? p->flash_mmu_pro : p->flash_mmu_app;
     uint32_t *other = core == 0 ? p->flash_mmu_app : p->flash_mmu_pro;
     own[entry] = val;
+
+    /* Only the first four 64-entry banks describe flash XIP buses. Preserve
+     * the remainder of the hardware register window without treating its
+     * reserved/PSRAM/PID banks as aliases of those virtual addresses. */
+    if (entry >= FLASH_MMU_ENTRY_COUNT) return;
 
     /* An invalidation on one core must not remove a mapping still active on
      * the other core. Once both are invalid, remove all 4 KiB host pages. */
@@ -1998,10 +2008,11 @@ static void flash_mmu_invalidate_physical(esp32_periph_t *p, uint32_t offset,
 static uint32_t dport_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - DPORT_BASE;
-    /* Flash MMU tables: PRO 0x3FF10000-0x3FF103FF, APP 0x3FF12000-0x3FF123FF */
-    if (off >= 0x10000 && off < 0x10400)
+    /* Full 8 KiB MMU register files. ESP-IDF 5.5 mirrors all 2048 words from
+     * PRO to APP during multicore startup, including non-XIP banks. */
+    if (off >= 0x10000 && off < 0x12000)
         return p->flash_mmu_pro[(off - 0x10000) >> 2];
-    if (off >= 0x12000 && off < 0x12400)
+    if (off >= 0x12000 && off < 0x14000)
         return p->flash_mmu_app[(off - 0x12000) >> 2];
     switch (off) {
     case 0x018: return p->app_cpu_in_reset ? 1 : 0; /* APPCPU_CTRL_D: reset state */
@@ -2049,13 +2060,12 @@ static uint32_t dport_read(void *ctx, uint32_t addr) {
 static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - DPORT_BASE;
-    /* Flash MMU tables: PRO 0x3FF10000-0x3FF103FF, APP 0x3FF12000-0x3FF123FF. */
-    if (off >= 0x10000 && off < 0x10400) {
+    if (off >= 0x10000 && off < 0x12000) {
         uint32_t entry = (off - 0x10000) >> 2;
         flash_mmu_write_entry(p, 0, entry, val);
         return;
     }
-    if (off >= 0x12000 && off < 0x12400) {
+    if (off >= 0x12000 && off < 0x14000) {
         uint32_t entry = (off - 0x12000) >> 2;
         flash_mmu_write_entry(p, 1, entry, val);
         return;
@@ -12660,9 +12670,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
      * handler (SHA installs its own MMIO model during session creation). */
     mem_register_mmio(mem, (int)PAGE_OF(DPORT_BASE),
                       dport_read, dport_write, p);
-    /* DPORT flash MMU tables: PRO 0x3FF10000, APP 0x3FF12000 */
-    mem_register_mmio(mem, (int)PAGE_OF(0x3FF10000u), dport_read, dport_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(0x3FF12000u), dport_read, dport_write, p);
+    /* Two adjacent 8 KiB DPORT flash-MMU register windows. */
+    mem_register_mmio_range(mem, 0x3FF10000u, 0x4000u,
+                            dport_read, dport_write, p);
 
     /* Three independent UART controllers (interrupt sources 34/35/36). */
     mem_register_mmio(mem, (int)PAGE_OF(UART0_BASE), uart_read, uart_write, p);

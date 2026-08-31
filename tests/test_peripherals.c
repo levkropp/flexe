@@ -2583,6 +2583,40 @@ TEST(flash_mmu_maps_complete_pages_and_all_instruction_buses) {
     mem_destroy(mem);
 }
 
+TEST(flash_mmu_exposes_full_multicore_copy_windows) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t pro = 0x3FF10000u;
+    const uint32_t app = 0x3FF12000u;
+
+    /* ESP-IDF 5.5 copies all 2048 words when restoring APP CPU cache state,
+     * not only the first 256 entries used for flash XIP mappings. */
+    ASSERT_EQ(mem_read32(mem, pro), 0x100u);
+    ASSERT_EQ(mem_read32(mem, pro + 2047u * 4u), 0x100u);
+    ASSERT_EQ(mem_read32(mem, app), 0x100u);
+    ASSERT_EQ(mem_read32(mem, app + 2047u * 4u), 0x100u);
+
+    mem_write32(mem, pro + 0u * 4u, 0x12u);
+    mem_write32(mem, pro + 255u * 4u, 0x34u);
+    mem_write32(mem, pro + 256u * 4u, 0x56u);
+    mem_write32(mem, pro + 1152u * 4u, 0x78u);
+    mem_write32(mem, pro + 2047u * 4u, UINT32_MAX);
+
+    for (uint32_t entry = 0; entry < 2048u; entry++)
+        mem_write32(mem, app + entry * 4u,
+                    mem_read32(mem, pro + entry * 4u));
+
+    ASSERT_EQ(mem_read32(mem, app + 0u * 4u), 0x12u);
+    ASSERT_EQ(mem_read32(mem, app + 255u * 4u), 0x34u);
+    ASSERT_EQ(mem_read32(mem, app + 256u * 4u), 0x56u);
+    ASSERT_EQ(mem_read32(mem, app + 1152u * 4u), 0x78u);
+    ASSERT_EQ(mem_read32(mem, app + 2047u * 4u), 0x1FFu);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(spi_flash_dual_io_mode_bits_are_not_address_bits) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -5406,6 +5440,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(spi_flash_write_enable_latch);
     RUN_TEST(spi_flash_program_erase_require_write_enable);
     RUN_TEST(flash_mmu_maps_complete_pages_and_all_instruction_buses);
+    RUN_TEST(flash_mmu_exposes_full_multicore_copy_windows);
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);
     RUN_TEST(wifi_mac_init_ready_handshake);
     RUN_TEST(radio_phy_calibration_register_files);
