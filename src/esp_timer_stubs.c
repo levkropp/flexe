@@ -35,16 +35,19 @@ struct esp_timer_stubs {
     emu_timer_t timers[MAX_TIMERS];
     int         timer_count;
 
-    /* Host wall-clock boot time for millis()/micros()/esp_timer_get_time().
-     * These return real elapsed time so the firmware's elapsed-time displays
-     * track wall-clock time instead of fast-forwarded virtual time. */
+    /* Host wall-clock boot time, used only when virtual time is disabled. */
     struct timespec boot_time;
 
     /* Bump allocator for timer handles */
     uint32_t bump_ptr;
 
-    /* If true, use virtual time for millis/micros/esp_timer_get_time
-     * instead of host wall-clock (native FreeRTOS mode) */
+    /* If true (the default), millis/micros/esp_timer_get_time derive from
+     * emulated time rather than the host wall clock. Guest-visible clocks
+     * must advance with emulated cycles: a firmware that busy-waits on
+     * millis() otherwise burns a real wall-clock interval — a different
+     * number of guest instructions on every run and on every host — which
+     * makes execution non-deterministic and decouples the guest's sense of
+     * time from CCOUNT and the peripherals. */
     int use_virtual_time;
 };
 
@@ -113,12 +116,23 @@ static uint64_t current_time_us(esp_timer_stubs_t *et) {
            et->cpu->virtual_time_us : cycle_us;
 }
 
+/* Fast-forward past a wait when no scheduler is available to block on.
+ * Guest-visible time (ccount, virtual_time_us) advances; cycle_count does
+ * not, because it counts *executed* guest instructions and drives the -c
+ * budget, and a fast-forward executes none.
+ *
+ * NOTE: this jumps straight to the end of the wait, so a peripheral or
+ * ccompare event scheduled inside the window is collapsed into a single
+ * observation instead of firing at its own ccount. Waits that go through the
+ * FreeRTOS scheduler (vTaskDelay) do advance event-by-event; Arduino's
+ * delay() is intercepted ahead of that call and does not. */
 static void advance_wait_time(esp_timer_stubs_t *et, xtensa_cpu_t *cpu,
                               uint64_t us) {
     uint64_t cycles = us * current_cpu_freq_mhz(et);
     cpu->virtual_time_us += us;
     cpu->ccount += (uint32_t)cycles;
 }
+
 
 /* ===== Find timer by handle ===== */
 
@@ -373,7 +387,9 @@ void stub_micros(xtensa_cpu_t *cpu, void *ctx) {
     et_return(cpu, (uint32_t)us);
 }
 
-/* delay(ms) — advance virtual time, dispatch timers */
+/* delay(ms) — Arduino's delay() is vTaskDelay() on real hardware, so block on
+ * the scheduler rather than jumping the clock past everything that should
+ * have run during the wait. */
 void stub_delay(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
     uint32_t ms = et_arg(cpu, 0);
@@ -389,6 +405,7 @@ esp_timer_stubs_t *esp_timer_stubs_create(xtensa_cpu_t *cpu) {
     if (!et) return NULL;
     et->cpu = cpu;
     et->cpu_freq_mhz = 160;
+    et->use_virtual_time = 1;
     et->bump_ptr = TIMER_BUMP_BASE;
     clock_gettime(CLOCK_MONOTONIC, &et->boot_time);
     return et;
@@ -446,6 +463,7 @@ int esp_timer_stubs_timer_count(const esp_timer_stubs_t *et) {
 void esp_timer_stubs_set_virtual_time(esp_timer_stubs_t *et, int enable) {
     if (et) et->use_virtual_time = enable;
 }
+
 
 void esp_timer_stubs_tick(esp_timer_stubs_t *et) {
     if (!et) return;
