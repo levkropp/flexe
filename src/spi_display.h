@@ -40,4 +40,13 @@ void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cf
 /* Release raw-SPI backing resources owned by a peripheral instance. */
 void periph_disable_spi_display(esp32_periph_t *p);
 
+/* Observe a transaction addressed to no modelled device -- that is, one whose
+ * chip select is none of display/touch/SD. Lets a test harness stand in as an
+ * arbitrary SPI slave: it sees the MOSI bytes and fills the MISO buffer.
+ * Without this the only way to exercise the SPI controller is through a
+ * device model, which fixes both the protocol and the pins. */
+typedef void (*spi_probe_fn)(const uint8_t *mosi, size_t mosi_len,
+                             uint8_t *miso, size_t miso_len, void *ctx);
+void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx);
+
 #endif /* SPI_DISPLAY_H */

@@ -158,8 +158,17 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 17 of 17 on x86-64
+The compiled Arduino hardware gates below all pass — 18 of 18 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
+
+`test-spi-master.sh` covers the one peripheral a CYD depends on most and no
+stock ROM exercises: TFT_eSPI and its relatives drive the GP-SPI registers
+directly, so ESP-IDF's `spi_master` driver — queued transactions, DMA
+descriptors, command and address phases — was never reached. The fixture puts
+its chip select on a pin the emulator models no device on, and the harness
+stands in as the slave, choosing every MISO byte from the transfer's own
+length and byte index so a short read or a shifted buffer cannot look
+plausible.
 
 The optional compiled Arduino gate builds an unmodified `Wire` client, runs
 40-byte writes and repeated-start reads through the real ESP-IDF interrupt

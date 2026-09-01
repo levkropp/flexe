@@ -2831,10 +2831,18 @@ static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
     /* Preserve the compatibility layer's historical no-op behavior for
      * interrupt sources whose peripheral ISR path is not modeled yet.  Some
      * production drivers use a non-NULL handle to select management paths
-     * that cannot work while their interrupt is intentionally stubbed. */
+     * that cannot work while their interrupt is intentionally stubbed.
+     *
+     * SPI2/SPI3 (30/31) are modelled and must be here: ESP-IDF's spi_master
+     * allocates its interrupt with ESP_INTR_FLAG_INTRDISABLED and performs
+     * every transaction from the ISR, so a no-op alloc left the driver
+     * blocked on its completion semaphore forever. Nothing noticed because
+     * the CYD display libraries drive the SPI registers directly and never
+     * go near the driver. */
     if (source != 10 && source != 11 &&
         source != 12 && source != 13 && source != 14 && source != 15 &&
         source != 18 && source != 19 &&
+        source != 30 && source != 31 &&
         source != 32 && source != 33 && source != 37 && source != 38 &&
         source != 39 && source != 40 &&
         source != 43 && source != 45 && source != 47 && source != 48 && source != 49 &&

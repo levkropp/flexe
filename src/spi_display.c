@@ -176,6 +176,9 @@ typedef struct {
     int      sd_write_pos;
     uint32_t sd_multi_sector;    /* CMD18/25 ongoing read/write sector */
     int      sd_multi;           /* 1 = read multi, 2 = write multi */
+    /* Harness stand-in for an unmodelled slave (see periph_spi_attach_probe). */
+    spi_probe_fn probe_fn;
+    void        *probe_ctx;
 } spi_display_t;
 
 /* One instance per host controller */
@@ -965,6 +968,9 @@ static void gp_spi_transact(spi_display_t *s) {
         if (tx_len > 0)
             ili9341_feed(s, dc, tx_data, (int)tx_len);
         /* Read commands (RDID 0x04 etc.): leave W as-is (zeros read as 0) */
+    } else if (!cs_touch && !cs_disp && !cs_sd && s->probe_fn) {
+        /* No modelled device selected, but a harness is standing in for one. */
+        s->probe_fn(tx_data, tx_len, rx_data, rx_len, s->probe_ctx);
     } else if (cs_sd) {
         /* Byte-at-a-time SD protocol exchange; write MISO back to W */
         size_t total = tx_len > rx_len ? tx_len : rx_len;
@@ -1058,8 +1064,16 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
     case SPI_MISO_DLEN_REG: s->miso_dlen = val; break;
     case SPI_PIN_REG:      s->pin = val; break;
     case SPI_SLAVE_REG:
+        /* SPI_TRANS_DONE is writable in both directions, not just
+         * write-zero-to-clear. ESP-IDF's spi_ll_set_int_stat() sets it
+         * deliberately to raise the interrupt with no transfer behind it:
+         * that is how spi_master kicks off the first queued transaction,
+         * whose setup happens in the ISR. Ignoring the set left the driver
+         * blocked on its completion semaphore forever, so the public
+         * spi_master API did not work at all -- only register-level display
+         * libraries did, which is all a stock CYD ROM happens to use. */
         s->slave = val & ~SPI_TRANS_DONE;
-        if (!(val & SPI_TRANS_DONE)) s->trans_done = 0;  /* clear_intr */
+        s->trans_done = (val & SPI_TRANS_DONE) ? 1 : 0;
         gp_spi_intr_update(s);
         break;
     case SPI_DMA_CONF_REG:
@@ -1103,6 +1117,15 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
 }
 
 /* ---- public API ---- */
+
+void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx) {
+    if (!p) return;
+    for (int i = 0; i < 2; i++) {
+        if (g_host[i].periph != p) continue;
+        g_host[i].probe_fn = fn;
+        g_host[i].probe_ctx = ctx;
+    }
+}
 
 void periph_disable_spi_display(esp32_periph_t *p) {
     if (!p) return;
