@@ -91,18 +91,24 @@ int main(int argc, char **argv) {
                     (unsigned long long)cpu->cycle_count, cpu->pc);
             last_stage = stage;
         }
-        if (stage == 2u && injected == 0u) {
+        bool terminal = (stage == SUCCESS_MARKER ||
+                         (stage & 0xFFF00000u) == 0xBAD00000u);
+        /* Latch on "has reached stage 2" rather than requiring stage 2 to be
+         * live at a batch boundary: the guest's delay() wait retires almost
+         * no instructions, so the whole RX window can fit inside one batch. */
+        if (stage >= 2u && !terminal && injected == 0u) {
             uint8_t input[DMA_BYTES];
             for (size_t index = 0; index < sizeof(input); ++index)
                 input[index] = (uint8_t)(0xA0u ^ index);
             injected = periph_uart_rx_inject_num(
                 periph, 0, input, sizeof(input));
         }
-        if (stage == SUCCESS_MARKER ||
-            (stage & 0xFFF00000u) == 0xBAD00000u)
+        if (terminal)
             break;
-        (void)flexe_session_run_core(session, 0, 10000);
-        flexe_session_post_batch(session, 10000);
+        /* Small batches so the stage machine is sampled finely enough to
+         * react while the guest is still waiting. */
+        (void)flexe_session_run_core(session, 0, 500);
+        flexe_session_post_batch(session, 500);
     }
 
     stage = mem_read32(mem, stage_addr);

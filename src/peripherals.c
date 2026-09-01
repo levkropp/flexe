@@ -1121,7 +1121,9 @@ typedef struct {
     uint64_t core_cycles[2];
     uint32_t last_ccount[2];
     bool valid[2];
-} timg_clock_state_t;
+} periph_clock_t;
+
+typedef periph_clock_t timg_clock_state_t;
 
 /* The legacy FRC block predates the Timer Groups. FRC1 is a 23-bit
  * down-counter; FRC2 is a 32-bit up-counter with a programmable compare. */
@@ -1271,8 +1273,8 @@ typedef struct {
     bool tx_event_armed;
     bool quick_event_armed;
     uint8_t quick_event_kind; /* 1 = single, 2 = continuous */
-    uint32_t next_tx_ccount;
-    uint32_t next_quick_ccount;
+    uint64_t next_tx_cycle;
+    uint64_t next_quick_cycle;
 
     /* The reset protocol is Bluetooth H:5: a four-byte header and optional
      * CRC inside configurable SLIP framing. State spans descriptors. */
@@ -1513,7 +1515,7 @@ typedef struct {
     bool tx_active;
     bool rx_active;
     bool tx_event_armed;
-    uint32_t next_tx_ccount;
+    uint64_t next_tx_cycle;
 
     rmt_tx_event_kind_t pending_kind;
     uint16_t pending_next_index;
@@ -1764,11 +1766,12 @@ struct esp32_periph {
     /* Radio/PHY register state used by the closed-source WiFi/BT HAL. */
     radio_state_t radio;
 
+    /* Shared cycle timeline for the deadline-driven peripheral models. */
+    periph_clock_t event_clock;
+
     /* Classic ESP32 high/low-speed LEDC timers, channels, and timed fades. */
     ledc_state_t ledc;
-    uint64_t ledc_time_cycles;
-    uint32_t ledc_last_ccount;
-    bool ledc_time_valid;
+    periph_clock_t ledc_clock;
 
     /* Eight two-channel classic ESP32 pulse-counter units. */
     pcnt_state_t pcnt;
@@ -1799,6 +1802,57 @@ struct esp32_periph {
     uint32_t flash_mmu_app[FLASH_MMU_REGISTER_COUNT];
     uint16_t flash_mmu_effective[FLASH_MMU_ENTRY_COUNT];
 };
+
+/* ===== Shared monotonic peripheral cycle clock =====
+ *
+ * The two emulated cores advance their own CCOUNT independently:
+ * flexe_session_post_batch() syncs cycle_count between them but deliberately
+ * not ccount, and esp_timer's advance_wait_time() bumps only the calling
+ * core. A model that samples cpu[0] alone therefore freezes whenever the task
+ * driving it runs on core 1 -- which is where Arduino's loopTask lives.
+ *
+ * Accumulate elapsed ccount per core and publish the maximum. Sampling is
+ * idempotent and monotone, so both cores may sample freely without ever
+ * advancing the peripheral twice.
+ *
+ * NOTE: periph_clock_now() mutates state, so a *_next_fire() built on it is
+ * not a pure query; sampling from either core moves the shared timeline. */
+static uint64_t periph_clock_now(esp32_periph_t *p, periph_clock_t *c) {
+    for (unsigned core = 0; core < 2u; core++) {
+        if (!p->cpu[core]) continue;
+        uint32_t now = p->cpu[core]->ccount;
+        if (!c->valid[core]) {
+            c->last_ccount[core] = now;
+            c->core_cycles[core] = c->cycles;
+            c->valid[core] = true;
+            continue;
+        }
+        uint32_t elapsed = now - c->last_ccount[core];
+        if (elapsed < (uint32_t)INT32_MAX) {
+            if (c->core_cycles[core] > UINT64_MAX - elapsed)
+                c->core_cycles[core] = UINT64_MAX;
+            else
+                c->core_cycles[core] += elapsed;
+        }
+        c->last_ccount[core] = now;
+        if (c->core_cycles[core] > c->cycles)
+            c->cycles = c->core_cycles[core];
+    }
+    return c->cycles;
+}
+
+/* Translate a deadline on the shared timeline into `cpu`'s 32-bit CCOUNT
+ * frame. next_timer_event is compared against that core's ccount, so a
+ * deadline must never be handed back in shared-timeline units. */
+static uint32_t periph_deadline_ccount(esp32_periph_t *p, periph_clock_t *c,
+                                       const xtensa_cpu_t *cpu,
+                                       uint64_t deadline) {
+    uint64_t now = periph_clock_now(p, c);
+    uint64_t delta = deadline > now ? deadline - now : 0;
+    if (delta > (uint64_t)INT32_MAX) delta = (uint64_t)INT32_MAX;
+    return cpu->ccount + (uint32_t)delta;
+}
+
 
 /* Bootloader-style initial flash MMU contents for an app at flash 0x10000:
  * DROM slot S -> page S+1 (vaddr 0x3F400000 maps flash 0x10000), IROM
@@ -4968,7 +5022,7 @@ static void rmt_tx_cancel(rmt_channel_state_t *channel) {
  * delivery happens before the following portion is sampled, so the genuine
  * driver can safely refill the half which hardware has just consumed. */
 static void rmt_plan_tx_segment_at(esp32_periph_t *p, unsigned channel_index,
-                                   uint32_t start_ccount) {
+                                   uint64_t start_cycle) {
     rmt_state_t *rmt = &p->rmt;
     rmt_channel_state_t *channel = &rmt->channel[channel_index];
     if (!channel->tx_active || channel->tx_event_armed) return;
@@ -4979,7 +5033,7 @@ static void rmt_plan_tx_segment_at(esp32_periph_t *p, unsigned channel_index,
         channel->pending_count = 0;
         channel->pending_next_index = 0;
         channel->pending_next_threshold = 0;
-        channel->next_tx_ccount = start_ccount + 1u;
+        channel->next_tx_cycle = start_cycle + 1u;
         channel->tx_event_armed = true;
         return;
     }
@@ -5046,13 +5100,13 @@ static void rmt_plan_tx_segment_at(esp32_periph_t *p, unsigned channel_index,
     channel->pending_next_threshold = (uint16_t)since_threshold;
     if (cycles == 0) cycles = 1;
     if (cycles > INT32_MAX) cycles = INT32_MAX;
-    channel->next_tx_ccount = start_ccount + (uint32_t)cycles;
+    channel->next_tx_cycle = start_cycle + cycles;
     channel->tx_event_armed = true;
 }
 
 static void rmt_plan_tx_segment(esp32_periph_t *p, unsigned channel_index) {
-    uint32_t now = p->cpu[0] ? p->cpu[0]->ccount : 0;
-    rmt_plan_tx_segment_at(p, channel_index, now);
+    rmt_plan_tx_segment_at(p, channel_index,
+                           periph_clock_now(p, &p->event_clock));
 }
 
 static void rmt_reset_state(esp32_periph_t *p) {
@@ -5091,26 +5145,24 @@ static uint32_t rmt_status_word(const esp32_periph_t *p, unsigned index) {
 }
 
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    if (!p || !cpu) return UINT32_MAX;
     bool have = false;
-    uint32_t best = UINT32_MAX;
-    uint32_t best_distance = 0;
+    uint64_t best = 0;
     for (unsigned index = 0; index < RMT_CHANNEL_COUNT; index++) {
         rmt_channel_state_t *channel = &p->rmt.channel[index];
         if (!channel->tx_event_armed) continue;
-        uint32_t distance = channel->next_tx_ccount - cpu->ccount;
-        if ((int32_t)distance < 0) distance = 0;
-        if (!have || distance < best_distance) {
+        if (!have || channel->next_tx_cycle < best) {
             have = true;
-            best = channel->next_tx_ccount;
-            best_distance = distance;
+            best = channel->next_tx_cycle;
         }
     }
-    return have ? best : UINT32_MAX;
+    if (!have) return UINT32_MAX;
+    return periph_deadline_ccount(p, &p->event_clock, cpu, best);
 }
 
 static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return;
+    if (!p || !cpu) return;
+    uint64_t now_cycle = periph_clock_now(p, &p->event_clock);
     for (unsigned index = 0; index < RMT_CHANNEL_COUNT; index++) {
         rmt_channel_state_t *channel = &p->rmt.channel[index];
         /* A wait stub may advance CCOUNT across several RMT deadlines in one
@@ -5118,9 +5170,9 @@ static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
          * continuously looping channel so it cannot monopolize the CPU. */
         unsigned drained = 0;
         while (channel->tx_event_armed &&
-               (int32_t)(cpu->ccount - channel->next_tx_ccount) >= 0 &&
+               now_cycle >= channel->next_tx_cycle &&
                drained++ < 4096u) {
-            uint32_t event_ccount = channel->next_tx_ccount;
+            uint64_t event_cycle = channel->next_tx_cycle;
 
             channel->tx_event_armed = false;
             channel->tx_index = channel->pending_next_index;
@@ -5147,7 +5199,7 @@ static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
                 /* The compatibility dispatcher runs the refill ISR inline. */
                 rmt_irq_update(p);
                 if (channel->tx_active)
-                    rmt_plan_tx_segment_at(p, index, event_ccount);
+                    rmt_plan_tx_segment_at(p, index, event_cycle);
                 break;
             case RMT_TX_EVENT_END:
                 rmt_tx_cancel(channel);
@@ -5157,7 +5209,7 @@ static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
             case RMT_TX_EVENT_LOOP:
                 channel->tx_index = 0;
                 if (channel->tx_active)
-                    rmt_plan_tx_segment_at(p, index, event_ccount);
+                    rmt_plan_tx_segment_at(p, index, event_cycle);
                 break;
             case RMT_TX_EVENT_ERROR:
                 channel->status_flags |= RMT_STATUS_MEM_EMPTY;
@@ -7359,28 +7411,7 @@ static uint32_t ledc_cpu_mhz(const esp32_periph_t *p) {
 }
 
 static uint64_t ledc_now_cycles(esp32_periph_t *p) {
-    if (!p->cpu[0]) return p->ledc_time_cycles;
-
-    uint32_t now = p->cpu[0]->ccount;
-    if (!p->ledc_time_valid) {
-        p->ledc_last_ccount = now;
-        p->ledc_time_valid = true;
-        return p->ledc_time_cycles;
-    }
-
-    /* Peripherals advance with the hardware clock, including time skipped by
-     * delay()/WAITI. cycle_count deliberately measures executed guest work
-     * and therefore cannot be used as a peripheral timebase. Sampling at
-     * every peripheral event extends the 32-bit CCOUNT wrap into 64 bits. */
-    uint32_t elapsed = now - p->ledc_last_ccount;
-    if (elapsed < (uint32_t)INT32_MAX) {
-        if (p->ledc_time_cycles > UINT64_MAX - elapsed)
-            p->ledc_time_cycles = UINT64_MAX;
-        else
-            p->ledc_time_cycles += elapsed;
-    }
-    p->ledc_last_ccount = now;
-    return p->ledc_time_cycles;
+    return periph_clock_now(p, &p->ledc_clock);
 }
 
 /* floor(value * multiplier / divisor) without overflowing solely because of
@@ -7779,16 +7810,11 @@ static void ledc_finish_channel_update(esp32_periph_t *p,
 static uint32_t ledc_deadline_ccount(esp32_periph_t *p,
                                      const xtensa_cpu_t *cpu,
                                      uint64_t deadline) {
-    uint64_t now = ledc_now_cycles(p);
-    if (deadline <= now) return cpu->ccount;
-    uint64_t distance = deadline - now;
-    if (distance >= (uint64_t)INT32_MAX)
-        distance = (uint64_t)INT32_MAX - 1u;
-    return cpu->ccount + (uint32_t)distance;
+    return periph_deadline_ccount(p, &p->ledc_clock, cpu, deadline);
 }
 
 static uint32_t ledc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    if (!p || !cpu) return UINT32_MAX;
     bool have = false;
     uint32_t best = UINT32_MAX;
     uint32_t best_distance = 0;
@@ -7838,7 +7864,7 @@ static uint32_t ledc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 }
 
 static void ledc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return;
+    if (!p || !cpu) return;
     ledc_sync_timer_overflows(p);
 
     for (unsigned speed = 0; speed < LEDC_SPEED_MODE_COUNT; speed++) {
@@ -8412,7 +8438,8 @@ static void uhci_arm_tx_event(esp32_periph_t *p, unsigned port) {
     xtensa_cpu_t *cpu = uhci_event_cpu(p);
     if (!cpu) return;
     size_t wire = uhci_tx_wire_estimate(p, port, s->tx_desc);
-    s->next_tx_ccount = cpu->ccount + uhci_uart_cycles(p, uart_num, wire);
+    s->next_tx_cycle = periph_clock_now(p, &p->event_clock) +
+                       uhci_uart_cycles(p, uart_num, wire);
     s->tx_event_armed = true;
     uhci_kick(p);
 }
@@ -8549,8 +8576,8 @@ static void uhci_arm_quick_event(esp32_periph_t *p, unsigned port) {
     if (!cpu) return;
     size_t wire = 8u +
         ((s->regs[UHCI_CONF0_OFF / 4u] & UHCI_CONF0_SEPER_EN) ? 2u : 0u);
-    s->next_quick_ccount =
-        cpu->ccount + uhci_uart_cycles(p, uart_num, wire);
+    s->next_quick_cycle = periph_clock_now(p, &p->event_clock) +
+                          uhci_uart_cycles(p, uart_num, wire);
     s->quick_event_armed = true;
     uhci_kick(p);
 }
@@ -9037,40 +9064,36 @@ static bool uhci_uart_rx_break(esp32_periph_t *p, int uart_num) {
 }
 
 static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != uhci_event_cpu(p)) return UINT32_MAX;
+    if (!p || !cpu) return UINT32_MAX;
     bool have = false;
-    uint32_t best = UINT32_MAX;
-    uint32_t best_distance = 0u;
+    uint64_t best = 0;
     for (unsigned port = 0; port < UHCI_PORT_COUNT; port++) {
         uhci_state_t *s = &p->uhci[port];
-        uint32_t events[2] = {s->next_tx_ccount, s->next_quick_ccount};
+        uint64_t events[2] = {s->next_tx_cycle, s->next_quick_cycle};
         bool armed[2] = {s->tx_event_armed, s->quick_event_armed};
         for (unsigned index = 0; index < 2u; index++) {
             if (!armed[index] || !uhci_clocked(p, port)) continue;
-            uint32_t distance = events[index] - cpu->ccount;
-            if ((int32_t)distance < 0) distance = 0u;
-            if (!have || distance < best_distance) {
+            if (!have || events[index] < best) {
                 have = true;
                 best = events[index];
-                best_distance = distance;
             }
         }
     }
-    return have ? best : UINT32_MAX;
+    if (!have) return UINT32_MAX;
+    return periph_deadline_ccount(p, &p->event_clock, cpu, best);
 }
 
 static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != uhci_event_cpu(p)) return;
+    if (!p || !cpu) return;
+    uint64_t now_cycle = periph_clock_now(p, &p->event_clock);
     for (unsigned port = 0; port < UHCI_PORT_COUNT; port++) {
         uhci_state_t *s = &p->uhci[port];
         if (!uhci_clocked(p, port)) continue;
-        if (s->tx_event_armed &&
-            (int32_t)(cpu->ccount - s->next_tx_ccount) >= 0) {
+        if (s->tx_event_armed && now_cycle >= s->next_tx_cycle) {
             s->tx_event_armed = false;
             (void)uhci_complete_tx_descriptor(p, port);
         }
-        if (s->quick_event_armed &&
-            (int32_t)(cpu->ccount - s->next_quick_ccount) >= 0) {
+        if (s->quick_event_armed && now_cycle >= s->next_quick_cycle) {
             s->quick_event_armed = false;
             uhci_complete_quick_event(p, port);
         }
@@ -13228,6 +13251,12 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         p->sigmadelta.core_cycles[core] = p->sigmadelta.time_cycles;
         p->sigmadelta.last_ccount[core] = cpu ? cpu->ccount : 0u;
         p->sigmadelta.time_valid[core] = cpu != NULL;
+        p->ledc_clock.core_cycles[core] = p->ledc_clock.cycles;
+        p->ledc_clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
+        p->ledc_clock.valid[core] = cpu != NULL;
+        p->event_clock.core_cycles[core] = p->event_clock.cycles;
+        p->event_clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
+        p->event_clock.valid[core] = cpu != NULL;
         if (cpu) {
             for (int source = 0; source < 71; source++) {
                 if (p->source_level_core[core][source])
