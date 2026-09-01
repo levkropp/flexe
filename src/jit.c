@@ -128,6 +128,9 @@ struct jit_state {
      * descent loop in jit_compile_now). Reset per compile; single-threaded. */
     uint32_t      (*dt)[2];
     int            dt_count;
+    /* Loop variant of the block currently being compiled, for the same
+     * reason and with the same lifetime. */
+    uint32_t       cur_lv;
 
     /* Hook bitmap management: at install we swap cpu->pc_hook_bitmap for a
      * JIT-owned merged copy (ROM stub bits | JIT block bits). orig_bitmap
@@ -154,8 +157,23 @@ struct jit_state {
 /* Hash key combines PC and windowbase so each (pc, wb) pair gets its own slot.
  * This eliminates the runtime windowbase guard — blocks are compiled for a
  * specific windowbase and only found when that windowbase is active. */
-static inline uint32_t jit_hash_key(uint32_t pc, uint32_t wb) {
-    return ((pc >> 2) ^ (wb * 2654435761u)) & JIT_HASH_MASK;
+/* A third key component: whether a zero-overhead loop was live, with its LEND
+ * ahead of this PC, when the block was scanned. jit_scan_block() bounds a
+ * block at LEND only in that case, so the same PC needs two compilations --
+ * one that stops at LEND and one that does not -- and picking the wrong one
+ * runs a loop body straight out of its loop. Giving each variant its own slot
+ * is what makes that safe without recompiling on every alternation, which is
+ * how an earlier attempt at this (keying on the LEND value itself) starved
+ * guest_call8's step budget badly enough to break the stock-ROM BLE path. */
+static inline uint32_t jit_loop_variant(const xtensa_cpu_t *cpu, uint32_t pc) {
+    return (cpu->lcount != 0u && cpu->lend > pc) ? 1u : 0u;
+}
+
+#define JIT_LOOP_VARIANT_SALT 0x5F1D3B7u
+
+static inline uint32_t jit_hash_key(uint32_t pc, uint32_t wb, uint32_t lv) {
+    return ((pc >> 2) ^ (wb * 2654435761u) ^
+            (lv ? JIT_LOOP_VARIANT_SALT : 0u)) & JIT_HASH_MASK;
 }
 
 /* Combined tag for collision detection: pack wb into unused high bits of PC.
@@ -165,17 +183,9 @@ static inline uint32_t jit_make_tag(uint32_t pc, uint32_t wb) {
     return pc ^ (wb << 28);
 }
 
-/* NOTE: jit_scan_block() bounds a block at LEND using the *runtime* loop
- * registers, while blocks are keyed only by (pc, windowbase). A block first
- * compiled at LBEG outside a loop is therefore scanned past LEND, and reusing
- * it once the loop is live would run the body out of the loop. Keying the
- * cache on the compile-time LEND as well was tried and reverted: a PC entered
- * both inside and outside a loop then recompiles on every alternation, and
- * the resulting thrash starved guest_call8()'s step budget badly enough to
- * break the stock-ROM BLE path. In practice jit_run() only samples LBEG while
- * lcount > 0, so the bound is right on the path that matters. */
-static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb) {
-    uint32_t idx = jit_hash_key(pc, wb);
+static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb,
+                               uint32_t lv) {
+    uint32_t idx = jit_hash_key(pc, wb, lv);
     uint32_t tag = jit_make_tag(pc, wb);
     jit_block_t *b = &jit->hash[idx];
     if (b->code && b->pc == tag)
@@ -183,8 +193,9 @@ static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb) {
     return NULL;
 }
 
-static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc, uint32_t wb) {
-    uint32_t idx = jit_hash_key(pc, wb);
+static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc,
+                                      uint32_t wb, uint32_t lv) {
+    uint32_t idx = jit_hash_key(pc, wb, lv);
     uint32_t tag = jit_make_tag(pc, wb);
     jit_block_t *b = &jit->hash[idx];
     if (b->pc != tag) {
@@ -231,9 +242,16 @@ typedef struct {
 } jit_scan_t;
 
 /* Check if a PC is a ROM stub hook address (NOT a JIT block bit) */
+/* Only *ROM stub* hooks may terminate a scan. Falling back to the CPU's
+ * live bitmap when there is no ROM bitmap -- which is the case whenever the
+ * emulator runs without stubs, as the unit tests do -- reads the merged
+ * bitmap instead, so a PC that already has a compiled block looks like a hook
+ * and can never be scanned again. That silently prevents a second
+ * compilation of the same PC, which is exactly what the loop-variant key
+ * needs to do. */
 static int is_hook_addr(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
-    const uint64_t *bm = jit->orig_bitmap ? jit->orig_bitmap
-                                          : (const uint64_t *)cpu->pc_hook_bitmap;
+    (void)cpu;
+    const uint64_t *bm = jit->orig_bitmap;
     if (!bm) return 0;
     uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
     return (bm[idx / 64] >> (idx & 63)) & 1;
@@ -2365,8 +2383,19 @@ static void jit_patch_chain_site(uint8_t *jmp_site, uint8_t *target) {
 }
 
 /* Chain newly compiled block: patch any pending sites that target (pc, wb) */
-static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb, uint8_t *entry_ptr) {
-    uint32_t idx = jit_hash_key(pc, wb);
+/* Chaining is recorded and resolved for the unbounded variant only. A chain
+ * site is patched to whichever block later compiles at its target, and there
+ * is no way to tell from the site which variant the jump will be executed
+ * under -- so the loop-bounded variant is simply never a chain target. */
+static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb,
+                                uint32_t lv, uint8_t *entry_ptr) {
+    /* Only the unbounded variant may satisfy a pending chain site. A site
+     * records "jump here once something compiles at this PC", with no way to
+     * say which variant the jump will execute under -- patching it to a
+     * loop-bounded block would enter a body that stops at some other loop's
+     * LEND. */
+    if (lv != 0u) return;
+    uint32_t idx = jit_hash_key(pc, wb, 0u);
     uint32_t tag = jit_make_tag(pc, wb);
     chain_pending_t *p = &jit->pend[idx];
     if (p->tag != tag) return;
@@ -2384,6 +2413,12 @@ static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb, uint
  * Also appends to jit->dt[] when set (descent target collection). */
 static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
                              uint32_t target_wb, uint8_t *jmp_site) {
+    /* A loop-bounded block neither chains out nor is chained to. Its
+     * successor inside the same body must also stop at LEND, and a chain
+     * site cannot say which variant it will run under, so linking either
+     * direction would splice in a block that runs straight through LEND. */
+    if (jit->cur_lv != 0u) return;
+
     /* Not chained under verification. A chain jumps directly between blocks,
      * so it steps over PCs at which the interpreted reference run still
      * dispatches a ROM stub -- the two stop executing comparable work and
@@ -2403,14 +2438,14 @@ static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
         jit->dt_count++;
     }
 
-    jit_block_t *tb = jit_lookup(jit, target_pc, target_wb);
+    jit_block_t *tb = jit_lookup(jit, target_pc, target_wb, 0u);
     if (tb && tb->chain_entry) {
         jit_patch_chain_site(jmp_site, (uint8_t *)tb->chain_entry);
         jit->stats.chains_patched++;
         return;
     }
 
-    uint32_t idx = jit_hash_key(target_pc, target_wb);
+    uint32_t idx = jit_hash_key(target_pc, target_wb, 0u);
     uint32_t tag = jit_make_tag(target_pc, target_wb);
     chain_pending_t *p = &jit->pend[idx];
     if (p->tag != tag) { p->tag = tag; p->n = 0; }
@@ -2579,7 +2614,8 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
      * Chain sites jump to chain_entry (past prologue), not code_start.
      * NOTE: still inside the W^X write window — chain patches mutate
      * previously-emitted code in the cache. */
-    jit_chain_new_block(jit, pc, cpu->windowbase, chain_entry);
+    jit_chain_new_block(jit, pc, cpu->windowbase,
+                        jit_loop_variant(cpu, pc), chain_entry);
 
     jit_wx_write_end(code_start, emit_size(&e));
     return (jit_block_fn)code_start;
@@ -2878,13 +2914,25 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
 
     /* Direct hash table probe for firmware-space PCs */
     uint32_t wb = cpu->windowbase;
-    uint32_t hidx = ((pc >> 2) ^ (wb * 2654435761u)) & JIT_HASH_MASK;
-    uint32_t tag = pc ^ (wb << 28);
+    uint32_t lv = jit_loop_variant(cpu, pc);
+    uint32_t hidx = jit_hash_key(pc, wb, lv);
+    uint32_t tag = jit_make_tag(pc, wb);
     jit_block_t *b = &jit->hash[hidx];
 
     jit_block_fn fn = NULL;
     if (__builtin_expect(b->code != NULL && b->pc == tag, 1)) {
-        fn = (jit_block_fn)b->code;
+        /* The loop-variant key already keeps a block compiled outside a loop
+         * from being reused inside one. What it cannot express is a block
+         * bounded at one loop's LEND being reached under a *different* loop
+         * whose LEND falls inside it -- both are variant 1. Rare enough to
+         * be worth an interpreter round-trip rather than a third slot, and
+         * it costs one predicted-not-taken test on lcount, which is zero
+         * whenever no loop is running. */
+        if (__builtin_expect(cpu->lcount != 0, 0) &&
+            cpu->lend > pc && cpu->lend < b->end_pc)
+            fn = NULL;
+        else
+            fn = (jit_block_fn)b->code;
     } else {
         /* Hash miss — try hot-counting and compilation */
         fn = jit_get_block(jit, cpu, pc);
@@ -3032,10 +3080,11 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     /* Cache-pressure adaptive: once the cache is 75% full, only genuinely
      * hot code may compile (the last quarter is reserved for it). */
     if (jit->code_size > (jit->code_capacity * 3) / 4 && depth > 0) return;
-    jit_block_t *b = jit_lookup(jit, pc, wb);
+    uint32_t lv = jit_loop_variant(cpu, pc);
+    jit_block_t *b = jit_lookup(jit, pc, wb, lv);
     if (b && b->code) return;
 
-    b = jit_get_or_create(jit, pc, wb);
+    b = jit_get_or_create(jit, pc, wb, lv);
 
     jit_scan_t scan;
     jit_scan_block(jit, cpu, pc, &scan);
@@ -3050,13 +3099,16 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     uint32_t dt[JIT_MAX_BLOCK_INSNS * 2][2];
     uint32_t (*saved_dt)[2] = jit->dt;
     int saved_dt_count = jit->dt_count;
+    uint32_t saved_lv = jit->cur_lv;
     jit->dt = dt;
     jit->dt_count = 0;
+    jit->cur_lv = lv;
 
     jit_block_fn fn = jit_compile_block(jit, cpu, pc, &scan);
     int dt_count = jit->dt_count;
     jit->dt = saved_dt;
     jit->dt_count = saved_dt_count;
+    jit->cur_lv = saved_lv;
     cpu->windowbase = saved_wb;
     if (!fn) return;
 
@@ -3076,6 +3128,7 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     b->code = (void *)fn;
     b->chain_entry = (void *)jit->last_chain_entry;
     b->guest_insns = (uint16_t)scan.count;
+    b->end_pc = scan.end_pc;
 
     /* Set JIT bitmap bit so the interpreter's hook fires for this PC */
     jit_bitmap_set(jit, pc);
@@ -3097,12 +3150,13 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
 
 jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
     uint32_t wb = cpu->windowbase;
-    jit_block_t *b = jit_lookup(jit, pc, wb);
+    uint32_t lv = jit_loop_variant(cpu, pc);
+    jit_block_t *b = jit_lookup(jit, pc, wb, lv);
     if (b && b->code)
         return (jit_block_fn)b->code;
 
     /* Get or create entry */
-    b = jit_get_or_create(jit, pc, wb);
+    b = jit_get_or_create(jit, pc, wb, lv);
     b->exec_count++;
 
     /* Cache-pressure adaptive threshold: the last quarter of the cache is

@@ -843,6 +843,86 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     teardown(&cpu);
 }
 
+/* jit_scan_block() can only bound a block at LEND using the loop registers
+ * as they stand when it compiles, so a block first compiled outside a loop is
+ * scanned straight through what later becomes LEND. Re-entering that block
+ * once the loop is live would execute the instruction at LEND -- which
+ * belongs *after* the body -- instead of taking the back-edge, and would
+ * leave LCOUNT undecremented. Real firmware does reach the same PC both ways:
+ * this is what made two Marauder CYD board builds hang. */
+TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* LOOP sits at BASE+2 so that LBEG (always the next instruction, three
+     * bytes on) lands in a different word. The block hash indexes on pc >> 2,
+     * so a loop head and its LBEG in the same word share a slot and evict
+     * each other -- harmless in production, but it would hide what this test
+     * is checking. */
+    const uint32_t loop_pc = BASE + 2u;
+    const uint32_t lbeg = loop_pc + 3u;
+    const uint32_t lend = lbeg + 10u;
+    /* Body: five ADDI.N a4, a4, 1 */
+    for (unsigned i = 0; i < 5u; i++)
+        put_insn2(&cpu, lbeg + i * 2u, narrow(0xB, 4, 4, 1));
+    /* At LEND, and so outside the body: ADDI.N a5, a5, 1. A block that runs
+     * past LEND is exactly what bumps a5 while the loop is still going. */
+    put_insn2(&cpu, lend, narrow(0xB, 5, 5, 1));
+    put_insn2(&cpu, lend + 2u, narrow(0xB, 5, 5, 1));
+    put_insn2(&cpu, lend + 4u, narrow(0xD, 15, 0, 0)); /* RET.N */
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3));      /* NOP.N */
+    /* LOOP a3, lend */
+    put_insn3(&cpu, loop_pc, (uint32_t)0x76u |
+                             ((uint32_t)((8 << 4) | 3) << 8) |
+                             ((lend - (loop_pc + 4u)) << 16));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    /* Compile the body's PC while no loop is active: nothing bounds the scan,
+     * so this block runs off the end of what will become the body. */
+    ASSERT_EQ(cpu.lcount, 0u);
+    for (int i = 0; i < JIT_HOT_THRESHOLD + 1; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+    jit_block_fn outside = jit_get_block(jit, &cpu, lbeg);
+    ASSERT_TRUE(outside != NULL);
+
+    /* Now enter the loop for real. */
+    ar_write(&cpu, 3, 100);
+    ar_write(&cpu, 4, 0);
+    ar_write(&cpu, 5, 0);
+    cpu.pc = loop_pc;
+    cpu.running = true;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, lbeg);
+    ASSERT_EQ(cpu.lend, lend);
+    ASSERT_TRUE(cpu.lcount > 0);
+
+    /* The same PC inside the loop must not resolve to the block compiled
+     * outside it. It gets its own, LEND-bounded compilation. */
+    for (int i = 0; i < JIT_HOT_THRESHOLD + 1; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+    jit_block_fn inside = jit_get_block(jit, &cpu, lbeg);
+    ASSERT_TRUE(inside != NULL);
+    ASSERT_TRUE(inside != outside);
+
+    (void)xtensa_run(&cpu, 200);
+
+    /* Still mid-loop, so the instruction at LEND must not have run yet. */
+    ASSERT_TRUE(cpu.lcount > 0);
+    ASSERT_EQ(ar_read(&cpu, 5), 0u);
+    /* The body bumps a4 once per instruction, so a4 pins down both how many
+     * back-edges were taken and how far into the current iteration the run
+     * stopped -- an off-by-one in either shows up here. */
+    ASSERT_TRUE(cpu.pc >= lbeg && cpu.pc < lend);
+    ASSERT_EQ(ar_read(&cpu, 4), 5u * (99u - cpu.lcount) + (cpu.pc - lbeg) / 2u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_flush) {
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -1109,6 +1189,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
+    RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);

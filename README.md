@@ -462,13 +462,11 @@ unchanged, which is what makes a nonzero delta elsewhere trustworthy.
 
 Marauder v1.14.3 is also published for three other CYD boards, which are
 separate links with their own entry point (`0x400830D0`). The 2432S024
-(guition) and 3.5-inch builds have relocated profiles and boot, run Wi-Fi end
-to end, and drive BLE scan start/stop; injecting a BLE advertisement into them
-does not yet complete, because their IRAM contains a NimBLE callback path with
-no counterpart in the 2432S028 build, so they are not part of the stock-ROM
-gate. The `2432S028_2usb` build is a different link generation again -- only 3
-of its 41 profile addresses relocate from v1.14.3 -- and is still rejected as
-an unsupported layout.
+(guition) and 3.5-inch builds have relocated profiles and pass the stock-ROM
+gate end to end under both engines, exactly as the 2432S028 build does. The
+`2432S028_2usb` build is a different link generation -- only 3 of its 41
+profile addresses relocate from v1.14.3 -- and is rejected as an unsupported
+layout rather than given addresses that cannot be confirmed.
 
 ```bash
 MARAUDER_BIN=/path/to/marauder.bin \

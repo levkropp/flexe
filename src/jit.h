@@ -35,6 +35,7 @@
 /* Block entry in the hash table */
 typedef struct {
     uint32_t pc;            /* Guest PC (tag for collision detection) */
+    uint32_t end_pc;        /* First guest PC past the block */
     void    *code;          /* Pointer into code cache (NULL = empty) */
     void    *chain_entry;   /* Entry point for chained blocks (after prologue) */
     uint32_t exec_count;    /* Hot counter / execution count */

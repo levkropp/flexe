@@ -8,6 +8,7 @@
  */
 
 #include "flexe_session.h"
+#include "jit.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -878,9 +879,17 @@ static void usage(const char *argv0)
 int main(int argc, char **argv)
 {
     int disable_jit = 0;
+    int jit_verify = 0;
     int argi = 1;
     if (argi < argc && strcmp(argv[argi], "--no-jit") == 0) {
         disable_jit = 1;
+        argi++;
+    }
+    /* Differential-verify every compiled block against the interpreter while
+     * the scenario runs. Much slower, but it reaches the driven paths -- UART
+     * commands, Wi-Fi capture, BLE -- that a bare image run never does. */
+    if (argi < argc && strcmp(argv[argi], "--verify") == 0) {
+        jit_verify = 1;
         argi++;
     }
     if (argc - argi != 2) {
@@ -940,6 +949,8 @@ int main(int argc, char **argv)
 
     uint64_t wall_start = monotonic_ns();
     flexe_session_t *session = flexe_session_create(&cfg);
+    if (session && jit_verify)
+        jit_set_verify(flexe_session_jit(session), true);
     if (!session) {
         fprintf(stderr, "error: failed to create stock-ROM session\n");
         pthread_mutex_destroy(&framebuffer_mutex);
