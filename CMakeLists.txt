@@ -14,6 +14,12 @@ endif()
 #   3. cmake -B build-pgo -DPGO=use && cmake --build build-pgo
 option(PGO "PGO mode: 'generate' to collect profiles, 'use' to apply them" "")
 set(PREDECODE_FLASH_MB "4" CACHE STRING "Pre-decode table flash coverage in MB (0=disabled, 2/4/8/16)")
+# -march=native bakes the building machine's CPU into the binary, which is
+# what you want locally and not what you want on a shared CI runner: the
+# result is unreproducible, and a runner whose feature set the compiler
+# dislikes fails the build outright under -Werror for reasons that have
+# nothing to do with the code.
+option(NATIVE_ARCH "Tune Release builds for the building machine's CPU" ON)
 
 # LTO and native tuning for Release builds (GCC/Clang only)
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
@@ -22,7 +28,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     if(IPO_SUPPORTED AND NOT PGO)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
     endif()
-    if(NOT MSVC)
+    if(NOT MSVC AND NATIVE_ARCH)
         add_compile_options(-march=native)
     endif()
 endif()

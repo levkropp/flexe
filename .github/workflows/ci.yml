@@ -27,7 +27,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev ${{ matrix.cc }}
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
+        # -DNATIVE_ARCH=OFF: a shared runner's CPU should not be baked into
+        # the build, and -march=native there produced a feature combination
+        # clang rejects under -Werror.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} -DNATIVE_ARCH=OFF
       - name: Build
         run: cmake --build build -j"$(nproc)"
       - name: Unit tests
@@ -46,6 +51,7 @@ jobs:
         run: |
           cmake -S . -B build-asan -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DNATIVE_ARCH=OFF \
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
       - name: Build
@@ -108,7 +114,7 @@ jobs:
             --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
       - name: Build
         run: |
-          cmake -S . -B build -G Ninja
+          cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF
           cmake --build build -j"$(nproc)"
       - name: Run gates
         env:
