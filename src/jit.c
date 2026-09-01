@@ -2204,7 +2204,16 @@ static void emit_side_exit_body(emit_t *e, const side_exit_t *sx,
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
     emit_acc_add(e, sx->insn_count);
 
-    if (jit) jit_chain_record(jit, sx->target_pc, sx->target_wb, e->ptr);
+    /* Side-exit chaining is disabled: patching a taken conditional branch
+     * to jump natively into its target miscompiles. It is reproducible with
+     * the SDMMC gate, whose guest fills a 20 KiB buffer and then writes it
+     * out -- the stores stop partway (byte 19305 of 20480) and the host-side
+     * content check fails, while the interpreter and FLEXE_JIT_NOCHAIN=1
+     * both produce correct data. Chaining block exits is unaffected; only
+     * this path is, and disabling it costs nothing measurable
+     * (1271 -> 1278 MIPS on the loop benchmark, i.e. within noise).
+     * TODO: root-cause and re-enable. */
+    (void)jit_chain_record;
     emit_jmp_to_epilogue(e, jit);
 }
 
