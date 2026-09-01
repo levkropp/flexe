@@ -184,6 +184,18 @@ static uint32_t bump_alloc(freertos_stubs_t *frt, uint32_t size) {
 /* ===== Cooperative scheduler core ===== */
 
 static void sched_save_context(freertos_stubs_t *frt, int core_id) {
+    /* A synthetic guest call (guest_call8, used to deliver peripheral ISRs
+     * and BT/Wi-Fi callbacks) runs on a fabricated register file. Writing
+     * that into the current task's TCB would destroy the task. */
+    if (frt->cpu[core_id] && frt->cpu[core_id]->in_guest_call) {
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[flexe] refused task context save inside a "
+                            "synthetic guest call (core %d)\n", core_id);
+        }
+        return;
+    }
     xtensa_cpu_t *cpu = frt->cpu[core_id];
     int tidx = frt->current_task[core_id];
     task_tcb_t *t = &frt->tasks[tidx];
@@ -292,10 +304,41 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
 
     /* No READY tasks — fast-forward through sleeping tasks until we find
      * one eligible for this core, or exhaust all sleepers. */
+    int stalled_steps = 0;
     while (nearest != UINT64_MAX) {
         xtensa_cpu_t *cpu = frt->cpu[core_id];
-        uint64_t advance = nearest - cpu->cycle_count;
-        cpu->cycle_count = nearest;
+
+        /* Step to the next observable boundary, not straight to the wake
+         * time.  A ccompare tick, TIMG alarm or peripheral threshold falling
+         * inside the idle window has to be raised at its own ccount: drivers
+         * that depend on a *sequence* of interrupts across a delay (RMT,
+         * LEDC and UHCI all refill from their ISR) are stranded forever if
+         * the whole window collapses into one jump.
+         *
+         * This loop must still resolve the wait synchronously — returning
+         * early would leave the core halted with current_task pointing at a
+         * sleeping task, and nothing outside clears cpu->halted. */
+        uint64_t target = nearest;
+        if (cpu->next_timer_event != UINT32_MAX) {
+            uint32_t distance =
+                ((int32_t)(cpu->ccount - cpu->next_timer_event) >= 0)
+                    ? 0u : cpu->next_timer_event - cpu->ccount;
+            uint64_t event_at = cpu->cycle_count + distance;
+            if (event_at < target)
+                target = event_at;
+        }
+
+        uint64_t advance = target - cpu->cycle_count;
+        /* A due-but-unclearable event yields no progress; fall back to the
+         * plain jump rather than spinning here forever. */
+        if (advance == 0 && ++stalled_steps > 8) {
+            target = nearest;
+            advance = target - cpu->cycle_count;
+        }
+        if (advance)
+            stalled_steps = 0;
+
+        cpu->cycle_count = target;
         cpu->ccount += (uint32_t)advance;
         cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
         /* Credit the other core's currently-running task for this
@@ -309,6 +352,19 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
         if (other_cur >= 0 && frt->tasks[other_cur].state == TASK_RUNNING)
             frt->tasks[other_cur].cumulative_cycles += advance;
         frt->idle_cycles += advance;
+
+        /* Raise whatever is due at this exact ccount, so a peripheral or
+         * ccompare event inside the idle window is not skipped.
+         *
+         * The lock must be released across this call. Firing an event can
+         * reach periph_event_hook -> intr_matrix_update_source -> the
+         * guest-IRQ bridge, which runs a guest ISR that may itself call a
+         * FreeRTOS stub and re-take this non-recursive mutex. That is a
+         * self-deadlock; dispatch_peripherals_until_queue() drops the lock
+         * for the same reason. */
+        pthread_mutex_unlock(&frt->lock);
+        xtensa_fire_due_timers(cpu);
+        pthread_mutex_lock(&frt->lock);
         /* Wake tasks at this time and find next nearest */
         nearest = sched_wake_sleepers(frt, core_id);
 
@@ -341,6 +397,10 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
  * continue and xtensa_run_halted() fast-forwards to the next peripheral or
  * timer event; stopping the CPU outright would deadlock ISR-backed waits. */
 static void sched_switch(freertos_stubs_t *frt, int core_id) {
+    /* Likewise, switching away would strand the in-flight synthetic call:
+     * its sentinel return would never be reached. */
+    if (frt->cpu[core_id] && frt->cpu[core_id]->in_guest_call)
+        return;
     int prev = frt->current_task[core_id];
     int next = sched_pick_next(frt, core_id);
     if (next < 0) {

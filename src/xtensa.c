@@ -70,6 +70,9 @@ void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
     xtensa_recompute_next_timer_impl(cpu);
 }
 
+/* Forward declaration: definition follows xtensa_fire_timers() below. */
+void xtensa_fire_due_timers(xtensa_cpu_t *cpu);
+
 /* Fire any ccompare timers whose time has arrived, hardware semantics:
  * the interrupt is raised when ccount >= ccompare (not exact equality),
  * so overshooting the target (stubs advancing time, batch accounting)
@@ -86,6 +89,10 @@ static inline void xtensa_fire_timers(xtensa_cpu_t *cpu) {
     /* Peripheral timer events (TIMG LACT alarms) */
     if (cpu->periph_event) cpu->periph_event(cpu);
     xtensa_recompute_next_timer_impl(cpu);
+}
+
+void xtensa_fire_due_timers(xtensa_cpu_t *cpu) {
+    xtensa_fire_timers(cpu);
 }
 
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {

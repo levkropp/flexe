@@ -261,6 +261,11 @@ struct xtensa_cpu {
      * fall-through exit (a genuine loop back-edge) from a side exit that
      * merely branches to LEND. Consumed and cleared by jit_pc_hook(). */
     uint32_t jit_loop_exit;
+    /* Non-zero while guest_call8() is running guest code on a fabricated
+     * register file (windowbase 0, its own stack, PS.INTLEVEL 15). The
+     * FreeRTOS scheduler must not save that frame into a real task's TCB
+     * or switch away from the in-flight call. */
+    uint32_t in_guest_call;
     bool     irq_check;                 /* Set when interrupt/intenable changes */
     int      breakpoint_count;
 
@@ -452,6 +457,12 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
 void xtensa_check_interrupts(xtensa_cpu_t *cpu);
 void xtensa_flush_windows(xtensa_cpu_t *cpu);
 void xtensa_recompute_next_timer(xtensa_cpu_t *cpu);
+
+/* Raise any ccompare/peripheral timer interrupts whose ccount has arrived and
+ * recompute next_timer_event.  Callers that move ccount forward themselves
+ * (the FreeRTOS idle fast-forward) must invoke this at each event boundary,
+ * or every interrupt scheduled inside the skipped window is silently lost. */
+void xtensa_fire_due_timers(xtensa_cpu_t *cpu);
 
 /*
  * Breakpoint support

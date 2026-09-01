@@ -80,6 +80,7 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     bool completed = false;
     uint32_t retval = 0;
     uint32_t executed = 0;
+    cpu->in_guest_call++;
     for (; executed < instruction_limit; executed++) {
         if (cpu->pc == GUEST_CALL_SENTINEL) {
             completed = true;
@@ -135,6 +136,7 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     cpu->irq_check = save_irq_check;
     cpu->accelerated_blocks = save_accelerated;
 
+    cpu->in_guest_call--;
     if (!completed)
         return -2;
     if (retval_out)
