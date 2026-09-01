@@ -60,6 +60,7 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 #define CPU_OFF_HALTED      offsetof(xtensa_cpu_t, halted)
 #define CPU_OFF_EXCEPTION   offsetof(xtensa_cpu_t, exception)
 #define CPU_OFF_PC_WRITTEN  offsetof(xtensa_cpu_t, _pc_written)
+#define CPU_OFF_LOOP_EXIT   offsetof(xtensa_cpu_t, jit_loop_exit)
 #define CPU_OFF_IRQ_CHECK   offsetof(xtensa_cpu_t, irq_check)
 #define CPU_OFF_CYCLE_COUNT offsetof(xtensa_cpu_t, cycle_count)
 #define CPU_OFF_MEM         offsetof(xtensa_cpu_t, mem)
@@ -158,6 +159,15 @@ static inline uint32_t jit_make_tag(uint32_t pc, uint32_t wb) {
     return pc ^ (wb << 28);
 }
 
+/* NOTE: jit_scan_block() bounds a block at LEND using the *runtime* loop
+ * registers, while blocks are keyed only by (pc, windowbase). A block first
+ * compiled at LBEG outside a loop is therefore scanned past LEND, and reusing
+ * it once the loop is live would run the body out of the loop. Keying the
+ * cache on the compile-time LEND as well was tried and reverted: a PC entered
+ * both inside and outside a loop then recompiles on every alternation, and
+ * the resulting thrash starved guest_call8()'s step budget badly enough to
+ * break the stock-ROM BLE path. In practice jit_run() only samples LBEG while
+ * lcount > 0, so the bound is right on the path that matters. */
 static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb) {
     uint32_t idx = jit_hash_key(pc, wb);
     uint32_t tag = jit_make_tag(pc, wb);
@@ -211,6 +221,7 @@ typedef struct {
     int      ilens[JIT_MAX_BLOCK_INSNS];
     int      count;
     uint32_t end_pc;   /* PC after last instruction */
+    bool     ends_at_lend; /* Truncated at LEND: fall-through is a loop back-edge */
 } jit_scan_t;
 
 /* Check if a PC is a ROM stub hook address (NOT a JIT block bit) */
@@ -404,6 +415,7 @@ static int classify_for_jit(uint32_t insn, int ilen) {
 static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
                            jit_scan_t *scan) {
     scan->count = 0;
+    scan->ends_at_lend = false;
     uint32_t cur_pc = pc;
     uint32_t page_end = (pc & ~0xFFFu) + 0x1000;
 
@@ -432,7 +444,7 @@ static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
 
         /* Stop at loop end boundary: the instruction AT lend is the last
          * one before the loop-back fires, so include it then stop. */
-        if (lend && cur_pc >= lend) break;
+        if (lend && cur_pc >= lend) { scan->ends_at_lend = true; break; }
 
         if (cls == 1) {
             /* Block terminator (call/ret/jmp) — include it, then stop */
@@ -931,7 +943,7 @@ static void emit_mem_write16(emit_t *e, int addr_reg, int val_reg) {
 /* Forward declarations for helpers used in instruction compilation */
 static void emit_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
                                uint32_t exit_pc, int insn_count,
-                               jit_state_t *jit);
+                               jit_state_t *jit, bool loop_end_exit);
 static void emit_jmp_to_epilogue(emit_t *e, jit_state_t *jit);
 static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
                              uint32_t target_wb, uint8_t *jmp_site);
@@ -1040,7 +1052,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
                     /* Set _pc_written = true */
                     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
-                    emit_block_exit_ra(e, ra, wb4, 0 /* will use cpu->pc */, insn_idx + 1, jit);
+                    emit_block_exit_ra(e, ra, wb4, 0 /* will use cpu->pc */, insn_idx + 1, jit, false);
                     return 1;
                 }
                 if (t == 1) {
@@ -1091,7 +1103,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     ra_load_ar(e, ra,RAX, wb4, 0);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
                     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
-                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit);
+                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit, false);
                     return 1;
                 }
                 /* RETW: window return (r==0, m==2, nn==1) */
@@ -1103,7 +1115,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     ra_load_ar(e, ra, RAX, wb4, s);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
                     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
-                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit);
+                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit, false);
                     return 1;
                 }
                 /* Boolean ops */
@@ -1824,7 +1836,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         emit_store32_disp_imm(e, REG_CPU, ret_ar_off, ret_addr);
 
         /* Block exit to callee. */
-        emit_block_exit_ra(e, ra, wb4, call_target, insn_idx + 1, jit);
+        emit_block_exit_ra(e, ra, wb4, call_target, insn_idx + 1, jit, false);
         return 1;
     }
 
@@ -1836,7 +1848,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             /* J: unconditional jump */
             int32_t offset = sign_extend(XT_OFFSET18(insn), 18);
             uint32_t target = next_pc + (uint32_t)offset + 1; /* +1 per ISA */
-            emit_block_exit_ra(e, ra, wb4, target, insn_idx + 1, jit);
+            emit_block_exit_ra(e, ra, wb4, target, insn_idx + 1, jit, false);
             return 1;
         }
 
@@ -2203,18 +2215,27 @@ static void emit_side_exit_body(emit_t *e, const side_exit_t *sx,
  * 4. Record chain slot (if static target) and jmp to epilogue */
 static void emit_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
                                uint32_t exit_pc, int insn_count,
-                               jit_state_t *jit) {
+                               jit_state_t *jit, bool loop_end_exit) {
     /* Flush dirty regs to memory */
     ra_flush(e, ra, wb4);
 
     if (exit_pc != 0) {
         emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, exit_pc);
         emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+        /* Flag a fall-through onto LEND so jit_pc_hook can tell a genuine
+         * back-edge from a side exit that merely branches there. This must
+         * not ride on _pc_written: clearing that would also close the hook
+         * gate for any ROM or firmware stub sitting at the exit PC. */
+        if (loop_end_exit)
+            emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LOOP_EXIT, 1);
     }
     emit_acc_add(e, insn_count);
 
-    /* Record chain slot for static targets */
-    if (exit_pc != 0 && jit)
+    /* Record chain slot for static targets. Never chain a loop-body exit:
+     * a native jump straight into a block compiled at LEND would bypass
+     * jit_pc_hook entirely, and with it the lcount decrement and the branch
+     * back to LBEG -- the loop would run once and fall out. */
+    if (exit_pc != 0 && jit && !loop_end_exit)
         jit_chain_record(jit, exit_pc, (uint32_t)(wb4 / 4), e->ptr);
 
     emit_jmp_to_epilogue(e, jit);
@@ -2384,7 +2405,7 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         if (!ok) {
             if (i == 0) { jit_wx_write_end(code_start, 0); return NULL; }
             /* End block before this instruction */
-            emit_block_exit_ra(&e, &ra, wb4, scan->pcs[i], i, jit);
+            emit_block_exit_ra(&e, &ra, wb4, scan->pcs[i], i, jit, false);
             last_compiled = i;
             break;
         }
@@ -2396,7 +2417,8 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     if (last_compiled == scan->count) {
         int last_cls = classify_for_jit(scan->insns[scan->count - 1], scan->ilens[scan->count - 1]);
         if (last_cls == 0 || last_cls == 3) {
-            emit_block_exit_ra(&e, &ra, wb4, scan->end_pc, scan->count, jit);
+            emit_block_exit_ra(&e, &ra, wb4, scan->end_pc, scan->count, jit,
+                               scan->ends_at_lend);
         }
     }
 
@@ -2558,10 +2580,15 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             jit_flush(jit);
 
         if (block_insns > 0) {
-            /* Apply zero-overhead loop */
-            if (cpu->lcount > 0 && cpu->pc == cpu->lend) {
+            /* Apply the zero-overhead loop back-edge. Only a fall-through
+             * onto LEND closes the loop; a side exit that branches there is
+             * a break out of it and must not consume an iteration. */
+            uint32_t loop_exit = cpu->jit_loop_exit;
+            cpu->jit_loop_exit = 0;
+            if (loop_exit && cpu->lcount > 0 && cpu->pc == cpu->lend) {
                 cpu->lcount--;
                 cpu->pc = cpu->lbeg;
+                cpu->_pc_written = 1;
             }
 
             /* Advance ccount by block_insns - 1 (the interpreter adds 1) */

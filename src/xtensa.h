@@ -252,7 +252,15 @@ struct xtensa_cpu {
     bool     running;
     bool     halted;                    /* WAITI halt state */
     bool     exception;                 /* Exception pending flag */
-    bool     _pc_written;               /* Set when instruction modifies PC */
+    /* Set when an instruction modifies PC. 32-bit, not bool: the JIT stores
+     * it with a 32-bit immediate store, which at a bool offset would also
+     * overwrite the neighbouring irq_check and silently drop a pending
+     * interrupt check on every block exit. */
+    uint32_t _pc_written;
+    /* Set by a JIT block whose scan was truncated at LEND, to tell its
+     * fall-through exit (a genuine loop back-edge) from a side exit that
+     * merely branches to LEND. Consumed and cleared by jit_pc_hook(). */
+    uint32_t jit_loop_exit;
     bool     irq_check;                 /* Set when interrupt/intenable changes */
     int      breakpoint_count;
 
