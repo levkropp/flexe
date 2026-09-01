@@ -1080,18 +1080,32 @@ static int fuzz_case(uint32_t insn, int ilen, unsigned seed) {
 }
 
 TEST(test_jit_encoding_sweep_matches_interpreter) {
-    static const int rst[][3] = {          /* r, s, t operand triples */
+    /* Operand triples chosen to cross the register allocator's boundaries:
+     * a1-a6 live in host registers and a0/a7-a15 are spilled, so a wrong host
+     * register only shows up when both kinds are in play. Same-register forms
+     * are included because an emitter that clobbers its source before reading
+     * it is only wrong when they coincide -- and RBP/RSI/RDI destinations are
+     * where the byte-store REX bug lived. */
+    static const int rst[][3] = {
         {2, 3, 4}, {5, 5, 6}, {3, 3, 3}, {7, 2, 9},
+        {0, 1, 15}, {15, 0, 1}, {1, 14, 6}, {12, 12, 2},
+        {6, 10, 11}, {10, 6, 0},
     };
+    const unsigned ntriples = (unsigned)(sizeof(rst) / sizeof(rst[0]));
     int compared = 0;
     unsigned seed = 1u;
 
-    /* 24-bit formats: op0 0 (RST0-3 and friends), 2 (RRI8), 4 (MAC16). */
-    static const unsigned op0s[] = {0u, 2u, 4u};
+    /* 24-bit formats. For op0=0 the op1/op2 loops walk the QRST sub-opcode
+     * space; for op0=2 (RRI8) the same bits are the 8-bit offset, so the
+     * sweep covers load/store displacements as a side effect. op0 1 (L32R)
+     * and 5-7 (calls and branches) are PC-relative and left out: they would
+     * be dropped by the straight-line filter anyway. op0 3 compiles nothing
+     * today, and is listed so that it starts being covered if it ever does. */
+    static const unsigned op0s[] = {0u, 2u, 3u, 4u};
     for (unsigned oi = 0; oi < sizeof(op0s) / sizeof(op0s[0]); oi++) {
         for (unsigned op1 = 0; op1 < 16u; op1++) {
             for (unsigned op2 = 0; op2 < 16u; op2++) {
-                for (unsigned k = 0; k < 4u; k++) {
+                for (unsigned k = 0; k < ntriples; k++) {
                     uint32_t insn = op0s[oi] |
                                     ((uint32_t)rst[k][2] << 4) |
                                     ((uint32_t)rst[k][1] << 8) |
@@ -1106,9 +1120,9 @@ TEST(test_jit_encoding_sweep_matches_interpreter) {
     }
 
     /* 16-bit density formats. */
-    for (unsigned op0 = 8u; op0 <= 13u; op0++)
+    for (unsigned op0 = 8u; op0 <= 15u; op0++)
         for (unsigned r = 0; r < 16u; r++)
-            for (unsigned k = 0; k < 4u; k++) {
+            for (unsigned k = 0; k < ntriples; k++) {
                 uint32_t insn = op0 | ((uint32_t)rst[k][2] << 4) |
                                 ((uint32_t)rst[k][1] << 8) | (r << 12);
                 compared += fuzz_case(insn, 2, seed * 2u);
