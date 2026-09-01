@@ -529,11 +529,16 @@ is a debugging tool rather than a run mode, but it is what found the SRC
 miscompile, the byte-store miscompile, and the LEND-spanning block that hung
 two of the CYD board builds. The stock images verify clean over 9.4M blocks.
 
-Chaining is switched off while verifying: a chain jumps directly between
-blocks, so it steps over PCs at which the interpreted reference still
-dispatches a ROM stub, and the two stop executing comparable work. Block-level
-verification stays exact, and that chaining preserves results is covered by
-the gates and by bench-compute's cross-engine checksum.
+Chaining is switched off while verifying, and that is not a limitation worth
+working around. The reference run replays the exact guest-instruction count
+the native block reported, but a stub emulates a whole guest function in one
+dispatch -- spending one instruction of that budget while standing in for many
+-- and native code cannot enter ROM at all. Any window long enough to chain
+crosses at least one stub, so skipping those cases removes all of the coverage
+rather than the noise: measured across three stock ROMs, every single chained
+block gets skipped. Block-level verification stays exact, and that chaining
+preserves results is covered by the gates and by bench-compute's cross-engine
+checksum instead.
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real

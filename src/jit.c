@@ -107,6 +107,7 @@ struct jit_state {
     uint64_t verify_blocks;
     uint64_t verify_mismatches;
     uint64_t verify_skipped;
+    uint64_t verify_stub_hits;
 
     /* Hook chaining: JIT installs itself as a pc_hook, forwarding
      * non-JIT addresses to the original (ROM stubs) hook. */
@@ -2427,6 +2428,23 @@ static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
      * direction would splice in a block that runs straight through LEND. */
     if (jit->cur_lv != 0u) return;
 
+    /* Not chained under verification, and not fixable by being cleverer about
+     * it. The reference run replays the exact guest-instruction count fn()
+     * reported, but a stub emulates a whole guest function in one dispatch --
+     * it spends one instruction of that budget while standing in for many, and
+     * native code cannot enter ROM at all. Any window long enough to chain
+     * crosses at least one stub, so skipping those cases removes *all* the
+     * coverage rather than the noise: measured across three stock ROMs, every
+     * single chained block gets skipped. Block-level verification stays exact,
+     * and that chaining preserves results is covered instead by the stock-ROM
+     * gates and by bench-compute.sh, which requires the two engines to agree
+     * on a checksum over ~910M cycles.
+     *
+     * The native loop back-edge is deliberately *not* suppressed: it stays
+     * inside one block, and fn()'s return value says exactly how many guest
+     * instructions it covered, so the reference can replay it. */
+    if (jit->verify) return;
+
     /* Not chained under verification. A chain jumps directly between blocks,
      * so it steps over PCs at which the interpreted reference run still
      * dispatches a ROM stub -- the two stop executing comparable work and
@@ -2438,7 +2456,6 @@ static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
      * The native loop back-edge is deliberately *not* suppressed: it stays
      * inside one block, and fn()'s return value says exactly how many guest
      * instructions it covered, so the reference run can replay it. */
-    if (jit->verify) return;
     if (jit->no_chain) return;
     if (jit->dt && jit->dt_count < JIT_MAX_BLOCK_INSNS * 2) {
         jit->dt[jit->dt_count][0] = target_pc;
@@ -2829,10 +2846,19 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
     /* Reference run: the same guest instructions, interpreted. Journalled as
      * well, so a store the block *failed* to make is caught too. */
     mem_journal_begin();
+    /* A stub emulates a whole guest function in a single dispatch, so it
+     * costs one instruction of the reference run's budget while standing in
+     * for many; native code cannot enter ROM at all, since jit_pc_hook sends
+     * everything below 0x40070000 straight to the stub. Either way a run that
+     * passes through a stub covers different ground than a replay of the same
+     * instruction count, so the two are no longer comparable. Skip rather
+     * than report a mismatch that is an artefact of how stubs are counted. */
+    uint64_t stubs_before = jit->verify_stub_hits;
     jit->verify_active = true;
     for (int i = 0; i < n_jit && cpu->running; i++)
         xtensa_step(cpu);
     jit->verify_active = false;
+    bool ref_used_stub = jit->verify_stub_hits != stubs_before;
     int iwrites = g_mem_journal_count;
     int ionly[MEM_JOURNAL_MAX_COMPARE];
     int in = iwrites < MEM_JOURNAL_MAX_COMPARE ? iwrites
@@ -2844,7 +2870,8 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
     /* An interrupt or exception taken by the reference run is not a
      * miscompile: a native block defers interrupts to its exit, while
      * xtensa_step() checks after every instruction. */
-    if (cpu->exception || (XT_PS_EXCM(cpu->ps) && !XT_PS_EXCM(before.ps))) {
+    if (ref_used_stub || cpu->exception ||
+        (XT_PS_EXCM(cpu->ps) && !XT_PS_EXCM(before.ps))) {
         jit->verify_skipped++;
         mem_journal_end();
         cpu->ccount = before.ccount;
@@ -2904,8 +2931,15 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
      * must not dispatch back into the code being checked. ROM stubs stay
      * live -- they are part of the semantics being compared. */
     if (__builtin_expect(jit->verify_active, 0)) {
-        if (jit->original_hook)
-            return jit->original_hook(cpu, pc, jit->original_hook_ctx);
+        if (jit->original_hook) {
+            /* Only a stub that actually handled the call counts. The hook
+             * fires at every bitmap-marked PC, and the bitmap is the merged
+             * one, so most of those dispatches are just JIT block entries
+             * being forwarded and mean nothing here. */
+            int r = jit->original_hook(cpu, pc, jit->original_hook_ctx);
+            if (r > 0) jit->verify_stub_hits++;
+            return r;
+        }
         return 0;
     }
 
@@ -3260,7 +3294,7 @@ void jit_set_verify(jit_state_t *jit, bool enable) {
 void jit_verify_summary(const jit_state_t *jit) {
     if (!jit || !jit->verify) return;
     fprintf(stderr, "[jit-verify] %llu blocks checked, %llu mismatching, "
-            "%llu skipped (MMIO or interrupt)\n",
+            "%llu skipped (MMIO, interrupt or ROM stub)\n",
             (unsigned long long)jit->verify_blocks,
             (unsigned long long)jit->verify_mismatches,
             (unsigned long long)jit->verify_skipped);
