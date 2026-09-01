@@ -1684,6 +1684,19 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "Cycles:     %llu (virtual: %llu)\n",
             (unsigned long long)cycles, (unsigned long long)cpu->cycle_count);
+    {
+        /* Simulated time vs work actually done. The gap is time spent halted
+         * in WAITI or fast-forwarded by a scheduler shim, which is real
+         * elapsed guest time but retires nothing -- and so must not be
+         * counted when judging throughput. */
+        xtensa_cpu_t *core1 = flexe_session_cpu(session, 1);
+        uint64_t retired = xtensa_retired_insns(cpu) +
+                           (core1 ? xtensa_retired_insns(core1) : 0);
+        fprintf(stderr, "Insns:      %llu retired (%llu cycles idle)\n",
+                (unsigned long long)retired,
+                (unsigned long long)(cpu->cycle_count > retired
+                                     ? cpu->cycle_count - retired : 0));
+    }
 
     /* Final PC with symbol */
     char pc_sym[128];

@@ -2464,8 +2464,14 @@ have_insn:
  * Always checks timers + interrupts unconditionally (no batching). */
 int xtensa_step(xtensa_cpu_t *cpu) {
     uint64_t cc = cpu->cycle_count;
+    const uint64_t before = cc;
+    const bool was_halted = cpu->halted;
     int r = xtensa_step_impl(cpu, &cc);
     cpu->cycle_count = cc;
+    /* One dispatch can retire many instructions when a native block runs, and
+     * none at all when the core is halted. The advance in cc says which. */
+    if (!was_halted)
+        cpu->insn_count += cc - before;
     if (cpu->ccount >= cpu->next_timer_event)
         xtensa_fire_timers(cpu);
     if (cpu->interrupt & cpu->intenable)
@@ -2554,6 +2560,7 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
             }
         }
         cpu->cycle_count = cc;
+        cpu->insn_count += (uint64_t)executed;   /* idle retires nothing */
         return idle_executed + executed;
     }
 
@@ -2565,6 +2572,7 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
             break;
     }
     cpu->cycle_count = cc;
+    cpu->insn_count += (uint64_t)i;              /* idle retires nothing */
     return idle_executed + i;
 }
 

@@ -270,7 +270,21 @@ struct xtensa_cpu {
     int      breakpoint_count;
 
     /* --- CL 5-6: pointers, cycle count, window --- */
-    uint64_t cycle_count;               /* Total emulated cycles */
+    /* Elapsed simulated cycles. This is *time*, not work: it also advances
+     * while the core is halted in WAITI and across the scheduler's
+     * fast-forwards, because peripherals, timers and task wakeups are all
+     * scheduled against it. Every -c budget and every harness cycle limit is
+     * expressed in these units. */
+    uint64_t cycle_count;
+    /* Guest instructions this core actually retired. Kept separately because
+     * cycle_count cannot answer the question: it advances while the core is
+     * halted, and flexe_session_post_batch() publishes the *maximum* of the
+     * two cores' values so both share one timeline. Throughput has to be
+     * measured in these units -- crediting idle time as work would let a
+     * firmware that mostly sleeps report a MIPS figure it never achieved.
+     * Updated once per xtensa_run() batch, so the per-instruction path is
+     * untouched. */
+    uint64_t insn_count;
     xtensa_mem_t *mem;                  /* Memory subsystem */
     xtensa_pc_hook_fn pc_hook;          /* PC hook (for ROM stubs etc.) */
     void             *pc_hook_ctx;
@@ -443,6 +457,11 @@ void     sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val);
  * Public API
  */
 void xtensa_cpu_init(xtensa_cpu_t *cpu);
+
+/* Guest instructions this core retired. See cycle_count / insn_count. */
+static inline uint64_t xtensa_retired_insns(const xtensa_cpu_t *cpu) {
+    return cpu->insn_count;
+}
 void xtensa_cpu_reset(xtensa_cpu_t *cpu);
 void xtensa_predecode_build(xtensa_cpu_t *cpu);  /* Pre-decode instruction memory */
 void xtensa_invalidate_code(xtensa_cpu_t *cpu, uint32_t addr, size_t len);

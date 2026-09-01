@@ -114,6 +114,13 @@ int main(int argc, char **argv) {
     }
 
     uint64_t start_cycles = cpu->cycle_count;
+    /* The fixture's loop() runs on core 1 (Arduino pins loopTask there), so
+     * throughput has to count both cores' retired instructions. cycle_count
+     * cannot be used for this: post_batch publishes the maximum of the two,
+     * which is a shared timeline, not a sum of work. */
+    xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
+    uint64_t start_insns = xtensa_retired_insns(cpu) +
+                           (cpu1 ? xtensa_retired_insns(cpu1) : 0);
     uint32_t start_rounds = mem_read32(mem, rounds_addr);
     uint32_t stop_rounds = start_rounds + (uint32_t)rounds_target;
     /* Let the fixture stop itself exactly on the target round. A host batch
@@ -130,16 +137,24 @@ int main(int argc, char **argv) {
 
     double wall = monotonic_seconds() - start_wall;
     uint64_t cycles = cpu->cycle_count - start_cycles;
+    /* MIPS is instructions per second, so it must exclude the simulated time
+     * the core spent halted -- otherwise a workload that sleeps reports
+     * throughput it never achieved. The two differ little here by design,
+     * but reporting both makes that visible rather than assumed. */
+    uint64_t insns = xtensa_retired_insns(cpu) +
+                     (cpu1 ? xtensa_retired_insns(cpu1) : 0) - start_insns;
     uint32_t done = mem_read32(mem, rounds_addr) - start_rounds;
     uint32_t checksum = mem_read32(mem, sum_addr);
 
-    double mips = wall > 0.0 ? (double)cycles / 1e6 / wall : 0.0;
+    double mips = wall > 0.0 ? (double)insns / 1e6 / wall : 0.0;
     double realtime = wall > 0.0 ? (double)cycles / ESP32_HZ / wall : 0.0;
 
-    printf("engine=%s rounds=%u cycles=%llu wall=%.3f mips=%.1f "
+    printf("engine=%s rounds=%u cycles=%llu insns=%llu wall=%.3f mips=%.1f "
            "realtime=%.2fx checksum=0x%08X kernel=",
            flexe_session_jit(session) ? "jit" : "interp",
-           done, (unsigned long long)cycles, wall, mips, realtime, checksum);
+           done, (unsigned long long)cycles,
+           (unsigned long long)insns, wall, mips, realtime,
+           checksum);
     for (unsigned i = 0; i < KERNEL_COUNT; i++)
         printf("%s0x%08X", i ? "/" : "", mem_read32(mem, kernel_addr + i * 4u));
     printf("\n");

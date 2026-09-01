@@ -501,6 +501,7 @@ static void sched_start(freertos_stubs_t *frt) {
      * causes firmware division-by-subtraction loops on millis() to hang. */
     frt->cpu[0]->ccount = 0;
     frt->cpu[0]->cycle_count = 0;
+    frt->cpu[0]->insn_count = 0;
 
     /* All registered tasks are READY; pick the first to run on core 0 */
     int next = sched_pick_next(frt, 0);

@@ -923,6 +923,39 @@ TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one) {
     teardown(&cpu);
 }
 
+/* cycle_count is elapsed simulated time and advances while the core is
+ * halted in WAITI, because timers and task wakeups are scheduled against it.
+ * Throughput must not be measured in those units: a firmware that mostly
+ * sleeps would report a MIPS figure it never achieved. idle_cycles records
+ * the sleeping part so the two can be told apart. */
+TEST(test_waiti_time_is_not_counted_as_retired_instructions) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    /* WAITI 0 */
+    put_insn3(&cpu, BASE, 0x007000u);
+    put_insn2(&cpu, BASE + 3u, narrow(0xD, 15, 0, 3));
+    cpu.running = true;
+    cpu._pc_written = true;
+
+    uint64_t insns_before = xtensa_retired_insns(&cpu);
+    xtensa_step(&cpu);                      /* retires WAITI, then halts */
+    ASSERT_TRUE(cpu.halted);
+    ASSERT_EQ64(xtensa_retired_insns(&cpu) - insns_before, 1u);
+
+    uint64_t cycles_before = cpu.cycle_count;
+    insns_before = xtensa_retired_insns(&cpu);
+    int ran = xtensa_run(&cpu, 5000);
+
+    /* Simulated time advanced across the whole batch... */
+    ASSERT_EQ64(cpu.cycle_count - cycles_before, (uint64_t)ran);
+    ASSERT_TRUE(ran > 0);
+    /* ...while nothing retired, because the core never left WAITI. */
+    ASSERT_TRUE(cpu.halted);
+    ASSERT_EQ64(xtensa_retired_insns(&cpu) - insns_before, 0u);
+
+    teardown(&cpu);
+}
+
 TEST(test_jit_flush) {
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -1190,6 +1223,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
+    RUN_TEST(test_waiti_time_is_not_counted_as_retired_instructions);
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);

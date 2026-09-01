@@ -487,25 +487,39 @@ Current Release-build results on Apple silicon (three default-length runs):
 | ESP32 Marauder v1.14.3 | **8.50× real-time** |
 | NerdMiner v1.8.3 | **5.86× real-time** |
 
-Stock images idle a great deal, so that gate measures the emulator's ability
-to keep up with real firmware rather than its peak throughput. For the latter
-use `bench-compute.sh`, which builds an in-repo fixture and runs a fixed
-number of *rounds* -- identical work every run and on both engines, rather
-than a cycle budget -- across a dependent scalar chain, strided array traffic,
-SHA-256-shaped rotate/xor mixing, and byte-wide load/store:
+Those figures are real-time factors, not throughput. `cycle_count` is elapsed
+*simulated time*: it advances while a core is halted in `WAITI` and across the
+scheduler's fast-forwards, because timers, peripherals and task wakeups are
+all scheduled against it, and every `-c` budget is expressed in those units.
+Stock images idle a great deal -- Marauder retires about 32M instructions per
+100M simulated cycles -- so keeping up with real time and executing
+instructions quickly are different claims. `insn_count` records the work, and
+the emulator reports both:
+
+```
+Cycles:     200007053 (virtual: 100057053)
+Insns:      32211607 retired (67845446 cycles idle)
+```
+
+For throughput use `bench-compute.sh`, which builds an in-repo fixture and
+runs a fixed number of *rounds* -- identical work every run and on both
+engines, rather than a cycle budget -- across a dependent scalar chain,
+strided array traffic, SHA-256-shaped rotate/xor mixing, and byte-wide
+load/store:
 
 ```bash
 ARDUINO_CLI=/path/to/arduino-cli ./bench-compute.sh
-# engine=interp rounds=12000 ... mips=187.1 realtime=0.78x checksum=0xC6B74AFC
-# engine=jit    rounds=12000 ... mips=768.4 realtime=3.20x checksum=0xC6B74AFC
-# checksum=0xC6B74AFC (engines agree)  jit-speedup=4.11x
+# engine=interp rounds=12000 ... mips=176.7  realtime=0.74x checksum=0xC6B74AFC
+# engine=jit    rounds=12000 ... mips=1458.5 realtime=6.08x checksum=0xC6B74AFC
+# checksum=0xC6B74AFC (engines agree)  jit-speedup=8.25x
 ```
 
 Both engines must agree on the checksum, so this is a JIT correctness check on
 real compiler output as much as a measurement. `BENCH_ROUNDS`, `BENCH_REPS`
-and `MIN_REALTIME` are configurable. On x86-64 Linux (GCC 15, Release) a
-loop-heavy sketch reaches **1878 MIPS, 7.83× real-time**, against 304 MIPS
-interpreted.
+and `MIN_REALTIME` are configurable. MIPS counts retired instructions across
+both cores, so it never credits idle time as work. On x86-64 Linux (GCC 15,
+Release) a loop-heavy sketch reaches **1881 MIPS, 7.84× real-time**, against
+304 MIPS interpreted.
 
 `--jit-verify` runs every compiled block twice -- once natively, once through
 the interpreter from the same starting state, with the interpreter's memory
