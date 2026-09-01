@@ -51,8 +51,15 @@ typedef struct {
     void    *chain_entry;   /* Entry point for chained blocks (after prologue) */
     uint32_t exec_count;    /* Hot counter / execution count */
     uint16_t guest_insns;   /* Number of guest instructions in block */
-    uint16_t flags;         /* Reserved */
+    uint16_t flags;         /* JIT_BLK_* */
 } jit_block_t;
+
+/* Scanning this (pc, windowbase, loop-variant) produced nothing worth
+ * compiling, and will again: the scan depends only on the instruction stream,
+ * the loop context that the cache key already distinguishes, and the ROM-stub
+ * bitmap, none of which change without a flush. Without remembering it, a hot
+ * PC the JIT declines is re-scanned on every single execution. */
+#define JIT_BLK_UNCOMPILABLE 0x1u
 
 /* Block chaining: max pending chain slots */
 #define MAX_CHAIN_SLOTS  131072

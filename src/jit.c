@@ -3127,8 +3127,12 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
 
     jit_scan_t scan;
     jit_scan_block(jit, cpu, pc, &scan);
-    if (scan.count < 4 && !jit_short_block_has_backedge(&scan, pc))
-        return;  /* short straight-line block: dispatch overhead dominates */
+    if (scan.count < 4 && !jit_short_block_has_backedge(&scan, pc)) {
+        /* Short straight-line block: dispatch overhead dominates. Record it,
+         * or every later execution pays for the same scan again. */
+        b->flags |= JIT_BLK_UNCOMPILABLE;
+        return;
+    }
 
     uint32_t saved_wb = cpu->windowbase;
     cpu->windowbase = wb;
@@ -3205,6 +3209,8 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
         threshold = 64;
     if (b->exec_count < threshold)
         return NULL;  /* Not hot yet */
+    if (b->flags & JIT_BLK_UNCOMPILABLE)
+        return NULL;  /* Already scanned and declined */
 
     jit_compile_now(jit, cpu, pc, wb, 0);
     return (b->code) ? (jit_block_fn)b->code : NULL;
