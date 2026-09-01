@@ -489,6 +489,33 @@ Current Release-build results on Apple silicon (three default-length runs):
 | ESP32 Marauder v1.14.3 | **8.50× real-time** |
 | NerdMiner v1.8.3 | **5.86× real-time** |
 
+Stock images idle a great deal, so that gate measures the emulator's ability
+to keep up with real firmware rather than its peak throughput. For the latter
+use `bench-compute.sh`, which builds an in-repo fixture and runs a fixed
+number of *rounds* -- identical work every run and on both engines, rather
+than a cycle budget -- across a dependent scalar chain, strided array traffic,
+SHA-256-shaped rotate/xor mixing, and byte-wide load/store:
+
+```bash
+ARDUINO_CLI=/path/to/arduino-cli ./bench-compute.sh
+# engine=interp rounds=12000 ... mips=187.1 realtime=0.78x checksum=0xC6B74AFC
+# engine=jit    rounds=12000 ... mips=768.4 realtime=3.20x checksum=0xC6B74AFC
+# checksum=0xC6B74AFC (engines agree)  jit-speedup=4.11x
+```
+
+Both engines must agree on the checksum, so this is a JIT correctness check on
+real compiler output as much as a measurement. `BENCH_ROUNDS`, `BENCH_REPS`
+and `MIN_REALTIME` are configurable. On x86-64 Linux (GCC 15, Release) a
+loop-heavy sketch reaches **1878 MIPS, 7.83× real-time**, against 304 MIPS
+interpreted.
+
+`--jit-verify` runs every compiled block twice -- once natively, once through
+the interpreter from the same starting state, with the interpreter's memory
+effects rolled back in between -- and reports any block whose architectural
+state or memory writes differ. It is roughly an order of magnitude slower and
+is a debugging tool rather than a run mode, but it is what found the SRC and
+byte-store miscompiles; all three stock ROMs now verify clean over 11M blocks.
+
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real
 UART0 FIFO/interrupt path, feeds a valid NMEA fix through the independent
