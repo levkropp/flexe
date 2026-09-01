@@ -552,8 +552,10 @@ static bool frt_block_cycles(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
         return true;
     }
     pthread_mutex_unlock(&frt->lock);
-    /* Legacy: single-task mode */
-    cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
+    /* Legacy: single-task mode. This path credits the wait to cycle_count, so
+     * it must not also credit virtual_time_us -- the two are summed into the
+     * guest clock and this is the one site that could pay the same interval
+     * twice. */
     cpu->cycle_count += advance;
     cpu->ccount += (uint32_t)advance;
     return false;
@@ -715,9 +717,7 @@ void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
 void stub_xTaskGetTickCount(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     frt_refresh_cpu_frequency(frt, cpu);
-    uint64_t cycle_us = (uint64_t)cpu->ccount / frt->cpu_freq_mhz;
-    uint64_t total_us = cpu->virtual_time_us > cycle_us ?
-                        cpu->virtual_time_us : cycle_us;
+    uint64_t total_us = xtensa_guest_time_us(cpu, frt->cpu_freq_mhz);
     uint32_t ticks = (uint32_t)(total_us /
                                 (1000000u / FLEXE_FREERTOS_HZ));
     frt_return(cpu, ticks);

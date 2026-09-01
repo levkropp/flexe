@@ -23,6 +23,33 @@ static void frt_teardown(xtensa_cpu_t *cpu, esp32_rom_stubs_t *rom, freertos_stu
 
 /* ===== Tests ===== */
 
+TEST(test_guest_clock_sums_executed_and_skipped_time) {
+    /* The two counters measure disjoint things, so the guest clock has to be
+     * their sum. This used to be max(), which meant that after any fast
+     * forward the guest's clock stood still until executed cycles caught up
+     * with the skipped total -- long enough, on a real boot, to swallow the
+     * first several hundred milliseconds of esp_timer alarms. */
+    xtensa_cpu_t cpu;
+    memset(&cpu, 0, sizeof(cpu));
+
+    cpu.cycle_count = 160u * 1000u;      /* 1 ms executed */
+    cpu.virtual_time_us = 0;
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 160), 1000u);
+
+    cpu.virtual_time_us = 5000;          /* 5 ms skipped on top */
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 160), 6000u);
+
+    /* Executing more must keep moving the clock even while the skipped total
+     * is still the larger of the two -- the case max() got wrong. */
+    cpu.cycle_count += 160u * 1000u;
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 160), 7000u);
+
+    /* Only the executed half scales with the clock rate; skipped time is
+     * already in microseconds. And a zero frequency must not divide by zero. */
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 240), 320000u / 240u + 5000u);
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 0), xtensa_guest_time_us(&cpu, 160));
+}
+
 TEST(test_vTaskDelay_advances_ccount) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -35,7 +62,7 @@ TEST(test_vTaskDelay_advances_ccount) {
     /* We use the rom_stubs_register to hook the address */
     rom_stubs_register_ctx(rom, vtd_addr, (rom_stub_fn)stub_vTaskDelay, "vTaskDelay", frt);
 
-    uint64_t vtime_before = cpu.virtual_time_us;
+    uint64_t vtime_before = xtensa_guest_time_us(&cpu, 160);
     uint32_t ccount_before = cpu.ccount;
     /* Set up call: a2 = ticks = 10 */
     XT_PS_SET_CALLINC(cpu.ps, 0);
@@ -46,8 +73,11 @@ TEST(test_vTaskDelay_advances_ccount) {
     /* Step to trigger the PC hook */
     xtensa_step(&cpu);
 
-    /* Arduino-ESP32 uses a 1 kHz tick: ten ticks are ten milliseconds. */
-    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 10000);
+    /* Arduino-ESP32 uses a 1 kHz tick: ten ticks are ten milliseconds. Assert
+     * on the composite guest clock rather than on either counter: which of
+     * the two a wait is charged to is an implementation detail, and the guest
+     * only ever sees the sum. */
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 160) - vtime_before, 10000);
     /* Fast-forwarded wall time advances the architectural cycle counter;
      * xtensa_step charges one additional cycle for dispatching the stub. */
     ASSERT_EQ(cpu.ccount - ccount_before, 1600001u);
@@ -170,7 +200,7 @@ TEST(test_xTaskGetTickCount) {
     extern void stub_xTaskGetTickCount(xtensa_cpu_t *, void *);
     rom_stubs_register_ctx(rom, addr, (rom_stub_fn)stub_xTaskGetTickCount, "xTaskGetTickCount", frt);
 
-    cpu.ccount = 1600000;  /* 10 ticks at 160K cycles per tick */
+    cpu.cycle_count = 1600000;  /* 10 ticks at 160K cycles per tick */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
     cpu.pc = addr;
@@ -792,7 +822,7 @@ TEST(test_vTaskDelay_caps_large_ticks) {
     extern void stub_vTaskDelay(xtensa_cpu_t *, void *);
     rom_stubs_register_ctx(rom, vtd_addr, (rom_stub_fn)stub_vTaskDelay, "vTaskDelay", frt);
 
-    uint64_t vtime_before = cpu.virtual_time_us;
+    uint64_t vtime_before = xtensa_guest_time_us(&cpu, 160);
     /* Very large ticks value that would overflow without cap */
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE + 0x100);
@@ -801,7 +831,7 @@ TEST(test_vTaskDelay_caps_large_ticks) {
     xtensa_step(&cpu);
 
     /* Capped at 200M cycles / 160 MHz = 1,250,000 us */
-    ASSERT_EQ(cpu.virtual_time_us - vtime_before, 200000000 / 160);
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 160) - vtime_before, 200000000 / 160);
 
     frt_teardown(&cpu, rom, frt);
 }
@@ -851,6 +881,7 @@ TEST(test_vPortFree_noop) {
 
 static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
+    RUN_TEST(test_guest_clock_sums_executed_and_skipped_time);
     RUN_TEST(test_vTaskDelay_advances_ccount);
     RUN_TEST(test_xTaskCreate_returns_pdPASS);
     RUN_TEST(test_pinned_task_reads_core_affinity_from_windowed_stack);

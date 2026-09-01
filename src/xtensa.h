@@ -350,7 +350,7 @@ struct xtensa_cpu {
     bool     window_trace_active; /* Set by main loop to gate window trace */
     bool     spill_verify;      /* Enable spill/fill verification */
     bool     accelerated_blocks; /* PC hook/AOT may execute >1 guest insn */
-    uint64_t virtual_time_us;   /* Simulated wall-clock microseconds */
+    uint64_t virtual_time_us;   /* Guest time skipped without executing (us) */
 
     /* Interrupt configuration */
     uint8_t  int_level[32];     /* Interrupt level per line (default: 1) */
@@ -419,6 +419,29 @@ struct xtensa_cpu {
     xtensa_code_invalidate_fn code_invalidate;
     void *code_invalidate_ctx;
 };
+
+/*
+ * Guest-visible elapsed time, in microseconds.
+ *
+ * Two counters make up the guest's clock and they measure disjoint things:
+ * `cycle_count` counts cycles the emulator actually executed, and
+ * `virtual_time_us` counts time it skipped past without executing any (a
+ * delay with nothing else runnable, a stub that models a wait rather than
+ * performing one). Elapsed time is therefore the *sum*.
+ *
+ * Taking the larger of the two instead -- which millis(), micros(),
+ * esp_timer_get_time() and xTaskGetTickCount() all used to do -- stalls the
+ * guest clock after any fast-forward, for however long it takes executed
+ * cycles to catch up with the skipped total. Firmware sees time stand still
+ * and esp_timer alarms armed during the stall come due late or never.
+ *
+ * Every site that skips time must credit exactly one of the two counters.
+ */
+static inline uint64_t xtensa_guest_time_us(const xtensa_cpu_t *cpu,
+                                            uint32_t freq_mhz) {
+    if (freq_mhz == 0) freq_mhz = 160;
+    return cpu->cycle_count / freq_mhz + cpu->virtual_time_us;
+}
 
 /*
  * Inline register access helpers

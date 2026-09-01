@@ -103,10 +103,8 @@ static uint64_t host_elapsed_us(const esp_timer_stubs_t *et) {
     return (uint64_t)sec * 1000000ULL + (uint64_t)nsec / 1000ULL;
 }
 
-/* Monotonic clock used for scheduling esp_timer alarms. Normal execution is
- * represented by cycle_count, while delay/scheduler shims may explicitly move
- * virtual_time_us ahead. The later value keeps timers progressing through
- * either path without counting the same fast-forward twice. */
+/* Monotonic clock used for scheduling esp_timer alarms; see
+ * xtensa_guest_time_us() for why executed and skipped time are summed. */
 static uint32_t current_cpu_freq_mhz(esp_timer_stubs_t *et) {
     uint32_t mhz = mem_read32(et->cpu->mem, ESP32_CPU_TICKS_PER_US_ADDR);
     if (mhz >= 10u && mhz <= 240u)
@@ -115,9 +113,7 @@ static uint32_t current_cpu_freq_mhz(esp_timer_stubs_t *et) {
 }
 
 static uint64_t current_time_us(esp_timer_stubs_t *et) {
-    uint64_t cycle_us = et->cpu->cycle_count / current_cpu_freq_mhz(et);
-    return et->cpu->virtual_time_us > cycle_us ?
-           et->cpu->virtual_time_us : cycle_us;
+    return xtensa_guest_time_us(et->cpu, current_cpu_freq_mhz(et));
 }
 
 /* Fast-forward past a wait when no scheduler is available to block on.
