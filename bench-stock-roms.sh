@@ -9,14 +9,14 @@
 #   NERDMINER_BIN=/path/to/nerdminer.bin ./bench-stock-roms.sh
 #
 # Useful overrides:
-#   EMU=./build/xtensa-emu  CYCLES=1200000000  REPS=3
+#   EMU=./build/xtensa-emu  CYCLES=2000000000  REPS=3
 #   ENGINE=jit|interp      MIN_REALTIME=1.0     ESP_HZ=240000000
 
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 emu=${EMU:-"$script_dir/build/xtensa-emu"}
-cycles=${CYCLES:-1200000000}
+cycles=${CYCLES:-2000000000}
 reps=${REPS:-3}
 engine=${ENGINE:-jit}
 min_realtime=${MIN_REALTIME:-1.0}
@@ -74,6 +74,16 @@ for rom in "${roms[@]}"; do
     fi
 done
 
+# Parse the child user+system line of bash's `times` ("0m1.234s 0m0.005s").
+child_cpu_seconds() {
+    awk 'END { t = 0
+               for (i = 1; i <= NF; i++) {
+                   split($i, a, "m"); sub(/s$/, "", a[2])
+                   t += a[1] * 60 + a[2]
+               }
+               print t }' "$1"
+}
+
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/flexe-stock-bench.XXXXXX")
 trap 'rm -rf -- "$work_dir"' EXIT
 
@@ -95,6 +105,7 @@ for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
         log="$work_dir/${rom_index}-${rep}.stderr"
         uart="$work_dir/${rom_index}-${rep}.uart"
         start_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
+        times >"$work_dir/times-before"
         if ! "$emu" "${emu_args[@]}" -q -c "$cycles" "$rom" \
                 >"$uart" 2>"$log"; then
             echo "error: $name run $rep exited nonzero" >&2
@@ -103,6 +114,7 @@ for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
             break
         fi
         end_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
+        times >"$work_dir/times-after"
 
         if grep -aEq '\[TRAP\]|Stop reason: (cpu stopped|exception loop)' "$log"; then
             echo "error: $name run $rep trapped or stopped unexpectedly" >&2
@@ -129,6 +141,28 @@ for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
         wall=$(python3 -c \
             'import sys; print((int(sys.argv[2])-int(sys.argv[1]))/1e9)' \
             "$start_ns" "$end_ns")
+        # Wall time the emulator spent off-CPU is time it was blocked on the
+        # host rather than emulating. A 50ms poll per accept() once cost a
+        # NerdMiner run 35 of its 37 seconds while emulated time barely moved,
+        # and every correctness gate passed throughout -- nothing else here
+        # would notice it coming back.
+        # `times` must run in this shell: only the process that reaped the
+        # child has its CPU time, and a command substitution would fork and
+        # report zero. Its last line is cumulative child user/system time.
+        cpu_before=$(child_cpu_seconds "$work_dir/times-before")
+        cpu_after=$(child_cpu_seconds "$work_dir/times-after")
+        if ! python3 -c '
+import sys
+wall, before, after = (float(a) for a in sys.argv[1:4])
+cpu = after - before
+if wall < 0.5:            # too short to judge
+    sys.exit(0)
+sys.exit(0 if cpu >= 0.5 * wall else 1)' "$wall" "$cpu_before" "$cpu_after"; then
+            echo "error: $name run $rep spent most of its wall time off-CPU" \
+                 "(blocked on the host, not emulating)" >&2
+            workload_ok=0
+            break
+        fi
         wall_total=$(python3 -c 'import sys; print(float(sys.argv[1])+float(sys.argv[2]))' \
             "$wall_total" "$wall")
         virtual_total=$((virtual_total + virtual))

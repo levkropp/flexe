@@ -480,8 +480,15 @@ NERDMINER_BIN=/path/to/nerdminer.bin \
 The gate uses Flexe's reported per-core virtual cycles to compare elapsed
 simulated time with wall time, so dual-core workloads are not mistakenly
 credited twice. It rejects traps and early stops and defaults to requiring at
-least 1.0× real-time averaged over three 1.2-billion-cycle runs. `EMU`,
+least 1.0× real-time averaged over three 2-billion-cycle runs. `EMU`,
 `CYCLES`, `REPS`, `ENGINE`, `MIN_REALTIME`, and `ESP_HZ` are configurable.
+
+It also rejects a run that spent most of its wall time *off*-CPU. A real-time
+factor alone cannot tell emulating slowly apart from not emulating at all: a
+50 ms poll per `accept()` once cost a NerdMiner run 35 of its 37 seconds
+asleep while emulated time barely advanced, and every correctness gate passed
+throughout. The window is 2 billion cycles rather than 1.2 because that is
+what it takes to reach the phase where that happened.
 
 Current Release-build results on Apple silicon (three default-length runs):
 
