@@ -6,6 +6,7 @@
 
 #include "jit.h"
 #include "peripherals.h"
+#include "savestate.h"
 
 /* ===== Helpers ===== */
 
@@ -1135,6 +1136,35 @@ TEST(test_jit_encoding_sweep_matches_interpreter) {
     fprintf(stderr, "  [sweep] %d encodings compiled and compared\n", compared);
 }
 
+/* insn_count is separate state, so a checkpoint has to carry it. Restoring
+ * only cycle_count would leave a resumed run reporting far more idle than it
+ * had, since retired work would restart from zero against a cycle count that
+ * did not. */
+TEST(test_savestate_round_trips_retired_instruction_count) {
+    char path[] = "/tmp/flexe-savestate-test-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+
+    xtensa_cpu_t saved;
+    setup(&saved);
+    saved.cycle_count = 1234567u;
+    saved.insn_count = 987654u;
+    ASSERT_EQ64(xtensa_retired_insns(&saved), 987654u);
+    ASSERT_EQ(savestate_save(&saved, NULL, path, "unit-test"), 0);
+
+    xtensa_cpu_t restored;
+    setup(&restored);
+    ASSERT_EQ64(restored.insn_count, 0u);
+    ASSERT_EQ(savestate_restore(&restored, NULL, path), 0);
+    ASSERT_EQ64(restored.cycle_count, 1234567u);
+    ASSERT_EQ64(xtensa_retired_insns(&restored), 987654u);
+
+    unlink(path);
+    teardown(&saved);
+    teardown(&restored);
+}
+
 TEST(test_jit_flush) {
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -1404,6 +1434,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
     RUN_TEST(test_waiti_time_is_not_counted_as_retired_instructions);
     RUN_TEST(test_jit_encoding_sweep_matches_interpreter);
+    RUN_TEST(test_savestate_round_trips_retired_instruction_count);
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);

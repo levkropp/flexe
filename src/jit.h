@@ -17,10 +17,21 @@
 #define JIT_HASH_SIZE   (1u << JIT_HASH_BITS)
 #define JIT_HASH_MASK   (JIT_HASH_SIZE - 1)
 
-/* Compilation threshold: compile after N interpreter executions */
-/* Production firmware crosses thousands of cold control-flow targets during
+/* Compilation threshold: compile after N interpreter executions.
+ *
+ * Production firmware crosses thousands of cold control-flow targets during
  * startup. Compiling after only three observations spends more time toggling
- * W^X and emitting code than it saves; genuinely hot loops reach 16 quickly. */
+ * W^X and emitting code than it saves; genuinely hot loops reach 16 quickly.
+ *
+ * Measured, so it does not need re-deriving: on the stock ROMs, lowering this
+ * to 2 compiles twenty times as many blocks (18 -> 375 on NerdMiner) and
+ * changes neither the share of instructions executed natively (7.8%) nor the
+ * wall time. Sampling candidate PCs more often does not move it either. Those
+ * ROMs simply have no further hot code to find -- excluding idle, roughly a
+ * fifth to a quarter of retired instructions run natively and the rest is
+ * genuinely diffuse: the single hottest PC accounts for about 0.06% of
+ * samples. Stock-ROM throughput is bounded by cold code, not by JIT coverage,
+ * so raising coverage is not the lever it looks like. */
 #define JIT_HOT_THRESHOLD  16
 
 /* Maximum guest instructions per block */

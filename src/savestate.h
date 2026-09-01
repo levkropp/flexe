@@ -8,7 +8,7 @@ typedef struct xtensa_cpu xtensa_cpu_t;
 typedef struct freertos_stubs freertos_stubs_t;
 
 /* File format version (increment when structure changes) */
-#define SAVESTATE_VERSION 1
+#define SAVESTATE_VERSION 2
 
 /* Savestate file magic (ASCII: "XTST") */
 #define SAVESTATE_MAGIC 0x54535458
@@ -17,8 +17,8 @@ typedef struct freertos_stubs freertos_stubs_t;
 typedef struct {
     uint32_t magic;           /* SAVESTATE_MAGIC */
     uint32_t version;         /* SAVESTATE_VERSION */
-    uint64_t cycle_count;     /* Virtual cycles at checkpoint */
-    uint64_t real_cycles;     /* Real cycles (includes delay stubs) - same as cycle_count for now */
+    uint64_t cycle_count;     /* Elapsed simulated cycles at checkpoint */
+    uint64_t insn_count;      /* Guest instructions retired (excludes idle) */
     uint64_t timestamp;       /* Unix timestamp of save */
     char description[256];    /* Human-readable checkpoint name */
 

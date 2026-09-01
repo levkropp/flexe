@@ -57,7 +57,7 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
     hdr.magic = SAVESTATE_MAGIC;
     hdr.version = SAVESTATE_VERSION;
     hdr.cycle_count = cpu->cycle_count;
-    hdr.real_cycles = cpu->cycle_count; /* Same for now (no delay stub acceleration) */
+    hdr.insn_count = cpu->insn_count;
     hdr.timestamp = (uint64_t)time(NULL);
 
     if (description) {
@@ -149,6 +149,7 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
     WRITE_OR_FAIL(f, &cpu->debug_break, sizeof(cpu->debug_break), "DEBUG_BREAK");
     WRITE_OR_FAIL(f, &cpu->halted, sizeof(cpu->halted), "HALTED");
     WRITE_OR_FAIL(f, &cpu->cycle_count, sizeof(cpu->cycle_count), "CYCLE_COUNT");
+    WRITE_OR_FAIL(f, &cpu->insn_count, sizeof(cpu->insn_count), "INSN_COUNT");
     WRITE_OR_FAIL(f, &cpu->virtual_time_us, sizeof(cpu->virtual_time_us), "VIRTUAL_TIME_US");
 
     /* === Memory Regions === */
@@ -284,6 +285,8 @@ int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path
     fprintf(stderr, "Restoring checkpoint: %s\n", hdr.description);
     fprintf(stderr, "  Saved at:     %llu (Unix timestamp)\n", (unsigned long long)hdr.timestamp);
     fprintf(stderr, "  Cycle count:  %llu\n", (unsigned long long)hdr.cycle_count);
+    fprintf(stderr, "  Insns:        %llu retired\n",
+            (unsigned long long)hdr.insn_count);
 
     /* === Restore CPU State === */
     READ_OR_FAIL(f, cpu->ar, sizeof(cpu->ar), "AR registers");
@@ -346,6 +349,7 @@ int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path
     READ_OR_FAIL(f, &cpu->debug_break, sizeof(cpu->debug_break), "DEBUG_BREAK");
     READ_OR_FAIL(f, &cpu->halted, sizeof(cpu->halted), "HALTED");
     READ_OR_FAIL(f, &cpu->cycle_count, sizeof(cpu->cycle_count), "CYCLE_COUNT");
+    READ_OR_FAIL(f, &cpu->insn_count, sizeof(cpu->insn_count), "INSN_COUNT");
     READ_OR_FAIL(f, &cpu->virtual_time_us, sizeof(cpu->virtual_time_us), "VIRTUAL_TIME_US");
 
     /* === Restore Memory Regions === */
