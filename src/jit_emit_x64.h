@@ -82,6 +82,16 @@ static inline void emit_rex(emit_t *e, int w, int reg, int rm) {
     if (r != 0x40 || w) emit8(e, r);
 }
 
+/* REX for instructions whose `reg` operand is an 8-bit register.
+ * Without a REX prefix, reg encodings 4-7 name AH/CH/DH/BH; with one (even a
+ * bare 0x40) they name SPL/BPL/SIL/DIL. Dropping the prefix as an
+ * optimisation therefore silently retargets the operand to the high byte of
+ * a completely different register. */
+static inline void emit_rex8(emit_t *e, int reg, int rm) {
+    uint8_t r = rex(0, (reg >> 3) & 1, 0, (rm >> 3) & 1);
+    if (r != 0x40 || (reg & 7) >= 4) emit8(e, r);
+}
+
 static inline void emit_rex_w(emit_t *e, int reg, int rm) {
     emit8(e, rex(1, (reg >> 3) & 1, 0, (rm >> 3) & 1));
 }
@@ -223,8 +233,7 @@ static inline void emit_load16s_disp(emit_t *e, int dst, int base, int32_t disp)
 
 /* mov byte [base64 + disp32], reg8 */
 static inline void emit_store8_disp(emit_t *e, int src, int base, int32_t disp) {
-    /* Need REX if src >= 4 (SPL, BPL, SIL, DIL) or if high regs */
-    emit_rex(e, 0, src, base);
+    emit_rex8(e, src, base);
     emit8(e, 0x88);
     if ((base & 7) == RSP) {
         emit8(e, modrm(2, src, RSP));

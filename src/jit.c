@@ -908,7 +908,10 @@ static void emit_mem_write8(emit_t *e, int addr_reg, int val_reg) {
 #ifdef JIT_ARCH_ARM64
     emit_store8_rof(e, val_reg, RAX, RDX);
 #else
-    emit_rex(e, 0, val_reg, RAX);
+    /* val_reg is RBP here, so the REX prefix is mandatory: without it the
+     * reg field names CH rather than BPL, and CH currently holds bits 8-15
+     * of the page index -- the store lands, with the wrong byte. */
+    emit_rex8(e, val_reg, RAX);
     emit8(e, 0x88);
     emit8(e, modrm(0, val_reg, 4));
     emit8(e, sib(0, RDX, RAX));
@@ -1313,16 +1316,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 /* Load SAR into CL */
                 emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_SAR);
                 emit_and_reg32_imm32(e, RCX, 0x3F);
-                /* Build 64-bit concat in RAX */
+                /* Build the 64-bit concatenation (as:at) in RAX. Both halves
+                 * are loaded with 32-bit moves, which zero-extend, so a
+                 * single 64-bit OR is enough -- and is the *only* thing that
+                 * works here. A 32-bit `or eax, ebx` would zero RAX's upper
+                 * half and silently turn SRC into a plain `at >> SAR`. */
                 ra_load_ar(e, ra,RAX, wb4, s);
                 emit_shl_reg64_imm(e, RAX, 32);  /* high 32 */
                 ra_load_ar(e, ra,RBX, wb4, t);
-                /* Zero-extend RBX to 64-bit and OR */
-                emit_or_reg32(e, RAX, RBX);  /* This only ORs low 32 into RAX */
-                /* Actually need: RAX = (as << 32) | at
-                 * The 32-bit OR won't work for 64-bit - use OR r64 */
-                /* Redo: rax already has as << 32. rbx has at (32-bit, zero-extended).
-                 * We need: or rax, rbx (64-bit) */
 #ifdef JIT_ARCH_ARM64
                 emit_or_reg64(e, RAX, RBX);
 #else

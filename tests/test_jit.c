@@ -318,6 +318,66 @@ TEST(test_jit_extui) {
     teardown(&cpu);
 }
 
+/* The SAR-driven shifts were covered against the interpreter in test_shift.c
+ * but never against the JIT, and SRC shipped miscompiled: the emitter built
+ * the 64-bit (as:at) concatenation and then clobbered its high half with a
+ * 32-bit `or eax, ebx`, which zero-extends. SRC silently degenerated to
+ * `at >> SAR`, so every compiler-emitted rotate -- GCC lowers `(x << n) |
+ * (x >> (32 - n))` to SSAI+SRC -- produced a wrong result once its block got
+ * hot. Sweep the whole family, and sweep SAR: SAR 0 and 32 are the boundaries
+ * where the high or low half alone is the answer, so a broken funnel still
+ * looks right there. */
+static void jit_src_case(uint32_t sar, uint32_t as, uint32_t at,
+                         const char *name) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    ar_write(&cpu, 4, as);
+    ar_write(&cpu, 5, at);
+    cpu.sar = sar;
+    put_insn3(&cpu, BASE, rrr(8, 1, 3, 4, 5));  /* SRC a3, a4, a5 */
+    test_block_differential(&cpu, 1, name);
+    teardown(&cpu);
+}
+
+TEST(test_jit_src_funnel) {
+    jit_src_case(0,  0xAAAAAAAAu, 0x55555555u, "src_sar0");
+    jit_src_case(8,  0xAA0000FFu, 0x00BB0000u, "src_sar8");
+    jit_src_case(16, 0x12345678u, 0x9ABCDEF0u, "src_sar16");
+    jit_src_case(31, 0x12345678u, 0x9ABCDEF0u, "src_sar31");
+    jit_src_case(32, 0x12345678u, 0x9ABCDEF0u, "src_sar32");
+    /* The exact rotate the bench_compute mix kernel performs, and the value
+     * it converged on: a broken funnel returns 0x00000007 and then stays
+     * there forever, because 7 is a fixed point of `x >> 27`. */
+    jit_src_case(27, 0x3D2154BFu, 0x3D2154BFu, "src_rotate27");
+}
+
+TEST(test_jit_sll_srl_sra) {
+    static const uint32_t sars[] = {0, 1, 8, 16, 31, 32};
+    for (unsigned i = 0; i < sizeof(sars) / sizeof(sars[0]); i++) {
+        xtensa_cpu_t cpu;
+        setup(&cpu);
+        ar_write(&cpu, 4, 0x87654321u);
+        cpu.sar = sars[i];
+        put_insn3(&cpu, BASE, rrr(10, 1, 3, 4, 0)); /* SLL a3, a4 */
+        test_block_differential(&cpu, 1, "sll");
+        teardown(&cpu);
+
+        setup(&cpu);
+        ar_write(&cpu, 5, 0x87654321u);
+        cpu.sar = sars[i];
+        put_insn3(&cpu, BASE, rrr(9, 1, 3, 0, 5));  /* SRL a3, a5 */
+        test_block_differential(&cpu, 1, "srl");
+        teardown(&cpu);
+
+        setup(&cpu);
+        ar_write(&cpu, 5, 0x87654321u);
+        cpu.sar = sars[i];
+        put_insn3(&cpu, BASE, rrr(11, 1, 3, 0, 5)); /* SRA a3, a5 */
+        test_block_differential(&cpu, 1, "sra");
+        teardown(&cpu);
+    }
+}
+
 TEST(test_jit_mull) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -410,6 +470,91 @@ TEST(test_jit_s32i) {
     xtensa_step(&verify);
     ASSERT_EQ(mem_read32(verify.mem, data_addr), 0xDEADBEEF);
     teardown(&cpu);
+}
+
+/* Byte and half-word memory ops had no JIT coverage at all, and S8I shipped
+ * broken because of it: emit_rex() drops a bare 0x40 prefix as an
+ * optimisation, but for an 8-bit register operand that prefix is exactly what
+ * distinguishes BPL from CH. The store therefore wrote bits 8-15 of RCX --
+ * the page index the address lowering had just computed into it -- instead of
+ * the guest value, so every S8I stored a byte of its own target address.
+ *
+ * compare_state() only looks at registers, so these cases compare memory
+ * explicitly; a store bug is invisible otherwise. The two engines run on
+ * separate CPUs with separate memories so neither can observe the other. */
+static void ldst_program(xtensa_cpu_t *cpu, unsigned subop, int treg,
+                         int sreg, uint32_t addr, uint32_t treg_val) {
+    setup(cpu);
+    mem_write32(cpu->mem, (addr & ~3u), 0xA5A5A5A5u);
+    mem_write32(cpu->mem, (addr & ~3u) + 4u, 0x5A5A5A5Au);
+    ar_write(cpu, sreg, addr);
+    ar_write(cpu, treg, treg_val);
+    /* RRI8: byte0 = (t << 4) | op0(2), byte1 = (subop << 4) | s, byte2 = 0 */
+    put_insn3(cpu, BASE, (uint32_t)(((unsigned)treg << 4) | 2u) |
+                         ((uint32_t)(((subop & 0xFu) << 4) |
+                                     ((unsigned)sreg & 0xFu)) << 8));
+    put_insn2(cpu, BASE + 3u, narrow(0xD, 15, 0, 3)); /* pad to the JIT's */
+    put_insn2(cpu, BASE + 5u, narrow(0xD, 15, 0, 3)); /* four-instruction */
+    put_insn2(cpu, BASE + 7u, narrow(0xD, 15, 0, 3)); /* profitability floor */
+}
+
+static void ldst_check(unsigned subop, int treg, int sreg, uint32_t addr,
+                       uint32_t treg_val, const char *name) {
+    xtensa_cpu_t ic, jc;
+    ldst_program(&ic, subop, treg, sreg, addr, treg_val);
+    run_interp(&ic, 4);
+
+    ldst_program(&jc, subop, treg, sreg, addr, treg_val);
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &jc, BASE);
+    jit_block_fn fn = jit_get_block(jit, &jc, BASE);
+    if (!fn) {
+        fprintf(stderr, "  FAIL %s: JIT refused the block\n", name);
+        test_failures++;
+        jit_destroy(jit);
+        teardown(&ic);
+        teardown(&jc);
+        return;
+    }
+    (void)fn(&jc);
+
+    int diffs = compare_state(&ic, &jc, name);
+    for (unsigned w = 0; w < 2u; w++) {
+        uint32_t a = (addr & ~3u) + w * 4u;
+        uint32_t iv = mem_read32(ic.mem, a), jv = mem_read32(jc.mem, a);
+        if (iv != jv) {
+            fprintf(stderr, "  DIFF %s: mem[0x%08X] interp=0x%08X jit=0x%08X\n",
+                    name, a, iv, jv);
+            diffs++;
+        }
+    }
+    if (diffs == 0) test_passes++; else test_failures += diffs;
+
+    jit_destroy(jit);
+    teardown(&ic);
+    teardown(&jc);
+}
+
+TEST(test_jit_byte_halfword_memory_ops) {
+    /* Cover mapped guest registers (a2-a6 live in host registers) and spilled
+     * ones (a7+ live in ar[]), and every byte offset within a word. */
+    static const int tregs[] = {2, 3, 4, 5, 6, 7, 12};
+    for (unsigned i = 0; i < sizeof(tregs) / sizeof(tregs[0]); i++) {
+        int t = tregs[i];
+        for (unsigned off = 0; off < 4u; off++) {
+            uint32_t addr = 0x3FFE0000u + off;
+            ldst_check(0x4, t, 9, addr, 0x1234567Bu, "s8i");
+            ldst_check(0x0, t, 9, addr, 0xDEADBEEFu, "l8ui");
+        }
+        for (unsigned off = 0; off < 4u; off += 2u) {
+            uint32_t addr = 0x3FFE0000u + off;
+            ldst_check(0x5, t, 9, addr, 0x1234F0E1u, "s16i");
+            ldst_check(0x1, t, 9, addr, 0xDEADBEEFu, "l16ui");
+            ldst_check(0x9, t, 9, addr, 0xDEADBEEFu, "l16si");
+        }
+    }
 }
 
 TEST(test_jit_multi_insn_block) {
@@ -964,6 +1109,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_srai);
     RUN_TEST(test_jit_extui);
     RUN_TEST(test_jit_srli);
+    RUN_TEST(test_jit_src_funnel);
+    RUN_TEST(test_jit_sll_srl_sra);
     RUN_TEST(test_jit_mull);
     RUN_TEST(test_jit_neg);
     RUN_TEST(test_jit_mov_n);
@@ -972,6 +1119,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_addi_n_minus1);
     RUN_TEST(test_jit_l32i_s32i);
     RUN_TEST(test_jit_s32i);
+    RUN_TEST(test_jit_byte_halfword_memory_ops);
     RUN_TEST(test_jit_multi_insn_block);
     RUN_TEST(test_jit_moveqz);
     RUN_TEST(test_jit_moveqz_not_taken);
