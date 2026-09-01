@@ -158,6 +158,15 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
+The compiled Arduino hardware gates below currently stand at 16 of 17 passing
+on x86-64 Linux (GCC 15, Arduino-ESP32 2.0.11). `test-emac-driver.sh` is the
+exception: the hardware model and its ISR are correct — the ISR runs and
+notifies — but ESP-IDF's `emac_esp32_rx_task` blocks on `ulTaskNotifyTake()`
+and is never rescheduled, because Arduino's `delay()` is intercepted and
+fast-forwards instead of yielding. Making `delay()` yield needs a real idle
+task so guest ISRs can execute during a blocking wait; done naively it
+regresses four other gates, so it is deliberately not attempted here.
+
 The optional compiled Arduino gate builds an unmodified `Wire` client, runs
 40-byte writes and repeated-start reads through the real ESP-IDF interrupt
 driver, checks address NACK behavior, and requires zero unhandled MMIO:
