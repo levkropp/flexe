@@ -328,6 +328,20 @@ static int framebuffer_nonblack(const uint16_t *fb, pthread_mutex_t *mutex)
     return count;
 }
 
+/* A pixel count says something was drawn; it does not say what. Two renders
+ * with the same number of lit pixels in different places or colours compare
+ * equal, which is most of what a display regression looks like. */
+static uint32_t framebuffer_checksum(const uint16_t *fb,
+                                     pthread_mutex_t *mutex)
+{
+    uint32_t h = 2166136261u;
+    pthread_mutex_lock(mutex);
+    for (size_t i = 0; i < FB_PIXELS; i++)
+        h = (h ^ fb[i]) * 16777619u;
+    pthread_mutex_unlock(mutex);
+    return h;
+}
+
 static int framebuffer_diff(const uint16_t *a, const uint16_t *b,
                             pthread_mutex_t *mutex)
 {
@@ -1692,9 +1706,10 @@ int main(int argc, char **argv)
     uint64_t total_cycles = flexe_session_cpu(session, 0)->cycle_count;
     const char *engine = flexe_session_jit(session) ? "jit" : "interp";
     printf("PASS profile=%s engine=%s wall=%.3fs virtual_cycles=%llu "
-           "nonblack=%d uart_bytes=%llu",
+           "nonblack=%d fb=%08X uart_bytes=%llu",
            profile, engine, (double)wall_ns / 1e9,
            (unsigned long long)total_cycles, nonblack,
+           framebuffer_checksum(framebuf, &framebuffer_mutex),
            (unsigned long long)uart.count);
     printf(" mmio_unhandled=%d rom_unregistered=%d",
            unhandled_mmio, unregistered_rom);

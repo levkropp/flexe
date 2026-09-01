@@ -469,6 +469,8 @@ address-based ROM, Wi-Fi, or NimBLE hooks.
 | Marauder v1.14.2 | `esp32_marauder_v1_14_2_20260815_cyd_2432S028.bin` | `5965e59f0e6f599eae213941d5ccc9d8d1dab1ebd7faa12b694cdff1a5cd3047` |
 | Marauder v1.14.3 | `esp32_marauder_v1_14_3_20260816_cyd_2432S028.bin` | `ad91696012f407bf782826793edd509119acf00e4751cd0d30eddd6223d6bf2d` |
 | Marauder v1.15.1 | `esp32_marauder_v1_15_1_20260824_cyd_2432S028.bin` | `72fa27948cd7f3bce4b6eabaaa8757b0d0e7854c534e8a502ce197d2397d899b` |
+| Marauder v1.14.3 (2432S024 guition) | `esp32_marauder_v1_14_3_20260816_cyd_2432S024_guition.bin` | `6459db43b36b5d303485185e0fc9fa4e672c0409246592b9c955550fc3091a26` |
+| Marauder v1.14.3 (3.5-inch) | `esp32_marauder_v1_14_3_20260816_cyd_3_5_inch.bin` | `968c1babf8b72c82a86e7e4cb3b86fcd4d619a67ad879aab02e7358f2a1a30d1` |
 
 Every v1.15.1 address was relocated from the v1.14.3 profile by unique
 masked-signature matching (L32R/CALL immediates wildcarded, since those move
@@ -499,8 +501,19 @@ symbols.
 ```bash
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
-./bench-stock-roms.sh
+./check-stock-roms.sh          # correctness
+./bench-stock-roms.sh          # performance
 ```
+
+`check-stock-roms.sh` runs each image through the scripted scenario on both
+engines and requires them to agree, including on the final framebuffer. The
+non-black pixel count the scenario already checks is sampled while the display
+is still coming up, so it legitimately differs between engines and says
+nothing about *what* was drawn; the framebuffer checksum is taken once the
+scenario has converged and is identical across engines for every image above.
+For the pinned images it is also held to a specific value, keyed by the ROM's
+SHA-256, so a change to the display model shows up as a decision to make
+rather than a silent difference.
 
 The gate uses Flexe's reported per-core virtual cycles to compare elapsed
 simulated time with wall time, so dual-core workloads are not mistakenly
