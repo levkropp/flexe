@@ -161,6 +161,15 @@ covered by both the unit suite and the compiled/stock-ROM integration runners.
 The compiled Arduino hardware gates below all pass — 19 of 19 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
+One deliberate gap is worth stating rather than leaving to be rediscovered:
+the ESP-IDF UART driver (`uart_driver_install`, `uart_read_bytes` and the rest
+of `driver/uart.h`) is stubbed to report success and do nothing. Arduino's
+`HardwareSerial` carries its own ISR and ring buffer and is modelled at the
+register and `uartBegin` level instead, which is the path every CYD ROM takes;
+the two cannot both own the UART. Firmware written against the IDF driver
+directly would install cleanly and then never move a byte. Making it work
+means unpicking that layering, not adding a register.
+
 `test-gpio-isr.sh` covers `attachInterrupt()`. The other gates that touch GPIO
 drive it as a level input and poll, so nothing exercised interrupt delivery —
 and it did not work: a per-core interrupt source raised its CPU line without
