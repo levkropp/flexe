@@ -66,6 +66,15 @@ static const marauder_bt_layout_t marauder_v11423_bt = {
     0x3FFC9544u, 0x3FFC9550u,
 };
 
+/* v1.15.x: NimBLE C++ moved +0x2C68, the host stack +0x2BE8, the vtable
+ * +0x3058, the literal pool +0xE8/+0xE0, and .bss uniformly +0x188. */
+static const marauder_bt_layout_t marauder_v1151_bt = {
+    0x40107C04u, 0x40107D04u, 0x40107DECu, 0x401DE1F4u,
+    0x4010F2ECu, 0x40113508u, 0x40112F0Cu, 0x40113F74u,
+    0x4010B5C4u, 0x4010B5D0u, 0x4010B6ECu,
+    0x3FFC96CCu, 0x3FFC96D8u,
+};
+
 /* A ble_gap_event is 52 bytes in this ESP32 NimBLE build.  Its discovery
  * descriptor begins at +4 and holds a pointer to the advertisement payload.
  * This bounded RTC-fast gap lies between the virtual PHY and WiFi buffers. */
@@ -780,6 +789,8 @@ int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
         layout = &marauder_v11401_bt;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
         layout = &marauder_v11423_bt;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1151)
+        layout = &marauder_v1151_bt;
     else
         return 0;
 

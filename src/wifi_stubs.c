@@ -2222,6 +2222,27 @@ static const wifi_fw_hook_t marauder_v11423_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
+/* Marauder v1.15.x: esp_wifi_init/deinit moved by +0x2C80 and the rest of the
+ * WiFi wrappers by +0x2DF4 (+0x2DF8 for esp_wifi_80211_tx). */
+static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
+    { 0x4013E198u, stub_esp_wifi_init,                  "esp_wifi_init" },
+    { 0x4013E130u, stub_esp_wifi_deinit,                "esp_wifi_deinit" },
+    { 0x4019BE94u, stub_esp_wifi_start,                 "esp_wifi_start" },
+    { 0x4019BEF0u, stub_esp_wifi_stop,                  "esp_wifi_stop" },
+    { 0x4019BE30u, stub_esp_wifi_set_mode,              "esp_wifi_set_mode" },
+    { 0x4019BE6Cu, stub_esp_wifi_get_mode,              "esp_wifi_get_mode" },
+    { 0x4019C5F0u, stub_esp_wifi_set_channel,           "esp_wifi_set_channel" },
+    { 0x4019C634u, stub_esp_wifi_get_channel,           "esp_wifi_get_channel" },
+    { 0x4019C700u, stub_esp_wifi_get_mac,               "esp_wifi_get_mac" },
+    { 0x4019C698u, stub_esp_wifi_set_mac,               "esp_wifi_set_mac" },
+    { 0x4019C77Cu, stub_esp_wifi_set_promiscuous,       "esp_wifi_set_promiscuous" },
+    { 0x4019C72Cu, stub_esp_wifi_set_promiscuous_filter,"esp_wifi_set_promiscuous_filter" },
+    { 0x4019C7E8u, stub_esp_wifi_set_promiscuous_rx_cb, "esp_wifi_set_promiscuous_rx_cb" },
+    { 0x4019C800u, stub_esp_wifi_noop,                   "esp_wifi_set_storage" },
+    { 0x401A8BBCu, stub_esp_wifi_80211_tx,              "esp_wifi_80211_tx" },
+    { 0, NULL, NULL },
+};
+
 int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
 {
     if (!ws) return 0;
@@ -2238,6 +2259,8 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = marauder_v114_wifi_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
         hooks = marauder_v11423_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1151)
+        hooks = marauder_v1151_wifi_hooks;
     else
         return 0;
     if (profile == ROM_FIRMWARE_NERDMINER_V183)

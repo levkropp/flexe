@@ -52,6 +52,11 @@ static const marauder_state_layout_t marauder_v11401_state = {
 static const marauder_state_layout_t marauder_v11423_state = {
     0x3FFC8CA8u, 0x3FFC8CACu, 0x3FFC8CB0u, 0x3FFC9394u,
 };
+/* v1.15.x: the frame-counter triple moved up by 0x184 and the scan-mode byte
+ * by 0x188 — adjacent .bss objects, but repacked independently. */
+static const marauder_state_layout_t marauder_v1151_state = {
+    0x3FFC8E2Cu, 0x3FFC8E30u, 0x3FFC8E34u, 0x3FFC951Cu,
+};
 static const marauder_state_layout_t *marauder_state =
         &marauder_v11401_state;
 #define MARAUDER_RAW_SCAN_MODE      25u
@@ -945,6 +950,8 @@ int main(int argc, char **argv)
             marauder_state = &marauder_v11401_state;
         else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1142_3)
             marauder_state = &marauder_v11423_state;
+        else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1151)
+            marauder_state = &marauder_v1151_state;
         else {
             fprintf(stderr,
                     "FAIL profile=marauder reason=unsupported-image-layout\n");

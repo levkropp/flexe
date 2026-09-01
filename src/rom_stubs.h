@@ -19,6 +19,7 @@ typedef enum {
     ROM_FIRMWARE_NERDMINER_V183,
     ROM_FIRMWARE_MARAUDER_V1140_1,
     ROM_FIRMWARE_MARAUDER_V1142_3,
+    ROM_FIRMWARE_MARAUDER_V1151,
 } rom_firmware_profile_t;
 
 esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);

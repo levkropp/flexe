@@ -94,6 +94,21 @@ static inline void seed_marauder_v11423_profile(xtensa_cpu_t *cpu) {
     put_test_bytes(cpu, 0x401990A0u, wifi_start, sizeof(wifi_start));
 }
 
+/* v1.15.x relinked the same entry point a third time: the phy wrapper's
+ * literal offset moved again and the WiFi wrappers shifted by 0x2DF4. */
+static inline void seed_marauder_v1151_profile(xtensa_cpu_t *cpu) {
+    static const uint8_t phy[] = {
+        0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
+        0x00, 0x81, 0xBE, 0xF0, 0xA9, 0x08, 0x3D, 0xF0,
+    };
+    static const uint8_t wifi_start[] = {
+        0x36, 0x41, 0x00, 0xA5, 0xAE, 0xFF, 0x21, 0x9B,
+        0xFE, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0x9B, 0xFE,
+    };
+    put_test_bytes(cpu, 0x401C1438u, phy, sizeof(phy));
+    put_test_bytes(cpu, 0x4019BE94u, wifi_start, sizeof(wifi_start));
+}
+
 static inline uint32_t rrr(int op2, int op1, int r, int s, int t) {
     return (uint32_t)((op2 << 20) | (op1 << 16) | (r << 12) | (s << 8) | (t << 4) | 0);
 }

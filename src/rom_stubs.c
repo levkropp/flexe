@@ -3955,6 +3955,12 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
             0x00, 0x81, 0xC4, 0xF0, 0xA9, 0x08, 0x3D, 0xF0,
         };
+        /* v1.15.x relinked again: the phy wrapper's second L32R offset moved
+         * from 0xC4 to 0xBE with the literal pool. */
+        static const uint8_t v115_phy[] = {
+            0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
+            0x00, 0x81, 0xBE, 0xF0, 0xA9, 0x08, 0x3D, 0xF0,
+        };
         static const uint8_t wifi_start[] = {
             0x36, 0x41, 0x00, 0xA5, 0xAE, 0xFF, 0x21, 0x9B,
             0xFE, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0x9B, 0xFE,
@@ -3970,6 +3976,11 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
                  fw_signature_matches(mem, 0x401990A0u,
                                       wifi_start, sizeof(wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1142_3;
+        else if (fw_signature_matches(mem, 0x401C1438u,
+                                      v115_phy, sizeof(v115_phy)) &&
+                 fw_signature_matches(mem, 0x4019BE94u,
+                                      wifi_start, sizeof(wifi_start)))
+            profile = ROM_FIRMWARE_MARAUDER_V1151;
     }
 
     stubs->firmware_profile = profile;
@@ -3987,6 +3998,7 @@ rom_firmware_profile_t rom_stubs_firmware_profile(
  * bounded table of guest return stubs before the first dispatch. */
 #define FW_NOOP_FN_V11401 0x401DBFC4u
 #define FW_NOOP_FN_V11423 0x401DC890u
+#define FW_NOOP_FN_V1151  0x401DF918u
 #define FW_FAKE_TBL_BT    0x50000400u
 #define FW_FAKE_TBL_WIFI  0x50000800u
 
@@ -4017,6 +4029,13 @@ static const fw_tbl_patch_t fw_marauder_v11423_ble_tbls[] = {
     {0x3FFCD984u, FW_FAKE_TBL_BT},
     {0x3FFD0554u, FW_FAKE_TBL_WIFI},
     {0x3FFD0558u, FW_FAKE_TBL_WIFI},
+};
+
+/* v1.15.x moved the whole .bss block up by 0x188. */
+static const fw_tbl_patch_t fw_marauder_v1151_ble_tbls[] = {
+    {0x3FFCDB0Cu, FW_FAKE_TBL_BT},
+    {0x3FFD06DCu, FW_FAKE_TBL_WIFI},
+    {0x3FFD06E0u, FW_FAKE_TBL_WIFI},
 };
 
 /* Decode an L32R's literal and return it when it points to firmware DRAM.
@@ -4087,7 +4106,12 @@ static void stub_fw_virtual_phy_init(xtensa_cpu_t *cpu, void *ctx) {
 static void stub_fw_marauder_phy_init(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *stubs = ctx;
     fw_virtualize_phy_table(cpu, stubs);
-    if (cpu->pc == 0x401BE628u)
+    if (cpu->pc == 0x401C1438u)
+        fw_patch_handler_tables(stubs, fw_marauder_v1151_ble_tbls,
+                                (int)(sizeof(fw_marauder_v1151_ble_tbls) /
+                                      sizeof(fw_marauder_v1151_ble_tbls[0])),
+                                FW_NOOP_FN_V1151);
+    else if (cpu->pc == 0x401BE628u)
         fw_patch_handler_tables(stubs, fw_marauder_v11423_ble_tbls,
                                 (int)(sizeof(fw_marauder_v11423_ble_tbls) /
                                       sizeof(fw_marauder_v11423_ble_tbls[0])),
@@ -4155,6 +4179,21 @@ static const fw_addr_hook_t fw_marauder_v11423_hooks[] = {
     { 0, NULL, NULL, 0 }
 };
 
+/* Marauder v1.15.x reuses entry 0x400831D8 with a third link layout. The
+ * IRAM DPORT helpers stayed put; everything in flash moved by a per-library
+ * delta (NimBLE C++ +0x2C68, NimBLE host +0x2BE8, phy +0x2E10). */
+static const fw_addr_hook_t fw_marauder_v1151_hooks[] = {
+    { 0x400816FC, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_start", 0 },
+    { 0x40081760, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_end", 0 },
+    { 0x401C1438, stub_fw_marauder_phy_init, "phy_get_romfunc_addr", 0 },
+    { 0x401078E5, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
+    { 0x4010798C, stub_fw_marauder_nimble_deinit,
+      "NimBLEDevice::deinit", 0 },
+    { 0, NULL, NULL, 0 }
+};
+
 /* NerdMiner v1.8.3 (CYD 2432S028R, entry 0x40089268). */
 static const fw_addr_hook_t fw_nerdminer_hooks[] = {
     /* Keep libphy's ABI but bypass physical RF calibration.  Higher-level
@@ -4181,6 +4220,8 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
         tbl = fw_marauder_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
         tbl = fw_marauder_v11423_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1151)
+        tbl = fw_marauder_v1151_hooks;
     else if (profile == ROM_FIRMWARE_NERDMINER_V183)
         tbl = fw_nerdminer_hooks;
     if (!tbl) {

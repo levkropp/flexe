@@ -582,11 +582,50 @@ TEST(test_marauder_same_entry_uses_instruction_fingerprint) {
     ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x400831D8u),
               ROM_FIRMWARE_MARAUDER_V1142_3);
 
+    /* The third layout shares the entry point again and must be told apart
+     * from both older ones by its own anchors. */
+    mem_write8(cpu.mem, 0x401BE628u, 0u);
+    seed_marauder_v1151_profile(&cpu);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x400831D8u),
+              ROM_FIRMWARE_MARAUDER_V1151);
+
     /* A reused entry with a near miss must not receive address hooks. */
     mem_write8(cpu.mem, 0x401990A0u, 0u);
+    mem_write8(cpu.mem, 0x4019BE94u, 0u);
     ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x400831D8u),
               ROM_FIRMWARE_UNKNOWN);
     ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_marauder_v1151_hooks_use_third_layout) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v1151_profile(&cpu);
+
+    /* Neither older layout's BLE dispatch global may be touched. */
+    const uint32_t v11401_table_global = 0x3FFCD974u;
+    const uint32_t v11423_table_global = 0x3FFCD984u;
+    const uint32_t v1151_table_global = 0x3FFCDB0Cu;
+    mem_write32(cpu.mem, v11401_table_global, 0xA5A5A5A5u);
+    mem_write32(cpu.mem, v11423_table_global, 0x5A5A5A5Au);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 5);
+
+    cpu.pc = 0x401C1438u;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(mem_read32(cpu.mem, v11401_table_global), 0xA5A5A5A5u);
+    ASSERT_EQ(mem_read32(cpu.mem, v11423_table_global), 0x5A5A5A5Au);
+    ASSERT_EQ(mem_read32(cpu.mem, v1151_table_global), 0x50000400u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FFD06DCu), 0x50000800u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x3FFD06E0u), 0x50000800u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x50000400u), 0x401DF918u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x50000800u), 0x401DF918u);
 
     rom_stubs_destroy(rom);
     teardown(&cpu);
@@ -778,6 +817,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);
     RUN_TEST(test_marauder_v11423_hooks_use_shifted_phy_and_data_layout);
+    RUN_TEST(test_marauder_v1151_hooks_use_third_layout);
     RUN_TEST(test_marauder_nimble_deinit_preserves_cpp_lists);
     RUN_TEST(test_marauder_dport_cache_stall_is_coherent_noop);
     RUN_TEST(test_bt_rom_table_accessors_use_bounded_scratch);
