@@ -363,11 +363,24 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
      * path in xtensa_run() advances event-by-event, fires each timer at its
      * own ccount, delivers pending interrupts, and — crucially — charges the
      * cycles it skips against the caller's batch budget. */
-    frt_install_idle_tasks(frt);
-    if (frt->idle_ready) {
-        int idle = frt->idle_task[core_id];
-        frt->tasks[idle].state = TASK_READY;
-        return idle;
+    /* Only a core that actually owns real work needs somewhere to idle. A
+     * core with nothing assigned (core 0 in an Arduino sketch, whose loopTask
+     * is pinned to core 1) is left parked as before: running an idle task
+     * there would spin the halted path every batch for no benefit. */
+    bool owns_work = false;
+    for (int i = 0; i < frt->task_count && !owns_work; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->is_idle || t->state == TASK_UNUSED) continue;
+        if (t->core_affinity < 0 || t->core_affinity == core_id)
+            owns_work = true;
+    }
+    if (owns_work) {
+        frt_install_idle_tasks(frt);
+        if (frt->idle_ready) {
+            int idle = frt->idle_task[core_id];
+            frt->tasks[idle].state = TASK_READY;
+            return idle;
+        }
     }
     return -1;  /* all tasks blocked/unused/pinned elsewhere */
 }
