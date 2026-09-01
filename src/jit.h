@@ -35,6 +35,7 @@
 /* Block entry in the hash table */
 typedef struct {
     uint32_t pc;            /* Guest PC (tag for collision detection) */
+    uint32_t end_pc;        /* First guest PC past the block */
     void    *code;          /* Pointer into code cache (NULL = empty) */
     void    *chain_entry;   /* Entry point for chained blocks (after prologue) */
     uint32_t exec_count;    /* Hot counter / execution count */
@@ -95,7 +96,13 @@ void         jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu);
 const jit_stats_t *jit_get_stats(const jit_state_t *jit);
 void               jit_print_stats(const jit_state_t *jit);
 
-/* Differential verification mode: compare each JIT block against interpreter */
+/* Differential verification mode: every compiled block is executed natively,
+ * rolled back, re-executed through the interpreter, and the two architectural
+ * states compared. Mismatches are reported and execution continues from the
+ * interpreter's (reference) state. Blocks that touch MMIO cannot be replayed
+ * and are skipped. Roughly an order of magnitude slower -- a debugging tool,
+ * not a run mode. */
 void               jit_set_verify(jit_state_t *jit, bool enable);
+void               jit_verify_summary(const jit_state_t *jit);
 
 #endif /* JIT_H */
