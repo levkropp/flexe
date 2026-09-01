@@ -522,6 +522,9 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
      * never fire during normal instruction execution — only when firmware
      * explicitly calls usleep/delay. */
     esp_timer_stubs_tick(s->etimer);
+    /* Same for FreeRTOS software timers, which Flexe models directly rather
+     * than running the guest's timer daemon. */
+    freertos_stubs_tick(s->frt);
 }
 
 /* ===== Callback configuration ===== */

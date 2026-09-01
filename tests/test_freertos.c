@@ -23,6 +23,87 @@ static void frt_teardown(xtensa_cpu_t *cpu, esp32_rom_stubs_t *rom, freertos_stu
 
 /* ===== Tests ===== */
 
+/* Call a hooked stub at `addr` with up to five arguments and return a2. */
+static uint32_t frt_call_stub(xtensa_cpu_t *cpu, uint32_t addr,
+                              const uint32_t *args, int nargs) {
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, BASE + 0x100);
+    for (int i = 0; i < nargs; i++)
+        ar_write(cpu, 2 + i, args[i]);
+    cpu->pc = addr;
+    xtensa_step(cpu);
+    return ar_read(cpu, 2);
+}
+
+TEST(test_software_timer_commands) {
+    /* xTimerStart/Stop/Reset/ChangePeriod/Delete are all macros over
+     * xTimerGenericCommand, so the command dispatch is the whole API. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    extern void stub_xTimerCreate(xtensa_cpu_t *, void *);
+    extern void stub_xTimerGenericCommand(xtensa_cpu_t *, void *);
+    extern void stub_xTimerIsTimerActive(xtensa_cpu_t *, void *);
+    extern void stub_pvTimerGetTimerID(xtensa_cpu_t *, void *);
+    extern void stub_vTimerSetTimerID(xtensa_cpu_t *, void *);
+    extern void stub_xTimerGetPeriod(xtensa_cpu_t *, void *);
+    uint32_t a_create = 0x400D0000, a_cmd = 0x400D0010, a_active = 0x400D0020;
+    uint32_t a_getid = 0x400D0030, a_setid = 0x400D0040, a_period = 0x400D0050;
+    rom_stubs_register_ctx(rom, a_create, (rom_stub_fn)stub_xTimerCreate, "xTimerCreate", frt);
+    rom_stubs_register_ctx(rom, a_cmd, (rom_stub_fn)stub_xTimerGenericCommand, "xTimerGenericCommand", frt);
+    rom_stubs_register_ctx(rom, a_active, (rom_stub_fn)stub_xTimerIsTimerActive, "xTimerIsTimerActive", frt);
+    rom_stubs_register_ctx(rom, a_getid, (rom_stub_fn)stub_pvTimerGetTimerID, "pvTimerGetTimerID", frt);
+    rom_stubs_register_ctx(rom, a_setid, (rom_stub_fn)stub_vTimerSetTimerID, "vTimerSetTimerID", frt);
+    rom_stubs_register_ctx(rom, a_period, (rom_stub_fn)stub_xTimerGetPeriod, "xTimerGetPeriod", frt);
+
+    /* create(name, 20 ticks, autoreload, id=0xA11E, cb) */
+    uint32_t cargs[5] = { 0x3FF00000u, 20u, 1u, 0xA11Eu, 0x400D9000u };
+    uint32_t h = frt_call_stub(&cpu, a_create, cargs, 5);
+    ASSERT_TRUE(h != 0);
+
+    /* A freshly created timer is not running until it is started. */
+    uint32_t one[1] = { h };
+    ASSERT_EQ(frt_call_stub(&cpu, a_active, one, 1), 0u);
+
+    uint32_t start[3] = { h, 1u /* tmrCOMMAND_START */, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_cmd, start, 3), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_active, one, 1), 1u);
+
+    uint32_t stop[3] = { h, 3u /* tmrCOMMAND_STOP */, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_cmd, stop, 3), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_active, one, 1), 0u);
+
+    /* Changing the period also starts the timer, as FreeRTOS does. */
+    uint32_t chg[3] = { h, 4u /* tmrCOMMAND_CHANGE_PERIOD */, 55u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_cmd, chg, 3), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_period, one, 1), 55u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_active, one, 1), 1u);
+
+    ASSERT_EQ(frt_call_stub(&cpu, a_getid, one, 1), 0xA11Eu);
+    uint32_t setid[2] = { h, 0xFEEDu };
+    (void)frt_call_stub(&cpu, a_setid, setid, 2);
+    ASSERT_EQ(frt_call_stub(&cpu, a_getid, one, 1), 0xFEEDu);
+
+    /* A deleted handle stops resolving, and commands against it fail rather
+     * than landing on whatever timer is reallocated into the slot. */
+    uint32_t del[3] = { h, 5u /* tmrCOMMAND_DELETE */, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_cmd, del, 3), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_cmd, start, 3), 0u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_active, one, 1), 0u);
+
+    /* A zero period is invalid in FreeRTOS; it must not divide by zero or
+     * schedule a timer that is permanently due. */
+    uint32_t zargs[5] = { 0x3FF00000u, 0u, 0u, 0u, 0x400D9000u };
+    uint32_t h2 = frt_call_stub(&cpu, a_create, zargs, 5);
+    ASSERT_TRUE(h2 != 0);
+    uint32_t two[1] = { h2 };
+    ASSERT_EQ(frt_call_stub(&cpu, a_period, two, 1), 1u);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_guest_clock_sums_executed_and_skipped_time) {
     /* The two counters measure disjoint things, so the guest clock has to be
      * their sum. This used to be max(), which meant that after any fast
@@ -881,6 +962,7 @@ TEST(test_vPortFree_noop) {
 
 static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
+    RUN_TEST(test_software_timer_commands);
     RUN_TEST(test_guest_clock_sums_executed_and_skipped_time);
     RUN_TEST(test_vTaskDelay_advances_ccount);
     RUN_TEST(test_xTaskCreate_returns_pdPASS);

@@ -60,7 +60,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 655 tests
+- 656 tests
 
 ## building
 
@@ -149,7 +149,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 655 tests, 12980 passed, 0 failed
+# 656 tests, 12996 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -158,7 +158,7 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 20 of 20 on x86-64
+The compiled Arduino hardware gates below all pass — 21 of 21 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 One deliberate gap is worth stating rather than leaving to be rediscovered:
@@ -176,6 +176,21 @@ and it did not work: a per-core interrupt source raised its CPU line without
 ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
+
+`test-frt-timer.sh` covers FreeRTOS software timers, which did not work at
+all. Unlike the rest of the FreeRTOS surface these were not stubbed, so the
+guest's own timer module was linked in but never driven: Flexe replaces
+`vTaskStartScheduler`, which is where real FreeRTOS creates the `Tmr Svc`
+daemon, so the daemon did not exist. Reviving it is not an option either —
+it blocks on its command queue through `vQueueWaitForMessageRestricted`, which
+reaches into the real queue structure, while every queue API the guest calls
+is hooked to Flexe's own queue objects, so it would wait forever on an
+always-empty queue. Software timers are now modelled directly, like tasks,
+queues and semaphores. The failure mode this removes is the bad kind:
+`xTimerCreate` returned a handle and `xTimerStart` returned `pdPASS`, and
+nothing ever happened. Hooking `xTimerGenericCommand` covers start, stop,
+reset, period change and delete in one entry point, since the rest of the API
+is macros over it.
 
 `test-esp-timer.sh` covers `esp_timer` callbacks — periodic, one-shot, stop and
 restart. Nothing drove that API from guest code before, and two defects were

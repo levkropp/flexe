@@ -1,6 +1,7 @@
 #include "freertos_stubs.h"
 #include "rom_stubs.h"
 #include "memory.h"
+#include "guest_call.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -18,6 +19,33 @@
 #define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
 #define FLEXE_FREERTOS_HZ           1000u
 
+/* Software timer storage. FreeRTOS's own timer module cannot be used here:
+ * its daemon blocks on the command queue through vQueueWaitForMessageRestricted,
+ * which reaches into the real queue structure, while every queue API the guest
+ * calls is hooked to Flexe's queue objects. The daemon would wait forever on an
+ * always-empty queue. Model the timers directly instead, as tasks, queues and
+ * semaphores already are. */
+#define MAX_SW_TIMERS    32
+
+/* Command IDs from FreeRTOS timers.h. xTimerStart(), xTimerStop() and the
+ * rest are macros over xTimerGenericCommand(), so hooking that one entry
+ * point covers the whole API. */
+#define tmrCOMMAND_EXECUTE_CALLBACK_FROM_ISR (-2)
+#define tmrCOMMAND_EXECUTE_CALLBACK          (-1)
+#define tmrCOMMAND_START_DONT_TRACE          0
+#define tmrCOMMAND_START                     1
+#define tmrCOMMAND_RESET                     2
+#define tmrCOMMAND_STOP                      3
+#define tmrCOMMAND_CHANGE_PERIOD             4
+#define tmrCOMMAND_DELETE                    5
+#define tmrCOMMAND_START_FROM_ISR            6
+#define tmrCOMMAND_RESET_FROM_ISR            7
+#define tmrCOMMAND_STOP_FROM_ISR             8
+#define tmrCOMMAND_CHANGE_PERIOD_FROM_ISR    9
+
+/* Instruction budget for one software-timer callback. */
+#define SW_TIMER_CALLBACK_INSNS 100000u
+
 /* Queue storage */
 #define MAX_QUEUES       64
 #define MAX_QUEUE_ITEMS  32
@@ -32,6 +60,18 @@ typedef struct {
     int      tail;
     uint8_t  buf[MAX_QUEUE_ITEMS * MAX_ITEM_SIZE];
 } queue_t;
+
+typedef struct {
+    uint32_t handle;         /* address returned as the TimerHandle_t */
+    uint32_t callback_addr;
+    uint32_t id;             /* pvTimerGetTimerID / vTimerSetTimerID */
+    uint32_t name_addr;      /* guest pointer, returned by pcTimerGetName */
+    uint32_t period_ticks;
+    bool     autoreload;
+    bool     active;
+    bool     used;
+    uint64_t alarm_us;       /* absolute guest time */
+} sw_timer_t;
 
 /* ===== Cooperative scheduler types ===== */
 
@@ -101,6 +141,10 @@ struct freertos_stubs {
     /* Queue storage */
     queue_t  queues[MAX_QUEUES];
     int      queue_count;
+
+    /* Software timer storage */
+    sw_timer_t sw_timers[MAX_SW_TIMERS];
+    int        sw_timer_count;
 
     /* Deferred task: saved by xTaskCreatePinnedToCore for later execution */
     uint32_t deferred_task_fn;
@@ -711,6 +755,179 @@ void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
         frt_return_void(cpu);
     }
     pthread_mutex_unlock(&frt->lock);
+}
+
+/* ===== Software timers ===== */
+
+#define SW_TIMER_TICK_US (1000000u / FLEXE_FREERTOS_HZ)
+
+static sw_timer_t *find_sw_timer(freertos_stubs_t *frt, uint32_t handle) {
+    for (int i = 0; i < frt->sw_timer_count; i++)
+        if (frt->sw_timers[i].used && frt->sw_timers[i].handle == handle)
+            return &frt->sw_timers[i];
+    return NULL;
+}
+
+static uint64_t sw_timer_now_us(freertos_stubs_t *frt, xtensa_cpu_t *cpu) {
+    frt_refresh_cpu_frequency(frt, cpu);
+    return xtensa_guest_time_us(cpu, frt->cpu_freq_mhz);
+}
+
+static void sw_timer_create(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                            uint32_t name, uint32_t period_ticks,
+                            uint32_t autoreload, uint32_t id, uint32_t cb) {
+    sw_timer_t *t = NULL;
+    for (int i = 0; i < frt->sw_timer_count; i++)
+        if (!frt->sw_timers[i].used) { t = &frt->sw_timers[i]; break; }
+    if (!t) {
+        if (frt->sw_timer_count >= MAX_SW_TIMERS) { frt_return(cpu, 0); return; }
+        t = &frt->sw_timers[frt->sw_timer_count++];
+    }
+    uint32_t handle = bump_alloc(frt, 4);
+    if (handle == 0) { frt_return(cpu, 0); return; }
+
+    memset(t, 0, sizeof(*t));
+    t->used = true;
+    t->handle = handle;
+    t->name_addr = name;
+    /* A zero period is invalid in FreeRTOS; clamp to one tick rather than
+     * dividing by it later. */
+    t->period_ticks = period_ticks ? period_ticks : 1u;
+    t->autoreload = autoreload != 0;
+    t->id = id;
+    t->callback_addr = cb;
+    frt_return(cpu, handle);
+}
+
+/* xTimerCreate(name, period_ticks, autoreload, id, callback) */
+void stub_xTimerCreate(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_create(cpu, frt, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                    frt_arg(cpu, 2), frt_arg(cpu, 3), frt_arg(cpu, 4));
+}
+
+/* xTimerCreateStatic(name, period, autoreload, id, callback, buffer) — the
+ * caller-supplied buffer is ignored; the handle is ours either way. */
+void stub_xTimerCreateStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_create(cpu, frt, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                    frt_arg(cpu, 2), frt_arg(cpu, 3), frt_arg(cpu, 4));
+}
+
+/* xTimerGenericCommand(timer, command, optional_value, woken, ticks_to_wait).
+ * xTimerStart/Stop/Reset/ChangePeriod/Delete are all macros over this. */
+void stub_xTimerGenericCommand(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    int32_t  command = (int32_t)frt_arg(cpu, 1);
+    uint32_t optional = frt_arg(cpu, 2);
+
+    sw_timer_t *t = find_sw_timer(frt, handle);
+    if (!t) { frt_return(cpu, pdFALSE); return; }
+
+    uint64_t now = sw_timer_now_us(frt, cpu);
+    switch (command) {
+    case tmrCOMMAND_START:
+    case tmrCOMMAND_START_DONT_TRACE:
+    case tmrCOMMAND_RESET:
+    case tmrCOMMAND_START_FROM_ISR:
+    case tmrCOMMAND_RESET_FROM_ISR:
+        t->active = true;
+        t->alarm_us = now + (uint64_t)t->period_ticks * SW_TIMER_TICK_US;
+        break;
+    case tmrCOMMAND_STOP:
+    case tmrCOMMAND_STOP_FROM_ISR:
+        t->active = false;
+        break;
+    case tmrCOMMAND_CHANGE_PERIOD:
+    case tmrCOMMAND_CHANGE_PERIOD_FROM_ISR:
+        /* FreeRTOS starts a timer whose period is changed, whether or not it
+         * was running. */
+        t->period_ticks = optional ? optional : 1u;
+        t->active = true;
+        t->alarm_us = now + (uint64_t)t->period_ticks * SW_TIMER_TICK_US;
+        break;
+    case tmrCOMMAND_DELETE:
+        t->used = false;
+        t->active = false;
+        break;
+    case tmrCOMMAND_EXECUTE_CALLBACK:
+    case tmrCOMMAND_EXECUTE_CALLBACK_FROM_ISR:
+        /* xTimerPendFunctionCall(): the "timer" carries the function and one
+         * argument rather than a deadline. */
+        t->active = false;
+        break;
+    default:
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+    frt_return(cpu, pdPASS);
+}
+
+void stub_xTimerIsTimerActive(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, (t && t->active) ? pdTRUE : pdFALSE);
+}
+
+void stub_pvTimerGetTimerID(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? t->id : 0);
+}
+
+void stub_vTimerSetTimerID(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    if (t) t->id = frt_arg(cpu, 1);
+    frt_return_void(cpu);
+}
+
+void stub_pcTimerGetName(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? t->name_addr : 0);
+}
+
+void stub_xTimerGetPeriod(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? t->period_ticks : 0);
+}
+
+void stub_xTimerGetExpiryTime(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? (uint32_t)(t->alarm_us / SW_TIMER_TICK_US) : 0);
+}
+
+/* Deliver any software timers that have come due.
+ *
+ * Called once per execution batch, outside frt->lock: the callback re-enters
+ * guest code and may call straight back into these stubs, so holding the lock
+ * here would deadlock exactly as the peripheral dispatch path does. Each
+ * timer's own state is settled *before* its callback runs, so a callback that
+ * stops or restarts its own timer wins over the reload.
+ */
+void freertos_stubs_tick(freertos_stubs_t *frt) {
+    if (!frt || !frt->cpu[0]) return;
+    xtensa_cpu_t *cpu = frt->cpu[0];
+    uint64_t now = sw_timer_now_us(frt, cpu);
+
+    for (int i = 0; i < frt->sw_timer_count; i++) {
+        sw_timer_t *t = &frt->sw_timers[i];
+        if (!t->used || !t->active || now < t->alarm_us) continue;
+
+        uint32_t handle = t->handle;
+        uint32_t cb = t->callback_addr;
+        if (t->autoreload)
+            t->alarm_us += (uint64_t)t->period_ticks * SW_TIMER_TICK_US;
+        else
+            t->active = false;
+        if (cb)
+            (void)guest_call8(cpu, cb, &handle, 1, SW_TIMER_CALLBACK_INSNS,
+                              NULL);
+    }
 }
 
 /* xTaskGetTickCount() -> virtual ticks (1 kHz) */
@@ -1815,6 +2032,19 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xTaskCreatePinnedToCore",       stub_xTaskCreatePinnedToCore },
         { "vTaskDelete",                   stub_vTaskDelete },
         { "xTaskGetTickCount",             stub_xTaskGetTickCount },
+        { "xTimerCreate",                  stub_xTimerCreate },
+        { "xTimerCreateStatic",            stub_xTimerCreateStatic },
+        { "xTimerGenericCommand",          stub_xTimerGenericCommand },
+        /* FreeRTOS v11 split the command entry point in two; hook both so a
+         * newer Arduino core keeps working. */
+        { "xTimerGenericCommandFromTask",  stub_xTimerGenericCommand },
+        { "xTimerGenericCommandFromISR",   stub_xTimerGenericCommand },
+        { "xTimerIsTimerActive",           stub_xTimerIsTimerActive },
+        { "pvTimerGetTimerID",             stub_pvTimerGetTimerID },
+        { "vTimerSetTimerID",              stub_vTimerSetTimerID },
+        { "pcTimerGetName",                stub_pcTimerGetName },
+        { "xTimerGetPeriod",               stub_xTimerGetPeriod },
+        { "xTimerGetExpiryTime",           stub_xTimerGetExpiryTime },
         { "xQueueCreate",                  stub_xQueueCreate },
         { "xQueueGenericCreate",           stub_xQueueGenericCreate },
         { "xQueueGenericCreateStatic",     stub_xQueueGenericCreateStatic },
@@ -1995,6 +2225,10 @@ int freertos_stubs_save_state(const freertos_stubs_t *frt, FILE *f) {
     if (fwrite(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
     if (fwrite(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
 
+    /* Save software timers */
+    if (fwrite(&frt->sw_timer_count, sizeof(frt->sw_timer_count), 1, f) != 1) return -1;
+    if (fwrite(frt->sw_timers, sizeof(frt->sw_timers), 1, f) != 1) return -1;
+
     /* Save deferred task */
     if (fwrite(&frt->deferred_task_fn, sizeof(frt->deferred_task_fn), 1, f) != 1) return -1;
     if (fwrite(&frt->deferred_task_param, sizeof(frt->deferred_task_param), 1, f) != 1) return -1;
@@ -2022,6 +2256,12 @@ int freertos_stubs_restore_state(freertos_stubs_t *frt, FILE *f) {
     /* Restore queue storage */
     if (fread(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
     if (fread(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
+
+    /* Restore software timers */
+    if (fread(&frt->sw_timer_count, sizeof(frt->sw_timer_count), 1, f) != 1) return -1;
+    if (fread(frt->sw_timers, sizeof(frt->sw_timers), 1, f) != 1) return -1;
+    if (frt->sw_timer_count < 0 || frt->sw_timer_count > MAX_SW_TIMERS)
+        return -1;
 
     /* Restore deferred task */
     if (fread(&frt->deferred_task_fn, sizeof(frt->deferred_task_fn), 1, f) != 1) return -1;

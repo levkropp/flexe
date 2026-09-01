@@ -48,6 +48,10 @@ bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
 bool freertos_stubs_sleep_us(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
                              uint64_t us);
 
+/* Deliver any software timers that have come due. Call once per execution
+ * batch, outside any FreeRTOS lock: callbacks re-enter guest code. */
+void freertos_stubs_tick(freertos_stubs_t *frt);
+
 /* Start the cooperative scheduler (called on self-loop detection) */
 void freertos_stubs_start_scheduler(freertos_stubs_t *frt);
 
