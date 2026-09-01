@@ -124,13 +124,16 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
      * esp_partition's load_partitions computes it). CRC32 follows, over
      * entries + MD5 entry. */
     uint8_t digest[16];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+/* OpenSSL 3.0 deprecates the low-level MD5_* API. This is a partition-table
+ * checksum, not a security primitive, so the legacy calls are fine; silence
+ * the deprecation with the "GCC" pragma spelling, which clang also honors. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     MD5_CTX mctx;
     MD5_Init(&mctx);
     MD5_Update(&mctx, pt, (size_t)n * 32);
     MD5_Final(digest, &mctx);
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
     uint8_t *md5e = pt + n * 32;
     md5e[0] = 0xEB; md5e[1] = 0xEB;             /* ESP_PARTITION_MAGIC_MD5 */
     memcpy(md5e + 16, digest, 16);

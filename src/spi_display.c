@@ -629,8 +629,10 @@ static void touch_sample(spi_display_t *s, int *rx, int *ry, int *pressed) {
         *ry = 200 + panel_x * (3700 - 200) / 239; /* library p.x */
         *rx = 240 + panel_y * (3800 - 240) / 319; /* library p.y */
     }
-    if (*rx < 0) *rx = 0; if (*rx > 4095) *rx = 4095;
-    if (*ry < 0) *ry = 0; if (*ry > 4095) *ry = 4095;
+    if (*rx < 0) *rx = 0;
+    if (*rx > 4095) *rx = 4095;
+    if (*ry < 0) *ry = 0;
+    if (*ry > 4095) *ry = 4095;
     *pressed = 1;
 }
 
@@ -686,8 +688,16 @@ static void sd_read_sector(spi_display_t *s, uint32_t lba, uint8_t *out) {
 }
 
 static void sd_write_sector(spi_display_t *s, uint32_t lba, const uint8_t *in) {
-    if (sd_image_open(s) >= 0)
-        (void)pwrite(s->sd_fd, in, 512, (off_t)lba * 512);
+    if (sd_image_open(s) < 0) return;
+    /* Loop over short writes; the backing image is a regular file, so a
+     * partial write means the sector would silently tear. */
+    off_t off = (off_t)lba * 512;
+    size_t done = 0;
+    while (done < 512) {
+        ssize_t n = pwrite(s->sd_fd, in + done, 512 - done, off + (off_t)done);
+        if (n <= 0) break;
+        done += (size_t)n;
+    }
 }
 
 /* CSD v2 for a 4 GB SDHC card (C_SIZE = 8191) */
