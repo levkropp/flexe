@@ -2667,14 +2667,23 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
     }
     jit->verify_active = false;
 
+    /* An interrupt or exception taken by the reference run is not a
+     * miscompile: a native block runs its whole instruction sequence with
+     * interrupts deferred to its exit, and xtensa_step() checks for them
+     * every instruction. The two engines are then not executing comparable
+     * work, so record a skip rather than a spurious mismatch. */
+    int diverted = cpu->exception ||
+                   (XT_PS_EXCM(cpu->ps) && !XT_PS_EXCM(before.ps));
+
     int unsafe = g_mem_journal_unsafe;
     int nwrites = g_mem_journal_count;
     g_mem_journal_en = 0;
 
-    /* MMIO in the window: the reference run cannot be undone, so running the
-     * block natively on top of it would apply its side effects twice. Keep
-     * the interpreted result -- it is the correct one -- and count a skip. */
-    if (unsafe) {
+    /* Either MMIO in the window (the reference run cannot be undone, so
+     * running the block natively on top of it would apply its side effects
+     * twice) or a diverted reference run. Keep the interpreted result -- it
+     * is the correct one -- and count a skip. */
+    if (unsafe || diverted) {
         jit->verify_skipped++;
         mem_journal_end();
         cpu->ccount = before.ccount;
@@ -3068,7 +3077,7 @@ void jit_set_verify(jit_state_t *jit, bool enable) {
 void jit_verify_summary(const jit_state_t *jit) {
     if (!jit || !jit->verify) return;
     fprintf(stderr, "[jit-verify] %llu blocks checked, %llu mismatching, "
-            "%llu skipped (MMIO)\n",
+            "%llu skipped (MMIO or interrupt)\n",
             (unsigned long long)jit->verify_blocks,
             (unsigned long long)jit->verify_mismatches,
             (unsigned long long)jit->verify_skipped);

@@ -1780,6 +1780,7 @@ int main(int argc, char *argv[]) {
 
     if (jit && jit_stats_enabled)
         jit_print_stats(jit);
+    jit_verify_summary(jit);
 
     /* Cleanup */
     ring_destroy(g_ring);
