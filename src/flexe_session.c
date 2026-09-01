@@ -498,13 +498,20 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
             else
                 s->cpu[1].cycle_count = s->cpu[0].cycle_count;
         } else {
-            if (s->cpu[1].cycle_count > s->cpu[0].cycle_count) {
+            if (s->cpu[1].cycle_count > s->cpu[0].cycle_count)
                 s->cpu[0].cycle_count = s->cpu[1].cycle_count;
-                s->cpu[0].virtual_time_us = s->cpu[1].cycle_count / 160;
-            } else {
+            else
                 s->cpu[1].cycle_count = s->cpu[0].cycle_count;
-            }
-            s->cpu[1].virtual_time_us = s->cpu[0].virtual_time_us;
+            /* Publish the later of the two cores' virtual_time_us, and only
+             * that. esp_timer's current_time_us() already reconciles it
+             * against cycle_count at the *real* CPU frequency; recomputing it
+             * here as cycle_count / 160 assumed a 160 MHz part and could move
+             * guest-visible time backwards on a 240 MHz one. */
+            uint64_t vt = s->cpu[0].virtual_time_us > s->cpu[1].virtual_time_us
+                        ? s->cpu[0].virtual_time_us
+                        : s->cpu[1].virtual_time_us;
+            s->cpu[0].virtual_time_us = vt;
+            s->cpu[1].virtual_time_us = vt;
         }
     }
 
