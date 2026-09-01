@@ -160,12 +160,12 @@ covered by both the unit suite and the compiled/stock-ROM integration runners.
 
 The compiled Arduino hardware gates below currently stand at 16 of 17 passing
 on x86-64 Linux (GCC 15, Arduino-ESP32 2.0.11). `test-emac-driver.sh` is the
-exception: the hardware model and its ISR are correct — the ISR runs and
-notifies — but ESP-IDF's `emac_esp32_rx_task` blocks on `ulTaskNotifyTake()`
-and is never rescheduled, because Arduino's `delay()` is intercepted and
-fast-forwards instead of yielding. Making `delay()` yield needs a real idle
-task so guest ISRs can execute during a blocking wait; done naively it
-regresses four other gates, so it is deliberately not attempted here.
+exception, and the remaining fault is in the Ethernet RX driver path rather
+than in scheduling: the model writes both injected frames into the descriptor
+ring and hands ownership back, source 38 fires, ESP-IDF's ISR notifies
+`emac_esp32_rx_task`, and that task is scheduled and runs — but its
+`receive()` yields no frame, so `stack_input` is never called. The `emac_hal`
+profile, which consumes RX inside the ISR, passes against the same model.
 
 The optional compiled Arduino gate builds an unmodified `Wire` client, runs
 40-byte writes and repeated-start reads through the real ESP-IDF interrupt
