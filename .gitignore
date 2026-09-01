@@ -7,3 +7,4 @@ build-pgo/
 # Python bytecode from tools/
 __pycache__/
 *.pyc
+build-prof*/
