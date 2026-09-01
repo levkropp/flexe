@@ -60,6 +60,10 @@ typedef struct {
     char         name[16];
     uint64_t     wake_cycle;     /* cycle_count threshold for SLEEPING */
     bool         is_idle;        /* per-core WAITI task, never real work */
+    /* Physical ar[] index the blocked call's return value belongs in. The
+     * caller's slot depends on PS.CALLINC at the call, so it cannot be
+     * recomputed after frt_return() has zeroed it. */
+    uint8_t      ret_ar_slot;
     uint32_t     blocked_queue;  /* queue handle for BLOCKED_QUEUE */
     uint32_t     notify_value[FRT_NOTIFY_SLOTS];
     uint8_t      notify_wait_index;
@@ -146,6 +150,16 @@ static uint32_t frt_arg(xtensa_cpu_t *cpu, int n) {
     if (n < 6)
         return ar_read(cpu, ci * 4 + 2 + n);
     return mem_read32(cpu->mem, ar_read(cpu, 1) + (uint32_t)(n - 6) * 4u);
+}
+
+/* Physical ar[] index frt_return() would write for the current call frame.
+ * A task that blocks inside a CALL4/8/12 returns into the caller's
+ * a(4*CALLINC+2), not a2; patching a2 instead silently overwrites the
+ * callee's first argument. */
+static uint8_t frt_return_slot(const xtensa_cpu_t *cpu) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    unsigned n = ci > 0 ? (unsigned)(ci * 4 + 2) : 2u;
+    return (uint8_t)((cpu->windowbase * 4u + n) & 63u);
 }
 
 static void frt_return(xtensa_cpu_t *cpu, uint32_t retval) {
@@ -1186,7 +1200,7 @@ static void stub_task_notify_give_from_isr(xtensa_cpu_t *cpu,
             else if (task->notify_value[slot] != 0u)
                 task->notify_value[slot]--;
             task->notify_waiting = false;
-            task->ar[(task->windowbase * 4u + 2u) & 63u] = result;
+            task->ar[task->ret_ar_slot] = result;
 
             bool is_current = false;
             for (int core = 0; core < 2; core++) {
@@ -1245,6 +1259,7 @@ static void stub_task_notify_take(xtensa_cpu_t *cpu,
 
     /* Resume after the call when a give arrives; the ISR patches the saved
      * return register with the notification count before waking this TCB. */
+    task->ret_ar_slot = frt_return_slot(cpu);
     frt_return(cpu, 0u);
     sched_save_context(frt, core_id);
     task->notify_wait_index = (uint8_t)slot;

@@ -693,6 +693,64 @@ TEST(test_task_notify_isr_preempts_and_preserves_window_context) {
     frt_teardown(&cpu, rom, frt);
 }
 
+/* A task that blocks inside a windowed call returns into the caller's
+ * a(4*CALLINC+2), not a2. Patching a2 instead silently overwrote the
+ * callee's first argument: ESP-IDF's emac_esp32_rx_task lost its `emac`
+ * pointer the first time an ISR notified it, and every later receive()
+ * dereferenced the notification count as a driver handle. */
+TEST(test_task_notify_give_targets_the_windowed_return_register) {
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    const uint32_t waiter_entry = 0x400D5000u;
+    const uint32_t other_entry  = 0x400D6000u;
+    uint32_t other_handle = frt_create_sched_task(
+        &cpu, frt, other_entry, "other", 1u, 0x3FFB3020u, 0x3FFB3044u);
+    uint32_t waiter_handle = frt_create_sched_task(
+        &cpu, frt, waiter_entry, "waiter", 5u, 0x3FFB3000u, 0x3FFB3040u);
+    ASSERT_TRUE(waiter_handle != 0u && other_handle != 0u);
+    ASSERT_TRUE(freertos_stubs_check_preempt(frt));
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0), "waiter") == 0);
+
+    /* Block the waiter from inside a CALL8 frame: a0/a2 belong to the
+     * callee's window at CALLINC 2, so the caller's slots are a8 and a10. */
+    extern void stub_ulTaskGenericNotifyTake(xtensa_cpu_t *, void *);
+    const uint32_t kArg = 0x3F8001E4u;   /* the callee's first argument */
+    XT_PS_SET_CALLINC(cpu.ps, 2);
+    ar_write(&cpu, 2, kArg);
+    ar_write(&cpu, 8, 0x400D5100u);      /* caller's a0: return address */
+    ar_write(&cpu, 10, 0u);              /* slot 0 */
+    ar_write(&cpu, 11, 1u);              /* clear count on exit */
+    ar_write(&cpu, 12, UINT32_MAX);      /* wait indefinitely */
+    cpu.pc = 0x400D5080u;
+    stub_ulTaskGenericNotifyTake(&cpu, frt);
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0), "other") == 0);
+
+    extern void stub_vTaskGenericNotifyGiveFromISR(xtensa_cpu_t *, void *);
+    uint32_t woken_addr = 0x3FFB3050u;
+    mem_write32(cpu.mem, woken_addr, 0u);
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, 0x400D6100u);
+    ar_write(&cpu, 2, waiter_handle);
+    ar_write(&cpu, 3, 0u);
+    ar_write(&cpu, 4, woken_addr);
+    cpu.pc = 0x400D6080u;
+    stub_vTaskGenericNotifyGiveFromISR(&cpu, frt);
+    ASSERT_EQ(mem_read32(cpu.mem, woken_addr), 1u);
+
+    ASSERT_TRUE(freertos_stubs_check_preempt(frt));
+    ASSERT_TRUE(strcmp(freertos_stubs_current_task_name(frt, 0), "waiter") == 0);
+    ASSERT_EQ(cpu.pc, 0x400D5100u);
+    /* The count lands in the caller's return slot ... */
+    ASSERT_EQ(ar_read(&cpu, 10), 1u);
+    /* ... and the callee's argument is untouched. */
+    ASSERT_EQ(ar_read(&cpu, 2), kArg);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_bump_allocator) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -804,6 +862,7 @@ static void run_freertos_tests(void) {
     RUN_TEST(test_semaphore_create_take_give);
     RUN_TEST(test_counting_semaphore_supports_idf_unbounded_capacity);
     RUN_TEST(test_task_notify_isr_preempts_and_preserves_window_context);
+    RUN_TEST(test_task_notify_give_targets_the_windowed_return_register);
     RUN_TEST(test_bump_allocator);
     RUN_TEST(test_vTaskDelay_caps_large_ticks);
     RUN_TEST(test_vTaskDelete_noop);
