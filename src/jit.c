@@ -2229,6 +2229,66 @@ static void emit_side_exit_body(emit_t *e, const side_exit_t *sx,
  * 2. Store exit PC (if known) + mark _pc_written
  * 3. Accumulate return value (chained runs keep a running total in RAX)
  * 4. Record chain slot (if static target) and jmp to epilogue */
+/* Close a zero-overhead loop's back-edge in native code.
+ *
+ * A block covering a whole LOOP body otherwise pays a full dispatcher
+ * round-trip per iteration: return to jit_pc_hook, decrement LCOUNT there,
+ * re-hash the PC and call back in. Loop bodies compilers emit are typically a
+ * handful of instructions, so that dispatch dominates the work. Jump straight
+ * back to the block's own chain entry instead, which re-checks the chain cap
+ * so timers, preemption and the batch budget stay live.
+ *
+ * Only correct when the block starts at LBEG: a block covering just the tail
+ * of a body must still go through the hook, because its entry is not where
+ * the loop resumes.
+ *
+ * LBEG and LEND are re-read and compared every iteration rather than trusted
+ * from compile time. The block cache is keyed on (pc, windowbase) and not on
+ * the loop context, and the body may itself contain a WSR to LBEG/LEND, so
+ * the compile-time loop is not guaranteed to be the live one. Either check
+ * failing simply falls out to the hook, which handles the general case.
+ */
+/* Whether a block gets the native back-edge. Kept in one place so the
+ * verifier can bound its reference run the same way the block behaves. */
+static bool jit_block_self_loops(const xtensa_cpu_t *cpu,
+                                 const jit_scan_t *scan, uint32_t pc) {
+    return scan->ends_at_lend && pc == cpu->lbeg;
+}
+
+static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
+                                    uint32_t lbeg, uint32_t lend,
+                                    int insn_count, jit_state_t *jit,
+                                    uint8_t *chain_entry) {
+    ra_flush(e, ra, wb4);
+
+    emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_LCOUNT);
+    emit_cmp_reg32_imm32(e, RCX, 0);
+    int done = emit_jcc_rel32(e, CC_E);
+    emit_cmp32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LEND, lend);
+    int other_lend = emit_jcc_rel32(e, CC_NE);
+    emit_cmp32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LBEG, lbeg);
+    int other_lbeg = emit_jcc_rel32(e, CC_NE);
+
+    emit_add_reg32_imm32(e, RCX, (uint32_t)-1);
+    emit_store_cpu32(e, RCX, (int32_t)CPU_OFF_LCOUNT);
+    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, lbeg);
+    emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+    emit_acc_add(e, insn_count);
+    emit_jmp_rel32_to(e, chain_entry);
+
+    /* Loop finished, or this is not the loop the block was compiled for:
+     * exit exactly as a plain loop-end block would, and let jit_pc_hook
+     * decide what the arrival at LEND means. */
+    emit_patch_rel32(e, done);
+    emit_patch_rel32(e, other_lend);
+    emit_patch_rel32(e, other_lbeg);
+    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, lend);
+    emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+    emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LOOP_EXIT, 1);
+    emit_acc_add(e, insn_count);
+    emit_jmp_to_epilogue(e, jit);
+}
+
 static void emit_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
                                uint32_t exit_pc, int insn_count,
                                jit_state_t *jit, bool loop_end_exit) {
@@ -2439,8 +2499,12 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     if (last_compiled == scan->count) {
         int last_cls = classify_for_jit(scan->insns[scan->count - 1], scan->ilens[scan->count - 1]);
         if (last_cls == 0 || last_cls == 3) {
-            emit_block_exit_ra(&e, &ra, wb4, scan->end_pc, scan->count, jit,
-                               scan->ends_at_lend);
+            if (jit_block_self_loops(cpu, scan, pc))
+                emit_loop_backedge_exit(&e, &ra, wb4, cpu->lbeg, cpu->lend,
+                                        scan->count, jit, chain_entry);
+            else
+                emit_block_exit_ra(&e, &ra, wb4, scan->end_pc, scan->count,
+                                   jit, scan->ends_at_lend);
         }
     }
 
@@ -2655,15 +2719,24 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
     mem_journal_begin();
     jit->verify_active = true;
     uint32_t blk_end = b && b->end_pc ? b->end_pc : pc + limit * 3u;
+    bool self_loop = b && (b->flags & JIT_BLK_SELF_LOOP);
+    /* A self-looping block keeps going until LCOUNT runs out or the chain cap
+     * trips at an iteration boundary, so the reference run has to follow it
+     * the same way -- bounding it at one iteration would compare a hundred
+     * native iterations against one interpreted one. */
+    unsigned hard_limit = self_loop ? JIT_CHAIN_CAP + limit : limit;
     int n_interp = 0;
-    while ((unsigned)n_interp < limit && cpu->running) {
+    while ((unsigned)n_interp < hard_limit && cpu->running) {
         xtensa_step(cpu);
         n_interp++;
-        /* Leaving the block's extent -- or branching back to its entry --
-         * ends the sequence the block covers. A LOOP body reaches its entry
-         * again only on the step that exhausts guest_insns, so both cases
-         * terminate at the same place the native block does. */
-        if (cpu->pc < pc || cpu->pc >= blk_end || cpu->pc == pc) break;
+        if (cpu->pc < pc || cpu->pc >= blk_end) break;  /* left the block */
+        if (cpu->pc == pc) {
+            /* Back at the entry: an iteration boundary for a self-looping
+             * block, and the end of the sequence for anything else. */
+            if (!self_loop || (unsigned)n_interp >= JIT_CHAIN_CAP) break;
+            continue;
+        }
+        if ((unsigned)n_interp >= limit && !self_loop) break;
     }
     jit->verify_active = false;
 
@@ -2952,6 +3025,7 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     b->chain_entry = (void *)jit->last_chain_entry;
     b->guest_insns = (uint16_t)scan.count;
     b->end_pc = scan.end_pc;
+    b->flags = jit_block_self_loops(cpu, &scan, pc) ? JIT_BLK_SELF_LOOP : 0u;
 
     /* Set JIT bitmap bit so the interpreter's hook fires for this PC */
     jit_bitmap_set(jit, pc);

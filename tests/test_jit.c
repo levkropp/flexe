@@ -817,11 +817,27 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     /* No pending branch: only the loop back-edge can hand control to the
      * compiled body from here. */
     cpu._pc_written = false;
+    uint32_t a4_before = ar_read(&cpu, 4);
+    uint32_t lcount_before = cpu.lcount;
     (void)xtensa_run(&cpu, 400);
 
     const jit_stats_t *stats = jit_get_stats(jit);
-    ASSERT_TRUE(stats->blocks_executed > 20);
     ASSERT_TRUE(stats->insns_jitted > 100);
+
+    /* The body counts iterations in a4, so the guest-visible effect must
+     * match the number of back-edges actually taken. A run that stops with
+     * the PC sitting on LBEG has taken the edge but not yet re-entered the
+     * body, which is one increment short. */
+    uint32_t taken = lcount_before - cpu.lcount;
+    uint32_t pending = cpu.pc == cpu.lbeg ? 1u : 0u;
+    ASSERT_EQ(ar_read(&cpu, 4) - a4_before, taken - pending);
+
+    /* The back-edge is closed in native code, so one dispatch covers many
+     * iterations. Requiring a high insns-per-dispatch ratio is what
+     * distinguishes native self-looping from returning to jit_pc_hook once
+     * per iteration -- the whole point of compiling the edge. */
+    ASSERT_TRUE(stats->blocks_executed > 0);
+    ASSERT_TRUE(stats->insns_jitted > stats->blocks_executed * 20);
 
     jit_destroy(jit);
     teardown(&cpu);
