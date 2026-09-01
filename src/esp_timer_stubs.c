@@ -192,13 +192,23 @@ static void dispatch_expired_timers(esp_timer_stubs_t *et) {
          * via vTaskDelete), but periodic timers still need to fire to drive
          * LVGL / tick subsystems running on core 1. */
         int save_running = et->cpu->running;
+        int save_halted = et->cpu->halted;
         et->cpu->running = 1;
+        /* A halted core executes nothing: xtensa_step() returns immediately
+         * and only ticks ccount. Since the idle task parks an otherwise-idle
+         * core in WAITI, that is the normal state at the moment a timer comes
+         * due -- so leaving it set meant the dispatcher faithfully rescheduled
+         * every periodic timer and advanced every alarm while never running a
+         * single callback body. We are synthesizing a call, so the core has to
+         * be awake for it; the previous state is restored below. */
+        et->cpu->halted = false;
         int max_cb_cycles = 100000;
         for (int c = 0; c < max_cb_cycles; c++) {
             if (et->cpu->pc == CALLBACK_SENTINEL) break;
             xtensa_step(et->cpu);
         }
         et->cpu->running = save_running;
+        et->cpu->halted = save_halted;
 
         /* Restore entire CPU register state */
         memcpy(et->cpu->ar, save_ar, sizeof(save_ar));
