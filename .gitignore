@@ -1,4 +1,5 @@
 build/
+build-asan/
 build-pgo/
 *.pdf
 *.bin
