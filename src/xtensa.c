@@ -2425,11 +2425,15 @@ have_insn:
         }
     }
 
-    /* Zero-overhead loop */
+    /* Zero-overhead loop.  The back-edge is a taken branch, so flag the PC as
+     * written: pc_hook dispatch is gated on _pc_written, and without this a
+     * JIT block compiled at LBEG could never be entered — leaving every
+     * compiler-emitted LOOP body running interpreted. */
     if (__builtin_expect(cpu->lcount > 0, 0) &&
         cpu->pc == cpu->lend && !cpu->_pc_written) {
         cpu->lcount--;
         cpu->pc = cpu->lbeg;
+        cpu->_pc_written = true;
     }
 
     cpu->ccount++;

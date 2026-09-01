@@ -620,6 +620,68 @@ TEST(test_jit_chained_run_accounts_every_block) {
     teardown(&cpu);
 }
 
+/* A zero-overhead loop's back-edge is a taken branch and must dispatch like
+ * one.  The interpreter rewrites PC to LBEG without executing a branch, so if
+ * that path does not mark the PC as written, pc_hook dispatch is skipped and a
+ * block compiled at LBEG can never be entered — every compiler-emitted LOOP
+ * body then runs interpreted no matter how hot it gets. */
+TEST(test_jit_loop_backedge_dispatches_native_body) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* LOOP a3, lend ; body ; (lend) — op0=6, t=7 (n=3,m=1), r=8 selects LOOP.
+     * Body is five instructions so it clears the four-instruction floor. */
+    const uint32_t lbeg = BASE + 3u;
+    const uint32_t lend = lbeg + 10u;
+    put_insn3(&cpu, BASE, (uint32_t)0x76u | ((uint32_t)((8 << 4) | 3) << 8) |
+                          ((lend - (BASE + 4u)) << 16));
+    put_insn2(&cpu, lbeg,      narrow(0xB, 4, 4, 1));  /* ADDI.N a4, a4, 1 */
+    put_insn2(&cpu, lbeg + 2u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lbeg + 4u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lbeg + 6u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lbeg + 8u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lend,      narrow(0xD, 15, 0, 0)); /* RET.N */
+    ar_write(&cpu, 3, 200);
+    ar_write(&cpu, 4, 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    /* Execute LOOP itself so LBEG/LEND/LCOUNT are live; the scanner needs
+     * LEND to bound the body block. */
+    cpu.running = true;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, lbeg);
+    ASSERT_EQ(cpu.lbeg, lbeg);
+    ASSERT_EQ(cpu.lend, lend);
+    ASSERT_TRUE(cpu.lcount > 0);
+
+    /* Interpret a few iterations first, so the run below resumes mid-body and
+     * the next arrival at LBEG comes from the interpreter's back-edge rather
+     * than from a JIT dispatch. */
+    for (int i = 0; i < 7; i++)
+        xtensa_step(&cpu);
+    ASSERT_TRUE(cpu.pc > lbeg && cpu.pc <= lend);
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, lbeg) != NULL);
+
+    /* No pending branch: only the loop back-edge can hand control to the
+     * compiled body from here. */
+    cpu._pc_written = false;
+    (void)xtensa_run(&cpu, 400);
+
+    const jit_stats_t *stats = jit_get_stats(jit);
+    ASSERT_TRUE(stats->blocks_executed > 20);
+    ASSERT_TRUE(stats->insns_jitted > 100);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_flush) {
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -885,6 +947,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_chained_run_accounts_every_block);
+    RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);

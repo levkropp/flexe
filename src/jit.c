@@ -2830,6 +2830,20 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
                              pc < ESP32_INSN_ADDR_HIGH, 1)) {
             jit_get_block(jit, cpu, pc);
         }
+        /* Inside an active zero-overhead loop, sample LBEG as well.  LOOP
+         * itself is not compilable, so a block sampled at an arbitrary PC in
+         * the body can only ever reach LEND — yielding short tail fragments
+         * that re-dispatch every iteration.  The profitable block is the one
+         * starting at LBEG, which spans the whole body and which jit_pc_hook
+         * already branches back to when a block ends at LEND.  Compilers emit
+         * LOOP for exactly the hot inner loops that matter most, so without
+         * this the JIT stays near interpreter speed on loop-heavy code. */
+        if (__builtin_expect(cpu->lcount > 0, 0)) {
+            uint32_t lbeg = cpu->lbeg;
+            if (lbeg != pc && lbeg >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
+                lbeg < ESP32_INSN_ADDR_HIGH)
+                jit_get_block(jit, cpu, lbeg);
+        }
 
         if (__builtin_expect(ran < batch, 0)) {
             if (!cpu->running || cpu->halted || cpu->breakpoint_hit) break;
