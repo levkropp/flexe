@@ -60,7 +60,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 645 tests
+- 655 tests
 
 ## building
 
@@ -149,7 +149,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 645 tests, 4932 passed, 0 failed
+# 655 tests, 12980 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -158,7 +158,7 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 19 of 19 on x86-64
+The compiled Arduino hardware gates below all pass — 20 of 20 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 One deliberate gap is worth stating rather than leaving to be rediscovered:
@@ -176,6 +176,20 @@ and it did not work: a per-core interrupt source raised its CPU line without
 ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
+
+`test-esp-timer.sh` covers `esp_timer` callbacks — periodic, one-shot, stop and
+restart. Nothing drove that API from guest code before, and two defects were
+hiding behind it. The guest clock took `max(executed, skipped)` of two counters
+that measure disjoint things, so after boot's fast-forwards `millis()`,
+`micros()`, `esp_timer_get_time()` and `xTaskGetTickCount()` all stood still
+until executed cycles caught up — 292 ms of frozen time on this fixture, with
+every alarm armed in that window coming due late or not at all. Underneath
+that, callbacks were dispatched onto a core parked in `WAITI` by the idle task,
+where `xtensa_step()` executes nothing: the dispatcher rescheduled each
+periodic timer and retired each one-shot on time while never running a single
+callback body. The gate checks callbacks against `esp_timer_get_time()` rather
+than counting them, because a dispatcher that fires the right number of times
+but bunches them up passes a count check.
 
 `test-spi-master.sh` covers the one peripheral a CYD depends on most and no
 stock ROM exercises: TFT_eSPI and its relatives drive the GP-SPI registers
