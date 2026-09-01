@@ -525,8 +525,15 @@ Release) a loop-heavy sketch reaches **1881 MIPS, 7.84× real-time**, against
 the interpreter from the same starting state, with the interpreter's memory
 effects rolled back in between -- and reports any block whose architectural
 state or memory writes differ. It is roughly an order of magnitude slower and
-is a debugging tool rather than a run mode, but it is what found the SRC and
-byte-store miscompiles; all three stock ROMs now verify clean over 11M blocks.
+is a debugging tool rather than a run mode, but it is what found the SRC
+miscompile, the byte-store miscompile, and the LEND-spanning block that hung
+two of the CYD board builds. The stock images verify clean over 9.4M blocks.
+
+Chaining is switched off while verifying: a chain jumps directly between
+blocks, so it steps over PCs at which the interpreted reference still
+dispatches a ROM stub, and the two stop executing comparable work. Block-level
+verification stays exact, and that chaining preserves results is covered by
+the gates and by bench-compute's cross-engine checksum.
 
 The headless integration runner exercises display output and storage. The
 Marauder profile drives touch navigation, submits `sniffraw` through the real
