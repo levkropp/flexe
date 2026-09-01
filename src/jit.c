@@ -2248,6 +2248,18 @@ static void emit_side_exit_body(emit_t *e, const side_exit_t *sx,
  * the compile-time loop is not guaranteed to be the live one. Either check
  * failing simply falls out to the hook, which handles the general case.
  */
+/* Compare a 32-bit field of the CPU struct against an immediate. x86 can do
+ * that against memory directly; ARM64 has to load it into a register first,
+ * so callers must not rely on RAX surviving. */
+static inline void emit_cmp_cpu32_imm(emit_t *e, int32_t off, uint32_t imm) {
+#ifdef JIT_ARCH_ARM64
+    emit_load_cpu32(e, RAX, off);
+    emit_cmp_reg32_imm32(e, RAX, imm);
+#else
+    emit_cmp32_disp_imm(e, REG_CPU, off, imm);
+#endif
+}
+
 /* Whether a block gets the native back-edge. Kept in one place so the
  * verifier can bound its reference run the same way the block behaves. */
 static bool jit_block_self_loops(const xtensa_cpu_t *cpu,
@@ -2264,9 +2276,9 @@ static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
     emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_LCOUNT);
     emit_cmp_reg32_imm32(e, RCX, 0);
     int done = emit_jcc_rel32(e, CC_E);
-    emit_cmp32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LEND, lend);
+    emit_cmp_cpu32_imm(e, (int32_t)CPU_OFF_LEND, lend);
     int other_lend = emit_jcc_rel32(e, CC_NE);
-    emit_cmp32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LBEG, lbeg);
+    emit_cmp_cpu32_imm(e, (int32_t)CPU_OFF_LBEG, lbeg);
     int other_lbeg = emit_jcc_rel32(e, CC_NE);
 
     emit_add_reg32_imm32(e, RCX, (uint32_t)-1);

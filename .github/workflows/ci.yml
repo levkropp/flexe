@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Two compilers, because the tree is built with -Werror and they disagree
+  # about which warnings exist.
+  unit:
+    name: unit tests (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev ${{ matrix.cc }}
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Unit tests
+        run: ./build/xtensa-tests
+
+  sanitizers:
+    name: asan + ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev
+      - name: Configure
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build-asan -j"$(nproc)"
+      - name: Unit tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build-asan/xtensa-tests
+
+  # The JIT has two backends and only one of them is exercised by a host
+  # build. A native aarch64 runner would be better, but a cross-compile at
+  # least catches the common failure: adding an emitter helper on one side
+  # and calling it from shared code. openssl-dependent sources are skipped
+  # because the cross toolchain has no aarch64 openssl headers; none of them
+  # contain backend-specific code.
+  cross-aarch64:
+    name: aarch64 cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Compile every backend-relevant source
+        run: |
+          status=0
+          for f in src/*.c; do
+            case "$(basename "$f")" in
+              loader.c|mpi_stubs.c|sha_stubs.c|wifi_stubs.c) continue ;;
+            esac
+            # gnu17, not c11: c11 hides pread/pwrite behind feature macros.
+            aarch64-linux-gnu-gcc -std=gnu17 -O2 -Wall -Wextra \
+              -Wno-unused-parameter -c -I src "$f" -o /dev/null || status=1
+          done
+          exit $status
+
+  # Compiled-firmware coverage. Slower than the rest, and the only job that
+  # needs a toolchain download, so it is kept separate: a failure here means
+  # peripheral behaviour changed, not that the build is broken.
+  hardware-gates:
+    name: arduino hardware gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev
+      - name: Install arduino-cli and ESP32 core 2.0.11
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR="$HOME/bin" sh
+          "$HOME/bin/arduino-cli" core update-index \
+            --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          "$HOME/bin/arduino-cli" core install esp32:esp32@2.0.11 \
+            --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja
+          cmake --build build -j"$(nproc)"
+      - name: Run gates
+        env:
+          ARDUINO_CLI: /home/runner/bin/arduino-cli
+        run: |
+          status=0
+          for gate in ./test-*.sh; do
+            echo "::group::$gate"
+            if ! "$gate"; then
+              echo "::error::$gate failed"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
