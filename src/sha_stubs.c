@@ -88,6 +88,94 @@ struct sha_stubs {
 
 /* ===== SHA peripheral MMIO handler ===== */
 
+/* Recover the message block from SHA_TEXT.
+ *
+ * IDF's sha_ll_fill_text_block byte-swaps each word on the way in, so a
+ * TEXT register holds the big-endian reading of four message bytes. OpenSSL's
+ * *_Transform wants those bytes back in memory order. */
+static void sha_text_to_block(const sha_stubs_t *ss, uint8_t *raw, int words) {
+    for (int i = 0; i < words; i++) {
+        uint32_t w = ss->sha_text[i];
+        raw[i * 4 + 0] = (uint8_t)(w >> 24);
+        raw[i * 4 + 1] = (uint8_t)(w >> 16);
+        raw[i * 4 + 2] = (uint8_t)(w >> 8);
+        raw[i * 4 + 3] = (uint8_t)w;
+    }
+}
+
+/* Compress the block currently in SHA_TEXT into the engine's state.
+ * `first` distinguishes START (begin from the algorithm's IV) from CONTINUE
+ * (fold another block into the running state). */
+static void sha_engine_hash_block(sha_stubs_t *ss, uint32_t sha_type,
+                                  bool first) {
+    uint8_t raw[128];
+
+    switch (sha_type) {
+    case SHA_TYPE_1: {
+        SHA_CTX c;
+        uint32_t *h = ss->sha1_engine;
+        sha_text_to_block(ss, raw, 16);
+        if (first) {
+            SHA1_Init(&c);
+            h[0] = c.h0; h[1] = c.h1; h[2] = c.h2; h[3] = c.h3; h[4] = c.h4;
+        }
+        c.h0 = h[0]; c.h1 = h[1]; c.h2 = h[2]; c.h3 = h[3]; c.h4 = h[4];
+        SHA1_Transform(&c, raw);
+        h[0] = c.h0; h[1] = c.h1; h[2] = c.h2; h[3] = c.h3; h[4] = c.h4;
+        break;
+    }
+    case SHA_TYPE_256: {
+        SHA256_CTX c;
+        uint32_t *h = ss->sha256_engine;
+        sha_text_to_block(ss, raw, 16);
+        if (first) { SHA256_Init(&c); memcpy(h, c.h, sizeof c.h); }
+        memcpy(c.h, h, sizeof c.h);
+        SHA256_Transform(&c, raw);
+        memcpy(h, c.h, sizeof c.h);
+        break;
+    }
+    case SHA_TYPE_384:
+    case SHA_TYPE_512: {
+        SHA512_CTX c;
+        uint64_t *h = ss->sha512_engine;
+        sha_text_to_block(ss, raw, 32);
+        if (first) {
+            if (sha_type == SHA_TYPE_384) SHA384_Init(&c); else SHA512_Init(&c);
+            memcpy(h, c.h, sizeof c.h);
+        }
+        memcpy(c.h, h, sizeof c.h);
+        SHA512_Transform(&c, raw);
+        memcpy(h, c.h, sizeof c.h);
+        break;
+    }
+    default:
+        break;
+    }
+    ss->current_type = (int)sha_type;
+}
+
+/* SHA_x_LOAD publishes the engine's state into SHA_TEXT, which is how
+ * software reads a digest out on this part. */
+static void sha_engine_publish(sha_stubs_t *ss, uint32_t sha_type) {
+    switch (sha_type) {
+    case SHA_TYPE_1:
+        for (int i = 0; i < 5; i++) ss->sha_text[i] = ss->sha1_engine[i];
+        break;
+    case SHA_TYPE_256:
+        for (int i = 0; i < 8; i++) ss->sha_text[i] = ss->sha256_engine[i];
+        break;
+    case SHA_TYPE_384:
+    case SHA_TYPE_512:
+        for (int i = 0; i < 8; i++) {
+            ss->sha_text[i * 2]     = (uint32_t)(ss->sha512_engine[i] >> 32);
+            ss->sha_text[i * 2 + 1] = (uint32_t)ss->sha512_engine[i];
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static uint32_t sha_mmio_read(void *ctx, uint32_t addr) {
     sha_stubs_t *ss = ctx;
     uint32_t off = addr - SHA_PERIPH_BASE;
@@ -116,26 +204,27 @@ static void sha_mmio_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     }
 
-    /* Control registers: handle LOAD commands.
-     * On ESP32, LOAD copies SHA_TEXT into engine internal state registers.
-     * Offsets: SHA1_LOAD=0x88, SHA256_LOAD=0x98, SHA384_LOAD=0xA8, SHA512_LOAD=0xB8 */
-    switch (off) {
-    case 0x88: /* SHA1_LOAD */
-        for (int i = 0; i < 5; i++)
-            ss->sha1_engine[i] = ss->sha_text[i];
-        break;
-    case 0x98: /* SHA256_LOAD */
-        for (int i = 0; i < 8; i++)
-            ss->sha256_engine[i] = ss->sha_text[i];
-        break;
-    case 0xA8: /* SHA384_LOAD */
-    case 0xB8: /* SHA512_LOAD */
-        for (int i = 0; i < 8; i++)
-            ss->sha512_engine[i] = ((uint64_t)ss->sha_text[i*2] << 32) |
-                                    ss->sha_text[i*2+1];
-        break;
-    default:
-        break; /* START/CONTINUE/BUSY — no-op (our hooks handle processing) */
+    /* Control registers. Each engine has START/CONTINUE/LOAD/BUSY four words
+     * apart: SHA-1 at 0x80, SHA-256 at 0x90, SHA-384 at 0xA0, SHA-512 at
+     * 0xB0. These used to be ignored on the grounds that the ELF-symbol hooks
+     * on sha_hal_hash_block do the work -- but a production image has no
+     * symbols, so nothing hooked, and the guest read back whatever it had
+     * just written as its digest. NerdMiner drives 16k SHA-1 operations this
+     * way. BUSY already reads idle, so completion is immediate. */
+    if (off >= 0x80 && off < 0xC0) {
+        uint32_t sha_type;
+        switch (off & ~0xFu) {
+        case 0x80: sha_type = SHA_TYPE_1;   break;
+        case 0x90: sha_type = SHA_TYPE_256; break;
+        case 0xA0: sha_type = SHA_TYPE_384; break;
+        default:   sha_type = SHA_TYPE_512; break;
+        }
+        switch (off & 0xFu) {
+        case 0x0: sha_engine_hash_block(ss, sha_type, true);  break; /* START */
+        case 0x4: sha_engine_hash_block(ss, sha_type, false); break; /* CONT */
+        case 0x8: sha_engine_publish(ss, sha_type);           break; /* LOAD */
+        default:  break;                                             /* BUSY */
+        }
     }
 }
 
