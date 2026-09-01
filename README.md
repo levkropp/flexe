@@ -158,14 +158,8 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below currently stand at 16 of 17 passing
-on x86-64 Linux (GCC 15, Arduino-ESP32 2.0.11). `test-emac-driver.sh` is the
-exception, and the remaining fault is in the Ethernet RX driver path rather
-than in scheduling: the model writes both injected frames into the descriptor
-ring and hands ownership back, source 38 fires, ESP-IDF's ISR notifies
-`emac_esp32_rx_task`, and that task is scheduled and runs — but its
-`receive()` yields no frame, so `stack_input` is never called. The `emac_hal`
-profile, which consumes RX inside the ISR, passes against the same model.
+The compiled Arduino hardware gates below all pass — 17 of 17 on x86-64
+Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 The optional compiled Arduino gate builds an unmodified `Wire` client, runs
 40-byte writes and repeated-start reads through the real ESP-IDF interrupt
