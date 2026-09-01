@@ -464,9 +464,12 @@ Marauder v1.14.3 is also published for three other CYD boards, which are
 separate links with their own entry point (`0x400830D0`). The 2432S024
 (guition) and 3.5-inch builds have relocated profiles and pass the stock-ROM
 gate end to end under both engines, exactly as the 2432S028 build does. The
-`2432S028_2usb` build is a different link generation -- only 3 of its 41
-profile addresses relocate from v1.14.3 -- and is rejected as an unsupported
-layout rather than given addresses that cannot be confirmed.
+`2432S028_2usb` build is a different code generation rather than a relink:
+only 3 of its 41 profile addresses relocate from v1.14.3 and 10 from v1.15.1,
+and its entry point (0x40081E90) matches neither. Signature relocation cannot
+bridge that, so it is rejected as an unsupported layout rather than given
+addresses that cannot be confirmed; it needs a profile built from its own
+symbols.
 
 ```bash
 MARAUDER_BIN=/path/to/marauder.bin \
