@@ -1049,10 +1049,14 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
         return;
     }
 
-    /* Make the listening socket non-blocking with a short poll so the
-     * emulator's request loop doesn't stall forever waiting for clients. */
+    /* Check for a pending client without waiting. A guest that calls accept()
+     * polls -- it gets EAGAIN and comes back -- so blocking here buys nothing
+     * and costs everything: a client that is not already queued will not
+     * arrive within the wait either, and the next call would have caught it.
+     * At 50ms a poll, NerdMiner's server loop spent 35 of its 37 wall-clock
+     * seconds asleep while emulated time barely moved. */
     struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
-    int pr = poll(&pfd, 1, 50); /* 50ms */
+    int pr = poll(&pfd, 1, 0);
     if (pr <= 0) {
         set_firmware_errno(cpu, NEWLIB_EAGAIN);
         ws_return(cpu, (uint32_t)-1);
