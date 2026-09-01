@@ -114,7 +114,56 @@ static inline uint32_t mem_read32(xtensa_mem_t *mem, uint32_t addr) {
     return mem_read32_slow(mem, addr);
 }
 
+
+/* ===== Speculative-write journal =====
+ *
+ * Records the pre-write contents of every RAM word a run touches so the run
+ * can be undone. The JIT's differential verify mode needs this: it has to
+ * execute the same guest instructions twice -- once natively, once
+ * interpreted -- and a block containing a read-modify-write would otherwise
+ * apply its update twice.
+ *
+ * MMIO is deliberately *not* journalled. Reading a device register to save it
+ * can itself have side effects, and replaying a device write is not
+ * meaningful, so any MMIO touch marks the window unreplayable and the
+ * verifier skips that block rather than guessing.
+ *
+ * Entirely inert when disabled: one predicted-not-taken test per store.
+ */
+#define MEM_JOURNAL_MAX 8192
+typedef struct { uint32_t addr; uint32_t old; } mem_journal_entry_t;
+extern int      g_mem_journal_en;       /* 1 = recording */
+extern int      g_mem_journal_unsafe;   /* MMIO touched, or capacity exceeded */
+extern int      g_mem_journal_count;
+extern mem_journal_entry_t g_mem_journal[MEM_JOURNAL_MAX];
+
+void mem_journal_begin(void);
+void mem_journal_rollback(xtensa_mem_t *mem);
+void mem_journal_end(void);
+
+static inline void mem_journal_word(xtensa_mem_t *mem, uint32_t addr) {
+    uint32_t w = addr & ~3u;
+    uint8_t *page = mem->page_table[w >> 12];
+    if (!page) { g_mem_journal_unsafe = 1; return; }
+    if (g_mem_journal_count >= MEM_JOURNAL_MAX) {
+        g_mem_journal_unsafe = 1;
+        return;
+    }
+    mem_journal_entry_t *e = &g_mem_journal[g_mem_journal_count++];
+    e->addr = w;
+    memcpy(&e->old, page + (w & 0xFFF), 4);
+}
+
+/* Journal every word an access of `len` bytes at `addr` can reach. */
+static inline void mem_journal_note(xtensa_mem_t *mem, uint32_t addr,
+                                    unsigned len) {
+    mem_journal_word(mem, addr);
+    uint32_t last = addr + len - 1u;
+    if ((last & ~3u) != (addr & ~3u)) mem_journal_word(mem, last);
+}
+
 static inline void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
+    if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 1);
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         page[addr & 0xFFF] = val;
@@ -124,6 +173,7 @@ static inline void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
 }
 
 static inline void mem_write16(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
+    if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 2);
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         memcpy(page + (addr & 0xFFF), &val, 2);
@@ -160,6 +210,7 @@ static inline void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
         fprintf(stderr, "[PW] pc=0x%08X store 0x%08X <- 0x%08X core%d\n",
                 g_dbg_pc, addr, val, g_dbg_core);
     }
+    if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 4);
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         memcpy(page + (addr & 0xFFF), &val, 4);

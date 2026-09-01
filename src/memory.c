@@ -247,3 +247,32 @@ int mem_register_mmio_range(xtensa_mem_t *mem, uint32_t base, uint32_t size,
         mem_register_mmio(mem, start_page + i, read_fn, write_fn, ctx);
     return 0;
 }
+
+/* ===== Speculative-write journal (see memory.h) ===== */
+int      g_mem_journal_en = 0;
+int      g_mem_journal_unsafe = 0;
+int      g_mem_journal_count = 0;
+mem_journal_entry_t g_mem_journal[MEM_JOURNAL_MAX];
+
+void mem_journal_begin(void) {
+    g_mem_journal_count = 0;
+    g_mem_journal_unsafe = 0;
+    g_mem_journal_en = 1;
+}
+
+/* Undo in reverse so the earliest recorded value for a repeatedly-written
+ * word wins. Writes go straight to the page: the journal only ever holds RAM
+ * addresses, and routing through mem_write32 would re-enter the journal. */
+void mem_journal_rollback(xtensa_mem_t *mem) {
+    for (int i = g_mem_journal_count - 1; i >= 0; i--) {
+        uint32_t addr = g_mem_journal[i].addr;
+        uint8_t *page = mem->page_table[addr >> 12];
+        if (page) memcpy(page + (addr & 0xFFF), &g_mem_journal[i].old, 4);
+    }
+    g_mem_journal_count = 0;
+}
+
+void mem_journal_end(void) {
+    g_mem_journal_en = 0;
+    g_mem_journal_count = 0;
+}
