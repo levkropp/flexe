@@ -41,6 +41,13 @@ int freertos_stubs_dump_tasks(const freertos_stubs_t *frt, char *buf, int buflen
 /* Returns true if the cooperative scheduler is running (multi-task mode) */
 bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
 
+/* Block the running task for `us` microseconds of guest time, using the same
+ * scheduler and clock as vTaskDelay(). Returns true if the scheduler took
+ * ownership (the guest return has already been performed and a context switch
+ * made, so the caller must not write a return value). */
+bool freertos_stubs_sleep_us(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                             uint64_t us);
+
 /* Start the cooperative scheduler (called on self-loop detection) */
 void freertos_stubs_start_scheduler(freertos_stubs_t *frt);
 

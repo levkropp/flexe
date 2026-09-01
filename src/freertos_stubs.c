@@ -59,6 +59,7 @@ typedef struct {
     task_state_t state;
     char         name[16];
     uint64_t     wake_cycle;     /* cycle_count threshold for SLEEPING */
+    bool         is_idle;        /* per-core WAITI task, never real work */
     uint32_t     blocked_queue;  /* queue handle for BLOCKED_QUEUE */
     uint32_t     notify_value[FRT_NOTIFY_SLOTS];
     uint8_t      notify_wait_index;
@@ -112,6 +113,8 @@ struct freertos_stubs {
      * sched_pick_next during deep sleeps. Keeps uxTaskGetSystemState's
      * total_run_time monotonically advancing even when every task slept. */
     uint64_t   idle_cycles;
+    int        idle_task[2];   /* per-core WAITI task index */
+    bool       idle_ready;
 
     /* Thread safety */
     pthread_mutex_t lock;
@@ -274,16 +277,62 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
     return nearest;
 }
 
+/* Per-core idle task.
+ *
+ * Without one there is no context in which a core may sit while every real
+ * task is blocked. Parking the core with cpu->halted alone is not enough: an
+ * interrupt un-halts it and RFI returns straight into the *blocked* task's
+ * saved PC, so it resumes behind the scheduler's back. The idle task gives
+ * that interrupt somewhere legitimate to land — it executes WAITI, the ISR
+ * runs on its context, and RFI returns to the jump that loops back to WAITI.
+ *
+ * Six bytes of guest code placed in RTC-fast RAM through its instruction-bus
+ * alias at 0x400C0000, which is inside the address range the interpreter and
+ * the scheduler both accept as executable:  WAITI 0 ; J .-3 */
+#define IDLE_STUB_ADDR 0x400C1E00u  /* RTC-fast via its instruction alias */
+
+static int sched_register_task(freertos_stubs_t *frt, uint32_t fn,
+                               uint32_t param, uint8_t priority,
+                               uint32_t handle, int core_affinity);
+
+static void frt_install_idle_tasks(freertos_stubs_t *frt) {
+    if (frt->idle_ready || !frt->cpu[0] || !frt->cpu[0]->mem) return;
+    static const uint8_t stub[] = {
+        0x00, 0x70, 0x00,   /* WAITI 0            */
+        0x46, 0xFE, 0xFF,   /* J    IDLE_STUB_ADDR */
+    };
+    for (unsigned i = 0; i < sizeof(stub); i++)
+        mem_write8(frt->cpu[0]->mem, IDLE_STUB_ADDR + i, stub[i]);
+    for (int core = 0; core < 2; core++) {
+        int idx = sched_register_task(frt, IDLE_STUB_ADDR, 0u, 0u,
+                                      0x3FFF0100u + (uint32_t)core, core);
+        if (idx < 0) return;
+        snprintf(frt->tasks[idx].name, sizeof(frt->tasks[idx].name),
+                 "IDLE%d", core);
+        frt->tasks[idx].is_idle = true;
+        /* WAITI is privileged, and any window unwind that reaches a0 must
+         * land somewhere sane rather than the generic dummy return address:
+         * point it back at the stub, CALL8-encoded. */
+        frt->tasks[idx].ps = 0x00040000u;   /* WOE=1, kernel mode */
+        frt->tasks[idx].ar[0] =
+            (2u << 30) | (IDLE_STUB_ADDR & 0x3FFFFFFFu);
+        frt->idle_task[core] = idx;
+    }
+    frt->idle_ready = true;
+}
+
 /* Find the highest-priority READY task eligible for core_id,
  * round-robin among equals.  Returns task index or -1. */
 static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
-    uint64_t nearest = sched_wake_sleepers(frt, core_id);
+    (void)sched_wake_sleepers(frt, core_id);
 
-    /* Find highest priority among READY tasks eligible for this core */
+    /* Find highest priority among READY tasks eligible for this core. Idle
+     * tasks are excluded here and used only as the fallback below, so they
+     * can never win on a priority tie with real work. */
     int best_prio = -1;
     for (int i = 0; i < frt->task_count; i++) {
         task_tcb_t *t = &frt->tasks[i];
-        if (t->state != TASK_READY) continue;
+        if (t->state != TASK_READY || t->is_idle) continue;
         if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
         if (t->priority > best_prio)
             best_prio = t->priority;
@@ -296,99 +345,30 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
         for (int j = 0; j < frt->task_count; j++) {
             int i = (start + j) % frt->task_count;
             task_tcb_t *t = &frt->tasks[i];
-            if (t->state == TASK_READY && t->priority == best_prio &&
+            if (t->state == TASK_READY && !t->is_idle &&
+                t->priority == best_prio &&
                 (t->core_affinity < 0 || t->core_affinity == core_id))
                 return i;
         }
     }
 
-    /* No READY tasks — fast-forward through sleeping tasks until we find
-     * one eligible for this core, or exhaust all sleepers. */
-    int stalled_steps = 0;
-    while (nearest != UINT64_MAX) {
-        xtensa_cpu_t *cpu = frt->cpu[core_id];
-
-        /* Step to the next observable boundary, not straight to the wake
-         * time.  A ccompare tick, TIMG alarm or peripheral threshold falling
-         * inside the idle window has to be raised at its own ccount: drivers
-         * that depend on a *sequence* of interrupts across a delay (RMT,
-         * LEDC and UHCI all refill from their ISR) are stranded forever if
-         * the whole window collapses into one jump.
-         *
-         * This loop must still resolve the wait synchronously — returning
-         * early would leave the core halted with current_task pointing at a
-         * sleeping task, and nothing outside clears cpu->halted. */
-        uint64_t target = nearest;
-        if (cpu->next_timer_event != UINT32_MAX) {
-            uint32_t distance =
-                ((int32_t)(cpu->ccount - cpu->next_timer_event) >= 0)
-                    ? 0u : cpu->next_timer_event - cpu->ccount;
-            uint64_t event_at = cpu->cycle_count + distance;
-            if (event_at < target)
-                target = event_at;
-        }
-
-        uint64_t advance = target - cpu->cycle_count;
-        /* A due-but-unclearable event yields no progress; fall back to the
-         * plain jump rather than spinning here forever. */
-        if (advance == 0 && ++stalled_steps > 8) {
-            target = nearest;
-            advance = target - cpu->cycle_count;
-        }
-        if (advance)
-            stalled_steps = 0;
-
-        cpu->cycle_count = target;
-        cpu->ccount += (uint32_t)advance;
-        cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
-        /* Credit the other core's currently-running task for this
-         * advancement: while this core idle-waits for a wake time, the
-         * other core is actively executing its task for that same wall-
-         * clock duration. This fixes uxTaskGetSystemState cumulative
-         * tracking for no-affinity tasks on dual-core where one core
-         * often fast-forwards while the other does the real work. */
-        int other = core_id ^ 1;
-        int other_cur = frt->current_task[other];
-        if (other_cur >= 0 && frt->tasks[other_cur].state == TASK_RUNNING)
-            frt->tasks[other_cur].cumulative_cycles += advance;
-        frt->idle_cycles += advance;
-
-        /* Raise whatever is due at this exact ccount, so a peripheral or
-         * ccompare event inside the idle window is not skipped.
-         *
-         * The lock must be released across this call. Firing an event can
-         * reach periph_event_hook -> intr_matrix_update_source -> the
-         * guest-IRQ bridge, which runs a guest ISR that may itself call a
-         * FreeRTOS stub and re-take this non-recursive mutex. That is a
-         * self-deadlock; dispatch_peripherals_until_queue() drops the lock
-         * for the same reason. */
-        pthread_mutex_unlock(&frt->lock);
-        xtensa_fire_due_timers(cpu);
-        pthread_mutex_lock(&frt->lock);
-        /* Wake tasks at this time and find next nearest */
-        nearest = sched_wake_sleepers(frt, core_id);
-
-        best_prio = -1;
-        for (int i = 0; i < frt->task_count; i++) {
-            task_tcb_t *t = &frt->tasks[i];
-            if (t->state != TASK_READY) continue;
-            if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
-            if (t->priority > best_prio)
-                best_prio = t->priority;
-        }
-        if (best_prio >= 0) {
-            int cur = frt->current_task[core_id];
-            int start = (cur >= 0) ? (cur + 1) % frt->task_count : 0;
-            for (int j = 0; j < frt->task_count; j++) {
-                int i = (start + j) % frt->task_count;
-                task_tcb_t *t = &frt->tasks[i];
-                if (t->state == TASK_READY && t->priority == best_prio &&
-                    (t->core_affinity < 0 || t->core_affinity == core_id))
-                    return i;
-            }
-        }
+    /* Nothing real to run: fall back to this core's idle task, which sits in
+     * WAITI. Do NOT fast-forward here: this runs inside a stub,
+     * so a single xtensa_run() batch could span unbounded simulated time
+     * (10000 guest instructions can contain a thousand delay() calls, i.e.
+     * hundreds of millions of cycles), which starves every frontend that
+     * interleaves with the guest at batch granularity.
+     *
+     * Report "idle" instead. sched_switch() parks the core, and the halted
+     * path in xtensa_run() advances event-by-event, fires each timer at its
+     * own ccount, delivers pending interrupts, and — crucially — charges the
+     * cycles it skips against the caller's batch budget. */
+    frt_install_idle_tasks(frt);
+    if (frt->idle_ready) {
+        int idle = frt->idle_task[core_id];
+        frt->tasks[idle].state = TASK_READY;
+        return idle;
     }
-
     return -1;  /* all tasks blocked/unused/pinned elsewhere */
 }
 
@@ -404,6 +384,10 @@ static void sched_switch(freertos_stubs_t *frt, int core_id) {
     int prev = frt->current_task[core_id];
     int next = sched_pick_next(frt, core_id);
     if (next < 0) {
+        /* Idle: park the core. current_task is cleared so the preemption
+         * check adopts a task (and clears halted) as soon as one is ready;
+         * leaving it pointing at a blocked task strands the core. */
+        frt->current_task[core_id] = -1;
         frt->cpu[core_id]->running = true;
         frt->cpu[core_id]->halted = true;
         return;
@@ -519,12 +503,11 @@ static void sched_promote_legacy(freertos_stubs_t *frt) {
 
 /* ===== FreeRTOS stub implementations ===== */
 
-/* vTaskDelay(ticks) — yield to scheduler or advance ccount */
-void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
-    freertos_stubs_t *frt = ctx;
-    frt_refresh_cpu_frequency(frt, cpu);
-    uint32_t ticks = frt_arg(cpu, 0);
-    uint64_t advance = (uint64_t)ticks * frt->cycles_per_tick;
+/* Block the running task for `advance` guest cycles. Returns true when the
+ * scheduler took ownership: the guest return has already been performed and
+ * a context switch made, so the caller must not write a return value. */
+static bool frt_block_cycles(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                             uint64_t advance) {
     if (advance > 200000000ULL) advance = 200000000ULL;
     int core_id = cpu->core_id;
 
@@ -538,14 +521,46 @@ void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
         t->wake_cycle = cpu->cycle_count + advance;
         sched_switch(frt, core_id);
         pthread_mutex_unlock(&frt->lock);
-    } else {
-        pthread_mutex_unlock(&frt->lock);
-        /* Legacy: single-task mode */
-        cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
-        cpu->cycle_count += advance;
-        cpu->ccount += (uint32_t)advance;
-        frt_return_void(cpu);
+        return true;
     }
+    pthread_mutex_unlock(&frt->lock);
+    /* Legacy: single-task mode */
+    cpu->virtual_time_us += advance / frt->cpu_freq_mhz;
+    cpu->cycle_count += advance;
+    cpu->ccount += (uint32_t)advance;
+    return false;
+}
+
+/* Block for `us` microseconds of guest time. Shared with the Arduino
+ * delay()/usleep() shims so they yield exactly like the vTaskDelay() they
+ * wrap on real hardware.
+ *
+ * Returns false *without side effects* when there is no scheduler to block
+ * on, so the caller can apply its own fast-forward. Falling back to
+ * frt_block_cycles()'s legacy path here would be wrong: that advances
+ * cycle_count, which counts executed guest instructions and bounds every
+ * fixture harness, and a pre-scheduler delay() loop would exhaust those
+ * budgets without the guest making any progress. */
+bool freertos_stubs_sleep_us(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                             uint64_t us) {
+    if (!frt || !cpu) return false;
+    int core_id = cpu->core_id;
+    pthread_mutex_lock(&frt->lock);
+    bool schedulable = frt->scheduler_started &&
+                       frt->current_task[core_id] >= 0;
+    pthread_mutex_unlock(&frt->lock);
+    if (!schedulable) return false;
+    frt_refresh_cpu_frequency(frt, cpu);
+    return frt_block_cycles(frt, cpu, us * frt->cpu_freq_mhz);
+}
+
+/* vTaskDelay(ticks) — yield to scheduler or advance ccount */
+void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    frt_refresh_cpu_frequency(frt, cpu);
+    uint32_t ticks = frt_arg(cpu, 0);
+    if (!frt_block_cycles(frt, cpu, (uint64_t)ticks * frt->cycles_per_tick))
+        frt_return_void(cpu);
 }
 
 /* xTaskCreate(func, name, stack, param, prio, handle_out) -> pdPASS */
@@ -1586,11 +1601,18 @@ bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id) {
             frt->tasks[next].state = TASK_RUNNING;
             frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
             sched_restore_context(frt, core_id);
+            /* The core was parked in the idle state; resume it. */
+            frt->cpu[core_id]->halted = false;
         }
         pthread_mutex_unlock(&frt->lock);
         return next >= 0;
     }
-    int cur_prio = frt->tasks[frt->current_task[core_id]].priority;
+    /* An idle task must give way to any real work at once, so treat it as
+     * below every priority rather than letting the equal-priority
+     * round-robin timeslice gate the switch. */
+    bool cur_is_idle = frt->tasks[frt->current_task[core_id]].is_idle;
+    int cur_prio = cur_is_idle
+                 ? -1 : (int)frt->tasks[frt->current_task[core_id]].priority;
 
     /* Wake any sleeping tasks whose delay has expired */
     sched_wake_sleepers(frt, core_id);
@@ -1603,7 +1625,7 @@ bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id) {
         int i = (start + j) % frt->task_count;
         if (i == frt->current_task[core_id]) continue;
         task_tcb_t *t = &frt->tasks[i];
-        if (t->state != TASK_READY) continue;
+        if (t->state != TASK_READY || t->is_idle) continue;
         if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
         if (t->priority > best_prio) {
             best_prio = t->priority;
@@ -1650,12 +1672,17 @@ bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id) {
 
     int prev = frt->current_task[core_id];
     sched_save_context(frt, core_id);
-    frt->tasks[frt->current_task[core_id]].state = TASK_READY;
+    /* Only a task that was actually running becomes runnable again; marking
+     * unconditionally would resurrect one that is blocked or suspended. */
+    if (frt->tasks[prev].state == TASK_RUNNING)
+        frt->tasks[prev].state = TASK_READY;
 
     frt->current_task[core_id] = next;
     frt->tasks[next].state = TASK_RUNNING;
     frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
     sched_restore_context(frt, core_id);
+    /* Leaving the idle task means leaving WAITI. */
+    frt->cpu[core_id]->halted = false;
 
     if (frt->event_fn && next != prev) {
         const char *from = frt->tasks[prev].name;

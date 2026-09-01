@@ -55,6 +55,13 @@ struct flexe_session {
     int                touch_irq_level;
 };
 
+/* Let the esp_timer delay()/usleep() shims block on the FreeRTOS scheduler
+ * instead of fast-forwarding the clock past pending work. */
+static bool session_sleep_us(void *ctx, xtensa_cpu_t *cpu, uint64_t us)
+{
+    return freertos_stubs_sleep_us((freertos_stubs_t *)ctx, cpu, us);
+}
+
 flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
 {
     if (!cfg || !cfg->bin_path) return NULL;
@@ -148,6 +155,8 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     if (s->etimer) {
         if (cfg->native_freertos)
             esp_timer_stubs_set_virtual_time(s->etimer, 1);
+        if (s->frt)
+            esp_timer_stubs_set_sleep_fn(s->etimer, session_sleep_us, s->frt);
         if (s->syms)
             esp_timer_stubs_hook_symbols(s->etimer, s->syms);
     }

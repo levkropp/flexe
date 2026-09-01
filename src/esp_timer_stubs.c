@@ -49,6 +49,10 @@ struct esp_timer_stubs {
      * makes execution non-deterministic and decouples the guest's sense of
      * time from CCOUNT and the peripherals. */
     int use_virtual_time;
+
+    /* Optional blocking-wait delegate (the FreeRTOS scheduler). */
+    esp_timer_sleep_fn sleep_fn;
+    void              *sleep_ctx;
 };
 
 #define TIMER_BUMP_BASE  0x3FFE8000u
@@ -133,6 +137,15 @@ static void advance_wait_time(esp_timer_stubs_t *et, xtensa_cpu_t *cpu,
     cpu->ccount += (uint32_t)cycles;
 }
 
+
+/* Block for `us` microseconds, preferring the scheduler so peer tasks, ISRs
+ * and peripheral events still run during the wait. */
+static bool et_block_us(esp_timer_stubs_t *et, xtensa_cpu_t *cpu, uint64_t us) {
+    if (et->sleep_fn && et->sleep_fn(et->sleep_ctx, cpu, us))
+        return true;
+    advance_wait_time(et, cpu, us);
+    return false;
+}
 
 /* ===== Find timer by handle ===== */
 
@@ -362,9 +375,10 @@ void stub_esp_timer_is_active(xtensa_cpu_t *cpu, void *ctx) {
 void stub_usleep(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
     uint32_t us = et_arg(cpu, 0);
-    advance_wait_time(et, cpu, us);
+    bool yielded = et_block_us(et, cpu, us);
     dispatch_expired_timers(et);
-    et_return(cpu, 0);
+    if (!yielded)
+        et_return(cpu, 0);
 }
 
 /* esp_timer_init() — no-op, return ESP_OK */
@@ -393,9 +407,10 @@ void stub_micros(xtensa_cpu_t *cpu, void *ctx) {
 void stub_delay(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
     uint32_t ms = et_arg(cpu, 0);
-    advance_wait_time(et, cpu, (uint64_t)ms * 1000u);
+    bool yielded = et_block_us(et, cpu, (uint64_t)ms * 1000u);
     dispatch_expired_timers(et);
-    et_return_void(cpu);
+    if (!yielded)
+        et_return_void(cpu);
 }
 
 /* ===== Public API ===== */
@@ -462,6 +477,13 @@ int esp_timer_stubs_timer_count(const esp_timer_stubs_t *et) {
 
 void esp_timer_stubs_set_virtual_time(esp_timer_stubs_t *et, int enable) {
     if (et) et->use_virtual_time = enable;
+}
+
+void esp_timer_stubs_set_sleep_fn(esp_timer_stubs_t *et,
+                                  esp_timer_sleep_fn fn, void *ctx) {
+    if (!et) return;
+    et->sleep_fn = fn;
+    et->sleep_ctx = ctx;
 }
 
 
