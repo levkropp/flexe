@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* JIT compiler for Xtensa LX6 → x86-64 native code.
+/* JIT compiler for Xtensa LX6 → x86-64 and ARM64 native code.
  * Translates hot basic blocks to native machine code, falling back
  * to the interpreter for cold code and complex instructions. */
 
@@ -25,6 +25,12 @@
 
 /* Maximum guest instructions per block */
 #define JIT_MAX_BLOCK_INSNS  64
+
+/* Max guest instructions executed in one chained JIT run before breaking
+ * out to the dispatcher. Keeps timers, FreeRTOS preemption and the -c
+ * batch budget live inside self-chaining loops. A run may overshoot by at
+ * most the final block's length, since the cap is tested at block exits. */
+#define JIT_CHAIN_CAP  400
 
 /* Block entry in the hash table */
 typedef struct {

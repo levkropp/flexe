@@ -85,45 +85,6 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 /* Memory struct offsets */
 #define MEM_OFF_PAGE_TABLE  offsetof(xtensa_mem_t, page_table)
 
-/* Max guest instructions executed in one chained JIT run before breaking
- * out to the dispatcher. Keeps timers, FreeRTOS preemption and the -c
- * batch budget live inside self-chaining loops. */
-#define JIT_CHAIN_CAP  400
-
-/* Guest-insn accumulator. Every block exit ADDS its count into REG_ACC;
- * the epilogue returns it to jit_pc_hook. The register must survive the
- * whole block body (all instruction emitters clobber RAX..RDI + the
- * guest-mapped R8..R13).
- *
- * ARM64: X27 — callee-saved, outside the RAX..R15 compat enum, saved in
- *        the block prologue/epilogue. Body code never touches it.
- * x86:   no free register exists, so RAX accumulates only within a single
- *        block (set, not add, at each exit) — chained runs count just the
- *        final block, the pre-existing accounting quirk. */
-#ifdef JIT_ARCH_ARM64
-#define REG_ACC  27  /* X27 */
-static inline void emit_acc_zero(emit_t *e) { emit_mov_reg_imm32(e, REG_ACC, 0); }
-static inline void emit_acc_add(emit_t *e, int n) {
-    if (n) emit_add_reg32_imm32(e, REG_ACC, n);
-}
-/* cap check: returns jcc site that CONTINUES the block when under cap */
-static inline int emit_acc_cap_jcc(emit_t *e) {
-    emit_cmp_reg32_imm32(e, REG_ACC, JIT_CHAIN_CAP);
-    return emit_jcc_rel32(e, CC_B);
-}
-#else
-#define REG_ACC  RAX
-static inline void emit_acc_zero(emit_t *e) { (void)e; }
-static inline void emit_acc_add(emit_t *e, int n) {
-    emit_mov_reg_imm32(e, RAX, (uint32_t)n);
-}
-static inline int emit_acc_cap_jcc(emit_t *e) {
-    /* RAX can't hold a run total on x86 (body clobbers it) — never break */
-    emit_cmp_reg32(e, RAX, RAX);
-    return emit_jcc_rel32(&*e, CC_E);
-}
-#endif
-
 /* JIT state */
 struct jit_state {
     /* Code cache */
@@ -549,6 +510,43 @@ static int jit_short_block_has_backedge(const jit_scan_t *scan,
 /* CPU register R15, MEM pointer R14 */
 #define REG_CPU  R15
 #define REG_MEM  R14
+
+/* Guest-insn accumulator. Every block exit ADDS its count into the
+ * accumulator; the epilogue returns the total to jit_pc_hook. It must
+ * survive the whole block body (all instruction emitters clobber RAX..RDI
+ * plus the guest-mapped R8..R13).
+ *
+ * ARM64: X27 — callee-saved, outside the RAX..R15 compat enum, saved in
+ *        the block prologue/epilogue. Body code never touches it.
+ * x86:   no free register exists (R8-R13 hold guest a1-a6 via RA_MAP,
+ *        R14/R15 hold mem/cpu, and RAX..RDI plus RBP are body scratch), so
+ *        the total lives in cpu->jit_acc. x86 adds to and compares against
+ *        memory directly, so a block exit still costs one instruction, as
+ *        in the ARM64 register form; the epilogue loads it into EAX. */
+#ifdef JIT_ARCH_ARM64
+#define REG_ACC  27  /* X27 */
+static inline void emit_acc_zero(emit_t *e) { emit_mov_reg_imm32(e, REG_ACC, 0); }
+static inline void emit_acc_add(emit_t *e, int n) {
+    if (n) emit_add_reg32_imm32(e, REG_ACC, n);
+}
+/* cap check: returns jcc site that CONTINUES the block when under cap */
+static inline int emit_acc_cap_jcc(emit_t *e) {
+    emit_cmp_reg32_imm32(e, REG_ACC, JIT_CHAIN_CAP);
+    return emit_jcc_rel32(e, CC_B);
+}
+#else
+#define CPU_OFF_JIT_ACC  offsetof(xtensa_cpu_t, jit_acc)
+static inline void emit_acc_zero(emit_t *e) {
+    emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_JIT_ACC, 0);
+}
+static inline void emit_acc_add(emit_t *e, int n) {
+    if (n) emit_add32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_JIT_ACC, (uint32_t)n);
+}
+static inline int emit_acc_cap_jcc(emit_t *e) {
+    emit_cmp32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_JIT_ACC, JIT_CHAIN_CAP);
+    return emit_jcc_rel32(e, CC_B);
+}
+#endif
 
 /* Bit-test branch conditions. x86 BT sets CF=bit, so "bit clear" branches
  * use CC_AE (CF=0) and "bit set" uses CC_B. The ARM64 lowering uses TST,
@@ -2464,6 +2462,9 @@ static void jit_emit_epilogue_stub(emit_t *e) {
     emit32(e, 0xA8C153F3u);  /* ldp x19, x20, [sp], #16 */
     emit_ret(e);
 #else
+    /* Return value: guest-insn accumulator cpu->jit_acc → EAX. Must happen
+     * while REG_CPU is still live, i.e. before the pops below. */
+    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_JIT_ACC);
     /* Matches prologue: 6 pushes + sub rsp,8 → add rsp,8 + 6 pops + ret. */
     emit_add_reg64_imm32(e, RSP, 8);
     emit_pop(e, R12);

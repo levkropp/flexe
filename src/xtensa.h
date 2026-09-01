@@ -373,6 +373,14 @@ struct xtensa_cpu {
     uint8_t window_callsize[16];
     uint32_t dbg_prev_pc;   /* previous step PC, for trap diagnosis */
 
+    /* Guest-instruction accumulator for a single chained JIT run.  ARM64
+     * keeps this in a callee-saved register (X27); x86-64 has no free
+     * register (R8-R13 are guest a1-a6, R14/R15 are mem/cpu, and the rest
+     * are body scratch), so it accumulates here and the epilogue loads the
+     * total into EAX.  Transient: written only between a block prologue and
+     * its epilogue, so it is deliberately not serialized in savestates. */
+    uint32_t jit_acc;
+
     /* Peripheral timer-event hooks (TIMG LACT): fold peripheral alarms into
      * the next_timer_event mechanism so alarm interrupts fire on time and
      * can wake the core from WAITI. */

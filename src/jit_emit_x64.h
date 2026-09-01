@@ -342,6 +342,16 @@ static inline void emit_cmp_reg32_imm32(emit_t *e, int reg, int32_t imm) {
     emit32(e, (uint32_t)imm);
 }
 
+/* test reg32, imm32 — sets Z=1 iff (reg & imm) == 0. Unlike the ARM64
+ * form, this needs no scratch register, so callers must not assume one
+ * is clobbered. */
+static inline void emit_test_reg32_imm32(emit_t *e, int reg, uint32_t imm) {
+    emit_rex(e, 0, 0, reg);
+    emit8(e, 0xF7);
+    emit8(e, modrm(3, 0, reg));
+    emit32(e, imm);
+}
+
 /* add reg64, imm32 (sign-extended) */
 static inline void emit_add_reg64_imm32(emit_t *e, int reg, int32_t imm) {
     emit_rex_w(e, 0, reg);
@@ -544,6 +554,34 @@ static inline void emit_store32_disp_imm(emit_t *e, int base, int32_t disp, uint
     }
     emit32(e, (uint32_t)disp);
     emit32(e, imm);
+}
+
+/* Shared encoder for the "group 1" ALU ops with a 32-bit immediate against
+ * a memory operand: 81 /ext id.  ext selects the operation (0=add, 7=cmp). */
+static inline void emit_alu32_disp_imm(emit_t *e, int ext, int base,
+                                       int32_t disp, uint32_t imm) {
+    emit_rex(e, 0, 0, base);
+    emit8(e, 0x81);
+    if ((base & 7) == RSP) {
+        emit8(e, modrm(2, ext, RSP));
+        emit8(e, sib(0, RSP, RSP));
+    } else {
+        emit8(e, modrm(2, ext, base));
+    }
+    emit32(e, (uint32_t)disp);
+    emit32(e, imm);
+}
+
+/* add dword [base64 + disp32], imm32 */
+static inline void emit_add32_disp_imm(emit_t *e, int base, int32_t disp,
+                                       uint32_t imm) {
+    emit_alu32_disp_imm(e, 0, base, disp, imm);
+}
+
+/* cmp dword [base64 + disp32], imm32 */
+static inline void emit_cmp32_disp_imm(emit_t *e, int base, int32_t disp,
+                                       uint32_t imm) {
+    emit_alu32_disp_imm(e, 7, base, disp, imm);
 }
 
 /* movsx eax, ax (sign extend 16→32) — movsxd variant */

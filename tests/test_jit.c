@@ -559,6 +559,67 @@ TEST(test_jit_short_backedge_loop_is_native) {
     teardown(&cpu);
 }
 
+/* A chained JIT run must report every block it executed, not just the last
+ * one, and must stay bounded by JIT_CHAIN_CAP.  The guest-insn accumulator
+ * is the sole driver of ccount/cycle_count in JIT mode (jit_pc_hook adds the
+ * returned count), so under-reporting stalls virtual time and starves timers,
+ * FreeRTOS preemption and the -c budget; a cap check that never fires hangs
+ * outright on any self-chaining loop. */
+TEST(test_jit_chained_run_accounts_every_block) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* Four-instruction self-chaining loop. a4 counts iterations independently
+     * of the JIT's own accounting; a3 stays zero so the backward BEQZ is
+     * always taken and the block chains to itself. */
+    put_insn2(&cpu, BASE,     narrow(0xB, 4, 4, 1));  /* ADDI.N a4, a4, 1 */
+    put_insn2(&cpu, BASE + 2, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 4, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    uint32_t imm12 = (uint32_t)-10 & 0xFFFu;
+    put_insn3(&cpu, BASE + 6,
+              (imm12 << 12) | (3u << 8) | (1u << 4) | 6u); /* BEQZ a3, BASE */
+    ar_write(&cpu, 3, 0);
+    ar_write(&cpu, 4, 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    const int budget = 4000;
+    uint64_t cycles_before = cpu.cycle_count;
+    int ran = xtensa_run(&cpu, budget);
+    uint64_t cycles_after = cpu.cycle_count;
+
+    /* Each iteration is exactly four guest instructions. */
+    uint32_t iterations = ar_read(&cpu, 4);
+    ASSERT_TRUE(iterations > 0);
+    ASSERT_EQ((uint32_t)ran, iterations * 4);
+
+    /* Virtual time must advance by exactly what the run reports. */
+    ASSERT_EQ64(cycles_after - cycles_before, (uint64_t)ran);
+
+    /* The cap must bound the run: an infinite guest loop whose chain never
+     * re-checks the budget never returns here. Overshoot is limited to the
+     * final block, which the cap can only observe at its exit. */
+    ASSERT_TRUE(ran >= budget);
+    ASSERT_TRUE(ran <= budget + JIT_CHAIN_CAP + JIT_MAX_BLOCK_INSNS);
+
+    /* Guard against the case degenerating into interpreted stepping, which
+     * would not exercise chained accounting at all: one dispatch has to
+     * cover many iterations. */
+    const jit_stats_t *stats = jit_get_stats(jit);
+    ASSERT_TRUE(stats->insns_jitted >= (uint64_t)budget);
+    ASSERT_TRUE(stats->blocks_executed < iterations);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_flush) {
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -823,6 +884,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_init_destroy);
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
+    RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);
