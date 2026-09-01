@@ -91,6 +91,10 @@ struct esp32_rom_stubs {
     rom_firmware_profile_t firmware_profile;  /* exact symbol-less ROM layout */
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     stub_irq_t irq[71];
+    /* Per-pin handlers registered through gpio_isr_handler_add(). See
+     * gpio_isr_dispatch(). */
+    struct { uint32_t fn, arg; } gpio_isr[40];
+    bool gpio_isr_installed;
     stub_heap_region_t heap;
     stub_heap_region_t internal_heap;
     struct {
@@ -2107,6 +2111,165 @@ void stub_gpio_reset_pin(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, ESP_OK);
 }
 
+/* esp_ipc_call_blocking(cpu_id, func, arg)
+ *
+ * IDF runs a per-core IPC task and hands it the callback; drivers use it to
+ * allocate an interrupt on a particular core. gpio_isr_register() goes
+ * through here, so with the IPC tasks not running the callback was simply
+ * dropped and GPIO interrupt allocation never happened -- attachInterrupt()
+ * silently did nothing.
+ *
+ * Which core a handler is installed on does not matter to the emulator, so
+ * run the callback synchronously on the caller instead of modelling the task
+ * handshake. That is what "blocking" means to the caller anyway. */
+static void stub_esp_ipc_call_blocking(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t func = rom_arg(cpu, 1);
+    uint32_t arg  = rom_arg(cpu, 2);
+    if (func)
+        (void)guest_call8(cpu, func, &arg, 1, 2000000u, NULL);
+    rom_return(cpu, 0); /* ESP_OK */
+}
+
+
+/* ===== GPIO interrupt service =====
+ *
+ * ESP-IDF installs one shared handler for the GPIO source and dispatches
+ * per-pin callbacks from it, reading GPIO_STATUS to find which pins fired and
+ * clearing them afterwards. Its own installer routes the allocation through
+ * an inter-processor call to a specific core, which is not something this
+ * emulator models, so the registration was dropped and attachInterrupt() had
+ * no effect at all -- silently, since the driver reports success.
+ *
+ * Model the service instead of the plumbing: record the per-pin handlers and
+ * run the same dispatch loop when the GPIO source asserts. Edge and level
+ * detection, GPIO_STATUS and the per-core INT_ENA routing are all already in
+ * the peripheral model, so only this dispatch was missing. */
+#define GPIO_INTR_SOURCE_NUM 22
+#define GPIO_BASE_ADDR       0x3FF44000u
+#define GPIO_STATUS_REG_ADDR (GPIO_BASE_ADDR + 0x044u)
+#define GPIO_STATUS_W1TC_ADDR (GPIO_BASE_ADDR + 0x04Cu)
+#define GPIO_STATUS1_REG_ADDR (GPIO_BASE_ADDR + 0x050u)
+#define GPIO_STATUS1_W1TC_ADDR (GPIO_BASE_ADDR + 0x058u)
+
+static void gpio_isr_dispatch(void *ctx, int source) {
+    esp32_rom_stubs_t *s = ctx;
+    (void)source;
+    if (!s || !s->cpu) return;
+
+    uint32_t st0 = mem_read32(s->cpu->mem, GPIO_STATUS_REG_ADDR);
+    uint32_t st1 = mem_read32(s->cpu->mem, GPIO_STATUS1_REG_ADDR);
+    uint32_t handled0 = 0, handled1 = 0;
+
+    for (int pin = 0; pin < 40; pin++) {
+        uint32_t bit = pin < 32 ? (1u << pin) : (1u << (pin - 32));
+        uint32_t st = pin < 32 ? st0 : st1;
+        if (!(st & bit)) continue;
+        if (pin < 32) handled0 |= bit; else handled1 |= bit;
+        if (!s->gpio_isr[pin].fn) continue;
+        uint32_t args[] = { s->gpio_isr[pin].arg };
+        int r = guest_call8(s->cpu, s->gpio_isr[pin].fn, args, 1,
+                            2000000u, NULL);
+        if (r != 0)
+            fprintf(stderr, "[gpio] pin %d handler 0x%08X failed (%d)\n",
+                    pin, s->gpio_isr[pin].fn, r);
+    }
+
+    /* Acknowledge every pin whose status was latched, handler or not:
+     * leaving a bit set holds the source asserted and the guest would be
+     * re-entered forever. */
+    if (handled0)
+        mem_write32(s->cpu->mem, GPIO_STATUS_W1TC_ADDR, handled0);
+    if (handled1)
+        mem_write32(s->cpu->mem, GPIO_STATUS1_W1TC_ADDR, handled1);
+}
+
+/* GPIO_PINn_REG: INT_TYPE is bits 9:7, INT_ENA bits 17:13. The driver
+ * normally writes these itself, but gpio_intr_enable() picks the target core
+ * from the ISR handle that its own installer would have produced -- which
+ * this one does not, since the service is modelled rather than installed. Set
+ * the registers here so the peripheral's existing edge detection and per-core
+ * routing see what the caller asked for. */
+#define GPIO_PIN0_REG_ADDR   (GPIO_BASE_ADDR + 0x088u)
+#define GPIO_PIN_INT_TYPE_SHIFT 7
+#define GPIO_PIN_INT_ENA_SHIFT  13
+#define GPIO_PIN_PRO_CPU_INTR   (1u << 2)
+
+static void gpio_pin_reg_update(xtensa_cpu_t *cpu, uint32_t pin,
+                                uint32_t mask, uint32_t value) {
+    if (pin >= 40u) return;
+    uint32_t addr = GPIO_PIN0_REG_ADDR + pin * 4u;
+    uint32_t cfg = mem_read32(cpu->mem, addr);
+    mem_write32(cpu->mem, addr, (cfg & ~mask) | (value & mask));
+}
+
+/* gpio_install_isr_service(flags) -> ESP_OK */
+static void stub_gpio_install_isr_service(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    if (s && !s->gpio_isr_installed) {
+        s->gpio_isr_installed = true;
+        if (s->periph)
+            periph_set_irq_dispatch(s->periph, GPIO_INTR_SOURCE_NUM,
+                                    gpio_isr_dispatch, s);
+    }
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_isr_handler_add(gpio_num, isr_handler, args) -> ESP_OK
+ *
+ * The driver enables the pin's interrupt here rather than making the caller
+ * do it -- attachInterrupt() never calls gpio_intr_enable() -- so enable it
+ * here too, or the peripheral latches status that is routed to no core. */
+static void stub_gpio_isr_handler_add(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t pin = rom_arg(cpu, 0);
+    if (s && pin < 40u) {
+        s->gpio_isr[pin].fn = rom_arg(cpu, 1);
+        s->gpio_isr[pin].arg = rom_arg(cpu, 2);
+        gpio_pin_reg_update(cpu, pin, 0x1Fu << GPIO_PIN_INT_ENA_SHIFT,
+                            GPIO_PIN_PRO_CPU_INTR << GPIO_PIN_INT_ENA_SHIFT);
+    }
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_set_intr_type(gpio_num, intr_type) -> ESP_OK */
+static void stub_gpio_set_intr_type(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t pin = rom_arg(cpu, 0), type = rom_arg(cpu, 1) & 0x7u;
+    gpio_pin_reg_update(cpu, pin, 0x7u << GPIO_PIN_INT_TYPE_SHIFT,
+                        type << GPIO_PIN_INT_TYPE_SHIFT);
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_intr_enable(gpio_num) -> ESP_OK */
+static void stub_gpio_intr_enable(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    gpio_pin_reg_update(cpu, rom_arg(cpu, 0),
+                        0x1Fu << GPIO_PIN_INT_ENA_SHIFT,
+                        GPIO_PIN_PRO_CPU_INTR << GPIO_PIN_INT_ENA_SHIFT);
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_intr_disable(gpio_num) -> ESP_OK */
+static void stub_gpio_intr_disable(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    gpio_pin_reg_update(cpu, rom_arg(cpu, 0),
+                        0x1Fu << GPIO_PIN_INT_ENA_SHIFT, 0u);
+    rom_return(cpu, ESP_OK);
+}
+
+/* gpio_isr_handler_remove(gpio_num) -> ESP_OK */
+static void stub_gpio_isr_handler_remove(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t pin = rom_arg(cpu, 0);
+    if (s && pin < 40u) {
+        s->gpio_isr[pin].fn = 0;
+        s->gpio_isr[pin].arg = 0;
+        gpio_pin_reg_update(cpu, pin, 0x1Fu << GPIO_PIN_INT_ENA_SHIFT, 0u);
+    }
+    rom_return(cpu, ESP_OK);
+}
+
 /* gpio_install_isr_service(flags) -> ESP_OK */
 void stub_gpio_isr_service(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -2842,6 +3005,7 @@ static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
     if (source != 10 && source != 11 &&
         source != 12 && source != 13 && source != 14 && source != 15 &&
         source != 18 && source != 19 &&
+        source != 22 &&
         source != 30 && source != 31 &&
         source != 32 && source != 33 && source != 37 && source != 38 &&
         source != 39 && source != 40 &&
@@ -4449,17 +4613,19 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
 
     /* GPIO driver stubs */
     struct { const char *name; rom_stub_fn fn; } gpio_hooks[] = {
+        { "esp_ipc_call_blocking",      stub_esp_ipc_call_blocking },
+        { "esp_ipc_call",               stub_esp_ipc_call_blocking },
+        { "gpio_install_isr_service",   stub_gpio_install_isr_service },
+        { "gpio_set_intr_type",         stub_gpio_set_intr_type },
+        { "gpio_intr_enable",           stub_gpio_intr_enable },
+        { "gpio_intr_disable",          stub_gpio_intr_disable },
+        { "gpio_isr_handler_add",       stub_gpio_isr_handler_add },
+        { "gpio_isr_handler_remove",    stub_gpio_isr_handler_remove },
         { "gpio_config",                stub_gpio_config },
         { "gpio_set_direction",         stub_gpio_set_direction },
         { "gpio_set_level",             stub_gpio_set_level },
         { "gpio_get_level",             stub_gpio_get_level },
         { "gpio_reset_pin",             stub_gpio_reset_pin },
-        { "gpio_install_isr_service",   stub_gpio_isr_service },
-        { "gpio_isr_handler_add",       stub_gpio_isr_service },
-        { "gpio_isr_handler_remove",    stub_gpio_isr_service },
-        { "gpio_set_intr_type",         stub_gpio_isr_service },
-        { "gpio_intr_enable",           stub_gpio_isr_service },
-        { "gpio_intr_disable",          stub_gpio_isr_service },
         { "gpio_pullup_en",             stub_gpio_isr_service },
         { "gpio_pullup_dis",            stub_gpio_isr_service },
         { "gpio_pulldown_en",           stub_gpio_isr_service },

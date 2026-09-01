@@ -158,8 +158,15 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 18 of 18 on x86-64
+The compiled Arduino hardware gates below all pass — 19 of 19 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
+
+`test-gpio-isr.sh` covers `attachInterrupt()`. The other gates that touch GPIO
+drive it as a level input and poll, so nothing exercised interrupt delivery —
+and it did not work: a per-core interrupt source raised its CPU line without
+ever running a registered handler, so no GPIO interrupt reached the guest by
+any route. A CYD's touch controller signals with PENIRQ, so this matters on
+the target hardware.
 
 `test-spi-master.sh` covers the one peripheral a CYD depends on most and no
 stock ROM exercises: TFT_eSPI and its relatives drive the GP-SPI registers

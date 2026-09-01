@@ -2007,6 +2007,18 @@ static void intr_matrix_update_source_core(esp32_periph_t *p, int core,
     if (core < 0 || core > 1 || source < 0 || source >= 71) return;
     p->source_level_core[core][source] = assert;
     intr_matrix_refresh_cpu_line(p, core, p->intr_matrix[core][source]);
+
+    /* Dispatch on the combined rising edge, exactly as the whole-source path
+     * does. Without this a handler registered for a per-core source is never
+     * called, which is why no GPIO interrupt ever reached the guest however
+     * it was registered: the pin latched status and the CPU line was raised,
+     * and nothing ran. */
+    bool now = p->source_level_core[0][source] ||
+               p->source_level_core[1][source];
+    bool rising = now && !p->source_level[source];
+    p->source_level[source] = now;
+    if (rising && p->irq_dispatch[source])
+        p->irq_dispatch[source](p->irq_dispatch_ctx[source], source);
 }
 
 static void flash_mmu_invalidate_code(esp32_periph_t *p, uint32_t addr,

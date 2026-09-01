@@ -220,6 +220,11 @@ if(UNIX)
     target_compile_options(flexe-bench-compute PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-gpio-isr-test tools/gpio_isr_test.c)
+    target_link_libraries(flexe-gpio-isr-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-gpio-isr-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-spi-master-test tools/spi_master_test.c)
     target_link_libraries(flexe-spi-master-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-spi-master-test PRIVATE
