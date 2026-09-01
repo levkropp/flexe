@@ -1481,8 +1481,12 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 /* 32-bit loads already zero-extended; UMULL + LSR #32 */
                 emit_umulh32(e, RAX, RAX, RBX);
 #else
-                /* mov eax, eax already zero-extends in 64-bit mode */
-                emit8(e, rex(1, RAX, 0, RBX)); emit8(e, 0x0F); emit8(e, 0xAF);
+                /* Both halves arrive zero-extended (a 32-bit mov clears the
+                 * upper half), so a single 64-bit multiply of the extended
+                 * values gives the full 64-bit product. rex() takes *bits*,
+                 * not register numbers: passing RBX as the b argument set
+                 * REX.B and multiplied by r11 instead. */
+                emit_rex_w(e, RAX, RBX); emit8(e, 0x0F); emit8(e, 0xAF);
                 emit8(e, modrm(3, RAX, RBX)); /* imul rax, rbx */
                 emit_shr_reg64_imm(e, RAX, 32);
 #endif
@@ -1500,7 +1504,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 emit8(e, 0x48); emit8(e, 0x63); emit8(e, modrm(3, RAX, RAX));
                 ra_load_ar(e, ra,RBX, wb4, t);
                 emit8(e, 0x48); emit8(e, 0x63); emit8(e, modrm(3, RBX, RBX));
-                emit8(e, rex(1, RAX, 0, RBX)); emit8(e, 0x0F); emit8(e, 0xAF);
+                emit_rex_w(e, RAX, RBX); emit8(e, 0x0F); emit8(e, 0xAF);
                 emit8(e, modrm(3, RAX, RBX));
                 emit_shr_reg64_imm(e, RAX, 32);
 #endif
@@ -1699,21 +1703,25 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 return 1;
             }
             case 12: { /* MOVF: if (!bt) ar = as */
-                emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_BR);
-                emit_test_reg32_imm32(e, RBX, (uint32_t)(1 << t)); /* Z=1 iff bit clear */
-                int skip_patch = emit_jcc_rel32(e, CC_NE);
-                ra_load_ar(e, ra,RAX, wb4, s);
+                /* Select rather than branch, for the same reason MOVEQZ does:
+                 * jumping over ra_store_ar() leaves its compile-time dirty
+                 * mapping live on the untaken path, so the block's exit flush
+                 * writes a host register that was never loaded. */
+                ra_load_ar(e, ra,RAX, wb4, r);
+                ra_load_ar(e, ra,RBX, wb4, s);
+                emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_BR);
+                emit_test_reg32_imm32(e, RCX, (uint32_t)(1 << t));
+                emit_cmov_reg32(e, CC_E, RAX, RBX);   /* bit clear -> take as */
                 ra_store_ar(e, ra,RAX, wb4, r);
-                emit_patch_rel32(e, skip_patch);
                 return 1;
             }
             case 13: { /* MOVT: if (bt) ar = as */
-                emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_BR);
-                emit_test_reg32_imm32(e, RBX, (uint32_t)(1 << t));
-                int skip_patch = emit_jcc_rel32(e, CC_E);
-                ra_load_ar(e, ra,RAX, wb4, s);
+                ra_load_ar(e, ra,RAX, wb4, r);
+                ra_load_ar(e, ra,RBX, wb4, s);
+                emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_BR);
+                emit_test_reg32_imm32(e, RCX, (uint32_t)(1 << t));
+                emit_cmov_reg32(e, CC_NE, RAX, RBX);  /* bit set -> take as */
                 ra_store_ar(e, ra,RAX, wb4, r);
-                emit_patch_rel32(e, skip_patch);
                 return 1;
             }
             case 14: { /* RUR */
