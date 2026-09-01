@@ -1146,7 +1146,7 @@ typedef struct {
     uint32_t rtc;           /* LACTRTC */
     uint64_t alarm;         /* LACTALARMHI:LO */
     uint64_t load;          /* LACTLOADHI:LO pending value */
-    uint64_t load_ccount;   /* cpu0 ccount when LACTLOAD fired */
+    uint64_t load_ccount;   /* shared timg cycle when LACTLOAD fired */
     bool     loaded;        /* a LACTLOAD has occurred */
     bool     level;         /* interrupt level currently asserted */
 } lact_state_t;
@@ -1190,10 +1190,7 @@ typedef struct {
 
     /* Shared monotonic CPU-cycle timeline. Sampling both cores and taking the
      * maximum avoids advancing an always-on APB peripheral twice. */
-    uint64_t time_cycles;
-    uint64_t core_cycles[2];
-    uint32_t last_ccount[2];
-    bool time_valid[2];
+    periph_clock_t clock;
 } sigmadelta_state_t;
 
 /* SPI0 (cache flash controller) / SPI1 (memspi host) state.
@@ -1396,7 +1393,7 @@ typedef struct {
     bool tx_event_armed;
     bool data_overrun;
     bool bus_off;
-    uint32_t next_tx_ccount;
+    uint64_t next_tx_cycle;
 
     twai_rx_entry_t rx_fifo[TWAI_RX_FIFO_FRAMES];
     uint8_t rx_head;
@@ -1405,7 +1402,7 @@ typedef struct {
 
     bool recovery_event_armed;
     uint8_t recovery_phase;
-    uint32_t next_recovery_ccount;
+    uint64_t next_recovery_cycle;
 
     periph_twai_tx_fn tx_cb;
     void *tx_cb_ctx;
@@ -1484,8 +1481,8 @@ typedef struct {
     bool rx_active;
     bool tx_event_armed;
     bool rx_event_armed;
-    uint32_t next_tx_ccount;
-    uint32_t next_rx_ccount;
+    uint64_t next_tx_cycle;
+    uint64_t next_rx_cycle;
 
     uint8_t rx_fifo[I2S_RX_FIFO_SIZE];
     size_t rx_head;
@@ -1578,7 +1575,7 @@ typedef struct {
 typedef struct {
     bool pending;
     bool level;
-    uint32_t deadline;
+    uint64_t deadline;
 } pcnt_filter_state_t;
 
 typedef struct {
@@ -1651,10 +1648,7 @@ typedef struct {
 
 typedef struct {
     mcpwm_unit_state_t unit[MCPWM_UNIT_COUNT];
-    uint64_t time_cycles;
-    uint64_t core_cycles[2];
-    uint32_t last_ccount[2];
-    bool time_valid[2];
+    periph_clock_t clock;
 } mcpwm_state_t;
 
 struct esp32_periph {
@@ -1839,6 +1833,22 @@ static uint64_t periph_clock_now(esp32_periph_t *p, periph_clock_t *c) {
             c->cycles = c->core_cycles[core];
     }
     return c->cycles;
+}
+
+/* Read the shared timeline without advancing it, for callers that must stay
+ * pure queries. Never lower than the last periph_clock_now(). */
+static uint64_t periph_clock_peek(const esp32_periph_t *p,
+                                  const periph_clock_t *c) {
+    uint64_t best = c->cycles;
+    for (unsigned core = 0; core < 2u; core++) {
+        if (!p->cpu[core] || !c->valid[core]) continue;
+        uint32_t elapsed = p->cpu[core]->ccount - c->last_ccount[core];
+        if (elapsed >= (uint32_t)INT32_MAX) continue;
+        uint64_t candidate = c->core_cycles[core] > UINT64_MAX - elapsed ?
+            UINT64_MAX : c->core_cycles[core] + elapsed;
+        if (candidate > best) best = candidate;
+    }
+    return best;
 }
 
 /* Translate a deadline on the shared timeline into `cpu`'s 32-bit CCOUNT
@@ -2409,43 +2419,11 @@ static uint64_t sigmadelta_add_saturating(uint64_t value,
 }
 
 static uint64_t sigmadelta_peek_cycles(const esp32_periph_t *p) {
-    uint64_t best = p->sigmadelta.time_cycles;
-    for (unsigned core = 0; core < 2u; core++) {
-        if (!p->cpu[core] || !p->sigmadelta.time_valid[core]) continue;
-        uint32_t elapsed = p->cpu[core]->ccount -
-                           p->sigmadelta.last_ccount[core];
-        if (elapsed >= (uint32_t)INT32_MAX) continue;
-        uint64_t candidate = sigmadelta_add_saturating(
-            p->sigmadelta.core_cycles[core], elapsed);
-        if (candidate > best) best = candidate;
-    }
-    return best;
+    return periph_clock_peek(p, &p->sigmadelta.clock);
 }
 
 static uint64_t sigmadelta_now_cycles(esp32_periph_t *p) {
-    for (unsigned core = 0; core < 2u; core++) {
-        if (!p->cpu[core]) continue;
-        uint32_t now = p->cpu[core]->ccount;
-        if (!p->sigmadelta.time_valid[core]) {
-            p->sigmadelta.last_ccount[core] = now;
-            p->sigmadelta.core_cycles[core] =
-                p->sigmadelta.time_cycles;
-            p->sigmadelta.time_valid[core] = true;
-            continue;
-        }
-        uint32_t elapsed = now - p->sigmadelta.last_ccount[core];
-        if (elapsed < (uint32_t)INT32_MAX) {
-            p->sigmadelta.core_cycles[core] = sigmadelta_add_saturating(
-                p->sigmadelta.core_cycles[core], elapsed);
-        }
-        p->sigmadelta.last_ccount[core] = now;
-        if (p->sigmadelta.core_cycles[core] >
-            p->sigmadelta.time_cycles) {
-            p->sigmadelta.time_cycles =
-                p->sigmadelta.core_cycles[core];
-        }
-    }
-    return p->sigmadelta.time_cycles;
+    return periph_clock_now(p, &p->sigmadelta.clock);
 }
 
 static uint64_t sigmadelta_mul_div_floor(uint64_t value,
@@ -2595,13 +2573,13 @@ static void sigmadelta_reset_state(esp32_periph_t *p) {
 
     uint64_t now = sigmadelta_peek_cycles(p);
     memset(&p->sigmadelta, 0, sizeof(p->sigmadelta));
-    p->sigmadelta.time_cycles = now;
+    p->sigmadelta.clock.cycles = now;
     p->sigmadelta.version = SIGMADELTA_VERSION_RESET;
     for (unsigned core = 0; core < 2u; core++) {
-        p->sigmadelta.core_cycles[core] = now;
+        p->sigmadelta.clock.core_cycles[core] = now;
         if (p->cpu[core]) {
-            p->sigmadelta.last_ccount[core] = p->cpu[core]->ccount;
-            p->sigmadelta.time_valid[core] = true;
+            p->sigmadelta.clock.last_ccount[core] = p->cpu[core]->ccount;
+            p->sigmadelta.clock.valid[core] = true;
         }
     }
     for (unsigned index = 0; index < SIGMADELTA_CHANNEL_COUNT; index++) {
@@ -3185,27 +3163,7 @@ static uint32_t timg_cpu_mhz(const esp32_periph_t *p) {
 }
 
 static uint64_t timg_now_cycles(esp32_periph_t *p) {
-    for (unsigned core = 0; core < 2u; core++) {
-        if (!p->cpu[core]) continue;
-        uint32_t now = p->cpu[core]->ccount;
-        if (!p->timg_clock.valid[core]) {
-            p->timg_clock.last_ccount[core] = now;
-            p->timg_clock.core_cycles[core] = p->timg_clock.cycles;
-            p->timg_clock.valid[core] = true;
-            continue;
-        }
-        uint32_t elapsed = now - p->timg_clock.last_ccount[core];
-        if (elapsed < (uint32_t)INT32_MAX) {
-            if (p->timg_clock.core_cycles[core] > UINT64_MAX - elapsed)
-                p->timg_clock.core_cycles[core] = UINT64_MAX;
-            else
-                p->timg_clock.core_cycles[core] += elapsed;
-        }
-        p->timg_clock.last_ccount[core] = now;
-        if (p->timg_clock.core_cycles[core] > p->timg_clock.cycles)
-            p->timg_clock.cycles = p->timg_clock.core_cycles[core];
-    }
-    return p->timg_clock.cycles;
+    return periph_clock_now(p, &p->timg_clock);
 }
 
 static bool timg_group_clocked(const esp32_periph_t *p, unsigned group) {
@@ -3480,10 +3438,12 @@ static uint32_t lact_divider(const lact_state_t *l) {
     return d ? d : 1;
 }
 
-/* Live 64-bit LACT counter in timer ticks (cpu0 ccount / DIVIDER). */
-static uint64_t lact_counter(const esp32_periph_t *p, int group) {
+/* Live 64-bit LACT counter in timer ticks (shared cycle / DIVIDER).
+ * LACT is part of the timer group, so it shares timg's clock: sampling from
+ * either core advances the same timeline. */
+static uint64_t lact_counter(esp32_periph_t *p, int group) {
     const lact_state_t *l = &p->lact[group];
-    uint64_t cc = p->cpu[0] ? p->cpu[0]->ccount : 0;
+    uint64_t cc = timg_now_cycles(p);
     uint32_t div = lact_divider(l);
     uint64_t ticks = cc / div;
     if (l->loaded) {
@@ -4034,7 +3994,7 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
     case 0x090: l->load = (l->load & 0xFFFFFFFFull) | ((uint64_t)val << 32); break;
     case 0x094:                    /* LACTLOAD: counter := load value */
         l->loaded = true;
-        l->load_ccount = p->cpu[0] ? p->cpu[0]->ccount : 0;
+        l->load_ccount = timg_now_cycles(p);
         lact_eval_irq(p, group); lact_kick(p);
         break;
     case 0x098:
@@ -5583,7 +5543,8 @@ static void pcnt_handle_signal_level(esp32_periph_t *p, unsigned unit,
     uint32_t threshold = conf0 & PCNT_CONF_FILTER_MASK;
     uint32_t pending_bit = pcnt_filter_bit(unit, channel, control);
 
-    if (!(conf0 & PCNT_CONF_FILTER_EN) || threshold == 0u || !p->cpu[0]) {
+    if (!(conf0 & PCNT_CONF_FILTER_EN) || threshold == 0u ||
+        (!p->cpu[0] && !p->cpu[1])) {
         filter->pending = false;
         p->pcnt.pending_filters &= ~pending_bit;
         if (level != stable)
@@ -5598,7 +5559,7 @@ static void pcnt_handle_signal_level(esp32_periph_t *p, unsigned unit,
         filter->pending = true;
         p->pcnt.pending_filters |= pending_bit;
         filter->level = level;
-        filter->deadline = p->cpu[0]->ccount +
+        filter->deadline = periph_clock_now(p, &p->event_clock) +
             pcnt_filter_cpu_cycles(p, threshold);
     }
     pcnt_kick(p);
@@ -5643,11 +5604,10 @@ static void pcnt_gpio_input_changed(esp32_periph_t *p, int gpio) {
 }
 
 static uint32_t pcnt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    if (!p || !cpu) return UINT32_MAX;
     if (p->pcnt.pending_filters == 0) return UINT32_MAX;
     bool have = false;
-    uint32_t best = UINT32_MAX;
-    uint32_t best_distance = 0;
+    uint64_t best = 0;
     for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++) {
         pcnt_unit_state_t *state = &p->pcnt.unit[unit];
         for (unsigned channel = 0; channel < PCNT_CHANNEL_COUNT; channel++) {
@@ -5658,26 +5618,23 @@ static uint32_t pcnt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
             for (unsigned index = 0; index < 2u; index++) {
                 pcnt_filter_state_t *filter = filters[index];
                 if (!filter->pending) continue;
-                uint32_t distance = filter->deadline - cpu->ccount;
-                if ((int32_t)distance < 0) distance = 0;
-                if (!have || distance < best_distance) {
+                if (!have || filter->deadline < best) {
                     have = true;
-                    best = cpu->ccount + distance;
-                    best_distance = distance;
+                    best = filter->deadline;
                 }
             }
         }
     }
-    return have ? best : UINT32_MAX;
+    if (!have) return UINT32_MAX;
+    return periph_deadline_ccount(p, &p->event_clock, cpu, best);
 }
 
 static void pcnt_eval_filter(esp32_periph_t *p, unsigned unit,
-                             unsigned channel, bool control) {
+                             unsigned channel, bool control, uint64_t now) {
     pcnt_unit_state_t *state = &p->pcnt.unit[unit];
     pcnt_filter_state_t *filter = control ?
         &state->control_filter[channel] : &state->pulse_filter[channel];
-    if (!filter->pending ||
-        (int32_t)(p->cpu[0]->ccount - filter->deadline) < 0)
+    if (!filter->pending || now < filter->deadline)
         return;
 
     unsigned signal = pcnt_signal_base(unit) + channel +
@@ -5691,14 +5648,15 @@ static void pcnt_eval_filter(esp32_periph_t *p, unsigned unit,
 }
 
 static void pcnt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return;
+    if (!p || !cpu) return;
     if (p->pcnt.pending_filters == 0) return;
+    uint64_t now_cycle = periph_clock_now(p, &p->event_clock);
     for (unsigned unit = 0; unit < PCNT_UNIT_COUNT; unit++) {
         for (unsigned channel = 0; channel < PCNT_CHANNEL_COUNT; channel++) {
             /* Qualify control first so a pulse edge expiring at the same APB
              * cycle observes the newly stable control level. */
-            pcnt_eval_filter(p, unit, channel, true);
-            pcnt_eval_filter(p, unit, channel, false);
+            pcnt_eval_filter(p, unit, channel, true, now_cycle);
+            pcnt_eval_filter(p, unit, channel, false, now_cycle);
         }
     }
     pcnt_kick(p);
@@ -5916,27 +5874,7 @@ static uint32_t mcpwm_cpu_mhz(const esp32_periph_t *p) {
 }
 
 static uint64_t mcpwm_now_cycles(esp32_periph_t *p) {
-    for (unsigned core = 0; core < 2u; core++) {
-        if (!p->cpu[core]) continue;
-        uint32_t now = p->cpu[core]->ccount;
-        if (!p->mcpwm.time_valid[core]) {
-            p->mcpwm.last_ccount[core] = now;
-            p->mcpwm.core_cycles[core] = p->mcpwm.time_cycles;
-            p->mcpwm.time_valid[core] = true;
-            continue;
-        }
-        uint32_t elapsed = now - p->mcpwm.last_ccount[core];
-        if (elapsed < (uint32_t)INT32_MAX) {
-            if (p->mcpwm.core_cycles[core] > UINT64_MAX - elapsed)
-                p->mcpwm.core_cycles[core] = UINT64_MAX;
-            else
-                p->mcpwm.core_cycles[core] += elapsed;
-        }
-        p->mcpwm.last_ccount[core] = now;
-        if (p->mcpwm.core_cycles[core] > p->mcpwm.time_cycles)
-            p->mcpwm.time_cycles = p->mcpwm.core_cycles[core];
-    }
-    return p->mcpwm.time_cycles;
+    return periph_clock_now(p, &p->mcpwm.clock);
 }
 
 static bool mcpwm_unit_clocked(const esp32_periph_t *p, unsigned unit) {
@@ -11138,7 +11076,8 @@ static void twai_arm_tx(esp32_periph_t *p) {
     xtensa_cpu_t *cpu = twai_event_cpu(p);
     if (!cpu) return;
     s->tx_event_armed = true;
-    s->next_tx_ccount = cpu->ccount + twai_wire_cycles(p, &s->tx_frame);
+    s->next_tx_cycle = periph_clock_now(p, &p->event_clock) +
+                       twai_wire_cycles(p, &s->tx_frame);
     twai_kick(p);
 }
 
@@ -11260,7 +11199,7 @@ static void twai_start_recovery(esp32_periph_t *p) {
     if (delay > INT32_MAX) delay = INT32_MAX;
     s->recovery_phase = 1u;
     s->recovery_event_armed = true;
-    s->next_recovery_ccount = cpu->ccount + (uint32_t)delay;
+    s->next_recovery_cycle = periph_clock_now(p, &p->event_clock) + delay;
     twai_kick(p);
 }
 
@@ -11277,7 +11216,7 @@ static void twai_recovery_step(esp32_periph_t *p) {
         if (delay > INT32_MAX) delay = INT32_MAX;
         s->recovery_phase = 2u;
         s->recovery_event_armed = true;
-        s->next_recovery_ccount = cpu->ccount + (uint32_t)delay;
+        s->next_recovery_cycle = periph_clock_now(p, &p->event_clock) + delay;
     } else {
         s->bus_off = false;
         s->recovery_phase = 0u;
@@ -11292,33 +11231,31 @@ static uint32_t twai_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     if (!p || !cpu || cpu != twai_event_cpu(p) || !twai_clocked(p))
         return UINT32_MAX;
     const twai_state_t *s = &p->twai;
-    uint32_t event = UINT32_MAX;
-    uint32_t distance = UINT32_MAX;
+    bool have = false;
+    uint64_t best = 0;
     if (s->tx_event_armed) {
-        event = s->next_tx_ccount;
-        distance = event - cpu->ccount;
-        if ((int32_t)distance < 0) distance = 0u;
+        have = true;
+        best = s->next_tx_cycle;
     }
-    if (s->recovery_event_armed) {
-        uint32_t recovery_distance = s->next_recovery_ccount - cpu->ccount;
-        if ((int32_t)recovery_distance < 0) recovery_distance = 0u;
-        if (event == UINT32_MAX || recovery_distance < distance)
-            event = s->next_recovery_ccount;
+    if (s->recovery_event_armed &&
+        (!have || s->next_recovery_cycle < best)) {
+        have = true;
+        best = s->next_recovery_cycle;
     }
-    return event;
+    if (!have) return UINT32_MAX;
+    return periph_deadline_ccount(p, &p->event_clock, cpu, best);
 }
 
 static void twai_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     if (!p || !cpu || cpu != twai_event_cpu(p) || !twai_clocked(p))
         return;
     twai_state_t *s = &p->twai;
-    if (s->tx_event_armed &&
-        (int32_t)(cpu->ccount - s->next_tx_ccount) >= 0) {
+    uint64_t now_cycle = periph_clock_now(p, &p->event_clock);
+    if (s->tx_event_armed && now_cycle >= s->next_tx_cycle) {
         s->tx_event_armed = false;
         twai_finish_tx_attempt(p);
     }
-    if (s->recovery_event_armed &&
-        (int32_t)(cpu->ccount - s->next_recovery_ccount) >= 0) {
+    if (s->recovery_event_armed && now_cycle >= s->next_recovery_cycle) {
         s->recovery_event_armed = false;
         twai_recovery_step(p);
     }
@@ -12423,13 +12360,13 @@ static void i2s_arm_event(esp32_periph_t *p, int port, bool tx) {
     size_t len = tx ?
         ((ctrl & I2S_DESC_LENGTH_MASK) >> I2S_DESC_LENGTH_SHIFT) :
         (ctrl & I2S_DESC_SIZE_MASK);
-    uint32_t now = p->cpu[0] ? p->cpu[0]->ccount : 0;
-    uint32_t next = now + i2s_descriptor_cycles(s, tx, len ? len : 4u);
+    uint64_t now = periph_clock_now(p, &p->event_clock);
+    uint64_t next = now + i2s_descriptor_cycles(s, tx, len ? len : 4u);
     if (tx) {
-        s->next_tx_ccount = next;
+        s->next_tx_cycle = next;
         s->tx_event_armed = true;
     } else {
-        s->next_rx_ccount = next;
+        s->next_rx_cycle = next;
         s->rx_event_armed = true;
     }
     i2s_kick(p);
@@ -12483,40 +12420,36 @@ static void i2s_refresh_active(esp32_periph_t *p, int port) {
 }
 
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return UINT32_MAX;
+    if (!p || !cpu) return UINT32_MAX;
     bool have = false;
-    uint32_t best = UINT32_MAX;
-    uint32_t best_distance = 0;
+    uint64_t best = 0;
     for (int port = 0; port < I2S_PORT_COUNT; port++) {
         i2s_state_t *s = &p->i2s[port];
-        uint32_t events[2] = {s->next_tx_ccount, s->next_rx_ccount};
+        uint64_t events[2] = {s->next_tx_cycle, s->next_rx_cycle};
         bool armed[2] = {s->tx_event_armed, s->rx_event_armed};
         for (int direction = 0; direction < 2; direction++) {
             if (!armed[direction]) continue;
-            uint32_t distance = events[direction] - cpu->ccount;
-            if ((int32_t)distance < 0) distance = 0;
-            if (!have || distance < best_distance) {
+            if (!have || events[direction] < best) {
                 have = true;
                 best = events[direction];
-                best_distance = distance;
             }
         }
     }
-    return have ? best : UINT32_MAX;
+    if (!have) return UINT32_MAX;
+    return periph_deadline_ccount(p, &p->event_clock, cpu, best);
 }
 
 static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
-    if (!p || !cpu || cpu != p->cpu[0]) return;
+    if (!p || !cpu) return;
+    uint64_t now_cycle = periph_clock_now(p, &p->event_clock);
     for (int port = 0; port < I2S_PORT_COUNT; port++) {
         i2s_state_t *s = &p->i2s[port];
-        if (s->tx_event_armed &&
-            (int32_t)(cpu->ccount - s->next_tx_ccount) >= 0) {
+        if (s->tx_event_armed && now_cycle >= s->next_tx_cycle) {
             s->tx_event_armed = false;
             (void)i2s_process_tx_descriptor(p, port);
             if (s->tx_active) i2s_arm_event(p, port, true);
         }
-        if (s->rx_event_armed &&
-            (int32_t)(cpu->ccount - s->next_rx_ccount) >= 0) {
+        if (s->rx_event_armed && now_cycle >= s->next_rx_cycle) {
             s->rx_event_armed = false;
             (void)i2s_process_rx_descriptor(p, port);
             if (s->rx_active) i2s_arm_event(p, port, false);
@@ -13240,23 +13173,20 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     if (!p) return;
     p->cpu[0] = cpu0;
     p->cpu[1] = cpu1;
+    /* Re-anchor every shared clock against the newly attached cores. Listing
+     * them here rather than open-coding each one keeps a clock that is added
+     * later from being silently left un-anchored. */
+    periph_clock_t *clocks[] = {
+        &p->timg_clock, &p->mcpwm.clock, &p->sigmadelta.clock,
+        &p->ledc_clock, &p->event_clock,
+    };
     for (unsigned core = 0; core < 2u; core++) {
         xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;
-        p->timg_clock.core_cycles[core] = p->timg_clock.cycles;
-        p->timg_clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
-        p->timg_clock.valid[core] = cpu != NULL;
-        p->mcpwm.core_cycles[core] = p->mcpwm.time_cycles;
-        p->mcpwm.last_ccount[core] = cpu ? cpu->ccount : 0u;
-        p->mcpwm.time_valid[core] = cpu != NULL;
-        p->sigmadelta.core_cycles[core] = p->sigmadelta.time_cycles;
-        p->sigmadelta.last_ccount[core] = cpu ? cpu->ccount : 0u;
-        p->sigmadelta.time_valid[core] = cpu != NULL;
-        p->ledc_clock.core_cycles[core] = p->ledc_clock.cycles;
-        p->ledc_clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
-        p->ledc_clock.valid[core] = cpu != NULL;
-        p->event_clock.core_cycles[core] = p->event_clock.cycles;
-        p->event_clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
-        p->event_clock.valid[core] = cpu != NULL;
+        for (size_t i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+            clocks[i]->core_cycles[core] = clocks[i]->cycles;
+            clocks[i]->last_ccount[core] = cpu ? cpu->ccount : 0u;
+            clocks[i]->valid[core] = cpu != NULL;
+        }
         if (cpu) {
             for (int source = 0; source < 71; source++) {
                 if (p->source_level_core[core][source])
