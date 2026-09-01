@@ -209,6 +209,11 @@ if(UNIX)
     target_compile_options(flexe-ledc-pwm-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-bench-compute tools/bench_compute.c)
+    target_link_libraries(flexe-bench-compute PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-bench-compute PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-pcnt-pulse-test tools/pcnt_pulse_test.c)
     target_link_libraries(flexe-pcnt-pulse-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-pcnt-pulse-test PRIVATE
