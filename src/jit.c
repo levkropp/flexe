@@ -2809,11 +2809,9 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
      * before, so an address only the interpreter writes can be compared too. */
     uint32_t waddr[MEM_JOURNAL_MAX_COMPARE];
     uint32_t wjit[MEM_JOURNAL_MAX_COMPARE];
-    uint32_t wold[MEM_JOURNAL_MAX_COMPARE];
     int wn = nwrites;
     for (int i = 0; i < wn; i++) {
         waddr[i] = g_mem_journal[i].addr;
-        wold[i] = g_mem_journal[i].old;
         wjit[i] = mem_read32(cpu->mem, waddr[i]);
     }
     mem_journal_rollback(cpu->mem);
@@ -2883,7 +2881,6 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
      * reports every bad block instead of derailing at the first. Cycle
      * accounting is left to the caller, which adds n_jit - 1 on top of the
      * step that dispatched here. */
-    (void)wold;
     cpu->ccount = before.ccount;
     cpu->cycle_count = before.cycle_count;
     return n_jit;

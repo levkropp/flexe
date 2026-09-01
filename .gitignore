@@ -3,3 +3,7 @@ build-asan/
 build-pgo/
 *.pdf
 *.bin
+
+# Python bytecode from tools/
+__pycache__/
+*.pyc
