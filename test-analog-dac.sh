@@ -32,3 +32,6 @@ cmake --build "$host_build" --target flexe-analog-dac-test -j
 "$host_build/flexe-analog-dac-test" \
     "$fixture_build/analog_dac.ino.bin" \
     "$fixture_build/analog_dac.ino.elf"
+"$host_build/flexe-analog-dac-test" --no-jit \
+    "$fixture_build/analog_dac.ino.bin" \
+    "$fixture_build/analog_dac.ino.elf"

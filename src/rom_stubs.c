@@ -2101,18 +2101,6 @@ static void stub_adc2_get_raw(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, ESP_OK);
 }
 
-/* adc_oneshot_read(handle, channel, int *out_raw) -> ESP_OK */
-static void stub_adc_oneshot_read(xtensa_cpu_t *cpu, void *ctx) {
-    esp32_rom_stubs_t *s = ctx;
-    /* arg0 = handle (ignored), arg1 = channel, arg2 = out_raw pointer */
-    uint32_t ch      = rom_arg(cpu, 1);
-    uint32_t out_ptr = rom_arg(cpu, 2);
-    uint16_t raw = s->periph ? periph_get_adc_value(s->periph, (int)ch) : 0;
-    if (out_ptr)
-        mem_write32(cpu->mem, out_ptr, (uint32_t)raw);
-    rom_return(cpu, ESP_OK);
-}
-
 /* gpio_reset_pin(pin) -> ESP_OK */
 void stub_gpio_reset_pin(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
@@ -4363,10 +4351,10 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* ADC oneshot / legacy stubs. These need context (periph) to read the
-     * sandbox-injected analog values, so we use register_ctx with `stubs`. */
+    /* Legacy ADC stubs need context (periph) to read the sandbox-injected
+     * analog values, so use register_ctx with `stubs`. The modern oneshot
+     * driver runs through the SENS MMIO model directly. */
     struct { const char *name; rom_stub_fn fn; } adc_hooks[] = {
-        { "adc_oneshot_read",   stub_adc_oneshot_read },
         { "adc1_get_raw",       stub_adc1_get_raw },
         { "adc2_get_raw",       stub_adc2_get_raw },
         { NULL, NULL }
