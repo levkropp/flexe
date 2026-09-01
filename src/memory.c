@@ -276,3 +276,21 @@ void mem_journal_end(void) {
     g_mem_journal_en = 0;
     g_mem_journal_count = 0;
 }
+
+/* Out-of-line stores for the JIT's verification mode.
+ *
+ * A compiled block normally stores through inline page-table code, which the
+ * write journal cannot observe. Routing its stores through these instead
+ * makes a native block's memory effects replayable, which is what lets the
+ * verifier run the block first, undo it, and then compare it against the
+ * interpreter from the identical starting state. Only verification pays for
+ * the call. */
+void mem_write8_journaled(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
+    mem_write8(mem, addr, val);
+}
+void mem_write16_journaled(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
+    mem_write16(mem, addr, val);
+}
+void mem_write32_journaled(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
+    mem_write32(mem, addr, val);
+}

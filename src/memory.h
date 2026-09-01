@@ -137,6 +137,10 @@ extern int      g_mem_journal_unsafe;   /* MMIO touched, or capacity exceeded */
 extern int      g_mem_journal_count;
 extern mem_journal_entry_t g_mem_journal[MEM_JOURNAL_MAX];
 
+void mem_write8_journaled(xtensa_mem_t *mem, uint32_t addr, uint8_t val);
+void mem_write16_journaled(xtensa_mem_t *mem, uint32_t addr, uint16_t val);
+void mem_write32_journaled(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
+
 void mem_journal_begin(void);
 void mem_journal_rollback(xtensa_mem_t *mem);
 void mem_journal_end(void);

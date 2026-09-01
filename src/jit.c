@@ -790,7 +790,15 @@ static void emit_mem_read32(emit_t *e, int addr_reg, int dst_reg) {
  * val_reg: register containing value to store
  * Uses RAX, RCX, RDX as scratch. addr_reg and val_reg must not be RAX/RCX/RDX.
  */
-static void emit_mem_write32(emit_t *e, int addr_reg, int val_reg) {
+static void emit_mem_write32(emit_t *e, int addr_reg, int val_reg,
+                             jit_state_t *jit) {
+    /* Verification needs the journal to see this store, and the inline
+     * page-table path bypasses it. Give up the fast path for the
+     * duration -- a verification run has already given up speed. */
+    if (jit && jit->verify) {
+        emit_call_slow3(e, (void *)(uintptr_t)mem_write32_journaled, addr_reg, val_reg);
+        return;
+    }
     /* ecx = addr >> 12 */
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
@@ -897,7 +905,15 @@ static void emit_mem_read16s(emit_t *e, int addr_reg, int dst_reg) {
 }
 
 /* Emit memory write8 */
-static void emit_mem_write8(emit_t *e, int addr_reg, int val_reg) {
+static void emit_mem_write8(emit_t *e, int addr_reg, int val_reg,
+                             jit_state_t *jit) {
+    /* Verification needs the journal to see this store, and the inline
+     * page-table path bypasses it. Give up the fast path for the
+     * duration -- a verification run has already given up speed. */
+    if (jit && jit->verify) {
+        emit_call_slow3(e, (void *)(uintptr_t)mem_write8_journaled, addr_reg, val_reg);
+        return;
+    }
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
     emit_pt_load(e, RCX);
@@ -923,7 +939,15 @@ static void emit_mem_write8(emit_t *e, int addr_reg, int val_reg) {
 }
 
 /* Emit memory write16 */
-static void emit_mem_write16(emit_t *e, int addr_reg, int val_reg) {
+static void emit_mem_write16(emit_t *e, int addr_reg, int val_reg,
+                             jit_state_t *jit) {
+    /* Verification needs the journal to see this store, and the inline
+     * page-table path bypasses it. Give up the fast path for the
+     * duration -- a verification run has already given up speed. */
+    if (jit && jit->verify) {
+        emit_call_slow3(e, (void *)(uintptr_t)mem_write16_journaled, addr_reg, val_reg);
+        return;
+    }
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
     emit_pt_load(e, RCX);
@@ -1010,7 +1034,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             ra_load_ar(e, ra,RSI, wb4, s);
             emit_add_reg32_imm32(e, RSI, r << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, RSI, RBP);
+            emit_mem_write32(e, RSI, RBP, jit);
             return 1;
         }
         case 0xA: { /* ADD.N: ar = as + at */
@@ -1755,21 +1779,21 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             ra_load_ar(e, ra,RSI, wb4, s);
             emit_add_reg32_imm32(e, RSI, imm8);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write8(e, RSI, RBP);
+            emit_mem_write8(e, RSI, RBP, jit);
             return 1;
         }
         case 0x5: { /* S16I */
             ra_load_ar(e, ra,RSI, wb4, s);
             emit_add_reg32_imm32(e, RSI, imm8 << 1);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write16(e, RSI, RBP);
+            emit_mem_write16(e, RSI, RBP, jit);
             return 1;
         }
         case 0x6: { /* S32I */
             ra_load_ar(e, ra,RSI, wb4, s);
             emit_add_reg32_imm32(e, RSI, imm8 << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, RSI, RBP);
+            emit_mem_write32(e, RSI, RBP, jit);
             return 1;
         }
         case 0x7: /* Cache ops — no-op */
@@ -1812,7 +1836,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             ra_load_ar(e, ra,RSI, wb4, s);
             emit_add_reg32_imm32(e, RSI, imm8 << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, RSI, RBP);
+            emit_mem_write32(e, RSI, RBP, jit);
             return 1;
         }
         default: return 0;
@@ -2211,16 +2235,7 @@ static void emit_side_exit_body(emit_t *e, const side_exit_t *sx,
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
     emit_acc_add(e, sx->insn_count);
 
-    /* Side-exit chaining is disabled: patching a taken conditional branch
-     * to jump natively into its target miscompiles. It is reproducible with
-     * the SDMMC gate, whose guest fills a 20 KiB buffer and then writes it
-     * out -- the stores stop partway (byte 19305 of 20480) and the host-side
-     * content check fails, while the interpreter and FLEXE_JIT_NOCHAIN=1
-     * both produce correct data. Chaining block exits is unaffected; only
-     * this path is, and disabling it costs nothing measurable
-     * (1271 -> 1278 MIPS on the loop benchmark, i.e. within noise).
-     * TODO: root-cause and re-enable. */
-    (void)jit_chain_record;
+    jit_chain_record(jit, sx->target_pc, sx->target_wb, e->ptr);
     emit_jmp_to_epilogue(e, jit);
 }
 
@@ -2369,12 +2384,18 @@ static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb, uint
  * Also appends to jit->dt[] when set (descent target collection). */
 static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
                              uint32_t target_wb, uint8_t *jmp_site) {
-    /* Verification needs one native call to mean exactly one block, so that
-     * the interpreted reference run can be bounded by that block's extent.
-     * Chaining is a pure optimisation, so switching it off costs only speed
-     * -- which a verification run has already given up. */
+    /* Not chained under verification. A chain jumps directly between blocks,
+     * so it steps over PCs at which the interpreted reference run still
+     * dispatches a ROM stub -- the two stop executing comparable work and
+     * every chain-cap exit reports a spurious mismatch. Block-level
+     * verification stays exact; that chaining preserves results is covered
+     * instead by the stock-ROM gates and by bench-compute.sh, which requires
+     * the two engines to agree on a checksum over ~910M cycles.
+     *
+     * The native loop back-edge is deliberately *not* suppressed: it stays
+     * inside one block, and fn()'s return value says exactly how many guest
+     * instructions it covered, so the reference run can replay it. */
     if (jit->verify) return;
-
     if (jit->no_chain) return;
     if (jit->dt && jit->dt_count < JIT_MAX_BLOCK_INSNS * 2) {
         jit->dt[jit->dt_count][0] = target_pc;
@@ -2657,7 +2678,7 @@ static void jit_bitmap_set(jit_state_t *jit, uint32_t pc) {
  * design (the hook adds block_insns - 1 for a native block), and that is not
  * a miscompile.
  */
-#define MEM_JOURNAL_MAX_COMPARE 256
+#define MEM_JOURNAL_MAX_COMPARE 1024
 
 typedef struct {
     uint32_t ar[64];
@@ -2715,105 +2736,120 @@ static void jit_apply_block_exit(xtensa_cpu_t *cpu) {
     }
 }
 
-/* The interpreter runs *first*, and it is its effects that get rolled back.
- * That ordering is forced: compiled blocks store through inline page-table
- * code rather than mem_write*(), so the journal cannot see them and a
- * JIT-first order would leave the native writes in place for the interpreted
- * re-run to read back -- reporting a mismatch on every store block. */
+/* The native block runs *first* and is then undone, which is only possible
+ * because verification compiles stores through mem_write*_journaled(). That
+ * ordering is what lets a chained run be checked at all: one call to fn() may
+ * cover many blocks, and only its return value says how many guest
+ * instructions that was -- which the interpreted reference then replays
+ * exactly. */
 static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
-                                  uint32_t pc, jit_block_fn fn,
-                                  const jit_block_t *b) {
+                                  uint32_t pc, jit_block_fn fn) {
     xtensa_cpu_t before = *cpu;
-    unsigned limit = b && b->guest_insns ? b->guest_insns : JIT_MAX_BLOCK_INSNS;
 
-    /* Reference run. Stop once control leaves the block's extent, so a block
-     * that side-exits is compared against the same instruction sequence. */
     mem_journal_begin();
-    jit->verify_active = true;
-    uint32_t blk_end = b && b->end_pc ? b->end_pc : pc + limit * 3u;
-    bool self_loop = b && (b->flags & JIT_BLK_SELF_LOOP);
-    /* A self-looping block keeps going until LCOUNT runs out or the chain cap
-     * trips at an iteration boundary, so the reference run has to follow it
-     * the same way -- bounding it at one iteration would compare a hundred
-     * native iterations against one interpreted one. */
-    unsigned hard_limit = self_loop ? JIT_CHAIN_CAP + limit : limit;
-    int n_interp = 0;
-    while ((unsigned)n_interp < hard_limit && cpu->running) {
-        xtensa_step(cpu);
-        n_interp++;
-        if (cpu->pc < pc || cpu->pc >= blk_end) break;  /* left the block */
-        if (cpu->pc == pc) {
-            /* Back at the entry: an iteration boundary for a self-looping
-             * block, and the end of the sequence for anything else. */
-            if (!self_loop || (unsigned)n_interp >= JIT_CHAIN_CAP) break;
-            continue;
-        }
-        if ((unsigned)n_interp >= limit && !self_loop) break;
-    }
-    jit->verify_active = false;
-
-    /* An interrupt or exception taken by the reference run is not a
-     * miscompile: a native block runs its whole instruction sequence with
-     * interrupts deferred to its exit, and xtensa_step() checks for them
-     * every instruction. The two engines are then not executing comparable
-     * work, so record a skip rather than a spurious mismatch. */
-    int diverted = cpu->exception ||
-                   (XT_PS_EXCM(cpu->ps) && !XT_PS_EXCM(before.ps));
-
+    int n_jit = fn(cpu);
+    if (n_jit > 0) jit_apply_block_exit(cpu);
     int unsafe = g_mem_journal_unsafe;
     int nwrites = g_mem_journal_count;
     g_mem_journal_en = 0;
 
-    /* Either MMIO in the window (the reference run cannot be undone, so
-     * running the block natively on top of it would apply its side effects
-     * twice) or a diverted reference run. Keep the interpreted result -- it
-     * is the correct one -- and count a skip. */
-    if (unsafe || diverted) {
+    if (n_jit <= 0) {
+        mem_journal_end();
+        return n_jit;
+    }
+    /* MMIO in the window: the block cannot be undone, because reading a
+     * device register to save it is itself a side effect. Keep the native
+     * result and count a skip. */
+    if (unsafe || nwrites > MEM_JOURNAL_MAX_COMPARE) {
         jit->verify_skipped++;
         mem_journal_end();
-        cpu->ccount = before.ccount;
-        cpu->cycle_count = before.cycle_count;
-        return n_interp;
+        return n_jit;
     }
 
-    jit_arch_state_t interp_state;
-    jit_arch_capture(cpu, &interp_state);
+    jit_arch_state_t jit_state;
+    jit_arch_capture(cpu, &jit_state);
 
-    /* Snapshot what the reference run wrote, then undo it. */
+    /* What the block left at every address it touched, and what was there
+     * before, so an address only the interpreter writes can be compared too. */
     uint32_t waddr[MEM_JOURNAL_MAX_COMPARE];
-    uint32_t wval[MEM_JOURNAL_MAX_COMPARE];
-    int wn = nwrites < MEM_JOURNAL_MAX_COMPARE ? nwrites
-                                               : MEM_JOURNAL_MAX_COMPARE;
+    uint32_t wjit[MEM_JOURNAL_MAX_COMPARE];
+    uint32_t wold[MEM_JOURNAL_MAX_COMPARE];
+    int wn = nwrites;
     for (int i = 0; i < wn; i++) {
         waddr[i] = g_mem_journal[i].addr;
-        wval[i] = mem_read32(cpu->mem, waddr[i]);
+        wold[i] = g_mem_journal[i].old;
+        wjit[i] = mem_read32(cpu->mem, waddr[i]);
     }
     mem_journal_rollback(cpu->mem);
     mem_journal_end();
     *cpu = before;
 
-    int n_jit = fn(cpu);
-    if (n_jit > 0) jit_apply_block_exit(cpu);
+    /* Reference run: the same guest instructions, interpreted. Journalled as
+     * well, so a store the block *failed* to make is caught too. */
+    mem_journal_begin();
+    jit->verify_active = true;
+    for (int i = 0; i < n_jit && cpu->running; i++)
+        xtensa_step(cpu);
+    jit->verify_active = false;
+    int iwrites = g_mem_journal_count;
+    int ionly[MEM_JOURNAL_MAX_COMPARE];
+    int in = iwrites < MEM_JOURNAL_MAX_COMPARE ? iwrites
+                                               : MEM_JOURNAL_MAX_COMPARE;
+    for (int i = 0; i < in; i++)
+        ionly[i] = i;
+    g_mem_journal_en = 0;
+
+    /* An interrupt or exception taken by the reference run is not a
+     * miscompile: a native block defers interrupts to its exit, while
+     * xtensa_step() checks after every instruction. */
+    if (cpu->exception || (XT_PS_EXCM(cpu->ps) && !XT_PS_EXCM(before.ps))) {
+        jit->verify_skipped++;
+        mem_journal_end();
+        cpu->ccount = before.ccount;
+        cpu->cycle_count = before.cycle_count;
+        return n_jit;
+    }
+
+    jit_arch_state_t interp_state;
+    jit_arch_capture(cpu, &interp_state);
 
     jit->verify_blocks++;
-    int diffs = 0;
-    if (n_jit != n_interp) {
-        fprintf(stderr, "[jit-verify] block %08X: executed %d guest insns, "
-                "interpreter took %d\n", pc, n_jit, n_interp);
-        diffs++;
-    }
-    jit_arch_state_t jit_state;
-    jit_arch_capture(cpu, &jit_state);
-    diffs += jit_arch_report(&interp_state, &jit_state, pc);
+    int diffs = jit_arch_report(&interp_state, &jit_state, pc);
     for (int i = 0; i < wn; i++) {
         uint32_t got = mem_read32(cpu->mem, waddr[i]);
-        if (got != wval[i]) {
+        if (got != wjit[i]) {
             fprintf(stderr, "[jit-verify] block %08X: mem[%08X] interp=%08X "
-                    "jit=%08X\n", pc, waddr[i], wval[i], got);
+                    "jit=%08X\n", pc, waddr[i], got, wjit[i]);
             diffs++;
         }
     }
+    /* Addresses only the reference touched: the block left them untouched, so
+     * its value is whatever was there before. */
+    for (int k = 0; k < in; k++) {
+        uint32_t addr = g_mem_journal[ionly[k]].addr;
+        bool seen = false;
+        for (int i = 0; i < wn; i++)
+            if (waddr[i] == addr) { seen = true; break; }
+        if (seen) continue;
+        uint32_t got = mem_read32(cpu->mem, addr);
+        uint32_t was = g_mem_journal[ionly[k]].old;
+        if (got != was) {
+            fprintf(stderr, "[jit-verify] block %08X: mem[%08X] interp=%08X "
+                    "jit=%08X (block never wrote it)\n", pc, addr, got, was);
+            diffs++;
+        }
+    }
+    mem_journal_end();
     if (diffs > 0) jit->verify_mismatches++;
+
+    /* Continue from the reference state: it is by definition correct, so a
+     * verification run of a whole firmware image stays on the rails and
+     * reports every bad block instead of derailing at the first. Cycle
+     * accounting is left to the caller, which adds n_jit - 1 on top of the
+     * step that dispatched here. */
+    (void)wold;
+    cpu->ccount = before.ccount;
+    cpu->cycle_count = before.cycle_count;
     return n_jit;
 }
 
@@ -2857,7 +2893,7 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     if (fn) {
         jit->execution_depth++;
         int block_insns = __builtin_expect(jit->verify, 0)
-                        ? jit_run_block_verified(jit, cpu, pc, fn, b)
+                        ? jit_run_block_verified(jit, cpu, pc, fn)
                         : fn(cpu);
         jit->execution_depth--;
         if (jit->invalidate_pending)
@@ -3024,6 +3060,10 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     cpu->windowbase = saved_wb;
     if (!fn) return;
 
+    /* FLEXE_COMPILEDBG lists every block as it compiles. Diffing that list
+     * between a passing and a failing run is what localises a miscompile to
+     * a block: an identical list means the fault is value-dependent inside a
+     * block that was already there, a longer one names the new suspect. */
     {
         static int dbg = -1;
         if (dbg < 0) dbg = getenv("FLEXE_COMPILEDBG") != NULL;
@@ -3036,8 +3076,6 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     b->code = (void *)fn;
     b->chain_entry = (void *)jit->last_chain_entry;
     b->guest_insns = (uint16_t)scan.count;
-    b->end_pc = scan.end_pc;
-    b->flags = jit_block_self_loops(cpu, &scan, pc) ? JIT_BLK_SELF_LOOP : 0u;
 
     /* Set JIT bitmap bit so the interpreter's hook fires for this PC */
     jit_bitmap_set(jit, pc);

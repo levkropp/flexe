@@ -35,17 +35,12 @@
 /* Block entry in the hash table */
 typedef struct {
     uint32_t pc;            /* Guest PC (tag for collision detection) */
-    uint32_t end_pc;        /* First guest PC past the block */
     void    *code;          /* Pointer into code cache (NULL = empty) */
     void    *chain_entry;   /* Entry point for chained blocks (after prologue) */
     uint32_t exec_count;    /* Hot counter / execution count */
     uint16_t guest_insns;   /* Number of guest instructions in block */
-    uint16_t flags;         /* JIT_BLK_* */
+    uint16_t flags;         /* Reserved */
 } jit_block_t;
-
-/* Block closes its own zero-overhead-loop back-edge in native code, so one
- * call to it runs iterations until LCOUNT hits zero or the chain cap trips. */
-#define JIT_BLK_SELF_LOOP  0x1u
 
 /* Block chaining: max pending chain slots */
 #define MAX_CHAIN_SLOTS  131072
