@@ -5,6 +5,7 @@
 #include "esp_timer_stubs.h"
 #include "rom_stubs.h"
 #include "memory.h"
+#include "guest_call.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -14,8 +15,8 @@
 #define MAX_TIMERS 16
 #define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
 
-/* Sentinel address for callback return interception */
-#define CALLBACK_SENTINEL 0x40001FFCu
+/* Instruction budget for one esp_timer callback. */
+#define ESP_TIMER_CALLBACK_INSNS 100000u
 
 typedef struct {
     int      active;
@@ -162,64 +163,23 @@ static void dispatch_expired_timers(esp_timer_stubs_t *et) {
         if (!t->active) continue;
         if (now < t->alarm_us) continue;
 
-        /* Timer expired — dispatch callback inline.
-         * The callback may be a windowed function (ENTRY/RETW/CALL8 etc.)
-         * that modifies physical registers across multiple windows. We must
-         * save and restore the ENTIRE register file + window state to prevent
-         * any side effects on the caller's register context. */
-        uint32_t save_pc = et->cpu->pc;
-        uint32_t save_ps = et->cpu->ps;
-        uint32_t save_wb = et->cpu->windowbase;
-        uint32_t save_ws = et->cpu->windowstart;
-        uint32_t save_sar = et->cpu->sar;
-        uint32_t save_lbeg = et->cpu->lbeg;
-        uint32_t save_lend = et->cpu->lend;
-        uint32_t save_lcount = et->cpu->lcount;
-        uint32_t save_ar[64];
-        memcpy(save_ar, et->cpu->ar, sizeof(save_ar));
-
-        /* Set up as CALL4: CALLINC=1, callee's a0 (at ar[4]) = sentinel
-         * with bits 31:30 = 01 (CALL4 return encoding), callee's a2 = arg */
-        XT_PS_SET_CALLINC(et->cpu->ps, 1);
-        ar_write(et->cpu, 4, CALLBACK_SENTINEL); /* bits 31:30 = 01, matches CALL4 */
-        ar_write(et->cpu, 6, t->arg);
-
-        et->cpu->pc = t->callback_addr;
-
-        /* Run callback: execute up to 100000 instructions or until sentinel hit.
-         * Force running=true during callback execution: the dispatcher may be
-         * invoked after core 0 has been marked stopped (e.g. main_task exited
-         * via vTaskDelete), but periodic timers still need to fire to drive
-         * LVGL / tick subsystems running on core 1. */
-        int save_running = et->cpu->running;
-        int save_halted = et->cpu->halted;
-        et->cpu->running = 1;
-        /* A halted core executes nothing: xtensa_step() returns immediately
-         * and only ticks ccount. Since the idle task parks an otherwise-idle
-         * core in WAITI, that is the normal state at the moment a timer comes
-         * due -- so leaving it set meant the dispatcher faithfully rescheduled
-         * every periodic timer and advanced every alarm while never running a
-         * single callback body. We are synthesizing a call, so the core has to
-         * be awake for it; the previous state is restored below. */
-        et->cpu->halted = false;
-        int max_cb_cycles = 100000;
-        for (int c = 0; c < max_cb_cycles; c++) {
-            if (et->cpu->pc == CALLBACK_SENTINEL) break;
-            xtensa_step(et->cpu);
-        }
-        et->cpu->running = save_running;
-        et->cpu->halted = save_halted;
-
-        /* Restore entire CPU register state */
-        memcpy(et->cpu->ar, save_ar, sizeof(save_ar));
-        et->cpu->pc = save_pc;
-        et->cpu->ps = save_ps;
-        et->cpu->windowbase = save_wb;
-        et->cpu->windowstart = save_ws;
-        et->cpu->sar = save_sar;
-        et->cpu->lbeg = save_lbeg;
-        et->cpu->lend = save_lend;
-        et->cpu->lcount = save_lcount;
+        /* Timer expired. Deliver it with guest_call8(), the shared
+         * synthetic-call path also used for peripheral ISRs and BLE/WiFi
+         * callbacks. This used to be hand-rolled here, and the hand-rolled
+         * copy had drifted: it ran the callback on whichever task stack
+         * happened to be interrupted rather than the private one, saved the
+         * general registers but not BR, the MAC16 accumulator, the FP file or
+         * the window spill state, did not set in_guest_call (so a callback
+         * that touched a FreeRTOS primitive could take a scheduler switch and
+         * write the synthetic register file over a real task's TCB), and left
+         * cpu->halted set -- which, once the idle task started parking cores
+         * in WAITI, meant the callback body never executed at all.
+         *
+         * A completed call leaves the core awake, as an interrupt waking
+         * WAITI would on hardware; the idle task simply re-enters WAITI. */
+        uint32_t arg = t->arg;
+        (void)guest_call8(et->cpu, t->callback_addr, &arg, 1,
+                          ESP_TIMER_CALLBACK_INSNS, NULL);
 
         /* Reschedule periodic or deactivate */
         if (t->periodic) {
