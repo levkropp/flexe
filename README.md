@@ -451,6 +451,25 @@ with the literal pool), and the three NimBLE literal-pool entries and five DRAM
 globals were confirmed independently. v1.15.1 passes the gate end to end under
 both engines.
 
+`tools/relocate_profile.py` is that relocation, made repeatable. It wildcards
+the operand fields a relink moves, requires a *unique* match before reporting
+an address, and resolves literal slots and DRAM globals through the L32R that
+references them rather than by assuming a uniform section delta. Run it
+against the reference image itself first: every address must come back
+unchanged, which is what makes a nonzero delta elsewhere trustworthy.
+
+    python3 tools/relocate_profile.py REFERENCE.bin TARGET.bin ADDR [ADDR ...]
+
+Marauder v1.14.3 is also published for three other CYD boards, which are
+separate links with their own entry point (`0x400830D0`). The 2432S024
+(guition) and 3.5-inch builds have relocated profiles and boot, run Wi-Fi end
+to end, and drive BLE scan start/stop; injecting a BLE advertisement into them
+does not yet complete, because their IRAM contains a NimBLE callback path with
+no counterpart in the 2432S028 build, so they are not part of the stock-ROM
+gate. The `2432S028_2usb` build is a different link generation again -- only 3
+of its 41 profile addresses relocate from v1.14.3 -- and is still rejected as
+an unsupported layout.
+
 ```bash
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \

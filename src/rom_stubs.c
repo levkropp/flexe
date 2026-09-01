@@ -3981,6 +3981,29 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
                  fw_signature_matches(mem, 0x4019BE94u,
                                       wifi_start, sizeof(wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1151;
+    } else if (entry_point == 0x400830D0u) {
+        /* v1.14.3 for the other CYD boards. Both carry the v1.14.0/1 phy
+         * wrapper bytes verbatim, so only the address the signature sits at
+         * separates them. */
+        static const uint8_t board_phy[] = {
+            0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
+            0x00, 0x81, 0xC5, 0xF0, 0xA9, 0x08, 0x3D, 0xF0,
+        };
+        static const uint8_t board_wifi_start[] = {
+            0x36, 0x41, 0x00, 0xA5, 0xAE, 0xFF, 0x21, 0x9B,
+            0xFE, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0x9B, 0xFE,
+        };
+        xtensa_mem_t *mem = stubs->cpu->mem;
+        if (fw_signature_matches(mem, 0x401BE0E8u,
+                                 board_phy, sizeof(board_phy)) &&
+            fw_signature_matches(mem, 0x40198B64u, board_wifi_start,
+                                 sizeof(board_wifi_start)))
+            profile = ROM_FIRMWARE_MARAUDER_V1143_GUITION;
+        else if (fw_signature_matches(mem, 0x401BE274u,
+                                      board_phy, sizeof(board_phy)) &&
+                 fw_signature_matches(mem, 0x40198CF0u, board_wifi_start,
+                                      sizeof(board_wifi_start)))
+            profile = ROM_FIRMWARE_MARAUDER_V1143_35INCH;
     }
 
     stubs->firmware_profile = profile;
@@ -3999,6 +4022,8 @@ rom_firmware_profile_t rom_stubs_firmware_profile(
 #define FW_NOOP_FN_V11401 0x401DBFC4u
 #define FW_NOOP_FN_V11423 0x401DC890u
 #define FW_NOOP_FN_V1151  0x401DF918u
+#define FW_NOOP_FN_GUITION 0x401DC394u
+#define FW_NOOP_FN_35INCH  0x401DC4F8u
 #define FW_FAKE_TBL_BT    0x50000400u
 #define FW_FAKE_TBL_WIFI  0x50000800u
 
@@ -4032,6 +4057,18 @@ static const fw_tbl_patch_t fw_marauder_v11423_ble_tbls[] = {
 };
 
 /* v1.15.x moved the whole .bss block up by 0x188. */
+static const fw_tbl_patch_t fw_marauder_guition_ble_tbls[] = {
+    {0x3FFCD774u, FW_FAKE_TBL_BT},
+    {0x3FFD0344u, FW_FAKE_TBL_WIFI},
+    {0x3FFD0348u, FW_FAKE_TBL_WIFI},
+};
+
+static const fw_tbl_patch_t fw_marauder_35inch_ble_tbls[] = {
+    {0x3FFCD8B4u, FW_FAKE_TBL_BT},
+    {0x3FFD0484u, FW_FAKE_TBL_WIFI},
+    {0x3FFD0488u, FW_FAKE_TBL_WIFI},
+};
+
 static const fw_tbl_patch_t fw_marauder_v1151_ble_tbls[] = {
     {0x3FFCDB0Cu, FW_FAKE_TBL_BT},
     {0x3FFD06DCu, FW_FAKE_TBL_WIFI},
@@ -4111,6 +4148,16 @@ static void stub_fw_marauder_phy_init(xtensa_cpu_t *cpu, void *ctx) {
                                 (int)(sizeof(fw_marauder_v1151_ble_tbls) /
                                       sizeof(fw_marauder_v1151_ble_tbls[0])),
                                 FW_NOOP_FN_V1151);
+    else if (cpu->pc == 0x401BE0E8u)
+        fw_patch_handler_tables(stubs, fw_marauder_guition_ble_tbls,
+                                (int)(sizeof(fw_marauder_guition_ble_tbls) /
+                                      sizeof(fw_marauder_guition_ble_tbls[0])),
+                                FW_NOOP_FN_GUITION);
+    else if (cpu->pc == 0x401BE274u)
+        fw_patch_handler_tables(stubs, fw_marauder_35inch_ble_tbls,
+                                (int)(sizeof(fw_marauder_35inch_ble_tbls) /
+                                      sizeof(fw_marauder_35inch_ble_tbls[0])),
+                                FW_NOOP_FN_35INCH);
     else if (cpu->pc == 0x401BE628u)
         fw_patch_handler_tables(stubs, fw_marauder_v11423_ble_tbls,
                                 (int)(sizeof(fw_marauder_v11423_ble_tbls) /
@@ -4182,6 +4229,30 @@ static const fw_addr_hook_t fw_marauder_v11423_hooks[] = {
 /* Marauder v1.15.x reuses entry 0x400831D8 with a third link layout. The
  * IRAM DPORT helpers stayed put; everything in flash moved by a per-library
  * delta (NimBLE C++ +0x2C68, NimBLE host +0x2BE8, phy +0x2E10). */
+static const fw_addr_hook_t fw_marauder_guition_hooks[] = {
+    { 0x400816E0, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_start", 0 },
+    { 0x40081744, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_end", 0 },
+    { 0x401BE0E8, stub_fw_marauder_phy_init, "phy_get_romfunc_addr", 0 },
+    { 0x40104B4D, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
+    { 0x40104BF4, stub_fw_marauder_nimble_deinit,
+      "NimBLEDevice::deinit", 0 },
+    { 0, NULL, NULL, 0 }
+};
+
+static const fw_addr_hook_t fw_marauder_35inch_hooks[] = {
+    { 0x400816E0, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_start", 0 },
+    { 0x40081744, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_end", 0 },
+    { 0x401BE274, stub_fw_marauder_phy_init, "phy_get_romfunc_addr", 0 },
+    { 0x40104D4D, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
+    { 0x40104DF4, stub_fw_marauder_nimble_deinit,
+      "NimBLEDevice::deinit", 0 },
+    { 0, NULL, NULL, 0 }
+};
+
 static const fw_addr_hook_t fw_marauder_v1151_hooks[] = {
     { 0x400816FC, stub_void_unregistered,
       "esp_dport_access_stall_other_cpu_start", 0 },
@@ -4222,6 +4293,10 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
         tbl = fw_marauder_v11423_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1151)
         tbl = fw_marauder_v1151_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1143_GUITION)
+        tbl = fw_marauder_guition_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1143_35INCH)
+        tbl = fw_marauder_35inch_hooks;
     else if (profile == ROM_FIRMWARE_NERDMINER_V183)
         tbl = fw_nerdminer_hooks;
     if (!tbl) {

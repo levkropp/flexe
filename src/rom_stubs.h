@@ -20,6 +20,10 @@ typedef enum {
     ROM_FIRMWARE_MARAUDER_V1140_1,
     ROM_FIRMWARE_MARAUDER_V1142_3,
     ROM_FIRMWARE_MARAUDER_V1151,
+    /* v1.14.3 built for other CYD boards. Same sources, separate
+     * links: entry 0x400830D0 and their own address maps. */
+    ROM_FIRMWARE_MARAUDER_V1143_GUITION,
+    ROM_FIRMWARE_MARAUDER_V1143_35INCH,
 } rom_firmware_profile_t;
 
 esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);

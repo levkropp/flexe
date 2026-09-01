@@ -2224,6 +2224,44 @@ static const wifi_fw_hook_t marauder_v11423_wifi_hooks[] = {
 
 /* Marauder v1.15.x: esp_wifi_init/deinit moved by +0x2C80 and the rest of the
  * WiFi wrappers by +0x2DF4 (+0x2DF8 for esp_wifi_80211_tx). */
+static const wifi_fw_hook_t marauder_guition_wifi_hooks[] = {
+    { 0x4013AFF4u, stub_esp_wifi_init,                  "esp_wifi_init" },
+    { 0x4013AF8Cu, stub_esp_wifi_deinit,                "esp_wifi_deinit" },
+    { 0x40198B64u, stub_esp_wifi_start,                 "esp_wifi_start" },
+    { 0x40198BC0u, stub_esp_wifi_stop,                  "esp_wifi_stop" },
+    { 0x40198B00u, stub_esp_wifi_set_mode,              "esp_wifi_set_mode" },
+    { 0x40198B3Cu, stub_esp_wifi_get_mode,              "esp_wifi_get_mode" },
+    { 0x401992C0u, stub_esp_wifi_set_channel,           "esp_wifi_set_channel" },
+    { 0x40199304u, stub_esp_wifi_get_channel,           "esp_wifi_get_channel" },
+    { 0x401993D0u, stub_esp_wifi_get_mac,               "esp_wifi_get_mac" },
+    { 0x40199368u, stub_esp_wifi_set_mac,               "esp_wifi_set_mac" },
+    { 0x4019944Cu, stub_esp_wifi_set_promiscuous,       "esp_wifi_set_promiscuous" },
+    { 0x401993FCu, stub_esp_wifi_set_promiscuous_filter,"esp_wifi_set_promiscuous_filter" },
+    { 0x401994B8u, stub_esp_wifi_set_promiscuous_rx_cb, "esp_wifi_set_promiscuous_rx_cb" },
+    { 0x401994D0u, stub_esp_wifi_noop,                  "esp_wifi_set_storage" },
+    { 0x401A5888u, stub_esp_wifi_80211_tx,              "esp_wifi_80211_tx" },
+    { 0, NULL, NULL },
+};
+
+static const wifi_fw_hook_t marauder_35inch_wifi_hooks[] = {
+    { 0x4013B15Cu, stub_esp_wifi_init,                  "esp_wifi_init" },
+    { 0x4013B0F4u, stub_esp_wifi_deinit,                "esp_wifi_deinit" },
+    { 0x40198CF0u, stub_esp_wifi_start,                 "esp_wifi_start" },
+    { 0x40198D4Cu, stub_esp_wifi_stop,                  "esp_wifi_stop" },
+    { 0x40198C8Cu, stub_esp_wifi_set_mode,              "esp_wifi_set_mode" },
+    { 0x40198CC8u, stub_esp_wifi_get_mode,              "esp_wifi_get_mode" },
+    { 0x4019944Cu, stub_esp_wifi_set_channel,           "esp_wifi_set_channel" },
+    { 0x40199490u, stub_esp_wifi_get_channel,           "esp_wifi_get_channel" },
+    { 0x4019955Cu, stub_esp_wifi_get_mac,               "esp_wifi_get_mac" },
+    { 0x401994F4u, stub_esp_wifi_set_mac,               "esp_wifi_set_mac" },
+    { 0x401995D8u, stub_esp_wifi_set_promiscuous,       "esp_wifi_set_promiscuous" },
+    { 0x40199588u, stub_esp_wifi_set_promiscuous_filter,"esp_wifi_set_promiscuous_filter" },
+    { 0x40199644u, stub_esp_wifi_set_promiscuous_rx_cb, "esp_wifi_set_promiscuous_rx_cb" },
+    { 0x4019965Cu, stub_esp_wifi_noop,                  "esp_wifi_set_storage" },
+    { 0x401A5A14u, stub_esp_wifi_80211_tx,              "esp_wifi_80211_tx" },
+    { 0, NULL, NULL },
+};
+
 static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
     { 0x4013E198u, stub_esp_wifi_init,                  "esp_wifi_init" },
     { 0x4013E130u, stub_esp_wifi_deinit,                "esp_wifi_deinit" },
@@ -2261,6 +2299,10 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = marauder_v11423_wifi_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1151)
         hooks = marauder_v1151_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1143_GUITION)
+        hooks = marauder_guition_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1143_35INCH)
+        hooks = marauder_35inch_wifi_hooks;
     else
         return 0;
     if (profile == ROM_FIRMWARE_NERDMINER_V183)

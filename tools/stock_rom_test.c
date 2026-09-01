@@ -57,6 +57,12 @@ static const marauder_state_layout_t marauder_v11423_state = {
 static const marauder_state_layout_t marauder_v1151_state = {
     0x3FFC8E2Cu, 0x3FFC8E30u, 0x3FFC8E34u, 0x3FFC951Cu,
 };
+static const marauder_state_layout_t marauder_guition_state = {
+    0x3FFC8C78u, 0x3FFC8C7Cu, 0x3FFC8C80u, 0x3FFC9364u,
+};
+static const marauder_state_layout_t marauder_35inch_state = {
+    0x3FFC8C78u, 0x3FFC8C7Cu, 0x3FFC8C80u, 0x3FFC94A4u,
+};
 static const marauder_state_layout_t *marauder_state =
         &marauder_v11401_state;
 #define MARAUDER_RAW_SCAN_MODE      25u
@@ -952,6 +958,10 @@ int main(int argc, char **argv)
             marauder_state = &marauder_v11423_state;
         else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1151)
             marauder_state = &marauder_v1151_state;
+        else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1143_GUITION)
+            marauder_state = &marauder_guition_state;
+        else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1143_35INCH)
+            marauder_state = &marauder_35inch_state;
         else {
             fprintf(stderr,
                     "FAIL profile=marauder reason=unsupported-image-layout\n");

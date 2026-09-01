@@ -35,6 +35,7 @@
 /* ESP32 Marauder v1.14 CYD production addresses, verified against each
  * release layout's instruction bytes.  v1.14.2 kept the same image entry but
  * shifted both code and DRAM, so the entry point alone is not an identity. */
+#define MARAUDER_BOARD_ENTRY 0x400830D0u
 #define MARAUDER_V114_ENTRY 0x400831D8u
 typedef struct {
     uint32_t scan_start;
@@ -68,6 +69,22 @@ static const marauder_bt_layout_t marauder_v11423_bt = {
 
 /* v1.15.x: NimBLE C++ moved +0x2C68, the host stack +0x2BE8, the vtable
  * +0x3058, the literal pool +0xE8/+0xE0, and .bss uniformly +0x188. */
+/* v1.14.3 built for the 2432S024 guition board. */
+static const marauder_bt_layout_t marauder_guition_bt = {
+    0x40104E6Cu, 0x40104F6Cu, 0x40105054u, 0x401DAC60u,
+    0x40109C98u, 0x401107A8u, 0x401101ACu, 0x40111214u,
+    0x4010B4A0u, 0x4010B4ACu, 0x4010B5D0u,
+    0x3FFC9514u, 0x3FFC9520u,
+};
+
+/* v1.14.3 built for the 3.5-inch board. */
+static const marauder_bt_layout_t marauder_35inch_bt = {
+    0x4010506Cu, 0x4010516Cu, 0x40105254u, 0x401DADECu,
+    0x40109E98u, 0x40110998u, 0x4011039Cu, 0x40111404u,
+    0x4010B4B8u, 0x4010B4C4u, 0x4010B5E8u,
+    0x3FFC9654u, 0x3FFC9660u,
+};
+
 static const marauder_bt_layout_t marauder_v1151_bt = {
     0x40107C04u, 0x40107D04u, 0x40107DECu, 0x401DE1F4u,
     0x4010F2ECu, 0x40113508u, 0x40112F0Cu, 0x40113F74u,
@@ -776,7 +793,10 @@ int bt_stubs_hook_symbols(bt_stubs_t *bt, const elf_symbols_t *syms)
 
 int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
 {
-    if (!bt || entry_point != MARAUDER_V114_ENTRY)
+    /* v1.14/v1.15 for the 2432S028 share one entry point; the other CYD
+     * boards are a separate link with their own. */
+    if (!bt || (entry_point != MARAUDER_V114_ENTRY &&
+                entry_point != MARAUDER_BOARD_ENTRY))
         return 0;
     esp32_rom_stubs_t *rom = bt->cpu->pc_hook_ctx;
     if (!rom)
@@ -791,6 +811,10 @@ int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
         layout = &marauder_v11423_bt;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1151)
         layout = &marauder_v1151_bt;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1143_GUITION)
+        layout = &marauder_guition_bt;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1143_35INCH)
+        layout = &marauder_35inch_bt;
     else
         return 0;
 
