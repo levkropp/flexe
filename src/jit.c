@@ -3258,6 +3258,27 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
                              pc < ESP32_INSN_ADDR_HIGH, 1)) {
             jit_get_block(jit, cpu, pc);
         }
+        /* Also offer the two most recent control-transfer targets.
+         *
+         * The batch-boundary PC alone is a poor candidate: it is wherever the
+         * instruction budget happened to run out, which is rarely the head of
+         * anything. Branch targets are where compiled blocks should begin,
+         * and the hot ones recur, so they cross the threshold quickly.
+         *
+         * Two, not the whole ring: sampling all eight compiles more blocks
+         * but they are cold, and the extra work cost Marauder 3.6% while
+         * gaining nothing. Two captures nearly all of the benefit --
+         * NerdMiner +7%, the compute benchmark +23% -- for no measurable
+         * cost elsewhere. Note the win is not from compiling *more* (JIT
+         * coverage barely moves) but from compiling blocks that start where
+         * control flow actually enters, which chain far better. */
+        for (unsigned k = 0; k < 2; k++) {
+            uint32_t bt = cpu->br_ring[(cpu->br_ring_idx - 1u - k) &
+                                       (XT_BR_RING_SIZE - 1)];
+            if (bt >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
+                bt < ESP32_INSN_ADDR_HIGH && bt != pc)
+                jit_get_block(jit, cpu, bt);
+        }
         /* Inside an active zero-overhead loop, sample LBEG as well.  LOOP
          * itself is not compilable, so a block sampled at an arbitrary PC in
          * the body can only ever reach LEND — yielding short tail fragments

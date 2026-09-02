@@ -363,8 +363,19 @@ struct xtensa_cpu {
 
     /* Debug: PC history ring buffer */
 #define PC_HISTORY_SIZE 32
+#define XT_BR_RING_SIZE 8
     uint32_t pc_history[PC_HISTORY_SIZE];
     int      pc_history_idx;
+
+    /* Ring of recent control-transfer targets, for JIT block discovery.
+     * The JIT used to sample one PC per execution batch -- one candidate per
+     * ten thousand instructions, at whatever arbitrary point the batch ended
+     * -- so a hot loop header almost never reached the compile threshold and
+     * production firmware ran essentially interpreted. Branch targets are
+     * where blocks should start anyway, so recording them costs one store per
+     * taken transfer and gives the JIT real candidates. */
+    uint32_t br_ring[XT_BR_RING_SIZE];
+    uint8_t  br_ring_idx;
 
     /* ================================================================
      * COLD SECTION — large arrays, rarely accessed per-instruction.

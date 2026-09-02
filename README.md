@@ -16,6 +16,10 @@ a real esp32 lx6 hums along at 240 mhz. that's the bar. here's flexe on apple si
 | real_time_stats (dual-core freertos) | 334 mips | **499 mips** | 2.1× faster |
 | cpu_bench (alu/mem loops) | 318 mips | **2476 mips** | 10.3× faster |
 
+On x86-64 the committed `bench-compute.sh` reports 1789 MIPS under the JIT
+(7.45× real-time) against 187 interpreted, and the stock ROMs run at 3.2×
+(NerdMiner) and 10.6× (Marauder) real-time.
+
 so yeah — flexe emulates an esp32 at 2–10× the speed of an actual esp32. the jit traces hot basic blocks through branches, chains them into long native runs, and constant-folds literal loads. cold code falls back to the interpreter, which itself is already above real-time.
 
 ```

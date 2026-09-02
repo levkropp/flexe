@@ -2261,6 +2261,10 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
      * bitmap load is skipped entirely.  Runs BEFORE the invalid-PC
      * trap so a hook at 0x00000000 can turn callxN-through-NULL into
      * a benign return-0 (symbol-less firmware driver tables). */
+    if (__builtin_expect(cpu->_pc_written, 0)) {
+        cpu->br_ring[cpu->br_ring_idx & (XT_BR_RING_SIZE - 1)] = cpu->pc;
+        cpu->br_ring_idx++;
+    }
     if (cpu->_pc_written && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */

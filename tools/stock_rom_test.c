@@ -167,6 +167,30 @@ static int touch_read(int *x, int *y, void *ctx)
     return touch->pressed;
 }
 
+
+/* Run until neither core is inside a critical section, before injecting a
+ * host-side event.
+ *
+ * guest_call8() runs one core to completion, so it cannot preempt a spinlock
+ * the *other* core holds: injecting while the guest is inside a critical
+ * section makes the synthetic callback spin until its instruction budget runs
+ * out. Retrying the injection is not an answer -- the failed attempt has
+ * already run most of the handler, so the firmware dedupes the retry and
+ * silently does nothing. Wait for a moment when the callback can actually
+ * run instead. PS.INTLEVEL is zero exactly when no critical section is held.
+ */
+static void wait_for_no_critical_section(flexe_session_t *session)
+{
+    for (int i = 0; i < 400; i++) {
+        const xtensa_cpu_t *c0 = flexe_session_cpu(session, 0);
+        const xtensa_cpu_t *c1 = flexe_session_cpu(session, 1);
+        if (XT_PS_INTLEVEL(c0->ps) == 0 && XT_PS_INTLEVEL(c1->ps) == 0)
+            return;
+        if (flexe_session_run_core(session, 0, 2000) < 0) return;
+        flexe_session_post_batch(session, 2000);
+    }
+}
+
 static void uart_count(void *ctx, uint8_t byte)
 {
     uart_state_t *uart = ctx;
@@ -1407,6 +1431,7 @@ int main(int argc, char **argv)
         beacon[46] = 3; /* DS parameter set: channel 1 */
         beacon[47] = 1;
         beacon[48] = 1;
+        wait_for_no_critical_section(session);
         int inject_result = wifi_stubs_inject_promiscuous_frame(
                 flexe_session_wifi(session), beacon, sizeof(beacon), -42, 1, 0);
         wifi_stubs_get_stats(flexe_session_wifi(session), &wifi_stats);
@@ -1595,6 +1620,7 @@ int main(int argc, char **argv)
         };
         size_t bt_uart_before = uart.log_len;
         uint64_t bt_adv_before = bt_stats.advertisement_frames;
+        wait_for_no_critical_section(session);
         int bt_inject_result = bt_stubs_inject_advertisement(
                 flexe_session_bt(session), ble_addr, 1, -47,
                 ble_advertisement, sizeof(ble_advertisement));
@@ -1851,6 +1877,13 @@ int main(int argc, char **argv)
         free(framebuf);
         return 1;
     }
+
+    /* Optional profile of where guest instructions actually executed.
+     * Useful for asking why one ROM runs slower than another: a low jitted
+     * fraction means the workload is spread over cold code the JIT never gets
+     * hot enough to compile. */
+    if (getenv("FLEXE_JIT_STATS") && flexe_session_jit(session))
+        jit_print_stats(flexe_session_jit(session));
 
     uint64_t wall_ns = monotonic_ns() - wall_start;
     uint64_t total_cycles = flexe_session_cpu(session, 0)->cycle_count;
