@@ -35,6 +35,60 @@ static uint32_t frt_call_stub(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+TEST(test_queue_accessors_read_flexe_storage) {
+    /* uxQueueMessagesWaiting and friends were not hooked, so the guest ran
+     * FreeRTOS's own versions against the real Queue_t -- which Flexe never
+     * populates, because every queue operation is serviced from its own
+     * storage. They reported an empty queue no matter what was in it. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    extern void stub_xQueueCreate(xtensa_cpu_t *, void *);
+    extern void stub_xQueueSend(xtensa_cpu_t *, void *);
+    extern void stub_xQueuePeek(xtensa_cpu_t *, void *);
+    extern void stub_uxQueueMessagesWaiting(xtensa_cpu_t *, void *);
+    extern void stub_uxQueueSpacesAvailable(xtensa_cpu_t *, void *);
+    extern void stub_xQueueReset(xtensa_cpu_t *, void *);
+    uint32_t a_new = 0x400D0000, a_send = 0x400D0010, a_cnt = 0x400D0020;
+    uint32_t a_space = 0x400D0030, a_reset = 0x400D0040, a_peek = 0x400D0050;
+    rom_stubs_register_ctx(rom, a_new, (rom_stub_fn)stub_xQueueCreate, "xQueueCreate", frt);
+    rom_stubs_register_ctx(rom, a_send, (rom_stub_fn)stub_xQueueSend, "xQueueSend", frt);
+    rom_stubs_register_ctx(rom, a_cnt, (rom_stub_fn)stub_uxQueueMessagesWaiting, "uxQueueMessagesWaiting", frt);
+    rom_stubs_register_ctx(rom, a_space, (rom_stub_fn)stub_uxQueueSpacesAvailable, "uxQueueSpacesAvailable", frt);
+    rom_stubs_register_ctx(rom, a_reset, (rom_stub_fn)stub_xQueueReset, "xQueueReset", frt);
+    rom_stubs_register_ctx(rom, a_peek, (rom_stub_fn)stub_xQueuePeek, "xQueuePeek", frt);
+
+    uint32_t cargs[2] = { 4u, 4u };          /* four items of four bytes */
+    uint32_t q = frt_call_stub(&cpu, a_new, cargs, 2);
+    ASSERT_TRUE(q != 0);
+
+    uint32_t one[1] = { q };
+    ASSERT_EQ(frt_call_stub(&cpu, a_cnt, one, 1), 0u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_space, one, 1), 4u);
+
+    uint32_t item = 0x3FFB0100u;
+    mem_write32(cpu.mem, item, 0xDEADBEEFu);
+    uint32_t send[3] = { q, item, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_send, send, 3), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_cnt, one, 1), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_space, one, 1), 3u);
+
+    /* A peek copies the item out and leaves it queued. */
+    uint32_t dst = 0x3FFB0200u;
+    uint32_t peek[3] = { q, dst, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_peek, peek, 3), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, dst), 0xDEADBEEFu);
+    ASSERT_EQ(frt_call_stub(&cpu, a_cnt, one, 1), 1u);
+
+    ASSERT_EQ(frt_call_stub(&cpu, a_reset, one, 1), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_cnt, one, 1), 0u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_space, one, 1), 4u);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_event_group_bits) {
     /* The non-blocking half. It is worth pinning separately because it kept
      * working while every blocking wait hung, which is what made the gap easy
@@ -1024,6 +1078,7 @@ TEST(test_vPortFree_noop) {
 
 static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
+    RUN_TEST(test_queue_accessors_read_flexe_storage);
     RUN_TEST(test_event_group_bits);
     RUN_TEST(test_software_timer_commands);
     RUN_TEST(test_guest_clock_sums_executed_and_skipped_time);

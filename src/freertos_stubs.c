@@ -118,7 +118,14 @@ typedef struct {
      * caller's slot depends on PS.CALLINC at the call, so it cannot be
      * recomputed after frt_return() has zeroed it. */
     uint8_t      ret_ar_slot;
-    uint32_t     blocked_queue;  /* queue handle for BLOCKED_QUEUE */
+    uint32_t     blocked_queue;  /* queue/semaphore handle being waited on */
+    /* A blocked receive or take. q_waiting is matched instead of the task
+     * state, because a finite timeout parks the task in TASK_SLEEPING so its
+     * deadline is honoured and it must still be wakeable by a send. */
+    uint32_t     q_recv_buf;     /* destination for the item; 0 for a semaphore */
+    bool         q_waiting;
+    bool         q_is_semaphore;
+    bool         q_peek;         /* xQueuePeek: copy the item, leave it queued */
     /* Event group wait, mirroring the notification fields below: eg_waiting
      * stays true across both the indefinite and the timed block, so a setter
      * can wake the task whichever state it is parked in. */
@@ -370,6 +377,12 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
         if (t->state == TASK_SLEEPING) {
             if (now >= t->wake_cycle) {
                 t->notify_waiting = false;
+                if (t->q_waiting) {
+                    /* The pre-set return value is already pdFALSE, which is
+                     * what a receive or take that ran out of time reports. */
+                    t->q_waiting = false;
+                    t->blocked_queue = 0;
+                }
                 if (t->eg_waiting) {
                     /* A timed-out xEventGroupWaitBits() returns the bits as
                      * they stand at the timeout, not as they stood when the
@@ -1272,9 +1285,37 @@ static bool wake_queue_waiter_locked(freertos_stubs_t *frt,
                                      uint32_t handle) {
     if (!frt->scheduler_started) return false;
     for (int i = 0; i < frt->task_count; i++) {
-        if (frt->tasks[i].state != TASK_BLOCKED_QUEUE ||
-            frt->tasks[i].blocked_queue != handle)
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->q_waiting || t->blocked_queue != handle)
             continue;
+
+        if (!t->q_is_semaphore) {
+            /* Hand the item over here, on the waiter's behalf. The blocked
+             * xQueueReceive() call cannot re-run when the task resumes -- it
+             * continues after the call with whatever is in its return
+             * register -- so if the wake does not dequeue, nobody does: the
+             * receiver reports failure while its item sits in the queue.
+             * Semaphore waiters take the token directly instead, which is
+             * why stub_queue_send() skips the enqueue when one is woken. */
+            queue_t *q = find_queue(frt, handle);
+            if (!q || q->count == 0) continue;
+            if (q->item_size > 0 && t->q_recv_buf && frt->cpu[0]) {
+                int offset = q->head * q->item_size;
+                for (int k = 0; k < q->item_size; k++)
+                    mem_write8(frt->cpu[0]->mem,
+                               t->q_recv_buf + (uint32_t)k,
+                               q->buf[offset + k]);
+            }
+            if (!t->q_peek) {
+                q->head = (q->head + 1) % q->max_items;
+                q->count--;
+            }
+        }
+
+        t->ar[t->ret_ar_slot] = pdTRUE;
+        t->q_waiting = false;
+        t->blocked_queue = 0;
+
         bool is_current = false;
         for (int core = 0; core < 2; core++) {
             if (frt->current_task[core] != i) continue;
@@ -1284,11 +1325,73 @@ static bool wake_queue_waiter_locked(freertos_stubs_t *frt,
                 frt->cpu[core]->halted = false;
             }
         }
-        frt->tasks[i].state = is_current ? TASK_RUNNING : TASK_READY;
-        frt->tasks[i].blocked_queue = 0;
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
         return true;
     }
     return false;
+}
+
+
+/* ===== Queue accessors =====
+ *
+ * These were not hooked, so the guest ran FreeRTOS's own implementations
+ * against the real queue structure -- which Flexe never populates, since
+ * every queue operation is serviced from its own storage. They therefore
+ * reported an empty queue no matter what was in it.
+ */
+
+static uint32_t queue_count_of(freertos_stubs_t *frt, uint32_t handle) {
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    uint32_t n = q ? (uint32_t)q->count : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    return n;
+}
+
+/* uxQueueMessagesWaiting(queue), and uxSemaphoreGetCount(), which FreeRTOS
+ * defines as a macro over it but which some builds emit as its own symbol. */
+void stub_uxQueueMessagesWaiting(xtensa_cpu_t *cpu, void *ctx) {
+    frt_return(cpu, queue_count_of(ctx, frt_arg(cpu, 0)));
+}
+
+void stub_uxQueueSpacesAvailable(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, frt_arg(cpu, 0));
+    uint32_t n = q ? (uint32_t)(q->max_items - q->count) : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, n);
+}
+
+void stub_xQueueIsQueueEmptyFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    frt_return(cpu, queue_count_of(ctx, frt_arg(cpu, 0)) == 0u ? pdTRUE
+                                                               : pdFALSE);
+}
+
+/* xQueueReset(queue) -> pdPASS. Waiters stay blocked, as on hardware. */
+void stub_xQueueReset(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, frt_arg(cpu, 0));
+    if (q) { q->count = 0; q->head = 0; q->tail = 0; }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdPASS);
+}
+
+/* xQueuePeekFromISR(queue, buffer): copy the head item, leave it queued. */
+void stub_xQueuePeekFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t buf_ptr = frt_arg(cpu, 1);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, frt_arg(cpu, 0));
+    bool got = q && q->count > 0;
+    if (got && q->item_size > 0 && buf_ptr) {
+        int offset = q->head * q->item_size;
+        for (int i = 0; i < q->item_size; i++)
+            mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, got ? pdTRUE : pdFALSE);
 }
 
 static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
@@ -1412,8 +1515,10 @@ static bool dispatch_peripherals_until_queue(freertos_stubs_t *frt,
 }
 
 /* xQueueReceive(queue, buf, timeout) -> pdTRUE/pdFALSE */
-void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
-    freertos_stubs_t *frt = ctx;
+/* Shared body of xQueueReceive() and xQueuePeek(); a peek copies the head
+ * item without removing it. */
+static void queue_receive(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                          bool peek) {
     frt_refresh_cpu_frequency(frt, cpu);
     uint32_t handle = frt_arg(cpu, 0);
     uint32_t buf_ptr = frt_arg(cpu, 1);
@@ -1450,16 +1555,22 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
         }
         if (frt->scheduler_started && frt->current_task[core_id] >= 0 &&
             timeout > 0) {
-            /* Block: unwind call (returning pdFALSE), save, sleep/block, switch */
+            /* Block. The return register is patched to pdTRUE by whichever
+             * send hands us an item; pdFALSE stands if the timeout wins. */
+            task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+            t->ret_ar_slot = frt_return_slot(cpu);
             frt_return(cpu, pdFALSE);
             sched_save_context(frt, core_id);
-            task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+            t->blocked_queue = handle;
+            t->q_recv_buf = buf_ptr;
+            t->q_waiting = true;
+            t->q_is_semaphore = false;
+            t->q_peek = peek;
             if (timeout == 0xFFFFFFFFu) {
                 /* portMAX_DELAY: block on queue indefinitely */
                 t->state = TASK_BLOCKED_QUEUE;
-                t->blocked_queue = handle;
             } else {
-                /* Timed wait: sleep until timeout */
+                /* Timed wait: wakeable by a send, or by the deadline */
                 uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
                 if (advance > 200000000ULL) advance = 200000000ULL;
                 t->state = TASK_SLEEPING;
@@ -1488,11 +1599,21 @@ dequeue_locked:
     int offset = q->head * q->item_size;
     for (int i = 0; i < q->item_size; i++)
         mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
-    q->head = (q->head + 1) % q->max_items;
-    q->count--;
+    if (!peek) {
+        q->head = (q->head + 1) % q->max_items;
+        q->count--;
+    }
     pthread_mutex_unlock(&frt->lock);
 
     frt_return(cpu, pdTRUE);
+}
+
+void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
+    queue_receive(cpu, ctx, false);
+}
+
+void stub_xQueuePeek(xtensa_cpu_t *cpu, void *ctx) {
+    queue_receive(cpu, ctx, true);
 }
 
 /* ISR queue helpers used by ESP-IDF DMA drivers. Compatibility-mode queues
@@ -1610,12 +1731,20 @@ void stub_xSemaphoreTake(xtensa_cpu_t *cpu, void *ctx) {
     }
     if (timeout != 0 && frt->scheduler_started &&
         frt->current_task[core_id] >= 0) {
-        frt_return(cpu, pdTRUE);
-        sched_save_context(frt, core_id);
+        /* pdFALSE is the timeout outcome; a give patches it to pdTRUE.
+         * This used to be pre-set to pdTRUE, so a take that timed out
+         * reported that it had acquired the semaphore. */
         task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+        t->ret_ar_slot = frt_return_slot(cpu);
+        frt_return(cpu, pdFALSE);
+        sched_save_context(frt, core_id);
+        t->blocked_queue = handle;
+        t->q_recv_buf = 0;
+        t->q_waiting = true;
+        t->q_is_semaphore = true;
+        t->q_peek = false;
         if (timeout == UINT32_MAX) {
             t->state = TASK_BLOCKED_QUEUE;
-            t->blocked_queue = handle;
         } else {
             uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
             if (advance > 200000000ULL) advance = 200000000ULL;
@@ -2330,6 +2459,14 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "pcTimerGetName",                stub_pcTimerGetName },
         { "xTimerGetPeriod",               stub_xTimerGetPeriod },
         { "xTimerGetExpiryTime",           stub_xTimerGetExpiryTime },
+        { "uxQueueMessagesWaiting",        stub_uxQueueMessagesWaiting },
+        { "uxQueueMessagesWaitingFromISR", stub_uxQueueMessagesWaiting },
+        { "uxSemaphoreGetCount",           stub_uxQueueMessagesWaiting },
+        { "uxQueueSpacesAvailable",        stub_uxQueueSpacesAvailable },
+        { "xQueueIsQueueEmptyFromISR",     stub_xQueueIsQueueEmptyFromISR },
+        { "xQueueReset",                   stub_xQueueReset },
+        { "xQueuePeekFromISR",             stub_xQueuePeekFromISR },
+        { "xQueuePeek",                    stub_xQueuePeek },
         { "xQueueCreate",                  stub_xQueueCreate },
         { "xQueueGenericCreate",           stub_xQueueGenericCreate },
         { "xQueueGenericCreateStatic",     stub_xQueueGenericCreateStatic },

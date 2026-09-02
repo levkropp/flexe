@@ -60,7 +60,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 657 tests
+- 658 tests
 
 ## building
 
@@ -149,7 +149,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 657 tests, 13008 passed, 0 failed
+# 658 tests, 13020 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -158,7 +158,7 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 22 of 22 on x86-64
+The compiled Arduino hardware gates below all pass — 23 of 23 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 One deliberate gap is worth stating rather than leaving to be rediscovered:
@@ -176,6 +176,22 @@ and it did not work: a per-core interrupt source raised its CPU line without
 ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
+
+`test-task-queue.sh` covers the plain producer/consumer handoff: one guest
+task sending to another, with the receiver blocked on it. Every queue gate
+before it had a *peripheral* fill the queue from an ISR, which Flexe services
+through a separate path, so the most common thing FreeRTOS is used for was
+untested — and broken. A receive with a finite timeout parked in
+`TASK_SLEEPING`, which the send-side wake path did not look at, so it slept
+its entire timeout; and because the blocked call cannot re-run when the task
+resumes, nothing ever dequeued the item. A 500 ms receive returned failure at
+500 ms while its item had been sitting in the queue since 50 ms.
+`xSemaphoreTake` had the mirror-image bug: it pre-set its return to `pdTRUE`,
+so a take that timed out reported that it had acquired the semaphore. The same
+gate found a family of queue accessors — `uxQueueMessagesWaiting`,
+`uxQueueSpacesAvailable`, `xQueuePeek`, `xQueueReset` — that were never hooked
+and so ran FreeRTOS's own code against a `Queue_t` Flexe never populates,
+reporting an empty queue no matter what was in it.
 
 `test-event-group.sh` covers FreeRTOS event groups, which hung. Like the
 software timers these were not stubbed, so the guest's own implementation ran
