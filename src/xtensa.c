@@ -16,6 +16,9 @@
 /* TEMP DEBUG: window-ops trace + forward decls (definitions near bottom) */
 extern int g_dbg_winlog;
 extern int g_dbg_c1ilog;
+
+
+
 extern uint32_t g_dbg_watch_addr;
 extern uint32_t g_dbg_watch_addr2;
 extern uint32_t g_dbg_watch_val;
@@ -2207,6 +2210,9 @@ static void g_dbg_watch_init(void) {
     if (e) g_dbg_winlog = atoi(e);
     e = getenv("FLEXE_C1ILOG");
     if (e) g_dbg_c1ilog = atoi(e);
+#if FLEXE_PROFILE_BUILD
+    xtensa_profile_init();
+#endif
     e = getenv("FLEXE_WATCHVAL");
     if (e) g_dbg_watch_val = (uint32_t)strtoul(e, NULL, 0);
 }
@@ -2384,6 +2390,9 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
 have_insn:
 #endif
 
+#if FLEXE_PROFILE_BUILD
+    xtensa_profile_tick(cpu->pc);
+#endif
     cpu->_pc_written = false;
     cpu->pc += (uint32_t)ilen;
 
@@ -2533,6 +2542,7 @@ static inline int xtensa_run_halted(xtensa_cpu_t *cpu, uint64_t *local_cc,
  * lives in this function body, eliminating per-instruction call overhead.
  * cycle_count is cached in a local to stay in a register across iterations
  * (avoids per-instruction 64-bit memory increment). */
+
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
     uint64_t cc = cpu->cycle_count;
     int idle_executed = 0;

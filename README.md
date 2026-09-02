@@ -66,6 +66,21 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
 - 660 tests
 
+### profiling
+
+`cmake -S . -B build-prof -DFLEXE_PROFILE=ON` builds an interpreter sampling
+profiler; run any harness with `FLEXE_PROFILE=1` for the top guest PCs, and
+`FLEXE_JIT_STATS=1` on the stock-ROM runner for JIT coverage. It is off by
+default and lives in its own translation unit for a reason: an earlier version
+sat in `xtensa.c` behind the same compile-time switch and, *even fully
+compiled out*, cost 4% on both stock ROMs — the handful of bytes it added
+shifted the dispatch loop's code layout. Measuring that needed an interleaved
+A/B, since a straight before/after was swamped by machine drift.
+
+What it found first: NerdMiner spends over a tenth of its interpreted
+instructions in a single `xPortEnterCriticalTimeout` spin loop, waiting on a
+lock held by the other core.
+
 ## building
 
 ```

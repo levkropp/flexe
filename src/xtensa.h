@@ -431,6 +431,14 @@ struct xtensa_cpu {
     void *code_invalidate_ctx;
 };
 
+/* Interpreter sampling profiler; see src/profile.c. The report is a no-op
+ * unless built with -DFLEXE_PROFILE=ON. */
+void xtensa_profile_report(void);
+#if FLEXE_PROFILE_BUILD
+void xtensa_profile_init(void);
+void xtensa_profile_tick(uint32_t pc);
+#endif
+
 /*
  * Guest-visible elapsed time, in microseconds.
  *

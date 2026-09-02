@@ -19,6 +19,13 @@ set(PREDECODE_FLASH_MB "4" CACHE STRING "Pre-decode table flash coverage in MB (
 # result is unreproducible, and a runner whose feature set the compiler
 # dislikes fails the build outright under -Werror for reasons that have
 # nothing to do with the code.
+# Interpreter sampling profiler. Off by default: the runtime flag check costs
+# ~3% in the dispatch loop even when the profiler is disabled.
+option(FLEXE_PROFILE "Build the interpreter sampling profiler" OFF)
+if(FLEXE_PROFILE)
+    add_compile_definitions(FLEXE_PROFILE_BUILD=1)
+endif()
+
 option(NATIVE_ARCH "Tune Release builds for the building machine's CPU" ON)
 
 # LTO and native tuning for Release builds (GCC/Clang only)
@@ -56,6 +63,7 @@ endif()
 # Library (core emulator)
 set(LIB_SOURCES
     src/xtensa.c
+    src/profile.c
     src/xtensa_disasm.c
     src/memory.c
     src/loader.c

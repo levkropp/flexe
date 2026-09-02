@@ -1884,6 +1884,7 @@ int main(int argc, char **argv)
      * hot enough to compile. */
     if (getenv("FLEXE_JIT_STATS") && flexe_session_jit(session))
         jit_print_stats(flexe_session_jit(session));
+    xtensa_profile_report();
 
     uint64_t wall_ns = monotonic_ns() - wall_start;
     uint64_t total_cycles = flexe_session_cpu(session, 0)->cycle_count;
