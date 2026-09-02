@@ -230,6 +230,22 @@ static void frt_return_void(xtensa_cpu_t *cpu) {
     }
 }
 
+
+/* Convert FreeRTOS ticks to cycles against the *current* CPU frequency.
+ *
+ * Reading the cached cycles_per_tick without refreshing first is a real
+ * hazard rather than a tidiness point: it starts at the 160 MHz default and
+ * is only updated when some other stub happens to refresh it, so a timeout
+ * computed before that -- which for a firmware whose first blocking call is a
+ * queue or notification wait is the very first one -- comes out a third short
+ * at 240 MHz. Measured: a 120 ms wait that expired after 80 ms.
+ */
+static uint64_t frt_ticks_to_cycles(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                                    uint32_t ticks) {
+    frt_refresh_cpu_frequency(frt, cpu);
+    return (uint64_t)ticks * frt->cycles_per_tick;
+}
+
 /* ===== Bump allocator ===== */
 
 static uint32_t bump_alloc(freertos_stubs_t *frt, uint32_t size) {
@@ -633,7 +649,7 @@ void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     frt_refresh_cpu_frequency(frt, cpu);
     uint32_t ticks = frt_arg(cpu, 0);
-    if (!frt_block_cycles(frt, cpu, (uint64_t)ticks * frt->cycles_per_tick))
+    if (!frt_block_cycles(frt, cpu, frt_ticks_to_cycles(frt, cpu, ticks)))
         frt_return_void(cpu);
 }
 
@@ -1158,7 +1174,7 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
         uint64_t hardware_advance = 0u;
         uint64_t timeout_cycles = 0u;
         if (timeout > 0u && timeout != UINT32_MAX) {
-            timeout_cycles = (uint64_t)timeout * frt->cycles_per_tick;
+            timeout_cycles = frt_ticks_to_cycles(frt, cpu, timeout);
             if (timeout_cycles > 200000000ULL)
                 timeout_cycles = 200000000ULL;
             pthread_mutex_unlock(&frt->lock);
@@ -1186,7 +1202,7 @@ void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
                 t->blocked_queue = handle;
             } else {
                 /* Timed wait: sleep until timeout */
-                uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
+                uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
                 if (advance > 200000000ULL) advance = 200000000ULL;
                 t->state = TASK_SLEEPING;
                 t->wake_cycle = cpu->cycle_count + advance;
@@ -1343,7 +1359,7 @@ void stub_xSemaphoreTake(xtensa_cpu_t *cpu, void *ctx) {
             t->state = TASK_BLOCKED_QUEUE;
             t->blocked_queue = handle;
         } else {
-            uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
+            uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
             if (advance > 200000000ULL) advance = 200000000ULL;
             t->state = TASK_SLEEPING;
             t->wake_cycle = cpu->cycle_count + advance;
@@ -1486,7 +1502,7 @@ static void stub_task_notify_take(xtensa_cpu_t *cpu,
     if (timeout == UINT32_MAX) {
         task->state = TASK_BLOCKED_NOTIFY;
     } else {
-        uint64_t advance = (uint64_t)timeout * frt->cycles_per_tick;
+        uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
         if (advance > 200000000ULL) advance = 200000000ULL;
         task->state = TASK_SLEEPING;
         task->wake_cycle = cpu->cycle_count + advance;
