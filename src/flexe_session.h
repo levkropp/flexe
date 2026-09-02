@@ -106,4 +106,8 @@ void flexe_session_set_event_log(flexe_session_t *s, int enable);
 void flexe_session_set_freertos_event_fn(flexe_session_t *s,
         freertos_event_fn fn, void *ctx);
 
+/* Rebuild the machine as a software reset does. Flash -- and with it NVS and
+ * SPIFFS -- is preserved, exactly as across a real reboot. */
+void flexe_session_reset(flexe_session_t *s);
+
 #endif /* FLEXE_SESSION_H */

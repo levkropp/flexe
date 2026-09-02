@@ -352,4 +352,8 @@ uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel);
 int     periph_dac_enabled(const esp32_periph_t *p, int channel);
 uint8_t periph_dac_value(const esp32_periph_t *p, int channel);
 
+/* True once firmware has asked for a software reset via RTC_CNTL_OPTIONS0;
+ * reading it clears the request. */
+bool periph_take_reset_request(esp32_periph_t *p);
+
 #endif /* PERIPHERALS_H */

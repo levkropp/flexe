@@ -1652,6 +1652,8 @@ typedef struct {
 } mcpwm_state_t;
 
 struct esp32_periph {
+    /* Set when firmware writes a software-reset bit to RTC_CNTL_OPTIONS0. */
+    bool reset_requested;
     xtensa_mem_t *mem;
 
     /* Three independent ESP32 UART controllers. */
@@ -3073,6 +3075,18 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     }
     uint32_t off = addr - RTC_CNTL_BASE;
+    if (off == 0x000u) {
+        /* RTC_CNTL_OPTIONS0. SW_SYS_RST (bit 31) and SW_PROCPU_RST (bit 5)
+         * are how firmware reboots itself: esp_restart_noos() sets one and
+         * then spins in a `while (1)` waiting for the reset to take. This
+         * register had no case here at all, so the request was discarded and
+         * the guest span in that loop for ever. SW_APPCPU_RST (bit 4) is
+         * routine -- the PRO CPU uses it to start the APP CPU -- so it is not
+         * a reboot on its own. */
+        if (val & ((1u << 31) | (1u << 5)))
+            p->reset_requested = true;
+        return;
+    }
     switch (off) {
     case 0x068u:
         p->rtc_cpu_period_conf = val & RTC_CPU_PERIOD_CONF_MASK;
@@ -13171,6 +13185,13 @@ bool periph_interrupt_pending(const esp32_periph_t *p, int source) {
     if (!p || source < 0 || source >= 71) return false;
     return (p->pending_sources[source / 32] &
             (1u << (source % 32))) != 0;
+}
+
+bool periph_take_reset_request(esp32_periph_t *p)
+{
+    if (!p || !p->reset_requested) return false;
+    p->reset_requested = false;
+    return true;
 }
 
 int periph_unhandled_count(const esp32_periph_t *p) {

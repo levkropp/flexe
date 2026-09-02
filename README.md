@@ -214,6 +214,18 @@ ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
 
+Firmware that reboots itself now actually reboots. `RTC_CNTL_OPTIONS0` had no
+handler at all, so the `SW_PROCPU_RST` write that `esp_restart_noos()` makes
+was discarded and the guest span forever in the `while (1)` that follows it.
+NerdMiner hits this every run: WiFiManager reboots after saving credentials,
+so the firmware never got as far as creating its mining tasks — no display
+updates, no DNS, no sockets, for reasons that looked nothing like a missing
+reset. A reset now tears down and rebuilds every subsystem, because a fresh
+boot must see a cold machine; only the memory object survives, so flash — and
+with it NVS and SPIFFS — persists exactly as across a real reboot, which is
+the entire reason firmware reboots itself. With that, NerdMiner reaches its
+network startup and begins trying NTP and its pool API.
+
 The stock-ROM scenario now provisions NerdMiner through its captive portal's
 own `/wifisave` form and then keeps the firmware running for several more
 seconds, checking it is still alive. Both were needed to find a crash that had

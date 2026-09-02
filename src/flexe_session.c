@@ -53,6 +53,14 @@ struct flexe_session {
     void              *touch_ctx;
     int                touch_irq_pin;
     int                touch_irq_level;
+    /* Everything needed to rebuild the machine on a software reset. The
+     * caller owns the strings in here and must outlive the session, which is
+     * already true of every frontend. */
+    flexe_session_config_t cfg;
+    char               bin_path[512];
+    uint32_t           entry_point;
+    uint32_t           initial_sp;
+    unsigned           resets;
 };
 
 /* Let the esp_timer delay()/usleep() shims block on the FreeRTOS scheduler
@@ -62,44 +70,17 @@ static bool session_sleep_us(void *ctx, xtensa_cpu_t *cpu, uint64_t us)
     return freertos_stubs_sleep_us((freertos_stubs_t *)ctx, cpu, us);
 }
 
-flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
+/* Build every emulated subsystem on top of an already-created memory.
+ * Shared by session creation and by the software-reset path, which has to
+ * produce a machine indistinguishable from a cold boot. */
+static int session_build(flexe_session_t *s)
 {
-    if (!cfg || !cfg->bin_path) return NULL;
-
-    flexe_session_t *s = calloc(1, sizeof(*s));
-    if (!s) return NULL;
-    s->single_core = cfg->single_core;
-    s->native_freertos = cfg->native_freertos;
-    s->touch_fn = cfg->touch_fn;
-    s->touch_ctx = cfg->touch_ctx;
-    s->touch_irq_pin = cfg->spi_touch_irq_pin ? cfg->spi_touch_irq_pin : 36;
-    s->touch_irq_level = 1;
-
-    /* Load ELF symbols */
-    if (cfg->elf_path) {
-        s->syms = elf_symbols_load(cfg->elf_path);
-        if (s->syms)
-            fprintf(stderr, "Loaded %d symbols from %s\n",
-                    elf_symbols_count(s->syms), cfg->elf_path);
-        else
-            fprintf(stderr, "Warning: failed to load symbols from %s\n",
-                    cfg->elf_path);
-    }
-
-    /* Create memory */
-    s->mem = mem_create();
-    if (!s->mem) {
-        fprintf(stderr, "flexe: failed to allocate memory\n");
-        flexe_session_destroy(s);
-        return NULL;
-    }
-
+    const flexe_session_config_t *cfg = &s->cfg;
     /* Create peripherals */
     s->periph = periph_create(s->mem);
     if (!s->periph) {
         fprintf(stderr, "flexe: failed to create peripherals\n");
-        flexe_session_destroy(s);
-        return NULL;
+        return -1;
     }
     if (cfg->uart_cb)
         periph_set_uart_callback(s->periph, cfg->uart_cb, cfg->uart_ctx);
@@ -110,8 +91,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     load_result_t res = loader_load_bin(s->mem, cfg->bin_path);
     if (res.result != 0) {
         fprintf(stderr, "flexe: load error: %s\n", res.error);
-        flexe_session_destroy(s);
-        return NULL;
+        return -1;
     }
     fprintf(stderr, "Loaded %s: %d segments, entry=0x%08X\n",
             cfg->bin_path, res.segment_count, res.entry_point);
@@ -133,8 +113,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     s->rom = rom_stubs_create(&s->cpu[0]);
     if (!s->rom) {
         fprintf(stderr, "flexe: failed to create ROM stubs\n");
-        flexe_session_destroy(s);
-        return NULL;
+        return -1;
     }
     rom_stubs_set_single_core(s->rom, cfg->single_core);
     rom_stubs_set_native_freertos(s->rom, cfg->native_freertos);
@@ -335,6 +314,49 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
         }
     }
 
+    return 0;
+}
+
+flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
+{
+    if (!cfg || !cfg->bin_path) return NULL;
+
+    flexe_session_t *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->single_core = cfg->single_core;
+    s->native_freertos = cfg->native_freertos;
+    s->touch_fn = cfg->touch_fn;
+    s->touch_ctx = cfg->touch_ctx;
+    s->touch_irq_pin = cfg->spi_touch_irq_pin ? cfg->spi_touch_irq_pin : 36;
+    s->touch_irq_level = 1;
+
+    /* Load ELF symbols */
+    if (cfg->elf_path) {
+        s->syms = elf_symbols_load(cfg->elf_path);
+        if (s->syms)
+            fprintf(stderr, "Loaded %d symbols from %s\n",
+                    elf_symbols_count(s->syms), cfg->elf_path);
+        else
+            fprintf(stderr, "Warning: failed to load symbols from %s\n",
+                    cfg->elf_path);
+    }
+
+    /* Create memory */
+    s->mem = mem_create();
+    if (!s->mem) {
+        fprintf(stderr, "flexe: failed to allocate memory\n");
+        flexe_session_destroy(s);
+        return NULL;
+    }
+
+    s->cfg = *cfg;
+    snprintf(s->bin_path, sizeof(s->bin_path), "%s", cfg->bin_path);
+    s->cfg.bin_path = s->bin_path;
+    if (session_build(s) != 0) {
+        flexe_session_destroy(s);
+        return NULL;
+    }
+
     return s;
 }
 
@@ -362,6 +384,64 @@ void flexe_session_destroy(flexe_session_t *s)
     mem_destroy(s->mem);
     elf_symbols_destroy(s->syms);
     free(s);
+}
+
+
+/* Software reset: rebuild the machine as a reboot would.
+ *
+ * Firmware reboots itself by writing SW_PROCPU_RST to RTC_CNTL_OPTIONS0 and
+ * spinning in a `while (1)` until the reset takes. Flexe used to discard that
+ * write, so the guest span in that loop forever -- on NerdMiner, after
+ * WiFiManager saves credentials, which is why it never got as far as creating
+ * its mining tasks.
+ *
+ * Every subsystem is torn down and rebuilt, because a fresh boot must see a
+ * cold machine: half-reset state (peripheral registers mid-transaction, open
+ * sockets, a scheduler mid-switch) makes the firmware crash on the way back
+ * up. One thing survives, deliberately: the memory object -- so flash, and
+ * with it NVS and SPIFFS, persists exactly as across a real reboot, which is
+ * the entire reason firmware reboots itself.
+ */
+void flexe_session_reset(flexe_session_t *s)
+{
+    if (!s) return;
+    uint64_t cycles = s->cpu[0].cycle_count;
+    uint32_t *predecode = s->cpu[0].predecode;
+
+    bt_stubs_destroy(s->bstubs);      s->bstubs = NULL;
+    vfs_stubs_destroy(s->vstubs);     s->vstubs = NULL;
+    wifi_stubs_destroy(s->wstubs);    s->wstubs = NULL;
+    mpi_stubs_destroy(s->mstubs);     s->mstubs = NULL;
+    aes_stubs_destroy(s->astubs);     s->astubs = NULL;
+    sha_stubs_destroy(s->shstubs);    s->shstubs = NULL;
+    sdcard_stubs_destroy(s->sstubs);  s->sstubs = NULL;
+    touch_stubs_destroy(s->tstubs);   s->tstubs = NULL;
+    display_stubs_destroy(s->dstubs); s->dstubs = NULL;
+    esp_timer_stubs_destroy(s->etimer); s->etimer = NULL;
+    freertos_stubs_destroy(s->frt);   s->frt = NULL;
+    rom_stubs_destroy(s->rom);        s->rom = NULL;
+    periph_destroy(s->periph);        s->periph = NULL;
+
+    /* session_build() allocates its own predecode table. */
+    s->cpu[0].predecode = NULL;
+    s->cpu[1].predecode = NULL;
+    free(predecode);
+
+    /* session_build() creates the JIT and installs its hook on both cores,
+     * so the old one has to go: keeping it leaves the CPUs hooked to a JIT
+     * the session no longer points at, which runs but is ruinously slow. */
+    jit_destroy(s->jit);
+    s->jit = NULL;
+    if (session_build(s) != 0) {
+        fprintf(stderr, "[reset] rebuild failed; halting\n");
+        s->cpu[0].running = false;
+        s->cpu[1].running = false;
+        return;
+    }
+    /* Keep the clock monotonic: emulator budgets and harness deadlines are
+     * all measured against it, and a reboot does not rewind wall time here. */
+    s->cpu[0].cycle_count = cycles;
+    s->cpu[1].cycle_count = cycles;
 }
 
 /* ===== Accessors ===== */
@@ -521,6 +601,14 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
      * this, periodic timers registered via esp_timer_start_periodic would
      * never fire during normal instruction execution — only when firmware
      * explicitly calls usleep/delay. */
+    if (periph_take_reset_request(s->periph)) {
+        s->resets++;
+        fprintf(stderr, "[reset] firmware requested a software reset (#%u)\n",
+                s->resets);
+        flexe_session_reset(s);
+        return;
+    }
+
     esp_timer_stubs_tick(s->etimer);
     /* Same for FreeRTOS software timers, which Flexe models directly rather
      * than running the guest's timer daemon. */

@@ -42,7 +42,7 @@
 /* Extra cycles run after the scripted steps, to catch a firmware that passes
  * every check and then panics. Sized to cover the observed failure at roughly
  * 2.8 billion cycles from reset. */
-#define SOAK_CYCLES 3600000000ull
+#define SOAK_CYCLES 6000000000ull
 
 /* Verified production CYD state for both v1.14 link layouts.  The release
  * series retained one image entry point while v1.14.2 shifted DRAM by 16
