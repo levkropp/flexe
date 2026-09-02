@@ -10,6 +10,7 @@
 #include "flexe_session.h"
 #include "jit.h"
 #include "spi_display.h"
+#include "guest_call.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -998,6 +999,8 @@ int main(int argc, char **argv)
     pthread_mutex_t framebuffer_mutex;
     pthread_mutex_init(&framebuffer_mutex, NULL);
     touch_state_t touch = {0, 50, 139};
+    static struct { uint32_t sp; char name[20]; unsigned long hits; } seen[24];
+    static int nseen;
     uart_state_t uart = {0};
     uint64_t provisioned_connects = 0;
     uint64_t provisioned_events = 0;
@@ -1849,9 +1852,46 @@ int main(int argc, char **argv)
     {
         uint64_t soak_target = flexe_session_cpu(session, 0)->cycle_count
                              + SOAK_CYCLES;
+        /* Name the running task on each core by calling the guest's own
+         * pcTaskGetName(NULL). A symbol-less ROM running its own FreeRTOS
+         * exposes no task list to read, and stack addresses alone are
+         * anonymous -- but one call per sample turns them into names, which
+         * is what distinguishes a blocked task from one that was never
+         * created. Pass the address for the ROM in question, e.g.
+         * FLEXE_TASK_NAMES=0x40096648 for NerdMiner v1.8.3. */
+        const char *tn = getenv("FLEXE_TASK_NAMES");
+        uint32_t name_fn = tn ? (uint32_t)strtoul(tn, NULL, 0) : 0;
         while (flexe_session_cpu(session, 0)->cycle_count < soak_target) {
             if (flexe_session_run_core(session, 0, 100000) < 0) break;
             flexe_session_post_batch(session, 100000);
+            if (name_fn) {
+                for (int c = 0; c < 2; c++) {
+                    xtensa_cpu_t *cc3 = flexe_session_cpu(session, c);
+                    uint32_t sp = cc3->ar[(cc3->windowbase * 4 + 1) & 63]
+                                  & ~0xFFFu;
+                    uint32_t ret = 0;
+                    if (guest_call8(cc3, name_fn, NULL, 0, 200000u, &ret) != 0
+                        || ret == 0)
+                        continue;
+                    char nm[20]; nm[0] = 0;
+                    for (int k = 0; k < 19; k++) {
+                        uint8_t ch = mem_read8(flexe_session_mem(session), ret + (uint32_t)k);
+                        nm[k] = (char)ch; nm[k + 1] = 0;
+                        if (!ch) break;
+                    }
+                    int f = -1;
+                    for (int q = 0; q < nseen; q++)
+                        if (seen[q].sp == sp && strcmp(seen[q].name, nm) == 0)
+                            f = q;
+                    if (f < 0 && nseen < 24) {
+                        f = nseen++;
+                        seen[f].sp = sp;
+                        snprintf(seen[f].name, sizeof(seen[f].name), "%s", nm);
+                        seen[f].hits = 0;
+                    }
+                    if (f >= 0) seen[f].hits++;
+                }
+            }
         }
     }
     if (uart.panic >= 0) {
@@ -1891,6 +1931,12 @@ int main(int argc, char **argv)
      * framebuffer changing is busy but not progressing -- which is a
      * different failure from one that is simply idle, and the two are easy to
      * confuse from a single end-of-run PC sample. */
+    if (getenv("FLEXE_TASK_NAMES")) {
+        for (int q = 0; q < nseen; q++)
+            fprintf(stderr, "[task] sp=0x%08X %-16s %lu samples\n",
+                    seen[q].sp, seen[q].name, seen[q].hits);
+    }
+
     if (getenv("FLEXE_SOAK_STATS")) {
         fprintf(stderr, "[soak] fb_before=%08X fb_after=%08X display_bytes=%llu\n",
                 fb_sum, framebuffer_checksum(framebuf, &framebuffer_mutex),
