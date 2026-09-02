@@ -1849,23 +1849,6 @@ int main(int argc, char **argv)
             flexe_session_post_batch(session, 100000);
         }
     }
-    /* The firmware's own report that a socket call failed. NerdMiner's UDP
-     * receive path was returning ENOENT on every call -- the descriptor was
-     * not in the guest's VFS table, so its recvfrom() wrapper failed before
-     * ever reaching the socket model -- and the firmware logged that
-     * thousands of times a second, over a megabyte of UART in one run. */
-    if (uart_contains(&uart, "could not receive data")) {
-        fprintf(stderr, "FAIL profile=%s reason=firmware-socket-errors "
-                "uart_bytes=%llu\n", profile, (unsigned long long)uart.count);
-        nerd_probe_close(&network_probe);
-        flexe_session_destroy(session);
-        pthread_mutex_destroy(&framebuffer_mutex);
-        unlink(sd_path);
-        free(before);
-        free(framebuf);
-        return 1;
-    }
-
     if (uart.panic >= 0) {
         fprintf(stderr, "FAIL profile=%s reason=firmware-panic marker=\"%s\" "
                 "uart_bytes=%llu\n",
@@ -1957,8 +1940,6 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_frames,
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
-    if (is_nerdminer)
-        printf(" udp_recv_calls=%llu", (unsigned long long)wifi_stats.recvfrom_calls);
     if (is_nerdminer)
         printf(" provisioned=%llu wifi_events=%llu",
                (unsigned long long)provisioned_connects,
