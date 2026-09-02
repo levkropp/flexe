@@ -35,6 +35,68 @@ static uint32_t frt_call_stub(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+TEST(test_event_group_bits) {
+    /* The non-blocking half. It is worth pinning separately because it kept
+     * working while every blocking wait hung, which is what made the gap easy
+     * to miss: xEventGroupGetBits() is a macro for xEventGroupClearBits(g, 0),
+     * so "reading the bits" exercised nothing but the clear path. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    extern void stub_xEventGroupCreate(xtensa_cpu_t *, void *);
+    extern void stub_xEventGroupSetBits(xtensa_cpu_t *, void *);
+    extern void stub_xEventGroupClearBits(xtensa_cpu_t *, void *);
+    extern void stub_xEventGroupWaitBits(xtensa_cpu_t *, void *);
+    extern void stub_vEventGroupDelete(xtensa_cpu_t *, void *);
+    uint32_t a_new = 0x400D0000, a_set = 0x400D0010, a_clr = 0x400D0020;
+    uint32_t a_wait = 0x400D0030, a_del = 0x400D0040;
+    rom_stubs_register_ctx(rom, a_new, (rom_stub_fn)stub_xEventGroupCreate, "xEventGroupCreate", frt);
+    rom_stubs_register_ctx(rom, a_set, (rom_stub_fn)stub_xEventGroupSetBits, "xEventGroupSetBits", frt);
+    rom_stubs_register_ctx(rom, a_clr, (rom_stub_fn)stub_xEventGroupClearBits, "xEventGroupClearBits", frt);
+    rom_stubs_register_ctx(rom, a_wait, (rom_stub_fn)stub_xEventGroupWaitBits, "xEventGroupWaitBits", frt);
+    rom_stubs_register_ctx(rom, a_del, (rom_stub_fn)stub_vEventGroupDelete, "vEventGroupDelete", frt);
+
+    uint32_t g = frt_call_stub(&cpu, a_new, NULL, 0);
+    ASSERT_TRUE(g != 0);
+
+    /* Get is clear-nothing, and returns the bits before the clear. */
+    uint32_t get[2] = { g, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_clr, get, 2), 0u);
+
+    uint32_t set[2] = { g, 0x5u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_set, set, 2), 0x5u);  /* bits after set */
+    ASSERT_EQ(frt_call_stub(&cpu, a_clr, get, 2), 0x5u);
+
+    uint32_t clr[2] = { g, 0x4u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_clr, clr, 2), 0x5u);  /* bits *before* */
+    ASSERT_EQ(frt_call_stub(&cpu, a_clr, get, 2), 0x1u);
+
+    /* A satisfied wait returns without blocking, and honours clear-on-exit. */
+    uint32_t wait[5] = { g, 0x1u, 1u /* clear */, 0u /* any */, 100u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_wait, wait, 5), 0x1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_clr, get, 2), 0x0u);
+
+    /* Wait-for-all must not match on a partial set. With no scheduler running
+     * there is nothing to block on, so it returns the current bits. */
+    uint32_t set_a[2] = { g, 0x1u };
+    (void)frt_call_stub(&cpu, a_set, set_a, 2);
+    uint32_t wait_all[5] = { g, 0x3u, 0u, 1u /* all */, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_wait, wait_all, 5), 0x1u);
+    uint32_t set_b[2] = { g, 0x2u };
+    (void)frt_call_stub(&cpu, a_set, set_b, 2);
+    ASSERT_EQ(frt_call_stub(&cpu, a_wait, wait_all, 5), 0x3u);
+
+    /* A deleted group stops resolving rather than aliasing a reused slot. */
+    uint32_t one[1] = { g };
+    (void)frt_call_stub(&cpu, a_del, one, 1);
+    ASSERT_EQ(frt_call_stub(&cpu, a_set, set, 2), 0u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_wait, wait, 5), 0u);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_software_timer_commands) {
     /* xTimerStart/Stop/Reset/ChangePeriod/Delete are all macros over
      * xTimerGenericCommand, so the command dispatch is the whole API. */
@@ -962,6 +1024,7 @@ TEST(test_vPortFree_noop) {
 
 static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
+    RUN_TEST(test_event_group_bits);
     RUN_TEST(test_software_timer_commands);
     RUN_TEST(test_guest_clock_sums_executed_and_skipped_time);
     RUN_TEST(test_vTaskDelay_advances_ccount);

@@ -225,6 +225,11 @@ if(UNIX)
     target_compile_options(flexe-gpio-isr-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-event-group-test tools/event_group_test.c)
+    target_link_libraries(flexe-event-group-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-event-group-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-frt-timer-test tools/frt_timer_test.c)
     target_link_libraries(flexe-frt-timer-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-frt-timer-test PRIVATE

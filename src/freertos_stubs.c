@@ -19,6 +19,13 @@
 #define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
 #define FLEXE_FREERTOS_HZ           1000u
 
+/* Event group storage. Like the software timers, these cannot be left to the
+ * guest's own implementation: it blocks waiters by threading them onto
+ * FreeRTOS's unordered event lists, which Flexe's scheduler does not read, so
+ * every blocking wait hangs forever. The non-blocking half (set, clear, get)
+ * works either way, which is what makes the breakage easy to miss. */
+#define MAX_EVENT_GROUPS 16
+
 /* Software timer storage. FreeRTOS's own timer module cannot be used here:
  * its daemon blocks on the command queue through vQueueWaitForMessageRestricted,
  * which reaches into the real queue structure, while every queue API the guest
@@ -62,6 +69,12 @@ typedef struct {
 } queue_t;
 
 typedef struct {
+    uint32_t handle;         /* address returned as the EventGroupHandle_t */
+    uint32_t bits;
+    bool     used;
+} event_group_t;
+
+typedef struct {
     uint32_t handle;         /* address returned as the TimerHandle_t */
     uint32_t callback_addr;
     uint32_t id;             /* pvTimerGetTimerID / vTimerSetTimerID */
@@ -81,7 +94,8 @@ typedef enum {
     TASK_RUNNING,
     TASK_SLEEPING,
     TASK_BLOCKED_QUEUE,
-    TASK_BLOCKED_NOTIFY
+    TASK_BLOCKED_NOTIFY,
+    TASK_BLOCKED_EVENTGROUP
 } task_state_t;
 
 #define FRT_NOTIFY_SLOTS 4u
@@ -105,6 +119,14 @@ typedef struct {
      * recomputed after frt_return() has zeroed it. */
     uint8_t      ret_ar_slot;
     uint32_t     blocked_queue;  /* queue handle for BLOCKED_QUEUE */
+    /* Event group wait, mirroring the notification fields below: eg_waiting
+     * stays true across both the indefinite and the timed block, so a setter
+     * can wake the task whichever state it is parked in. */
+    uint32_t     eg_handle;
+    uint32_t     eg_bits;        /* bits waited for */
+    bool         eg_waiting;
+    bool         eg_clear_on_exit;
+    bool         eg_wait_all;
     uint32_t     notify_value[FRT_NOTIFY_SLOTS];
     uint8_t      notify_wait_index;
     bool         notify_waiting;
@@ -145,6 +167,10 @@ struct freertos_stubs {
     /* Software timer storage */
     sw_timer_t sw_timers[MAX_SW_TIMERS];
     int        sw_timer_count;
+
+    /* Event group storage */
+    event_group_t event_groups[MAX_EVENT_GROUPS];
+    int           event_group_count;
 
     /* Deferred task: saved by xTaskCreatePinnedToCore for later execution */
     uint32_t deferred_task_fn;
@@ -237,8 +263,8 @@ static void frt_return_void(xtensa_cpu_t *cpu) {
  * hazard rather than a tidiness point: it starts at the 160 MHz default and
  * is only updated when some other stub happens to refresh it, so a timeout
  * computed before that -- which for a firmware whose first blocking call is a
- * queue or notification wait is the very first one -- comes out a third short
- * at 240 MHz. Measured: a 120 ms wait that expired after 80 ms.
+ * queue, notification or event-group wait is the very first one -- comes out
+ * a third short at 240 MHz. Measured: a 120 ms wait that expired after 80 ms.
  */
 static uint64_t frt_ticks_to_cycles(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
                                     uint32_t ticks) {
@@ -332,6 +358,8 @@ static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
     cpu->lcount = t->lcount;
 }
 
+static uint32_t eg_current_bits(freertos_stubs_t *frt, uint32_t handle);
+
 /* Wake any SLEEPING tasks whose wake_cycle has been reached.
  * Returns the nearest wake time if all tasks are sleeping, or 0. */
 static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
@@ -342,6 +370,13 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
         if (t->state == TASK_SLEEPING) {
             if (now >= t->wake_cycle) {
                 t->notify_waiting = false;
+                if (t->eg_waiting) {
+                    /* A timed-out xEventGroupWaitBits() returns the bits as
+                     * they stand at the timeout, not as they stood when the
+                     * wait began. */
+                    t->ar[t->ret_ar_slot] = eg_current_bits(frt, t->eg_handle);
+                    t->eg_waiting = false;
+                }
                 t->state = TASK_READY;
             } else if (t->wake_cycle < nearest) {
                 nearest = t->wake_cycle;
@@ -771,6 +806,229 @@ void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
         frt_return_void(cpu);
     }
     pthread_mutex_unlock(&frt->lock);
+}
+
+/* ===== Event groups ===== */
+
+static event_group_t *find_event_group(freertos_stubs_t *frt, uint32_t handle) {
+    for (int i = 0; i < frt->event_group_count; i++)
+        if (frt->event_groups[i].used && frt->event_groups[i].handle == handle)
+            return &frt->event_groups[i];
+    return NULL;
+}
+
+static uint32_t eg_current_bits(freertos_stubs_t *frt, uint32_t handle) {
+    event_group_t *g = find_event_group(frt, handle);
+    return g ? g->bits : 0u;
+}
+
+static bool eg_condition_met(uint32_t bits, uint32_t wanted, bool wait_all) {
+    if (wanted == 0u) return true;
+    return wait_all ? ((bits & wanted) == wanted) : ((bits & wanted) != 0u);
+}
+
+/* Wake every task whose wait is satisfied by the group's current bits.
+ * Called with frt->lock held. Each woken task takes its result from the bits
+ * as they stood when its condition was met, before any clear-on-exit, which
+ * is what FreeRTOS reports. */
+static void eg_wake_waiters_locked(freertos_stubs_t *frt, event_group_t *g) {
+    if (!frt->scheduler_started) return;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->eg_waiting || t->eg_handle != g->handle) continue;
+        if (!eg_condition_met(g->bits, t->eg_bits, t->eg_wait_all)) continue;
+
+        t->ar[t->ret_ar_slot] = g->bits;
+        if (t->eg_clear_on_exit)
+            g->bits &= ~t->eg_bits;
+        t->eg_waiting = false;
+
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
+    }
+}
+
+void stub_xEventGroupCreate(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = NULL;
+    for (int i = 0; i < frt->event_group_count; i++)
+        if (!frt->event_groups[i].used) { g = &frt->event_groups[i]; break; }
+    if (!g) {
+        if (frt->event_group_count >= MAX_EVENT_GROUPS) {
+            pthread_mutex_unlock(&frt->lock);
+            frt_return(cpu, 0);
+            return;
+        }
+        g = &frt->event_groups[frt->event_group_count++];
+    }
+    uint32_t handle = bump_alloc(frt, 4);
+    if (handle == 0) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0);
+        return;
+    }
+    g->used = true;
+    g->handle = handle;
+    g->bits = 0;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* xEventGroupSetBits(group, bits) -> bits after the call. */
+static uint32_t eg_set_bits(freertos_stubs_t *frt, uint32_t handle,
+                            uint32_t bits) {
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, handle);
+    if (!g) { pthread_mutex_unlock(&frt->lock); return 0; }
+    g->bits |= bits;
+    eg_wake_waiters_locked(frt, g);
+    uint32_t result = g->bits;
+    pthread_mutex_unlock(&frt->lock);
+    return result;
+}
+
+void stub_xEventGroupSetBits(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    frt_return(cpu, eg_set_bits(frt, frt_arg(cpu, 0), frt_arg(cpu, 1)));
+}
+
+/* xEventGroupSetBitsFromISR(group, bits, pxHigherPriorityTaskWoken) */
+void stub_xEventGroupSetBitsFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t woken_ptr = frt_arg(cpu, 2);
+    (void)eg_set_bits(frt, frt_arg(cpu, 0), frt_arg(cpu, 1));
+    if (woken_ptr) mem_write32(cpu->mem, woken_ptr, pdFALSE);
+    frt_return(cpu, pdPASS);
+}
+
+/* xEventGroupClearBits(group, bits) -> bits *before* the clear. This is also
+ * xEventGroupGetBits(), which is a macro for clearing nothing. */
+void stub_xEventGroupClearBits(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0), bits = frt_arg(cpu, 1);
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, handle);
+    uint32_t before = g ? g->bits : 0u;
+    if (g) g->bits &= ~bits;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, before);
+}
+
+/* xEventGroupClearBitsFromISR(group, bits) -> pdPASS, unlike the task
+ * version, which returns the bits. */
+void stub_xEventGroupClearBitsFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, frt_arg(cpu, 0));
+    if (g) g->bits &= ~frt_arg(cpu, 1);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdPASS);
+}
+
+void stub_xEventGroupGetBitsFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t bits = eg_current_bits(frt, frt_arg(cpu, 0));
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, bits);
+}
+
+void stub_vEventGroupDelete(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, frt_arg(cpu, 0));
+    if (g) {
+        /* Waiters on a deleted group are released with the bits they can
+         * still see, rather than being left blocked forever. */
+        g->bits = 0;
+        for (int i = 0; i < frt->task_count; i++) {
+            task_tcb_t *t = &frt->tasks[i];
+            if (!t->eg_waiting || t->eg_handle != g->handle) continue;
+            t->ar[t->ret_ar_slot] = 0u;
+            t->eg_waiting = false;
+            t->state = TASK_READY;
+        }
+        g->used = false;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return_void(cpu);
+}
+
+/* Shared body of xEventGroupWaitBits() and xEventGroupSync(). */
+static void eg_wait(xtensa_cpu_t *cpu, freertos_stubs_t *frt, uint32_t handle,
+                    uint32_t wait_bits, bool clear_on_exit, bool wait_all,
+                    uint32_t timeout) {
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, handle);
+    if (!g) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0);
+        return;
+    }
+    if (eg_condition_met(g->bits, wait_bits, wait_all)) {
+        uint32_t result = g->bits;
+        if (clear_on_exit) g->bits &= ~wait_bits;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, result);
+        return;
+    }
+    if (timeout == 0u || !frt->scheduler_started ||
+        frt->current_task[core_id] < 0) {
+        uint32_t result = g->bits;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, result);
+        return;
+    }
+
+    /* Block. The return register is patched at wake time -- by the setter, or
+     * by sched_wake_sleepers on timeout -- so record which slot it is before
+     * frt_return() zeroes CALLINC. */
+    task_tcb_t *task = &frt->tasks[frt->current_task[core_id]];
+    task->ret_ar_slot = frt_return_slot(cpu);
+    frt_return(cpu, g->bits);
+    sched_save_context(frt, core_id);
+    task->eg_handle = handle;
+    task->eg_bits = wait_bits;
+    task->eg_clear_on_exit = clear_on_exit;
+    task->eg_wait_all = wait_all;
+    task->eg_waiting = true;
+    if (timeout == UINT32_MAX) {
+        task->state = TASK_BLOCKED_EVENTGROUP;
+    } else {
+        uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+        if (advance > 200000000ULL) advance = 200000000ULL;
+        task->state = TASK_SLEEPING;
+        task->wake_cycle = cpu->cycle_count + advance;
+    }
+    sched_switch(frt, core_id);
+    pthread_mutex_unlock(&frt->lock);
+}
+
+/* xEventGroupWaitBits(group, bits, clear_on_exit, wait_for_all, ticks) */
+void stub_xEventGroupWaitBits(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    eg_wait(cpu, frt, frt_arg(cpu, 0), frt_arg(cpu, 1),
+            frt_arg(cpu, 2) != 0, frt_arg(cpu, 3) != 0, frt_arg(cpu, 4));
+}
+
+/* xEventGroupSync(group, bits_to_set, bits_to_wait_for, ticks): set, then
+ * wait for all, clearing on exit. */
+void stub_xEventGroupSync(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    (void)eg_set_bits(frt, handle, frt_arg(cpu, 1));
+    eg_wait(cpu, frt, handle, frt_arg(cpu, 2), true, true, frt_arg(cpu, 3));
 }
 
 /* ===== Software timers ===== */
@@ -1637,6 +1895,7 @@ static void stub_uxTaskGetSystemState(xtensa_cpu_t *cpu, void *ctx) {
             case TASK_READY:         estate = 1; break;
             case TASK_BLOCKED_QUEUE: estate = 2; break;
             case TASK_BLOCKED_NOTIFY: estate = 2; break;
+            case TASK_BLOCKED_EVENTGROUP: estate = 2; break;
             case TASK_SLEEPING:      estate = 2; break;
             case TASK_UNUSED:        estate = 4; break;
             default:                 estate = 1; break;
@@ -2048,6 +2307,16 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xTaskCreatePinnedToCore",       stub_xTaskCreatePinnedToCore },
         { "vTaskDelete",                   stub_vTaskDelete },
         { "xTaskGetTickCount",             stub_xTaskGetTickCount },
+        { "xEventGroupCreate",             stub_xEventGroupCreate },
+        { "xEventGroupCreateStatic",       stub_xEventGroupCreate },
+        { "xEventGroupWaitBits",           stub_xEventGroupWaitBits },
+        { "xEventGroupSetBits",            stub_xEventGroupSetBits },
+        { "xEventGroupSetBitsFromISR",     stub_xEventGroupSetBitsFromISR },
+        { "xEventGroupClearBits",          stub_xEventGroupClearBits },
+        { "xEventGroupClearBitsFromISR",   stub_xEventGroupClearBitsFromISR },
+        { "xEventGroupGetBitsFromISR",     stub_xEventGroupGetBitsFromISR },
+        { "xEventGroupSync",               stub_xEventGroupSync },
+        { "vEventGroupDelete",             stub_vEventGroupDelete },
         { "xTimerCreate",                  stub_xTimerCreate },
         { "xTimerCreateStatic",            stub_xTimerCreateStatic },
         { "xTimerGenericCommand",          stub_xTimerGenericCommand },
@@ -2241,6 +2510,10 @@ int freertos_stubs_save_state(const freertos_stubs_t *frt, FILE *f) {
     if (fwrite(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
     if (fwrite(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
 
+    /* Save event groups */
+    if (fwrite(&frt->event_group_count, sizeof(frt->event_group_count), 1, f) != 1) return -1;
+    if (fwrite(frt->event_groups, sizeof(frt->event_groups), 1, f) != 1) return -1;
+
     /* Save software timers */
     if (fwrite(&frt->sw_timer_count, sizeof(frt->sw_timer_count), 1, f) != 1) return -1;
     if (fwrite(frt->sw_timers, sizeof(frt->sw_timers), 1, f) != 1) return -1;
@@ -2272,6 +2545,12 @@ int freertos_stubs_restore_state(freertos_stubs_t *frt, FILE *f) {
     /* Restore queue storage */
     if (fread(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
     if (fread(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
+
+    /* Restore event groups */
+    if (fread(&frt->event_group_count, sizeof(frt->event_group_count), 1, f) != 1) return -1;
+    if (fread(frt->event_groups, sizeof(frt->event_groups), 1, f) != 1) return -1;
+    if (frt->event_group_count < 0 || frt->event_group_count > MAX_EVENT_GROUPS)
+        return -1;
 
     /* Restore software timers */
     if (fread(&frt->sw_timer_count, sizeof(frt->sw_timer_count), 1, f) != 1) return -1;

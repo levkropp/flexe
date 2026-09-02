@@ -60,7 +60,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 656 tests
+- 657 tests
 
 ## building
 
@@ -149,7 +149,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 656 tests, 12996 passed, 0 failed
+# 657 tests, 13008 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -158,7 +158,7 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 21 of 21 on x86-64
+The compiled Arduino hardware gates below all pass — 22 of 22 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 One deliberate gap is worth stating rather than leaving to be rediscovered:
@@ -176,6 +176,22 @@ and it did not work: a per-core interrupt source raised its CPU line without
 ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
+
+`test-event-group.sh` covers FreeRTOS event groups, which hung. Like the
+software timers these were not stubbed, so the guest's own implementation ran
+— and it blocks waiters by threading them onto FreeRTOS's unordered event
+lists, which Flexe's scheduler never reads, so the first
+`xEventGroupWaitBits()` that had to actually wait never returned. The
+non-blocking half kept working throughout, which is what made it easy to miss:
+`xEventGroupGetBits()` is a macro for `xEventGroupClearBits(g, 0)`, so reading
+the bits exercised none of the machinery. Event groups are now modelled
+against Flexe's scheduler, blocking and waking like the task notifications
+next to them. This is how the WiFi stack, lwIP and most connect-then-wait
+sketches synchronise. Writing the gate also turned up a separate latent bug:
+`cycles_per_tick` was read without refreshing the CPU frequency, so any
+timeout computed before some other stub happened to refresh it — for many
+firmwares, the very first blocking call — was a third short at 240 MHz. A
+120 ms wait expired after 80 ms.
 
 `test-frt-timer.sh` covers FreeRTOS software timers, which did not work at
 all. Unlike the rest of the FreeRTOS surface these were not stubbed, so the
