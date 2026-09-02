@@ -58,7 +58,9 @@ jobs:
         run: cmake --build build-asan -j"$(nproc)"
       - name: Unit tests
         env:
-          ASAN_OPTIONS: detect_leaks=0
+          # Leak detection is on: the suite is leak-clean, and a test that
+          # forgets to tear down its emulator leaks a whole address space.
+          ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ./build-asan/xtensa-tests
 

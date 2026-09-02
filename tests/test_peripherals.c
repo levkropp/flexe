@@ -5514,6 +5514,7 @@ TEST(excmlevel3_masks_level3) {
     xtensa_step(&cpu);
     /* Level-3 masked by EXCMLEVEL=3: should NOT dispatch */
     ASSERT_EQ(cpu.pc, pc_before + 3);  /* NOP executed, no interrupt */
+    teardown(&cpu);
 }
 
 static void run_peripheral_tests(void) {
