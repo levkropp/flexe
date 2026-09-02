@@ -10,6 +10,7 @@
 #include "flexe_session.h"
 #include "jit.h"
 #include "spi_display.h"
+#include "wifi_stubs.h"
 #include "guest_call.h"
 
 #include <errno.h>
@@ -191,6 +192,74 @@ static void wait_for_no_critical_section(flexe_session_t *session)
         if (flexe_session_run_core(session, 0, 2000) < 0) return;
         flexe_session_post_batch(session, 2000);
     }
+}
+
+
+/* Minimal Stratum endpoint, so NerdMiner has a pool to reach.
+ *
+ * The firmware's own default configuration points at public-pool.io:21496 and
+ * cannot be changed through its portal (that page renders no parameter
+ * fields), so instead of provisioning a different pool the harness answers
+ * the one the firmware already wants: every name resolves to the loopback and
+ * outbound traffic is redirected there. Reaching a `mining.subscribe` is the
+ * end-to-end proof that provisioning, reboot, association, DNS and the
+ * outbound socket path all work together.
+ */
+#define STRATUM_PORT 21496
+
+typedef struct {
+    int  listen_fd;
+    volatile int connected;
+    char first_line[256];
+} stratum_server_t;
+
+static void *stratum_thread(void *arg)
+{
+    stratum_server_t *sv = arg;
+    int fd = accept(sv->listen_fd, NULL, NULL);
+    if (fd < 0) return NULL;
+    sv->connected = 1;
+    size_t n = 0;
+    while (n + 1 < sizeof(sv->first_line)) {
+        ssize_t r = recv(fd, sv->first_line + n, 1, 0);
+        if (r <= 0) break;
+        if (sv->first_line[n] == '\n') break;
+        n++;
+    }
+    sv->first_line[n] = '\0';
+    /* Answer the subscribe so the firmware can carry on rather than retry. */
+    static const char reply[] =
+        "{\"id\":1,\"result\":[[[\"mining.notify\",\"ae6812eb\"]],"
+        "\"08000002\",4],\"error\":null}\n";
+    (void)!write(fd, reply, sizeof(reply) - 1);
+    close(fd);
+    return NULL;
+}
+
+static int stratum_start(stratum_server_t *sv, pthread_t *tid)
+{
+    memset(sv, 0, sizeof(*sv));
+    sv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sv->listen_fd < 0) return -1;
+    int one = 1;
+    setsockopt(sv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(STRATUM_PORT);
+    if (bind(sv->listen_fd, (struct sockaddr *)&a, sizeof(a)) != 0 ||
+        listen(sv->listen_fd, 2) != 0) {
+        close(sv->listen_fd);
+        sv->listen_fd = -1;
+        return -1;
+    }
+    if (pthread_create(tid, NULL, stratum_thread, sv) != 0) {
+        close(sv->listen_fd);
+        sv->listen_fd = -1;
+        return -1;
+    }
+    return 0;
 }
 
 static void uart_count(void *ctx, uint8_t byte)
@@ -1031,6 +1100,26 @@ int main(int argc, char **argv)
         jit_set_verify(flexe_session_jit(session), true);
     /* Optional pre-provisioned station credentials, so a firmware that would
      * otherwise sit in its captive portal can be driven past provisioning. */
+    /* An emulated device has no route to the internet. Resolving every name
+     * to the loopback lets the harness answer the services the firmware
+     * expects; without it an unresolvable name reaches sendto() as a null
+     * address and surfaces as EINVAL far from its cause. */
+    stratum_server_t stratum;
+    pthread_t stratum_tid;
+    int stratum_up = 0;
+    if (session && is_nerdminer) {
+        /* Give the firmware a network it can actually reach: names resolve
+         * to the loopback and outbound traffic is redirected there, where
+         * the harness answers as its pool. */
+        wifi_stubs_set_dns_override(flexe_session_wifi(session),
+                                    htonl(INADDR_LOOPBACK));
+        wifi_stubs_set_sta_credentials(flexe_session_wifi(session),
+                                       "flexe-net", "flexe-secret");
+        stratum_up = stratum_start(&stratum, &stratum_tid) == 0;
+        if (!stratum_up)
+            fprintf(stderr, "warning: could not listen on port %d; the "
+                    "mining check will be skipped\n", STRATUM_PORT);
+    }
     if (session && getenv("FLEXE_WIFI_SSID"))
         wifi_stubs_set_sta_credentials(flexe_session_wifi(session),
                                        getenv("FLEXE_WIFI_SSID"),
@@ -1937,6 +2026,25 @@ int main(int argc, char **argv)
                     seen[q].sp, seen[q].name, seen[q].hits);
     }
 
+    if (is_nerdminer && stratum_up) {
+        shutdown(stratum.listen_fd, SHUT_RDWR);
+        close(stratum.listen_fd);
+        pthread_join(stratum_tid, NULL);
+        if (!stratum.connected ||
+            strstr(stratum.first_line, "mining.subscribe") == NULL) {
+            fprintf(stderr, "FAIL profile=nerdminer reason=no-mining-subscribe "
+                    "connected=%d line=\"%s\"\n",
+                    stratum.connected, stratum.first_line);
+            nerd_probe_close(&network_probe);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+    }
+
     if (getenv("FLEXE_SOAK_STATS")) {
         fprintf(stderr, "[soak] fb_before=%08X fb_after=%08X display_bytes=%llu\n",
                 fb_sum, framebuffer_checksum(framebuf, &framebuffer_mutex),
@@ -1949,6 +2057,10 @@ int main(int argc, char **argv)
                 (unsigned long long)(i1 - soak_insns0),
                 (double)(i1 - soak_insns0) / (double)(c1 - soak_cyc0 + 1));
     }
+
+    if (getenv("FLEXE_DUMP_UART"))
+        fprintf(stderr, "[uart %zu/%llu]\n%s\n[end]\n", uart.log_len,
+                (unsigned long long)uart.count, uart.log);
 
     int unhandled_mmio = periph_unhandled_count(flexe_session_periph(session));
     if (unhandled_mmio != 0) {
@@ -2026,6 +2138,8 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_frames,
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
+    if (is_nerdminer)
+        printf(" stratum=%s", stratum_up ? "subscribed" : "skipped");
     if (is_nerdminer)
         printf(" provisioned=%llu wifi_events=%llu",
                (unsigned long long)provisioned_connects,

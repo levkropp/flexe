@@ -407,6 +407,11 @@ void flexe_session_reset(flexe_session_t *s)
     if (!s) return;
     uint64_t cycles = s->cpu[0].cycle_count;
     uint32_t *predecode = s->cpu[0].predecode;
+    /* Host-supplied network settings are configuration, not machine state:
+     * they describe the world the device is plugged into and must survive a
+     * reboot, or the firmware comes back up unable to reach anything. */
+    wifi_host_config_t netcfg;
+    wifi_stubs_snapshot_host_config(s->wstubs, &netcfg);
 
     bt_stubs_destroy(s->bstubs);      s->bstubs = NULL;
     vfs_stubs_destroy(s->vstubs);     s->vstubs = NULL;
@@ -438,6 +443,8 @@ void flexe_session_reset(flexe_session_t *s)
         s->cpu[1].running = false;
         return;
     }
+    wifi_stubs_apply_host_config(s->wstubs, &netcfg);
+
     /* Keep the clock monotonic: emulator budgets and harness deadlines are
      * all measured against it, and a reboot does not rewind wall time here. */
     s->cpu[0].cycle_count = cycles;

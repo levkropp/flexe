@@ -95,4 +95,23 @@ void wifi_stubs_set_sta_credentials(wifi_stubs_t *ws, const char *ssid,
  * these stubs, so they must not be dispatched from inside one. */
 void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu);
 
+/* Resolve every hostname to this address (network byte order); 0 disables.
+ * An emulated device has no route to the real internet, and an unresolvable
+ * name surfaces as EINVAL from sendto(), far from its cause. */
+void wifi_stubs_set_dns_override(wifi_stubs_t *ws, uint32_t addr_net_order);
+
+/* Host-supplied settings that must outlive a software reset: the firmware
+ * reboots precisely to come back up with what it saved, and the emulated
+ * network it comes back to has to be the same one. */
+typedef struct {
+    char     sta_ssid[33];
+    char     sta_password[65];
+    uint32_t dns_override;
+} wifi_host_config_t;
+
+void wifi_stubs_snapshot_host_config(const wifi_stubs_t *ws,
+                                     wifi_host_config_t *out);
+void wifi_stubs_apply_host_config(wifi_stubs_t *ws,
+                                  const wifi_host_config_t *cfg);
+
 #endif /* WIFI_STUBS_H */

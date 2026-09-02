@@ -188,6 +188,9 @@ struct wifi_stubs {
     bool               wifi_started;
     bool               wifi_inited;
     bool               sta_connected;
+    /* When non-zero, name lookups answer with this address and outbound
+     * traffic is redirected to it, port preserved. */
+    uint32_t           dns_override;
     /* Station credentials the host has pre-provisioned, reported by
      * esp_wifi_get_config() as though saved in NVS. Empty by default. */
     char               sta_ssid[33];
@@ -413,6 +416,22 @@ static void ws_fail(xtensa_cpu_t *cpu, int err)
     ws_return(cpu, (uint32_t)-1);
 }
 
+
+/* Redirect an outbound destination to the local stand-in, keeping the port.
+ *
+ * Overriding name lookups alone is not enough: firmware resolves through
+ * several paths (gethostbyname, getaddrinfo, a cached address in NVS), and
+ * anything that slips through ends up addressed to the real internet, which
+ * an emulated device has no route to -- surfacing as EINVAL from sendto(),
+ * nowhere near its cause. Redirecting at the point of use covers every path.
+ */
+static void ws_redirect_dest(wifi_stubs_t *ws, struct sockaddr_in *sa)
+{
+    if (!ws->dns_override || !sa) return;
+    if (sa->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) return;
+    sa->sin_addr.s_addr = ws->dns_override;
+}
+
 static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -432,6 +451,7 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
     /* Firmware lwIP may use a different sin_family numeric value than the
      * host. Force AF_INET — we always create AF_INET host sockets. */
     sa.sin_family = AF_INET;
+    ws_redirect_dest(ws, &sa);
 
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &sa.sin_addr, ip_str, sizeof(ip_str));
@@ -677,6 +697,7 @@ static void stub_lwip_recv(xtensa_cpu_t *cpu, void *ctx)
  */
 static void stub_lwip_gethostbyname(xtensa_cpu_t *cpu, void *ctx)
 {
+
     wifi_stubs_t *ws = ctx;
     ws->stats.dns_calls++;
     uint32_t name_addr = ws_arg(cpu, 0);
@@ -688,21 +709,33 @@ static void stub_lwip_gethostbyname(xtensa_cpu_t *cpu, void *ctx)
 
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
-    int err = getaddrinfo(hostname, NULL, &hints, &res);
-    if (err != 0 || !res) {
+    /* An emulated device usually has no route to the real internet, and a
+     * name that will not resolve leaves firmware with a null address --
+     * which it then hands to sendto() and gets EINVAL, several layers away
+     * from the actual cause. With an override every name resolves to one
+     * host-side address, so services the firmware expects can be answered
+     * locally. */
+    uint32_t ip_override = ws->dns_override;
+    int err = ip_override ? 0 : getaddrinfo(hostname, NULL, &hints, &res);
+    if (!ip_override && (err != 0 || !res)) {
         wifi_log(ws, "DNS failed for %s: %s\n", hostname,
                 gai_strerror(err));
         ws_return(cpu, 0); /* NULL */
         return;
     }
 
-    struct sockaddr_in *resolved = (struct sockaddr_in *)res->ai_addr;
-    uint32_t ip = resolved->sin_addr.s_addr;
-
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &resolved->sin_addr, ip_str, sizeof(ip_str));
-    wifi_log(ws, "DNS: %s → %s\n", hostname, ip_str);
-    freeaddrinfo(res);
+    uint32_t ip;
+    if (ip_override) {
+        ip = ip_override;
+        wifi_log(ws, "DNS: %s → override\n", hostname);
+    } else {
+        struct sockaddr_in *resolved = (struct sockaddr_in *)res->ai_addr;
+        ip = resolved->sin_addr.s_addr;
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &resolved->sin_addr, ip_str, sizeof(ip_str));
+        wifi_log(ws, "DNS: %s → %s\n", hostname, ip_str);
+        freeaddrinfo(res);
+    }
 
     /* Write struct hostent into scratch area */
     uint32_t base = ws->hostent_buf;
@@ -1165,6 +1198,7 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
         struct sockaddr_in sa;
         read_emu_sockaddr_in(cpu, sa_addr, &sa);
         sa.sin_family = AF_INET;
+        ws_redirect_dest(ws, &sa);
         n = sendto(s->host_fd, tmp, len, MSG_NOSIGNAL,
                    (struct sockaddr *)&sa, sizeof(sa));
     } else {
@@ -1172,6 +1206,18 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
         n = sendto(s->host_fd, tmp, len, MSG_NOSIGNAL, NULL, 0);
     }
     int saved_errno = errno;
+    if (getenv("FLEXE_SENDTO_DEBUG") && n < 0) {
+        static int dn = 0;
+        if (dn++ < 6) {
+            struct sockaddr_in dbg; memset(&dbg, 0, sizeof(dbg));
+            if (sa_addr) read_emu_sockaddr_in(cpu, sa_addr, &dbg);
+            char ip[INET_ADDRSTRLEN] = "-";
+            inet_ntop(AF_INET, &dbg.sin_addr, ip, sizeof(ip));
+            fprintf(stderr, "[sendto] fail errno=%d sa_addr=0x%08X addrlen=%u "
+                    "dst=%s:%d len=%u\n", saved_errno, sa_addr, addrlen, ip,
+                    ntohs(dbg.sin_port), len);
+        }
+    }
     free(tmp);
 
     if (n > 0) {
@@ -2605,6 +2651,28 @@ void wifi_stubs_set_sta_credentials(wifi_stubs_t *ws, const char *ssid,
         strncpy(ws->sta_password, password, sizeof(ws->sta_password) - 1);
         ws->sta_password[sizeof(ws->sta_password) - 1] = '\0';
     }
+}
+
+void wifi_stubs_snapshot_host_config(const wifi_stubs_t *ws,
+                                     wifi_host_config_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!ws) return;
+    snprintf(out->sta_ssid, sizeof(out->sta_ssid), "%s", ws->sta_ssid);
+    snprintf(out->sta_password, sizeof(out->sta_password), "%s",
+             ws->sta_password);
+    out->dns_override = ws->dns_override;
+}
+
+void wifi_stubs_apply_host_config(wifi_stubs_t *ws,
+                                  const wifi_host_config_t *cfg) {
+    if (!ws || !cfg) return;
+    wifi_stubs_set_sta_credentials(ws, cfg->sta_ssid, cfg->sta_password);
+    ws->dns_override = cfg->dns_override;
+}
+
+void wifi_stubs_set_dns_override(wifi_stubs_t *ws, uint32_t addr_net_order) {
+    if (ws) ws->dns_override = addr_net_order;
 }
 
 void wifi_stubs_set_event_log(wifi_stubs_t *ws, bool enabled) {

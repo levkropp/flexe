@@ -223,8 +223,19 @@ updates, no DNS, no sockets, for reasons that looked nothing like a missing
 reset. A reset now tears down and rebuilds every subsystem, because a fresh
 boot must see a cold machine; only the memory object survives, so flash — and
 with it NVS and SPIFFS — persists exactly as across a real reboot, which is
-the entire reason firmware reboots itself. With that, NerdMiner reaches its
-network startup and begins trying NTP and its pool API.
+the entire reason firmware reboots itself. With that, **NerdMiner mines**: it provisions through its portal, reboots,
+associates, syncs time over NTP and opens a Stratum session, and the scenario
+asserts the `mining.subscribe` it sends.
+
+Reaching that needed one more thing. An emulated device has no route to the
+real internet, and NerdMiner's pool is fixed at `public-pool.io:21496` — its
+portal renders no parameter fields, so the pool cannot be provisioned. So
+instead of pointing the firmware somewhere else, the harness answers where it
+already wants to go: `wifi_stubs_set_dns_override()` resolves every name to
+one address *and* redirects outbound traffic there, port preserved. Overriding
+lookups alone is not enough — firmware resolves through several paths, and
+anything that slips through is addressed to the real internet and surfaces as
+`EINVAL` from `sendto()`, nowhere near its cause.
 
 The stock-ROM scenario now provisions NerdMiner through its captive portal's
 own `/wifisave` form and then keeps the firmware running for several more
