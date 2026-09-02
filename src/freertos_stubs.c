@@ -66,6 +66,12 @@ typedef struct {
     int      head;
     int      tail;
     uint8_t  buf[MAX_QUEUE_ITEMS * MAX_ITEM_SIZE];
+    /* Mutex bookkeeping. A recursive mutex is re-entrant for the task that
+     * already holds it, so the owner and depth have to be tracked; a plain
+     * semaphore has neither. */
+    bool     is_mutex;
+    uint32_t mutex_owner;    /* task handle, 0 when free */
+    int      mutex_depth;
 } queue_t;
 
 typedef struct {
@@ -95,7 +101,8 @@ typedef enum {
     TASK_SLEEPING,
     TASK_BLOCKED_QUEUE,
     TASK_BLOCKED_NOTIFY,
-    TASK_BLOCKED_EVENTGROUP
+    TASK_BLOCKED_EVENTGROUP,
+    TASK_SUSPENDED
 } task_state_t;
 
 #define FRT_NOTIFY_SLOTS 4u
@@ -126,6 +133,8 @@ typedef struct {
     bool         q_waiting;
     bool         q_is_semaphore;
     bool         q_peek;         /* xQueuePeek: copy the item, leave it queued */
+    bool         q_is_sender;    /* blocked in a send on a full queue */
+    uint8_t      q_copy_pos;     /* copy position the blocked send asked for */
     /* Event group wait, mirroring the notification fields below: eg_waiting
      * stays true across both the indefinite and the timed block, so a setter
      * can wake the task whichever state it is parked in. */
@@ -381,6 +390,7 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
                     /* The pre-set return value is already pdFALSE, which is
                      * what a receive or take that ran out of time reports. */
                     t->q_waiting = false;
+                    t->q_is_sender = false;
                     t->blocked_queue = 0;
                 }
                 if (t->eg_waiting) {
@@ -1217,6 +1227,60 @@ void freertos_stubs_tick(freertos_stubs_t *frt) {
     }
 }
 
+/* Current tick count, on the same clock stub_xTaskGetTickCount() reports. */
+static uint32_t frt_tick_count(freertos_stubs_t *frt, xtensa_cpu_t *cpu) {
+    frt_refresh_cpu_frequency(frt, cpu);
+    return (uint32_t)(xtensa_guest_time_us(cpu, frt->cpu_freq_mhz) /
+                      (1000000u / FLEXE_FREERTOS_HZ));
+}
+
+/* vTaskDelayUntil(&previous_wake, increment) / xTaskDelayUntil(...).
+ *
+ * This was not hooked, so the guest ran FreeRTOS's own version, which parks
+ * the task on the real delayed-task list and yields -- neither of which
+ * Flexe's scheduler acts on. It returned immediately, every time: a
+ * fixed-rate loop of ten 20 ms periods completed in 0 us and then span at
+ * full speed. Unlike a missing vTaskDelay this does not look like a hang, it
+ * looks like firmware running impossibly fast.
+ *
+ * The deadline is absolute, which is the whole point of the call: the wake
+ * time advances by the increment regardless of how long the body took, so a
+ * loop keeps its rate instead of drifting by its own execution time.
+ */
+static void frt_delay_until(xtensa_cpu_t *cpu, void *ctx, bool returns_status) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t prev_ptr = frt_arg(cpu, 0);
+    uint32_t increment = frt_arg(cpu, 1);
+
+    uint32_t previous = prev_ptr ? mem_read32(cpu->mem, prev_ptr) : 0u;
+    uint32_t target = previous + increment;
+    if (prev_ptr) mem_write32(cpu->mem, prev_ptr, target);
+
+    /* Signed difference, so a tick counter that has wrapped past the target
+     * is recognised as "already due" rather than as a near-infinite wait. */
+    int32_t remaining = (int32_t)(target - frt_tick_count(frt, cpu));
+    if (remaining <= 0) {
+        /* The deadline has already passed: FreeRTOS does not block, and
+         * reports that it did not. */
+        if (returns_status) frt_return(cpu, pdFALSE);
+        else frt_return_void(cpu);
+        return;
+    }
+    if (!frt_block_cycles(frt, cpu,
+                          frt_ticks_to_cycles(frt, cpu, (uint32_t)remaining))) {
+        if (returns_status) frt_return(cpu, pdTRUE);
+        else frt_return_void(cpu);
+    }
+}
+
+void stub_vTaskDelayUntil(xtensa_cpu_t *cpu, void *ctx) {
+    frt_delay_until(cpu, ctx, false);
+}
+
+void stub_xTaskDelayUntil(xtensa_cpu_t *cpu, void *ctx) {
+    frt_delay_until(cpu, ctx, true);
+}
+
 /* xTaskGetTickCount() -> virtual ticks (1 kHz) */
 void stub_xTaskGetTickCount(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
@@ -1286,7 +1350,7 @@ static bool wake_queue_waiter_locked(freertos_stubs_t *frt,
     if (!frt->scheduler_started) return false;
     for (int i = 0; i < frt->task_count; i++) {
         task_tcb_t *t = &frt->tasks[i];
-        if (!t->q_waiting || t->blocked_queue != handle)
+        if (!t->q_waiting || t->q_is_sender || t->blocked_queue != handle)
             continue;
 
         if (!t->q_is_semaphore) {
@@ -1312,6 +1376,15 @@ static bool wake_queue_waiter_locked(freertos_stubs_t *frt,
             }
         }
 
+        if (t->q_is_semaphore) {
+            /* A woken mutex waiter becomes the owner, so a recursive take
+             * from that task re-enters instead of blocking on itself. */
+            queue_t *mq = find_queue(frt, handle);
+            if (mq && mq->is_mutex) {
+                mq->mutex_owner = t->handle;
+                mq->mutex_depth = 1;
+            }
+        }
         t->ar[t->ret_ar_slot] = pdTRUE;
         t->q_waiting = false;
         t->blocked_queue = 0;
@@ -1394,6 +1467,64 @@ void stub_xQueuePeekFromISR(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, got ? pdTRUE : pdFALSE);
 }
 
+/* Copy one item into the queue. Shared by stub_queue_send() and by the wake
+ * path, which has to complete a blocked send on the sender's behalf. */
+static void queue_enqueue_locked(xtensa_mem_t *mem, queue_t *q,
+                                 uint32_t item_ptr, uint32_t copy_position,
+                                 bool overwrite) {
+    int slot;
+    if (overwrite && q->count != 0) {
+        slot = q->head;
+    } else if (copy_position == 1u) { /* queueSEND_TO_FRONT */
+        q->head = (q->head + q->max_items - 1) % q->max_items;
+        slot = q->head;
+    } else {
+        slot = q->tail;
+    }
+    int offset = slot * q->item_size;
+    for (int i = 0; i < q->item_size; i++)
+        q->buf[offset + i] = mem_read8(mem, item_ptr + (uint32_t)i);
+    if (!overwrite || q->count == 0) {
+        if (copy_position != 1u)
+            q->tail = (q->tail + 1) % q->max_items;
+        q->count++;
+    }
+}
+
+/* Complete one send that was blocked on a full queue, now that a slot has
+ * freed. Same contract as the receiver side: the blocked call cannot re-run,
+ * so the item is enqueued here and the return register patched to pdTRUE. */
+static bool wake_queue_sender_locked(freertos_stubs_t *frt, uint32_t handle) {
+    if (!frt->scheduler_started || !frt->cpu[0]) return false;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->q_waiting || !t->q_is_sender || t->blocked_queue != handle)
+            continue;
+        queue_t *q = find_queue(frt, handle);
+        if (!q || q->count >= q->max_items) continue;
+
+        queue_enqueue_locked(frt->cpu[0]->mem, q, t->q_recv_buf,
+                             t->q_copy_pos, false);
+        t->ar[t->ret_ar_slot] = pdTRUE;
+        t->q_waiting = false;
+        t->q_is_sender = false;
+        t->blocked_queue = 0;
+
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
+        return true;
+    }
+    return false;
+}
+
 static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
                             uint32_t copy_position) {
     uint32_t handle = frt_arg(cpu, 0);
@@ -1417,29 +1548,43 @@ static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
         return;
     }
     if (q->count >= q->max_items && !overwrite) {
+        /* Full. With a timeout, block until a receive frees a slot -- the
+         * flow-control half of a bounded producer/consumer, which used to
+         * report failure immediately however long the caller was willing to
+         * wait. */
+        uint32_t timeout = frt_arg(cpu, 2);
+        if (timeout != 0u && frt->scheduler_started &&
+            frt->current_task[cpu->core_id] >= 0) {
+            int core_id = cpu->core_id;
+            task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+            t->ret_ar_slot = frt_return_slot(cpu);
+            frt_return(cpu, pdFALSE);
+            sched_save_context(frt, core_id);
+            t->blocked_queue = handle;
+            t->q_recv_buf = item_ptr;
+            t->q_copy_pos = (uint8_t)copy_position;
+            t->q_waiting = true;
+            t->q_is_sender = true;
+            t->q_is_semaphore = false;
+            t->q_peek = false;
+            if (timeout == UINT32_MAX) {
+                t->state = TASK_BLOCKED_QUEUE;
+            } else {
+                uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+                if (advance > 200000000ULL) advance = 200000000ULL;
+                t->state = TASK_SLEEPING;
+                t->wake_cycle = cpu->cycle_count + advance;
+            }
+            sched_switch(frt, core_id);
+            pthread_mutex_unlock(&frt->lock);
+            return;
+        }
         pthread_mutex_unlock(&frt->lock);
         frt_return(cpu, pdFALSE);
         return;
     }
 
-    /* Copy item from emulator memory into queue buffer */
-    int slot;
-    if (overwrite && q->count != 0) {
-        slot = q->head;
-    } else if (copy_position == 1u) { /* queueSEND_TO_FRONT */
-        q->head = (q->head + q->max_items - 1) % q->max_items;
-        slot = q->head;
-    } else {
-        slot = q->tail;
-    }
-    int offset = slot * q->item_size;
-    for (int i = 0; i < q->item_size; i++)
-        q->buf[offset + i] = mem_read8(cpu->mem, item_ptr + (uint32_t)i);
-    if (!overwrite || q->count == 0) {
-        if (copy_position != 1u)
-            q->tail = (q->tail + 1) % q->max_items;
-        q->count++;
-    }
+    queue_enqueue_locked(cpu->mem, q, item_ptr, copy_position, overwrite);
 
     /* Wake one task blocked on an ordinary data queue. Semaphore waiters
      * consume the token directly above instead of leaving a surplus give. */
@@ -1602,6 +1747,7 @@ dequeue_locked:
     if (!peek) {
         q->head = (q->head + 1) % q->max_items;
         q->count--;
+        (void)wake_queue_sender_locked(frt, handle);
     }
     pthread_mutex_unlock(&frt->lock);
 
@@ -1641,6 +1787,7 @@ void stub_xQueueReceiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
         mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
     q->head = (q->head + 1) % q->max_items;
     q->count--;
+    (void)wake_queue_sender_locked(frt, handle);
     pthread_mutex_unlock(&frt->lock);
     if (woken_ptr)
         mem_write32(cpu->mem, woken_ptr, pdFALSE);
@@ -1662,8 +1809,92 @@ void stub_xSemaphoreCreateMutex(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     pthread_mutex_lock(&frt->lock);
     uint32_t handle = queue_create_locked(frt, 1, 0, 1, 0);
+    queue_t *q = find_queue(frt, handle);
+    if (q) q->is_mutex = true;
     pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, handle);
+}
+
+/* ===== Recursive mutexes =====
+ *
+ * xQueueTakeMutexRecursive and xQueueGiveMutexRecursive were not hooked, so
+ * the guest ran FreeRTOS's own versions against a Queue_t Flexe never
+ * populates. The first take appeared to succeed and the second -- the whole
+ * point of a recursive mutex -- failed, which in real firmware is a library
+ * deadlocking on its own re-entrant call.
+ */
+
+void stub_xSemaphoreTake(xtensa_cpu_t *cpu, void *ctx);
+
+/* Owner identity for mutex bookkeeping. Boot and compatibility calls own no
+ * TCB, but they can still take a recursive mutex twice, so they get their own
+ * identity rather than sharing the "unowned" value -- otherwise the second
+ * take does not recognise itself as the holder and blocks on its own lock. */
+#define FRT_BOOT_OWNER 0xFFFFFFFFu
+
+static uint32_t frt_current_task_handle(freertos_stubs_t *frt, int core_id) {
+    if (!frt->scheduler_started || frt->current_task[core_id] < 0)
+        return FRT_BOOT_OWNER;
+    uint32_t h = frt->tasks[frt->current_task[core_id]].handle;
+    return h ? h : FRT_BOOT_OWNER;
+}
+
+/* xSemaphoreTakeRecursive(mutex, ticks) -> xQueueTakeMutexRecursive */
+void stub_xQueueTakeMutexRecursive(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t owner = frt_current_task_handle(frt, cpu->core_id);
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q && q->mutex_owner == owner) {
+        /* Already ours: re-entry costs nothing and must not block. */
+        q->mutex_depth++;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    if (q && q->count > 0) {
+        q->count--;
+        q->mutex_owner = owner;
+        q->mutex_depth = 1;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    /* Contended, or not one of ours: fall back to the ordinary take, whose
+     * wake path assigns ownership. */
+    stub_xSemaphoreTake(cpu, ctx);
+}
+
+/* xSemaphoreGiveRecursive(mutex) -> xQueueGiveMutexRecursive */
+void stub_xQueueGiveMutexRecursive(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t owner = frt_current_task_handle(frt, cpu->core_id);
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q || q->mutex_owner != owner) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+    if (q->mutex_depth > 1) {
+        q->mutex_depth--;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    /* Last give: release, and hand the token straight to a waiter if there
+     * is one rather than leaving a surplus. */
+    q->mutex_depth = 0;
+    q->mutex_owner = 0;
+    if (!wake_queue_waiter_locked(frt, handle) && q->count < q->max_items)
+        q->count++;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdTRUE);
 }
 
 /* xSemaphoreCreateBinary() -> empty one-token host-backed queue. */
@@ -1938,19 +2169,73 @@ void stub_xTaskGetCurrentTaskHandle(xtensa_cpu_t *cpu, void *ctx) {
 }
 
 /* vTaskSuspend(handle) — mark task UNUSED and switch */
+/* vTaskSuspend(handle), where a null handle means the calling task.
+ *
+ * This used to ignore the argument entirely and always suspend the caller, so
+ * parking a worker from another task parked the wrong one -- and it marked the
+ * TCB TASK_UNUSED, which is the free-slot state, so the task could never be
+ * resumed and its slot could be handed to the next xTaskCreate. */
 void stub_vTaskSuspend(xtensa_cpu_t *cpu, void *ctx) {
     freertos_stubs_t *frt = ctx;
     int core_id = cpu->core_id;
+    uint32_t handle = frt_arg(cpu, 0);
+
     pthread_mutex_lock(&frt->lock);
-    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
+    if (!frt->scheduler_started || frt->current_task[core_id] < 0) {
+        pthread_mutex_unlock(&frt->lock);
+        cpu->running = false;
+        return;
+    }
+
+    int target = frt->current_task[core_id];
+    if (handle != 0) {
+        int index = -1;
+        if (find_task(frt, handle, &index)) target = index;
+    }
+
+    if (target == frt->current_task[core_id]) {
+        /* Suspending ourselves: unwind the call, park, and switch away. */
         frt_return_void(cpu);
         sched_save_context(frt, core_id);
-        frt->tasks[frt->current_task[core_id]].state = TASK_UNUSED;
+        frt->tasks[target].state = TASK_SUSPENDED;
         sched_switch(frt, core_id);
-    } else {
-        cpu->running = false;
+        pthread_mutex_unlock(&frt->lock);
+        return;
+    }
+
+    /* Suspending someone else: it keeps its saved context and simply stops
+     * being picked. Any wait it was in is abandoned, as on hardware. */
+    frt->tasks[target].state = TASK_SUSPENDED;
+    frt->tasks[target].q_waiting = false;
+    frt->tasks[target].eg_waiting = false;
+    frt->tasks[target].notify_waiting = false;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return_void(cpu);
+}
+
+/* vTaskResume(handle) / vTaskResumeFromISR(handle). Not hooked before, so a
+ * suspended task stayed suspended for good. */
+static void frt_resume_task(xtensa_cpu_t *cpu, void *ctx, bool from_isr) {
+    freertos_stubs_t *frt = ctx;
+    bool woke = false;
+    pthread_mutex_lock(&frt->lock);
+    int index = -1;
+    task_tcb_t *t = find_task(frt, frt_arg(cpu, 0), &index);
+    if (t && t->state == TASK_SUSPENDED) {
+        t->state = TASK_READY;
+        woke = true;
     }
     pthread_mutex_unlock(&frt->lock);
+    if (from_isr) frt_return(cpu, woke ? pdTRUE : pdFALSE);
+    else frt_return_void(cpu);
+}
+
+void stub_vTaskResume(xtensa_cpu_t *cpu, void *ctx) {
+    frt_resume_task(cpu, ctx, false);
+}
+
+void stub_vTaskResumeFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    frt_resume_task(cpu, ctx, true);
 }
 
 /* uxTaskGetStackHighWaterMark() -> return a comfortable margin */
@@ -2025,6 +2310,7 @@ static void stub_uxTaskGetSystemState(xtensa_cpu_t *cpu, void *ctx) {
             case TASK_BLOCKED_QUEUE: estate = 2; break;
             case TASK_BLOCKED_NOTIFY: estate = 2; break;
             case TASK_BLOCKED_EVENTGROUP: estate = 2; break;
+            case TASK_SUSPENDED:     estate = 3; break;
             case TASK_SLEEPING:      estate = 2; break;
             case TASK_UNUSED:        estate = 4; break;
             default:                 estate = 1; break;
@@ -2436,6 +2722,11 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xTaskCreatePinnedToCore",       stub_xTaskCreatePinnedToCore },
         { "vTaskDelete",                   stub_vTaskDelete },
         { "xTaskGetTickCount",             stub_xTaskGetTickCount },
+        { "vTaskDelayUntil",               stub_vTaskDelayUntil },
+        { "vTaskResume",                   stub_vTaskResume },
+        { "xTaskResumeFromISR",            stub_vTaskResumeFromISR },
+        { "vTaskResumeFromISR",            stub_vTaskResumeFromISR },
+        { "xTaskDelayUntil",               stub_xTaskDelayUntil },
         { "xEventGroupCreate",             stub_xEventGroupCreate },
         { "xEventGroupCreateStatic",       stub_xEventGroupCreate },
         { "xEventGroupWaitBits",           stub_xEventGroupWaitBits },
@@ -2486,6 +2777,10 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xQueueIsQueueFullFromISR",      stub_xQueueIsQueueFullFromISR },
         { "xSemaphoreCreateMutex",         stub_xSemaphoreCreateMutex },
         { "xQueueCreateMutex",             stub_xSemaphoreCreateMutex },
+        { "xSemaphoreCreateRecursiveMutex", stub_xSemaphoreCreateMutex },
+        { "xQueueCreateMutexStatic",       stub_xSemaphoreCreateMutex },
+        { "xQueueTakeMutexRecursive",      stub_xQueueTakeMutexRecursive },
+        { "xQueueGiveMutexRecursive",      stub_xQueueGiveMutexRecursive },
         { "xSemaphoreCreateBinary",        stub_xSemaphoreCreateBinary },
         { "xQueueCreateCountingSemaphore", stub_xQueueCreateCountingSemaphore },
         { "xQueueCreateCountingSemaphoreStatic",

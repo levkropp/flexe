@@ -35,6 +35,84 @@ static uint32_t frt_call_stub(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+TEST(test_recursive_mutex_reentry_and_ownership) {
+    /* The point of a recursive mutex is the second take by the holder. That
+     * take used to fail, which in real firmware is a library deadlocking on
+     * its own re-entrant call. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    extern void stub_xSemaphoreCreateMutex(xtensa_cpu_t *, void *);
+    extern void stub_xQueueTakeMutexRecursive(xtensa_cpu_t *, void *);
+    extern void stub_xQueueGiveMutexRecursive(xtensa_cpu_t *, void *);
+    uint32_t a_new = 0x400D0000, a_take = 0x400D0010, a_give = 0x400D0020;
+    rom_stubs_register_ctx(rom, a_new, (rom_stub_fn)stub_xSemaphoreCreateMutex, "xSemaphoreCreateMutex", frt);
+    rom_stubs_register_ctx(rom, a_take, (rom_stub_fn)stub_xQueueTakeMutexRecursive, "xQueueTakeMutexRecursive", frt);
+    rom_stubs_register_ctx(rom, a_give, (rom_stub_fn)stub_xQueueGiveMutexRecursive, "xQueueGiveMutexRecursive", frt);
+
+    uint32_t m = frt_call_stub(&cpu, a_new, NULL, 0);
+    ASSERT_TRUE(m != 0);
+
+    /* Nested takes, then the matching gives. Only the last give releases it,
+     * so the intermediate states must still report success. */
+    uint32_t take[2] = { m, 0u };
+    uint32_t one[1] = { m };
+    ASSERT_EQ(frt_call_stub(&cpu, a_take, take, 2), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_take, take, 2), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_take, take, 2), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_give, one, 1), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_give, one, 1), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_give, one, 1), 1u);
+
+    /* Fully released: it can be taken afresh. */
+    ASSERT_EQ(frt_call_stub(&cpu, a_take, take, 2), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_give, one, 1), 1u);
+
+    /* A give with nothing held fails rather than manufacturing a token. */
+    ASSERT_EQ(frt_call_stub(&cpu, a_give, one, 1), 0u);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
+TEST(test_delay_until_deadline_is_absolute) {
+    /* vTaskDelayUntil's wake time advances by the increment regardless of how
+     * long the body took, which is what keeps a fixed-rate loop from drifting
+     * by its own execution time. It also must not block when the deadline has
+     * already passed. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    extern void stub_vTaskDelayUntil(xtensa_cpu_t *, void *);
+    uint32_t addr = 0x400D0000;
+    rom_stubs_register_ctx(rom, addr, (rom_stub_fn)stub_vTaskDelayUntil, "vTaskDelayUntil", frt);
+
+    uint32_t prev = 0x3FFB0100u;
+    mem_write32(cpu.mem, prev, 0u);          /* previous wake time = tick 0 */
+
+    /* Tick 0 + 10, with the clock still at 0: this blocks, and the stored
+     * wake time moves to 10 whether or not it did. */
+    uint32_t args[2] = { prev, 10u };
+    uint64_t before = xtensa_guest_time_us(&cpu, 160);
+    (void)frt_call_stub(&cpu, addr, args, 2);
+    ASSERT_EQ(mem_read32(cpu.mem, prev), 10u);
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 160) - before, 10000u);
+
+    /* Now pretend the body overran: push the clock well past the next
+     * deadline. The call must return without blocking, and still advance the
+     * stored wake time by exactly one increment. */
+    cpu.cycle_count += (uint64_t)160 * 1000000u;   /* +1 s */
+    before = xtensa_guest_time_us(&cpu, 160);
+    (void)frt_call_stub(&cpu, addr, args, 2);
+    ASSERT_EQ(mem_read32(cpu.mem, prev), 20u);
+    ASSERT_EQ(xtensa_guest_time_us(&cpu, 160) - before, 0u);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_queue_accessors_read_flexe_storage) {
     /* uxQueueMessagesWaiting and friends were not hooked, so the guest ran
      * FreeRTOS's own versions against the real Queue_t -- which Flexe never
@@ -1078,6 +1156,8 @@ TEST(test_vPortFree_noop) {
 
 static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
+    RUN_TEST(test_recursive_mutex_reentry_and_ownership);
+    RUN_TEST(test_delay_until_deadline_is_absolute);
     RUN_TEST(test_queue_accessors_read_flexe_storage);
     RUN_TEST(test_event_group_bits);
     RUN_TEST(test_software_timer_commands);

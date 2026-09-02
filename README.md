@@ -60,7 +60,7 @@ flexe interprets (and now jits) the xtensa lx6 instruction set well enough to bo
 - gpio driver stubs
 - elf symbol loading, breakpoints, verbose trace mode
 - jit compiler: hot blocks → native code (arm64 + x86-64), on by default
-- 658 tests
+- 660 tests
 
 ## building
 
@@ -149,7 +149,7 @@ src/
 
 ```
 ./build/xtensa-tests
-# 658 tests, 13020 passed, 0 failed
+# 660 tests, 13034 passed, 0 failed
 ```
 
 tests cover individual instructions, memory operations, windowed registers, exceptions, interrupts, peripherals, rom stubs, freertos, esp_timer, nvs, gpio driver, and end-to-end firmware compatibility.
@@ -158,7 +158,7 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 23 of 23 on x86-64
+The compiled Arduino hardware gates below all pass — 24 of 24 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 One deliberate gap is worth stating rather than leaving to be rediscovered:
@@ -176,6 +176,21 @@ and it did not work: a per-core interrupt source raised its CPU line without
 ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
+
+`test-scheduler.sh` covers the rest of the scheduling surface, and found four
+more of the same kind. `vTaskDelayUntil` — how every fixed-rate loop is
+written — was not hooked, so the guest's version parked the task on FreeRTOS's
+own delayed list and yielded, neither of which Flexe acts on: ten 20 ms
+periods completed in 0 us and the loop then span at full speed. Unlike a
+missing delay that does not look like a hang, it looks like firmware running
+impossibly fast. `xQueueSend` into a full queue reported failure immediately
+however long the caller was willing to wait, so a bounded queue had no flow
+control. Recursive mutexes failed on the second take by the holder, which in
+real firmware is a library deadlocking on its own re-entrant call. And
+`vTaskSuspend` ignored its handle argument, so suspending a worker from
+another task suspended the caller instead — and marked the TCB `TASK_UNUSED`,
+the free-slot state, so it could never be resumed and its slot could be handed
+to the next `xTaskCreate`. `vTaskResume` did not exist at all.
 
 `test-task-queue.sh` covers the plain producer/consumer handoff: one guest
 task sending to another, with the receiver blocked on it. Every queue gate
