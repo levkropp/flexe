@@ -22,6 +22,12 @@
 
 #define PROF_BUCKETS 4096u
 static uint32_t g_prof_pc[PROF_BUCKETS];
+/* Second histogram keyed by 1 KB region. Individual PCs are useless for
+ * diffuse code -- unrolled hashing or a large state machine spreads samples
+ * so thinly that no single PC stands out -- but the region they live in
+ * still identifies the function. */
+static uint32_t g_prof_rgn[PROF_BUCKETS];
+static uint64_t g_prof_rgn_hits[PROF_BUCKETS];
 static uint64_t g_prof_hits[PROF_BUCKETS];
 static uint64_t g_prof_total;
 static uint32_t g_prof_tick;
@@ -45,6 +51,16 @@ void xtensa_profile_tick(uint32_t pc)
         if (g_prof_hits[k] == 0 || g_prof_pc[k] == pc) {
             g_prof_pc[k] = pc;
             g_prof_hits[k]++;
+            break;
+        }
+    }
+    uint32_t r = pc & ~0x3FFu;
+    uint32_t rh = (r >> 10) * 2654435761u;
+    for (unsigned i = 0; i < 8; i++) {
+        uint32_t k = (rh + i) & (PROF_BUCKETS - 1);
+        if (g_prof_rgn_hits[k] == 0 || g_prof_rgn[k] == r) {
+            g_prof_rgn[k] = r;
+            g_prof_rgn_hits[k]++;
             return;
         }
     }
@@ -65,6 +81,17 @@ void xtensa_profile_report(void)
                 100.0 * (double)g_prof_hits[best] / (double)g_prof_total,
                 (unsigned long long)g_prof_hits[best]);
         g_prof_hits[best] = 0;
+    }
+    fprintf(stderr, "[profile] top 1 KB regions:\n");
+    for (int n = 0; n < 12; n++) {
+        unsigned best = 0;
+        for (unsigned i = 1; i < PROF_BUCKETS; i++)
+            if (g_prof_rgn_hits[i] > g_prof_rgn_hits[best]) best = i;
+        if (g_prof_rgn_hits[best] == 0) break;
+        fprintf(stderr, "  %2d. 0x%08X..0x%08X  %6.2f%%\n", n + 1,
+                g_prof_rgn[best], g_prof_rgn[best] + 0x3FF,
+                100.0 * (double)g_prof_rgn_hits[best] / (double)g_prof_total);
+        g_prof_rgn_hits[best] = 0;
     }
 }
 

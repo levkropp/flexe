@@ -1841,6 +1841,9 @@ int main(int argc, char **argv)
      * then reboots itself has not run correctly end to end, and nothing here
      * would have said so. The panic strings are the firmware's own, so this
      * catches any abort, not just that one. */
+    uint64_t soak_insns0 = xtensa_retired_insns(flexe_session_cpu(session, 0))
+                         + xtensa_retired_insns(flexe_session_cpu(session, 1));
+    uint64_t soak_cyc0 = flexe_session_cpu(session, 0)->cycle_count;
     {
         uint64_t soak_target = flexe_session_cpu(session, 0)->cycle_count
                              + SOAK_CYCLES;
@@ -1879,6 +1882,23 @@ int main(int argc, char **argv)
         free(before);
         free(framebuf);
         return 1;
+    }
+
+    /* How much the firmware actually did during the soak, and whether its
+     * display moved. A ROM that retires billions of instructions without its
+     * framebuffer changing is busy but not progressing -- which is a
+     * different failure from one that is simply idle, and the two are easy to
+     * confuse from a single end-of-run PC sample. */
+    if (getenv("FLEXE_SOAK_STATS")) {
+        fprintf(stderr, "[soak] fb_before=%08X fb_after=%08X\n", fb_sum,
+                framebuffer_checksum(framebuf, &framebuffer_mutex));
+        uint64_t i1 = xtensa_retired_insns(flexe_session_cpu(session, 0))
+                    + xtensa_retired_insns(flexe_session_cpu(session, 1));
+        uint64_t c1 = flexe_session_cpu(session, 0)->cycle_count;
+        fprintf(stderr, "[soak] cycles=%llu retired=%llu (%.3f insn/cycle)\n",
+                (unsigned long long)(c1 - soak_cyc0),
+                (unsigned long long)(i1 - soak_insns0),
+                (double)(i1 - soak_insns0) / (double)(c1 - soak_cyc0 + 1));
     }
 
     int unhandled_mmio = periph_unhandled_count(flexe_session_periph(session));

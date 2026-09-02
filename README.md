@@ -77,9 +77,20 @@ compiled out*, cost 4% on both stock ROMs — the handful of bytes it added
 shifted the dispatch loop's code layout. Measuring that needed an interleaved
 A/B, since a straight before/after was swamped by machine drift.
 
-What it found first: NerdMiner spends over a tenth of its interpreted
-instructions in a single `xPortEnterCriticalTimeout` spin loop, waiting on a
-lock held by the other core.
+It reports hot PCs and, more usefully, hot 1 KB regions: diffuse code
+(unrolled hashing, a large state machine) spreads samples so thinly that no
+single PC stands out while the region still names the function.
+
+What it found: **32% of NerdMiner's execution is inside
+`xPortEnterCriticalTimeout`** — a third of the machine spent spinning on locks
+held by the other core. Per-PC sampling had put that at 10%, because the loop
+is spread over five addresses. This is an artifact of interleaving the two
+cores a batch at a time: the core holding a lock does not run until the
+spinning core's batch ends. `FLEXE_SOAK_STATS=1` on the stock-ROM runner
+reports retired instructions and the framebuffer before and after the soak,
+which distinguishes a firmware that is idle from one that is busy but not
+progressing — NerdMiner retires 2.7 billion instructions after provisioning
+with its display frozen, while Marauder's display keeps changing.
 
 ## building
 
