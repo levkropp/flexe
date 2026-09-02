@@ -1864,6 +1864,23 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* The firmware's own report that a socket call failed. Its errno was
+     * being read from newlib's reentrancy slot while the socket model wrote
+     * to a scratch word, so every errno the model set was invisible: a UDP
+     * poll with nothing pending, which should read EWOULDBLOCK and return
+     * quietly, was reported as a hard error thousands of times a second. */
+    if (uart_contains(&uart, "could not receive data")) {
+        fprintf(stderr, "FAIL profile=%s reason=firmware-socket-errors "
+                "uart_bytes=%llu\n", profile, (unsigned long long)uart.count);
+        nerd_probe_close(&network_probe);
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
     int unhandled_mmio = periph_unhandled_count(flexe_session_periph(session));
     if (unhandled_mmio != 0) {
         fprintf(stderr,

@@ -223,7 +223,18 @@ Arduino-ESP32 2.0.11 sketch and then confirmed by what the ROM passes it —
 where the one neighbouring candidate takes concrete event ids with a null
 handler instead.
 
-Socket error paths now set a truthful `errno`. Most of them returned -1
+Every `errno` the socket layer set was invisible to the firmware. Newlib keeps
+`errno` inside its reentrancy structure, reached through `__errno()`, while
+Flexe wrote to a fixed scratch word — two different addresses, so firmware
+read whatever happened to be in its own slot. Firmware branches on `errno`:
+Arduino's `WiFiUDP::parsePacket()` treats `EWOULDBLOCK` as "nothing to read"
+and logs an error for anything else, so a UDP poll with nothing pending — the
+normal case, on every poll — was reported as a hard failure thousands of times
+a second, over a megabyte of UART per run. `__errno()` is now hooked to return
+the word the model writes. The scenario fails if the firmware reports a socket
+error at all.
+
+Socket error paths also set a truthful `errno` at the point of failure. Most of them returned -1
 without touching it, leaving firmware to read whatever was last set, and
 firmware branches on that: Arduino's `WiFiUDP::parsePacket()` treats
 `EWOULDBLOCK` as "nothing to read" and logs an error for anything else.

@@ -1808,6 +1808,26 @@ static void stub_esp_netif_get_ip_info(xtensa_cpu_t *cpu, void *ctx)
 /* esp_wifi_sta_get_ap_info(wifi_ap_record_t *) -- what Arduino's WiFi.SSID()
  * and WiFi.RSSI() read. Not modelled before, so firmware could never report
  * or display which network it was on. */
+/* __errno() -> &errno.
+ *
+ * Newlib's errno lives inside the reentrancy structure, reached through this
+ * function, while this emulator's socket layer writes errno to a fixed
+ * scratch word. Those were different addresses, so every errno the model set
+ * was invisible to the firmware, which read whatever happened to be in its
+ * own slot.
+ *
+ * That is not cosmetic. Arduino's WiFiUDP::parsePacket() treats EWOULDBLOCK
+ * as "nothing to read" and logs an error for anything else, so a UDP socket
+ * with no data pending -- the normal case, on every poll -- was reported as a
+ * hard failure. It logged that thousands of times a second.
+ *
+ * Point the firmware at the same word the model writes, so the two agree. */
+static void stub_errno(xtensa_cpu_t *cpu, void *ctx)
+{
+    (void)ctx;
+    ws_return(cpu, REENT_ADDR + REENT_ERRNO_OFS);
+}
+
 static void stub_esp_wifi_sta_get_ap_info(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -2295,6 +2315,7 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "esp_wifi_get_config",          stub_esp_wifi_get_config },
         { "esp_wifi_connect",             stub_esp_wifi_connect },
         { "esp_wifi_sta_get_ap_info",     stub_esp_wifi_sta_get_ap_info },
+        { "__errno",                      stub_errno },
         { "esp_netif_dhcpc_start",        stub_esp_netif_dhcpc_start },
         { "esp_netif_dhcpc_stop",         stub_esp_netif_ok },
         { "esp_netif_dhcps_start",        stub_esp_netif_ok },
@@ -2407,6 +2428,7 @@ static const wifi_fw_hook_t nerdminer_wifi_hooks[] = {
      * 0x401B3110 takes concrete event ids with a null handler. */
     { 0x401B30CCu, stub_esp_event_handler_instance_register,
                    "esp_event_handler_instance_register" },
+    { 0x4019832Cu, stub_errno,              "__errno" },
     { 0x401643ECu, stub_esp_wifi_connect,   "esp_wifi_connect" },
     { 0x401645ACu, stub_esp_wifi_scan_start,"esp_wifi_scan_start" },
     { 0x40196404u, stub_start_ssl_client,   "start_ssl_client" },
