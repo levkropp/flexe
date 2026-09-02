@@ -844,6 +844,88 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     teardown(&cpu);
 }
 
+/* Compilation is driven from PCs the CPU is not sitting at: jit_run() samples
+ * the branch-target ring and LBEG, and jit_compile_now() descends into branch
+ * targets. For all of those the live loop registers belong to whatever loop
+ * the CPU is in, not to the candidate PC. Classifying the candidate on LEND
+ * alone calls a PC that sits *before* LBEG "in-loop" and files an unbounded
+ * block in the in-loop slot -- the very slot that PC needs once its own loop
+ * runs. The runtime bound check then declines that block every iteration, and
+ * because a decline follows a hash *hit*, jit_get_block() never runs and the
+ * correctly bounded block never compiles: the body interprets forever.
+ *
+ * This is not hypothetical. It cost the compute benchmark 18%: three of its
+ * four hot loop bodies ran interpreted, at 2.7M declines per run, while the
+ * JIT reported a healthy block count and no fallbacks. */
+TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* LOOP a3, lend ; five-instruction body ; RET.N at lend. */
+    const uint32_t lbeg = BASE + 3u;
+    const uint32_t lend = lbeg + 10u;
+    put_insn3(&cpu, BASE, (uint32_t)0x76u | ((uint32_t)((8 << 4) | 3) << 8) |
+                          ((lend - (BASE + 4u)) << 16));
+    put_insn2(&cpu, lbeg,      narrow(0xB, 4, 4, 1));  /* ADDI.N a4, a4, 1 */
+    put_insn2(&cpu, lbeg + 2u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lbeg + 4u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lbeg + 6u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lbeg + 8u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, lend,      narrow(0xD, 15, 0, 0)); /* RET.N */
+    ar_write(&cpu, 3, 400);
+    ar_write(&cpu, 4, 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);                      /* execute LOOP: registers live */
+    ASSERT_EQ(cpu.lbeg, lbeg);
+    ASSERT_EQ(cpu.lend, lend);
+
+    /* Now stand in for the sampler: a *different* loop, further along, is
+     * live when this body's PC comes up as a compilation candidate. Its LEND
+     * is ahead of lbeg, which is all the old classification looked at, but
+     * its LBEG is well past it -- so lbeg is plainly not inside it. */
+    cpu.lbeg   = lend + 4u;
+    cpu.lend   = lend + 24u;
+    cpu.lcount = 50u;
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+
+    /* Back to the body's own loop, resuming mid-body so the next arrival at
+     * LBEG is the interpreter's back-edge rather than a JIT dispatch. */
+    cpu.lbeg   = lbeg;
+    cpu.lend   = lend;
+    cpu.lcount = 400u;
+    cpu.pc     = lbeg + 4u;
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+
+    cpu._pc_written = false;
+    uint32_t a4_before = ar_read(&cpu, 4);
+    uint32_t lcount_before = cpu.lcount;
+    (void)xtensa_run(&cpu, 400);
+
+    const jit_stats_t *stats = jit_get_stats(jit);
+    /* The discriminating assertion. A poisoned in-loop slot shows up here and
+     * nowhere else in the stats: blocks still compile, nothing falls back,
+     * and the body simply never runs native. */
+    ASSERT_EQ(stats->loop_bound_rejects, 0u);
+    ASSERT_TRUE(stats->insns_jitted > 100);
+
+    /* And it ran correctly: the body counts iterations in a4, so the
+     * guest-visible effect must match the back-edges actually taken. */
+    uint32_t taken = lcount_before - cpu.lcount;
+    uint32_t pending = cpu.pc == cpu.lbeg ? 1u : 0u;
+    ASSERT_EQ(ar_read(&cpu, 4) - a4_before, taken - pending);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* jit_scan_block() can only bound a block at LEND using the loop registers
  * as they stand when it compiles, so a block first compiled outside a loop is
  * scanned straight through what later becomes LEND. Re-entering that block
@@ -1431,6 +1513,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
+    RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
     RUN_TEST(test_waiti_time_is_not_counted_as_retired_instructions);
     RUN_TEST(test_jit_encoding_sweep_matches_interpreter);

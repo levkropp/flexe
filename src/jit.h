@@ -84,6 +84,11 @@ typedef struct {
     uint64_t cache_flushes;
     uint64_t fallbacks;         /* Instructions that fell back to interpreter */
     uint64_t chains_patched;    /* Block chain links patched */
+    /* Cached blocks declined because a live loop ends inside them. Each one
+     * is an interpreted dispatch, and because the decline follows a hash hit
+     * no replacement is ever compiled — so a large count here is a hot loop
+     * running interpreted, which costs far more than the count suggests. */
+    uint64_t loop_bound_rejects;
 } jit_stats_t;
 
 /* Opaque JIT state */

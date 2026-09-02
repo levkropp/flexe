@@ -160,6 +160,15 @@ int main(int argc, char **argv) {
     printf("\n");
 
     if (verify) jit_verify_summary(flexe_session_jit(session));
+    /* Where the guest instructions actually ran. A benchmark that is fast
+     * because it JITs everything and one that is fast in spite of
+     * interpreting a tenth of its work look identical from mips= alone. */
+    if (getenv("FLEXE_JIT_STATS") && flexe_session_jit(session))
+        jit_print_stats(flexe_session_jit(session));
+    /* Only the interpreter ticks the profiler, so in a JIT run this reports
+     * exactly the PCs that did not get compiled -- which is the question to
+     * ask of a benchmark whose remaining cost is the code the JIT missed. */
+    xtensa_profile_report();
 
     int ok = done == (uint32_t)rounds_target && checksum != 0u && wall > 0.0;
     if (!ok)

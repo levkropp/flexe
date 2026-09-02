@@ -166,8 +166,16 @@ struct jit_state {
  * is what makes that safe without recompiling on every alternation, which is
  * how an earlier attempt at this (keying on the LEND value itself) starved
  * guest_call8's step budget badly enough to break the stock-ROM BLE path. */
+/* Both bounds matter. Compilation is driven from PCs the CPU is not sitting
+ * at -- descent into branch targets, the branch-target ring, LBEG sampling --
+ * and for those the live loop registers describe whatever loop the CPU is in,
+ * not the candidate's. Testing only LEND classifies a PC that sits *before*
+ * LBEG as in-loop, filing an unbounded block in the in-loop slot. The runtime
+ * bound check then declines that block on every iteration, and since a
+ * decline follows a hash hit, jit_get_block never runs and the correctly
+ * bounded block never compiles -- the loop body interprets forever. */
 static inline uint32_t jit_loop_variant(const xtensa_cpu_t *cpu, uint32_t pc) {
-    return (cpu->lcount != 0u && cpu->lend > pc) ? 1u : 0u;
+    return (cpu->lcount != 0u && pc >= cpu->lbeg && cpu->lend > pc) ? 1u : 0u;
 }
 
 #define JIT_LOOP_VARIANT_SALT 0x5F1D3B7u
@@ -444,9 +452,11 @@ static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
     uint32_t cur_pc = pc;
     uint32_t page_end = (pc & ~0xFFFu) + 0x1000;
 
-    /* If a zero-overhead loop is active, stop the block at lend so the
-     * loop-back check in jit_run fires between blocks. */
-    uint32_t lend = (cpu->lcount > 0) ? cpu->lend : 0;
+    /* If a zero-overhead loop is active *and this block is inside it*, stop
+     * at lend so the loop-back check in jit_run fires between blocks. The
+     * LBEG half of the test matters because compilation is driven from PCs
+     * the CPU is not at; see jit_loop_variant(). */
+    uint32_t lend = (cpu->lcount > 0 && pc >= cpu->lbeg) ? cpu->lend : 0;
 
     for (int i = 0; i < JIT_MAX_BLOCK_INSNS; i++) {
         /* Stop at page boundary */
@@ -2968,9 +2978,10 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
          * it costs one predicted-not-taken test on lcount, which is zero
          * whenever no loop is running. */
         if (__builtin_expect(cpu->lcount != 0, 0) &&
-            cpu->lend > pc && cpu->lend < b->end_pc)
+            cpu->lend > pc && cpu->lend < b->end_pc) {
             fn = NULL;
-        else
+            jit->stats.loop_bound_rejects++;
+        } else
             fn = (jit_block_fn)b->code;
     } else {
         /* Hash miss — try hot-counting and compilation */
@@ -3344,6 +3355,8 @@ void jit_print_stats(const jit_state_t *jit) {
     fprintf(stderr, "  Fallbacks:       %llu\n", (unsigned long long)s->fallbacks);
     fprintf(stderr, "  Cache flushes:   %llu\n", (unsigned long long)s->cache_flushes);
     fprintf(stderr, "  Chains patched:  %llu\n", (unsigned long long)s->chains_patched);
+    fprintf(stderr, "  Loop-bound rej:  %llu\n",
+            (unsigned long long)s->loop_bound_rejects);
     fprintf(stderr, "  Code cache:      %zu / %zu KB\n",
             jit->code_size / 1024, jit->code_capacity / 1024);
 }
