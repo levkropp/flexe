@@ -190,7 +190,6 @@ struct wifi_stubs {
      * esp_wifi_get_config() as though saved in NVS. Empty by default. */
     char               sta_ssid[33];
     char               sta_password[65];
-    uint32_t           firmware_status_addr;
     uint8_t            channel;         /* 1-14 */
     uint8_t            sta_mac[6];      /* STA MAC */
     uint8_t            ap_mac[6];       /* AP MAC */
@@ -1816,8 +1815,6 @@ static void stub_esp_wifi_connect(xtensa_cpu_t *cpu, void *ctx)
     wifi_stubs_t *ws = ctx;
     ws->stats.wifi_connect_calls++;
     ws->sta_connected = true;
-    if (ws->firmware_status_addr)
-        mem_write32(cpu->mem, ws->firmware_status_addr, 3); /* WL_CONNECTED */
     /* Association then address assignment, in that order, as on hardware. */
     wifi_queue_event(ws, "WIFI_EVENT", 4 /* STA_CONNECTED */,
                      EVT_DATA_STA_CONNECTED);
@@ -1830,8 +1827,6 @@ static void stub_esp_wifi_disconnect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     ws->sta_connected = false;
-    if (ws->firmware_status_addr)
-        mem_write32(cpu->mem, ws->firmware_status_addr, 6); /* WL_DISCONNECTED */
     wifi_queue_event(ws, "WIFI_EVENT", 5 /* STA_DISCONNECTED */,
                      EVT_DATA_NONE);
     wifi_log(ws, "esp_wifi_disconnect()\n");
@@ -2523,8 +2518,21 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = marauder_35inch_wifi_hooks;
     else
         return 0;
-    if (profile == ROM_FIRMWARE_NERDMINER_V183)
-        ws->firmware_status_addr = 0x3FFC5C78u;
+    /* No firmware_status_addr for any profile.
+     *
+     * This used to write WL_CONNECTED into 0x3FFC5C78 on esp_wifi_connect()
+     * for NerdMiner, to make the firmware believe it had associated back when
+     * no WiFi events were delivered. Poking an emulator-chosen value into a
+     * guessed DRAM address is unsound, and this address is not the status
+     * variable: the firmware reads an EventGroupHandle_t from it. The write
+     * left a handle of 3, so xEventGroupClearBits() took a critical section
+     * on lock address 3+28, and the ROM died on
+     *   assert failed: spinlock_acquire ... (result == core_id || ...)
+     * and rebooted, about sixteen seconds of guest time into an ordinary
+     * captive-portal session -- just past where the scenario stopped looking.
+     *
+     * Firmware learns it is connected the way hardware tells it: through the
+     * WIFI_EVENT/IP_EVENT handlers that wifi_stubs_tick() now delivers. */
 
     int hooked = 0;
     for (const wifi_fw_hook_t *h = hooks; h->fn; h++) {

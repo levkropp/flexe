@@ -37,6 +37,11 @@
 #define STOCK_SD_SECTORS         (STOCK_SD_BYTES / 512u)
 #define STOCK_SD_ROOT_SECTOR     65u
 
+/* Extra cycles run after the scripted steps, to catch a firmware that passes
+ * every check and then panics. Sized to cover the observed failure at roughly
+ * 2.8 billion cycles from reset. */
+#define SOAK_CYCLES 3600000000ull
+
 /* Verified production CYD state for both v1.14 link layouts.  The release
  * series retained one image entry point while v1.14.2 shifted DRAM by 16
  * bytes, so the profile selected by rom_stubs is authoritative. */
@@ -81,10 +86,25 @@ typedef struct {
     int y;
 } touch_state_t;
 
+/* Firmware panic strings, matched as bytes arrive.
+ *
+ * The captured log is a fixed buffer that stops recording once full, and a
+ * panicking firmware reboots in a loop and emits hundreds of kilobytes -- so
+ * by the time anything looks at the log, the panic is long past its end.
+ * Matching in the byte stream is the only way to see it. */
+static const char *const kPanicMarkers[] = {
+    "assert failed:", "Guru Meditation", "Rebooting...",
+    "abort() was called", "CORRUPT HEAP",
+};
+#define PANIC_MARKER_COUNT \
+    (sizeof(kPanicMarkers) / sizeof(kPanicMarkers[0]))
+
 typedef struct {
     uint64_t count;
     char log[8192];
     size_t log_len;
+    size_t match[PANIC_MARKER_COUNT];  /* per-marker match progress */
+    int    panic;                      /* index of the marker seen, or -1 */
 } uart_state_t;
 
 typedef struct {
@@ -154,6 +174,19 @@ static void uart_count(void *ctx, uint8_t byte)
     if (uart->log_len + 1 < sizeof(uart->log)) {
         uart->log[uart->log_len++] = (char)byte;
         uart->log[uart->log_len] = '\0';
+    }
+    for (size_t m = 0; m < PANIC_MARKER_COUNT; m++) {
+        const char *needle = kPanicMarkers[m];
+        if ((char)byte == needle[uart->match[m]]) {
+            uart->match[m]++;
+            if (needle[uart->match[m]] == '\0') {
+                if (uart->panic < 0) uart->panic = (int)m;
+                uart->match[m] = 0;
+            }
+        } else {
+            /* Restart, allowing this byte to begin a fresh match. */
+            uart->match[m] = ((char)byte == needle[0]) ? 1u : 0u;
+        }
     }
 }
 
@@ -941,6 +974,8 @@ int main(int argc, char **argv)
     pthread_mutex_init(&framebuffer_mutex, NULL);
     touch_state_t touch = {0, 50, 139};
     uart_state_t uart = {0};
+    uint64_t provisioned_connects = 0;
+    uart.panic = -1;
     uart_state_t gps_uart = {0};
     raw_tx_probe_t raw_tx_probe = {0};
     bt_tx_probe_t bt_tx_probe = {0};
@@ -1694,6 +1729,107 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (is_nerdminer) {
+        /* Provision through the portal's own save form -- the path a user
+         * takes on real hardware -- and require the firmware to associate.
+         *
+         * This is also what makes the soak below meaningful for this ROM:
+         * everything that happens once WiFi is actually up was previously
+         * unreachable, because the scenario left the firmware sitting in its
+         * captive portal forever. */
+        static const char save_req[] =
+            "GET /wifisave?s=flexe-net&p=flexe-secret"
+            "&PoolUrl=127.0.0.1&PoolPort=3333&BtcWallet=bc1qflexe"
+            "&PoolPassword=x&Timezone=0 HTTP/1.0\r\n"
+            "Host: 192.168.4.1\r\nConnection: close\r\n\r\n";
+        struct sockaddr_in sv;
+        memset(&sv, 0, sizeof(sv));
+        sv.sin_family = AF_INET;
+        sv.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sv.sin_port = htons(network_probe.tcp_port);
+        int sfd = socket(AF_INET, SOCK_STREAM, 0);
+        char save_resp[4096];
+        size_t save_len = 0;
+        int saved = 0;
+        uint64_t connect_calls = 0;
+        if (sfd >= 0 && connect(sfd, (struct sockaddr *)&sv, sizeof(sv)) == 0 &&
+            nerd_probe_send_all(sfd, save_req, sizeof(save_req) - 1) == 0 &&
+            nerd_probe_nonblocking(sfd) == 0) {
+            for (int i = 0; i < 8000; i++) {
+                if (flexe_session_run_core(session, 0, 100000) < 0) break;
+                flexe_session_post_batch(session, 100000);
+                if (save_len + 1 < sizeof(save_resp)) {
+                    ssize_t n = recv(sfd, save_resp + save_len,
+                                     sizeof(save_resp) - 1 - save_len, 0);
+                    if (n > 0) save_len += (size_t)n;
+                }
+                wifi_stubs_get_stats(flexe_session_wifi(session), &wifi_stats);
+                if (wifi_stats.wifi_connect_calls > 0) break;
+            }
+            save_resp[save_len] = '\0';
+            connect_calls = wifi_stats.wifi_connect_calls;
+            saved = strstr(save_resp, "Credentials saved") != NULL;
+        }
+        if (sfd >= 0) close(sfd);
+        if (!saved || connect_calls == 0) {
+            fprintf(stderr,
+                    "FAIL profile=nerdminer reason=provisioning-failed "
+                    "saved=%d wifi_connect_calls=%llu resp_bytes=%zu\n",
+                    saved, (unsigned long long)connect_calls, save_len);
+            nerd_probe_close(&network_probe);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        provisioned_connects = connect_calls;
+    }
+
+    /* The render is asserted at the converged point, before the soak below.
+     * The soak deliberately runs the firmware on for many more seconds, and a
+     * live UI keeps animating -- sampling after it would compare two engines
+     * at slightly different points in an animation and see them disagree. */
+    uint32_t fb_sum = framebuffer_checksum(framebuf, &framebuffer_mutex);
+
+    /* Soak: keep the firmware running well past the scripted steps and
+     * require that it is still alive.
+     *
+     * The scenario used to stop shortly after each profile's checks, which
+     * left a window nothing looked at -- NerdMiner panicked in it, on the
+     * ordinary captive-portal path, about sixteen seconds of guest time in:
+     *
+     *   assert failed: spinlock_acquire ... (result == core_id || ...)
+     *   Rebooting...
+     *
+     * A firmware that boots, draws its UI, passes every scripted step and
+     * then reboots itself has not run correctly end to end, and nothing here
+     * would have said so. The panic strings are the firmware's own, so this
+     * catches any abort, not just that one. */
+    {
+        uint64_t soak_target = flexe_session_cpu(session, 0)->cycle_count
+                             + SOAK_CYCLES;
+        while (flexe_session_cpu(session, 0)->cycle_count < soak_target) {
+            if (flexe_session_run_core(session, 0, 100000) < 0) break;
+            flexe_session_post_batch(session, 100000);
+        }
+    }
+    if (uart.panic >= 0) {
+        fprintf(stderr, "FAIL profile=%s reason=firmware-panic marker=\"%s\" "
+                "uart_bytes=%llu\n",
+                profile, kPanicMarkers[uart.panic],
+                (unsigned long long)uart.count);
+        fprintf(stderr, "UART0 log head:\n%s\n", uart.log);
+        nerd_probe_close(&network_probe);
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
     int unhandled_mmio = periph_unhandled_count(flexe_session_periph(session));
     if (unhandled_mmio != 0) {
         fprintf(stderr,
@@ -1715,7 +1851,7 @@ int main(int argc, char **argv)
            "nonblack=%d fb=%08X uart_bytes=%llu",
            profile, engine, (double)wall_ns / 1e9,
            (unsigned long long)total_cycles, nonblack,
-           framebuffer_checksum(framebuf, &framebuffer_mutex),
+           fb_sum,
            (unsigned long long)uart.count);
     printf(" mmio_unhandled=%d rom_unregistered=%d",
            unhandled_mmio, unregistered_rom);
@@ -1762,6 +1898,8 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_frames,
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
+    if (is_nerdminer)
+        printf(" provisioned=%llu", (unsigned long long)provisioned_connects);
     if (is_nerdminer)
         printf(" spiffs_blocks=%d spiffs_cycles=%llu sd_fat=mounted "
                "network_cycles=%llu "

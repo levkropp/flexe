@@ -177,6 +177,24 @@ ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
 
+The stock-ROM scenario now provisions NerdMiner through its captive portal's
+own `/wifisave` form and then keeps the firmware running for several more
+seconds, checking it is still alive. Both were needed to find a crash that had
+been sitting there the whole time: Flexe used to write `WL_CONNECTED` into a
+hardcoded DRAM address to make NerdMiner believe it had associated, back when
+no WiFi events were delivered. That address is not the status variable — the
+firmware reads an `EventGroupHandle_t` from it — so the write left a handle of
+3, `xEventGroupClearBits()` took a critical section on lock address 3+28, and
+the ROM died on `assert failed: spinlock_acquire` and rebooted, about sixteen
+seconds of guest time in. The scenario stopped just short of that, and the
+firmware only associates at all once provisioned, so nothing looked. Firmware
+now learns it is connected the way hardware tells it, through the event
+handlers. The panic markers are matched in the UART byte stream rather than in
+the captured log, because a firmware in a reboot loop emits hundreds of
+kilobytes and the log is a fixed buffer that stops recording once full. The
+render is still sampled at the converged point, before the soak: a live UI
+keeps animating, and comparing two engines mid-animation makes them disagree.
+
 `test-wifi-client.sh` covers station association and an outbound TCP client,
 and closes the largest remaining gap for firmware built from source: WiFi
 events were recorded and never delivered. Stock ROMs are driven past this by
