@@ -78,6 +78,8 @@ static inline int fcntl(int fd, int cmd, ...)
 
 /* newlib EINPROGRESS (different from Linux host value) */
 #define NEWLIB_EAGAIN      11
+#define NEWLIB_EBADF        9
+#define NEWLIB_ENOMEM      12
 #define NEWLIB_EINPROGRESS 119
 
 /* lwip error codes */
@@ -396,6 +398,21 @@ static void set_firmware_errno(xtensa_cpu_t *cpu, int eno)
     mem_write32(cpu->mem, REENT_ADDR + REENT_ERRNO_OFS, (uint32_t)eno);
 }
 
+
+/* Fail a socket call with a truthful errno.
+ *
+ * Most error paths here used to return -1 without touching errno, leaving the
+ * guest to read whatever was last set. That is not cosmetic: firmware
+ * branches on errno. Arduino's WiFiUDP::parsePacket() treats EWOULDBLOCK as
+ * "nothing to read" and logs an error for anything else, so a stale value
+ * turned quiet polling into an error logged thousands of times a second --
+ * over a megabyte of UART in one run. */
+static void ws_fail(xtensa_cpu_t *cpu, int err)
+{
+    set_firmware_errno(cpu, err);
+    ws_return(cpu, (uint32_t)-1);
+}
+
 static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -406,7 +423,7 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -505,7 +522,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
 
     /* Copy data from emulator memory */
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
     for (uint32_t i = 0; i < len; i++)
         tmp[i] = mem_read8(cpu->mem, buf + i);
 
@@ -547,7 +564,7 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -559,7 +576,7 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
 
     ssize_t n;
     if (s->nonblocking) {
@@ -851,7 +868,7 @@ static void stub_lwip_ioctl(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -877,7 +894,7 @@ static void stub_lwip_setsockopt(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -896,7 +913,7 @@ static void stub_lwip_getsockopt(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -921,7 +938,7 @@ static void stub_lwip_fcntl(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -953,7 +970,7 @@ static void stub_lwip_getsockname(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -984,7 +1001,7 @@ static void stub_lwip_bind(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1044,7 +1061,7 @@ static void stub_lwip_listen(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
     int bl = (int)backlog;
@@ -1071,7 +1088,7 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1133,12 +1150,12 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
     for (uint32_t i = 0; i < len; i++)
         tmp[i] = mem_read8(cpu->mem, buf + i);
 
@@ -1184,12 +1201,12 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_return(cpu, (uint32_t)-1);
+        ws_fail(cpu, NEWLIB_EBADF);
         return;
     }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
 
     struct sockaddr_in source;
     socklen_t source_len = sizeof(source);
@@ -1402,7 +1419,7 @@ static void stub_send_ssl_data(xtensa_cpu_t *cpu, void *ctx)
     if (!s) { ws_return(cpu, (uint32_t)-1); return; }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
     for (uint32_t i = 0; i < len; i++)
         tmp[i] = mem_read8(cpu->mem, buf_addr + i);
 
@@ -1438,7 +1455,7 @@ static void stub_get_ssl_receive(xtensa_cpu_t *cpu, void *ctx)
     if (!s || len <= 0) { ws_return(cpu, (uint32_t)-1); return; }
 
     uint8_t *tmp = malloc((size_t)len);
-    if (!tmp) { ws_return(cpu, (uint32_t)-1); return; }
+    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
 
     ssize_t n;
     if (s->ssl) {
@@ -1695,7 +1712,8 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu) {
         if (h->event_id != e.event_id && h->event_id != -1) continue;
         uint32_t args[4] = { h->handler_arg, h->event_base,
                              (uint32_t)e.event_id, data };
-        (void)guest_call8(cpu, h->handler_addr, args, 4, 2000000u, NULL);
+        if (guest_call8(cpu, h->handler_addr, args, 4, 2000000u, NULL) == 0)
+            ws->stats.events_delivered++;
     }
     wifi_log(ws, "event %s/%d delivered\n", e.base_name, e.event_id);
 }
@@ -2380,6 +2398,15 @@ static const wifi_fw_hook_t nerdminer_wifi_hooks[] = {
     { 0x401216E8u, stub_dns_gethostbyname,  "dns_gethostbyname" },
     { 0x401156ACu, stub_vfs_select,         "esp_vfs_select" },
     { 0x40134844u, stub_vfs_fcntl,          "fcntl" },
+    /* esp_event_handler_instance_register. Arduino registers its WiFi/IP
+     * event handler through this, and without it the firmware never
+     * learns that it associated. Located by relocating the symbol from a
+     * locally built Arduino-ESP32 2.0.11 sketch, then confirmed by what
+     * this ROM passes it -- ("WIFI_EVENT", ESP_EVENT_ANY_ID, handler),
+     * matching the reference build exactly. The neighbouring candidate
+     * 0x401B3110 takes concrete event ids with a null handler. */
+    { 0x401B30CCu, stub_esp_event_handler_instance_register,
+                   "esp_event_handler_instance_register" },
     { 0x401643ECu, stub_esp_wifi_connect,   "esp_wifi_connect" },
     { 0x401645ACu, stub_esp_wifi_scan_start,"esp_wifi_scan_start" },
     { 0x40196404u, stub_start_ssl_client,   "start_ssl_client" },

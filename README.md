@@ -195,6 +195,20 @@ kilobytes and the log is a fixed buffer that stops recording once full. The
 render is still sampled at the converged point, before the soak: a live UI
 keeps animating, and comparing two engines mid-animation makes them disagree.
 
+The scenario also requires that the firmware *learns* it associated, which
+means its own event handler has to be reached. Arduino registers that handler
+through `esp_event_handler_instance_register`, which was not in NerdMiner's
+profile; the address was found by relocating the symbol from a locally built
+Arduino-ESP32 2.0.11 sketch and then confirmed by what the ROM passes it —
+`("WIFI_EVENT", ESP_EVENT_ANY_ID, handler)`, matching the reference build,
+where the one neighbouring candidate takes concrete event ids with a null
+handler instead.
+
+Socket error paths now set a truthful `errno`. Most of them returned -1
+without touching it, leaving firmware to read whatever was last set, and
+firmware branches on that: Arduino's `WiFiUDP::parsePacket()` treats
+`EWOULDBLOCK` as "nothing to read" and logs an error for anything else.
+
 `test-wifi-client.sh` covers station association and an outbound TCP client,
 and closes the largest remaining gap for firmware built from source: WiFi
 events were recorded and never delivered. Stock ROMs are driven past this by

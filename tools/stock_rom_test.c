@@ -975,6 +975,7 @@ int main(int argc, char **argv)
     touch_state_t touch = {0, 50, 139};
     uart_state_t uart = {0};
     uint64_t provisioned_connects = 0;
+    uint64_t provisioned_events = 0;
     uart.panic = -1;
     uart_state_t gps_uart = {0};
     raw_tx_probe_t raw_tx_probe = {0};
@@ -1771,11 +1772,17 @@ int main(int argc, char **argv)
             saved = strstr(save_resp, "Credentials saved") != NULL;
         }
         if (sfd >= 0) close(sfd);
-        if (!saved || connect_calls == 0) {
+        /* The firmware must also *learn* it associated: the events have to
+         * reach a handler it registered. Without that it sits waiting for a
+         * connection it already has. */
+        uint64_t events = wifi_stats.events_delivered;
+        if (!saved || connect_calls == 0 || events == 0) {
             fprintf(stderr,
                     "FAIL profile=nerdminer reason=provisioning-failed "
-                    "saved=%d wifi_connect_calls=%llu resp_bytes=%zu\n",
-                    saved, (unsigned long long)connect_calls, save_len);
+                    "saved=%d wifi_connect_calls=%llu events=%llu "
+                    "resp_bytes=%zu\n",
+                    saved, (unsigned long long)connect_calls,
+                    (unsigned long long)events, save_len);
             nerd_probe_close(&network_probe);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
@@ -1785,6 +1792,7 @@ int main(int argc, char **argv)
             return 1;
         }
         provisioned_connects = connect_calls;
+        provisioned_events = events;
     }
 
     /* The render is asserted at the converged point, before the soak below.
@@ -1899,7 +1907,9 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
     if (is_nerdminer)
-        printf(" provisioned=%llu", (unsigned long long)provisioned_connects);
+        printf(" provisioned=%llu wifi_events=%llu",
+               (unsigned long long)provisioned_connects,
+               (unsigned long long)provisioned_events);
     if (is_nerdminer)
         printf(" spiffs_blocks=%d spiffs_cycles=%llu sd_fat=mounted "
                "network_cycles=%llu "

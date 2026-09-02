@@ -34,6 +34,9 @@ typedef struct {
     uint64_t recvfrom_bytes;
     uint64_t dns_calls;
     uint64_t wifi_connect_calls;
+    /* WiFi/IP events actually delivered to a handler the firmware
+     * registered. Zero means the firmware never learned it associated. */
+    uint64_t events_delivered;
     uint64_t scan_start_calls;
     uint64_t wifi_init_calls;
     uint64_t wifi_start_calls;
