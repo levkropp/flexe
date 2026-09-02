@@ -2407,6 +2407,7 @@ static const wifi_fw_hook_t nerdminer_wifi_hooks[] = {
      * 0x401B3110 takes concrete event ids with a null handler. */
     { 0x401B30CCu, stub_esp_event_handler_instance_register,
                    "esp_event_handler_instance_register" },
+    { 0x4013F524u, stub_lwip_recvfrom,      "recvfrom(vfs)" },
     { 0x401643ECu, stub_esp_wifi_connect,   "esp_wifi_connect" },
     { 0x401645ACu, stub_esp_wifi_scan_start,"esp_wifi_scan_start" },
     { 0x40196404u, stub_start_ssl_client,   "start_ssl_client" },

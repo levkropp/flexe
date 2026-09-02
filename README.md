@@ -223,6 +223,16 @@ Arduino-ESP32 2.0.11 sketch and then confirmed by what the ROM passes it —
 where the one neighbouring candidate takes concrete event ids with a null
 handler instead.
 
+NerdMiner's UDP receive path did not work at all. Its `recvfrom()` is the
+VFS wrapper, not `lwip_recvfrom` — Flexe's synthetic socket descriptors are
+not in the guest's VFS table, so the wrapper failed with `ENOENT` before ever
+reaching the socket model, on every call. `WiFiUDP::parsePacket()` logged that
+thousands of times a second: over a megabyte of UART in one run, and no
+datagram ever delivered. The address was read out of the ROM's own code —
+decoding the `CALL8` that `parsePacket` makes just before the log — rather
+than guessed. The scenario now fails if the firmware reports a socket error at
+all, and the run's UART output dropped from 698 bytes to 76.
+
 Socket error paths now set a truthful `errno`. Most of them returned -1
 without touching it, leaving firmware to read whatever was last set, and
 firmware branches on that: Arduino's `WiFiUDP::parsePacket()` treats
