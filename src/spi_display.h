@@ -49,4 +49,10 @@ typedef void (*spi_probe_fn)(const uint8_t *mosi, size_t mosi_len,
                              uint8_t *miso, size_t miso_len, void *ctx);
 void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx);
 
+/* Total bytes fed to the panel since start. A firmware whose display task has
+ * stopped shows up as this standing still while the CPU stays busy, which a
+ * framebuffer checksum alone cannot distinguish from a UI redrawing the same
+ * picture. */
+uint64_t spi_display_bytes_fed(void);
+
 #endif /* SPI_DISPLAY_H */

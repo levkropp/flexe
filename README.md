@@ -86,11 +86,18 @@ What it found: **32% of NerdMiner's execution is inside
 held by the other core. Per-PC sampling had put that at 10%, because the loop
 is spread over five addresses. This is an artifact of interleaving the two
 cores a batch at a time: the core holding a lock does not run until the
-spinning core's batch ends. `FLEXE_SOAK_STATS=1` on the stock-ROM runner
-reports retired instructions and the framebuffer before and after the soak,
-which distinguishes a firmware that is idle from one that is busy but not
-progressing — NerdMiner retires 2.7 billion instructions after provisioning
-with its display frozen, while Marauder's display keeps changing.
+spinning core's batch ends. It can also filter samples to one task's stack (`FLEXE_PROFILE_SP=0x3FFD7000`),
+which is the only way to ask what a *particular* task is doing in a
+symbol-less ROM running its own scheduler — there is no task list to read, but
+each task has its own stack, so the stack-pointer histogram enumerates them.
+
+`FLEXE_SOAK_STATS=1` on the stock-ROM runner reports retired instructions,
+bytes fed to the display, and the framebuffer before and after the soak. That
+distinguishes a firmware that is idle from one that is busy but not
+progressing, and a display task that has stopped from a UI redrawing the same
+picture: NerdMiner retires 2.7 billion instructions after provisioning with
+`display_bytes=0`, while Marauder writes 5.3 million bytes over the same
+window.
 
 ## building
 

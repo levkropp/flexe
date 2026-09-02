@@ -578,7 +578,16 @@ static void ili9341_pixel_byte(spi_display_t *s, uint8_t b) {
     }
 }
 
+/* Bytes handed to the panel. A firmware whose display task has stopped shows
+ * up as this standing still while the CPU stays busy -- which a framebuffer
+ * checksum alone cannot distinguish from a UI that is merely redrawing the
+ * same picture. */
+static uint64_t g_display_bytes;
+
+uint64_t spi_display_bytes_fed(void) { return g_display_bytes; }
+
 static void ili9341_feed(spi_display_t *s, int dc, const uint8_t *data, int len) {
+    g_display_bytes += (uint64_t)len;
     /* A GP-SPI transaction carries up to 32 RGB565 pixels. Lock the shared
      * framebuffer once for the whole burst instead of once per pixel: the
      * per-pixel lock let a continuously-redrawing firmware starve the SDL

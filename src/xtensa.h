@@ -437,6 +437,7 @@ void xtensa_profile_report(void);
 #if FLEXE_PROFILE_BUILD
 void xtensa_profile_init(void);
 void xtensa_profile_tick(uint32_t pc);
+void xtensa_profile_tick_sp(uint32_t pc, uint32_t sp);
 #endif
 
 /*

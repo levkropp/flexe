@@ -2391,7 +2391,7 @@ have_insn:
 #endif
 
 #if FLEXE_PROFILE_BUILD
-    xtensa_profile_tick(cpu->pc);
+    xtensa_profile_tick_sp(cpu->pc, ar_read(cpu, 1));
 #endif
     cpu->_pc_written = false;
     cpu->pc += (uint32_t)ilen;

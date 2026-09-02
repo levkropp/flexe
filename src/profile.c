@@ -33,14 +33,50 @@ static uint64_t g_prof_total;
 static uint32_t g_prof_tick;
 static int      g_prof_on;
 
+/* Optional filter: only sample while the stack pointer is inside this 4 KB
+ * region, i.e. only while one particular FreeRTOS task is running. That turns
+ * a whole-system profile into a per-task one, which is the only way to ask
+ * "what is *that* task doing" in a symbol-less ROM running its own
+ * scheduler. Set FLEXE_PROFILE_SP=0x3FFD7000. */
+static uint32_t g_prof_sp_filter;
+
 void xtensa_profile_init(void)
 {
     const char *e = getenv("FLEXE_PROFILE");
     g_prof_on = e ? atoi(e) : 0;
+    const char *f = getenv("FLEXE_PROFILE_SP");
+    g_prof_sp_filter = f ? (uint32_t)strtoul(f, NULL, 0) & ~0xFFFu : 0;
 }
 
 /* Sampled every 1024th dispatch: frequent enough to rank the hot PCs,
  * infrequent enough that the sampling itself does not distort them. */
+/* Stack-pointer histogram. Each FreeRTOS task runs on its own stack, so
+ * distinct a1 regions are distinct tasks -- which identifies who is consuming
+ * the machine even in a symbol-less ROM running its own scheduler, where
+ * there is no task list to read. */
+static uint32_t g_prof_sp[PROF_BUCKETS];
+static uint64_t g_prof_sp_hits[PROF_BUCKETS];
+
+void xtensa_profile_tick_sp(uint32_t pc, uint32_t sp)
+{
+    if (g_prof_sp_filter && (sp & ~0xFFFu) != g_prof_sp_filter) {
+        g_prof_tick++;   /* keep the sampling cadence honest */
+        return;
+    }
+    xtensa_profile_tick(pc);
+    if (!g_prof_on || (g_prof_tick & 1023u) != 0) return;
+    uint32_t r = sp & ~0xFFFu;
+    uint32_t h = (r >> 12) * 2654435761u;
+    for (unsigned i = 0; i < 8; i++) {
+        uint32_t k = (h + i) & (PROF_BUCKETS - 1);
+        if (g_prof_sp_hits[k] == 0 || g_prof_sp[k] == r) {
+            g_prof_sp[k] = r;
+            g_prof_sp_hits[k]++;
+            return;
+        }
+    }
+}
+
 void xtensa_profile_tick(uint32_t pc)
 {
     if (!g_prof_on || (++g_prof_tick & 1023u) != 0) return;
@@ -92,6 +128,17 @@ void xtensa_profile_report(void)
                 g_prof_rgn[best], g_prof_rgn[best] + 0x3FF,
                 100.0 * (double)g_prof_rgn_hits[best] / (double)g_prof_total);
         g_prof_rgn_hits[best] = 0;
+    }
+    fprintf(stderr, "[profile] top task stacks (4 KB regions of a1):\n");
+    for (int n = 0; n < 10; n++) {
+        unsigned best = 0;
+        for (unsigned i = 1; i < PROF_BUCKETS; i++)
+            if (g_prof_sp_hits[i] > g_prof_sp_hits[best]) best = i;
+        if (g_prof_sp_hits[best] == 0) break;
+        fprintf(stderr, "  %2d. sp 0x%08X..0x%08X  %6.2f%%\n", n + 1,
+                g_prof_sp[best], g_prof_sp[best] + 0xFFF,
+                100.0 * (double)g_prof_sp_hits[best] / (double)g_prof_total);
+        g_prof_sp_hits[best] = 0;
     }
 }
 

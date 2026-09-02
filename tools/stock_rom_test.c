@@ -9,6 +9,7 @@
 
 #include "flexe_session.h"
 #include "jit.h"
+#include "spi_display.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1841,6 +1842,7 @@ int main(int argc, char **argv)
      * then reboots itself has not run correctly end to end, and nothing here
      * would have said so. The panic strings are the firmware's own, so this
      * catches any abort, not just that one. */
+    uint64_t soak_disp0 = spi_display_bytes_fed();
     uint64_t soak_insns0 = xtensa_retired_insns(flexe_session_cpu(session, 0))
                          + xtensa_retired_insns(flexe_session_cpu(session, 1));
     uint64_t soak_cyc0 = flexe_session_cpu(session, 0)->cycle_count;
@@ -1890,8 +1892,9 @@ int main(int argc, char **argv)
      * different failure from one that is simply idle, and the two are easy to
      * confuse from a single end-of-run PC sample. */
     if (getenv("FLEXE_SOAK_STATS")) {
-        fprintf(stderr, "[soak] fb_before=%08X fb_after=%08X\n", fb_sum,
-                framebuffer_checksum(framebuf, &framebuffer_mutex));
+        fprintf(stderr, "[soak] fb_before=%08X fb_after=%08X display_bytes=%llu\n",
+                fb_sum, framebuffer_checksum(framebuf, &framebuffer_mutex),
+                (unsigned long long)(spi_display_bytes_fed() - soak_disp0));
         uint64_t i1 = xtensa_retired_insns(flexe_session_cpu(session, 0))
                     + xtensa_retired_insns(flexe_session_cpu(session, 1));
         uint64_t c1 = flexe_session_cpu(session, 0)->cycle_count;
