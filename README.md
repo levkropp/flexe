@@ -158,7 +158,7 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 24 of 24 on x86-64
+The compiled Arduino hardware gates below all pass — 25 of 25 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 One deliberate gap is worth stating rather than leaving to be rediscovered:
@@ -176,6 +176,22 @@ and it did not work: a per-core interrupt source raised its CPU line without
 ever running a registered handler, so no GPIO interrupt reached the guest by
 any route. A CYD's touch controller signals with PENIRQ, so this matters on
 the target hardware.
+
+`test-wifi-client.sh` covers station association and an outbound TCP client,
+and closes the largest remaining gap for firmware built from source: WiFi
+events were recorded and never delivered. Stock ROMs are driven past this by
+poking a status address named in their profile, but a source build has no such
+address — Arduino's `WiFi.status()` is updated purely from those events, so a
+station connect never completed and anything waiting for `WL_CONNECTED` never
+got on the air. Alongside that, `esp_wifi_get_config()` zeroed its output
+unconditionally, so the guest could never see saved credentials, which is
+exactly what WiFiManager and everything built on it checks to decide whether
+to start a captive portal; `wifi_stubs_set_sta_credentials()` now lets the
+host pre-provision them. `esp_wifi_sta_get_ap_info()` was not modelled at all,
+so firmware could not report which network it was on. The gate also covers an
+outbound connection, which neither stock-ROM scenario reaches — both only bind
+and listen for their portals — with the host echoing a 1000-byte payload that
+each side checks against the other.
 
 `test-scheduler.sh` covers the rest of the scheduling surface, and found four
 more of the same kind. `vTaskDelayUntil` — how every fixed-rate loop is

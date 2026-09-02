@@ -965,6 +965,12 @@ int main(int argc, char **argv)
     flexe_session_t *session = flexe_session_create(&cfg);
     if (session && jit_verify)
         jit_set_verify(flexe_session_jit(session), true);
+    /* Optional pre-provisioned station credentials, so a firmware that would
+     * otherwise sit in its captive portal can be driven past provisioning. */
+    if (session && getenv("FLEXE_WIFI_SSID"))
+        wifi_stubs_set_sta_credentials(flexe_session_wifi(session),
+                                       getenv("FLEXE_WIFI_SSID"),
+                                       getenv("FLEXE_WIFI_PASS"));
     if (!session) {
         fprintf(stderr, "error: failed to create stock-ROM session\n");
         pthread_mutex_destroy(&framebuffer_mutex);

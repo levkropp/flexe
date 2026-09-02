@@ -80,4 +80,16 @@ int wifi_stubs_inject_promiscuous_frame(wifi_stubs_t *ws,
 /* Enable event log mode: prefix wifi output with [cycle] WIFI format */
 void wifi_stubs_set_event_log(wifi_stubs_t *ws, bool enabled);
 
+/* Pre-provision station credentials, reported by esp_wifi_get_config() as
+ * though a previous run had saved them. Firmware that provisions WiFi through
+ * a captive portal checks for saved credentials to decide whether to start
+ * the portal, so without these it can never be driven past provisioning. */
+void wifi_stubs_set_sta_credentials(wifi_stubs_t *ws, const char *ssid,
+                                    const char *password);
+
+/* Deliver one queued WiFi/IP event to the firmware's registered handlers.
+ * Call between execution batches: handlers run guest code and call back into
+ * these stubs, so they must not be dispatched from inside one. */
+void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu);
+
 #endif /* WIFI_STUBS_H */

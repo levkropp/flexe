@@ -525,6 +525,8 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     /* Same for FreeRTOS software timers, which Flexe models directly rather
      * than running the guest's timer daemon. */
     freertos_stubs_tick(s->frt);
+    /* And any queued WiFi/IP event, which likewise re-enters guest code. */
+    wifi_stubs_tick(s->wstubs, &s->cpu[0]);
 }
 
 /* ===== Callback configuration ===== */

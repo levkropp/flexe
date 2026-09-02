@@ -225,6 +225,11 @@ if(UNIX)
     target_compile_options(flexe-gpio-isr-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-wifi-client-test tools/wifi_client_test.c)
+    target_link_libraries(flexe-wifi-client-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-wifi-client-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-scheduler-test tools/scheduler_test.c)
     target_link_libraries(flexe-scheduler-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-scheduler-test PRIVATE

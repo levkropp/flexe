@@ -122,8 +122,29 @@ typedef struct {
 typedef struct {
     uint32_t handler_addr;   /* firmware callback address */
     uint32_t event_base;     /* event base identifier (pointer in emu mem) */
+    uint32_t handler_arg;    /* opaque arg the handler registered with */
     int32_t  event_id;       /* event ID (-1 = any) */
+    /* esp_event_base_t is a const char *, and ESP_EVENT_DEFINE_BASE gives it
+     * the base's own name as its string. Reading it is the only way to tell
+     * WIFI_EVENT from IP_EVENT, since both arrive here as bare pointers. */
+    char     base_name[16];
 } event_handler_t;
+
+/* Events queued by the WiFi model, delivered from wifi_stubs_tick(). */
+#define MAX_PENDING_EVENTS 8
+#define WIFI_EVENT_SCRATCH 0x3FFE9000u   /* guest scratch for event data */
+
+typedef enum {
+    EVT_DATA_NONE = 0,
+    EVT_DATA_STA_CONNECTED,
+    EVT_DATA_GOT_IP,
+} evt_data_kind_t;
+
+typedef struct {
+    char            base_name[16];
+    int32_t         event_id;
+    evt_data_kind_t data_kind;
+} pending_event_t;
 
 /* Synthetic AP for scan results */
 typedef struct {
@@ -165,6 +186,10 @@ struct wifi_stubs {
     bool               wifi_started;
     bool               wifi_inited;
     bool               sta_connected;
+    /* Station credentials the host has pre-provisioned, reported by
+     * esp_wifi_get_config() as though saved in NVS. Empty by default. */
+    char               sta_ssid[33];
+    char               sta_password[65];
     uint32_t           firmware_status_addr;
     uint8_t            channel;         /* 1-14 */
     uint8_t            sta_mac[6];      /* STA MAC */
@@ -187,6 +212,8 @@ struct wifi_stubs {
     /* Event system */
     event_handler_t    event_handlers[MAX_EVENT_HANDLERS];
     int                event_handler_count;
+    pending_event_t    pending_events[MAX_PENDING_EVENTS];
+    int                pending_event_count;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -1591,6 +1618,89 @@ static void stub_esp_wifi_get_mode(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, 0);
 }
 
+/* ===== WiFi/IP event delivery =====
+ *
+ * Handlers were recorded and never called. Stock ROMs are driven past this by
+ * poking a known status address in their profile, but firmware built from
+ * source has no such address: Arduino's WiFi.status() is updated purely from
+ * these events, so a station connect never completed and WiFi.begin() simply
+ * timed out. Anything that waits for WL_CONNECTED -- which is nearly every
+ * networked sketch -- could not get on the air at all.
+ *
+ * Events are queued rather than dispatched inside the stub that causes them:
+ * a handler runs guest code and commonly calls straight back into the WiFi
+ * API (Arduino's own handler calls esp_wifi_connect on STA_START), so
+ * dispatching inline would re-enter these stubs from underneath themselves.
+ * wifi_stubs_tick() drains the queue between execution batches instead.
+ */
+static void wifi_queue_event(wifi_stubs_t *ws, const char *base,
+                             int32_t event_id, evt_data_kind_t kind) {
+    if (ws->pending_event_count >= MAX_PENDING_EVENTS) return;
+    pending_event_t *e = &ws->pending_events[ws->pending_event_count++];
+    strncpy(e->base_name, base, sizeof(e->base_name) - 1);
+    e->base_name[sizeof(e->base_name) - 1] = '\0';
+    e->event_id = event_id;
+    e->data_kind = kind;
+}
+
+/* Lay out the event payload the handler expects, in guest scratch. */
+static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
+                                      evt_data_kind_t kind) {
+    uint32_t p = WIFI_EVENT_SCRATCH;
+    for (int i = 0; i < 64; i++) mem_write8(cpu->mem, p + (uint32_t)i, 0);
+
+    if (kind == EVT_DATA_STA_CONNECTED) {
+        /* wifi_event_sta_connected_t: ssid[32], ssid_len, bssid[6], channel,
+         * authmode. */
+        for (int i = 0; i < 32 && ws->sta_ssid[i]; i++)
+            mem_write8(cpu->mem, p + (uint32_t)i, (uint8_t)ws->sta_ssid[i]);
+        mem_write8(cpu->mem, p + 32u, (uint8_t)strlen(ws->sta_ssid));
+        static const uint8_t bssid[6] = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
+        for (int i = 0; i < 6; i++)
+            mem_write8(cpu->mem, p + 33u + (uint32_t)i, bssid[i]);
+        mem_write8(cpu->mem, p + 39u, 1);        /* channel */
+        mem_write8(cpu->mem, p + 40u, 3);        /* WIFI_AUTH_WPA2_PSK */
+    } else if (kind == EVT_DATA_GOT_IP) {
+        /* ip_event_got_ip_t on IDF 4.x leads with if_index, *then* the netif
+         * pointer, then ip/netmask/gw, then ip_changed. Getting that wrong is
+         * silent: the guest reads a neighbouring field and sees a plausible
+         * address (it read the netmask as its IP). */
+        mem_write32(cpu->mem, p + 0u, 0);            /* if_index */
+        mem_write32(cpu->mem, p + 4u, 0);            /* esp_netif */
+        mem_write32(cpu->mem, p + 8u, 0x0A00020Fu);  /* 10.0.2.15, LE u32 */
+        mem_write32(cpu->mem, p + 12u, 0x00FFFFFFu); /* 255.255.255.0 */
+        mem_write32(cpu->mem, p + 16u, 0x0A000202u); /* 10.0.2.2 */
+        mem_write32(cpu->mem, p + 20u, 1);           /* ip_changed */
+    } else {
+        return 0;
+    }
+    return p;
+}
+
+void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu) {
+    if (!ws || !cpu || ws->pending_event_count == 0) return;
+
+    /* One event per batch: a handler may queue more (STA_START leads to
+     * connect, which queues CONNECTED and GOT_IP), and draining the queue in
+     * a loop here would run them all inside one batch. */
+    pending_event_t e = ws->pending_events[0];
+    for (int i = 1; i < ws->pending_event_count; i++)
+        ws->pending_events[i - 1] = ws->pending_events[i];
+    ws->pending_event_count--;
+
+    uint32_t data = wifi_write_event_data(ws, cpu, e.data_kind);
+
+    for (int i = 0; i < ws->event_handler_count; i++) {
+        event_handler_t *h = &ws->event_handlers[i];
+        if (strcmp(h->base_name, e.base_name) != 0) continue;
+        if (h->event_id != e.event_id && h->event_id != -1) continue;
+        uint32_t args[4] = { h->handler_arg, h->event_base,
+                             (uint32_t)e.event_id, data };
+        (void)guest_call8(cpu, h->handler_addr, args, 4, 2000000u, NULL);
+    }
+    wifi_log(ws, "event %s/%d delivered\n", e.base_name, e.event_id);
+}
+
 static void stub_esp_wifi_set_config(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -1608,15 +1718,59 @@ static void stub_esp_wifi_set_config(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, 0);
 }
 
+/* esp_wifi_get_config(interface, config)
+ *
+ * This used to zero the struct unconditionally, which means the guest never
+ * has saved station credentials -- and firmware that provisions WiFi through
+ * a captive portal (WiFiManager and everything built on it, which is most of
+ * it) checks exactly that to decide whether to start the portal. Such firmware
+ * could therefore never get past provisioning, however it was configured; the
+ * portal is as far as it ever ran.
+ *
+ * Credentials the host has supplied are reported here as if they had been
+ * saved in NVS by a previous run, which is what lets a provisioned firmware
+ * be driven through to whatever it does once it is on the network. */
 static void stub_esp_wifi_get_config(xtensa_cpu_t *cpu, void *ctx)
 {
-    (void)ctx;
+    wifi_stubs_t *ws = ctx;
+    uint32_t iface = ws_arg(cpu, 0);
     uint32_t config_ptr = ws_arg(cpu, 1);
-    /* Zero out the config struct (at least first 128 bytes) */
     if (config_ptr) {
         for (int i = 0; i < 128; i++)
             mem_write8(cpu->mem, config_ptr + (uint32_t)i, 0);
+        /* wifi_sta_config_t: ssid[32] then password[64]. */
+        if (iface == 0 && ws && ws->sta_ssid[0]) {
+            for (int i = 0; i < 32 && ws->sta_ssid[i]; i++)
+                mem_write8(cpu->mem, config_ptr + (uint32_t)i,
+                           (uint8_t)ws->sta_ssid[i]);
+            for (int i = 0; i < 64 && ws->sta_password[i]; i++)
+                mem_write8(cpu->mem, config_ptr + 32u + (uint32_t)i,
+                           (uint8_t)ws->sta_password[i]);
+        }
     }
+    ws_return(cpu, 0);
+}
+
+/* esp_wifi_sta_get_ap_info(wifi_ap_record_t *) -- what Arduino's WiFi.SSID()
+ * and WiFi.RSSI() read. Not modelled before, so firmware could never report
+ * or display which network it was on. */
+static void stub_esp_wifi_sta_get_ap_info(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t rec = ws_arg(cpu, 0);
+    if (!ws->sta_connected || !rec) {
+        ws_return(cpu, (uint32_t)-1);   /* ESP_FAIL: not connected */
+        return;
+    }
+    /* wifi_ap_record_t: bssid[6], ssid[33], primary, second, rssi at 44. */
+    for (int i = 0; i < 80; i++) mem_write8(cpu->mem, rec + (uint32_t)i, 0);
+    static const uint8_t bssid[6] = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
+    for (int i = 0; i < 6; i++)
+        mem_write8(cpu->mem, rec + (uint32_t)i, bssid[i]);
+    for (int i = 0; i < 32 && ws->sta_ssid[i]; i++)
+        mem_write8(cpu->mem, rec + 6u + (uint32_t)i, (uint8_t)ws->sta_ssid[i]);
+    mem_write8(cpu->mem, rec + 39u, 1);              /* primary channel */
+    mem_write8(cpu->mem, rec + 44u, (uint8_t)(int8_t)-55); /* rssi */
     ws_return(cpu, 0);
 }
 
@@ -1627,6 +1781,10 @@ static void stub_esp_wifi_connect(xtensa_cpu_t *cpu, void *ctx)
     ws->sta_connected = true;
     if (ws->firmware_status_addr)
         mem_write32(cpu->mem, ws->firmware_status_addr, 3); /* WL_CONNECTED */
+    /* Association then address assignment, in that order, as on hardware. */
+    wifi_queue_event(ws, "WIFI_EVENT", 4 /* STA_CONNECTED */,
+                     EVT_DATA_STA_CONNECTED);
+    wifi_queue_event(ws, "IP_EVENT", 0 /* STA_GOT_IP */, EVT_DATA_GOT_IP);
     wifi_log(ws, "esp_wifi_connect()\n");
     ws_return(cpu, 0);
 }
@@ -1637,6 +1795,8 @@ static void stub_esp_wifi_disconnect(xtensa_cpu_t *cpu, void *ctx)
     ws->sta_connected = false;
     if (ws->firmware_status_addr)
         mem_write32(cpu->mem, ws->firmware_status_addr, 6); /* WL_DISCONNECTED */
+    wifi_queue_event(ws, "WIFI_EVENT", 5 /* STA_DISCONNECTED */,
+                     EVT_DATA_NONE);
     wifi_log(ws, "esp_wifi_disconnect()\n");
     ws_return(cpu, 0);
 }
@@ -1887,6 +2047,7 @@ static void stub_esp_event_loop_create_default(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, 0);
 }
 
+
 static void stub_esp_event_handler_register(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -1895,9 +2056,18 @@ static void stub_esp_event_handler_register(xtensa_cpu_t *cpu, void *ctx)
     uint32_t handler    = ws_arg(cpu, 2);
 
     if (ws->event_handler_count < MAX_EVENT_HANDLERS) {
-        ws->event_handlers[ws->event_handler_count].handler_addr = handler;
-        ws->event_handlers[ws->event_handler_count].event_base = event_base;
-        ws->event_handlers[ws->event_handler_count].event_id = event_id;
+        event_handler_t *h = &ws->event_handlers[ws->event_handler_count];
+        h->handler_addr = handler;
+        h->event_base = event_base;
+        h->handler_arg = ws_arg(cpu, 3);
+        h->event_id = event_id;
+        h->base_name[0] = '\0';
+        for (int i = 0; i < (int)sizeof(h->base_name) - 1; i++) {
+            uint8_t c = mem_read8(cpu->mem, event_base + (uint32_t)i);
+            h->base_name[i] = (char)c;
+            h->base_name[i + 1] = '\0';
+            if (c == 0) break;
+        }
         ws->event_handler_count++;
     }
     wifi_log(ws, "esp_event_handler_register(base=0x%08x, id=%d, handler=0x%08x)\n",
@@ -2074,6 +2244,7 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "esp_wifi_set_config",          stub_esp_wifi_set_config },
         { "esp_wifi_get_config",          stub_esp_wifi_get_config },
         { "esp_wifi_connect",             stub_esp_wifi_connect },
+        { "esp_wifi_sta_get_ap_info",     stub_esp_wifi_sta_get_ap_info },
         { "esp_wifi_disconnect",          stub_esp_wifi_disconnect },
         { "esp_wifi_scan_start",          stub_esp_wifi_scan_start },
         { "esp_wifi_scan_stop",           stub_esp_wifi_scan_stop },
@@ -2319,6 +2490,21 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
     }
     fprintf(stderr, "[wifi] hooked %d verified production-ROM entries\n", hooked);
     return hooked;
+}
+
+void wifi_stubs_set_sta_credentials(wifi_stubs_t *ws, const char *ssid,
+                                    const char *password) {
+    if (!ws) return;
+    ws->sta_ssid[0] = '\0';
+    ws->sta_password[0] = '\0';
+    if (ssid) {
+        strncpy(ws->sta_ssid, ssid, sizeof(ws->sta_ssid) - 1);
+        ws->sta_ssid[sizeof(ws->sta_ssid) - 1] = '\0';
+    }
+    if (password) {
+        strncpy(ws->sta_password, password, sizeof(ws->sta_password) - 1);
+        ws->sta_password[sizeof(ws->sta_password) - 1] = '\0';
+    }
 }
 
 void wifi_stubs_set_event_log(wifi_stubs_t *ws, bool enabled) {
