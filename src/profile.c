@@ -56,6 +56,12 @@ void xtensa_profile_init(void)
  * there is no task list to read. */
 static uint32_t g_prof_sp[PROF_BUCKETS];
 static uint64_t g_prof_sp_hits[PROF_BUCKETS];
+/* Last PC seen on each stack, and the sample index it was seen at. A task
+ * that stops shows up as a stack whose last sample is far in the past, and
+ * the PC recorded there is where it blocked -- which is the question worth
+ * asking about a task that used to run and no longer does. */
+static uint32_t g_prof_sp_lastpc[PROF_BUCKETS];
+static uint64_t g_prof_sp_lastseen[PROF_BUCKETS];
 
 void xtensa_profile_tick_sp(uint32_t pc, uint32_t sp)
 {
@@ -72,6 +78,8 @@ void xtensa_profile_tick_sp(uint32_t pc, uint32_t sp)
         if (g_prof_sp_hits[k] == 0 || g_prof_sp[k] == r) {
             g_prof_sp[k] = r;
             g_prof_sp_hits[k]++;
+            g_prof_sp_lastpc[k] = pc;
+            g_prof_sp_lastseen[k] = g_prof_total;
             return;
         }
     }
@@ -135,9 +143,13 @@ void xtensa_profile_report(void)
         for (unsigned i = 1; i < PROF_BUCKETS; i++)
             if (g_prof_sp_hits[i] > g_prof_sp_hits[best]) best = i;
         if (g_prof_sp_hits[best] == 0) break;
-        fprintf(stderr, "  %2d. sp 0x%08X..0x%08X  %6.2f%%\n", n + 1,
+        fprintf(stderr, "  %2d. sp 0x%08X..0x%08X  %6.2f%%  last_pc=0x%08X "
+                "last_seen=%.1f%% through run\n", n + 1,
                 g_prof_sp[best], g_prof_sp[best] + 0xFFF,
-                100.0 * (double)g_prof_sp_hits[best] / (double)g_prof_total);
+                100.0 * (double)g_prof_sp_hits[best] / (double)g_prof_total,
+                g_prof_sp_lastpc[best],
+                100.0 * (double)g_prof_sp_lastseen[best] /
+                        (double)(g_prof_total ? g_prof_total : 1));
         g_prof_sp_hits[best] = 0;
     }
 }
