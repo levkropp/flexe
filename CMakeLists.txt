@@ -238,6 +238,11 @@ if(UNIX)
     target_compile_options(flexe-wifi-client-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-task-wdt-test tools/task_wdt_test.c)
+    target_link_libraries(flexe-task-wdt-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-task-wdt-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-scheduler-test tools/scheduler_test.c)
     target_link_libraries(flexe-scheduler-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-scheduler-test PRIVATE

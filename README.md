@@ -177,7 +177,7 @@ For host-memory and undefined-behavior validation, build with
 `-fsanitize=address,undefined`; the default 4 MB predecode configuration is
 covered by both the unit suite and the compiled/stock-ROM integration runners.
 
-The compiled Arduino hardware gates below all pass — 25 of 25 on x86-64
+The compiled Arduino hardware gates below all pass — 26 of 26 on x86-64
 Linux (GCC 15, Arduino-ESP32 2.0.11), under both the interpreter and the JIT.
 
 One deliberate gap is worth stating rather than leaving to be rediscovered:
@@ -238,6 +238,19 @@ Socket error paths also set a truthful `errno` at the point of failure. Most of 
 without touching it, leaving firmware to read whatever was last set, and
 firmware branches on that: Arduino's `WiFiUDP::parsePacket()` treats
 `EWOULDBLOCK` as "nothing to read" and logs an error for anything else.
+
+`test-task-wdt.sh` covers the task watchdog. `esp_task_wdt_init`, `_add` and
+`_reset` answered with a bare success and the rest of the family was not
+modelled at all, so the real ESP-IDF code ran against a subscription list
+nothing had populated. Arduino's `disableCore0WDT()` calls
+`esp_task_wdt_delete()` on the idle task and reports the failure — it is in
+NerdMiner's boot log on every run. Firmware that subscribes a task and later
+unsubscribes it simply could not. The subscription set is modelled now, so the
+calls agree with one another and return the `esp_err_t` values ESP-IDF returns
+rather than a blanket success. The watchdog deliberately never fires: there is
+no wall clock to miss a deadline against, and a spurious reset would be far
+worse than a watchdog that never bites — the gate checks the device is still
+alive long after it stopped feeding it.
 
 `test-wifi-client.sh` covers station association and an outbound TCP client,
 and closes the largest remaining gap for firmware built from source: WiFi

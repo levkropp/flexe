@@ -2926,6 +2926,102 @@ static void stub_cache_flash_mmu_set(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
+
+/* ===== Task watchdog =====
+ *
+ * esp_task_wdt_init/add/reset were answered with a bare success and the rest
+ * of the family was not modelled at all, so the real ESP-IDF implementations
+ * ran against a subscription list nothing had populated. Arduino's
+ * disableCore0WDT() calls esp_task_wdt_delete() on the idle task and reports
+ * the failure -- it is in NerdMiner's boot log on every run:
+ *
+ *   [E][esp32-hal-misc.c:128] disableCore0WDT(): Failed to remove Core 0
+ *   IDLE task from WDT
+ *
+ * Firmware that subscribes a task and later unsubscribes it therefore could
+ * not, and anything checking esp_task_wdt_status() got whatever the real
+ * implementation made of an empty list. Model the subscription set so the
+ * calls agree with each other. The watchdog deliberately never fires: there
+ * is no wall clock to miss a deadline against, and a spurious reset would be
+ * far worse than a watchdog that never bites.
+ */
+/* esp_err_t values used by the task-watchdog API. */
+#define ESP_ERR_INVALID_ARG_VAL   0x102u
+#define ESP_ERR_INVALID_STATE_VAL 0x103u
+#define ESP_ERR_NOT_FOUND_VAL     0x105u
+#define ESP_ERR_NO_MEM_VAL        0x101u
+
+#define TWDT_MAX_TASKS 16
+#define TWDT_CURRENT_TASK 0xFFFFFFFFu   /* NULL handle means "calling task" */
+
+static uint32_t twdt_tasks[TWDT_MAX_TASKS];
+static int      twdt_count;
+static bool     twdt_inited;
+
+static int twdt_find(uint32_t h) {
+    for (int i = 0; i < twdt_count; i++)
+        if (twdt_tasks[i] == h) return i;
+    return -1;
+}
+
+static uint32_t twdt_handle(xtensa_cpu_t *cpu, int argno) {
+    uint32_t h = rom_arg(cpu, argno);
+    return h ? h : TWDT_CURRENT_TASK;
+}
+
+static void stub_esp_task_wdt_init(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    twdt_inited = true;
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_task_wdt_deinit(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    /* ESP-IDF refuses to deinit while tasks are still subscribed. */
+    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    if (twdt_count != 0) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    twdt_inited = false;
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_task_wdt_add(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    uint32_t h = twdt_handle(cpu, 0);
+    if (twdt_find(h) >= 0) { rom_return(cpu, ESP_ERR_INVALID_ARG_VAL); return; }
+    if (twdt_count >= TWDT_MAX_TASKS) { rom_return(cpu, ESP_ERR_NO_MEM_VAL); return; }
+    twdt_tasks[twdt_count++] = h;
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_task_wdt_delete(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    int i = twdt_find(twdt_handle(cpu, 0));
+    if (i < 0) { rom_return(cpu, ESP_ERR_NOT_FOUND_VAL); return; }
+    twdt_tasks[i] = twdt_tasks[--twdt_count];
+    rom_return(cpu, 0);
+}
+
+static void stub_esp_task_wdt_status(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    rom_return(cpu, twdt_find(twdt_handle(cpu, 0)) >= 0
+                    ? 0u : ESP_ERR_NOT_FOUND_VAL);
+}
+
+static void stub_esp_task_wdt_reset(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    rom_return(cpu, twdt_find(TWDT_CURRENT_TASK) >= 0
+                    ? 0u : ESP_ERR_NOT_FOUND_VAL);
+}
+
+void rom_stubs_task_wdt_reset_state(void) {
+    twdt_count = 0;
+    twdt_inited = false;
+}
+
 static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_return(cpu, 0);
@@ -5105,9 +5201,6 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         "esp_timer_impl_init_system_time",
         "esp_int_wdt_init",
         "esp_int_wdt_cpu_init",
-        "esp_task_wdt_init",
-        "esp_task_wdt_add",
-        "esp_task_wdt_reset",
         "esp_crosscore_int_init",
         "esp_cache_err_int_init",
         "esp_ipc_isr_init",
@@ -5124,6 +5217,27 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         if (elf_symbols_find(syms, init_ret0_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, init_ret0_fns[i]);
             hooked++;
+        }
+    }
+
+    /* Task watchdog: a modelled subscription set, so init/add/delete/status
+     * and reset agree with one another. */
+    {
+        static const struct { const char *name; rom_stub_fn fn; } twdt[] = {
+            { "esp_task_wdt_init",   stub_esp_task_wdt_init },
+            { "esp_task_wdt_deinit", stub_esp_task_wdt_deinit },
+            { "esp_task_wdt_add",    stub_esp_task_wdt_add },
+            { "esp_task_wdt_delete", stub_esp_task_wdt_delete },
+            { "esp_task_wdt_status", stub_esp_task_wdt_status },
+            { "esp_task_wdt_reset",  stub_esp_task_wdt_reset },
+            { NULL, NULL }
+        };
+        for (int i = 0; twdt[i].name; i++) {
+            uint32_t addr;
+            if (elf_symbols_find(syms, twdt[i].name, &addr) == 0) {
+                rom_stubs_register(stubs, addr, twdt[i].fn, twdt[i].name);
+                hooked++;
+            }
         }
     }
 
