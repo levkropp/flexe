@@ -191,7 +191,12 @@ host pre-provision them. `esp_wifi_sta_get_ap_info()` was not modelled at all,
 so firmware could not report which network it was on. The gate also covers an
 outbound connection, which neither stock-ROM scenario reaches — both only bind
 and listen for their portals — with the host echoing a 1000-byte payload that
-each side checks against the other.
+each side checks against the other. One more was needed to make the Arduino
+path work at all: `esp_netif_dhcpc_start()` was unmodelled, and
+`WiFiSTAClass::begin()` returns `WL_CONNECT_FAILED` if it reports failure,
+*before* ever calling `esp_wifi_connect()`. So `WiFi.begin()` — what real
+firmware calls — failed without the firmware ever associating, and the gate
+now covers that path as well as the IDF calls beneath it.
 
 `test-scheduler.sh` covers the rest of the scheduling surface, and found four
 more of the same kind. `vTaskDelayUntil` — how every fixed-rate loop is

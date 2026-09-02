@@ -1751,6 +1751,43 @@ static void stub_esp_wifi_get_config(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, 0);
 }
 
+/* ===== esp_netif =====
+ *
+ * Arduino's WiFiSTAClass::begin() calls esp_netif_dhcpc_start() and returns
+ * WL_CONNECT_FAILED if it reports failure -- *before* it ever reaches
+ * esp_wifi_connect(). With no model for it the real implementation ran
+ * against a netif this emulator never really created, so begin() failed there
+ * and the firmware never associated at all. Nothing about that is visible
+ * from the outside: begin() simply returns a failure code that most sketches
+ * turn into a retry loop.
+ */
+static void stub_esp_netif_dhcpc_start(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    wifi_log(ws, "esp_netif_dhcpc_start()\n");
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_netif_ok(xtensa_cpu_t *cpu, void *ctx)
+{
+    (void)ctx;
+    ws_return(cpu, 0);
+}
+
+/* esp_netif_get_ip_info(netif, esp_netif_ip_info_t *) -- the address the
+ * firmware displays and binds to. Matches what the GOT_IP event reports. */
+static void stub_esp_netif_get_ip_info(xtensa_cpu_t *cpu, void *ctx)
+{
+    (void)ctx;
+    uint32_t out = ws_arg(cpu, 1);
+    if (out) {
+        mem_write32(cpu->mem, out + 0u, 0x0A00020Fu);  /* 10.0.2.15 */
+        mem_write32(cpu->mem, out + 4u, 0x00FFFFFFu);  /* 255.255.255.0 */
+        mem_write32(cpu->mem, out + 8u, 0x0A000202u);  /* 10.0.2.2 */
+    }
+    ws_return(cpu, 0);
+}
+
 /* esp_wifi_sta_get_ap_info(wifi_ap_record_t *) -- what Arduino's WiFi.SSID()
  * and WiFi.RSSI() read. Not modelled before, so firmware could never report
  * or display which network it was on. */
@@ -2245,6 +2282,12 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "esp_wifi_get_config",          stub_esp_wifi_get_config },
         { "esp_wifi_connect",             stub_esp_wifi_connect },
         { "esp_wifi_sta_get_ap_info",     stub_esp_wifi_sta_get_ap_info },
+        { "esp_netif_dhcpc_start",        stub_esp_netif_dhcpc_start },
+        { "esp_netif_dhcpc_stop",         stub_esp_netif_ok },
+        { "esp_netif_dhcps_start",        stub_esp_netif_ok },
+        { "esp_netif_dhcps_stop",         stub_esp_netif_ok },
+        { "esp_netif_set_hostname",       stub_esp_netif_ok },
+        { "esp_netif_get_ip_info",        stub_esp_netif_get_ip_info },
         { "esp_wifi_disconnect",          stub_esp_wifi_disconnect },
         { "esp_wifi_scan_start",          stub_esp_wifi_scan_start },
         { "esp_wifi_scan_stop",           stub_esp_wifi_scan_stop },

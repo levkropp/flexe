@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
                                     strlen(TEST_SSID));
 
     printf("engine=%s stage=0x%08X ssid=%u/%08X status=%u@%ums ping=%u/%08X "
-           "echo=%u/%08X vs %08X ip=%08X closed=%u joined=%08X "
+           "echo=%u/%08X vs %08X ip=%08X begin=%u joined=%08X "
            "accepted=%d server_bytes=%zu unhandled=%d unregistered=%d\n",
            flexe_session_jit(session) ? "jit" : "interp", stage,
            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
@@ -203,13 +203,15 @@ int main(int argc, char **argv) {
     bool server_ok = sv.accepted == 1 &&
                      sv.echoed >= (size_t)PAYLOAD_LEN + 4u;
 
+    /* WiFi.begin() -- the Arduino path real firmware uses -- also associated. */
+    bool begin_ok = r[10] >= 1u;
     int ok = stage == SUCCESS_MARKER && ssid_ok && status_ok && ping_ok &&
-             echo_ok && server_ok && r[10] == 0u &&
+             echo_ok && server_ok && begin_ok &&
              unhandled == 0 && unregistered == 0;
     if (!ok)
         fprintf(stderr, "[wifi-client] ssid=%d status=%d ping=%d echo=%d "
-                        "server=%d (want ssid %zu/%08X)\n",
-                ssid_ok, status_ok, ping_ok, echo_ok, server_ok,
+                        "server=%d begin=%d (want ssid %zu/%08X)\n",
+                ssid_ok, status_ok, ping_ok, echo_ok, server_ok, begin_ok,
                 strlen(TEST_SSID), want_ssid_hash);
 
     flexe_session_destroy(session);

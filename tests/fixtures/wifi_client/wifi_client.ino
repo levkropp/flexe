@@ -106,6 +106,24 @@ void setup() {
                           ? fnv1a(ap.ssid, joined_len) : 0xDEAD0000u;
   flexe_wifi_stage = 2;
 
+  /* And now the path real firmware actually takes. WiFi.begin() returns
+   * WL_CONNECT_FAILED without ever calling esp_wifi_connect() if
+   * esp_netif_dhcpc_start() reports failure, which is what happened when it
+   * was unmodelled -- so this covers the Arduino wrapper as well as the IDF
+   * calls above. */
+  WiFi.disconnect();
+  delay(20);
+  saw_connected = 0;
+  saw_got_ip = 0;
+  WiFi.begin("flexe-net", "flexe-secret");
+  waited = 0;
+  while ((saw_connected == 0 || saw_got_ip == 0) && waited < 5000) {
+    delay(10);
+    waited += 10;
+  }
+  flexe_wifi_result[10] = saw_got_ip;
+  if (saw_got_ip == 0) { fail(11); return; }
+
   /* Wait for the harness to publish the port it is listening on. */
   uint32_t spins = 0;
   while (flexe_wifi_port == 0 && spins < 2000) { delay(1); spins++; }
@@ -161,7 +179,6 @@ void setup() {
     if (rx[i] != tx[i]) { fail(9); return; }
 
   client.stop();
-  flexe_wifi_result[10] = client.connected() ? 1u : 0u;
   flexe_wifi_stage = SUCCESS_MARKER;
 }
 
