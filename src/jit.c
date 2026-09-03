@@ -565,7 +565,7 @@ static int jit_short_block_has_backedge(const jit_scan_t *scan,
  *
  * ARM64: X27 — callee-saved, outside the RAX..R15 compat enum, saved in
  *        the block prologue/epilogue. Body code never touches it.
- * x86:   no free register exists (R8-R13 hold guest a1-a6 via RA_MAP,
+ * x86:   no free register exists (R8-R13 hold guest registers via RA_HOST,
  *        R14/R15 hold mem/cpu, and RAX..RDI plus RBP are body scratch), so
  *        the total lives in cpu->jit_acc. x86 adds to and compares against
  *        memory directly, so a block exit still costs one instruction, as
@@ -615,32 +615,111 @@ static inline int32_t ar_offset(int wb4, int n) {
 
 /* ===== Register Allocation ===== */
 
-/* Number of guest registers allocated to host regs.
- * a1-a2 → R12-R13 (callee-saved, no save/restore needed around C calls).
- * a3-a6 → R8-R11 (caller-saved, push/pop around slow-path C calls in mem emitters). */
+/* Host registers that may hold guest registers.
+ * R12-R13 are callee-saved, so they survive the memory slow path's C calls
+ * untouched; R8-R11 are caller-saved and are pushed and popped around it. */
 #define RA_COUNT 6
 
-static const int8_t RA_MAP[16] = {
-    -1,  /* a0: spilled (modified by CALL/RETW) */
-    R12, /* a1: stack pointer — callee-saved */
-    R13, /* a2: arg/return  — callee-saved */
-    R8,  /* a3: arg — caller-saved, save around C calls */
-    R9,  /* a4: arg — caller-saved */
-    R10, /* a5: arg — caller-saved */
-    R11, /* a6: arg — caller-saved */
-    -1, -1, -1, -1, -1, -1, -1, -1, -1  /* a7-a15: spilled */
-};
+static const int8_t RA_HOST[RA_COUNT] = { R12, R13, R8, R9, R10, R11 };
 
 typedef struct {
-    uint8_t dirty;    /* bit i set = a(i+1) was written, deferred store */
-    uint8_t loaded;   /* bit i set = a(i+1) is live in its host reg */
+    uint8_t dirty;          /* bit i set = slot i was written */
+    uint8_t loaded;         /* bit i set = slot i is live in its host reg */
+    /* Set for a block that keeps its registers resident across a native loop
+     * back-edge. Such a block's exits cannot flush the dirty set as it stands
+     * where the exit is *written*, because on the second and later iterations
+     * registers written further down the body are already dirty from the
+     * previous pass and live only in host registers. Their write-back has to
+     * be deferred to a stub emitted after the body, where the dirty set is
+     * complete. Safe only because such a block preloads every mapped
+     * register, so a host register named by the full set always holds a
+     * valid value even on a path that never wrote it. */
+    uint8_t defer_flush;
+    int8_t  slot[16];       /* guest ar index -> slot, or -1 for spilled */
+    int8_t  greg[RA_COUNT]; /* slot -> guest ar index, or -1 for unused */
 } regalloc_t;
+
+/* Host register holding guest ar[n], or -1 if n is spilled. */
+static inline int ra_host(const regalloc_t *ra, int n) {
+    if (n < 0 || n > 15) return -1;
+    int sl = ra->slot[n];
+    return sl < 0 ? -1 : RA_HOST[sl];
+}
+
+/* Which guest registers get host registers for this block.
+ *
+ * The map used to be fixed at a1-a6, which suits the windowed ABI's argument
+ * registers but not the code a compiler emits inside a function, where the
+ * hot values sit wherever the register allocator put them -- frequently
+ * a8-a15. Every reference to one of those was a load or a store, and in a
+ * loop body that is per iteration. Counting references over the block and
+ * keeping the busiest costs one pass over instructions that are already
+ * decoded, and pays for itself the first time a loop keeps its accumulator
+ * above a7.
+ *
+ * Any choice is correct: a guest register that is not in the map is simply
+ * accessed in memory. So the operand extraction only has to be a good guess.
+ * It reads the r/s/t nibbles at bits 15:12, 11:8 and 7:4, skipping the fields
+ * the common formats use as immediates -- a stray vote only wastes a slot.
+ *
+ * a0 is never allocated. CALLn writes the return address straight into ar[]
+ * and RETW reads it back the same way, neither through the allocator. Every
+ * other direct ar[] access is either window-relative past a15 (CALLn's
+ * rotated slots, at n = 16, 32 or 48) or happens after a flush that ends the
+ * block (ENTRY), so a0 is the whole of the exclusion. */
+static void ra_init(regalloc_t *ra, const jit_scan_t *scan) {
+    memset(ra, 0, sizeof *ra);
+    for (int n = 0; n < 16; n++) ra->slot[n] = -1;
+    for (int i = 0; i < RA_COUNT; i++) ra->greg[i] = -1;
+
+    uint16_t votes[16];
+    memset(votes, 0, sizeof votes);
+
+    for (int i = 0; i < scan->count; i++) {
+        uint32_t insn = scan->insns[i];
+        int t = (int)((insn >> 4) & 0xF);
+        int sreg = (int)((insn >> 8) & 0xF);
+        int r = (int)((insn >> 12) & 0xF);
+        int op0 = (int)(insn & 0xF);
+        int vt = 1, vs = 1, vr = 1;
+        if (scan->ilens[i] == 2) {
+            switch (op0) {
+            case 0x8: case 0x9: vr = 0; break;          /* L32I.N/S32I.N: r is the offset */
+            case 0xB: vt = 0; break;                    /* ADDI.N: t is the immediate */
+            case 0xC: vt = 0; vr = 0; break;            /* MOVI.N / BEQZ.N: s only */
+            default: break;
+            }
+        } else {
+            switch (op0) {
+            case 1: vs = 0; vr = 0; break;              /* L32R: t and a literal */
+            case 2: vr = 0; break;                      /* LSAI: r is the sub-opcode */
+            case 5: vt = 0; vs = 0; vr = 0; break;      /* CALLn: no register fields */
+            case 6: vt = 0; vr = 0; break;              /* BRI/LOOP: s and a literal */
+            default: break;                             /* QRST etc: r, s and t */
+            }
+        }
+        if (vt) votes[t]++;
+        if (vs) votes[sreg]++;
+        if (vr) votes[r]++;
+    }
+    votes[0] = 0;   /* a0 is never a candidate */
+
+    for (int i = 0; i < RA_COUNT; i++) {
+        int best = -1;
+        for (int n = 1; n < 16; n++)
+            if (votes[n] > 0 && (best < 0 || votes[n] > votes[best])) best = n;
+        if (best < 0) break;
+        ra->slot[best] = (int8_t)i;
+        ra->greg[i] = (int8_t)best;
+        votes[best] = 0;
+    }
+}
 
 /* Load guest ar[n] into dst_x86. Uses host reg if allocated. */
 static void ra_load_ar(emit_t *e, regalloc_t *ra, int dst_x86, int wb4, int n) {
-    if (n >= 0 && n < 16 && RA_MAP[n] >= 0) {
-        int host = RA_MAP[n];
-        int bit = n - 1;
+    int bit = (n >= 0 && n < 16) ? ra->slot[n] : -1;
+    if (bit >= 0) {
+        int host = RA_HOST[bit];
         if (!(ra->loaded & (1u << bit))) {
             /* Load from memory into host reg */
             emit_load32_disp(e, host, REG_CPU, ar_offset(wb4, n));
@@ -666,9 +745,10 @@ static void ra_load_ar(emit_t *e, regalloc_t *ra, int dst_x86, int wb4, int n) {
  * Marks the register loaded and dirty, exactly as ra_load_ar + ra_store_ar
  * would have. */
 static int ra_inplace(emit_t *e, regalloc_t *ra, int wb4, int r, int s) {
-    if (r != s || r < 1 || r > RA_COUNT || RA_MAP[r] < 0) return -1;
-    int host = RA_MAP[r];
-    int bit = r - 1;
+    if (r != s || r < 1 || r > 15) return -1;
+    int bit = ra->slot[r];
+    if (bit < 0) return -1;
+    int host = RA_HOST[bit];
     if (!(ra->loaded & (1u << bit))) {
         emit_load32_disp(e, host, REG_CPU, ar_offset(wb4, r));
         ra->loaded |= (uint8_t)(1u << bit);
@@ -687,9 +767,9 @@ static int ra_inplace(emit_t *e, regalloc_t *ra, int wb4, int r, int s) {
  * for L32I.N/S32I.N, and the copy this removes sat in the middle of every
  * such access. */
 static int ra_addr_reg(emit_t *e, regalloc_t *ra, int wb4, int s, int32_t off) {
-    if (off == 0 && s >= 1 && s <= RA_COUNT && RA_MAP[s] >= 0) {
-        int host = RA_MAP[s];
-        int bit = s - 1;
+    int bit = (off == 0 && s >= 1 && s <= 15) ? ra->slot[s] : -1;
+    if (bit >= 0) {
+        int host = RA_HOST[bit];
         if (!(ra->loaded & (1u << bit))) {
             emit_load32_disp(e, host, REG_CPU, ar_offset(wb4, s));
             ra->loaded |= (uint8_t)(1u << bit);
@@ -703,9 +783,9 @@ static int ra_addr_reg(emit_t *e, regalloc_t *ra, int wb4, int s, int32_t off) {
 
 /* Store x86 reg into guest ar[n]. Defers write if allocated. */
 static void ra_store_ar(emit_t *e, regalloc_t *ra, int src_x86, int wb4, int n) {
-    if (n >= 0 && n < 16 && RA_MAP[n] >= 0) {
-        int host = RA_MAP[n];
-        int bit = n - 1;
+    int bit = (n >= 0 && n < 16) ? ra->slot[n] : -1;
+    if (bit >= 0) {
+        int host = RA_HOST[bit];
         if (src_x86 != host) {
             emit_mov_reg32_reg32(e, host, src_x86);
         }
@@ -717,15 +797,27 @@ static void ra_store_ar(emit_t *e, regalloc_t *ra, int src_x86, int wb4, int n) 
     }
 }
 
+/* Drop whatever the allocator holds for guest ar[n], without writing it back.
+ * For use where an instruction writes ar[n] in memory itself: the old value is
+ * dead, and leaving the dirty bit set would let a later flush put it back over
+ * what was just written. */
+static void ra_invalidate(regalloc_t *ra, int n) {
+    if (n < 0 || n > 15) return;
+    int bit = ra->slot[n];
+    if (bit < 0) return;
+    ra->dirty  &= (uint8_t)~(1u << bit);
+    ra->loaded &= (uint8_t)~(1u << bit);
+}
+
 /* Flush all dirty allocated regs to memory. Called at block exits.
  * Dirty bits persist for the full block compilation (reset via regalloc_t ra = {0,0}
  * at each new block). Both branch exits emit the same stores — the second is
  * redundant but correct. Cost: ≤2 extra mov instructions at one exit per block. */
 static void ra_flush(emit_t *e, regalloc_t *ra, int wb4) {
-    for (int n = 1; n <= RA_COUNT; n++) {
-        int bit = n - 1;
-        if (ra->dirty & (1u << bit)) {
-            emit_store32_disp(e, RA_MAP[n], REG_CPU, ar_offset(wb4, n));
+    for (int i = 0; i < RA_COUNT; i++) {
+        if (ra->greg[i] >= 0 && (ra->dirty & (1u << i))) {
+            emit_store32_disp(e, RA_HOST[i], REG_CPU,
+                              ar_offset(wb4, ra->greg[i]));
         }
     }
     /* NOTE: do NOT clear ra->dirty here. Multiple block exits (both sides of a
@@ -1074,7 +1166,7 @@ static void jit_add_side_exit(emit_t *e, regalloc_t *ra, int wb4, int cc,
                               uint32_t target_pc, int insn_count,
                               side_exit_t *sx, int *sx_count, jit_state_t *jit) {
     (void)jit;
-    ra_flush(e, ra, wb4);
+    if (!ra->defer_flush) ra_flush(e, ra, wb4);
     int patch = emit_jcc_rel32(e, (uint8_t)cc);
     sx[*sx_count].patch_site = patch;
     sx[*sx_count].target_pc  = target_pc;
@@ -1982,7 +2074,15 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
         }
 
-        /* Write return address to a0/current or the callee's future a0 slot. */
+        /* Write return address to a0/current or the callee's future a0 slot.
+         *
+         * CALLn encodes n as 0-3, so the slot is guest a0, a4, a8 or a12 --
+         * inside this window, and so possibly a register the allocator is
+         * holding. This store goes straight to memory, and the flush at the
+         * block exit would then write the stale cached value back over the
+         * return address. Drop the allocator's copy first: the guest's old
+         * value there is dead, CALLn overwrites it unconditionally. */
+        ra_invalidate(ra, call_nn * 4);
         emit_store32_disp_imm(e, REG_CPU, ret_ar_off, ret_addr);
 
         /* Block exit to callee. */
@@ -2347,9 +2447,10 @@ static void emit_jmp_to_epilogue(emit_t *e, jit_state_t *jit) {
  * Accumulates insn_count into RAX (chained runs accumulate) and sets
  * _pc_written so the interpreter's hook gate re-dispatches compiled
  * code on the very next step. */
-static void emit_side_exit_body(emit_t *e, const side_exit_t *sx,
-                                jit_state_t *jit) {
+static void emit_side_exit_body(emit_t *e, regalloc_t *ra, int wb4,
+                                const side_exit_t *sx, jit_state_t *jit) {
     emit_patch_rel32(e, sx->patch_site);
+    if (ra->defer_flush) ra_flush(e, ra, wb4);
     emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, sx->target_pc);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
     emit_acc_add(e, sx->insn_count);
@@ -2687,7 +2788,8 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
 
     /* Register allocator: lazy load — regs are loaded from ar[] on first
      * use, so blocks only pay for the guest regs they actually touch. */
-    regalloc_t ra = {0, 0};
+    regalloc_t ra;
+    ra_init(&ra, scan);
 
     /* A block that closes its own loop back-edge natively runs its body many
      * times per entry, and lazy loading made every iteration reload the
@@ -2703,12 +2805,16 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
      * whether one check on entry is enough because the body cannot write
      * them. */
     const bool recheck_sr = self_loop && jit_block_writes_loop_sr(scan);
+    ra.defer_flush = self_loop ? 1u : 0u;
     int sr_bail[2];
     int sr_bail_count = 0;
     if (self_loop) {
-        for (int n = 1; n <= RA_COUNT; n++)
-            emit_load32_disp(&e, RA_MAP[n], REG_CPU, ar_offset(wb4, n));
-        ra.loaded = (uint8_t)((1u << RA_COUNT) - 1u);
+        for (int i = 0; i < RA_COUNT; i++) {
+            if (ra.greg[i] < 0) continue;
+            emit_load32_disp(&e, RA_HOST[i], REG_CPU,
+                             ar_offset(wb4, ra.greg[i]));
+            ra.loaded |= (uint8_t)(1u << i);
+        }
 
         if (!recheck_sr) {
             /* The live loop must be the one this block was compiled for.
@@ -2805,11 +2911,12 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
              * the interpreted branch that first got us here, so the full
              * stub's stores are dead work. Emit just the accounting + jump. */
             emit_patch_rel32(&e, sx[k].patch_site);
+            if (ra.defer_flush) ra_flush(&e, &ra, wb4);
             emit_acc_add(&e, sx[k].insn_count);
             jit_chain_record(jit, sx[k].target_pc, sx[k].target_wb, e.ptr);
             emit_jmp_to_epilogue(&e, jit);
         } else {
-            emit_side_exit_body(&e, &sx[k], jit);
+            emit_side_exit_body(&e, &ra, wb4, &sx[k], jit);
         }
     }
 
@@ -2972,6 +3079,22 @@ static void jit_arch_capture(const xtensa_cpu_t *cpu, jit_arch_state_t *st) {
     st->br = cpu->br;
 }
 
+/* Print the guest instructions of a block that miscompiled. A block address
+ * alone leaves the next step -- finding out which instruction it was -- to a
+ * disassembler and a load-address calculation, and stock ROMs have no symbols
+ * to make that easy. Printed once per block. */
+static void jit_report_block_source(const xtensa_cpu_t *cpu, uint32_t pc) {
+    if (!cpu) return;
+    char line[128];
+    uint32_t at = pc;
+    for (int i = 0; i < 24; i++) {
+        int len = xtensa_disasm(cpu, at, line, sizeof line);
+        if (len <= 0) break;
+        fprintf(stderr, "[jit-verify]   %08X: %s\n", at, line);
+        at += (uint32_t)len;
+    }
+}
+
 static int jit_arch_report(const jit_arch_state_t *ref,
                            const jit_arch_state_t *got, uint32_t pc) {
     int diffs = 0;
@@ -3124,7 +3247,15 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
         }
     }
     mem_journal_end();
-    if (diffs > 0) jit->verify_mismatches++;
+    if (diffs > 0) {
+        jit->verify_mismatches++;
+        /* Name the instructions once per bad block, not once per report. */
+        static uint32_t last_reported = 0xFFFFFFFFu;
+        if (pc != last_reported) {
+            last_reported = pc;
+            jit_report_block_source(cpu, pc);
+        }
+    }
 
     /* Continue from the reference state: it is by definition correct, so a
      * verification run of a whole firmware image stays on the rails and

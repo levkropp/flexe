@@ -844,6 +844,139 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     teardown(&cpu);
 }
 
+/* The same flush obligation, but with the branch *before* the registers it
+ * has to write back -- which is the case the obvious test misses.
+ *
+ * A side exit's flush used to be emitted inline at the branch, covering the
+ * registers dirty at that point in the block. In a block that keeps its
+ * registers resident across the loop back-edge that is not enough: a register
+ * written further down the body is already dirty from the *previous*
+ * iteration and lives only in a host register, so an exit taken before it is
+ * written in program order still has to write it back. Leaving it out loses
+ * every iteration's work but the first, silently -- the loop still terminates
+ * and the exit still goes to the right place.
+ *
+ * This is what a real Marauder block did: a counted search loop whose early
+ * out came first and whose shift-and-count came after. */
+TEST(test_jit_self_loop_early_exit_flushes_later_writes) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* LOOP a3, lend
+     *   lbeg: ADDI.N a9, a9, -1     countdown, dirty before the branch
+     *         BEQZ.N a9, out        the early out
+     *         ADDI.N a10, a10, 1    written only after it
+     *         NOP.N ; NOP.N
+     *   lend: NOP.N
+     *   out:  RET.N                                                     */
+    const uint32_t loop_pc = BASE + 2u;
+    const uint32_t lbeg = loop_pc + 3u;
+    const uint32_t lend = lbeg + 10u;
+    const uint32_t out  = lbeg + 12u;
+
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3));
+    put_insn3(&cpu, loop_pc, (uint32_t)0x76u |
+              ((uint32_t)((8 << 4) | 3) << 8) |
+              ((lend - (loop_pc + 4u)) << 16));
+    put_insn2(&cpu, lbeg,      narrow(0xB, 9, 9, 0));    /* ADDI.N a9,a9,-1 */
+    put_insn2(&cpu, lbeg + 2u, narrow(0xC, 6, 9, 8));    /* BEQZ.N a9, out  */
+    put_insn2(&cpu, lbeg + 4u, narrow(0xB, 10, 10, 1));  /* ADDI.N a10,a10,1 */
+    put_insn2(&cpu, lbeg + 6u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, lbeg + 8u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, lend,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, out,       narrow(0xD, 15, 0, 0));   /* RET.N */
+
+    ar_write(&cpu, 3, 500);
+    ar_write(&cpu, 9, 5);
+    ar_write(&cpu, 10, 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.pc = loop_pc;
+    cpu.running = true;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);                       /* execute LOOP */
+    ASSERT_EQ(cpu.lbeg, lbeg);
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, lbeg) != NULL);
+
+    /* Restart the countdown and let the block run it to the early out. */
+    ar_write(&cpu, 9, 5);
+    ar_write(&cpu, 10, 0);
+    cpu.pc = lbeg;
+    cpu.lcount = 400;
+    cpu._pc_written = true;
+    (void)xtensa_run(&cpu, 400);
+
+    /* Four iterations ran the increment, the fifth took the early out. */
+    ASSERT_EQ(ar_read(&cpu, 9), 0u);
+    ASSERT_EQ(ar_read(&cpu, 10), 4u);
+    ASSERT_EQ(cpu.ar[(cpu.windowbase * 4 + 10) & 63], 4u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+/* CALLn writes its return address straight into ar[], bypassing the register
+ * allocator. The slot is guest a0, a4, a8 or a12 -- n is encoded 0-3, so it is
+ * inside the current window, not past a15 -- which means it can be a register
+ * the allocator is holding a modified copy of. The flush at the block exit
+ * then puts that stale copy back over the return address, and the callee
+ * returns into whatever the guest last had in a8.
+ *
+ * This is what a windowed CALL8 does in real firmware, and it is the calling
+ * convention Arduino and IDF code is built with.
+ */
+TEST(test_jit_call8_return_address_survives_the_exit_flush) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    const uint32_t call_pc = BASE + 6u;
+    const uint32_t next_pc = call_pc + 3u;
+    const uint32_t target  = BASE + 0x40u;
+    /* CALL8: op0=5, n=2 (bits 5:4), offset18 in bits 23:6. */
+    const uint32_t off18 = ((target >> 2) - (call_pc >> 2) - 1u) & 0x3FFFFu;
+
+    put_insn2(&cpu, BASE,      narrow(0xB, 8, 8, 1));   /* ADDI.N a8, a8, 1 */
+    put_insn2(&cpu, BASE + 2u, narrow(0xD, 15, 0, 3));  /* NOP.N */
+    put_insn2(&cpu, BASE + 4u, narrow(0xD, 15, 0, 3));  /* NOP.N */
+    put_insn3(&cpu, call_pc, 5u | (2u << 4) | (off18 << 6));
+    put_insn2(&cpu, target,    narrow(0xD, 15, 0, 0));  /* RET.N */
+
+    ar_write(&cpu, 8, 0x3FFC6034u);   /* a8 holds a pointer, as it would */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.pc = BASE;
+    cpu.running = true;
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++) {
+        cpu.pc = BASE;
+        (void)jit_get_block(jit, &cpu, BASE);
+    }
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    ar_write(&cpu, 8, 0x3FFC6034u);
+    (void)xtensa_run(&cpu, 4);
+
+    /* The block modified a8 and then called through it. What has to be in a8
+     * is the return address the CALL wrote, not the value the allocator was
+     * carrying. */
+    uint32_t want = 0x80000000u | (next_pc & 0x3FFFFFFFu);
+    ASSERT_EQ(ar_read(&cpu, 8), want);
+    ASSERT_EQ(cpu.pc, target);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* The native back-edge no longer re-reads LBEG/LEND every iteration when the
  * body provably cannot write them, so the check that the live loop is the one
  * the block was compiled for happens once, on entry. That check is what stops
@@ -1674,6 +1807,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);
     RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
     RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);
+    RUN_TEST(test_jit_call8_return_address_survives_the_exit_flush);
+    RUN_TEST(test_jit_self_loop_early_exit_flushes_later_writes);
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
     RUN_TEST(test_waiti_time_is_not_counted_as_retired_instructions);
     RUN_TEST(test_jit_encoding_sweep_matches_interpreter);
