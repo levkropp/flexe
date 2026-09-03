@@ -844,6 +844,88 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     teardown(&cpu);
 }
 
+/* A block that closes its own loop back-edge keeps its allocated guest
+ * registers resident in host registers for the whole loop instead of writing
+ * them back and reloading them every iteration. That makes every path *out*
+ * of the body responsible for the write-back, and a conditional branch
+ * leaving the loop mid-body is the one that is easy to get wrong: the
+ * registers it must flush are the ones several iterations of arithmetic have
+ * accumulated, and nothing else in the run would notice them being stale.
+ *
+ * The counters here are read back out of cpu->ar, so a missing flush shows up
+ * as the guest-visible values lagging the work actually done. */
+TEST(test_jit_self_loop_side_exit_flushes_resident_registers) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* LOOP a3, lend
+     *   lbeg: ADDI.N a4, a4, 1     accumulate
+     *         ADDI.N a5, a5, 1     accumulate
+     *         ADDI.N a6, a6, -1    countdown
+     *         BEQZ.N a6, out       leave the loop from inside the body
+     *         NOP.N
+     *   lend: NOP.N
+     *   out:  RET.N
+     * a3 is far larger than the countdown, so the loop is left by the branch
+     * and not by running out of iterations. */
+    const uint32_t lbeg = BASE + 3u;
+    const uint32_t lend = lbeg + 8u;
+    const uint32_t out  = lend + 2u;
+    put_insn3(&cpu, BASE, (uint32_t)0x76u | ((uint32_t)((8 << 4) | 3) << 8) |
+                          ((lend - (BASE + 4u)) << 16));
+    put_insn2(&cpu, lbeg,      narrow(0xB, 4, 4, 1));   /* ADDI.N a4, a4, 1 */
+    put_insn2(&cpu, lbeg + 2u, narrow(0xB, 5, 5, 1));   /* ADDI.N a5, a5, 1 */
+    put_insn2(&cpu, lbeg + 4u, narrow(0xB, 6, 6, 0));   /* ADDI.N a6, a6, -1 */
+    /* BEQZ.N a6, out: t_hi = 2, imm6 = target - (next_pc + 2) */
+    {
+        uint32_t next_pc = lbeg + 8u;
+        int imm6 = (int)(out - (next_pc + 2u));
+        put_insn2(&cpu, lbeg + 6u,
+                  narrow(0xC, imm6 & 0xF, 6, (2 << 2) | ((imm6 >> 4) & 3)));
+    }
+    put_insn2(&cpu, lend,      narrow(0xD, 15, 0, 3));  /* NOP.N */
+    put_insn2(&cpu, out,       narrow(0xD, 15, 0, 0));  /* RET.N */
+    ar_write(&cpu, 3, 5000);
+    ar_write(&cpu, 4, 0);
+    ar_write(&cpu, 5, 0);
+    ar_write(&cpu, 6, 40);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);                       /* execute LOOP */
+    ASSERT_EQ(cpu.pc, lbeg);
+    ASSERT_EQ(cpu.lbeg, lbeg);
+
+    /* Interpret into the body so the next arrival at LBEG is the
+     * interpreter's back-edge, then compile the body block. */
+    for (int i = 0; i < 6; i++)
+        xtensa_step(&cpu);
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, lbeg) != NULL);
+
+    cpu._pc_written = false;
+    (void)xtensa_run(&cpu, 4000);
+
+    /* The branch fired, so the loop was left from inside the body. */
+    ASSERT_EQ(ar_read(&cpu, 6), 0u);
+    /* Both accumulators counted once per iteration, including the one the
+     * branch left from -- a4 and a5 are incremented before the test. */
+    ASSERT_EQ(ar_read(&cpu, 4), 40u);
+    ASSERT_EQ(ar_read(&cpu, 5), 40u);
+    /* And the values are in the guest register file, not only in the host
+     * registers the block was holding them in. */
+    ASSERT_EQ(cpu.ar[(cpu.windowbase * 4 + 4) & 63], 40u);
+    ASSERT_EQ(cpu.ar[(cpu.windowbase * 4 + 6) & 63], 0u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* Compilation is driven from PCs the CPU is not sitting at: jit_run() samples
  * the branch-target ring and LBEG, and jit_compile_now() descends into branch
  * targets. For all of those the live loop registers belong to whatever loop
@@ -1514,6 +1596,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
     RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);
+    RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
     RUN_TEST(test_waiti_time_is_not_counted_as_retired_instructions);
     RUN_TEST(test_jit_encoding_sweep_matches_interpreter);

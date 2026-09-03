@@ -30,12 +30,34 @@ typedef struct {
     uint8_t *buf;       /* Start of code buffer */
     uint8_t *ptr;       /* Current write position */
     uint8_t *end;       /* End of buffer */
+    /* Last 32-bit store, for forwarding it to an immediately following load
+     * of the same slot. Guest registers the allocator could not keep in host
+     * registers are written back and read straight out again by the next
+     * instruction, and that round trip costs a store-to-load forwarding stall
+     * on the dependency chain, not just an instruction.
+     *
+     * Only a *strictly adjacent* pair is forwarded: with nothing emitted in
+     * between, the only way to reach the load without the store is a branch
+     * landing on it, so emit_fwd_barrier() drops the record wherever a label
+     * can be defined. */
+    uint8_t *fwd_end;   /* ptr just after the store; NULL = no record */
+    int32_t  fwd_disp;
+    int      fwd_base;
+    int      fwd_src;
 } emit_t;
+
+/* Forget any pending store-to-load forward. Call wherever control flow can
+ * enter at the current position. */
+static inline void emit_fwd_barrier(emit_t *e) { e->fwd_end = NULL; }
 
 static inline void emit_init(emit_t *e, uint8_t *buf, size_t size) {
     e->buf = buf;
     e->ptr = buf;
     e->end = buf + size;
+    e->fwd_end = NULL;
+    e->fwd_disp = 0;
+    e->fwd_base = -1;
+    e->fwd_src = -1;
 }
 
 static inline size_t emit_size(const emit_t *e) {
@@ -138,6 +160,14 @@ static inline void emit_mov_reg32_reg32(emit_t *e, int dst, int src) {
 
 /* mov reg32, [base64 + disp32] */
 static inline void emit_load32_disp(emit_t *e, int dst, int base, int32_t disp) {
+    /* Reading back the slot the immediately preceding instruction just wrote:
+     * take the value from the register it came from instead. */
+    if (e->fwd_end == e->ptr && e->fwd_base == base && e->fwd_disp == disp) {
+        if (dst != e->fwd_src) emit_mov_reg32_reg32(e, dst, e->fwd_src);
+        emit_fwd_barrier(e);
+        return;
+    }
+    emit_fwd_barrier(e);
     emit_rex(e, 0, dst, base);
     emit8(e, 0x8B);
     if ((base & 7) == RSP) {
@@ -161,6 +191,10 @@ static inline void emit_store32_disp(emit_t *e, int src, int base, int32_t disp)
         emit8(e, modrm(2, src, base));
     }
     emit32(e, (uint32_t)disp);
+    e->fwd_end  = e->ptr;
+    e->fwd_base = base;
+    e->fwd_disp = disp;
+    e->fwd_src  = src;
 }
 
 /* mov reg64, [base64 + disp32] (64-bit load) */
@@ -321,6 +355,10 @@ static inline void emit_test_reg32(emit_t *e, int a, int b) {
 
 /* add reg32, imm32 */
 static inline void emit_add_reg32_imm32(emit_t *e, int reg, int32_t imm) {
+    /* Adding zero is what a base+0 address computation emits (L32I.N /
+     * S32I.N with offset 0), and it lands six bytes in the middle of every
+     * such access. No caller consumes the flags. */
+    if (imm == 0) return;
     emit_rex(e, 0, 0, reg);
     emit8(e, 0x81);
     emit8(e, modrm(3, 0, reg));
@@ -479,6 +517,9 @@ static inline int emit_jcc_rel32(emit_t *e, uint8_t cc) {
 static inline void emit_patch_rel32(emit_t *e, int patch_offset) {
     int32_t rel = (int32_t)(e->ptr - (e->buf + patch_offset + 4));
     memcpy(e->buf + patch_offset, &rel, 4);
+    /* A branch now lands here, so the preceding store is not guaranteed to
+     * have run on every path reaching the next instruction. */
+    emit_fwd_barrier(e);
 }
 
 /* Condition codes for jcc */

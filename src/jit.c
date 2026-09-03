@@ -655,6 +655,52 @@ static void ra_load_ar(emit_t *e, regalloc_t *ra, int dst_x86, int wb4, int n) {
     }
 }
 
+/* Most ALU instructions a compiler emits write back to a register they also
+ * read -- `ar = as OP x` with r == s -- because that is what an induction
+ * variable or an accumulator looks like. Compiling those through the generic
+ * load-into-RAX / operate / store-back template costs two register moves that
+ * do nothing: when the guest register is allocated, the operation can be done
+ * on its host register directly.
+ *
+ * Returns the host register to operate on in place, or -1 to use the template.
+ * Marks the register loaded and dirty, exactly as ra_load_ar + ra_store_ar
+ * would have. */
+static int ra_inplace(emit_t *e, regalloc_t *ra, int wb4, int r, int s) {
+    if (r != s || r < 1 || r > RA_COUNT || RA_MAP[r] < 0) return -1;
+    int host = RA_MAP[r];
+    int bit = r - 1;
+    if (!(ra->loaded & (1u << bit))) {
+        emit_load32_disp(e, host, REG_CPU, ar_offset(wb4, r));
+        ra->loaded |= (uint8_t)(1u << bit);
+    }
+    ra->dirty |= (uint8_t)(1u << bit);
+    return host;
+}
+
+
+/* Address register for a base+offset guest memory access.
+ *
+ * The memory emitters take any register that is not one of their RAX/RCX/RDX
+ * scratch, so when the offset is zero and the base is allocated there is
+ * nothing to compute: hand back the base's own host register. Otherwise
+ * materialise the address in RSI as before. A zero offset is the common case
+ * for L32I.N/S32I.N, and the copy this removes sat in the middle of every
+ * such access. */
+static int ra_addr_reg(emit_t *e, regalloc_t *ra, int wb4, int s, int32_t off) {
+    if (off == 0 && s >= 1 && s <= RA_COUNT && RA_MAP[s] >= 0) {
+        int host = RA_MAP[s];
+        int bit = s - 1;
+        if (!(ra->loaded & (1u << bit))) {
+            emit_load32_disp(e, host, REG_CPU, ar_offset(wb4, s));
+            ra->loaded |= (uint8_t)(1u << bit);
+        }
+        return host;
+    }
+    ra_load_ar(e, ra, RSI, wb4, s);
+    emit_add_reg32_imm32(e, RSI, off);
+    return RSI;
+}
+
 /* Store x86 reg into guest ar[n]. Defers write if allocated. */
 static void ra_store_ar(emit_t *e, regalloc_t *ra, int src_x86, int wb4, int n) {
     if (n >= 0 && n < 16 && RA_MAP[n] >= 0) {
@@ -1053,20 +1099,27 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
 
         switch (op0) {
         case 0x8: { /* L32I.N: at = mem32[as + r*4] */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, r << 2);
-            emit_mem_read32(e, RSI, RBX);
+            int areg = ra_addr_reg(e, ra, wb4, s, r << 2);
+            emit_mem_read32(e, areg, RBX);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x9: { /* S32I.N: mem32[as + r*4] = at */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, r << 2);
+            int areg = ra_addr_reg(e, ra, wb4, s, r << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, RSI, RBP, jit);
+            emit_mem_write32(e, areg, RBP, jit);
             return 1;
         }
         case 0xA: { /* ADD.N: ar = as + at */
+            /* Commutative, so either operand may be the in-place one. */
+            int d = ra_inplace(e, ra, wb4, r, s);
+            int other = t;
+            if (d < 0) { d = ra_inplace(e, ra, wb4, r, t); other = s; }
+            if (d >= 0) {
+                ra_load_ar(e, ra,RBX, wb4, other);
+                emit_add_reg32(e, d, RBX);
+                return 1;
+            }
             ra_load_ar(e, ra,RAX, wb4, s);
             ra_load_ar(e, ra,RBX, wb4, t);
             emit_add_reg32(e, RAX, RBX);
@@ -1075,6 +1128,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         }
         case 0xB: { /* ADDI.N: ar = as + (t==0 ? -1 : t) */
             int32_t imm = (t == 0) ? -1 : t;
+            int d = ra_inplace(e, ra, wb4, r, s);
+            if (d >= 0) { emit_add_reg32_imm32(e, d, imm); return 1; }
             ra_load_ar(e, ra,RAX, wb4, s);
             emit_add_reg32_imm32(e, RAX, imm);
             ra_store_ar(e, ra,RAX, wb4, r);
@@ -1188,6 +1243,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 return 0;
             }
             case 1: { /* AND: ar = as & at */
+                int d = ra_inplace(e, ra, wb4, r, s);
+                int other = t;
+                if (d < 0) { d = ra_inplace(e, ra, wb4, r, t); other = s; }
+                if (d >= 0) {
+                    ra_load_ar(e, ra,RBX, wb4, other);
+                    emit_and_reg32(e, d, RBX);
+                    return 1;
+                }
                 ra_load_ar(e, ra,RAX, wb4, s);
                 ra_load_ar(e, ra,RBX, wb4, t);
                 emit_and_reg32(e, RAX, RBX);
@@ -1195,6 +1258,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 return 1;
             }
             case 2: { /* OR: ar = as | at */
+                int d = ra_inplace(e, ra, wb4, r, s);
+                int other = t;
+                if (d < 0) { d = ra_inplace(e, ra, wb4, r, t); other = s; }
+                if (d >= 0) {
+                    ra_load_ar(e, ra,RBX, wb4, other);
+                    emit_or_reg32(e, d, RBX);
+                    return 1;
+                }
                 ra_load_ar(e, ra,RAX, wb4, s);
                 ra_load_ar(e, ra,RBX, wb4, t);
                 emit_or_reg32(e, RAX, RBX);
@@ -1202,6 +1273,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 return 1;
             }
             case 3: { /* XOR: ar = as ^ at */
+                int d = ra_inplace(e, ra, wb4, r, s);
+                int other = t;
+                if (d < 0) { d = ra_inplace(e, ra, wb4, r, t); other = s; }
+                if (d >= 0) {
+                    ra_load_ar(e, ra,RBX, wb4, other);
+                    emit_xor_reg32(e, d, RBX);
+                    return 1;
+                }
                 ra_load_ar(e, ra,RAX, wb4, s);
                 ra_load_ar(e, ra,RBX, wb4, t);
                 emit_xor_reg32(e, RAX, RBX);
@@ -1274,6 +1353,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 return 0;
             }
             case 8: { /* ADD: ar = as + at */
+                int d = ra_inplace(e, ra, wb4, r, s);
+                int other = t;
+                if (d < 0) { d = ra_inplace(e, ra, wb4, r, t); other = s; }
+                if (d >= 0) {
+                    ra_load_ar(e, ra,RBX, wb4, other);
+                    emit_add_reg32(e, d, RBX);
+                    return 1;
+                }
                 ra_load_ar(e, ra,RAX, wb4, s);
                 ra_load_ar(e, ra,RBX, wb4, t);
                 emit_add_reg32(e, RAX, RBX);
@@ -1792,53 +1879,46 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
     case 2: { /* LSAI: loads, stores, immediates */
         switch (r) {
         case 0x0: { /* L8UI */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8);
-            emit_mem_read8u(e, RSI, RBX);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8);
+            emit_mem_read8u(e, areg, RBX);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x1: { /* L16UI */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8 << 1);
-            emit_mem_read16u(e, RSI, RBX);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 1);
+            emit_mem_read16u(e, areg, RBX);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x2: { /* L32I */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8 << 2);
-            emit_mem_read32(e, RSI, RBX);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
+            emit_mem_read32(e, areg, RBX);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x4: { /* S8I */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write8(e, RSI, RBP, jit);
+            emit_mem_write8(e, areg, RBP, jit);
             return 1;
         }
         case 0x5: { /* S16I */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8 << 1);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 1);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write16(e, RSI, RBP, jit);
+            emit_mem_write16(e, areg, RBP, jit);
             return 1;
         }
         case 0x6: { /* S32I */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8 << 2);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, RSI, RBP, jit);
+            emit_mem_write32(e, areg, RBP, jit);
             return 1;
         }
         case 0x7: /* Cache ops — no-op */
             return 1;
         case 0x9: { /* L16SI */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8 << 1);
-            emit_mem_read16s(e, RSI, RBX);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 1);
+            emit_mem_read16s(e, areg, RBX);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
@@ -1849,14 +1929,15 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             return 1;
         }
         case 0xB: { /* L32AI (acquire = no-op, same as L32I) */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8 << 2);
-            emit_mem_read32(e, RSI, RBX);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
+            emit_mem_read32(e, areg, RBX);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0xC: { /* ADDI: at = as + sext8(imm8) */
             int32_t simm8 = sign_extend(imm8, 8);
+            int d = ra_inplace(e, ra, wb4, t, s);
+            if (d >= 0) { emit_add_reg32_imm32(e, d, simm8); return 1; }
             ra_load_ar(e, ra,RAX, wb4, s);
             emit_add_reg32_imm32(e, RAX, simm8);
             ra_store_ar(e, ra,RAX, wb4, t);
@@ -1864,16 +1945,17 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         }
         case 0xD: { /* ADDMI: at = as + sext8(imm8) << 8 */
             int32_t simm8 = sign_extend(imm8, 8);
+            int d = ra_inplace(e, ra, wb4, t, s);
+            if (d >= 0) { emit_add_reg32_imm32(e, d, simm8 * 256); return 1; }
             ra_load_ar(e, ra,RAX, wb4, s);
             emit_add_reg32_imm32(e, RAX, simm8 * 256);
             ra_store_ar(e, ra,RAX, wb4, t);
             return 1;
         }
         case 0xF: { /* S32RI (release = no-op, same as S32I) */
-            ra_load_ar(e, ra,RSI, wb4, s);
-            emit_add_reg32_imm32(e, RSI, imm8 << 2);
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, RSI, RBP, jit);
+            emit_mem_write32(e, areg, RBP, jit);
             return 1;
         }
         default: return 0;
@@ -2322,9 +2404,12 @@ static bool jit_block_self_loops(const xtensa_cpu_t *cpu,
 static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
                                     uint32_t lbeg, uint32_t lend,
                                     int insn_count, jit_state_t *jit,
-                                    uint8_t *chain_entry) {
-    ra_flush(e, ra, wb4);
-
+                                    uint8_t *loop_entry) {
+    /* No flush here. The block preloaded its guest registers at the chain
+     * entry and they stay resident for the whole loop; only a path that
+     * actually leaves the body writes them back. Flushing every iteration
+     * meant storing the allocated registers and reloading them immediately
+     * on re-entry, which on a short body was a sizeable share of the work. */
     emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_LCOUNT);
     emit_cmp_reg32_imm32(e, RCX, 0);
     int done = emit_jcc_rel32(e, CC_E);
@@ -2335,10 +2420,10 @@ static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
 
     emit_add_reg32_imm32(e, RCX, (uint32_t)-1);
     emit_store_cpu32(e, RCX, (int32_t)CPU_OFF_LCOUNT);
-    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, lbeg);
-    emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+    /* PC and _pc_written are not published per iteration: nothing between
+     * here and an exit reads them, and every exit sets them itself. */
     emit_acc_add(e, insn_count);
-    emit_jmp_rel32_to(e, chain_entry);
+    emit_jmp_rel32_to(e, loop_entry);
 
     /* Loop finished, or this is not the loop the block was compiled for:
      * exit exactly as a plain loop-end block would, and let jit_pc_hook
@@ -2346,6 +2431,7 @@ static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
     emit_patch_rel32(e, done);
     emit_patch_rel32(e, other_lend);
     emit_patch_rel32(e, other_lbeg);
+    ra_flush(e, ra, wb4);
     emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, lend);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LOOP_EXIT, 1);
@@ -2563,18 +2649,44 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
 
     /* Chain entry point: chained blocks jump here (stack already has
      * callee-saved regs, REG_CPU=cpu, REG_MEM=mem, RAX=accumulated). */
+    emit_fwd_barrier(&e);   /* chained blocks enter here */
     uint8_t *chain_entry = e.ptr;
+
+    /* Register allocator: lazy load — regs are loaded from ar[] on first
+     * use, so blocks only pay for the guest regs they actually touch. */
+    regalloc_t ra = {0, 0};
+
+    /* A block that closes its own loop back-edge natively runs its body many
+     * times per entry, and lazy loading made every iteration reload the
+     * registers it touches and write them all back at the edge -- a pure
+     * round trip through memory for values that were already in host
+     * registers. Load them once here and let them stay resident for the
+     * whole loop instead. Every path out of the body (side exit, loop end,
+     * chain cap) flushes what is dirty, and nothing in between reads
+     * cpu->ar: the memory slow path takes only (mem, addr, val), and no
+     * peripheral model touches guest registers. */
+    const bool self_loop = jit_block_self_loops(cpu, scan, pc);
+    if (self_loop) {
+        for (int n = 1; n <= RA_COUNT; n++)
+            emit_load32_disp(&e, RA_MAP[n], REG_CPU, ar_offset(wb4, n));
+        ra.loaded = (uint8_t)((1u << RA_COUNT) - 1u);
+    }
+
+    /* Loop entry: the native back-edge lands here, past the preload. */
+    emit_fwd_barrier(&e);   /* the native back-edge enters here */
+    uint8_t *loop_entry = e.ptr;
 
     /* Chain-run cap: break out to the dispatcher every JIT_CHAIN_CAP
      * guest insns so timers, preemption and batch limits stay live even
      * inside self-chaining loops. REG_ACC accumulates the run total. */
     int cap_ok = emit_acc_cap_jcc(&e);
-    emit_jmp_to_epilogue(&e, jit);
+    /* The self-loop form has to write its registers back before leaving, and
+     * which ones are dirty is only known once the body is emitted, so its
+     * exit is deferred to a stub after the body. */
+    int cap_fail = -1;
+    if (self_loop) cap_fail = emit_jmp_rel32(&e);
+    else           emit_jmp_to_epilogue(&e, jit);
     emit_patch_rel32(&e, cap_ok);
-
-    /* Register allocator: lazy load — regs are loaded from ar[] on first
-     * use, so blocks only pay for the guest regs they actually touch. */
-    regalloc_t ra = {0, 0};
 
     /* Deferred side exits for conditional branches */
     side_exit_t sx[JIT_MAX_BLOCK_INSNS];
@@ -2604,11 +2716,22 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         if (last_cls == 0 || last_cls == 3) {
             if (jit_block_self_loops(cpu, scan, pc))
                 emit_loop_backedge_exit(&e, &ra, wb4, cpu->lbeg, cpu->lend,
-                                        scan->count, jit, chain_entry);
+                                        scan->count, jit, loop_entry);
             else
                 emit_block_exit_ra(&e, &ra, wb4, scan->end_pc, scan->count,
                                    jit, scan->ends_at_lend);
         }
+    }
+
+    /* Chain cap reached with the loop still running: write the resident
+     * registers back, leave the PC at the body head, and hand control to the
+     * dispatcher so timers and preemption get their turn. */
+    if (cap_fail >= 0) {
+        emit_patch_rel32(&e, cap_fail);
+        ra_flush(&e, &ra, wb4);
+        emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_PC, pc);
+        emit_store32_disp_imm(&e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+        emit_jmp_to_epilogue(&e, jit);
     }
 
     /* Emit the deferred side-exit stubs (targets of the in-body jcc's) */
@@ -2632,6 +2755,25 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     jit->code_size += emit_size(&e);
     jit->stats.blocks_compiled++;
     jit->last_chain_entry = chain_entry;
+
+    /* FLEXE_JIT_DUMP=<dir> writes each block's machine code to
+     * <dir>/blk_<pc>.bin, for `objdump -D -b binary -m i386:x86-64`. Reading
+     * the emitted code is the only way to judge its quality; the hex in
+     * FLEXE_JIT_DEBUG is word-swapped for eyeballing, not for a disassembler. */
+    {
+        static const char *dump_dir = (const char *)-1;
+        if (__builtin_expect(dump_dir == (const char *)-1, 0))
+            dump_dir = getenv("FLEXE_JIT_DUMP");
+        if (__builtin_expect(dump_dir != NULL, 0)) {
+            char path[512];
+            snprintf(path, sizeof path, "%s/blk_%08X.bin", dump_dir, pc);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(code_start, 1, emit_size(&e), f);
+                fclose(f);
+            }
+        }
+    }
 
     static int dbg_jit = -1;
     if (__builtin_expect(dbg_jit < 0, 0))
