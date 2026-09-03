@@ -844,6 +844,82 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     teardown(&cpu);
 }
 
+/* The native back-edge no longer re-reads LBEG/LEND every iteration when the
+ * body provably cannot write them, so the check that the live loop is the one
+ * the block was compiled for happens once, on entry. That check is what stops
+ * a block reached under a *different* loop from running its back-edge against
+ * the wrong bounds -- ending the body early, every iteration, and silently
+ * skipping the instructions between the two LENDs.
+ *
+ * Two loops share a head here and differ only in where they end. The inner
+ * one's body updates a4; the outer one's body updates a4 and a5. Entering the
+ * inner block with the outer loop live has to hand back to the interpreter,
+ * which is visible as the two counters staying equal. */
+TEST(test_jit_self_loop_block_declines_a_different_loop) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* LOOP sits at BASE+2 so LBEG (+3) lands in the next 4-byte word: the
+     * block hash indexes on pc >> 2, and a loop head sharing a word with its
+     * own LBEG evicts it. */
+    const uint32_t loop_pc = BASE + 2u;
+    const uint32_t lbeg  = loop_pc + 3u;
+    const uint32_t lend1 = lbeg + 10u;      /* inner: 5 instructions */
+    const uint32_t lend2 = lbeg + 12u;      /* outer: 6 instructions */
+
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3));            /* NOP.N */
+    put_insn3(&cpu, loop_pc, (uint32_t)0x76u |
+              ((uint32_t)((8 << 4) | 3) << 8) |
+              ((lend1 - (loop_pc + 4u)) << 16));             /* LOOP a3 */
+    put_insn2(&cpu, lbeg,      narrow(0xB, 4, 4, 1));        /* ADDI.N a4,a4,1 */
+    put_insn2(&cpu, lbeg + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, lbeg + 4u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, lbeg + 6u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, lbeg + 8u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, lend1,     narrow(0xB, 5, 5, 1));        /* ADDI.N a5,a5,1 */
+    put_insn2(&cpu, lend2,     narrow(0xD, 15, 0, 0));       /* RET.N */
+    ar_write(&cpu, 3, 500);
+    ar_write(&cpu, 4, 0);
+    ar_write(&cpu, 5, 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    /* Compile the block for the inner loop. */
+    cpu.pc = loop_pc;
+    cpu.running = true;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.lbeg, lbeg);
+    ASSERT_EQ(cpu.lend, lend1);
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, lbeg) != NULL);
+
+    /* Now arrive at the same head with the outer loop live. Its LEND is past
+     * the block's end, so the dispatcher's own bound check does not decline
+     * it -- only the block's entry check can. */
+    ar_write(&cpu, 4, 0);
+    ar_write(&cpu, 5, 0);
+    cpu.pc     = lbeg;
+    cpu.lbeg   = lbeg;
+    cpu.lend   = lend2;
+    cpu.lcount = 20;
+    cpu.jit_loop_exit = 0;
+    cpu._pc_written = true;
+    (void)xtensa_run(&cpu, 400);
+
+    /* Both counters live in the outer body, so they move together. A block
+     * that ran its own back-edge here would end each iteration at lend1 and
+     * never reach the a5 increment. */
+    ASSERT_TRUE(ar_read(&cpu, 4) > 0u);
+    ASSERT_EQ(ar_read(&cpu, 4), ar_read(&cpu, 5));
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* A block that closes its own loop back-edge keeps its allocated guest
  * registers resident in host registers for the whole loop instead of writing
  * them back and reloading them every iteration. That makes every path *out*
@@ -1597,6 +1673,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
     RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);
     RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
+    RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
     RUN_TEST(test_waiti_time_is_not_counted_as_retired_instructions);
     RUN_TEST(test_jit_encoding_sweep_matches_interpreter);

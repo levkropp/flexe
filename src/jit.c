@@ -2394,6 +2394,34 @@ static inline void emit_cmp_cpu32_imm(emit_t *e, int32_t off, uint32_t imm) {
 #endif
 }
 
+/* Whether any instruction in the block can change the loop registers.
+ *
+ * The native back-edge re-reads LBEG and LEND from the CPU struct every
+ * iteration, because the body is allowed to WSR them and the block cache does
+ * not key on their values. Almost no body does: a compiler emits LOOP for a
+ * counted loop and never touches the registers again. When the block provably
+ * cannot, those two loads and their compares are dead work on the hottest
+ * path there is, and the check can be made once on entry instead.
+ *
+ * Only WSR and XSR reach the loop registers (op0=0/op1=3, op2=1 and op2=6
+ * respectively, with the SR number in bits 15:8), and RSR cannot write. Any
+ * instruction that is not one of those is answered no; anything unrecognised
+ * would have failed to compile and so cannot be in the block at all. */
+static bool jit_block_writes_loop_sr(const jit_scan_t *scan) {
+    for (int i = 0; i < scan->count; i++) {
+        if (scan->ilens[i] != 3) continue;      /* narrow forms cannot WSR */
+        uint32_t insn = scan->insns[i];
+        if ((insn & 0xF) != 0) continue;        /* not QRST */
+        if (((insn >> 16) & 0xF) != 3) continue;/* not RST3 */
+        uint32_t op2 = (insn >> 20) & 0xF;
+        if (op2 != 1 && op2 != 6) continue;     /* not WSR, not XSR */
+        uint32_t sr = (insn >> 8) & 0xFF;
+        if (sr == XT_SR_LBEG || sr == XT_SR_LEND || sr == XT_SR_LCOUNT)
+            return true;
+    }
+    return false;
+}
+
 /* Whether a block gets the native back-edge. Kept in one place so the
  * verifier can bound its reference run the same way the block behaves. */
 static bool jit_block_self_loops(const xtensa_cpu_t *cpu,
@@ -2404,7 +2432,7 @@ static bool jit_block_self_loops(const xtensa_cpu_t *cpu,
 static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
                                     uint32_t lbeg, uint32_t lend,
                                     int insn_count, jit_state_t *jit,
-                                    uint8_t *loop_entry) {
+                                    uint8_t *loop_entry, bool recheck_sr) {
     /* No flush here. The block preloaded its guest registers at the chain
      * entry and they stay resident for the whole loop; only a path that
      * actually leaves the body writes them back. Flushing every iteration
@@ -2413,10 +2441,15 @@ static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
     emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_LCOUNT);
     emit_cmp_reg32_imm32(e, RCX, 0);
     int done = emit_jcc_rel32(e, CC_E);
-    emit_cmp_cpu32_imm(e, (int32_t)CPU_OFF_LEND, lend);
-    int other_lend = emit_jcc_rel32(e, CC_NE);
-    emit_cmp_cpu32_imm(e, (int32_t)CPU_OFF_LBEG, lbeg);
-    int other_lbeg = emit_jcc_rel32(e, CC_NE);
+    /* LBEG/LEND only need re-reading if the body can rewrite them; when it
+     * cannot, the caller has already checked them once on entry. */
+    int other_lend = -1, other_lbeg = -1;
+    if (recheck_sr) {
+        emit_cmp_cpu32_imm(e, (int32_t)CPU_OFF_LEND, lend);
+        other_lend = emit_jcc_rel32(e, CC_NE);
+        emit_cmp_cpu32_imm(e, (int32_t)CPU_OFF_LBEG, lbeg);
+        other_lbeg = emit_jcc_rel32(e, CC_NE);
+    }
 
     emit_add_reg32_imm32(e, RCX, (uint32_t)-1);
     emit_store_cpu32(e, RCX, (int32_t)CPU_OFF_LCOUNT);
@@ -2429,8 +2462,8 @@ static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
      * exit exactly as a plain loop-end block would, and let jit_pc_hook
      * decide what the arrival at LEND means. */
     emit_patch_rel32(e, done);
-    emit_patch_rel32(e, other_lend);
-    emit_patch_rel32(e, other_lbeg);
+    if (other_lend >= 0) emit_patch_rel32(e, other_lend);
+    if (other_lbeg >= 0) emit_patch_rel32(e, other_lbeg);
     ra_flush(e, ra, wb4);
     emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, lend);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
@@ -2666,10 +2699,28 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
      * cpu->ar: the memory slow path takes only (mem, addr, val), and no
      * peripheral model touches guest registers. */
     const bool self_loop = jit_block_self_loops(cpu, scan, pc);
+    /* Whether the back-edge has to re-read LBEG/LEND on every iteration, or
+     * whether one check on entry is enough because the body cannot write
+     * them. */
+    const bool recheck_sr = self_loop && jit_block_writes_loop_sr(scan);
+    int sr_bail[2];
+    int sr_bail_count = 0;
     if (self_loop) {
         for (int n = 1; n <= RA_COUNT; n++)
             emit_load32_disp(&e, RA_MAP[n], REG_CPU, ar_offset(wb4, n));
         ra.loaded = (uint8_t)((1u << RA_COUNT) - 1u);
+
+        if (!recheck_sr) {
+            /* The live loop must be the one this block was compiled for.
+             * Entering under a different loop whose LEND falls elsewhere in
+             * the body would run the back-edge against the wrong bounds, so
+             * check once here and hand such an entry back to the
+             * interpreter having executed nothing. */
+            emit_cmp_cpu32_imm(&e, (int32_t)CPU_OFF_LEND, cpu->lend);
+            sr_bail[sr_bail_count++] = emit_jcc_rel32(&e, CC_NE);
+            emit_cmp_cpu32_imm(&e, (int32_t)CPU_OFF_LBEG, cpu->lbeg);
+            sr_bail[sr_bail_count++] = emit_jcc_rel32(&e, CC_NE);
+        }
     }
 
     /* Loop entry: the native back-edge lands here, past the preload. */
@@ -2716,11 +2767,23 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         if (last_cls == 0 || last_cls == 3) {
             if (jit_block_self_loops(cpu, scan, pc))
                 emit_loop_backedge_exit(&e, &ra, wb4, cpu->lbeg, cpu->lend,
-                                        scan->count, jit, loop_entry);
+                                        scan->count, jit, loop_entry,
+                                        recheck_sr);
             else
                 emit_block_exit_ra(&e, &ra, wb4, scan->end_pc, scan->count,
                                    jit, scan->ends_at_lend);
         }
+    }
+
+    /* Entered under a loop this block was not compiled for. Nothing has run
+     * and nothing is dirty -- the registers still hold what the preload read
+     * -- so just leave the PC where it was and let the interpreter take it. */
+    if (sr_bail_count) {
+        for (int k = 0; k < sr_bail_count; k++)
+            emit_patch_rel32(&e, sr_bail[k]);
+        emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_PC, pc);
+        emit_store32_disp_imm(&e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+        emit_jmp_to_epilogue(&e, jit);
     }
 
     /* Chain cap reached with the loop still running: write the resident
