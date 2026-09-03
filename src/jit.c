@@ -639,13 +639,6 @@ typedef struct {
     int8_t  greg[RA_COUNT]; /* slot -> guest ar index, or -1 for unused */
 } regalloc_t;
 
-/* Host register holding guest ar[n], or -1 if n is spilled. */
-static inline int ra_host(const regalloc_t *ra, int n) {
-    if (n < 0 || n > 15) return -1;
-    int sl = ra->slot[n];
-    return sl < 0 ? -1 : RA_HOST[sl];
-}
-
 /* Which guest registers get host registers for this block.
  *
  * The map used to be fixed at a1-a6, which suits the windowed ABI's argument
