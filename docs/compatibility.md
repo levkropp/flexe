@@ -63,6 +63,7 @@ requires each engine to:
 - reach the requested virtual-time budget without trapping or stopping early
 - retire enough instructions to demonstrate useful execution
 - avoid unhandled MMIO and unregistered ROM calls
+- stay below a bounded number of unmapped-memory probes
 - end on a fetchable guest PC
 - produce the same normalized UART transcript digest
 
@@ -72,6 +73,8 @@ FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 
 Known failures remain in the run and are reported as `KNOWN-BAD`. If one starts
 passing, the script reports that its exception entry should be removed.
+`BATCH` controls the dual-core scheduling quantum and `MAX_UNMAPPED` controls
+the unmapped-access ceiling; their conservative defaults are 10,000 and 1,000.
 
 ## Architectural register windows
 

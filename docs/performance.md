@@ -69,9 +69,10 @@ For any other image:
 FLEXE_ROMS=/path/to/corpus ./scripts/bench-firmware.sh
 ```
 
-Always pair that output with `scripts/check-firmware.sh`; a speed number is
-meaningful only when the same image also passes the progress and correctness
-gate.
+The benchmark refuses to report a speed unless every timed run passes the
+generic progress gate and both engines produce the same UART digest. `BATCH`
+and `MAX_UNMAPPED` override its 10,000-instruction scheduling quantum and
+1,000-access unmapped-memory ceiling.
 
 ## JIT coverage
 

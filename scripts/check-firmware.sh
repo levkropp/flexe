@@ -17,7 +17,7 @@
 #   ./scripts/check-firmware.sh ~/flexe-roms/wled_16_0_1_esp32.bin
 #   FLEXE_ROMS=~/flexe-roms ./scripts/check-firmware.sh
 #
-# Overrides: RUNNER, CYCLES, MIN_INSNS.
+# Overrides: RUNNER, CYCLES, MIN_INSNS, BATCH, MAX_UNMAPPED.
 
 set -euo pipefail
 
@@ -25,6 +25,8 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$script_dir/build/flexe-generic-rom-test"}
 cycles=${CYCLES:-800000000}
 min_insns=${MIN_INSNS:-10000000}
+batch=${BATCH:-10000}
+max_unmapped=${MAX_UNMAPPED:-1000}
 
 if [[ ! -x "$runner" ]]; then
     echo "error: runner is not executable: $runner" >&2
@@ -67,8 +69,10 @@ for rom in "${roms[@]}"; do
     [[ -f "$rom" ]] || { echo "error: missing $rom" >&2; exit 2; }
 
     jit_line=$("$runner" --cycles "$cycles" --min-insns "$min_insns" \
+                          --batch "$batch" --max-unmapped "$max_unmapped" \
                           "$rom" 2>/dev/null || true)
     int_line=$("$runner" --no-jit --cycles "$cycles" --min-insns "$min_insns" \
+                          --batch "$batch" --max-unmapped "$max_unmapped" \
                           "$rom" 2>/dev/null || true)
 
     jit_ok=$(cut -d' ' -f1 <<<"$jit_line")

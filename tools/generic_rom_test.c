@@ -89,13 +89,16 @@ static void uart_sink(void *ctx, uint8_t byte)
  * interpreted, openHASP "[       2.097]" against "[       2.098]". Hashing
  * those makes every timestamping firmware look miscompiled.
  *
- * Two forms are recognised, and both are deliberately narrow:
+ * Three forms are recognised, and all are deliberately narrow:
  *
  *  - A bracketed group of nothing but digits, spaces and dots, anywhere in the
  *    line. That covers Arduino's "[  4716]" and openHASP's "[       2.097]",
  *    which is *not* line-leading -- it follows ANSI cursor moves. It leaves
- *    "[E]", "[esp32-hal-cpu.c:244]" and openHASP's "[110580/182884 39]" heap
- *    figures alone, because those carry letters or a slash.
+ *    "[E]" and "[esp32-hal-cpu.c:244]" alone.
+ *  - openHASP's bracketed allocator telemetry, "[used/free pct]". The free
+ *    byte count changes slightly with engine scheduling even when every log
+ *    message and final state agrees. Requiring the exact three-number/slash
+ *    shape avoids masking ordinary numeric values in messages.
  *  - A line-leading "00:00:00.121 " clock.
  *
  * Everything else is hashed, so numbers inside a message still count. A block
@@ -138,6 +141,31 @@ static bool skip_paren_timestamp(const char *p, size_t len, size_t *i)
     return false;
 }
 
+static bool skip_bracketed_runtime_metrics(const char *p, size_t len,
+                                            size_t *i)
+{
+    size_t k = *i;
+    if (k >= len || p[k++] != '[') return false;
+
+    while (k < len && p[k] == ' ') k++;
+    size_t digits = k;
+    while (k < len && p[k] >= '0' && p[k] <= '9') k++;
+    if (k == digits || k >= len || p[k++] != '/') return false;
+
+    while (k < len && p[k] == ' ') k++;
+    digits = k;
+    while (k < len && p[k] >= '0' && p[k] <= '9') k++;
+    if (k == digits || k >= len || p[k] != ' ') return false;
+
+    while (k < len && p[k] == ' ') k++;
+    digits = k;
+    while (k < len && p[k] >= '0' && p[k] <= '9') k++;
+    if (k == digits || k >= len || p[k] != ']') return false;
+
+    *i = k + 1;
+    return true;
+}
+
 static bool skip_clock_timestamp(const char *p, size_t len, size_t *i)
 {
     size_t j = *i, k = j;
@@ -161,6 +189,7 @@ static uint32_t uart_digest(const uart_state_t *u)
             continue;
         }
         if (skip_bracketed_timestamp(u->log, u->len, &i) ||
+            skip_bracketed_runtime_metrics(u->log, u->len, &i) ||
             skip_paren_timestamp(u->log, u->len, &i)) {
             at_line_start = false;
             continue;
@@ -177,15 +206,20 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--no-jit] [--cycles N] [--min-insns N] "
-            "[--min-uart N] [--dump-uart] FIRMWARE.bin\n", argv0);
+            "[--min-uart N] [--max-unmapped N] [--batch N] "
+            "[--dump-uart] FIRMWARE.bin\n", argv0);
 }
 
 int main(int argc, char **argv)
 {
     int argi = 1;
     int disable_jit = 0, dump_uart = 0;
+    /* A bounded quantum keeps callback latency realistic and gives the peer
+     * core regular opportunities even when no contended spinlock is visible. */
+    int batch = 10000;
     uint64_t budget = DEFAULT_CYCLES;
     uint64_t min_insns = 10000000ull;
+    uint64_t max_unmapped = 1000;
     /* Any output. Deliberately not a guess at what the image should say: WLED
      * legitimately emits only its five-byte Adalight prompt, "Ada\r\n". */
     uint64_t min_uart = 1;
@@ -199,6 +233,16 @@ int main(int argc, char **argv)
             min_insns = strtoull(argv[argi + 1], NULL, 0); argi += 2;
         } else if (strcmp(argv[argi], "--min-uart") == 0 && argi + 1 < argc) {
             min_uart = strtoull(argv[argi + 1], NULL, 0); argi += 2;
+        } else if (strcmp(argv[argi], "--max-unmapped") == 0 && argi + 1 < argc) {
+            max_unmapped = strtoull(argv[argi + 1], NULL, 0); argi += 2;
+        } else if (strcmp(argv[argi], "--batch") == 0 && argi + 1 < argc) {
+            unsigned long value = strtoul(argv[argi + 1], NULL, 0);
+            if (value == 0 || value > 10000000ul) {
+                usage(argv[0]);
+                return 2;
+            }
+            batch = (int)value;
+            argi += 2;
         } else { usage(argv[0]); return 2; }
     }
     if (argc - argi != 1) { usage(argv[0]); return 2; }
@@ -241,8 +285,8 @@ int main(int argc, char **argv)
             break;
         }
         if (uart.panic >= 0) { stop = "panic"; break; }
-        (void)flexe_session_run_core(session, 0, 100000);
-        flexe_session_post_batch(session, 100000);
+        (void)flexe_session_run_core(session, 0, batch);
+        flexe_session_post_batch(session, batch);
     }
 
     /* Reported per core, because which core does the work is the first thing
@@ -254,6 +298,7 @@ int main(int argc, char **argv)
     uint64_t retired = r0 + r1;
     int unhandled = periph_unhandled_count(flexe_session_periph(session));
     int unregistered = rom_stubs_unregistered_count(flexe_session_rom(session));
+    uint64_t unmapped = mem_unmapped_count(flexe_session_mem(session));
     xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
 
     /* ESP32 fetches only from ROM (0x40000000-0x4005FFFF), IRAM
@@ -271,7 +316,7 @@ int main(int argc, char **argv)
 
     bool ok = strcmp(stop, "budget") == 0 && uart.panic < 0 &&
               unhandled == 0 && unregistered == 0 && retired >= min_insns &&
-              uart.count >= min_uart && pc_ok;
+              uart.count >= min_uart && unmapped <= max_unmapped && pc_ok;
 
     printf("%s image=%s engine=%s stop=%s retired=%llu uart_bytes=%llu "
            "uart_digest=%08X unhandled=%d unregistered=%d "
@@ -282,19 +327,21 @@ int main(int argc, char **argv)
            (unsigned long long)retired, (unsigned long long)uart.count,
            uart_digest(&uart), unhandled, unregistered,
            (unsigned long long)r0, (unsigned long long)r1,
-           (unsigned long long)mem_unmapped_count(flexe_session_mem(session)),
+           (unsigned long long)unmapped,
            mem_unmapped_first(flexe_session_mem(session)),
            cpu0->pc, cpu1->pc, flexe_session_reset_count(session));
 
     if (!ok)
         fprintf(stderr, "  budget_ok=%d panic=%s unhandled=%d unregistered=%d "
                         "retired=%llu (min %llu) uart=%llu (min %llu) "
-                        "pc_ok=%d\n",
+                        "unmapped=%llu (max %llu) pc_ok=%d\n",
                 strcmp(stop, "budget") == 0,
                 uart.panic >= 0 ? PANIC_MARKERS[uart.panic] : "none",
                 unhandled, unregistered,
                 (unsigned long long)retired, (unsigned long long)min_insns,
                 (unsigned long long)uart.count, (unsigned long long)min_uart,
+                (unsigned long long)unmapped,
+                (unsigned long long)max_unmapped,
                 pc_ok);
 
     if (dump_uart || !ok) {
