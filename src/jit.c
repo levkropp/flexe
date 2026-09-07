@@ -3035,6 +3035,38 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     emit_fwd_barrier(&e);   /* chained blocks enter here */
     uint8_t *chain_entry = e.ptr;
 
+    /* Native blocks address the physical AR file directly, so they cannot
+     * discover a register-window collision the way xtensa_step() does before
+     * each instruction.  If any of the three windows reachable as a4-a15 is
+     * live, execute from this block head in the interpreter until the exact
+     * accessing instruction raises its guest vector.  This check is at the
+     * chain entry as well as the C entry: CALL8/CALLX8 commonly reaches a
+     * compiled callee without returning to the dispatcher.
+     *
+     * The guard is deliberately per block rather than an eager spill.  A
+     * block that only uses a0-a3 is allowed by the ISA to leave the collision
+     * untouched, while the interpreter's operand check identifies the first
+     * instruction that really crosses the boundary.  Collisions occur only
+     * when the 64-register ring wraps, so this slow path is cold. */
+    const uint32_t w = (uint32_t)wb4 >> 2;
+    const uint32_t collision_mask =
+        (1u << ((w + 1u) & 15u)) |
+        (1u << ((w + 2u) & 15u)) |
+        (1u << ((w + 3u) & 15u));
+    int window_safe[2];
+    emit_load_cpu32(&e, RAX, (int32_t)CPU_OFF_PS);
+    emit_and_reg32_imm32(&e, RAX, (1u << 18) | (1u << 4));
+    emit_cmp_reg32_imm32(&e, RAX, 1u << 18); /* WOE && !EXCM */
+    window_safe[0] = emit_jcc_rel32(&e, CC_NE);
+    emit_load_cpu32(&e, RAX, (int32_t)CPU_OFF_WINDOWSTART);
+    emit_test_reg32_imm32(&e, RAX, collision_mask);
+    window_safe[1] = emit_jcc_rel32(&e, CC_E);
+    emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_PC, pc);
+    emit_store32_disp_imm(&e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+    emit_jmp_to_epilogue(&e, jit);
+    emit_patch_rel32(&e, window_safe[0]);
+    emit_patch_rel32(&e, window_safe[1]);
+
     /* Register allocator: lazy load — regs are loaded from ar[] on first
      * use, so blocks only pay for the guest regs they actually touch. */
     regalloc_t ra;

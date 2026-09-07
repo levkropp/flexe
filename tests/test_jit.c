@@ -988,6 +988,55 @@ TEST(test_jit_call8_return_address_survives_the_exit_flush) {
     teardown(&cpu);
 }
 
+/* A native CALLX8 must not write its return address into a live aliased
+ * window.  Native code cannot take WindowOverflow directly, so the block
+ * guard hands the collision to xtensa_step(), which faults before CALLX8 has
+ * any side effects. */
+TEST(test_jit_window_collision_falls_back_before_callx8) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    const uint32_t call_pc = BASE + 6u;
+    const uint32_t target = BASE + 0x200u;
+    /* CALLX8 a2: op0/op1/op2/r=0, m=3, n=2, s=2. */
+    const uint32_t callx8 = (2u << 8) | (14u << 4);
+    put_insn2(&cpu, BASE,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 4u, narrow(0xD, 15, 0, 3));
+    put_insn3(&cpu, call_pc, callx8);
+
+    cpu.windowbase = 1;
+    cpu.windowstart = 1u << 1;
+    ar_write(&cpu, 2, target);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.ps = 1u << 18; /* WOE, not EXCM */
+    cpu.windowstart = (1u << 1) | (1u << 3) | (1u << 5);
+    cpu.ar[3 * 4] = 0xDEADBEEFu;
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    cpu.running = true;
+
+    for (int i = 0; i < 4; i++)
+        (void)xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE + VECOFS_WINDOW_OVERFLOW8);
+    ASSERT_EQ(cpu.epc[0], call_pc);
+    ASSERT_EQ(cpu.windowbase, 3u);
+    ASSERT_EQ(cpu.ar[3 * 4], 0xDEADBEEFu);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* The native back-edge no longer re-reads LBEG/LEND every iteration when the
  * body provably cannot write them, so the check that the live loop is the one
  * the block was compiled for happens once, on entry. That check is what stops
@@ -1819,6 +1868,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
     RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);
     RUN_TEST(test_jit_call8_return_address_survives_the_exit_flush);
+    RUN_TEST(test_jit_window_collision_falls_back_before_callx8);
     RUN_TEST(test_jit_self_loop_early_exit_flushes_later_writes);
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);
     RUN_TEST(test_waiti_time_is_not_counted_as_retired_instructions);

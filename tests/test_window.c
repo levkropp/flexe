@@ -693,6 +693,36 @@ TEST(overflow_vector_uses_windowstart_distance) {
     teardown(&cpu);
 }
 
+/* An ENTRY whose destination window is live must fault before changing any
+ * architectural register.  The destination of `entry a1, 32` after CALL8 is
+ * physical window 2's a1 -- precisely the SP the Overflow8 vector needs in
+ * order to save that live frame. */
+TEST(entry_overflow_is_restartable) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    const uint32_t caller_sp = BASE + 0x5000;
+    const uint32_t live_sp = BASE + 0x6400;
+
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.windowbase = 0;
+    cpu.windowstart = (1u << 0) | (1u << 2) | (1u << 4);
+    XT_PS_SET_CALLINC(cpu.ps, 2);
+    XT_PS_SET_EXCM(cpu.ps, 0);
+    ar_write(&cpu, 1, caller_sp);
+    cpu.ar[2 * 4 + 1] = live_sp;
+
+    put_insn3(&cpu, BASE, entry_insn(1, 32));
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE + VECOFS_WINDOW_OVERFLOW8);
+    ASSERT_EQ(cpu.epc[0], BASE);
+    ASSERT_EQ(cpu.windowbase, 2);
+    ASSERT_EQ(cpu.ar[2 * 4 + 1], live_sp);
+    ASSERT_EQ(cpu.windowstart, (1u << 0) | (1u << 2) | (1u << 4));
+
+    teardown(&cpu);
+}
+
 /* ===== L32E basic ===== */
 
 TEST(l32e_basic) {
@@ -1262,6 +1292,7 @@ static void run_window_tests(void) {
     RUN_TEST(rotw_basic);
     RUN_TEST(rotw_vectors_preserve_windowstart);
     RUN_TEST(overflow_vector_uses_windowstart_distance);
+    RUN_TEST(entry_overflow_is_restartable);
     RUN_TEST(l32e_basic);
     RUN_TEST(s32e_basic);
     RUN_TEST(l32e_s32e_round_trip);

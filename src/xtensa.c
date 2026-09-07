@@ -610,26 +610,186 @@ static inline uint32_t window_overflow_vec(xtensa_cpu_t *cpu, int w) {
     return VECOFS_WINDOW_OVERFLOW4 + (uint32_t)(d - 1) * 0x80u;
 }
 
-static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline unsigned window_need2(unsigned a, unsigned b) {
+    return (a > b ? a : b) >> 2;
+}
+
+static inline unsigned window_need3(unsigned a, unsigned b, unsigned c) {
+    unsigned m = a > b ? a : b;
+    return (m > c ? m : c) >> 2;
+}
+
+/* Highest logical AR window an instruction actually touches.  Xtensa reuses
+ * the r/s/t bit positions for immediates, FP/boolean/MAC registers and opcode
+ * selectors in several formats.  Treating all three nibbles as AR operands
+ * makes harmless instructions such as NOP.N (whose fixed r field is 15)
+ * raise a WindowOverflow12 exception.  Mirror the implemented decoder here,
+ * just as QEMU builds its windowed-register mask from decoded operands. */
+static inline unsigned window_operand_need(const xtensa_cpu_t *cpu,
+                                           uint32_t insn, int ilen) {
+    unsigned t = XT_T(insn);
+    unsigned s = XT_S(insn);
+    unsigned r = XT_R(insn);
+
+    if (ilen == 2) {
+        switch (XT_OP0(insn)) {
+        case 0x8: /* L32I.N */
+        case 0x9: /* S32I.N */
+            return window_need2(s, t);
+        case 0xA: /* ADD.N */
+            return window_need3(r, s, t);
+        case 0xB: /* ADDI.N: t is the immediate */
+            return window_need2(r, s);
+        case 0xC: /* MOVI.N / BEQZ.N / BNEZ.N */
+            return s >> 2;
+        case 0xD: /* MOV.N, or fixed encodings with no high AR operand */
+            return r == 0 ? window_need2(s, t) : 0;
+        default:
+            return 0;
+        }
+    }
+
+    unsigned op0 = XT_OP0(insn);
+    unsigned op1 = XT_OP1(insn);
+    unsigned op2 = XT_OP2(insn);
+    switch (op0) {
+    case 0: /* QRST */
+        switch (op1) {
+        case 0: /* RST0 */
+            if (op2 == 0) { /* ST0 specials */
+                unsigned m = XT_M(insn);
+                unsigned nn = XT_N(insn);
+                switch (r) {
+                case 0:
+                    if (m == 2 && nn == 2) return s >> 2; /* JX */
+                    if (m == 3) return window_need2(s, nn * 4u); /* CALLXn */
+                    return 0; /* RET/RETW and fixed control encodings */
+                case 1: return window_need2(s, t); /* MOVSP */
+                case 6: return t >> 2;              /* RSIL; s is a level */
+                default: return 0;
+                }
+            }
+            if (op2 >= 1 && op2 <= 3)
+                return window_need3(r, s, t); /* AND/OR/XOR */
+            if (op2 == 4) { /* shift setup / ROTW / NSA / external regs */
+                if (r <= 3) return s >> 2;
+                if (r == 6 || r == 7 || r == 14 || r == 15)
+                    return window_need2(s, t);
+                return 0; /* SSAI and ROTW operands are immediates */
+            }
+            if (op2 == 6) return window_need2(r, t); /* NEG/ABS */
+            if (op2 >= 8) return window_need3(r, s, t); /* integer ALU */
+            return 0;
+
+        case 1: /* RST1 */
+            switch (op2) {
+            case 0: case 1: return window_need2(r, s); /* SLLI */
+            case 2: case 3: case 4: return window_need2(r, t); /* SRAI/SRLI */
+            case 6: return t >> 2; /* XSR; r/s encode the SR */
+            case 8: case 12: case 13: return window_need3(r, s, t);
+            case 9: case 11: return window_need2(r, t);
+            case 10: return window_need2(r, s);
+            default: return 0;
+            }
+
+        case 2: /* RST2: boolean ops 0..4 have no AR operands */
+            return (op2 == 6 || op2 == 7 || op2 == 8 || op2 >= 10)
+                 ? window_need3(r, s, t) : 0;
+
+        case 3: /* RST3 */
+            switch (op2) {
+            case 0: case 1: return t >> 2; /* RSR/WSR */
+            case 2: case 3: return window_need2(r, s); /* SEXT/CLAMPS */
+            case 4: case 5: case 6: case 7:
+            case 8: case 9: case 10: case 11:
+                return window_need3(r, s, t);
+            case 12: case 13: return window_need2(r, s); /* t is boolean */
+            case 14: case 15: return t >> 2; /* r/s encode the user reg */
+            default: return 0;
+            }
+
+        case 4: case 5: /* EXTUI: s/op2 are immediates */
+            return window_need2(r, t);
+
+        case 8: /* indexed FP load/store: r is an FP register */
+            return (op2 == 0 || op2 == 1 || op2 == 4 || op2 == 5)
+                 ? window_need2(s, t) : 0;
+
+        case 9: /* L32E/S32E: r is the displacement */
+            return (op2 == 0 || op2 == 4) ? window_need2(s, t) : 0;
+
+        case 10: /* FP0 */
+            if (op2 >= 8 && op2 <= 11) return r >> 2;
+            if (op2 == 12 || op2 == 13) return s >> 2;
+            if (op2 == 14) return r >> 2;
+            if (op2 == 15 && t == 4) return r >> 2; /* RFR */
+            if (op2 == 15 && t == 5) return s >> 2; /* WFR */
+            return 0;
+
+        case 11: /* FP1: only the integer-conditioned forms touch AR[t] */
+            return (op2 >= 8 && op2 <= 11) ? t >> 2 : 0;
+        default:
+            return 0;
+        }
+
+    case 1: /* L32R: r/s form the literal displacement */
+        return t >> 2;
+
+    case 2: /* LSAI: r selects the operation */
+        if (r == 0xA) return t >> 2; /* MOVI */
+        if (r == 0x0 || r == 0x1 || r == 0x2 || r == 0x4 ||
+            r == 0x5 || r == 0x6 || r == 0xB || r == 0xC ||
+            r == 0xD || r == 0xE || r == 0xF)
+            return window_need2(s, t);
+        if (r == 0x7) return s >> 2; /* cache address */
+        return 0;
+
+    case 3: /* LSI/SSI/LSIU/SSIU: only the AR base is integer */
+        return s >> 2;
+
+    case 4: { /* MAC16: r names an accumulator/MR, not AR */
+        if ((op2 & 0xCu) == 8u) return window_need2(s, t);
+        switch ((op2 >> 2) & 3u) {
+        case 0: return window_need2(s, t); /* AA */
+        case 1: return s >> 2;             /* AD */
+        case 2: return t >> 2;             /* DA */
+        default: return 0;                 /* DD */
+        }
+    }
+
+    case 5: /* CALLn writes a0/a4/a8/a12 */
+        return XT_N(insn);
+
+    case 6: { /* J / immediate branches / LOOP / ENTRY */
+        unsigned nn = XT_N(insn);
+        unsigned m = XT_M(insn);
+        if (nn == 0) return 0;
+        if (nn == 1 || nn == 2) return s >> 2;
+        if (m == 0) { /* ENTRY source and CALLINC-selected destination */
+            unsigned dst = ((unsigned)XT_PS_CALLINC(cpu->ps) << 2) | (s & 3u);
+            return window_need2(s, dst);
+        }
+        if (m == 1) return (r >= 8 && r <= 10) ? s >> 2 : 0;
+        return s >> 2;
+    }
+
+    case 7: /* register and immediate-bit branches */
+        return (r == 6 || r == 7 || r == 14 || r == 15)
+             ? s >> 2 : window_need2(s, t);
+    default:
+        return 0;
+    }
+}
+
+static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
+                                       int ilen) {
     uint32_t ws = cpu->windowstart & 0xFFFFu;
     unsigned sh = ((unsigned)cpu->windowbase + 1u) & 0xFu;
     uint32_t rot = ((ws >> sh) | (ws << (16u - sh))) & 0xFFFFu;
     if (__builtin_expect((rot & 7u) == 0u, 1))
         return false;
 
-    /* How far up the window the instruction can actually reach. The register
-     * fields sit at the same bit positions in every format that has them, and
-     * a field that is really an immediate only ever over-estimates, which is
-     * safe. Checking all three windows unconditionally instead -- which is
-     * what this did -- invents accesses that never happen: it fired 6,365
-     * times in 20M cycles of WLED while PS.EXCM was set, i.e. inside the
-     * window handlers, where a spill would corrupt the frame in flight. */
-    uint32_t rf = (insn >> 12) & 0xFu;
-    uint32_t sf = (insn >> 8) & 0xFu;
-    uint32_t tf = (insn >> 4) & 0xFu;
-    uint32_t mr = rf > sf ? rf : sf;
-    if (tf > mr) mr = tf;
-    unsigned need = mr >> 2;               /* 0..3 windows beyond this one */
+    unsigned need = window_operand_need(cpu, insn, ilen);
     if (need == 0u || (rot & ((1u << need) - 1u)) == 0u)
         return false;
 
@@ -2300,27 +2460,9 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
               int callinc = XT_PS_CALLINC(cpu->ps);
               uint32_t imm12 = XT_IMM12(insn);
               uint32_t frame_size = imm12 << 3;
-
-              /* Set callee's a1 (SP) BEFORE overflow check so that
-               * synth_spill_window reads the correct base address.
-               * The callee's a1 is in the rotated window at register
-               * index (callinc*4 | s&3), which is the same register
-               * the ENTRY instruction targets. */
               int new_reg = (callinc << 2) | (s & 3);
               uint32_t caller_sp = ar_read(cpu, s);
-              ar_write(cpu, new_reg, caller_sp - frame_size);
-
-              /* First frame on this core: stand in for the bootloader that
-               * would have called us, so this frame can be spilled. */
-              if (__builtin_expect(cpu->seed_entry_link, 0)) {
-                  cpu->seed_entry_link = false;
-                  uint32_t nsp = caller_sp - frame_size;
-                  if (nsp >= 0x3FF80000u && nsp < 0x40000000u &&
-                      mem_read32(cpu->mem, nsp - 12u) == 0u) {
-                      mem_write32(cpu->mem, nsp - 16u, 0u);  /* ends unwind */
-                      mem_write32(cpu->mem, nsp - 12u, caller_sp);
-                  }
-              }
+              uint32_t new_sp = caller_sp - frame_size;
 
               /* The ISA ENTRY check is wb+1 through wb+callinc -- every
                * window the rotation passes over, not just the one it lands on.
@@ -2339,12 +2481,38 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                       if (cpu->windowstart & (1u << w)) { hit = w; break; }
                   }
                   if (hit >= 0) {
+                      /* ENTRY is restartable.  In particular, its destination
+                       * a(4*CALLINC+s) is part of the window that just
+                       * collided.  Writing the new SP before taking the
+                       * exception destroys that live frame before the guest's
+                       * overflow vector can save it. */
                       raise_window_exception(cpu, cpu->pc - 3, hit,
                                              window_overflow_vec(cpu, hit));
                       return;
                   }
               } else {
+                  /* The legacy synthesized spill derives a colliding frame's
+                   * save area from the callee SP, so retain its historical
+                   * ordering.  Architectural-vector mode above must have no
+                   * instruction side effects until all checks pass. */
+                  ar_write(cpu, new_reg, new_sp);
                   synth_overflow_check(cpu, callinc);
+              }
+
+              if (ent_vec)
+                  ar_write(cpu, new_reg, new_sp);
+
+              /* First frame on this core: stand in for the bootloader that
+               * would have called us, so this frame can be spilled.  This is
+               * an ENTRY side effect too, and therefore belongs after its
+               * architectural overflow check. */
+              if (__builtin_expect(cpu->seed_entry_link, 0)) {
+                  cpu->seed_entry_link = false;
+                  if (new_sp >= 0x3FF80000u && new_sp < 0x40000000u &&
+                      mem_read32(cpu->mem, new_sp - 12u) == 0u) {
+                      mem_write32(cpu->mem, new_sp - 16u, 0u);  /* ends unwind */
+                      mem_write32(cpu->mem, new_sp - 12u, caller_sp);
+                  }
               }
 
               uint32_t owb = cpu->windowbase;
@@ -2894,7 +3062,7 @@ have_insn:
     cpu->_pc_written = false;
 
     if (__builtin_expect(cpu->real_window_vectors, 0) &&
-        window_access_check(cpu, insn)) {
+        window_access_check(cpu, insn, ilen)) {
         /* Faulted into a window vector; the instruction has not run and RFWO
          * returns to it. */
         cpu->ccount++;
