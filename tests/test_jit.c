@@ -1076,6 +1076,82 @@ TEST(test_jit_call8_return_address_survives_the_exit_flush) {
     teardown(&cpu);
 }
 
+/* A live window beyond the highest register a block touches is irrelevant.
+ * The old all-three-windows guard returned every such block to the
+ * interpreter even though the architectural operand check would let it run. */
+TEST(test_jit_window_guard_checks_only_touched_windows) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.windowbase = 1;
+    cpu.windowstart = 1u << 1;
+    ar_write(&cpu, 4, 10u);
+    for (unsigned i = 0; i < 4; i++)
+        put_insn2(&cpu, BASE + i * 2u, narrow(0xB, 4, 4, 1));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+
+    cpu.real_window_vectors = true;
+    cpu.ps = 1u << 18; /* WOE, not EXCM */
+    /* a4 reaches only WB+1 (bit 2); WB+2 (bit 3) may remain live. */
+    cpu.windowstart = (1u << 1) | (1u << 3);
+    cpu.pc = BASE;
+    ASSERT_EQ(fn(&cpu), 4);
+    ASSERT_EQ(cpu.pc, BASE + 8u);
+    ASSERT_EQ(ar_read(&cpu, 4), 14u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+/* WSR PS can enable window exceptions in the middle of a block. When a later
+ * high-register operand collides, the entry guard must not rely only on the
+ * old PS value; it returns to the interpreter so the precise access faults. */
+TEST(test_jit_window_guard_handles_mid_block_woe_enable) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.windowbase = 1;
+    cpu.windowstart = 1u << 1;
+    ar_write(&cpu, 2, 1u << 18); /* new PS: WOE, not EXCM */
+    put_insn3(&cpu, BASE,
+              rrr(1, 3, XT_SR_PS >> 4, XT_SR_PS & 15, 2));
+    put_insn2(&cpu, BASE + 3u, narrow(0xB, 4, 4, 1));
+    put_insn2(&cpu, BASE + 5u, narrow(0xB, 4, 4, 1));
+    put_insn2(&cpu, BASE + 7u, narrow(0xB, 4, 4, 1));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.ps = 0; /* WOE becomes enabled by the first instruction. */
+    cpu.windowstart = (1u << 1) | (1u << 2) | (1u << 3);
+    cpu.pc = BASE;
+    ASSERT_EQ(fn(&cpu), 0);
+    ASSERT_EQ(cpu.ps, 0u);
+
+    cpu._pc_written = true;
+    cpu.running = true;
+    (void)xtensa_step(&cpu); /* WSR PS */
+    (void)xtensa_step(&cpu); /* colliding ADDI.N a4 */
+    ASSERT_EQ(cpu.epc[0], BASE + 3u);
+    ASSERT_EQ(cpu.pc, BASE + VECOFS_WINDOW_OVERFLOW4);
+    ASSERT_EQ(cpu.windowbase, 2u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* A native CALLX8 must not write its return address into a live aliased
  * window.  Native code cannot take WindowOverflow directly, so the block
  * guard hands the collision to xtensa_step(), which faults before CALLX8 has
@@ -2158,6 +2234,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
     RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);
     RUN_TEST(test_jit_call8_return_address_survives_the_exit_flush);
+    RUN_TEST(test_jit_window_guard_checks_only_touched_windows);
+    RUN_TEST(test_jit_window_guard_handles_mid_block_woe_enable);
     RUN_TEST(test_jit_window_collision_falls_back_before_callx8);
     RUN_TEST(test_jit_self_loop_early_exit_flushes_later_writes);
     RUN_TEST(test_jit_block_compiled_outside_a_loop_is_not_reused_inside_one);

@@ -538,6 +538,13 @@ static inline int32_t sign_extend(uint32_t val, int bits) {
     return (int32_t)((val ^ sign_bit) - sign_bit);
 }
 
+/* Highest adjacent physical register window (0..3) touched by an
+ * instruction's architectural AR operands. The interpreter uses this to
+ * raise precise window-overflow exceptions; translation engines use the same
+ * decoder to decide which live-window collisions require fallback. */
+unsigned xtensa_window_operand_need(const xtensa_cpu_t *cpu,
+                                    uint32_t insn, int ilen);
+
 /*
  * Instruction fetch: read 2 or 3 bytes from memory, return instruction word and length.
  * Returns instruction length (2 or 3), or 0 on error.

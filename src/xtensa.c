@@ -782,6 +782,11 @@ static inline unsigned window_operand_need(const xtensa_cpu_t *cpu,
     }
 }
 
+unsigned xtensa_window_operand_need(const xtensa_cpu_t *cpu,
+                                    uint32_t insn, int ilen) {
+    return window_operand_need(cpu, insn, ilen);
+}
+
 static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
                                        int ilen) {
     uint32_t ws = cpu->windowstart & 0xFFFFu;
