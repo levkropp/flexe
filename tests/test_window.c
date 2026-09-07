@@ -522,6 +522,71 @@ TEST(mixed_call_chain) {
 
 /* ===== MOVSP triggers spill ===== */
 
+/* Architectural MOVSP is a register move, not a stack-frame memcpy.  Marauder
+ * restores its pre-alloca SP with MOVSP; copying the dynamic frame's 48-byte
+ * save area over the restored one destroys [sp-12], which WindowUnderflow8
+ * later follows to reload a4-a7. */
+TEST(movsp_vectors_preserve_stack_memory) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    const uint32_t old_sp = BASE + 0x3800;
+    const uint32_t new_sp = BASE + 0x3400;
+
+    cpu.real_window_vectors = true;
+    cpu.windowbase = 4;
+    cpu.windowstart = (1u << 2) | (1u << 4); /* call8 caller is live */
+    XT_PS_SET_EXCM(cpu.ps, 0);
+    ar_write(&cpu, 1, old_sp);
+    ar_write(&cpu, 2, new_sp);
+    for (uint32_t off = 4; off <= 48; off += 4) {
+        mem_write32(cpu.mem, old_sp - off, 0xA1000000u | off);
+        mem_write32(cpu.mem, new_sp - off, 0xB2000000u | off);
+    }
+
+    put_insn3(&cpu, BASE, movsp_insn(1, 2));
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(ar_read(&cpu, 1), new_sp);
+    for (uint32_t off = 4; off <= 48; off += 4) {
+        ASSERT_EQ(mem_read32(cpu.mem, old_sp - off), 0xA1000000u | off);
+        ASSERT_EQ(mem_read32(cpu.mem, new_sp - off), 0xB2000000u | off);
+    }
+
+    teardown(&cpu);
+}
+
+/* If every possible caller window is spilled, MOVSP traps before changing SP.
+ * The guest's Alloca handler fills one caller and returns through RFWU, after
+ * which the retried MOVSP can safely change the stack pointer. */
+TEST(movsp_vectors_raise_alloca) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    const uint32_t old_sp = BASE + 0x3800;
+    const uint32_t new_sp = BASE + 0x3400;
+
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.windowbase = 4;
+    cpu.windowstart = 1u << 4;
+    XT_PS_SET_EXCM(cpu.ps, 0);
+    cpu.ps |= 1u << 5; /* user mode selects UserExceptionVector */
+    ar_write(&cpu, 1, old_sp);
+    ar_write(&cpu, 2, new_sp);
+    mem_write32(cpu.mem, old_sp - 12, 0xA5A5A5A5u);
+    mem_write32(cpu.mem, new_sp - 12, 0x5A5A5A5Au);
+
+    put_insn3(&cpu, BASE, movsp_insn(1, 2));
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE + VECOFS_USER_EXC);
+    ASSERT_EQ(cpu.epc[0], BASE);
+    ASSERT_EQ(cpu.exccause, EXCCAUSE_ALLOCA);
+    ASSERT_TRUE(XT_PS_EXCM(cpu.ps));
+    ASSERT_EQ(ar_read(&cpu, 1), old_sp);
+    ASSERT_EQ(mem_read32(cpu.mem, old_sp - 12), 0xA5A5A5A5u);
+    ASSERT_EQ(mem_read32(cpu.mem, new_sp - 12), 0x5A5A5A5Au);
+
+    teardown(&cpu);
+}
+
 TEST(movsp_triggers_spill) {
     xtensa_cpu_t cpu; setup_windowed(&cpu);
 
@@ -576,6 +641,26 @@ TEST(rotw_basic) {
     put_insn3(&cpu, cpu.pc, rotw_insn(3));
     xtensa_step(&cpu);
     ASSERT_EQ(cpu.windowbase, 4);
+
+    teardown(&cpu);
+}
+
+/* In architectural-vector mode ROTW only rotates WINDOWBASE.  The guest's
+ * AllocaCause handler uses two ROTW -1 instructions while EXCM is set; running
+ * the synthesized spill helper there clears the interrupted frame's live bit
+ * and makes the retried MOVSP corrupt a later return. */
+TEST(rotw_vectors_preserve_windowstart) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.windowbase = 6;
+    cpu.windowstart = 1u << 7;
+    XT_PS_SET_EXCM(cpu.ps, 1);
+
+    put_insn3(&cpu, BASE, rotw_insn(0xF)); /* -1 */
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.windowbase, 5);
+    ASSERT_EQ(cpu.windowstart, 1u << 7);
 
     teardown(&cpu);
 }
@@ -1143,8 +1228,11 @@ static void run_window_tests(void) {
     RUN_TEST(deep_call4_return);
     RUN_TEST(call8_overflow);
     RUN_TEST(mixed_call_chain);
+    RUN_TEST(movsp_vectors_preserve_stack_memory);
+    RUN_TEST(movsp_vectors_raise_alloca);
     RUN_TEST(movsp_triggers_spill);
     RUN_TEST(rotw_basic);
+    RUN_TEST(rotw_vectors_preserve_windowstart);
     RUN_TEST(l32e_basic);
     RUN_TEST(s32e_basic);
     RUN_TEST(l32e_s32e_round_trip);

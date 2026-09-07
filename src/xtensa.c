@@ -1509,6 +1509,35 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 }
                 break;
             case 1: { /* MOVSP */
+                /* MOVSP does not move a stack frame.  With the architectural
+                 * window handlers enabled it first raises AllocaCause when
+                 * all three possible caller windows are spilled.  The
+                 * guest's _xt_alloca_exc fills the caller whose save-area
+                 * links would otherwise become unreachable, then RFWU
+                 * retries this instruction.  Once any caller window is live,
+                 * MOVSP is only the register-to-register assignment below.
+                 *
+                 * The synthesized fallback predates real window exceptions
+                 * and retains its private spill bookkeeping.  In particular,
+                 * never run its 48-byte stack copy in architectural mode:
+                 * restoring an alloca'd SP that way overwrites [sp-12], the
+                 * back-chain used by WindowUnderflow8/12. */
+                if (__builtin_expect(cpu->real_window_vectors, 0)) {
+                    if (XT_PS_WOE(cpu->ps) && !XT_PS_EXCM(cpu->ps)) {
+                        uint32_t callers =
+                            (1u << ((cpu->windowbase - 1u) & 15u)) |
+                            (1u << ((cpu->windowbase - 2u) & 15u)) |
+                            (1u << ((cpu->windowbase - 3u) & 15u));
+                        if ((cpu->windowstart & callers) == 0u) {
+                            xtensa_raise_exception(cpu, EXCCAUSE_ALLOCA,
+                                                   cpu->pc - 3u, 0);
+                            return;
+                        }
+                    }
+                    ar_write(cpu, t, ar_read(cpu, s));
+                    break;
+                }
+
                 /* Spill any live windows below current */
                 for (int i = 1; i <= 3; i++) {
                     int w = (cpu->windowbase - i) & 15;
@@ -1683,7 +1712,12 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                  * the ISA specifies for an a12-a15 access: WB+1 through WB+3,
                  * and no wider. (The same routine reached through SYSCALL is
                  * handled a few cases above.) */
-                if (XT_PS_WOE(cpu->ps))
+                /* Architectural mode performs the register-access window
+                 * check before execution.  ROTW itself only changes WB.  In
+                 * particular, guest overflow/alloca handlers execute ROTW
+                 * with PS.EXCM set and must not have their WINDOWSTART bits
+                 * silently spilled by the synthesized fallback. */
+                if (!cpu->real_window_vectors && XT_PS_WOE(cpu->ps))
                     synth_overflow_check(cpu, 0);
                 cpu->windowbase = (cpu->windowbase + (int32_t)sign_extend(t, 4)) & 0xF;
                 break;
