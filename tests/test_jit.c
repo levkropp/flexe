@@ -390,6 +390,17 @@ TEST(test_jit_mull) {
     teardown(&cpu);
 }
 
+TEST(test_jit_mulsh) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    ar_write(&cpu, 3, 0x80000000u);
+    ar_write(&cpu, 4, 2u);
+    /* MULSH a2, a3, a4: high half of INT32_MIN * 2 is 0xffffffff. */
+    put_insn3(&cpu, BASE, rrr(11, 2, 2, 3, 4));
+    test_block_differential(&cpu, 1, "mulsh");
+    teardown(&cpu);
+}
+
 TEST(test_jit_neg) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1832,6 +1843,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_src_funnel);
     RUN_TEST(test_jit_sll_srl_sra);
     RUN_TEST(test_jit_mull);
+    RUN_TEST(test_jit_mulsh);
     RUN_TEST(test_jit_neg);
     RUN_TEST(test_jit_mov_n);
     RUN_TEST(test_jit_add_n);

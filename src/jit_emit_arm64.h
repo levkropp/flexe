@@ -77,6 +77,11 @@ typedef struct {
     uint8_t *end;       /* End of buffer */
 } emit_t;
 
+/* The shared JIT marks control-flow entry points so x86 can invalidate its
+ * store-to-load forwarding record. ARM64 has no such peephole, but keeps the
+ * same emitter interface so shared block-generation code stays portable. */
+static inline void emit_fwd_barrier(emit_t *e) { (void)e; }
+
 static inline void emit_init(emit_t *e, uint8_t *buf, size_t size) {
     e->buf = buf;
     e->ptr = buf;
@@ -872,7 +877,7 @@ static inline void emit_or_reg64(emit_t *e, int dst, int src) {
 /* ASR Xd, Xn, #sh — alias of SBFM Xd, Xn, #sh, #63. */
 static inline void emit_sar_reg64_imm(emit_t *e, int reg, uint8_t sh) {
     sh &= 63;
-    emit32(e, 0x93407C00u | ((uint32_t)sh << 16)
+    emit32(e, 0x9340FC00u | ((uint32_t)sh << 16)
              | ((uint32_t)(reg & 31) << 5) | (uint32_t)(reg & 31));
 }
 
