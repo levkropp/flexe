@@ -147,31 +147,43 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
 
 /* ===== Asynchronous callbacks: see guest_call_async() in guest_call.h ===== */
 
-/* Saved on the borrowed task's stack, below its frame, so that a context
- * switch in the middle of the callee cannot lose it. CALL8 hands a0-a7 of the
- * new window to the callee, which is the caller's a8-a15, so those eight are
- * the ones the windowed ABI does not preserve for us. */
-#define ASYNC_FRAME_BYTES 48u
-#define ASYNC_OFF_RESUME  32u
-#define ASYNC_OFF_MAGIC   36u
-#define ASYNC_MAGIC       0x41535943u  /* 'ASYC' */
+/* CALL8 hands a0-a7 of the new window to the callee, which is the caller's
+ * a8-a15, so those eight are the interrupted registers the ABI does not
+ * preserve for us. Keep them outside guest memory while the callback runs.
+ *
+ * An earlier implementation made room by subtracting 48 from the borrowed
+ * task's a1 and putting this state there. That silently changed the ABI link
+ * for every live ancestor window: if the callback caused one to overflow, it
+ * was saved relative to the temporary a1. After the callback restored the old
+ * a1, RETW looked for that ancestor at the old link and reloaded the callback
+ * marker as a stack pointer. Leaving a1 alone makes the injected CALL8 a
+ * normal nested call and keeps every overflow/underflow save area coherent.
+ * Host state remains available across a FreeRTOS context switch just as guest
+ * RAM does. */
+static uint32_t async_saved_a8_a15[8];
+static uint32_t async_resume_pc;
+static uint32_t async_resume_sp;
+static uint32_t async_resume_wb;
 
 /* One outstanding callback at a time, matching the one-event-per-batch rule
- * the WiFi model already follows. The frame is self-describing, so this is
- * only a rate limit -- correctness does not depend on it. */
+ * the WiFi model already follows. There is one continuation slot, so this is
+ * also the backpressure that prevents a second callback from replacing it. */
 static bool     async_busy;
 static uint64_t async_deadline;
+static bool     async_timeout_reported;
 
 bool guest_call_async_busy(const xtensa_cpu_t *cpu) {
     if (!async_busy) return false;
-    /* A callee that never returns would otherwise stop event delivery for the
-     * rest of the run. Give up tracking it after a second of guest time; the
-     * frame stays valid, so a late return still restores correctly. */
-    if (cpu && cpu->cycle_count > async_deadline) {
-        fprintf(stderr, "[flexe] async callback did not return within 1s of "
-                        "guest time; allowing the next one\n");
-        async_busy = false;
-        return false;
+    /* Never overwrite a still-live continuation. A callback that blocks for
+     * a long time legitimately owns the borrowed task until it resumes; a
+     * second injected call would make either late return restore the other's
+     * registers. Report the stall once, but retain correctness and backpressure
+     * until this callback actually returns. */
+    if (cpu && cpu->cycle_count > async_deadline &&
+        !async_timeout_reported) {
+        fprintf(stderr, "[flexe] async callback has not returned after 1s of "
+                        "guest time; deferring subsequent callbacks\n");
+        async_timeout_reported = true;
     }
     return true;
 }
@@ -198,19 +210,17 @@ int guest_call_async(xtensa_cpu_t *cpu, uint32_t entry,
     }
 
     uint32_t sp = ar_read(cpu, 1);
-    if ((sp & 3u) != 0 || sp < 0x3FF80000u || sp >= 0x40000000u ||
-        sp - ASYNC_FRAME_BYTES < 0x3FF80000u) {
+    if ((sp & 3u) != 0 || sp < 0x3FF80000u || sp >= 0x40000000u) {
         if (getenv("FLEXE_ASYNCDBG"))
             fprintf(stderr, "[async] refused: sp=%08X\n", sp);
         return -1;
     }
 
-    uint32_t nsp = sp - ASYNC_FRAME_BYTES;
     for (int i = 0; i < 8; i++)
-        mem_write32(cpu->mem, nsp + (uint32_t)i * 4u, ar_read(cpu, 8 + i));
-    mem_write32(cpu->mem, nsp + ASYNC_OFF_RESUME, cpu->pc);
-    mem_write32(cpu->mem, nsp + ASYNC_OFF_MAGIC, ASYNC_MAGIC);
-    ar_write(cpu, 1, nsp);
+        async_saved_a8_a15[i] = ar_read(cpu, 8 + i);
+    async_resume_pc = cpu->pc;
+    async_resume_sp = sp;
+    async_resume_wb = cpu->windowbase;
 
     for (size_t i = 0; i < arg_count; i++)
         ar_write(cpu, 10 + (int)i, args[i]);   /* callee sees a2..a5 */
@@ -223,10 +233,11 @@ int guest_call_async(xtensa_cpu_t *cpu, uint32_t entry,
 
     async_busy = true;
     async_deadline = cpu->cycle_count + 240000000ull;
+    async_timeout_reported = false;
     if (getenv("FLEXE_ASYNCDBG"))
         fprintf(stderr, "[async] start entry=%08X sp=%08X resume=%08X ps=%08X "
-                "wb=%u ws=%08X core%d\n", entry, nsp,
-                mem_read32(cpu->mem, nsp + ASYNC_OFF_RESUME), cpu->ps,
+                "wb=%u ws=%08X core%d\n", entry, sp,
+                async_resume_pc, cpu->ps,
                 cpu->windowbase, cpu->windowstart, cpu->core_id);
     return 0;
 }
@@ -234,20 +245,21 @@ int guest_call_async(xtensa_cpu_t *cpu, uint32_t entry,
 void guest_call_async_return(xtensa_cpu_t *cpu)
 {
     uint32_t sp = ar_read(cpu, 1);
-    if (mem_read32(cpu->mem, sp + ASYNC_OFF_MAGIC) != ASYNC_MAGIC) {
-        /* Reaching the sentinel without our frame under a1 means the callee
-         * returned on a different stack than it was started on. Restoring
-         * from whatever is there would be worse than stopping. */
-        fprintf(stderr, "[flexe] async callback returned with a1=0x%08X and no "
-                        "frame magic; cannot resume\n", sp);
+    if (!async_busy || sp != async_resume_sp ||
+        cpu->windowbase != async_resume_wb) {
+        /* Reaching the sentinel in another frame means the callee did not
+         * unwind the injected CALL8. Restoring registers into that frame
+         * would corrupt it, so stop with an actionable diagnostic. */
+        fprintf(stderr, "[flexe] async callback returned in the wrong frame "
+                        "(a1=0x%08X wb=%u, expected a1=0x%08X wb=%u)\n",
+                        sp, cpu->windowbase, async_resume_sp, async_resume_wb);
         async_busy = false;
         cpu->running = false;
         return;
     }
     for (int i = 0; i < 8; i++)
-        ar_write(cpu, 8 + i, mem_read32(cpu->mem, sp + (uint32_t)i * 4u));
-    cpu->pc = mem_read32(cpu->mem, sp + ASYNC_OFF_RESUME);
-    ar_write(cpu, 1, sp + ASYNC_FRAME_BYTES);
+        ar_write(cpu, 8 + i, async_saved_a8_a15[i]);
+    cpu->pc = async_resume_pc;
     if (getenv("FLEXE_ASYNCDBG"))
         fprintf(stderr, "[async] return sp=%08X resume=%08X core%d\n",
                 sp, cpu->pc, cpu->core_id);

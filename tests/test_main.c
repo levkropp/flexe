@@ -13,6 +13,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_loop.c"
 #include "test_integration.c"
 #include "test_window.c"
+#include "test_guest_call.c"
 #include "test_exception.c"
 #include "test_boolean.c"
 #include "test_mac16.c"
@@ -48,6 +49,7 @@ int main(void) {
     run_loop_tests();
     run_integration_tests();
     run_window_tests();
+    run_guest_call_tests();
     run_exception_tests();
     run_boolean_tests();
     run_mac16_tests();

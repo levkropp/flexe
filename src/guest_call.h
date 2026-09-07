@@ -38,10 +38,12 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
  * given -- which is what the hardware does, because there the handler runs in
  * the event task.
  *
- * Everything needed to resume the interrupted code lives on that task's
- * stack, so it survives any number of context switches. Returns 0 if the call
- * was started, -1 if the guest is not in a state where borrowing the current
- * task is safe; the caller should try again later. */
+ * The task's stack pointer remains unchanged so its architectural window-spill
+ * links stay valid. The small continuation (the eight registers clobbered by
+ * CALL8 and the resume PC) is retained by the emulator across context
+ * switches. Returns 0 if the call was started, -1 if the guest is not in a
+ * state where borrowing the current task is safe; the caller should try again
+ * later. */
 int guest_call_async(xtensa_cpu_t *cpu, uint32_t entry,
                      const uint32_t *args, size_t arg_count);
 
