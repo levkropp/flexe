@@ -672,6 +672,75 @@ TEST(test_jit_init_destroy) {
     jit_destroy(jit);
 }
 
+TEST(test_jit_verify_toggle_recompiles_blocks) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    for (unsigned i = 0; i < 4; i++)
+        put_insn2(&cpu, BASE + i * 2u, narrow(0xD, 15, 0, 3));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    uint64_t flushes = jit_get_stats(jit)->cache_flushes;
+    jit_set_verify(jit, true);
+    ASSERT_TRUE(jit_verify_enabled(jit));
+    ASSERT_EQ64(jit_get_stats(jit)->cache_flushes, flushes + 1u);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) == NULL);
+    ASSERT_EQ64(jit_verify_mismatch_count(jit), 0u);
+
+    /* Setting the already-active mode is not another cache transition. */
+    jit_set_verify(jit, true);
+    ASSERT_EQ64(jit_get_stats(jit)->cache_flushes, flushes + 1u);
+
+    jit_set_verify(jit, false);
+    ASSERT_FALSE(jit_verify_enabled(jit));
+    ASSERT_EQ64(jit_get_stats(jit)->cache_flushes, flushes + 2u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_verify_keeps_cross_block_chains_disabled) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE + 0x40u;
+
+    put_insn2(&cpu, BASE,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 4u, narrow(0xD, 15, 0, 3));
+    int32_t joff = (int32_t)target - (int32_t)(BASE + 6u + 3u) - 1;
+    put_insn3(&cpu, BASE + 6u,
+              (((uint32_t)joff & 0x3FFFFu) << 6) | 6u);
+
+    put_insn2(&cpu, target,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, target + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, target + 4u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, target + 6u, narrow(0xD, 15, 0, 0)); /* RET.N */
+    ar_write(&cpu, 0, BASE + 0x100u);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_set_verify(jit, true);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+
+    cpu.pc = BASE;
+    ASSERT_EQ(fn(&cpu), 4);
+    ASSERT_EQ(cpu.pc, target);
+    ASSERT_EQ64(jit_get_stats(jit)->chains_patched, 0u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_hot_threshold) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2328,6 +2397,8 @@ TEST(test_jit_window_underflow_vector_is_native) {
 static void run_jit_tests(void) {
     TEST_SUITE("jit");
     RUN_TEST(test_jit_init_destroy);
+    RUN_TEST(test_jit_verify_toggle_recompiles_blocks);
+    RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);

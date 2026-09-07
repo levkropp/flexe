@@ -3039,34 +3039,16 @@ static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
      * direction would splice in a block that runs straight through LEND. */
     if (jit->cur_lv != 0u) return;
 
-    /* Chaining used to be suppressed under verification, on the grounds that
-     * any window long enough to chain crosses a ROM stub -- which costs one
-     * instruction of the reference run's replay budget while standing in for a
-     * whole guest function -- so every chained block would be skipped as
-     * incomparable.
-     *
-     * Measured again 2026-09-04, that is no longer true: with chaining live,
-     * Marauder verifies 20.3M blocks with zero mismatches and just 18 stub
-     * skips out of a million. Something in between fixed it; the note stayed.
-     *
-     * It matters because chained execution was the one thing the verifier
-     * could not see, and a real hang lived exactly there -- compiling QUOU
-     * hangs the v1.15.1 image while --verify passed it on all five ROMs. A
-     * blind spot in the tool that finds miscompiles is worth more than the
-     * verification speed it costs. FLEXE_JIT_NOCHAIN still turns chaining off
-     * for bisecting. */
-
-    /* Not chained under verification. A chain jumps directly between blocks,
-     * so it steps over PCs at which the interpreted reference run still
-     * dispatches a ROM stub -- the two stop executing comparable work and
-     * every chain-cap exit reports a spurious mismatch. Block-level
-     * verification stays exact; that chaining preserves results is covered
-     * instead by the stock-ROM gates and by bench-compute.sh, which requires
-     * the two engines to agree on a checksum over ~910M cycles.
+    /* Differential verification is deliberately block-local. A native chain
+     * can span a scheduling or timer boundary which the instruction-by-
+     * instruction reference observes inside its replay window. The resulting
+     * paths are both valid at their respective boundaries but are no longer a
+     * comparison of one basic block from identical external state.
      *
      * The native loop back-edge is deliberately *not* suppressed: it stays
      * inside one block, and fn()'s return value says exactly how many guest
-     * instructions it covered, so the reference run can replay it. */
+     * instructions it covered, so the reference run can replay it. Normal
+     * stock-ROM and compute gates exercise cross-block chaining. */
     if (jit->no_chain) return;
     if (jit->dt && jit->dt_count < JIT_MAX_BLOCK_INSNS * 2) {
         jit->dt[jit->dt_count][0] = target_pc;
@@ -3096,7 +3078,7 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     static int no_chain = -1;
     if (__builtin_expect(no_chain < 0, 0))
         no_chain = getenv("FLEXE_JIT_NOCHAIN") != NULL;
-    jit->no_chain = no_chain;
+    jit->no_chain = no_chain || jit->verify;
 
     /* Check code cache space (worst case: ~512 bytes per guest instruction for ENTRY/RETW) */
     size_t needed = (size_t)scan->count * 512 + 512;
@@ -3579,11 +3561,8 @@ static void jit_apply_block_exit(xtensa_cpu_t *cpu) {
 }
 
 /* The native block runs *first* and is then undone, which is only possible
- * because verification compiles stores through mem_write*_journaled(). That
- * ordering is what lets a chained run be checked at all: one call to fn() may
- * cover many blocks, and only its return value says how many guest
- * instructions that was -- which the interpreted reference then replays
- * exactly. */
+ * because verification compiles stores through mem_write*_journaled(). Its
+ * returned instruction count bounds the interpreter replay exactly. */
 static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
                                   uint32_t pc, jit_block_fn fn) {
     xtensa_cpu_t before = *cpu;
@@ -4158,7 +4137,16 @@ bool jit_verify_enabled(const jit_state_t *jit) {
 }
 
 void jit_set_verify(jit_state_t *jit, bool enable) {
-    if (jit) jit->verify = enable;
+    if (!jit || jit->verify == enable) return;
+    /* Store codegen and chain policy both differ in verification mode. Any
+     * existing block was emitted under the old policy and must not survive
+     * the transition. */
+    jit->verify = enable;
+    jit_flush(jit);
+}
+
+uint64_t jit_verify_mismatch_count(const jit_state_t *jit) {
+    return jit ? jit->verify_mismatches : 0;
 }
 
 void jit_verify_summary(const jit_state_t *jit) {

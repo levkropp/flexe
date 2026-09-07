@@ -2350,6 +2350,20 @@ int main(int argc, char **argv)
      * mismatches says nothing unless you can also see how many blocks it
      * actually checked and how many it skipped. */
     jit_verify_summary(flexe_session_jit(session));
+    uint64_t verify_mismatches =
+        jit_verify_mismatch_count(flexe_session_jit(session));
+    if (verify_mismatches != 0) {
+        fprintf(stderr,
+                "FAIL profile=%s reason=jit-verify-mismatch blocks=%llu\n",
+                profile, (unsigned long long)verify_mismatches);
+        nerd_probe_close(&network_probe);
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
     xtensa_profile_report();
 
     uint64_t wall_ns = monotonic_ns() - wall_start;

@@ -164,6 +164,7 @@ void               jit_print_stats(const jit_state_t *jit,
  * not a run mode. */
 void               jit_set_verify(jit_state_t *jit, bool enable);
 bool               jit_verify_enabled(const jit_state_t *jit);
+uint64_t           jit_verify_mismatch_count(const jit_state_t *jit);
 void               jit_verify_summary(const jit_state_t *jit);
 
 #endif /* JIT_H */
