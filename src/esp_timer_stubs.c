@@ -117,21 +117,38 @@ static uint64_t current_time_us(esp_timer_stubs_t *et) {
     return xtensa_guest_time_us(et->cpu, current_cpu_freq_mhz(et));
 }
 
+/* The clock as the *calling* core sees it.
+ *
+ * et->cpu is core 0, and each core carries its own cycle_count and
+ * virtual_time_us until flexe_session_post_batch() republishes the later of the
+ * two to both. Reading core 0 unconditionally meant a task on core 1 could not
+ * observe time it had just skipped itself: a run of ets_delay_us() calls
+ * returned with the caller's clock unmoved, because the whole sequence fitted
+ * inside one batch and the reconciliation had not happened yet. Take the later
+ * of the two, which is the value post_batch would publish anyway — just
+ * observed now rather than at the next boundary, and still monotonic. */
+static uint64_t current_time_us_seen_by(esp_timer_stubs_t *et,
+                                        const xtensa_cpu_t *cpu) {
+    uint64_t base = current_time_us(et);
+    if (!cpu || cpu == et->cpu) return base;
+    uint64_t mine = xtensa_guest_time_us(cpu, current_cpu_freq_mhz(et));
+    return mine > base ? mine : base;
+}
+
 /* Fast-forward past a wait when no scheduler is available to block on.
  * Guest-visible time (ccount, virtual_time_us) advances; cycle_count does
  * not, because it counts *executed* guest instructions and drives the -c
  * budget, and a fast-forward executes none.
  *
- * NOTE: this jumps straight to the end of the wait, so a peripheral or
- * ccompare event scheduled inside the window is collapsed into a single
- * observation instead of firing at its own ccount. Waits that go through the
- * FreeRTOS scheduler (vTaskDelay) do advance event-by-event; Arduino's
- * delay() is intercepted ahead of that call and does not. */
+ * CCOUNT walks to the end of the wait through xtensa_advance_idle_cycles()
+ * rather than being assigned: writing it directly stepped over every ccompare
+ * and peripheral deadline inside the window, so a driver that needs a
+ * *sequence* of interrupts across a wait saw one. */
 static void advance_wait_time(esp_timer_stubs_t *et, xtensa_cpu_t *cpu,
                               uint64_t us) {
     uint64_t cycles = us * current_cpu_freq_mhz(et);
     cpu->virtual_time_us += us;
-    cpu->ccount += (uint32_t)cycles;
+    xtensa_advance_idle_cycles(cpu, cycles);
 }
 
 
@@ -296,7 +313,8 @@ void stub_esp_timer_delete(xtensa_cpu_t *cpu, void *ctx) {
  * In native mode: virtual time so timing is deterministic. */
 void stub_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint64_t us = et->use_virtual_time ? current_time_us(et) : host_elapsed_us(et);
+    uint64_t us = et->use_virtual_time ? current_time_us_seen_by(et, cpu)
+                                      : host_elapsed_us(et);
     /* Return 64-bit value: low in a2, high in a3 */
     int ci = XT_PS_CALLINC(cpu->ps);
     if (ci > 0) {
@@ -356,14 +374,16 @@ void stub_esp_timer_init(xtensa_cpu_t *cpu, void *ctx) {
 /* millis() — in stub mode: host wall-clock. In native mode: virtual time. */
 void stub_millis(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint64_t us = et->use_virtual_time ? current_time_us(et) : host_elapsed_us(et);
+    uint64_t us = et->use_virtual_time ? current_time_us_seen_by(et, cpu)
+                                      : host_elapsed_us(et);
     et_return(cpu, (uint32_t)(us / 1000));
 }
 
 /* micros() — in stub mode: host wall-clock. In native mode: virtual time. */
 void stub_micros(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
-    uint64_t us = et->use_virtual_time ? current_time_us(et) : host_elapsed_us(et);
+    uint64_t us = et->use_virtual_time ? current_time_us_seen_by(et, cpu)
+                                      : host_elapsed_us(et);
     et_return(cpu, (uint32_t)us);
 }
 

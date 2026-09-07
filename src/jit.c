@@ -108,6 +108,13 @@ struct jit_state {
     uint64_t verify_mismatches;
     uint64_t verify_skipped;
     uint64_t verify_stub_hits;
+    /* Why blocks were skipped. A summary that only reports a total cannot
+     * distinguish "verified almost everything" from "skipped almost
+     * everything", and both look like success. */
+    uint64_t verify_skip_mmio;
+    uint64_t verify_skip_stub;
+    uint64_t verify_skip_irq;
+    uint64_t verify_skip_exc;
 
     /* Hook chaining: JIT installs itself as a pc_hook, forwarding
      * non-JIT addresses to the original (ROM stubs) hook. */
@@ -180,42 +187,88 @@ static inline uint32_t jit_loop_variant(const xtensa_cpu_t *cpu, uint32_t pc) {
 
 #define JIT_LOOP_VARIANT_SALT 0x5F1D3B7u
 
+/* Index mix. Every PC bit has to reach the index: Xtensa has 16-bit
+ * instructions, so block heads land on 2-byte boundaries, and the old
+ * `pc >> 2` folded every pair of heads inside one aligned word onto the same
+ * slot. On Marauder that put 0x4011E548 and 0x4011E54B — three bytes apart —
+ * in permanent conflict, recompiling each other 5,487 times. */
+static inline uint32_t jit_mix(uint32_t pc, uint32_t wb, uint32_t lv) {
+    uint32_t h = pc ^ (wb * 0x9E3779B9u) ^ (lv ? JIT_LOOP_VARIANT_SALT : 0u);
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    return h;
+}
+
 static inline uint32_t jit_hash_key(uint32_t pc, uint32_t wb, uint32_t lv) {
-    return ((pc >> 2) ^ (wb * 2654435761u) ^
-            (lv ? JIT_LOOP_VARIANT_SALT : 0u)) & JIT_HASH_MASK;
+    return jit_mix(pc, wb, lv) & JIT_SET_MASK;
+}
+
+/* The pending-chain table stays direct-mapped at full width — a lost entry
+ * there costs an epilogue round-trip, never correctness — but it takes the
+ * same mixed hash rather than the truncating one. */
+static inline uint32_t jit_pend_key(uint32_t pc, uint32_t wb) {
+    return jit_mix(pc, wb, 0u) & JIT_HASH_MASK;
 }
 
 /* Combined tag for collision detection: pack wb into unused high bits of PC.
  * ESP32 PCs are 0x4000xxxx-0x404xxxxx, so bits 31:27 = 01000. We can pack
- * wb (0-15) into bits 31:28 safely by XORing. */
-static inline uint32_t jit_make_tag(uint32_t pc, uint32_t wb) {
-    return pc ^ (wb << 28);
+ * wb (0-15) into bits 31:28 safely by XORing.
+ *
+ * The loop variant has to be in the tag as well now. It used to be carried by
+ * the index alone, which was sound only while a slot held exactly one entry:
+ * with several ways per set, two variants of the same (pc, wb) can share a set
+ * and would otherwise be indistinguishable. */
+static inline uint32_t jit_make_tag(uint32_t pc, uint32_t wb, uint32_t lv) {
+    return pc ^ (wb << 28) ^ (lv ? JIT_LOOP_VARIANT_SALT : 0u);
+}
+
+static inline jit_block_t *jit_set_of(jit_state_t *jit, uint32_t pc,
+                                      uint32_t wb, uint32_t lv) {
+    return &jit->hash[jit_hash_key(pc, wb, lv) * JIT_WAYS];
 }
 
 static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb,
                                uint32_t lv) {
-    uint32_t idx = jit_hash_key(pc, wb, lv);
-    uint32_t tag = jit_make_tag(pc, wb);
-    jit_block_t *b = &jit->hash[idx];
-    if (b->code && b->pc == tag)
-        return b;
+    jit_block_t *set = jit_set_of(jit, pc, wb, lv);
+    uint32_t tag = jit_make_tag(pc, wb, lv);
+    for (unsigned w = 0; w < JIT_WAYS; w++)
+        if (set[w].code && set[w].pc == tag)
+            return &set[w];
     return NULL;
 }
 
 static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc,
                                       uint32_t wb, uint32_t lv) {
-    uint32_t idx = jit_hash_key(pc, wb, lv);
-    uint32_t tag = jit_make_tag(pc, wb);
-    jit_block_t *b = &jit->hash[idx];
-    if (b->pc != tag) {
-        /* Empty slot or collision with different PC/wb — reset */
-        b->pc = tag;
-        b->code = NULL;
-        b->exec_count = 0;
-        b->guest_insns = 0;
-        b->flags = 0;
+    jit_block_t *set = jit_set_of(jit, pc, wb, lv);
+    uint32_t tag = jit_make_tag(pc, wb, lv);
+    jit_block_t *victim = NULL;
+
+    for (unsigned w = 0; w < JIT_WAYS; w++) {
+        jit_block_t *b = &set[w];
+        if ((b->flags & JIT_BLK_VALID) && b->pc == tag)
+            return b;
+        if (!(b->flags & JIT_BLK_VALID)) {
+            if (!victim) victim = b;      /* a free way always wins */
+            continue;
+        }
+        if (victim && !(victim->flags & JIT_BLK_VALID)) continue;
+        /* Compiled code outranks anything not yet compiled, whatever its
+         * counter says: hot-counting traffic must not be able to throw away
+         * work already done. Among equals, the coldest goes. */
+        if (!victim ||
+            (!b->code && victim->code) ||
+            (!b->code == !victim->code && b->exec_count < victim->exec_count))
+            victim = b;
     }
-    return b;
+
+    victim->pc = tag;
+    victim->code = NULL;
+    victim->chain_entry = NULL;
+    victim->end_pc = 0;
+    victim->exec_count = 0;
+    victim->guest_insns = 0;
+    victim->flags = JIT_BLK_VALID;
+    return victim;
 }
 
 /* ===== Instruction fetch for block scanning ===== */
@@ -315,7 +368,12 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                     if (m == 2 && nn == 0) return 1;  /* RET */
                     if (m == 2 && nn == 1) return 1;  /* RETW — block terminator */
                     if (m == 2 && nn == 2) return 1;  /* JX — terminator */
-                    if (m == 3) return 2;  /* CALLX — fallback */
+                    /* CALLX is a block terminator like JX, not something to
+                     * give up on. Treating it as a fallback truncated the
+                     * block *before* it, and firmware calls through function
+                     * pointers constantly -- every Arduino and IDF driver
+                     * table. */
+                    if (m == 3) return 1;
                     return 2;
                 }
                 if (r == 1) return 2;  /* MOVSP — complex */
@@ -368,6 +426,39 @@ static int classify_for_jit(uint32_t insn, int ilen) {
             case 7: return 0;  /* SALTU */
             case 10: return 0; /* MULUH */
             case 11: return 0; /* MULSH */
+            case 13: case 14: case 15:
+                return 0;      /* QUOS / REMU / REMS */
+            /* QUOU: compilable, but it was held for two weeks and the
+             * reason is worth keeping, because it was never this emitter.
+             *
+             * It is the most common of the four -- 1,042 of the 1,639
+             * instructions the scanner could not compile on a Marauder run.
+             * Enabling it used to make the v1.15.1 stock-ROM scenario hang,
+             * and the cause was a *timing* perturbation, not a miscompile:
+             * the scenario injects a BLE advertisement through guest_call8(),
+             * which hijacks a core, and if that lands on a task midway
+             * through a FreeRTOS list update the injected handler walks an
+             * inconsistent list forever. Compiling one more opcode moved the
+             * injection onto such a moment.
+             *
+             * What actually fixed it was unrelated to both: idle stopped
+             * being simulated one cycle per dispatch (see xtensa_run), which
+             * shifted the injection off the bad moment. The harness also
+             * waits for both cores to be halted in WAITI now, which is a
+             * sounder precondition than the PS.INTLEVEL test it replaced --
+             * vTaskSuspendAll does not raise INTLEVEL -- but QUOU passes
+             * with or without it, so do not credit the guard for this.
+             *
+             * Established, so none of it needs redoing: QUOS/REMU/REMS share
+             * the identical guard, helper and register plumbing; the
+             * divide-by-zero fault path is never taken (instrumented, zero
+             * hits); --verify reports zero mismatches with chaining live; and
+             * advancing the peer core during a synthetic call changes nothing,
+             * because the conflict is with the interrupted task on the *same*
+             * core. The underlying fragility is still there: every
+             * host-initiated event -- WiFi, BLE, esp_timer -- goes through
+             * guest_call8, and a big enough timing change can resurrect it. */
+            case 12: return 0; /* QUOU */
             default: return 2;
             }
         case 3: /* RST3 */
@@ -417,7 +508,7 @@ static int classify_for_jit(uint32_t insn, int ilen) {
         case 0xB: return 0;  /* L32AI */
         case 0xC: return 0;  /* ADDI */
         case 0xD: return 0;  /* ADDMI */
-        case 0xE: return 2;  /* S32C1I — complex */
+        case 0xE: return 0;  /* S32C1I — compiled via a helper call */
         case 0xF: return 0;  /* S32RI */
         default: return 2;
         }
@@ -872,6 +963,18 @@ static void emit_call_slow3(emit_t *e, void *fn, int addr_reg, int val_reg) {
     emit_mov_reg_imm64(e, ARM64_SCRATCH, (uint64_t)(uintptr_t)fn);
     emit_call_reg(e, ARM64_SCRATCH);
 }
+/* Same shape, but arg0 is the CPU rather than the memory: helpers that need
+ * other architectural state (S32C1I wants SCOMPARE1) take it from there
+ * instead of being handed a fourth argument, which would need a second
+ * staging scratch on this side. */
+static void emit_call_cpu3(emit_t *e, void *fn, int addr_reg, int val_reg) {
+    emit_mov_reg32_reg32(e, ARM64_SCRATCH, val_reg);            /* W9 = val  */
+    if (addr_reg != RCX) emit_mov_reg32_reg32(e, RCX, addr_reg); /* W1 = addr */
+    emit_mov_reg32_reg32(e, RDX, ARM64_SCRATCH);                /* W2 = val  */
+    emit_mov_reg_reg(e, RAX, REG_CPU);                          /* X0 = cpu  */
+    emit_mov_reg_imm64(e, ARM64_SCRATCH, (uint64_t)(uintptr_t)fn);
+    emit_call_reg(e, ARM64_SCRATCH);
+}
 #else
 static void emit_pt_load(emit_t *e, int idx32) {
     /* rax = [r14 + idx*8 + MEM_OFF_PAGE_TABLE] */
@@ -906,7 +1009,67 @@ static void emit_call_slow3(emit_t *e, void *fn, int addr_reg, int val_reg) {
     emit_call_reg(e, RAX);
     emit_pop(e, R11); emit_pop(e, R10); emit_pop(e, R9); emit_pop(e, R8);
 }
+/* Same shape, but arg0 is the CPU rather than the memory: helpers that need
+ * other architectural state (S32C1I wants SCOMPARE1) take it from there
+ * instead of being handed a fourth argument. */
+static void emit_call_cpu3(emit_t *e, void *fn, int addr_reg, int val_reg) {
+    emit_push(e, R8); emit_push(e, R9); emit_push(e, R10); emit_push(e, R11);
+    emit_mov_reg_reg(e, RDI, REG_CPU);
+    emit_mov_reg32_reg32(e, RSI, addr_reg);
+    emit_mov_reg32_reg32(e, RDX, val_reg);
+    emit_mov_reg_imm64(e, RAX, (uint64_t)(uintptr_t)fn);
+    emit_call_reg(e, RAX);
+    emit_pop(e, R11); emit_pop(e, R10); emit_pop(e, R9); emit_pop(e, R8);
+}
 #endif
+
+/* S32C1I, the Xtensa compare-and-swap. Every FreeRTOS critical section and
+ * every spinlock is built on it, and the scanner used to classify it as
+ * uncompilable -- which truncated the block at the CAS and left the hottest
+ * code in production firmware permanently interpreted (18.9% of Marauder's
+ * instructions sat in one five-instruction spin loop).
+ *
+ * Kept as a C call rather than inlined: it is a load, a compare and a
+ * conditional store, and going through mem_write32() also keeps the verifier's
+ * write journal able to see the store, which the inline page-table path
+ * cannot. */
+static uint32_t jit_s32c1i_helper(xtensa_cpu_t *cpu, uint32_t addr,
+                                  uint32_t val) {
+    uint32_t old = mem_read32(cpu->mem, addr);
+    if (old == cpu->scompare1)
+        mem_write32(cpu->mem, addr, val);
+    return old;
+}
+
+/* Integer divide. QUOU alone accounts for 1,042 of the 1,639 instructions the
+ * scanner could not compile on a Marauder run -- the single largest reason
+ * blocks get truncated after the LOOP family.
+ *
+ * Through a C helper rather than an inline `div`: x86 divide is hard-wired to
+ * EDX:EAX, which collides with the scratch set the surrounding emitter uses,
+ * and it *faults* on the two cases Xtensa defines (divide by zero, and
+ * INT_MIN / -1). The call costs perhaps twenty cycles against a divide's
+ * twenty-odd; truncating the block costs the rest of the block. The zero
+ * divisor never reaches here -- the emitter guards it and side-exits so the
+ * interpreter re-executes the instruction and raises the exception. */
+static uint32_t jit_quou_helper(xtensa_cpu_t *cpu, uint32_t n, uint32_t d) {
+    (void)cpu; return n / d;
+}
+static uint32_t jit_remu_helper(xtensa_cpu_t *cpu, uint32_t n, uint32_t d) {
+    (void)cpu; return n % d;
+}
+static uint32_t jit_quos_helper(xtensa_cpu_t *cpu, uint32_t n, uint32_t d) {
+    (void)cpu;
+    int32_t sn = (int32_t)n, sd = (int32_t)d;
+    if (sn == (int32_t)0x80000000 && sd == -1) return 0x80000000u;
+    return (uint32_t)(sn / sd);
+}
+static uint32_t jit_rems_helper(xtensa_cpu_t *cpu, uint32_t n, uint32_t d) {
+    (void)cpu;
+    int32_t sn = (int32_t)n, sd = (int32_t)d;
+    if (sn == (int32_t)0x80000000 && sd == -1) return 0;
+    return (uint32_t)(sn % sd);
+}
 
 static void emit_mem_read32(emit_t *e, int addr_reg, int dst_reg) {
     /* ecx = addr >> 12 */
@@ -1296,6 +1459,12 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_and_reg32_imm32(e, RAX, ~0xF);
                     emit_add_reg32_imm32(e, RAX, s & 0xF);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                    /* Lowering INTLEVEL can unmask an already-pending
+                     * interrupt, so re-arm the check the way the
+                     * interpreter does. A byte store: irq_check is a bool
+                     * and a 32-bit one would take its neighbours with it. */
+                    emit_mov_reg_imm32(e, RAX, 1);
+                    emit_store8_disp(e, RAX, REG_CPU, (int32_t)CPU_OFF_IRQ_CHECK);
                     return 1;
                 }
                 /* RET: pc = a0 */
@@ -1317,6 +1486,42 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     ra_load_ar(e, ra, RAX, wb4, s);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
                     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit, false);
+                    return 1;
+                }
+                /* CALLX0/4/8/12: pc = as, plus the return-address and window
+                 * setup CALLn does with a static target. */
+                if (r == 0 && m == 3) {
+                    int call_nn = nn;
+                    uint32_t ret_addr = call_nn == 0
+                                      ? next_pc
+                                      : ((uint32_t)call_nn << 30) |
+                                        (next_pc & 0x3FFFFFFFu);
+                    int32_t ret_ar_off = (int32_t)(CPU_OFF_AR +
+                        (((uint32_t)(wb4 + call_nn * 4)) & 63) * 4);
+
+                    /* Read the target *before* anything writes the
+                     * return-address slot. CALLn encodes n as 0-3, so that
+                     * slot is guest a0/a4/a8/a12 -- inside this window, and
+                     * `callx8 a8` is the ordinary form -- so storing first
+                     * would send the call to its own return address. */
+                    ra_load_ar(e, ra, RAX, wb4, s);
+                    emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
+                    emit_store32_disp_imm(e, REG_CPU,
+                                          (int32_t)CPU_OFF_PC_WRITTEN, 1);
+
+                    if (call_nn != 0) {
+                        emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                        emit_and_reg32_imm32(e, RAX, (int32_t)(~(3u << 16)));
+                        emit_or_reg32_imm32(e, RAX,
+                                            (int32_t)((uint32_t)call_nn << 16));
+                        emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                    }
+                    /* Same aliasing hazard as CALLn: drop the allocator's copy
+                     * so the exit flush cannot write it back over the return
+                     * address we are about to store. */
+                    ra_invalidate(ra, call_nn * 4);
+                    emit_store32_disp_imm(e, REG_CPU, ret_ar_off, ret_addr);
                     emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit, false);
                     return 1;
                 }
@@ -1647,6 +1852,31 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 emit8(e, 0x0F); emit8(e, 0xB6); emit8(e, modrm(3, RAX, RAX));
 #endif
                 ra_store_ar(e, ra,RAX, wb4, r);
+                return 1;
+            }
+            case 12: case 13: case 14: case 15: { /* QUOU/QUOS/REMU/REMS */
+                static void *const div_fn[4] = {
+                    (void *)(uintptr_t)jit_quou_helper,
+                    (void *)(uintptr_t)jit_quos_helper,
+                    (void *)(uintptr_t)jit_remu_helper,
+                    (void *)(uintptr_t)jit_rems_helper,
+                };
+                /* A zero divisor is an exception, not a result. Leave through
+                 * a side exit aimed at this same instruction so the
+                 * interpreter re-executes it and raises the fault with the
+                 * right EPC; insn_idx says this one has not run. */
+                ra_load_ar(e, ra, RBX, wb4, t);
+                emit_test_reg32(e, RBX, RBX);
+                int div_ok = emit_jcc_rel32(e, CC_NE);
+                ra_flush(e, ra, wb4);
+                emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc);
+                emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                emit_acc_add(e, insn_idx);
+                emit_jmp_to_epilogue(e, jit);
+                emit_patch_rel32(e, div_ok);
+                ra_load_ar(e, ra, RAX, wb4, s);
+                emit_call_cpu3(e, div_fn[op2 - 12], RAX, RBX);
+                ra_store_ar(e, ra, RAX, wb4, r);
                 return 1;
             }
             case 8: { /* MULL: ar = as * at */
@@ -2037,6 +2267,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             ra_store_ar(e, ra,RAX, wb4, t);
             return 1;
         }
+        case 0xE: { /* S32C1I: at = mem32[as+imm]; if it matched SCOMPARE1,
+                    * the store happened. */
+            int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
+            ra_load_ar(e, ra, RBX, wb4, t);
+            emit_call_cpu3(e, (void *)(uintptr_t)jit_s32c1i_helper, areg, RBX);
+            ra_store_ar(e, ra, RAX, wb4, t);
+            return 1;
+        }
         case 0xF: { /* S32RI (release = no-op, same as S32I) */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
@@ -2229,9 +2467,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 emit_shl_reg32_cl(e, RAX);
                 emit_or_mem32_reg(e, REG_CPU, (int32_t)CPU_OFF_WINDOWSTART, RAX);
 
-                /* Update PS: OWB=old_wb, CALLINC=0 */
+                /* Update PS: OWB=old_wb, CALLINC untouched. Only CALLn/CALLXn
+                 * write CALLINC; ENTRY leaving it alone is what lets
+                 * xthal_window_spill walk the file with a run of bare ENTRYs
+                 * after one call12. Must match the interpreter or the
+                 * differential test catches it -- which is how this was
+                 * found. */
                 emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
-                emit_and_reg32_imm32(e, RAX, (int32_t)(~((3u << 16) | (0xFu << 8))));
+                emit_and_reg32_imm32(e, RAX, (int32_t)(~(0xFu << 8)));
                 emit_mov_reg32_reg32(e, RCX, RBX);  /* old_wb */
                 emit_shl_reg32_imm(e, RCX, 8);
                 emit_or_reg32(e, RAX, RCX);
@@ -2627,8 +2870,8 @@ static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb,
      * loop-bounded block would enter a body that stops at some other loop's
      * LEND. */
     if (lv != 0u) return;
-    uint32_t idx = jit_hash_key(pc, wb, 0u);
-    uint32_t tag = jit_make_tag(pc, wb);
+    uint32_t idx = jit_pend_key(pc, wb);
+    uint32_t tag = jit_make_tag(pc, wb, 0u);
     chain_pending_t *p = &jit->pend[idx];
     if (p->tag != tag) return;
     for (uint32_t i = 0; i < p->n; i++) {
@@ -2637,6 +2880,19 @@ static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb,
     }
     p->tag = 0;
     p->n = 0;
+}
+
+/* Does a compiled block already want to jump to this (pc, wb)?
+ *
+ * A pending chain site means some block's exit is waiting to be patched here.
+ * Such a block is entered by a native jump, not by a dispatch, so the
+ * "dispatch overhead dominates" rule that rejects short blocks does not apply
+ * to it -- and rejecting it strands the chain, leaving the exit to go the long
+ * way round through the epilogue and the hook on every iteration. */
+static bool jit_chain_wanted(const jit_state_t *jit, uint32_t pc, uint32_t wb) {
+    uint32_t idx = jit_pend_key(pc, wb);
+    const chain_pending_t *p = &jit->pend[idx];
+    return p->n != 0u && p->tag == jit_make_tag(pc, wb, 0u);
 }
 
 /* Record a block exit's jump site for later chaining.
@@ -2651,22 +2907,22 @@ static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
      * direction would splice in a block that runs straight through LEND. */
     if (jit->cur_lv != 0u) return;
 
-    /* Not chained under verification, and not fixable by being cleverer about
-     * it. The reference run replays the exact guest-instruction count fn()
-     * reported, but a stub emulates a whole guest function in one dispatch --
-     * it spends one instruction of that budget while standing in for many, and
-     * native code cannot enter ROM at all. Any window long enough to chain
-     * crosses at least one stub, so skipping those cases removes *all* the
-     * coverage rather than the noise: measured across three stock ROMs, every
-     * single chained block gets skipped. Block-level verification stays exact,
-     * and that chaining preserves results is covered instead by the stock-ROM
-     * gates and by bench-compute.sh, which requires the two engines to agree
-     * on a checksum over ~910M cycles.
+    /* Chaining used to be suppressed under verification, on the grounds that
+     * any window long enough to chain crosses a ROM stub -- which costs one
+     * instruction of the reference run's replay budget while standing in for a
+     * whole guest function -- so every chained block would be skipped as
+     * incomparable.
      *
-     * The native loop back-edge is deliberately *not* suppressed: it stays
-     * inside one block, and fn()'s return value says exactly how many guest
-     * instructions it covered, so the reference can replay it. */
-    if (jit->verify) return;
+     * Measured again 2026-09-04, that is no longer true: with chaining live,
+     * Marauder verifies 20.3M blocks with zero mismatches and just 18 stub
+     * skips out of a million. Something in between fixed it; the note stayed.
+     *
+     * It matters because chained execution was the one thing the verifier
+     * could not see, and a real hang lived exactly there -- compiling QUOU
+     * hangs the v1.15.1 image while --verify passed it on all five ROMs. A
+     * blind spot in the tool that finds miscompiles is worth more than the
+     * verification speed it costs. FLEXE_JIT_NOCHAIN still turns chaining off
+     * for bisecting. */
 
     /* Not chained under verification. A chain jumps directly between blocks,
      * so it steps over PCs at which the interpreted reference run still
@@ -2693,8 +2949,8 @@ static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
         return;
     }
 
-    uint32_t idx = jit_hash_key(target_pc, target_wb, 0u);
-    uint32_t tag = jit_make_tag(target_pc, target_wb);
+    uint32_t idx = jit_pend_key(target_pc, target_wb);
+    uint32_t tag = jit_make_tag(target_pc, target_wb, 0u);
     chain_pending_t *p = &jit->pend[idx];
     if (p->tag != tag) { p->tag = tag; p->n = 0; }
     if (p->n < CHAIN_PENDING_MAX)
@@ -3154,6 +3410,7 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
      * result and count a skip. */
     if (unsafe || nwrites > MEM_JOURNAL_MAX_COMPARE) {
         jit->verify_skipped++;
+        jit->verify_skip_mmio++;
         mem_journal_end();
         return n_jit;
     }
@@ -3185,6 +3442,7 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
      * instruction count, so the two are no longer comparable. Skip rather
      * than report a mismatch that is an artefact of how stubs are counted. */
     uint64_t stubs_before = jit->verify_stub_hits;
+    uint64_t irqs_before = g_xtensa_irq_dispatched;
     jit->verify_active = true;
     for (int i = 0; i < n_jit && cpu->running; i++)
         xtensa_step(cpu);
@@ -3202,8 +3460,12 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
      * miscompile: a native block defers interrupts to its exit, while
      * xtensa_step() checks after every instruction. */
     if (ref_used_stub || cpu->exception ||
+        g_xtensa_irq_dispatched != irqs_before ||
         (XT_PS_EXCM(cpu->ps) && !XT_PS_EXCM(before.ps))) {
         jit->verify_skipped++;
+        if (ref_used_stub) jit->verify_skip_stub++;
+        else if (g_xtensa_irq_dispatched != irqs_before) jit->verify_skip_irq++;
+        else jit->verify_skip_exc++;
         mem_journal_end();
         cpu->ccount = before.ccount;
         cpu->cycle_count = before.cycle_count;
@@ -3265,6 +3527,7 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
  * Flow: check JIT hash → if hit, run block; if miss, forward to ROM stubs. */
 static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     jit_state_t *jit = ctx;
+    jit->stats.hook_calls++;
 
     /* Inside a verification re-run: the interpreter is the reference, so it
      * must not dispatch back into the code being checked. ROM stubs stay
@@ -3293,12 +3556,20 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     /* Direct hash table probe for firmware-space PCs */
     uint32_t wb = cpu->windowbase;
     uint32_t lv = jit_loop_variant(cpu, pc);
-    uint32_t hidx = jit_hash_key(pc, wb, lv);
-    uint32_t tag = jit_make_tag(pc, wb);
-    jit_block_t *b = &jit->hash[hidx];
+    jit_block_t *set = jit_set_of(jit, pc, wb, lv);
+    uint32_t tag = jit_make_tag(pc, wb, lv);
+    jit_block_t *b = set;
+    /* Way scan. A hit is overwhelmingly in way 0 because a compiled block is
+     * only displaced within its set when every way holds compiled code, so the
+     * common case is one compare. */
+    if (__builtin_expect(!(b->code && b->pc == tag), 0)) {
+        b = NULL;
+        for (unsigned w = 1; w < JIT_WAYS; w++)
+            if (set[w].code && set[w].pc == tag) { b = &set[w]; break; }
+    }
 
     jit_block_fn fn = NULL;
-    if (__builtin_expect(b->code != NULL && b->pc == tag, 1)) {
+    if (__builtin_expect(b != NULL, 1)) {
         /* The loop-variant key already keeps a block compiled outside a loop
          * from being reused inside one. What it cannot express is a block
          * bounded at one loop's LEND being reached under a *different* loop
@@ -3467,7 +3738,15 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
 
     jit_scan_t scan;
     jit_scan_block(jit, cpu, pc, &scan);
-    if (scan.count < 4 && !jit_short_block_has_backedge(&scan, pc)) {
+    /* A scan that produced nothing is never compilable, whatever wants to
+     * chain to it: the emitted block would contain no guest instructions, so
+     * a chain jumping into it runs straight off the end into whatever the code
+     * cache holds next. The old `< 4` test filtered these out as a side
+     * effect; relaxing it for chain targets without saying so explicitly
+     * crashed NerdMiner inside the code cache. */
+    if (scan.count == 0 ||
+        (scan.count < 4 && !jit_short_block_has_backedge(&scan, pc) &&
+         !(scan.count >= 2 && lv == 0u && jit_chain_wanted(jit, pc, wb)))) {
         /* Short straight-line block: dispatch overhead dominates. Record it,
          * or every later execution pays for the same scan again. */
         b->flags |= JIT_BLK_UNCOMPILABLE;
@@ -3493,7 +3772,20 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     jit->dt_count = saved_dt_count;
     jit->cur_lv = saved_lv;
     cpu->windowbase = saved_wb;
-    if (!fn) return;
+    if (!fn) {
+        /* Codegen declined this block, and will decline it again: the scan it
+         * works from depends only on the instruction stream and the loop
+         * context the cache key already distinguishes. Without recording that,
+         * every later sample of a hot PC pays for the whole scan and the
+         * failed codegen again -- 12,399 times over one Marauder run.
+         *
+         * Not when the code cache simply ran out of room, though: that is a
+         * property of the cache rather than of this block, and marking it
+         * would keep the block from ever compiling after a flush. */
+        if (!jit->compile_disabled)
+            b->flags |= JIT_BLK_UNCOMPILABLE;
+        return;
+    }
 
     /* FLEXE_COMPILEDBG lists every block as it compiles. Diffing that list
      * between a passing and a failing run is what localises a miscompile to
@@ -3605,14 +3897,18 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
          * anything. Branch targets are where compiled blocks should begin,
          * and the hot ones recur, so they cross the threshold quickly.
          *
-         * Two, not the whole ring: sampling all eight compiles more blocks
-         * but they are cold, and the extra work cost Marauder 3.6% while
-         * gaining nothing. Two captures nearly all of the benefit --
-         * NerdMiner +7%, the compute benchmark +23% -- for no measurable
-         * cost elsewhere. Note the win is not from compiling *more* (JIT
-         * coverage barely moves) but from compiling blocks that start where
-         * control flow actually enters, which chain far better. */
-        for (unsigned k = 0; k < 2; k++) {
+         * The whole ring, and the loop bound says so. This comment used to
+         * claim the bound was two and that eight "cost Marauder 3.6% while
+         * gaining nothing" -- but the code has always read XT_BR_RING_SIZE,
+         * so that was never what shipped. Re-measured 2026-09-05, best of
+         * three at a 900M-cycle budget: eight is 5% *faster* than two on
+         * NerdMiner (0.694s vs 0.728s) and level on Marauder. Two is the
+         * regression, not the win.
+         *
+         * The benefit is not from compiling *more* -- JIT coverage barely
+         * moves -- but from compiling blocks that start where control flow
+         * actually enters, which chain far better. */
+        for (unsigned k = 0; k < XT_BR_RING_SIZE; k++) {
             uint32_t bt = cpu->br_ring[(cpu->br_ring_idx - 1u - k) &
                                        (XT_BR_RING_SIZE - 1)];
             if (bt >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
@@ -3654,6 +3950,10 @@ const jit_stats_t *jit_get_stats(const jit_state_t *jit) {
     return &jit->stats;
 }
 
+bool jit_verify_enabled(const jit_state_t *jit) {
+    return jit && jit->verify;
+}
+
 void jit_set_verify(jit_state_t *jit, bool enable) {
     if (jit) jit->verify = enable;
 }
@@ -3661,26 +3961,59 @@ void jit_set_verify(jit_state_t *jit, bool enable) {
 void jit_verify_summary(const jit_state_t *jit) {
     if (!jit || !jit->verify) return;
     fprintf(stderr, "[jit-verify] %llu blocks checked, %llu mismatching, "
-            "%llu skipped (MMIO, interrupt or ROM stub)\n",
+            "%llu skipped (mmio=%llu stub=%llu irq=%llu exc=%llu)\n",
             (unsigned long long)jit->verify_blocks,
             (unsigned long long)jit->verify_mismatches,
-            (unsigned long long)jit->verify_skipped);
+            (unsigned long long)jit->verify_skipped,
+            (unsigned long long)jit->verify_skip_mmio,
+            (unsigned long long)jit->verify_skip_stub,
+            (unsigned long long)jit->verify_skip_irq,
+            (unsigned long long)jit->verify_skip_exc);
 }
 
-void jit_print_stats(const jit_state_t *jit) {
+void jit_print_stats(const jit_state_t *jit, uint64_t retired_insns) {
     const jit_stats_t *s = &jit->stats;
-    /* insns_jitted is tracked by the hook; interp insns derived from total */
-    uint64_t total = s->insns_jitted + s->insns_interp;
-    /* If insns_interp wasn't tracked (hook-based mode), show what we have */
     fprintf(stderr, "\n[JIT Statistics]\n");
     fprintf(stderr, "  Blocks compiled: %llu\n", (unsigned long long)s->blocks_compiled);
     fprintf(stderr, "  Blocks executed: %llu\n", (unsigned long long)s->blocks_executed);
-    fprintf(stderr, "  Insns JIT:       %llu (%.1f%%)\n",
-            (unsigned long long)s->insns_jitted,
-            total > 0 ? 100.0 * (double)s->insns_jitted / (double)total : 0.0);
-    fprintf(stderr, "  Insns interp:    %llu (%.1f%%)\n",
-            (unsigned long long)s->insns_interp,
-            total > 0 ? 100.0 * (double)s->insns_interp / (double)total : 0.0);
+
+    /* Coverage against instructions the guest actually retired.
+     *
+     * This number has been wrong twice, both times too low, so treat any
+     * figure recorded before 2026-09-04 as unusable. It first divided by
+     * insns_jitted + insns_interp, where insns_interp counts idle and
+     * fast-forwarded cycles. Switching to xtensa_retired_insns() was supposed
+     * to fix it, but that counter was itself inflated 6.7x -- xtensa_run()
+     * credited halted dispatches as retired instructions. True coverage on the
+     * stock ROMs is 22.5% to 46%, not the 1.4% and then 6.7% reported.
+     *
+     * The cross-check that keeps it honest, and which is cheap to repeat:
+     * insns_jitted plus the instructions the interpreter stepped must equal
+     * what the same scenario retires under --no-jit. On Marauder v1.15.1 that
+     * is 204.2M + 262.7M = 466.9M against 463.6M.
+     *
+     * Mean instructions per entry is printed beside it because coverage alone
+     * cannot distinguish "compiles a lot" from "compiles long units": a taken
+     * control transfer arrives every 4.2-6.1 guest instructions on these ROMs,
+     * so an entry averaging 8.9 is already spanning basic blocks. */
+    if (retired_insns > 0)
+        fprintf(stderr, "  Insns JIT:       %llu of %llu retired (%.1f%%)\n",
+                (unsigned long long)s->insns_jitted,
+                (unsigned long long)retired_insns,
+                100.0 * (double)s->insns_jitted / (double)retired_insns);
+    else
+        fprintf(stderr, "  Insns JIT:       %llu\n",
+                (unsigned long long)s->insns_jitted);
+    fprintf(stderr, "  Hook calls:      %llu (blocks per dispatch %.2f)\n",
+            (unsigned long long)s->hook_calls,
+            s->hook_calls ? (double)s->blocks_executed / (double)s->hook_calls
+                          : 0.0);
+    fprintf(stderr, "  Insns/entry:     %.1f\n",
+            s->blocks_executed
+                ? (double)s->insns_jitted / (double)s->blocks_executed : 0.0);
+    /* Kept for continuity, but note it is cycles-with-idle, not instructions. */
+    fprintf(stderr, "  Batch cycles:    %llu (includes idle)\n",
+            (unsigned long long)s->insns_interp);
     fprintf(stderr, "  Fallbacks:       %llu\n", (unsigned long long)s->fallbacks);
     fprintf(stderr, "  Cache flushes:   %llu\n", (unsigned long long)s->cache_flushes);
     fprintf(stderr, "  Chains patched:  %llu\n", (unsigned long long)s->chains_patched);

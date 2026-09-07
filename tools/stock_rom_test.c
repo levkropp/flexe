@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -182,8 +183,37 @@ static int touch_read(int *x, int *y, void *ctx)
  * silently does nothing. Wait for a moment when the callback can actually
  * run instead. PS.INTLEVEL is zero exactly when no critical section is held.
  */
+/* Run until both cores are parked in WAITI, so an injected event can be
+ * delivered without landing on top of a FreeRTOS operation in progress.
+ *
+ * guest_call8() hijacks a core and runs guest code on a fabricated register
+ * file. If the task it interrupted was midway through a list update, the
+ * injected handler re-enters FreeRTOS, finds the structures inconsistent, and
+ * spins in vListInsert until its 2M-instruction budget is gone.
+ *
+ * Waiting for PS.INTLEVEL == 0 on both cores cannot exclude that: ESP-IDF's
+ * vTaskSuspendAll does not raise INTLEVEL, so a task can hold the scheduler
+ * suspended and still read as uncritical. A core *halted* in WAITI is a
+ * stronger and much simpler signal -- it is in the idle loop, holding nothing
+ * -- and it needs no symbol lookup, so it works on symbol-less ROMs.
+ *
+ * Advancing the peer core instead was tried and does nothing: the conflict is
+ * with the interrupted task on the same core, not with the other one.
+ *
+ * Measured around the failing injection point: core 0 is halted in 99% of
+ * samples and both cores together in 57-88%, so this rarely has to wait long.
+ * If it does time out, fall back to the old condition rather than refusing to
+ * inject -- a late event is better than no event. */
 static void wait_for_no_critical_section(flexe_session_t *session)
 {
+    for (int i = 0; i < 400; i++) {
+        const xtensa_cpu_t *c0 = flexe_session_cpu(session, 0);
+        const xtensa_cpu_t *c1 = flexe_session_cpu(session, 1);
+        if (c0->halted && c1->halted)
+            return;
+        if (flexe_session_run_core(session, 0, 2000) < 0) return;
+        flexe_session_post_batch(session, 2000);
+    }
     for (int i = 0; i < 400; i++) {
         const xtensa_cpu_t *c0 = flexe_session_cpu(session, 0);
         const xtensa_cpu_t *c1 = flexe_session_cpu(session, 1);
@@ -195,71 +225,227 @@ static void wait_for_no_critical_section(flexe_session_t *session)
 }
 
 
-/* Minimal Stratum endpoint, so NerdMiner has a pool to reach.
+/* Stratum pool, so NerdMiner has somewhere to mine.
  *
- * The firmware's own default configuration points at public-pool.io:21496 and
- * cannot be changed through its portal (that page renders no parameter
- * fields), so instead of provisioning a different pool the harness answers
- * the one the firmware already wants: every name resolves to the loopback and
- * outbound traffic is redirected there. Reaching a `mining.subscribe` is the
- * end-to-end proof that provisioning, reboot, association, DNS and the
- * outbound socket path all work together.
+ * The firmware's configuration points at public-pool.io and cannot be changed
+ * through its portal (that page renders no parameter fields), so instead of
+ * provisioning a different pool the harness answers the one the firmware
+ * already wants: every name resolves to the loopback and outbound traffic is
+ * redirected there with the port preserved.
+ *
+ * This used to accept one connection, read one line, write a canned subscribe
+ * reply and hang up. That proved DNS and the socket path worked and nothing
+ * else -- the firmware took EPIPE on its next write and spent the whole run
+ * reconnecting, so the SHA-256 path it exists to run was never driven.
+ *
+ * Two things the single-shot version hid, both found by watching what the
+ * firmware actually does:
+ *
+ *  - **It uses two ports.** 21496 for the primary pool and 40557 for the
+ *    TLS endpoint, which falls back to plain TCP here. Listening on only one
+ *    leaves the other refusing connections.
+ *  - **It opens several connections at once** and keeps retrying. A server
+ *    that accepts one and then blocks in recv() leaves the rest in the
+ *    backlog, where the firmware's writes succeed into a socket buffer that
+ *    nobody ever reads. That deadlocks the run: the emulator thread waits on
+ *    a reply that cannot come, so the process burns 35 seconds of CPU in 15
+ *    minutes of wall clock. Hence poll() over every socket rather than a
+ *    connection at a time.
+ *
+ * Difficulty is deliberately absurd (1e-6). Share targets scale as
+ * 1/difficulty, so this makes essentially any hash acceptable and keeps the
+ * gate bounded; the firmware still has to hash until its own leading-zero
+ * prescreen passes, which is the part being exercised.
  */
-#define STRATUM_PORT 21496
+#define STRATUM_PORT      21496
+#define STRATUM_PORT_TLS  40557
+#define STRATUM_LISTENERS 2
+#define STRATUM_MAX_CONN  8
 
 typedef struct {
-    int  listen_fd;
+    int    fd;
+    size_t used;
+    char   buf[1024];
+} stratum_conn_t;
+
+typedef struct {
+    int  listen_fd[STRATUM_LISTENERS];
     volatile int connected;
+    volatile int subscribed;
+    volatile int authorized;
+    volatile int jobs_sent;
+    volatile int shares;
+    volatile int stop;
     char first_line[256];
+    char last_submit[320];
+    stratum_conn_t conn[STRATUM_MAX_CONN];
 } stratum_server_t;
+
+static void stratum_send(int fd, const char *s)
+{
+    (void)!send(fd, s, strlen(s), MSG_NOSIGNAL);
+}
+
+/* A syntactically complete job. The contents need not correspond to a real
+ * chain -- the firmware hashes whatever header it is handed -- but the field
+ * count, widths and types do, or the client rejects the notify and then
+ * silently never mines, which looks identical to a pool that sent nothing. */
+static void stratum_send_job(stratum_server_t *sv, int fd)
+{
+    /* Fresh ntime per job. Resending an identical job makes the miner
+     * rediscover the same nonce and resubmit it, which looks like sustained
+     * mining while actually repeating one search. */
+    char job[1024];
+    unsigned t = 0x66000000u + (unsigned)sv->jobs_sent;
+
+    stratum_send(fd, "{\"id\":null,\"method\":\"mining.set_difficulty\","
+                     "\"params\":[0.000001]}\n");
+    snprintf(job, sizeof(job),
+        "{\"id\":null,\"method\":\"mining.notify\",\"params\":["
+        "\"flexe%02d\","
+        "\"0000000000000000000a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcd\","
+        "\"01000000010000000000000000000000000000000000000000000000000000"
+        "0000000000ffffffff1f03\","
+        "\"ffffffff0100f2052a010000001976a914000000000000000000000000000"
+        "000000000000088ac00000000\","
+        "[],"
+        "\"20000000\",\"1d00ffff\",\"%08x\",true]}\n",
+        sv->jobs_sent % 100, t);
+    stratum_send(fd, job);
+    sv->jobs_sent++;
+}
+
+static void stratum_handle_line(stratum_server_t *sv, int fd, char *line)
+{
+    if (getenv("FLEXE_STRATUMDBG")) fprintf(stderr, "[stratum] <- %s\n", line);
+    if (!sv->first_line[0])
+        snprintf(sv->first_line, sizeof(sv->first_line), "%s", line);
+
+    if (strstr(line, "mining.subscribe")) {
+        stratum_send(fd, "{\"id\":1,\"result\":[[[\"mining.notify\","
+                         "\"ae6812eb\"]],\"08000002\",4],\"error\":null}\n");
+        sv->subscribed = 1;
+    } else if (strstr(line, "mining.authorize")) {
+        stratum_send(fd, "{\"id\":2,\"result\":true,\"error\":null}\n");
+        sv->authorized = 1;
+        stratum_send_job(sv, fd);
+    } else if (strstr(line, "mining.submit")) {
+        snprintf(sv->last_submit, sizeof(sv->last_submit), "%s", line);
+        stratum_send(fd, "{\"id\":4,\"result\":true,\"error\":null}\n");
+        sv->shares++;
+        stratum_send_job(sv, fd);   /* keep it working */
+    } else if (strstr(line, "mining.suggest_difficulty") ||
+               strstr(line, "mining.configure") ||
+               strstr(line, "mining.extranonce")) {
+        stratum_send(fd, "{\"id\":3,\"result\":true,\"error\":null}\n");
+    }
+}
+
+static void stratum_drain(stratum_server_t *sv, stratum_conn_t *c)
+{
+    ssize_t r = recv(c->fd, c->buf + c->used, sizeof(c->buf) - c->used - 1, 0);
+    if (r <= 0) { close(c->fd); c->fd = -1; c->used = 0; return; }
+    c->used += (size_t)r;
+    c->buf[c->used] = '\0';
+
+    char *line = c->buf, *nl;
+    while ((nl = memchr(line, '\n', c->used - (size_t)(line - c->buf)))) {
+        *nl = '\0';
+        stratum_handle_line(sv, c->fd, line);
+        line = nl + 1;
+    }
+    /* Carry any unterminated tail; drop it if one line ever fills the buffer,
+     * which would otherwise wedge this connection for good. */
+    size_t rest = c->used - (size_t)(line - c->buf);
+    memmove(c->buf, line, rest);
+    c->used = (rest + 1 >= sizeof(c->buf)) ? 0 : rest;
+}
 
 static void *stratum_thread(void *arg)
 {
     stratum_server_t *sv = arg;
-    int fd = accept(sv->listen_fd, NULL, NULL);
-    if (fd < 0) return NULL;
-    sv->connected = 1;
-    size_t n = 0;
-    while (n + 1 < sizeof(sv->first_line)) {
-        ssize_t r = recv(fd, sv->first_line + n, 1, 0);
-        if (r <= 0) break;
-        if (sv->first_line[n] == '\n') break;
-        n++;
+
+    while (!sv->stop) {
+        struct pollfd p[STRATUM_LISTENERS + STRATUM_MAX_CONN];
+        int n = 0;
+        for (int i = 0; i < STRATUM_LISTENERS; i++) {
+            p[n].fd = sv->listen_fd[i];
+            p[n].events = POLLIN;
+            p[n].revents = 0;
+            n++;
+        }
+        int first_conn = n;
+        for (int i = 0; i < STRATUM_MAX_CONN; i++) {
+            if (sv->conn[i].fd < 0) continue;
+            p[n].fd = sv->conn[i].fd;
+            p[n].events = POLLIN;
+            p[n].revents = 0;
+            n++;
+        }
+        /* Bounded wait so sv->stop is noticed even with no traffic. */
+        if (poll(p, (nfds_t)n, 100) <= 0) continue;
+
+        for (int i = 0; i < STRATUM_LISTENERS; i++) {
+            if (!(p[i].revents & POLLIN)) continue;
+            int fd = accept(sv->listen_fd[i], NULL, NULL);
+            if (fd < 0) continue;
+            int slot = -1;
+            for (int k = 0; k < STRATUM_MAX_CONN; k++)
+                if (sv->conn[k].fd < 0) { slot = k; break; }
+            if (slot < 0) { close(fd); continue; }
+            sv->conn[slot].fd = fd;
+            sv->conn[slot].used = 0;
+            sv->connected = 1;
+        }
+        /* Re-scan rather than trusting the poll indices: a handler may have
+         * closed a connection, and the array is small. */
+        (void)first_conn;
+        for (int k = 0; k < STRATUM_MAX_CONN; k++) {
+            if (sv->conn[k].fd < 0) continue;
+            for (int j = STRATUM_LISTENERS; j < n; j++)
+                if (p[j].fd == sv->conn[k].fd &&
+                    (p[j].revents & (POLLIN | POLLHUP | POLLERR)))
+                    stratum_drain(sv, &sv->conn[k]);
+        }
     }
-    sv->first_line[n] = '\0';
-    /* Answer the subscribe so the firmware can carry on rather than retry. */
-    static const char reply[] =
-        "{\"id\":1,\"result\":[[[\"mining.notify\",\"ae6812eb\"]],"
-        "\"08000002\",4],\"error\":null}\n";
-    (void)!write(fd, reply, sizeof(reply) - 1);
-    close(fd);
+    for (int k = 0; k < STRATUM_MAX_CONN; k++)
+        if (sv->conn[k].fd >= 0) close(sv->conn[k].fd);
     return NULL;
 }
 
 static int stratum_start(stratum_server_t *sv, pthread_t *tid)
 {
+    static const int ports[STRATUM_LISTENERS] = {
+        STRATUM_PORT, STRATUM_PORT_TLS
+    };
     memset(sv, 0, sizeof(*sv));
-    sv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sv->listen_fd < 0) return -1;
-    int one = 1;
-    setsockopt(sv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = htons(STRATUM_PORT);
-    if (bind(sv->listen_fd, (struct sockaddr *)&a, sizeof(a)) != 0 ||
-        listen(sv->listen_fd, 2) != 0) {
-        close(sv->listen_fd);
-        sv->listen_fd = -1;
-        return -1;
+    for (int k = 0; k < STRATUM_MAX_CONN; k++) sv->conn[k].fd = -1;
+    for (int i = 0; i < STRATUM_LISTENERS; i++) sv->listen_fd[i] = -1;
+
+    for (int i = 0; i < STRATUM_LISTENERS; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) goto fail;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons((uint16_t)ports[i]);
+        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 ||
+            listen(fd, 8) != 0) {
+            close(fd);
+            goto fail;
+        }
+        sv->listen_fd[i] = fd;
     }
-    if (pthread_create(tid, NULL, stratum_thread, sv) != 0) {
-        close(sv->listen_fd);
-        sv->listen_fd = -1;
-        return -1;
-    }
+    if (pthread_create(tid, NULL, stratum_thread, sv) != 0) goto fail;
     return 0;
+
+fail:
+    for (int i = 0; i < STRATUM_LISTENERS; i++)
+        if (sv->listen_fd[i] >= 0) { close(sv->listen_fd[i]); sv->listen_fd[i] = -1; }
+    return -1;
 }
 
 static void uart_count(void *ctx, uint8_t byte)
@@ -580,6 +766,40 @@ static int run_until_nerd_spiffs(flexe_session_t *session,
     }
 
     *blocks_out = nerdminer_spiffs_formatted(session);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+/* Wait for firmware to create a directory on the emulated SD card.
+ *
+ * The boot phase ends when the screen reaches its non-black pixel count,
+ * which is a completely independent milestone from the SD mount and the
+ * writes that follow it. Asserting the directory exists at that instant is a
+ * race, and it was being won only by luck: enabling the guest's own
+ * register-window vectors shifts guest timing enough to lose it, and Marauder
+ * then fails a check about SD writes for reasons that have nothing to do with
+ * SD. Wait for the thing being asserted instead. */
+static int run_until_sd_directory(flexe_session_t *session, const char *path,
+                                  const char name[11], uint64_t max_cycles,
+                                  uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+    unsigned batches = 0;
+
+    if (fat16_root_has_directory(path, name) == 1) {
+        *cycles_out = 0;
+        return 0;
+    }
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        if (++batches % 100 == 0 &&
+            fat16_root_has_directory(path, name) == 1) {
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
     *cycles_out = cpu0->cycle_count - start;
     return 1;
 }
@@ -1352,9 +1572,18 @@ int main(int argc, char **argv)
             return 1;
         }
         static const char scripts_dir[] = "SCRIPTS    ";
-        if (fat16_root_has_directory(sd_path, scripts_dir) != 1) {
+        uint64_t sd_dir_cycles = 0;
+        if (run_until_sd_directory(session, sd_path, scripts_dir,
+                                   2000000000ull, &sd_dir_cycles) != 0) {
             fprintf(stderr,
-                    "FAIL profile=marauder reason=sd-directory-write-failed\n");
+                    "FAIL profile=marauder reason=sd-directory-write-failed "
+                    "waited_cycles=%llu pc0=0x%08X pc1=0x%08X\n",
+                    (unsigned long long)sd_dir_cycles,
+                    flexe_session_cpu(session, 0)
+                        ? flexe_session_cpu(session, 0)->pc : 0,
+                    flexe_session_cpu(session, 1)
+                        ? flexe_session_cpu(session, 1)->pc : 0);
+
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -2027,14 +2256,39 @@ int main(int argc, char **argv)
     }
 
     if (is_nerdminer && stratum_up) {
-        shutdown(stratum.listen_fd, SHUT_RDWR);
-        close(stratum.listen_fd);
+        stratum.stop = 1;
+        for (int i = 0; i < STRATUM_LISTENERS; i++) {
+            shutdown(stratum.listen_fd[i], SHUT_RDWR);
+            close(stratum.listen_fd[i]);
+        }
         pthread_join(stratum_tid, NULL);
-        if (!stratum.connected ||
-            strstr(stratum.first_line, "mining.subscribe") == NULL) {
-            fprintf(stderr, "FAIL profile=nerdminer reason=no-mining-subscribe "
-                    "connected=%d line=\"%s\"\n",
-                    stratum.connected, stratum.first_line);
+        /* Assert on shares, not on subscribe. Reaching mining.subscribe only
+         * proves DNS and the socket path; the firmware exists to hash, and
+         * for two weeks it was reconnecting in a loop while this check passed.
+         * A submitted share means the whole chain worked: provisioning,
+         * reboot, association, DNS, the outbound socket, the stratum session,
+         * and SHA-256 over a header the pool chose. */
+        /* --verify cannot be held to the share count. It re-runs every
+         * compiled block through the interpreter and rolls the CPU back, but
+         * a reference run that passes through a ROM stub repeats the stub's
+         * *host* side effects, which are not rolled back. That perturbs the
+         * socket timing the mining loop depends on: same 7.34e9 guest cycles,
+         * but 270M instructions retired instead of 407M, and no share found.
+         * It is a miscompile detector, not a run mode, so hold it to the
+         * session being established and let the two normal engines carry the
+         * end-to-end assertion. */
+        int need_shares = !jit_verify;
+        if (!stratum.connected || !stratum.subscribed ||
+            !stratum.authorized || (need_shares && stratum.shares == 0)) {
+            fprintf(stderr, "FAIL profile=nerdminer reason=no-mining-shares "
+                    "connected=%d subscribed=%d authorized=%d jobs=%d "
+                    "shares=%d cycles=%llu retired=%llu line=\"%s\"\n",
+                    stratum.connected, stratum.subscribed, stratum.authorized,
+                    stratum.jobs_sent, stratum.shares,
+                    (unsigned long long)flexe_session_cpu(session, 0)->cycle_count,
+                    (unsigned long long)(xtensa_retired_insns(flexe_session_cpu(session, 0)) +
+                                         xtensa_retired_insns(flexe_session_cpu(session, 1))),
+                    stratum.first_line);
             nerd_probe_close(&network_probe);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
@@ -2081,7 +2335,13 @@ int main(int argc, char **argv)
      * fraction means the workload is spread over cold code the JIT never gets
      * hot enough to compile. */
     if (getenv("FLEXE_JIT_STATS") && flexe_session_jit(session))
-        jit_print_stats(flexe_session_jit(session));
+        jit_print_stats(flexe_session_jit(session),
+                        xtensa_retired_insns(flexe_session_cpu(session, 0)) +
+                        xtensa_retired_insns(flexe_session_cpu(session, 1)));
+    /* Always, not only under FLEXE_JIT_STATS: a --verify run that reports no
+     * mismatches says nothing unless you can also see how many blocks it
+     * actually checked and how many it skipped. */
+    jit_verify_summary(flexe_session_jit(session));
     xtensa_profile_report();
 
     uint64_t wall_ns = monotonic_ns() - wall_start;
@@ -2138,8 +2398,13 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_frames,
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
-    if (is_nerdminer)
-        printf(" stratum=%s", stratum_up ? "subscribed" : "skipped");
+    if (is_nerdminer) {
+        if (stratum_up)
+            printf(" stratum=mining jobs=%d shares=%d",
+                   stratum.jobs_sent, stratum.shares);
+        else
+            printf(" stratum=skipped");
+    }
     if (is_nerdminer)
         printf(" provisioned=%llu wifi_events=%llu",
                (unsigned long long)provisioned_connects,

@@ -17,6 +17,17 @@
 #define JIT_HASH_SIZE   (1u << JIT_HASH_BITS)
 #define JIT_HASH_MASK   (JIT_HASH_SIZE - 1)
 
+/* The block table is set-associative. It used to be direct-mapped with one
+ * entry per slot, and any colliding key reset the slot -- discarding compiled
+ * code. Because hot-counting calls jit_get_or_create() for *every* sampled PC,
+ * most of which never compile, cold code continuously destroyed hot code:
+ * Marauder compiled 20,842 blocks covering only 87 distinct PCs, one pair of
+ * them 5,487 times each. Four ways at 32 bytes per entry keeps a set inside
+ * two cache lines. */
+#define JIT_WAYS        4u
+#define JIT_SET_COUNT   (JIT_HASH_SIZE / JIT_WAYS)
+#define JIT_SET_MASK    (JIT_SET_COUNT - 1)
+
 /* Compilation threshold: compile after N interpreter executions.
  *
  * Production firmware crosses thousands of cold control-flow targets during
@@ -25,13 +36,16 @@
  *
  * Measured, so it does not need re-deriving: on the stock ROMs, lowering this
  * to 2 compiles twenty times as many blocks (18 -> 375 on NerdMiner) and
- * changes neither the share of instructions executed natively (7.8%) nor the
- * wall time. Sampling candidate PCs more often does not move it either. Those
- * ROMs simply have no further hot code to find -- excluding idle, roughly a
- * fifth to a quarter of retired instructions run natively and the rest is
- * genuinely diffuse: the single hottest PC accounts for about 0.06% of
- * samples. Stock-ROM throughput is bounded by cold code, not by JIT coverage,
- * so raising coverage is not the lever it looks like. */
+ * changes neither the share of instructions executed natively nor the wall
+ * time. Sampling candidate PCs more often does not move it either. Those ROMs
+ * simply have no further hot code to find -- 22.5% to 46% of retired
+ * instructions already run natively and the rest is genuinely diffuse: the
+ * single hottest PC accounts for about 0.06% of samples, and the interpreted
+ * remainder averages 3.6 instructions per taken control transfer.
+ *
+ * The percentages here were re-derived on 2026-09-04 after the retired-
+ * instruction counter was found to be inflated 6.7x; the *comparisons* were
+ * unaffected, since both arms of each experiment shared the denominator. */
 #define JIT_HOT_THRESHOLD  16
 
 /* Maximum guest instructions per block */
@@ -61,6 +75,11 @@ typedef struct {
  * PC the JIT declines is re-scanned on every single execution. */
 #define JIT_BLK_UNCOMPILABLE 0x1u
 
+/* Way is in use. Needed because a zeroed way and a real entry are otherwise
+ * indistinguishable by tag alone, and the victim search has to tell "free"
+ * from "occupied but not yet compiled". */
+#define JIT_BLK_VALID        0x2u
+
 /* Block chaining: max pending chain slots */
 #define MAX_CHAIN_SLOTS  131072
 
@@ -84,6 +103,20 @@ typedef struct {
     uint64_t cache_flushes;
     uint64_t fallbacks;         /* Instructions that fell back to interpreter */
     uint64_t chains_patched;    /* Block chain links patched */
+    /* Calls into jit_pc_hook. Against blocks_executed this is the *hit rate*
+     * of the dispatch path -- 0.83 on Marauder, 0.50 on NerdMiner -- because
+     * blocks_executed counts C dispatches that found a block, not native
+     * blocks run. A chained run jumps block to block without returning, and
+     * shows up only as a larger insns_jitted. So the remainder is dispatches
+     * that found nothing: 13% misses and 4% ROM stubs on Marauder, 30% and
+     * 20% on NerdMiner.
+     *
+     * Do not read this ratio as chaining reach; it cannot fall below 1.0 by
+     * chaining more, and an earlier note here claimed exactly that. For
+     * chaining, divide insns_jitted/blocks_executed by the natural basic-block
+     * length: 9.1/6.1 = 1.5 blocks per dispatch on Marauder, 25.1/4.2 = 6.0 on
+     * NerdMiner. Chaining is working. */
+    uint64_t hook_calls;
     /* Cached blocks declined because a live loop ends inside them. Each one
      * is an interpreted dispatch, and because the decline follows a hash hit
      * no replacement is ever compiled — so a large count here is a hot loop
@@ -117,7 +150,11 @@ void         jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu);
 
 /* Statistics */
 const jit_stats_t *jit_get_stats(const jit_state_t *jit);
-void               jit_print_stats(const jit_state_t *jit);
+/* `retired_insns` is the sum of xtensa_retired_insns() over both cores.
+ * Coverage is reported against it rather than against the JIT's own batch
+ * counters, which include idle and fast-forwarded cycles. Pass 0 if unknown. */
+void               jit_print_stats(const jit_state_t *jit,
+                                   uint64_t retired_insns);
 
 /* Differential verification mode: every compiled block is executed natively,
  * rolled back, re-executed through the interpreter, and the two architectural
@@ -126,6 +163,7 @@ void               jit_print_stats(const jit_state_t *jit);
  * and are skipped. Roughly an order of magnitude slower -- a debugging tool,
  * not a run mode. */
 void               jit_set_verify(jit_state_t *jit, bool enable);
+bool               jit_verify_enabled(const jit_state_t *jit);
 void               jit_verify_summary(const jit_state_t *jit);
 
 #endif /* JIT_H */

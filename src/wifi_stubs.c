@@ -218,6 +218,12 @@ struct wifi_stubs {
     int                event_handler_count;
     pending_event_t    pending_events[MAX_PENDING_EVENTS];
     int                pending_event_count;
+    /* One event fans out to every handler registered for it, and each is
+     * delivered as its own asynchronous call -- one at a time, because a
+     * handler that blocks stays in flight across context switches. */
+    struct { uint32_t handler; uint32_t args[4]; }
+                       dispatch[MAX_EVENT_HANDLERS];
+    int                dispatch_count;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -1645,12 +1651,26 @@ static void stub_esp_wifi_deinit(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, 0);
 }
 
+static void wifi_queue_event(wifi_stubs_t *ws, const char *base,
+                             int32_t event_id, evt_data_kind_t kind);
+
 static void stub_esp_wifi_start(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     ws->stats.wifi_start_calls++;
     ws->wifi_started = true;
     wifi_log(ws, "esp_wifi_start()\n");
+    /* Post the start event for whichever interfaces came up. Hardware does,
+     * and firmware depends on it: Arduino's WiFiGeneric does not call
+     * esp_wifi_connect() from esp_wifi_start(), it calls it from the
+     * WIFI_EVENT_STA_START handler. Without this, WLED started the station,
+     * waited for a start that never arrived, and tore the whole stack back
+     * down again -- disconnect, stop, deinit -- which is exactly what the log
+     * showed before this. */
+    if (ws->wifi_mode == WIFI_MODE_STA || ws->wifi_mode == WIFI_MODE_APSTA)
+        wifi_queue_event(ws, "WIFI_EVENT", 2 /* STA_START */, EVT_DATA_NONE);
+    if (ws->wifi_mode == WIFI_MODE_AP || ws->wifi_mode == WIFI_MODE_APSTA)
+        wifi_queue_event(ws, "WIFI_EVENT", 12 /* AP_START */, EVT_DATA_NONE);
     ws_return(cpu, 0);
 }
 
@@ -1659,6 +1679,10 @@ static void stub_esp_wifi_stop(xtensa_cpu_t *cpu, void *ctx)
     wifi_stubs_t *ws = ctx;
     ws->wifi_started = false;
     wifi_log(ws, "esp_wifi_stop()\n");
+    if (ws->wifi_mode == WIFI_MODE_STA || ws->wifi_mode == WIFI_MODE_APSTA)
+        wifi_queue_event(ws, "WIFI_EVENT", 3 /* STA_STOP */, EVT_DATA_NONE);
+    if (ws->wifi_mode == WIFI_MODE_AP || ws->wifi_mode == WIFI_MODE_APSTA)
+        wifi_queue_event(ws, "WIFI_EVENT", 13 /* AP_STOP */, EVT_DATA_NONE);
     ws_return(cpu, 0);
 }
 
@@ -1739,29 +1763,67 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
     return p;
 }
 
-void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu) {
-    if (!ws || !cpu || ws->pending_event_count == 0) return;
+void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
+                     xtensa_cpu_t *peer) {
+    if (!ws || !cpu) return;
 
-    /* One event per batch: a handler may queue more (STA_START leads to
-     * connect, which queues CONNECTED and GOT_IP), and draining the queue in
-     * a loop here would run them all inside one batch. */
-    pending_event_t e = ws->pending_events[0];
-    for (int i = 1; i < ws->pending_event_count; i++)
-        ws->pending_events[i - 1] = ws->pending_events[i];
-    ws->pending_event_count--;
+    /* A handler started earlier is still running -- possibly blocked on a
+     * semaphore, with the borrowed task descheduled. Delivering another now
+     * would nest one borrowed frame inside another. */
+    if (guest_call_async_busy(cpu)) return;
 
-    uint32_t data = wifi_write_event_data(ws, cpu, e.data_kind);
+    if (ws->dispatch_count == 0) {
+        if (ws->pending_event_count == 0) return;
 
-    for (int i = 0; i < ws->event_handler_count; i++) {
-        event_handler_t *h = &ws->event_handlers[i];
-        if (strcmp(h->base_name, e.base_name) != 0) continue;
-        if (h->event_id != e.event_id && h->event_id != -1) continue;
-        uint32_t args[4] = { h->handler_arg, h->event_base,
-                             (uint32_t)e.event_id, data };
-        if (guest_call8(cpu, h->handler_addr, args, 4, 2000000u, NULL) == 0)
-            ws->stats.events_delivered++;
+        /* One event per batch: a handler may queue more (STA_START leads to
+         * connect, which queues CONNECTED and GOT_IP), and draining the queue
+         * in a loop here would run them all inside one batch. */
+        pending_event_t e = ws->pending_events[0];
+        for (int i = 1; i < ws->pending_event_count; i++)
+            ws->pending_events[i - 1] = ws->pending_events[i];
+        ws->pending_event_count--;
+
+        uint32_t data = wifi_write_event_data(ws, cpu, e.data_kind);
+
+        for (int i = 0; i < ws->event_handler_count &&
+                        ws->dispatch_count < MAX_EVENT_HANDLERS; i++) {
+            event_handler_t *h = &ws->event_handlers[i];
+            if (strcmp(h->base_name, e.base_name) != 0) continue;
+            if (h->event_id != e.event_id && h->event_id != -1) continue;
+            int d = ws->dispatch_count++;
+            ws->dispatch[d].handler = h->handler_addr;
+            ws->dispatch[d].args[0] = h->handler_arg;
+            ws->dispatch[d].args[1] = h->event_base;
+            ws->dispatch[d].args[2] = (uint32_t)e.event_id;
+            ws->dispatch[d].args[3] = data;
+        }
+        wifi_log(ws, "event %s/%d queued to %d handler(s)\n",
+                 e.base_name, e.event_id, ws->dispatch_count);
+        if (ws->dispatch_count == 0) return;
     }
-    wifi_log(ws, "event %s/%d delivered\n", e.base_name, e.event_id);
+
+    /* Borrowing a real task is what lets the handler block. Either core will
+     * do -- WLED's blocking handlers arrive while core 0 sits in WAITI and
+     * core 1 is busy -- so try both before giving up. A core in WAITI is
+     * running the idle task, which guest_call_async() refuses to borrow:
+     * blocking the one task FreeRTOS requires to stay runnable would be worse
+     * than not delivering.
+     *
+     * When neither core has a task, fall back to the private-stack call. That
+     * is how every image delivered its events before, and the ones that are
+     * idle whenever an event is ready -- NerdMiner is, every time -- still
+     * need it. Waiting for a task instead breaks their provisioning. */
+    if (guest_call_async(cpu, ws->dispatch[0].handler,
+                         ws->dispatch[0].args, 4) != 0 &&
+        (!peer || guest_call_async(peer, ws->dispatch[0].handler,
+                                   ws->dispatch[0].args, 4) != 0) &&
+        guest_call8(cpu, ws->dispatch[0].handler,
+                    ws->dispatch[0].args, 4, 2000000u, NULL) != 0)
+        return;
+    ws->stats.events_delivered++;
+    for (int i = 1; i < ws->dispatch_count; i++)
+        ws->dispatch[i - 1] = ws->dispatch[i];
+    ws->dispatch_count--;
 }
 
 static void stub_esp_wifi_set_config(xtensa_cpu_t *cpu, void *ctx)
@@ -2589,6 +2651,72 @@ static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
+/* WLED 16.0.1, plain ESP32.
+ *
+ * These are the first entry points in this file that were *not* found by hand.
+ * WLED reports IDF 4.4.8, which is Arduino-ESP32 2.0.17, so a throwaway sketch
+ * built against that exact core links a byte-identical libnet80211 and
+ * libesp_wifi; matching each function's prologue against the production image
+ * -- with the PC-relative immediates of L32R, CALLn and J masked out, since
+ * those move with the link -- recovers the addresses.
+ *
+ * The method was validated before it was trusted: run against a Marauder build
+ * whose fifteen addresses were already known by hand, it returns all fifteen
+ * and nothing else. Here every entry below matched uniquely at 32 bytes or
+ * more of masked prologue, except the three noted.
+ *
+ * esp_wifi_connect and esp_wifi_disconnect are short near-identical wrappers
+ * and match three sites each. They are pinned by two independent facts: the
+ * reference spaces them 0x48 apart and exactly one candidate pair is, and
+ * their offset from the reference (0x83EA4) is the one four unambiguous
+ * neighbours share. esp_wifi_init needed a 14-byte prologue to be unique, so
+ * it is corroborated twice over -- it is 0x18 past esp_wifi_deinit, as in the
+ * reference, and it is the call8 target following the L32R of
+ * WIFI_INIT_CONFIG_MAGIC (0x1F2F3F4F) in WLED's wifiLowLevelInit.
+ *
+ * Deliberately absent: esp_wifi_set_mac, esp_wifi_set_promiscuous{,_filter,
+ * _rx_cb} and esp_wifi_80211_tx. Those did not match uniquely, and they are
+ * the packet-injection API a lighting controller has no reason to call. If
+ * WLED does call one, it runs the real library against state these stubs never
+ * built -- so check the unregistered-ROM and unhandled-MMIO counts, which is
+ * what check-firmware.sh is for, rather than assuming.
+ */
+static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
+    { 0x401561B8u, stub_esp_wifi_init,             "esp_wifi_init" },
+    { 0x401561A0u, stub_esp_wifi_deinit,           "esp_wifi_deinit" },
+    { 0x40182CD8u, stub_esp_wifi_set_mode,         "esp_wifi_set_mode" },
+    { 0x40182D14u, stub_esp_wifi_get_mode,         "esp_wifi_get_mode" },
+    { 0x40182D44u, stub_esp_wifi_start,            "esp_wifi_start" },
+    { 0x40182D9Cu, stub_esp_wifi_stop,             "esp_wifi_stop" },
+    { 0x40182F0Cu, stub_esp_wifi_connect,          "esp_wifi_connect" },
+    { 0x40182F54u, stub_esp_wifi_disconnect,       "esp_wifi_disconnect" },
+    { 0x401830D0u, stub_esp_wifi_scan_start,       "esp_wifi_scan_start" },
+    { 0x40183344u, stub_esp_wifi_set_config,       "esp_wifi_set_config" },
+    { 0x401833B0u, stub_esp_wifi_get_config,       "esp_wifi_get_config" },
+    { 0x40183444u, stub_esp_wifi_noop,             "esp_wifi_set_ps" },
+    { 0x40183548u, stub_esp_wifi_set_channel,      "esp_wifi_set_channel" },
+    { 0x401835A4u, stub_esp_wifi_get_channel,      "esp_wifi_get_channel" },
+    { 0x40183604u, stub_esp_wifi_get_mac,          "esp_wifi_get_mac" },
+    { 0x40183634u, stub_esp_wifi_sta_get_ap_info,  "esp_wifi_sta_get_ap_info" },
+    { 0x401836F4u, stub_esp_wifi_noop,             "esp_wifi_set_storage" },
+    /* Hooking the esp_wifi API alone gets the firmware through init and then
+     * leaves it waiting: it learns it associated only through the handler it
+     * registers here, and without this Flexe has nowhere to deliver the
+     * WIFI_EVENT/IP_EVENT that wifi_stubs_tick() posts. Same lesson as
+     * NerdMiner, whose table has carried this entry from the start.
+     *
+     * esp_event_handler_register_with() is deliberately not hooked even though
+     * it matched uniquely (0x401514D8): it takes the loop handle as its first
+     * argument, so every other argument shifts by one and the register stub
+     * would record a handler from the wrong slot. */
+    { 0x40150E34u, stub_esp_event_handler_register,
+                   "esp_event_handler_register" },
+    { 0x40150E74u, stub_esp_event_handler_unregister,
+                   "esp_event_handler_unregister" },
+    { 0x40151768u, stub_esp_event_post,           "esp_event_send_internal" },
+    { 0, NULL, NULL },
+};
+
 int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
 {
     if (!ws) return 0;
@@ -2611,6 +2739,8 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = marauder_guition_wifi_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1143_35INCH)
         hooks = marauder_35inch_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_WLED_V1601)
+        hooks = wled_v1601_wifi_hooks;
     else
         return 0;
     /* No firmware_status_addr for any profile.

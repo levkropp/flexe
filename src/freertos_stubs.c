@@ -675,7 +675,7 @@ static bool frt_block_cycles(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
      * guest clock and this is the one site that could pay the same interval
      * twice. */
     cpu->cycle_count += advance;
-    cpu->ccount += (uint32_t)advance;
+    xtensa_advance_idle_cycles(cpu, advance);
     return false;
 }
 
@@ -1621,8 +1621,17 @@ static bool dispatch_peripherals_until_queue(freertos_stubs_t *frt,
             if (!candidate || !candidate->periph_next_event ||
                 !candidate->periph_event)
                 continue;
-            uint32_t candidate_event =
-                candidate->periph_next_event(candidate);
+            /* next_timer_event covers the ccompare deadlines as well as the
+             * peripheral ones. Searching only periph_next_event() stepped this
+             * pump straight over the guest's own FreeRTOS tick for the whole
+             * time a task sat in a blocking receive. */
+            uint32_t candidate_event = candidate->next_timer_event;
+            uint32_t periph_event_at = candidate->periph_next_event(candidate);
+            if (periph_event_at != UINT32_MAX &&
+                (candidate_event == UINT32_MAX ||
+                 (uint32_t)(periph_event_at - candidate->ccount) <
+                 (uint32_t)(candidate_event - candidate->ccount)))
+                candidate_event = periph_event_at;
             if (candidate_event == UINT32_MAX) continue;
             uint32_t candidate_distance =
                 candidate_event - candidate->ccount;
@@ -1641,7 +1650,12 @@ static bool dispatch_peripherals_until_queue(freertos_stubs_t *frt,
         waiting_cpu->virtual_time_us +=
             distance / frt->cpu_freq_mhz;
         elapsed += distance;
-        event_cpu->periph_event(event_cpu);
+        /* Fire everything now due, not just the peripheral models:
+         * xtensa_fire_due_timers() raises the ccompare interrupts and then
+         * calls periph_event() itself, so this is the same peripheral step
+         * plus the ccompare deadlines the pump used to skip. */
+        xtensa_fire_due_timers(event_cpu);
+        if (event_cpu != waiting_cpu) xtensa_fire_due_timers(waiting_cpu);
 
         pthread_mutex_lock(&frt->lock);
         queue_t *q = find_queue(frt, handle);
@@ -1732,7 +1746,7 @@ static void queue_receive(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
             uint64_t remaining = timeout_cycles > hardware_advance ?
                 timeout_cycles - hardware_advance : 0u;
             cpu->virtual_time_us += remaining / frt->cpu_freq_mhz;
-            cpu->ccount += (uint32_t)remaining;
+            xtensa_advance_idle_cycles(cpu, remaining);
         }
         frt_return(cpu, pdFALSE);
         return;

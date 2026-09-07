@@ -29,6 +29,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* rtc.h: timer wake trigger, and the RESET_REASON for a deep-sleep wake. */
+#define RTC_TIMER_WAKE_CAUSE        (1u << 3)
+#define RTC_DEEPSLEEP_RESET_CAUSE   5u
+
 struct flexe_session {
     xtensa_cpu_t       cpu[2];
     xtensa_mem_t      *mem;
@@ -61,6 +65,7 @@ struct flexe_session {
     uint32_t           entry_point;
     uint32_t           initial_sp;
     unsigned           resets;
+    int                preserve_rtc_mem;
 };
 
 /* Let the esp_timer delay()/usleep() shims block on the FreeRTOS scheduler
@@ -183,8 +188,15 @@ static int session_build(flexe_session_t *s)
             .touch_fn       = cfg->touch_fn,
             .touch_ctx      = cfg->touch_ctx,
         };
-        if (scfg.dc_pin >= 0)
-            periph_enable_spi_display(s->periph, &scfg);
+        /* Always model the SPI2/SPI3 registers, even with every pin set to
+         * -1. A -1 pin means "do not try to interpret this traffic as a
+         * panel", not "there is no SPI controller" -- the chip has one either
+         * way, and leaving the window unregistered made firmware that drives
+         * VSPI look like it was touching hardware Flexe does not model.
+         * openHASP alone logged 59,957 phantom unhandled accesses to
+         * 0x3FF65000 that way. Every pin helper already treats a negative pin
+         * as absent, so sniffing stays off. */
+        periph_enable_spi_display(s->periph, &scfg);
     }
 
     /* SD card stubs */
@@ -267,9 +279,25 @@ static int session_build(flexe_session_t *s)
     else if (res.entry_point != 0)
         s->cpu[0].pc = res.entry_point;
 
+    /* PS.EXCM is set out of reset, and on hardware the second-stage
+     * bootloader has cleared it long before the app entry runs. Flexe loads
+     * the app on its own and jumps straight there, so without this the bit
+     * survives into the application -- and everything downstream of it
+     * behaves as though an exception were in progress. Concretely, a RETW
+     * needing a window fill is diverted away from the guest's own
+     * WindowUnderflow vector, because raising there would be a double
+     * exception; Tasmota takes that diversion from cycle 165 onward and the
+     * synthesized fill reads a link slot nothing ever wrote, at 0xFFFFFFE0.
+     *
+     * INTLEVEL stays at 15. The app lowers it itself once its vectors are
+     * installed, and unmasking before then would deliver an interrupt to
+     * whatever the ROM left at VECBASE. */
+    XT_PS_SET_EXCM(s->cpu[0].ps, 0);
+
     /* Set initial stack pointer */
     uint32_t sp = cfg->initial_sp ? cfg->initial_sp : 0x3FFE0000u;
     ar_write(&s->cpu[0], 1, sp);
+    s->cpu[0].seed_entry_link = true;
 
     /* Initialize CPU core 1 */
     xtensa_cpu_init(&s->cpu[1]);
@@ -278,13 +306,29 @@ static int session_build(flexe_session_t *s)
     s->cpu[1].predecode = s->cpu[0].predecode;  /* Share predecode table */
     s->cpu[1].core_id = 1;
     s->cpu[1].prid = 0xABAB;
+    XT_PS_SET_EXCM(s->cpu[1].ps, 0);   /* see core 0, above */
     s->cpu[1].running = false;
     s->cpu[1].window_trace = cfg->window_trace;
     s->cpu[1].window_trace_active = false;
     s->cpu[1].spill_verify = cfg->spill_verify;
-    /* Core 1 needs a valid stack before its boot entry runs (on hardware
-     * the ROM startup provides one). Give it 16 KB below core 0's stack. */
-    ar_write(&s->cpu[1], 1, sp - 0x4000);
+    /* Core 1 needs a valid stack before its boot entry runs: the APP CPU
+     * entry point begins with `entry a1, 32` and never sets one itself, so
+     * whatever we put here carries its whole startup.
+     *
+     * *Above* core 0's stack, not below. Below put it 16 KB under core 0 at
+     * 0x3FFDC000, which is inside the application heap -- static data ends
+     * around 0x3FFC4C00 and the heap grows from there toward core 0's stack.
+     * A firmware that allocates enough eventually writes over core 1's
+     * startup frame. Meshtastic does: the saved a0 in call_start_cpu1's frame
+     * became 0x0000000A, its RETW computed 0x4000000A, and core 1 spent the
+     * rest of the run spinning in unregistered ROM -- 98% of all instructions
+     * retired, with core 0 stalled waiting for a core that never came up.
+     *
+     * The ROM data region above core 0's stack is where hardware's APP CPU
+     * startup stack lives, and the heap does not reach it during startup, so
+     * this is both the safer choice and the more faithful one. */
+    ar_write(&s->cpu[1], 1, sp + 0x8000);
+    s->cpu[1].seed_entry_link = true;
 
     /* Attach CPUs to peripherals for interrupt delivery */
     periph_attach_cpus(s->periph, &s->cpu[0], &s->cpu[1]);
@@ -402,10 +446,36 @@ void flexe_session_destroy(flexe_session_t *s)
  * with it NVS and SPIFFS, persists exactly as across a real reboot, which is
  * the entire reason firmware reboots itself.
  */
+/* RTC domains, which a deep-sleep wake must preserve. Everything else is
+ * rebuilt: that is the point of the reset. */
+#define RTC_SLOW_BASE  0x50000000u
+#define RTC_SLOW_SIZE  0x2000u
+#define RTC_DRAM_BASE  0x3FF80000u
+#define RTC_DRAM_SIZE  0x2000u
+
 void flexe_session_reset(flexe_session_t *s)
 {
     if (!s) return;
     uint64_t cycles = s->cpu[0].cycle_count;
+
+    /* A pad held with rtc_gpio_hold_en() keeps its level across the reset;
+     * see periph_pad_hold_snapshot(). */
+    periph_pad_hold_t pad_hold;
+    periph_pad_hold_snapshot(s->periph, &pad_hold);
+
+    /* A deep-sleep wake keeps RTC memory -- RTC_DATA_ATTR variables and the
+     * wake stub live there, and firmware counts on them surviving. The reload
+     * inside session_build() writes the image's RTC segments back over them,
+     * which is right for a cold boot and wrong here, so snapshot and restore. */
+    uint8_t *rtc_slow = NULL, *rtc_dram = NULL;
+    if (s->preserve_rtc_mem) {
+        rtc_slow = malloc(RTC_SLOW_SIZE);
+        rtc_dram = malloc(RTC_DRAM_SIZE);
+        for (uint32_t i = 0; rtc_slow && i < RTC_SLOW_SIZE; i++)
+            rtc_slow[i] = mem_read8(s->mem, RTC_SLOW_BASE + i);
+        for (uint32_t i = 0; rtc_dram && i < RTC_DRAM_SIZE; i++)
+            rtc_dram[i] = mem_read8(s->mem, RTC_DRAM_BASE + i);
+    }
     uint32_t *predecode = s->cpu[0].predecode;
     /* Host-supplied network settings are configuration, not machine state:
      * they describe the world the device is plugged into and must survive a
@@ -434,7 +504,13 @@ void flexe_session_reset(flexe_session_t *s)
 
     /* session_build() creates the JIT and installs its hook on both cores,
      * so the old one has to go: keeping it leaves the CPUs hooked to a JIT
-     * the session no longer points at, which runs but is ruinously slow. */
+     * the session no longer points at, which runs but is ruinously slow.
+     *
+     * Verification is a property of the run, not of the JIT instance, so it
+     * has to be carried over -- it was silently switched off by every reboot.
+     * NerdMiner reboots partway through its own scenario, so most of that run
+     * was unverified while still reporting no mismatches. */
+    bool was_verifying = jit_verify_enabled(s->jit);
     jit_destroy(s->jit);
     s->jit = NULL;
     if (session_build(s) != 0) {
@@ -444,6 +520,18 @@ void flexe_session_reset(flexe_session_t *s)
         return;
     }
     wifi_stubs_apply_host_config(s->wstubs, &netcfg);
+    periph_pad_hold_restore(s->periph, &pad_hold);
+    if (was_verifying) jit_set_verify(s->jit, true);
+
+    if (s->preserve_rtc_mem) {
+        for (uint32_t i = 0; rtc_slow && i < RTC_SLOW_SIZE; i++)
+            mem_write8(s->mem, RTC_SLOW_BASE + i, rtc_slow[i]);
+        for (uint32_t i = 0; rtc_dram && i < RTC_DRAM_SIZE; i++)
+            mem_write8(s->mem, RTC_DRAM_BASE + i, rtc_dram[i]);
+        s->preserve_rtc_mem = 0;
+    }
+    free(rtc_slow);
+    free(rtc_dram);
 
     /* Keep the clock monotonic: emulator budgets and harness deadlines are
      * all measured against it, and a reboot does not rewind wall time here. */
@@ -497,6 +585,11 @@ wifi_stubs_t *flexe_session_wifi(flexe_session_t *s)
 bt_stubs_t *flexe_session_bt(flexe_session_t *s)
 {
     return s ? s->bstubs : NULL;
+}
+
+unsigned flexe_session_reset_count(const flexe_session_t *s)
+{
+    return s ? s->resets : 0u;
 }
 
 int flexe_session_is_native_freertos(const flexe_session_t *s)
@@ -585,20 +678,39 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
             else
                 s->cpu[1].cycle_count = s->cpu[0].cycle_count;
         } else {
-            if (s->cpu[1].cycle_count > s->cpu[0].cycle_count)
-                s->cpu[0].cycle_count = s->cpu[1].cycle_count;
-            else
-                s->cpu[1].cycle_count = s->cpu[0].cycle_count;
-            /* Publish the later of the two cores' virtual_time_us, and only
-             * that. esp_timer's current_time_us() already reconciles it
-             * against cycle_count at the *real* CPU frequency; recomputing it
-             * here as cycle_count / 160 assumed a 160 MHz part and could move
+            /* Publish one timeline to both cores — and hand the core that is
+             * behind the CCOUNT to go with it.
+             *
+             * Taking the maximum of cycle_count and virtual_time_us alone moved
+             * the lagging core's guest clock forward while its CCOUNT stood
+             * still, and CCOUNT is what that core's own FreeRTOS tick is
+             * scheduled against through CCOMPARE0. Every tick inside the
+             * injected interval was skipped: Marauder took 2.65 s of time this
+             * way across a 36 s run and its guest tick ran at 925 Hz instead of
+             * 1000 Hz, so every FreeRTOS timeout measured against it ran ~8%
+             * long. Publish the time, then let each core walk its own CCOUNT up
+             * to it, firing what falls inside.
+             *
+             * virtual_time_us is published as-is rather than recomputed from
+             * cycle_count: esp_timer's current_time_us() already reconciles the
+             * two at the real CPU frequency, and deriving it here as
+             * cycle_count / 160 assumed a 160 MHz part and could move
              * guest-visible time backwards on a 240 MHz one. */
+            uint32_t mhz = xtensa_cpu_freq_mhz(&s->cpu[0]);
+            uint64_t was0 = s->cpu[0].cycle_count +
+                            s->cpu[0].virtual_time_us * mhz;
+            uint64_t was1 = s->cpu[1].cycle_count +
+                            s->cpu[1].virtual_time_us * mhz;
+            uint64_t cyc = s->cpu[0].cycle_count > s->cpu[1].cycle_count
+                         ? s->cpu[0].cycle_count : s->cpu[1].cycle_count;
             uint64_t vt = s->cpu[0].virtual_time_us > s->cpu[1].virtual_time_us
                         ? s->cpu[0].virtual_time_us
                         : s->cpu[1].virtual_time_us;
-            s->cpu[0].virtual_time_us = vt;
-            s->cpu[1].virtual_time_us = vt;
+            s->cpu[0].cycle_count = s->cpu[1].cycle_count = cyc;
+            s->cpu[0].virtual_time_us = s->cpu[1].virtual_time_us = vt;
+            uint64_t now = cyc + vt * mhz;
+            if (now > was0) xtensa_advance_idle_cycles(&s->cpu[0], now - was0);
+            if (now > was1) xtensa_advance_idle_cycles(&s->cpu[1], now - was1);
         }
     }
 
@@ -608,6 +720,60 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
      * this, periodic timers registered via esp_timer_start_periodic would
      * never fire during normal instruction execution — only when firmware
      * explicitly calls usleep/delay. */
+    /* Sleep. The peripheral decides that the chip is going to sleep and what
+     * could wake it; the clock and the reset path live here.
+     *
+     * Time is stepped in slices rather than jumped, for two reasons: the
+     * level-triggered wake sources (EXT0/EXT1/touch) have to be polled, and
+     * xtensa_advance_idle_cycles() has to see the interval so the timers
+     * inside it still fire. Deep sleep then takes the same reset the software
+     * reset path uses -- RTC memory survives it because session_build()
+     * reloads image segments into the existing memory, which is exactly
+     * deep-sleep semantics. */
+    {
+        bool deep = false;
+        uint64_t timeout_us = 0;
+        uint32_t cause = 0;
+        if (periph_take_sleep_request(s->periph, &deep, &timeout_us, &cause)) {
+            fprintf(stderr, "[sleep] request deep=%d timeout_us=%llu cause=0x%X "
+                    "cycles=%llu\n", deep, (unsigned long long)timeout_us, cause,
+                    (unsigned long long)s->cpu[0].cycle_count);
+            /* A sleep with nothing armed to end it would step forward for
+             * ever. That is a firmware bug or a gap in what is modelled here;
+             * either way, hanging the emulator is the worst way to report it. */
+            if (timeout_us == PERIPH_SLEEP_FOREVER && cause == 0) {
+                fprintf(stderr, "[sleep] no wake source armed; refusing to "
+                        "sleep (wake_ena=0x%X)\n", cause);
+                periph_finish_wake(s->periph, 0);
+                return;
+            }
+            const uint64_t SLICE_US = 1000;
+            uint32_t mhz = xtensa_cpu_freq_mhz(&s->cpu[0]);
+            uint64_t slept = 0;
+            while (cause == 0 && slept < timeout_us) {
+                uint64_t step = timeout_us - slept;
+                if (step > SLICE_US) step = SLICE_US;
+                for (int c = 0; c < 2; c++) {
+                    s->cpu[c].virtual_time_us += step;
+                    xtensa_advance_idle_cycles(&s->cpu[c], step * mhz);
+                }
+                slept += step;
+                cause = periph_sleep_poll_wake(s->periph);
+            }
+            if (cause == 0) cause = RTC_TIMER_WAKE_CAUSE;
+            fprintf(stderr, "[sleep] %s sleep, woke after %llu us, cause=0x%X\n",
+                    deep ? "deep" : "light", (unsigned long long)slept, cause);
+            if (deep) {
+                s->resets++;
+                s->preserve_rtc_mem = 1;
+                flexe_session_reset(s);
+                periph_set_wake_state(s->periph, cause, RTC_DEEPSLEEP_RESET_CAUSE);
+                return;
+            }
+            periph_finish_wake(s->periph, cause);
+        }
+    }
+
     if (periph_take_reset_request(s->periph)) {
         s->resets++;
         fprintf(stderr, "[reset] firmware requested a software reset (#%u)\n",
@@ -621,7 +787,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
      * than running the guest's timer daemon. */
     freertos_stubs_tick(s->frt);
     /* And any queued WiFi/IP event, which likewise re-enters guest code. */
-    wifi_stubs_tick(s->wstubs, &s->cpu[0]);
+    wifi_stubs_tick(s->wstubs, &s->cpu[0], &s->cpu[1]);
 }
 
 /* ===== Callback configuration ===== */

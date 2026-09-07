@@ -123,7 +123,7 @@ jobs:
           ARDUINO_CLI: /home/runner/bin/arduino-cli
         run: |
           status=0
-          for gate in ./test-*.sh; do
+          for gate in ./scripts/test-*.sh; do
             echo "::group::$gate"
             if ! "$gate"; then
               echo "::error::$gate failed"

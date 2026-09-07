@@ -117,6 +117,20 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
                      0x10000u, "coredump");
             n++; off += 0x10000u;
         }
+        /* Whatever flash is left becomes a filesystem partition.
+         *
+         * Modern firmware assumes one exists and says so when it does not:
+         * Meshtastic prints `esp_littlefs: partition "spiffs" could not be
+         * found`, openHASP `config partition not found`. Both SPIFFS and
+         * LittleFS look it up by the subtype, not the label, so one entry
+         * serves either. Aligned to 64 KiB because a filesystem partition has
+         * to start on a flash erase-block boundary. */
+        off = (off + 0xFFFFu) & ~0xFFFFu;
+        if (off + 0x10000u <= PT_FLASH_SIZE) {
+            pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_SPIFFS, off,
+                     PT_FLASH_SIZE - off, "spiffs");
+            n++;
+        }
     }
 
     /* MD5 entry: magic 0xEBEB, digest at +16 (ESP_PARTITION_MD5_OFFSET),

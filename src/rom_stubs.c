@@ -9,6 +9,14 @@
 #include <stdio.h>
 #include <zlib.h>
 
+/* Resolved once; see gpio_dbg() in peripherals.c for the measurement. */
+static int rom_gpio_dbg_flag = -1;
+static inline int rom_gpio_dbg(void) {
+    if (__builtin_expect(rom_gpio_dbg_flag < 0, 0))
+        rom_gpio_dbg_flag = getenv("FLEXE_GPIODBG") != NULL;
+    return rom_gpio_dbg_flag;
+}
+
 #define MAX_ROM_STUBS 1024
 #define OUTPUT_BUF_SIZE 8192
 #define HOOK_HT_SIZE  2048
@@ -64,7 +72,14 @@ typedef struct {
     bool pending;
 } stub_irq_t;
 
+#define TWDT_MAX_TASKS_DECL 16
+
 struct esp32_rom_stubs {
+    /* Task-watchdog subscriptions. Machine state, so it lives here and is
+     * rebuilt with everything else on a reset. */
+    uint32_t twdt_tasks[TWDT_MAX_TASKS_DECL];
+    int      twdt_count;
+    bool     twdt_inited;
     xtensa_cpu_t    *cpu;
     rom_stub_entry_t entries[MAX_ROM_STUBS];
     int              count;
@@ -404,9 +419,11 @@ static void stub_ets_set_appcpu_boot_addr(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+/* The real reset cause, which is no longer always power-on: a deep-sleep wake
+ * reports DEEPSLEEP_RESET, and esp_reset_reason() is built on this. */
 static void stub_rtc_get_reset_reason(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    rom_return(cpu, 1);  /* POWERON_RESET */
+    esp32_rom_stubs_t *s = ctx;
+    rom_return(cpu, s && s->periph ? periph_reset_cause(s->periph) : 1u);
 }
 
 static void stub_ets_install_uart_printf(xtensa_cpu_t *cpu, void *ctx) {
@@ -675,10 +692,17 @@ static void stub_ets_install_putc1(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+/* ets_delay_us is a CCOUNT busy-wait on real hardware, so the tick and every
+ * other interrupt keep firing throughout it. Crediting only virtual_time_us
+ * moved the guest clock without moving CCOUNT, and CCOMPARE0 — the FreeRTOS
+ * tick — is scheduled against CCOUNT. Marauder makes 28,622 of these calls
+ * while bringing up the PHY and its drivers, which is where 2.7 s of a 36 s run
+ * went: its guest tick ran at 925 Hz instead of 1000 Hz. */
 static void stub_ets_delay_us(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t us = rom_arg(cpu, 0);
     cpu->virtual_time_us += us;
+    xtensa_advance_idle_cycles(cpu, (uint64_t)us * xtensa_cpu_freq_mhz(cpu));
     rom_return_void(cpu);
 }
 
@@ -2951,16 +2975,18 @@ static void stub_cache_flash_mmu_set(xtensa_cpu_t *cpu, void *ctx) {
 #define ESP_ERR_NOT_FOUND_VAL     0x105u
 #define ESP_ERR_NO_MEM_VAL        0x101u
 
-#define TWDT_MAX_TASKS 16
+#define TWDT_MAX_TASKS TWDT_MAX_TASKS_DECL
 #define TWDT_CURRENT_TASK 0xFFFFFFFFu   /* NULL handle means "calling task" */
 
-static uint32_t twdt_tasks[TWDT_MAX_TASKS];
-static int      twdt_count;
-static bool     twdt_inited;
-
-static int twdt_find(uint32_t h) {
-    for (int i = 0; i < twdt_count; i++)
-        if (twdt_tasks[i] == h) return i;
+/* The subscription set belongs to the machine, not to the translation unit.
+ * It used to be file-scope, and so survived rom_stubs_destroy(): after a
+ * software reset or a deep-sleep wake the idle task was still subscribed from
+ * the *previous* boot, esp_task_wdt_add(idle_0) answered ESP_ERR_INVALID_ARG,
+ * and IDF's ESP_ERROR_CHECK in main_task aborted. That is why no source-built
+ * image could reboot. */
+static int twdt_find(const esp32_rom_stubs_t *s, uint32_t h) {
+    for (int i = 0; i < s->twdt_count; i++)
+        if (s->twdt_tasks[i] == h) return i;
     return -1;
 }
 
@@ -2970,56 +2996,60 @@ static uint32_t twdt_handle(xtensa_cpu_t *cpu, int argno) {
 }
 
 static void stub_esp_task_wdt_init(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    twdt_inited = true;
+    esp32_rom_stubs_t *s = ctx;
+    s->twdt_inited = true;
     rom_return(cpu, 0);
 }
 
 static void stub_esp_task_wdt_deinit(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
+    esp32_rom_stubs_t *s = ctx;
     /* ESP-IDF refuses to deinit while tasks are still subscribed. */
-    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
-    if (twdt_count != 0) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
-    twdt_inited = false;
+    if (!s->twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    if (s->twdt_count != 0) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    s->twdt_inited = false;
     rom_return(cpu, 0);
 }
 
 static void stub_esp_task_wdt_add(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    esp32_rom_stubs_t *s = ctx;
+    if (!s->twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
     uint32_t h = twdt_handle(cpu, 0);
-    if (twdt_find(h) >= 0) { rom_return(cpu, ESP_ERR_INVALID_ARG_VAL); return; }
-    if (twdt_count >= TWDT_MAX_TASKS) { rom_return(cpu, ESP_ERR_NO_MEM_VAL); return; }
-    twdt_tasks[twdt_count++] = h;
+    if (twdt_find(s, h) >= 0) { rom_return(cpu, ESP_ERR_INVALID_ARG_VAL); return; }
+    if (s->twdt_count >= TWDT_MAX_TASKS) { rom_return(cpu, ESP_ERR_NO_MEM_VAL); return; }
+    s->twdt_tasks[s->twdt_count++] = h;
     rom_return(cpu, 0);
 }
 
 static void stub_esp_task_wdt_delete(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
-    int i = twdt_find(twdt_handle(cpu, 0));
+    esp32_rom_stubs_t *s = ctx;
+    if (!s->twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    int i = twdt_find(s, twdt_handle(cpu, 0));
     if (i < 0) { rom_return(cpu, ESP_ERR_NOT_FOUND_VAL); return; }
-    twdt_tasks[i] = twdt_tasks[--twdt_count];
+    s->twdt_tasks[i] = s->twdt_tasks[--s->twdt_count];
     rom_return(cpu, 0);
 }
 
 static void stub_esp_task_wdt_status(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
-    rom_return(cpu, twdt_find(twdt_handle(cpu, 0)) >= 0
+    esp32_rom_stubs_t *s = ctx;
+    if (!s->twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    rom_return(cpu, twdt_find(s, twdt_handle(cpu, 0)) >= 0
                     ? 0u : ESP_ERR_NOT_FOUND_VAL);
 }
 
 static void stub_esp_task_wdt_reset(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    if (!twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
-    rom_return(cpu, twdt_find(TWDT_CURRENT_TASK) >= 0
+    esp32_rom_stubs_t *s = ctx;
+    if (!s->twdt_inited) { rom_return(cpu, ESP_ERR_INVALID_STATE_VAL); return; }
+    rom_return(cpu, twdt_find(s, TWDT_CURRENT_TASK) >= 0
                     ? 0u : ESP_ERR_NOT_FOUND_VAL);
 }
 
-void rom_stubs_task_wdt_reset_state(void) {
-    twdt_count = 0;
-    twdt_inited = false;
+/* roundup2(x, align) rounds x up to the next multiple of a power-of-two
+ * alignment. Trivial, but a ROM call that returns 0 instead silently hands
+ * the caller a zero-sized buffer. */
+static void stub_roundup2(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t x = rom_arg(cpu, 0), align = rom_arg(cpu, 1);
+    rom_return(cpu, align ? ((x + align - 1u) & ~(align - 1u)) : x);
 }
 
 static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
@@ -3105,7 +3135,8 @@ static void stub_esp_intr_alloc_common(xtensa_cpu_t *cpu,
         source != 30 && source != 31 &&
         source != 32 && source != 33 && source != 37 && source != 38 &&
         source != 39 && source != 40 &&
-        source != 43 && source != 45 && source != 47 && source != 48 && source != 49 &&
+        source != 43 && source != 45 && source != 46 && source != 47 &&
+        source != 48 && source != 49 &&
         source != 50 && source != 56 && source != 57 && source != 58 &&
         source != 59 && source != 62 && source != 63) {
         rom_return(cpu, 0);
@@ -3411,7 +3442,7 @@ static void stub_gpio_matrix_out(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t signal = rom_arg(cpu, 1);
     uint32_t out_invert = rom_arg(cpu, 2);
     uint32_t oen_invert = rom_arg(cpu, 3);
-    if (getenv("FLEXE_GPIODBG"))
+    if (rom_gpio_dbg())
         fprintf(stderr,
                 "[GPIO] gpio_matrix_out(gpio=%u signal=%u out_inv=%u "
                 "oen_inv=%u)\n",
@@ -3971,10 +4002,15 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x4000c2c8, stub_memcpy,              "memcpy");
     rom_stubs_register(s, 0x4000c44c, stub_memset,              "memset");
     rom_stubs_register(s, 0x400014c0, stub_strlen,              "strlen");
+    /* roundup2(x, align): the ROM's power-of-two round-up. openHASP's WiFi
+     * bring-up is the only image in the corpus that calls it, and it was the
+     * one unregistered ROM call left in that image once PHY init got past. */
+    rom_stubs_register(s, 0x4000ab7c, stub_roundup2,            "roundup2");
 
     /* Boot-sequence stubs */
     rom_stubs_register(s, 0x4000689c, stub_ets_set_appcpu_boot_addr, "ets_set_appcpu_boot_addr");
-    rom_stubs_register(s, 0x400081d4, stub_rtc_get_reset_reason, "rtc_get_reset_reason");
+    rom_stubs_register_ctx(s, 0x400081d4, stub_rtc_get_reset_reason,
+                           "rtc_get_reset_reason", s);
     rom_stubs_register(s, 0x40008550, stub_ets_update_cpu_frequency, "ets_update_cpu_frequency_rom");
     rom_stubs_register(s, 0x4000855c, stub_ets_get_cpu_frequency, "ets_get_cpu_frequency");
     rom_stubs_register(s, 0x40007d28, stub_ets_install_uart_printf, "ets_install_uart_printf");
@@ -4272,6 +4308,24 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
                  fw_signature_matches(mem, 0x40198CF0u, board_wifi_start,
                                       sizeof(board_wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1143_35INCH;
+    } else if (entry_point == 0x40083E68u) {
+        /* WLED 16.0.1, ESP32. Confirm with two of the entry points the hook
+         * table uses, so a different image that happens to share the entry
+         * address cannot pick up this profile. */
+        static const uint8_t wifi_init[] = {
+            0x36, 0x41, 0x00, 0x31, 0x18, 0xDC, 0x4D, 0x02,
+            0x0C, 0x02, 0x82, 0x03, 0x00, 0x27, 0x98, 0x37,
+        };
+        static const uint8_t wifi_start[] = {
+            0x36, 0x41, 0x00, 0x65, 0x82, 0xFF, 0x21, 0x39,
+            0x29, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0xE8, 0xF6,
+        };
+        xtensa_mem_t *mem = stubs->cpu->mem;
+        if (fw_signature_matches(mem, 0x401561B8u,
+                                 wifi_init, sizeof(wifi_init)) &&
+            fw_signature_matches(mem, 0x40182D44u,
+                                 wifi_start, sizeof(wifi_start)))
+            profile = ROM_FIRMWARE_WLED_V1601;
     }
 
     stubs->firmware_profile = profile;
@@ -4404,6 +4458,126 @@ static bool fw_virtualize_phy_table(xtensa_cpu_t *cpu,
 static void stub_fw_virtual_phy_init(xtensa_cpu_t *cpu, void *ctx) {
     fw_virtualize_phy_table(cpu, ctx);
     rom_return_void(cpu);
+}
+
+/* Find phy_get_romfunc_addr in a stripped image, structurally.
+ *
+ * Until now this address came from an ELF symbol or from a per-ROM table of
+ * hand-found constants, so an image that was neither -- which is every
+ * firmware anyone downloads -- got no PHY virtualization at all.  It does not
+ * have to be that way.  The function is the one place in libphy that calls the
+ * ROM's phy_get_romfuncs() at 0x40004100, and Xtensa cannot materialize a
+ * constant that large inline: it must sit in a literal pool and be loaded with
+ * an L32R.  So the address is derivable from the instruction stream:
+ *
+ *     the word 0x40004100 in flash instruction space   (the literal)
+ *     an L32R somewhere after it that resolves to that literal
+ *     a three-byte ENTRY immediately before that L32R  (the prologue)
+ *
+ * Checked against every image in the corpus: it recovers 0x401BDE2C,
+ * 0x401BE628, 0x401BE0E8, 0x401BE274 and 0x401C1438 -- all five verified
+ * Marauder constants -- and finds exactly one candidate in WLED, Tasmota,
+ * openHASP and Meshtastic, which had none.
+ *
+ * Ambiguity is treated as failure rather than resolved by a tiebreak.  Hooking
+ * the wrong address executes emulator code in place of firmware code, and a
+ * missing hook is a hang while a misplaced one is silent corruption.
+ */
+#define PHY_GET_ROMFUNCS_ROM_ADDR  0x40004100u
+#define PHY_SCAN_TEXT_LO           0x400C0000u
+#define PHY_SCAN_TEXT_HI           0x40400000u
+/* How far past its literal pool the referencing L32R may sit. An L32R reaches
+ * 256 KB back, but a compiler emits the pool next to the code that uses it. */
+#define PHY_SCAN_L32R_WINDOW       0x400u
+
+/* Read n bytes of guest memory without disturbing the unmapped-access counter,
+ * which exists to report firmware bugs and should not log a scan's probes. */
+static bool fw_peek(xtensa_cpu_t *cpu, uint32_t addr, int n, uint32_t *out) {
+    uint32_t v = 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = mem_get_ptr(cpu->mem, addr + (uint32_t)i);
+        if (!p) return false;
+        v |= (uint32_t)*p << (8 * i);
+    }
+    *out = v;
+    return true;
+}
+
+static bool fw_insn_is_entry(uint32_t insn) {
+    return (insn & 0xFu) == 6u &&        /* op0 = SI  */
+           ((insn >> 4) & 3u) == 3u &&   /* n  = BI1  */
+           ((insn >> 6) & 3u) == 0u;     /* m  = 0    */
+}
+
+/* Does an L32R at pc resolve to the literal at lit? */
+static bool fw_l32r_targets(xtensa_cpu_t *cpu, uint32_t pc, uint32_t lit) {
+    uint32_t insn;
+    if (!fw_peek(cpu, pc, 3, &insn)) return false;
+    if ((insn & 0xFu) != 1u) return false;
+    uint32_t target = ((pc + 3u) & ~3u) +
+                      (0xFFFC0000u | ((uint32_t)XT_IMM16(insn) << 2));
+    return target == lit;
+}
+
+static uint32_t fw_scan_phy_romfunc_addr(xtensa_cpu_t *cpu) {
+    uint32_t found = 0;
+    int candidates = 0;
+
+    for (uint32_t page = PHY_SCAN_TEXT_LO; page < PHY_SCAN_TEXT_HI;
+         page += 0x1000u) {
+        const uint8_t *p = mem_get_ptr(cpu->mem, page);
+        if (!p) continue;
+        for (uint32_t off = 0; off < 0x1000u; off += 4u) {
+            uint32_t word;
+            memcpy(&word, p + off, 4);
+            if (word != PHY_GET_ROMFUNCS_ROM_ADDR) continue;
+
+            uint32_t lit = page + off;
+            for (uint32_t pc = lit + 4u;
+                 pc < lit + PHY_SCAN_L32R_WINDOW; pc++) {
+                uint32_t entry_insn;
+                if (!fw_l32r_targets(cpu, pc, lit)) continue;
+                if (!fw_peek(cpu, pc - 3u, 3, &entry_insn)) continue;
+                if (!fw_insn_is_entry(entry_insn)) continue;
+                if (pc - 3u != found) {
+                    found = pc - 3u;
+                    candidates++;
+                }
+            }
+        }
+    }
+
+    if (candidates != 1) {
+        if (candidates > 1)
+            fprintf(stderr,
+                    "[flexe] virtual PHY: %d phy_get_romfunc_addr candidates; "
+                    "refusing to guess\n", candidates);
+        return 0;
+    }
+    return found;
+}
+
+/* Install PHY virtualization on firmware Flexe has no profile for. */
+static int fw_hook_scanned_phy(esp32_rom_stubs_t *stubs) {
+    xtensa_cpu_t *cpu = stubs->cpu;
+    uint32_t addr = fw_scan_phy_romfunc_addr(cpu);
+    uint32_t global = 0;
+    if (!addr) return 0;
+    /* The same decode fw_virtualize_phy_table() will do at run time. Doing it
+     * now turns "hooked an address that turns out to be undecodable" into "did
+     * not hook", which is the failure worth having. */
+    if (!fw_find_phy_global(cpu, addr, &global)) {
+        fprintf(stderr,
+                "[flexe] virtual PHY: 0x%08X looks like phy_get_romfunc_addr "
+                "but holds no table global; not hooking\n", addr);
+        return 0;
+    }
+    rom_stubs_register_ctx(stubs, addr, stub_fw_virtual_phy_init,
+                           "phy_get_romfunc_addr", stubs);
+    fprintf(stderr,
+            "[flexe] virtual PHY: located phy_get_romfunc_addr at 0x%08X "
+            "(table global 0x%08X) by signature\n", addr, global);
+    return 1;
 }
 
 /* Marauder's phy_get_romfunc_addr is also the earliest safe point at which
@@ -4573,7 +4747,9 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
                     "[flexe] unsupported Marauder image signature at "
                     "entry 0x%08X; refusing address-based hooks\n",
                     entry_point);
-        return 0;
+        /* No profile is not the same as nothing to do: the PHY boundary can
+         * be found by signature in any image. */
+        return fw_hook_scanned_phy(stubs);
     }
     int n = 0;
     for (const fw_addr_hook_t *h = tbl; h->fn; h++) {
@@ -5235,7 +5411,8 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         for (int i = 0; twdt[i].name; i++) {
             uint32_t addr;
             if (elf_symbols_find(syms, twdt[i].name, &addr) == 0) {
-                rom_stubs_register(stubs, addr, twdt[i].fn, twdt[i].name);
+                rom_stubs_register_ctx(stubs, addr, twdt[i].fn, twdt[i].name,
+                                       stubs);
                 hooked++;
             }
         }

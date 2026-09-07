@@ -93,7 +93,10 @@ void wifi_stubs_set_sta_credentials(wifi_stubs_t *ws, const char *ssid,
 /* Deliver one queued WiFi/IP event to the firmware's registered handlers.
  * Call between execution batches: handlers run guest code and call back into
  * these stubs, so they must not be dispatched from inside one. */
-void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu);
+/* Deliver one queued event. `cpu` is the core the WiFi model runs on; `peer`
+ * is the other core, or NULL on a single-core session. A handler is started
+ * on whichever core has a real task to borrow. */
+void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu, xtensa_cpu_t *peer);
 
 /* Resolve every hostname to this address (network byte order); 0 disables.
  * An emulated device has no route to the real internet, and an unresolvable

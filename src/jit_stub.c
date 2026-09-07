@@ -21,5 +21,8 @@ void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) { (void)jit; (void)cp
 
 static const jit_stats_t g_empty_stats;
 const jit_stats_t *jit_get_stats(const jit_state_t *jit) { (void)jit; return &g_empty_stats; }
-void               jit_print_stats(const jit_state_t *jit) { (void)jit; }
+bool               jit_verify_enabled(const jit_state_t *jit) { (void)jit; return false; }
+void               jit_print_stats(const jit_state_t *jit, uint64_t retired) {
+    (void)jit; (void)retired;
+}
 void               jit_set_verify(jit_state_t *jit, bool enable) { (void)jit; (void)enable; }

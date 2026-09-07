@@ -185,11 +185,38 @@ uint16_t mem_read16_slow(xtensa_mem_t *mem, uint32_t addr) {
     return 0;
 }
 
+/* An access that matches no RAM page and no MMIO handler.
+ *
+ * Reading one returns 0 and writing one is dropped, which is deliberate --
+ * firmware probes addresses that a given board does not populate, and
+ * faulting on those would be worse than useless. But it also means a *null
+ * pointer dereference reads 0 and keeps going*, where hardware would raise
+ * LoadProhibited and panic with a backtrace.
+ *
+ * That difference turns a diagnosable crash into a silent hang. Tasmota
+ * 15.6.0 walks a list whose head is NULL, loads from 0+68, gets 0, compares
+ * equal to the terminator and loops for ever -- 4 billion cycles with no
+ * further output and no indication anything is wrong. Counting these makes
+ * the condition visible without changing behaviour. */
+static void note_unmapped(xtensa_mem_t *mem, uint32_t addr) {
+    if (mem->unmapped_count < UINT64_MAX) mem->unmapped_count++;
+    if (mem->unmapped_first == 0u) mem->unmapped_first = addr;
+}
+
 uint32_t mem_read32_slow(xtensa_mem_t *mem, uint32_t addr) {
     uint32_t xaddr = translate_ahb_alias(addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
     if (h && h->read) return h->read(h->ctx, xaddr);
+    note_unmapped(mem, addr);
     return 0;
+}
+
+uint64_t mem_unmapped_count(const xtensa_mem_t *mem) {
+    return mem ? mem->unmapped_count : 0u;
+}
+
+uint32_t mem_unmapped_first(const xtensa_mem_t *mem) {
+    return mem ? mem->unmapped_first : 0u;
 }
 
 void mem_write8_slow(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
@@ -275,6 +302,29 @@ void mem_journal_rollback(xtensa_mem_t *mem) {
 void mem_journal_end(void) {
     g_mem_journal_en = 0;
     g_mem_journal_count = 0;
+}
+
+/* Watchpoint reporting for mem_write32. Reached only when g_dbg_mem_watch is
+ * armed, so the individual arm-tests can be re-checked here at no hot-path
+ * cost. Kept out of line to keep the store path a single predicted branch. */
+int g_dbg_mem_watch;
+
+void mem_watch_report32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
+    if (g_dbg_watch_en &&
+        (addr == g_dbg_watch_addr || addr == g_dbg_watch_addr2)) {
+        uint32_t old = mem_read32(mem, addr);
+        fprintf(stderr, "[W] 0x%08X: 0x%08X -> 0x%08X  pc=0x%08X core%d\n",
+                addr, old, val, g_dbg_pc, g_dbg_core);
+    }
+    if (g_dbg_watch_val && val == g_dbg_watch_val) {
+        fprintf(stderr, "[WV] 0x%08X <- 0x%08X  pc=0x%08X core%d\n",
+                addr, val, g_dbg_pc, g_dbg_core);
+    }
+    if (g_dbg_pcwatch_en &&
+        (g_dbg_pc == g_dbg_pcwatch || g_dbg_pc == g_dbg_pcwatch2)) {
+        fprintf(stderr, "[PW] pc=0x%08X store 0x%08X <- 0x%08X core%d\n",
+                g_dbg_pc, addr, val, g_dbg_core);
+    }
 }
 
 /* Out-of-line stores for the JIT's verification mode.

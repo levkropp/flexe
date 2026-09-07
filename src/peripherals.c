@@ -7,6 +7,21 @@
 #include <string.h>
 #include <stdbool.h>
 
+/* Resolved once. gpio_dbg() is asked on every edge evaluation, which a CYD
+ * firmware does constantly: 4,122,787 lookups in one Marauder scenario, which
+ * put getenv() -- a linear scan of environ -- at 3.9% of the emulator's host
+ * CPU. Same fix and same reason as spi_dbg() in spi_display.c.
+ *
+ * The memcmp time next to it in the profile is not this: it stayed at 3.8%
+ * after these lookups went away, because it is the guest's own memcmp running
+ * through stub_memcmp(). That one is real work, not overhead. */
+static int gpio_dbg_flag = -1;
+static inline int gpio_dbg(void) {
+    if (__builtin_expect(gpio_dbg_flag < 0, 0))
+        gpio_dbg_flag = getenv("FLEXE_GPIODBG") != NULL;
+    return gpio_dbg_flag;
+}
+
 /* ESP32 peripheral base addresses */
 #define PERIPH_BASE     0x3FF00000u
 #define DPORT_BASE      0x3FF00000u
@@ -78,6 +93,24 @@
 #define RTCIO_DAC_XPD               (1u << 18)
 #define RTCIO_DAC_XPD_FORCE         (1u << 10)
 
+/* RTC GPIO. Eighteen RTC-capable pads, addressed by channel rather than by
+ * GPIO number, all packed into bits 31:14 of their registers (rtc_io_reg.h). */
+#define RTC_GPIO_OUT_OFF            0x000u
+#define RTC_GPIO_OUT_W1TS_OFF       0x004u
+#define RTC_GPIO_OUT_W1TC_OFF       0x008u
+#define RTC_GPIO_ENABLE_OFF         0x00Cu
+#define RTC_GPIO_ENABLE_W1TS_OFF    0x010u
+#define RTC_GPIO_ENABLE_W1TC_OFF    0x014u
+#define RTC_GPIO_IN_OFF             0x024u
+#define RTC_GPIO_DATA_S             14
+#define RTC_GPIO_CHANNELS           18
+
+/* Channel -> GPIO, from rtc_io_channel.h. */
+static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
+    36, 37, 38, 39, 34, 35, 25, 26, 33, 32, 4, 0, 2, 15, 13, 12, 14, 27
+};
+
+
 #define SENS_REG_FILE_SIZE          0x100u
 #define SENS_SAR_START_FORCE_OFF    0x02Cu
 #define SENS_SAR_SLAVE_ADDR1_OFF    0x03Cu
@@ -97,6 +130,70 @@
 #define SENS_SAR_START              (1u << 17)
 #define SENS_SAR_DONE               (1u << 16)
 #define SENS_SAR_CONFIG_MASK        0xFFFE0000u
+
+/* Capacitive touch controller. All ten pads live inside the SENS window this
+ * file already decodes. Offsets and field shifts are from sens_reg.h; the
+ * THRES and OUT registers each carry two pads, the even one in bits 31:16 and
+ * the odd one in bits 15:0. */
+#define SENS_SAR_TOUCH_CTRL1_OFF    0x058u
+#define SENS_SAR_TOUCH_THRES1_OFF   0x05Cu
+#define SENS_SAR_TOUCH_OUT1_OFF     0x070u
+#define SENS_SAR_TOUCH_CTRL2_OFF    0x084u
+#define SENS_SAR_TOUCH_ENABLE_OFF   0x08Cu
+#define SENS_TOUCH_PAD_COUNT        10
+#define SENS_TOUCH_STATUS_MASK      0x000003FFu   /* CTRL2 bits 9:0  */
+#define SENS_TOUCH_MEAS_DONE_BIT    (1u << 10)
+#define SENS_TOUCH_START_FSM_EN_BIT (1u << 11)
+#define SENS_TOUCH_START_EN_BIT     (1u << 12)
+#define SENS_TOUCH_START_FORCE_BIT  (1u << 13)
+#define SENS_TOUCH_MEAS_EN_CLR_BIT  (1u << 30)
+#define SENS_TOUCH_WORKEN_MASK      0x000003FFu   /* ENABLE bits 9:0 */
+
+/* RTC_CNTL interrupt block (rtc_cntl_reg.h). The touch controller reports
+ * through bit 6, delivered on ETS_RTC_CORE_INTR_SOURCE. */
+#define RTC_CNTL_INT_ENA_OFF        0x03Cu
+#define RTC_CNTL_INT_RAW_OFF        0x040u
+#define RTC_CNTL_INT_ST_OFF         0x044u
+#define RTC_CNTL_INT_CLR_OFF        0x048u
+#define RTC_CNTL_TOUCH_INT_BIT      (1u << 6)
+#define RTC_CNTL_SLP_WAKEUP_INT_BIT (1u << 0)
+#define RTC_CORE_INTR_SOURCE        46
+
+/* Sleep and wake (rtc_cntl_reg.h). */
+#define RTC_CNTL_SLP_TIMER0_OFF     0x004u
+#define RTC_CNTL_SLP_TIMER1_OFF     0x008u
+#define RTC_CNTL_TIME_UPDATE_OFF    0x00Cu
+#define RTC_CNTL_TIME0_OFF          0x010u
+#define RTC_CNTL_TIME1_OFF          0x014u
+#define RTC_CNTL_STATE0_OFF         0x018u
+#define RTC_CNTL_RESET_STATE_OFF    0x034u
+#define RTC_CNTL_WAKEUP_STATE_OFF   0x038u
+#define RTC_CNTL_STORE0_OFF         0x04Cu
+#define RTC_CNTL_EXT_WAKEUP_CONF_OFF 0x060u
+#define RTC_CNTL_DIG_PWC_OFF        0x084u
+#define RTC_CNTL_EXT_WAKEUP1_OFF    0x0CCu
+#define RTC_CNTL_SLEEP_EN_BIT       (1u << 31)
+#define RTC_CNTL_SLP_WAKEUP_BIT     (1u << 29)
+#define RTC_CNTL_WAKEUP_ENA_S       11
+#define RTC_CNTL_WAKEUP_ENA_MASK    0x7FFu
+#define RTC_CNTL_DG_WRAP_PD_EN_BIT  (1u << 31)
+#define RTC_CNTL_EXT_WAKEUP0_LV_BIT (1u << 30)
+#define RTC_CNTL_EXT_WAKEUP1_LV_BIT (1u << 31)
+#define RTC_IO_EXT_WAKEUP0_OFF      0x0BCu
+#define RTC_IO_EXT_WAKEUP0_SEL_S    27
+
+/* Wake trigger bits, from rtc.h. These are what esp_sleep_get_wakeup_cause()
+ * decodes out of RTC_CNTL_WAKEUP_STATE. */
+#define RTC_EXT0_TRIG_EN            (1u << 0)
+#define RTC_EXT1_TRIG_EN            (1u << 1)
+#define RTC_TIMER_TRIG_EN           (1u << 3)
+#define RTC_TOUCH_TRIG_EN           (1u << 8)
+
+/* RTC slow clock, nominal 150 kHz. */
+#define RTC_SLOW_CLK_HZ             150000u
+/* rtc.h RESET_REASON. */
+#define RTC_POWERON_RESET           1u
+#define RTC_DEEPSLEEP_RESET         5u
 
 #define RTC_CPU_PERIOD_CONF_MASK    0xE0000000u
 #define RTC_CLK_CONF_MASK           0xFFFFFFF0u
@@ -774,7 +871,12 @@
 #define I2C_COMMAND0_OFF     0x058u
 #define I2C_DATE_OFF         0x0F8u
 
+#define I2C_SLAVE_ADDR_OFF   0x010u
+#define I2C_CTR_MS_MODE      (1u << 4)   /* 1 = master, 0 = slave */
 #define I2C_CTR_TRANS_START  (1u << 5)
+#define I2C_SR_SLAVE_ADDRESSED (1u << 5)
+#define I2C_SLAVE_ADDR_MASK  0x7FFFu
+#define I2C_SLAVE_ADDR_10BIT (1u << 31)
 #define I2C_FIFO_RX_RST      (1u << 12)
 #define I2C_FIFO_TX_RST      (1u << 13)
 
@@ -782,6 +884,7 @@
 #define I2C_INT_TXFIFO_EMPTY (1u << 1)
 #define I2C_INT_RXFIFO_OVF   (1u << 2)
 #define I2C_INT_END_DETECT   (1u << 3)
+#define I2C_INT_SLAVE_TRAN_COMP (1u << 4)
 #define I2C_INT_MASTER_DONE  (1u << 6)
 #define I2C_INT_TRANS_DONE   (1u << 7)
 #define I2C_INT_TRANS_START  (1u << 9)
@@ -1444,6 +1547,7 @@ typedef struct {
     uint32_t int_raw;
     uint32_t int_ena;
     bool ack_nack;
+    bool slave_addressed;
 
     /* Bus transaction state survives END commands: ESP-IDF streams long
      * command links through the 32-byte FIFO over several interrupts. */
@@ -1726,6 +1830,10 @@ struct esp32_periph {
      * retain GPIO's asymmetric routing and make fan-in/remapping coherent. */
     bool source_level[71];
     bool source_level_core[2][71];
+    /* Last enabled-status mask seen for each source, so a *new* condition
+     * arriving while the line is already high can be re-dispatched. See
+     * periph_assert_interrupt_status(). */
+    uint32_t source_status[71];
     periph_irq_dispatch_fn irq_dispatch[71];
     void *irq_dispatch_ctx[71];
 
@@ -1755,6 +1863,27 @@ struct esp32_periph {
     uint32_t rtc_clk_conf;
     uint16_t sens_adc_result[2];
     bool sens_adc_done[2];
+    /* Touch: per-pad count injected by the host, and the latched
+     * below-threshold status the guest reads back out of CTRL2. */
+    uint16_t touch_value[SENS_TOUCH_PAD_COUNT];
+    uint32_t touch_status;
+    uint32_t rtc_int_raw;
+    uint32_t rtc_int_ena;
+    /* Sleep. rtc_regs holds the RTC_CNTL words that are plain storage
+     * (STORE0-3, the wake config, DIG_PWC); the rest are computed. */
+    uint32_t rtc_state0;
+    uint32_t rtc_store[4];
+    uint32_t rtc_ext_wakeup_conf;
+    uint32_t rtc_ext_wakeup1;
+    uint32_t rtc_ext_wakeup0;      /* RTCIO 0xBC */
+    uint32_t rtc_dig_pwc;
+    uint64_t rtc_slp_target;       /* SLP_TIMER0/1, in slow-clock ticks */
+    uint64_t rtc_time_latched;     /* snapshot taken on TIME_UPDATE */
+    uint32_t rtc_wakeup_cause;
+    uint32_t rtc_wakeup_ena;
+    uint32_t rtc_reset_cause;
+    bool     sleep_requested;
+    bool     sleep_deep;
 
     /* SPI flash controllers: [0] = SPI0 (cache), [1] = SPI1 (memspi) */
     spi_state_t spi[2];
@@ -2319,11 +2448,15 @@ static void uart_intr_update(esp32_periph_t *p, int uart_num) {
     int source = uart_intr_sources[uart_num];
     uint32_t mask = 1u << (source % 32);
     bool active = (uart->int_raw & uart->int_ena) != 0;
-    if (active)
-        p->pending_sources[source / 32] |= mask;
-    else
+    if (active) {
+        periph_assert_interrupt_status(p, source,
+                                       uart->int_raw & uart->int_ena);
+    } else {
         p->pending_sources[source / 32] &= ~mask;
-    intr_matrix_update_source(p, source, active);
+        p->source_status[source] = 0;
+        intr_matrix_update_source(p, source, false);
+    }
+    (void)mask;
 }
 
 static void uart_refresh_level_conditions(uart_state_t *uart) {
@@ -2746,6 +2879,11 @@ static uint32_t gpio_read(void *ctx, uint32_t addr) {
     case 0x010: return p->gpio.out1;        /* GPIO_OUT1_REG */
     case 0x020: return p->gpio.enable;      /* GPIO_ENABLE_REG */
     case 0x02C: return p->gpio.enable1;     /* GPIO_ENABLE1_REG */
+    /* Deliberately the externally-applied level only. Feeding a driven output
+     * back into GPIO_IN looks right and is not: the pad's input buffer is
+     * gated by IO_MUX FUN_IE, which GPIO_MODE_OUTPUT leaves off, so firmware
+     * that configures an output-only pin is entitled to read zero here. Doing
+     * the read-back unconditionally would need FUN_IE modelled first. */
     case 0x03C: return p->gpio.in;          /* GPIO_IN_REG */
     case 0x040: return p->gpio.in1;         /* GPIO_IN1_REG */
     case 0x044: return p->gpio.status;      /* GPIO_STATUS_REG */
@@ -2800,7 +2938,7 @@ static void gpio_emit_changed(uint32_t prev, uint32_t now, int pin_base) {
     while (diff) {
         int bit = __builtin_ctz(diff);
         diff &= ~(1u << bit);
-        if (getenv("FLEXE_GPIODBG"))
+        if (gpio_dbg())
             fprintf(stderr, "[GPIO] pin%d -> %d\n", pin_base + bit, (now >> bit) & 1u);
         sbx_event_t ev = { .kind = SBX_EV_GPIO_OUT, .cycle = 0 };
         ev.gpio_out.pin = (uint8_t)(pin_base + bit);
@@ -2842,6 +2980,7 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
     case 0x058: p->gpio.status1 &= ~(val & 0xFFu); break; /* GPIO_STATUS1_W1TC */
     default: break;
     }
+
     /* Interrupt source line follows the latched status registers */
     if (off >= 0x044 && off <= 0x058)
         gpio_intr_update(p);
@@ -2911,6 +3050,87 @@ static void rtcio_emit_dac_change(int channel, uint32_t before,
     sbx_events_emit(&ev);
 }
 
+/* RTC GPIO and the ordinary GPIO block are two views of the same eighteen
+ * pads, and firmware mixes them freely -- rtc_gpio_init() a pin, then read it
+ * with gpio_get_level(), or drive it from the RTC domain and watch it on the
+ * matrix. Keeping a second copy of the pad state here would give those two
+ * views different answers, so RTC_GPIO_OUT/ENABLE push into the shared shadow
+ * and RTC_GPIO_IN is built from it. */
+/* Pad hold. Each RTC pad carries its own HOLD bit, in its own register at its
+ * own bit position -- IDF's rtc_gpio_hold_en() is a read-modify-write of that
+ * word, so there is no single "hold" register to watch. Offsets and bits are
+ * from rtc_io_reg.h; the channel order matches RTCIO_CHANNEL_GPIO above.
+ *
+ * A held pad keeps driving whatever it was driving, and ignores further
+ * writes, until it is unheld. That is what makes it useful: the hold survives
+ * the digital domain being reset, so an output can be parked at a known level
+ * across deep sleep. */
+static const struct { uint16_t off; uint8_t bit; } RTCIO_HOLD[RTC_GPIO_CHANNELS] = {
+    { 0x7Cu, 31 }, { 0x7Cu, 30 }, { 0x7Cu, 29 }, { 0x7Cu, 28 },  /* 36 37 38 39 */
+    { 0x80u, 31 }, { 0x80u, 30 },                                /* 34 35 */
+    { 0x84u, 29 }, { 0x88u, 29 },                                /* 25 26 (DAC) */
+    { 0x8Cu, 29 }, { 0x8Cu, 24 },                                /* 33 32 (32k) */
+    { 0x94u, 31 }, { 0x98u, 31 }, { 0x9Cu, 31 }, { 0xA0u, 31 },  /* 4 0 2 15 */
+    { 0xA4u, 31 }, { 0xA8u, 31 }, { 0xACu, 31 }, { 0xB0u, 31 },  /* 13 12 14 27 */
+};
+
+/* Only RTC pads are modelled here. RTC_IO_DIG_PAD_HOLD_REG (0x74) is stored
+ * but not acted on: it holds *digital* pads, whose bit positions are a pad
+ * map rather than GPIO numbers, and it only survives light sleep -- deep
+ * sleep powers the digital domain down, which is exactly why firmware that
+ * needs a level across deep sleep uses rtc_gpio_hold_en() instead. */
+
+static bool rtcio_channel_held(const esp32_periph_t *p, int ch) {
+    if (ch < 0 || ch >= RTC_GPIO_CHANNELS) return false;
+    uint32_t word = p->rtcio_regs[RTCIO_HOLD[ch].off / 4u];
+    return (word >> RTCIO_HOLD[ch].bit) & 1u;
+}
+
+static void rtcio_publish_pads(esp32_periph_t *p, uint32_t out_before,
+                               uint32_t en_before) {
+    uint32_t out = p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u] >> RTC_GPIO_DATA_S;
+    uint32_t en  = p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u] >> RTC_GPIO_DATA_S;
+    uint32_t was_en = en_before >> RTC_GPIO_DATA_S;
+    (void)out_before;
+
+    for (int ch = 0; ch < RTC_GPIO_CHANNELS; ch++) {
+        int gpio = RTCIO_CHANNEL_GPIO[ch];
+        uint32_t bit = 1u << ch;
+        uint32_t mask = (gpio < 32) ? (1u << gpio) : (1u << (gpio - 32));
+        if (rtcio_channel_held(p, ch)) continue;   /* held: pad ignores writes */
+        uint32_t *g_out = (gpio < 32) ? &p->gpio.out : &p->gpio.out1;
+        uint32_t *g_en  = (gpio < 32) ? &p->gpio.enable : &p->gpio.enable1;
+
+        if (en & bit) {
+            *g_en |= mask;
+            if (out & bit) *g_out |= mask; else *g_out &= ~mask;
+        } else if (was_en & bit) {
+            /* Handed back: stop driving, but leave the level alone so the
+             * matrix keeps whatever it had. */
+            *g_en &= ~mask;
+        }
+    }
+}
+
+/* RTC_GPIO_IN reflects the pad. For an input that is whatever the host or
+ * another peripheral put on it; for a pad the RTC is *driving*, it is the
+ * level being driven -- a pin reads back what it outputs, and firmware that
+ * holds a level across deep sleep checks it exactly that way. */
+static uint32_t rtcio_input_word(const esp32_periph_t *p) {
+    uint32_t out = p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u] >> RTC_GPIO_DATA_S;
+    uint32_t en  = p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u] >> RTC_GPIO_DATA_S;
+    uint32_t in = 0;
+    for (int ch = 0; ch < RTC_GPIO_CHANNELS; ch++) {
+        int gpio = RTCIO_CHANNEL_GPIO[ch];
+        uint32_t mask = (gpio < 32) ? (1u << gpio) : (1u << (gpio - 32));
+        uint32_t level = (gpio < 32) ? p->gpio.in : p->gpio.in1;
+        bool driven = (en >> ch) & 1u;
+        bool bit = driven ? ((out >> ch) & 1u) != 0u : (level & mask) != 0u;
+        if (bit) in |= (1u << ch);
+    }
+    return in << RTC_GPIO_DATA_S;
+}
+
 static uint32_t rtcio_read(esp32_periph_t *p, uint32_t off) {
     if ((off & 3u) != 0 || off >= RTCIO_REG_FILE_SIZE)
         return 0;
@@ -2923,6 +3143,8 @@ static uint32_t rtcio_read(esp32_periph_t *p, uint32_t off) {
     case 0x01Cu:
     case 0x020u:
         return 0;
+    case RTC_GPIO_IN_OFF:
+        return rtcio_input_word(p);
     default:
         return p->rtcio_regs[off / 4u];
     }
@@ -2932,19 +3154,38 @@ static void rtcio_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
     if ((off & 3u) != 0 || off >= RTCIO_REG_FILE_SIZE)
         return;
 
+    uint32_t out_before = p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u];
+    uint32_t en_before   = p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u];
+
     switch (off) {
-    case 0x004u: p->rtcio_regs[0x000u / 4u] |= val; return;
-    case 0x008u: p->rtcio_regs[0x000u / 4u] &= ~val; return;
-    case 0x010u: p->rtcio_regs[0x00Cu / 4u] |= val; return;
-    case 0x014u: p->rtcio_regs[0x00Cu / 4u] &= ~val; return;
+    case RTC_GPIO_OUT_W1TS_OFF:
+        p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u] |= val;
+        rtcio_publish_pads(p, out_before, en_before); return;
+    case RTC_GPIO_OUT_W1TC_OFF:
+        p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u] &= ~val;
+        rtcio_publish_pads(p, out_before, en_before); return;
+    case RTC_GPIO_ENABLE_W1TS_OFF:
+        p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u] |= val;
+        rtcio_publish_pads(p, out_before, en_before); return;
+    case RTC_GPIO_ENABLE_W1TC_OFF:
+        p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u] &= ~val;
+        rtcio_publish_pads(p, out_before, en_before); return;
     case 0x01Cu: p->rtcio_regs[0x018u / 4u] |= val; return;
     case 0x020u: p->rtcio_regs[0x018u / 4u] &= ~val; return;
-    case 0x024u: return; /* RTC_GPIO_IN is read-only. */
+    case RTC_GPIO_IN_OFF: return; /* read-only */
+    case RTC_IO_EXT_WAKEUP0_OFF:
+        p->rtc_ext_wakeup0 = val;
+        p->rtcio_regs[off / 4u] = val;
+        return;
     default: break;
     }
 
     uint32_t before = p->rtcio_regs[off / 4u];
     p->rtcio_regs[off / 4u] = val;
+    if (off == RTC_GPIO_OUT_OFF || off == RTC_GPIO_ENABLE_OFF) {
+        rtcio_publish_pads(p, out_before, en_before);
+        return;
+    }
     if (off == RTCIO_DAC1_OFF)
         rtcio_emit_dac_change(0, before, val);
     else if (off == RTCIO_DAC2_OFF)
@@ -2959,6 +3200,59 @@ static int sens_measure_unit(uint32_t off) {
     if (off == SENS_SAR_MEAS_START1_OFF) return 0;
     if (off == SENS_SAR_MEAS_START2_OFF) return 1;
     return -1;
+}
+
+/* Threshold for one pad. THRES1..5 pack two pads each, the even one in the
+ * high half. */
+static uint16_t touch_threshold(const esp32_periph_t *p, int pad) {
+    uint32_t reg = p->sens_regs[(SENS_SAR_TOUCH_THRES1_OFF / 4u) + (uint32_t)(pad / 2)];
+    return (uint16_t)((pad & 1) ? (reg & 0xFFFFu) : (reg >> 16));
+}
+
+static void touch_raise_int(esp32_periph_t *p) {
+    p->rtc_int_raw |= RTC_CNTL_TOUCH_INT_BIT;
+    if (p->rtc_int_ena & RTC_CNTL_TOUCH_INT_BIT)
+        periph_assert_interrupt(p, RTC_CORE_INTR_SOURCE);
+}
+
+/* One scan of the enabled pads.
+ *
+ * A pad reads *lower* as capacitance rises, so "touched" is count below
+ * threshold -- the opposite of the intuitive direction, and the thing to get
+ * right: inverting it makes an untouched panel look permanently pressed. The
+ * count lands in the OUT pair registers, the below-threshold set latches into
+ * CTRL2's low ten bits where touch_pad_get_status() reads it, and a newly
+ * touched pad raises the RTC core interrupt. */
+static void touch_run_measurement(esp32_periph_t *p) {
+    uint32_t worken = p->sens_regs[SENS_SAR_TOUCH_ENABLE_OFF / 4u] &
+                      SENS_TOUCH_WORKEN_MASK;
+    uint32_t before = p->touch_status;
+
+    for (int pad = 0; pad < SENS_TOUCH_PAD_COUNT; pad++) {
+        uint32_t *out = &p->sens_regs[(SENS_SAR_TOUCH_OUT1_OFF / 4u) +
+                                      (uint32_t)(pad / 2)];
+        if (!(worken & (1u << pad))) {
+            /* A disabled pad measures nothing and cannot be touched. */
+            p->touch_status &= ~(1u << pad);
+            continue;
+        }
+        uint16_t value = p->touch_value[pad];
+        if (pad & 1) *out = (*out & 0xFFFF0000u) | value;
+        else         *out = (*out & 0x0000FFFFu) | ((uint32_t)value << 16);
+
+        uint16_t thres = touch_threshold(p, pad);
+        if (thres != 0 && value < thres) p->touch_status |= (1u << pad);
+        else                             p->touch_status &= ~(1u << pad);
+    }
+
+    p->sens_regs[SENS_SAR_TOUCH_CTRL2_OFF / 4u] |= SENS_TOUCH_MEAS_DONE_BIT;
+    if (p->touch_status & ~before)
+        touch_raise_int(p);
+}
+
+static bool touch_fsm_running(const esp32_periph_t *p) {
+    uint32_t ctrl2 = p->sens_regs[SENS_SAR_TOUCH_CTRL2_OFF / 4u];
+    return (ctrl2 & SENS_TOUCH_START_FSM_EN_BIT) != 0;
 }
 
 static uint32_t sens_read(esp32_periph_t *p, uint32_t off) {
@@ -2978,6 +3272,11 @@ static uint32_t sens_read(esp32_periph_t *p, uint32_t off) {
             val |= SENS_SAR_DONE;
         val |= p->sens_adc_result[unit];
     }
+    if (off == SENS_SAR_TOUCH_CTRL2_OFF) {
+        /* The low ten bits are status, not a stored field. */
+        val = (val & ~SENS_TOUCH_STATUS_MASK) |
+              (p->touch_status & SENS_TOUCH_STATUS_MASK);
+    }
     return val;
 }
 
@@ -2989,6 +3288,26 @@ static void sens_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
         if (off >= SENS_SAR_SLAVE_ADDR1_OFF &&
             off <= SENS_SAR_SLAVE_ADDR4_OFF) {
             p->sens_regs[off / 4u] = val & SENS_I2C_ADDR_FIELDS_MASK;
+            return;
+        }
+        if (off == SENS_SAR_TOUCH_CTRL2_OFF) {
+            if (val & SENS_TOUCH_MEAS_EN_CLR_BIT)
+                p->touch_status = 0;
+            /* MEAS_DONE and the status bits are hardware-owned. */
+            p->sens_regs[off / 4u] =
+                val & ~(SENS_TOUCH_STATUS_MASK | SENS_TOUCH_MEAS_DONE_BIT |
+                        SENS_TOUCH_MEAS_EN_CLR_BIT);
+            /* Either a software-forced start or the FSM being switched on
+             * produces a scan; IDF uses both, depending on the mode. */
+            if ((val & (SENS_TOUCH_START_FORCE_BIT | SENS_TOUCH_START_EN_BIT)) ==
+                    (SENS_TOUCH_START_FORCE_BIT | SENS_TOUCH_START_EN_BIT) ||
+                (val & SENS_TOUCH_START_FSM_EN_BIT))
+                touch_run_measurement(p);
+            return;
+        }
+        if (off == SENS_SAR_TOUCH_ENABLE_OFF) {
+            p->sens_regs[off / 4u] = val;
+            touch_run_measurement(p);
             return;
         }
         if (off == SENS_SAR_I2C_CTRL_OFF) {
@@ -3032,6 +3351,53 @@ static void sens_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
     p->sens_adc_done[unit] = true;
 }
 
+/* The RTC slow clock, derived from elapsed emulated time. It has to be a real
+ * counter: the sleep timer is armed as an absolute value on this clock, so a
+ * register that always reads zero makes every timed sleep either instant or
+ * infinite. */
+static uint64_t rtc_slow_ticks(esp32_periph_t *p) {
+    uint32_t mhz = mem_read32(p->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    if (mhz < 10u || mhz > 240u) mhz = 160u;
+    uint64_t us = timg_now_cycles(p) / mhz;
+    return us * RTC_SLOW_CLK_HZ / 1000000u;
+}
+
+static int rtc_pad_level(const esp32_periph_t *p, int channel) {
+    if (channel < 0 || channel >= RTC_GPIO_CHANNELS) return 0;
+    int gpio = RTCIO_CHANNEL_GPIO[channel];
+    uint32_t mask = (gpio < 32) ? (1u << gpio) : (1u << (gpio - 32));
+    uint32_t in = (gpio < 32) ? p->gpio.in : p->gpio.in1;
+    return (in & mask) ? 1 : 0;
+}
+
+/* Which armed wake source, if any, is satisfied right now. Returns the trigger
+ * bits esp_sleep_get_wakeup_cause() expects, or 0. The timer is handled by the
+ * caller, which knows how far time has moved. */
+static uint32_t rtc_wake_condition(esp32_periph_t *p) {
+    uint32_t ena = p->rtc_wakeup_ena;
+    uint32_t cause = 0;
+
+    if (ena & RTC_EXT0_TRIG_EN) {
+        int ch = (int)(p->rtc_ext_wakeup0 >> RTC_IO_EXT_WAKEUP0_SEL_S) & 0x1F;
+        int want = (p->rtc_ext_wakeup_conf & RTC_CNTL_EXT_WAKEUP0_LV_BIT) ? 1 : 0;
+        if (rtc_pad_level(p, ch) == want) cause |= RTC_EXT0_TRIG_EN;
+    }
+    if (ena & RTC_EXT1_TRIG_EN) {
+        uint32_t sel = p->rtc_ext_wakeup1 & 0x3FFFFu;
+        bool all_low = (p->rtc_ext_wakeup_conf & RTC_CNTL_EXT_WAKEUP1_LV_BIT) == 0;
+        bool any_high = false, every_low = sel != 0;
+        for (int ch = 0; ch < RTC_GPIO_CHANNELS; ch++) {
+            if (!(sel & (1u << ch))) continue;
+            if (rtc_pad_level(p, ch)) any_high = true; else every_low = false;
+        }
+        /* ESP_EXT1_WAKEUP_ANY_HIGH vs ALL_LOW. */
+        if (sel && (all_low ? every_low : any_high)) cause |= RTC_EXT1_TRIG_EN;
+    }
+    if ((ena & RTC_TOUCH_TRIG_EN) && p->touch_status != 0)
+        cause |= RTC_TOUCH_TRIG_EN;
+    return cause;
+}
+
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     uint32_t off = addr - RTC_CNTL_BASE;
@@ -3045,11 +3411,32 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr) {
     /* Reserved RTCIO/SENS portions of the shared page read as zero. */
     if (off >= 0x400u) return 0;
     switch (off) {
-    case 0x00C: return (1u << 30);   /* TIME_UPDATE: time-valid bit always set */
-    case 0x010: return 0;           /* TIME_LOW0: RTC timer low word */
-    case 0x014: return 0;           /* TIME_HIGH0: RTC timer high word */
-    case 0x034: return 1;           /* RESET_STATE: POWERON */
-    case 0x038: return 1;           /* STORE0: wakeup cause = power-on */
+    case RTC_CNTL_TIME_UPDATE_OFF: return (1u << 30); /* time always valid */
+    case RTC_CNTL_TIME0_OFF: return (uint32_t)p->rtc_time_latched;
+    case RTC_CNTL_TIME1_OFF: return (uint32_t)(p->rtc_time_latched >> 32);
+    case RTC_CNTL_SLP_TIMER0_OFF: return (uint32_t)p->rtc_slp_target;
+    case RTC_CNTL_SLP_TIMER1_OFF: return (uint32_t)(p->rtc_slp_target >> 32);
+    case RTC_CNTL_STATE0_OFF: return p->rtc_state0;
+    /* Reset cause, duplicated into both the PRO and APP CPU fields. */
+    case RTC_CNTL_RESET_STATE_OFF:
+        return p->rtc_reset_cause | (p->rtc_reset_cause << 6);
+    /* One register, two fields: WAKEUP_ENA at bit 11 is what firmware writes
+     * to arm the sources, WAKEUP_CAUSE at bit 0 is the read-only report that
+     * esp_sleep_get_wakeup_cause() decodes. This used to answer a hardcoded 1
+     * -- reading as "woke from EXT0" on a board that had never slept. */
+    case RTC_CNTL_WAKEUP_STATE_OFF:
+        return (p->rtc_wakeup_ena << RTC_CNTL_WAKEUP_ENA_S) |
+               p->rtc_wakeup_cause;
+    case RTC_CNTL_STORE0_OFF + 0u:  return p->rtc_store[0];
+    case RTC_CNTL_STORE0_OFF + 4u:  return p->rtc_store[1];
+    case RTC_CNTL_STORE0_OFF + 8u:  return p->rtc_store[2];
+    case RTC_CNTL_STORE0_OFF + 12u: return p->rtc_store[3];
+    case RTC_CNTL_EXT_WAKEUP_CONF_OFF: return p->rtc_ext_wakeup_conf;
+    case RTC_CNTL_EXT_WAKEUP1_OFF: return p->rtc_ext_wakeup1;
+    case RTC_CNTL_DIG_PWC_OFF: return p->rtc_dig_pwc;
+    case RTC_CNTL_INT_ENA_OFF: return p->rtc_int_ena;
+    case RTC_CNTL_INT_RAW_OFF: return p->rtc_int_raw;
+    case RTC_CNTL_INT_ST_OFF:  return p->rtc_int_raw & p->rtc_int_ena;
     case 0x080: return 0;           /* SLP_TIMER_BASE */
     case 0x068: return p->rtc_cpu_period_conf;
     case 0x070: return p->rtc_clk_conf;
@@ -3088,6 +3475,51 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     }
     switch (off) {
+    case RTC_CNTL_TIME_UPDATE_OFF:
+        /* Firmware sets TIME_UPDATE and then reads TIME0/TIME1; the counter is
+         * latched at that moment so the two halves are consistent. */
+        p->rtc_time_latched = rtc_slow_ticks(p);
+        return;
+    case RTC_CNTL_SLP_TIMER0_OFF:
+        p->rtc_slp_target = (p->rtc_slp_target & 0xFFFFFFFF00000000ULL) | val;
+        return;
+    case RTC_CNTL_SLP_TIMER1_OFF:
+        p->rtc_slp_target = (p->rtc_slp_target & 0xFFFFFFFFULL) |
+                            ((uint64_t)(val & 0xFFFFu) << 32);
+        return;
+    case RTC_CNTL_STATE0_OFF:
+        p->rtc_state0 = val;
+        if (val & RTC_CNTL_SLEEP_EN_BIT) {
+            /* Deep sleep is distinguished by the digital domain being powered
+             * down; light sleep leaves it up and simply resumes. */
+            p->sleep_deep = (p->rtc_dig_pwc & RTC_CNTL_DG_WRAP_PD_EN_BIT) != 0;
+            p->sleep_requested = true;
+        }
+        return;
+    case RTC_CNTL_RESET_STATE_OFF: return;   /* read-only */
+    case RTC_CNTL_WAKEUP_STATE_OFF:
+        /* rtc_sleep_start() arms the wake sources here, not in STATE0. */
+        p->rtc_wakeup_ena = (val >> RTC_CNTL_WAKEUP_ENA_S) &
+                            RTC_CNTL_WAKEUP_ENA_MASK;
+        return;
+    case RTC_CNTL_STORE0_OFF + 0u:  p->rtc_store[0] = val; return;
+    case RTC_CNTL_STORE0_OFF + 4u:  p->rtc_store[1] = val; return;
+    case RTC_CNTL_STORE0_OFF + 8u:  p->rtc_store[2] = val; return;
+    case RTC_CNTL_STORE0_OFF + 12u: p->rtc_store[3] = val; return;
+    case RTC_CNTL_EXT_WAKEUP_CONF_OFF: p->rtc_ext_wakeup_conf = val; return;
+    case RTC_CNTL_EXT_WAKEUP1_OFF: p->rtc_ext_wakeup1 = val; return;
+    case RTC_CNTL_DIG_PWC_OFF: p->rtc_dig_pwc = val; return;
+    case RTC_CNTL_INT_ENA_OFF:
+        p->rtc_int_ena = val;
+        /* Enabling a source whose condition is already latched has to deliver
+         * it, or firmware that arms the interrupt after configuring the
+         * peripheral never hears about a pad that is already down. */
+        if (p->rtc_int_raw & p->rtc_int_ena)
+            periph_assert_interrupt(p, RTC_CORE_INTR_SOURCE);
+        return;
+    case RTC_CNTL_INT_CLR_OFF:
+        p->rtc_int_raw &= ~val;
+        return;
     case 0x068u:
         p->rtc_cpu_period_conf = val & RTC_CPU_PERIOD_CONF_MASK;
         return;
@@ -4088,25 +4520,50 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
  * Accepted values are "all", a single offset, or START-END (base 0).  The
  * historical bare setting keeps tracing the boot/partition area below 128 KB.
  */
-static bool spi_debug_offset(uint32_t off) {
-    const char *spec = getenv("FLEXE_SPIDBG");
-    if (!spec) return false;
-    if (*spec == '\0') return off < 0x20000u;
-    if (strcmp(spec, "all") == 0) return true;
+/* Resolved once. getenv() is a linear scan of environ, and this is asked on
+ * every flash read, program, erase and SPI command -- 3.7% of host CPU on a
+ * Marauder run, for a variable that is almost never set. Same fix and same
+ * reason as the display path's spi_dbg_* flags.
+ *
+ * Unlike the GPIO case this was not measurable on these ROMs; it is the same
+ * known-costly pattern on a path flash-heavy firmware would make hot. */
+enum { SPI_DBG_OFF, SPI_DBG_BOOT, SPI_DBG_ALL, SPI_DBG_RANGE };
+static int           spi_dbg_mode = -1;
+static unsigned long spi_dbg_first, spi_dbg_last;
 
+static void spi_debug_resolve(void) {
+    const char *spec = getenv("FLEXE_SPIDBG");
+    if (!spec)                    { spi_dbg_mode = SPI_DBG_OFF;  return; }
+    if (*spec == '\0')            { spi_dbg_mode = SPI_DBG_BOOT; return; }
+    if (strcmp(spec, "all") == 0) { spi_dbg_mode = SPI_DBG_ALL;  return; }
+
+    spi_dbg_mode = SPI_DBG_BOOT;   /* every parse failure falls back to this */
     errno = 0;
     char *end = NULL;
     unsigned long first = strtoul(spec, &end, 0);
-    if (errno || end == spec) return off < 0x20000u;
+    if (errno || end == spec) return;
     unsigned long last = first;
     if (*end == '-') {
         const char *tail = end + 1;
         errno = 0;
         last = strtoul(tail, &end, 0);
-        if (errno || end == tail) return off < 0x20000u;
+        if (errno || end == tail) return;
     }
-    if (*end != '\0') return off < 0x20000u;
-    return (unsigned long)off >= first && (unsigned long)off <= last;
+    if (*end != '\0') return;
+    spi_dbg_first = first;
+    spi_dbg_last  = last;
+    spi_dbg_mode  = SPI_DBG_RANGE;
+}
+
+static bool spi_debug_offset(uint32_t off) {
+    if (__builtin_expect(spi_dbg_mode < 0, 0)) spi_debug_resolve();
+    switch (spi_dbg_mode) {
+    case SPI_DBG_OFF:   return false;
+    case SPI_DBG_ALL:   return true;
+    case SPI_DBG_RANGE: return (unsigned long)off >= spi_dbg_first &&
+                               (unsigned long)off <= spi_dbg_last;
+    default:            return off < 0x20000u;   /* SPI_DBG_BOOT */
+    }
 }
 
 static void spi_debug_command(const esp32_periph_t *p, const spi_state_t *s,
@@ -4445,16 +4902,50 @@ static int i2c_port_from_addr(uint32_t addr) {
     return -1;
 }
 
+/* Deliver the ISR again when a *new* enabled condition appears, even though
+ * the source line was already high.
+ *
+ * intr_matrix_update_source() dispatches a registered handler on the rising
+ * edge of the aggregate line only. That is fine for a source that goes quiet
+ * between events, and wrong for a level-triggered one that accumulates: the
+ * I2C slave holds TXFIFO_EMPTY high for as long as its transmit FIFO is empty,
+ * so the line never falls, and every later condition -- including the
+ * TRANS_COMPLETE that tells the driver to drain a received transfer -- arrived
+ * with no edge to carry it. The ISR ran exactly once in the whole run.
+ *
+ * Scoped to I2C rather than changed in the matrix, because re-entering every
+ * level-triggered handler for as long as its line is high is what hardware
+ * does and is also how an interrupt storm starts; the general gap is worth
+ * fixing separately and with its own measurements. */
 static void i2c_intr_update(esp32_periph_t *p, int port) {
     i2c_state_t *i2c = &p->i2c[port];
     int source = i2c_intr_sources[port];
-    uint32_t mask = 1u << (source % 32);
-    bool active = (i2c->int_raw & i2c->int_ena) != 0;
-    if (active)
-        p->pending_sources[source / 32] |= mask;
+
+    /* The two FIFO interrupts are *level* conditions, not events: the hardware
+     * asserts TXFIFO_EMPTY for as long as the TX FIFO is below its threshold
+     * and RXFIFO_FULL for as long as the RX FIFO is above its. Latching them
+     * only where the FIFOs happen to be touched leaves the slave driver
+     * deadlocked -- it stages a reply into its ringbuffer and waits for
+     * TXFIFO_EMPTY to tell its ISR to move it into the FIFO, and that
+     * interrupt never comes because the FIFO was already empty when it was
+     * enabled. Recompute both here instead. */
+    uint32_t conf = i2c->regs[I2C_FIFO_CONF_OFF / 4u];
+    uint32_t rx_threshold = conf & 0x1Fu;
+    uint32_t tx_threshold = (conf >> 5) & 0x1Fu;
+    if (i2c->tx_count <= tx_threshold) i2c->int_raw |= I2C_INT_TXFIFO_EMPTY;
+    else                               i2c->int_raw &= ~I2C_INT_TXFIFO_EMPTY;
+    if (i2c->rx_count > rx_threshold)  i2c->int_raw |= I2C_INT_RXFIFO_FULL;
+    else                               i2c->int_raw &= ~I2C_INT_RXFIFO_FULL;
+
+    /* Level conditions need the status-aware form: a fresh condition arriving
+     * while the line is already high produces no edge, and the plain assert
+     * would never call the handler again. This used to be a bespoke
+     * i2c_dispatch_new_conditions() helper; it is the general mechanism now,
+     * so every peripheral with a raw/ena pair gets the same behaviour. */
+    if (i2c->int_raw & i2c->int_ena)
+        periph_assert_interrupt_status(p, source, i2c->int_raw & i2c->int_ena);
     else
-        p->pending_sources[source / 32] &= ~mask;
-    intr_matrix_update_source(p, source, active);
+        periph_deassert_interrupt(p, source);
 }
 
 static void i2c_tx_reset(i2c_state_t *i2c) {
@@ -4853,6 +5344,56 @@ static void i2c_execute(esp32_periph_t *p, int port) {
     i2c_intr_update(p, port);
 }
 
+/* The mirror of periph_i2c_attach_device(): there the host supplies a device
+ * for the guest's master to talk to, here the host *is* the master and the
+ * guest is the slave. The guest never originates a slave transfer, so nothing
+ * on its side can start one -- it has to arrive from outside.
+ *
+ * Returns the number of bytes the slave accepted, or -1 if it is not in slave
+ * mode or the address does not match. */
+int periph_i2c_master_xfer(esp32_periph_t *p, int port, uint8_t address,
+                           const uint8_t *wr, size_t wrlen,
+                           uint8_t *rd, size_t rdlen)
+{
+    if (!p || port < 0 || port >= I2C_PORT_COUNT) return -1;
+    i2c_state_t *i2c = &p->i2c[port];
+
+    if (i2c->regs[I2C_CTR_OFF / 4u] & I2C_CTR_MS_MODE) return -1;
+    uint32_t own = i2c->regs[I2C_SLAVE_ADDR_OFF / 4u] & I2C_SLAVE_ADDR_MASK;
+    if ((own & 0x7Fu) != (uint32_t)(address & 0x7Fu)) return -1;
+
+    i2c->slave_addressed = true;
+    int accepted = 0;
+
+    /* A write from the master lands in the RX FIFO, which is where
+     * i2c_slave_read_buffer() drains it. Overflow is reported rather than
+     * silently dropped: a slave that is not being serviced fast enough is a
+     * real condition firmware handles. */
+    for (size_t i = 0; i < wrlen; i++) {
+        if (!i2c_rx_push(i2c, wr[i])) {
+            i2c->int_raw |= I2C_INT_RXFIFO_OVF;
+            break;
+        }
+        accepted++;
+    }
+    if (wrlen) {
+        uint32_t threshold = i2c->regs[I2C_FIFO_CONF_OFF / 4u] & 0x1Fu;
+        if (i2c->rx_count > threshold)
+            i2c->int_raw |= I2C_INT_RXFIFO_FULL;
+    }
+
+    /* A read is answered from whatever the guest left in the TX FIFO. Real
+     * hardware clocks out 0xFF when the slave has nothing staged. */
+    for (size_t i = 0; i < rdlen; i++)
+        rd[i] = i2c->tx_count ? i2c_tx_pop(i2c) : 0xFFu;
+    if (rdlen && i2c->tx_count == 0)
+        i2c->int_raw |= I2C_INT_TXFIFO_EMPTY;
+
+    i2c->int_raw |= I2C_INT_SLAVE_TRAN_COMP | I2C_INT_TRANS_DONE;
+    i2c_intr_update(p, port);
+    return accepted;
+}
+
 static uint32_t i2c_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     int port = i2c_port_from_addr(addr);
@@ -4868,14 +5409,18 @@ static uint32_t i2c_read(void *ctx, uint32_t addr) {
         return ((uint32_t)i2c->tx_count << 18) |
                ((uint32_t)i2c->rx_count << 8) |
                (i2c->active ? 1u << 4 : 0) |
+               (i2c->slave_addressed ? I2C_SR_SLAVE_ADDRESSED : 0) |
                (i2c->ack_nack ? 1u : 0);
     case I2C_RXFIFO_ST_OFF:
         return ((uint32_t)(i2c->tx_head & 0x1Fu) << 15) |
                ((uint32_t)(i2c->tx_tail & 0x1Fu) << 10) |
                ((uint32_t)(i2c->rx_head & 0x1Fu) << 5) |
                (uint32_t)(i2c->rx_tail & 0x1Fu);
-    case I2C_DATA_OFF:
-        return i2c_rx_pop(i2c);
+    case I2C_DATA_OFF: {
+        uint8_t byte = i2c_rx_pop(i2c);
+        i2c_intr_update(p, i2c_port_from_addr(addr));
+        return byte;
+    }
     case I2C_INT_RAW_OFF:
         return i2c->int_raw;
     case I2C_INT_CLR_OFF:
@@ -4906,7 +5451,10 @@ static void i2c_write(void *ctx, uint32_t addr, uint32_t val) {
     switch (off) {
     case I2C_CTR_OFF:
         i2c->regs[off / 4u] = val;
-        if (val & I2C_CTR_TRANS_START)
+        /* The command list belongs to master mode. A slave has no say in when
+         * a transfer happens -- it answers one -- so running the list here
+         * would have the port originate traffic it should be receiving. */
+        if ((val & I2C_CTR_TRANS_START) && (val & I2C_CTR_MS_MODE))
             i2c_execute(p, port);
         break;
     case I2C_FIFO_CONF_OFF:
@@ -4915,9 +5463,11 @@ static void i2c_write(void *ctx, uint32_t addr, uint32_t val) {
             i2c_tx_reset(i2c);
         if (val & I2C_FIFO_RX_RST)
             i2c_rx_reset(i2c);
+        i2c_intr_update(p, port);
         break;
     case I2C_DATA_OFF:
         i2c_tx_push(i2c, (uint8_t)val);
+        i2c_intr_update(p, port);
         break;
     case I2C_INT_RAW_OFF:
     case I2C_INT_ST_OFF:
@@ -4986,7 +5536,8 @@ static uint32_t rmt_item_cycles(const esp32_periph_t *p,
 
 static void rmt_irq_update(esp32_periph_t *p) {
     if (p->rmt.int_raw & p->rmt.int_ena)
-        periph_assert_interrupt(p, RMT_INTR_SOURCE);
+        periph_assert_interrupt_status(p, RMT_INTR_SOURCE,
+                                       p->rmt.int_raw & p->rmt.int_ena);
     else
         periph_deassert_interrupt(p, RMT_INTR_SOURCE);
 }
@@ -5429,7 +5980,7 @@ static void pcnt_update_irq(esp32_periph_t *p) {
     uint32_t raw = p->pcnt.regs[PCNT_INT_RAW_OFF / 4u];
     uint32_t ena = p->pcnt.regs[PCNT_INT_ENA_OFF / 4u];
     if (raw & ena)
-        periph_assert_interrupt(p, PCNT_INTR_SOURCE);
+        periph_assert_interrupt_status(p, PCNT_INTR_SOURCE, raw & ena);
     else
         periph_deassert_interrupt(p, PCNT_INTR_SOURCE);
 }
@@ -6075,7 +6626,8 @@ static void mcpwm_update_irq(esp32_periph_t *p, unsigned unit) {
     uint32_t raw = state->regs[MCPWM_INT_RAW_OFF / 4u];
     uint32_t ena = state->regs[MCPWM_INT_ENA_OFF / 4u];
     if (raw & ena)
-        periph_assert_interrupt(p, mcpwm_unit_interrupt_source(unit));
+        periph_assert_interrupt_status(p, mcpwm_unit_interrupt_source(unit),
+                                       raw & ena);
     else
         periph_deassert_interrupt(p, mcpwm_unit_interrupt_source(unit));
 }
@@ -7611,7 +8163,7 @@ static void ledc_update_irq(esp32_periph_t *p) {
     uint32_t raw = p->ledc.regs[LEDC_INT_RAW_OFF / 4u];
     uint32_t ena = p->ledc.regs[LEDC_INT_ENA_OFF / 4u];
     if (raw & ena)
-        periph_assert_interrupt(p, LEDC_INTR_SOURCE);
+        periph_assert_interrupt_status(p, LEDC_INTR_SOURCE, raw & ena);
     else
         periph_deassert_interrupt(p, LEDC_INTR_SOURCE);
 }
@@ -8116,7 +8668,9 @@ static void uhci_irq_update(esp32_periph_t *p, unsigned port) {
     bool active = uhci_clocked(p, port) &&
                   (s->int_raw & s->int_ena & UHCI_INT_VALID_MASK) != 0u;
     if (active)
-        periph_assert_interrupt(p, uhci_intr_sources[port]);
+        periph_assert_interrupt_status(p, uhci_intr_sources[port],
+                                       s->int_raw & s->int_ena &
+                                       UHCI_INT_VALID_MASK);
     else
         periph_deassert_interrupt(p, uhci_intr_sources[port]);
 }
@@ -9298,7 +9852,10 @@ static void slc_irq_update(esp32_periph_t *p, unsigned channel) {
                    slc_valid_interrupts(channel)) != 0u;
     int source = channel == 0u ? SLC_INTR_SOURCE0 : SLC_INTR_SOURCE1;
     if (active)
-        periph_assert_interrupt(p, source);
+        periph_assert_interrupt_status(p, source,
+                                       s->int_raw[channel] &
+                                       s->int_ena[channel] &
+                                       slc_valid_interrupts(channel));
     else
         periph_deassert_interrupt(p, source);
 }
@@ -10002,7 +10559,7 @@ static void sdmmc_irq_update(esp32_periph_t *p) {
     bool active = sdmmc_clocked(p) && (ctrl & SDMMC_CTRL_INT_ENABLE) &&
                   (normal != 0u || dma != 0u);
     if (active)
-        periph_assert_interrupt(p, SDMMC_INTR_SOURCE);
+        periph_assert_interrupt_status(p, SDMMC_INTR_SOURCE, normal | dma);
     else
         periph_deassert_interrupt(p, SDMMC_INTR_SOURCE);
 }
@@ -10804,7 +11361,9 @@ static void twai_irq_update(esp32_periph_t *p) {
     bool active = twai_clocked(p) &&
                   (s->int_raw & s->int_ena & TWAI_INT_VALID_MASK) != 0u;
     if (active)
-        periph_assert_interrupt(p, TWAI_INTR_SOURCE);
+        periph_assert_interrupt_status(p, TWAI_INTR_SOURCE,
+                                       s->int_raw & s->int_ena &
+                                       TWAI_INT_VALID_MASK);
     else
         periph_deassert_interrupt(p, TWAI_INTR_SOURCE);
 }
@@ -11518,7 +12077,8 @@ static void emac_irq_update(esp32_periph_t *p) {
                     (s->dma_status & enabled &
                      EMAC_DMA_ST_ABNORMAL_EVENTS) != 0u;
     if (emac_clocked(p) && (normal || abnormal))
-        periph_assert_interrupt(p, EMAC_INTR_SOURCE);
+        periph_assert_interrupt_status(p, EMAC_INTR_SOURCE,
+                                       s->dma_status & enabled);
     else
         periph_deassert_interrupt(p, EMAC_INTR_SOURCE);
 }
@@ -12203,7 +12763,9 @@ static uint32_t i2s_descriptor_cycles(const i2s_state_t *s, bool tx,
 static void i2s_irq_update(esp32_periph_t *p, int port) {
     i2s_state_t *s = &p->i2s[port];
     if (s->int_raw & s->int_ena & I2S_INT_VALID_MASK)
-        periph_assert_interrupt(p, i2s_intr_sources[port]);
+        periph_assert_interrupt_status(p, i2s_intr_sources[port],
+                                       s->int_raw & s->int_ena &
+                                       I2S_INT_VALID_MASK);
     else
         periph_deassert_interrupt(p, i2s_intr_sources[port]);
 }
@@ -12619,6 +13181,19 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     p->rtc_cpu_period_conf = 1u << 30u;
     p->rtc_clk_conf = (1u << 27u) | 0x00002210u; /* PLL + reset dividers */
     p->radio.rng_state = 0x12345678ABCDEF01ULL;
+    p->rtc_reset_cause = RTC_POWERON_RESET;
+    /* RTC_SLOW_CLK_CAL_REG is STORE1, and the second-stage bootloader would
+     * have calibrated it. Flexe loads an application image directly, so it
+     * starts at zero -- and rtc_time_us_to_slowclk() divides by it, making
+     * every timed sleep ask to wake at the time it started. The format is the
+     * slow-clock period in microseconds, Q13.19. */
+    p->rtc_store[1] = (uint32_t)((1000000ull << 19) / RTC_SLOW_CLK_HZ);
+    /* An untouched pad reads *high* -- the count falls as capacitance rises.
+     * Leaving these zeroed made every enabled pad look permanently pressed to
+     * firmware the host never drives, which is the wrong default to hand a
+     * ROM that merely happens to call touch_pad_init(). */
+    for (int pad = 0; pad < SENS_TOUCH_PAD_COUNT; pad++)
+        p->touch_value[pad] = 0xFFFFu;
     for (int port = 0; port < I2C_PORT_COUNT; port++)
         p->i2c[port].regs[I2C_DATE_OFF / 4u] = 0x16042000u;
 
@@ -13187,6 +13762,76 @@ bool periph_interrupt_pending(const esp32_periph_t *p, int source) {
             (1u << (source % 32))) != 0;
 }
 
+/* Hand a pending sleep to the session, which owns the clock and the reset
+ * path. `timeout_us` is how long the armed RTC timer has left, or
+ * PERIPH_SLEEP_FOREVER when no timer is armed; `cause` is any wake source
+ * already satisfied at entry, in which case the sleep is over immediately. */
+bool periph_take_sleep_request(esp32_periph_t *p, bool *deep,
+                               uint64_t *timeout_us, uint32_t *cause)
+{
+    if (!p || !p->sleep_requested) return false;
+    p->sleep_requested = false;
+    if (deep) *deep = p->sleep_deep;
+
+    uint32_t ena = p->rtc_wakeup_ena;
+    uint64_t us = PERIPH_SLEEP_FOREVER;
+    if (ena & RTC_TIMER_TRIG_EN) {
+        /* Measure the interval in the guest's own units, not ours.
+         *
+         * timer_wakeup_prepare() computes its target as "the value I just read
+         * out of TIME0/TIME1, plus the requested delay converted through the
+         * calibration in RTC_SLOW_CLK_CAL_REG". Both of those are the guest's
+         * numbers: it re-calibrates the slow clock at startup and writes its
+         * own answer into STORE1. Comparing the target against a tick count
+         * derived independently here compounds every disagreement between the
+         * two -- it produced a 50 ms sleep that asked to end before it began.
+         * Taking the difference from the same reading the guest used, and
+         * converting with the same calibration, makes the sleep exactly as
+         * long as the firmware intended however the clock is modelled. */
+        uint64_t ticks = (p->rtc_slp_target > p->rtc_time_latched)
+                       ? p->rtc_slp_target - p->rtc_time_latched : 0;
+        uint32_t cal = p->rtc_store[1];   /* slow-clock period, Q13.19 us */
+        if (cal == 0) cal = (uint32_t)((1000000ull << 19) / RTC_SLOW_CLK_HZ);
+        us = (ticks * cal) >> 19;
+    }
+    if (timeout_us) *timeout_us = us;
+    if (cause) *cause = rtc_wake_condition(p);
+    return true;
+}
+
+/* Poll the level-triggered wake sources while time is being stepped forward. */
+uint32_t periph_sleep_poll_wake(esp32_periph_t *p)
+{
+    return p ? rtc_wake_condition(p) : 0;
+}
+
+/* Record why the chip woke and release the guest's wait. Light sleep resumes
+ * inside rtc_sleep_start()'s poll on SLP_WAKEUP; deep sleep resets instead,
+ * and the session carries the cause across through periph_set_wake_state(). */
+void periph_finish_wake(esp32_periph_t *p, uint32_t cause)
+{
+    if (!p) return;
+    p->rtc_wakeup_cause = cause & RTC_CNTL_WAKEUP_ENA_MASK;
+    p->rtc_state0 &= ~RTC_CNTL_SLEEP_EN_BIT;
+    p->rtc_state0 |= RTC_CNTL_SLP_WAKEUP_BIT;
+    p->rtc_int_raw |= RTC_CNTL_SLP_WAKEUP_INT_BIT;
+    if (p->rtc_int_ena & RTC_CNTL_SLP_WAKEUP_INT_BIT)
+        periph_assert_interrupt(p, RTC_CORE_INTR_SOURCE);
+}
+
+void periph_set_wake_state(esp32_periph_t *p, uint32_t wake_cause,
+                           uint32_t reset_cause)
+{
+    if (!p) return;
+    p->rtc_wakeup_cause = wake_cause & RTC_CNTL_WAKEUP_ENA_MASK;
+    p->rtc_reset_cause = reset_cause & 0x3Fu;
+}
+
+uint32_t periph_reset_cause(const esp32_periph_t *p)
+{
+    return p ? p->rtc_reset_cause : RTC_POWERON_RESET;
+}
+
 bool periph_take_reset_request(esp32_periph_t *p)
 {
     if (!p || !p->reset_requested) return false;
@@ -13248,10 +13893,97 @@ void periph_assert_interrupt(esp32_periph_t *p, int source) {
     intr_matrix_update_source(p, source, true);
 }
 
+void periph_assert_interrupt_status(esp32_periph_t *p, int source,
+                                    uint32_t status) {
+    if (!p || source < 0 || source > 70) return;
+    p->pending_sources[source / 32] |= (1u << (source % 32));
+
+    bool was = p->source_level[source];
+    uint32_t fresh = status & ~p->source_status[source];
+    p->source_status[source] = status;
+
+    intr_matrix_update_source(p, source, true);
+
+    /* Dispatch on a *new* condition, independently of the electrical edge
+     * that intr_matrix_update_source() already reported. The two are
+     * different signals -- "the line went high" and "there is work the
+     * handler has not seen" -- so the first assert after a deassert calls the
+     * handler twice. That is deliberate and load-bearing: ESP-IDF's I2C slave
+     * driver does not drain a staged transfer on a single invocation, and
+     * gating this on the line having already been high (the obvious
+     * simplification) reproduces the original bug, with guest_got=0 in
+     * test-i2c-slave.sh. An unchanged mask still dispatches nothing, which is
+     * what keeps this safe on the every-register-write path. */
+    (void)was;
+    if (fresh && p->irq_dispatch[source])
+        p->irq_dispatch[source](p->irq_dispatch_ctx[source], source);
+}
+
 void periph_deassert_interrupt(esp32_periph_t *p, int source) {
     if (!p || source < 0 || source > 70) return;
     p->pending_sources[source / 32] &= ~(1u << (source % 32));
+    p->source_status[source] = 0;
     intr_matrix_update_source(p, source, false);
+}
+
+void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!p) return;
+
+    for (int ch = 0; ch < RTC_GPIO_CHANNELS; ch++) {
+        if (!rtcio_channel_held(p, ch)) continue;
+        out->hold_mask |= 1u << ch;
+        /* Carry the pad word itself, so the hold bit is still set after the
+         * restore and the pad stays held until firmware clears it. */
+        uint16_t off = RTCIO_HOLD[ch].off;
+        unsigned k;
+        for (k = 0; k < out->reg_count; k++)
+            if (out->reg_off[k] == off) break;
+        if (k == out->reg_count && out->reg_count < 8u) {
+            out->reg_off[k] = off;
+            out->regs[k] = p->rtcio_regs[off / 4u];
+            out->reg_count++;
+        }
+    }
+    if (!out->hold_mask) return;
+    out->rtcio_out    = p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u];
+    out->rtcio_enable = p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u];
+}
+
+void periph_pad_hold_restore(esp32_periph_t *p, const periph_pad_hold_t *in)
+{
+    if (!p || !in || !in->hold_mask) return;
+
+    /* Put the hold bits back first: rtcio_publish_pads() consults them, and
+     * restoring the levels while the pads read as unheld would let a later
+     * write clobber exactly what was being preserved. */
+    for (unsigned k = 0; k < in->reg_count; k++)
+        p->rtcio_regs[in->reg_off[k] / 4u] = in->regs[k];
+
+    uint32_t keep = in->hold_mask << RTC_GPIO_DATA_S;
+    p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u] =
+        (p->rtcio_regs[RTC_GPIO_OUT_OFF / 4u] & ~keep) | (in->rtcio_out & keep);
+    p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u] =
+        (p->rtcio_regs[RTC_GPIO_ENABLE_OFF / 4u] & ~keep) |
+        (in->rtcio_enable & keep);
+
+    /* Drive the pins directly. rtcio_publish_pads() would skip these, since
+     * they are held -- which is correct for a guest write and wrong here. */
+    uint32_t out = in->rtcio_out >> RTC_GPIO_DATA_S;
+    uint32_t en  = in->rtcio_enable >> RTC_GPIO_DATA_S;
+    for (int ch = 0; ch < RTC_GPIO_CHANNELS; ch++) {
+        if (!(in->hold_mask & (1u << ch))) continue;
+        int gpio = RTCIO_CHANNEL_GPIO[ch];
+        uint32_t mask = (gpio < 32) ? (1u << gpio) : (1u << (gpio - 32));
+        uint32_t *g_out = (gpio < 32) ? &p->gpio.out : &p->gpio.out1;
+        uint32_t *g_en  = (gpio < 32) ? &p->gpio.enable : &p->gpio.enable1;
+        if (en & (1u << ch)) {
+            *g_en |= mask;
+            if (out & (1u << ch)) *g_out |= mask; else *g_out &= ~mask;
+        }
+    }
 }
 
 void periph_intr_matrix_set(esp32_periph_t *p, int core, int cpu_int, int source) {
@@ -13293,6 +14025,17 @@ uint8_t periph_dac_value(const esp32_periph_t *p, int channel) {
     return rtcio_dac_value(p->rtcio_regs[off / 4u]);
 }
 
+/* Inject a touch-pad reading. Counts fall as capacitance rises, so a "touched"
+ * pad is one whose value is below its threshold; the gate drives it that way.
+ * A scan runs immediately when the FSM is on, which is what lets a host-side
+ * touch raise the interrupt without the guest polling for it. */
+void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value) {
+    if (!p || pad < 0 || pad >= SENS_TOUCH_PAD_COUNT) return;
+    p->touch_value[pad] = (uint16_t)value;
+    if (touch_fsm_running(p))
+        touch_run_measurement(p);
+}
+
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
     if (!p || pin < 0 || pin > 39) return;
     uint32_t mask = (pin < 32) ? (1u << pin) : (1u << (pin - 32));
@@ -13325,12 +14068,12 @@ void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
     if (fire) {
         if (pin < 32) p->gpio.status  |= mask;
         else          p->gpio.status1 |= mask;
-        if (getenv("FLEXE_GPIODBG"))
+        if (gpio_dbg())
             fprintf(stderr, "[GPIO] pin%d intr (type=%u ena=0x%X level=%d)\n",
                     pin, int_type, (cfg >> 13) & 0x1Fu, now);
     }
     gpio_intr_update(p);
-    if (fire && getenv("FLEXE_GPIODBG")) {
+    if (fire && gpio_dbg()) {
         fprintf(stderr,
                 "[GPIO] delivery cpu0=int:%08X ena:%08X ps:%08X "
                 "cpu1=int:%08X ena:%08X ps:%08X\n",

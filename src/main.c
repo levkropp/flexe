@@ -1791,8 +1791,11 @@ int main(int argc, char *argv[]) {
         htrace_print_stats(g_htrace, stderr);
     }
 
-    if (jit && jit_stats_enabled)
-        jit_print_stats(jit);
+    if (jit && jit_stats_enabled) {
+        xtensa_cpu_t *stats_core1 = flexe_session_cpu(session, 1);
+        jit_print_stats(jit, xtensa_retired_insns(cpu) +
+                             (stats_core1 ? xtensa_retired_insns(stats_core1) : 0));
+    }
     jit_verify_summary(jit);
 
     /* Cleanup */

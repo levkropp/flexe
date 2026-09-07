@@ -3,6 +3,7 @@
 #endif
 
 #include "xtensa.h"
+#include "guest_call.h"
 #include "memory.h"
 #include "rom_stubs.h"
 #include <stdlib.h>
@@ -98,9 +99,59 @@ void xtensa_fire_due_timers(xtensa_cpu_t *cpu) {
     xtensa_fire_timers(cpu);
 }
 
+/* Where the ROM keeps ticks-per-microsecond; the same word esp_timer_stubs.c,
+ * freertos_stubs.c and peripherals.c each read for the current CPU clock. */
+#define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
+
+uint32_t xtensa_cpu_freq_mhz(const xtensa_cpu_t *cpu) {
+    uint32_t mhz = cpu->mem ? mem_read32(cpu->mem, ESP32_CPU_TICKS_PER_US_ADDR) : 0;
+    return (mhz >= 10u && mhz <= 240u) ? mhz : 160u;
+}
+
+/* Move a core's CCOUNT forward across time it did not execute, firing each
+ * ccompare and peripheral event inside the interval at its own ccount rather
+ * than all of them at the end.
+ *
+ * Anything that advances a core's clock without running it has to come through
+ * here. Assigning cpu->ccount directly steps straight over the guest's own
+ * FreeRTOS tick (CCOMPARE0 -> interrupt 6), and because an interrupt latches
+ * rather than counts, every tick in the interval collapses into at most one.
+ * The guest's tick counter then runs slow and every FreeRTOS timeout measured
+ * against it runs long.
+ *
+ * Stepping stops as soon as an enabled interrupt is latched: the guest cannot
+ * observe a second one until it runs again, so visiting further boundaries
+ * costs recomputes and buys nothing. */
+void xtensa_advance_idle_cycles(xtensa_cpu_t *cpu, uint64_t cycles) {
+    while (cycles > 0) {
+        uint32_t next = cpu->next_timer_event;
+        if (next == UINT32_MAX) break;
+        uint32_t distance = ((int32_t)(cpu->ccount - next) >= 0)
+                          ? 0u : (uint32_t)(next - cpu->ccount);
+        if ((uint64_t)distance > cycles) break;
+        cpu->ccount += distance;
+        cycles -= distance;
+        xtensa_fire_timers(cpu);
+        if (cpu->next_timer_event == next) break;   /* no forward progress */
+        if (cpu->interrupt & cpu->intenable) break; /* guest must run to see it */
+    }
+    if (cycles > 0) {
+        cpu->ccount += (uint32_t)cycles;
+        xtensa_fire_timers(cpu);
+    }
+}
+
 void xtensa_cpu_init(xtensa_cpu_t *cpu) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->core_id = 0;
+    {   /* Read once, per CPU, so the hot paths test a field, never getenv(). */
+        static int enabled = -1;
+        if (enabled < 0) {
+            const char *e = getenv("FLEXE_WINDOW_VECTORS");
+            enabled = e ? atoi(e) : 0;
+        }
+        cpu->real_window_vectors = enabled != 0;
+    }
     cpu->next_timer_event = UINT32_MAX;  /* No timer pending until ccompare is written */
     /* First step counts as a control-flow transfer so the PC hook /
      * AOT bitmap gates fire on the initial PC (entry vector). */
@@ -381,7 +432,17 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_INTSET:   cpu->interrupt |= val; cpu->irq_check = true; break;
     case XT_SR_INTCLEAR: cpu->interrupt &= ~val; break;
     case XT_SR_INTENABLE:   cpu->intenable = val; cpu->irq_check = true; break;
+    /* PS carries the interrupt mask (INTLEVEL) and EXCM, so writing it can
+     * unmask an interrupt that is already pending. `irq_check` is the hint
+     * that says "re-evaluate", and it used to be set only when `interrupt`
+     * or `intenable` changed -- so an interrupt asserted while INTLEVEL was
+     * high got tested once, declined, and was then never reconsidered when
+     * the guest lowered the level. It fired late, whenever some unrelated
+     * event happened to set the hint again. Every path that writes PS needs
+     * this; the re-evaluation itself re-tests everything, so setting it
+     * where nothing was unmasked costs only the store. */
     case XT_SR_PS:          cpu->ps = val;
+                            cpu->irq_check = true;
                             break;
     case XT_SR_VECBASE:     cpu->vecbase = val; break;
     case XT_SR_EXCCAUSE:    cpu->exccause = val; break;
@@ -446,6 +507,137 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
 #define EXCMLEVEL 3  /* ESP32 XCHAL_EXCM_LEVEL=3: when EXCM=1, levels 1-3 masked */
 
 static void synth_spill_window(xtensa_cpu_t *cpu, int widx);
+extern int g_flexe_shadow_fill;
+static inline uint32_t phys_read(const xtensa_cpu_t *cpu, int widx, int reg);
+
+/* ===== Real window exceptions =====
+ *
+ * Flexe's default is to synthesize register-window spill and fill in C.
+ * That cannot be made right, and the reason is structural: the shadow records
+ * are keyed by *physical* window while what they describe is a *logical*
+ * frame, and the two stop coinciding the moment the window file wraps or the
+ * guest writes WINDOWSTART. Real firmware does write it -- newlib's longjmp
+ * executes `wsr.windowstart 1<<wb` to declare every other window already
+ * saved, which is sound on hardware because the matching setjmp called
+ * xthal_window_spill first.
+ *
+ * The alternative is to do what the chip does: fault into the guest's own
+ * handlers. Every IDF image carries the six of them at VECBASE, and they are
+ * short -- WindowOverflow4 is four s32e and an rfwo. Hardware never has to know
+ * which logical frame a slot holds, because the handler derives the save
+ * address from the callee's own a1.
+ *
+ * The handler runs with WindowBase rotated onto the frame being moved and
+ * PS.OWB holding where to return; RFWO and RFWU already implement that. EPC1
+ * is the faulting instruction, which re-executes and this time finds the
+ * WindowStart bit it needed.
+ */
+/* Only fault once the application's vectors are actually in place. VECBASE
+ * starts at the ROM's 0x40000000, whose window handlers Flexe does not model,
+ * and startup runs for millions of instructions before the app relocates it to
+ * IRAM. Faulting into unmapped ROM there turns the first wrap into 50M
+ * unregistered ROM calls, which is precisely what it did. Until then the
+ * synthesized path carries it, exactly as it does today. */
+static inline bool window_vectors_ready(const xtensa_cpu_t *cpu,
+                                        uint32_t vecofs) {
+    return cpu->vecbase >= 0x40070000u && cpu->vecbase < 0x40400000u &&
+           mem_get_ptr(cpu->mem, cpu->vecbase + vecofs) != NULL;
+}
+
+static void raise_window_exception(xtensa_cpu_t *cpu, uint32_t fault_pc,
+                                   int handler_wb, uint32_t vecofs) {
+    if (getenv("FLEXE_WVDBG")) {
+        static int n;
+        if (n++ < 12)
+            fprintf(stderr, "[wv] +0x%03X wb=%d->%d ws=%04X a0=%08X a1=%08X "
+                    "pc=%08X vec=%08X core%d\n", vecofs, cpu->windowbase,
+                    handler_wb & 0xF, cpu->windowstart,
+                    phys_read(cpu, handler_wb & 0xF, 0),
+                    phys_read(cpu, handler_wb & 0xF, 1),
+                    fault_pc, cpu->vecbase + vecofs, cpu->core_id);
+    }
+    cpu->epc[0] = fault_pc;
+    XT_PS_SET_OWB(cpu->ps, cpu->windowbase);
+    XT_PS_SET_EXCM(cpu->ps, 1);
+    cpu->windowbase = handler_wb & 0xF;
+    WINLOG(cpu, "WINDOW EXC +0x%03X owb=%d wb=%d epc=%08X ws=%04X\n",
+           vecofs, XT_PS_OWB(cpu->ps), cpu->windowbase, fault_pc,
+           cpu->windowstart);
+    BRANCH_TO(cpu, cpu->vecbase + vecofs);
+}
+
+/* Which of the six, from the call size recorded in the moving window's a0.
+ * A frame whose a0 carries none is a task bottom; the 4-register form is the
+ * smallest the ABI defines and is the right handler for it. */
+static uint32_t window_vec_offset(uint32_t a0, bool underflow) {
+    unsigned n = (a0 >> 30) & 3u;
+    if (n == 0) n = 1;
+    return (underflow ? VECOFS_WINDOW_UNDERFLOW4 : VECOFS_WINDOW_OVERFLOW4) +
+           (uint32_t)(n - 1) * 0x80u;
+}
+
+/* The per-instruction window check: hardware faults on any access to a4-a15
+ * whose physical window belongs to another live frame. That is what
+ * xthal_window_spill leans on -- it walks the file with `mov.n a12, a0;
+ * rotw 3` and the register touch is the whole mechanism.
+ *
+ * It does not decode which registers the instruction reads: it tests all three
+ * windows the current frame can reach, every instruction. More eager than the
+ * hardware and harmless, because a WindowStart bit is set only at a live
+ * frame's *base* window -- a set bit in WB+1..WB+3 always means a foreign frame
+ * is aliased there, and moving it early only does work the next a4-a15 access
+ * would have forced. Rotate WindowStart so bit 0 is WB+1, test three bits;
+ * they are zero unless the register file has wrapped.
+ */
+static int find_callee_window(xtensa_cpu_t *cpu, int widx);
+
+/* Which of Overflow4/8/12. Not the spilled frame's own call size -- that is
+ * the distance from its *caller*. The handler needs the distance to its
+ * *callee*, because that is the register it reads the save-area base from:
+ * a5 for Overflow4 (window +1), a9 for Overflow8 (+2), a13 for Overflow12
+ * (+3). Picking by the frame's own size gets Overflow4 for a call8 chain and
+ * the handler then saves through a register belonging to the wrong frame. */
+static inline uint32_t window_overflow_vec(xtensa_cpu_t *cpu, int w) {
+    int d = (find_callee_window(cpu, w) - w) & 0xF;
+    if (d < 1 || d > 3) d = 1;
+    return VECOFS_WINDOW_OVERFLOW4 + (uint32_t)(d - 1) * 0x80u;
+}
+
+static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn) {
+    uint32_t ws = cpu->windowstart & 0xFFFFu;
+    unsigned sh = ((unsigned)cpu->windowbase + 1u) & 0xFu;
+    uint32_t rot = ((ws >> sh) | (ws << (16u - sh))) & 0xFFFFu;
+    if (__builtin_expect((rot & 7u) == 0u, 1))
+        return false;
+
+    /* How far up the window the instruction can actually reach. The register
+     * fields sit at the same bit positions in every format that has them, and
+     * a field that is really an immediate only ever over-estimates, which is
+     * safe. Checking all three windows unconditionally instead -- which is
+     * what this did -- invents accesses that never happen: it fired 6,365
+     * times in 20M cycles of WLED while PS.EXCM was set, i.e. inside the
+     * window handlers, where a spill would corrupt the frame in flight. */
+    uint32_t rf = (insn >> 12) & 0xFu;
+    uint32_t sf = (insn >> 8) & 0xFu;
+    uint32_t tf = (insn >> 4) & 0xFu;
+    uint32_t mr = rf > sf ? rf : sf;
+    if (tf > mr) mr = tf;
+    unsigned need = mr >> 2;               /* 0..3 windows beyond this one */
+    if (need == 0u || (rot & ((1u << need) - 1u)) == 0u)
+        return false;
+
+    if (!XT_PS_WOE(cpu->ps) || XT_PS_EXCM(cpu->ps))
+        return false;
+    int j = (rot & 1u) ? 1 : ((rot & 2u) ? 2 : 3);
+    int w = (cpu->windowbase + j) & 0xF;
+    uint32_t vecofs = window_overflow_vec(cpu, w);
+    if (!window_vectors_ready(cpu, vecofs))
+        return false;   /* pre-vector startup: the synthesized check carries it */
+    raise_window_exception(cpu, cpu->pc, w, vecofs);
+    return true;
+}
+
+
 
 /*
  * SPILL_ALL_WINDOWS emulation.
@@ -480,6 +672,8 @@ void xtensa_flush_windows(xtensa_cpu_t *cpu) {
     }
 }
 
+uint64_t g_xtensa_irq_dispatched;
+
 void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
     uint32_t pending = cpu->interrupt & cpu->intenable;
     if (!pending) return;
@@ -501,6 +695,13 @@ void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
     if (best_level == 0) return;
 
     xtensa_flush_windows(cpu);
+    /* Counts every vectored interrupt. The JIT verifier samples it across a
+     * reference run: a native block defers interrupts to its exit while
+     * xtensa_step() checks after every instruction, so a replay that vectors
+     * covers different ground and cannot be compared. Watching PS is not
+     * enough -- a handler clears EXCM to allow nesting, so by the end of the
+     * replay the evidence is gone. */
+    g_xtensa_irq_dispatched++;
 
     if (best_level == 1) {
         /* Level-1: dispatched as exception */
@@ -622,7 +823,13 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
                 widx & 0xF, cpu->spill_base[widx & 0xF], base);
     cpu->spill_base[widx & 0xF] = base;
 
-    /* Push onto spill stack for correct underflow restore */
+    /* Push onto spill stack for correct underflow restore.
+     *
+     * Pointless once fills go to the guest's own vector: nothing consumes
+     * these, and they fill the 32-deep stack within 1.5M cycles (openHASP
+     * emitted 27,000 "depth exceeds limit" warnings that way). */
+    if (!(cpu->real_window_vectors && !g_flexe_shadow_fill &&
+          window_vectors_ready(cpu, VECOFS_WINDOW_UNDERFLOW4)))
     {
         int si = widx & 0xF;
         int d = cpu->spill_stack[si].depth;
@@ -754,6 +961,77 @@ static void synth_overflow_check(xtensa_cpu_t *cpu, int callinc) {
  * switches) must never be used, so buffer entries are matched by base rather
  * than popped blindly.
  */
+/* An underflow fill that restores a nonzero a0 with bits 31:30 clear has
+ * restored something that is not a saved register window: every a0 the
+ * hardware writes encodes the call size in those bits, and the only legitimate
+ * exception is the zero a FreeRTOS task's bottom frame carries.
+ *
+ * Worth reporting because the failure is otherwise silent and arbitrarily far
+ * from its cause. Tasmota 15.6.0 hangs on exactly this: one fill takes its base
+ * from 0x3FFD2D40 -- a *different task's* stack -- restores a0 = 8 into
+ * window 14, and the frame it hands back has an uninitialised local that the
+ * firmware then dereferences as a pointer, 136 million times.
+ *
+ * Off unless FLEXE_FILLDBG is set, and the getenv is resolved once: this sits
+ * on the underflow path, which legitimate task-entry frames also take. */
+/* A fill that restores a0 = 0 is exempted by the check below, because a
+ * FreeRTOS task's bottom frame really does hold zero. That exemption hides
+ * the failure both remaining corpus images end on: a save area nothing ever
+ * wrote reads back as zeroes, the fill accepts it as a bottom frame, and the
+ * next RETW computes a return address of (pc & 0xC0000000) | 0 -- 0x40000000,
+ * which is unmapped ROM. WLED spends 217 million instructions there.
+ *
+ * A genuine bottom frame is filled once, at task start, and never returned
+ * through. Anything else reported here is a chain that has unwound one frame
+ * too far. Separate from FLEXE_FILLDBG so it can be turned on alone; the two
+ * ask different questions. */
+static __attribute__((noinline, cold))
+void report_zero_fill(xtensa_cpu_t *cpu, int ret_wb, uint32_t base, int owb) {
+    static int on = -1, shown;
+    if (on < 0) on = getenv("FLEXE_ZEROFILL") != NULL;
+    if (!on || shown >= 32) return;
+    shown++;
+    fprintf(stderr, "[ZFILL] a0=0 restored to wb=%d (from wb=%d) a1=%08X "
+            "base=%08X retw@%08X core%d\n", ret_wb, owb,
+            phys_read(cpu, ret_wb, 1), base, cpu->pc, cpu->core_id);
+}
+
+static __attribute__((noinline, cold))
+void report_impossible_fill(xtensa_cpu_t *cpu, int ret_wb, uint32_t base,
+                            int use_rec, int owb, int callsize) {
+    static int enabled = -1, shown;
+    if (enabled < 0) enabled = getenv("FLEXE_FILLDBG") != NULL;
+    if (!enabled || shown >= 32) return;
+    shown++;
+    fprintf(stderr,
+            "[FILL] impossible a0=%08X restored to wb=%d (from wb=%d, "
+            "callsize=%d) a1=%08X base=%08X record=%s retw@%08X core%d\n",
+            phys_read(cpu, ret_wb, 0), ret_wb, owb, callsize,
+            phys_read(cpu, ret_wb, 1), base, use_rec ? "yes" : "no",
+            cpu->pc, cpu->core_id);
+    /* The spill records for the same window slot, newest first. When none of
+     * them carries the base the fill is looking for, this window was last
+     * saved for a different frame -- which is the shape of the failure, not
+     * a corrupted copy of the right one. */
+    const typeof(cpu->spill_stack[0]) *ss = &cpu->spill_stack[ret_wb & 0xF];
+    fprintf(stderr, "       ws=%04X  slot[%d] holds %d spill(s):",
+            cpu->windowstart, ret_wb & 0xF, ss->depth);
+    for (int d = ss->depth - 1; d >= 0 && d >= ss->depth - 6; d--)
+        fprintf(stderr, " base=%08X", ss->base[d]);
+    if (ss->depth == 0) fprintf(stderr, " none");
+    fprintf(stderr, "\n");
+}
+
+/* Does a spill record describe the frame this fill is about to restore?
+ * If so the data is in Flexe, not on the guest's stack, and is immune to the
+ * stack having been reused since -- which is how the flush's spills get lost. */
+static bool have_spill_record(const xtensa_cpu_t *cpu, uint32_t base) {
+    for (int s = 0; s < 16; s++)
+        for (int d = cpu->spill_stack[s].depth - 1; d >= 0; d--)
+            if (cpu->spill_stack[s].base[d] == base) return true;
+    return false;
+}
+
 static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int callsize) {
     uint32_t base = phys_read(cpu, owb, 1);  /* callee SP (hardware convention) */
 
@@ -800,6 +1078,15 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int cal
         int healed = (int)(phys_read(cpu, ret_wb, 0) >> 30);
         if (healed)
             cpu->window_callsize[ret_wb & 0xF] = (uint8_t)healed;
+        else if (phys_read(cpu, ret_wb, 0) != 0)
+            report_impossible_fill(cpu, ret_wb, base, use_rec, owb, callsize);
+        else
+            report_zero_fill(cpu, ret_wb, base, owb);
+        /* a0 == 0 is not reported: a FreeRTOS task's bottom frame really does
+         * hold zero, so it is the one legitimate way for the top bits to be
+         * clear. Any *other* value with bits 31:30 clear cannot be a return
+         * address the hardware produced, and means this fill restored
+         * something that was never a saved window. */
     }
 
     if (callsize >= 2) {
@@ -876,7 +1163,7 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int cal
  *   if WS[WB-n] set → normal: clear WS[owb], WB -= n
  *   if WS[WB-n] clear → underflow fill, then WB -= n
  */
-static void exec_retw(xtensa_cpu_t *cpu) {
+static void exec_retw(xtensa_cpu_t *cpu, int retw_len) {
     uint32_t a0 = ar_read(cpu, 0);
     int n = (a0 >> 30) & 3;
     if (n == 0) {
@@ -900,6 +1187,20 @@ static void exec_retw(xtensa_cpu_t *cpu) {
     }
     WINLOG(cpu, "RETW n=%d owb=%d ret_wb=%d a0=%08X a1=%08X fill=%d\n",
            n, owb, ret_wb, a0, ar_read(cpu, 1), (int)need_fill);
+
+    if (need_fill && __builtin_expect(cpu->real_window_vectors, 0) &&
+        XT_PS_WOE(cpu->ps) && !XT_PS_EXCM(cpu->ps) &&
+        !(g_flexe_shadow_fill &&
+          have_spill_record(cpu, phys_read(cpu, owb, 1))) &&
+        window_vectors_ready(cpu, window_vec_offset(a0, true))) {
+        /* The guest's WindowUnderflow handler reads the frame back from the
+         * stack the ABI put it on; RFWU sets the bit and returns to this
+         * RETW, which then takes the normal path. cpu->pc is already past the
+         * instruction, so back it up by the length the caller decoded. */
+        raise_window_exception(cpu, cpu->pc - (uint32_t)retw_len, ret_wb,
+                               window_vec_offset(a0, true));
+        return;
+    }
 
     if (need_fill) {
         /* Caller's window was spilled — fill it back. n (from the returning
@@ -1183,7 +1484,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         return; /* skip default pc advance */
                     } else if (m == 2 && nn == 1) {
                         /* RETW: windowed return */
-                        exec_retw(cpu);
+                        exec_retw(cpu, 3);
                         return;
                     } else if (m == 2 && nn == 2) {
                         /* JX: pc = ar[s] */
@@ -1252,11 +1553,13 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         WINLOG(cpu, "RFE epc=%08X ps=%08X a1=%08X\n",
                                cpu->epc[0], cpu->ps, ar_read(cpu, 1));
                         XT_PS_SET_EXCM(cpu->ps, 0);
+                        cpu->irq_check = true;  /* may unmask; see WSR PS */
                         BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     case 4: /* RFWO */
                         WINLOG(cpu, "RFWO epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
+                        cpu->irq_check = true;  /* may unmask; see WSR PS */
                         cpu->windowstart &= ~(1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
                         BRANCH_TO(cpu, cpu->epc[0]);
@@ -1264,6 +1567,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                     case 5: /* RFWU */
                         WINLOG(cpu, "RFWU epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
+                        cpu->irq_check = true;  /* may unmask; see WSR PS */
                         cpu->windowstart |= (1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
                         BRANCH_TO(cpu, cpu->epc[0]);
@@ -1274,6 +1578,15 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 case 1: /* RFI */
                     if (s >= 1 && s <= 7) {
                         cpu->ps = cpu->eps[s - 1];
+                        /* Deliberately no irq_check here, unlike every
+                         * other PS write. Hardware does re-evaluate at an
+                         * interrupt return, but our peripherals deassert a
+                         * level-triggered source a little later than the
+                         * handler acknowledges it, so re-checking on the
+                         * spot re-enters the same handler and the guest
+                         * makes no progress -- NerdMiner stops finding
+                         * shares. The interrupt is not lost: the next
+                         * assert, timer tick or PS write picks it up. */
                         BRANCH_TO(cpu, cpu->epc[s - 1]);
                     }
                     return;
@@ -1304,6 +1617,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             case 6: /* RSIL - read/set interrupt level */
                 ar_write(cpu, t, cpu->ps);
                 cpu->ps = (cpu->ps & ~0xF) | (s & 0xF);
+                cpu->irq_check = true;   /* may unmask; see WSR PS */
                 break;
             case 7: /* WAITI */
                 XT_PS_SET_INTLEVEL(cpu->ps, s);
@@ -1356,7 +1670,21 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 cpu->sar = (s | ((t & 1) << 4));
                 break;
             case 8: /* ROTW - rotate window */
-                /* Simplified: just adjust windowbase */
+                /* xthal_window_spill walks the window file with
+                 * `and a12,a12,a12; rotw 3`. The register touch is the point:
+                 * on hardware, reading a12 with WS[WB+1..WB+3] set raises
+                 * WindowOverflow, and the handler writes that frame to the
+                 * stack. Flexe synthesizes spills at ENTRY and does not do the
+                 * per-instruction window check, so the walk used to rotate and
+                 * write nothing -- and setjmp, which reads its caller's
+                 * spilled a0-a3 straight back from [sp-16], saved stale words.
+                 *
+                 * Do the check the touch would have done, with the window set
+                 * the ISA specifies for an a12-a15 access: WB+1 through WB+3,
+                 * and no wider. (The same routine reached through SYSCALL is
+                 * handled a few cases above.) */
+                if (XT_PS_WOE(cpu->ps))
+                    synth_overflow_check(cpu, 0);
                 cpu->windowbase = (cpu->windowbase + (int32_t)sign_extend(t, 4)) & 0xF;
                 break;
             case 14: /* NSA: normalized shift amount */
@@ -1835,7 +2163,7 @@ void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
                 BRANCH_TO(cpu, ar_read(cpu, 0));
                 return; /* skip default pc advance */
             case 1: /* RETW.N */
-                exec_retw(cpu);
+                exec_retw(cpu, 2);
                 return;
             case 2: /* BREAK.N */
                 cpu->debug_break = true;
@@ -1938,16 +2266,63 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                * index (callinc*4 | s&3), which is the same register
                * the ENTRY instruction targets. */
               int new_reg = (callinc << 2) | (s & 3);
-              ar_write(cpu, new_reg, ar_read(cpu, s) - frame_size);
+              uint32_t caller_sp = ar_read(cpu, s);
+              ar_write(cpu, new_reg, caller_sp - frame_size);
 
-              synth_overflow_check(cpu, callinc);
+              /* First frame on this core: stand in for the bootloader that
+               * would have called us, so this frame can be spilled. */
+              if (__builtin_expect(cpu->seed_entry_link, 0)) {
+                  cpu->seed_entry_link = false;
+                  uint32_t nsp = caller_sp - frame_size;
+                  if (nsp >= 0x3FF80000u && nsp < 0x40000000u &&
+                      mem_read32(cpu->mem, nsp - 12u) == 0u) {
+                      mem_write32(cpu->mem, nsp - 16u, 0u);  /* ends unwind */
+                      mem_write32(cpu->mem, nsp - 12u, caller_sp);
+                  }
+              }
+
+              /* The ISA ENTRY check is wb+1 through wb+callinc -- every
+               * window the rotation passes over, not just the one it lands on.
+               * Getting that wrong is undetectable afterwards: a live frame
+               * rotated over is simply gone, and no later access can fault on
+               * it. The windows the *callee* will reach through a4-a15 are
+               * window_access_check()'s job on the instructions that follow. */
+              bool ent_vec = __builtin_expect(cpu->real_window_vectors, 0) &&
+                             XT_PS_WOE(cpu->ps) && !XT_PS_EXCM(cpu->ps) &&
+                             window_vectors_ready(cpu,
+                                                  VECOFS_WINDOW_OVERFLOW4);
+              if (ent_vec) {
+                  int hit = -1;
+                  for (int i = 1; i <= callinc; i++) {
+                      int w = (cpu->windowbase + i) & 0xF;
+                      if (cpu->windowstart & (1u << w)) { hit = w; break; }
+                  }
+                  if (hit >= 0) {
+                      raise_window_exception(cpu, cpu->pc - 3, hit,
+                                             window_overflow_vec(cpu, hit));
+                      return;
+                  }
+              } else {
+                  synth_overflow_check(cpu, callinc);
+              }
 
               uint32_t owb = cpu->windowbase;
               cpu->windowbase = (owb + callinc) & 0xF;
               cpu->windowstart |= (1u << cpu->windowbase);
               cpu->window_callsize[cpu->windowbase] = (uint8_t)callinc;
               XT_PS_SET_OWB(cpu->ps, owb);
-              XT_PS_SET_CALLINC(cpu->ps, 0);
+              /* ENTRY must NOT clear PS.CALLINC. Only CALLn/CALLXn write it,
+               * and it stays put until the next one -- which is the whole
+               * mechanism behind xthal_window_spill: one `call12` followed by
+               * a run of bare `entry a1,48; mov.n a12,a0` pairs, each ENTRY
+               * rotating another three windows and each a12 touch overflowing
+               * the frame it exposes, until the register file has been walked.
+               *
+               * Clearing it collapsed that walk to its first rotation. On
+               * Tasmota the caller's window was left unspilled, so the setjmp
+               * that runs immediately afterwards read stale words back from
+               * [sp-16] and saved them; the matching longjmp then restored
+               * a0 = 8 into a live frame. FLEXE_FILLDBG names that fill. */
               WINLOG(cpu, "ENTRY callinc=%d owb=%d nwb=%d a1=%08X\n",
                      callinc, owb, cpu->windowbase, ar_read(cpu, 1));
           } break;
@@ -2178,13 +2553,27 @@ uint32_t g_dbg_watch_addr;
 uint32_t g_dbg_watch_addr2;
 uint32_t g_dbg_watch_val;
 /* PC-armed instruction trace: fires when PC hits arm address, then logs N insns */
+#define DBG_RING_MAX 256
+
 uint32_t g_dbg_tarm;
+/* Optional register filters on the PC-armed trace, plus the control-transfer
+ * ring. See xtensa_dbg_step_trace(). */
+uint32_t g_dbg_tarm_a2, g_dbg_tarm_a3;
+int      g_dbg_tarm_a2_en, g_dbg_tarm_a3_en;
+int      g_dbg_ring_n;
 int g_dbg_tn = 200;
 int g_dbg_tcore = -1;
 int g_dbg_tcount;          /* remaining insns in current fire */
 int g_dbg_tfires = 3;      /* max fires */
 int g_dbg_winlog;          /* FLEXE_WINLOG: window-ops trace */
 int g_dbg_c1ilog;          /* FLEXE_C1ILOG: log garbage s32c1i reads */
+/* Single gate for every per-instruction diagnostic below. None of them is
+ * armed unless the matching FLEXE_* variable is set, but the checks themselves
+ * used to run unconditionally: `perf annotate -s xtensa_run` put the arm-test
+ * loads and the g_dbg_core store among the ten hottest instructions in the
+ * interpreter, which is pure waste in every normal run. */
+int g_dbg_step_trace;
+int g_flexe_shadow_fill;   /* FLEXE_SHADOWFILL */
 
 __attribute__((constructor))
 static void g_dbg_watch_init(void) {
@@ -2202,10 +2591,26 @@ static void g_dbg_watch_init(void) {
     if (e) g_dbg_tarm = (uint32_t)strtoul(e, NULL, 0);
     e = getenv("FLEXE_TN");
     if (e) g_dbg_tn = atoi(e);
+    e = getenv("FLEXE_TARM_A2");
+    if (e) { g_dbg_tarm_a2 = (uint32_t)strtoul(e, NULL, 0); g_dbg_tarm_a2_en = 1; }
+    e = getenv("FLEXE_TARM_A3");
+    if (e) { g_dbg_tarm_a3 = (uint32_t)strtoul(e, NULL, 0); g_dbg_tarm_a3_en = 1; }
+    e = getenv("FLEXE_RING");
+    if (e) {
+        g_dbg_ring_n = atoi(e);
+        if (g_dbg_ring_n > DBG_RING_MAX) g_dbg_ring_n = DBG_RING_MAX;
+        if (g_dbg_ring_n < 0) g_dbg_ring_n = 0;
+    }
     e = getenv("FLEXE_TCORE");
     if (e) g_dbg_tcore = atoi(e);
     e = getenv("FLEXE_TFIRES");
     if (e) g_dbg_tfires = atoi(e);
+    {   /* On by default; FLEXE_SHADOWFILL=0 disables. A fill whose frame we
+         * still hold a spill record for is satisfied from that record rather
+         * than from the guest's stack, which by then may have been reused. */
+        const char *sf = getenv("FLEXE_SHADOWFILL");
+        g_flexe_shadow_fill = sf ? atoi(sf) != 0 : 1;
+    }
     e = getenv("FLEXE_WINLOG");
     if (e) g_dbg_winlog = atoi(e);
     e = getenv("FLEXE_C1ILOG");
@@ -2215,22 +2620,54 @@ static void g_dbg_watch_init(void) {
 #endif
     e = getenv("FLEXE_WATCHVAL");
     if (e) g_dbg_watch_val = (uint32_t)strtoul(e, NULL, 0);
+    /* g_dbg_core is read by the memory watch prints in memory.h as well as by
+     * the instruction trace, so arm the gate for either. */
+    g_dbg_mem_watch = (g_dbg_watch_en || g_dbg_pcwatch_en ||
+                       g_dbg_watch_val) ? 1 : 0;
+    g_dbg_step_trace = (g_dbg_tarm || g_dbg_mem_watch) ? 1 : 0;
 }
 
-static inline __attribute__((always_inline))
-int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
-    uint32_t insn;
-    cpu->dbg_prev_pc = g_dbg_pc;
-    g_dbg_pc = cpu->pc;
+/* Per-instruction diagnostics: the PC-armed instruction trace, and publishing
+ * the current core for the memory watchpoints in memory.h. Out of line and
+ * cold, so the hot path pays a single predictable test of g_dbg_step_trace. */
+static __attribute__((noinline, cold))
+void xtensa_dbg_step_trace(xtensa_cpu_t *cpu) {
+    static uint32_t ring[DBG_RING_MAX];
+    static unsigned ring_pos;
+    static uint32_t ring_prev;
+
     g_dbg_core = cpu->core_id;
-    if (__builtin_expect(g_dbg_tarm && cpu->pc == g_dbg_tarm && g_dbg_tfires > 0
-                         && (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore), 0)) {
+
+    /* FLEXE_RING: the last N control transfers, dumped when the trace fires.
+     * Keeping only non-sequential PCs turns a few dozen slots into thousands
+     * of instructions of context, which is what makes one dump enough to say
+     * how the guest arrived somewhere -- through an interrupt vector, a tail
+     * call, a scheduler switch. */
+    if (g_dbg_ring_n > 0 &&
+        (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore)) {
+        int32_t step = (int32_t)(cpu->pc - ring_prev);
+        if (step < 0 || step > 8)
+            ring[ring_pos++ % (unsigned)g_dbg_ring_n] = cpu->pc;
+        ring_prev = cpu->pc;
+    }
+
+    if (g_dbg_tarm && cpu->pc == g_dbg_tarm && g_dbg_tfires > 0
+        && (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore)
+        /* FLEXE_TARM_A2/A3: a hot address like vListInsert is reached by every
+         * object in the system. Without a way to say "only this one" the trace
+         * is unreadable. */
+        && (!g_dbg_tarm_a2_en || ar_read(cpu, 2) == g_dbg_tarm_a2)
+        && (!g_dbg_tarm_a3_en || ar_read(cpu, 3) == g_dbg_tarm_a3)) {
         g_dbg_tfires--;
         g_dbg_tcount = g_dbg_tn;
         fprintf(stderr, "[TARM] fire at pc=0x%08X core%d\n", cpu->pc, cpu->core_id);
+        for (int i = 0; i < g_dbg_ring_n; i++) {
+            uint32_t p = ring[(ring_pos + (unsigned)i) % (unsigned)g_dbg_ring_n];
+            if (p) fprintf(stderr, "[RING] %3d pc=%08X\n", i, p);
+        }
     }
-    if (__builtin_expect(g_dbg_tcount > 0
-                         && (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore), 0)) {
+    if (g_dbg_tcount > 0
+        && (g_dbg_tcore < 0 || cpu->core_id == g_dbg_tcore)) {
         g_dbg_tcount--;
         fprintf(stderr,
                 "[T%d] pc=0x%08X a0=%08X a1=%08X a2=%08X a3=%08X "
@@ -2244,6 +2681,22 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
                 ar_read(cpu, 12), ar_read(cpu, 13), ar_read(cpu, 14), ar_read(cpu, 15),
                 cpu->ps, cpu->windowbase, cpu->windowstart);
     }
+}
+
+/* prev_pc carries the previous instruction's PC between iterations. It is a
+ * caller-owned local rather than an xtensa_cpu_t field so it stays in a
+ * register: the only consumer is the invalid-PC trap, which is fatal and cold,
+ * and paying a store to the struct on every instruction to feed it showed up
+ * in the profile. */
+static inline __attribute__((always_inline))
+int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
+                     uint32_t *restrict prev_pc) {
+    uint32_t insn;
+    const uint32_t last_pc = *prev_pc;
+    g_dbg_pc = cpu->pc;
+    *prev_pc = cpu->pc;
+    if (__builtin_expect(g_dbg_step_trace, 0))
+        xtensa_dbg_step_trace(cpu);
     if (__builtin_expect(cpu->halted, 0)) {
         cpu->ccount++;
         ++*local_cc;
@@ -2270,6 +2723,10 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     if (__builtin_expect(cpu->_pc_written, 0)) {
         cpu->br_ring[cpu->br_ring_idx & (XT_BR_RING_SIZE - 1)] = cpu->pc;
         cpu->br_ring_idx++;
+        /* Return from a guest_call_async() callee. Only reachable through the
+         * return address that call planted, so the compare is enough. */
+        if (__builtin_expect(cpu->pc == GUEST_CALL_ASYNC_SENTINEL, 0))
+            guest_call_async_return(cpu);
     }
     if (cpu->_pc_written && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
@@ -2304,6 +2761,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc) {
     if (__builtin_expect(cpu->pc < ESP32_INSN_ADDR_LOW ||
                          cpu->pc >= ESP32_INSN_ADDR_HIGH, 0)) {
         cpu->cycle_count = *local_cc;
+        cpu->dbg_prev_pc = last_pc;
         xtensa_invalid_pc_trap(cpu);
         return -1;
     }
@@ -2394,6 +2852,16 @@ have_insn:
     xtensa_profile_tick_sp(cpu->pc, ar_read(cpu, 1));
 #endif
     cpu->_pc_written = false;
+
+    if (__builtin_expect(cpu->real_window_vectors, 0) &&
+        window_access_check(cpu, insn)) {
+        /* Faulted into a window vector; the instruction has not run and RFWO
+         * returns to it. */
+        cpu->ccount++;
+        ++*local_cc;
+        return cpu->exception ? -1 : 0;
+    }
+
     cpu->pc += (uint32_t)ilen;
 
     if (ilen == 2) {
@@ -2477,14 +2945,23 @@ have_insn:
  * Always checks timers + interrupts unconditionally (no batching). */
 int xtensa_step(xtensa_cpu_t *cpu) {
     uint64_t cc = cpu->cycle_count;
-    const uint64_t before = cc;
+    uint32_t prev_pc = cpu->dbg_prev_pc;
     const bool was_halted = cpu->halted;
-    int r = xtensa_step_impl(cpu, &cc);
+    int r = xtensa_step_impl(cpu, &cc, &prev_pc);
+    cpu->dbg_prev_pc = prev_pc;
     cpu->cycle_count = cc;
     /* One dispatch can retire many instructions when a native block runs, and
-     * none at all when the core is halted. The advance in cc says which. */
+     * none at all when the core is halted.
+     *
+     * This used to add the advance in cycle_count, which is a different
+     * quantity: a ROM stub charges for the guest function it stands in for,
+     * and stub_ets_delay_us() walks the clock forward by an arbitrary amount.
+     * That is skipped time, not retired work, and crediting it inflated
+     * insn_count -- which every MIPS and JIT-coverage figure divides by.
+     * A step_result above 1 is a native block reporting its own length;
+     * anything else retired exactly one instruction. */
     if (!was_halted)
-        cpu->insn_count += cc - before;
+        cpu->insn_count += (r > 1) ? (uint64_t)r : 1u;
     if (cpu->ccount >= cpu->next_timer_event)
         xtensa_fire_timers(cpu);
     if (cpu->interrupt & cpu->intenable)
@@ -2545,49 +3022,82 @@ static inline int xtensa_run_halted(xtensa_cpu_t *cpu, uint64_t *local_cc,
 
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
     uint64_t cc = cpu->cycle_count;
-    int idle_executed = 0;
+    uint32_t prev_pc = cpu->dbg_prev_pc;
+    int idle_total = 0;   /* skipped time: advances the clock, retires nothing */
+    int exec_total = 0;   /* guest instructions actually retired */
 
-    if (__builtin_expect(cpu->halted, 0)) {
-        idle_executed = xtensa_run_halted(cpu, &cc, max_cycles);
-        if (idle_executed >= max_cycles || cpu->halted || !cpu->running) {
-            cpu->cycle_count = cc;
-            return idle_executed;
+    /* Alternate between running and idling until the budget is spent.
+     *
+     * The loop matters. A core that executes WAITI mid-batch has to have its
+     * idle skipped -- stepping it a cycle at a time both wasted host time and
+     * counted the cycles as retired instructions -- but skipping to the next
+     * timer event usually *wakes* it, and the batch must then carry on
+     * executing. Returning early instead silently starves the guest: it gets
+     * the simulated time but not the work.
+     *
+     * jit_run() has always had this loop, so only the interpreter was
+     * affected, and the stock-ROM gates could not see it because NerdMiner's
+     * mining loop -- the one workload that keeps both cores busy for long
+     * stretches -- was never actually reached. Once it was, the interpreter
+     * submitted zero shares against the JIT's 27.
+     */
+    /* Not `while (cpu->running && ...)`: the stepping loops check `running`
+     * *after* a dispatch, and callers rely on that -- a hook installed at the
+     * entry PC must get its one chance to run even when the CPU has not been
+     * marked running. Exit conditions are at the bottom instead. */
+    for (;;) {
+        int remaining = max_cycles - exec_total - idle_total;
+        if (remaining <= 0) break;
+
+        if (__builtin_expect(cpu->halted, 0)) {
+            int idled = xtensa_run_halted(cpu, &cc, remaining);
+            if (idled <= 0) break;          /* nothing to wait for */
+            idle_total += idled;
+            if (cpu->halted) break;         /* still idle: budget is gone */
+            continue;                       /* woke up: go execute */
         }
-        max_cycles -= idle_executed;
-    }
 
-    /* A native hook can execute hundreds of guest instructions during one
-     * xtensa_step_impl() dispatch.  Bound and report the batch in guest
-     * instructions rather than hook invocations so embedded frontends keep
-     * timer/preemption cadence and throughput accounting honest. */
-    if (__builtin_expect(cpu->accelerated_blocks, 0)) {
-        int executed;
-        for (executed = 0; executed < max_cycles; executed++) {
-            int step_result = xtensa_step_impl(cpu, &cc);
-            if (__builtin_expect(step_result != 0, 0)) {
-                if (step_result < 0) break;
-                executed += step_result - 1;
+        int executed = 0;
+        /* A native hook can execute hundreds of guest instructions in one
+         * xtensa_step_impl() dispatch. Bound and report the batch in guest
+         * instructions rather than hook invocations, so embedded frontends
+         * keep timer/preemption cadence and throughput accounting honest. */
+        if (__builtin_expect(cpu->accelerated_blocks, 0)) {
+            for (; executed < remaining; executed++) {
+                int step_result = xtensa_step_impl(cpu, &cc, &prev_pc);
+                if (__builtin_expect(step_result != 0, 0)) {
+                    if (step_result < 0) { executed++; break; }
+                    executed += step_result - 1;
+                }
+                if (__builtin_expect(!cpu->running, 0)) {
+                    executed++;   /* include the dispatch that stopped the CPU */
+                    break;
+                }
+                if (__builtin_expect(cpu->halted, 0)) {
+                    executed++;   /* the WAITI itself did retire */
+                    break;
+                }
             }
-            if (__builtin_expect(!cpu->running, 0)) {
-                executed++; /* include the dispatch that stopped the CPU */
-                break;
+        } else {
+            for (; executed < remaining; executed++) {
+                if (__builtin_expect(xtensa_step_impl(cpu, &cc, &prev_pc) != 0,
+                                     0)) {
+                    executed++;
+                    break;
+                }
+                if (__builtin_expect(!cpu->running, 0)) { executed++; break; }
+                if (__builtin_expect(cpu->halted, 0)) { executed++; break; }
             }
         }
-        cpu->cycle_count = cc;
-        cpu->insn_count += (uint64_t)executed;   /* idle retires nothing */
-        return idle_executed + executed;
+        exec_total += executed;
+        /* No progress, or the CPU stopped: either way do not spin. */
+        if (executed == 0 || !cpu->running) break;
     }
 
-    int i;
-    for (i = 0; i < max_cycles; i++) {
-        if (__builtin_expect(xtensa_step_impl(cpu, &cc) != 0, 0))
-            break;
-        if (__builtin_expect(!cpu->running, 0))
-            break;
-    }
     cpu->cycle_count = cc;
-    cpu->insn_count += (uint64_t)i;              /* idle retires nothing */
-    return idle_executed + i;
+    cpu->dbg_prev_pc = prev_pc;
+    cpu->insn_count += (uint64_t)exec_total;   /* idle retires nothing */
+    return idle_total + exec_total;
 }
 
 /* ===== Breakpoint API ===== */

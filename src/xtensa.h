@@ -267,6 +267,14 @@ struct xtensa_cpu {
      * or switch away from the in-flight call. */
     uint32_t in_guest_call;
     bool     irq_check;                 /* Set when interrupt/intenable changes */
+    /* Set by the session before the first instruction; consumed by the first
+     * ENTRY. The windowed ABI wants a caller's stack pointer at [sp-12] of
+     * every frame, and hardware's bootloader leaves one because it *calls*
+     * the app entry. Flexe jumps straight there, so the first frame's slot
+     * is zero and WindowOverflow8/12 on it reads a4-a7 from 0xFFFFFFE0. The
+     * address depends on the frame size the guest picks, so it can only be
+     * written once that ENTRY has run. */
+    bool     seed_entry_link;
     int      breakpoint_count;
 
     /* --- CL 5-6: pointers, cycle count, window --- */
@@ -348,6 +356,10 @@ struct xtensa_cpu {
     bool     debug_break;       /* Debug break requested */
     bool     window_trace;      /* Emit window spill/fill/ENTRY/RETW trace to stderr */
     bool     window_trace_active; /* Set by main loop to gate window trace */
+    /* Raise WindowOverflow/WindowUnderflow into the guest's own vectors
+     * instead of synthesizing the spill and fill in C. FLEXE_WINDOW_VECTORS=1.
+     * See the block comment above raise_window_exception() in xtensa.c. */
+    bool     real_window_vectors;
     bool     spill_verify;      /* Enable spill/fill verification */
     bool     accelerated_blocks; /* PC hook/AOT may execute >1 guest insn */
     uint64_t virtual_time_us;   /* Guest time skipped without executing (us) */
@@ -525,6 +537,19 @@ void xtensa_recompute_next_timer(xtensa_cpu_t *cpu);
  * (the FreeRTOS idle fast-forward) must invoke this at each event boundary,
  * or every interrupt scheduled inside the skipped window is silently lost. */
 void xtensa_fire_due_timers(xtensa_cpu_t *cpu);
+
+/* Monotonic count of vectored interrupts; see xtensa_check_interrupts(). */
+extern uint64_t g_xtensa_irq_dispatched;
+
+/* Current CPU clock in MHz, from the ticks-per-microsecond word the ROM keeps.
+ * Falls back to 160 when the guest has not written it yet. */
+uint32_t xtensa_cpu_freq_mhz(const xtensa_cpu_t *cpu);
+
+/* Advance CCOUNT across `cycles` of simulated time the core did not execute,
+ * firing the timers inside the interval as it goes. Every site that moves a
+ * core's clock forward without running it must use this rather than writing
+ * cpu->ccount, or the guest's own FreeRTOS tick is skipped for the interval. */
+void xtensa_advance_idle_cycles(xtensa_cpu_t *cpu, uint64_t cycles);
 
 /*
  * Breakpoint support

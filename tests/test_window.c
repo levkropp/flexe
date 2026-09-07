@@ -114,7 +114,13 @@ TEST(call4_entry_retw) {
     ASSERT_EQ(cpu.windowbase, 1);
     ASSERT_EQ(cpu.windowstart & (1u << 1), (1u << 1));
     ASSERT_EQ(XT_PS_OWB(cpu.ps), 0);
-    ASSERT_EQ(XT_PS_CALLINC(cpu.ps), 0);
+    /* ENTRY leaves PS.CALLINC alone -- only CALLn/CALLXn write it. This
+     * assertion used to require 0, matching what the emulator did rather than
+     * what the ISA says, and that difference is not academic:
+     * xthal_window_spill is one `call12` followed by a run of bare ENTRYs,
+     * each relying on CALLINC still holding 3 to rotate another three
+     * windows. Clearing it collapsed the walk to its first rotation. */
+    ASSERT_EQ(XT_PS_CALLINC(cpu.ps), 1);
     /* New a1 = old a1 - 32 = sp_val - 32 */
     ASSERT_EQ(ar_read(&cpu, 1), sp_val - 32);
 
@@ -262,6 +268,49 @@ TEST(retw_restores_window) {
     /* Back in caller — a3 should still be intact */
     ASSERT_EQ(cpu.windowbase, 0);
     ASSERT_EQ(ar_read(&cpu, 3), 0xDEADBEEF);
+
+    teardown(&cpu);
+}
+
+/* A RETW that had to underflow-fill leaves the window it filled marked live,
+ * exactly as the hardware round trip does: the underflow handler ends in RFWU,
+ * and RFWU sets WindowStart for the window it just restored (see rfwu_basic)
+ * before the RETW completes. synth_underflow_fill() already does this; there
+ * was no test saying it must.
+ *
+ * Worth pinning because losing it is invisible until something returns into
+ * the same window twice, and one real workload does that constantly:
+ * Tasmota's Berry interpreter longjmps with `wsr.windowstart 1<<wb`, declaring
+ * every other window spilled, so its landing frame always arrives through a
+ * fill. If the bit were left clear that frame would keep running as if
+ * spilled, and the next return out of it would underflow again against a save
+ * area nothing had written. */
+TEST(retw_underflow_marks_window_live) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    uint32_t sp_val = BASE + 0x1000;
+
+    /* Stand in the callee (window 1) with the caller's window 0 spilled. */
+    cpu.windowbase = 1;
+    cpu.windowstart = (1u << 1);
+    cpu.window_callsize[1] = 1;
+    ar_write(&cpu, 1, sp_val - 32);                       /* callee SP */
+    ar_write(&cpu, 0, (1u << 30) | ((BASE + 3) & 0x3FFFFFFFu));
+
+    /* The caller's a0-a3, where the overflow vector would have put them. */
+    mem_write32(cpu.mem, sp_val - 32 - 16, (1u << 30) | (BASE & 0x3FFFFFFFu));
+    mem_write32(cpu.mem, sp_val - 32 - 12, sp_val);
+    mem_write32(cpu.mem, sp_val - 32 - 8,  0xA5A5A5A5u);
+    mem_write32(cpu.mem, sp_val - 32 - 4,  0x5A5A5A5Au);
+
+    put_insn3(&cpu, BASE + 0x40, retw_insn());
+    cpu.pc = BASE + 0x40;
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.windowbase, 0);
+    ASSERT_TRUE(cpu.windowstart & (1u << 0));   /* filled window is live */
+    ASSERT_EQ(cpu.windowstart & (1u << 1), 0u); /* returning window is not */
+    ASSERT_EQ(ar_read(&cpu, 1), sp_val);
+    ASSERT_EQ(cpu.pc, BASE + 3);
 
     teardown(&cpu);
 }
@@ -1101,6 +1150,7 @@ static void run_window_tests(void) {
     RUN_TEST(l32e_s32e_round_trip);
     RUN_TEST(rfwo_basic);
     RUN_TEST(rfwu_basic);
+    RUN_TEST(retw_underflow_marks_window_live);
     RUN_TEST(retw_n_basic);
     RUN_TEST(factorial_windowed);
     RUN_TEST(call8_linked_spill_area);

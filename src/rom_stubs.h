@@ -24,6 +24,11 @@ typedef enum {
      * links: entry 0x400830D0 and their own address maps. */
     ROM_FIRMWARE_MARAUDER_V1143_GUITION,
     ROM_FIRMWARE_MARAUDER_V1143_35INCH,
+    /* WLED 16.0.1 for plain ESP32. Its esp_wifi entry points were located by
+     * masked-signature matching against a locally built Arduino-ESP32 2.0.17
+     * sketch -- the same core version WLED links (both report IDF 4.4.8) --
+     * rather than by hand. */
+    ROM_FIRMWARE_WLED_V1601,
 } rom_firmware_profile_t;
 
 esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);

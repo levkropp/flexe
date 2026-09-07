@@ -268,6 +268,36 @@ if(UNIX)
     target_compile_options(flexe-esp-timer-test PRIVATE
         -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 
+    add_executable(flexe-i2c-slave-test tools/i2c_slave_test.c)
+    target_link_libraries(flexe-i2c-slave-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-i2c-slave-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-generic-rom-test tools/generic_rom_test.c)
+    target_link_libraries(flexe-generic-rom-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-generic-rom-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-deep-sleep-test tools/deep_sleep_test.c)
+    target_link_libraries(flexe-deep-sleep-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-deep-sleep-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-rtc-gpio-test tools/rtc_gpio_test.c)
+    target_link_libraries(flexe-rtc-gpio-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-rtc-gpio-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-touch-pad-test tools/touch_pad_test.c)
+    target_link_libraries(flexe-touch-pad-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-touch-pad-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
+    add_executable(flexe-guest-clock-test tools/guest_clock_test.c)
+    target_link_libraries(flexe-guest-clock-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-guest-clock-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_executable(flexe-spi-master-test tools/spi_master_test.c)
     target_link_libraries(flexe-spi-master-test PRIVATE xtensa-emu-lib)
     target_compile_options(flexe-spi-master-test PRIVATE

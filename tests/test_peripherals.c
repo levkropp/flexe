@@ -7,6 +7,9 @@
 #include <string.h>
 #include <unistd.h>
 
+/* i2c_reg.h I2C_SLAVE_ADDRESSED, in I2C_SR_REG. */
+#define I2C_SR_SLAVE_ADDRESSED_BIT (1u << 5)
+
 /* ===== MMIO callback framework ===== */
 
 static uint32_t test_hook_read_val;
@@ -2389,6 +2392,56 @@ TEST(irq_dispatch_observes_only_rising_edges) {
     mem_destroy(mem);
 }
 
+/* A level-triggered source accumulates conditions, and the ISR that reads the
+ * status register clears only what it saw. The plain rising-edge dispatch
+ * cannot deliver a condition that arrives while the line is already high --
+ * measured on I2C slave mode, where the ISR ran exactly once in a whole run.
+ * periph_assert_interrupt_status() closes that, without storming on a level
+ * that merely stays asserted. */
+TEST(irq_dispatch_delivers_new_conditions_on_a_held_line) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_irq_dispatch_t dispatch = {0};
+
+    ASSERT_EQ(periph_set_irq_dispatch(p, 49, test_irq_dispatch, &dispatch), 0);
+
+    /* First condition. Twice: once for the electrical rising edge and once
+     * for the new condition. They are separate signals and the I2C slave
+     * driver needs both -- see periph_assert_interrupt_status(). */
+    periph_assert_interrupt_status(p, 49, 0x1u);
+    ASSERT_EQ(dispatch.count, 2);
+
+    /* Same condition still asserted -- no new work, so no new dispatch. This
+     * is what makes the call safe from an *_irq_update() that runs on every
+     * register write. */
+    periph_assert_interrupt_status(p, 49, 0x1u);
+    ASSERT_EQ(dispatch.count, 2);
+
+    /* A second, distinct condition while the line never fell. The rising edge
+     * cannot see this; before the status-aware form it was lost entirely. */
+    periph_assert_interrupt_status(p, 49, 0x3u);
+    ASSERT_EQ(dispatch.count, 3);
+    ASSERT_EQ(dispatch.last_source, 49);
+
+    /* Dropping one of two conditions is not new work. */
+    periph_assert_interrupt_status(p, 49, 0x2u);
+    ASSERT_EQ(dispatch.count, 3);
+
+    /* Re-raising the one that went away is. */
+    periph_assert_interrupt_status(p, 49, 0x3u);
+    ASSERT_EQ(dispatch.count, 4);
+
+    /* Deassert forgets the mask, so the same condition dispatches again on the
+     * next edge rather than being suppressed as "already seen". */
+    periph_deassert_interrupt(p, 49);
+    ASSERT_FALSE(periph_interrupt_pending(p, 49));
+    periph_assert_interrupt_status(p, 49, 0x3u);
+    ASSERT_EQ(dispatch.count, 6);   /* edge + condition */
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 /* ESP32 SPI1 flash-controller register subset used by ESP-IDF's memspi
  * driver. */
 #define TEST_SPI1_BASE       0x3FF42000u
@@ -3655,8 +3708,225 @@ TEST(wdt_disable) {
 TEST(rtc_reset_cause) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
-    ASSERT_EQ(mem_read32(mem, 0x3FF48034), 1); /* POWERON */
+    /* RESET_STATE carries the cause once per CPU: RESET_CAUSE_PROCPU at bit 0
+     * and RESET_CAUSE_APPCPU at bit 6, so a power-on board reads 0x41. This
+     * used to answer a flat 1, which is the PRO field alone. */
+    ASSERT_EQ(mem_read32(mem, 0x3FF48034), 0x41u); /* POWERON, both CPUs */
     ASSERT_EQ(mem_read32(mem, 0x3FF480A8), 0x2210); /* CLK_CONF */
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(i2c_slave_answers_a_master_transfer) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t i2c0 = 0x3FF53000u;
+    uint8_t rd[3] = {0};
+    const uint8_t wr[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+    /* Master mode: a transfer aimed at the port is not ours to answer. */
+    mem_write32(mem, i2c0 + 0x004u, 1u << 4);       /* CTR MS_MODE */
+    mem_write32(mem, i2c0 + 0x010u, 0x42u);         /* SLAVE_ADDR  */
+    ASSERT_EQ(periph_i2c_master_xfer(p, 0, 0x42, wr, 4, rd, 3), -1);
+
+    /* Slave mode, but a different address. */
+    mem_write32(mem, i2c0 + 0x004u, 0u);
+    ASSERT_EQ(periph_i2c_master_xfer(p, 0, 0x43, wr, 4, rd, 3), -1);
+
+    /* Addressed: the write lands in the RX FIFO and the read drains the TX
+     * FIFO the guest staged. */
+    mem_write32(mem, i2c0 + 0x01Cu, 0x11u);         /* stage three bytes */
+    mem_write32(mem, i2c0 + 0x01Cu, 0x22u);
+    mem_write32(mem, i2c0 + 0x01Cu, 0x33u);
+    ASSERT_EQ(periph_i2c_master_xfer(p, 0, 0x42, wr, 4, rd, 3), 4);
+    ASSERT_EQ(rd[0], 0x11u);
+    ASSERT_EQ(rd[1], 0x22u);
+    ASSERT_EQ(rd[2], 0x33u);
+    ASSERT_EQ(mem_read32(mem, i2c0 + 0x008u) & I2C_SR_SLAVE_ADDRESSED_BIT,
+              I2C_SR_SLAVE_ADDRESSED_BIT);
+    /* Four bytes waiting, and the completion the driver drains on. */
+    ASSERT_EQ((mem_read32(mem, i2c0 + 0x008u) >> 8) & 0x3Fu, 4u);
+    ASSERT_EQ(mem_read32(mem, i2c0 + 0x020u) & (1u << 4), 1u << 4);
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(mem_read32(mem, i2c0 + 0x01Cu) & 0xFFu, wr[i]);
+
+    /* With nothing staged, a read clocks out 0xFF as the bus would. */
+    ASSERT_EQ(periph_i2c_master_xfer(p, 0, 0x42, NULL, 0, rd, 3), 0);
+    ASSERT_EQ(rd[0], 0xFFu);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rtc_sleep_registers_and_wake_cause) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t rtc = 0x3FF48000u;
+
+    /* Before anything sleeps the wake cause must be zero. It used to answer a
+     * hardcoded 1, which esp_sleep_get_wakeup_cause() decodes as EXT0. */
+    ASSERT_EQ(mem_read32(mem, rtc + 0x38u) & 0x7FFu, 0u);
+    ASSERT_EQ(periph_reset_cause(p), 1u);          /* POWERON */
+
+    /* WAKEUP_ENA and WAKEUP_CAUSE share the register: the guest writes the
+     * enables at bit 11 and reads the cause back at bit 0. */
+    mem_write32(mem, rtc + 0x38u, 0x8u << 11);     /* RTC_TIMER_TRIG_EN */
+    ASSERT_EQ(mem_read32(mem, rtc + 0x38u) >> 11 & 0x7FFu, 0x8u);
+
+    /* Arm a target one second ahead of the value the guest last latched. */
+    mem_write32(mem, rtc + 0x0Cu, 1u << 31);       /* TIME_UPDATE */
+    uint64_t latched = mem_read32(mem, rtc + 0x10u) |
+                       ((uint64_t)mem_read32(mem, rtc + 0x14u) << 32);
+    uint64_t target = latched + 150000u;           /* 1 s of slow clock */
+    mem_write32(mem, rtc + 0x04u, (uint32_t)target);
+    mem_write32(mem, rtc + 0x08u, (uint32_t)(target >> 32));
+
+    /* Light sleep: DG_WRAP_PD_EN clear. */
+    mem_write32(mem, rtc + 0x18u, 1u << 31);       /* STATE0 SLEEP_EN */
+
+    bool deep = true;
+    uint64_t timeout_us = 0;
+    uint32_t cause = 0xFF;
+    ASSERT_EQ(periph_take_sleep_request(p, &deep, &timeout_us, &cause), true);
+    ASSERT_EQ(deep, false);
+    ASSERT_EQ(cause, 0u);                          /* nothing already pending */
+    /* One second, converted through the calibration in STORE1. */
+    ASSERT_EQ(timeout_us > 900000u && timeout_us < 1100000u, true);
+    /* Taken once. */
+    ASSERT_EQ(periph_take_sleep_request(p, &deep, &timeout_us, &cause), false);
+
+    periph_finish_wake(p, 0x8u);
+    ASSERT_EQ(mem_read32(mem, rtc + 0x38u) & 0x7FFu, 0x8u);
+    ASSERT_EQ(mem_read32(mem, rtc + 0x18u) & (1u << 31), 0u);  /* SLEEP_EN clear */
+
+    /* Powering the digital domain down is what makes it a deep sleep. */
+    mem_write32(mem, rtc + 0x84u, 1u << 31);       /* DIG_PWC DG_WRAP_PD_EN */
+    mem_write32(mem, rtc + 0x18u, 1u << 31);
+    ASSERT_EQ(periph_take_sleep_request(p, &deep, &timeout_us, &cause), true);
+    ASSERT_EQ(deep, true);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rtc_sleep_wakes_on_ext1_and_touch) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t rtc = 0x3FF48000u;
+
+    /* EXT1 on GPIO 25 (RTC channel 6), any-high. */
+    mem_write32(mem, rtc + 0x38u, (0x1u << 1) << 11);   /* RTC_EXT1_TRIG_EN */
+    mem_write32(mem, rtc + 0xCCu, 1u << 6);             /* EXT_WAKEUP1_SEL */
+    mem_write32(mem, rtc + 0x60u, 1u << 31);            /* EXT_WAKEUP1_LV: high */
+    ASSERT_EQ(periph_sleep_poll_wake(p), 0u);
+    periph_gpio_set_input(p, 25, 1);
+    ASSERT_EQ(periph_sleep_poll_wake(p), 1u << 1);
+    periph_gpio_set_input(p, 25, 0);
+    ASSERT_EQ(periph_sleep_poll_wake(p), 0u);
+
+    /* Touch, once a pad drops below its threshold. */
+    mem_write32(mem, rtc + 0x38u, (0x1u << 8) << 11);   /* RTC_TOUCH_TRIG_EN */
+    mem_write32(mem, 0x3FF48800u + 0x5Cu, (500u << 16));
+    mem_write32(mem, 0x3FF48800u + 0x8Cu, 0x1u);        /* pad 0 enabled */
+    ASSERT_EQ(periph_sleep_poll_wake(p), 0u);
+    periph_touch_set_value(p, 0, 100u);
+    mem_write32(mem, 0x3FF48800u + 0x8Cu, 0x1u);        /* rescan */
+    ASSERT_EQ(periph_sleep_poll_wake(p), 1u << 8);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(rtc_gpio_shares_the_pad_with_the_gpio_block) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t rtcio = 0x3FF48400u;
+    /* GPIO 25 is RTC channel 6; the data field starts at bit 14. */
+    const uint32_t CH6 = 1u << (14 + 6);
+
+    mem_write32(mem, rtcio + 0x10u, CH6);          /* ENABLE_W1TS */
+    mem_write32(mem, rtcio + 0x04u, CH6);          /* OUT_W1TS    */
+    ASSERT_EQ(periph_gpio_pin_level(p, 25), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 25), 1);
+
+    mem_write32(mem, rtcio + 0x08u, CH6);          /* OUT_W1TC    */
+    ASSERT_EQ(periph_gpio_pin_level(p, 25), 0);
+
+    /* Handing the pad back stops the RTC domain driving it. */
+    mem_write32(mem, rtcio + 0x14u, CH6);          /* ENABLE_W1TC */
+    ASSERT_EQ(periph_gpio_output_enabled(p, 25), 0);
+
+    /* And an input level put on the pad is visible from the RTC domain.
+     * GPIO 26 is channel 7. */
+    periph_gpio_set_input(p, 26, 1);
+    ASSERT_EQ((mem_read32(mem, rtcio + 0x24u) >> (14 + 7)) & 1u, 1u);
+    periph_gpio_set_input(p, 26, 0);
+    ASSERT_EQ((mem_read32(mem, rtcio + 0x24u) >> (14 + 7)) & 1u, 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(touch_pad_threshold_and_status) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t sens = 0x3FF48800u;
+    const uint32_t THRES1 = sens + 0x5Cu, OUT1 = sens + 0x70u;
+    const uint32_t CTRL2  = sens + 0x84u, ENABLE = sens + 0x8Cu;
+
+    /* Pads 0 and 1 share THRES1/OUT1, the even pad in the high half. */
+    mem_write32(mem, THRES1, (500u << 16) | 500u);
+    periph_touch_set_value(p, 0, 1000u);   /* released */
+    periph_touch_set_value(p, 1, 100u);    /* pressed  */
+
+    /* Nothing is measured until a pad is enabled for work. */
+    mem_write32(mem, ENABLE, 0x3u);
+    ASSERT_EQ(mem_read32(mem, OUT1) >> 16, 1000u);
+    ASSERT_EQ(mem_read32(mem, OUT1) & 0xFFFFu, 100u);
+
+    /* Counts fall as capacitance rises, so only the pad *below* its threshold
+     * shows up in the status field. */
+    ASSERT_EQ(mem_read32(mem, CTRL2) & 0x3FFu, 0x2u);
+
+    /* A disabled pad cannot be touched, whatever its count says. */
+    mem_write32(mem, ENABLE, 0x1u);
+    ASSERT_EQ(mem_read32(mem, CTRL2) & 0x3FFu, 0x0u);
+
+    /* Clearing is explicit: the guest writes MEAS_EN_CLR. */
+    mem_write32(mem, ENABLE, 0x3u);
+    ASSERT_EQ(mem_read32(mem, CTRL2) & 0x3FFu, 0x2u);
+    mem_write32(mem, CTRL2, 1u << 30);
+    ASSERT_EQ(mem_read32(mem, CTRL2) & 0x3FFu, 0x0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(touch_pad_raises_rtc_interrupt) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t sens = 0x3FF48800u, rtc = 0x3FF48000u;
+
+    mem_write32(mem, sens + 0x5Cu, (500u << 16) | 500u);
+    mem_write32(mem, sens + 0x8Cu, 0x1u);            /* pad 0 enabled */
+    mem_write32(mem, rtc + 0x3Cu, 1u << 6);          /* TOUCH_INT_ENA */
+    mem_write32(mem, sens + 0x84u, 1u << 11);        /* FSM on */
+
+    /* A pad nobody has driven reads high, so enabling the FSM must not by
+     * itself look like a touch. */
+    ASSERT_EQ(mem_read32(mem, rtc + 0x40u) & (1u << 6), 0u);
+    periph_touch_set_value(p, 0, 1000u);
+    ASSERT_EQ(mem_read32(mem, rtc + 0x40u) & (1u << 6), 0u);
+
+    /* Crossing the threshold latches the raw bit and, because it is enabled,
+     * shows through the status register. */
+    periph_touch_set_value(p, 0, 100u);
+    ASSERT_EQ(mem_read32(mem, rtc + 0x40u) & (1u << 6), 1u << 6);
+    ASSERT_EQ(mem_read32(mem, rtc + 0x44u) & (1u << 6), 1u << 6);
+
+    mem_write32(mem, rtc + 0x48u, 1u << 6);          /* INT_CLR */
+    ASSERT_EQ(mem_read32(mem, rtc + 0x40u) & (1u << 6), 0u);
+
     periph_destroy(p);
     mem_destroy(mem);
 }
@@ -5556,6 +5826,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(rtc_i2c_register_masks_and_command_file);
     RUN_TEST(rtc_i2c_sens_master_read_write_nack_and_timeout);
     RUN_TEST(irq_dispatch_observes_only_rising_edges);
+    RUN_TEST(irq_dispatch_delivers_new_conditions_on_a_held_line);
     RUN_TEST(spi_flash_write_enable_latch);
     RUN_TEST(spi_flash_program_erase_require_write_enable);
     RUN_TEST(flash_mmu_maps_complete_pages_and_all_instruction_buses);
@@ -5615,5 +5886,11 @@ static void run_peripheral_tests(void) {
     RUN_TEST(rmt_tx_deadline_tracks_runtime_cpu_frequency);
     RUN_TEST(rmt_rx_injection_uses_channel_memory_and_interrupts);
     RUN_TEST(rmt_dport_module_reset_clears_hardware_and_preserves_endpoint);
+    RUN_TEST(i2c_slave_answers_a_master_transfer);
+    RUN_TEST(rtc_sleep_registers_and_wake_cause);
+    RUN_TEST(rtc_sleep_wakes_on_ext1_and_touch);
+    RUN_TEST(rtc_gpio_shares_the_pad_with_the_gpio_block);
+    RUN_TEST(touch_pad_threshold_and_status);
+    RUN_TEST(touch_pad_raises_rtc_interrupt);
     RUN_TEST(excmlevel3_masks_level3);
 }

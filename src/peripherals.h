@@ -182,6 +182,14 @@ int  periph_unhandled_count(const esp32_periph_t *p);
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
                              periph_i2c_device_fn fn, void *ctx);
 
+/* The mirror of the above, for slave mode: the host drives a transfer *at* the
+ * guest, which is answering rather than originating. Writes land in the port's
+ * RX FIFO and reads drain its TX FIFO. Returns bytes accepted, or -1 if the
+ * port is not a slave or the address does not match. */
+int periph_i2c_master_xfer(esp32_periph_t *p, int port, uint8_t address,
+                           const uint8_t *wr, size_t wrlen,
+                           uint8_t *rd, size_t rdlen);
+
 /* Insert or remove an SDHC card in native SDMMC slot 0/1. sector_count is
  * rounded down to the CSD-v2 capacity granularity (1024 sectors) when the
  * card reports its geometry. A NULL read callback detaches the slot. */
@@ -331,6 +339,44 @@ int periph_iomux_function(const esp32_periph_t *p, int pin);
 void periph_assert_interrupt(esp32_periph_t *p, int source);
 void periph_deassert_interrupt(esp32_periph_t *p, int source);
 
+/* Assert a source that carries a status/enable register pair, passing the
+ * currently enabled conditions (`raw & ena`).
+ *
+ * Prefer this to periph_assert_interrupt() for any peripheral with such a
+ * pair, because the plain form dispatches a registered handler only on the
+ * *rising edge* of the source line. That is right for a source which goes
+ * quiet between events and wrong for a level-triggered one that accumulates:
+ * a second condition arriving before the ISR clears the first leaves the line
+ * high, so no edge occurs and the handler is never called again. Measured on
+ * I2C slave mode, the ISR ran exactly **once** in an entire run.
+ *
+ * This form remembers the mask and dispatches again when a bit appears that
+ * was not set last time. It cannot storm on a level that simply stays
+ * asserted -- an unchanged mask produces no new dispatch -- which is what
+ * makes it safe to use from the *_irq_update() helpers that run on every
+ * register write. */
+void periph_assert_interrupt_status(esp32_periph_t *p, int source,
+                                    uint32_t status);
+
+/* Pad hold across a deep-sleep reset.
+ *
+ * Deep sleep powers the digital domain down and the session rebuilds the
+ * peripheral model, which would drop every pin level. A pad whose RTC hold bit
+ * is set must not lose its level -- parking an output at a known state across
+ * sleep is the only reason the bit exists. Snapshot before periph_destroy(),
+ * restore after periph_create(); only held channels are carried over. */
+typedef struct {
+    uint32_t hold_mask;     /* RTC channels with their hold bit set */
+    uint32_t rtcio_out;     /* RTC_GPIO_OUT/ENABLE, channel-indexed */
+    uint32_t rtcio_enable;
+    uint32_t regs[8];       /* the pad words carrying the hold bits */
+    uint16_t reg_off[8];
+    unsigned reg_count;
+} periph_pad_hold_t;
+
+void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out);
+void periph_pad_hold_restore(esp32_periph_t *p, const periph_pad_hold_t *in);
+
 /* Direct interrupt matrix access used by the intr_matrix_set ROM stub.
  * The compatibility getter returns the first source selecting cpu_int. */
 void periph_intr_matrix_set(esp32_periph_t *p, int core, int cpu_int, int source);
@@ -340,6 +386,11 @@ int  periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int);
  * frontend, host-side tests). Updates GPIO_IN_REG / GPIO_IN1_REG so the
  * firmware's gpio_get_level() returns the new value on its next read. */
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level);
+
+/* Capacitive touch: set the raw count a pad reports. The ESP32 counts *down*
+ * as capacitance rises, so a touched pad reads below its threshold. Pads are
+ * 0-9, mapping to GPIO 4, 0, 2, 15, 13, 12, 14, 27, 33, 32. */
+void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value);
 
 /* ADC input injection. Channels 0-39 cover both ADC1 (0-9) and ADC2 (0-9)
  * plus the GPIO-number oriented indexing used by some APIs; we over-allocate
@@ -355,5 +406,21 @@ uint8_t periph_dac_value(const esp32_periph_t *p, int channel);
 /* True once firmware has asked for a software reset via RTC_CNTL_OPTIONS0;
  * reading it clears the request. */
 bool periph_take_reset_request(esp32_periph_t *p);
+
+/* Sleep. The peripheral decides *whether* the chip sleeps and what would wake
+ * it; the session owns the clock and the reset path, so it takes the request
+ * and steps time forward itself. */
+#define PERIPH_SLEEP_FOREVER UINT64_MAX
+bool periph_take_sleep_request(esp32_periph_t *p, bool *deep,
+                               uint64_t *timeout_us, uint32_t *cause);
+/* Level-triggered wake sources (EXT0/EXT1/touch), polled while time advances.
+ * Returns the rtc.h trigger bits, or 0. */
+uint32_t periph_sleep_poll_wake(esp32_periph_t *p);
+void periph_finish_wake(esp32_periph_t *p, uint32_t cause);
+/* Carry the wake and reset cause across a deep-sleep reset, which rebuilds the
+ * peripheral model from scratch. */
+void periph_set_wake_state(esp32_periph_t *p, uint32_t wake_cause,
+                           uint32_t reset_cause);
+uint32_t periph_reset_cause(const esp32_periph_t *p);
 
 #endif /* PERIPHERALS_H */

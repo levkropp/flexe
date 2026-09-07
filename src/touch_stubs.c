@@ -98,6 +98,7 @@ static void stub_touch_wait_tap(xtensa_cpu_t *cpu, void *ctx) {
             break;
         }
         cpu->virtual_time_us += 20000;
+        xtensa_advance_idle_cycles(cpu, 20000ULL * xtensa_cpu_freq_mhz(cpu));
         usleep(20000);
     }
 
@@ -108,6 +109,7 @@ static void stub_touch_wait_tap(xtensa_cpu_t *cpu, void *ctx) {
             break;
         tx = x; ty = y;
         cpu->virtual_time_us += 20000;
+        xtensa_advance_idle_cycles(cpu, 20000ULL * xtensa_cpu_freq_mhz(cpu));
         usleep(20000);
     }
 

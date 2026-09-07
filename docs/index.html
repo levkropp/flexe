@@ -294,7 +294,7 @@
 <span class="g">I (0) cpu_start: Starting scheduler on PRO CPU.</span>
 <span class="g">Hello world!</span>
 
-<span class="p">$</span> ./bench.sh
+<span class="p">$</span> ./scripts/bench.sh
 <span class="c"># 500M–1B executed instructions per workload, pgo build:</span>
 tjpgd        693 mips   <span class="g">2.9× real-time</span>
 rts          499 mips   <span class="g">2.1× real-time</span>
@@ -309,16 +309,16 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <span class="stat-label">mips on alu/memory loops<br>(10.3× a real esp32)</span>
       </div>
       <div>
-        <span class="stat-num">2.9×</span>
-        <span class="stat-label">real-time on jpeg decode<br>(693 mips, jit tracing)</span>
+        <span class="stat-num">13.6×</span>
+        <span class="stat-label">real-time on stock esp32 marauder<br>(unmodified production firmware)</span>
       </div>
       <div>
         <span class="stat-num">0</span>
         <span class="stat-label">dependencies<br>(c11 + cmake + openssl. that's it)</span>
       </div>
       <div>
-        <span class="stat-num">590</span>
-        <span class="stat-label">tests, all passing<br>(1935 assertions, 0 failures)</span>
+        <span class="stat-num">673</span>
+        <span class="stat-label">tests, all passing<br>(13,205 assertions, 0 failures)</span>
       </div>
     </section>
 
@@ -329,6 +329,11 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <div class="feature-card">
           <h3>a jit that actually jit</h3>
           <p>traces hot basic blocks through conditional branches, chains them into long native runs (arm64 + x86-64), and constant-folds flash literal loads. cold code stays interpreted. no correctness cliff — unhandled instructions just run in the interpreter.</p>
+        </div>
+        <div class="feature-card">
+          <h3>runs firmware people actually ship</h3>
+          <p>unmodified esp32 marauder and nerdminer images boot, associate to wifi, drive the cyd display and mine. five stock roms run on both engines and have to produce byte-identical final framebuffers, pinned by sha-256 — which is what catches a jit that renders the wrong thing rather than no thing.</p>
+          <p>meshtastic and openhasp boot too, at 6.3× and 1.9× real-time. wled and tasmota do not yet: both stop doing useful work partway in, which their real-time figures flatter rather than expose — so the bench prints retired instructions and uart bytes next to every number.</p>
         </div>
         <div class="feature-card">
           <h3>full lx6 isa</h3>

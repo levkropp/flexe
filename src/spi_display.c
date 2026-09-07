@@ -26,6 +26,31 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+/* Debug logging switches, resolved once.
+ *
+ * Several of these sit on per-SPI-byte paths, and a CYD firmware pushes
+ * megabytes through them: Marauder writes 5.3 MB to the panel in one scenario.
+ * getenv() is a linear scan of environ, so asking it per byte cost 5.2% of the
+ * emulator's total host CPU — more than the whole JIT dispatch path. */
+static int spi_dbg_cs = -1, spi_dbg_route = -1, spi_dbg_dma = -1,
+           spi_dbg_disp = -1, spi_dbg_sd = -1, spi_dbg_sd2 = -1,
+           spi_dbg_touch = -1;
+
+static void spi_dbg_resolve(void) {
+    spi_dbg_cs    = getenv("FLEXE_CSDBG") != NULL;
+    spi_dbg_route = getenv("FLEXE_SPIROUTEDBG") != NULL;
+    spi_dbg_dma   = getenv("FLEXE_SPIDMADBG") != NULL;
+    spi_dbg_disp  = getenv("FLEXE_DISPG") != NULL;
+    spi_dbg_sd    = getenv("FLEXE_SDDBG") != NULL;
+    spi_dbg_sd2   = getenv("FLEXE_SDDBG2") != NULL;
+    spi_dbg_touch = getenv("FLEXE_TOUCHDBG") != NULL;
+}
+
+static inline int spi_dbg(const int *flag) {
+    if (__builtin_expect(*flag < 0, 0)) spi_dbg_resolve();
+    return *flag;
+}
+
 #define SPI2_BASE 0x3FF64000u
 #define SPI3_BASE 0x3FF65000u
 
@@ -207,7 +232,7 @@ static int cs_asserted(spi_display_t *s, int pin) {
     int asserted = lvl == 0 &&
                    (cs_seen_high(pin) ||
                     periph_gpio_output_enabled(s->periph, pin));
-    if (asserted && getenv("FLEXE_CSDBG"))
+    if (asserted && spi_dbg(&spi_dbg_cs))
         fprintf(stderr, "[CS] pin=%d asserted (touch_cs=%d sd_cs=%d)\n", pin, s->cfg.touch_cs_pin, s->cfg.sd_cs_pin);
     return asserted;
 }
@@ -276,7 +301,7 @@ static int device_cs_state(spi_display_t *s, int pin) {
 }
 
 static void report_routes(spi_display_t *s) {
-    if (!getenv("FLEXE_SPIROUTEDBG")) return;
+    if (!spi_dbg(&spi_dbg_route)) return;
     int display_clk = periph_gpio_out_signal(s->periph, s->cfg.display_sck_pin);
     int touch_clk = periph_gpio_out_signal(s->periph, s->cfg.touch_sck_pin);
     int sd_clk = periph_gpio_out_signal(s->periph, s->cfg.sd_sck_pin);
@@ -370,7 +395,7 @@ static size_t gp_spi_dma_read_tx(spi_display_t *s, uint8_t *dst,
     for (int count = 0; count < SPI_DMA_MAX_DESCRIPTORS && copied < wanted;
          count++) {
         if (!dma_range_mapped(s, desc, 12, false)) {
-            if (getenv("FLEXE_SPIDMADBG"))
+            if (spi_dbg(&spi_dbg_dma))
                 fprintf(stderr,
                         "[SPIDMA] SPI%d TX descriptor 0x%08X is unmapped "
                         "(OUT_LINK=0x%08X)\n",
@@ -391,7 +416,7 @@ static size_t gp_spi_dma_read_tx(spi_display_t *s, uint8_t *dst,
 
         if (!(ctrl & SPI_DMA_DESC_OWNER) || len > size ||
             (len != 0 && !dma_range_mapped(s, buf, len, false))) {
-            if (getenv("FLEXE_SPIDMADBG"))
+            if (spi_dbg(&spi_dbg_dma))
                 fprintf(stderr,
                         "[SPIDMA] SPI%d invalid TX descriptor 0x%08X: "
                         "ctrl=0x%08X buf=0x%08X next=0x%08X\n",
@@ -528,7 +553,7 @@ static void ili9341_param(spi_display_t *s, uint8_t b) {
         if (s->param_cnt == 4) {
             s->xs = (uint16_t)((s->params[0] << 8) | s->params[1]);
             s->xe = (uint16_t)((s->params[2] << 8) | s->params[3]);
-            if (getenv("FLEXE_DISPG"))
+            if (spi_dbg(&spi_dbg_disp))
                 fprintf(stderr, "[DISPG] CASET xs=%u xe=%u (w=%u)\n", s->xs, s->xe, s->xe - s->xs + 1);
         }
         break;
@@ -536,14 +561,14 @@ static void ili9341_param(spi_display_t *s, uint8_t b) {
         if (s->param_cnt == 4) {
             s->ys = (uint16_t)((s->params[0] << 8) | s->params[1]);
             s->ye = (uint16_t)((s->params[2] << 8) | s->params[3]);
-            if (getenv("FLEXE_DISPG"))
+            if (spi_dbg(&spi_dbg_disp))
                 fprintf(stderr, "[DISPG] PASET ys=%u ye=%u (h=%u)\n", s->ys, s->ye, s->ye - s->ys + 1);
         }
         break;
     case ILI_MADCTL:
         if (s->param_cnt == 1) {
             s->madctl = b;
-            if (getenv("FLEXE_DISPG"))
+            if (spi_dbg(&spi_dbg_disp))
                 fprintf(stderr, "[DISPG] MADCTL=0x%02X (MY=%d MX=%d MV=%d BGR=%d)\n",
                         b, !!(b & 0x80), !!(b & 0x40), !!(b & 0x20), !!(b & 0x08));
         }
@@ -734,7 +759,7 @@ static void sd_queue_block_read(spi_display_t *s, uint32_t lba) {
     sd_queue(s, &tok, 1);
     uint8_t blk[512];
     sd_read_sector(s, lba, blk);
-    if (getenv("FLEXE_SDDBG"))
+    if (spi_dbg(&spi_dbg_sd))
         fprintf(stderr, "[SD] read lba=%u data=%02X %02X %02X %02X\n",
                 lba, blk[0], blk[1], blk[2], blk[3]);
     sd_queue(s, blk, 512);
@@ -747,8 +772,10 @@ static void sd_execute(spi_display_t *s) {
     uint8_t cmd = s->sd_cmd[0] & 0x3F;
     uint32_t arg = ((uint32_t)s->sd_cmd[1] << 24) | ((uint32_t)s->sd_cmd[2] << 16) |
                    ((uint32_t)s->sd_cmd[3] << 8) | s->sd_cmd[4];
-    if (getenv("FLEXE_SDDBG"))
-        fprintf(stderr, "[SD] cmd%u arg=0x%08X\n", cmd, arg);
+    if (spi_dbg(&spi_dbg_sd))
+        { extern uint32_t g_dbg_pc;
+          fprintf(stderr, "[SD] cmd%u arg=0x%08X pc=%08X\n", cmd, arg,
+                  g_dbg_pc); }
     s->sd_resp_pos = 0;
     s->sd_resp_len = 0;
     switch (cmd) {
@@ -956,7 +983,7 @@ static void gp_spi_transact(spi_display_t *s) {
             if (touch_tx[i] & 0x80)
                 s->touch_cmd = touch_tx[i];
         }
-        if (getenv("FLEXE_TOUCHDBG")) {
+        if (spi_dbg(&spi_dbg_touch)) {
             int rx, ry, pr; touch_sample(s, &rx, &ry, &pr);
             fprintf(stderr, "[TOUCH] reply=0x%02X next=0x%02X W0=0x%08X (rx=%d ry=%d pressed=%d)\n",
                     reply_cmd, s->touch_cmd, s->w[0], rx, ry, pr);
@@ -987,7 +1014,7 @@ static void gp_spi_transact(spi_display_t *s) {
             uint8_t miso = sd_byte(s, i < tx_len ? tx_data[i] : 0xFF);
             if (i < rx_len) rx_data[i] = miso;
         }
-        if (getenv("FLEXE_SDDBG2")) {
+        if (spi_dbg(&spi_dbg_sd2)) {
             fprintf(stderr, "[SD2] txn n=%zu m=%zu mosi=", tx_len, rx_len);
             for (size_t i = 0; i < total && i < 8; i++)
                 fprintf(stderr, "%02X ", i < tx_len ? tx_data[i] : 0xFF);
@@ -1001,7 +1028,7 @@ static void gp_spi_transact(spi_display_t *s) {
     size_t rx_written = 0;
     if (rx_dma && rx_owned)
         rx_written = gp_spi_dma_write_rx(s, rx_owned, rx_requested);
-    if ((tx_dma || rx_dma) && getenv("FLEXE_SPIDMADBG"))
+    if ((tx_dma || rx_dma) && spi_dbg(&spi_dbg_dma))
         fprintf(stderr,
                 "[SPIDMA] SPI%d tx=%zu/%zu rx=%zu/%zu raw=0x%03X\n",
                 s->host_num, tx_len, tx_requested, rx_written, rx_requested,
@@ -1093,7 +1120,7 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
             s->dma_in_link &= ~SPI_DMA_LINK_START;
         break;
     case SPI_DMA_OUT_LINK_REG:
-        if (getenv("FLEXE_SPIDMADBG"))
+        if (spi_dbg(&spi_dbg_dma))
             fprintf(stderr, "[SPIDMA] SPI%d OUT_LINK <- 0x%08X\n",
                     s->host_num, val);
         s->dma_out_link = val &
@@ -1102,7 +1129,7 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
             s->dma_out_link &= ~SPI_DMA_LINK_START;
         break;
     case SPI_DMA_IN_LINK_REG:
-        if (getenv("FLEXE_SPIDMADBG"))
+        if (spi_dbg(&spi_dbg_dma))
             fprintf(stderr, "[SPIDMA] SPI%d IN_LINK <- 0x%08X\n",
                     s->host_num, val);
         s->dma_in_link = val &

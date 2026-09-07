@@ -86,6 +86,9 @@ display_stubs_t   *flexe_session_display(flexe_session_t *s);
 wifi_stubs_t      *flexe_session_wifi(flexe_session_t *s);
 bt_stubs_t        *flexe_session_bt(flexe_session_t *s);
 int                flexe_session_is_native_freertos(const flexe_session_t *s);
+/* How many times the machine has been rebuilt: software resets and
+ * deep-sleep wakes. */
+unsigned           flexe_session_reset_count(const flexe_session_t *s);
 jit_state_t       *flexe_session_jit(flexe_session_t *s);
 
 /* Execute up to max_cycles on one core using the session's configured

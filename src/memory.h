@@ -35,6 +35,12 @@ struct xtensa_mem {
     uint8_t *rtc_slow;
     uint8_t *psram;
     mmio_handler_t mmio[MEM_PERIPH_PAGES];
+
+    /* Accesses matching no RAM page and no MMIO handler. Reads return 0 and
+     * writes are dropped -- see note_unmapped() for why that is deliberate and
+     * why it is worth counting anyway. */
+    uint64_t unmapped_count;
+    uint32_t unmapped_first;
     uint8_t *page_table[MEM_PAGE_TABLE_SIZE];
 };
 
@@ -57,6 +63,13 @@ int mem_register_mmio_range(xtensa_mem_t *mem, uint32_t base, uint32_t size,
 
 /* MMIO slow-path functions (called from inline fast paths on page table miss) */
 uint32_t mem_read32_slow(xtensa_mem_t *mem, uint32_t addr);
+
+/* Accesses that matched no RAM page and no MMIO handler. A non-zero count
+ * usually means the firmware dereferenced a null or wild pointer -- hardware
+ * would have raised LoadProhibited there, while Flexe reads 0 and carries on,
+ * so an otherwise silent hang shows up here. */
+uint64_t mem_unmapped_count(const xtensa_mem_t *mem);
+uint32_t mem_unmapped_first(const xtensa_mem_t *mem);
 uint16_t mem_read16_slow(xtensa_mem_t *mem, uint32_t addr);
 uint8_t  mem_read8_slow(xtensa_mem_t *mem, uint32_t addr);
 void     mem_write32_slow(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
@@ -87,14 +100,14 @@ static inline uint8_t *mem_get_ptr_w(xtensa_mem_t *mem, uint32_t addr) {
     return NULL;
 }
 
-static inline uint8_t mem_read8(xtensa_mem_t *mem, uint32_t addr) {
+static inline __attribute__((always_inline)) uint8_t mem_read8(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1))
         return page[addr & 0xFFF];
     return mem_read8_slow(mem, addr);
 }
 
-static inline uint16_t mem_read16(xtensa_mem_t *mem, uint32_t addr) {
+static inline __attribute__((always_inline)) uint16_t mem_read16(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         uint16_t val;
@@ -104,7 +117,7 @@ static inline uint16_t mem_read16(xtensa_mem_t *mem, uint32_t addr) {
     return mem_read16_slow(mem, addr);
 }
 
-static inline uint32_t mem_read32(xtensa_mem_t *mem, uint32_t addr) {
+static inline __attribute__((always_inline)) uint32_t mem_read32(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         uint32_t val;
@@ -166,7 +179,7 @@ static inline void mem_journal_note(xtensa_mem_t *mem, uint32_t addr,
     if ((last & ~3u) != (addr & ~3u)) mem_journal_word(mem, last);
 }
 
-static inline void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
+static inline __attribute__((always_inline)) void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
     if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 1);
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
@@ -176,7 +189,7 @@ static inline void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
     mem_write8_slow(mem, addr, val);
 }
 
-static inline void mem_write16(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
+static inline __attribute__((always_inline)) void mem_write16(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
     if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 2);
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
@@ -196,24 +209,16 @@ extern uint32_t g_dbg_pcwatch2;
 extern uint32_t g_dbg_watch_addr2;
 extern uint32_t g_dbg_watch_val;
 
-static inline void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
-    /* TEMP DEBUG: watch writes to up to two addresses (env FLEXE_WATCH/2) */
-    if (__builtin_expect(g_dbg_watch_en &&
-        (addr == g_dbg_watch_addr || addr == g_dbg_watch_addr2), 0)) {
-        uint32_t old = mem_read32(mem, addr);
-        fprintf(stderr, "[W] 0x%08X: 0x%08X -> 0x%08X  pc=0x%08X core%d\n",
-                addr, old, val, g_dbg_pc, g_dbg_core);
-    }
-    if (__builtin_expect(g_dbg_watch_val && val == g_dbg_watch_val, 0)) {
-        fprintf(stderr, "[WV] 0x%08X <- 0x%08X  pc=0x%08X core%d\n",
-                addr, val, g_dbg_pc, g_dbg_core);
-    }
-    /* TEMP DEBUG: log stores issued from specific PCs (env FLEXE_PCWATCH/2) */
-    if (__builtin_expect(g_dbg_pcwatch_en &&
-        (g_dbg_pc == g_dbg_pcwatch || g_dbg_pc == g_dbg_pcwatch2), 0)) {
-        fprintf(stderr, "[PW] pc=0x%08X store 0x%08X <- 0x%08X core%d\n",
-                g_dbg_pc, addr, val, g_dbg_core);
-    }
+/* Address / value / storing-PC watchpoints (FLEXE_WATCH, FLEXE_WATCHVAL,
+ * FLEXE_PCWATCH). This is the hottest store path in the emulator, so the three
+ * separate arm-tests that used to sit here — none of which can fire unless the
+ * matching variable is set — are collapsed into one gate, and the reporting
+ * itself lives out of line in memory.c. */
+extern int g_dbg_mem_watch;
+void mem_watch_report32(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
+
+static inline __attribute__((always_inline)) void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
+    if (__builtin_expect(g_dbg_mem_watch, 0)) mem_watch_report32(mem, addr, val);
     if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 4);
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
