@@ -3295,6 +3295,8 @@ static void stub_void_unregistered(xtensa_cpu_t *cpu, void *ctx) {
 #define ROM_BT_LM_DEFAULT_TABLE   0x50000C80u
 #define ROM_BT_LLC_HCI_TABLE      0x50000CC0u
 #define ROM_BT_LLM_DEFAULT_TABLE  0x50000D00u
+#define ROM_BT_LB_DEFAULT_TABLE   0x50001640u /* 15 eight-byte entries */
+#define ROM_BT_LB_HCI_TABLE       0x500016C0u /* 12 eight-byte entries */
 #define ROM_PHY_FUNCS              0x50001900u /* IDF patches through +0x1A4 */
 #define VIRTUAL_PHY_NOOP_FN        0x4006FFF0u
 
@@ -3472,6 +3474,45 @@ static void stub_bt_rom_llm_default_table_get(xtensa_cpu_t *cpu, void *ctx) {
     static const uint16_t tags[] = {0x0009, 0x0200, 0x0001, 0x0805};
     bt_rom_make_tagged_table(cpu, ROM_BT_LLM_DEFAULT_TABLE, tags,
                              sizeof(tags) / sizeof(tags[0]));
+}
+
+/* Lower-baseband tables from the rev-0 ESP32 ROM. New controller blobs copy
+ * and patch selected handlers by their 16-bit event/command tag. Returning
+ * NULL here used to make that fixed-size scan walk address 0 and accounted
+ * for every remaining low-memory probe in the current Marauder 2-USB image.
+ * The physical controller handlers have no radio to drive in Flexe, so leave
+ * unpatched slots on the registered virtual no-op while preserving the exact
+ * table shape and tags the binary patcher consumes. */
+static void bt_rom_make_virtual_table(xtensa_cpu_t *cpu, uint32_t addr,
+                                      const uint16_t *tags, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        mem_write16(cpu->mem, addr + (uint32_t)i * 8u, tags[i]);
+        mem_write16(cpu->mem, addr + (uint32_t)i * 8u + 2u, 0);
+        mem_write32(cpu->mem, addr + (uint32_t)i * 8u + 4u,
+                    VIRTUAL_PHY_NOOP_FN);
+    }
+    rom_return(cpu, addr);
+}
+
+static void stub_bt_rom_lb_default_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = {
+        0x0805, 0x0808, 0x0605, 0x0609, 0x0606,
+        0x0607, 0x0608, 0x060A, 0x060B, 0x060C,
+        0x0601, 0x0602, 0x0603, 0x0604, 0x060D,
+    };
+    bt_rom_make_virtual_table(cpu, ROM_BT_LB_DEFAULT_TABLE, tags,
+                              sizeof(tags) / sizeof(tags[0]));
+}
+
+static void stub_bt_rom_lb_hci_table_get(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    static const uint16_t tags[] = {
+        0x0417, 0x0C29, 0x0C2A, 0x0C74, 0x0C75, 0x0441,
+        0x0442, 0x0C76, 0x0C77, 0x0C78, 0x0443, 0x0444,
+    };
+    bt_rom_make_virtual_table(cpu, ROM_BT_LB_HCI_TABLE, tags,
+                              sizeof(tags) / sizeof(tags[0]));
 }
 
 /* Real intr_matrix_set(core, source, cpu_int): programs the interrupt matrix.
@@ -4141,6 +4182,10 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
                        "llc_hci_cmd_handler_tab_p_get");
     rom_stubs_register(s, 0x4004E718, stub_bt_rom_llm_default_table_get,
                        "llm_default_state_tab_p_get");
+    rom_stubs_register(s, 0x4001C198, stub_bt_rom_lb_default_table_get,
+                       "lb_default_state_tab_p_get");
+    rom_stubs_register(s, 0x4001C18C, stub_bt_rom_lb_hci_table_get,
+                       "lb_hci_cmd_handler_tab_p_get");
     /* Controller operations reached while the virtual BT host is starting.
      * They have no physical link-layer peer, but are deliberate supported
      * outcomes rather than unknown-ROM fallbacks. */

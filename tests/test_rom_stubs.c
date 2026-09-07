@@ -850,6 +850,21 @@ TEST(test_bt_rom_table_accessors_use_bounded_scratch) {
     ASSERT_TRUE(llcp >= 0x50000000u && llcp + 171u < 0x50002000u);
     ASSERT_TRUE(llm >= 0x50000000u && llm + 37u * 8u <= 0x50002000u);
 
+    uint32_t lb_default = call_builtin_rom0(&cpu, 0x4001C198u, 0);
+    uint32_t lb_hci = call_builtin_rom0(&cpu, 0x4001C18Cu, 0);
+    ASSERT_TRUE(lb_default >= 0x50000000u &&
+                lb_default + 15u * 8u <= 0x50002000u);
+    ASSERT_TRUE(lb_hci >= 0x50000000u &&
+                lb_hci + 12u * 8u <= 0x50002000u);
+    ASSERT_EQ(mem_read16(cpu.mem, lb_default + 0u * 8u), 0x0805u);
+    ASSERT_EQ(mem_read16(cpu.mem, lb_default + 5u * 8u), 0x0607u);
+    ASSERT_EQ(mem_read16(cpu.mem, lb_default + 14u * 8u), 0x060Du);
+    ASSERT_EQ(mem_read16(cpu.mem, lb_hci + 0u * 8u), 0x0417u);
+    ASSERT_EQ(mem_read16(cpu.mem, lb_hci + 7u * 8u), 0x0C76u);
+    ASSERT_EQ(mem_read16(cpu.mem, lb_hci + 11u * 8u), 0x0444u);
+    ASSERT_EQ(mem_read32(cpu.mem, lb_default + 4u), 0x4006FFF0u);
+    ASSERT_EQ(mem_read32(cpu.mem, lb_hci + 4u), 0x4006FFF0u);
+
     static const struct {
         uint32_t accessor;
         uint16_t first_tag;
