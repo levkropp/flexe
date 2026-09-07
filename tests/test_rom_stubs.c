@@ -508,6 +508,89 @@ TEST(test_cpu_frequency_rom_pair) {
     teardown(&cpu);
 }
 
+static uint32_t rom_syscall_test_reent;
+static uint32_t rom_syscall_test_args[4];
+
+static void return_from_test_call8(xtensa_cpu_t *cpu, uint32_t value) {
+    ar_write(cpu, 10, value);
+    cpu->pc = 0x40000000u | (ar_read(cpu, 8) & 0x3FFFFFFFu);
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+}
+
+static void test_rom_getreent_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    return_from_test_call8(cpu, rom_syscall_test_reent);
+}
+
+static void test_rom_open_r_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    for (int i = 0; i < 4; i++)
+        rom_syscall_test_args[i] = ar_read(cpu, 10 + i);
+    return_from_test_call8(cpu, 37u);
+}
+
+TEST(test_rom_open_dispatches_through_guest_syscall_table) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    const uint32_t table = 0x3FFB1000u;
+    const uint32_t getreent = 0x400D0100u;
+    const uint32_t open_r = 0x400D0200u;
+    const uint32_t path = 0x3FFB2000u;
+    rom_syscall_test_reent = 0x3FFB3000u;
+    memset(rom_syscall_test_args, 0, sizeof(rom_syscall_test_args));
+
+    /* Core 0 selects syscall_table_ptr_pro. */
+    mem_write32(cpu.mem, 0x3FFAE024u, table);
+    mem_write32(cpu.mem, table + 0x00u, getreent);
+    mem_write32(cpu.mem, table + 0x50u, open_r);
+    rom_stubs_register(rom, getreent, test_rom_getreent_handler,
+                       "test_getreent");
+    rom_stubs_register(rom, open_r, test_rom_open_r_handler,
+                       "test_open_r");
+
+    cpu.pc = 0x4000178Cu;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, path);
+    ar_write(&cpu, 3, 2u);
+    ar_write(&cpu, 4, 0644u);
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 2), 37u);
+    ASSERT_EQ(rom_syscall_test_args[0], rom_syscall_test_reent);
+    ASSERT_EQ(rom_syscall_test_args[1], path);
+    ASSERT_EQ(rom_syscall_test_args[2], 2u);
+    ASSERT_EQ(rom_syscall_test_args[3], 0644u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_rom_open_fails_when_syscall_table_is_uninitialized) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    cpu.pc = 0x4000178Cu;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, 0x3FFB2000u);
+    ar_write(&cpu, 3, 0u);
+    ar_write(&cpu, 4, 0u);
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 2), (uint32_t)-1);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static uint32_t encode_test_l32r(uint32_t pc, uint32_t literal, int reg) {
     uint32_t base = (pc + 3u) & ~3u;
     uint32_t delta = literal - base;
@@ -814,6 +897,8 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses);
     RUN_TEST(test_stub_memcpy);
     RUN_TEST(test_cpu_frequency_rom_pair);
+    RUN_TEST(test_rom_open_dispatches_through_guest_syscall_table);
+    RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);
     RUN_TEST(test_marauder_v11423_hooks_use_shifted_phy_and_data_layout);

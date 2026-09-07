@@ -3057,6 +3057,71 @@ static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
+/* The ESP32 ROM's POSIX entry points are not implementations of a device or
+ * filesystem.  They are small newlib veneers: fetch the per-core syscall
+ * table, call __getreent(), then call the corresponding *_r function that
+ * ESP-IDF installed in that table.  Treating open() as an ordinary unknown
+ * ROM call used to return fd 0 without ever entering ESP-IDF's VFS.  Current
+ * Marauder images exercise this while opening /dev/uart/0, leaving newlib's
+ * console disconnected and the application completely silent.
+ *
+ * Keep this bridge in the ROM layer rather than teaching the host-backed VFS
+ * about guest UART descriptors.  The firmware has already registered the
+ * correct UART/filesystem/socket VFS and therefore remains the authority for
+ * fd allocation and routing. */
+#define ROM_SYSCALL_TABLE_APP_PTR 0x3FFAE020u
+#define ROM_SYSCALL_TABLE_PRO_PTR 0x3FFAE024u
+#define ROM_SYSCALL_GETREENT_OFF  0x00u
+#define ROM_SYSCALL_OPEN_R_OFF    0x50u
+#define ROM_SYSCALL_CALL_LIMIT    2000000u
+
+static bool rom_syscall_target_valid(uint32_t target) {
+    return (target >= 0x40070000u && target < 0x400A0000u) ||
+           (target >= 0x400C0000u && target < 0x40400000u);
+}
+
+static bool rom_syscall_table(xtensa_cpu_t *cpu, uint32_t *table_out) {
+    uint32_t ptr = cpu->core_id == 1 ? ROM_SYSCALL_TABLE_APP_PTR
+                                     : ROM_SYSCALL_TABLE_PRO_PTR;
+    uint32_t table = mem_read32(cpu->mem, ptr);
+    if (table < 0x3FF80000u || table >= 0x40000000u)
+        return false;
+    *table_out = table;
+    return true;
+}
+
+static void stub_rom_open(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t path = rom_arg(cpu, 0);
+    uint32_t flags = rom_arg(cpu, 1);
+    uint32_t mode = rom_arg(cpu, 2);
+    uint32_t table;
+    uint32_t reent;
+    uint32_t result;
+
+    if (!rom_syscall_table(cpu, &table)) {
+        rom_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    uint32_t getreent = mem_read32(cpu->mem,
+                                   table + ROM_SYSCALL_GETREENT_OFF);
+    uint32_t open_r = mem_read32(cpu->mem, table + ROM_SYSCALL_OPEN_R_OFF);
+    if (!rom_syscall_target_valid(getreent) ||
+        !rom_syscall_target_valid(open_r) ||
+        guest_call8(cpu, getreent, NULL, 0, ROM_SYSCALL_CALL_LIMIT,
+                    &reent) != 0) {
+        rom_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    uint32_t args[] = { reent, path, flags, mode };
+    if (guest_call8(cpu, open_r, args, 4, ROM_SYSCALL_CALL_LIMIT,
+                    &result) != 0)
+        result = (uint32_t)-1;
+    rom_return(cpu, result);
+}
+
 /* Compatibility-mode interrupt bridge. FreeRTOS is replaced in this mode,
  * but interrupt-driven IDF drivers still depend on their registered ISR to
  * recycle I2S DMA buffers and complete I2C command queues. Invoke those
@@ -4196,6 +4261,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* POSIX syscall stubs (used by VFS / mbedTLS for socket I/O) */
     rom_stubs_register(s, 0x40001778, stub_void_unregistered,   "close");
+    rom_stubs_register(s, 0x4000178C, stub_rom_open,             "open");
     rom_stubs_register(s, 0x400017DC, stub_unregistered,        "read");
     rom_stubs_register(s, 0x4000181C, stub_unregistered,        "write");
 
