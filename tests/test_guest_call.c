@@ -13,6 +13,26 @@ static uint32_t async_test_entry(int source, uint32_t frame_size)
            (3u << 4) | 6u;
 }
 
+typedef struct {
+    bool seen;
+    uint32_t sp;
+    uint32_t root_link;
+} guest_root_probe_t;
+
+static int guest_root_probe(xtensa_cpu_t *cpu, uint32_t pc, void *opaque)
+{
+    guest_root_probe_t *probe = opaque;
+    if (pc != BASE)
+        return 0;
+    probe->seen = true;
+    probe->sp = ar_read(cpu, 1);
+    probe->root_link = mem_read32(cpu->mem, probe->sp - 12u);
+    /* Complete the synthetic call without depending on a callback body. */
+    cpu->pc = 0x40001FF8u;
+    cpu->_pc_written = true;
+    return 1;
+}
+
 TEST(async_call_preserves_window_spill_area)
 {
     xtensa_cpu_t cpu;
@@ -100,9 +120,27 @@ TEST(sync_call_uses_only_transient_private_stack)
     teardown(&cpu);
 }
 
+TEST(sync_call_builds_linked_window_root)
+{
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    guest_root_probe_t probe = {0};
+    cpu.pc_hook = guest_root_probe;
+    cpu.pc_hook_ctx = &probe;
+
+    ASSERT_EQ(guest_call8(&cpu, BASE, NULL, 0, 10u, NULL), 0);
+    ASSERT_TRUE(probe.seen);
+    ASSERT_EQ(probe.sp, 0x7FFF1000u - 48u);
+    ASSERT_EQ(probe.root_link, 0x7FFF1000u);
+    ASSERT_TRUE(mem_get_ptr(cpu.mem, 0x7FFF0000u) == NULL);
+
+    teardown(&cpu);
+}
+
 static void run_guest_call_tests(void)
 {
     TEST_SUITE("Guest Calls");
     RUN_TEST(async_call_preserves_window_spill_area);
     RUN_TEST(sync_call_uses_only_transient_private_stack);
+    RUN_TEST(sync_call_builds_linked_window_root);
 }

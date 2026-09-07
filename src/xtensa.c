@@ -862,7 +862,13 @@ void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
     }
     if (best_level == 0) return;
 
-    xtensa_flush_windows(cpu);
+    /* In architectural-vector mode the guest's interrupt prologue executes
+     * SPILL_ALL_WINDOWS itself. Pre-flushing here would make the legacy
+     * synthetic spill algorithm race the guest's real overflow handlers and
+     * can manufacture save-area links that never existed on hardware. Keep
+     * the host-side flush only for the explicit legacy fallback. */
+    if (!cpu->real_window_vectors)
+        xtensa_flush_windows(cpu);
     /* Counts every vectored interrupt. The JIT verifier samples it across a
      * reference run: a native block defers interrupts to its exit while
      * xtensa_step() checks after every instruction, so a replay that vectors

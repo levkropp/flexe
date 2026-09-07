@@ -14,6 +14,7 @@
 #define GUEST_CALL_STACK_BASE 0x7FFF0000u
 #define GUEST_CALL_STACK_SIZE 0x1000u
 #define GUEST_CALL_STACK_TOP  (GUEST_CALL_STACK_BASE + GUEST_CALL_STACK_SIZE)
+#define GUEST_CALL_STACK_ROOT (GUEST_CALL_STACK_TOP - 48u)
 #define GUEST_CALL_SENTINEL  0x40001FF8u
 #define GUEST_CALL_MAX_ARGS  6u
 
@@ -82,7 +83,14 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     cpu->ps = 1u << 18; /* WOE, kernel mode */
     XT_PS_SET_INTLEVEL(cpu->ps, 15);
     XT_PS_SET_CALLINC(cpu->ps, 2);
-    ar_write(cpu, 1, GUEST_CALL_STACK_TOP);
+    /* Match ESP-IDF's SET_STACK bootstrap frame. WindowOverflow8/12 save the
+     * high registers relative to the caller SP stored at [a1-12], and the
+     * matching underflow vectors follow that link to reload them. A bare top
+     * of stack leaves a zero link, turning the first deep CALL8 return into
+     * reads from 0xffffffe0. */
+    mem_write32(cpu->mem, GUEST_CALL_STACK_ROOT - 12u,
+                GUEST_CALL_STACK_TOP);
+    ar_write(cpu, 1, GUEST_CALL_STACK_ROOT);
     ar_write(cpu, 8, (2u << 30) |
                      (GUEST_CALL_SENTINEL & 0x3FFFFFFFu));
     for (size_t i = 0; i < arg_count; i++)

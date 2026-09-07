@@ -1060,6 +1060,34 @@ TEST(call12_linked_spill_area) {
     linked_spill_round_trip(3);
 }
 
+/* The IDF high-priority interrupt prologue executes SPILL_ALL_WINDOWS using
+ * the architectural overflow vectors. Flexe must enter the interrupt with
+ * the interrupted call chain intact; pre-flushing it in the host clears the
+ * WINDOWSTART bits before guest code has a chance to save them. */
+TEST(interrupt_vector_entry_preserves_live_windows) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.pc = BASE + 0x1000u;
+    cpu.ps = 1u << 18; /* WOE, INTLEVEL=0, EXCM=0 */
+    cpu.windowbase = 6;
+    cpu.windowstart = (1u << 0) | (1u << 2) | (1u << 4) | (1u << 6);
+    cpu.int_level[1] = 2;
+    cpu.interrupt = 1u << 1;
+    cpu.intenable = 1u << 1;
+
+    uint32_t live = cpu.windowstart;
+    xtensa_check_interrupts(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE + VECOFS_LEVEL2_INT);
+    ASSERT_EQ(cpu.windowbase, 6);
+    ASSERT_EQ(cpu.windowstart, live);
+    ASSERT_EQ(cpu.epc[1], BASE + 0x1000u);
+    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 2);
+
+    teardown(&cpu);
+}
+
 /* Reproduces the context-switch register corruption scenario: a live call
  * chain (w0-w6) holds distinctive values in ancestor windows, an interrupt
  * flushes all non-current windows to the stack (SPILL_ALL_WINDOWS), the
@@ -1303,6 +1331,7 @@ static void run_window_tests(void) {
     RUN_TEST(factorial_windowed);
     RUN_TEST(call8_linked_spill_area);
     RUN_TEST(call12_linked_spill_area);
+    RUN_TEST(interrupt_vector_entry_preserves_live_windows);
     RUN_TEST(interrupt_flush_round_trip);
     RUN_TEST(interrupt_flush_stale_callsize);
 }
