@@ -2013,6 +2013,24 @@ static uint32_t jit_entry_insn(int s, uint32_t framesize) {
     return (imm12 << 12) | ((uint32_t)s << 8) | (3u << 4) | 6u;
 }
 
+static uint32_t jit_l32e_insn(int t, int s, int byte_offset) {
+    int r = (byte_offset + 64) >> 2;
+    return rrr(0, 9, r & 15, s, t);
+}
+
+static uint32_t jit_s32e_insn(int t, int s, int byte_offset) {
+    int r = (byte_offset + 64) >> 2;
+    return rrr(4, 9, r & 15, s, t);
+}
+
+static uint32_t jit_rfwo_insn(void) {
+    return rrr(0, 0, 3, 4, 0);
+}
+
+static uint32_t jit_rfwu_insn(void) {
+    return rrr(0, 0, 3, 5, 0);
+}
+
 TEST(test_jit_entry_dispatches_compiled_callee_body) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2219,6 +2237,92 @@ TEST(test_jit_entry_overflow_fallback) {
     teardown(&cpu);
 }
 
+TEST(test_jit_window_overflow_vector_is_native) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t stack = DATA_BASE + 0x800u;
+    const uint32_t target = BASE + 0x180u;
+    static const uint32_t values[4] = {
+        0x10203040u, 0x55667788u, 0x89ABCDEFu, 0xDEADC0DEu,
+    };
+
+    cpu.ps = (1u << 18) | (1u << 4) | (1u << 8); /* WOE, EXCM, OWB=1 */
+    cpu.windowbase = 3;
+    cpu.windowstart = (1u << 1) | (1u << 3);
+    cpu.epc[0] = target;
+    ar_write(&cpu, 8, stack);
+    for (int i = 0; i < 4; i++) {
+        ar_write(&cpu, i, values[i]);
+        mem_write32(cpu.mem, stack - 64u + (uint32_t)i * 4u, 0);
+        put_insn3(&cpu, BASE + (uint32_t)i * 3u,
+                  jit_s32e_insn(i, 8, -64 + i * 4));
+    }
+    put_insn3(&cpu, BASE + 12u, jit_rfwo_insn());
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_EQ(fn(&cpu), 5);
+
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(mem_read32(cpu.mem,
+                            stack - 64u + (uint32_t)i * 4u), values[i]);
+    ASSERT_EQ(cpu.ps, (1u << 18) | (1u << 8));
+    ASSERT_EQ(cpu.windowbase, 1);
+    ASSERT_EQ(cpu.windowstart, 1u << 1);
+    ASSERT_EQ(cpu.pc, target);
+    ASSERT_TRUE(cpu._pc_written);
+    ASSERT_TRUE(cpu.irq_check);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_window_underflow_vector_is_native) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t stack = DATA_BASE + 0xA00u;
+    const uint32_t target = BASE + 0x1C0u;
+    static const uint32_t values[4] = {
+        0xCAFEBABEu, 0x0BADF00Du, 0x13579BDFu, 0x2468ACE0u,
+    };
+
+    cpu.ps = (1u << 18) | (1u << 4) | (2u << 8); /* WOE, EXCM, OWB=2 */
+    cpu.windowbase = 5;
+    cpu.windowstart = 1u << 2;
+    cpu.epc[0] = target;
+    ar_write(&cpu, 9, stack);
+    for (int i = 0; i < 4; i++) {
+        mem_write32(cpu.mem, stack - 64u + (uint32_t)i * 4u, values[i]);
+        put_insn3(&cpu, BASE + (uint32_t)i * 3u,
+                  jit_l32e_insn(i, 9, -64 + i * 4));
+    }
+    put_insn3(&cpu, BASE + 12u, jit_rfwu_insn());
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_EQ(fn(&cpu), 5);
+
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(cpu.ar[5 * 4 + i], values[i]);
+    ASSERT_EQ(cpu.ps, (1u << 18) | (2u << 8));
+    ASSERT_EQ(cpu.windowbase, 2);
+    ASSERT_EQ(cpu.windowstart, (1u << 2) | (1u << 5));
+    ASSERT_EQ(cpu.pc, target);
+    ASSERT_TRUE(cpu._pc_written);
+    ASSERT_TRUE(cpu.irq_check);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* ===== Test suite runner ===== */
 
 static void run_jit_tests(void) {
@@ -2290,6 +2394,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_retw_n_windowed);
     RUN_TEST(test_jit_retw_tail_call_fallback);
     RUN_TEST(test_jit_entry_overflow_fallback);
+    RUN_TEST(test_jit_window_overflow_vector_is_native);
+    RUN_TEST(test_jit_window_underflow_vector_is_native);
 }
 
 #else /* _MSC_VER */

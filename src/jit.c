@@ -378,7 +378,15 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                 }
                 if (r == 1) return 2;  /* MOVSP — complex */
                 if (r == 2) return 0;  /* SYNC group (NOP, etc.) */
-                if (r == 3) return 2;  /* RFEI group */
+                if (r == 3) {
+                    /* The architectural window spill/fill vectors end in
+                     * RFWO/RFWU. They are self-contained block terminators;
+                     * the other exception-return forms remain interpreted. */
+                    int rt = (insn >> 4) & 0xF;
+                    int rs = (insn >> 8) & 0xF;
+                    if (rt == 0 && (rs == 4 || rs == 5)) return 1;
+                    return 2;
+                }
                 if (r == 4) return 2;  /* BREAK */
                 if (r == 5) return 2;  /* SYSCALL */
                 if (r == 6) return 0;  /* RSIL */
@@ -494,6 +502,8 @@ static int classify_for_jit(uint32_t insn, int ilen) {
             default: return 2;
             }
         case 4: case 5: return 0;  /* EXTUI */
+        case 9: /* LSC4: architectural register-window spill/fill transfers */
+            return (op2 == 0 || op2 == 4) ? 0 : 2;  /* L32E / S32E */
         default: return 2;  /* FP, MAC16, LSCX, etc */
         }
     }
@@ -777,6 +787,11 @@ static void ra_init(regalloc_t *ra, const jit_scan_t *scan) {
             }
         } else {
             switch (op0) {
+            case 0:
+                /* L32E/S32E encode their negative stack displacement in r,
+                 * not a third architectural register. */
+                if (((insn >> 16) & 0xF) == 9) vr = 0;
+                break;
             case 1: vs = 0; vr = 0; break;              /* L32R: t and a literal */
             case 2: vr = 0; break;                      /* LSAI: r is the sub-opcode */
             case 5: vt = 0; vs = 0; vr = 0; break;      /* CALLn: no register fields */
@@ -1469,6 +1484,45 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                      * and a 32-bit one would take its neighbours with it. */
                     emit_mov_reg_imm32(e, RAX, 1);
                     emit_store8_disp(e, RAX, REG_CPU, (int32_t)CPU_OFF_IRQ_CHECK);
+                    return 1;
+                }
+                /* RFWO/RFWU complete an architectural register-window
+                 * exception after the vector has transferred a frame with
+                 * S32E/L32E. The block is keyed by windowbase, so the bit
+                 * changed in WINDOWSTART is known at compile time; OWB and
+                 * the return PC remain live architectural state. */
+                if (r == 3 && t == 0 && (s == 4 || s == 5)) {
+                    ra_flush(e, ra, wb4);
+
+                    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                    emit_and_reg32_imm32(e, RAX, (int32_t)~(1u << 4));
+                    emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+
+                    emit_mov_reg_imm32(e, RBX, 1);
+                    emit_store8_disp(e, RBX, REG_CPU,
+                                     (int32_t)CPU_OFF_IRQ_CHECK);
+
+                    emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_WINDOWSTART);
+                    if (s == 4)
+                        emit_and_reg32_imm32(e, RBX,
+                            (int32_t)~(1u << ((unsigned)wb4 >> 2)));
+                    else
+                        emit_or_reg32_imm32(e, RBX,
+                            (int32_t)(1u << ((unsigned)wb4 >> 2)));
+                    emit_store_cpu32(e, RBX,
+                                     (int32_t)CPU_OFF_WINDOWSTART);
+
+                    emit_shr_reg32_imm(e, RAX, 8);
+                    emit_and_reg32_imm32(e, RAX, 15);
+                    emit_store_cpu32(e, RAX,
+                                     (int32_t)CPU_OFF_WINDOWBASE);
+
+                    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_EPC);
+                    emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
+                    emit_store32_disp_imm(e, REG_CPU,
+                                          (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                    emit_acc_add(e, insn_idx + 1);
+                    emit_jmp_to_epilogue(e, jit);
                     return 1;
                 }
                 /* RET: pc = a0 */
@@ -2227,6 +2281,21 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             emit_and_reg32_imm32(e, RAX, (int32_t)mask);
             ra_store_ar(e, ra,RAX, wb4, r);
             return 1;
+        }
+
+        case 9: { /* LSC4: L32E/S32E window spill/fill stack transfers */
+            int areg = ra_addr_reg(e, ra, wb4, s, (r << 2) - 64);
+            if (op2 == 0) {
+                emit_mem_read32(e, areg, RBX);
+                ra_store_ar(e, ra, RBX, wb4, t);
+                return 1;
+            }
+            if (op2 == 4) {
+                ra_load_ar(e, ra, RBP, wb4, t);
+                emit_mem_write32(e, areg, RBP, jit);
+                return 1;
+            }
+            return 0;
         }
 
         default: return 0;
