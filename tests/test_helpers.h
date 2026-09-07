@@ -109,6 +109,19 @@ static inline void seed_marauder_v1151_profile(xtensa_cpu_t *cpu) {
     put_test_bytes(cpu, 0x4019BE94u, wifi_start, sizeof(wifi_start));
 }
 
+static inline void seed_wled_v1601_profile(xtensa_cpu_t *cpu) {
+    static const uint8_t wifi_init[] = {
+        0x36, 0x41, 0x00, 0x31, 0x18, 0xDC, 0x4D, 0x02,
+        0x0C, 0x02, 0x82, 0x03, 0x00, 0x27, 0x98, 0x37,
+    };
+    static const uint8_t wifi_start[] = {
+        0x36, 0x41, 0x00, 0x65, 0x82, 0xFF, 0x21, 0x39,
+        0x29, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0xE8, 0xF6,
+    };
+    put_test_bytes(cpu, 0x401561B8u, wifi_init, sizeof(wifi_init));
+    put_test_bytes(cpu, 0x40182D44u, wifi_start, sizeof(wifi_start));
+}
+
 static inline uint32_t rrr(int op2, int op1, int r, int s, int t) {
     return (uint32_t)((op2 << 20) | (op1 << 16) | (r << 12) | (s << 8) | (t << 4) | 0);
 }

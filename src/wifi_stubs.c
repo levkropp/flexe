@@ -139,6 +139,7 @@ typedef struct {
 typedef enum {
     EVT_DATA_NONE = 0,
     EVT_DATA_STA_CONNECTED,
+    EVT_DATA_STA_DISCONNECTED,
     EVT_DATA_GOT_IP,
 } evt_data_kind_t;
 
@@ -218,6 +219,11 @@ struct wifi_stubs {
     int                event_handler_count;
     pending_event_t    pending_events[MAX_PENDING_EVENTS];
     int                pending_event_count;
+    /* Some stripped images retain a complete ESP-IDF default event loop. For
+     * those, post into the firmware's real queue instead of invoking handlers
+     * from a borrowed or fabricated task. The event task then owns blocking,
+     * stack lifetime, and scheduler interaction exactly as it does on silicon. */
+    uint32_t           native_event_post_addr;
     /* One event fans out to every handler registered for it, and each is
      * delivered as its own asynchronous call -- one at a time, because a
      * handler that blocks stays in flight across context switches. */
@@ -1735,7 +1741,8 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
     uint32_t p = WIFI_EVENT_SCRATCH;
     for (int i = 0; i < 64; i++) mem_write8(cpu->mem, p + (uint32_t)i, 0);
 
-    if (kind == EVT_DATA_STA_CONNECTED) {
+    if (kind == EVT_DATA_STA_CONNECTED ||
+        kind == EVT_DATA_STA_DISCONNECTED) {
         /* wifi_event_sta_connected_t: ssid[32], ssid_len, bssid[6], channel,
          * authmode. */
         for (int i = 0; i < 32 && ws->sta_ssid[i]; i++)
@@ -1744,8 +1751,16 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
         static const uint8_t bssid[6] = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
         for (int i = 0; i < 6; i++)
             mem_write8(cpu->mem, p + 33u + (uint32_t)i, bssid[i]);
-        mem_write8(cpu->mem, p + 39u, 1);        /* channel */
-        mem_write8(cpu->mem, p + 40u, 3);        /* WIFI_AUTH_WPA2_PSK */
+        if (kind == EVT_DATA_STA_CONNECTED) {
+            mem_write8(cpu->mem, p + 39u, 1);    /* channel */
+            mem_write8(cpu->mem, p + 40u, 3);    /* WIFI_AUTH_WPA2_PSK */
+        } else {
+            /* wifi_event_sta_disconnected_t replaces channel/authmode with
+             * reason and RSSI. IDF always supplies this payload; Arduino's
+             * event bridge copies all 41 bytes without accepting NULL. */
+            mem_write8(cpu->mem, p + 39u, 8);    /* WIFI_REASON_ASSOC_LEAVE */
+            mem_write8(cpu->mem, p + 40u, (uint8_t)(int8_t)-55);
+        }
     } else if (kind == EVT_DATA_GOT_IP) {
         /* ip_event_got_ip_t on IDF 4.x leads with if_index, *then* the netif
          * pointer, then ip/netmask/gw, then ip_changed. Getting that wrong is
@@ -1763,9 +1778,63 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
     return p;
 }
 
+static uint32_t wifi_event_data_size(evt_data_kind_t kind) {
+    switch (kind) {
+    case EVT_DATA_STA_CONNECTED:
+        return 44u; /* sizeof(wifi_event_sta_connected_t), IDF 4.x */
+    case EVT_DATA_STA_DISCONNECTED:
+        return 41u; /* sizeof(wifi_event_sta_disconnected_t), IDF 4.x */
+    case EVT_DATA_GOT_IP:
+        return 24u; /* sizeof(ip_event_got_ip_t), IDF 4.x */
+    default:
+        return 0u;
+    }
+}
+
+static uint32_t wifi_event_base(const wifi_stubs_t *ws, const char *name) {
+    for (int i = 0; i < ws->event_handler_count; i++) {
+        if (strcmp(ws->event_handlers[i].base_name, name) == 0)
+            return ws->event_handlers[i].event_base;
+    }
+    return 0u;
+}
+
+static void wifi_pop_pending_event(wifi_stubs_t *ws) {
+    for (int i = 1; i < ws->pending_event_count; i++)
+        ws->pending_events[i - 1] = ws->pending_events[i];
+    ws->pending_event_count--;
+}
+
 void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
                      xtensa_cpu_t *peer) {
     if (!ws || !cpu) return;
+
+    if (ws->native_event_post_addr != 0u) {
+        if (ws->pending_event_count == 0) return;
+
+        pending_event_t *e = &ws->pending_events[0];
+        uint32_t base = wifi_event_base(ws, e->base_name);
+        if (base == 0u) return; /* registration has not run yet */
+
+        uint32_t data = wifi_write_event_data(ws, cpu, e->data_kind);
+        uint32_t args[5] = {
+            base,
+            (uint32_t)e->event_id,
+            data,
+            wifi_event_data_size(e->data_kind),
+            0u, /* do not block if the real event queue is temporarily full */
+        };
+        uint32_t result = UINT32_MAX;
+        if (guest_call8(cpu, ws->native_event_post_addr, args, 5,
+                        2000000u, &result) != 0 || result != 0u)
+            return;
+
+        wifi_log(ws, "event %s/%d posted to native event loop\n",
+                 e->base_name, e->event_id);
+        wifi_pop_pending_event(ws);
+        ws->stats.events_delivered++;
+        return;
+    }
 
     /* A handler started earlier is still running -- possibly blocked on a
      * semaphore, with the borrowed task descheduled. Delivering another now
@@ -1779,9 +1848,7 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
          * connect, which queues CONNECTED and GOT_IP), and draining the queue
          * in a loop here would run them all inside one batch. */
         pending_event_t e = ws->pending_events[0];
-        for (int i = 1; i < ws->pending_event_count; i++)
-            ws->pending_events[i - 1] = ws->pending_events[i];
-        ws->pending_event_count--;
+        wifi_pop_pending_event(ws);
 
         uint32_t data = wifi_write_event_data(ws, cpu, e.data_kind);
 
@@ -1974,7 +2041,7 @@ static void stub_esp_wifi_disconnect(xtensa_cpu_t *cpu, void *ctx)
     wifi_stubs_t *ws = ctx;
     ws->sta_connected = false;
     wifi_queue_event(ws, "WIFI_EVENT", 5 /* STA_DISCONNECTED */,
-                     EVT_DATA_NONE);
+                     EVT_DATA_STA_DISCONNECTED);
     wifi_log(ws, "esp_wifi_disconnect()\n");
     ws_return(cpu, 0);
 }
@@ -2226,9 +2293,9 @@ static void stub_esp_event_loop_create_default(xtensa_cpu_t *cpu, void *ctx)
 }
 
 
-static void stub_esp_event_handler_register(xtensa_cpu_t *cpu, void *ctx)
+static void record_esp_event_handler_register(xtensa_cpu_t *cpu,
+                                              wifi_stubs_t *ws)
 {
-    wifi_stubs_t *ws = ctx;
     uint32_t event_base = ws_arg(cpu, 0);
     int32_t  event_id   = (int32_t)ws_arg(cpu, 1);
     uint32_t handler    = ws_arg(cpu, 2);
@@ -2250,7 +2317,20 @@ static void stub_esp_event_handler_register(xtensa_cpu_t *cpu, void *ctx)
     }
     wifi_log(ws, "esp_event_handler_register(base=0x%08x, id=%d, handler=0x%08x)\n",
              event_base, event_id, handler);
+}
+
+static void stub_esp_event_handler_register(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    record_esp_event_handler_register(cpu, ws);
     ws_return(cpu, 0);
+}
+
+/* Observe registration while allowing the firmware's own event subsystem to
+ * build its handler list. Used with rom_stubs_register_spy(). */
+static void spy_esp_event_handler_register(xtensa_cpu_t *cpu, void *ctx)
+{
+    record_esp_event_handler_register(cpu, ctx);
 }
 
 static void stub_esp_event_handler_instance_register(xtensa_cpu_t *cpu, void *ctx)
@@ -2698,21 +2778,6 @@ static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
     { 0x40183604u, stub_esp_wifi_get_mac,          "esp_wifi_get_mac" },
     { 0x40183634u, stub_esp_wifi_sta_get_ap_info,  "esp_wifi_sta_get_ap_info" },
     { 0x401836F4u, stub_esp_wifi_noop,             "esp_wifi_set_storage" },
-    /* Hooking the esp_wifi API alone gets the firmware through init and then
-     * leaves it waiting: it learns it associated only through the handler it
-     * registers here, and without this Flexe has nowhere to deliver the
-     * WIFI_EVENT/IP_EVENT that wifi_stubs_tick() posts. Same lesson as
-     * NerdMiner, whose table has carried this entry from the start.
-     *
-     * esp_event_handler_register_with() is deliberately not hooked even though
-     * it matched uniquely (0x401514D8): it takes the loop handle as its first
-     * argument, so every other argument shifts by one and the register stub
-     * would record a handler from the wrong slot. */
-    { 0x40150E34u, stub_esp_event_handler_register,
-                   "esp_event_handler_register" },
-    { 0x40150E74u, stub_esp_event_handler_unregister,
-                   "esp_event_handler_unregister" },
-    { 0x40151768u, stub_esp_event_post,           "esp_event_send_internal" },
     { 0, NULL, NULL },
 };
 
@@ -2761,6 +2826,18 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
     int hooked = 0;
     for (const wifi_fw_hook_t *h = hooks; h->fn; h++) {
         rom_stubs_register_ctx(rom, h->addr, h->fn, h->name, ws);
+        hooked++;
+    }
+    if (profile == ROM_FIRMWARE_WLED_V1601) {
+        /* WLED carries a working default ESP-IDF event loop. Observe its
+         * registrations, let the real routine populate that loop, and post
+         * modelled WiFi/IP events through esp_event_send_internal(). This
+         * gives handlers their real event-task stack and fixes callbacks that
+         * wait on queues or semaphores before returning. */
+        rom_stubs_register_spy(rom, 0x40150E34u,
+                               spy_esp_event_handler_register,
+                               "esp_event_handler_register", ws);
+        ws->native_event_post_addr = 0x40151768u;
         hooked++;
     }
     fprintf(stderr, "[wifi] hooked %d verified production-ROM entries\n", hooked);

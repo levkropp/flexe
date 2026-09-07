@@ -11,6 +11,10 @@
 #define TEST_WIFI_RAW_TX_ADDR        0x401A55CCu
 #define TEST_PROMISC_PACKET_ADDR     0x50001D00u
 #define TEST_PROMISC_RX_CTRL_SIZE    28u
+#define TEST_WLED_ENTRY              0x40083E68u
+#define TEST_WLED_EVENT_REGISTER     0x40150E34u
+#define TEST_WLED_EVENT_POST         0x40151768u
+#define TEST_WLED_DISCONNECT         0x40182F54u
 
 typedef struct {
     uint64_t calls;
@@ -19,6 +23,37 @@ typedef struct {
     size_t len;
     bool en_sys_seq;
 } test_raw_tx_capture_t;
+
+typedef struct {
+    uint64_t calls;
+    uint32_t base;
+    int32_t event_id;
+    uint32_t data;
+    uint32_t size;
+    uint32_t ticks_to_wait;
+    uint8_t payload[64];
+} test_event_post_capture_t;
+
+static void capture_native_event_post(xtensa_cpu_t *cpu, void *ctx)
+{
+    test_event_post_capture_t *capture = ctx;
+    capture->calls++;
+    capture->base = ar_read(cpu, 10);
+    capture->event_id = (int32_t)ar_read(cpu, 11);
+    capture->data = ar_read(cpu, 12);
+    capture->size = ar_read(cpu, 13);
+    capture->ticks_to_wait = ar_read(cpu, 14);
+    uint32_t copy = capture->size < sizeof(capture->payload) ?
+                    capture->size : (uint32_t)sizeof(capture->payload);
+    for (uint32_t i = 0; i < copy; i++)
+        capture->payload[i] = mem_read8(cpu->mem, capture->data + i);
+
+    /* guest_call8 enters a windowed function with CALLINC=2, a8 holding the
+     * encoded return address, and its result slot at a10. */
+    ar_write(cpu, 10, 0);
+    cpu->pc = 0x40000000u | (ar_read(cpu, 8) & 0x3FFFFFFFu);
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+}
 
 static void capture_raw_tx(void *ctx, uint32_t iface, const uint8_t *frame,
                            size_t len, bool en_sys_seq)
@@ -221,10 +256,58 @@ TEST(v11423_fingerprint_selects_shifted_wifi_entries) {
     teardown(&cpu);
 }
 
+TEST(wled_posts_disconnect_on_native_event_loop) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_wled_v1601_profile(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    test_event_post_capture_t capture = {0};
+    const uint32_t event_base = 0x3FFB1000u;
+    static const char name[] = "WIFI_EVENT";
+
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_WLED_ENTRY), 18);
+    ASSERT_EQ(rom_stubs_register_ctx(rom, TEST_WLED_EVENT_POST,
+                                     capture_native_event_post,
+                                     "test_event_post", &capture), 0);
+    for (size_t i = 0; i < sizeof(name); i++)
+        mem_write8(cpu.mem, event_base + (uint32_t)i, (uint8_t)name[i]);
+
+    /* The registration hook is a spy: it records WLED's handler but allows
+     * the firmware implementation to execute. RET.N is a minimal stand-in
+     * for that implementation in this unit test. */
+    put_insn2(&cpu, TEST_WLED_EVENT_REGISTER, narrow(0xD, 15, 0, 0));
+    invoke_wifi_call0_4(&cpu, TEST_WLED_EVENT_REGISTER, event_base, 5,
+                        BASE + 0x200u, 0x11223344u);
+    ASSERT_EQ(cpu.pc, BASE + 0x100u);
+
+    invoke_wifi_call0(&cpu, TEST_WLED_DISCONNECT, 0);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+
+    ASSERT_EQ64(capture.calls, 1u);
+    ASSERT_EQ(capture.base, event_base);
+    ASSERT_EQ(capture.event_id, 5);
+    ASSERT_EQ(capture.data, 0x3FFE9000u);
+    ASSERT_EQ(capture.size, 41u);
+    ASSERT_EQ(capture.ticks_to_wait, 0u);
+    ASSERT_EQ(capture.payload[33], 0x02u); /* synthetic BSSID */
+    ASSERT_EQ(capture.payload[39], 8u);    /* WIFI_REASON_ASSOC_LEAVE */
+    ASSERT_EQ(capture.payload[40], (uint8_t)(int8_t)-55);
+
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.events_delivered, 1u);
+
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);
     RUN_TEST(raw_tx_crosses_host_radio_boundary);
     RUN_TEST(v11423_fingerprint_selects_shifted_wifi_entries);
+    RUN_TEST(wled_posts_disconnect_on_native_event_loop);
 }
