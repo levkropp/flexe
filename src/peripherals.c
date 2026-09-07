@@ -13912,8 +13912,8 @@ void periph_assert_interrupt_status(esp32_periph_t *p, int source,
      * driver does not drain a staged transfer on a single invocation, and
      * gating this on the line having already been high (the obvious
      * simplification) reproduces the original bug, with guest_got=0 in
-     * test-i2c-slave.sh. An unchanged mask still dispatches nothing, which is
-     * what keeps this safe on the every-register-write path. */
+     * the i2c_slave fixture gate. An unchanged mask still dispatches nothing,
+     * which keeps this safe on the every-register-write path. */
     (void)was;
     if (fresh && p->irq_dispatch[source])
         p->irq_dispatch[source](p->irq_dispatch_ctx[source], source);

@@ -121,14 +121,4 @@ jobs:
       - name: Run gates
         env:
           ARDUINO_CLI: /home/runner/bin/arduino-cli
-        run: |
-          status=0
-          for gate in ./scripts/test-*.sh; do
-            echo "::group::$gate"
-            if ! "$gate"; then
-              echo "::error::$gate failed"
-              status=1
-            fi
-            echo "::endgroup::"
-          done
-          exit $status
+        run: ./scripts/test-fixtures.sh

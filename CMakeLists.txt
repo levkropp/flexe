@@ -178,173 +178,48 @@ else()
     target_compile_options(trace-filter PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
 endif()
 
-# Optional POSIX external-ROM integration runner. The ROM images themselves
-# are supplied at runtime and are not part of the normal unit-test fixtures.
+# Optional POSIX integration runners. Firmware images and Arduino CLI stay
+# outside the core build; these targets provide their host-side harnesses.
 if(UNIX)
-    add_executable(flexe-stock-rom-test tools/stock_rom_test.c)
-    target_link_libraries(flexe-stock-rom-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-stock-rom-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+    function(add_flexe_runner target source)
+        add_executable(${target} tools/${source})
+        target_link_libraries(${target} PRIVATE xtensa-emu-lib)
+        target_compile_options(${target} PRIVATE
+            -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+    endfunction()
 
-    # Optional compiled-firmware gates. Their .ino fixtures are built by the
-    # shell runners so Arduino CLI remains outside the core build.
-    add_executable(flexe-i2c-wire-test tools/i2c_wire_test.c)
-    target_link_libraries(flexe-i2c-wire-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-i2c-wire-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+    add_flexe_runner(flexe-stock-rom-test stock_rom_test.c)
+    add_flexe_runner(flexe-generic-rom-test generic_rom_test.c)
+    add_flexe_runner(flexe-bench-compute bench_compute.c)
 
-    add_executable(flexe-rtc-i2c-test tools/rtc_i2c_test.c)
-    target_link_libraries(flexe-rtc-i2c-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-rtc-i2c-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-analog-dac-test tools/analog_dac_test.c)
-    target_link_libraries(flexe-analog-dac-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-analog-dac-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-sigmadelta-test tools/sigmadelta_test.c)
-    target_link_libraries(flexe-sigmadelta-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-sigmadelta-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-i2s-dma-test tools/i2s_dma_test.c)
-    target_link_libraries(flexe-i2s-dma-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-i2s-dma-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-rmt-tx-test tools/rmt_tx_test.c)
-    target_link_libraries(flexe-rmt-tx-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-rmt-tx-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-ledc-pwm-test tools/ledc_pwm_test.c)
-    target_link_libraries(flexe-ledc-pwm-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-ledc-pwm-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-bench-compute tools/bench_compute.c)
-    target_link_libraries(flexe-bench-compute PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-bench-compute PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-gpio-isr-test tools/gpio_isr_test.c)
-    target_link_libraries(flexe-gpio-isr-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-gpio-isr-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-wifi-client-test tools/wifi_client_test.c)
-    target_link_libraries(flexe-wifi-client-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-wifi-client-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-task-wdt-test tools/task_wdt_test.c)
-    target_link_libraries(flexe-task-wdt-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-task-wdt-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-scheduler-test tools/scheduler_test.c)
-    target_link_libraries(flexe-scheduler-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-scheduler-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-task-queue-test tools/task_queue_test.c)
-    target_link_libraries(flexe-task-queue-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-task-queue-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-event-group-test tools/event_group_test.c)
-    target_link_libraries(flexe-event-group-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-event-group-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-frt-timer-test tools/frt_timer_test.c)
-    target_link_libraries(flexe-frt-timer-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-frt-timer-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-esp-timer-test tools/esp_timer_test.c)
-    target_link_libraries(flexe-esp-timer-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-esp-timer-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-i2c-slave-test tools/i2c_slave_test.c)
-    target_link_libraries(flexe-i2c-slave-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-i2c-slave-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-generic-rom-test tools/generic_rom_test.c)
-    target_link_libraries(flexe-generic-rom-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-generic-rom-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-deep-sleep-test tools/deep_sleep_test.c)
-    target_link_libraries(flexe-deep-sleep-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-deep-sleep-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-rtc-gpio-test tools/rtc_gpio_test.c)
-    target_link_libraries(flexe-rtc-gpio-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-rtc-gpio-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-touch-pad-test tools/touch_pad_test.c)
-    target_link_libraries(flexe-touch-pad-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-touch-pad-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-guest-clock-test tools/guest_clock_test.c)
-    target_link_libraries(flexe-guest-clock-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-guest-clock-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-spi-master-test tools/spi_master_test.c)
-    target_link_libraries(flexe-spi-master-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-spi-master-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-pcnt-pulse-test tools/pcnt_pulse_test.c)
-    target_link_libraries(flexe-pcnt-pulse-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-pcnt-pulse-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-mcpwm-motor-test tools/mcpwm_motor_test.c)
-    target_link_libraries(flexe-mcpwm-motor-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-mcpwm-motor-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-timer-group-test tools/timer_group_test.c)
-    target_link_libraries(flexe-timer-group-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-timer-group-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-frc-timer-test tools/frc_timer_test.c)
-    target_link_libraries(flexe-frc-timer-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-frc-timer-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-uhci-dma-test tools/uhci_dma_test.c)
-    target_link_libraries(flexe-uhci-dma-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-uhci-dma-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-sdmmc-host-test tools/sdmmc_host_test.c)
-    target_link_libraries(flexe-sdmmc-host-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-sdmmc-host-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-sdio-slave-test tools/sdio_slave_test.c)
-    target_link_libraries(flexe-sdio-slave-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-sdio-slave-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-twai-bus-test tools/twai_bus_test.c)
-    target_link_libraries(flexe-twai-bus-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-twai-bus-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
-
-    add_executable(flexe-emac-hal-test tools/emac_hal_test.c)
-    target_link_libraries(flexe-emac-hal-test PRIVATE xtensa-emu-lib)
-    target_compile_options(flexe-emac-hal-test PRIVATE
-        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+    add_flexe_runner(flexe-analog-dac-test analog_dac_test.c)
+    add_flexe_runner(flexe-deep-sleep-test deep_sleep_test.c)
+    add_flexe_runner(flexe-emac-hal-test emac_hal_test.c)
+    add_flexe_runner(flexe-esp-timer-test esp_timer_test.c)
+    add_flexe_runner(flexe-event-group-test event_group_test.c)
+    add_flexe_runner(flexe-frc-timer-test frc_timer_test.c)
+    add_flexe_runner(flexe-frt-timer-test frt_timer_test.c)
+    add_flexe_runner(flexe-gpio-isr-test gpio_isr_test.c)
+    add_flexe_runner(flexe-guest-clock-test guest_clock_test.c)
+    add_flexe_runner(flexe-i2c-slave-test i2c_slave_test.c)
+    add_flexe_runner(flexe-i2c-wire-test i2c_wire_test.c)
+    add_flexe_runner(flexe-i2s-dma-test i2s_dma_test.c)
+    add_flexe_runner(flexe-ledc-pwm-test ledc_pwm_test.c)
+    add_flexe_runner(flexe-mcpwm-motor-test mcpwm_motor_test.c)
+    add_flexe_runner(flexe-pcnt-pulse-test pcnt_pulse_test.c)
+    add_flexe_runner(flexe-rmt-tx-test rmt_tx_test.c)
+    add_flexe_runner(flexe-rtc-gpio-test rtc_gpio_test.c)
+    add_flexe_runner(flexe-rtc-i2c-test rtc_i2c_test.c)
+    add_flexe_runner(flexe-scheduler-test scheduler_test.c)
+    add_flexe_runner(flexe-sdio-slave-test sdio_slave_test.c)
+    add_flexe_runner(flexe-sdmmc-host-test sdmmc_host_test.c)
+    add_flexe_runner(flexe-sigmadelta-test sigmadelta_test.c)
+    add_flexe_runner(flexe-spi-master-test spi_master_test.c)
+    add_flexe_runner(flexe-task-queue-test task_queue_test.c)
+    add_flexe_runner(flexe-task-wdt-test task_wdt_test.c)
+    add_flexe_runner(flexe-timer-group-test timer_group_test.c)
+    add_flexe_runner(flexe-touch-pad-test touch_pad_test.c)
+    add_flexe_runner(flexe-twai-bus-test twai_bus_test.c)
+    add_flexe_runner(flexe-uhci-dma-test uhci_dma_test.c)
+    add_flexe_runner(flexe-wifi-client-test wifi_client_test.c)
 endif()

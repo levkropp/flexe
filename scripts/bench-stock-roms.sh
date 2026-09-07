@@ -6,7 +6,7 @@
 # as positional arguments:
 #
 #   MARAUDER_BIN=/path/to/marauder.bin \
-#   NERDMINER_BIN=/path/to/nerdminer.bin ./bench-stock-roms.sh
+#   NERDMINER_BIN=/path/to/nerdminer.bin ./scripts/bench-stock-roms.sh
 #
 # Useful overrides:
 #   EMU=./build/xtensa-emu  CYCLES=2000000000  REPS=3

@@ -6,8 +6,10 @@
 #include "memory.h"
 #include "peripherals.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define SUCCESS_MARKER 0x1C2C0040u
 #define MAX_CYCLES     30000000ull
@@ -42,12 +44,19 @@ static int register_device(void *opaque, int port, uint8_t address,
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s FIRMWARE.bin FIRMWARE.elf\n", argv[0]);
+    bool disable_jit = false;
+    int arg = 1;
+    if (argc > 1 && strcmp(argv[1], "--no-jit") == 0) {
+        disable_jit = true;
+        arg++;
+    }
+    if (argc - arg != 2) {
+        fprintf(stderr, "usage: %s [--no-jit] FIRMWARE.bin FIRMWARE.elf\n",
+                argv[0]);
         return 2;
     }
 
-    elf_symbols_t *symbols = elf_symbols_load(argv[2]);
+    elf_symbols_t *symbols = elf_symbols_load(argv[arg + 1]);
     uint32_t stage_addr = 0;
     uint32_t result_addr = 0;
     if (!symbols ||
@@ -59,8 +68,9 @@ int main(int argc, char **argv) {
     }
 
     flexe_session_config_t config = {
-        .bin_path = argv[1],
-        .elf_path = argv[2],
+        .bin_path = argv[arg],
+        .elf_path = argv[arg + 1],
+        .disable_jit = disable_jit,
     };
     flexe_session_t *session = flexe_session_create(&config);
     if (!session) {
@@ -104,10 +114,11 @@ int main(int argc, char **argv) {
             memory_ok = 0;
     }
     int unhandled = periph_unhandled_count(periph);
-    printf("stage=0x%08X result=%u/%u/%u/0x%08X calls=%u "
+    printf("engine=%s stage=0x%08X result=%u/%u/%u/0x%08X calls=%u "
            "write_bytes=%zu read_bytes=%zu memory_ok=%d unhandled=%d "
            "cycles=%llu\n",
-           stage, results[0], results[1], results[2], results[3],
+           disable_jit ? "interp" : "jit", stage,
+           results[0], results[1], results[2], results[3],
            device.calls, device.write_bytes, device.read_bytes, memory_ok,
            unhandled, (unsigned long long)cpu->cycle_count);
 

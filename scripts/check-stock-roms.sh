@@ -13,7 +13,7 @@
 # bench-stock-roms.sh does:
 #
 #   MARAUDER_BIN=/path/to/marauder.bin \
-#   NERDMINER_BIN=/path/to/nerdminer.bin ./check-stock-roms.sh
+#   NERDMINER_BIN=/path/to/nerdminer.bin ./scripts/check-stock-roms.sh
 #
 # Any extra positional arguments are treated as Marauder-profile images, which
 # is how the other CYD board builds are checked.

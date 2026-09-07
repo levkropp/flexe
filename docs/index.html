@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>flexe — free little xtensa emulator</title>
-  <meta name="description" content="a fast, dependency-free xtensa lx6 (esp32) emulator in c. boots real esp-idf firmware 2–10× faster than the real chip.">
+  <meta name="description" content="a fast xtensa lx6 (esp32) emulator in c with arm64 and x86-64 jit backends and production-firmware integration tests.">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -272,7 +272,7 @@
     <!-- hero -->
     <section class="hero">
       <h1>flexe</h1>
-      <p class="tagline">free little xtensa emulator. boots real esp-idf firmware. emulates an esp32 at 2–10× the speed of an actual esp32, because why not.</p>
+      <p class="tagline">free little xtensa emulator. boots real esp-idf firmware, models esp32 hardware, and tests production roms end to end.</p>
       <div class="hero-buttons">
         <a href="https://github.com/levkropp/flexe" class="btn btn-primary">view on github</a>
         <a href="#benchmarks" class="btn btn-secondary">see the numbers</a>
@@ -288,7 +288,7 @@
           <span class="term-dot g"></span>
         </div>
         <pre><span class="p">$</span> cmake -S . -B build && cmake --build build -j
-<span class="c"># done. that's the whole build. no runtime deps.</span>
+<span class="c"># c17, cmake, openssl, zlib, and pthreads.</span>
 
 <span class="p">$</span> ./build/xtensa-emu -q -s hello_world.elf -c 5000000 hello_world.bin
 <span class="g">I (0) cpu_start: Starting scheduler on PRO CPU.</span>
@@ -309,16 +309,16 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <span class="stat-label">mips on alu/memory loops<br>(10.3× a real esp32)</span>
       </div>
       <div>
-        <span class="stat-num">13.6×</span>
-        <span class="stat-label">real-time on stock esp32 marauder<br>(unmodified production firmware)</span>
+        <span class="stat-num">5</span>
+        <span class="stat-label">curated cyd images<br>(both engines, pinned rendering)</span>
       </div>
       <div>
-        <span class="stat-num">0</span>
-        <span class="stat-label">dependencies<br>(c11 + cmake + openssl. that's it)</span>
+        <span class="stat-num">2</span>
+        <span class="stat-label">native jit backends<br>(arm64 + x86-64)</span>
       </div>
       <div>
-        <span class="stat-num">673</span>
-        <span class="stat-label">tests, all passing<br>(13,205 assertions, 0 failures)</span>
+        <span class="stat-num">674</span>
+        <span class="stat-label">tests, all passing<br>(13,208 assertions, 0 failures)</span>
       </div>
     </section>
 
@@ -333,7 +333,7 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <div class="feature-card">
           <h3>runs firmware people actually ship</h3>
           <p>unmodified esp32 marauder and nerdminer images boot, associate to wifi, drive the cyd display and mine. five stock roms run on both engines and have to produce byte-identical final framebuffers, pinned by sha-256 — which is what catches a jit that renders the wrong thing rather than no thing.</p>
-          <p>meshtastic and openhasp boot too, at 6.3× and 1.9× real-time. wled and tasmota do not yet: both stop doing useful work partway in, which their real-time figures flatter rather than expose — so the bench prints retired instructions and uart bytes next to every number.</p>
+          <p>meshtastic and openhasp boot too. wled and default-path tasmota do not yet complete useful work, so their apparent real-time factors are treated as invalid and every corpus benchmark reports progress beside speed.</p>
         </div>
         <div class="feature-card">
           <h3>full lx6 isa</h3>
@@ -353,7 +353,7 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         </div>
         <div class="feature-card">
           <h3>tiny and boring (on purpose)</h3>
-          <p>~20k lines of c11. no frameworks, no runtime, no drama. just a switch-based interpreter and a hand-rolled jit. reads like a textbook, runs like a rocket.</p>
+          <p>plain c17, a switch-based interpreter, and hand-rolled jit backends. the implementation stays inspectable even as production firmware expands the hardware model.</p>
         </div>
       </div>
     </section>
@@ -370,9 +370,10 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <span class="cmd">./build/xtensa-emu</span> -s app.elf -c 10000000 app.bin
       </div>
       <div class="prereqs">
-        <span class="prereq">c11 compiler</span>
+        <span class="prereq">c17 compiler</span>
         <span class="prereq">cmake</span>
         <span class="prereq">openssl</span>
+        <span class="prereq">zlib + pthreads</span>
         <span class="prereq">an esp-idf firmware .bin to play with</span>
       </div>
       <p class="bench-note">benchmarks measured on apple silicon with the pgo build. jit is on by default; <code>--no-jit</code> takes the scenic route. real esp32 = 240 mips, for scale.</p>
