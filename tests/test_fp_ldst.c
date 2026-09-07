@@ -115,34 +115,31 @@ TEST(exec_ssiu_post_update) {
     teardown(&cpu);
 }
 
-/* ===== RUR/WUR for FCR/FSR ===== */
+/* ===== RUR/WUR user registers ===== */
 
 /*
- * RUR at: op2=14, op1=3, ur = (s<<4)|r
- * FCR=232: s=14, r=8 → ur=(14<<4)|8 = 232
- * dest = t
+ * RUR at: op2=14, op1=3, destination=r, user register=(s<<4)|t.
+ * For example, rur.f64r_lo a3 is encoded as bytes A0 3E E3.
  */
-static uint32_t rur_insn(int ur, int dest_t) {
+static uint32_t rur_insn(int ur, int dest_r) {
     int s = (ur >> 4) & 0xF;
-    int r = ur & 0xF;
-    return rrr(14, 3, r, s, dest_t);
+    int t = ur & 0xF;
+    return rrr(14, 3, dest_r, s, t);
 }
 
 /*
- * WUR at: op2=15, op1=3, ur = (s<<4)|r
- * src = t
+ * WUR at: op2=15, op1=3, source=t, user register=(r<<4)|s.
  */
 static uint32_t wur_insn(int ur, int src_t) {
-    int s = (ur >> 4) & 0xF;
-    int r = ur & 0xF;
+    int r = (ur >> 4) & 0xF;
+    int s = ur & 0xF;
     return rrr(15, 3, r, s, src_t);
 }
 
 TEST(exec_rur_fcr) {
     xtensa_cpu_t cpu; setup(&cpu);
     cpu.fcr = 0x0000001F;
-    /* RUR a3, FCR(232): dest=a3 → t=3 */
-    put_insn3(&cpu, BASE, rur_insn(232, 3));
+    put_insn3(&cpu, BASE, rur_insn(XT_UR_FCR, 3));
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 3), 0x0000001F);
     teardown(&cpu);
@@ -151,8 +148,7 @@ TEST(exec_rur_fcr) {
 TEST(exec_wur_fcr) {
     xtensa_cpu_t cpu; setup(&cpu);
     ar_write(&cpu, 3, 0x0000000F);
-    /* WUR FCR(232), a3: src=a3 → t=3 */
-    put_insn3(&cpu, BASE, wur_insn(232, 3));
+    put_insn3(&cpu, BASE, wur_insn(XT_UR_FCR, 3));
     xtensa_step(&cpu);
     ASSERT_EQ(cpu.fcr, 0x0000000F);
     teardown(&cpu);
@@ -162,16 +158,54 @@ TEST(exec_wur_fsr_rur_fsr) {
     xtensa_cpu_t cpu; setup(&cpu);
     ar_write(&cpu, 5, 0x00000078);
 
-    /* WUR FSR(233), a5 */
-    put_insn3(&cpu, BASE, wur_insn(233, 5));
+    put_insn3(&cpu, BASE, wur_insn(XT_UR_FSR, 5));
     xtensa_step(&cpu);
     ASSERT_EQ(cpu.fsr, 0x00000078);
 
-    /* RUR a6, FSR(233) */
     cpu.pc = BASE;
-    put_insn3(&cpu, BASE, rur_insn(233, 6));
+    put_insn3(&cpu, BASE, rur_insn(XT_UR_FSR, 6));
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 6), 0x00000078);
+    teardown(&cpu);
+}
+
+/* ESP-IDF's interrupt context save executes this exact instruction. The old
+ * decoder treated t as the destination and silently zeroed a10, which can be
+ * a live register in a suspended caller's overlapping physical window. */
+TEST(exec_rur_f64r_lo_uses_r_as_destination) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    cpu.f64r_lo = 0xD00DFEEDu;
+    ar_write(&cpu, 10, 0xA10A10A1u);
+    uint32_t insn = rur_insn(XT_UR_F64R_LO, 3);
+    ASSERT_EQ(insn, 0x00E33EA0u); /* bytes A0 3E E3 */
+    put_insn3(&cpu, BASE, insn);
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 3), 0xD00DFEEDu);
+    ASSERT_EQ(ar_read(&cpu, 10), 0xA10A10A1u);
+    teardown(&cpu);
+}
+
+TEST(exec_wur_rur_threadptr_roundtrip) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    ar_write(&cpu, 5, 0x3FFB7A80u);
+    put_insn3(&cpu, BASE, wur_insn(XT_UR_THREADPTR, 5));
+    put_insn3(&cpu, BASE + 3, rur_insn(XT_UR_THREADPTR, 6));
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.threadptr, 0x3FFB7A80u);
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 6), 0x3FFB7A80u);
+    teardown(&cpu);
+}
+
+TEST(exec_wur_rur_fp64_helper_state) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    ar_write(&cpu, 7, 0x76543210u);
+    put_insn3(&cpu, BASE, wur_insn(XT_UR_F64R_HI, 7));
+    put_insn3(&cpu, BASE + 3, rur_insn(XT_UR_F64R_HI, 8));
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.f64r_hi, 0x76543210u);
+    xtensa_step(&cpu);
+    ASSERT_EQ(ar_read(&cpu, 8), 0x76543210u);
     teardown(&cpu);
 }
 
@@ -185,4 +219,7 @@ void run_fp_ldst_tests(void) {
     RUN_TEST(exec_rur_fcr);
     RUN_TEST(exec_wur_fcr);
     RUN_TEST(exec_wur_fsr_rur_fsr);
+    RUN_TEST(exec_rur_f64r_lo_uses_r_as_destination);
+    RUN_TEST(exec_wur_rur_threadptr_roundtrip);
+    RUN_TEST(exec_wur_rur_fp64_helper_state);
 }

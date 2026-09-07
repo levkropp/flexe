@@ -128,9 +128,14 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
     WRITE_OR_FAIL(f, &cpu->acchi, sizeof(cpu->acchi), "ACCHI");
     WRITE_OR_FAIL(f, cpu->mr, sizeof(cpu->mr), "MR");
 
-    /* Floating-point state */
+    /* User-register and floating-point state */
+    WRITE_OR_FAIL(f, &cpu->expstate, sizeof(cpu->expstate), "EXPSTATE");
+    WRITE_OR_FAIL(f, &cpu->threadptr, sizeof(cpu->threadptr), "THREADPTR");
     WRITE_OR_FAIL(f, &cpu->fcr, sizeof(cpu->fcr), "FCR");
     WRITE_OR_FAIL(f, &cpu->fsr, sizeof(cpu->fsr), "FSR");
+    WRITE_OR_FAIL(f, &cpu->f64r_lo, sizeof(cpu->f64r_lo), "F64R_LO");
+    WRITE_OR_FAIL(f, &cpu->f64r_hi, sizeof(cpu->f64r_hi), "F64R_HI");
+    WRITE_OR_FAIL(f, &cpu->f64s, sizeof(cpu->f64s), "F64S");
     WRITE_OR_FAIL(f, cpu->fr, sizeof(cpu->fr), "FR");
 
     /* Interrupt configuration */
@@ -329,8 +334,13 @@ int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path
     READ_OR_FAIL(f, &cpu->acchi, sizeof(cpu->acchi), "ACCHI");
     READ_OR_FAIL(f, cpu->mr, sizeof(cpu->mr), "MR");
 
+    READ_OR_FAIL(f, &cpu->expstate, sizeof(cpu->expstate), "EXPSTATE");
+    READ_OR_FAIL(f, &cpu->threadptr, sizeof(cpu->threadptr), "THREADPTR");
     READ_OR_FAIL(f, &cpu->fcr, sizeof(cpu->fcr), "FCR");
     READ_OR_FAIL(f, &cpu->fsr, sizeof(cpu->fsr), "FSR");
+    READ_OR_FAIL(f, &cpu->f64r_lo, sizeof(cpu->f64r_lo), "F64R_LO");
+    READ_OR_FAIL(f, &cpu->f64r_hi, sizeof(cpu->f64r_hi), "F64R_HI");
+    READ_OR_FAIL(f, &cpu->f64s, sizeof(cpu->f64s), "F64S");
     READ_OR_FAIL(f, cpu->fr, sizeof(cpu->fr), "FR");
 
     READ_OR_FAIL(f, cpu->int_level, sizeof(cpu->int_level), "INT_LEVEL");

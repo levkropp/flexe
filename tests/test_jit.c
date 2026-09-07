@@ -85,6 +85,24 @@ static int compare_state(const xtensa_cpu_t *a, const xtensa_cpu_t *b,
         }
     }
 
+#define COMPARE_U32(field) \
+    do { \
+        if (a->field != b->field) { \
+            fprintf(stderr, "  DIFF %s: " #field \
+                    " interp=0x%08X jit=0x%08X\n", \
+                    test_name, a->field, b->field); \
+            diffs++; \
+        } \
+    } while (0)
+    COMPARE_U32(expstate);
+    COMPARE_U32(threadptr);
+    COMPARE_U32(fcr);
+    COMPARE_U32(fsr);
+    COMPARE_U32(f64r_lo);
+    COMPARE_U32(f64r_hi);
+    COMPARE_U32(f64s);
+#undef COMPARE_U32
+
     return diffs;
 }
 
@@ -1653,6 +1671,13 @@ TEST(test_savestate_round_trips_retired_instruction_count) {
     setup(&saved);
     saved.cycle_count = 1234567u;
     saved.insn_count = 987654u;
+    saved.expstate = 0xE6E6E6E6u;
+    saved.threadptr = 0x3FFB7A80u;
+    saved.fcr = 0x0000001Fu;
+    saved.fsr = 0x00000078u;
+    saved.f64r_lo = 0x01234567u;
+    saved.f64r_hi = 0x89ABCDEFu;
+    saved.f64s = 0x13579BDFu;
     mem_write32(saved.mem, 0x3FF801FCu, 0xF45A7A57u);
     mem_write32(saved.mem, 0x500001FCu, 0x5100A11Eu);
     ASSERT_EQ64(xtensa_retired_insns(&saved), 987654u);
@@ -1664,6 +1689,13 @@ TEST(test_savestate_round_trips_retired_instruction_count) {
     ASSERT_EQ(savestate_restore(&restored, NULL, path), 0);
     ASSERT_EQ64(restored.cycle_count, 1234567u);
     ASSERT_EQ64(xtensa_retired_insns(&restored), 987654u);
+    ASSERT_EQ(restored.expstate, 0xE6E6E6E6u);
+    ASSERT_EQ(restored.threadptr, 0x3FFB7A80u);
+    ASSERT_EQ(restored.fcr, 0x0000001Fu);
+    ASSERT_EQ(restored.fsr, 0x00000078u);
+    ASSERT_EQ(restored.f64r_lo, 0x01234567u);
+    ASSERT_EQ(restored.f64r_hi, 0x89ABCDEFu);
+    ASSERT_EQ(restored.f64s, 0x13579BDFu);
     ASSERT_EQ(mem_read32(restored.mem, 0x3FF801FCu), 0xF45A7A57u);
     ASSERT_EQ(mem_read32(restored.mem, 0x500001FCu), 0x5100A11Eu);
 
@@ -1802,6 +1834,27 @@ TEST(test_jit_rsr_wsr_sar) {
     put_insn3(&cpu, BASE, rrr(1, 3, 0, 3, 2));  /* WSR SAR, a2 */
     put_insn3(&cpu, BASE + 3, rrr(0, 3, 0, 3, 5));  /* RSR a5, SAR */
     test_block_differential(&cpu, 2, "rsr_wsr_sar");
+    teardown(&cpu);
+}
+
+TEST(test_jit_rur_wur_user_registers) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.f64r_lo = 0xD00DFEEDu;
+    ar_write(&cpu, 5, 0x3FFB7A80u);
+    ar_write(&cpu, 10, 0xA10A10A1u);
+    /* WUR THREADPTR,a5: UR=(r<<4)|s. */
+    put_insn3(&cpu, BASE, rrr(15, 3,
+                              XT_UR_THREADPTR >> 4,
+                              XT_UR_THREADPTR & 15, 5));
+    /* RUR a3,THREADPTR and the exact ESP-IDF rur.f64r_lo a4 shape. */
+    put_insn3(&cpu, BASE + 3, rrr(14, 3, 3,
+                                  XT_UR_THREADPTR >> 4,
+                                  XT_UR_THREADPTR & 15));
+    put_insn3(&cpu, BASE + 6, rrr(14, 3, 4,
+                                  XT_UR_F64R_LO >> 4,
+                                  XT_UR_F64R_LO & 15));
+    test_block_differential(&cpu, 3, "rur_wur_user_registers");
     teardown(&cpu);
 }
 
@@ -1985,6 +2038,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_addx2);
     RUN_TEST(test_jit_rsil);
     RUN_TEST(test_jit_rsr_wsr_sar);
+    RUN_TEST(test_jit_rur_wur_user_registers);
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);
     RUN_TEST(test_jit_entry_windowed);

@@ -44,8 +44,13 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     uint32_t save_acclo = cpu->acclo;
     uint32_t save_acchi = cpu->acchi;
     uint32_t save_mr[4];
+    uint32_t save_expstate = cpu->expstate;
+    uint32_t save_threadptr = cpu->threadptr;
     uint32_t save_fcr = cpu->fcr;
     uint32_t save_fsr = cpu->fsr;
+    uint32_t save_f64r_lo = cpu->f64r_lo;
+    uint32_t save_f64r_hi = cpu->f64r_hi;
+    uint32_t save_f64s = cpu->f64s;
     float save_fr[16];
     uint8_t save_window_callsize[sizeof(cpu->window_callsize)];
     uint8_t save_spill_stack[sizeof(cpu->spill_stack)];
@@ -135,8 +140,13 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     cpu->br = save_br;
     cpu->acclo = save_acclo;
     cpu->acchi = save_acchi;
+    cpu->expstate = save_expstate;
+    cpu->threadptr = save_threadptr;
     cpu->fcr = save_fcr;
     cpu->fsr = save_fsr;
+    cpu->f64r_lo = save_f64r_lo;
+    cpu->f64r_hi = save_f64r_hi;
+    cpu->f64s = save_f64s;
     cpu->running = save_running;
     /* A completed asynchronous guest callback represents interrupt/event
      * delivery. Interrupt entry wakes WAITI, so do not reinstate a halted

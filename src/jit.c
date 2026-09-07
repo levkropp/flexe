@@ -2140,19 +2140,44 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 ra_store_ar(e, ra,RAX, wb4, r);
                 return 1;
             }
-            case 14: { /* RUR */
-                int ur = (s << 4) | r;
-                if (ur == 232)      emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fcr));
-                else if (ur == 233) emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fsr));
-                else                emit_mov_reg_imm32(e, RAX, 0);
-                ra_store_ar(e, ra,RAX, wb4, t);
+            case 14: { /* RUR: r=destination, s/t=user-register number */
+                int ur = (s << 4) | t;
+                if (ur == XT_UR_EXPSTATE)
+                    emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, expstate));
+                else if (ur == XT_UR_THREADPTR)
+                    emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, threadptr));
+                else if (ur == XT_UR_FCR)
+                    emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fcr));
+                else if (ur == XT_UR_FSR)
+                    emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fsr));
+                else if (ur == XT_UR_F64R_LO)
+                    emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, f64r_lo));
+                else if (ur == XT_UR_F64R_HI)
+                    emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, f64r_hi));
+                else if (ur == XT_UR_F64S)
+                    emit_load_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, f64s));
+                else
+                    emit_mov_reg_imm32(e, RAX, 0);
+                ra_store_ar(e, ra,RAX, wb4, r);
                 return 1;
             }
-            case 15: { /* WUR */
-                int ur = (s << 4) | r;
+            case 15: { /* WUR: t=source, r/s=user-register number */
+                int ur = (r << 4) | s;
                 ra_load_ar(e, ra,RAX, wb4, t);
-                if (ur == 232)      emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fcr));
-                else if (ur == 233) emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fsr));
+                if (ur == XT_UR_EXPSTATE)
+                    emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, expstate));
+                else if (ur == XT_UR_THREADPTR)
+                    emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, threadptr));
+                else if (ur == XT_UR_FCR)
+                    emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fcr));
+                else if (ur == XT_UR_FSR)
+                    emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, fsr));
+                else if (ur == XT_UR_F64R_LO)
+                    emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, f64r_lo));
+                else if (ur == XT_UR_F64R_HI)
+                    emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, f64r_hi));
+                else if (ur == XT_UR_F64S)
+                    emit_store_cpu32(e, RAX, (int32_t)offsetof(xtensa_cpu_t, f64s));
                 return 1;
             }
             default: return 0;
@@ -3350,6 +3375,7 @@ static void jit_bitmap_set(jit_state_t *jit, uint32_t pc) {
 typedef struct {
     uint32_t ar[64];
     uint32_t pc, sar, ps, lbeg, lend, lcount, windowbase, windowstart;
+    uint32_t expstate, threadptr, fcr, fsr, f64r_lo, f64r_hi, f64s;
     uint16_t br;
 } jit_arch_state_t;
 
@@ -3360,6 +3386,10 @@ static void jit_arch_capture(const xtensa_cpu_t *cpu, jit_arch_state_t *st) {
     st->lend = cpu->lend;         st->lcount = cpu->lcount;
     st->windowbase = cpu->windowbase;
     st->windowstart = cpu->windowstart;
+    st->expstate = cpu->expstate;   st->threadptr = cpu->threadptr;
+    st->fcr = cpu->fcr;             st->fsr = cpu->fsr;
+    st->f64r_lo = cpu->f64r_lo;     st->f64r_hi = cpu->f64r_hi;
+    st->f64s = cpu->f64s;
     st->br = cpu->br;
 }
 
@@ -3398,6 +3428,9 @@ static int jit_arch_report(const jit_arch_state_t *ref,
     JV_CMP(pc, "%08X") JV_CMP(sar, "%u") JV_CMP(ps, "%08X")
     JV_CMP(lbeg, "%08X") JV_CMP(lend, "%08X") JV_CMP(lcount, "%u")
     JV_CMP(windowbase, "%u") JV_CMP(windowstart, "%04X")
+    JV_CMP(expstate, "%08X") JV_CMP(threadptr, "%08X")
+    JV_CMP(fcr, "%08X") JV_CMP(fsr, "%08X")
+    JV_CMP(f64r_lo, "%08X") JV_CMP(f64r_hi, "%08X") JV_CMP(f64s, "%08X")
 #undef JV_CMP
     if (ref->br != got->br) {
         fprintf(stderr, "[jit-verify] block %08X: br interp=%04X jit=%04X\n",

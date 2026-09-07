@@ -134,6 +134,17 @@ typedef int (*xtensa_pc_hook_fn)(xtensa_cpu_t *cpu, uint32_t pc, void *ctx);
 #define XT_SR_MISC2         246
 #define XT_SR_MISC3         247
 
+/* ESP32 user-register numbers used by the thread-pointer, FPU, and the
+ * non-coprocessor FP64 helper state. RUR and WUR encode these differently
+ * from special-register RSR/WSR instructions. */
+#define XT_UR_EXPSTATE      230
+#define XT_UR_THREADPTR     231
+#define XT_UR_FCR           232
+#define XT_UR_FSR           233
+#define XT_UR_F64R_LO       234
+#define XT_UR_F64R_HI       235
+#define XT_UR_F64S          236
+
 /*
  * Stop reason — why did execution end?
  */
@@ -354,8 +365,13 @@ struct xtensa_cpu {
     uint32_t mr[4];             /* SR 32-35: MAC16 data registers */
 
     /* Floating-point coprocessor */
+    uint32_t expstate;          /* UR 230: exception state (if configured) */
+    uint32_t threadptr;         /* UR 231: thread-local storage base */
     uint32_t fcr;               /* Floating-point control */
     uint32_t fsr;               /* Floating-point status */
+    uint32_t f64r_lo;           /* UR 234: FP64 helper result low */
+    uint32_t f64r_hi;           /* UR 235: FP64 helper result high */
+    uint32_t f64s;              /* UR 236: FP64 helper state */
     float    fr[16];            /* Floating-point registers */
 
     /* Execution control */

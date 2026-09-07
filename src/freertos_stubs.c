@@ -159,6 +159,9 @@ typedef struct {
     uint8_t      spill_shadow[sizeof(((xtensa_cpu_t *)0)->spill_shadow)];
     uint8_t      window_callsize[sizeof(((xtensa_cpu_t *)0)->window_callsize)];
     uint32_t     sar, lbeg, lend, lcount;
+    uint32_t     expstate, threadptr, fcr, fsr;
+    uint32_t     f64r_lo, f64r_hi, f64s;
+    float        fr[16];
     uint32_t     stack_top;
     /* Run-time accounting for uxTaskGetSystemState. Cumulative cycles
      * spent in TASK_RUNNING on any core, updated at every sched_save_context. */
@@ -341,6 +344,14 @@ static void sched_save_context(freertos_stubs_t *frt, int core_id) {
     t->lbeg = cpu->lbeg;
     t->lend = cpu->lend;
     t->lcount = cpu->lcount;
+    t->expstate = cpu->expstate;
+    t->threadptr = cpu->threadptr;
+    t->fcr = cpu->fcr;
+    t->fsr = cpu->fsr;
+    t->f64r_lo = cpu->f64r_lo;
+    t->f64r_hi = cpu->f64r_hi;
+    t->f64s = cpu->f64s;
+    memcpy(t->fr, cpu->fr, sizeof(cpu->fr));
 }
 
 static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
@@ -372,6 +383,14 @@ static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
     cpu->lbeg = t->lbeg;
     cpu->lend = t->lend;
     cpu->lcount = t->lcount;
+    cpu->expstate = t->expstate;
+    cpu->threadptr = t->threadptr;
+    cpu->fcr = t->fcr;
+    cpu->fsr = t->fsr;
+    cpu->f64r_lo = t->f64r_lo;
+    cpu->f64r_hi = t->f64r_hi;
+    cpu->f64s = t->f64s;
+    memcpy(cpu->fr, t->fr, sizeof(cpu->fr));
 }
 
 static uint32_t eg_current_bits(freertos_stubs_t *frt, uint32_t handle);

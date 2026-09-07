@@ -704,7 +704,8 @@ static inline unsigned window_operand_need(const xtensa_cpu_t *cpu,
             case 8: case 9: case 10: case 11:
                 return window_need3(r, s, t);
             case 12: case 13: return window_need2(r, s); /* t is boolean */
-            case 14: case 15: return t >> 2; /* r/s encode the user reg */
+            case 14: return r >> 2; /* RUR: r=dest, s/t=user reg */
+            case 15: return t >> 2; /* WUR: t=source, r/s=user reg */
             default: return 0;
             }
 
@@ -2142,19 +2143,32 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             if ((cpu->br >> t) & 1)
                 ar_write(cpu, r, ar_read(cpu, s));
             break;
-        case 14: /* RUR */
-            { int ur = (s << 4) | r;
+        case 14: /* RUR: r=destination, s/t=user-register number */
+            { int ur = (s << 4) | t;
+              uint32_t value;
               switch (ur) {
-              case 232: ar_write(cpu, t, cpu->fcr); break;
-              case 233: ar_write(cpu, t, cpu->fsr); break;
-              default:  ar_write(cpu, t, 0); break;
+              case XT_UR_EXPSTATE:  value = cpu->expstate; break;
+              case XT_UR_THREADPTR: value = cpu->threadptr; break;
+              case XT_UR_FCR:       value = cpu->fcr; break;
+              case XT_UR_FSR:       value = cpu->fsr; break;
+              case XT_UR_F64R_LO:   value = cpu->f64r_lo; break;
+              case XT_UR_F64R_HI:   value = cpu->f64r_hi; break;
+              case XT_UR_F64S:      value = cpu->f64s; break;
+              default:              value = 0; break;
               }
+              ar_write(cpu, r, value);
             } break;
-        case 15: /* WUR */
-            { int ur = (s << 4) | r;
+        case 15: /* WUR: t=source, r/s=user-register number */
+            { int ur = (r << 4) | s;
+              uint32_t value = ar_read(cpu, t);
               switch (ur) {
-              case 232: cpu->fcr = ar_read(cpu, t); break;
-              case 233: cpu->fsr = ar_read(cpu, t); break;
+              case XT_UR_EXPSTATE:  cpu->expstate = value; break;
+              case XT_UR_THREADPTR: cpu->threadptr = value; break;
+              case XT_UR_FCR:       cpu->fcr = value; break;
+              case XT_UR_FSR:       cpu->fsr = value; break;
+              case XT_UR_F64R_LO:   cpu->f64r_lo = value; break;
+              case XT_UR_F64R_HI:   cpu->f64r_hi = value; break;
+              case XT_UR_F64S:      cpu->f64s = value; break;
               default: break;
               }
             } break;
@@ -2848,7 +2862,6 @@ void xtensa_dbg_step_trace(xtensa_cpu_t *cpu) {
     static uint32_t ring_prev;
 
     g_dbg_core = cpu->core_id;
-
     /* FLEXE_RING: the last N control transfers, dumped when the trace fires.
      * Keeping only non-sequential PCs turns a few dozen slots into thousands
      * of instructions of context, which is what makes one dump enough to say

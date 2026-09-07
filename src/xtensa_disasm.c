@@ -381,11 +381,11 @@ static int disasm_qrst(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
         case 12: EMIT("movf\ta%d, a%d, b%d", r, s, t); break;
         case 13: EMIT("movt\ta%d, a%d, b%d", r, s, t); break;
         case 14: /* RUR */
-            { int ur = ((s << 4) | r);
-              EMIT("rur\ta%d, %d", t, ur);
+            { int ur = ((s << 4) | t);
+              EMIT("rur\ta%d, %d", r, ur);
             } break;
         case 15: /* WUR */
-            { int ur = ((s << 4) | r);
+            { int ur = ((r << 4) | s);
               EMIT("wur\ta%d, %d", t, ur);
             } break;
         }
