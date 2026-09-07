@@ -2744,6 +2744,12 @@ TEST(radio_phy_calibration_register_files) {
     uint32_t random_a = mem_read32(mem, 0x3FF75144u);
     uint32_t random_b = mem_read32(mem, 0x3FF75144u);
     ASSERT_TRUE(random_a != random_b);
+    uint32_t random_ahb = mem_read32(mem, 0x60035144u);
+    ASSERT_TRUE(random_ahb != random_b);
+
+    /* The modern AHB and legacy DPORT windows alias ordinary WDEV state too. */
+    mem_write32(mem, 0x60035020u, 0xA5A55A5Au);
+    ASSERT_EQ(mem_read32(mem, 0x3FF75020u), 0xA5A55A5Au);
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
     periph_destroy(p);

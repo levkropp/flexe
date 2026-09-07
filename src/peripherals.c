@@ -4815,7 +4815,7 @@ static void syscon_write(void *ctx, uint32_t addr, uint32_t val) {
 /* ---- WiFi/BT RF, PHY, baseband, and controller register files ---- */
 
 #define WIFI_MAC_INIT_CTRL 0x3FF73D24u
-#define WDEV_RND_REG       0x3FF75144u
+#define WDEV_RND_OFF       0x144u
 #define PHY_CAL_COMMAND    0x3FF4E0C4u
 
 static uint32_t *radio_reg_ptr(esp32_periph_t *p, uint32_t addr) {
@@ -4869,7 +4869,8 @@ static void radio_write(void *ctx, uint32_t addr, uint32_t val) {
  * are ordinary RMW registers; the random source is active on every read. */
 static uint32_t wdev_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    if (addr == WDEV_RND_REG) {
+    uint32_t off = addr - WDEV_BASE;
+    if (off == WDEV_RND_OFF) {
         /* Per-session xorshift64 stream. It is deterministic for reproducible
          * firmware tests while still changing on every hardware read. */
         p->radio.rng_state ^= p->radio.rng_state << 13;
@@ -4877,12 +4878,13 @@ static uint32_t wdev_read(void *ctx, uint32_t addr) {
         p->radio.rng_state ^= p->radio.rng_state << 17;
         return (uint32_t)p->radio.rng_state;
     }
-    return p->radio.wdev[(addr - WDEV_BASE) / sizeof(uint32_t)];
+    return p->radio.wdev[off / sizeof(uint32_t)];
 }
 
 static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
-    p->radio.wdev[(addr - WDEV_BASE) / sizeof(uint32_t)] = val;
+    uint32_t off = addr - WDEV_BASE;
+    p->radio.wdev[off / sizeof(uint32_t)] = val;
 }
 
 /* ---- I2C0/I2C1 master controllers ---- */

@@ -146,6 +146,7 @@ void mem_reset(xtensa_mem_t *mem) {
  *  UART2 AHB 0x6002_E000 -> APB 0x3FF6_E000
  *  I2C0  AHB 0x6001_3000 -> APB 0x3FF5_3000
  *  I2C1  AHB 0x6002_7000 -> APB 0x3FF6_7000
+ *  WDEV  AHB 0x6003_5000 -> DPORT 0x3FF7_5000
  * ESP-IDF's LL FIFO helpers use these aliases, so they must reach the same
  * controller state as ordinary APB register accesses. */
 static inline uint32_t translate_ahb_alias(uint32_t addr) {
@@ -154,6 +155,7 @@ static inline uint32_t translate_ahb_alias(uint32_t addr) {
     if (addr >= 0x60013000u && addr < 0x60014000u) return addr - 0x60013000u + 0x3FF53000u;
     if (addr >= 0x60027000u && addr < 0x60028000u) return addr - 0x60027000u + 0x3FF67000u;
     if (addr >= 0x6002e000u && addr < 0x6002f000u) return addr - 0x6002e000u + 0x3FF6e000u;
+    if (addr >= 0x60035000u && addr < 0x60036000u) return addr - 0x60035000u + 0x3FF75000u;
     return addr;
 }
 
