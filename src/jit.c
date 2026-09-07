@@ -547,7 +547,8 @@ static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
      * at lend so the loop-back check in jit_run fires between blocks. The
      * LBEG half of the test matters because compilation is driven from PCs
      * the CPU is not at; see jit_loop_variant(). */
-    uint32_t lend = (cpu->lcount > 0 && pc >= cpu->lbeg) ? cpu->lend : 0;
+    uint32_t lend = (cpu->lcount != 0u && pc >= cpu->lbeg && pc < cpu->lend)
+                  ? cpu->lend : 0;
 
     for (int i = 0; i < JIT_MAX_BLOCK_INSNS; i++) {
         /* Stop at page boundary */

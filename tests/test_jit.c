@@ -716,6 +716,38 @@ TEST(test_jit_short_backedge_loop_is_native) {
     teardown(&cpu);
 }
 
+TEST(test_jit_stale_loop_past_lend_does_not_truncate_block) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* FreeRTOS context frames may restore a nonzero LCOUNT after execution
+     * has already moved beyond that loop. The cache key treats this PC as an
+     * ordinary block; the scanner must make the identical range check rather
+     * than truncating it after one instruction at the stale LEND. */
+    put_insn2(&cpu, BASE,     narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 2, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 4, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 6, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    cpu.lbeg = BASE - 0x100;
+    cpu.lend = BASE - 0x20;
+    cpu.lcount = UINT32_MAX;
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+    if (fn) {
+        int ran = fn(&cpu);
+        ASSERT_EQ(ran, 4);
+        ASSERT_EQ(cpu.pc, BASE + 8);
+    }
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_contended_spinlock_returns_to_scheduler) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1900,6 +1932,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_init_destroy);
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
+    RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);
     RUN_TEST(test_jit_contended_spinlock_returns_to_scheduler);
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
