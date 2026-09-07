@@ -22,6 +22,12 @@ Booting to one UART line is not considered a pass.
 ROM images are not stored in this repository. Results are tied to the image
 versions above and should be rechecked when a release changes.
 
+Firmware that uses controller data embedded in the mask ROM (notably newer
+ESP-IDF Bluetooth builds) needs Espressif's official ESP32 ROM ELF. Pass it as
+`-R /path/to/esp32_rev0_rom.elf`, `--rom-elf` to either ROM test runner, or set
+`FLEXE_ROM_ELF`. Flexe loads immutable ROM sections and their linker-described
+data images; the ROM binary is intentionally not copied into this repository.
+
 ## Curated CYD scenarios
 
 `scripts/check-stock-roms.sh` drives unmodified Marauder and NerdMiner images

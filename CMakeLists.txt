@@ -67,6 +67,7 @@ set(LIB_SOURCES
     src/xtensa_disasm.c
     src/memory.c
     src/loader.c
+    src/rom_elf.c
     src/peripherals.c
     src/spi_display.c
     src/rom_stubs.c

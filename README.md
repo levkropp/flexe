@@ -79,6 +79,7 @@ Common options:
 | `--jit-stats` | Print compilation and coverage statistics |
 | `--jit-verify` | Replay compiled blocks in the interpreter and compare state |
 | `-s ELF` | Load symbols and firmware hooks from an ELF image |
+| `-R ROM_ELF` | Load official ESP32 ROM code and data images |
 | `-c N` | Stop after `N` aggregate emulated cycles |
 | `-q` | Suppress emulator diagnostics |
 | `-T` | Emit an instruction trace to stderr |

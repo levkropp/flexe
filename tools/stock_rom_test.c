@@ -1234,7 +1234,8 @@ static int run_until_nerd_services(flexe_session_t *session,
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s [--no-jit] marauder|nerdminer <firmware.bin>\n",
+            "Usage: %s [--no-jit] [--verify] [--rom-elf ESP32_ROM.elf] "
+            "marauder|nerdminer <firmware.bin>\n",
             argv0);
 }
 
@@ -1242,17 +1243,23 @@ int main(int argc, char **argv)
 {
     int disable_jit = 0;
     int jit_verify = 0;
+    const char *rom_elf_path = NULL;
     int argi = 1;
-    if (argi < argc && strcmp(argv[argi], "--no-jit") == 0) {
-        disable_jit = 1;
-        argi++;
-    }
-    /* Differential-verify every compiled block against the interpreter while
-     * the scenario runs. Much slower, but it reaches the driven paths -- UART
-     * commands, Wi-Fi capture, BLE -- that a bare image run never does. */
-    if (argi < argc && strcmp(argv[argi], "--verify") == 0) {
-        jit_verify = 1;
-        argi++;
+    while (argi < argc) {
+        if (strcmp(argv[argi], "--no-jit") == 0) {
+            disable_jit = 1;
+            argi++;
+        } else if (strcmp(argv[argi], "--verify") == 0) {
+            /* Differential-verify every compiled block against the
+             * interpreter while the driven scenario runs. */
+            jit_verify = 1;
+            argi++;
+        } else if (strcmp(argv[argi], "--rom-elf") == 0 && argi + 1 < argc) {
+            rom_elf_path = argv[argi + 1];
+            argi += 2;
+        } else {
+            break;
+        }
     }
     if (argc - argi != 2) {
         usage(argv[0]);
@@ -1300,6 +1307,7 @@ int main(int argc, char **argv)
     rom_audit_t rom_audit = {0};
     flexe_session_config_t cfg = {
         .bin_path = rom_path,
+        .rom_elf_path = rom_elf_path,
         .initial_sp = 0x3FFF8000u,
         .disable_jit = disable_jit,
         .sdcard_path = sd_path,

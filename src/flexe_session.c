@@ -8,6 +8,7 @@
 #include "flexe_session.h"
 #include "memory.h"
 #include "loader.h"
+#include "rom_elf.h"
 #include "peripherals.h"
 #include "rom_stubs.h"
 #include "elf_symbols.h"
@@ -62,6 +63,7 @@ struct flexe_session {
      * already true of every frontend. */
     flexe_session_config_t cfg;
     char               bin_path[512];
+    char               rom_elf_path[1024];
     uint32_t           entry_point;
     uint32_t           initial_sp;
     unsigned           resets;
@@ -81,6 +83,21 @@ static bool session_sleep_us(void *ctx, xtensa_cpu_t *cpu, uint64_t us)
 static int session_build(flexe_session_t *s)
 {
     const flexe_session_config_t *cfg = &s->cfg;
+    if (cfg->rom_elf_path && *cfg->rom_elf_path) {
+        rom_elf_load_result_t rom_res = rom_elf_load(s->mem,
+                                                     cfg->rom_elf_path);
+        if (rom_res.result != 0) {
+            fprintf(stderr, "flexe: ROM ELF load error: %s\n", rom_res.error);
+            return -1;
+        }
+        fprintf(stderr,
+                "Loaded ESP32 ROM %s: %u immutable sections (%u bytes), "
+                "%u data images (%u bytes)\n",
+                cfg->rom_elf_path, rom_res.sections_loaded,
+                rom_res.bytes_loaded, rom_res.data_images_loaded,
+                rom_res.data_image_bytes);
+    }
+
     /* Create peripherals */
     s->periph = periph_create(s->mem);
     if (!s->periph) {
@@ -396,6 +413,14 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     s->cfg = *cfg;
     snprintf(s->bin_path, sizeof(s->bin_path), "%s", cfg->bin_path);
     s->cfg.bin_path = s->bin_path;
+    const char *rom_elf_path = cfg->rom_elf_path;
+    if (!rom_elf_path) rom_elf_path = getenv("FLEXE_ROM_ELF");
+    if (rom_elf_path && *rom_elf_path) {
+        snprintf(s->rom_elf_path, sizeof(s->rom_elf_path), "%s", rom_elf_path);
+        s->cfg.rom_elf_path = s->rom_elf_path;
+    } else {
+        s->cfg.rom_elf_path = NULL;
+    }
     if (session_build(s) != 0) {
         flexe_session_destroy(s);
         return NULL;

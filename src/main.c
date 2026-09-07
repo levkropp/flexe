@@ -549,6 +549,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -q              Quiet: suppress per-access unhandled peripheral warnings\n");
     fprintf(stderr, "  -e <addr>       Override entry point (hex)\n");
     fprintf(stderr, "  -s <file.elf>   Load ELF symbols for trace/breakpoints\n");
+    fprintf(stderr, "  -R <rom.elf>    Load official ESP32 ROM code and data images\n");
     fprintf(stderr, "  -b <addr|name>  Set breakpoint (repeatable)\n");
     fprintf(stderr, "  -m <addr[:len]> Dump memory on exit (repeatable, default len=256)\n");
     fprintf(stderr, "  -W              Window trace (spill/fill/ENTRY/RETW events)\n");
@@ -890,6 +891,7 @@ int main(int argc, char *argv[]) {
     uint32_t entry_override = 0;
     int has_entry_override = 0;
     const char *elf_path = NULL;
+    const char *rom_elf_path = NULL;
     const char *sdcard_path = NULL;
     uint64_t sdcard_size = 0;
     const char *bp_args[MAX_BP_ARGS];
@@ -976,7 +978,7 @@ int main(int argc, char *argv[]) {
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:b:m:S:Z:C:FB:A:EP:D:HUNJ")) != -1) {
+    while ((opt = getopt(argc, argv, "1c:tT::WVvqe:s:R:b:m:S:Z:C:FB:A:EP:D:HUNJ")) != -1) {
         switch (opt) {
         case '1': single_core = 1; break;
         case 'c': max_cycles = strtoll(optarg, NULL, 10); break;
@@ -998,6 +1000,7 @@ int main(int argc, char *argv[]) {
             has_entry_override = 1;
             break;
         case 's': elf_path = optarg; break;
+        case 'R': rom_elf_path = optarg; break;
         case 'S': sdcard_path = optarg; break;
         case 'Z': sdcard_size = strtoull(optarg, NULL, 0); break;
         case 'b':
@@ -1104,6 +1107,7 @@ int main(int argc, char *argv[]) {
     flexe_session_config_t sess_cfg = {
         .bin_path = firmware,
         .elf_path = elf_path,
+        .rom_elf_path = rom_elf_path,
         .sdcard_path = sdcard_path,
         .sdcard_size = sdcard_size,
         .entry_override = has_entry_override ? entry_override : 0,

@@ -207,13 +207,14 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [--no-jit] [--cycles N] [--min-insns N] "
             "[--min-uart N] [--max-unmapped N] [--batch N] "
-            "[--dump-uart] FIRMWARE.bin\n", argv0);
+            "[--rom-elf ESP32_ROM.elf] [--dump-uart] FIRMWARE.bin\n", argv0);
 }
 
 int main(int argc, char **argv)
 {
     int argi = 1;
     int disable_jit = 0, dump_uart = 0;
+    const char *rom_elf_path = NULL;
     /* A bounded quantum keeps callback latency realistic and gives the peer
      * core regular opportunities even when no contended spinlock is visible. */
     int batch = 10000;
@@ -227,6 +228,9 @@ int main(int argc, char **argv)
     while (argi < argc && argv[argi][0] == '-') {
         if (strcmp(argv[argi], "--no-jit") == 0) { disable_jit = 1; argi++; }
         else if (strcmp(argv[argi], "--dump-uart") == 0) { dump_uart = 1; argi++; }
+        else if (strcmp(argv[argi], "--rom-elf") == 0 && argi + 1 < argc) {
+            rom_elf_path = argv[argi + 1]; argi += 2;
+        }
         else if (strcmp(argv[argi], "--cycles") == 0 && argi + 1 < argc) {
             budget = strtoull(argv[argi + 1], NULL, 0); argi += 2;
         } else if (strcmp(argv[argi], "--min-insns") == 0 && argi + 1 < argc) {
@@ -253,6 +257,7 @@ int main(int argc, char **argv)
 
     flexe_session_config_t config = {
         .bin_path = rom_path,
+        .rom_elf_path = rom_elf_path,
         .disable_jit = disable_jit,
         .uart_cb = uart_sink,
         .uart_ctx = &uart,

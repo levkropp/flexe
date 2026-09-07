@@ -27,8 +27,9 @@ typedef struct {
     /* Required */
     const char *bin_path;           /* Firmware .bin file */
 
-    /* Optional — ELF / SD card */
+    /* Optional — ELF / ROM image / SD card */
     const char *elf_path;           /* ELF symbol file (NULL = no symbols) */
+    const char *rom_elf_path;       /* ESP32 ROM ELF (NULL = FLEXE_ROM_ELF) */
     const char *sdcard_path;        /* SD card backing image (NULL = none) */
     uint64_t    sdcard_size;        /* SD card size override (0 = auto) */
 
