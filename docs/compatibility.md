@@ -14,9 +14,9 @@ Booting to one UART line is not considered a pass.
 | ESP32 Marauder 1.14.3 (3.5-inch and Guition variants) | Interpreter + JIT | Pass | None in the scripted scenario |
 | NerdMiner 1.8.3 | Interpreter + JIT | Pass | None in the scripted scenario |
 | Meshtastic 2.7.26 (T-Beam) | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
-| openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Known gap | Default runs differ in one heap-fragmentation value |
-| Tasmota 15.6.0 | Interpreter + JIT | Known gap | Bad synthesized window fill after Berry `longjmp` |
-| WLED 16.0.1 | Interpreter + JIT | Known gap | Borrowed frame spills, then `retw` restores address zero |
+| openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand display and network interaction coverage |
+| Tasmota 15.6.0 | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
+| WLED 16.0.1 | Interpreter + JIT | Pass | Expand LED and protocol interaction coverage |
 | Marauder 2432S028 2USB | Interpreter + JIT | Known gap | Early register-window spill runaway |
 
 ROM images are not stored in this repository. Results are tied to the image
@@ -73,21 +73,17 @@ FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 Known failures remain in the run and are reported as `KNOWN-BAD`. If one starts
 passing, the script reports that its exception entry should be removed.
 
-## Register-window blocker
+## Architectural register windows
 
-Tasmota and WLED currently expose the same underlying weakness: a windowed
-return restores a frame from a save-area base that no longer describes the
-call chain. Tasmota reaches this after Berry changes control flow with
-`longjmp`; WLED reaches it after a borrowed core frame spills inside the heap
-allocator.
+Flexe executes the firmware's own WindowOverflow and WindowUnderflow vectors
+by default. This is the ESP32 architectural path and keeps `setjmp`/`longjmp`,
+dynamic stack allocation, borrowed callback frames, and wrapped register files
+on the same ABI save areas the hardware uses. It is what allows Marauder,
+Tasmota, WLED, and openHASP to pass the same configuration.
 
-`FLEXE_WINDOW_VECTORS=1` executes the firmware's own spill/fill vectors instead
-of synthesizing the operation. With shadow fills enabled (the default), that
-path allows Tasmota to finish booting and removes openHASP's cross-engine
-mismatch. It is not yet the default because Marauder then stops issuing the SD
-filesystem writes required to create its `SCRIPTS` directory. Fixing that
-interaction, then making the vector path universal, is the current correctness
-priority.
+`FLEXE_WINDOW_VECTORS=0` selects the legacy synthesized spill/fill path for
+diagnosis. `FLEXE_SHADOWFILL=1` separately enables the old shadow-record restore
+shortcut; it is also off by default.
 
 ## Firmware-specific hooks
 

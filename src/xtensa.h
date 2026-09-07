@@ -357,8 +357,8 @@ struct xtensa_cpu {
     bool     window_trace;      /* Emit window spill/fill/ENTRY/RETW trace to stderr */
     bool     window_trace_active; /* Set by main loop to gate window trace */
     /* Raise WindowOverflow/WindowUnderflow into the guest's own vectors
-     * instead of synthesizing the spill and fill in C. FLEXE_WINDOW_VECTORS=1.
-     * See the block comment above raise_window_exception() in xtensa.c. */
+     * instead of synthesizing the spill and fill in C. Enabled by default;
+     * FLEXE_WINDOW_VECTORS=0 selects the legacy fallback. */
     bool     real_window_vectors;
     bool     spill_verify;      /* Enable spill/fill verification */
     bool     accelerated_blocks; /* PC hook/AOT may execute >1 guest insn */

@@ -148,7 +148,10 @@ void xtensa_cpu_init(xtensa_cpu_t *cpu) {
         static int enabled = -1;
         if (enabled < 0) {
             const char *e = getenv("FLEXE_WINDOW_VECTORS");
-            enabled = e ? atoi(e) : 0;
+            /* Guest-owned window vectors are the architectural path. Keep the
+             * old synthesized implementation as an explicit diagnostic
+             * fallback with FLEXE_WINDOW_VECTORS=0. */
+            enabled = e ? atoi(e) : 1;
         }
         cpu->real_window_vectors = enabled != 0;
     }
@@ -2643,11 +2646,10 @@ static void g_dbg_watch_init(void) {
     if (e) g_dbg_tcore = atoi(e);
     e = getenv("FLEXE_TFIRES");
     if (e) g_dbg_tfires = atoi(e);
-    {   /* On by default; FLEXE_SHADOWFILL=0 disables. A fill whose frame we
-         * still hold a spill record for is satisfied from that record rather
-         * than from the guest's stack, which by then may have been reused. */
+    {   /* Legacy diagnostic fallback only. The default restores through the
+         * guest's ABI save areas and underflow vectors, like the hardware. */
         const char *sf = getenv("FLEXE_SHADOWFILL");
-        g_flexe_shadow_fill = sf ? atoi(sf) != 0 : 1;
+        g_flexe_shadow_fill = sf ? atoi(sf) != 0 : 0;
     }
     e = getenv("FLEXE_WINLOG");
     if (e) g_dbg_winlog = atoi(e);

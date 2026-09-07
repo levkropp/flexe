@@ -86,10 +86,10 @@ for ((i = 0; i < ${#roms[@]}; i++)); do
     jit_out=$("$runner" "$profile" "$rom" 2>/dev/null || true)
     int_out=$("$runner" --no-jit "$profile" "$rom" 2>/dev/null || true)
 
-    jit_res=$(printf '%s' "$jit_out" | grep -oE '^(PASS|FAIL)' | head -1)
-    int_res=$(printf '%s' "$int_out" | grep -oE '^(PASS|FAIL)' | head -1)
-    jit_fb=$(printf '%s' "$jit_out" | grep -oE 'fb=[0-9A-F]+' | head -1)
-    int_fb=$(printf '%s' "$int_out" | grep -oE 'fb=[0-9A-F]+' | head -1)
+    jit_res=$(printf '%s' "$jit_out" | grep -oE '^(PASS|FAIL)' | head -1 || true)
+    int_res=$(printf '%s' "$int_out" | grep -oE '^(PASS|FAIL)' | head -1 || true)
+    jit_fb=$(printf '%s' "$jit_out" | grep -oE 'fb=[0-9A-F]+' | head -1 || true)
+    int_fb=$(printf '%s' "$int_out" | grep -oE 'fb=[0-9A-F]+' | head -1 || true)
 
     result=PASS
     want=$(expected_render "$(sha256sum "$rom" | cut -d' ' -f1)")

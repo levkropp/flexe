@@ -186,9 +186,9 @@ int main(int argc, char **argv)
     int disable_jit = 0, dump_uart = 0;
     uint64_t budget = DEFAULT_CYCLES;
     uint64_t min_insns = 10000000ull;
-    /* One line of anything. Deliberately not a guess at what the image should
-     * say -- this runner knows nothing about the image. */
-    uint64_t min_uart = 16;
+    /* Any output. Deliberately not a guess at what the image should say: WLED
+     * legitimately emits only its five-byte Adalight prompt, "Ada\r\n". */
+    uint64_t min_uart = 1;
 
     while (argi < argc && argv[argi][0] == '-') {
         if (strcmp(argv[argi], "--no-jit") == 0) { disable_jit = 1; argi++; }

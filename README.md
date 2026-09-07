@@ -5,9 +5,9 @@ emulator written in C. Flexe boots unmodified ESP-IDF and Arduino firmware,
 models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
 backends.
 
-Flexe is under active development. Marauder and NerdMiner run end to end;
-broader production-firmware coverage is tracked in
-[Firmware compatibility](docs/compatibility.md).
+Flexe is under active development. Marauder and NerdMiner pass scripted
+end-to-end scenarios, and the broader production corpus passes the generic
+interpreter/JIT gate described in [Firmware compatibility](docs/compatibility.md).
 
 ## Highlights
 
@@ -94,13 +94,13 @@ The committed corpus currently establishes these outcomes:
 | ESP32 Marauder 1.14.x/1.15.x CYD builds | Scripted display, touch, UART, GPS, Wi-Fi, BLE, and storage scenarios pass |
 | NerdMiner 1.8.3 | Captive portal, DNS, pool connection, and mining path pass |
 | Meshtastic 2.7.26 | Boots and both engines agree |
-| openHASP 0.7.0-rc13 | Boots; default cross-engine heap-fragmentation output still differs |
-| Tasmota 15.6.0 | Boots with guest window vectors; default synthesized fill path still fails after Berry `longjmp` |
-| WLED 16.0.1 | Reaches its Adalight prompt, then returns through a bad restored window to address zero |
+| openHASP 0.7.0-rc13 | Boots and both engines agree |
+| Tasmota 15.6.0 | Boots through the Berry runtime and both engines agree |
+| WLED 16.0.1 | Boots to its Adalight prompt and both engines agree |
 
-The remaining failures are correctness defects, not meaningful throughput
-results. See [Firmware compatibility](docs/compatibility.md) for the exact
-gates and active blockers.
+These are bounded, reproducible claims rather than blanket compatibility
+promises. See [Firmware compatibility](docs/compatibility.md) for the exact
+images, gates, and remaining board-specific coverage.
 
 ## Test
 

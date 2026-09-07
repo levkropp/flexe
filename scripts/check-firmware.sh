@@ -52,34 +52,6 @@ known_bad() {
     # the first milliseconds. Predates the firmware corpus and is unrelated
     # to the images it was added for.
     *2432S028_2usb) echo "window-spill runaway at cycle 156k, pre-existing" ;;
-    # Berry's setjmp/longjmp works now that ENTRY stops clearing PS.CALLINC,
-    # and Tasmota gets far enough to report its own error
-    # ("BRY: Exception> 'type_error'"). It then derails on one more bad window
-    # fill -- retw at 0x4016BFDF, base 0x3FFD2DB0, save area holding a
-    # timestamp string -- into 142M unregistered ROM calls. The JIT's 5.80x
-    # real-time factor is that spin loop, not progress; retired instructions
-    # fell from 634M to 87M.
-    tasmota32_*) echo "one bad window fill after longjmp, retw at 0x4016BFDF" ;;
-    # Boots fully -- 6.4 kB of log, MQTT and telnet up -- but the two engines
-    # disagree by four bytes in openHASP's "largest free block" figure. Free
-    # heap is identical on both, so nothing computed a different value; the
-    # allocation *order* differs because the engines interleave the two cores
-    # at different simulated moments. Masking that field is deliberately not
-    # the fix: it would also hide a block that miscompiles and prints a wrong
-    # number, which is what this comparison exists to catch.
-    openhasp_*) echo "heap fragmentation figure differs by 4 bytes across engines" ;;
-    # The scheduler livelock is gone: IDF's default event handlers block on a
-    # lock, and they now run on a borrowed task that can block instead of on
-    # guest_call8's fabricated frame that could not. WLED boots to its
-    # Adalight prompt ("Ada"), and the WiFi model drives it correctly.
-    #
-    # What is left is a register window that spills and fills wrongly. Core 1
-    # is borrowed seven frames deep inside multi_heap_malloc; the handler's
-    # own calls spill that chain; the allocator resumes, finds nothing, and
-    # its retw at 0x40084D3D returns to address 0. FLEXE_FILLDBG stays silent
-    # because the restored a0 is zero, which the check exempts as a task's
-    # bottom frame. Same defect as tasmota32 above.
-    wled_*) echo "retw to address 0 after a borrowed frame spills and fills" ;;
     *) echo "" ;;
     esac
 }

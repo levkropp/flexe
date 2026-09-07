@@ -69,9 +69,9 @@ For any other image:
 FLEXE_ROMS=/path/to/corpus ./scripts/bench-firmware.sh
 ```
 
-Always pair that output with `scripts/check-firmware.sh`; performance numbers
-for WLED and default-path Tasmota are currently invalid because those images
-stop doing useful work.
+Always pair that output with `scripts/check-firmware.sh`; a speed number is
+meaningful only when the same image also passes the progress and correctness
+gate.
 
 ## JIT coverage
 

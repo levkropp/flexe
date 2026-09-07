@@ -317,8 +317,8 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <span class="stat-label">native jit backends<br>(arm64 + x86-64)</span>
       </div>
       <div>
-        <span class="stat-num">674</span>
-        <span class="stat-label">tests, all passing<br>(13,208 assertions, 0 failures)</span>
+        <span class="stat-num">678</span>
+        <span class="stat-label">tests, all passing<br>(13,247 assertions, 0 failures)</span>
       </div>
     </section>
 
@@ -333,11 +333,11 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <div class="feature-card">
           <h3>runs firmware people actually ship</h3>
           <p>unmodified esp32 marauder and nerdminer images boot, associate to wifi, drive the cyd display and mine. five stock roms run on both engines and have to produce byte-identical final framebuffers, pinned by sha-256 — which is what catches a jit that renders the wrong thing rather than no thing.</p>
-          <p>meshtastic and openhasp boot too. wled and default-path tasmota do not yet complete useful work, so their apparent real-time factors are treated as invalid and every corpus benchmark reports progress beside speed.</p>
+          <p>meshtastic, openhasp, tasmota, and wled also pass the generic production gate in both engines. every corpus benchmark reports useful progress beside speed, so a fast crash or idle loop never counts as a result.</p>
         </div>
         <div class="feature-card">
           <h3>full lx6 isa</h3>
-          <p>every instruction: alu, shifts, branches, zero-overhead loops, mac16, fpu, windowed registers with synthesized spill/fill, exceptions and interrupts (levels 1–7, ccompare timers, waiti).</p>
+          <p>alu, shifts, branches, zero-overhead loops, mac16, fpu, guest-managed window overflow/underflow vectors, exceptions and interrupts (levels 1–7, ccompare timers, waiti).</p>
         </div>
         <div class="feature-card">
           <h3>dual core, like the real thing</h3>

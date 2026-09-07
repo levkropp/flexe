@@ -77,6 +77,9 @@ static uint32_t nop_insn(void) {
  * Unlike setup(), this enables WOE and sets windowstart=1. */
 static void setup_windowed(xtensa_cpu_t *cpu) {
     setup(cpu);
+    /* Most tests below exercise the legacy synthesized path deliberately;
+     * architectural-vector cases opt in explicitly at their setup sites. */
+    cpu->real_window_vectors = false;
     cpu->running = true;
     cpu->ps = (1 << 18) | (1 << 4); /* WOE=1, EXCM=1 */
     cpu->windowbase = 0;
