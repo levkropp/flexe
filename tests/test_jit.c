@@ -716,6 +716,44 @@ TEST(test_jit_short_backedge_loop_is_native) {
     teardown(&cpu);
 }
 
+TEST(test_jit_contended_spinlock_returns_to_scheduler) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* Four-instruction CAS retry loop, matching ESP-IDF's spinlock shape.
+     * The native self-chain may finish its bounded run, but jit_run() must
+     * return well before the caller's batch so core 1 gets a turn. */
+    put_insn3(&cpu, BASE, 0x00E432u); /* S32C1I a3, a4, 0 */
+    put_insn2(&cpu, BASE + 3, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 5, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    uint32_t off18 = (uint32_t)-11 & 0x3FFFFu;
+    put_insn3(&cpu, BASE + 7, (off18 << 6) | 6u); /* J BASE */
+    ar_write(&cpu, 3, XTENSA_SPINLOCK_OWNER_CORE0);
+    ar_write(&cpu, 4, DATA_BASE);
+    cpu.scompare1 = XTENSA_SPINLOCK_FREE;
+    mem_write32(cpu.mem, DATA_BASE, XTENSA_SPINLOCK_OWNER_CORE1);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    const int budget = 5000;
+    int ran = jit_run(jit, &cpu, budget);
+    ASSERT_TRUE(ran > 0);
+    ASSERT_TRUE(ran < budget);
+    ASSERT_TRUE(cpu.core_handoff);
+    ASSERT_EQ(mem_read32(cpu.mem, DATA_BASE), XTENSA_SPINLOCK_OWNER_CORE1);
+    ASSERT_TRUE(jit_get_stats(jit)->insns_jitted > 0);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* A chained JIT run must report every block it executed, not just the last
  * one, and must stay bounded by JIT_CHAIN_CAP.  The guest-insn accumulator
  * is the sole driver of ccount/cycle_count in JIT mode (jit_pc_hook adds the
@@ -1862,6 +1900,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_init_destroy);
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
+    RUN_TEST(test_jit_contended_spinlock_returns_to_scheduler);
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
     RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);

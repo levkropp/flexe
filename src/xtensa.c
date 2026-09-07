@@ -2270,14 +2270,17 @@ void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
     case 0xE: /* S32C1I (conditional store) */
         { uint32_t addr = ar_read(cpu, s) + (uint32_t)(imm8 << 2);
           uint32_t old = mem_read32(cpu->mem, addr);
-          if (__builtin_expect(g_dbg_c1ilog && old != 0xB33FFFFFu
-                  && old != 0x0000CDCDu && old != 0x0001CDCDu
+          if (__builtin_expect(g_dbg_c1ilog && old != XTENSA_SPINLOCK_FREE
+                  && old != XTENSA_SPINLOCK_OWNER_CORE0
+                  && old != XTENSA_SPINLOCK_OWNER_CORE1
                   && addr < 0x40000000u, 0)) {
               fprintf(stderr, "[C1I] garbage read pc=0x%08X addr=0x%08X old=0x%08X core%d\n",
                       cpu->pc, addr, old, cpu->core_id);
           }
           if (old == cpu->scompare1)
               mem_write32(cpu->mem, addr, ar_read(cpu, t));
+          else if (__builtin_expect(xtensa_s32c1i_needs_handoff(cpu, old), 0))
+              cpu->core_handoff = true;
           ar_write(cpu, t, old);
         } break;
     case 0xF: /* S32RI (release semantics = no-op in emulator) */
@@ -3234,6 +3237,10 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
     int idle_total = 0;   /* skipped time: advances the clock, retires nothing */
     int exec_total = 0;   /* guest instructions actually retired */
 
+    /* A handoff belongs to one invocation. The caller can inspect the flag
+     * after an early return; the next scheduled turn starts fresh. */
+    cpu->core_handoff = false;
+
     /* Alternate between running and idling until the budget is spent.
      *
      * The loop matters. A core that executes WAITI mid-batch has to have its
@@ -3285,6 +3292,10 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
                     executed++;   /* the WAITI itself did retire */
                     break;
                 }
+                if (__builtin_expect(cpu->core_handoff, 0)) {
+                    executed++;   /* include the contended S32C1I/native run */
+                    break;
+                }
             }
         } else {
             for (; executed < remaining; executed++) {
@@ -3295,11 +3306,12 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
                 }
                 if (__builtin_expect(!cpu->running, 0)) { executed++; break; }
                 if (__builtin_expect(cpu->halted, 0)) { executed++; break; }
+                if (__builtin_expect(cpu->core_handoff, 0)) { executed++; break; }
             }
         }
         exec_total += executed;
         /* No progress, or the CPU stopped: either way do not spin. */
-        if (executed == 0 || !cpu->running) break;
+        if (executed == 0 || !cpu->running || cpu->core_handoff) break;
     }
 
     cpu->cycle_count = cc;

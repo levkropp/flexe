@@ -267,6 +267,12 @@ struct xtensa_cpu {
      * or switch away from the in-flight call. */
     uint32_t in_guest_call;
     bool     irq_check;                 /* Set when interrupt/intenable changes */
+    /* Transient scheduler hint. ESP-IDF spinlocks busy-wait with S32C1I; in
+     * Flexe's deterministic dual-core scheduler the lock holder cannot run
+     * until the current core returns its timeslice. A failed CAS which sees
+     * the other ESP32 core as owner sets this flag so the runner hands over
+     * early. It is deliberately not architectural or serialized. */
+    bool     core_handoff;
     /* Set by the session before the first instruction; consumed by the first
      * ENTRY. The windowed ABI wants a caller's stack pointer at [sp-12] of
      * every frame, and hardware's bootloader leaves one because it *calls*
@@ -442,6 +448,20 @@ struct xtensa_cpu {
     xtensa_code_invalidate_fn code_invalidate;
     void *code_invalidate_ctx;
 };
+
+/* ESP-IDF's Xtensa spinlock owner words are the raw PRID values. Restrict
+ * cooperative handoff to its exact "free -> this core" CAS shape: arbitrary
+ * failed atomics must retain normal instruction-stream semantics. */
+#define XTENSA_SPINLOCK_FREE        0xB33FFFFFu
+#define XTENSA_SPINLOCK_OWNER_CORE0 0x0000CDCDu
+#define XTENSA_SPINLOCK_OWNER_CORE1 0x0000ABABu
+
+static inline bool xtensa_s32c1i_needs_handoff(const xtensa_cpu_t *cpu,
+                                                uint32_t observed) {
+    uint32_t other = cpu->core_id == 0 ? XTENSA_SPINLOCK_OWNER_CORE1
+                                       : XTENSA_SPINLOCK_OWNER_CORE0;
+    return cpu->scompare1 == XTENSA_SPINLOCK_FREE && observed == other;
+}
 
 /* Interpreter sampling profiler; see src/profile.c. The report is a no-op
  * unless built with -DFLEXE_PROFILE=ON. */

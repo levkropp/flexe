@@ -258,6 +258,7 @@ TEST(ls_s32c1i_match) {
     ASSERT_EQ(ar_read(&cpu, 3), 0xAAAAAAAA);
     /* Memory updated */
     ASSERT_EQ(mem_read32(cpu.mem, DATA_BASE), 0xBBBBBBBB);
+    ASSERT_FALSE(cpu.core_handoff);
     teardown(&cpu);
 }
 
@@ -273,6 +274,28 @@ TEST(ls_s32c1i_no_match) {
     ASSERT_EQ(ar_read(&cpu, 3), 0xAAAAAAAA);
     /* Memory NOT updated */
     ASSERT_EQ(mem_read32(cpu.mem, DATA_BASE), 0xAAAAAAAA);
+    /* An ordinary compare failure is not necessarily inter-core contention. */
+    ASSERT_FALSE(cpu.core_handoff);
+    teardown(&cpu);
+}
+
+TEST(ls_s32c1i_other_core_ends_timeslice) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    mem_write32(cpu.mem, DATA_BASE, XTENSA_SPINLOCK_OWNER_CORE1);
+    cpu.scompare1 = XTENSA_SPINLOCK_FREE;
+    put_insn3(&cpu, BASE, ls_rri8(0xE, 4, 3, 0));
+    ar_write(&cpu, 3, XTENSA_SPINLOCK_OWNER_CORE0);
+    ar_write(&cpu, 4, DATA_BASE);
+    cpu.running = true;
+
+    /* The following bytes are intentionally unmapped. A full 1000-insn run
+     * would trap there; contention must return immediately after the CAS. */
+    int ran = xtensa_run(&cpu, 1000);
+    ASSERT_EQ(ran, 1);
+    ASSERT_TRUE(cpu.core_handoff);
+    ASSERT_EQ(cpu.pc, BASE + 3);
+    ASSERT_EQ(ar_read(&cpu, 3), XTENSA_SPINLOCK_OWNER_CORE1);
+    ASSERT_EQ(mem_read32(cpu.mem, DATA_BASE), XTENSA_SPINLOCK_OWNER_CORE1);
     teardown(&cpu);
 }
 
@@ -332,6 +355,7 @@ void run_loadstore_tests(void) {
     RUN_TEST(ls_l32r_farther_back);
     RUN_TEST(ls_s32c1i_match);
     RUN_TEST(ls_s32c1i_no_match);
+    RUN_TEST(ls_s32c1i_other_core_ends_timeslice);
     RUN_TEST(ls_l32ai_like_l32i);
     RUN_TEST(ls_s32ri_like_s32i);
     RUN_TEST(ls_cache_noop);

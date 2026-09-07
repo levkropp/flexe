@@ -1038,6 +1038,8 @@ static uint32_t jit_s32c1i_helper(xtensa_cpu_t *cpu, uint32_t addr,
     uint32_t old = mem_read32(cpu->mem, addr);
     if (old == cpu->scompare1)
         mem_write32(cpu->mem, addr, val);
+    else if (__builtin_expect(xtensa_s32c1i_needs_handoff(cpu, old), 0))
+        cpu->core_handoff = true;
     return old;
 }
 
@@ -3963,6 +3965,11 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
         }
 
         if (__builtin_expect(ran < batch, 0)) {
+            /* The other emulated core owns an ESP-IDF spinlock. Returning to
+             * the session scheduler is the only way it can run and release
+             * that lock; immediately entering xtensa_run() again would clear
+             * the hint and spend the rest of this batch spinning. */
+            if (cpu->core_handoff) break;
             if (!cpu->running || cpu->halted || cpu->breakpoint_hit) break;
             if (ran <= 0) break;
         }
