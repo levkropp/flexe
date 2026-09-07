@@ -1837,6 +1837,73 @@ TEST(test_jit_rsr_wsr_sar) {
     teardown(&cpu);
 }
 
+TEST(test_jit_rsr_prid_wsr_ps) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.prid = XTENSA_SPINLOCK_OWNER_CORE1;
+    cpu.ps = 0x00060003u;
+    ar_write(&cpu, 6, 0x00060000u);
+    /* The exact pair used by ESP-IDF spinlock acquire/release: identify the
+     * core through PRID, then restore the saved PS after the critical region. */
+    put_insn3(&cpu, BASE,
+              rrr(0, 3, XT_SR_PRID >> 4, XT_SR_PRID & 15, 5));
+    put_insn3(&cpu, BASE + 3,
+              rrr(1, 3, XT_SR_PS >> 4, XT_SR_PS & 15, 6));
+    test_block_differential(&cpu, 2, "rsr_prid_wsr_ps");
+    teardown(&cpu);
+}
+
+TEST(test_jit_wsr_ps_rearms_irq_check) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    ar_write(&cpu, 6, 0x00060000u);
+    put_insn3(&cpu, BASE,
+              rrr(1, 3, XT_SR_PS >> 4, XT_SR_PS & 15, 6));
+    put_insn2(&cpu, BASE + 3, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 5, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 7, narrow(0xD, 15, 0, 3));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_EQ(fn(&cpu), 4);
+    ASSERT_EQ(cpu.ps, 0x00060000u);
+    ASSERT_TRUE(cpu.irq_check);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_wsr_ps_exits_before_pending_irq) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = 3u;
+    cpu.interrupt = 1u << 6;
+    cpu.intenable = 1u << 6;
+    ar_write(&cpu, 6, 0u);
+    put_insn3(&cpu, BASE,
+              rrr(1, 3, XT_SR_PS >> 4, XT_SR_PS & 15, 6));
+    put_insn2(&cpu, BASE + 3, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 5, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, BASE + 7, narrow(0xD, 15, 0, 3));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_EQ(fn(&cpu), 1);
+    ASSERT_EQ(cpu.pc, BASE + 3);
+    ASSERT_TRUE(cpu.irq_check);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_rur_wur_user_registers) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2038,6 +2105,9 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_addx2);
     RUN_TEST(test_jit_rsil);
     RUN_TEST(test_jit_rsr_wsr_sar);
+    RUN_TEST(test_jit_rsr_prid_wsr_ps);
+    RUN_TEST(test_jit_wsr_ps_rearms_irq_check);
+    RUN_TEST(test_jit_wsr_ps_exits_before_pending_irq);
     RUN_TEST(test_jit_rur_wur_user_registers);
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);

@@ -478,10 +478,11 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                 case XT_SR_EPS2: case XT_SR_EPS3: case XT_SR_EPS4:
                 case XT_SR_EPS5: case XT_SR_EPS6: case XT_SR_EPS7:
                 case XT_SR_VECBASE: case XT_SR_EXCCAUSE: case XT_SR_EXCVADDR:
+                case XT_SR_PS:
                 case XT_SR_DEPC:
-                    return 0;  /* Safe SRs */
+                    return 0;  /* Direct fields, or side effects emitted below */
                 default:
-                    return 2;  /* CCOUNT, CCOMPARE, INTENABLE, PS, etc — side effects */
+                    return 2;  /* CCOUNT, CCOMPARE, INTENABLE, etc — side effects */
                 }
             }
             case 2: return 0;  /* SEXT */
@@ -1948,6 +1949,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 case XT_SR_INTENABLE: off = CPU_OFF_INTENABLE; break;
                 case XT_SR_INTSET:   off = CPU_OFF_INTERRUPT; break;
                 case XT_SR_CCOUNT:   off = CPU_OFF_CCOUNT; break;
+                case XT_SR_PRID:
+                    off = (int32_t)offsetof(xtensa_cpu_t, prid); break;
                 case XT_SR_VECBASE:  off = CPU_OFF_VECBASE; break;
                 case XT_SR_EXCCAUSE: off = CPU_OFF_EXCCAUSE; break;
                 case XT_SR_EXCVADDR: off = CPU_OFF_EXCVADDR; break;
@@ -2008,6 +2011,38 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 case XT_SR_EXCCAUSE: off = CPU_OFF_EXCCAUSE; break;
                 case XT_SR_EXCVADDR: off = CPU_OFF_EXCVADDR; break;
                 case XT_SR_DEPC:     off = (int32_t)offsetof(xtensa_cpu_t, depc); break;
+                case XT_SR_PS:
+                    /* Restoring PS is the exit half of every ESP-IDF
+                     * critical section. It can lower INTLEVEL and thereby
+                     * unmask an already-pending interrupt, so mirror
+                     * sr_write()'s recheck hint as well as the register.
+                     *
+                     * A native chain normally defers interrupt polling until
+                     * its bounded exit. That is not safe for an interrupt
+                     * which was already pending behind the old PS mask: the
+                     * interpreter polls immediately after WSR, and running
+                     * another critical-section block first can expose a
+                     * half-updated scheduler list. Leave the chain at this
+                     * exact instruction when any enabled source is pending;
+                     * xtensa_step_impl() then performs the architectural
+                     * priority/mask check before another guest instruction. */
+                    ra_load_ar(e, ra, RAX, wb4, t);
+                    emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                    emit_mov_reg_imm32(e, RAX, 1);
+                    emit_store8_disp(e, RAX, REG_CPU,
+                                     (int32_t)CPU_OFF_IRQ_CHECK);
+                    ra_flush(e, ra, wb4);
+                    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_INTERRUPT);
+                    emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_INTENABLE);
+                    emit_test_reg32(e, RAX, RBX);
+                    int no_pending_irq = emit_jcc_rel32(e, CC_E);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, next_pc);
+                    emit_store32_disp_imm(e, REG_CPU,
+                                          (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                    emit_acc_add(e, insn_idx + 1);
+                    emit_jmp_to_epilogue(e, jit);
+                    emit_patch_rel32(e, no_pending_irq);
+                    return 1;
                 default: return 0;
                 }
                 ra_load_ar(e, ra,RAX, wb4, t);
