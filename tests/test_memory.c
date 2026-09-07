@@ -42,6 +42,29 @@ TEST(mem_sram_alias) {
     mem_destroy(mem);
 }
 
+/* ===== On-chip ROM instruction/data buses ===== */
+
+TEST(mem_full_esp32_rom_map) {
+    xtensa_mem_t *mem = mem_create();
+
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FF8FFFFu) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FF90000u) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FF9FFFFu) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40000000u) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x4006FFFFu) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40070000u) != NULL); /* IRAM begins here */
+
+    mem_write32(mem, 0x3FF96000u, 0xDADA1234u);
+    mem_write32(mem, 0x40064EECu, 0xC0DE5678u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF96000u), 0xDADA1234u);
+    ASSERT_EQ(mem_read32(mem, 0x40064EECu), 0xC0DE5678u);
+
+    /* The two ROM buses and adjacent IRAM have independent backing. */
+    ASSERT_EQ(mem_read32(mem, 0x40000000u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x40070000u), 0u);
+    mem_destroy(mem);
+}
+
 /* ===== Flash data/instruction regions ===== */
 
 TEST(mem_rw32_flash_data) {
@@ -153,6 +176,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw16_sram_data);
     RUN_TEST(mem_rw32_sram_data);
     RUN_TEST(mem_sram_alias);
+    RUN_TEST(mem_full_esp32_rom_map);
     RUN_TEST(mem_rw32_flash_data);
     RUN_TEST(mem_flash_erased_at_reset);
     RUN_TEST(mem_flash_alias);

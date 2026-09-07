@@ -10,7 +10,7 @@
 
 /* Memory region sizes (from memory.c) */
 #define SRAM_SIZE       (704 * 1024)
-#define ROM_SIZE        (384 * 1024)
+#define ROM_SIZE        (512 * 1024)
 #define FLASH_SIZE      (4 * 1024 * 1024)
 #define PSRAM_SIZE      (4 * 1024 * 1024)
 #define RTC_DRAM_SIZE   (8 * 1024)
@@ -163,7 +163,7 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
             return -1;
         }
 
-        /* ROM (384KB) - Optional: skip if not needed for restore */
+        /* ESP32 instruction ROM (448KB) plus data ROM (64KB). */
         if (cpu->mem->rom) {
             WRITE_OR_FAIL(f, cpu->mem->rom, ROM_SIZE, "ROM");
         } else {

@@ -511,8 +511,9 @@ const char *loader_region_name(uint32_t addr) {
     if (addr >= 0x3F400000u && addr < 0x3F800000u) return "flash_data";
     if (addr >= 0x3FF00000u && addr < 0x3FF80000u) return "peripheral";
     if (addr >= 0x3FF80000u && addr < 0x3FF82000u) return "rtc_dram";
+    if (addr >= 0x3FF90000u && addr < 0x3FFA0000u) return "rom_data";
     if (addr >= 0x3FFB0000u && addr < 0x40000000u) return "sram_data";
-    if (addr >= 0x40000000u && addr < 0x40060000u) return "rom";
+    if (addr >= 0x40000000u && addr < 0x40070000u) return "rom";
     if (addr >= 0x40070000u && addr < 0x400C0000u) return "sram_insn";
     if (addr >= 0x400C0000u && addr < 0x400C2000u) return "rtc_iram";
     if (addr >= 0x400D0000u && addr < 0x40C00000u) return "flash_insn";

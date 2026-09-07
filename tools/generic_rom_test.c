@@ -301,13 +301,13 @@ int main(int argc, char **argv)
     uint64_t unmapped = mem_unmapped_count(flexe_session_mem(session));
     xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
 
-    /* ESP32 fetches only from ROM (0x40000000-0x4005FFFF), IRAM
+    /* ESP32 fetches only from ROM (0x40000000-0x4006FFFF), IRAM
      * (0x40070000-0x4009FFFF), RTC-fast (0x400C0000-0x400C1FFF) and mapped
      * flash (0x400D0000-0x403FFFFF). Anything else and the core is lost. */
     bool pc_ok = true;
     for (int c = 0; c < 2; c++) {
         uint32_t p = flexe_session_cpu(session, c)->pc;
-        if (!((p >= 0x40000000u && p < 0x40060000u) ||
+        if (!((p >= 0x40000000u && p < 0x40070000u) ||
               (p >= 0x40070000u && p < 0x400A0000u) ||
               (p >= 0x400C0000u && p < 0x400C2000u) ||
               (p >= 0x400D0000u && p < 0x40400000u)))

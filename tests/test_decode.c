@@ -63,7 +63,7 @@ TEST(test_fetch_cross_page_wide) {
 TEST(test_fetch_rejects_missing_boundary_page) {
     xtensa_cpu_t cpu;
     setup(&cpu);
-    uint32_t addr = 0x4005FFFFu;  /* final byte of the 384 KiB ESP32 ROM */
+    uint32_t addr = 0x403FFFFFu;  /* final byte of the flash instruction bus */
     mem_write8(cpu.mem, addr, 0x00);  /* requests a 24-bit instruction */
 
     uint32_t insn = 0;

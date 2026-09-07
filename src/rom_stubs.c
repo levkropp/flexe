@@ -45,7 +45,7 @@ typedef struct {
     uint32_t free_list;
 } stub_heap_region_t;
 
-/* ROM address range: 0x40000000 - 0x4005FFFF */
+/* ROM address range: 0x40000000 - 0x4006FFFF */
 #define ROM_BASE 0x40000000u
 #define ROM_END  0x40070000u   /* includes SPI flash ROM at 0x4006xxxx */
 

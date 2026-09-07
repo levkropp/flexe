@@ -7,7 +7,8 @@
  * ESP32 memory regions:
  *   SRAM:      0x3FFB0000-0x3FFFFFFF (data), 0x40070000-0x400BFFFF (instruction)
  *              Both are aliases for the same 520 KB physical SRAM.
- *   ROM:       0x40000000-0x4005FFFF (384 KB)
+ *   ROM I-bus: 0x40000000-0x4006FFFF (448 KB)
+ *   ROM D-bus: 0x3FF90000-0x3FF9FFFF (64 KB)
  *   Flash:     0x3F400000-0x3F7FFFFF (data), 0x400D0000-0x403FFFFF (initial
  *              IRAM0 instruction mapping; upper cache buses are MMU-mapped)
  *   RTC DRAM:  0x3FF80000-0x3FF81FFF (8 KB, data bus alias of RTC Fast)
@@ -18,7 +19,9 @@
  */
 
 #define SRAM_SIZE       (704 * 1024)
-#define ROM_SIZE        (384 * 1024)
+#define ROM_INSN_SIZE   (448 * 1024)
+#define ROM_DATA_SIZE   (64 * 1024)
+#define ROM_SIZE        (ROM_INSN_SIZE + ROM_DATA_SIZE)
 #define FLASH_SIZE      (4 * 1024 * 1024)
 #define RTC_FAST_SIZE   (8 * 1024)
 #define RTC_SLOW_SIZE   (8 * 1024)
@@ -27,8 +30,10 @@
 #define SRAM_DATA_END   0x40000000u
 #define SRAM_INSN_BASE  0x40070000u
 #define SRAM_INSN_END   0x400C0000u
+#define ROM_DATA_BASE   0x3FF90000u
+#define ROM_DATA_END    0x3FFA0000u
 #define ROM_BASE        0x40000000u
-#define ROM_END         0x40060000u
+#define ROM_END         0x40070000u
 #define FLASH_DATA_BASE 0x3F400000u
 #define FLASH_DATA_END  0x3F800000u
 #define FLASH_INSN_BASE 0x400D0000u
@@ -62,6 +67,8 @@ static void page_table_init(xtensa_mem_t *mem) {
     page_table_map(mem, SRAM_INSN_BASE, SRAM_INSN_END,
                    mem->sram + (SRAM_DATA_END - SRAM_DATA_BASE));
     page_table_map(mem, ROM_BASE, ROM_END, mem->rom);
+    page_table_map(mem, ROM_DATA_BASE, ROM_DATA_END,
+                   mem->rom + ROM_INSN_SIZE);
     page_table_map(mem, FLASH_DATA_BASE, FLASH_DATA_END, mem->flash_data);
     page_table_map(mem, FLASH_INSN_BASE, FLASH_INSN_END, mem->flash_insn);
     page_table_map(mem, RTC_DRAM_BASE, RTC_DRAM_END, mem->rtc_dram);

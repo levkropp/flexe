@@ -2179,7 +2179,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         /* Constant-fold literal pools in ROM or the instruction-flash buses.
          * Flash-MMU and SPI writes flush translated code before these bytes
          * can change. Internal IRAM and DROM stay as runtime loads. */
-        if ((target >= ESP32_INSN_ADDR_LOW && target < 0x40060000u) ||
+        if ((target >= ESP32_INSN_ADDR_LOW && target < 0x40070000u) ||
             (target >= ESP32_FLASH_INSN_ADDR_LOW &&
              target < ESP32_INSN_ADDR_HIGH)) {
             uint32_t val = mem_read32(cpu->mem, target);
