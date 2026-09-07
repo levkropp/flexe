@@ -591,15 +591,19 @@ static uint32_t window_vec_offset(uint32_t a0, bool underflow) {
  */
 static int find_callee_window(xtensa_cpu_t *cpu, int widx);
 
-/* Which of Overflow4/8/12. Not the spilled frame's own call size -- that is
- * the distance from its *caller*. The handler needs the distance to its
- * *callee*, because that is the register it reads the save-area base from:
- * a5 for Overflow4 (window +1), a9 for Overflow8 (+2), a13 for Overflow12
- * (+3). Picking by the frame's own size gets Overflow4 for a call8 chain and
- * the handler then saves through a register belonging to the wrong frame. */
+/* Which of Overflow4/8/12. The ISA derives this entirely from WINDOWSTART:
+ * after rotating to the colliding window, the distance to the next live bit
+ * says whether its callee's SP is visible as a5, a9, or a13. Synthetic
+ * call-chain metadata is deliberately irrelevant here. It can be stale after
+ * longjmp or a context restore, while WINDOWSTART is the architectural source
+ * of truth the hardware uses. */
 static inline uint32_t window_overflow_vec(xtensa_cpu_t *cpu, int w) {
-    int d = (find_callee_window(cpu, w) - w) & 0xF;
-    if (d < 1 || d > 3) d = 1;
+    int d;
+    for (d = 1; d < 16; d++) {
+        if (cpu->windowstart & (1u << ((w + d) & 0xF)))
+            break;
+    }
+    if (d > 3) d = 3;
     return VECOFS_WINDOW_OVERFLOW4 + (uint32_t)(d - 1) * 0x80u;
 }
 

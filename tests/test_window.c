@@ -665,6 +665,31 @@ TEST(rotw_vectors_preserve_windowstart) {
     teardown(&cpu);
 }
 
+/* Overflow width comes from the next live WINDOWSTART bit, not Flexe's
+ * synthesized callsize bookkeeping.  Here stale metadata says window 2 is the
+ * callee of the colliding window 1, but the architectural state says the next
+ * live frame is window 3: distance two, therefore WindowOverflow8. */
+TEST(overflow_vector_uses_windowstart_distance) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.windowbase = 0;
+    cpu.windowstart = (1u << 0) | (1u << 1) | (1u << 3);
+    cpu.window_callsize[2] = 1; /* stale synthesized metadata */
+    XT_PS_SET_EXCM(cpu.ps, 0);
+
+    put_insn3(&cpu, BASE, rrr(1, 0, 12, 12, 12)); /* and a12,a12,a12 */
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, BASE + VECOFS_WINDOW_OVERFLOW8);
+    ASSERT_EQ(cpu.epc[0], BASE);
+    ASSERT_EQ(cpu.windowbase, 1);
+    ASSERT_EQ(XT_PS_OWB(cpu.ps), 0);
+    ASSERT_TRUE(XT_PS_EXCM(cpu.ps));
+
+    teardown(&cpu);
+}
+
 /* ===== L32E basic ===== */
 
 TEST(l32e_basic) {
@@ -1233,6 +1258,7 @@ static void run_window_tests(void) {
     RUN_TEST(movsp_triggers_spill);
     RUN_TEST(rotw_basic);
     RUN_TEST(rotw_vectors_preserve_windowstart);
+    RUN_TEST(overflow_vector_uses_windowstart_distance);
     RUN_TEST(l32e_basic);
     RUN_TEST(s32e_basic);
     RUN_TEST(l32e_s32e_round_trip);
