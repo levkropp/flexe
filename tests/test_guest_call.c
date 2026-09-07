@@ -1,6 +1,12 @@
 /* Regression tests for emulator-to-guest callback entry. */
 #include "guest_call.h"
 
+static uint32_t guest_call_test_rri8(int subop, int s, int t, int imm8)
+{
+    return (uint32_t)(((imm8 & 0xFF) << 16) | (subop << 12) |
+                      (s << 8) | (t << 4) | 2);
+}
+
 static uint32_t async_test_entry(int source, uint32_t frame_size)
 {
     return ((frame_size >> 3) << 12) | ((uint32_t)source << 8) |
@@ -68,8 +74,35 @@ TEST(async_call_preserves_window_spill_area)
     teardown(&cpu);
 }
 
+TEST(sync_call_uses_only_transient_private_stack)
+{
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    const uint32_t callback = BASE;
+    const uint32_t private_stack = 0x7FFF0000u;
+    const uint32_t rtc_slow_guard = 0x50001FFCu;
+    const uint32_t arg = 0x89ABCDEFu;
+
+    /* ENTRY a1,16; S32I a2,a1,0; RETW.N. The store proves that callback
+     * frames can really use the temporary page rather than merely returning
+     * before touching their fabricated stack. */
+    put_insn3(&cpu, callback, async_test_entry(1, 16));
+    put_insn3(&cpu, callback + 3u, guest_call_test_rri8(0x6, 1, 2, 0));
+    put_insn2(&cpu, callback + 6u, narrow(0xD, 15, 0, 1));
+    mem_write32(cpu.mem, rtc_slow_guard, 0xA5A55A5Au);
+
+    ASSERT_TRUE(mem_get_ptr(cpu.mem, private_stack) == NULL);
+    ASSERT_EQ(guest_call8(&cpu, callback, &arg, 1, 100u, NULL), 0);
+    ASSERT_TRUE(mem_get_ptr(cpu.mem, private_stack) == NULL);
+    ASSERT_EQ(mem_read32(cpu.mem, rtc_slow_guard), 0xA5A55A5Au);
+
+    teardown(&cpu);
+}
+
 static void run_guest_call_tests(void)
 {
     TEST_SUITE("Guest Calls");
     RUN_TEST(async_call_preserves_window_spill_area);
+    RUN_TEST(sync_call_uses_only_transient_private_stack);
 }

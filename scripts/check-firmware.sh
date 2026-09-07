@@ -44,20 +44,6 @@ if (( ${#roms[@]} == 0 )); then
     exit 2
 fi
 
-# Images known to fail, with the reason. Listing one here still runs it and
-# still reports it -- it just does not fail the suite. An image that starts
-# passing is reported too, so the entry can be removed rather than rotting.
-known_bad() {
-    case "$1" in
-    # Boots, prints nothing, and drowns in "spill_stack depth 32 exceeds
-    # limit 32" from three PCs at cycle ~156k -- a window-spill runaway in
-    # the first milliseconds. Predates the firmware corpus and is unrelated
-    # to the images it was added for.
-    *2432S028_2usb) echo "window-spill runaway at cycle 156k, pre-existing" ;;
-    *) echo "" ;;
-    esac
-}
-
 field() { tr ' ' '\n' <<<"$1" | grep -m1 "^$2=" | cut -d= -f2- || true; }
 
 printf '%-34s %10s %10s %10s %9s %s\n' \
@@ -84,16 +70,8 @@ for rom in "${roms[@]}"; do
     if [[ "$jit_dig" == "$int_dig" ]]; then digest="$jit_dig"; else
         digest="MISMATCH"; fi
 
-    reason=$(known_bad "$name")
     if [[ "$jit_ok" == PASS && "$int_ok" == PASS && "$digest" != MISMATCH ]]; then
         result=PASS
-        if [[ -n "$reason" ]]; then
-            result="PASS(was-known-bad)"
-            echo "note: $name now passes; drop it from known_bad()" >&2
-        fi
-    elif [[ -n "$reason" ]]; then
-        result="KNOWN-BAD"
-        echo "note: $name fails as expected: $reason" >&2
     else
         result=FAIL
         status=1

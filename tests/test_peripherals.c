@@ -69,6 +69,28 @@ TEST(mmio_no_handler_returns_zero) {
     mem_destroy(mem);
 }
 
+TEST(mmio_complete_ahb_alias_window) {
+    xtensa_mem_t *mem = mem_create();
+    test_hook_read_val = 0x13579BDFu;
+    test_hook_write_addr = 0;
+    test_hook_write_val = 0;
+
+    /* First and last APB pages prove the whole 256 KiB AHB mirror, not just
+     * the handful of UART/I2C pages that older firmware happened to use. */
+    ASSERT_EQ(mem_register_mmio(mem, 64, test_hook_read, test_hook_write, NULL), 0);
+    ASSERT_EQ(mem_register_mmio(mem, 127, test_hook_read, test_hook_write, NULL), 0);
+    ASSERT_EQ(mem_read32(mem, 0x60000024u), 0x13579BDFu);
+    mem_write32(mem, 0x6003FFF8u, 0x2468ACE0u);
+    ASSERT_EQ(test_hook_write_addr, 0x3FF7FFF8u);
+    ASSERT_EQ(test_hook_write_val, 0x2468ACE0u);
+
+    /* The byte immediately beyond the mirror must not wrap into DPORT. */
+    ASSERT_EQ(mem_read32(mem, 0x60040000u), 0u);
+    ASSERT_EQ64(mem_unmapped_count(mem), 1u);
+    ASSERT_EQ(mem_unmapped_first(mem), 0x60040000u);
+    mem_destroy(mem);
+}
+
 /* ===== ESP32 peripheral stubs ===== */
 
 TEST(uart_tx_capture) {
@@ -2720,6 +2742,7 @@ TEST(radio_phy_calibration_register_files) {
         {0x3FF5CC04u, 0x50607080u}, /* NRX private register space */
         {0x3FF5D040u, 0x90A0B0C0u}, /* WiFi baseband */
         {0x3FF7120Cu, 0xA5A5A5A4u}, /* BT private reference control */
+        {0x3FF72124u, 0x10200200u}, /* Bluetooth MAC configuration */
         {0x3FF740B8u, 0xCAFEBABEu}, /* second WiFi MAC page */
     };
 
@@ -2750,6 +2773,10 @@ TEST(radio_phy_calibration_register_files) {
     /* The modern AHB and legacy DPORT windows alias ordinary WDEV state too. */
     mem_write32(mem, 0x60035020u, 0xA5A55A5Au);
     ASSERT_EQ(mem_read32(mem, 0x3FF75020u), 0xA5A55A5Au);
+    mem_write32(mem, 0x60032130u, 0x000088E6u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF72130u), 0x000088E6u);
+    mem_write32(mem, 0x6000604Cu, 0x55AA00FFu);
+    ASSERT_EQ(mem_read32(mem, 0x3FF4604Cu), 0x55AA00FFu);
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
     periph_destroy(p);
@@ -5799,6 +5826,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(mmio_hook_write32);
     RUN_TEST(mmio_range_registration);
     RUN_TEST(mmio_no_handler_returns_zero);
+    RUN_TEST(mmio_complete_ahb_alias_window);
     RUN_TEST(uart_tx_capture);
     RUN_TEST(uhci_reset_register_file_dual_instance_and_dport);
     RUN_TEST(uhci_transparent_tx_dma_wire_timing_quick_send_and_interrupt);

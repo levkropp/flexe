@@ -13,8 +13,8 @@
  *              IRAM0 instruction mapping; upper cache buses are MMU-mapped)
  *   RTC DRAM:  0x3FF80000-0x3FF81FFF (8 KB, data bus alias of RTC Fast)
  *   RTC IRAM:  0x400C0000-0x400C1FFF (8 KB, instruction bus alias of RTC Fast)
- *   RTC Fast:  0x50000000-0x50001FFF (8 KB)
- *   RTC Slow:  0x60000000-0x60001FFF (8 KB)
+ *   RTC Slow:  0x50000000-0x50001FFF (8 KB)
+ *   AHB MMIO:  0x60000000-0x6003FFFF (mirror of 0x3FF40000-0x3FF7FFFF)
  *   Periph:    0x3FF00000-0x3FF7FFFF
  */
 
@@ -23,7 +23,6 @@
 #define ROM_DATA_SIZE   (64 * 1024)
 #define ROM_SIZE        (ROM_INSN_SIZE + ROM_DATA_SIZE)
 #define FLASH_SIZE      (4 * 1024 * 1024)
-#define RTC_FAST_SIZE   (8 * 1024)
 #define RTC_SLOW_SIZE   (8 * 1024)
 
 #define SRAM_DATA_BASE  0x3FFA0000u
@@ -45,10 +44,12 @@
 #define RTC_IRAM_BASE   0x400C0000u
 #define RTC_IRAM_END    0x400C2000u
 #define RTC_DRAM_SIZE   (8 * 1024)
-#define RTC_FAST_BASE   0x50000000u
-#define RTC_FAST_END    0x50002000u
-#define RTC_SLOW_BASE   0x60000000u
-#define RTC_SLOW_END    0x60002000u
+#define RTC_SLOW_BASE   0x50000000u
+#define RTC_SLOW_END    0x50002000u
+
+#define AHB_PERIPH_BASE 0x60000000u
+#define AHB_PERIPH_END  0x60040000u
+#define AHB_TO_APB_BIAS 0x200C0000u
 
 #define PSRAM_BASE      0x3F800000u
 #define PSRAM_END       0x3FC00000u
@@ -74,12 +75,7 @@ static void page_table_init(xtensa_mem_t *mem) {
     page_table_map(mem, RTC_DRAM_BASE, RTC_DRAM_END, mem->rtc_dram);
     page_table_map(mem, RTC_IRAM_BASE, RTC_IRAM_END, mem->rtc_dram);
     page_table_map(mem, PSRAM_BASE, PSRAM_END, mem->psram);
-    page_table_map(mem, RTC_FAST_BASE, RTC_FAST_END, mem->rtc_fast);
-    /* RTC slow: skip page 0x60000000 — it is the UART0 AHB FIFO alias used by
-     * ESP-IDF's uart_ll_write_txfifo(). Leaving the second page at 0x60001000
-     * available preserves any rtc_slow scratch use, while the first page
-     * falls through to MMIO dispatch (translate_ahb_alias → UART0 handler). */
-    page_table_map(mem, RTC_SLOW_BASE + PAGE_SIZE, RTC_SLOW_END, mem->rtc_slow + PAGE_SIZE);
+    page_table_map(mem, RTC_SLOW_BASE, RTC_SLOW_END, mem->rtc_slow);
 }
 
 xtensa_mem_t *mem_create(void) {
@@ -91,12 +87,11 @@ xtensa_mem_t *mem_create(void) {
     mem->flash_data = calloc(1, FLASH_SIZE);
     mem->flash_insn = calloc(1, FLASH_SIZE);
     mem->rtc_dram   = calloc(1, RTC_DRAM_SIZE);
-    mem->rtc_fast   = calloc(1, RTC_FAST_SIZE);
     mem->rtc_slow   = calloc(1, RTC_SLOW_SIZE);
     mem->psram      = calloc(1, PSRAM_SIZE);
 
     if (!mem->sram || !mem->rom || !mem->flash_data || !mem->flash_insn ||
-        !mem->rtc_dram || !mem->rtc_fast || !mem->rtc_slow || !mem->psram) {
+        !mem->rtc_dram || !mem->rtc_slow || !mem->psram) {
         mem_destroy(mem);
         return NULL;
     }
@@ -132,7 +127,6 @@ void mem_destroy(xtensa_mem_t *mem) {
     free(mem->flash_data);
     free(mem->flash_insn);
     free(mem->rtc_dram);
-    free(mem->rtc_fast);
     free(mem->rtc_slow);
     free(mem->psram);
     free(mem);
@@ -142,27 +136,21 @@ void mem_reset(xtensa_mem_t *mem) {
     if (!mem) return;
     memset(mem->sram, 0, SRAM_SIZE);
     memset(mem->rtc_dram, 0, RTC_DRAM_SIZE);
-    memset(mem->rtc_fast, 0, RTC_FAST_SIZE);
     memset(mem->rtc_slow, 0, RTC_SLOW_SIZE);
 }
 
-/* Translate ESP32 AHB peripheral aliases into their APB equivalents so
- * MMIO dispatch can reach the same handler.
- *  UART0 AHB 0x6000_0000 -> APB 0x3FF4_0000
- *  UART1 AHB 0x6001_0000 -> APB 0x3FF5_0000
- *  UART2 AHB 0x6002_E000 -> APB 0x3FF6_E000
- *  I2C0  AHB 0x6001_3000 -> APB 0x3FF5_3000
- *  I2C1  AHB 0x6002_7000 -> APB 0x3FF6_7000
- *  WDEV  AHB 0x6003_5000 -> DPORT 0x3FF7_5000
- * ESP-IDF's LL FIFO helpers use these aliases, so they must reach the same
- * controller state as ordinary APB register accesses. */
+/* The ESP32 exposes the entire 256 KiB APB peripheral window through a
+ * second AHB-Lite address window. ESP-IDF uses it for UART FIFO accesses and
+ * recent proprietary PHY blobs use it for radio register traffic. Preserve
+ * the low 18 address bits so both windows reach exactly the same handlers and
+ * register state:
+ *
+ *     AHB 0x6000_0000..0x6003_FFFF
+ *     APB 0x3FF4_0000..0x3FF7_FFFF
+ */
 static inline uint32_t translate_ahb_alias(uint32_t addr) {
-    if (addr >= 0x60000000u && addr < 0x60001000u) return addr - 0x60000000u + 0x3FF40000u;
-    if (addr >= 0x60010000u && addr < 0x60011000u) return addr - 0x60010000u + 0x3FF50000u;
-    if (addr >= 0x60013000u && addr < 0x60014000u) return addr - 0x60013000u + 0x3FF53000u;
-    if (addr >= 0x60027000u && addr < 0x60028000u) return addr - 0x60027000u + 0x3FF67000u;
-    if (addr >= 0x6002e000u && addr < 0x6002f000u) return addr - 0x6002e000u + 0x3FF6e000u;
-    if (addr >= 0x60035000u && addr < 0x60036000u) return addr - 0x60035000u + 0x3FF75000u;
+    if (addr >= AHB_PERIPH_BASE && addr < AHB_PERIPH_END)
+        return addr - AHB_TO_APB_BIAS;
     return addr;
 }
 

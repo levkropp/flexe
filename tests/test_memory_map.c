@@ -66,6 +66,18 @@ TEST(test_rtc_dram_mem_load) {
     teardown(&cpu);
 }
 
+TEST(test_rtc_slow_read_write_and_load) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    mem_write32(cpu.mem, 0x50000000u, 0xA1B2C3D4u);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x50000000u), 0xA1B2C3D4u);
+    uint8_t data[] = {0x78, 0x56, 0x34, 0x12};
+    ASSERT_EQ(mem_load(cpu.mem, 0x50001FFCu, data, sizeof(data)), 0);
+    ASSERT_EQ(mem_read32(cpu.mem, 0x50001FFCu), 0x12345678u);
+    ASSERT_TRUE(mem_get_ptr(cpu.mem, 0x50002000u) == NULL);
+    teardown(&cpu);
+}
+
 /* ====== Firmware segment load addresses test ====== */
 
 TEST(test_firmware_segment_regions) {
@@ -130,6 +142,10 @@ TEST(test_loader_region_names) {
     ASSERT_TRUE(strcmp(loader_region_name(0x40BFFFFF), "flash_insn") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x40C00000), "unmapped") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x3FF40000), "peripheral") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x50000000), "rtc_slow") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x60000000), "peripheral") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x6003FFFF), "peripheral") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name(0x60040000), "unmapped") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x10000000), "unmapped") == 0);
 }
 
@@ -182,6 +198,7 @@ static void run_memory_map_tests(void) {
     RUN_TEST(test_rtc_dram_boundary);
     RUN_TEST(test_sram_insn_boundary);
     RUN_TEST(test_rtc_dram_mem_load);
+    RUN_TEST(test_rtc_slow_read_write_and_load);
     RUN_TEST(test_firmware_segment_regions);
     RUN_TEST(test_peripheral_spi0_stub);
     RUN_TEST(test_peripheral_syscon_stub);

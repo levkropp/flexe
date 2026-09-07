@@ -102,20 +102,21 @@ TEST(mem_flash_instruction_window_boundary) {
     mem_destroy(mem);
 }
 
-/* ===== RTC fast/slow ===== */
+/* ===== RTC slow / AHB peripheral window ===== */
 
-TEST(mem_rw32_rtc_fast) {
+TEST(mem_rw32_rtc_slow) {
     xtensa_mem_t *mem = mem_create();
     mem_write32(mem, 0x50000000, 0x11111111);
     ASSERT_EQ(mem_read32(mem, 0x50000000), 0x11111111);
     mem_destroy(mem);
 }
 
-TEST(mem_rw32_rtc_slow) {
+TEST(mem_ahb_window_is_not_rtc_memory) {
     xtensa_mem_t *mem = mem_create();
-    /* 0x60000000 is the UART0 AHB FIFO alias — use the second rtc_slow page */
+    ASSERT_TRUE(mem_get_ptr(mem, 0x60000000) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x60001000) == NULL);
     mem_write32(mem, 0x60001000, 0x22222222);
-    ASSERT_EQ(mem_read32(mem, 0x60001000), 0x22222222);
+    ASSERT_EQ(mem_read32(mem, 0x60001000), 0);
     mem_destroy(mem);
 }
 
@@ -181,8 +182,8 @@ void run_memory_tests(void) {
     RUN_TEST(mem_flash_erased_at_reset);
     RUN_TEST(mem_flash_alias);
     RUN_TEST(mem_flash_instruction_window_boundary);
-    RUN_TEST(mem_rw32_rtc_fast);
     RUN_TEST(mem_rw32_rtc_slow);
+    RUN_TEST(mem_ahb_window_is_not_rtc_memory);
     RUN_TEST(mem_unmapped_read_zero);
     RUN_TEST(mem_unmapped_write_silent);
     RUN_TEST(mem_periph_returns_zero);

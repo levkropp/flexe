@@ -2302,13 +2302,12 @@ static void stub_esp_netif_create_default_wifi_ap(xtensa_cpu_t *cpu, void *ctx)
 
 /* ===== Scratch memory allocation ===== */
 
-/* Allocate a small region near the top of RTC-fast RAM for hostent data. */
+/* Allocate a small region near the top of RTC slow RAM for hostent data. */
 #define HOSTENT_SCRATCH_ADDR  0x50001F00u
 #define HOSTENT_SCRATCH_SIZE  64
 
-/* Dedicated radio callback resources. RTC slow page 1 is otherwise unused by
- * Flexe and gives the synthetic WiFi task a private 4 KB stack. The packet
- * buffer sits above the virtual PHY tables in RTC fast RAM. */
+/* Dedicated radio callback resources. The packet buffer sits above the
+ * virtual PHY tables in RTC slow RAM. */
 #define PROMISC_PACKET_ADDR    0x50001D00u
 #define PROMISC_PACKET_SIZE    256u
 #define PROMISC_RX_CTRL_SIZE   28u

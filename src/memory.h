@@ -31,7 +31,6 @@ struct xtensa_mem {
     uint8_t *flash_data;
     uint8_t *flash_insn;
     uint8_t *rtc_dram;
-    uint8_t *rtc_fast;
     uint8_t *rtc_slow;
     uint8_t *psram;
     mmio_handler_t mmio[MEM_PERIPH_PAGES];

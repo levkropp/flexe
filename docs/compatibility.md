@@ -17,7 +17,7 @@ Booting to one UART line is not considered a pass.
 | openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand display and network interaction coverage |
 | Tasmota 15.6.0 | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
 | WLED 16.0.1 | Interpreter + JIT | Pass | Expand LED and protocol interaction coverage |
-| Marauder 2432S028 2USB | Interpreter + JIT | Known gap | Early register-window spill runaway |
+| ESP32 Marauder 1.12.1 (CYD 2432S028 2USB) | Interpreter + JIT | Generic boot pass | Add a fingerprinted board-interaction scenario |
 
 ROM images are not stored in this repository. Results are tied to the image
 versions above and should be rechecked when a release changes.
@@ -77,10 +77,13 @@ requires each engine to:
 FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 ```
 
-Known failures remain in the run and are reported as `KNOWN-BAD`. If one starts
-passing, the script reports that its exception entry should be removed.
 `BATCH` controls the dual-core scheduling quantum and `MAX_UNMAPPED` controls
 the unmapped-access ceiling; their conservative defaults are 10,000 and 1,000.
+
+Recent ESP-IDF PHY libraries access the classic ESP32 peripheral fabric through
+its `0x60000000` AHB-Lite mirror. Flexe aliases the complete 256 KiB window to
+the corresponding `0x3ff40000` APB registers, including the private Bluetooth
+and Wi-Fi controller pages. RTC slow RAM remains distinct at `0x50000000`.
 
 ## Architectural register windows
 

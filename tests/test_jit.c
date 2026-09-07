@@ -1653,6 +1653,8 @@ TEST(test_savestate_round_trips_retired_instruction_count) {
     setup(&saved);
     saved.cycle_count = 1234567u;
     saved.insn_count = 987654u;
+    mem_write32(saved.mem, 0x3FF801FCu, 0xF45A7A57u);
+    mem_write32(saved.mem, 0x500001FCu, 0x5100A11Eu);
     ASSERT_EQ64(xtensa_retired_insns(&saved), 987654u);
     ASSERT_EQ(savestate_save(&saved, NULL, path, "unit-test"), 0);
 
@@ -1662,6 +1664,8 @@ TEST(test_savestate_round_trips_retired_instruction_count) {
     ASSERT_EQ(savestate_restore(&restored, NULL, path), 0);
     ASSERT_EQ64(restored.cycle_count, 1234567u);
     ASSERT_EQ64(xtensa_retired_insns(&restored), 987654u);
+    ASSERT_EQ(mem_read32(restored.mem, 0x3FF801FCu), 0xF45A7A57u);
+    ASSERT_EQ(mem_read32(restored.mem, 0x500001FCu), 0x5100A11Eu);
 
     unlink(path);
     teardown(&saved);

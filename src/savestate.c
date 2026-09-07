@@ -14,7 +14,6 @@
 #define FLASH_SIZE      (4 * 1024 * 1024)
 #define PSRAM_SIZE      (4 * 1024 * 1024)
 #define RTC_DRAM_SIZE   (8 * 1024)
-#define RTC_FAST_SIZE   (8 * 1024)
 #define RTC_SLOW_SIZE   (8 * 1024)
 
 /* Helper macros for safe file I/O */
@@ -203,9 +202,6 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
         if (cpu->mem->rtc_dram) {
             WRITE_OR_FAIL(f, cpu->mem->rtc_dram, RTC_DRAM_SIZE, "RTC_DRAM");
         }
-        if (cpu->mem->rtc_fast) {
-            WRITE_OR_FAIL(f, cpu->mem->rtc_fast, RTC_FAST_SIZE, "RTC_FAST");
-        }
         if (cpu->mem->rtc_slow) {
             WRITE_OR_FAIL(f, cpu->mem->rtc_slow, RTC_SLOW_SIZE, "RTC_SLOW");
         }
@@ -365,7 +361,6 @@ int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path
     READ_OR_FAIL(f, cpu->mem->flash_insn, FLASH_SIZE, "FLASH_INSN");
     READ_OR_FAIL(f, cpu->mem->psram, PSRAM_SIZE, "PSRAM");
     READ_OR_FAIL(f, cpu->mem->rtc_dram, RTC_DRAM_SIZE, "RTC_DRAM");
-    READ_OR_FAIL(f, cpu->mem->rtc_fast, RTC_FAST_SIZE, "RTC_FAST");
     READ_OR_FAIL(f, cpu->mem->rtc_slow, RTC_SLOW_SIZE, "RTC_SLOW");
 
     /* === Restore FreeRTOS State === */

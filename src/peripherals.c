@@ -68,6 +68,7 @@ static inline int gpio_dbg(void) {
 #define I2S1_BASE       0x3FF6D000u
 #define SYSCON_BASE     0x3FF66000u
 #define BT_PRIVATE_BASE 0x3FF71000u
+#define BT_MAC_BASE     0x3FF72000u
 #define WIFI_MAC_BASE   0x3FF73000u  /* WiFi MAC/BB control registers */
 #define WIFI_MAC_SIZE   0x2000u
 #define WDEV_BASE       0x3FF75000u  /* WiFi device (contains RNG register) */
@@ -1331,6 +1332,7 @@ typedef struct {
     uint32_t nrx[PAGE_WORDS];
     uint32_t bb[PAGE_WORDS];
     uint32_t bt_private[PAGE_WORDS];
+    uint32_t bt_mac[PAGE_WORDS];
     uint32_t wifi_mac[WIFI_MAC_SIZE / sizeof(uint32_t)];
     uint32_t wdev[PAGE_WORDS];
     uint64_t rng_state;
@@ -4830,6 +4832,7 @@ static uint32_t *radio_reg_ptr(esp32_periph_t *p, uint32_t addr) {
     case NRX_PRIVATE_BASE: return &p->radio.nrx[word];
     case BB_BASE:          return &p->radio.bb[word];
     case BT_PRIVATE_BASE:  return &p->radio.bt_private[word];
+    case BT_MAC_BASE:      return &p->radio.bt_mac[word];
     case WIFI_MAC_BASE:
     case WIFI_MAC_BASE + PAGE_SIZE:
         return &p->radio.wifi_mac[(addr - WIFI_MAC_BASE) /
@@ -13386,6 +13389,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     /* Bluetooth controller private register page. */
     mem_register_mmio(mem, (int)PAGE_OF(BT_PRIVATE_BASE),
+                      radio_read, radio_write, p);
+    mem_register_mmio(mem, (int)PAGE_OF(BT_MAC_BASE),
                       radio_read, radio_write, p);
 
     return p;

@@ -5,10 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* RTC-slow page 1 is intentionally left available by memory.c.  Keeping the
- * synthetic task here avoids corrupting whichever FreeRTOS stack happened to
- * be interrupted when a host device delivered an event. */
-#define GUEST_CALL_STACK_TOP 0x60002000u
+/* A synchronous callback needs a private guest-visible stack so it cannot
+ * corrupt whichever FreeRTOS task was interrupted. Map one otherwise-invalid
+ * page only for the duration of the call, then restore the page-table entry.
+ * This keeps the trampoline out of every architectural ESP32 RAM/MMIO region.
+ * The old permanent mapping at 0x60001000 collided with the AHB peripheral
+ * mirror and was incorrectly described as RTC slow RAM. */
+#define GUEST_CALL_STACK_BASE 0x7FFF0000u
+#define GUEST_CALL_STACK_SIZE 0x1000u
+#define GUEST_CALL_STACK_TOP  (GUEST_CALL_STACK_BASE + GUEST_CALL_STACK_SIZE)
 #define GUEST_CALL_SENTINEL  0x40001FF8u
 #define GUEST_CALL_MAX_ARGS  6u
 
@@ -19,6 +24,12 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     if (!cpu || !cpu->mem || entry == 0 || instruction_limit == 0 ||
         arg_count > GUEST_CALL_MAX_ARGS || (arg_count != 0 && !args))
         return -1;
+
+    uint8_t guest_stack[GUEST_CALL_STACK_SIZE];
+    memset(guest_stack, 0, sizeof(guest_stack));
+    uint32_t guest_stack_page = GUEST_CALL_STACK_BASE >> 12;
+    uint8_t *saved_stack_page = cpu->mem->page_table[guest_stack_page];
+    cpu->mem->page_table[guest_stack_page] = guest_stack;
 
     uint32_t save_ar[64];
     uint32_t save_pc = cpu->pc;
@@ -138,6 +149,7 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     cpu->accelerated_blocks = save_accelerated;
 
     cpu->in_guest_call--;
+    cpu->mem->page_table[guest_stack_page] = saved_stack_page;
     if (!completed)
         return -2;
     if (retval_out)
