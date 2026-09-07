@@ -1937,6 +1937,100 @@ static uint32_t jit_entry_insn(int s, uint32_t framesize) {
     return (imm12 << 12) | ((uint32_t)s << 8) | (3u << 4) | 6u;
 }
 
+TEST(test_jit_entry_dispatches_compiled_callee_body) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = 2u << 16;  /* CALLINC=2 */
+    cpu.windowbase = 0;
+    cpu.windowstart = 1u;
+    ar_write(&cpu, 1, DATA_BASE + 0x400u);
+    put_insn3(&cpu, BASE, jit_entry_insn(1, 32));
+    for (unsigned i = 0; i < 4; i++)
+        put_insn2(&cpu, BASE + 3u + i * 2u,
+                  narrow(0xD, 15, 0, 3));  /* NOP.N */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    /* Compile the body for the window ENTRY will select, then return to the
+     * caller state so execution still has to cross the interpreted ENTRY. */
+    cpu.windowbase = 2;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE + 3);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE + 3) != NULL);
+    cpu.windowbase = 0;
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_run(&cpu, 5), 5);
+    ASSERT_EQ(cpu.windowbase, 2);
+    ASSERT_EQ64(jit_get_stats(jit)->insns_jitted, 4u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+typedef struct {
+    unsigned calls;
+    uint32_t last_pc;
+} jit_entry_spy_t;
+
+static int jit_entry_spy_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
+    (void)cpu;
+    jit_entry_spy_t *spy = ctx;
+    if (pc == BASE || pc == BASE + 3u) {
+        spy->calls++;
+        spy->last_pc = pc;
+    }
+    return 0;  /* Observe the entry, then execute the guest instruction. */
+}
+
+TEST(test_jit_entry_fallthrough_does_not_repeat_original_hook) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = 2u << 16;  /* CALLINC=2 */
+    cpu.windowbase = 0;
+    cpu.windowstart = 1u;
+    ar_write(&cpu, 1, DATA_BASE + 0x400u);
+    put_insn3(&cpu, BASE, jit_entry_insn(1, 32));
+    put_insn2(&cpu, BASE + 3u, narrow(0xD, 15, 0, 3));  /* NOP.N */
+
+    uint64_t *hook_bitmap = calloc(HOOK_BITMAP_WORDS, sizeof(*hook_bitmap));
+    ASSERT_TRUE(hook_bitmap != NULL);
+    if (!hook_bitmap) {
+        teardown(&cpu);
+        return;
+    }
+    uint32_t bit = (BASE >> 2) & (HOOK_BITMAP_BITS - 1);
+    hook_bitmap[bit / 64] |= 1ULL << (bit & 63);
+
+    jit_entry_spy_t spy = {0};
+    cpu.pc_hook = jit_entry_spy_hook;
+    cpu.pc_hook_ctx = &spy;
+    cpu.pc_hook_bitmap = hook_bitmap;
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        free(hook_bitmap);
+        teardown(&cpu);
+        return;
+    }
+    jit_install_hook(jit, &cpu);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_run(&cpu, 2), 2);
+    ASSERT_EQ(spy.calls, 1);
+    ASSERT_EQ(spy.last_pc, BASE);
+    ASSERT_FALSE(cpu.jit_entry_fallthrough);
+
+    jit_destroy(jit);
+    free(hook_bitmap);
+    teardown(&cpu);
+}
+
 static uint32_t jit_retw_insn(void) {
     return rrr(0, 0, 0, 0, (2 << 2) | 1);
 }
@@ -2109,6 +2203,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_wsr_ps_rearms_irq_check);
     RUN_TEST(test_jit_wsr_ps_exits_before_pending_irq);
     RUN_TEST(test_jit_rur_wur_user_registers);
+    RUN_TEST(test_jit_entry_dispatches_compiled_callee_body);
+    RUN_TEST(test_jit_entry_fallthrough_does_not_repeat_original_hook);
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);
     RUN_TEST(test_jit_entry_windowed);

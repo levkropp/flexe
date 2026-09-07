@@ -2557,6 +2557,15 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                * a0 = 8 into a live frame. FLEXE_FILLDBG names that fill. */
               WINLOG(cpu, "ENTRY callinc=%d owb=%d nwb=%d a1=%08X\n",
                      callinc, owb, cpu->windowbase, ar_read(cpu, 1));
+
+              /* ENTRY changes the physical register window underneath the
+               * logical a0-a15 names. Give the accelerator a private dispatch
+               * boundary at the callee body, which is keyed by the new
+               * windowbase. This is deliberately distinct from _pc_written:
+               * the fallthrough is not a guest control-flow edge and must not
+               * invoke firmware observers registered at the post-ENTRY PC. */
+              if (__builtin_expect(cpu->accelerated_blocks, 0))
+                  cpu->jit_entry_fallthrough = true;
           } break;
           case 1: /* B1: BF, BT, LOOP, LOOPNEZ, LOOPGTZ */
               switch (r) {
@@ -2949,19 +2958,29 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
      * instruction writes PC again). On straight-line execution the
      * bitmap load is skipped entirely.  Runs BEFORE the invalid-PC
      * trap so a hook at 0x00000000 can turn callxN-through-NULL into
-     * a benign return-0 (symbol-less firmware driver tables). */
-    if (__builtin_expect(cpu->_pc_written, 0)) {
+     * a benign return-0 (symbol-less firmware driver tables).
+     *
+     * ENTRY is the one straight-line accelerator boundary: it changes the
+     * register-window identity used by JIT cache keys. Its transient marker
+     * lets jit_pc_hook dispatch the callee body without presenting a second
+     * call to ordinary firmware observers at that same address. */
+    const bool entry_fallthrough =
+        __builtin_expect(cpu->jit_entry_fallthrough != 0, 0);
+    const bool dispatch_boundary = cpu->_pc_written || entry_fallthrough;
+    if (__builtin_expect(dispatch_boundary, 0)) {
         cpu->br_ring[cpu->br_ring_idx & (XT_BR_RING_SIZE - 1)] = cpu->pc;
         cpu->br_ring_idx++;
         /* Return from a guest_call_async() callee. Only reachable through the
          * return address that call planted, so the compare is enough. */
-        if (__builtin_expect(cpu->pc == GUEST_CALL_ASYNC_SENTINEL, 0))
+        if (cpu->_pc_written &&
+            __builtin_expect(cpu->pc == GUEST_CALL_ASYNC_SENTINEL, 0))
             guest_call_async_return(cpu);
     }
-    if (cpu->_pc_written && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
+    if (dispatch_boundary && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
         int hook_insns = cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx);
+        cpu->jit_entry_fallthrough = false;
         if (hook_insns) {
             /* Native hooks may account a whole block, while time-oriented
              * stubs may fast-forward cycle_count.  Pull that advancement
@@ -2985,6 +3004,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
             return cpu->exception ? -1 : (hook_insns > 1 ? hook_insns : 0);
         }
     }
+    cpu->jit_entry_fallthrough = false;
 
     /* Invalid PC trap. Slow-path body lives in a noinline helper so
      * the hot-path branch is just a single range compare. */
