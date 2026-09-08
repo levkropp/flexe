@@ -135,12 +135,12 @@ MARAUDER_BIN=/path/to/marauder.bin ./scripts/bench-stock-roms.sh
 ./scripts/bench-firmware.sh /path/to/firmware.bin
 ```
 
-The most recently recorded Apple-silicon JIT results range from roughly
-2x real time on mixed FreeRTOS workloads to 10x on compute-heavy loops.
-Production images with substantial idle time can report higher real-time
-factors than their instruction throughput suggests, so benchmark output always
-includes both work and time. See [Performance](docs/performance.md) for current
-numbers and methodology.
+In the current Apple-silicon release benchmark, every image in the five-ROM
+generic corpus clears real time under the JIT; WLED is the limiting workload at
+1.42x. Production images with substantial idle time can report higher factors
+than their instruction throughput suggests, so benchmark output always includes
+retired work and UART progress. See [Performance](docs/performance.md) for the
+dated results, host configuration, and methodology.
 
 ## Architecture
 

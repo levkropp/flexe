@@ -294,31 +294,33 @@
 <span class="g">I (0) cpu_start: Starting scheduler on PRO CPU.</span>
 <span class="g">Hello world!</span>
 
-<span class="p">$</span> ./scripts/bench.sh
-<span class="c"># 500M–1B executed instructions per workload, pgo build:</span>
-tjpgd        693 mips   <span class="g">2.9× real-time</span>
-rts          499 mips   <span class="g">2.1× real-time</span>
-cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
+<span class="p">$</span> FLEXE_ROMS=./roms MAX_UNMAPPED=0 REPS=5 ./scripts/bench-firmware.sh
+<span class="c"># release + lto; both engines must pass and produce the same uart digest:</span>
+meshtastic  <span class="g">16.85× real-time</span>
+nerdminer    <span class="g">8.07× real-time</span>
+openhasp     <span class="g">5.92× real-time</span>
+tasmota      <span class="g">6.67× real-time</span>
+wled         <span class="g">1.42× real-time</span></pre>
       </div>
     </section>
 
     <!-- stats -->
     <section class="stats" id="benchmarks">
       <div>
-        <span class="stat-num">2476</span>
-        <span class="stat-label">mips on alu/memory loops<br>(10.3× a real esp32)</span>
+        <span class="stat-num">1.42×</span>
+        <span class="stat-label">slowest current corpus image<br>(against a 240 mhz esp32)</span>
       </div>
       <div>
         <span class="stat-num">5</span>
-        <span class="stat-label">curated cyd images<br>(both engines, pinned rendering)</span>
+        <span class="stat-label">production corpus images<br>(both engines, matching uart)</span>
       </div>
       <div>
         <span class="stat-num">2</span>
         <span class="stat-label">native jit backends<br>(arm64 + x86-64)</span>
       </div>
       <div>
-        <span class="stat-num">678</span>
-        <span class="stat-label">tests, all passing<br>(13,247 assertions, 0 failures)</span>
+        <span class="stat-num">700+</span>
+        <span class="stat-label">tests, all passing<br>(13k+ assertions)</span>
       </div>
     </section>
 
@@ -332,7 +334,7 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         </div>
         <div class="feature-card">
           <h3>runs firmware people actually ship</h3>
-          <p>unmodified esp32 marauder and nerdminer images boot, associate to wifi, drive the cyd display and mine. five stock roms run on both engines and have to produce byte-identical final framebuffers, pinned by sha-256 — which is what catches a jit that renders the wrong thing rather than no thing.</p>
+          <p>unmodified esp32 marauder and nerdminer images boot, associate to wifi, drive the cyd display and mine. scripted stock roms run on both engines and must meet pinned observable gates, including framebuffer digests — which catches a jit that renders the wrong thing rather than no thing.</p>
           <p>meshtastic, openhasp, tasmota, and wled also pass the generic production gate in both engines. every corpus benchmark reports useful progress beside speed, so a fast crash or idle loop never counts as a result.</p>
         </div>
         <div class="feature-card">
@@ -376,7 +378,7 @@ cpu_bench   2476 mips  <span class="g">10.3× real-time</span></pre>
         <span class="prereq">zlib + pthreads</span>
         <span class="prereq">an esp-idf firmware .bin to play with</span>
       </div>
-      <p class="bench-note">benchmarks measured on apple silicon with the pgo build. jit is on by default; <code>--no-jit</code> takes the scenic route. real esp32 = 240 mips, for scale.</p>
+      <p class="bench-note">production benchmarks measured on apple silicon with a release, lto, host-native build. jit is on by default. real-time factor is measured against a 240 mhz esp32.</p>
     </section>
 
     <!-- footer -->

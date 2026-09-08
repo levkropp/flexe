@@ -17,22 +17,36 @@ Firmware that spins, traps, or idles prematurely can show a flattering
 real-time factor while doing no useful work. The benchmark scripts therefore
 print retired instructions and UART activity next to elapsed time.
 
-## Recorded baselines
+## Current production baseline
 
-Representative Apple-silicon release/PGO measurements from the current
-development history:
+This snapshot was recorded on 2026-09-07 on an Apple A18 Pro MacBook with
+Apple Clang 21. The build used `Release`, LTO, and `NATIVE_ARCH=ON`; PGO was
+off. Each result is the fastest of five 600-million-cycle runs with a
+10,000-instruction scheduling batch and a zero-unmapped-access limit:
 
-| Workload | Interpreter | JIT | JIT vs 240 MHz |
-|---|---:|---:|---:|
-| TJpgDec JPEG decode | 330 MIPS | 693 MIPS | 2.9x |
-| dual-core FreeRTOS `real_time_stats` | 334 MIPS | 499 MIPS | 2.1x |
-| ALU/memory compute fixture | 318 MIPS | 2,476 MIPS | 10.3x |
+```sh
+FLEXE_ROMS=/path/to/corpus MAX_UNMAPPED=0 \
+  CYCLES=600000000 REPS=5 ./scripts/bench-firmware.sh
+```
 
-The recorded x86-64 compute fixture reached 1,789 MIPS under the JIT and
-187 MIPS in the interpreter. In scripted stock-ROM runs, x86-64 recorded
-approximately 12.8x real time for Marauder and 3.8x for NerdMiner. Host CPU,
-compiler, thermal state, scenario, and build options all matter; rerun the
-committed scripts instead of treating these figures as guarantees.
+| Firmware | Interpreter | JIT | Retired instructions | UART bytes |
+|---|---:|---:|---:|---:|
+| Meshtastic 2.7.26 T-Beam | 13.35x | 16.85x | 31,609,250 | 11,562 |
+| NerdMiner 1.8.3 | 5.41x | 8.07x | 90,261,905 | 578 |
+| openHASP 0.7.0-rc13 | 3.15x | 5.92x | 152,390,332 | 6,411 |
+| Tasmota 15.6.0 | 2.41x | 6.67x | 208,223,293 | 449 |
+| WLED 16.0.1 | 0.88x | 1.42x | 472,942,095 | 5 |
+
+Both engines passed the generic progress gate and produced the same UART digest
+for every image. All five clear real time under the JIT; WLED is deliberately
+kept in the corpus because it has the smallest margin. Host scheduling and
+thermal state move these numbers, so rerun the command before comparing a
+change.
+
+Historical compute-focused PGO runs reached 693 MIPS for TJpgDec, 499 MIPS for
+the dual-core FreeRTOS fixture, and 2,476 MIPS for the ALU/memory fixture on
+Apple silicon. An x86-64 compute run reached 1,789 MIPS. These describe native
+instruction throughput, not the production-firmware baseline above.
 
 ## Reproducible compute benchmark
 
@@ -76,19 +90,13 @@ and `MAX_UNMAPPED` override its 10,000-instruction scheduling quantum and
 
 ## JIT coverage
 
-Recent production runs recorded:
-
-| Image | JIT coverage | Guest instructions per JIT entry |
-|---|---:|---:|
-| Marauder 1.14.3 CYD | 49.5% | 9.1 |
-| Marauder 1.15.1 CYD 2432S028 | 46.6% | 9.8 |
-| Marauder 1.14.3 3.5-inch | 45.9% | 10.4 |
-| Marauder 1.14.3 Guition | 42.3% | 11.1 |
-| NerdMiner 1.8.3 | 22.5% | 25.1 |
-
-This is why optimizing only emitted native instructions has a limited effect
-on mixed firmware. Improving block eligibility, safe chaining, service and
-peripheral fast paths, and the interpreter all affect end-to-end performance.
+The WLED run above executes 88.1% of retired instructions in native blocks,
+averaging 10.0 guest instructions per JIT entry. Coverage is workload-specific
+and is not a speed score: compiling standalone one-instruction blocks raised
+WLED coverage to 92.2% but slowed median wall time by about 1.8%. Flexe therefore
+compiles hot standalone blocks from two instructions upward, while still
+allowing shorter targets when an existing native chain removes their dispatch
+cost.
 
 ## Profiling
 
