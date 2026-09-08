@@ -19,6 +19,8 @@ typedef struct {
     int      display_sck_pin; /* ILI9341 SCLK GPIO (default 14) */
     int      touch_cs_pin;    /* XPT2046 CS GPIO (default 33) */
     int      touch_sck_pin;   /* XPT2046 SCLK GPIO (default 25) */
+    int      touch_mosi_pin;  /* XPT2046 MOSI GPIO (default 32) */
+    int      touch_miso_pin;  /* XPT2046 MISO GPIO (default 39) */
     int      sd_cs_pin;       /* SD card CS GPIO (default 5) */
     int      sd_sck_pin;      /* SD card SCLK GPIO (default 18) */
     const char *sdcard_path;  /* SD card backing image (NULL = zeros) */
@@ -40,6 +42,13 @@ void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cf
 /* Release raw-SPI backing resources owned by a peripheral instance. */
 void periph_disable_spi_display(esp32_periph_t *p);
 
+/* Feed GPIO output edges to the software-SPI XPT2046 model. Some CYD
+ * libraries drive the touch controller by bit-banging GPIO rather than using
+ * either GP-SPI host, so register-level SPI emulation alone cannot serve
+ * their MISO reads. Called by the GPIO peripheral after its output latch has
+ * changed. */
+void spi_display_gpio_changed(esp32_periph_t *p, int pin, int level);
+
 /* Observe a transaction addressed to no modelled device -- that is, one whose
  * chip select is none of display/touch/SD. Lets a test harness stand in as an
  * arbitrary SPI slave: it sees the MOSI bytes and fills the MISO buffer.
@@ -54,5 +63,8 @@ void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx);
  * framebuffer checksum alone cannot distinguish from a UI redrawing the same
  * picture. */
 uint64_t spi_display_bytes_fed(void);
+
+/* Completed XPT2046 commands received over GPIO software SPI. */
+uint64_t spi_touch_bitbang_commands(void);
 
 #endif /* SPI_DISPLAY_H */

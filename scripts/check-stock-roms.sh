@@ -12,6 +12,7 @@
 # ROMs are deliberately not stored in this repository. Supply them the same way
 # bench-stock-roms.sh does:
 #
+#   BRUCE_BIN=/path/to/bruce.bin \
 #   MARAUDER_BIN=/path/to/marauder.bin \
 #   NERDMINER_BIN=/path/to/nerdminer.bin ./scripts/check-stock-roms.sh
 #
@@ -29,6 +30,9 @@ if [[ ! -x "$runner" ]]; then
 fi
 
 declare -a names profiles roms
+if [[ -n "${BRUCE_BIN:-}" ]]; then
+    names+=(bruce); profiles+=(bruce); roms+=("$BRUCE_BIN")
+fi
 if [[ -n "${NERDMINER_BIN:-}" ]]; then
     names+=(nerdminer); profiles+=(nerdminer); roms+=("$NERDMINER_BIN")
 fi
@@ -40,7 +44,7 @@ for rom in "$@"; do
 done
 
 if (( ${#roms[@]} == 0 )); then
-    echo "error: set MARAUDER_BIN/NERDMINER_BIN or pass at least one ROM" >&2
+    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN or pass at least one ROM" >&2
     exit 2
 fi
 
@@ -63,6 +67,7 @@ fi
 # a more faithful flash layout rather than a miscompile.
 expected_render() {
     case "$1" in
+    b0ed2710db5dfdd7117487b624ff742860614e1c3d8095d42b39b54f4ca18924) echo D3337E28 ;;  # Bruce 1.16.1 CYD
     d85d07b82bd29e28b9a5c786256317bda63cf29ebd64fa07541c3327a0ce0a73) echo D8F5FCCA ;;  # v1.12.1 CYD 2USB
     e7aece42f24ad7fd4146b94eeb28d04de7ce27f0c45e19be1bf38ad39ce0582c) echo EC54B518 ;;
     ad91696012f407bf782826793edd509119acf00e4751cd0d30eddd6223d6bf2d) echo 28C56B5E ;;

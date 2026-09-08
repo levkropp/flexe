@@ -5,9 +5,10 @@ emulator written in C. Flexe boots unmodified ESP-IDF and Arduino firmware,
 models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
 backends.
 
-Flexe is under active development. Marauder and NerdMiner pass scripted
-end-to-end scenarios, and the broader production corpus passes the generic
-interpreter/JIT gate described in [Firmware compatibility](docs/compatibility.md).
+Flexe is under active development. Bruce, Marauder, and NerdMiner pass
+scripted end-to-end scenarios, and the broader production corpus passes the
+generic interpreter/JIT gate described in
+[Firmware compatibility](docs/compatibility.md).
 
 ## Highlights
 
@@ -47,7 +48,7 @@ The main outputs are:
 
 - `build/xtensa-emu` — emulator CLI
 - `build/xtensa-tests` — unit and differential test suite
-- `build/flexe-stock-rom-test` — scripted Marauder/NerdMiner runner
+- `build/flexe-stock-rom-test` — scripted Bruce/Marauder/NerdMiner runner
 - `build/flexe-generic-rom-test` — arbitrary production-ROM probe
 
 Release builds use LTO and host-native tuning by default. Pass
@@ -98,7 +99,7 @@ The committed corpus currently establishes these outcomes:
 | openHASP 0.7.0-rc13 | Boots and both engines agree |
 | Tasmota 15.6.0 | Boots through the Berry runtime and both engines agree |
 | WLED 16.0.1 | Boots to its Adalight prompt and both engines agree |
-| Bruce 1.16.1 (CYD 2432S028) | Boots through filesystem and storage setup; both engines agree; official ROM ELF required |
+| Bruce 1.16.1 (CYD 2432S028) | Scripted display, GPIO-bit-banged touch, and storage scenario passes; official ROM ELF required |
 
 These are bounded, reproducible claims rather than blanket compatibility
 promises. See [Firmware compatibility](docs/compatibility.md) for the exact
@@ -115,8 +116,8 @@ FLEXE_ROMS=/path/to/roms ./scripts/check-firmware.sh
 ```
 
 Production ROMs are intentionally not committed. The stock runner accepts
-`MARAUDER_BIN` and `NERDMINER_BIN`; the generic runner accepts paths or a
-`FLEXE_ROMS` directory.
+`BRUCE_BIN`, `MARAUDER_BIN`, and `NERDMINER_BIN`; the generic runner accepts
+paths or a `FLEXE_ROMS` directory.
 
 See [Testing](docs/testing.md) for sanitizer builds, fixture configuration,
 JIT verification, and what each gate asserts.

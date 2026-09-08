@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Can Flexe run this firmware at all?
 #
-# check-stock-roms.sh asserts what two curated images are supposed to draw and
+# check-stock-roms.sh asserts what the curated images are supposed to draw and
 # do. This asks a much weaker question of arbitrary firmware, which is the only
 # question worth asking of an image downloaded ten minutes ago: does it boot,
 # does it keep executing, does it stay inside the hardware we model, and do the

@@ -749,6 +749,30 @@ static int run_for_virtual_cycles(flexe_session_t *session, uint64_t cycles)
     return 0;
 }
 
+static int run_until_touch_commands(flexe_session_t *session,
+                                    uint64_t commands_before,
+                                    uint64_t minimum_commands,
+                                    uint64_t max_cycles,
+                                    uint64_t *commands_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+    const int touch_batch = 1000;
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        if (cpu0->running)
+            (void)flexe_session_run_core(session, 0, touch_batch);
+        flexe_session_post_batch(session, touch_batch);
+        uint64_t commands = spi_touch_bitbang_commands() - commands_before;
+        if (commands >= minimum_commands) {
+            *commands_out = commands;
+            return 0;
+        }
+    }
+    *commands_out = spi_touch_bitbang_commands() - commands_before;
+    return 1;
+}
+
 static int run_until_nerd_spiffs(flexe_session_t *session,
                                  uint64_t max_cycles, int *blocks_out,
                                  uint64_t *cycles_out)
@@ -1238,7 +1262,7 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s [--no-jit] [--verify] [--rom-elf ESP32_ROM.elf] "
-            "marauder|nerdminer <firmware.bin>\n",
+            "bruce|marauder|nerdminer <firmware.bin>\n",
             argv0);
 }
 
@@ -1271,9 +1295,10 @@ int main(int argc, char **argv)
 
     const char *profile = argv[argi++];
     const char *rom_path = argv[argi];
+    int is_bruce = strcmp(profile, "bruce") == 0;
     int is_marauder = strcmp(profile, "marauder") == 0;
     int is_nerdminer = strcmp(profile, "nerdminer") == 0;
-    if (!is_marauder && !is_nerdminer) {
+    if (!is_bruce && !is_marauder && !is_nerdminer) {
         usage(argv[0]);
         return 2;
     }
@@ -1400,8 +1425,9 @@ int main(int argc, char **argv)
                 &bt_tx_probe);
     }
 
-    int min_nonblack = is_marauder ? 8000 : 20000;
-    uint64_t boot_limit = is_marauder ? 8000000000ull : 2000000000ull;
+    int min_nonblack = is_bruce ? 4000 : (is_marauder ? 8000 : 20000);
+    uint64_t boot_limit = (is_marauder || is_bruce) ?
+                          8000000000ull : 2000000000ull;
     int nonblack = 0;
     uint64_t boot_cycles = 0;
     int screen_result = run_until_screen(session, framebuf, &framebuffer_mutex,
@@ -1445,6 +1471,7 @@ int main(int argc, char **argv)
     }
 
     int touch_changed = 0;
+    uint64_t bruce_touch_commands = 0;
     int spiffs_blocks = 0;
     wifi_stubs_stats_t wifi_stats = {0};
     uint64_t network_cycles = 0;
@@ -1473,6 +1500,101 @@ int main(int argc, char **argv)
     uint32_t marauder_beacon_frames = 0;
     bt_stubs_stats_t bt_stats = {0};
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
+    if (is_bruce) {
+        if (!uart_contains(&uart, "SDCARD mounted successfully")) {
+            fprintf(stderr, "FAIL profile=bruce reason=sd-fat-mount-failed\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        /* The first pixels belong to Bruce's seven-second boot animation.
+         * Let its real main menu settle, then press the middle footer button.
+         * CYD28_TouchR reads the XPT2046 through GPIO software SPI, so this
+         * drives both PENIRQ and the physical command/data wire path rather
+         * than calling an application-level touch hook. */
+        if (run_for_virtual_cycles(session, 2000000000ull) != 0) {
+            fprintf(stderr,
+                    "FAIL profile=bruce reason=cpus-stopped-before-touch\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        framebuffer_copy(before, framebuf, &framebuffer_mutex);
+        uint64_t touch_commands_before = spi_touch_bitbang_commands();
+        /* This host point maps through the CYD's portrait glass calibration
+         * and Bruce's rotation-3 transform to approximately (160, 220): SEL. */
+        touch.x = 289;
+        touch.y = 119;
+        touch.pressed = 1;
+        int protocol_result = run_until_touch_commands(
+                session, touch_commands_before, 9, 300000000ull,
+                &bruce_touch_commands);
+        if (protocol_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=bruce reason=%s gpio_touch_commands=%llu\n",
+                    protocol_result < 0 ? "cpus-stopped-during-touch" :
+                                          "touch-protocol-timeout",
+                    (unsigned long long)bruce_touch_commands);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        touch.pressed = 0;
+        int touch_result = run_until_changed(session, before, framebuf,
+                                             &framebuffer_mutex, 1500,
+                                             1000000000ull, &touch_changed);
+        if (touch_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=bruce reason=%s changed_pixels=%d "
+                    "gpio_touch_commands=%llu\n",
+                    touch_result < 0 ? "cpus-stopped" : "touch-timeout",
+                    touch_changed,
+                    (unsigned long long)bruce_touch_commands);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        /* run_until_changed returns as soon as the first redraw crosses its
+         * threshold. Finish that redraw before taking the golden checksum so
+         * JIT/interpreter timing cannot sample different halves of a frame. */
+        if (run_for_virtual_cycles(session, 500000000ull) != 0) {
+            fprintf(stderr,
+                    "FAIL profile=bruce reason=cpus-stopped-after-touch\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        bruce_touch_commands = spi_touch_bitbang_commands() -
+                               touch_commands_before;
+        if (bruce_touch_commands < 13) {
+            fprintf(stderr,
+                    "FAIL profile=bruce reason=touch-release-incomplete "
+                    "gpio_touch_commands=%llu\n",
+                    (unsigned long long)bruce_touch_commands);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+    }
     if (is_nerdminer) {
         if (strstr(uart.log, "sdcard_mount(): f_mount failed") != NULL) {
             fprintf(stderr,
@@ -2386,6 +2508,10 @@ int main(int argc, char **argv)
            (unsigned long long)uart.count);
     printf(" mmio_unhandled=%d rom_unregistered=%d",
            unhandled_mmio, unregistered_rom);
+    if (is_bruce)
+        printf(" touch_changed=%d touch=gpio-xpt2046 "
+               "touch_commands=%llu sd_fat=mounted menu=wifi",
+               touch_changed, (unsigned long long)bruce_touch_commands);
     if (is_marauder)
         printf(" touch_changed=%d sd_fat=mounted sd_write=SCRIPTS "
                "gps_uart_rx=%zu gps_cli=lat gps_cycles=%llu "

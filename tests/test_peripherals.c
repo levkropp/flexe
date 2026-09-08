@@ -2847,6 +2847,26 @@ static void test_gpio_level(xtensa_mem_t *mem, int pin, int high) {
     mem_write32(mem, gpio + (high ? set : clear), bit);
 }
 
+static uint8_t test_touch_gpio_byte(xtensa_mem_t *mem, uint8_t value) {
+    const uint32_t gpio = 0x3FF44000u;
+    uint8_t result = 0;
+    for (int bit = 7; bit >= 0; bit--) {
+        test_gpio_level(mem, 32, (value >> bit) & 1u); /* MOSI */
+        test_gpio_level(mem, 25, 1);                   /* rising SCLK */
+        result = (uint8_t)((result << 1) |
+                 ((mem_read32(mem, gpio + 0x40u) >> (39 - 32)) & 1u));
+        test_gpio_level(mem, 25, 0);                   /* falling SCLK */
+    }
+    return result;
+}
+
+static uint16_t test_touch_gpio_transfer16(xtensa_mem_t *mem,
+                                           uint16_t value) {
+    uint16_t high = test_touch_gpio_byte(mem, (uint8_t)(value >> 8));
+    uint16_t low = test_touch_gpio_byte(mem, (uint8_t)value);
+    return (uint16_t)((high << 8) | low);
+}
+
 static void test_gpio_route(xtensa_mem_t *mem, int pin, int signal) {
     mem_write32(mem, 0x3FF44000u + 0x530u + (uint32_t)pin * 4,
                 (uint32_t)signal);
@@ -2921,6 +2941,60 @@ TEST(xpt2046_pipelined_conversions) {
     ASSERT_EQ(test_spi_transfer16(mem, 0xC1) >> 3, 0);          /* new Z1 */
     ASSERT_EQ(test_spi_transfer16(mem, 0x91) >> 3, 4095);       /* new Z2 */
 
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(xpt2046_gpio_bitbang_conversions) {
+    const uint32_t gpio = 0x3FF44000u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    test_touch_state_t touch = { .down = 1, .x = 240, .y = 60 };
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .touch_mosi_pin = 32,
+        .touch_miso_pin = 39,
+        .sd_cs_pin = 5,
+        .fb_w = 320,
+        .fb_h = 240,
+        .touch_fn = test_touch_read,
+        .touch_ctx = &touch,
+    };
+    periph_enable_spi_display(p, &cfg);
+
+    /* CYD28_TouchR uses GPIO software SPI: MOSI32, MISO39, CLK25, CS33. */
+    mem_write32(mem, gpio + 0x24u, 1u << 25); /* CLK output */
+    mem_write32(mem, gpio + 0x30u, 0x3u);     /* MOSI + CS outputs */
+    test_gpio_level(mem, 25, 0);
+    test_gpio_level(mem, 33, 1);
+    test_gpio_level(mem, 33, 0);
+
+    /* The command/result pipeline is the same as hardware SPI: the first
+     * byte starts Z1, and later transfer16 calls clock out the prior result
+     * while putting the next command on MOSI. */
+    (void)test_touch_gpio_byte(mem, 0xB1);
+    ASSERT_EQ(test_touch_gpio_transfer16(mem, 0x00C1) >> 3, 600);
+    ASSERT_EQ(test_touch_gpio_transfer16(mem, 0x0091) >> 3, 3500);
+
+    int panel_x = touch.y * 239 / (cfg.fb_h - 1);
+    int panel_y = (cfg.fb_w - 1 - touch.x) * 319 / (cfg.fb_w - 1);
+    uint16_t expected_p_x = (uint16_t)(200 + panel_x * 3500 / 239);
+    uint16_t expected_p_y = (uint16_t)(240 + panel_y * 3560 / 319);
+    ASSERT_EQ(test_touch_gpio_transfer16(mem, 0x00D1) >> 3,
+              expected_p_x);
+    ASSERT_EQ(test_touch_gpio_transfer16(mem, 0x0091) >> 3,
+              expected_p_y);
+    ASSERT_EQ64(spi_touch_bitbang_commands(), 5);
+
+    touch.down = 0;
+    (void)test_touch_gpio_transfer16(mem, 0x00B1);
+    ASSERT_EQ(test_touch_gpio_transfer16(mem, 0x00C1) >> 3, 0);
+    ASSERT_EQ(test_touch_gpio_transfer16(mem, 0x0091) >> 3, 4095);
+
+    test_gpio_level(mem, 33, 1);
     periph_destroy(p);
     mem_destroy(mem);
 }
@@ -5917,6 +5991,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(wifi_mac_init_ready_handshake);
     RUN_TEST(radio_phy_calibration_register_files);
     RUN_TEST(xpt2046_pipelined_conversions);
+    RUN_TEST(xpt2046_gpio_bitbang_conversions);
     RUN_TEST(gp_spi_matrix_routing_and_hardware_cs);
     RUN_TEST(gp_spi_native_iomux_routing_and_hardware_cs);
     RUN_TEST(gp_spi_dma_descriptor_chain_and_interrupt);

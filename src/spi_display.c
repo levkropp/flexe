@@ -181,6 +181,11 @@ typedef struct {
 
     /* XPT2046 state */
     uint8_t  touch_cmd;
+    uint8_t  touch_gpio_in;
+    uint8_t  touch_gpio_in_bits;
+    uint16_t touch_gpio_out;
+    uint8_t  touch_gpio_out_bits;
+    int      touch_gpio_selected;
 
     int      dc_seen;            /* D/C pin observed high on this host */
     int      host_num;           /* 2 = HSPI, 3 = VSPI */
@@ -208,6 +213,7 @@ typedef struct {
 
 /* One instance per host controller */
 static spi_display_t g_host[2];
+static uint64_t g_touch_bitbang_commands;
 
 static int gpio_level(const spi_display_t *s, int pin) {
     if (pin < 0) return -1;
@@ -676,10 +682,10 @@ static void touch_sample(spi_display_t *s, int *rx, int *ry, int *pressed) {
 /* Fill W0.. with the XPT2046 response for the latched command.
  * Channel select bits [6:4]: 1 = Y, 5 = X, 3/4 = Z1/Z2 pressure.
  * The 12-bit result is left-justified in the 16-bit frame (<<3). */
-static void xpt2046_respond(spi_display_t *s) {
+static uint16_t xpt2046_value(spi_display_t *s, uint8_t command) {
     int rx, ry, pressed;
     touch_sample(s, &rx, &ry, &pressed);
-    int chan = (s->touch_cmd >> 4) & 0x7;
+    int chan = (command >> 4) & 0x7;
     uint16_t val = 0;
     switch (chan) {
     case 1: val = (uint16_t)ry; break;              /* 0x91: library p.x */
@@ -690,6 +696,11 @@ static void xpt2046_respond(spi_display_t *s) {
     case 4: val = pressed ? 3500 : 4095; break;  /* Z2 */
     default: val = 0; break;
     }
+    return val;
+}
+
+static void xpt2046_respond(spi_display_t *s) {
+    uint16_t val = xpt2046_value(s, s->touch_cmd);
     uint16_t frame = (uint16_t)(val << 3);
     /* Firmware reads W0 bytes [0]=hi, [1]=lo of the 16-bit frame */
     s->w[0] = (uint32_t)(((frame >> 8) & 0xFF) | ((frame & 0xFF) << 8));
@@ -1163,6 +1174,62 @@ void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx) {
     }
 }
 
+void spi_display_gpio_changed(esp32_periph_t *p, int pin, int level) {
+    /* Software SPI is a set of board wires, not a GP-SPI host. Keep one copy
+     * of its state even though the register model has an instance per host. */
+    spi_display_t *s = &g_host[0];
+    if (!p || s->periph != p || s->cfg.touch_cs_pin < 0 ||
+        s->cfg.touch_sck_pin < 0 || s->cfg.touch_mosi_pin < 0 ||
+        s->cfg.touch_miso_pin < 0)
+        return;
+
+    if (pin == s->cfg.touch_cs_pin) {
+        s->touch_gpio_selected = level == 0;
+        s->touch_gpio_in = 0;
+        s->touch_gpio_in_bits = 0;
+        s->touch_gpio_out = 0;
+        s->touch_gpio_out_bits = 0;
+        periph_gpio_set_input(p, s->cfg.touch_miso_pin, 0);
+        return;
+    }
+
+    /* XPT2046 uses SPI mode 0. The bit-banged CYD driver raises SCLK, reads
+     * MISO, then lowers it, so present the current response bit on that
+     * rising edge and sample MOSI at the same point. */
+    if (!s->touch_gpio_selected || pin != s->cfg.touch_sck_pin || level == 0)
+        return;
+
+    int miso = 0;
+    if (s->touch_gpio_out_bits != 0) {
+        miso = (s->touch_gpio_out & 0x8000u) != 0;
+        s->touch_gpio_out <<= 1;
+        s->touch_gpio_out_bits--;
+    }
+    periph_gpio_set_input(p, s->cfg.touch_miso_pin, miso);
+
+    s->touch_gpio_in = (uint8_t)((s->touch_gpio_in << 1) |
+                                 (gpio_level(s, s->cfg.touch_mosi_pin) == 1));
+    if (++s->touch_gpio_in_bits == 8) {
+        uint8_t command = s->touch_gpio_in;
+        if (command & 0x80u) {
+            uint16_t value = xpt2046_value(s, command);
+            s->touch_gpio_out = (uint16_t)(value << 3);
+            s->touch_gpio_out_bits = 16;
+            g_touch_bitbang_commands++;
+            if (spi_dbg(&spi_dbg_touch))
+                fprintf(stderr,
+                        "[TOUCH-GPIO] command=0x%02X value=%u pressed=%d\n",
+                        command, value, value != 0 && value != 4095);
+        }
+        s->touch_gpio_in = 0;
+        s->touch_gpio_in_bits = 0;
+    }
+}
+
+uint64_t spi_touch_bitbang_commands(void) {
+    return g_touch_bitbang_commands;
+}
+
 void periph_disable_spi_display(esp32_periph_t *p) {
     if (!p) return;
     for (int i = 0; i < 2; i++) {
@@ -1179,6 +1246,7 @@ void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cf
 
     periph_disable_spi_display(p);
     g_cs_seen_high = 0;
+    g_touch_bitbang_commands = 0;
     for (int i = 0; i < 2; i++) {
         spi_display_t *s = &g_host[i];
         memset(s, 0, sizeof(*s));

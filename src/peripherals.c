@@ -2936,13 +2936,15 @@ static uint32_t gpio_read(void *ctx, uint32_t addr) {
     return 0;
 }
 
-static void gpio_emit_changed(uint32_t prev, uint32_t now, int pin_base) {
+static void gpio_emit_changed(esp32_periph_t *p, uint32_t prev, uint32_t now,
+                              int pin_base) {
     uint32_t diff = prev ^ now;
     while (diff) {
         int bit = __builtin_ctz(diff);
         diff &= ~(1u << bit);
         if (gpio_dbg())
             fprintf(stderr, "[GPIO] pin%d -> %d\n", pin_base + bit, (now >> bit) & 1u);
+        spi_display_gpio_changed(p, pin_base + bit, (now >> bit) & 1u);
         sbx_event_t ev = { .kind = SBX_EV_GPIO_OUT, .cycle = 0 };
         ev.gpio_out.pin = (uint8_t)(pin_base + bit);
         ev.gpio_out.level = (now >> bit) & 1u;
@@ -3021,9 +3023,9 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t val) {
 
     /* Fire sandbox events for any output pins that changed level. */
     if (p->gpio.out != prev_out)
-        gpio_emit_changed(prev_out, p->gpio.out, 0);
+        gpio_emit_changed(p, prev_out, p->gpio.out, 0);
     if (p->gpio.out1 != prev_out1)
-        gpio_emit_changed(prev_out1, p->gpio.out1, 32);
+        gpio_emit_changed(p, prev_out1, p->gpio.out1, 32);
 }
 
 /* ---- RTC_CNTL ---- */

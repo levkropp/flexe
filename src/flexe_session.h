@@ -63,6 +63,8 @@ typedef struct {
     int         spi_display_sck_pin;
     int         spi_touch_cs_pin;
     int         spi_touch_sck_pin;
+    int         spi_touch_mosi_pin;
+    int         spi_touch_miso_pin;
     int         spi_touch_irq_pin;
     int         spi_sd_cs_pin;
     int         spi_sd_sck_pin;

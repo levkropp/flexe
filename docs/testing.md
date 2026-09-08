@@ -65,6 +65,7 @@ directory and removed after its gate finishes.
 The curated scenarios require external images:
 
 ```sh
+BRUCE_BIN=/path/to/bruce.bin \
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
 ./scripts/check-stock-roms.sh

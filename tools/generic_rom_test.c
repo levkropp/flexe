@@ -271,6 +271,8 @@ int main(int argc, char **argv)
         .spi_display_sck_pin = -1,
         .spi_touch_cs_pin = -1,
         .spi_touch_sck_pin = -1,
+        .spi_touch_mosi_pin = -1,
+        .spi_touch_miso_pin = -1,
         .spi_touch_irq_pin = -1,
         .spi_sd_cs_pin = -1,
         .spi_sd_sck_pin = -1,

@@ -197,6 +197,8 @@ static int session_build(flexe_session_t *s)
             .display_sck_pin = cfg->spi_display_sck_pin ? cfg->spi_display_sck_pin : 14,
             .touch_cs_pin   = cfg->spi_touch_cs_pin   ? cfg->spi_touch_cs_pin   : 33,
             .touch_sck_pin  = cfg->spi_touch_sck_pin  ? cfg->spi_touch_sck_pin  : 25,
+            .touch_mosi_pin = cfg->spi_touch_mosi_pin ? cfg->spi_touch_mosi_pin : 32,
+            .touch_miso_pin = cfg->spi_touch_miso_pin ? cfg->spi_touch_miso_pin : 39,
             .sd_cs_pin      = cfg->spi_sd_cs_pin      ? cfg->spi_sd_cs_pin      : 5,
             .sd_sck_pin     = cfg->spi_sd_sck_pin     ? cfg->spi_sd_sck_pin     : 18,
             .sdcard_path    = cfg->sdcard_path,
