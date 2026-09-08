@@ -351,6 +351,15 @@ static inline void emit_test_reg32(emit_t *e, int a, int b) {
     emit8(e, modrm(3, b, a));
 }
 
+/* test reg64, reg64 -- used for host-pointer null checks after a page-table
+ * lookup.  Keep the 64-bit form distinct: testing only the low word can
+ * misclassify a valid pointer whose low 32 bits happen to be zero. */
+static inline void emit_test_reg64(emit_t *e, int a, int b) {
+    emit_rex_w(e, b, a);
+    emit8(e, 0x85);
+    emit8(e, modrm(3, b, a));
+}
+
 /* ===== ALU reg,imm32 ===== */
 
 /* add reg32, imm32 */
