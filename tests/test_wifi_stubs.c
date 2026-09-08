@@ -17,6 +17,8 @@
 #define TEST_WIFI_RAW_TX_ADDR        0x401A55CCu
 #define TEST_PROMISC_PACKET_ADDR     0x50001D00u
 #define TEST_PROMISC_RX_CTRL_SIZE    28u
+#define TEST_NERDMINER_ENTRY         0x40089268u
+#define TEST_NERDMINER_DNS           0x401216E8u
 #define TEST_WLED_ENTRY              0x40083E68u
 #define TEST_WLED_EVENT_REGISTER     0x40150E34u
 #define TEST_WLED_EVENT_POST         0x40151768u
@@ -245,6 +247,38 @@ TEST(raw_tx_crosses_host_radio_boundary) {
     wifi_stubs_get_stats(wifi, &stats);
     ASSERT_EQ64(stats.raw_tx_failures, 1);
     ASSERT_EQ64(capture.calls, 1);
+
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(dns_override_applies_to_raw_lwip_dns_api) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    const uint32_t name_addr = 0x3FFB1000u;
+    const uint32_t result_addr = 0x3FFB1100u;
+    static const char hostname[] = "must-not-resolve.invalid";
+    static const uint8_t loopback_bytes[] = {127u, 0u, 0u, 1u};
+    uint32_t loopback = 0;
+
+    memcpy(&loopback, loopback_bytes, sizeof(loopback));
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_NERDMINER_ENTRY), 31);
+    wifi_stubs_set_dns_override(wifi, loopback);
+    put_test_bytes(&cpu, name_addr, (const uint8_t *)hostname,
+                   sizeof(hostname));
+    mem_write32(cpu.mem, result_addr, 0xA5A5A5A5u);
+
+    invoke_wifi_call0_4(&cpu, TEST_NERDMINER_DNS, name_addr, result_addr,
+                        0u, 0u);
+
+    ASSERT_EQ(ar_read(&cpu, 2), 0u); /* lwIP ERR_OK */
+    ASSERT_EQ(mem_read32(cpu.mem, result_addr), loopback);
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.dns_calls, 1u);
 
     wifi_stubs_destroy(wifi);
     rom_stubs_destroy(rom);
@@ -482,6 +516,7 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);
     RUN_TEST(raw_tx_crosses_host_radio_boundary);
+    RUN_TEST(dns_override_applies_to_raw_lwip_dns_api);
     RUN_TEST(v11423_fingerprint_selects_shifted_wifi_entries);
     RUN_TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries);
     RUN_TEST(wled_posts_disconnect_on_native_event_loop);

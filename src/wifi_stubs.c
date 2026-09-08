@@ -817,21 +817,25 @@ static void stub_dns_gethostbyname(xtensa_cpu_t *cpu, void *ctx)
 
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
-    int err = getaddrinfo(hostname, NULL, &hints, &res);
-    if (err != 0 || !res) {
+    uint32_t ip = ws->dns_override;
+    int err = ip ? 0 : getaddrinfo(hostname, NULL, &hints, &res);
+    if (!ip && (err != 0 || !res)) {
         wifi_log(ws, "DNS failed for %s: %s\n", hostname,
                 gai_strerror(err));
         ws_return(cpu, (uint32_t)ERR_VAL);
         return;
     }
 
-    struct sockaddr_in *resolved = (struct sockaddr_in *)res->ai_addr;
-    uint32_t ip = resolved->sin_addr.s_addr;
-
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &resolved->sin_addr, ip_str, sizeof(ip_str));
-    wifi_log(ws, "DNS: %s → %s\n", hostname, ip_str);
-    freeaddrinfo(res);
+    if (ip) {
+        wifi_log(ws, "DNS: %s → override\n", hostname);
+    } else {
+        struct sockaddr_in *resolved = (struct sockaddr_in *)res->ai_addr;
+        ip = resolved->sin_addr.s_addr;
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &resolved->sin_addr, ip_str, sizeof(ip_str));
+        wifi_log(ws, "DNS: %s → %s\n", hostname, ip_str);
+        freeaddrinfo(res);
+    }
 
     /* Write IP to ip_addr_t in emulator memory */
     if (addr_ptr)
