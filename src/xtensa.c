@@ -2570,7 +2570,7 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                * the fallthrough is not a guest control-flow edge and must not
                * invoke firmware observers registered at the post-ENTRY PC. */
               if (__builtin_expect(cpu->accelerated_blocks, 0))
-                  cpu->jit_entry_fallthrough = true;
+                  cpu->jit_fallthrough_dispatch = true;
           } break;
           case 1: /* B1: BF, BT, LOOP, LOOPNEZ, LOOPGTZ */
               switch (r) {
@@ -2616,6 +2616,15 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                           cpu->lcount = ar_read(cpu, s) - 1;
                       }
                   }
+                  /* LOOP is an interpreter-only context setter. Once it has
+                   * entered the body, give an already-compiled LBEG block a
+                   * chance to run on the first iteration instead of waiting
+                   * for the first architectural back-edge. A skipped
+                   * LOOPNEZ/LOOPGTZ wrote PC and already has a real dispatch
+                   * boundary, so it must not acquire the private marker. */
+                  if (__builtin_expect(cpu->accelerated_blocks, 0) &&
+                      !cpu->_pc_written)
+                      cpu->jit_fallthrough_dispatch = true;
                   break;
               }
               default: break;
@@ -2965,13 +2974,13 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
      * trap so a hook at 0x00000000 can turn callxN-through-NULL into
      * a benign return-0 (symbol-less firmware driver tables).
      *
-     * ENTRY is the one straight-line accelerator boundary: it changes the
-     * register-window identity used by JIT cache keys. Its transient marker
-     * lets jit_pc_hook dispatch the callee body without presenting a second
-     * call to ordinary firmware observers at that same address. */
-    const bool entry_fallthrough =
-        __builtin_expect(cpu->jit_entry_fallthrough != 0, 0);
-    const bool dispatch_boundary = cpu->_pc_written || entry_fallthrough;
+     * Some interpreter-only context setters need a private accelerator
+     * boundary on their fallthrough. The transient marker lets jit_pc_hook
+     * dispatch a compatible block without presenting a second call to
+     * ordinary firmware observers at that same address. */
+    const bool accelerator_fallthrough =
+        __builtin_expect(cpu->jit_fallthrough_dispatch != 0, 0);
+    const bool dispatch_boundary = cpu->_pc_written || accelerator_fallthrough;
     if (__builtin_expect(dispatch_boundary, 0)) {
         cpu->br_ring[cpu->br_ring_idx & (XT_BR_RING_SIZE - 1)] = cpu->pc;
         cpu->br_ring_idx++;
@@ -2985,7 +2994,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
         int hook_insns = cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx);
-        cpu->jit_entry_fallthrough = false;
+        cpu->jit_fallthrough_dispatch = false;
         if (hook_insns) {
             /* Native hooks may account a whole block, while time-oriented
              * stubs may fast-forward cycle_count.  Pull that advancement
@@ -3009,7 +3018,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
             return cpu->exception ? -1 : (hook_insns > 1 ? hook_insns : 0);
         }
     }
-    cpu->jit_entry_fallthrough = false;
+    cpu->jit_fallthrough_dispatch = false;
 
     /* Invalid PC trap. Slow-path body lives in a noinline helper so
      * the hot-path branch is just a single range compare. */

@@ -268,12 +268,13 @@ struct xtensa_cpu {
      * overwrite the neighbouring irq_check and silently drop a pending
      * interrupt check on every block exit. */
     uint32_t _pc_written;
-    /* Set after an interpreted ENTRY rotates the architectural register
-     * window. The next instruction is a private accelerator dispatch
-     * boundary, not a guest control-flow edge: jit_pc_hook may enter a block
-     * compiled for the new window, but must not forward the boundary to
-     * firmware/ROM observers. Consumed by xtensa_step_impl(). */
-    uint32_t jit_entry_fallthrough;
+    /* Set after an interpreted instruction changes accelerator context while
+     * falling through (currently ENTRY and an entered LOOP). The next
+     * instruction is a private accelerator dispatch boundary, not a guest
+     * control-flow edge: jit_pc_hook may enter a compatible block, but must
+     * not forward the boundary to firmware/ROM observers. Consumed by
+     * xtensa_step_impl(). */
+    uint32_t jit_fallthrough_dispatch;
     /* Set by a JIT block whose scan was truncated at LEND, to tell its
      * fall-through exit (a genuine loop back-edge) from a side exit that
      * merely branches to LEND. Consumed and cleared by jit_pc_hook(). */

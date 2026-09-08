@@ -1112,6 +1112,55 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     teardown(&cpu);
 }
 
+/* LOOP itself remains interpreted because it establishes LBEG/LEND/LCOUNT,
+ * but that must not strand its first body iteration in the interpreter. A
+ * one-iteration loop has no back-edge at all, making it an exact regression
+ * test for the private fallthrough dispatch boundary. */
+TEST(test_jit_loop_fallthrough_dispatches_first_body) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    const uint32_t lbeg = BASE + 3u;
+    const uint32_t lend = lbeg + 2u;
+    const uint32_t done = lend + 7u;
+    put_insn3(&cpu, BASE, (uint32_t)0x76u | ((uint32_t)((8 << 4) | 3) << 8) |
+                          ((lend - (BASE + 4u)) << 16));
+    put_insn2(&cpu, lbeg, narrow(0xB, 4, 4, 1));  /* ADDI.N a4, a4, 1 */
+    /* J done: target = instruction PC + sign_extend(offset18) + 4. */
+    uint32_t jump_offset = (done - (lend + 4u)) & 0x3FFFFu;
+    put_insn3(&cpu, lend, (jump_offset << 6) | 6u);
+    put_insn2(&cpu, done, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    ar_write(&cpu, 3, 1);  /* exactly one loop iteration */
+    ar_write(&cpu, 4, 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);  /* interpreted LOOP */
+    ASSERT_EQ(cpu.pc, lbeg);
+    ASSERT_EQ(cpu.lcount, 0u);
+    ASSERT_TRUE(cpu.jit_fallthrough_dispatch);
+
+    /* The one-iteration form has LCOUNT=0, so compile the same non-loop
+     * variant jit_pc_hook will look up when it consumes the marker. */
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, lbeg);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, lbeg) != NULL);
+
+    uint64_t jitted_before = jit_get_stats(jit)->insns_jitted;
+    ASSERT_EQ(xtensa_run(&cpu, 2), 2);
+    ASSERT_EQ(ar_read(&cpu, 4), 1u);
+    ASSERT_EQ(cpu.pc, done);
+    ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - jitted_before, 2u);
+    ASSERT_FALSE(cpu.jit_fallthrough_dispatch);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 /* The same flush obligation, but with the branch *before* the registers it
  * has to write back -- which is the case the obvious test misses.
  *
@@ -2301,7 +2350,7 @@ TEST(test_jit_entry_fallthrough_does_not_repeat_original_hook) {
     ASSERT_EQ(xtensa_run(&cpu, 2), 2);
     ASSERT_EQ(spy.calls, 1);
     ASSERT_EQ(spy.last_pc, BASE);
-    ASSERT_FALSE(cpu.jit_entry_fallthrough);
+    ASSERT_FALSE(cpu.jit_fallthrough_dispatch);
 
     jit_destroy(jit);
     free(hook_bitmap);
@@ -2585,6 +2634,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_contended_spinlock_returns_to_scheduler);
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
+    RUN_TEST(test_jit_loop_fallthrough_dispatches_first_body);
     RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);
     RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
     RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);

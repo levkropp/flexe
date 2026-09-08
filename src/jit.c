@@ -3741,14 +3741,14 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
  * Flow: check JIT hash → if hit, run block; if miss, forward to ROM stubs. */
 static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     jit_state_t *jit = ctx;
-    const bool entry_fallthrough = cpu->jit_entry_fallthrough != 0;
+    const bool accelerator_fallthrough = cpu->jit_fallthrough_dispatch != 0;
     jit->stats.hook_calls++;
 
     /* Inside a verification re-run: the interpreter is the reference, so it
      * must not dispatch back into the code being checked. ROM stubs stay
      * live -- they are part of the semantics being compared. */
     if (__builtin_expect(jit->verify_active, 0)) {
-        if (jit->original_hook && !entry_fallthrough) {
+        if (jit->original_hook && !accelerator_fallthrough) {
             /* Only a stub that actually handled the call counts. The hook
              * fires at every bitmap-marked PC, and the bitmap is the merged
              * one, so most of those dispatches are just JIT block entries
@@ -3763,7 +3763,7 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     /* Skip JIT lookup for ROM range (0x40000000-0x4006FFFF) — always stubs.
      * This avoids a hash table access for the ~35M stub calls per 100M cycles. */
     if (__builtin_expect(pc < 0x40070000u, 0)) {
-        if (jit->original_hook && !entry_fallthrough)
+        if (jit->original_hook && !accelerator_fallthrough)
             return jit->original_hook(cpu, pc, jit->original_hook_ctx);
         return 0;
     }
@@ -3841,11 +3841,11 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
         }
     }
 
-    /* ENTRY fallthrough is an internal JIT dispatch point, not an
+    /* Accelerator fallthrough is an internal dispatch point, not an
      * architectural branch/call. A firmware observer may intentionally be
-     * registered both on ENTRY and its first body instruction; forwarding
-     * here would invoke it twice, after the register window has rotated. */
-    if (jit->original_hook && !entry_fallthrough) {
+     * registered at both sides of the split; forwarding here would present
+     * an extra edge that the guest never took. */
+    if (jit->original_hook && !accelerator_fallthrough) {
         return jit->original_hook(cpu, pc, jit->original_hook_ctx);
     }
 
