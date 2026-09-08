@@ -109,11 +109,8 @@ static int compare_state(const xtensa_cpu_t *a, const xtensa_cpu_t *b,
 /* Run a block: first via interpreter, then via JIT, compare results */
 static void test_block_differential(xtensa_cpu_t *template_cpu, int num_insns,
                                     const char *test_name) {
-    /* The production JIT deliberately rejects blocks shorter than two
-     * instructions because dispatch overhead would dominate.  Most of
-     * these differential cases isolate one instruction, so pad their
-     * straight-line tail with NOP.N instead of silently treating a refused
-     * compilation as a passing test. */
+    /* Give isolated non-terminating instructions an explicit fallthrough and
+     * exercise register allocation across more than one instruction. */
     uint32_t pad_pc = template_cpu->pc;
     for (int i = 0; i < num_insns; i++) {
         uint32_t insn;
@@ -541,8 +538,8 @@ static void ldst_program(xtensa_cpu_t *cpu, unsigned subop, int treg,
     put_insn3(cpu, BASE, (uint32_t)(((unsigned)treg << 4) | 2u) |
                          ((uint32_t)(((subop & 0xFu) << 4) |
                                      ((unsigned)sreg & 0xFu)) << 8));
-    /* Keep the memory differential case comfortably above the standalone
-     * block profitability floor. */
+    /* Keep the memory differential case multi-instruction so it also checks
+     * register allocation across adjacent operations. */
     put_insn2(cpu, BASE + 3u, narrow(0xD, 15, 0, 3));
     put_insn2(cpu, BASE + 5u, narrow(0xD, 15, 0, 3));
     put_insn2(cpu, BASE + 7u, narrow(0xD, 15, 0, 3));
@@ -818,7 +815,7 @@ TEST(test_jit_hash_collision_uses_free_way) {
     teardown(&cpu);
 }
 
-TEST(test_jit_one_instruction_straight_line_is_too_short) {
+TEST(test_jit_one_instruction_straight_line_compiles_when_hot) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     put_insn2(&cpu, BASE,     narrow(0xD, 15, 0, 3)); /* NOP.N */
@@ -826,9 +823,10 @@ TEST(test_jit_one_instruction_straight_line_is_too_short) {
 
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
-    for (int i = 0; i <= JIT_HOT_THRESHOLD; i++)
+    for (int i = 0; i < JIT_HOT_THRESHOLD - 1; i++)
         ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) == NULL);
-    ASSERT_EQ(jit_get_stats(jit)->blocks_compiled, 0u);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+    ASSERT_EQ(jit_get_stats(jit)->blocks_compiled, 1u);
 
     jit_destroy(jit);
     teardown(&cpu);
@@ -841,11 +839,9 @@ TEST(test_jit_single_instruction_chain_target_is_native) {
     const uint32_t source = BASE + 0x40u;
     const uint32_t return_pc = BASE + 0x100u;
 
-    /* A lone RET is normally too small to compile. Mark it cold first, then
-     * compile a backward predecessor: the pending native chain makes even a
-     * one-instruction target profitable because it shares the predecessor's
-     * prologue and dispatcher entry. This is the shape of the ENTRY/RETW
-     * fragments at the top of WLED's remaining interpreter profile. */
+    /* Compile a backward predecessor before the lone RET becomes hot. Static
+     * descent must still compile and chain the one-instruction target without
+     * waiting for a separate dispatcher threshold. */
     put_insn2(&cpu, target, narrow(0xD, 15, 0, 0)); /* RET.N */
     put_insn2(&cpu, source,      narrow(0xD, 15, 0, 3));
     put_insn2(&cpu, source + 2u, narrow(0xD, 15, 0, 3));
@@ -857,9 +853,6 @@ TEST(test_jit_single_instruction_chain_target_is_native) {
 
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
-    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
-        ASSERT_TRUE(jit_get_block(jit, &cpu, target) == NULL);
-
     for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
         (void)jit_get_block(jit, &cpu, source);
     jit_block_fn fn = jit_get_block(jit, &cpu, source);
@@ -1051,8 +1044,7 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     xtensa_cpu_t cpu;
     setup(&cpu);
 
-    /* LOOP a3, lend ; body ; (lend) — op0=6, t=7 (n=3,m=1), r=8 selects LOOP.
-     * Body is five instructions so it clears the four-instruction floor. */
+    /* LOOP a3, lend ; body ; (lend) — op0=6, t=7 (n=3,m=1), r=8 selects LOOP. */
     const uint32_t lbeg = BASE + 3u;
     const uint32_t lend = lbeg + 10u;
     put_insn3(&cpu, BASE, (uint32_t)0x76u | ((uint32_t)((8 << 4) | 3) << 8) |
@@ -2586,7 +2578,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_hash_collision_uses_free_way);
-    RUN_TEST(test_jit_one_instruction_straight_line_is_too_short);
+    RUN_TEST(test_jit_one_instruction_straight_line_compiles_when_hot);
     RUN_TEST(test_jit_single_instruction_chain_target_is_native);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);

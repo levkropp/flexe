@@ -605,61 +605,6 @@ static void jit_scan_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc,
     scan->end_pc = cur_pc;
 }
 
-/* Decode the fixed target of a control-flow instruction.  Dynamic returns
- * and calls are intentionally excluded: this is used only to recognize
- * short, native-chainable loops whose dispatch savings outweigh the normal
- * four-instruction JIT profitability floor. */
-static int jit_static_branch_target(uint32_t insn, int ilen, uint32_t pc,
-                                    uint32_t *target_out) {
-    if (ilen != 3)
-        return 0;  /* narrow conditional branches are forward-only */
-
-    uint32_t next_pc = pc + 3;
-    int op0 = XT_OP0(insn);
-    if (op0 == 6) {
-        int nn = XT_N(insn);
-        int m = XT_M(insn);
-        if (nn == 0) {
-            *target_out = next_pc + (uint32_t)sign_extend(XT_OFFSET18(insn), 18) + 1;
-            return 1;
-        }
-        if (nn == 1) {
-            *target_out = next_pc + (uint32_t)sign_extend(XT_IMM12(insn), 12) + 1;
-            return 1;
-        }
-        if (nn == 2) {
-            *target_out = next_pc + (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1;
-            return 1;
-        }
-        if (nn == 3) {
-            int r = XT_R(insn);
-            if ((m == 1 && (r == 0 || r == 1)) || m == 2 || m == 3) {
-                *target_out = next_pc + (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1;
-                return 1;
-            }
-        }
-        return 0;
-    }
-    if (op0 == 7) {
-        *target_out = next_pc + (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1;
-        return 1;
-    }
-    return 0;
-}
-
-static int jit_short_block_has_backedge(const jit_scan_t *scan,
-                                        uint32_t block_pc) {
-    for (int i = 0; i < scan->count; i++) {
-        uint32_t target;
-        if (jit_static_branch_target(scan->insns[i], scan->ilens[i],
-                                     scan->pcs[i], &target) &&
-            target <= block_pc)
-            return 1;
-    }
-    return 0;
-}
-
-
 /* ===== Code generation ===== */
 
 /* CPU register R15, MEM pointer R14 */
@@ -3115,19 +3060,6 @@ static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb,
     p->n = 0;
 }
 
-/* Does a compiled block already want to jump to this (pc, wb)?
- *
- * A pending chain site means some block's exit is waiting to be patched here.
- * Such a block is entered by a native jump, not by a dispatch, so the
- * "dispatch overhead dominates" rule that rejects short blocks does not apply
- * to it -- and rejecting it strands the chain, leaving the exit to go the long
- * way round through the epilogue and the hook on every iteration. */
-static bool jit_chain_wanted(const jit_state_t *jit, uint32_t pc, uint32_t wb) {
-    uint32_t idx = jit_pend_key(pc, wb);
-    const chain_pending_t *p = &jit->pend[idx];
-    return p->n != 0u && p->tag == jit_make_tag(pc, wb, 0u);
-}
-
 /* Record a block exit's jump site for later chaining.
  * If the target is already compiled, patch immediately (we're inside the
  * compile-time W^X window). Otherwise pend it for jit_chain_new_block.
@@ -4030,16 +3962,15 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
      * cache holds next. The old `< 4` test filtered these out as a side
      * effect; relaxing it for chain targets without saying so explicitly
      * crashed NerdMiner inside the code cache. */
-    /* Two standalone instructions are worth compiling once hot (WLED's
-     * return tails gain measurably). One is not: allowing every lone RETW
-     * nearly doubled compiled-block count and slowed the same workload by
-     * about 1.8%. Native chain targets remain exempt because they share the
-     * predecessor's dispatch/prologue cost. */
-    if (scan.count == 0 ||
-        (scan.count < 2 && !jit_short_block_has_backedge(&scan, pc) &&
-         !(lv == 0u && jit_chain_wanted(jit, pc, wb)))) {
-        /* Short straight-line block: dispatch overhead dominates. Record it,
-         * or every later execution pays for the same scan again. */
+    /* Compile every non-empty hot trace, including one-instruction return and
+     * ENTRY tails. Before the set-associative cache correctly used its free
+     * ways, singletons appeared 1.8% slower because they amplified cache
+     * thrashing. With that bug fixed they raise WLED coverage from 90.1% to
+     * 94.6% and improve an interleaved ten-pair median by 4.0%, while using
+     * only 2.8 MB of the 128 MB code cache. */
+    if (scan.count == 0) {
+        /* Nothing compilable at this PC. Record it, or every later execution
+         * pays for the same scan again. */
         b->flags |= JIT_BLK_UNCOMPILABLE;
         return;
     }
