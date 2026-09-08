@@ -4026,8 +4026,13 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
      * cache holds next. The old `< 4` test filtered these out as a side
      * effect; relaxing it for chain targets without saying so explicitly
      * crashed NerdMiner inside the code cache. */
+    /* Two standalone instructions are worth compiling once hot (WLED's
+     * return tails gain measurably). One is not: allowing every lone RETW
+     * nearly doubled compiled-block count and slowed the same workload by
+     * about 1.8%. Native chain targets remain exempt because they share the
+     * predecessor's dispatch/prologue cost. */
     if (scan.count == 0 ||
-        (scan.count < 3 && !jit_short_block_has_backedge(&scan, pc) &&
+        (scan.count < 2 && !jit_short_block_has_backedge(&scan, pc) &&
          !(lv == 0u && jit_chain_wanted(jit, pc, wb)))) {
         /* Short straight-line block: dispatch overhead dominates. Record it,
          * or every later execution pays for the same scan again. */

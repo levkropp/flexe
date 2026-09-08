@@ -109,7 +109,7 @@ static int compare_state(const xtensa_cpu_t *a, const xtensa_cpu_t *b,
 /* Run a block: first via interpreter, then via JIT, compare results */
 static void test_block_differential(xtensa_cpu_t *template_cpu, int num_insns,
                                     const char *test_name) {
-    /* The production JIT deliberately rejects blocks shorter than three
+    /* The production JIT deliberately rejects blocks shorter than two
      * instructions because dispatch overhead would dominate.  Most of
      * these differential cases isolate one instruction, so pad their
      * straight-line tail with NOP.N instead of silently treating a refused
@@ -122,7 +122,7 @@ static void test_block_differential(xtensa_cpu_t *template_cpu, int num_insns,
         pad_pc += (uint32_t)ilen;
     }
     int padded_insns = num_insns;
-    while (padded_insns < 3) {
+    while (padded_insns < 2) {
         put_insn2(template_cpu, pad_pc, narrow(0xD, 15, 0, 3));
         pad_pc += 2;
         padded_insns++;
@@ -764,10 +764,9 @@ TEST(test_jit_verify_keeps_cross_block_chains_disabled) {
 TEST(test_jit_hot_threshold) {
     xtensa_cpu_t cpu;
     setup(&cpu);
-    /* Three instructions are the minimum profitable standalone block. */
+    /* Two instructions are the minimum profitable standalone block. */
     put_insn2(&cpu, BASE,     narrow(0xD, 15, 0, 3)); /* NOP.N */
     put_insn2(&cpu, BASE + 2, narrow(0xD, 15, 0, 3)); /* NOP.N */
-    put_insn2(&cpu, BASE + 4, narrow(0xD, 15, 0, 3)); /* NOP.N */
 
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -787,12 +786,11 @@ TEST(test_jit_hot_threshold) {
     teardown(&cpu);
 }
 
-TEST(test_jit_two_instruction_straight_line_is_too_short) {
+TEST(test_jit_one_instruction_straight_line_is_too_short) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     put_insn2(&cpu, BASE,     narrow(0xD, 15, 0, 3)); /* NOP.N */
-    put_insn2(&cpu, BASE + 2, narrow(0xD, 15, 0, 3)); /* NOP.N */
-    put_insn2(&cpu, BASE + 4, narrow(0xD, 15, 0, 2)); /* ILL.N ends scan */
+    put_insn2(&cpu, BASE + 2, narrow(0xD, 15, 0, 2)); /* ILL.N ends scan */
 
     jit_state_t *jit = jit_init();
     ASSERT_TRUE(jit != NULL);
@@ -2555,7 +2553,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_verify_toggle_recompiles_blocks);
     RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
     RUN_TEST(test_jit_hot_threshold);
-    RUN_TEST(test_jit_two_instruction_straight_line_is_too_short);
+    RUN_TEST(test_jit_one_instruction_straight_line_is_too_short);
     RUN_TEST(test_jit_single_instruction_chain_target_is_native);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);
