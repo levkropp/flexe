@@ -2742,12 +2742,43 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 emit_or_reg32(e, RAX, RCX);
                 emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
 
-                /* Exit to pc+3 (ENTRY is always 3 bytes) — no dirty flush needed (done above) */
+                /* Exit to pc+3 (ENTRY is always 3 bytes) — no dirty flush needed (done above). */
                 emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc + 3);
                 emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
                 emit_acc_add(e, insn_idx + 1);
-                /* No chain slot: the target wb depends on runtime CALLINC. */
+
+                /* ENTRY's target PC is static even though its destination
+                 * window is not.  Returning to the C dispatcher here made
+                 * every windowed function pay a second lookup immediately
+                 * after its CALL: once for the ENTRY block and once for the
+                 * callee body.  There are only four possible CALLINC values,
+                 * so select one of four ordinary chain sites using the
+                 * new window we already computed in RDX.  An unavailable
+                 * target still jumps to the epilogue exactly as before and
+                 * is patched when that (PC, WB) block later compiles.
+                 *
+                 * Keep the selection after publishing PC, WINDOWBASE and
+                 * WINDOWSTART.  A chained target enters past its prologue
+                 * but still runs its window-collision and chain-cap guards,
+                 * all of which consume that architectural state. */
+                int entry_wb_path[3];
+                uint32_t old_wb = (uint32_t)wb4 >> 2;
+                for (uint32_t ci = 0; ci < 3; ci++) {
+                    emit_cmp_reg32_imm32(e, RDX,
+                                         (int32_t)((old_wb + ci) & 15u));
+                    entry_wb_path[ci] = emit_jcc_rel32(e, CC_E);
+                }
+                uint8_t *entry_chain_site = e->ptr;
                 emit_jmp_to_epilogue(e, jit);
+                jit_chain_record(jit, pc + 3, (old_wb + 3u) & 15u,
+                                 entry_chain_site);
+                for (uint32_t ci = 0; ci < 3; ci++) {
+                    emit_patch_rel32(e, entry_wb_path[ci]);
+                    entry_chain_site = e->ptr;
+                    emit_jmp_to_epilogue(e, jit);
+                    jit_chain_record(jit, pc + 3, (old_wb + ci) & 15u,
+                                     entry_chain_site);
+                }
 
                 /* Overflow fallback: interpreter handles it */
                 for (int i = 0; i < overflow_fb_count; i++)

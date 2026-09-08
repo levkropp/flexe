@@ -2405,6 +2405,56 @@ TEST(test_jit_entry_dispatches_compiled_callee_body) {
     teardown(&cpu);
 }
 
+TEST(test_jit_entry_chains_to_runtime_window) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ps = 0;
+    cpu.windowbase = 14;
+    cpu.windowstart = 1u << 14;
+    ar_write(&cpu, 1, DATA_BASE + 0x400u);
+    put_insn3(&cpu, BASE, jit_entry_insn(1, 32));
+    for (unsigned i = 0; i < 4; i++)
+        put_insn2(&cpu, BASE + 3u + i * 2u,
+                  narrow(0xD, 15, 0, 3));  /* NOP.N */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    /* Precompile the body under all four windows ENTRY can select, including
+     * wraparound, then compile ENTRY under its caller window. */
+    for (uint32_t ci = 0; ci < 4; ci++) {
+        cpu.windowbase = (14u + ci) & 15u;
+        for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+            (void)jit_get_block(jit, &cpu, BASE + 3u);
+        ASSERT_TRUE(jit_get_block(jit, &cpu, BASE + 3u) != NULL);
+    }
+    cpu.windowbase = 14;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    for (uint32_t ci = 0; ci < 4; ci++) {
+        cpu.ps = ci << 16;
+        cpu.windowbase = 14;
+        cpu.windowstart = 1u << 14;
+        ar_write(&cpu, 1, DATA_BASE + 0x400u);
+        cpu.pc = BASE;
+        cpu._pc_written = true;
+        cpu.running = true;
+        uint64_t hooks_before = jit_get_stats(jit)->hook_calls;
+        uint64_t insns_before = jit_get_stats(jit)->insns_jitted;
+        ASSERT_EQ(xtensa_run(&cpu, 5), 5);
+        ASSERT_EQ(cpu.windowbase, (14u + ci) & 15u);
+        ASSERT_EQ(cpu.pc, BASE + 11u);
+        ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - insns_before, 5u);
+        ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
+    }
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_rotw_flushes_old_mapping_and_wraps) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2895,6 +2945,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_wsr_ps_exits_before_pending_irq);
     RUN_TEST(test_jit_rur_wur_user_registers);
     RUN_TEST(test_jit_entry_dispatches_compiled_callee_body);
+    RUN_TEST(test_jit_entry_chains_to_runtime_window);
     RUN_TEST(test_jit_rotw_flushes_old_mapping_and_wraps);
     RUN_TEST(test_jit_rotw_legacy_without_woe_is_native);
     RUN_TEST(test_jit_rotw_legacy_woe_falls_back);

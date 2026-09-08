@@ -36,7 +36,7 @@ MAX_UNMAPPED=0 CYCLES=600000000 REPS=5 \
 | NerdMiner 1.8.3 | 6.01x | 10.68x | 90,590,628 | 578 |
 | openHASP 0.7.0-rc13 | 3.27x | 7.28x | 152,525,440 | 6,411 |
 | Tasmota 15.6.0 | 2.61x | 7.81x | 211,069,333 | 449 |
-| WLED 16.0.1 | 1.00x | 2.00x | 472,881,376 | 5 |
+| WLED 16.0.1 | 1.00x | 2.23x | 472,857,423 | 5 |
 
 Both engines passed the generic progress gate and produced the same UART digest
 for every image. All five clear real time under the JIT; WLED is deliberately
@@ -92,7 +92,7 @@ and `MAX_UNMAPPED` override its 10,000-instruction scheduling quantum and
 ## JIT coverage
 
 The WLED run above executes 96.6% of retired instructions in native blocks,
-averaging 11.5 guest instructions per JIT entry. Coverage is workload-specific
+averaging 18.4 guest instructions per JIT entry. Coverage is workload-specific
 and is not a speed score. Here the extra coverage is also a measured speed win:
 after the block cache stopped thrashing, compiling hot one-instruction tails
 improved median WLED wall time by 4.0% in an interleaved ten-pair A/B. Giving
@@ -103,7 +103,11 @@ further ten-pair A/Bs improved median wall time by 2.8% and 1.2% respectively.
 Compiling `ROTW` and preserving an eager chain patch when its target already
 exists then raised coverage to 96.6%, cut hook calls from 57.6 million to 43.5
 million, and improved median wall time by 12.1% and 13.5% in two more ten-pair
-A/Bs.
+A/Bs. Finally, selecting a native successor for `ENTRY`'s four possible
+runtime windows kept the same coverage while cutting C block dispatches from
+39.8 million to 24.8 million and hook calls from 43.5 million to 28.4 million.
+An interleaved ten-pair A/B reduced median WLED wall time from 1.147 seconds to
+0.955 seconds, a 20.0% throughput improvement.
 
 ## Profiling
 
