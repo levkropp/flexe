@@ -23,6 +23,7 @@ extern int g_dbg_c1ilog;
 extern uint32_t g_dbg_watch_addr;
 extern uint32_t g_dbg_watch_addr2;
 extern uint32_t g_dbg_watch_val;
+static int g_dbg_wvlog;
 #define WINLOG(cpu, fmt, ...) do { if (g_dbg_winlog) \
     fprintf(stderr, "[W%d] %s pc=0x%08X wb=%d ws=%04X " fmt, \
             (cpu)->core_id, __func__, (cpu)->pc, (cpu)->windowbase, \
@@ -549,7 +550,7 @@ static inline bool window_vectors_ready(const xtensa_cpu_t *cpu,
 
 static void raise_window_exception(xtensa_cpu_t *cpu, uint32_t fault_pc,
                                    int handler_wb, uint32_t vecofs) {
-    if (getenv("FLEXE_WVDBG")) {
+    if (__builtin_expect(g_dbg_wvlog, 0)) {
         static int n;
         if (n++ < 12)
             fprintf(stderr, "[wv] +0x%03X wb=%d->%d ws=%04X a0=%08X a1=%08X "
@@ -795,11 +796,15 @@ static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
     if (__builtin_expect((rot & 7u) == 0u, 1))
         return false;
 
-    unsigned need = window_operand_need(cpu, insn, ilen);
-    if (need == 0u || (rot & ((1u << need) - 1u)) == 0u)
+    /* Exception handlers run with EXCM set and cannot take a nested window
+     * fault.  Reject that state before decoding the instruction's register
+     * operands; window spill/fill handlers otherwise pay the full decoder on
+     * every one of their own loads and stores. */
+    if (!XT_PS_WOE(cpu->ps) || XT_PS_EXCM(cpu->ps))
         return false;
 
-    if (!XT_PS_WOE(cpu->ps) || XT_PS_EXCM(cpu->ps))
+    unsigned need = window_operand_need(cpu, insn, ilen);
+    if (need == 0u || (rot & ((1u << need) - 1u)) == 0u)
         return false;
     int j = (rot & 1u) ? 1 : ((rot & 2u) ? 2 : 3);
     int w = (cpu->windowbase + j) & 0xF;
@@ -2869,6 +2874,8 @@ static void g_dbg_watch_init(void) {
     if (e) g_dbg_winlog = atoi(e);
     e = getenv("FLEXE_C1ILOG");
     if (e) g_dbg_c1ilog = atoi(e);
+    e = getenv("FLEXE_WVDBG");
+    g_dbg_wvlog = e != NULL;
 #if FLEXE_PROFILE_BUILD
     xtensa_profile_init();
 #endif
