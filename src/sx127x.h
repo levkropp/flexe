@@ -21,9 +21,14 @@ typedef struct {
     uint64_t register_reads;
     uint64_t register_writes;
     uint64_t version_reads;
+    uint64_t cad_scans;
     uint64_t tx_packets;
+    uint64_t tx_packets_completed;
     uint64_t rx_packets;
+    uint64_t rx_packets_consumed;
+    uint64_t rx_fifo_bytes;
     size_t last_tx_len;
+    uint64_t last_tx_airtime_us;
 } sx127x_stats_t;
 
 sx127x_t *sx127x_create(const sx127x_config_t *config);

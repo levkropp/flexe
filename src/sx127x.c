@@ -13,10 +13,15 @@
 #define SX127X_REG_IRQ_FLAGS_MASK       0x11u
 #define SX127X_REG_IRQ_FLAGS            0x12u
 #define SX127X_REG_RX_NB_BYTES          0x13u
+#define SX127X_REG_MODEM_CONFIG_1       0x1Du
+#define SX127X_REG_MODEM_CONFIG_2       0x1Eu
+#define SX127X_REG_PREAMBLE_MSB         0x20u
+#define SX127X_REG_PREAMBLE_LSB         0x21u
 #define SX127X_REG_PKT_SNR_VALUE        0x19u
 #define SX127X_REG_PKT_RSSI_VALUE       0x1Au
 #define SX127X_REG_HOP_CHANNEL          0x1Cu
 #define SX127X_REG_PAYLOAD_LENGTH       0x22u
+#define SX127X_REG_MODEM_CONFIG_3       0x26u
 #define SX127X_REG_DIO_MAPPING_1        0x40u
 #define SX127X_REG_VERSION              0x42u
 
@@ -25,6 +30,7 @@
 #define SX127X_MODE_TX                  0x03u
 #define SX127X_MODE_RX_CONTINUOUS       0x05u
 #define SX127X_MODE_RX_SINGLE           0x06u
+#define SX127X_MODE_CAD                  0x07u
 
 #define SX127X_IRQ_RX_DONE              0x40u
 #define SX127X_IRQ_VALID_HEADER         0x10u
@@ -43,7 +49,14 @@ struct sx127x {
     bool have_command;
     bool write;
     uint8_t address;
+    bool rx_pending;
+    bool rx_irq_cleared;
+    size_t rx_expected_len;
+    size_t rx_read_count;
+    bool tx_pending;
 };
+
+static void sx127x_finish_tx(void *ctx);
 
 static bool sx127x_lora_mode(const sx127x_t *radio) {
     return (radio->reg[SX127X_REG_OP_MODE] & SX127X_LONG_RANGE_MODE) != 0;
@@ -65,10 +78,16 @@ static void sx127x_update_dio0(sx127x_t *radio) {
 
 void sx127x_reset(sx127x_t *radio) {
     if (!radio) return;
+    periph_cancel_deferred(radio->periph, sx127x_finish_tx, radio);
     memset(radio->reg, 0, sizeof(radio->reg));
     memset(radio->fifo, 0, sizeof(radio->fifo));
     radio->selected = false;
     radio->have_command = false;
+    radio->rx_pending = false;
+    radio->rx_irq_cleared = false;
+    radio->rx_expected_len = 0;
+    radio->rx_read_count = 0;
+    radio->tx_pending = false;
 
     /* SX1276/RFM95 reset values used by RadioLib during discovery and
      * read-modify-write configuration. */
@@ -100,6 +119,7 @@ sx127x_t *sx127x_create(const sx127x_config_t *config) {
 
 void sx127x_destroy(sx127x_t *radio) {
     if (!radio) return;
+    periph_cancel_deferred(radio->periph, sx127x_finish_tx, radio);
     if (radio->periph && radio->dio0_pin >= 0)
         periph_gpio_set_input(radio->periph, radio->dio0_pin, 0);
     free(radio);
@@ -110,9 +130,68 @@ static uint8_t sx127x_read_register(sx127x_t *radio, uint8_t address) {
     if (address == SX127X_REG_VERSION) radio->stats.version_reads++;
     if (address == SX127X_REG_FIFO) {
         uint8_t ptr = radio->reg[SX127X_REG_FIFO_ADDR_PTR]++;
+        if (radio->rx_pending && radio->rx_read_count < radio->rx_expected_len) {
+            radio->stats.rx_fifo_bytes++;
+            radio->rx_read_count++;
+        }
+        if (radio->rx_pending && radio->rx_irq_cleared &&
+            radio->rx_read_count >= radio->rx_expected_len) {
+            radio->stats.rx_packets_consumed++;
+            radio->rx_pending = false;
+        }
         return radio->fifo[ptr];
     }
     return radio->reg[address & 0x7Fu];
+}
+
+static uint64_t sx127x_tx_airtime_us(const sx127x_t *radio, size_t len) {
+    static const uint32_t bandwidth_hz[10] = {
+        7800u, 10400u, 15600u, 20800u, 31250u,
+        41700u, 62500u, 125000u, 250000u, 500000u,
+    };
+    uint8_t config1 = radio->reg[SX127X_REG_MODEM_CONFIG_1];
+    uint8_t config2 = radio->reg[SX127X_REG_MODEM_CONFIG_2];
+    uint8_t bw_index = config1 >> 4;
+    uint32_t bw = bw_index < 10u ? bandwidth_hz[bw_index] : 125000u;
+    unsigned sf = config2 >> 4;
+    if (sf < 6u || sf > 12u) sf = 7u;
+    unsigned cr = (config1 >> 1) & 0x07u;
+    if (cr < 1u || cr > 4u) cr = 1u;
+    unsigned implicit_header = config1 & 1u;
+    unsigned crc = (config2 >> 2) & 1u;
+    unsigned low_data_rate =
+            (radio->reg[SX127X_REG_MODEM_CONFIG_3] >> 3) & 1u;
+    unsigned preamble =
+            ((unsigned)radio->reg[SX127X_REG_PREAMBLE_MSB] << 8) |
+            radio->reg[SX127X_REG_PREAMBLE_LSB];
+
+    uint64_t symbol_us = (((uint64_t)1u << sf) * 1000000ull + bw - 1u) / bw;
+    int payload_numerator = (int)(8u * len) - (int)(4u * sf) + 28 +
+                            (int)(16u * crc) -
+                            (int)(20u * implicit_header);
+    unsigned payload_symbols = 8u;
+    unsigned denominator = 4u * (sf - 2u * low_data_rate);
+    if (payload_numerator > 0)
+        payload_symbols +=
+                ((unsigned)payload_numerator + denominator - 1u) /
+                denominator * (cr + 4u);
+
+    /* The LoRa preamble includes 4.25 symbols. Round upward so completion is
+     * never reported before a physical SX1276 could have put the last bit on
+     * the wire. */
+    uint64_t quarter_symbols = (uint64_t)preamble * 4u + 17u +
+                               (uint64_t)payload_symbols * 4u;
+    uint64_t airtime = (quarter_symbols * symbol_us + 3u) / 4u;
+    return airtime < 1000u ? 1000u : airtime;
+}
+
+static void sx127x_finish_tx(void *ctx) {
+    sx127x_t *radio = ctx;
+    if (!radio || !radio->tx_pending) return;
+    radio->tx_pending = false;
+    radio->stats.tx_packets_completed++;
+    radio->reg[SX127X_REG_IRQ_FLAGS] |= SX127X_IRQ_TX_DONE;
+    sx127x_update_dio0(radio);
 }
 
 static void sx127x_complete_tx(sx127x_t *radio) {
@@ -124,8 +203,20 @@ static void sx127x_complete_tx(sx127x_t *radio) {
 
     radio->stats.tx_packets++;
     radio->stats.last_tx_len = len;
+    radio->stats.last_tx_airtime_us = sx127x_tx_airtime_us(radio, len);
     if (radio->tx_fn) radio->tx_fn(radio->tx_ctx, packet, len);
-    radio->reg[SX127X_REG_IRQ_FLAGS] |= SX127X_IRQ_TX_DONE;
+    radio->tx_pending = true;
+    if (periph_schedule_deferred_us(radio->periph,
+                                    radio->stats.last_tx_airtime_us,
+                                    sx127x_finish_tx, radio) != 0)
+        sx127x_finish_tx(radio);
+}
+
+static void sx127x_complete_cad(sx127x_t *radio) {
+    /* No host packet is currently on the virtual channel, so CAD completes
+     * clear. CadDetected remains low and RadioLib may proceed to TX. */
+    radio->stats.cad_scans++;
+    radio->reg[SX127X_REG_IRQ_FLAGS] |= SX127X_IRQ_CAD_DONE;
 }
 
 static void sx127x_write_register(sx127x_t *radio, uint8_t address,
@@ -139,7 +230,15 @@ static void sx127x_write_register(sx127x_t *radio, uint8_t address,
     }
     if (address == SX127X_REG_VERSION) return;
     if (address == SX127X_REG_IRQ_FLAGS) {
+        if (radio->rx_pending && (radio->reg[address] & value &
+                                  SX127X_IRQ_RX_DONE) != 0)
+            radio->rx_irq_cleared = true;
         radio->reg[address] &= (uint8_t)~value;
+        if (radio->rx_pending && radio->rx_irq_cleared &&
+            radio->rx_read_count >= radio->rx_expected_len) {
+            radio->stats.rx_packets_consumed++;
+            radio->rx_pending = false;
+        }
         return;
     }
 
@@ -148,9 +247,13 @@ static void sx127x_write_register(sx127x_t *radio, uint8_t address,
     if (address == SX127X_REG_OP_MODE &&
         (old & (SX127X_LONG_RANGE_MODE | SX127X_MODE_MASK)) !=
             (value & (SX127X_LONG_RANGE_MODE | SX127X_MODE_MASK)) &&
-        (value & SX127X_LONG_RANGE_MODE) != 0 &&
-        (value & SX127X_MODE_MASK) == SX127X_MODE_TX)
-        sx127x_complete_tx(radio);
+        (value & SX127X_LONG_RANGE_MODE) != 0) {
+        uint8_t mode = value & SX127X_MODE_MASK;
+        if (mode == SX127X_MODE_TX)
+            sx127x_complete_tx(radio);
+        else if (mode == SX127X_MODE_CAD)
+            sx127x_complete_cad(radio);
+    }
 }
 
 void sx127x_spi_transfer(void *ctx, int host,
@@ -231,6 +334,10 @@ int sx127x_inject_packet(sx127x_t *radio, const uint8_t *data, size_t len,
     radio->reg[SX127X_REG_IRQ_FLAGS] |=
         SX127X_IRQ_RX_DONE | SX127X_IRQ_VALID_HEADER;
     radio->stats.rx_packets++;
+    radio->rx_pending = true;
+    radio->rx_irq_cleared = false;
+    radio->rx_expected_len = len;
+    radio->rx_read_count = 0;
     sx127x_update_dio0(radio);
     return 0;
 }

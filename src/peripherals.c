@@ -75,6 +75,7 @@ static inline int gpio_dbg(void) {
 #define PAGE_SIZE       4096
 #define PAGE_WORDS      (PAGE_SIZE / sizeof(uint32_t))
 #define EMU_FLASH_SIZE  (4u * 1024u * 1024u)
+#define PERIPH_DEFERRED_MAX 16u
 
 /* Classic ESP32 flash-cache MMU geometry. Each core exposes an 8 KiB register
  * window. The first 256 entries drive the four 64-entry DROM0/IRAM0/IRAM1/
@@ -1186,6 +1187,9 @@ static void mcpwm_gpio_output_route_changed(esp32_periph_t *p, int gpio,
 static void mcpwm_gpio_input_route_changed(esp32_periph_t *p,
                                             unsigned signal);
 static void mcpwm_gpio_input_changed(esp32_periph_t *p, int gpio);
+static uint32_t deferred_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void deferred_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void deferred_kick(esp32_periph_t *p);
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -1760,6 +1764,13 @@ typedef struct {
     periph_clock_t clock;
 } mcpwm_state_t;
 
+typedef struct {
+    periph_deferred_fn fn;
+    void *ctx;
+    uint64_t deadline;
+    bool armed;
+} periph_deferred_event_t;
+
 struct esp32_periph {
     /* Set when firmware writes a software-reset bit to RTC_CNTL_OPTIONS0. */
     bool reset_requested;
@@ -1899,6 +1910,9 @@ struct esp32_periph {
     /* Shared cycle timeline for the deadline-driven peripheral models. */
     periph_clock_t event_clock;
 
+    /* Timed completions owned by board-level devices attached to this SoC. */
+    periph_deferred_event_t deferred[PERIPH_DEFERRED_MAX];
+
     /* Classic ESP32 high/low-speed LEDC timers, channels, and timed fades. */
     ledc_state_t ledc;
     periph_clock_t ledc_clock;
@@ -1997,6 +2011,83 @@ static uint32_t periph_deadline_ccount(esp32_periph_t *p, periph_clock_t *c,
     uint64_t delta = deadline > now ? deadline - now : 0;
     if (delta > (uint64_t)INT32_MAX) delta = (uint64_t)INT32_MAX;
     return cpu->ccount + (uint32_t)delta;
+}
+
+static void deferred_kick(esp32_periph_t *p) {
+    for (int core = 0; core < 2; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static uint32_t deferred_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu) return UINT32_MAX;
+    bool have = false;
+    uint64_t best = 0;
+    for (size_t i = 0; i < PERIPH_DEFERRED_MAX; i++) {
+        if (!p->deferred[i].armed) continue;
+        if (!have || p->deferred[i].deadline < best) {
+            have = true;
+            best = p->deferred[i].deadline;
+        }
+    }
+    return have ? periph_deadline_ccount(p, &p->event_clock, cpu, best) :
+                  UINT32_MAX;
+}
+
+static void deferred_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    if (!p || !cpu) return;
+    uint64_t now = periph_clock_now(p, &p->event_clock);
+    for (size_t i = 0; i < PERIPH_DEFERRED_MAX; i++) {
+        periph_deferred_event_t *event = &p->deferred[i];
+        if (!event->armed || event->deadline > now) continue;
+        periph_deferred_fn fn = event->fn;
+        void *ctx = event->ctx;
+        event->armed = false;
+        if (fn) fn(ctx);
+    }
+    deferred_kick(p);
+}
+
+int periph_schedule_deferred_us(esp32_periph_t *p, uint64_t delay_us,
+                                periph_deferred_fn fn, void *ctx) {
+    if (!p || !fn) return -1;
+    int slot = -1;
+    for (size_t i = 0; i < PERIPH_DEFERRED_MAX; i++) {
+        if (p->deferred[i].fn == fn && p->deferred[i].ctx == ctx) {
+            slot = (int)i;
+            break;
+        }
+        if (slot < 0 && !p->deferred[i].armed)
+            slot = (int)i;
+    }
+    if (slot < 0) return -1;
+
+    xtensa_cpu_t *clock_cpu = p->cpu[0] ? p->cpu[0] : p->cpu[1];
+    uint64_t mhz = clock_cpu ? xtensa_cpu_freq_mhz(clock_cpu) : 160u;
+    uint64_t delay_cycles = delay_us > UINT64_MAX / mhz ?
+                            UINT64_MAX : delay_us * mhz;
+    uint64_t now = periph_clock_now(p, &p->event_clock);
+    periph_deferred_event_t *event = &p->deferred[slot];
+    event->fn = fn;
+    event->ctx = ctx;
+    event->deadline = now > UINT64_MAX - delay_cycles ?
+                      UINT64_MAX : now + delay_cycles;
+    event->armed = true;
+    deferred_kick(p);
+    return 0;
+}
+
+void periph_cancel_deferred(esp32_periph_t *p, periph_deferred_fn fn,
+                            void *ctx) {
+    if (!p || !fn) return;
+    for (size_t i = 0; i < PERIPH_DEFERRED_MAX; i++) {
+        periph_deferred_event_t *event = &p->deferred[i];
+        if (event->fn == fn && event->ctx == ctx) {
+            event->armed = false;
+            event->fn = NULL;
+            event->ctx = NULL;
+        }
+    }
+    deferred_kick(p);
 }
 
 
@@ -4281,6 +4372,7 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
         ledc_next_fire(p, cpu),
         pcnt_next_fire(p, cpu),
         mcpwm_next_fire(p, cpu),
+        deferred_next_fire(p, cpu),
     };
     bool have = false;
     uint32_t best = UINT32_MAX;
@@ -4311,6 +4403,7 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
     ledc_eval_events(p, cpu);
     pcnt_eval_events(p, cpu);
     mcpwm_eval_events(p, cpu);
+    deferred_eval_events(p, cpu);
 }
 
 /* Recompute both cores' next_timer_event after LACT state changes. */

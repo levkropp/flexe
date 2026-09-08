@@ -34,6 +34,10 @@ static void sx127x_test_capture_tx(void *ctx, const uint8_t *data, size_t len) {
 TEST(sx127x_registers_fifo_tx_and_dio0) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
     sx127x_config_t config = {.periph = periph, .dio0_pin = 26};
     sx127x_t *radio = sx127x_create(&config);
     ASSERT_TRUE(radio != NULL);
@@ -58,6 +62,11 @@ TEST(sx127x_registers_fifo_tx_and_dio0) {
     ASSERT_EQ(tx.len, 3u);
     static const uint8_t expected[] = {0xA1u, 0xB2u, 0xC3u};
     ASSERT_TRUE(memcmp(tx.data, expected, sizeof(expected)) == 0);
+    ASSERT_EQ(sx127x_register(radio, 0x12u) & 0x08u, 0u);
+    ASSERT_EQ(sx127x_test_dio0(mem), 0);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
     ASSERT_EQ(sx127x_register(radio, 0x12u) & 0x08u, 0x08u);
     ASSERT_EQ(sx127x_test_dio0(mem), 1);
 
@@ -68,7 +77,9 @@ TEST(sx127x_registers_fifo_tx_and_dio0) {
     sx127x_stats_t stats;
     sx127x_get_stats(radio, &stats);
     ASSERT_EQ64(stats.tx_packets, 1u);
+    ASSERT_EQ64(stats.tx_packets_completed, 1u);
     ASSERT_EQ(stats.last_tx_len, 3u);
+    ASSERT_TRUE(stats.last_tx_airtime_us >= 1000u);
     ASSERT_TRUE(stats.spi_transfers >= 10u);
 
     sx127x_destroy(radio);
@@ -110,6 +121,67 @@ TEST(sx127x_packet_injection_populates_rx_fifo) {
     sx127x_stats_t stats;
     sx127x_get_stats(radio, &stats);
     ASSERT_EQ64(stats.rx_packets, 1u);
+    ASSERT_EQ64(stats.rx_packets_consumed, 1u);
+    ASSERT_EQ64(stats.rx_fifo_bytes, sizeof(packet));
+
+    sx127x_destroy(radio);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(sx127x_cad_completes_on_an_idle_channel) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *periph = periph_create(mem);
+    sx127x_config_t config = {.periph = periph, .dio0_pin = 26};
+    sx127x_t *radio = sx127x_create(&config);
+    ASSERT_TRUE(radio != NULL);
+
+    sx127x_test_write(radio, 0x01u, 0x81u); /* LoRa standby */
+    sx127x_test_write(radio, 0x40u, 0x80u); /* DIO0 = CadDone */
+    sx127x_test_write(radio, 0x01u, 0x87u); /* LoRa CAD */
+    ASSERT_EQ(sx127x_register(radio, 0x12u) & 0x05u, 0x04u);
+    ASSERT_EQ(sx127x_test_dio0(mem), 1);
+
+    sx127x_test_write(radio, 0x12u, 0x04u);
+    ASSERT_EQ(sx127x_test_dio0(mem), 0);
+    sx127x_stats_t stats;
+    sx127x_get_stats(radio, &stats);
+    ASSERT_EQ64(stats.cad_scans, 1u);
+
+    sx127x_destroy(radio);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(sx127x_rx_consumption_requires_payload_and_irq_ack) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *periph = periph_create(mem);
+    sx127x_config_t config = {.periph = periph, .dio0_pin = 26};
+    sx127x_t *radio = sx127x_create(&config);
+    ASSERT_TRUE(radio != NULL);
+
+    sx127x_test_write(radio, 0x0Fu, 0x40u);
+    sx127x_test_write(radio, 0x01u, 0x85u); /* LoRa continuous RX */
+    static const uint8_t packet[] = {0x10u, 0x20u, 0x30u, 0x40u};
+    ASSERT_EQ(sx127x_inject_packet(radio, packet, sizeof(packet), -80, 4), 0);
+
+    sx127x_test_write(radio, 0x0Du, 0x40u);
+    uint8_t first_half[3] = {0};
+    sx127x_spi_transfer(radio, 3, first_half, sizeof(first_half),
+                        first_half, sizeof(first_half));
+    sx127x_test_write(radio, 0x12u, 0x50u);
+
+    sx127x_stats_t stats;
+    sx127x_get_stats(radio, &stats);
+    ASSERT_EQ64(stats.rx_fifo_bytes, 2u);
+    ASSERT_EQ64(stats.rx_packets_consumed, 0u);
+
+    uint8_t second_half[3] = {0};
+    sx127x_spi_transfer(radio, 3, second_half, sizeof(second_half),
+                        second_half, sizeof(second_half));
+    sx127x_get_stats(radio, &stats);
+    ASSERT_EQ64(stats.rx_fifo_bytes, 4u);
+    ASSERT_EQ64(stats.rx_packets_consumed, 1u);
 
     sx127x_destroy(radio);
     periph_destroy(periph);
@@ -154,5 +226,7 @@ static void run_sx127x_tests(void) {
     TEST_SUITE("SX127x radio");
     RUN_TEST(sx127x_registers_fifo_tx_and_dio0);
     RUN_TEST(sx127x_packet_injection_populates_rx_fifo);
+    RUN_TEST(sx127x_cad_completes_on_an_idle_channel);
+    RUN_TEST(sx127x_rx_consumption_requires_payload_and_irq_ack);
     RUN_TEST(sx127x_preserves_command_across_byte_transfers);
 }

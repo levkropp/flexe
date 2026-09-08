@@ -11,6 +11,11 @@ typedef struct xtensa_cpu xtensa_cpu_t;
 
 typedef struct esp32_periph esp32_periph_t;
 
+/* One-shot host-device completion on the guest's peripheral clock. External
+ * chips use this for operations which finish after their initiating bus
+ * transaction has returned (radio TX, conversions, flash programming, etc.). */
+typedef void (*periph_deferred_fn)(void *ctx);
+
 /* UART TX callback: called for each byte written to UART FIFO */
 typedef void (*uart_tx_cb)(void *ctx, uint8_t byte);
 
@@ -310,6 +315,14 @@ bool periph_app_cpu_released(const esp32_periph_t *p);
 
 /* Attach CPU pointers for interrupt delivery (call after cpu init) */
 void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1);
+
+/* Schedule or cancel a one-shot callback. Re-scheduling the same fn/ctx pair
+ * replaces its deadline. The deadline participates in WAITI fast-forwarding,
+ * so a sleeping guest still observes the completion at the right time. */
+int periph_schedule_deferred_us(esp32_periph_t *p, uint64_t delay_us,
+                                periph_deferred_fn fn, void *ctx);
+void periph_cancel_deferred(esp32_periph_t *p, periph_deferred_fn fn,
+                            void *ctx);
 
 /* Access the backing memory object (used by spi_display) */
 xtensa_mem_t *periph_mem(esp32_periph_t *p);

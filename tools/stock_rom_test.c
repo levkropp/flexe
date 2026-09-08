@@ -57,6 +57,8 @@
 #define MESHTASTIC_RADIO_SCK      5
 #define MESHTASTIC_RADIO_DIO0     26
 #define MESHTASTIC_PMU_ADDRESS    0x34u
+#define MESHTASTIC_MY_NODE_INFO_REF 0x3F4050F4u
+#define MESHTASTIC_BROADCAST      0xFFFFFFFFu
 
 /* Extra cycles run after the scripted steps, to catch a firmware that passes
  * every check and then panics. Sized to cover the observed failure at roughly
@@ -192,6 +194,27 @@ typedef struct {
     uint8_t scan_response[31];
     size_t scan_response_len;
 } bt_tx_probe_t;
+
+typedef struct {
+    uint64_t packets;
+    uint64_t bytes;
+    uint8_t packet[256];
+    size_t packet_len;
+} meshtastic_lora_probe_t;
+
+typedef struct {
+    uint32_t node_num;
+    size_t serial_rx_bytes;
+    size_t packet_len;
+    uint64_t config_cycles;
+    uint64_t tx_cycles;
+    uint64_t rx_cycles;
+} meshtastic_radio_exchange_t;
+
+typedef struct {
+    uint8_t data[512];
+    size_t len;
+} meshtastic_pb_t;
 
 typedef struct {
     uint32_t items[WLED_RMT_FRAME_ITEMS];
@@ -557,6 +580,137 @@ static void capture_bt_advertisement_tx(void *ctx,
     probe->scan_response_len = scan_response_len;
     memcpy(probe->advertisement, advertisement, advertisement_len);
     memcpy(probe->scan_response, scan_response, scan_response_len);
+}
+
+static void capture_meshtastic_lora_tx(void *ctx, const uint8_t *data,
+                                       size_t len)
+{
+    meshtastic_lora_probe_t *probe = ctx;
+    probe->packets++;
+    probe->bytes += len;
+    probe->packet_len = len > sizeof(probe->packet) ?
+                        sizeof(probe->packet) : len;
+    memcpy(probe->packet, data, probe->packet_len);
+}
+
+static bool meshtastic_pb_raw_varint(meshtastic_pb_t *pb, uint64_t value)
+{
+    do {
+        if (pb->len == sizeof(pb->data)) return false;
+        uint8_t byte = (uint8_t)(value & 0x7Fu);
+        value >>= 7;
+        pb->data[pb->len++] = value ? (uint8_t)(byte | 0x80u) : byte;
+    } while (value);
+    return true;
+}
+
+static bool meshtastic_pb_key(meshtastic_pb_t *pb, uint32_t field,
+                              uint8_t wire_type)
+{
+    return field != 0 &&
+           meshtastic_pb_raw_varint(pb, ((uint64_t)field << 3) | wire_type);
+}
+
+static bool meshtastic_pb_uint(meshtastic_pb_t *pb, uint32_t field,
+                               uint64_t value)
+{
+    return meshtastic_pb_key(pb, field, 0) &&
+           meshtastic_pb_raw_varint(pb, value);
+}
+
+static bool meshtastic_pb_fixed32(meshtastic_pb_t *pb, uint32_t field,
+                                  uint32_t value)
+{
+    if (!meshtastic_pb_key(pb, field, 5) ||
+        sizeof(pb->data) - pb->len < sizeof(value))
+        return false;
+    pb->data[pb->len + 0u] = (uint8_t)value;
+    pb->data[pb->len + 1u] = (uint8_t)(value >> 8);
+    pb->data[pb->len + 2u] = (uint8_t)(value >> 16);
+    pb->data[pb->len + 3u] = (uint8_t)(value >> 24);
+    pb->len += sizeof(value);
+    return true;
+}
+
+static bool meshtastic_pb_bytes(meshtastic_pb_t *pb, uint32_t field,
+                                const uint8_t *data, size_t len)
+{
+    if ((!data && len != 0) || !meshtastic_pb_key(pb, field, 2) ||
+        !meshtastic_pb_raw_varint(pb, len) ||
+        sizeof(pb->data) - pb->len < len)
+        return false;
+    memcpy(pb->data + pb->len, data, len);
+    pb->len += len;
+    return true;
+}
+
+/* Construct the exact serial transport used by Meshtastic's supported phone
+ * API: ToRadio.packet -> MeshPacket.decoded -> Data. MeshPacket's destination
+ * is fixed32 on the wire; treating it as an ordinary protobuf varint happens
+ * to decode as an unknown field and silently routes the request over LoRa. */
+static bool meshtastic_serial_packet(uint8_t *frame, size_t capacity,
+                                     uint32_t to, uint32_t portnum,
+                                     const uint8_t *payload,
+                                     size_t payload_len, uint8_t hop_limit,
+                                     size_t *frame_len)
+{
+    meshtastic_pb_t data = {0};
+    meshtastic_pb_t packet = {0};
+    meshtastic_pb_t to_radio = {0};
+    if (!meshtastic_pb_uint(&data, 1, portnum) ||
+        !meshtastic_pb_bytes(&data, 2, payload, payload_len) ||
+        !meshtastic_pb_fixed32(&packet, 2, to) ||
+        !meshtastic_pb_bytes(&packet, 4, data.data, data.len) ||
+        (hop_limit != 0 &&
+         !meshtastic_pb_uint(&packet, 9, hop_limit)) ||
+        !meshtastic_pb_bytes(&to_radio, 1, packet.data, packet.len) ||
+        to_radio.len > UINT16_MAX || capacity < 4u ||
+        to_radio.len > capacity - 4u)
+        return false;
+
+    frame[0] = 0x94u;
+    frame[1] = 0xC3u;
+    frame[2] = (uint8_t)(to_radio.len >> 8);
+    frame[3] = (uint8_t)to_radio.len;
+    memcpy(frame + 4u, to_radio.data, to_radio.len);
+    *frame_len = to_radio.len + 4u;
+    return true;
+}
+
+static bool meshtastic_begin_edit_frame(uint8_t *frame, size_t capacity,
+                                        uint32_t node_num,
+                                        size_t *frame_len)
+{
+    meshtastic_pb_t admin = {0};
+    return meshtastic_pb_uint(&admin, 64, 1) &&
+           meshtastic_serial_packet(frame, capacity, node_num, 6,
+                                    admin.data, admin.len, 0, frame_len);
+}
+
+static bool meshtastic_set_region_frame(uint8_t *frame, size_t capacity,
+                                        uint32_t node_num,
+                                        size_t *frame_len)
+{
+    meshtastic_pb_t lora = {0};
+    meshtastic_pb_t config = {0};
+    meshtastic_pb_t admin = {0};
+    return meshtastic_pb_uint(&lora, 1, 1) &&  /* use preset */
+           meshtastic_pb_uint(&lora, 7, 1) &&  /* US region */
+           meshtastic_pb_uint(&lora, 8, 3) &&  /* default hop limit */
+           meshtastic_pb_uint(&lora, 9, 1) &&  /* TX enabled */
+           meshtastic_pb_bytes(&config, 6, lora.data, lora.len) &&
+           meshtastic_pb_bytes(&admin, 34, config.data, config.len) &&
+           meshtastic_serial_packet(frame, capacity, node_num, 6,
+                                    admin.data, admin.len, 0, frame_len);
+}
+
+static bool meshtastic_text_frame(uint8_t *frame, size_t capacity,
+                                  size_t *frame_len)
+{
+    static const uint8_t message[] = "flexe-radio-loopback";
+    return meshtastic_serial_packet(frame, capacity, MESHTASTIC_BROADCAST, 1,
+                                    message, sizeof(message) - 1u, 3,
+                                    frame_len);
 }
 
 /* Reassemble one physical RMT transmission and decode ordinary WS2812 bits.
@@ -1249,6 +1403,169 @@ static int run_until_meshtastic_gps_fix(flexe_session_t *session,
 
     *cycles_out = cpu0->cycle_count - start;
     return 1;
+}
+
+enum {
+    MESHTASTIC_EXCHANGE_STOPPED = -1,
+    MESHTASTIC_EXCHANGE_NODE_LAYOUT = 1,
+    MESHTASTIC_EXCHANGE_ENCODE,
+    MESHTASTIC_EXCHANGE_UART,
+    MESHTASTIC_EXCHANGE_CONFIG_TIMEOUT,
+    MESHTASTIC_EXCHANGE_REBOOT,
+    MESHTASTIC_EXCHANGE_TX_TIMEOUT,
+    MESHTASTIC_EXCHANGE_RX_MODE,
+    MESHTASTIC_EXCHANGE_RX_INJECT,
+    MESHTASTIC_EXCHANGE_RX_TIMEOUT,
+};
+
+static const char *meshtastic_exchange_reason(int result)
+{
+    switch (result) {
+    case MESHTASTIC_EXCHANGE_STOPPED: return "cpus-stopped-radio-exchange";
+    case MESHTASTIC_EXCHANGE_NODE_LAYOUT: return "node-layout";
+    case MESHTASTIC_EXCHANGE_ENCODE: return "serial-protobuf-encode";
+    case MESHTASTIC_EXCHANGE_UART: return "serial-uart-overflow";
+    case MESHTASTIC_EXCHANGE_CONFIG_TIMEOUT: return "serial-config-timeout";
+    case MESHTASTIC_EXCHANGE_REBOOT: return "unexpected-config-reboot";
+    case MESHTASTIC_EXCHANGE_TX_TIMEOUT: return "lora-tx-timeout";
+    case MESHTASTIC_EXCHANGE_RX_MODE: return "lora-not-listening";
+    case MESHTASTIC_EXCHANGE_RX_INJECT: return "lora-rx-inject";
+    case MESHTASTIC_EXCHANGE_RX_TIMEOUT: return "lora-rx-timeout";
+    default: return "unknown-radio-exchange";
+    }
+}
+
+static int run_until_meshtastic_serial_settled(flexe_session_t *session,
+                                                unsigned reset_count,
+                                                uint64_t max_cycles)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+    uint64_t drained_at = UINT64_MAX;
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return MESHTASTIC_EXCHANGE_STOPPED;
+        if (flexe_session_reset_count(session) != reset_count)
+            return MESHTASTIC_EXCHANGE_REBOOT;
+        if (periph_uart_rx_pending(flexe_session_periph(session)) == 0) {
+            if (drained_at == UINT64_MAX)
+                drained_at = cpu0->cycle_count;
+            /* UART FIFO empty means StreamAPI owns the packet. Give the
+             * router task enough guest time to dispatch its local Admin
+             * message before feeding the next transaction member. */
+            if (cpu0->cycle_count - drained_at >= 50000000ull)
+                return 0;
+        } else {
+            drained_at = UINT64_MAX;
+        }
+        run_one_batch(session);
+    }
+    return MESHTASTIC_EXCHANGE_CONFIG_TIMEOUT;
+}
+
+/* Configure the untouched release image through its public serial API, ask
+ * it to transmit a text packet, then feed that exact encrypted on-air frame
+ * back into the virtual SX1276. Passing requires the guest's RadioLib ISR to
+ * acknowledge RxDone and drain every byte from the hardware FIFO. */
+static int run_meshtastic_radio_exchange(
+        flexe_session_t *session, sx127x_t *radio,
+        meshtastic_lora_probe_t *probe, unsigned reset_count,
+        meshtastic_radio_exchange_t *result)
+{
+    memset(result, 0, sizeof(*result));
+    xtensa_mem_t *mem = flexe_session_mem(session);
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+
+    /* This reference address is fingerprint-pinned to the same official
+     * T-Beam 2.7.26 image accepted by the virtual NimBLE controller. The C++
+     * global is a reference, so DROM contains a pointer to the first field of
+     * devicestate.my_node rather than the node number itself. */
+    if (!mem_get_ptr(mem, MESHTASTIC_MY_NODE_INFO_REF))
+        return MESHTASTIC_EXCHANGE_NODE_LAYOUT;
+    uint32_t node_info = mem_read32(mem, MESHTASTIC_MY_NODE_INFO_REF);
+    if (!mem_get_ptr(mem, node_info))
+        return MESHTASTIC_EXCHANGE_NODE_LAYOUT;
+    result->node_num = mem_read32(mem, node_info);
+    if (result->node_num < 4u || result->node_num == MESHTASTIC_BROADCAST)
+        return MESHTASTIC_EXCHANGE_NODE_LAYOUT;
+
+    uint8_t frame[520];
+    size_t frame_len = 0;
+    uint64_t config_start = cpu0->cycle_count;
+    if (!meshtastic_begin_edit_frame(frame, sizeof(frame), result->node_num,
+                                     &frame_len))
+        return MESHTASTIC_EXCHANGE_ENCODE;
+    size_t accepted = periph_uart_rx_inject(flexe_session_periph(session),
+                                            frame, frame_len);
+    result->serial_rx_bytes += accepted;
+    if (accepted != frame_len)
+        return MESHTASTIC_EXCHANGE_UART;
+    int settled = run_until_meshtastic_serial_settled(
+            session, reset_count, 500000000ull);
+    if (settled != 0) return settled;
+
+    if (!meshtastic_set_region_frame(frame, sizeof(frame), result->node_num,
+                                     &frame_len))
+        return MESHTASTIC_EXCHANGE_ENCODE;
+    accepted = periph_uart_rx_inject(flexe_session_periph(session),
+                                     frame, frame_len);
+    result->serial_rx_bytes += accepted;
+    if (accepted != frame_len)
+        return MESHTASTIC_EXCHANGE_UART;
+    settled = run_until_meshtastic_serial_settled(
+            session, reset_count, 1000000000ull);
+    if (settled != 0) return settled;
+    result->config_cycles = cpu0->cycle_count - config_start;
+
+    uint64_t tx_start = cpu0->cycle_count;
+    uint64_t tx_packets = probe->packets;
+    if (!meshtastic_text_frame(frame, sizeof(frame), &frame_len))
+        return MESHTASTIC_EXCHANGE_ENCODE;
+    accepted = periph_uart_rx_inject(flexe_session_periph(session),
+                                     frame, frame_len);
+    result->serial_rx_bytes += accepted;
+    if (accepted != frame_len)
+        return MESHTASTIC_EXCHANGE_UART;
+
+    while (cpu0->cycle_count - tx_start < 2000000000ull) {
+        if (!session_alive(session)) return MESHTASTIC_EXCHANGE_STOPPED;
+        if (flexe_session_reset_count(session) != reset_count)
+            return MESHTASTIC_EXCHANGE_REBOOT;
+        uint8_t mode = sx127x_register(radio, 0x01u) & 0x07u;
+        if (probe->packets > tx_packets && probe->packet_len >= 16u &&
+            (mode == 0x05u || mode == 0x06u))
+            break;
+        run_one_batch(session);
+    }
+    if (probe->packets == tx_packets || probe->packet_len < 16u)
+        return MESHTASTIC_EXCHANGE_TX_TIMEOUT;
+    result->tx_cycles = cpu0->cycle_count - tx_start;
+    result->packet_len = probe->packet_len;
+
+    uint8_t mode = sx127x_register(radio, 0x01u) & 0x07u;
+    if (mode != 0x05u && mode != 0x06u)
+        return MESHTASTIC_EXCHANGE_RX_MODE;
+    sx127x_stats_t before;
+    sx127x_get_stats(radio, &before);
+    if (sx127x_inject_packet(radio, probe->packet, probe->packet_len,
+                             -71, 9) != 0)
+        return MESHTASTIC_EXCHANGE_RX_INJECT;
+
+    uint64_t rx_start = cpu0->cycle_count;
+    while (cpu0->cycle_count - rx_start < 1000000000ull) {
+        if (!session_alive(session)) return MESHTASTIC_EXCHANGE_STOPPED;
+        if (flexe_session_reset_count(session) != reset_count)
+            return MESHTASTIC_EXCHANGE_REBOOT;
+        sx127x_stats_t stats;
+        sx127x_get_stats(radio, &stats);
+        if (stats.rx_packets_consumed > before.rx_packets_consumed &&
+            stats.rx_fifo_bytes - before.rx_fifo_bytes >= probe->packet_len &&
+            (sx127x_register(radio, 0x12u) & 0x40u) == 0) {
+            result->rx_cycles = cpu0->cycle_count - rx_start;
+            return 0;
+        }
+        run_one_batch(session);
+    }
+    return MESHTASTIC_EXCHANGE_RX_TIMEOUT;
 }
 
 static int run_until_marauder_sniffer(flexe_session_t *session,
@@ -1978,6 +2295,7 @@ int main(int argc, char **argv)
     raw_tx_probe_t raw_tx_probe = {0};
     bt_tx_probe_t bt_tx_probe = {0};
     wled_rmt_probe_t wled_rmt_probe = {.last_channel = -1};
+    meshtastic_lora_probe_t meshtastic_lora_probe = {0};
     sx127x_t *meshtastic_radio = NULL;
     axp192_t *meshtastic_pmu = NULL;
     ublox_gps_t *meshtastic_gps = NULL;
@@ -2079,6 +2397,9 @@ int main(int argc, char **argv)
             free(framebuf);
             return 1;
         }
+        sx127x_set_tx_callback(meshtastic_radio,
+                               capture_meshtastic_lora_tx,
+                               &meshtastic_lora_probe);
         periph_set_uart_callback_num(flexe_session_periph(session), 1,
                                      ublox_gps_uart_tx, meshtastic_gps);
     }
@@ -2263,6 +2584,8 @@ int main(int argc, char **argv)
     uint64_t gps_cycles = 0;
     uint64_t meshtastic_gps_ready_cycles = 0;
     uint64_t meshtastic_gps_fix_cycles = 0;
+    unsigned meshtastic_reset_count = 0;
+    meshtastic_radio_exchange_t meshtastic_exchange = {0};
     size_t cli_rx_bytes = 0;
     size_t tx_cli_rx_bytes = 0;
     size_t bt_cli_rx_bytes = 0;
@@ -2291,6 +2614,7 @@ int main(int argc, char **argv)
     bt_stubs_stats_t bt_stats = {0};
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
     if (is_meshtastic) {
+        meshtastic_reset_count = flexe_session_reset_count(session);
         int gps_ready = run_until_meshtastic_gps_ready(
                 session, meshtastic_gps, 1000000000ull,
                 &meshtastic_gps_ready_cycles);
@@ -2327,6 +2651,49 @@ int main(int argc, char **argv)
             ublox_gps_destroy(meshtastic_gps);
             axp192_destroy(meshtastic_pmu);
             sx127x_destroy(meshtastic_radio);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        int radio_exchange = run_meshtastic_radio_exchange(
+                session, meshtastic_radio, &meshtastic_lora_probe,
+                meshtastic_reset_count, &meshtastic_exchange);
+        if (radio_exchange != 0) {
+            sx127x_stats_t radio_stats;
+            sx127x_get_stats(meshtastic_radio, &radio_stats);
+            fprintf(stderr,
+                    "FAIL profile=meshtastic reason=%s node=%08X "
+                    "uart_rx=%zu config_cycles=%llu tx_cycles=%llu "
+                    "rx_cycles=%llu tx=%llu tx_len=%zu rx=%llu "
+                    "rx_consumed=%llu fifo_rx=%llu irq=0x%02X "
+                    "op_mode=0x%02X resets=%u/%u\n",
+                    meshtastic_exchange_reason(radio_exchange),
+                    meshtastic_exchange.node_num,
+                    meshtastic_exchange.serial_rx_bytes,
+                    (unsigned long long)meshtastic_exchange.config_cycles,
+                    (unsigned long long)meshtastic_exchange.tx_cycles,
+                    (unsigned long long)meshtastic_exchange.rx_cycles,
+                    (unsigned long long)radio_stats.tx_packets,
+                    radio_stats.last_tx_len,
+                    (unsigned long long)radio_stats.rx_packets,
+                    (unsigned long long)radio_stats.rx_packets_consumed,
+                    (unsigned long long)radio_stats.rx_fifo_bytes,
+                    sx127x_register(meshtastic_radio, 0x12u),
+                    sx127x_register(meshtastic_radio, 0x01u),
+                    meshtastic_reset_count,
+                    flexe_session_reset_count(session));
+            fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
+            fwrite(uart.log, 1, uart.log_len, stderr);
+            fputc('\n', stderr);
+            if (flexe_session_reset_count(session) == meshtastic_reset_count) {
+                ublox_gps_destroy(meshtastic_gps);
+                axp192_destroy(meshtastic_pmu);
+                sx127x_destroy(meshtastic_radio);
+            }
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
             unlink(sd_path);
@@ -3391,6 +3758,23 @@ int main(int argc, char **argv)
             }
         }
     }
+    if (is_meshtastic &&
+        flexe_session_reset_count(session) != meshtastic_reset_count) {
+        fprintf(stderr,
+                "FAIL profile=meshtastic reason=unexpected-soak-reboot "
+                "resets=%u/%u\n",
+                meshtastic_reset_count,
+                flexe_session_reset_count(session));
+        /* A reset replaces the SoC peripheral object. The board devices are
+         * still attached to the old one, so leave their teardown to process
+         * cleanup instead of dereferencing stale attachment pointers. */
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
     if (uart.panic >= 0) {
         fprintf(stderr, "FAIL profile=%s reason=firmware-panic marker=\"%s\" "
                 "uart_bytes=%llu\n",
@@ -3629,14 +4013,28 @@ int main(int argc, char **argv)
         axp192_get_stats(meshtastic_pmu, &pmu_stats);
         ublox_gps_get_stats(meshtastic_gps, &gps_stats);
         printf(" radio=sx1276 spi=%llu frames=%llu reads=%llu writes=%llu "
-               "tx=%llu rx=%llu op_mode=0x%02X",
+               "cad=%llu tx=%llu tx_completed=%llu tx_airtime_us=%llu "
+               "rx=%llu rx_consumed=%llu rx_fifo_bytes=%llu "
+               "op_mode=0x%02X node=%08X serial_rx=%zu frame_len=%zu "
+               "config_cycles=%llu tx_cycles=%llu rx_cycles=%llu",
                (unsigned long long)radio_stats.spi_transfers,
                (unsigned long long)radio_stats.spi_frames,
                (unsigned long long)radio_stats.register_reads,
                (unsigned long long)radio_stats.register_writes,
+               (unsigned long long)radio_stats.cad_scans,
                (unsigned long long)radio_stats.tx_packets,
+               (unsigned long long)radio_stats.tx_packets_completed,
+               (unsigned long long)radio_stats.last_tx_airtime_us,
                (unsigned long long)radio_stats.rx_packets,
-               sx127x_register(meshtastic_radio, 0x01u));
+               (unsigned long long)radio_stats.rx_packets_consumed,
+               (unsigned long long)radio_stats.rx_fifo_bytes,
+               sx127x_register(meshtastic_radio, 0x01u),
+               meshtastic_exchange.node_num,
+               meshtastic_exchange.serial_rx_bytes,
+               meshtastic_exchange.packet_len,
+               (unsigned long long)meshtastic_exchange.config_cycles,
+               (unsigned long long)meshtastic_exchange.tx_cycles,
+               (unsigned long long)meshtastic_exchange.rx_cycles);
         printf(" pmu=axp192 i2c=%llu reads=%llu writes=%llu outputs=0x%02X "
                "battery_mv=3970 vbus_mv=5000",
                (unsigned long long)pmu_stats.transfers,
