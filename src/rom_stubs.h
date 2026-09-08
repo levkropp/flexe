@@ -32,6 +32,9 @@ typedef enum {
      * sketch -- the same core version WLED links (both report IDF 4.4.8) --
      * rather than by hand. */
     ROM_FIRMWARE_WLED_V1601,
+    /* openHASP 0.7.0-rc13 for the Lanbon L8, built with the release's pinned
+     * Arduino-ESP32 2.0.14 / ESP-IDF 4.4 platform. */
+    ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8,
 } rom_firmware_profile_t;
 
 esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);

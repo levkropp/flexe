@@ -2824,6 +2824,34 @@ static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
+/* openHASP 0.7.0-rc13, Lanbon L8. The addresses below were relocated from a
+ * symbol-bearing build of the exact release commit and pinned 2.0.14 core to
+ * the official OTA image. All twenty masked code signatures matched uniquely;
+ * the same application is embedded in the distributed full-flash image. */
+static const wifi_fw_hook_t openhasp_v070rc13_wifi_hooks[] = {
+    { 0x4015ABFCu, stub_lwip_gethostbyname, "lwip_gethostbyname" },
+    { 0x4015C574u, stub_lwip_accept,        "lwip_accept" },
+    { 0x4015C758u, stub_lwip_bind,          "lwip_bind" },
+    { 0x4015C80Cu, stub_lwip_close,         "lwip_close" },
+    { 0x4015C934u, stub_lwip_connect,       "lwip_connect" },
+    { 0x4015C9F4u, stub_lwip_listen,        "lwip_listen" },
+    { 0x4015CA5Cu, stub_lwip_recvfrom,      "lwip_recvfrom" },
+    { 0x4015CB2Cu, stub_lwip_read,          "lwip_read" },
+    { 0x4015CB48u, stub_lwip_recv,          "lwip_recv" },
+    { 0x4015CB64u, stub_lwip_sendto,        "lwip_sendto" },
+    { 0x4015CCE4u, stub_lwip_send,          "lwip_send" },
+    { 0x4015CD70u, stub_lwip_socket,        "lwip_socket" },
+    { 0x4015CE20u, stub_lwip_write,         "lwip_write" },
+    { 0x4015CE38u, stub_lwip_select,        "lwip_select" },
+    { 0x4015D23Cu, stub_lwip_getsockopt,    "lwip_getsockopt" },
+    { 0x4015D2E4u, stub_lwip_setsockopt,    "lwip_setsockopt" },
+    { 0x4015D378u, stub_lwip_ioctl,         "lwip_ioctl" },
+    { 0x4015D420u, stub_lwip_fcntl,         "lwip_fcntl" },
+    { 0x4015E980u, stub_dns_gethostbyname,  "dns_gethostbyname" },
+    { 0x401D21D0u, stub_errno,              "__errno" },
+    { 0, NULL, NULL },
+};
+
 int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
 {
     if (!ws) return 0;
@@ -2850,6 +2878,8 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = marauder_35inch_wifi_hooks;
     else if (profile == ROM_FIRMWARE_WLED_V1601)
         hooks = wled_v1601_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8)
+        hooks = openhasp_v070rc13_wifi_hooks;
     else
         return 0;
     /* No firmware_status_addr for any profile.

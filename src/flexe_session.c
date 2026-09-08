@@ -191,16 +191,31 @@ static int session_build(flexe_session_t *s)
     /* Raw SPI display/touch capture (SPI2/SPI3 sniffing for symbol-less
      * firmware). Pins default to CYD 2432S028R; -1 disables. */
     {
+        bool openhasp_lanbon = rom_stubs_firmware_profile(s->rom) ==
+                ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8;
         spi_display_config_t scfg = {
-            .dc_pin         = cfg->spi_dc_pin         ? cfg->spi_dc_pin         : 2,
-            .display_cs_pin = cfg->spi_display_cs_pin ? cfg->spi_display_cs_pin : 15,
-            .display_sck_pin = cfg->spi_display_sck_pin ? cfg->spi_display_sck_pin : 14,
-            .touch_cs_pin   = cfg->spi_touch_cs_pin   ? cfg->spi_touch_cs_pin   : 33,
-            .touch_sck_pin  = cfg->spi_touch_sck_pin  ? cfg->spi_touch_sck_pin  : 25,
-            .touch_mosi_pin = cfg->spi_touch_mosi_pin ? cfg->spi_touch_mosi_pin : 32,
-            .touch_miso_pin = cfg->spi_touch_miso_pin ? cfg->spi_touch_miso_pin : 39,
-            .sd_cs_pin      = cfg->spi_sd_cs_pin      ? cfg->spi_sd_cs_pin      : 5,
-            .sd_sck_pin     = cfg->spi_sd_sck_pin     ? cfg->spi_sd_sck_pin     : 18,
+            .dc_pin = cfg->spi_dc_pin ? cfg->spi_dc_pin :
+                      (openhasp_lanbon ? 21 : 2),
+            .display_cs_pin = cfg->spi_display_cs_pin ?
+                              cfg->spi_display_cs_pin :
+                              (openhasp_lanbon ? 22 : 15),
+            .display_sck_pin = cfg->spi_display_sck_pin ?
+                               cfg->spi_display_sck_pin :
+                               (openhasp_lanbon ? 19 : 14),
+            .touch_cs_pin = cfg->spi_touch_cs_pin ? cfg->spi_touch_cs_pin :
+                            (openhasp_lanbon ? -1 : 33),
+            .touch_sck_pin = cfg->spi_touch_sck_pin ? cfg->spi_touch_sck_pin :
+                             (openhasp_lanbon ? -1 : 25),
+            .touch_mosi_pin = cfg->spi_touch_mosi_pin ?
+                              cfg->spi_touch_mosi_pin :
+                              (openhasp_lanbon ? -1 : 32),
+            .touch_miso_pin = cfg->spi_touch_miso_pin ?
+                              cfg->spi_touch_miso_pin :
+                              (openhasp_lanbon ? -1 : 39),
+            .sd_cs_pin = cfg->spi_sd_cs_pin ? cfg->spi_sd_cs_pin :
+                         (openhasp_lanbon ? -1 : 5),
+            .sd_sck_pin = cfg->spi_sd_sck_pin ? cfg->spi_sd_sck_pin :
+                          (openhasp_lanbon ? -1 : 18),
             .sdcard_path    = cfg->sdcard_path,
             .framebuf       = cfg->framebuf,
             .framebuf_mtx   = cfg->framebuf_mutex,

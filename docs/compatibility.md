@@ -16,7 +16,7 @@ Booting to one UART line is not considered a pass.
 | NerdMiner 1.8.3 | Interpreter + JIT | Pass | None in the scripted scenario |
 | Bruce 1.16.1 (CYD 2432S028) | Interpreter + JIT | Pass | Expand radio interaction coverage; requires the official ESP32 ROM ELF |
 | Meshtastic 2.7.26 (T-Beam) | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
-| openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand display and network interaction coverage |
+| openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand FT6336 touch and HTTP/MQTT interaction coverage |
 | Tasmota 15.6.0 | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
 | WLED 16.0.1 | Interpreter + JIT | Pass | DNRGB-to-RMT is covered; expand HTTP, DDP, and E1.31 coverage |
 
@@ -33,8 +33,8 @@ into this repository.
 
 ## Curated CYD scenarios
 
-`scripts/check-stock-roms.sh` drives unmodified Bruce, Marauder, NerdMiner, and
-WLED images through board-level scenarios on both engines. It checks
+`scripts/check-stock-roms.sh` drives unmodified Bruce, Marauder, NerdMiner,
+openHASP, and WLED images through board-level scenarios on both engines. It checks
 completion, modeled I/O, and identical final framebuffer or LED-waveform
 digests. Known official image hashes have pinned output digests, so a model
 change is explicit.
@@ -59,6 +59,13 @@ The NerdMiner scenario covers:
 - captive-portal HTTP and DNS traffic
 - host-backed pool networking and the mining task path
 
+The openHASP scenario covers:
+
+- ST7789V rendering over the Lanbon L8's production CS22/DC21/SCLK19 bus
+- a host TCP client connected to the firmware's production lwIP/Telnet service
+- three JSONL commands through ConsoleInput, the dispatcher, LVGL, and the
+  resulting deterministic RGB framebuffer
+
 The WLED scenario covers:
 
 - access-point startup and the production WiFiUDP socket bound on port 21324
@@ -72,6 +79,7 @@ Run the scenarios with:
 BRUCE_BIN=/path/to/bruce.bin \
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
+OPENHASP_BIN=/path/to/openhasp.bin \
 WLED_BIN=/path/to/wled.bin \
 ./scripts/check-stock-roms.sh
 ```

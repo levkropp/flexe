@@ -89,8 +89,8 @@ Common options:
 
 ## Production status
 
-Bruce, Marauder, NerdMiner, and WLED pass scripted board-level scenarios in
-both engines. Meshtastic, openHASP, and Tasmota pass the generic production
+Bruce, Marauder, NerdMiner, openHASP, and WLED pass scripted board-level
+scenarios in both engines. Meshtastic and Tasmota pass the generic production
 gate. See [Firmware compatibility](docs/compatibility.md) for pinned versions,
 assertions, and remaining board-specific coverage.
 
@@ -105,8 +105,8 @@ FLEXE_ROMS=/path/to/roms ./scripts/check-firmware.sh
 ```
 
 Production ROMs are intentionally not committed. The stock runner accepts
-`BRUCE_BIN`, `MARAUDER_BIN`, `NERDMINER_BIN`, and `WLED_BIN`; the generic
-runner accepts paths or a `FLEXE_ROMS` directory.
+`BRUCE_BIN`, `MARAUDER_BIN`, `NERDMINER_BIN`, `OPENHASP_BIN`, and `WLED_BIN`;
+the generic runner accepts paths or a `FLEXE_ROMS` directory.
 
 See [Testing](docs/testing.md) for sanitizer builds, fixture configuration,
 JIT verification, and what each gate asserts.

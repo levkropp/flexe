@@ -64,6 +64,7 @@ Use the scripted stock scenarios when the image has one:
 ```sh
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
+OPENHASP_BIN=/path/to/openhasp.bin \
 ./scripts/bench-stock-roms.sh
 ```
 

@@ -733,6 +733,26 @@ TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy) {
     teardown(&cpu);
 }
 
+TEST(test_openhasp_lanbon_requires_complete_fingerprint) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x40086E2Cu),
+              ROM_FIRMWARE_UNKNOWN);
+    seed_openhasp_v070rc13_profile(&cpu);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x40086E2Cu),
+              ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8);
+
+    /* A reused entry point cannot authorize fixed lwIP addresses by itself. */
+    mem_write8(cpu.mem, 0x4015C758u, 0u);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x40086E2Cu),
+              ROM_FIRMWARE_UNKNOWN);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_marauder_same_entry_uses_instruction_fingerprint) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1066,6 +1086,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy);
+    RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);
     RUN_TEST(test_marauder_v1121_cyd2usb_uses_independent_fingerprint);
     RUN_TEST(test_marauder_v1121_virtualizes_only_its_phy_and_sync_state);

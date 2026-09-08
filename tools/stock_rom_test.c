@@ -148,6 +148,15 @@ typedef struct {
 } nerd_network_probe_t;
 
 typedef struct {
+    int fd;
+    uint16_t host_port;
+    char response[16384];
+    size_t response_len;
+    size_t response_bytes;
+    size_t request_bytes;
+} openhasp_telnet_probe_t;
+
+typedef struct {
     uint64_t frames;
     uint64_t bytes;
     uint64_t beacon_frames;
@@ -778,6 +787,20 @@ static void framebuffer_copy(uint16_t *dst, const uint16_t *src,
     pthread_mutex_unlock(mutex);
 }
 
+static void framebuffer_primary_counts(const uint16_t *fb,
+                                       pthread_mutex_t *mutex,
+                                       size_t counts[3])
+{
+    counts[0] = counts[1] = counts[2] = 0;
+    pthread_mutex_lock(mutex);
+    for (int i = 0; i < FB_PIXELS; i++) {
+        if (fb[i] == 0xF800u) counts[0]++;
+        if (fb[i] == 0x07E0u) counts[1]++;
+        if (fb[i] == 0x001Fu) counts[2]++;
+    }
+    pthread_mutex_unlock(mutex);
+}
+
 static int session_alive(flexe_session_t *session)
 {
     xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
@@ -1340,13 +1363,13 @@ static void nerd_probe_close(nerd_network_probe_t *probe)
     probe->udp_fd = -1;
 }
 
-static int nerd_probe_nonblocking(int fd)
+static int host_socket_nonblocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     return flags < 0 ? -1 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static int nerd_probe_send_all(int fd, const void *data, size_t len)
+static int host_socket_send_all(int fd, const void *data, size_t len)
 {
     const uint8_t *src = data;
     while (len > 0) {
@@ -1389,9 +1412,9 @@ static int nerd_probe_open(wifi_stubs_t *wifi, nerd_network_probe_t *probe)
     if (probe->tcp_fd < 0) goto fail;
     peer.sin_port = htons(probe->tcp_port);
     if (connect(probe->tcp_fd, (struct sockaddr *)&peer, sizeof(peer)) != 0 ||
-        nerd_probe_send_all(probe->tcp_fd, http_request,
+        host_socket_send_all(probe->tcp_fd, http_request,
                             sizeof(http_request) - 1) != 0 ||
-        nerd_probe_nonblocking(probe->tcp_fd) != 0)
+        host_socket_nonblocking(probe->tcp_fd) != 0)
         goto fail;
 
     probe->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1400,7 +1423,7 @@ static int nerd_probe_open(wifi_stubs_t *wifi, nerd_network_probe_t *probe)
     if (sendto(probe->udp_fd, dns_query, sizeof(dns_query), 0,
                (struct sockaddr *)&peer, sizeof(peer)) !=
             (ssize_t)sizeof(dns_query) ||
-        nerd_probe_nonblocking(probe->udp_fd) != 0)
+        host_socket_nonblocking(probe->udp_fd) != 0)
         goto fail;
     return 0;
 
@@ -1465,11 +1488,179 @@ static int run_until_nerd_services(flexe_session_t *session,
     return 1;
 }
 
+static void openhasp_telnet_close(openhasp_telnet_probe_t *probe)
+{
+    if (probe->fd >= 0) close(probe->fd);
+    probe->fd = -1;
+}
+
+static int openhasp_telnet_open(wifi_stubs_t *wifi,
+                                openhasp_telnet_probe_t *probe)
+{
+    memset(probe, 0, sizeof(*probe));
+    probe->fd = -1;
+    if (wifi_stubs_get_bound_host_port(wifi, 23, false,
+                                       &probe->host_port) != 0)
+        return -1;
+
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    peer.sin_port = htons(probe->host_port);
+    probe->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (probe->fd < 0 ||
+        connect(probe->fd, (struct sockaddr *)&peer, sizeof(peer)) != 0 ||
+        host_socket_nonblocking(probe->fd) != 0) {
+        openhasp_telnet_close(probe);
+        return -1;
+    }
+    return 0;
+}
+
+static void openhasp_telnet_receive(openhasp_telnet_probe_t *probe)
+{
+    uint8_t chunk[2048];
+    if (probe->fd < 0) return;
+    for (;;) {
+        ssize_t n = recv(probe->fd, chunk, sizeof(chunk), MSG_DONTWAIT);
+        if (n <= 0) break;
+        probe->response_bytes += (size_t)n;
+        size_t room = sizeof(probe->response) - 1 - probe->response_len;
+        size_t keep = (size_t)n < room ? (size_t)n : room;
+        if (keep != 0) {
+            memcpy(probe->response + probe->response_len, chunk, keep);
+            probe->response_len += keep;
+            probe->response[probe->response_len] = '\0';
+        }
+    }
+}
+
+static int run_until_openhasp_telnet(flexe_session_t *session,
+                                     openhasp_telnet_probe_t *probe,
+                                     uint64_t max_cycles,
+                                     wifi_stubs_stats_t *stats_out,
+                                     uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    uint64_t start = cpu0->cycle_count;
+    uint64_t welcomed_at = 0;
+    wifi_stubs_stats_t stats = {0};
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        wifi_stubs_get_stats(wifi, &stats);
+        if (probe->fd < 0 && stats.listen_successes != 0 &&
+            wifi_stubs_get_bound_host_port(wifi, 23, false,
+                                           &probe->host_port) == 0 &&
+            openhasp_telnet_open(wifi, probe) != 0)
+            return -2;
+
+        run_one_batch(session);
+        openhasp_telnet_receive(probe);
+        wifi_stubs_get_stats(wifi, &stats);
+        /* With empty credentials openHASP calls telnetClientLogon() from the
+         * accept path, before telnetLoop() constructs ConsoleInput. Its
+         * attempted "Prompt > " update is consequently a no-op; the welcome
+         * banner plus the accepted socket is the real readiness contract. */
+        if (probe->fd >= 0 && stats.accept_successes != 0 &&
+            strstr(probe->response, "Welcome") != NULL &&
+            welcomed_at == 0)
+            welcomed_at = cpu0->cycle_count;
+        /* Do not race the two telnetClient.flush() calls at the tail of the
+         * accept path: Arduino's WiFiClient::flush() discards pending input.
+         * One short guest-time grace period lets telnetLoop construct its
+         * ConsoleInput before the harness transmits commands. */
+        if (welcomed_at != 0 && cpu0->cycle_count - welcomed_at >= 10000000u) {
+            *stats_out = stats;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    openhasp_telnet_receive(probe);
+    wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+static int run_openhasp_rgb_page(
+        flexe_session_t *session, openhasp_telnet_probe_t *probe,
+        const uint16_t *before, const uint16_t *fb, pthread_mutex_t *mutex,
+        const wifi_stubs_stats_t *stats_before, uint64_t max_cycles_per_line,
+        wifi_stubs_stats_t *stats_out, uint64_t *cycles_out,
+        int *changed_out, size_t primary_counts[3], size_t *lines_out)
+{
+    static const char *const commands[] = {
+        "{\"page\":0,\"id\":10,\"obj\":\"obj\",\"x\":0,\"y\":0,\"w\":240,\"h\":107,"
+        "\"bg_color\":\"#FF0000\",\"bg_opa\":255,\"border_width\":0,\"radius\":0}\r\n",
+        "{\"page\":0,\"id\":11,\"obj\":\"obj\",\"x\":0,\"y\":107,\"w\":240,\"h\":106,"
+        "\"bg_color\":\"#00FF00\",\"bg_opa\":255,\"border_width\":0,\"radius\":0}\r\n",
+        "{\"page\":0,\"id\":12,\"obj\":\"obj\",\"x\":0,\"y\":213,\"w\":240,\"h\":107,"
+        "\"bg_color\":\"#0000FF\",\"bg_opa\":255,\"border_width\":0,\"radius\":0}\r\n",
+    };
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    uint64_t start = cpu0->cycle_count;
+    probe->request_bytes = 0;
+    *lines_out = 0;
+
+    for (size_t line = 0; line < sizeof(commands) / sizeof(commands[0]);
+         line++) {
+        size_t len = strlen(commands[line]);
+        if (host_socket_send_all(probe->fd, commands[line], len) != 0) {
+            *cycles_out = cpu0->cycle_count - start;
+            return -2;
+        }
+        probe->request_bytes += len;
+
+        uint64_t line_start = cpu0->cycle_count;
+        unsigned batches = 0;
+        bool rendered = false;
+        while (cpu0->cycle_count - line_start < max_cycles_per_line) {
+            if (!session_alive(session)) return -1;
+            run_one_batch(session);
+            openhasp_telnet_receive(probe);
+            if (++batches % 100 != 0) continue;
+
+            wifi_stubs_get_stats(wifi, stats_out);
+            framebuffer_primary_counts(fb, mutex, primary_counts);
+            if (stats_out->recv_bytes >= stats_before->recv_bytes +
+                                              probe->request_bytes &&
+                primary_counts[line] >= 20000) {
+                rendered = true;
+                break;
+            }
+        }
+        if (!rendered) {
+            *changed_out = framebuffer_diff(before, fb, mutex);
+            *cycles_out = cpu0->cycle_count - start;
+            return 1;
+        }
+
+        /* telnetProcessLine() flushes unread RX after dispatching each line.
+         * Give it time to return and clear its own line before sending the
+         * next command, exactly as an interactive terminal does. */
+        if (run_for_virtual_cycles(session, 10000000u) != 0) return -1;
+        openhasp_telnet_receive(probe);
+        *lines_out = line + 1;
+    }
+
+    wifi_stubs_get_stats(wifi, stats_out);
+    *changed_out = framebuffer_diff(before, fb, mutex);
+    framebuffer_primary_counts(fb, mutex, primary_counts);
+    *cycles_out = cpu0->cycle_count - start;
+    return stats_out->send_bytes > stats_before->send_bytes &&
+           *changed_out >= 60000 && primary_counts[0] >= 20000 &&
+           primary_counts[1] >= 20000 && primary_counts[2] >= 20000 ? 0 : 1;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s [--no-jit] [--verify] [--rom-elf ESP32_ROM.elf] "
-            "bruce|marauder|nerdminer|wled <firmware.bin>\n",
+            "bruce|marauder|nerdminer|openhasp|wled <firmware.bin>\n",
             argv0);
 }
 
@@ -1505,8 +1696,10 @@ int main(int argc, char **argv)
     int is_bruce = strcmp(profile, "bruce") == 0;
     int is_marauder = strcmp(profile, "marauder") == 0;
     int is_nerdminer = strcmp(profile, "nerdminer") == 0;
+    int is_openhasp = strcmp(profile, "openhasp") == 0;
     int is_wled = strcmp(profile, "wled") == 0;
-    if (!is_bruce && !is_marauder && !is_nerdminer && !is_wled) {
+    if (!is_bruce && !is_marauder && !is_nerdminer && !is_openhasp &&
+        !is_wled) {
         usage(argv[0]);
         return 2;
     }
@@ -1651,7 +1844,9 @@ int main(int argc, char **argv)
                 &bt_tx_probe);
     }
 
-    int min_nonblack = is_bruce ? 4000 : (is_marauder ? 8000 : 20000);
+    int min_nonblack = is_bruce ? 4000 :
+                       (is_marauder ? 8000 :
+                        (is_openhasp ? 10000 : 20000));
     uint64_t boot_limit = (is_marauder || is_bruce) ?
                           8000000000ull : 2000000000ull;
     int nonblack = 0;
@@ -1748,6 +1943,12 @@ int main(int argc, char **argv)
     uint64_t wled_rmt_frames_at_match = 0;
     uint32_t wled_led_digest = 0;
     size_t wled_packet_bytes = 0;
+    uint64_t openhasp_telnet_cycles = 0;
+    uint64_t openhasp_rgb_cycles = 0;
+    int openhasp_changed = 0;
+    size_t openhasp_primary[3] = {0};
+    size_t openhasp_jsonl_lines = 0;
+    openhasp_telnet_probe_t openhasp_telnet = {.fd = -1};
     bt_stubs_stats_t bt_stats = {0};
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
     if (is_wled) {
@@ -1795,6 +1996,85 @@ int main(int argc, char **argv)
         }
         wled_led_digest = wled_rmt_probe.last_digest;
         wled_rmt_frames_at_match = wled_rmt_probe.frames;
+    }
+    if (is_openhasp) {
+        int telnet_result = run_until_openhasp_telnet(
+                session, &openhasp_telnet, 1500000000ull, &wifi_stats,
+                &openhasp_telnet_cycles);
+        if (telnet_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=openhasp reason=%s host_port=%u "
+                    "cycles=%llu accepts=%llu tcp_rx=%llu tcp_tx=%llu "
+                    "response_bytes=%zu\n",
+                    telnet_result == -2 ? "host-telnet-connect" :
+                    telnet_result < 0 ? "cpus-stopped-before-telnet" :
+                                        "telnet-ready-timeout",
+                    openhasp_telnet.host_port,
+                    (unsigned long long)openhasp_telnet_cycles,
+                    (unsigned long long)wifi_stats.accept_successes,
+                    (unsigned long long)wifi_stats.recv_bytes,
+                    (unsigned long long)wifi_stats.send_bytes,
+                    openhasp_telnet.response_bytes);
+            if (getenv("FLEXE_DUMP_UART")) {
+                fprintf(stderr, "Telnet response (%zu bytes retained):\n",
+                        openhasp_telnet.response_len);
+                fwrite(openhasp_telnet.response, 1,
+                       openhasp_telnet.response_len, stderr);
+                fprintf(stderr, "\nUART0 log (%zu bytes):\n", uart.log_len);
+                fwrite(uart.log, 1, uart.log_len, stderr);
+                fputc('\n', stderr);
+            }
+            openhasp_telnet_close(&openhasp_telnet);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+
+        framebuffer_copy(before, framebuf, &framebuffer_mutex);
+        wifi_stubs_stats_t before_commands = wifi_stats;
+        int rgb_result = run_openhasp_rgb_page(
+                session, &openhasp_telnet, before, framebuf,
+                &framebuffer_mutex, &before_commands, 500000000ull,
+                &wifi_stats, &openhasp_rgb_cycles, &openhasp_changed,
+                openhasp_primary, &openhasp_jsonl_lines);
+        if (rgb_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=openhasp reason=%s host_port=%u sent=%zu "
+                    "cycles=%llu lines=%zu changed=%d rgb=%zu/%zu/%zu "
+                    "tcp_rx=%llu tcp_tx=%llu response_bytes=%zu\n",
+                    rgb_result == -2 ? "telnet-send" :
+                    rgb_result < 0 ? "cpus-stopped-during-jsonl" :
+                                     "telnet-jsonl-display-timeout",
+                    openhasp_telnet.host_port,
+                    openhasp_telnet.request_bytes,
+                    (unsigned long long)openhasp_rgb_cycles,
+                    openhasp_jsonl_lines, openhasp_changed,
+                    openhasp_primary[0],
+                    openhasp_primary[1], openhasp_primary[2],
+                    (unsigned long long)wifi_stats.recv_bytes,
+                    (unsigned long long)wifi_stats.send_bytes,
+                    openhasp_telnet.response_bytes);
+            if (getenv("FLEXE_DUMP_UART")) {
+                fprintf(stderr, "Telnet response (%zu bytes retained):\n",
+                        openhasp_telnet.response_len);
+                fwrite(openhasp_telnet.response, 1,
+                       openhasp_telnet.response_len, stderr);
+                fprintf(stderr, "\nUART0 log (%zu bytes):\n", uart.log_len);
+                fwrite(uart.log, 1, uart.log_len, stderr);
+                fputc('\n', stderr);
+            }
+            openhasp_telnet_close(&openhasp_telnet);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        openhasp_telnet_close(&openhasp_telnet);
     }
     if (is_bruce) {
         if (!uart_contains(&uart, "SDCARD mounted successfully")) {
@@ -2533,8 +2813,8 @@ int main(int argc, char **argv)
         int saved = 0;
         uint64_t connect_calls = 0;
         if (sfd >= 0 && connect(sfd, (struct sockaddr *)&sv, sizeof(sv)) == 0 &&
-            nerd_probe_send_all(sfd, save_req, sizeof(save_req) - 1) == 0 &&
-            nerd_probe_nonblocking(sfd) == 0) {
+            host_socket_send_all(sfd, save_req, sizeof(save_req) - 1) == 0 &&
+            host_socket_nonblocking(sfd) == 0) {
             for (int i = 0; i < 8000; i++) {
                 if (flexe_session_run_core(session, 0, 100000) < 0) break;
                 flexe_session_post_batch(session, 100000);
@@ -2890,6 +3170,20 @@ int main(int argc, char **argv)
                wled_rmt_probe.last_byte_count,
                (unsigned long long)wled_rmt_probe.malformed_frames,
                wled_led_digest);
+    if (is_openhasp)
+        printf(" telnet=%u telnet_rx=%zu telnet_tx=%zu "
+               "telnet_cycles=%llu jsonl_cycles=%llu tcp_rx=%llu "
+               "tcp_tx=%llu display_changed=%d rgb=%zu/%zu/%zu "
+               "console=jsonl lines=%zu",
+               openhasp_telnet.host_port, openhasp_telnet.request_bytes,
+               openhasp_telnet.response_bytes,
+               (unsigned long long)openhasp_telnet_cycles,
+               (unsigned long long)openhasp_rgb_cycles,
+               (unsigned long long)wifi_stats.recv_bytes,
+               (unsigned long long)wifi_stats.send_bytes,
+               openhasp_changed, openhasp_primary[0],
+               openhasp_primary[1], openhasp_primary[2],
+               openhasp_jsonl_lines);
     if (is_nerdminer) {
         if (stratum_up)
             printf(" stratum=mining jobs=%d shares=%d",

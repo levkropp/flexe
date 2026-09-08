@@ -12,6 +12,7 @@
 #   BRUCE_BIN=/path/to/bruce.bin \
 #   MARAUDER_BIN=/path/to/marauder.bin \
 #   NERDMINER_BIN=/path/to/nerdminer.bin \
+#   OPENHASP_BIN=/path/to/openhasp.bin \
 #   WLED_BIN=/path/to/wled.bin ./scripts/check-stock-roms.sh
 #
 # Any extra positional arguments are treated as Marauder-profile images, which
@@ -37,6 +38,9 @@ fi
 if [[ -n "${MARAUDER_BIN:-}" ]]; then
     names+=(marauder); profiles+=(marauder); roms+=("$MARAUDER_BIN")
 fi
+if [[ -n "${OPENHASP_BIN:-}" ]]; then
+    names+=(openhasp); profiles+=(openhasp); roms+=("$OPENHASP_BIN")
+fi
 if [[ -n "${WLED_BIN:-}" ]]; then
     names+=(wled); profiles+=(wled); roms+=("$WLED_BIN")
 fi
@@ -45,7 +49,7 @@ for rom in "$@"; do
 done
 
 if (( ${#roms[@]} == 0 )); then
-    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/WLED_BIN or pass at least one ROM" >&2
+    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/WLED_BIN or pass at least one ROM" >&2
     exit 2
 fi
 
@@ -75,6 +79,7 @@ expected_artifact() {
     6459db43b36b5d303485185e0fc9fa4e672c0409246592b9c955550fc3091a26) echo 28C56B5E ;;  # re-pinned
     968c1babf8b72c82a86e7e4cb3b86fcd4d619a67ad879aab02e7358f2a1a30d1) echo 3F42FBF0 ;;  # re-pinned
     72fa27948cd7f3bce4b6eabaaa8757b0d0e7854c534e8a502ce197d2397d899b) echo F1858410 ;;
+    2f7a57fe7e23160ff2a73b214540d420abe395c5caa30ed809a40b16b67b0ee2) echo 026EBEE5 ;;  # openHASP 0.7.0-rc13 Lanbon L8
     628917b0753edcfc9a8408e6387c6d1ace6a360d315441e9563d60299fef8594) echo F29E02EB ;;  # WLED 16.0.1
     *) echo "" ;;
     esac

@@ -136,6 +136,19 @@ static inline void seed_wled_v1601_profile(xtensa_cpu_t *cpu) {
     put_test_bytes(cpu, 0x40182D44u, wifi_start, sizeof(wifi_start));
 }
 
+static inline void seed_openhasp_v070rc13_profile(xtensa_cpu_t *cpu) {
+    static const uint8_t socket_entry[] = {
+        0x36, 0x41, 0x00, 0x26, 0x23, 0x29, 0x26, 0x33,
+        0x12, 0x66, 0x13, 0x53, 0x22, 0xC2, 0xFE, 0xC1,
+    };
+    static const uint8_t bind_entry[] = {
+        0x36, 0x81, 0x00, 0xAD, 0x02, 0x25, 0xF7, 0xFE,
+        0x5D, 0x0A, 0x7C, 0xF2, 0x16, 0xEA, 0x04, 0x22,
+    };
+    put_test_bytes(cpu, 0x4015CD70u, socket_entry, sizeof(socket_entry));
+    put_test_bytes(cpu, 0x4015C758u, bind_entry, sizeof(bind_entry));
+}
+
 static inline uint32_t rrr(int op2, int op1, int r, int s, int t) {
     return (uint32_t)((op2 << 20) | (op1 << 16) | (r << 12) | (s << 8) | (t << 4) | 0);
 }

@@ -17,6 +17,9 @@
 #define TEST_WLED_SOCKET             0x4015820Cu
 #define TEST_WLED_CLOSE              0x40157E04u
 #define TEST_WLED_DISCONNECT         0x40182F54u
+#define TEST_OPENHASP_ENTRY          0x40086E2Cu
+#define TEST_OPENHASP_SOCKET         0x4015CD70u
+#define TEST_OPENHASP_CLOSE          0x4015C80Cu
 
 typedef struct {
     uint64_t calls;
@@ -338,6 +341,31 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     teardown(&cpu);
 }
 
+TEST(openhasp_profile_hooks_production_socket_boundary) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_openhasp_v070rc13_profile(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_OPENHASP_ENTRY), 20);
+    invoke_wifi_call0_4(&cpu, TEST_OPENHASP_SOCKET, 10u, 1u, 0u, 0u);
+    uint32_t socket_fd = ar_read(&cpu, 2);
+    ASSERT_EQ(socket_fd, 46u);
+    invoke_wifi_call0(&cpu, TEST_OPENHASP_CLOSE, socket_fd);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.socket_calls, 1u);
+    ASSERT_EQ64(stats.socket_successes, 1u);
+    ASSERT_EQ64(stats.close_calls, 1u);
+
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
@@ -346,4 +374,5 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(v11423_fingerprint_selects_shifted_wifi_entries);
     RUN_TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries);
     RUN_TEST(wled_posts_disconnect_on_native_event_loop);
+    RUN_TEST(openhasp_profile_hooks_production_socket_boundary);
 }

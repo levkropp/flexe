@@ -4476,6 +4476,25 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             fw_signature_matches(mem, 0x40182D44u,
                                  wifi_start, sizeof(wifi_start)))
             profile = ROM_FIRMWARE_WLED_V1601;
+    } else if (entry_point == 0x40086E2Cu) {
+        /* Official openHASP 0.7.0-rc13 Lanbon L8 image. The release commit
+         * builds against Arduino-ESP32 2.0.14; these independently relocated
+         * lwIP entries identify the exact stripped link before its host
+         * socket boundary is installed. */
+        static const uint8_t socket_entry[] = {
+            0x36, 0x41, 0x00, 0x26, 0x23, 0x29, 0x26, 0x33,
+            0x12, 0x66, 0x13, 0x53, 0x22, 0xC2, 0xFE, 0xC1,
+        };
+        static const uint8_t bind_entry[] = {
+            0x36, 0x81, 0x00, 0xAD, 0x02, 0x25, 0xF7, 0xFE,
+            0x5D, 0x0A, 0x7C, 0xF2, 0x16, 0xEA, 0x04, 0x22,
+        };
+        xtensa_mem_t *mem = stubs->cpu->mem;
+        if (fw_signature_matches(mem, 0x4015CD70u,
+                                 socket_entry, sizeof(socket_entry)) &&
+            fw_signature_matches(mem, 0x4015C758u,
+                                 bind_entry, sizeof(bind_entry)))
+            profile = ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8;
     }
 
     stubs->firmware_profile = profile;

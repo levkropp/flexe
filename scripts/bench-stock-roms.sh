@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Reproducible performance/correctness gate for external production ESP32 ROMs.
 #
-# ROMs are intentionally not stored in this repository. Supply either or both
-# well-known images through environment variables, or pass arbitrary .bin files
-# as positional arguments:
+# ROMs are intentionally not stored in this repository. Supply well-known
+# images through environment variables, or pass arbitrary .bin files as
+# positional arguments:
 #
-#   MARAUDER_BIN=/path/to/marauder.bin \
-#   NERDMINER_BIN=/path/to/nerdminer.bin ./scripts/bench-stock-roms.sh
+#   OPENHASP_BIN=/path/to/openhasp.bin ./scripts/bench-stock-roms.sh
 #
 # Useful overrides:
 #   EMU=./build/xtensa-emu  CYCLES=2000000000  REPS=3
@@ -50,6 +49,10 @@ case "$engine" in
 esac
 
 declare -a names roms
+if [[ -n "${BRUCE_BIN:-}" ]]; then
+    names+=(bruce)
+    roms+=("$BRUCE_BIN")
+fi
 if [[ -n "${MARAUDER_BIN:-}" ]]; then
     names+=(marauder)
     roms+=("$MARAUDER_BIN")
@@ -58,13 +61,21 @@ if [[ -n "${NERDMINER_BIN:-}" ]]; then
     names+=(nerdminer)
     roms+=("$NERDMINER_BIN")
 fi
+if [[ -n "${OPENHASP_BIN:-}" ]]; then
+    names+=(openhasp)
+    roms+=("$OPENHASP_BIN")
+fi
+if [[ -n "${WLED_BIN:-}" ]]; then
+    names+=(wled)
+    roms+=("$WLED_BIN")
+fi
 for rom in "$@"; do
     names+=("$(basename -- "$rom" .bin)")
     roms+=("$rom")
 done
 
 if (( ${#roms[@]} == 0 )); then
-    echo "error: set MARAUDER_BIN/NERDMINER_BIN or pass at least one ROM path" >&2
+    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/WLED_BIN or pass at least one ROM path" >&2
     exit 2
 fi
 for rom in "${roms[@]}"; do
