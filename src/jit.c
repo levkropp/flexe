@@ -1090,6 +1090,25 @@ static uint32_t jit_rems_helper(xtensa_cpu_t *cpu, uint32_t n, uint32_t d) {
     return (uint32_t)(sn % sd);
 }
 
+/* Normalized shift amounts. These instructions are uncommon as individual
+ * operations but compiler-built allocators use them to classify size bins;
+ * refusing one truncates the much larger surrounding block. Keep the exact
+ * Xtensa zero cases separate: NSAU(0) is 32, while NSA(0) and NSA(-1) are 31. */
+static uint32_t jit_nsa_helper(xtensa_cpu_t *cpu, uint32_t value,
+                               uint32_t unused) {
+    (void)cpu;
+    (void)unused;
+    if ((int32_t)value < 0) value = ~value;
+    return value ? (uint32_t)__builtin_clz(value) : 31u;
+}
+
+static uint32_t jit_nsau_helper(xtensa_cpu_t *cpu, uint32_t value,
+                                uint32_t unused) {
+    (void)cpu;
+    (void)unused;
+    return value ? (uint32_t)__builtin_clz(value) : 32u;
+}
+
 static void emit_mem_read32(emit_t *e, int addr_reg, int dst_reg) {
     /* ecx = addr >> 12 */
     emit_mov_reg32_reg32(e, RCX, addr_reg);
@@ -1667,15 +1686,15 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_mov_reg_imm32(e, RAX, (uint32_t)(s | ((t & 1) << 4)));
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_SAR);
                     return 1;
-                case 14: { /* NSA */
-                    ra_load_ar(e, ra,RAX, wb4, s);
-                    /* Full NSA emulation: normalize signed value */
-                    /* Emit a call to a small helper that computes NSA */
-                    /* For now, use a C helper call */
-                    return 0; /* skip for now */
-                }
-                case 15: { /* NSAU */
-                    return 0; /* skip for now */
+                case 14: case 15: { /* NSA / NSAU */
+                    ra_load_ar(e, ra, RAX, wb4, s);
+                    emit_mov_reg_imm32(e, RBX, 0);
+                    emit_call_cpu3(e,
+                        r == 14 ? (void *)(uintptr_t)jit_nsa_helper
+                                : (void *)(uintptr_t)jit_nsau_helper,
+                        RAX, RBX);
+                    ra_store_ar(e, ra, RAX, wb4, t);
+                    return 1;
                 }
                 default: return 0;
                 }
@@ -2034,6 +2053,21 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 default: return 0; /* Unknown SR: fall back */
                 }
                 emit_load_cpu32(e, RAX, off);
+                if (sr_num == XT_SR_CCOUNT) {
+                    /* CCOUNT advances once per guest instruction. The hook
+                     * charges a native run only after it returns, so a read
+                     * inside the run must add both completed chained blocks
+                     * and the instructions preceding this one. Without this,
+                     * ESP-IDF's cross-core clock calibration drifts by a few
+                     * ticks whenever its RSR lands in a compiled block. */
+#ifdef JIT_ARCH_ARM64
+                    emit_add_reg32(e, RAX, REG_ACC);
+#else
+                    emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_JIT_ACC);
+                    emit_add_reg32(e, RAX, RBX);
+#endif
+                    emit_add_reg32_imm32(e, RAX, insn_idx);
+                }
                 ra_store_ar(e, ra,RAX, wb4, t);
                 return 1;
             }
@@ -3923,7 +3957,7 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
      * crashed NerdMiner inside the code cache. */
     if (scan.count == 0 ||
         (scan.count < 4 && !jit_short_block_has_backedge(&scan, pc) &&
-         !(scan.count >= 2 && lv == 0u && jit_chain_wanted(jit, pc, wb)))) {
+         !(lv == 0u && jit_chain_wanted(jit, pc, wb)))) {
         /* Short straight-line block: dispatch overhead dominates. Record it,
          * or every later execution pays for the same scan again. */
         b->flags |= JIT_BLK_UNCOMPILABLE;

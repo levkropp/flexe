@@ -397,6 +397,24 @@ TEST(test_jit_sll_srl_sra) {
     }
 }
 
+TEST(test_jit_nsa_nsau) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    ar_write(&cpu, 2, 0u);
+    ar_write(&cpu, 3, 0x80000000u);
+    ar_write(&cpu, 8, 0x00010000u);
+    ar_write(&cpu, 9, 0xFFFEFFFFu);
+
+    /* ST1/r=14,15 write t from source s. Cover both special zero results and
+     * equal-magnitude positive/negative values in one compilable block. */
+    put_insn3(&cpu, BASE,      rrr(4, 0, 14, 2, 4)); /* NSA  a4, a2 */
+    put_insn3(&cpu, BASE + 3u, rrr(4, 0, 15, 2, 5)); /* NSAU a5, a2 */
+    put_insn3(&cpu, BASE + 6u, rrr(4, 0, 14, 9, 6)); /* NSA  a6, a9 */
+    put_insn3(&cpu, BASE + 9u, rrr(4, 0, 15, 8, 7)); /* NSAU a7, a8 */
+    test_block_differential(&cpu, 4, "nsa_nsau");
+    teardown(&cpu);
+}
+
 TEST(test_jit_mull) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -764,6 +782,48 @@ TEST(test_jit_hot_threshold) {
     ASSERT_TRUE(fn != NULL);
 
     ASSERT_EQ(jit_get_stats(jit)->blocks_compiled, 1);
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_single_instruction_chain_target_is_native) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE;
+    const uint32_t source = BASE + 0x40u;
+    const uint32_t return_pc = BASE + 0x100u;
+
+    /* A lone RET is normally too small to compile. Mark it cold first, then
+     * compile a backward predecessor: the pending native chain makes even a
+     * one-instruction target profitable because it shares the predecessor's
+     * prologue and dispatcher entry. This is the shape of the ENTRY/RETW
+     * fragments at the top of WLED's remaining interpreter profile. */
+    put_insn2(&cpu, target, narrow(0xD, 15, 0, 0)); /* RET.N */
+    put_insn2(&cpu, source,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, source + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, source + 4u, narrow(0xD, 15, 0, 3));
+    int32_t joff = (int32_t)target - (int32_t)(source + 6u + 3u) - 1;
+    put_insn3(&cpu, source + 6u,
+              (((uint32_t)joff & 0x3FFFFu) << 6) | 6u);
+    ar_write(&cpu, 0, return_pc);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        ASSERT_TRUE(jit_get_block(jit, &cpu, target) == NULL);
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, source);
+    jit_block_fn fn = jit_get_block(jit, &cpu, source);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    ASSERT_EQ(jit_get_stats(jit)->blocks_compiled, 2u);
+    ASSERT_EQ(jit_get_stats(jit)->chains_patched, 1u);
+
+    cpu.pc = source;
+    ASSERT_EQ(fn(&cpu), 5);
+    ASSERT_EQ(cpu.pc, return_pc);
+
     jit_destroy(jit);
     teardown(&cpu);
 }
@@ -1998,6 +2058,20 @@ TEST(test_jit_rsr_prid_wsr_ps) {
     teardown(&cpu);
 }
 
+TEST(test_jit_rsr_ccount_observes_instruction_position) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.ccount = 1000u;
+
+    put_insn2(&cpu, BASE,      narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, BASE + 2u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn3(&cpu, BASE + 4u,
+              rrr(0, 3, XT_SR_CCOUNT >> 4, XT_SR_CCOUNT & 15, 5));
+    put_insn2(&cpu, BASE + 7u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    test_block_differential(&cpu, 4, "rsr_ccount_position");
+    teardown(&cpu);
+}
+
 TEST(test_jit_wsr_ps_rearms_irq_check) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2400,6 +2474,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_verify_toggle_recompiles_blocks);
     RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
     RUN_TEST(test_jit_hot_threshold);
+    RUN_TEST(test_jit_single_instruction_chain_target_is_native);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);
     RUN_TEST(test_jit_contended_spinlock_returns_to_scheduler);
@@ -2435,6 +2510,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_srli);
     RUN_TEST(test_jit_src_funnel);
     RUN_TEST(test_jit_sll_srl_sra);
+    RUN_TEST(test_jit_nsa_nsau);
     RUN_TEST(test_jit_mull);
     RUN_TEST(test_jit_mulsh);
     RUN_TEST(test_jit_neg);
@@ -2453,6 +2529,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_rsil);
     RUN_TEST(test_jit_rsr_wsr_sar);
     RUN_TEST(test_jit_rsr_prid_wsr_ps);
+    RUN_TEST(test_jit_rsr_ccount_observes_instruction_position);
     RUN_TEST(test_jit_wsr_ps_rearms_irq_check);
     RUN_TEST(test_jit_wsr_ps_exits_before_pending_irq);
     RUN_TEST(test_jit_rur_wur_user_registers);
