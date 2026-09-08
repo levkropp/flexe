@@ -2784,10 +2784,9 @@ void exec_mac16(xtensa_cpu_t *cpu, uint32_t insn) {
 
 
 /* ===== Main step function (always-inlined into xtensa_run hot loop) ===== */
-/* Parameters local_cc/bitmap/hook are cached locals from xtensa_run to keep
- * them in registers instead of reloading from the cpu struct each iteration.
- * local_cc accumulates cycle_count in a register; flushed to cpu->cycle_count
- * only before callbacks that may read it (pc_hook stubs). */
+/* local_cc accumulates cycle_count in a register and is flushed to the CPU
+ * only before callbacks that may read it. prev_pc likewise keeps fatal-trap
+ * history out of the per-instruction CPU-state write set. */
 
 static __attribute__((noinline, cold))
 void xtensa_invalid_pc_trap(xtensa_cpu_t *cpu) {
@@ -2806,7 +2805,21 @@ void xtensa_invalid_pc_trap(xtensa_cpu_t *cpu) {
     cpu->exception = true;
 }
 
-/* TEMP DEBUG */
+static inline bool xtensa_pc_is_valid(uint32_t pc) {
+    return (uint32_t)(pc - ESP32_INSN_ADDR_LOW) <
+           (ESP32_INSN_ADDR_HIGH - ESP32_INSN_ADDR_LOW);
+}
+
+static __attribute__((noinline, cold))
+int xtensa_invalid_pc_step(xtensa_cpu_t *cpu, uint64_t local_cc,
+                           uint32_t last_pc) {
+    cpu->cycle_count = local_cc;
+    cpu->dbg_prev_pc = last_pc;
+    xtensa_invalid_pc_trap(cpu);
+    return -1;
+}
+
+/* Optional runtime diagnostics. */
 uint32_t g_dbg_pc;
 int g_dbg_core;
 int g_dbg_watch_en = 1;
@@ -3000,13 +3013,14 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
      * ordinary firmware observers at that same address. */
     const bool accelerator_fallthrough =
         __builtin_expect(cpu->jit_fallthrough_dispatch != 0, 0);
-    const bool dispatch_boundary = cpu->_pc_written || accelerator_fallthrough;
+    const bool pc_written = cpu->_pc_written != 0;
+    const bool dispatch_boundary = pc_written || accelerator_fallthrough;
     if (__builtin_expect(dispatch_boundary, 0)) {
         cpu->br_ring[cpu->br_ring_idx & (XT_BR_RING_SIZE - 1)] = cpu->pc;
         cpu->br_ring_idx++;
         /* Return from a guest_call_async() callee. Only reachable through the
          * return address that call planted, so the compare is enough. */
-        if (cpu->_pc_written &&
+        if (pc_written &&
             __builtin_expect(cpu->pc == GUEST_CALL_ASYNC_SENTINEL, 0))
             guest_call_async_return(cpu);
     }
@@ -3014,8 +3028,9 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
         int hook_insns = cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx);
-        cpu->jit_fallthrough_dispatch = false;
         if (hook_insns) {
+            if (accelerator_fallthrough)
+                cpu->jit_fallthrough_dispatch = false;
             /* Native hooks may account a whole block, while time-oriented
              * stubs may fast-forward cycle_count.  Pull that advancement
              * back into the cached counter before charging the dispatching
@@ -3038,20 +3053,17 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
             return cpu->exception ? -1 : (hook_insns > 1 ? hook_insns : 0);
         }
     }
-    cpu->jit_fallthrough_dispatch = false;
-
-    /* Invalid PC trap. Slow-path body lives in a noinline helper so
-     * the hot-path branch is just a single range compare. */
-    if (__builtin_expect(cpu->pc < ESP32_INSN_ADDR_LOW ||
-                         cpu->pc >= ESP32_INSN_ADDR_HIGH, 0)) {
-        cpu->cycle_count = *local_cc;
-        cpu->dbg_prev_pc = last_pc;
-        xtensa_invalid_pc_trap(cpu);
-        return -1;
-    }
+    /* This transition marker is normally already clear. */
+    if (accelerator_fallthrough)
+        cpu->jit_fallthrough_dispatch = false;
 
     /* Breakpoint check */
     if (__builtin_expect(cpu->breakpoint_count > 0, 0)) {
+        /* Preserve invalid-PC-before-breakpoint ordering for debugger runs.
+         * Normal predecoded execution proves the PC range with its table
+         * bounds below and avoids this check entirely. */
+        if (__builtin_expect(!xtensa_pc_is_valid(cpu->pc), 0))
+            return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
         cpu->breakpoint_hit = false;
         for (int i = 0; i < cpu->breakpoint_count; i++) {
             if (cpu->breakpoints[i] == cpu->pc) {
@@ -3065,12 +3077,6 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
     /* AOT fast path: try the statically-recompiled function for this PC.
      * Skipped if the PC is in the ROM-stub bitmap — those functions
      * (esp_chip_info, memcpy, ets_printf, ...) implement hardware
-     * behavior the AOT version can't fake, since the AOT function is
-     * just a literal translation of firmware code that would try to
-     * probe registers we don't model. */
-    /* AOT fast path: try the statically-recompiled function for this PC.
-     * Skipped if the PC is in the ROM-stub bitmap — those functions
-     * (esp_chip_info, memcpy, ets_printf, ...) implement hardware
      * behavior the AOT version can't fake.
      *
      * STATUS: integration plumbing verified, but the translator in
@@ -3079,29 +3085,34 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
      * differential testing (task #35), --aot is opt-in and prints a
      * warning at startup. Pass --aot only on a verified-good dylib. */
     /* AOT entry-point probing happens only after a control-flow
-     * transfer — straight-line execution can't land on a new
-     * translated function. `_pc_written` is set by branches/calls/
-     * returns/exceptions in the previous step and survives until the
-     * reset at line 2073 below. This cuts AOT probe cost from
-     * per-step to per-branch, typically 5-10x fewer probes. */
-    if (__builtin_expect(cpu->aot_bitmap != NULL && cpu->_pc_written, 0) &&
-        rom_stubs_hook_bitmap_test(cpu->aot_bitmap, cpu->pc) &&
-        !(cpu->pc_hook_bitmap &&
-          rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
-        typedef int (*aot_fn_t)(xtensa_cpu_t *);
-        aot_fn_t fn = (aot_fn_t)cpu->aot_lookup_fn(cpu->aot, cpu->pc);
-        if (fn) {
-            /* Flush local_cc so the AOT function's stub-flush path
-             * (cpu->cycle_count += insn_count) stacks on top of the
-             * current total rather than racing. */
-            cpu->cycle_count = *local_cc;
-            int n = fn(cpu);
-            if (n > 0) {
-                cpu->ccount += (uint32_t)n;
-                *local_cc = cpu->cycle_count + (uint64_t)n;
-                if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0))
-                    xtensa_fire_timers(cpu);
-                return cpu->exception ? -1 : 0;
+     * transfer — straight-line execution can't land on a new translated
+     * function. `_pc_written` is set by branches/calls/returns/exceptions in
+     * the previous step and consumed before executing this one. */
+    if (__builtin_expect(pc_written && cpu->aot_bitmap != NULL, 0)) {
+        /* An AOT lookup is the only normal-predecode operation that consumes
+         * PC before the table proves it is in range. Keep invalid addresses
+         * from reaching its bitmap while leaving straight-line interpreter
+         * dispatch free of a redundant range check. */
+        if (__builtin_expect(!xtensa_pc_is_valid(cpu->pc), 0))
+            return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
+        if (rom_stubs_hook_bitmap_test(cpu->aot_bitmap, cpu->pc) &&
+            !(cpu->pc_hook_bitmap &&
+              rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
+            typedef int (*aot_fn_t)(xtensa_cpu_t *);
+            aot_fn_t fn = (aot_fn_t)cpu->aot_lookup_fn(cpu->aot, cpu->pc);
+            if (fn) {
+                /* Flush local_cc so the AOT function's stub-flush path
+                 * (cpu->cycle_count += insn_count) stacks on top of the
+                 * current total rather than racing. */
+                cpu->cycle_count = *local_cc;
+                int n = fn(cpu);
+                if (n > 0) {
+                    cpu->ccount += (uint32_t)n;
+                    *local_cc = cpu->cycle_count + (uint64_t)n;
+                    if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0))
+                        xtensa_fire_timers(cpu);
+                    return cpu->exception ? -1 : 0;
+                }
             }
         }
     }
@@ -3122,6 +3133,11 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
         }
     }
 #endif
+    /* A populated predecode entry is indexed from ESP32_INSN_ADDR_LOW and is
+     * therefore also the common-path PC validity proof. Misses still take the
+     * architectural invalid-PC trap before the fallback fetch. */
+    if (__builtin_expect(!xtensa_pc_is_valid(cpu->pc), 0))
+        return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
     ilen = xtensa_fetch_inline(cpu, cpu->pc, &insn);
     if (__builtin_expect(ilen == 0, 0)) {
         xtensa_raise_exception(cpu, EXCCAUSE_IFETCH_ERROR, cpu->pc, 0);
@@ -3135,7 +3151,9 @@ have_insn:
 #if FLEXE_PROFILE_BUILD
     xtensa_profile_tick_sp(cpu->pc, ar_read(cpu, 1));
 #endif
-    cpu->_pc_written = false;
+    /* Avoid publishing a redundant zero on straight-line instructions. */
+    if (pc_written)
+        cpu->_pc_written = false;
 
     if (__builtin_expect(cpu->real_window_vectors, 0) &&
         window_access_check(cpu, insn, ilen)) {
