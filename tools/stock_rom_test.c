@@ -12,6 +12,7 @@
 #include "jit.h"
 #include "spi_display.h"
 #include "sx127x.h"
+#include "ublox_gps.h"
 #include "wifi_stubs.h"
 #include "guest_call.h"
 
@@ -124,7 +125,7 @@ static const char *const kPanicMarkers[] = {
 
 typedef struct {
     uint64_t count;
-    char log[8192];
+    char log[32768];
     size_t log_len;
     size_t match[PANIC_MARKER_COUNT];  /* per-marker match progress */
     int    panic;                      /* index of the marker seen, or -1 */
@@ -971,6 +972,31 @@ static int run_until_meshtastic_radio(flexe_session_t *session,
     return 1;
 }
 
+static int run_until_meshtastic_gps_ready(flexe_session_t *session,
+                                          ublox_gps_t *gps,
+                                          uint64_t max_cycles,
+                                          uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        ublox_gps_poll(gps);
+        ublox_gps_stats_t stats;
+        ublox_gps_get_stats(gps, &stats);
+        if (stats.mon_ver_requests != 0 && stats.ack_responses >= 5u &&
+            stats.pending_bytes == 0) {
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+        run_one_batch(session);
+    }
+
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
 static int send_wled_realtime_frame(uint16_t host_port, size_t *bytes_out)
 {
     /* DNRGB: protocol, timeout seconds, big-endian starting pixel, RGB data.
@@ -1189,6 +1215,40 @@ static bool uart_contains_from(const uart_state_t *uart, size_t start,
             return true;
     }
     return false;
+}
+
+static int run_until_meshtastic_gps_fix(flexe_session_t *session,
+                                        ublox_gps_t *gps,
+                                        const uart_state_t *uart,
+                                        size_t uart_start,
+                                        uint64_t max_cycles,
+                                        uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+    uint64_t next_fix = start;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        ublox_gps_poll(gps);
+        ublox_gps_stats_t stats;
+        ublox_gps_get_stats(gps, &stats);
+        if (uart_contains_from(uart, uart_start, "NMEA GPS time set") &&
+            stats.pending_bytes == 0 &&
+            periph_uart_rx_pending_num(flexe_session_periph(session), 1) == 0) {
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+        if (cpu0->cycle_count >= next_fix && stats.pending_bytes == 0 &&
+            periph_uart_rx_pending_num(flexe_session_periph(session), 1) == 0) {
+            if (ublox_gps_inject_fix(gps) != 0) return -2;
+            next_fix = cpu0->cycle_count + 200000000ull;
+        }
+        run_one_batch(session);
+    }
+
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
 }
 
 static int run_until_marauder_sniffer(flexe_session_t *session,
@@ -1920,6 +1980,7 @@ int main(int argc, char **argv)
     wled_rmt_probe_t wled_rmt_probe = {.last_channel = -1};
     sx127x_t *meshtastic_radio = NULL;
     axp192_t *meshtastic_pmu = NULL;
+    ublox_gps_t *meshtastic_gps = NULL;
     rom_audit_t rom_audit = {0};
     flexe_session_config_t cfg = {
         .bin_path = rom_path,
@@ -1987,9 +2048,14 @@ int main(int argc, char **argv)
             .battery_mv = 3970,
             .vbus_mv = 5000,
         };
+        ublox_gps_config_t gps_config = {
+            .periph = flexe_session_periph(session),
+            .uart_num = 1,
+        };
         meshtastic_radio = sx127x_create(&radio_config);
         meshtastic_pmu = axp192_create(&pmu_config);
-        if (!meshtastic_radio || !meshtastic_pmu ||
+        meshtastic_gps = ublox_gps_create(&gps_config);
+        if (!meshtastic_radio || !meshtastic_pmu || !meshtastic_gps ||
             periph_spi_attach_device_ex(flexe_session_periph(session),
                                         MESHTASTIC_RADIO_HOST,
                                         MESHTASTIC_RADIO_CS,
@@ -2003,6 +2069,7 @@ int main(int argc, char **argv)
                                      meshtastic_pmu) != 0) {
             fprintf(stderr,
                     "FAIL profile=meshtastic reason=board-endpoint\n");
+            ublox_gps_destroy(meshtastic_gps);
             axp192_destroy(meshtastic_pmu);
             sx127x_destroy(meshtastic_radio);
             flexe_session_destroy(session);
@@ -2012,6 +2079,8 @@ int main(int argc, char **argv)
             free(framebuf);
             return 1;
         }
+        periph_set_uart_callback_num(flexe_session_periph(session), 1,
+                                     ublox_gps_uart_tx, meshtastic_gps);
     }
     if (is_wled) {
         for (int channel = 0; channel < (int)WLED_RMT_CHANNELS; channel++) {
@@ -2168,6 +2237,7 @@ int main(int argc, char **argv)
         freertos_stubs_dump_tasks(flexe_session_frt(session), task_dump,
                                   sizeof(task_dump));
         fprintf(stderr, "FreeRTOS tasks:\n%s", task_dump);
+        ublox_gps_destroy(meshtastic_gps);
         axp192_destroy(meshtastic_pmu);
         sx127x_destroy(meshtastic_radio);
         flexe_session_destroy(session);
@@ -2191,6 +2261,8 @@ int main(int argc, char **argv)
     uint64_t bt_stop_cycles = 0;
     uint64_t bt_tx_cycles = 0;
     uint64_t gps_cycles = 0;
+    uint64_t meshtastic_gps_ready_cycles = 0;
+    uint64_t meshtastic_gps_fix_cycles = 0;
     size_t cli_rx_bytes = 0;
     size_t tx_cli_rx_bytes = 0;
     size_t bt_cli_rx_bytes = 0;
@@ -2218,6 +2290,51 @@ int main(int argc, char **argv)
     tasmota_http_probe_t tasmota_http = {.fd = -1};
     bt_stubs_stats_t bt_stats = {0};
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
+    if (is_meshtastic) {
+        int gps_ready = run_until_meshtastic_gps_ready(
+                session, meshtastic_gps, 1000000000ull,
+                &meshtastic_gps_ready_cycles);
+        size_t uart_start = uart.log_len;
+        int gps_fix = gps_ready == 0 ? run_until_meshtastic_gps_fix(
+                session, meshtastic_gps, &uart, uart_start, 1000000000ull,
+                &meshtastic_gps_fix_cycles) : 1;
+        if (gps_ready != 0 || gps_fix != 0) {
+            ublox_gps_stats_t gps_stats;
+            ublox_gps_get_stats(meshtastic_gps, &gps_stats);
+            fprintf(stderr,
+                    "FAIL profile=meshtastic reason=%s ready_cycles=%llu "
+                    "fix_cycles=%llu tx=%llu rx=%llu commands=%llu "
+                    "acks=%llu mon_ver=%llu nmea=%llu queued=%zu "
+                    "uart1_pending=%zu\n",
+                    gps_ready < 0 || gps_fix == -1 ? "cpus-stopped-gps" :
+                    gps_fix == -2 ? "gps-fix-queue" :
+                    gps_ready != 0 ? "gps-probe-timeout" :
+                                     "gps-fix-timeout",
+                    (unsigned long long)meshtastic_gps_ready_cycles,
+                    (unsigned long long)meshtastic_gps_fix_cycles,
+                    (unsigned long long)gps_stats.tx_bytes,
+                    (unsigned long long)gps_stats.rx_bytes,
+                    (unsigned long long)gps_stats.ubx_commands,
+                    (unsigned long long)gps_stats.ack_responses,
+                    (unsigned long long)gps_stats.mon_ver_requests,
+                    (unsigned long long)gps_stats.nmea_sentences,
+                    gps_stats.pending_bytes,
+                    periph_uart_rx_pending_num(
+                            flexe_session_periph(session), 1));
+            fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
+            fwrite(uart.log, 1, uart.log_len, stderr);
+            fputc('\n', stderr);
+            ublox_gps_destroy(meshtastic_gps);
+            axp192_destroy(meshtastic_pmu);
+            sx127x_destroy(meshtastic_radio);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+    }
     if (is_wled) {
         int realtime_result = run_until_wled_realtime(
                 session, &wled_rmt_probe, wled_host_port, 1000000000ull,
@@ -3507,8 +3624,10 @@ int main(int argc, char **argv)
     if (is_meshtastic) {
         sx127x_stats_t radio_stats;
         axp192_stats_t pmu_stats;
+        ublox_gps_stats_t gps_stats;
         sx127x_get_stats(meshtastic_radio, &radio_stats);
         axp192_get_stats(meshtastic_pmu, &pmu_stats);
+        ublox_gps_get_stats(meshtastic_gps, &gps_stats);
         printf(" radio=sx1276 spi=%llu frames=%llu reads=%llu writes=%llu "
                "tx=%llu rx=%llu op_mode=0x%02X",
                (unsigned long long)radio_stats.spi_transfers,
@@ -3524,6 +3643,17 @@ int main(int argc, char **argv)
                (unsigned long long)pmu_stats.register_reads,
                (unsigned long long)pmu_stats.register_writes,
                axp192_register(meshtastic_pmu, 0x12u));
+        printf(" gps=ublox-m8 uart1_tx=%llu uart1_rx=%llu commands=%llu "
+               "acks=%llu mon_ver=%llu nmea=%llu probe_cycles=%llu "
+               "fix_cycles=%llu",
+               (unsigned long long)gps_stats.tx_bytes,
+               (unsigned long long)gps_stats.rx_bytes,
+               (unsigned long long)gps_stats.ubx_commands,
+               (unsigned long long)gps_stats.ack_responses,
+               (unsigned long long)gps_stats.mon_ver_requests,
+               (unsigned long long)gps_stats.nmea_sentences,
+               (unsigned long long)meshtastic_gps_ready_cycles,
+               (unsigned long long)meshtastic_gps_fix_cycles);
     }
     if (is_wled)
         printf(" ap_udp=%u udp_tx=%zu udp_rx=%llu realtime_cycles=%llu "
@@ -3602,6 +3732,7 @@ int main(int argc, char **argv)
     putchar('\n');
 
     nerd_probe_close(&network_probe);
+    ublox_gps_destroy(meshtastic_gps);
     axp192_destroy(meshtastic_pmu);
     sx127x_destroy(meshtastic_radio);
     flexe_session_destroy(session);

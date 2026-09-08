@@ -72,6 +72,7 @@ set(LIB_SOURCES
     src/spi_display.c
     src/sx127x.c
     src/axp192.c
+    src/ublox_gps.c
     src/rom_stubs.c
     src/elf_symbols.c
     src/freertos_stubs.c
