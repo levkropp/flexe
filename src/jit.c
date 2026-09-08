@@ -4027,7 +4027,7 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
      * effect; relaxing it for chain targets without saying so explicitly
      * crashed NerdMiner inside the code cache. */
     if (scan.count == 0 ||
-        (scan.count < 4 && !jit_short_block_has_backedge(&scan, pc) &&
+        (scan.count < 3 && !jit_short_block_has_backedge(&scan, pc) &&
          !(lv == 0u && jit_chain_wanted(jit, pc, wb)))) {
         /* Short straight-line block: dispatch overhead dominates. Record it,
          * or every later execution pays for the same scan again. */
