@@ -100,15 +100,23 @@ for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
     virtual_total=0
     aggregate_total=0
     workload_ok=1
+    accepted=0
+    attempt=0
+    discarded=0
 
-    for ((rep = 1; rep <= reps; rep++)); do
-        log="$work_dir/${rom_index}-${rep}.stderr"
-        uart="$work_dir/${rom_index}-${rep}.uart"
+    # A newly launched process can occasionally lose most of one sample to
+    # dyld, filesystem, or scheduler activity. Discard one such sample, but
+    # fail on a second: persistent off-CPU time is an emulator regression,
+    # not benchmark noise (for example, blocking in poll()/accept()).
+    while (( accepted < reps && attempt < reps + 1 )); do
+        ((attempt += 1))
+        log="$work_dir/${rom_index}-${attempt}.stderr"
+        uart="$work_dir/${rom_index}-${attempt}.uart"
         start_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
         times >"$work_dir/times-before"
         if ! "$emu" "${emu_args[@]}" -q -c "$cycles" "$rom" \
                 >"$uart" 2>"$log"; then
-            echo "error: $name run $rep exited nonzero" >&2
+            echo "error: $name attempt $attempt exited nonzero" >&2
             tail -n 40 "$log" >&2
             workload_ok=0
             break
@@ -117,7 +125,7 @@ for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
         times >"$work_dir/times-after"
 
         if grep -aEq '\[TRAP\]|Stop reason: (cpu stopped|exception loop)' "$log"; then
-            echo "error: $name run $rep trapped or stopped unexpectedly" >&2
+            echo "error: $name attempt $attempt trapped or stopped unexpectedly" >&2
             tail -n 40 "$log" >&2
             workload_ok=0
             break
@@ -126,13 +134,13 @@ for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
         aggregate=$(awk '/^Cycles:/ {print $2; exit}' "$log")
         virtual=$(awk '/^Cycles:/ {gsub(/[()]/, "", $4); print $4; exit}' "$log")
         if [[ ! "$aggregate" =~ ^[0-9]+$ || ! "$virtual" =~ ^[0-9]+$ ]]; then
-            echo "error: $name run $rep produced no parseable execution summary" >&2
+            echo "error: $name attempt $attempt produced no parseable execution summary" >&2
             tail -n 40 "$log" >&2
             workload_ok=0
             break
         fi
         if (( aggregate < cycles )); then
-            echo "error: $name run $rep stopped early ($aggregate < $cycles cycles)" >&2
+            echo "error: $name attempt $attempt stopped early ($aggregate < $cycles cycles)" >&2
             tail -n 40 "$log" >&2
             workload_ok=0
             break
@@ -158,16 +166,28 @@ cpu = after - before
 if wall < 0.5:            # too short to judge
     sys.exit(0)
 sys.exit(0 if cpu >= 0.5 * wall else 1)' "$wall" "$cpu_before" "$cpu_after"; then
-            echo "error: $name run $rep spent most of its wall time off-CPU" \
-                 "(blocked on the host, not emulating)" >&2
-            workload_ok=0
-            break
+            ((discarded += 1))
+            if (( discarded > 1 )); then
+                echo "error: $name spent most of two attempts off-CPU" \
+                     "(blocked on the host, not emulating)" >&2
+                workload_ok=0
+                break
+            fi
+            echo "warning: $name attempt $attempt spent most of its wall time" \
+                 "off-CPU; discarding the contaminated sample" >&2
+            continue
         fi
+        ((accepted += 1))
         wall_total=$(python3 -c 'import sys; print(float(sys.argv[1])+float(sys.argv[2]))' \
             "$wall_total" "$wall")
         virtual_total=$((virtual_total + virtual))
         aggregate_total=$((aggregate_total + aggregate))
     done
+
+    if (( workload_ok && accepted < reps )); then
+        echo "error: $name produced only $accepted of $reps valid samples" >&2
+        workload_ok=0
+    fi
 
     if (( ! workload_ok )); then
         printf '%-18s %10s %12s %11s %11s %s\n' "$name" - - - - FAIL
