@@ -2887,10 +2887,18 @@ static void test_gpio_route(xtensa_mem_t *mem, int pin, int signal) {
 
 typedef struct {
     unsigned calls;
+    unsigned select_calls;
+    int selected;
     int host;
     uint8_t mosi[8];
     size_t mosi_len;
 } test_spi_device_t;
+
+static void test_spi_device_select(void *ctx, int selected) {
+    test_spi_device_t *device = ctx;
+    device->select_calls++;
+    device->selected = selected;
+}
 
 static void test_spi_device_xfer(void *ctx, int host,
                                  const uint8_t *mosi, size_t mosi_len,
@@ -2922,11 +2930,14 @@ TEST(gp_spi_routes_explicit_board_device) {
     periph_enable_spi_display(p, &cfg);
 
     test_spi_device_t device = {0};
-    ASSERT_EQ(periph_spi_attach_device(p, 3, 18, 5,
-                                       test_spi_device_xfer, &device), 0);
+    ASSERT_EQ(periph_spi_attach_device_ex(p, 3, 18, 5,
+                                          test_spi_device_xfer,
+                                          test_spi_device_select,
+                                          &device), 0);
     test_gpio_route(mem, 5, 63);       /* GPIO5 <- VSPICLK */
     test_gpio_route(mem, 18, 256);     /* GPIO18 is software CS */
     mem_write32(mem, 0x3FF44024u, 1u << 18); /* GPIO18 output enable */
+    test_gpio_level(mem, 18, 1);
     test_gpio_level(mem, 18, 0);
 
     static const uint8_t request[2] = {0x42u, 0x00u};
@@ -2938,6 +2949,11 @@ TEST(gp_spi_routes_explicit_board_device) {
     ASSERT_TRUE(memcmp(device.mosi, request, sizeof(request)) == 0);
     ASSERT_EQ(response[0], 0u);
     ASSERT_EQ(response[1], 0x12u);
+    ASSERT_EQ(device.select_calls, 2u);
+    ASSERT_EQ(device.selected, 1);
+    test_gpio_level(mem, 18, 1);
+    ASSERT_EQ(device.select_calls, 3u);
+    ASSERT_EQ(device.selected, 0);
 
     /* The same asserted pin must not claim a transaction from HSPI. */
     test_gp_spi_bytes(mem, spi2, request, response, sizeof(request));

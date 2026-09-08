@@ -10,6 +10,7 @@
 #include "flexe_session.h"
 #include "jit.h"
 #include "spi_display.h"
+#include "sx127x.h"
 #include "wifi_stubs.h"
 #include "guest_call.h"
 
@@ -49,6 +50,10 @@
 #define WLED_RMT_FRAME_BYTES      128u
 #define TASMOTA_HTTP_PORT         80u
 #define TASMOTA_TEST_GPIO         4
+#define MESHTASTIC_RADIO_HOST     3
+#define MESHTASTIC_RADIO_CS       18
+#define MESHTASTIC_RADIO_SCK      5
+#define MESHTASTIC_RADIO_DIO0     26
 
 /* Extra cycles run after the scripted steps, to catch a firmware that passes
  * every check and then panics. Sized to cover the observed failure at roughly
@@ -932,6 +937,32 @@ static int run_until_wled_ready(flexe_session_t *session,
     return 1;
 }
 
+static int run_until_meshtastic_radio(flexe_session_t *session,
+                                      sx127x_t *radio,
+                                      uint64_t max_cycles,
+                                      uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    uint64_t start = cpu0->cycle_count;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        sx127x_stats_t stats;
+        sx127x_get_stats(radio, &stats);
+        uint8_t op_mode = sx127x_register(radio, 0x01u);
+        uint8_t mode = op_mode & 0x07u;
+        if (stats.version_reads != 0 && (op_mode & 0x80u) != 0 &&
+            (mode == 0x05u || mode == 0x06u)) {
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+        run_one_batch(session);
+    }
+
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
 static int send_wled_realtime_frame(uint16_t host_port, size_t *bytes_out)
 {
     /* DNRGB: protocol, timeout seconds, big-endian starting pixel, RGB data.
@@ -1802,7 +1833,8 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s [--no-jit] [--verify] [--rom-elf ESP32_ROM.elf] "
-            "bruce|marauder|nerdminer|openhasp|tasmota|wled <firmware.bin>\n",
+            "bruce|marauder|meshtastic|nerdminer|openhasp|tasmota|wled "
+            "<firmware.bin>\n",
             argv0);
 }
 
@@ -1837,12 +1869,13 @@ int main(int argc, char **argv)
     const char *rom_path = argv[argi];
     int is_bruce = strcmp(profile, "bruce") == 0;
     int is_marauder = strcmp(profile, "marauder") == 0;
+    int is_meshtastic = strcmp(profile, "meshtastic") == 0;
     int is_nerdminer = strcmp(profile, "nerdminer") == 0;
     int is_openhasp = strcmp(profile, "openhasp") == 0;
     int is_tasmota = strcmp(profile, "tasmota") == 0;
     int is_wled = strcmp(profile, "wled") == 0;
-    if (!is_bruce && !is_marauder && !is_nerdminer && !is_openhasp &&
-        !is_tasmota && !is_wled) {
+    if (!is_bruce && !is_marauder && !is_meshtastic && !is_nerdminer &&
+        !is_openhasp && !is_tasmota && !is_wled) {
         usage(argv[0]);
         return 2;
     }
@@ -1877,6 +1910,7 @@ int main(int argc, char **argv)
     raw_tx_probe_t raw_tx_probe = {0};
     bt_tx_probe_t bt_tx_probe = {0};
     wled_rmt_probe_t wled_rmt_probe = {.last_channel = -1};
+    sx127x_t *meshtastic_radio = NULL;
     rom_audit_t rom_audit = {0};
     flexe_session_config_t cfg = {
         .bin_path = rom_path,
@@ -1932,6 +1966,31 @@ int main(int argc, char **argv)
         free(before);
         free(framebuf);
         return 1;
+    }
+    if (is_meshtastic) {
+        sx127x_config_t radio_config = {
+            .periph = flexe_session_periph(session),
+            .dio0_pin = MESHTASTIC_RADIO_DIO0,
+        };
+        meshtastic_radio = sx127x_create(&radio_config);
+        if (!meshtastic_radio ||
+            periph_spi_attach_device_ex(flexe_session_periph(session),
+                                        MESHTASTIC_RADIO_HOST,
+                                        MESHTASTIC_RADIO_CS,
+                                        MESHTASTIC_RADIO_SCK,
+                                        sx127x_spi_transfer,
+                                        sx127x_spi_select,
+                                        meshtastic_radio) != 0) {
+            fprintf(stderr,
+                    "FAIL profile=meshtastic reason=radio-endpoint\n");
+            sx127x_destroy(meshtastic_radio);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
     }
     if (is_wled) {
         for (int channel = 0; channel < (int)WLED_RMT_CHANNELS; channel++) {
@@ -1991,7 +2050,8 @@ int main(int argc, char **argv)
                        (is_marauder ? 8000 :
                         (is_openhasp ? 10000 : 20000));
     uint64_t boot_limit = (is_marauder || is_bruce) ?
-                          8000000000ull : 2000000000ull;
+                          8000000000ull :
+                          (is_meshtastic ? 4000000000ull : 2000000000ull);
     wifi_stubs_stats_t wifi_stats = {0};
     int nonblack = 0;
     uint64_t boot_cycles = 0;
@@ -2006,6 +2066,9 @@ int main(int argc, char **argv)
         screen_result = run_until_tasmota_ready(
                 session, boot_limit, &tasmota_host_port, &wifi_stats,
                 &boot_cycles);
+    else if (is_meshtastic)
+        screen_result = run_until_meshtastic_radio(
+                session, meshtastic_radio, boot_limit, &boot_cycles);
     else
         screen_result = run_until_screen(session, framebuf,
                                          &framebuffer_mutex, min_nonblack,
@@ -2022,6 +2085,7 @@ int main(int argc, char **argv)
                 profile, screen_result < 0 ? "cpus-stopped" :
                          (is_wled ? "udp-or-rmt-timeout" :
                           is_tasmota ? "http-server-timeout" :
+                          is_meshtastic ? "radio-init-timeout" :
                                        "screen-timeout"),
                 nonblack, (unsigned long long)boot_cycles,
                 cpu0 ? cpu0->pc : 0, cpu1 ? cpu1->pc : 0,
@@ -2047,6 +2111,23 @@ int main(int argc, char **argv)
                     wled_rmt_probe.last_item_count,
                     wled_rmt_probe.last_byte_count,
                     (unsigned long long)wled_rmt_probe.overflows);
+        if (is_meshtastic) {
+            sx127x_stats_t radio_stats;
+            sx127x_get_stats(meshtastic_radio, &radio_stats);
+            fprintf(stderr,
+                    "Meshtastic radio: spi=%llu frames=%llu reads=%llu "
+                    "writes=%llu version_reads=%llu tx=%llu rx=%llu "
+                    "op_mode=0x%02X version=0x%02X\n",
+                    (unsigned long long)radio_stats.spi_transfers,
+                    (unsigned long long)radio_stats.spi_frames,
+                    (unsigned long long)radio_stats.register_reads,
+                    (unsigned long long)radio_stats.register_writes,
+                    (unsigned long long)radio_stats.version_reads,
+                    (unsigned long long)radio_stats.tx_packets,
+                    (unsigned long long)radio_stats.rx_packets,
+                    sx127x_register(meshtastic_radio, 0x01u),
+                    sx127x_register(meshtastic_radio, 0x42u));
+        }
         fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
         fwrite(uart.log, 1, uart.log_len, stderr);
         fputc('\n', stderr);
@@ -2054,6 +2135,7 @@ int main(int argc, char **argv)
         freertos_stubs_dump_tasks(flexe_session_frt(session), task_dump,
                                   sizeof(task_dump));
         fprintf(stderr, "FreeRTOS tasks:\n%s", task_dump);
+        sx127x_destroy(meshtastic_radio);
         flexe_session_destroy(session);
         pthread_mutex_destroy(&framebuffer_mutex);
         unlink(sd_path);
@@ -3388,6 +3470,19 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_frames,
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
+    if (is_meshtastic) {
+        sx127x_stats_t radio_stats;
+        sx127x_get_stats(meshtastic_radio, &radio_stats);
+        printf(" radio=sx1276 spi=%llu frames=%llu reads=%llu writes=%llu "
+               "tx=%llu rx=%llu op_mode=0x%02X",
+               (unsigned long long)radio_stats.spi_transfers,
+               (unsigned long long)radio_stats.spi_frames,
+               (unsigned long long)radio_stats.register_reads,
+               (unsigned long long)radio_stats.register_writes,
+               (unsigned long long)radio_stats.tx_packets,
+               (unsigned long long)radio_stats.rx_packets,
+               sx127x_register(meshtastic_radio, 0x01u));
+    }
     if (is_wled)
         printf(" ap_udp=%u udp_tx=%zu udp_rx=%llu realtime_cycles=%llu "
                "rmt_channel=%d rmt_tick_hz=%u rmt_frames=%llu "
@@ -3465,6 +3560,7 @@ int main(int argc, char **argv)
     putchar('\n');
 
     nerd_probe_close(&network_probe);
+    sx127x_destroy(meshtastic_radio);
     flexe_session_destroy(session);
     pthread_mutex_destroy(&framebuffer_mutex);
     unlink(sd_path);

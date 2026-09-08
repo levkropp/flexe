@@ -214,6 +214,7 @@ typedef struct {
         int cs_pin;
         int sck_pin;
         periph_spi_device_fn fn;
+        periph_spi_select_fn select_fn;
         void *ctx;
     } device[SPI_DEVICE_MAX];
 } spi_display_t;
@@ -1201,6 +1202,13 @@ void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx) {
 
 int periph_spi_attach_device(esp32_periph_t *p, int host, int cs_pin,
                              int sck_pin, periph_spi_device_fn fn, void *ctx) {
+    return periph_spi_attach_device_ex(p, host, cs_pin, sck_pin, fn, NULL,
+                                       ctx);
+}
+
+int periph_spi_attach_device_ex(esp32_periph_t *p, int host, int cs_pin,
+                                int sck_pin, periph_spi_device_fn fn,
+                                periph_spi_select_fn select_fn, void *ctx) {
     if (!p || (host != 2 && host != 3) || cs_pin < 0 || cs_pin > 39 ||
         sck_pin < 0 || sck_pin > 39)
         return -1;
@@ -1218,6 +1226,7 @@ int periph_spi_attach_device(esp32_periph_t *p, int host, int cs_pin,
             if (fn) {
                 s->device[i].sck_pin = sck_pin;
                 s->device[i].fn = fn;
+                s->device[i].select_fn = select_fn;
                 s->device[i].ctx = ctx;
             } else {
                 memset(&s->device[i], 0, sizeof(s->device[i]));
@@ -1231,6 +1240,7 @@ int periph_spi_attach_device(esp32_periph_t *p, int host, int cs_pin,
         s->device[i].cs_pin = cs_pin;
         s->device[i].sck_pin = sck_pin;
         s->device[i].fn = fn;
+        s->device[i].select_fn = select_fn;
         s->device[i].ctx = ctx;
         return 0;
     }
@@ -1238,6 +1248,19 @@ int periph_spi_attach_device(esp32_periph_t *p, int host, int cs_pin,
 }
 
 void spi_display_gpio_changed(esp32_periph_t *p, int pin, int level) {
+    if (p) {
+        for (int host = 0; host < 2; host++) {
+            spi_display_t *target = &g_host[host];
+            if (target->periph != p) continue;
+            for (unsigned i = 0; i < SPI_DEVICE_MAX; i++) {
+                if (target->device[i].fn && target->device[i].select_fn &&
+                    target->device[i].cs_pin == pin)
+                    target->device[i].select_fn(target->device[i].ctx,
+                                                level == 0);
+            }
+        }
+    }
+
     /* Software SPI is a set of board wires, not a GP-SPI host. Keep one copy
      * of its state even though the register model has an instance per host. */
     spi_display_t *s = &g_host[0];

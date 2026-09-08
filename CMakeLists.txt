@@ -70,6 +70,7 @@ set(LIB_SOURCES
     src/rom_elf.c
     src/peripherals.c
     src/spi_display.c
+    src/sx127x.c
     src/rom_stubs.c
     src/elf_symbols.c
     src/freertos_stubs.c

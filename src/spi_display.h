@@ -58,16 +58,22 @@ typedef void (*spi_probe_fn)(const uint8_t *mosi, size_t mosi_len,
                              uint8_t *miso, size_t miso_len, void *ctx);
 void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx);
 
-/* Attach a target to one GP-SPI host and its board-level wires. The callback
- * receives the complete bytes clocked while cs_pin is asserted; it may fill
- * the MISO phase in place. host is 2 (HSPI) or 3 (VSPI), and sck_pin is used
- * to reject transactions routed through the other controller. Passing NULL
- * as fn detaches the matching host/CS target. */
+/* Attach a target to one GP-SPI host and its board-level wires. The transfer
+ * callback receives each controller transaction clocked while cs_pin is
+ * asserted and may fill the MISO phase in place. A software-controlled CS can
+ * remain asserted across several transactions, so the optional select
+ * callback reports its GPIO edges and lets a device preserve framing. host is
+ * 2 (HSPI) or 3 (VSPI), and sck_pin rejects traffic routed through the other
+ * controller. Passing NULL as fn detaches the matching host/CS target. */
 typedef void (*periph_spi_device_fn)(void *ctx, int host,
                                      const uint8_t *mosi, size_t mosi_len,
                                      uint8_t *miso, size_t miso_len);
+typedef void (*periph_spi_select_fn)(void *ctx, int selected);
 int periph_spi_attach_device(esp32_periph_t *p, int host, int cs_pin,
                              int sck_pin, periph_spi_device_fn fn, void *ctx);
+int periph_spi_attach_device_ex(esp32_periph_t *p, int host, int cs_pin,
+                                int sck_pin, periph_spi_device_fn fn,
+                                periph_spi_select_fn select_fn, void *ctx);
 
 /* Total bytes fed to the panel since start. A firmware whose display task has
  * stopped shows up as this standing still while the CPU stays busy, which a
