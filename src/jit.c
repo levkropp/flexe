@@ -249,8 +249,12 @@ static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc,
         if ((b->flags & JIT_BLK_VALID) && b->pc == tag)
             return b;
         if (!(b->flags & JIT_BLK_VALID)) {
-            if (!victim) victim = b;      /* a free way always wins */
-            continue;
+            /* A free way always wins. This must replace an earlier occupied
+             * candidate, not merely a NULL victim: keeping way 0 after seeing
+             * an empty way collapsed the table back to direct-mapped and made
+             * WLED recompile 93.6% of its emitted blocks. */
+            victim = b;
+            break;
         }
         if (victim && !(victim->flags & JIT_BLK_VALID)) continue;
         /* Compiled code outranks anything not yet compiled, whatever its

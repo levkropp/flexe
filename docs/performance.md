@@ -31,11 +31,11 @@ FLEXE_ROMS=/path/to/corpus MAX_UNMAPPED=0 \
 
 | Firmware | Interpreter | JIT | Retired instructions | UART bytes |
 |---|---:|---:|---:|---:|
-| Meshtastic 2.7.26 T-Beam | 13.35x | 16.85x | 31,609,250 | 11,562 |
-| NerdMiner 1.8.3 | 5.41x | 8.07x | 90,261,905 | 578 |
-| openHASP 0.7.0-rc13 | 3.15x | 5.92x | 152,390,332 | 6,411 |
-| Tasmota 15.6.0 | 2.41x | 6.67x | 208,223,293 | 449 |
-| WLED 16.0.1 | 0.88x | 1.42x | 472,942,095 | 5 |
+| Meshtastic 2.7.26 T-Beam | 13.15x | 19.03x | 31,615,162 | 11,562 |
+| NerdMiner 1.8.3 | 5.73x | 8.70x | 90,678,580 | 578 |
+| openHASP 0.7.0-rc13 | 3.27x | 6.15x | 152,399,237 | 6,411 |
+| Tasmota 15.6.0 | 2.52x | 6.55x | 212,454,580 | 449 |
+| WLED 16.0.1 | 0.92x | 1.64x | 472,823,757 | 5 |
 
 Both engines passed the generic progress gate and produced the same UART digest
 for every image. All five clear real time under the JIT; WLED is deliberately
@@ -90,8 +90,8 @@ and `MAX_UNMAPPED` override its 10,000-instruction scheduling quantum and
 
 ## JIT coverage
 
-The WLED run above executes 88.1% of retired instructions in native blocks,
-averaging 10.0 guest instructions per JIT entry. Coverage is workload-specific
+The WLED run above executes 90.1% of retired instructions in native blocks,
+averaging 10.8 guest instructions per JIT entry. Coverage is workload-specific
 and is not a speed score: compiling standalone one-instruction blocks raised
 WLED coverage to 92.2% but slowed median wall time by about 1.8%. Flexe therefore
 compiles hot standalone blocks from two instructions upward, while still

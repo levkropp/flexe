@@ -786,6 +786,38 @@ TEST(test_jit_hot_threshold) {
     teardown(&cpu);
 }
 
+TEST(test_jit_hash_collision_uses_free_way) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    /* These two (PC, windowbase=0, loop-variant=0) keys intentionally map to
+     * the same set under jit_mix(). Both must coexist: an empty second way
+     * takes precedence over evicting the compiled block in the first way. */
+    const uint32_t first = BASE + 0x560u;
+    const uint32_t second = BASE + 0x1080u;
+    put_insn2(&cpu, first,      narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, first + 2u, narrow(0xD, 15, 0, 0)); /* RET.N */
+    put_insn2(&cpu, second,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, second + 2u, narrow(0xD, 15, 0, 0));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, first);
+    jit_block_fn first_fn = jit_get_block(jit, &cpu, first);
+    ASSERT_TRUE(first_fn != NULL);
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, second);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, second) != NULL);
+
+    ASSERT_TRUE(jit_get_block(jit, &cpu, first) == first_fn);
+    ASSERT_EQ(jit_get_stats(jit)->blocks_compiled, 2u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_one_instruction_straight_line_is_too_short) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2553,6 +2585,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_verify_toggle_recompiles_blocks);
     RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
     RUN_TEST(test_jit_hot_threshold);
+    RUN_TEST(test_jit_hash_collision_uses_free_way);
     RUN_TEST(test_jit_one_instruction_straight_line_is_too_short);
     RUN_TEST(test_jit_single_instruction_chain_target_is_native);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
