@@ -35,6 +35,9 @@ typedef enum {
     /* openHASP 0.7.0-rc13 for the Lanbon L8, built with the release's pinned
      * Arduino-ESP32 2.0.14 / ESP-IDF 4.4 platform. */
     ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8,
+    /* Official Tasmota 15.6.0 tasmota32 release, built with
+     * Arduino-ESP32 3.3.8 / ESP-IDF 5.5.2. */
+    ROM_FIRMWARE_TASMOTA32_V1560,
 } rom_firmware_profile_t;
 
 esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);

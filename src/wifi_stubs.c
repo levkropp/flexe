@@ -583,10 +583,15 @@ static void stub_lwip_send(xtensa_cpu_t *cpu, void *ctx)
     stub_lwip_write(cpu, ctx);
 }
 
+/* lwIP uses different numeric values for these flags than Darwin does. */
+#define LWIP_MSG_PEEK_FLAG      0x01u
+#define LWIP_MSG_DONTWAIT_FLAG  0x08u
+
 /* lwip_read / lwip_recv — used for TCP data (including TLS via VFS).
  * For blocking sockets (nonblocking=false), polls with a timeout so that
- * TLS handshakes can complete. Non-blocking sockets use MSG_DONTWAIT. */
-static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
+ * TLS handshakes can complete. Per-call recv flags still take precedence. */
+static void stub_lwip_receive(xtensa_cpu_t *cpu, void *ctx,
+                              uint32_t guest_flags)
 {
     wifi_stubs_t *ws = ctx;
     ws->stats.recv_calls++;
@@ -610,9 +615,15 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     uint8_t *tmp = malloc(len);
     if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
 
-    ssize_t n;
-    if (s->nonblocking) {
-        n = recv(s->host_fd, tmp, len, MSG_DONTWAIT);
+    bool peek = (guest_flags & LWIP_MSG_PEEK_FLAG) != 0;
+    bool dontwait = s->nonblocking ||
+                    (guest_flags & LWIP_MSG_DONTWAIT_FLAG) != 0;
+    int host_flags = peek ? MSG_PEEK : 0;
+    if (dontwait) host_flags |= MSG_DONTWAIT;
+
+    ssize_t n = -1;
+    if (dontwait) {
+        n = recv(s->host_fd, tmp, len, host_flags);
     } else {
         /* Blocking socket: adaptive timeout based on socket state.
          *
@@ -638,7 +649,7 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
         for (int attempt = 0; attempt < max_attempts; attempt++) {
             int pr = poll(&pfd, 1, poll_ms);
             if (pr > 0) {
-                n = recv(s->host_fd, tmp, len, 0);
+                n = recv(s->host_fd, tmp, len, host_flags);
                 if (n == 0) {
                     wifi_log(ws, "recv(slot %u): EOF (host_fd=%d)\n", fd, s->host_fd);
                 }
@@ -654,18 +665,20 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
                 break;
             }
         }
-        if (n > 0) {
+    }
+
+    if (n > 0) {
+        if (!peek) {
             s->total_received += (uint64_t)n;
             s->awaiting_response = false;
-            wifi_log(ws, "recv(slot %u, %zd/%u bytes)\n", fd, n, len);
-        } else if (n == 0 && s->total_received > 0) {
-            /* Only log EOF for sockets that previously received data;
-             * first-recv EOF already logged above with detail */
-            s->awaiting_response = false;
-            wifi_log(ws, "recv(slot %u): EOF\n", fd);
-        } else if (n == -1) {
-            /* timeout: no data available within poll window */
         }
+        wifi_log(ws, "recv(slot %u, %zd/%u bytes%s)\n", fd, n, len,
+                 peek ? ", peek" : "");
+    } else if (n == 0 && s->total_received > 0) {
+        /* Only log EOF for sockets that previously received data;
+         * first-recv EOF already logged above with detail. */
+        s->awaiting_response = false;
+        wifi_log(ws, "recv(slot %u): EOF\n", fd);
     }
 
     if (n > 0) {
@@ -683,10 +696,14 @@ static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, (uint32_t)n);
 }
 
+static void stub_lwip_read(xtensa_cpu_t *cpu, void *ctx)
+{
+    stub_lwip_receive(cpu, ctx, 0);
+}
+
 static void stub_lwip_recv(xtensa_cpu_t *cpu, void *ctx)
 {
-    /* lwip_recv(fd, buf, len, flags) — same as read, ignore flags */
-    stub_lwip_read(cpu, ctx);
+    stub_lwip_receive(cpu, ctx, ws_arg(cpu, 3));
 }
 
 /* ===== Tier 3: DNS ===== */
@@ -1023,6 +1040,34 @@ static void stub_lwip_getsockname(xtensa_cpu_t *cpu, void *ctx)
     socklen_t slen = sizeof(sa);
     if (getsockname(s->host_fd, (struct sockaddr *)&sa, &slen) < 0) {
         ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
+    if (sa_addr)
+        write_emu_sockaddr_in(cpu, sa_addr, &sa);
+    if (len_addr)
+        mem_write32(cpu->mem, len_addr, sizeof(struct sockaddr_in));
+
+    ws_return(cpu, 0);
+}
+
+static void stub_lwip_getpeername(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t fd       = ws_arg(cpu, 0);
+    uint32_t sa_addr  = ws_arg(cpu, 1);
+    uint32_t len_addr = ws_arg(cpu, 2);
+
+    emu_socket_t *s = slot_get(ws, (int)fd);
+    if (!s) {
+        ws_fail(cpu, NEWLIB_EBADF);
+        return;
+    }
+
+    struct sockaddr_in sa;
+    socklen_t slen = sizeof(sa);
+    if (getpeername(s->host_fd, (struct sockaddr *)&sa, &slen) < 0) {
+        ws_fail(cpu, errno);
         return;
     }
 
@@ -2466,6 +2511,7 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "lwip_setsockopt",    stub_lwip_setsockopt },
         { "lwip_getsockopt",    stub_lwip_getsockopt },
         { "lwip_fcntl",         stub_lwip_fcntl },
+        { "lwip_getpeername",   stub_lwip_getpeername },
         { "lwip_getsockname",   stub_lwip_getsockname },
 
         /* VFS wrappers (WiFiClient uses these instead of lwip_*) */
@@ -2852,6 +2898,34 @@ static const wifi_fw_hook_t openhasp_v070rc13_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
+/* Tasmota 15.6.0, official tasmota32 release. All entries were
+ * relocated by unique 32-byte masked signatures from an independent build of
+ * the exact release tag and its pinned Arduino-ESP32 3.3.8 platform. */
+static const wifi_fw_hook_t tasmota32_v1560_wifi_hooks[] = {
+    { 0x4019A358u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
+    { 0x4019B8B4u, stub_lwip_accept,        "lwip_accept" },
+    { 0x4019BA54u, stub_lwip_bind,          "lwip_bind" },
+    { 0x4019BB14u, stub_lwip_close,         "lwip_close" },
+    { 0x4019BC40u, stub_lwip_connect,       "lwip_connect" },
+    { 0x4019BD10u, stub_lwip_listen,        "lwip_listen" },
+    { 0x4019BD7Cu, stub_lwip_recvfrom,      "lwip_recvfrom" },
+    { 0x4019BE40u, stub_lwip_read,          "lwip_read" },
+    { 0x4019BE5Cu, stub_lwip_recv,          "lwip_recv" },
+    { 0x4019BE78u, stub_lwip_sendto,        "lwip_sendto" },
+    { 0x4019BFE0u, stub_lwip_send,          "lwip_send" },
+    { 0x4019C06Cu, stub_lwip_socket,        "lwip_socket" },
+    { 0x4019C110u, stub_lwip_write,         "lwip_write" },
+    { 0x4019C128u, stub_lwip_select,        "lwip_select" },
+    { 0x4019C40Cu, stub_lwip_getpeername,   "lwip_getpeername" },
+    { 0x4019C424u, stub_lwip_getsockname,   "lwip_getsockname" },
+    { 0x4019C43Cu, stub_lwip_getsockopt,    "lwip_getsockopt" },
+    { 0x4019C4E0u, stub_lwip_setsockopt,    "lwip_setsockopt" },
+    { 0x4019C56Cu, stub_lwip_ioctl,         "lwip_ioctl" },
+    { 0x4019C608u, stub_lwip_fcntl,         "lwip_fcntl" },
+    { 0x4019D448u, stub_dns_gethostbyname,  "dns_gethostbyname_addrtype" },
+    { 0, NULL, NULL },
+};
+
 int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
 {
     if (!ws) return 0;
@@ -2880,6 +2954,8 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = wled_v1601_wifi_hooks;
     else if (profile == ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8)
         hooks = openhasp_v070rc13_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_TASMOTA32_V1560)
+        hooks = tasmota32_v1560_wifi_hooks;
     else
         return 0;
     /* No firmware_status_addr for any profile.

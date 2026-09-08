@@ -4,6 +4,12 @@
 #include "wifi_stubs.h"
 
 #include <string.h>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #define TEST_MARAUDER_ENTRY          0x400831D8u
 #define TEST_WIFI_SET_PROMISC_ADDR   0x40199190u
@@ -20,6 +26,13 @@
 #define TEST_OPENHASP_ENTRY          0x40086E2Cu
 #define TEST_OPENHASP_SOCKET         0x4015CD70u
 #define TEST_OPENHASP_CLOSE          0x4015C80Cu
+#define TEST_TASMOTA_ENTRY           0x40082A58u
+#define TEST_TASMOTA_SOCKET          0x4019C06Cu
+#define TEST_TASMOTA_CLOSE           0x4019BB14u
+#define TEST_TASMOTA_ACCEPT          0x4019B8B4u
+#define TEST_TASMOTA_BIND            0x4019BA54u
+#define TEST_TASMOTA_LISTEN          0x4019BD10u
+#define TEST_TASMOTA_RECV            0x4019BE5Cu
 
 typedef struct {
     uint64_t calls;
@@ -366,6 +379,104 @@ TEST(openhasp_profile_hooks_production_socket_boundary) {
     teardown(&cpu);
 }
 
+TEST(tasmota_profile_hooks_production_socket_boundary) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_tasmota32_v1560_profile(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_TASMOTA_ENTRY), 21);
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_SOCKET, 2u, 1u, 0u, 0u);
+    uint32_t socket_fd = ar_read(&cpu, 2);
+    ASSERT_EQ(socket_fd, 46u);
+    invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, socket_fd);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.socket_calls, 1u);
+    ASSERT_EQ64(stats.socket_successes, 1u);
+    ASSERT_EQ64(stats.close_calls, 1u);
+
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(tasmota_recv_peek_preserves_http_request) {
+#ifndef _WIN32
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_tasmota32_v1560_profile(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    const uint32_t sockaddr_addr = 0x3FFB1000u;
+    const uint32_t sockaddr_len_addr = 0x3FFB1020u;
+    const uint32_t recv_addr = 0x3FFB1040u;
+
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_TASMOTA_ENTRY), 21);
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_SOCKET, 2u, 1u, 0u, 0u);
+    uint32_t listen_fd = ar_read(&cpu, 2);
+    ASSERT_EQ(listen_fd, 46u);
+
+    mem_write8(cpu.mem, sockaddr_addr + 0u, 16u);
+    mem_write8(cpu.mem, sockaddr_addr + 1u, 2u);
+    mem_write16(cpu.mem, sockaddr_addr + 2u, htons(80));
+    mem_write32(cpu.mem, sockaddr_addr + 4u, htonl(INADDR_ANY));
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_BIND, listen_fd,
+                        sockaddr_addr, 16u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_LISTEN, listen_fd, 1u, 0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    uint16_t host_port = 0;
+    ASSERT_EQ(wifi_stubs_get_bound_host_port(wifi, 80, false, &host_port), 0);
+    int host_fd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_TRUE(host_fd >= 0);
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_port = htons(host_port),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    ASSERT_EQ(connect(host_fd, (struct sockaddr *)&peer, sizeof(peer)), 0);
+    ASSERT_EQ(send(host_fd, "GET", 3, 0), 3);
+
+    mem_write32(cpu.mem, sockaddr_len_addr, 16u);
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_ACCEPT, listen_fd,
+                        sockaddr_addr, sockaddr_len_addr, 0u);
+    uint32_t client_fd = ar_read(&cpu, 2);
+    ASSERT_EQ(client_fd, 47u);
+
+    /* lwIP's MSG_PEEK=0x01 and MSG_DONTWAIT=0x08 are not Darwin's flag
+     * values. Two NetworkClient::connected() probes must leave the first
+     * byte untouched for WebServer's parser. */
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+                        recv_addr, 1u, 0x09u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'G');
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+                        recv_addr, 1u, 0x09u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'G');
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+                        recv_addr, 1u, 0x08u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'G');
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+                        recv_addr, 1u, 0x08u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'E');
+
+    close(host_fd);
+    invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, client_fd);
+    invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, listen_fd);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+#endif
+}
+
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
@@ -375,4 +486,6 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries);
     RUN_TEST(wled_posts_disconnect_on_native_event_loop);
     RUN_TEST(openhasp_profile_hooks_production_socket_boundary);
+    RUN_TEST(tasmota_profile_hooks_production_socket_boundary);
+    RUN_TEST(tasmota_recv_peek_preserves_http_request);
 }

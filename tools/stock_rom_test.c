@@ -47,6 +47,8 @@
 #define WLED_RMT_EXPECTED_ITEMS   (8u + WLED_LED_BYTES * 8u)
 #define WLED_RMT_FRAME_ITEMS      1024u
 #define WLED_RMT_FRAME_BYTES      128u
+#define TASMOTA_HTTP_PORT         80u
+#define TASMOTA_TEST_GPIO         4
 
 /* Extra cycles run after the scripted steps, to catch a firmware that passes
  * every check and then panics. Sized to cover the observed failure at roughly
@@ -155,6 +157,15 @@ typedef struct {
     size_t response_bytes;
     size_t request_bytes;
 } openhasp_telnet_probe_t;
+
+typedef struct {
+    int fd;
+    uint16_t host_port;
+    char response[16384];
+    size_t response_len;
+    size_t response_bytes;
+    size_t request_bytes;
+} tasmota_http_probe_t;
 
 typedef struct {
     uint64_t frames;
@@ -1656,11 +1667,142 @@ static int run_openhasp_rgb_page(
            primary_counts[1] >= 20000 && primary_counts[2] >= 20000 ? 0 : 1;
 }
 
+static void tasmota_http_close(tasmota_http_probe_t *probe)
+{
+    if (probe->fd >= 0) close(probe->fd);
+    probe->fd = -1;
+}
+
+static void tasmota_http_receive(tasmota_http_probe_t *probe)
+{
+    uint8_t chunk[2048];
+    if (probe->fd < 0) return;
+    for (;;) {
+        ssize_t n = recv(probe->fd, chunk, sizeof(chunk), MSG_DONTWAIT);
+        if (n <= 0) break;
+        probe->response_bytes += (size_t)n;
+        size_t room = sizeof(probe->response) - 1 - probe->response_len;
+        size_t keep = (size_t)n < room ? (size_t)n : room;
+        if (keep != 0) {
+            memcpy(probe->response + probe->response_len, chunk, keep);
+            probe->response_len += keep;
+            probe->response[probe->response_len] = '\0';
+        }
+    }
+}
+
+static int run_until_tasmota_ready(flexe_session_t *session,
+                                    uint64_t max_cycles,
+                                    uint16_t *host_port_out,
+                                    wifi_stubs_stats_t *stats_out,
+                                    uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    uint64_t start = cpu0->cycle_count;
+    unsigned batches = 0;
+    uint16_t host_port = 0;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        if (++batches % 100 != 0) continue;
+        wifi_stubs_get_stats(wifi, stats_out);
+        if (stats_out->listen_successes != 0 &&
+            wifi_stubs_get_bound_host_port(wifi, TASMOTA_HTTP_PORT, false,
+                                           &host_port) == 0) {
+            *host_port_out = host_port;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    wifi_stubs_get_stats(wifi, stats_out);
+    *host_port_out = host_port;
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+static int run_tasmota_http_command(flexe_session_t *session,
+                                    tasmota_http_probe_t *probe,
+                                    const char *encoded_command,
+                                    const char *expected_response,
+                                    int expected_gpio_level,
+                                    uint64_t max_cycles,
+                                    wifi_stubs_stats_t *stats_out,
+                                    uint64_t *cycles_out)
+{
+    char request[1024];
+    int request_len = snprintf(request, sizeof(request),
+            "GET /cm?cmnd=%s HTTP/1.0\r\n"
+            "Host: 192.168.4.1\r\nConnection: close\r\n\r\n",
+            encoded_command);
+    if (request_len < 0 || (size_t)request_len >= sizeof(request)) return -2;
+
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_stats_t before = {0};
+    wifi_stubs_get_stats(wifi, &before);
+    uint64_t start = cpu0->cycle_count;
+
+    tasmota_http_close(probe);
+    probe->response_len = 0;
+    probe->response[0] = '\0';
+    if (wifi_stubs_get_bound_host_port(wifi, TASMOTA_HTTP_PORT, false,
+                                       &probe->host_port) != 0)
+        return -2;
+
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    peer.sin_port = htons(probe->host_port);
+    probe->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (probe->fd < 0 ||
+        connect(probe->fd, (struct sockaddr *)&peer, sizeof(peer)) != 0 ||
+        host_socket_send_all(probe->fd, request, (size_t)request_len) != 0 ||
+        host_socket_nonblocking(probe->fd) != 0) {
+        tasmota_http_close(probe);
+        return -2;
+    }
+    probe->request_bytes += (size_t)request_len;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        tasmota_http_receive(probe);
+        wifi_stubs_get_stats(wifi, stats_out);
+        bool gpio_ok = expected_gpio_level < 0 ||
+                (periph_gpio_output_enabled(flexe_session_periph(session),
+                                            TASMOTA_TEST_GPIO) &&
+                 periph_gpio_pin_level(flexe_session_periph(session),
+                                       TASMOTA_TEST_GPIO) ==
+                                            expected_gpio_level);
+        if (probe->response_len >= 5 &&
+            memcmp(probe->response, "HTTP/", 5) == 0 &&
+            strstr(probe->response, expected_response) != NULL && gpio_ok &&
+            stats_out->accept_successes > before.accept_successes &&
+            stats_out->recv_bytes >= before.recv_bytes +
+                                      (size_t)request_len &&
+            stats_out->send_bytes > before.send_bytes) {
+            *cycles_out = cpu0->cycle_count - start;
+            tasmota_http_close(probe);
+            return 0;
+        }
+    }
+
+    tasmota_http_receive(probe);
+    wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    tasmota_http_close(probe);
+    return 1;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s [--no-jit] [--verify] [--rom-elf ESP32_ROM.elf] "
-            "bruce|marauder|nerdminer|openhasp|wled <firmware.bin>\n",
+            "bruce|marauder|nerdminer|openhasp|tasmota|wled <firmware.bin>\n",
             argv0);
 }
 
@@ -1697,9 +1839,10 @@ int main(int argc, char **argv)
     int is_marauder = strcmp(profile, "marauder") == 0;
     int is_nerdminer = strcmp(profile, "nerdminer") == 0;
     int is_openhasp = strcmp(profile, "openhasp") == 0;
+    int is_tasmota = strcmp(profile, "tasmota") == 0;
     int is_wled = strcmp(profile, "wled") == 0;
     if (!is_bruce && !is_marauder && !is_nerdminer && !is_openhasp &&
-        !is_wled) {
+        !is_tasmota && !is_wled) {
         usage(argv[0]);
         return 2;
     }
@@ -1849,14 +1992,20 @@ int main(int argc, char **argv)
                         (is_openhasp ? 10000 : 20000));
     uint64_t boot_limit = (is_marauder || is_bruce) ?
                           8000000000ull : 2000000000ull;
+    wifi_stubs_stats_t wifi_stats = {0};
     int nonblack = 0;
     uint64_t boot_cycles = 0;
     uint16_t wled_host_port = 0;
+    uint16_t tasmota_host_port = 0;
     int screen_result;
     if (is_wled)
         screen_result = run_until_wled_ready(session, &wled_rmt_probe,
                                              boot_limit, &wled_host_port,
                                              &boot_cycles);
+    else if (is_tasmota)
+        screen_result = run_until_tasmota_ready(
+                session, boot_limit, &tasmota_host_port, &wifi_stats,
+                &boot_cycles);
     else
         screen_result = run_until_screen(session, framebuf,
                                          &framebuffer_mutex, min_nonblack,
@@ -1871,7 +2020,9 @@ int main(int argc, char **argv)
                 "ena=0x%08x/0x%08x ps=0x%08x/0x%08x "
                 "unhandled_mmio=%d unregistered_rom=%d\n",
                 profile, screen_result < 0 ? "cpus-stopped" :
-                         (is_wled ? "udp-or-rmt-timeout" : "screen-timeout"),
+                         (is_wled ? "udp-or-rmt-timeout" :
+                          is_tasmota ? "http-server-timeout" :
+                                       "screen-timeout"),
                 nonblack, (unsigned long long)boot_cycles,
                 cpu0 ? cpu0->pc : 0, cpu1 ? cpu1->pc : 0,
                 cpu0 ? cpu0->running : 0, cpu1 ? cpu1->running : 0,
@@ -1914,7 +2065,6 @@ int main(int argc, char **argv)
     int touch_changed = 0;
     uint64_t bruce_touch_commands = 0;
     int spiffs_blocks = 0;
-    wifi_stubs_stats_t wifi_stats = {0};
     uint64_t network_cycles = 0;
     uint64_t service_cycles = 0;
     uint64_t spiffs_cycles = 0;
@@ -1949,6 +2099,7 @@ int main(int argc, char **argv)
     size_t openhasp_primary[3] = {0};
     size_t openhasp_jsonl_lines = 0;
     openhasp_telnet_probe_t openhasp_telnet = {.fd = -1};
+    tasmota_http_probe_t tasmota_http = {.fd = -1};
     bt_stubs_stats_t bt_stats = {0};
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
     if (is_wled) {
@@ -2075,6 +2226,90 @@ int main(int argc, char **argv)
             return 1;
         }
         openhasp_telnet_close(&openhasp_telnet);
+    }
+    uint64_t tasmota_http_cycles = 0;
+    size_t tasmota_commands = 0;
+    if (is_tasmota) {
+        static const struct {
+            const char *encoded;
+            const char *response;
+            int gpio_level;
+        } commands[] = {
+            { "Status%200", "{}", -1 },
+            { "Br%20import%20gpio%3B%20gpio.pin_mode%284%2Cgpio.OUTPUT%29%3B%20gpio.digital_write%284%2C1%29",
+              "\"Br\":\"nil\"", 1 },
+            { "Br%20import%20gpio%3B%20gpio.pin_mode%284%2Cgpio.OUTPUT%29%3B%20gpio.digital_write%284%2C0%29",
+              "\"Br\":\"nil\"", 0 },
+        };
+        for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+            uint64_t command_cycles = 0;
+            int http_result = run_tasmota_http_command(
+                    session, &tasmota_http, commands[i].encoded,
+                    commands[i].response, commands[i].gpio_level,
+                    500000000ull, &wifi_stats, &command_cycles);
+            tasmota_http_cycles += command_cycles;
+            if (http_result != 0) {
+                fprintf(stderr,
+                        "FAIL profile=tasmota reason=%s command=%zu "
+                        "host_port=%u cycles=%llu accepts=%llu tcp_rx=%llu "
+                        "tcp_tx=%llu gpio%d=%d enabled=%d response_bytes=%zu\n",
+                        http_result == -2 ? "host-http-connect" :
+                        http_result < 0 ? "cpus-stopped-during-http" :
+                                          "http-command-timeout",
+                        i + 1, tasmota_http.host_port,
+                        (unsigned long long)command_cycles,
+                        (unsigned long long)wifi_stats.accept_successes,
+                        (unsigned long long)wifi_stats.recv_bytes,
+                        (unsigned long long)wifi_stats.send_bytes,
+                        TASMOTA_TEST_GPIO,
+                        periph_gpio_pin_level(flexe_session_periph(session),
+                                              TASMOTA_TEST_GPIO),
+                        periph_gpio_output_enabled(
+                                flexe_session_periph(session),
+                                TASMOTA_TEST_GPIO),
+                        tasmota_http.response_bytes);
+                if (tasmota_http.response_len != 0) {
+                    fprintf(stderr, "HTTP response (%zu bytes retained):\n",
+                            tasmota_http.response_len);
+                    fwrite(tasmota_http.response, 1,
+                           tasmota_http.response_len, stderr);
+                    fputc('\n', stderr);
+                }
+                fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
+                fwrite(uart.log, 1, uart.log_len, stderr);
+                fputc('\n', stderr);
+                tasmota_http_close(&tasmota_http);
+                flexe_session_destroy(session);
+                pthread_mutex_destroy(&framebuffer_mutex);
+                unlink(sd_path);
+                free(before);
+                free(framebuf);
+                return 1;
+            }
+            tasmota_commands = i + 1;
+            if (run_for_virtual_cycles(session, 10000000u) != 0) {
+                fprintf(stderr,
+                        "FAIL profile=tasmota reason=cpus-stopped-after-http "
+                        "command=%zu\n", i + 1);
+                flexe_session_destroy(session);
+                pthread_mutex_destroy(&framebuffer_mutex);
+                unlink(sd_path);
+                free(before);
+                free(framebuf);
+                return 1;
+            }
+        }
+        if (!uart_contains(&uart,
+                "STATUS2 = {\"StatusFWR\":{\"Version\":\"15.6.0")) {
+            fprintf(stderr,
+                    "FAIL profile=tasmota reason=status-command-not-executed\n");
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
     }
     if (is_bruce) {
         if (!uart_contains(&uart, "SDCARD mounted successfully")) {
@@ -3184,6 +3419,20 @@ int main(int argc, char **argv)
                openhasp_changed, openhasp_primary[0],
                openhasp_primary[1], openhasp_primary[2],
                openhasp_jsonl_lines);
+    if (is_tasmota)
+        printf(" http=%u http_rx=%zu http_tx=%zu http_cycles=%llu "
+               "tcp_rx=%llu tcp_tx=%llu commands=%zu api=status,berry-gpio "
+               "gpio%d=%d enabled=%d",
+               tasmota_host_port, tasmota_http.request_bytes,
+               tasmota_http.response_bytes,
+               (unsigned long long)tasmota_http_cycles,
+               (unsigned long long)wifi_stats.recv_bytes,
+               (unsigned long long)wifi_stats.send_bytes,
+               tasmota_commands, TASMOTA_TEST_GPIO,
+               periph_gpio_pin_level(flexe_session_periph(session),
+                                     TASMOTA_TEST_GPIO),
+               periph_gpio_output_enabled(flexe_session_periph(session),
+                                          TASMOTA_TEST_GPIO));
     if (is_nerdminer) {
         if (stratum_up)
             printf(" stratum=mining jobs=%d shares=%d",

@@ -2,9 +2,10 @@
 # Correctness gate for external production ESP32 ROMs.
 #
 # Runs each image through the scripted stock-ROM scenario on both engines and
-# requires them to agree on the externally visible result: the final
-# framebuffer for display firmware, or the decoded WS2812 waveform for WLED.
-# Those checksums are taken only after each scenario converges.
+# requires them to agree on the externally visible result. Display scenarios
+# compare the final framebuffer, WLED compares its decoded WS2812 waveform,
+# and headless scenarios assert their network and hardware effects directly.
+# Checksums are taken only after each scenario converges.
 #
 # ROMs are deliberately not stored in this repository. Supply them the same way
 # bench-stock-roms.sh does:
@@ -13,6 +14,7 @@
 #   MARAUDER_BIN=/path/to/marauder.bin \
 #   NERDMINER_BIN=/path/to/nerdminer.bin \
 #   OPENHASP_BIN=/path/to/openhasp.bin \
+#   TASMOTA_BIN=/path/to/tasmota32.bin \
 #   WLED_BIN=/path/to/wled.bin ./scripts/check-stock-roms.sh
 #
 # Any extra positional arguments are treated as Marauder-profile images, which
@@ -41,6 +43,9 @@ fi
 if [[ -n "${OPENHASP_BIN:-}" ]]; then
     names+=(openhasp); profiles+=(openhasp); roms+=("$OPENHASP_BIN")
 fi
+if [[ -n "${TASMOTA_BIN:-}" ]]; then
+    names+=(tasmota); profiles+=(tasmota); roms+=("$TASMOTA_BIN")
+fi
 if [[ -n "${WLED_BIN:-}" ]]; then
     names+=(wled); profiles+=(wled); roms+=("$WLED_BIN")
 fi
@@ -49,7 +54,7 @@ for rom in "$@"; do
 done
 
 if (( ${#roms[@]} == 0 )); then
-    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/WLED_BIN or pass at least one ROM" >&2
+    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/TASMOTA_BIN/WLED_BIN or pass at least one ROM" >&2
     exit 2
 fi
 
@@ -80,6 +85,7 @@ expected_artifact() {
     968c1babf8b72c82a86e7e4cb3b86fcd4d619a67ad879aab02e7358f2a1a30d1) echo 3F42FBF0 ;;  # re-pinned
     72fa27948cd7f3bce4b6eabaaa8757b0d0e7854c534e8a502ce197d2397d899b) echo F1858410 ;;
     2f7a57fe7e23160ff2a73b214540d420abe395c5caa30ed809a40b16b67b0ee2) echo 026EBEE5 ;;  # openHASP 0.7.0-rc13 Lanbon L8
+    5249c9b49e40c9fb96869f3fc573c3a00c9d99ea55997fd9117aaafbf7c0e7f3) echo 6AD58DC5 ;;  # Tasmota 15.6.0
     628917b0753edcfc9a8408e6387c6d1ace6a360d315441e9563d60299fef8594) echo F29E02EB ;;  # WLED 16.0.1
     *) echo "" ;;
     esac

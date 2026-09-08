@@ -5,9 +5,9 @@ emulator written in C. Flexe boots unmodified ESP-IDF and Arduino firmware,
 models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
 backends.
 
-Flexe is under active development. Bruce, Marauder, NerdMiner, and WLED pass
-scripted end-to-end scenarios, and the broader production corpus passes the
-generic interpreter/JIT gate described in
+Flexe is under active development. Bruce, Marauder, NerdMiner, openHASP,
+Tasmota, and WLED pass scripted end-to-end scenarios, and the broader
+production corpus passes the generic interpreter/JIT gate described in
 [Firmware compatibility](docs/compatibility.md).
 
 ## Highlights
@@ -48,7 +48,7 @@ The main outputs are:
 
 - `build/xtensa-emu` — emulator CLI
 - `build/xtensa-tests` — unit and differential test suite
-- `build/flexe-stock-rom-test` — scripted Bruce/Marauder/NerdMiner/WLED runner
+- `build/flexe-stock-rom-test` — scripted production-firmware scenario runner
 - `build/flexe-generic-rom-test` — arbitrary production-ROM probe
 
 Release builds use LTO and host-native tuning by default. Pass
@@ -89,10 +89,10 @@ Common options:
 
 ## Production status
 
-Bruce, Marauder, NerdMiner, openHASP, and WLED pass scripted board-level
-scenarios in both engines. Meshtastic and Tasmota pass the generic production
-gate. See [Firmware compatibility](docs/compatibility.md) for pinned versions,
-assertions, and remaining board-specific coverage.
+Bruce, Marauder, NerdMiner, openHASP, Tasmota, and WLED pass scripted
+board-level scenarios in both engines. Meshtastic passes the generic
+production gate. See [Firmware compatibility](docs/compatibility.md) for
+pinned versions, assertions, and remaining board-specific coverage.
 
 ## Test
 
@@ -105,8 +105,8 @@ FLEXE_ROMS=/path/to/roms ./scripts/check-firmware.sh
 ```
 
 Production ROMs are intentionally not committed. The stock runner accepts
-`BRUCE_BIN`, `MARAUDER_BIN`, `NERDMINER_BIN`, `OPENHASP_BIN`, and `WLED_BIN`;
-the generic runner accepts paths or a `FLEXE_ROMS` directory.
+`BRUCE_BIN`, `MARAUDER_BIN`, `NERDMINER_BIN`, `OPENHASP_BIN`, `TASMOTA_BIN`,
+and `WLED_BIN`; the generic runner accepts paths or a `FLEXE_ROMS` directory.
 
 See [Testing](docs/testing.md) for sanitizer builds, fixture configuration,
 JIT verification, and what each gate asserts.

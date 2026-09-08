@@ -149,6 +149,19 @@ static inline void seed_openhasp_v070rc13_profile(xtensa_cpu_t *cpu) {
     put_test_bytes(cpu, 0x4015C758u, bind_entry, sizeof(bind_entry));
 }
 
+static inline void seed_tasmota32_v1560_profile(xtensa_cpu_t *cpu) {
+    static const uint8_t socket_entry[] = {
+        0x36, 0x41, 0x00, 0x26, 0x23, 0x3D, 0x26, 0x33,
+        0x15, 0x26, 0x13, 0x56, 0x91, 0xF0, 0xB3, 0x70,
+    };
+    static const uint8_t bind_entry[] = {
+        0x36, 0x81, 0x00, 0x20, 0xA2, 0x20, 0xA5, 0xFF,
+        0xFE, 0xA0, 0x2A, 0x20, 0x16, 0x1A, 0x05, 0x82,
+    };
+    put_test_bytes(cpu, 0x4019C06Cu, socket_entry, sizeof(socket_entry));
+    put_test_bytes(cpu, 0x4019BA54u, bind_entry, sizeof(bind_entry));
+}
+
 static inline uint32_t rrr(int op2, int op1, int r, int s, int t) {
     return (uint32_t)((op2 << 20) | (op1 << 16) | (r << 12) | (s << 8) | (t << 4) | 0);
 }

@@ -5,7 +5,7 @@
 # images through environment variables, or pass arbitrary .bin files as
 # positional arguments:
 #
-#   OPENHASP_BIN=/path/to/openhasp.bin ./scripts/bench-stock-roms.sh
+#   TASMOTA_BIN=/path/to/tasmota32.bin ./scripts/bench-stock-roms.sh
 #
 # Useful overrides:
 #   EMU=./build/xtensa-emu  CYCLES=2000000000  REPS=3
@@ -65,6 +65,10 @@ if [[ -n "${OPENHASP_BIN:-}" ]]; then
     names+=(openhasp)
     roms+=("$OPENHASP_BIN")
 fi
+if [[ -n "${TASMOTA_BIN:-}" ]]; then
+    names+=(tasmota)
+    roms+=("$TASMOTA_BIN")
+fi
 if [[ -n "${WLED_BIN:-}" ]]; then
     names+=(wled)
     roms+=("$WLED_BIN")
@@ -75,7 +79,7 @@ for rom in "$@"; do
 done
 
 if (( ${#roms[@]} == 0 )); then
-    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/WLED_BIN or pass at least one ROM path" >&2
+    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/TASMOTA_BIN/WLED_BIN or pass at least one ROM path" >&2
     exit 2
 fi
 for rom in "${roms[@]}"; do

@@ -65,6 +65,8 @@ Use the scripted stock scenarios when the image has one:
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
 OPENHASP_BIN=/path/to/openhasp.bin \
+TASMOTA_BIN=/path/to/tasmota32.bin \
+WLED_BIN=/path/to/wled.bin \
 ./scripts/bench-stock-roms.sh
 ```
 

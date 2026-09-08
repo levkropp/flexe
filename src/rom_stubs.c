@@ -4495,6 +4495,24 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             fw_signature_matches(mem, 0x4015C758u,
                                  bind_entry, sizeof(bind_entry)))
             profile = ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8;
+    } else if (entry_point == 0x40082A58u) {
+        /* Official Tasmota 15.6.0 tasmota32 image. These anchors and the
+         * socket table were relocated from an independent build of release
+         * tag v15.6.0 with its pinned Arduino-ESP32 3.3.8 platform. */
+        static const uint8_t socket_entry[] = {
+            0x36, 0x41, 0x00, 0x26, 0x23, 0x3D, 0x26, 0x33,
+            0x15, 0x26, 0x13, 0x56, 0x91, 0xF0, 0xB3, 0x70,
+        };
+        static const uint8_t bind_entry[] = {
+            0x36, 0x81, 0x00, 0x20, 0xA2, 0x20, 0xA5, 0xFF,
+            0xFE, 0xA0, 0x2A, 0x20, 0x16, 0x1A, 0x05, 0x82,
+        };
+        xtensa_mem_t *mem = stubs->cpu->mem;
+        if (fw_signature_matches(mem, 0x4019C06Cu,
+                                 socket_entry, sizeof(socket_entry)) &&
+            fw_signature_matches(mem, 0x4019BA54u,
+                                 bind_entry, sizeof(bind_entry)))
+            profile = ROM_FIRMWARE_TASMOTA32_V1560;
     }
 
     stubs->firmware_profile = profile;
