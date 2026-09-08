@@ -63,6 +63,7 @@ Use the scripted stock scenarios when the image has one:
 
 ```sh
 MARAUDER_BIN=/path/to/marauder.bin \
+MESHTASTIC_BIN=/path/to/meshtastic.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
 OPENHASP_BIN=/path/to/openhasp.bin \
 TASMOTA_BIN=/path/to/tasmota32.bin \

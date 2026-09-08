@@ -5,8 +5,8 @@ emulator written in C. Flexe boots unmodified ESP-IDF and Arduino firmware,
 models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
 backends.
 
-Flexe is under active development. Bruce, Marauder, NerdMiner, openHASP,
-Tasmota, and WLED pass scripted end-to-end scenarios, and the broader
+Flexe is under active development. Bruce, Marauder, Meshtastic, NerdMiner,
+openHASP, Tasmota, and WLED pass scripted end-to-end scenarios, and the broader
 production corpus passes the generic interpreter/JIT gate described in
 [Firmware compatibility](docs/compatibility.md).
 
@@ -89,10 +89,10 @@ Common options:
 
 ## Production status
 
-Bruce, Marauder, NerdMiner, openHASP, Tasmota, and WLED pass scripted
-board-level scenarios in both engines. Meshtastic passes the generic
-production gate. See [Firmware compatibility](docs/compatibility.md) for
-pinned versions, assertions, and remaining board-specific coverage.
+Bruce, Marauder, Meshtastic, NerdMiner, openHASP, Tasmota, and WLED pass
+scripted board-level scenarios in both engines. See
+[Firmware compatibility](docs/compatibility.md) for pinned versions,
+assertions, and remaining board-specific coverage.
 
 ## Test
 
@@ -105,8 +105,10 @@ FLEXE_ROMS=/path/to/roms ./scripts/check-firmware.sh
 ```
 
 Production ROMs are intentionally not committed. The stock runner accepts
-`BRUCE_BIN`, `MARAUDER_BIN`, `NERDMINER_BIN`, `OPENHASP_BIN`, `TASMOTA_BIN`,
-and `WLED_BIN`; the generic runner accepts paths or a `FLEXE_ROMS` directory.
+`BRUCE_BIN`, `MARAUDER_BIN`, `MESHTASTIC_BIN`, `NERDMINER_BIN`,
+`OPENHASP_BIN`, `TASMOTA_BIN`, and `WLED_BIN`; the generic runner accepts paths
+or a `FLEXE_ROMS` directory. Set `FLEXE_ROM_ELF` for images that use data from
+the official ESP32 mask ROM, including the pinned Meshtastic build.
 
 See [Testing](docs/testing.md) for sanitizer builds, fixture configuration,
 JIT verification, and what each gate asserts.
@@ -122,7 +124,7 @@ Flexe measures two different things:
 
 ```sh
 ARDUINO_CLI=/path/to/arduino-cli ./scripts/bench-compute.sh
-MARAUDER_BIN=/path/to/marauder.bin ./scripts/bench-stock-roms.sh
+MESHTASTIC_BIN=/path/to/meshtastic.bin ./scripts/bench-stock-roms.sh
 ./scripts/bench-firmware.sh /path/to/firmware.bin
 ```
 

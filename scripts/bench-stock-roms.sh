@@ -57,6 +57,10 @@ if [[ -n "${MARAUDER_BIN:-}" ]]; then
     names+=(marauder)
     roms+=("$MARAUDER_BIN")
 fi
+if [[ -n "${MESHTASTIC_BIN:-}" ]]; then
+    names+=(meshtastic)
+    roms+=("$MESHTASTIC_BIN")
+fi
 if [[ -n "${NERDMINER_BIN:-}" ]]; then
     names+=(nerdminer)
     roms+=("$NERDMINER_BIN")
@@ -79,7 +83,7 @@ for rom in "$@"; do
 done
 
 if (( ${#roms[@]} == 0 )); then
-    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/TASMOTA_BIN/WLED_BIN or pass at least one ROM path" >&2
+    echo "error: set a supported *_BIN variable or pass at least one ROM path" >&2
     exit 2
 fi
 for rom in "${roms[@]}"; do

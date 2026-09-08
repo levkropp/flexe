@@ -12,6 +12,7 @@
 #
 #   BRUCE_BIN=/path/to/bruce.bin \
 #   MARAUDER_BIN=/path/to/marauder.bin \
+#   MESHTASTIC_BIN=/path/to/meshtastic.bin \
 #   NERDMINER_BIN=/path/to/nerdminer.bin \
 #   OPENHASP_BIN=/path/to/openhasp.bin \
 #   TASMOTA_BIN=/path/to/tasmota32.bin \
@@ -40,6 +41,9 @@ fi
 if [[ -n "${MARAUDER_BIN:-}" ]]; then
     names+=(marauder); profiles+=(marauder); roms+=("$MARAUDER_BIN")
 fi
+if [[ -n "${MESHTASTIC_BIN:-}" ]]; then
+    names+=(meshtastic); profiles+=(meshtastic); roms+=("$MESHTASTIC_BIN")
+fi
 if [[ -n "${OPENHASP_BIN:-}" ]]; then
     names+=(openhasp); profiles+=(openhasp); roms+=("$OPENHASP_BIN")
 fi
@@ -54,14 +58,14 @@ for rom in "$@"; do
 done
 
 if (( ${#roms[@]} == 0 )); then
-    echo "error: set BRUCE_BIN/MARAUDER_BIN/NERDMINER_BIN/OPENHASP_BIN/TASMOTA_BIN/WLED_BIN or pass at least one ROM" >&2
+    echo "error: set a supported *_BIN variable or pass at least one Marauder ROM" >&2
     exit 2
 fi
 
 # Expected final artifact for each pinned official image, keyed by the ROM's
-# SHA-256 -- the same hashes the README pins -- rather than by filename, which
-# varies by where the image was downloaded from. An image not listed here is
-# still checked for engine agreement; only the pinned ones are held to a
+# SHA-256 rather than by filename, which varies by where the image was
+# downloaded from. An image not listed here is still checked for engine
+# agreement; only the pinned ones are held to a
 # specific framebuffer or LED waveform.
 #
 # These are golden values. A deliberate improvement to an output model can
@@ -78,6 +82,7 @@ fi
 expected_artifact() {
     case "$1" in
     b0ed2710db5dfdd7117487b624ff742860614e1c3d8095d42b39b54f4ca18924) echo D3337E28 ;;  # Bruce 1.16.1 CYD
+    b412a593ebec58b16633aaa622aca3c5564b347cdbd22f8d04c4c95c53effc5e) echo 6AD58DC5 ;;  # Meshtastic 2.7.26 T-Beam
     d85d07b82bd29e28b9a5c786256317bda63cf29ebd64fa07541c3327a0ce0a73) echo D8F5FCCA ;;  # v1.12.1 CYD 2USB
     e7aece42f24ad7fd4146b94eeb28d04de7ce27f0c45e19be1bf38ad39ce0582c) echo EC54B518 ;;
     ad91696012f407bf782826793edd509119acf00e4751cd0d30eddd6223d6bf2d) echo 28C56B5E ;;

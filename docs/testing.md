@@ -67,12 +67,16 @@ The curated scenarios require external images:
 ```sh
 BRUCE_BIN=/path/to/bruce.bin \
 MARAUDER_BIN=/path/to/marauder.bin \
+MESHTASTIC_BIN=/path/to/meshtastic.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
 OPENHASP_BIN=/path/to/openhasp.bin \
 TASMOTA_BIN=/path/to/tasmota32.bin \
 WLED_BIN=/path/to/wled.bin \
 ./scripts/check-stock-roms.sh
 ```
+
+Set `FLEXE_ROM_ELF` to the official ESP32 ROM ELF for the Meshtastic and other
+newer ESP-IDF images that use mask-ROM data.
 
 For a broader directory of images:
 
