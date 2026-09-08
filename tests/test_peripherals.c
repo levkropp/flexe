@@ -3935,6 +3935,47 @@ TEST(touch_pad_threshold_and_status) {
     mem_destroy(mem);
 }
 
+TEST(touch_pad_rtc_timer_scans_host_injection) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t rtc = 0x3FF48000u, sens = 0x3FF48800u;
+
+    /* IDF 5.5's touch-sensor driver uses STATE0.touch_slp_timer_en rather
+     * than the legacy SENS FSM bit for continuous scans.  A host-side value
+     * change must consequently update the hardware output in this mode too. */
+    periph_touch_set_value(p, 0, 1000u);
+    mem_write32(mem, sens + 0x8Cu, 0x1u);           /* pad 0 enabled */
+    ASSERT_EQ(mem_read32(mem, sens + 0x70u) >> 16, 1000u);
+
+    mem_write32(mem, rtc + 0x18u, 1u << 23);        /* touch timer on */
+    periph_touch_set_value(p, 0, 100u);
+    ASSERT_EQ(mem_read32(mem, sens + 0x70u) >> 16, 100u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(touch_pad_oneshot_done_survives_start_pulse) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    const uint32_t sens = 0x3FF48800u;
+    const uint32_t ctrl2 = sens + 0x84u;
+
+    periph_touch_set_value(p, 0, 1234u);
+    mem_write32(mem, sens + 0x8Cu, 0x1u);           /* pad 0 enabled */
+    mem_write32(mem, ctrl2, (1u << 13) | (1u << 12));
+    ASSERT_EQ(mem_read32(mem, ctrl2) & (1u << 10), 1u << 10);
+    ASSERT_EQ(mem_read32(mem, sens + 0x70u) >> 16, 1234u);
+
+    /* The IDF LL helper lowers START_EN with a full register write. DONE is
+     * read-only hardware state and must remain set for its subsequent poll. */
+    mem_write32(mem, ctrl2, 1u << 13);
+    ASSERT_EQ(mem_read32(mem, ctrl2) & (1u << 10), 1u << 10);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(touch_pad_raises_rtc_interrupt) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -3956,9 +3997,16 @@ TEST(touch_pad_raises_rtc_interrupt) {
     periph_touch_set_value(p, 0, 100u);
     ASSERT_EQ(mem_read32(mem, rtc + 0x40u) & (1u << 6), 1u << 6);
     ASSERT_EQ(mem_read32(mem, rtc + 0x44u) & (1u << 6), 1u << 6);
+    ASSERT_EQ(periph_interrupt_pending(p, 46), true);
 
     mem_write32(mem, rtc + 0x48u, 1u << 6);          /* INT_CLR */
     ASSERT_EQ(mem_read32(mem, rtc + 0x40u) & (1u << 6), 0u);
+    ASSERT_EQ(periph_interrupt_pending(p, 46), false);
+
+    /* Clearing the level rearms the shared RTC source for a later crossing. */
+    periph_touch_set_value(p, 0, 1000u);
+    periph_touch_set_value(p, 0, 100u);
+    ASSERT_EQ(periph_interrupt_pending(p, 46), true);
 
     periph_destroy(p);
     mem_destroy(mem);
@@ -5925,6 +5973,8 @@ static void run_peripheral_tests(void) {
     RUN_TEST(rtc_sleep_wakes_on_ext1_and_touch);
     RUN_TEST(rtc_gpio_shares_the_pad_with_the_gpio_block);
     RUN_TEST(touch_pad_threshold_and_status);
+    RUN_TEST(touch_pad_rtc_timer_scans_host_injection);
+    RUN_TEST(touch_pad_oneshot_done_survives_start_pulse);
     RUN_TEST(touch_pad_raises_rtc_interrupt);
     RUN_TEST(excmlevel3_masks_level3);
 }

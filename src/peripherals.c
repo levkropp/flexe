@@ -175,6 +175,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define RTC_CNTL_EXT_WAKEUP1_OFF    0x0CCu
 #define RTC_CNTL_SLEEP_EN_BIT       (1u << 31)
 #define RTC_CNTL_SLP_WAKEUP_BIT     (1u << 29)
+#define RTC_CNTL_TOUCH_SLP_TIMER_EN_BIT (1u << 23)
 #define RTC_CNTL_WAKEUP_ENA_S       11
 #define RTC_CNTL_WAKEUP_ENA_MASK    0x7FFu
 #define RTC_CNTL_DG_WRAP_PD_EN_BIT  (1u << 31)
@@ -3211,10 +3212,16 @@ static uint16_t touch_threshold(const esp32_periph_t *p, int pad) {
     return (uint16_t)((pad & 1) ? (reg & 0xFFFFu) : (reg >> 16));
 }
 
+static void rtc_irq_update(esp32_periph_t *p) {
+    if (p->rtc_int_raw & p->rtc_int_ena)
+        periph_assert_interrupt(p, RTC_CORE_INTR_SOURCE);
+    else
+        periph_deassert_interrupt(p, RTC_CORE_INTR_SOURCE);
+}
+
 static void touch_raise_int(esp32_periph_t *p) {
     p->rtc_int_raw |= RTC_CNTL_TOUCH_INT_BIT;
-    if (p->rtc_int_ena & RTC_CNTL_TOUCH_INT_BIT)
-        periph_assert_interrupt(p, RTC_CORE_INTR_SOURCE);
+    rtc_irq_update(p);
 }
 
 /* One scan of the enabled pads.
@@ -3254,7 +3261,11 @@ static void touch_run_measurement(esp32_periph_t *p) {
 
 static bool touch_fsm_running(const esp32_periph_t *p) {
     uint32_t ctrl2 = p->sens_regs[SENS_SAR_TOUCH_CTRL2_OFF / 4u];
-    return (ctrl2 & SENS_TOUCH_START_FSM_EN_BIT) != 0;
+    /* IDF 5.5's new touch-sensor driver starts continuous scanning through
+     * RTC_CNTL_STATE0.touch_slp_timer_en.  Older drivers use the SENS FSM bit.
+     * Both controls feed the same touch measurement engine. */
+    return (ctrl2 & SENS_TOUCH_START_FSM_EN_BIT) != 0 ||
+           (p->rtc_state0 & RTC_CNTL_TOUCH_SLP_TIMER_EN_BIT) != 0;
 }
 
 static uint32_t sens_read(esp32_periph_t *p, uint32_t off) {
@@ -3293,12 +3304,18 @@ static void sens_write(esp32_periph_t *p, uint32_t off, uint32_t val) {
             return;
         }
         if (off == SENS_SAR_TOUCH_CTRL2_OFF) {
+            uint32_t hardware_done =
+                p->sens_regs[off / 4u] & SENS_TOUCH_MEAS_DONE_BIT;
             if (val & SENS_TOUCH_MEAS_EN_CLR_BIT)
                 p->touch_status = 0;
-            /* MEAS_DONE and the status bits are hardware-owned. */
+            /* MEAS_DONE and the status bits are hardware-owned.  In
+             * particular, preserve DONE across the driver's read/modify/write
+             * that lowers START_EN after a one-shot scan; treating the RO bit
+             * as writable made the following DONE poll wait forever. */
             p->sens_regs[off / 4u] =
                 val & ~(SENS_TOUCH_STATUS_MASK | SENS_TOUCH_MEAS_DONE_BIT |
                         SENS_TOUCH_MEAS_EN_CLR_BIT);
+            p->sens_regs[off / 4u] |= hardware_done;
             /* Either a software-forced start or the FSM being switched on
              * produces a scan; IDF uses both, depending on the mode. */
             if ((val & (SENS_TOUCH_START_FORCE_BIT | SENS_TOUCH_START_EN_BIT)) ==
@@ -3516,11 +3533,13 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
         /* Enabling a source whose condition is already latched has to deliver
          * it, or firmware that arms the interrupt after configuring the
          * peripheral never hears about a pad that is already down. */
-        if (p->rtc_int_raw & p->rtc_int_ena)
-            periph_assert_interrupt(p, RTC_CORE_INTR_SOURCE);
+        rtc_irq_update(p);
         return;
     case RTC_CNTL_INT_CLR_OFF:
         p->rtc_int_raw &= ~val;
+        /* RTC_CORE is level-sensitive: clearing the last enabled raw bit must
+         * lower source 46 so a later touch/wake event has a new rising edge. */
+        rtc_irq_update(p);
         return;
     case 0x068u:
         p->rtc_cpu_period_conf = val & RTC_CPU_PERIOD_CONF_MASK;
@@ -13822,8 +13841,7 @@ void periph_finish_wake(esp32_periph_t *p, uint32_t cause)
     p->rtc_state0 &= ~RTC_CNTL_SLEEP_EN_BIT;
     p->rtc_state0 |= RTC_CNTL_SLP_WAKEUP_BIT;
     p->rtc_int_raw |= RTC_CNTL_SLP_WAKEUP_INT_BIT;
-    if (p->rtc_int_ena & RTC_CNTL_SLP_WAKEUP_INT_BIT)
-        periph_assert_interrupt(p, RTC_CORE_INTR_SOURCE);
+    rtc_irq_update(p);
 }
 
 void periph_set_wake_state(esp32_periph_t *p, uint32_t wake_cause,

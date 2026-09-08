@@ -483,7 +483,7 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
  *
  * Six bytes of guest code placed in RTC-fast RAM through its instruction-bus
  * alias at 0x400C0000, which is inside the address range the interpreter and
- * the scheduler both accept as executable:  WAITI 0 ; J .-3 */
+ * the scheduler both accept as executable:  WAITI 0 ; J .-3. */
 #define IDLE_STUB_ADDR 0x400C1E00u  /* RTC-fast via its instruction alias */
 
 static int sched_register_task(freertos_stubs_t *frt, uint32_t fn,
@@ -498,6 +498,13 @@ static void frt_install_idle_tasks(freertos_stubs_t *frt) {
     };
     for (unsigned i = 0; i < sizeof(stub); i++)
         mem_write8(frt->cpu[0]->mem, IDLE_STUB_ADDR + i, stub[i]);
+    /* The firmware-wide predecode/JIT caches are already populated by the
+     * time the scheduler first needs an idle context.  Without invalidating
+     * this generated range, both engines continue executing the zero-filled
+     * RTC RAM they cached at load time -- an ILL at the first WAITI. */
+    xtensa_invalidate_code(frt->cpu[0], IDLE_STUB_ADDR, sizeof(stub));
+    if (frt->cpu[1] && frt->cpu[1]->predecode != frt->cpu[0]->predecode)
+        xtensa_invalidate_code(frt->cpu[1], IDLE_STUB_ADDR, sizeof(stub));
     for (int core = 0; core < 2; core++) {
         int idx = sched_register_task(frt, IDLE_STUB_ADDR, 0u, 0u,
                                       0x3FFF0100u + (uint32_t)core, core);
@@ -505,10 +512,11 @@ static void frt_install_idle_tasks(freertos_stubs_t *frt) {
         snprintf(frt->tasks[idx].name, sizeof(frt->tasks[idx].name),
                  "IDLE%d", core);
         frt->tasks[idx].is_idle = true;
-        /* WAITI is privileged, and any window unwind that reaches a0 must
-         * land somewhere sane rather than the generic dummy return address:
-         * point it back at the stub, CALL8-encoded. */
-        frt->tasks[idx].ps = 0x00040000u;   /* WOE=1, kernel mode */
+        /* Keep the same user-mode bit as every other synthetic task context.
+         * Any unwind that reaches a0 must land somewhere sane rather than the
+         * generic dummy return address, so point it back at the stub,
+         * CALL8-encoded. */
+        frt->tasks[idx].ps = 0x00040020u;   /* WOE=1, user mode */
         frt->tasks[idx].ar[0] =
             (2u << 30) | (IDLE_STUB_ADDR & 0x3FFFFFFFu);
         frt->idle_task[core] = idx;
@@ -558,24 +566,16 @@ static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
      * path in xtensa_run() advances event-by-event, fires each timer at its
      * own ccount, delivers pending interrupts, and — crucially — charges the
      * cycles it skips against the caller's batch budget. */
-    /* Only a core that actually owns real work needs somewhere to idle. A
-     * core with nothing assigned (core 0 in an Arduino sketch, whose loopTask
-     * is pinned to core 1) is left parked as before: running an idle task
-     * there would spin the halted path every batch for no benefit. */
-    bool owns_work = false;
-    for (int i = 0; i < frt->task_count && !owns_work; i++) {
-        task_tcb_t *t = &frt->tasks[i];
-        if (t->is_idle || t->state == TASK_UNUSED) continue;
-        if (t->core_affinity < 0 || t->core_affinity == core_id)
-            owns_work = true;
-    }
-    if (owns_work) {
-        frt_install_idle_tasks(frt);
-        if (frt->idle_ready) {
-            int idle = frt->idle_task[core_id];
-            frt->tasks[idle].state = TASK_READY;
-            return idle;
-        }
+    /* Both ESP32 cores always own an idle task, even when application work is
+     * pinned entirely to the other core.  Leaving an otherwise-empty core
+     * parked at the tail of its startup function is unsafe: a synchronous
+     * peripheral/timer callback wakes WAITI semantics on completion, and the
+     * core then returns through a startup frame that is no longer live. */
+    frt_install_idle_tasks(frt);
+    if (frt->idle_ready) {
+        int idle = frt->idle_task[core_id];
+        frt->tasks[idle].state = TASK_READY;
+        return idle;
     }
     return -1;  /* all tasks blocked/unused/pinned elsewhere */
 }
