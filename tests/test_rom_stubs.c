@@ -678,6 +678,61 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     teardown(&cpu);
 }
 
+TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_wled_v1601_profile(&cpu);
+
+    const uint32_t memcmp_entry = 0x4008B79Cu;
+    const uint32_t wrapper = 0x401A7B00u;
+    const uint32_t rom_literal = wrapper - 0x104u;
+    const uint32_t global_literal = wrapper - 0x100u;
+    const uint32_t phy_global = 0x3FFB2000u;
+
+    /* Match the release's memcmp prologue and provide one structurally
+     * discoverable phy_get_romfunc_addr wrapper. */
+    put_insn3(&cpu, memcmp_entry, 0x004136u); /* entry a1, 32 */
+    put_insn3(&cpu, wrapper, 0x004136u);
+    put_insn3(&cpu, wrapper + 3u,
+              encode_test_l32r(wrapper + 3u, rom_literal, 8));
+    put_insn3(&cpu, wrapper + 6u, rom_nop_insn());
+    put_insn3(&cpu, wrapper + 9u,
+              encode_test_l32r(wrapper + 9u, global_literal, 8));
+    mem_write32(cpu.mem, rom_literal, 0x40004100u);
+    mem_write32(cpu.mem, global_literal, phy_global);
+
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 2);
+
+    const uint32_t lhs = 0x3FFB0100u;
+    const uint32_t rhs = 0x3FFB0200u;
+    static const uint8_t lhs_bytes[] = { 0x11, 0x20, 0x33, 0x44 };
+    static const uint8_t rhs_bytes[] = { 0x11, 0x40, 0x33, 0x44 };
+    put_test_bytes(&cpu, lhs, lhs_bytes, sizeof(lhs_bytes));
+    put_test_bytes(&cpu, rhs, rhs_bytes, sizeof(rhs_bytes));
+    cpu.pc = memcmp_entry;
+    cpu._pc_written = true;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, lhs);
+    ar_write(&cpu, 3, rhs);
+    ar_write(&cpu, 4, sizeof(lhs_bytes));
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 2), (uint32_t)-0x20);
+
+    cpu.pc = wrapper;
+    cpu._pc_written = true;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(mem_read32(cpu.mem, phy_global), 0x50001900u);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_marauder_same_entry_uses_instruction_fingerprint) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1010,6 +1065,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_dispatches_through_guest_syscall_table);
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
+    RUN_TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);
     RUN_TEST(test_marauder_v1121_cyd2usb_uses_independent_fingerprint);
     RUN_TEST(test_marauder_v1121_virtualizes_only_its_phy_and_sync_state);

@@ -4906,6 +4906,14 @@ static const fw_addr_hook_t fw_nerdminer_hooks[] = {
     { 0, NULL, NULL, 0 }
 };
 
+/* WLED 0.16.0.1's IDF 4.4.8 image links newlib's optimized memcmp into
+ * IRAM. It is the same observable operation as the mask-ROM routine above,
+ * but this copy accounts for a material share of the idle/event-loop path. */
+static const fw_addr_hook_t fw_wled_v1601_hooks[] = {
+    { 0x4008B79C, stub_memcmp, "iram_memcmp", 0 },
+    { 0, NULL, NULL, 0 }
+};
+
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
@@ -4924,6 +4932,8 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
         tbl = fw_marauder_35inch_hooks;
     else if (profile == ROM_FIRMWARE_NERDMINER_V183)
         tbl = fw_nerdminer_hooks;
+    else if (profile == ROM_FIRMWARE_WLED_V1601)
+        tbl = fw_wled_v1601_hooks;
     if (!tbl) {
         if (entry_point == 0x40081E90u || entry_point == 0x400831D8u ||
             entry_point == 0x400830D0u)
@@ -4943,6 +4953,10 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
             rom_stubs_register(stubs, h->addr, h->fn, h->name);
         n++;
     }
+    /* WLED has no fixed-address PHY hook. Keep the structural discovery that
+     * was used before it acquired a profile-specific acceleration table. */
+    if (profile == ROM_FIRMWARE_WLED_V1601)
+        n += fw_hook_scanned_phy(stubs);
     if (n)
         fprintf(stderr, "[flexe] hooked %d firmware driver stub(s) at entry 0x%08X\n",
                 n, entry_point);
