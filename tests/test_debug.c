@@ -66,7 +66,7 @@ typedef struct {
  * Symbols: app_main @ 0x40080000 size 0x100
  *          uart_init @ 0x40080100 size 0x40
  *          some_data (OBJECT) @ 0x3FFB0000 size 4
- *          minimal FreeRTOS startup symbols used by scheduler tests
+ *          minimal FreeRTOS startup and IPC symbols used by scheduler tests
  */
 static const char *build_test_elf(void) {
     static const char *path = "/tmp/xt_test_debug.elf";
@@ -81,18 +81,28 @@ static const char *build_test_elf(void) {
         STR_CORE_STARTUP_DONE =
             STR_START_OTHER_CORES +
             sizeof("esp_startup_start_app_other_cores"),
+        STR_IPC_STALL =
+            STR_CORE_STARTUP_DONE + sizeof("port_uxCoreStartupDone"),
+        STR_IPC_RELEASE =
+            STR_IPC_STALL + sizeof("esp_ipc_isr_stall_other_cpu"),
+        STR_IPC_PAUSE =
+            STR_IPC_RELEASE + sizeof("esp_ipc_isr_release_other_cpu"),
+        STR_IPC_RESUME =
+            STR_IPC_PAUSE + sizeof("esp_ipc_isr_stall_pause"),
     };
     const char strtab[] =
         "\0app_main\0uart_init\0some_data\0vTaskStartScheduler\0"
-        "esp_startup_start_app_other_cores\0port_uxCoreStartupDone\0";
+        "esp_startup_start_app_other_cores\0port_uxCoreStartupDone\0"
+        "esp_ipc_isr_stall_other_cpu\0esp_ipc_isr_release_other_cpu\0"
+        "esp_ipc_isr_stall_pause\0esp_ipc_isr_stall_resume\0";
     int strtab_size = sizeof(strtab);
 
     /* Section header string table */
     const char shstrtab[] = "\0.symtab\0.strtab\0.shstrtab\0";
     int shstrtab_size = sizeof(shstrtab);
 
-    /* Symbol table: null sym + 6 symbols */
-    test_sym_t syms[7];
+    /* Symbol table: null sym + 10 symbols */
+    test_sym_t syms[11];
     memset(syms, 0, sizeof(syms));
     /* [0] = null */
     /* [1] = app_main: name_idx=1, value=0x40080000, size=0x100, FUNC */
@@ -128,6 +138,19 @@ static const char *build_test_elf(void) {
     syms[6].st_size = 8;
     syms[6].st_info = ELF_ST_INFO(STB_GLOBAL, STT_OBJECT);
     syms[6].st_shndx = 2;
+    const uint32_t ipc_addrs[] = {
+        0x40080400u, 0x40080410u, 0x40080420u, 0x40080430u
+    };
+    const uint32_t ipc_names[] = {
+        STR_IPC_STALL, STR_IPC_RELEASE, STR_IPC_PAUSE, STR_IPC_RESUME
+    };
+    for (int i = 0; i < 4; i++) {
+        syms[7 + i].st_name = ipc_names[i];
+        syms[7 + i].st_value = ipc_addrs[i];
+        syms[7 + i].st_size = 0x10;
+        syms[7 + i].st_info = ELF_ST_INFO(STB_GLOBAL, STT_FUNC);
+        syms[7 + i].st_shndx = 1;
+    }
     int symtab_size = (int)sizeof(syms);
 
     /* Layout:
@@ -314,8 +337,8 @@ TEST(test_elf_load_valid) {
 
     elf_symbols_t *s = elf_symbols_load(path);
     ASSERT_TRUE(s != NULL);
-    /* Two basic symbols plus the four data/startup symbols used by tests. */
-    ASSERT_EQ(elf_symbols_count(s), 6);
+    /* Two basic symbols plus the eight data/startup/IPC symbols used by tests. */
+    ASSERT_EQ(elf_symbols_count(s), 10);
 
     elf_symbols_destroy(s);
 }

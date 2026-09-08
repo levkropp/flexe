@@ -689,6 +689,38 @@ TEST(test_scheduler_start_sets_dual_core_ready_flags) {
     frt_teardown(&cpu0, rom, frt);
 }
 
+TEST(test_compat_ipc_stall_sequence_is_atomic_noop) {
+    /* The compatibility scheduler runs one virtual core at a time.  Its IPC
+     * worker task/ISR is therefore absent, and the matching DPORT stall is an
+     * atomic no-op.  In particular, light sleep's stall/pause/resume/release
+     * sequence must not execute IDF's guest nesting counter and turn 0 into
+     * -1 on the calling core. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    const char *path = build_test_elf();
+    elf_symbols_t *syms = elf_symbols_load(path);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(freertos_stubs_hook_symbols(frt, syms) >= 6);
+
+    const uint32_t ipc_addrs[] = {
+        0x40080400u, 0x40080420u, 0x40080430u, 0x40080410u
+    };
+    const uint32_t nesting_count = 0x3FFB0200u;
+    mem_write32(cpu.mem, nesting_count, 0u);
+    for (size_t i = 0; i < sizeof(ipc_addrs) / sizeof(ipc_addrs[0]); i++) {
+        ASSERT_EQ(frt_call_stub(&cpu, ipc_addrs[i], NULL, 0), 0u);
+        ASSERT_EQ(cpu.pc, BASE + 0x100u);
+        ASSERT_EQ(mem_read32(cpu.mem, nesting_count), 0u);
+    }
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    elf_symbols_destroy(syms);
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_queue_send_receive) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -1340,6 +1372,7 @@ static void run_freertos_tests(void) {
     RUN_TEST(test_pinned_task_reads_core_affinity_from_windowed_stack);
     RUN_TEST(test_xTaskGetTickCount);
     RUN_TEST(test_scheduler_start_sets_dual_core_ready_flags);
+    RUN_TEST(test_compat_ipc_stall_sequence_is_atomic_noop);
     RUN_TEST(test_queue_send_receive);
     RUN_TEST(test_queue_receive_empty_returns_false);
     RUN_TEST(test_queue_overwrite_and_reset);

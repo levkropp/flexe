@@ -2485,7 +2485,12 @@ static void stub_xTaskGetSchedulerState(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, 2);
 }
 
-/* esp_ipc_call / esp_ipc_call_blocking — no-op, IPC not needed */
+/* ESP-IDF IPC calls and cross-core DPORT stalls are unnecessary in the
+ * compatibility scheduler: both virtual cores execute serially against one
+ * coherent memory map.  More importantly, the real IPC ISR task is replaced
+ * along with FreeRTOS, so letting stall_pause()/stall_resume() run around
+ * light sleep can enable a release without a matching stall and underflow
+ * IDF's per-core nesting count. */
 static void stub_esp_ipc_noop(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     frt_return(cpu, 0);
@@ -3445,6 +3450,10 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xTaskGetSchedulerState",        stub_xTaskGetSchedulerState },
         { "esp_ipc_call",                  stub_esp_ipc_noop },
         { "esp_ipc_call_blocking",         stub_esp_ipc_noop },
+        { "esp_ipc_isr_stall_other_cpu",   stub_esp_ipc_noop },
+        { "esp_ipc_isr_release_other_cpu", stub_esp_ipc_noop },
+        { "esp_ipc_isr_stall_pause",       stub_esp_ipc_noop },
+        { "esp_ipc_isr_stall_resume",      stub_esp_ipc_noop },
         { "vApplicationStackOverflowHook", stub_disableCoreWDT },
         { "vTaskStartScheduler",           stub_vTaskStartScheduler },
         { "vPortYield",                    stub_vPortYield },
