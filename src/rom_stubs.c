@@ -103,6 +103,7 @@ struct esp32_rom_stubs {
     bool             app_cpu_start_requested;  /* Core 0 requested core 1 start */
     bool             single_core_mode;         /* -1 flag: fake core 1 init variables */
     bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
+    bool             real_rom;                /* execute unregistered loaded ROM code */
     rom_firmware_profile_t firmware_profile;  /* exact symbol-less ROM layout */
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     stub_irq_t irq[71];
@@ -4061,8 +4062,13 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             return 0; /* spy: let original function execute */
         return 1;
     }
-    /* Only intercept unregistered calls in ROM range */
+    /* With an official ROM ELF loaded, its ordinary library routines are the
+     * most accurate fallback. The registered entries above still virtualize
+     * hardware-facing calls, but masking every other function with return-0
+     * breaks valid ROM code such as newlib __sfp and its lock wrappers. */
     if (pc >= ROM_BASE && pc < ROM_END) {
+        if (s->real_rom)
+            return 0;
         if (s->log_fn)
             s->log_fn(s->log_ctx, pc, "UNREGISTERED", cpu);
         s->unregistered_count++;
@@ -4070,6 +4076,10 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
         return 1;
     }
     return 0;
+}
+
+void rom_stubs_set_real_rom(esp32_rom_stubs_t *stubs, bool enabled) {
+    if (stubs) stubs->real_rom = enabled;
 }
 
 /* ===== Public API ===== */

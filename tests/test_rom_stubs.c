@@ -61,6 +61,36 @@ TEST(test_pc_hook_skips_non_match) {
     teardown(&cpu);
 }
 
+TEST(test_loaded_rom_executes_unregistered_entry) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t rom_pc = 0x40010010u;
+
+    /* Without an external ROM image, an unknown mask-ROM call retains the
+     * compatibility fallback: return zero to its caller and count it. */
+    cpu.pc = rom_pc;
+    cpu._pc_written = true;
+    ar_write(&cpu, 0, BASE);
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 1);
+
+    /* Once a validated ROM ELF has been loaded, the same unknown entry runs
+     * its real instructions. A NOP stands in for that loaded code here. */
+    put_insn3(&cpu, rom_pc, rom_nop_insn());
+    rom_stubs_set_real_rom(rom, true);
+    cpu.pc = rom_pc;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, rom_pc + 3u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 1);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 /* ===== Test: rom_stub_dispatch ===== */
 
 static int dispatch_called;
@@ -963,6 +993,7 @@ static void run_rom_stub_tests(void) {
     TEST_SUITE("ROM Stubs (M10)");
     RUN_TEST(test_pc_hook_fires);
     RUN_TEST(test_pc_hook_skips_non_match);
+    RUN_TEST(test_loaded_rom_executes_unregistered_entry);
     RUN_TEST(test_rom_stub_dispatch);
     RUN_TEST(test_rom_conditional_stub);
     RUN_TEST(test_rom_arg_call4);

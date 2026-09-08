@@ -98,6 +98,7 @@ The committed corpus currently establishes these outcomes:
 | openHASP 0.7.0-rc13 | Boots and both engines agree |
 | Tasmota 15.6.0 | Boots through the Berry runtime and both engines agree |
 | WLED 16.0.1 | Boots to its Adalight prompt and both engines agree |
+| Bruce 1.16.1 (CYD 2432S028) | Boots through filesystem and storage setup; both engines agree; official ROM ELF required |
 
 These are bounded, reproducible claims rather than blanket compatibility
 promises. See [Firmware compatibility](docs/compatibility.md) for the exact
@@ -137,7 +138,7 @@ MARAUDER_BIN=/path/to/marauder.bin ./scripts/bench-stock-roms.sh
 
 In the current Apple-silicon release benchmark, every image in the five-ROM
 generic corpus clears real time under the JIT; WLED is the limiting workload at
-2.00x. Production images with substantial idle time can report higher factors
+2.23x. Production images with substantial idle time can report higher factors
 than their instruction throughput suggests, so benchmark output always includes
 retired work and UART progress. See [Performance](docs/performance.md) for the
 dated results, host configuration, and methodology.

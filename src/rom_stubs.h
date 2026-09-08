@@ -122,6 +122,10 @@ void rom_stubs_set_native_freertos(esp32_rom_stubs_t *stubs, bool native);
 /* Attach peripheral state (needed for intr_matrix_set in native mode) */
 void rom_stubs_set_periph(esp32_rom_stubs_t *stubs, esp32_periph_t *periph);
 
+/* Let unregistered mask-ROM entries execute from a successfully loaded
+ * official ROM ELF. Registered hardware/service shims still take priority. */
+void rom_stubs_set_real_rom(esp32_rom_stubs_t *stubs, bool enabled);
+
 /* Dual-core boot support */
 void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core);
 bool rom_stubs_app_cpu_start_requested(const esp32_rom_stubs_t *stubs);

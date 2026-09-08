@@ -140,6 +140,8 @@ static int session_build(flexe_session_t *s)
     rom_stubs_set_single_core(s->rom, cfg->single_core);
     rom_stubs_set_native_freertos(s->rom, cfg->native_freertos);
     rom_stubs_set_periph(s->rom, s->periph);
+    rom_stubs_set_real_rom(s->rom,
+                           cfg->rom_elf_path && *cfg->rom_elf_path);
     rom_stubs_hook_firmware_addrs(s->rom, res.entry_point);
     if (s->syms)
         rom_stubs_hook_symbols(s->rom, s->syms);

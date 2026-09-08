@@ -18,15 +18,18 @@ Booting to one UART line is not considered a pass.
 | openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand display and network interaction coverage |
 | Tasmota 15.6.0 | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
 | WLED 16.0.1 | Interpreter + JIT | Pass | Expand LED and protocol interaction coverage |
+| Bruce 1.16.1 (CYD 2432S028) | Interpreter + JIT | Boots through filesystem and storage setup | Expand display, touch, storage, and radio interaction coverage; requires the official ESP32 ROM ELF |
 
 ROM images are not stored in this repository. Results are tied to the image
 versions above and should be rechecked when a release changes.
 
 Firmware that uses controller data embedded in the mask ROM (notably newer
 ESP-IDF Bluetooth builds) needs Espressif's official ESP32 ROM ELF. Pass it as
-`-R /path/to/esp32_rev0_rom.elf`, `--rom-elf` to either ROM test runner, or set
+`-R /path/to/esp32_rev300_rom.elf`, `--rom-elf` to either ROM test runner, or set
 `FLEXE_ROM_ELF`. Flexe loads immutable ROM sections and their linker-described
-data images; the ROM binary is intentionally not copied into this repository.
+data images. Hardware-facing shims retain priority, while other mask-ROM calls
+execute the loaded instructions. The ROM binary is intentionally not copied
+into this repository.
 
 ## Curated CYD scenarios
 
