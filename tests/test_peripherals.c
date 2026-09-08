@@ -2885,6 +2885,73 @@ static void test_gpio_route(xtensa_mem_t *mem, int pin, int signal) {
                 (uint32_t)signal);
 }
 
+typedef struct {
+    unsigned calls;
+    int host;
+    uint8_t mosi[8];
+    size_t mosi_len;
+} test_spi_device_t;
+
+static void test_spi_device_xfer(void *ctx, int host,
+                                 const uint8_t *mosi, size_t mosi_len,
+                                 uint8_t *miso, size_t miso_len) {
+    test_spi_device_t *device = ctx;
+    device->calls++;
+    device->host = host;
+    device->mosi_len = mosi_len < sizeof(device->mosi) ?
+                       mosi_len : sizeof(device->mosi);
+    memcpy(device->mosi, mosi, device->mosi_len);
+    memset(miso, 0, miso_len);
+    if (miso_len > 1) miso[1] = 0x12u;
+}
+
+TEST(gp_spi_routes_explicit_board_device) {
+    const uint32_t spi2 = 0x3FF64000u;
+    const uint32_t spi3 = 0x3FF65000u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .display_sck_pin = 14,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .sd_cs_pin = 5,
+        .sd_sck_pin = 18,
+    };
+    periph_enable_spi_display(p, &cfg);
+
+    test_spi_device_t device = {0};
+    ASSERT_EQ(periph_spi_attach_device(p, 3, 18, 5,
+                                       test_spi_device_xfer, &device), 0);
+    test_gpio_route(mem, 5, 63);       /* GPIO5 <- VSPICLK */
+    test_gpio_route(mem, 18, 256);     /* GPIO18 is software CS */
+    mem_write32(mem, 0x3FF44024u, 1u << 18); /* GPIO18 output enable */
+    test_gpio_level(mem, 18, 0);
+
+    static const uint8_t request[2] = {0x42u, 0x00u};
+    uint8_t response[2] = {0xFFu, 0xFFu};
+    test_gp_spi_bytes(mem, spi3, request, response, sizeof(request));
+    ASSERT_EQ(device.calls, 1u);
+    ASSERT_EQ(device.host, 3);
+    ASSERT_EQ(device.mosi_len, sizeof(request));
+    ASSERT_TRUE(memcmp(device.mosi, request, sizeof(request)) == 0);
+    ASSERT_EQ(response[0], 0u);
+    ASSERT_EQ(response[1], 0x12u);
+
+    /* The same asserted pin must not claim a transaction from HSPI. */
+    test_gp_spi_bytes(mem, spi2, request, response, sizeof(request));
+    ASSERT_EQ(device.calls, 1u);
+
+    ASSERT_EQ(periph_spi_attach_device(p, 3, 18, 5, NULL, NULL), 0);
+    test_gp_spi_bytes(mem, spi3, request, response, sizeof(request));
+    ASSERT_EQ(device.calls, 1u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 static void test_sd_command_bytes(uint8_t out[6], uint8_t command,
                                   uint32_t argument) {
     out[0] = 0x40u | command;
@@ -6058,6 +6125,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);
     RUN_TEST(wifi_mac_init_ready_handshake);
     RUN_TEST(radio_phy_calibration_register_files);
+    RUN_TEST(gp_spi_routes_explicit_board_device);
     RUN_TEST(xpt2046_pipelined_conversions);
     RUN_TEST(xpt2046_gpio_bitbang_conversions);
     RUN_TEST(gp_spi_matrix_routing_and_hardware_cs);

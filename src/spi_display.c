@@ -116,6 +116,7 @@ static inline int spi_dbg(const int *flag) {
 #define SPI_DMA_DESC_SIZE_MASK  0x00000FFFu
 #define SPI_DMA_MAX_DESCRIPTORS 1024
 #define SPI_DMA_MAX_TRANSFER    (4u * 1024u * 1024u)
+#define SPI_DEVICE_MAX          8
 
 /* ILI9341 commands */
 #define ILI_CASET 0x2A
@@ -209,6 +210,12 @@ typedef struct {
     /* Harness stand-in for an unmodelled slave (see periph_spi_attach_probe). */
     spi_probe_fn probe_fn;
     void        *probe_ctx;
+    struct {
+        int cs_pin;
+        int sck_pin;
+        periph_spi_device_fn fn;
+        void *ctx;
+    } device[SPI_DEVICE_MAX];
 } spi_display_t;
 
 /* One instance per host controller */
@@ -967,7 +974,25 @@ static void gp_spi_transact(spi_display_t *s) {
                    route_allows_host(s, s->cfg.display_sck_pin) &&
                    display_active(s));
 
-    if (cs_touch) {
+    periph_spi_device_fn device_fn = NULL;
+    void *device_ctx = NULL;
+    for (unsigned i = 0; i < SPI_DEVICE_MAX; i++) {
+        if (!s->device[i].fn ||
+            !route_allows_host(s, s->device[i].sck_pin) ||
+            !device_cs_state(s, s->device[i].cs_pin))
+            continue;
+        device_fn = s->device[i].fn;
+        device_ctx = s->device[i].ctx;
+        break;
+    }
+
+    if (device_fn) {
+        /* Explicit board wiring is more specific than the built-in CYD
+         * defaults. This matters on boards such as the T-Beam, whose LoRa
+         * SCK/CS pins overlap the default CYD SD-card pin numbers. */
+        device_fn(device_ctx, s->host_num, tx_data, tx_len,
+                  rx_data, rx_len);
+    } else if (cs_touch) {
         /* XPT2046 conversions are pipelined.  The MISO bits clocked during
          * this transaction belong to the command accepted previously; a
          * new control byte in MOSI starts the conversion returned by the
@@ -1172,6 +1197,44 @@ void periph_spi_attach_probe(esp32_periph_t *p, spi_probe_fn fn, void *ctx) {
         g_host[i].probe_fn = fn;
         g_host[i].probe_ctx = ctx;
     }
+}
+
+int periph_spi_attach_device(esp32_periph_t *p, int host, int cs_pin,
+                             int sck_pin, periph_spi_device_fn fn, void *ctx) {
+    if (!p || (host != 2 && host != 3) || cs_pin < 0 || cs_pin > 39 ||
+        sck_pin < 0 || sck_pin > 39)
+        return -1;
+
+    spi_display_t *s = &g_host[host - 2];
+    if (s->periph != p) return -1;
+
+    int free_slot = -1;
+    for (unsigned i = 0; i < SPI_DEVICE_MAX; i++) {
+        if (!s->device[i].fn) {
+            if (free_slot < 0) free_slot = (int)i;
+            continue;
+        }
+        if (s->device[i].cs_pin == cs_pin) {
+            if (fn) {
+                s->device[i].sck_pin = sck_pin;
+                s->device[i].fn = fn;
+                s->device[i].ctx = ctx;
+            } else {
+                memset(&s->device[i], 0, sizeof(s->device[i]));
+            }
+            return 0;
+        }
+    }
+    if (!fn) return 0;
+    if (free_slot >= 0) {
+        unsigned i = (unsigned)free_slot;
+        s->device[i].cs_pin = cs_pin;
+        s->device[i].sck_pin = sck_pin;
+        s->device[i].fn = fn;
+        s->device[i].ctx = ctx;
+        return 0;
+    }
+    return -1;
 }
 
 void spi_display_gpio_changed(esp32_periph_t *p, int pin, int level) {
