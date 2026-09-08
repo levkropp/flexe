@@ -494,6 +494,11 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                 case XT_SR_PS:
                 case XT_SR_DEPC:
                     return 0;  /* Direct fields, or side effects emitted below */
+                case XT_SR_WINDOWBASE: case XT_SR_WINDOWSTART:
+                    /* Changing the register-window context invalidates the
+                     * block's compile-time mapping or entry guard. Compile
+                     * the write, then dispatch in the new context. */
+                    return 1;
                 default:
                     return 2;  /* CCOUNT, CCOMPARE, INTENABLE, etc — side effects */
                 }
@@ -2023,6 +2028,35 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             }
             case 1: { /* WSR: SR[sr] = at */
                 int sr_num = XT_SR_NUM(insn);
+                if (sr_num == XT_SR_WINDOWBASE) {
+                    /* The source may be dirty in the current block. Publish
+                     * all logical registers while the old mapping is still
+                     * active, then reload and mask the architectural value.
+                     * The destination window is runtime data, so this is a
+                     * dispatcher exit like ENTRY rather than a static chain. */
+                    ra_flush(e, ra, wb4);
+                    emit_load32_disp(e, RAX, REG_CPU, ar_offset(wb4, t));
+                    emit_and_reg32_imm32(e, RAX, 0xFu);
+                    emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_WINDOWBASE);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, next_pc);
+                    emit_store32_disp_imm(e, REG_CPU,
+                                          (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                    emit_acc_add(e, insn_idx + 1);
+                    emit_jmp_to_epilogue(e, jit);
+                    return 1;
+                }
+                if (sr_num == XT_SR_WINDOWSTART) {
+                    /* WINDOWSTART is architecturally 16 bits. It also feeds
+                     * the JIT's register-window collision guard, so terminate
+                     * here and chain through the next block's fresh guard. */
+                    ra_load_ar(e, ra, RAX, wb4, t);
+                    emit_and_reg32_imm32(e, RAX, 0xFFFFu);
+                    emit_store_cpu32(e, RAX,
+                                     (int32_t)CPU_OFF_WINDOWSTART);
+                    emit_block_exit_ra(e, ra, wb4, next_pc, insn_idx + 1,
+                                       jit, false);
+                    return 1;
+                }
                 int32_t off = -1;
                 switch (sr_num) {
                 case XT_SR_SAR:      off = CPU_OFF_SAR; break;

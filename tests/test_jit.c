@@ -2131,6 +2131,36 @@ TEST(test_jit_rsr_wsr_sar) {
     teardown(&cpu);
 }
 
+TEST(test_jit_wsr_windowstart_terminates_at_new_guard_context) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.windowstart = 1u;
+    ar_write(&cpu, 2, 0xABCD4321u);
+    put_insn3(&cpu, BASE,
+              rrr(1, 3, XT_SR_WINDOWSTART >> 4,
+                  XT_SR_WINDOWSTART & 15, 2));
+    put_insn2(&cpu, BASE + 3u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    test_run_differential(&cpu, 2, "wsr_windowstart_boundary");
+    teardown(&cpu);
+}
+
+TEST(test_jit_wsr_windowbase_flushes_old_mapping_before_dispatch) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.windowbase = 0;
+    ar_write(&cpu, 2, 2u);
+    /* Keep the WSR source dirty in the native register allocator. */
+    put_insn2(&cpu, BASE, narrow(0xB, 2, 2, 1)); /* ADDI.N a2, a2, 1 */
+    put_insn3(&cpu, BASE + 2u,
+              rrr(1, 3, XT_SR_WINDOWBASE >> 4,
+                  XT_SR_WINDOWBASE & 15, 2));
+    put_insn2(&cpu, BASE + 5u, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    test_run_differential(&cpu, 3, "wsr_windowbase_boundary");
+    teardown(&cpu);
+}
+
 TEST(test_jit_rsr_prid_wsr_ps) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2683,6 +2713,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_addx2);
     RUN_TEST(test_jit_rsil);
     RUN_TEST(test_jit_rsr_wsr_sar);
+    RUN_TEST(test_jit_wsr_windowstart_terminates_at_new_guard_context);
+    RUN_TEST(test_jit_wsr_windowbase_flushes_old_mapping_before_dispatch);
     RUN_TEST(test_jit_rsr_prid_wsr_ps);
     RUN_TEST(test_jit_rsr_ccount_observes_instruction_position);
     RUN_TEST(test_jit_wsr_ps_rearms_irq_check);

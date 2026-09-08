@@ -137,7 +137,7 @@ MARAUDER_BIN=/path/to/marauder.bin ./scripts/bench-stock-roms.sh
 
 In the current Apple-silicon release benchmark, every image in the five-ROM
 generic corpus clears real time under the JIT; WLED is the limiting workload at
-1.72x. Production images with substantial idle time can report higher factors
+1.79x. Production images with substantial idle time can report higher factors
 than their instruction throughput suggests, so benchmark output always includes
 retired work and UART progress. See [Performance](docs/performance.md) for the
 dated results, host configuration, and methodology.
