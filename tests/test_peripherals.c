@@ -2557,16 +2557,29 @@ TEST(spi_flash_program_erase_require_write_enable) {
     ASSERT_EQ(capture.len, 0x10000u);
     ASSERT_EQ(test_flash_status(mem) & (1u << 1), 0u); /* PP clears WEL */
 
+    /* ESP-IDF's dedicated page-program HAL stores the transfer length in
+     * SPI_ADDR[31:24]. It does not program SPI_MOSI_DLEN for this path. */
+    const uint32_t packed_off = off + 0x20u;
+    mem_write32(mem, TEST_SPI_ADDR_REG, (4u << 24) | packed_off);
+    mem_write32(mem, TEST_SPI_W0_REG, 0x44332211u);
+    mem_write32(mem, TEST_SPI_CMD_REG, 1u << 30);     /* FLASH_WREN */
+    mem_write32(mem, TEST_SPI_CMD_REG, 1u << 25);     /* FLASH_PP */
+    ASSERT_EQ(mem_read32(mem, 0x3F400000u + packed_off), 0x44332211u);
+    ASSERT_EQ(capture.count, 2);
+    ASSERT_EQ(capture.addr, 0x400D0000u);
+    ASSERT_EQ(capture.len, 0x10000u);
+    ASSERT_EQ(test_flash_status(mem) & (1u << 1), 0u);
+
     /* Erase has the same WEL requirement and restores the sector to 0xFF. */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 24);     /* FLASH_SE, no WEL */
     ASSERT_EQ(mem->flash_data[off], 0xA0);
     ASSERT_EQ(mem->flash_insn[off], 0xA0);
-    ASSERT_EQ(capture.count, 1);
+    ASSERT_EQ(capture.count, 2);
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 30);     /* FLASH_WREN */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 24);     /* FLASH_SE */
     ASSERT_EQ(mem->flash_data[off], 0xFF);
     ASSERT_EQ(mem->flash_insn[off], 0xFF);
-    ASSERT_EQ(capture.count, 2);
+    ASSERT_EQ(capture.count, 3);
     ASSERT_EQ(test_flash_status(mem) & (1u << 1), 0u); /* erase clears WEL */
 
     periph_destroy(p);

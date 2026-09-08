@@ -4623,6 +4623,16 @@ static int spi_data_bytes(uint32_t dlen_reg) {
     return bytes > 64 ? 64 : bytes;
 }
 
+/* The classic ESP32's dedicated FLASH_PP command packs its byte count in
+ * SPI_ADDR[31:24] and the 24-bit flash offset below it. USER transactions use
+ * SPI_MOSI_DLEN instead. Preserve a dlen fallback for ROM code which starts a
+ * dedicated command without the HAL's packed length. */
+static int spi_flash_page_program_bytes(const spi_state_t *s) {
+    int bytes = (int)(s->addr >> 24);
+    if (bytes == 0) bytes = spi_data_bytes(s->mosi_dlen);
+    return bytes > 64 ? 64 : bytes;
+}
+
 static void spi_flash_read_data(esp32_periph_t *p, spi_state_t *s,
                                 uint32_t off, int bytes) {
     memset(s->w, 0xFF, sizeof(s->w));   /* erased flash reads as 0xFF */
@@ -4760,18 +4770,21 @@ static void spi_flash_execute(esp32_periph_t *p, spi_state_t *s, uint32_t cmd) {
         s->sr[1] = (uint8_t)((s->w[0] >> 8) & 0xFF);
         s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
     }
+    uint32_t dedicated_off = s->addr & 0x00FFFFFFu;
     if (cmd & SPI_CMD_FLASH_READ)
-        spi_flash_read_data(p, s, s->addr, spi_data_bytes(s->miso_dlen));
+        spi_flash_read_data(p, s, dedicated_off,
+                            spi_data_bytes(s->miso_dlen));
     if ((cmd & SPI_CMD_FLASH_PP) && (s->sr[0] & FLASH_SR_WEL)) {
-        spi_flash_program(p, s, s->addr, spi_data_bytes(s->mosi_dlen));
+        spi_flash_program(p, s, dedicated_off,
+                          spi_flash_page_program_bytes(s));
         s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
     }
     if ((cmd & SPI_CMD_FLASH_SE) && (s->sr[0] & FLASH_SR_WEL)) {
-        spi_flash_erase(p, s->addr & ~0xFFFu, 0x1000);
+        spi_flash_erase(p, dedicated_off & ~0xFFFu, 0x1000);
         s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
     }
     if ((cmd & SPI_CMD_FLASH_BE) && (s->sr[0] & FLASH_SR_WEL)) {
-        spi_flash_erase(p, s->addr & ~0xFFFFu, 0x10000);
+        spi_flash_erase(p, dedicated_off & ~0xFFFFu, 0x10000);
         s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
     }
     if ((cmd & SPI_CMD_FLASH_CE) && (s->sr[0] & FLASH_SR_WEL)) {
