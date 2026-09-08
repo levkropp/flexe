@@ -2101,8 +2101,8 @@ int main(int argc, char **argv)
          * captive portal forever. */
         static const char save_req[] =
             "GET /wifisave?s=flexe-net&p=flexe-secret"
-            "&PoolUrl=127.0.0.1&PoolPort=3333&BtcWallet=bc1qflexe"
-            "&PoolPassword=x&Timezone=0 HTTP/1.0\r\n"
+            "&Poolurl=127.0.0.1&Poolport=21496&btcAddress=bc1qflexe"
+            "&TimeZone=0 HTTP/1.0\r\n"
             "Host: 192.168.4.1\r\nConnection: close\r\n\r\n";
         struct sockaddr_in sv;
         memset(&sv, 0, sizeof(sv));
@@ -2291,13 +2291,17 @@ int main(int argc, char **argv)
          * session being established and let the two normal engines carry the
          * end-to-end assertion. */
         int need_shares = !jit_verify;
+        int configured_wallet =
+                strstr(stratum.last_submit, "\"bc1qflexe\"") != NULL;
         if (!stratum.connected || !stratum.subscribed ||
-            !stratum.authorized || (need_shares && stratum.shares == 0)) {
+            !stratum.authorized || (need_shares && stratum.shares == 0) ||
+            (need_shares && !configured_wallet)) {
             fprintf(stderr, "FAIL profile=nerdminer reason=no-mining-shares "
                     "connected=%d subscribed=%d authorized=%d jobs=%d "
-                    "shares=%d cycles=%llu retired=%llu line=\"%s\"\n",
+                    "shares=%d configured_wallet=%d cycles=%llu "
+                    "retired=%llu line=\"%s\"\n",
                     stratum.connected, stratum.subscribed, stratum.authorized,
-                    stratum.jobs_sent, stratum.shares,
+                    stratum.jobs_sent, stratum.shares, configured_wallet,
                     (unsigned long long)flexe_session_cpu(session, 0)->cycle_count,
                     (unsigned long long)(xtensa_retired_insns(flexe_session_cpu(session, 0)) +
                                          xtensa_retired_insns(flexe_session_cpu(session, 1))),
