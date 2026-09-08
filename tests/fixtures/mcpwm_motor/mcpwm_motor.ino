@@ -89,7 +89,8 @@ void setup() {
   carrier.carrier_period = 3;
   carrier.carrier_duty = 5;
   carrier.pulse_width_in_os = 2;
-  carrier.carrier_os_mode = MCPWM_ONESHOT_MODE_EN;
+  // IDF 5.5 removed carrier_os_mode from the legacy compatibility struct.
+  // The fixture validates the carrier frequency/duty, not one-shot gating.
   carrier.carrier_ivt_mode = MCPWM_CARRIER_OUT_IVT_DIS;
   flexe_mcpwm_result[12] = (uint32_t)mcpwm_carrier_init(
       MCPWM_UNIT_0, MCPWM_TIMER_0, &carrier);

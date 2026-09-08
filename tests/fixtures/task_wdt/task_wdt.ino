@@ -12,6 +12,7 @@
  * ESP-IDF returns rather than a blanket success.
  */
 #include <Arduino.h>
+#include <esp_idf_version.h>
 #include <esp_task_wdt.h>
 
 #define SUCCESS_MARKER 0x7D060C0Bu
@@ -39,7 +40,16 @@ void setup() {
   /* The Arduino core initialises the task watchdog before setup() runs and
    * may already have subscribed this task, so start from a known state
    * rather than assuming an empty one. */
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  const esp_task_wdt_config_t config = {
+      .timeout_ms = 5000,
+      .idle_core_mask = 0,
+      .trigger_panic = false,
+  };
+  if (esp_task_wdt_init(&config) != ESP_OK) { fail(2); return; }
+#else
   if (esp_task_wdt_init(5, false) != ESP_OK) { fail(2); return; }
+#endif
   esp_task_wdt_delete(NULL);
   flexe_wdt_stage = 1;
 

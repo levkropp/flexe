@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_idf_version.h>
 #include <esp_intr_alloc.h>
 #include <driver/periph_ctrl.h>
 #include <hal/emac_hal.h>
@@ -29,6 +30,114 @@ static uint8_t *tx_buffers[CONFIG_ETH_DMA_TX_BUFFER_NUM];
 static uint8_t tx_frame[kTxLength];
 static uint8_t rx_frame[kRx1Length + 32];
 static intr_handle_t interrupt_handle;
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+static unsigned tx_descriptor_index;
+static unsigned rx_descriptor_index;
+
+static eth_dma_rx_descriptor_t *rxDescriptors() {
+  return reinterpret_cast<eth_dma_rx_descriptor_t *>(descriptors);
+}
+
+static eth_dma_tx_descriptor_t *txDescriptors() {
+  return reinterpret_cast<eth_dma_tx_descriptor_t *>(
+      descriptors + CONFIG_ETH_DMA_RX_BUFFER_NUM *
+                        sizeof(eth_dma_rx_descriptor_t));
+}
+
+static void initDescriptorChains() {
+  eth_dma_rx_descriptor_t *rx = rxDescriptors();
+  eth_dma_tx_descriptor_t *tx = txDescriptors();
+  for (unsigned i = 0; i < CONFIG_ETH_DMA_RX_BUFFER_NUM; ++i) {
+    memset(&rx[i], 0, sizeof(rx[i]));
+    rx[i].RDES0.Own = 1;
+    rx[i].RDES1.ReceiveBuffer1Size = CONFIG_ETH_DMA_BUFFER_SIZE;
+    rx[i].RDES1.SecondAddressChained = 1;
+    rx[i].Buffer1Addr = (uint32_t)(uintptr_t)rx_buffers[i];
+    rx[i].Buffer2NextDescAddr =
+        (uint32_t)(uintptr_t)&rx[(i + 1u) % CONFIG_ETH_DMA_RX_BUFFER_NUM];
+  }
+  for (unsigned i = 0; i < CONFIG_ETH_DMA_TX_BUFFER_NUM; ++i) {
+    memset(&tx[i], 0, sizeof(tx[i]));
+    tx[i].TDES0.SecondAddressChained = 1;
+    tx[i].Buffer1Addr = (uint32_t)(uintptr_t)tx_buffers[i];
+    tx[i].Buffer2NextDescAddr =
+        (uint32_t)(uintptr_t)&tx[(i + 1u) % CONFIG_ETH_DMA_TX_BUFFER_NUM];
+  }
+  tx_descriptor_index = 0;
+  rx_descriptor_index = 0;
+}
+
+static uint32_t transmitFrame(const uint8_t *frame, size_t length) {
+  eth_dma_tx_descriptor_t *tx = txDescriptors();
+  size_t remaining = length;
+  unsigned count = (unsigned)((length + CONFIG_ETH_DMA_BUFFER_SIZE - 1u) /
+                              CONFIG_ETH_DMA_BUFFER_SIZE);
+  if (count == 0u || count > CONFIG_ETH_DMA_TX_BUFFER_NUM) return 0;
+
+  for (unsigned part = 0; part < count; ++part) {
+    unsigned index = (tx_descriptor_index + part) % CONFIG_ETH_DMA_TX_BUFFER_NUM;
+    if (tx[index].TDES0.Own) return 0;
+    size_t chunk = remaining < CONFIG_ETH_DMA_BUFFER_SIZE
+                       ? remaining
+                       : CONFIG_ETH_DMA_BUFFER_SIZE;
+    memcpy(tx_buffers[index], frame + (length - remaining), chunk);
+    tx[index].TDES1.Value = 0;
+    tx[index].TDES1.TransmitBuffer1Size = (uint32_t)chunk;
+    tx[index].TDES0.Value = 0;
+    tx[index].TDES0.SecondAddressChained = 1;
+    tx[index].TDES0.FirstSegment = part == 0u;
+    tx[index].TDES0.LastSegment = part + 1u == count;
+    tx[index].TDES0.InterruptOnComplete = part + 1u == count;
+    tx[index].TDES0.Own = 1;
+    remaining -= chunk;
+  }
+  tx_descriptor_index = (tx_descriptor_index + count) %
+                        CONFIG_ETH_DMA_TX_BUFFER_NUM;
+  emac_hal_transmit_poll_demand(&hal_context);
+  return (uint32_t)length;
+}
+
+static uint32_t receiveFrame(uint8_t *frame, size_t capacity,
+                             uint32_t *frames_remain,
+                             uint32_t *free_descriptors) {
+  eth_dma_rx_descriptor_t *rx = rxDescriptors();
+  unsigned indices[CONFIG_ETH_DMA_RX_BUFFER_NUM];
+  unsigned count = 0;
+  uint32_t wire_length = 0;
+  size_t copied = 0;
+
+  while (count < CONFIG_ETH_DMA_RX_BUFFER_NUM) {
+    unsigned index = (rx_descriptor_index + count) %
+                     CONFIG_ETH_DMA_RX_BUFFER_NUM;
+    if (rx[index].RDES0.Own) return 0;
+    indices[count++] = index;
+    size_t chunk = CONFIG_ETH_DMA_BUFFER_SIZE;
+    if (copied + chunk > capacity) chunk = capacity - copied;
+    if (chunk != 0u) memcpy(frame + copied, rx_buffers[index], chunk);
+    copied += chunk;
+    if (rx[index].RDES0.LastDescriptor) {
+      wire_length = rx[index].RDES0.FrameLength;
+      break;
+    }
+  }
+  if (wire_length < 4u || count == 0u) return 0;
+  uint32_t frame_length = wire_length - 4u;
+  if (frame_length > capacity) frame_length = (uint32_t)capacity;
+
+  for (unsigned part = 0; part < count; ++part) {
+    unsigned index = indices[part];
+    rx[index].RDES0.Value = 0;
+    rx[index].RDES0.Own = 1;
+  }
+  rx_descriptor_index = (rx_descriptor_index + count) %
+                        CONFIG_ETH_DMA_RX_BUFFER_NUM;
+  if (frames_remain) *frames_remain = 0;
+  if (free_descriptors) *free_descriptors = CONFIG_ETH_DMA_RX_BUFFER_NUM;
+  emac_hal_receive_poll_demand(&hal_context);
+  return frame_length;
+}
+#endif
 
 static void fail(uint32_t stage, uint32_t detail) {
   flexe_emac_result[31] = detail;
@@ -76,11 +185,26 @@ void setup() {
     return;
   }
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  emac_hal_init(&hal_context);
+  initDescriptorChains();
+  emac_hal_set_rx_tx_desc_addr(&hal_context, rxDescriptors(), txDescriptors());
+#else
   emac_hal_init(&hal_context, descriptors, rx_buffers, tx_buffers);
   emac_hal_reset_desc_chain(&hal_context);
+#endif
   emac_hal_init_mac_default(&hal_context);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  emac_hal_set_promiscuous(&hal_context, true);
+  emac_hal_dma_config_t dma_config = {
+      .dma_burst_len = ETH_DMA_BURST_LEN_32,
+  };
+  emac_hal_init_dma_default(&hal_context, &dma_config);
+  emac_hal_clock_enable_rmii_input(&hal_context);
+#else
   emac_hal_init_dma_default(&hal_context);
   emac_ll_clock_enable_rmii_input(&EMAC_EXT);
+#endif
   uint8_t mac_address[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
   emac_hal_set_address(&hal_context, mac_address);
 
@@ -109,8 +233,12 @@ void setup() {
 
   for (size_t index = 0; index < sizeof(tx_frame); ++index)
     tx_frame[index] = (uint8_t)(index * 7u + 3u);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  flexe_emac_result[1] = transmitFrame(tx_frame, sizeof(tx_frame));
+#else
   flexe_emac_result[1] =
       emac_hal_transmit_frame(&hal_context, tx_frame, sizeof(tx_frame));
+#endif
   flexe_emac_result[11] = checksum(tx_frame, sizeof(tx_frame));
   if (flexe_emac_result[1] != sizeof(tx_frame)) {
     fail(3, flexe_emac_result[1]);
@@ -126,9 +254,14 @@ void setup() {
   uint32_t frames_remain = 0;
   uint32_t free_descriptors = 0;
   memset(rx_frame, 0, sizeof(rx_frame));
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  flexe_emac_result[3] = receiveFrame(
+      rx_frame, sizeof(rx_frame), &frames_remain, &free_descriptors);
+#else
   flexe_emac_result[3] = emac_hal_receive_frame(
       &hal_context, rx_frame, sizeof(rx_frame),
       &frames_remain, &free_descriptors);
+#endif
   flexe_emac_result[4] =
       (frames_remain & 0xFFFFu) | (free_descriptors << 16);
   flexe_emac_result[5] = checksum(rx_frame, flexe_emac_result[3]);
@@ -141,9 +274,14 @@ void setup() {
   memset(rx_frame, 0, sizeof(rx_frame));
   frames_remain = 0;
   free_descriptors = 0;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  flexe_emac_result[6] = receiveFrame(
+      rx_frame, sizeof(rx_frame), &frames_remain, &free_descriptors);
+#else
   flexe_emac_result[6] = emac_hal_receive_frame(
       &hal_context, rx_frame, sizeof(rx_frame),
       &frames_remain, &free_descriptors);
+#endif
   flexe_emac_result[7] =
       (frames_remain & 0xFFFFu) | (free_descriptors << 16);
   flexe_emac_result[8] = checksum(rx_frame, flexe_emac_result[6]);

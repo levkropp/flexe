@@ -25,7 +25,8 @@ void setup() {
   config.use_apll = false;
   config.tx_desc_auto_clear = false;
   config.fixed_mclk = 0;
-  config.mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT;
+  // IDF 5.5 removed the DEFAULT spelling; 256 is the value that macro used.
+  config.mclk_multiple = I2S_MCLK_MULTIPLE_256;
   config.bits_per_chan = I2S_BITS_PER_CHAN_DEFAULT;
 
   esp_err_t err = i2s_driver_install(I2S_NUM_0, &config, 0, nullptr);

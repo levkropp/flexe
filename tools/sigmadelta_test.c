@@ -19,6 +19,9 @@ volatile int emu_app_running = 1;
 typedef struct {
     unsigned count;
     bool channel0_ready;
+    bool channel0_modern_ready;
+    bool channel1_initial;
+    bool channel1_final;
     bool channel7_initial;
     bool channel7_final;
 } sigmadelta_capture_t;
@@ -32,6 +35,10 @@ static void capture_sigmadelta(void *opaque, int channel, int gpio,
         duty == 64 && enabled && !inverted) {
         capture->channel0_ready = true;
     }
+    if (channel == 0 && gpio == 18 && frequency_hz == 1220u &&
+        duty == 64 && enabled && !inverted) {
+        capture->channel0_modern_ready = true;
+    }
     if (channel == 7 && gpio == 23 && frequency_hz == 78125u &&
         duty == -64 && enabled && !inverted) {
         capture->channel7_initial = true;
@@ -39,6 +46,14 @@ static void capture_sigmadelta(void *opaque, int channel, int gpio,
     if (channel == 7 && gpio == 22 && frequency_hz == 39062u &&
         duty == -32 && enabled && !inverted) {
         capture->channel7_final = true;
+    }
+    if (channel == 1 && gpio == 23 && frequency_hz == 78125u &&
+        duty == -64 && enabled && !inverted) {
+        capture->channel1_initial = true;
+    }
+    if (channel == 1 && gpio == 22 && frequency_hz == 39062u &&
+        duty == -32 && enabled && !inverted) {
+        capture->channel1_final = true;
     }
 }
 
@@ -73,6 +88,8 @@ static int run_fixture(const char *bin_path, const char *elf_path,
     if (periph_set_sigmadelta_output_callback(
             periph, 0, capture_sigmadelta, &capture) != 0 ||
         periph_set_sigmadelta_output_callback(
+            periph, 1, capture_sigmadelta, &capture) != 0 ||
+        periph_set_sigmadelta_output_callback(
             periph, 7, capture_sigmadelta, &capture) != 0) {
         flexe_session_destroy(session);
         elf_symbols_destroy(symbols);
@@ -100,7 +117,9 @@ static int run_fixture(const char *bin_path, const char *elf_path,
     /* The channel-0 fixture leaves signed duty +64 and prescale zero routed
      * to GPIO18. Sample exactly one complete 256-tick PDM period. */
     uint32_t cpu_mhz = mem_read32(mem, 0x3FFE01E0u);
-    uint32_t sample_cycles = cpu_mhz >= 80u ? cpu_mhz / 80u : 0u;
+    uint32_t prescale = (results[2] >> 8u) & 0xFFu;
+    uint32_t sample_cycles = cpu_mhz >= 80u ?
+                             (cpu_mhz / 80u) * (prescale + 1u) : 0u;
     uint32_t base_ccount = cpu0->ccount;
     if (cpu1 && cpu1->ccount > base_ccount) base_ccount = cpu1->ccount;
     unsigned high_samples = 0u;
@@ -116,27 +135,38 @@ static int run_fixture(const char *bin_path, const char *elf_path,
     int unregistered = rom_stubs_unregistered_count(
         flexe_session_rom(session));
     const char *engine = disable_jit ? "interp" : "jit";
-    printf("engine=%s stage=0x%08X api=%u/%u "
+    bool modern_api = results[14] >= 3u;
+    bool second_initial = modern_api ? capture.channel1_initial
+                                     : capture.channel7_initial;
+    bool second_final = modern_api ? capture.channel1_final
+                                   : capture.channel7_final;
+    bool channel0_ready = modern_api ? capture.channel0_modern_ready
+                                     : capture.channel0_ready;
+    uint32_t second_route = modern_api ? 101u : 107u;
+    uint32_t channel0_reg = modern_api ? 0x0000FF40u : 0x00000040u;
+
+    printf("engine=%s stage=0x%08X api=%u/%u/%u "
            "regs=%04X/%04X routes=%u/%u enable=%08X "
            "callbacks=%u/%d/%d/%d density=%u/256 "
            "unhandled=%d unregistered=%d cycles=%llu\n",
-           engine, stage, results[0], results[1], results[2], results[9],
+           engine, stage, results[0], results[1], results[14],
+           results[2], results[9],
            results[3], results[10], results[11], capture.count,
-           capture.channel0_ready, capture.channel7_initial,
-           capture.channel7_final, high_samples, unhandled, unregistered,
+           channel0_ready, second_initial, second_final,
+           high_samples, unhandled, unregistered,
            (unsigned long long)cpu0->cycle_count);
 
     int ok = stage == SUCCESS_MARKER && results[0] == 312500u &&
-             results[1] == 192u && results[2] == 0x00000040u &&
+             results[1] == 192u && results[2] == channel0_reg &&
              results[3] == 100u && results[4] == 0u &&
              results[5] == 0x000003C0u && results[6] == 0u &&
              results[7] == 0u && results[8] == 0u &&
-             results[9] == 0x000007E0u && results[10] == 107u &&
+             results[9] == 0x000007E0u && results[10] == second_route &&
              (results[11] & ((1u << 18u) | (1u << 22u))) ==
                  ((1u << 18u) | (1u << 22u)) &&
              results[12] == 0x01506190u && results[13] == 1u &&
-             capture.channel0_ready && capture.channel7_initial &&
-             capture.channel7_final && high_samples == 192u &&
+             channel0_ready && second_initial && second_final &&
+             high_samples == 192u &&
              unhandled == 0 && unregistered == 0;
 
     flexe_session_destroy(session);

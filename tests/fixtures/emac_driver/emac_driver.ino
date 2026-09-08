@@ -1,6 +1,10 @@
 #include <Arduino.h>
+#include <esp_idf_version.h>
 #include <esp_eth_mac.h>
 #include <esp_eth_com.h>
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+#include <esp_eth_mac_esp.h>
+#endif
 
 volatile uint32_t flexe_emac_stage = 0;
 volatile uint32_t flexe_emac_command = 0;
@@ -54,6 +58,13 @@ static esp_err_t stackInput(esp_eth_mediator_t *, uint8_t *buffer,
   return ESP_OK;
 }
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+static esp_err_t stackInputInfo(esp_eth_mediator_t *eth, uint8_t *buffer,
+                                uint32_t length, void *) {
+  return stackInput(eth, buffer, length);
+}
+#endif
+
 static esp_err_t stateChanged(esp_eth_mediator_t *, esp_eth_state_t state,
                               void *) {
   flexe_emac_result[10] |= 1u << (unsigned)state;
@@ -74,14 +85,28 @@ void setup() {
   mediator.parent.phy_reg_read = phyRead;
   mediator.parent.phy_reg_write = phyWrite;
   mediator.parent.stack_input = stackInput;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  // Current EMAC DMA delivers through the extended callback even when the
+  // caller does not request timestamp metadata.
+  mediator.parent.stack_input_info = stackInputInfo;
+#endif
   mediator.parent.on_state_changed = stateChanged;
 
   eth_mac_config_t config = ETH_MAC_DEFAULT_CONFIG();
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  eth_esp32_emac_config_t esp32_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+  esp32_config.smi_gpio.mdc_num = -1;
+  esp32_config.smi_gpio.mdio_num = -1;
+  esp32_config.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
+  esp32_config.clock_config.rmii.clock_gpio = EMAC_CLK_IN_GPIO;
+  emac = esp_eth_mac_new_esp32(&esp32_config, &config);
+#else
   config.smi_mdc_gpio_num = -1;
   config.smi_mdio_gpio_num = -1;
   config.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
   config.clock_config.rmii.clock_gpio = EMAC_CLK_IN_GPIO;
   emac = esp_eth_mac_new_esp32(&config);
+#endif
   if (!emac) {
     fail(1, 0);
     return;
@@ -96,6 +121,14 @@ void setup() {
     fail(3, flexe_emac_result[13]);
     return;
   }
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  // The current driver no longer accepts multicast frames by default. Keep
+  // the fixture's multicast RX case by exercising its public filter control.
+  if (emac->set_promiscuous(emac, true) != ESP_OK) {
+    fail(3, 1);
+    return;
+  }
+#endif
 
   uint8_t address[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
   if (emac->set_addr(emac, address) != ESP_OK) {
