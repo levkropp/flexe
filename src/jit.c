@@ -403,7 +403,7 @@ static int classify_for_jit(uint32_t insn, int ilen) {
             case 3: return 0;  /* XOR */
             case 4: { /* ST1: shift-amount setup */
                 if (r <= 4 || r == 14 || r == 15) return 0; /* SSR/SSL/SSA8L/SSA8B/SSAI/NSA/NSAU */
-                if (r == 8) return 2; /* ROTW */
+                if (r == 8) return 1; /* ROTW — guarded window-context terminator */
                 return 2;
             }
             case 5: return 2;  /* TLB */
@@ -746,6 +746,11 @@ static void ra_init(regalloc_t *ra, const jit_scan_t *scan) {
                 /* L32E/S32E encode their negative stack displacement in r,
                  * not a third architectural register. */
                 if (((insn >> 16) & 0xF) == 9) vr = 0;
+                /* ROTW's t nibble is a signed immediate; it has no AR
+                 * operands and should not displace a useful allocation. */
+                if (((insn >> 16) & 0xF) == 0 &&
+                    ((insn >> 20) & 0xF) == 4 && r == 8)
+                    vt = vs = vr = 0;
                 break;
             case 1: vs = 0; vr = 0; break;              /* L32R: t and a literal */
             case 2: vr = 0; break;                      /* LSAI: r is the sub-opcode */
@@ -1641,6 +1646,52 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_mov_reg_imm32(e, RAX, (uint32_t)(s | ((t & 1) << 4)));
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_SAR);
                     return 1;
+                case 8: { /* ROTW: rotate the logical register window */
+                    /* Before architectural window vectors are active, the
+                     * interpreter's compatibility path can synthesize spills
+                     * when WOE is set. Preserve that uncommon state exactly;
+                     * architectural mode (and WOE-off startup code) only
+                     * changes WINDOWBASE and is safe to emit directly. */
+                    emit_load_cpu32(e, RAX,
+                                    (int32_t)CPU_OFF_REAL_WINDOW_VECTORS);
+                    emit_and_reg32_imm32(e, RAX, 0xFF);
+                    emit_test_reg32(e, RAX, RAX);
+                    int native_vectors = emit_jcc_rel32(e, CC_NE);
+
+                    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                    emit_test_reg32_imm32(e, RAX, 1u << 18); /* WOE */
+                    int legacy_spill = emit_jcc_rel32(e, CC_NE);
+
+                    emit_patch_rel32(e, native_vectors);
+                    /* Publish dirty logical registers under the old mapping
+                     * before the mapping itself changes. The immediate and
+                     * block key make the destination window static, so the
+                     * fallthrough can chain under its new cache key. */
+                    ra_flush(e, ra, wb4);
+                    uint32_t old_wb = (uint32_t)wb4 >> 2;
+                    uint32_t new_wb = (old_wb +
+                        (uint32_t)sign_extend((uint32_t)t, 4)) & 15u;
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_WINDOWBASE,
+                                         new_wb);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, next_pc);
+                    emit_store32_disp_imm(e, REG_CPU,
+                                          (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                    emit_acc_add(e, insn_idx + 1);
+                    uint8_t *chain_site = e->ptr;
+                    emit_jmp_to_epilogue(e, jit);
+                    jit_chain_record(jit, next_pc, new_wb, chain_site);
+
+                    /* Execute the prefix natively, then leave ROTW itself at
+                     * the current PC for synth_overflow_check() in the
+                     * interpreter. As with ENTRY/RETW fallbacks, do not set
+                     * _pc_written or create a chain back to the same opcode. */
+                    emit_patch_rel32(e, legacy_spill);
+                    ra_flush(e, ra, wb4);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc);
+                    emit_acc_add(e, insn_idx);
+                    emit_jmp_to_epilogue(e, jit);
+                    return 1;
+                }
                 case 14: case 15: { /* NSA / NSAU */
                     ra_load_ar(e, ra, RAX, wb4, s);
                     emit_mov_reg_imm32(e, RBX, 0);
@@ -2903,8 +2954,9 @@ static void emit_side_exit_body(emit_t *e, regalloc_t *ra, int wb4,
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
     emit_acc_add(e, sx->insn_count);
 
-    jit_chain_record(jit, sx->target_pc, sx->target_wb, e->ptr);
+    uint8_t *chain_site = e->ptr;
     emit_jmp_to_epilogue(e, jit);
+    jit_chain_record(jit, sx->target_pc, sx->target_wb, chain_site);
 }
 
 /* Emit the block exit sequence WITH register allocation:
@@ -3043,10 +3095,13 @@ static void emit_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
      * a native jump straight into a block compiled at LEND would bypass
      * jit_pc_hook entirely, and with it the lcount decrement and the branch
      * back to LBEG -- the loop would run once and fall out. */
-    if (exit_pc != 0 && jit && !loop_end_exit)
-        jit_chain_record(jit, exit_pc, (uint32_t)(wb4 / 4), e->ptr);
-
+    uint8_t *chain_site = e->ptr;
     emit_jmp_to_epilogue(e, jit);
+    /* Emit the default epilogue jump before asking for a chain patch. If the
+     * target is already compiled, jit_chain_record() rewrites this site
+     * immediately; recording first let the default jump overwrite its patch. */
+    if (exit_pc != 0 && jit && !loop_end_exit)
+        jit_chain_record(jit, exit_pc, (uint32_t)(wb4 / 4), chain_site);
 }
 
 /* (Legacy emit_block_exit removed — all exits go through emit_block_exit_ra) */
@@ -3405,8 +3460,10 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
             emit_patch_rel32(&e, sx[k].patch_site);
             if (ra.defer_flush) ra_flush(&e, &ra, wb4);
             emit_acc_add(&e, sx[k].insn_count);
-            jit_chain_record(jit, sx[k].target_pc, sx[k].target_wb, e.ptr);
+            uint8_t *chain_site = e.ptr;
             emit_jmp_to_epilogue(&e, jit);
+            jit_chain_record(jit, sx[k].target_pc, sx[k].target_wb,
+                             chain_site);
         } else {
             emit_side_exit_body(&e, &ra, wb4, &sx[k], jit);
         }

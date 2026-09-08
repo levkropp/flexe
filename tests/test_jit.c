@@ -869,6 +869,80 @@ TEST(test_jit_single_instruction_chain_target_is_native) {
     teardown(&cpu);
 }
 
+TEST(test_jit_precompiled_fallthrough_chain_is_not_overwritten) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE;
+    const uint32_t source = BASE + 0x40u;
+    const uint32_t return_pc = BASE + 0x100u;
+
+    put_insn2(&cpu, target, narrow(0xD, 15, 0, 0)); /* RET.N */
+    put_insn2(&cpu, source,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, source + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, source + 4u, narrow(0xD, 15, 0, 3));
+    int32_t joff = (int32_t)target - (int32_t)(source + 6u + 3u) - 1;
+    put_insn3(&cpu, source + 6u,
+              (((uint32_t)joff & 0x3FFFFu) << 6) | 6u);
+    ar_write(&cpu, 0, return_pc);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, source);
+    jit_block_fn source_fn = jit_get_block(jit, &cpu, source);
+    ASSERT_TRUE(source_fn != NULL);
+    ASSERT_EQ(jit_get_stats(jit)->chains_patched, 1u);
+
+    cpu.pc = source;
+    ASSERT_EQ(source_fn(&cpu), 5);
+    ASSERT_EQ(cpu.pc, return_pc);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_precompiled_side_exit_chain_is_not_overwritten) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE;
+    const uint32_t source = BASE + 0x40u;
+    const uint32_t branch_pc = source + 6u;
+    const uint32_t return_pc = BASE + 0x100u;
+
+    put_insn2(&cpu, target, narrow(0xD, 15, 0, 0)); /* RET.N */
+    put_insn2(&cpu, source,      narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, source + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, source + 4u, narrow(0xD, 15, 0, 3));
+    int32_t boff = (int32_t)target - (int32_t)(branch_pc + 3u) - 1;
+    put_insn3(&cpu, branch_pc,
+              (((uint32_t)boff & 0xFFFu) << 12) |
+              (3u << 8) | (1u << 4) | 6u); /* BEQZ a3, target */
+    put_insn2(&cpu, branch_pc + 3u, narrow(0xD, 15, 0, 2)); /* ILL.N */
+    ar_write(&cpu, 0, return_pc);
+    ar_write(&cpu, 3, 0u);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, source);
+    jit_block_fn source_fn = jit_get_block(jit, &cpu, source);
+    ASSERT_TRUE(source_fn != NULL);
+    ASSERT_EQ(jit_get_stats(jit)->chains_patched, 1u);
+
+    cpu.pc = source;
+    ASSERT_EQ(source_fn(&cpu), 5);
+    ASSERT_EQ(cpu.pc, return_pc);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_short_backedge_loop_is_native) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2275,6 +2349,10 @@ static uint32_t jit_entry_insn(int s, uint32_t framesize) {
     return (imm12 << 12) | ((uint32_t)s << 8) | (3u << 4) | 6u;
 }
 
+static uint32_t jit_rotw_insn(int amount) {
+    return rrr(4, 0, 8, 0, amount & 15);
+}
+
 static uint32_t jit_l32e_insn(int t, int s, int byte_offset) {
     int r = (byte_offset + 64) >> 2;
     return rrr(0, 9, r & 15, s, t);
@@ -2322,6 +2400,100 @@ TEST(test_jit_entry_dispatches_compiled_callee_body) {
     ASSERT_EQ(xtensa_run(&cpu, 5), 5);
     ASSERT_EQ(cpu.windowbase, 2);
     ASSERT_EQ64(jit_get_stats(jit)->insns_jitted, 4u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_rotw_flushes_old_mapping_and_wraps) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.ps = 1u << 18; /* WOE */
+    cpu.windowbase = 14;
+    cpu.windowstart = 1u << 14;
+    ar_write(&cpu, 2, 41u);
+    put_insn2(&cpu, BASE, narrow(0xB, 2, 2, 1)); /* ADDI.N a2, a2, 1 */
+    put_insn3(&cpu, BASE + 2u, jit_rotw_insn(3));
+    test_block_differential(&cpu, 2, "rotw_native_wrap");
+    teardown(&cpu);
+}
+
+TEST(test_jit_rotw_legacy_without_woe_is_native) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = false;
+    cpu.ps = 0;
+    cpu.windowbase = 1;
+    cpu.windowstart = 1u << 1;
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn3(&cpu, BASE + 2u, jit_rotw_insn(-2));
+    test_block_differential(&cpu, 2, "rotw_legacy_woe_off");
+    teardown(&cpu);
+}
+
+TEST(test_jit_rotw_legacy_woe_falls_back) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = false;
+    cpu.ps = 1u << 18; /* legacy WOE requires synth_overflow_check() */
+    cpu.windowbase = 2;
+    cpu.windowstart = 1u << 2;
+    ar_write(&cpu, 2, 9u);
+    put_insn2(&cpu, BASE, narrow(0xB, 2, 2, 1)); /* dirty native prefix */
+    put_insn3(&cpu, BASE + 2u, jit_rotw_insn(-1));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+
+    ASSERT_EQ(fn(&cpu), 1);
+    ASSERT_EQ(cpu.pc, BASE + 2u);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.ar[2 * 4 + 2], 10u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_rotw_chains_under_destination_window) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.ps = 1u << 18;
+    cpu.windowbase = 0;
+    cpu.windowstart = 1u;
+    put_insn3(&cpu, BASE, jit_rotw_insn(1));
+    for (unsigned i = 0; i < 4; i++)
+        put_insn2(&cpu, BASE + 3u + i * 2u,
+                  narrow(0xD, 15, 0, 3)); /* NOP.N */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.windowbase = 1;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE + 3u);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE + 3u) != NULL);
+
+    cpu.windowbase = 0;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+    ASSERT_TRUE(jit_get_stats(jit)->chains_patched > 0);
+
+    uint64_t hooks_before = jit_get_stats(jit)->hook_calls;
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    cpu.running = true;
+    ASSERT_EQ(xtensa_run(&cpu, 5), 5);
+    ASSERT_EQ(cpu.windowbase, 1u);
+    ASSERT_EQ(cpu.pc, BASE + 11u);
+    ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
 
     jit_destroy(jit);
     teardown(&cpu);
@@ -2659,6 +2831,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_hash_collision_uses_free_way);
     RUN_TEST(test_jit_one_instruction_straight_line_compiles_when_hot);
     RUN_TEST(test_jit_single_instruction_chain_target_is_native);
+    RUN_TEST(test_jit_precompiled_fallthrough_chain_is_not_overwritten);
+    RUN_TEST(test_jit_precompiled_side_exit_chain_is_not_overwritten);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);
     RUN_TEST(test_jit_contended_spinlock_returns_to_scheduler);
@@ -2721,6 +2895,10 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_wsr_ps_exits_before_pending_irq);
     RUN_TEST(test_jit_rur_wur_user_registers);
     RUN_TEST(test_jit_entry_dispatches_compiled_callee_body);
+    RUN_TEST(test_jit_rotw_flushes_old_mapping_and_wraps);
+    RUN_TEST(test_jit_rotw_legacy_without_woe_is_native);
+    RUN_TEST(test_jit_rotw_legacy_woe_falls_back);
+    RUN_TEST(test_jit_rotw_chains_under_destination_window);
     RUN_TEST(test_jit_entry_fallthrough_does_not_repeat_original_hook);
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);
