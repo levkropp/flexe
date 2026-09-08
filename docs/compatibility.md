@@ -110,7 +110,6 @@ shortcut; it is also off by default.
 ## Firmware-specific hooks
 
 Address-based Wi-Fi and Bluetooth hooks are accepted only for verified image
-fingerprints. `scripts/locate-wifi-symbols.py` can derive candidate entry points
-by matching masked function prologues against a throwaway build made with the
-same Arduino core. `scripts/disasm-firmware.sh` disassembles stripped images at
-their real load addresses for follow-up analysis.
+fingerprints. Candidate entry points must be verified against a symbol-bearing
+build made with the same ESP-IDF or Arduino core. `build/xt-dis` disassembles a
+stripped app image at its guest load address (`-a ADDR -n LEN firmware.bin`).

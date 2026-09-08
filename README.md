@@ -85,25 +85,14 @@ Common options:
 | `-q` | Suppress emulator diagnostics |
 | `-T` | Emit an instruction trace to stderr |
 | `-b ADDR` | Set a breakpoint |
-| `-d ADDR LEN` | Dump guest memory on exit |
+| `-m ADDR[:LEN]` | Dump guest memory on exit |
 
 ## Production status
 
-The committed corpus currently establishes these outcomes:
-
-| Firmware | Current result |
-|---|---|
-| ESP32 Marauder 1.12.1/1.14.x/1.15.x CYD builds | Scripted display, touch, UART, GPS, Wi-Fi, BLE, and storage scenarios pass |
-| NerdMiner 1.8.3 | Captive portal, DNS, pool connection, and mining path pass |
-| Meshtastic 2.7.26 | Boots and both engines agree |
-| openHASP 0.7.0-rc13 | Boots and both engines agree |
-| Tasmota 15.6.0 | Boots through the Berry runtime and both engines agree |
-| WLED 16.0.1 | Boots to its Adalight prompt and both engines agree |
-| Bruce 1.16.1 (CYD 2432S028) | Scripted display, GPIO-bit-banged touch, and storage scenario passes; official ROM ELF required |
-
-These are bounded, reproducible claims rather than blanket compatibility
-promises. See [Firmware compatibility](docs/compatibility.md) for the exact
-images, gates, and remaining board-specific coverage.
+Bruce, Marauder, and NerdMiner pass scripted board-level scenarios in both
+engines. Meshtastic, openHASP, Tasmota, and WLED pass the generic production
+gate. See [Firmware compatibility](docs/compatibility.md) for pinned versions,
+assertions, and remaining board-specific coverage.
 
 ## Test
 
@@ -138,11 +127,9 @@ MARAUDER_BIN=/path/to/marauder.bin ./scripts/bench-stock-roms.sh
 ```
 
 In the current Apple-silicon release benchmark, every image in the five-ROM
-generic corpus clears real time under the JIT; WLED is the limiting workload at
-2.23x. Production images with substantial idle time can report higher factors
-than their instruction throughput suggests, so benchmark output always includes
-retired work and UART progress. See [Performance](docs/performance.md) for the
-dated results, host configuration, and methodology.
+generic corpus clears real time in both engines. WLED is the limiting workload
+at 1.03x interpreted and 2.32x under the JIT. See
+[Performance](docs/performance.md) for dated results and methodology.
 
 ## Architecture
 
