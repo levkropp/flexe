@@ -8,7 +8,7 @@ typedef struct xtensa_cpu xtensa_cpu_t;
 typedef struct freertos_stubs freertos_stubs_t;
 
 /* File format version (increment when structure changes) */
-#define SAVESTATE_VERSION 7
+#define SAVESTATE_VERSION 8
 
 /* Savestate file magic (ASCII: "XTST") */
 #define SAVESTATE_MAGIC 0x54535458

@@ -49,6 +49,13 @@ int  rom_stubs_output_count(const esp32_rom_stubs_t *stubs);
 const char *rom_stubs_output_buf(const esp32_rom_stubs_t *stubs);
 void rom_stubs_output_clear(esp32_rom_stubs_t *stubs);
 
+/* Allocate/free guest-visible memory from the same capability-aware arenas
+ * used by the firmware heap hooks. Compatibility subsystems that replace a
+ * guest container still need stable pointers the guest can dereference. */
+uint32_t rom_stubs_heap_alloc_caps(esp32_rom_stubs_t *stubs, uint32_t size,
+                                   uint32_t caps);
+void rom_stubs_heap_free(esp32_rom_stubs_t *stubs, uint32_t ptr);
+
 /* Verbose logging callback (called before each ROM stub executes) */
 typedef void (*rom_log_fn)(void *ctx, uint32_t addr, const char *name,
                            const xtensa_cpu_t *cpu);

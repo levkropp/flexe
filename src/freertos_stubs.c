@@ -58,6 +58,16 @@
 #define MAX_QUEUE_ITEMS  32
 #define MAX_ITEM_SIZE    64
 
+/* ESP-IDF ring buffers sit above FreeRTOS queues but retain their own data
+ * store and item boundaries. Letting their native implementation run against
+ * Flexe's host-backed queue handles mixes two incompatible object models;
+ * keep the container state here and its payload in guest-visible heap RAM. */
+#define MAX_RINGBUFFERS       16
+#define MAX_RINGBUFFER_ITEMS 256
+#define RINGBUF_TYPE_NOSPLIT   0u
+#define RINGBUF_TYPE_ALLOWSPLIT 1u
+#define RINGBUF_TYPE_BYTEBUF   2u
+
 typedef struct {
     uint32_t handle;       /* address returned as handle */
     uint32_t static_storage; /* caller-owned item storage, when static */
@@ -75,6 +85,22 @@ typedef struct {
     uint32_t mutex_owner;    /* task handle, 0 when free */
     int      mutex_depth;
 } queue_t;
+
+typedef struct {
+    uint32_t handle;
+    uint32_t storage;
+    uint32_t static_control;
+    uint32_t capacity;
+    uint32_t used;
+    uint32_t borrowed_len;
+    uint32_t acquired_len;
+    uint32_t item_len[MAX_RINGBUFFER_ITEMS];
+    unsigned item_count;
+    uint8_t type;
+    bool borrowed;
+    bool acquired;
+    bool owns_storage;
+} ringbuffer_t;
 
 typedef struct {
     uint32_t handle;         /* address returned as the EventGroupHandle_t */
@@ -137,6 +163,10 @@ typedef struct {
     bool         q_peek;         /* xQueuePeek: copy the item, leave it queued */
     bool         q_is_sender;    /* blocked in a send on a full queue */
     uint8_t      q_copy_pos;     /* copy position the blocked send asked for */
+    uint32_t     rb_handle;      /* ring buffer awaited by pointer-return API */
+    uint32_t     rb_size_out;    /* guest size_t* written when data arrives */
+    uint32_t     rb_max_size;    /* ReceiveUpTo limit, UINT32_MAX otherwise */
+    bool         rb_waiting;
     /* Event group wait, mirroring the notification fields below: eg_waiting
      * stays true across both the indefinite and the timed block, so a setter
      * can wake the task whichever state it is parked in. */
@@ -184,6 +214,9 @@ struct freertos_stubs {
     /* Queue storage */
     queue_t  queues[MAX_QUEUES];
     int      queue_count;
+
+    ringbuffer_t ringbuffers[MAX_RINGBUFFERS];
+    int          ringbuffer_count;
 
     /* Software timer storage */
     sw_timer_t sw_timers[MAX_SW_TIMERS];
@@ -413,6 +446,15 @@ static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
                     t->q_waiting = false;
                     t->q_is_sender = false;
                     t->blocked_queue = 0;
+                }
+                if (t->rb_waiting) {
+                    /* The saved return value is already NULL.  Stop a later
+                     * ISR send from reviving a receive whose deadline has
+                     * expired. */
+                    t->rb_waiting = false;
+                    t->rb_handle = 0u;
+                    t->rb_size_out = 0u;
+                    t->rb_max_size = 0u;
                 }
                 if (t->eg_waiting) {
                     /* A timed-out xEventGroupWaitBits() returns the bits as
@@ -2539,6 +2581,479 @@ void stub_xQueueGenericGetStaticBuffers(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, is_static ? pdTRUE : pdFALSE);
 }
 
+/* ===== ESP-IDF ring buffers =====
+ *
+ * Payloads remain in guest RAM so a pointer returned by Receive is directly
+ * usable by unmodified firmware. Metadata and scheduling stay host-backed,
+ * matching the rest of the compatibility FreeRTOS implementation. Data is
+ * kept compacted at the start of the guest allocation; ReturnItem removes the
+ * borrowed prefix. This preserves byte-stream and item boundaries without
+ * exposing ESP-IDF's private Ringbuffer_t layout to either side. */
+
+static ringbuffer_t *find_ringbuffer(freertos_stubs_t *frt,
+                                     uint32_t handle) {
+    for (int i = 0; i < frt->ringbuffer_count; i++)
+        if (frt->ringbuffers[i].handle == handle && handle != 0u)
+            return &frt->ringbuffers[i];
+    return NULL;
+}
+
+static uint32_t ringbuffer_create_locked(xtensa_cpu_t *cpu,
+                                         freertos_stubs_t *frt,
+                                         uint32_t capacity, uint32_t type,
+                                         uint32_t storage,
+                                         uint32_t static_control,
+                                         uint32_t caps) {
+    if (capacity == 0u || type > RINGBUF_TYPE_BYTEBUF)
+        return 0u;
+
+    int slot = -1;
+    for (int i = 0; i < frt->ringbuffer_count; i++) {
+        if (static_control &&
+            frt->ringbuffers[i].handle == static_control)
+            return static_control;
+        if (slot < 0 && frt->ringbuffers[i].handle == 0u)
+            slot = i;
+    }
+    if (slot < 0) {
+        if (frt->ringbuffer_count >= MAX_RINGBUFFERS) return 0u;
+        slot = frt->ringbuffer_count++;
+    }
+
+    bool owns_storage = storage == 0u;
+    esp32_rom_stubs_t *rom = frt->rom;
+    if (!rom) rom = cpu->pc_hook_ctx;
+    if (owns_storage)
+        storage = rom_stubs_heap_alloc_caps(rom, capacity, caps);
+    if (!storage) return 0u;
+
+    uint32_t handle = static_control ? static_control : bump_alloc(frt, 4u);
+    if (!handle) {
+        if (owns_storage) rom_stubs_heap_free(rom, storage);
+        return 0u;
+    }
+
+    ringbuffer_t *rb = &frt->ringbuffers[slot];
+    memset(rb, 0, sizeof(*rb));
+    rb->handle = handle;
+    rb->storage = storage;
+    rb->static_control = static_control;
+    rb->capacity = capacity;
+    rb->type = (uint8_t)type;
+    rb->owns_storage = owns_storage;
+    return handle;
+}
+
+static void stub_ringbuffer_create(xtensa_cpu_t *cpu,
+                                   freertos_stubs_t *frt,
+                                   uint32_t capacity, uint32_t type,
+                                   uint32_t storage,
+                                   uint32_t static_control,
+                                   uint32_t caps) {
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = ringbuffer_create_locked(cpu, frt, capacity, type,
+                                                storage, static_control, caps);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+void stub_xRingbufferCreate(xtensa_cpu_t *cpu, void *ctx) {
+    stub_ringbuffer_create(cpu, ctx, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                           0u, 0u, 0u);
+}
+
+void stub_xRingbufferCreateWithCaps(xtensa_cpu_t *cpu, void *ctx) {
+    stub_ringbuffer_create(cpu, ctx, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                           0u, 0u, frt_arg(cpu, 2));
+}
+
+void stub_xRingbufferCreateStatic(xtensa_cpu_t *cpu, void *ctx) {
+    stub_ringbuffer_create(cpu, ctx, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                           frt_arg(cpu, 2), frt_arg(cpu, 3), 0u);
+}
+
+void stub_xRingbufferCreateNoSplit(xtensa_cpu_t *cpu, void *ctx) {
+    uint32_t item_size = frt_arg(cpu, 0);
+    uint32_t item_count = frt_arg(cpu, 1);
+    uint32_t capacity = 0u;
+    if (item_size <= UINT32_MAX - 3u && item_count != 0u) {
+        uint32_t aligned = (item_size + 3u) & ~3u;
+        uint64_t total = ((uint64_t)aligned + 8u) * item_count;
+        if (total <= UINT32_MAX) capacity = (uint32_t)total;
+    }
+    stub_ringbuffer_create(cpu, ctx, capacity, RINGBUF_TYPE_NOSPLIT,
+                           0u, 0u, 0u);
+}
+
+static bool ringbuffer_append_locked(xtensa_cpu_t *cpu, ringbuffer_t *rb,
+                                     uint32_t item, uint32_t size) {
+    if (!rb || rb->used > rb->capacity || rb->acquired ||
+        size > rb->capacity - rb->used ||
+        (size != 0u && item == 0u))
+        return false;
+    if (rb->type != RINGBUF_TYPE_BYTEBUF &&
+        rb->item_count >= MAX_RINGBUFFER_ITEMS)
+        return false;
+
+    for (uint32_t i = 0; i < size; i++)
+        mem_write8(cpu->mem, rb->storage + rb->used + i,
+                   mem_read8(cpu->mem, item + i));
+    rb->used += size;
+    if (rb->type != RINGBUF_TYPE_BYTEBUF)
+        rb->item_len[rb->item_count++] = size;
+    return true;
+}
+
+static uint32_t ringbuffer_borrow_locked(ringbuffer_t *rb,
+                                         uint32_t max_size,
+                                         uint32_t *size_out) {
+    if (!rb || rb->borrowed || max_size == 0u)
+        return 0u;
+
+    uint32_t size;
+    if (rb->type == RINGBUF_TYPE_BYTEBUF) {
+        if (rb->used == 0u) return 0u;
+        size = rb->used < max_size ? rb->used : max_size;
+    } else {
+        if (rb->item_count == 0u) return 0u;
+        size = rb->item_len[0];
+    }
+
+    rb->borrowed = true;
+    rb->borrowed_len = size;
+    if (size_out) *size_out = size;
+    return rb->storage;
+}
+
+static bool wake_ringbuffer_waiter_locked(freertos_stubs_t *frt,
+                                           ringbuffer_t *rb) {
+    if (!frt->scheduler_started || !frt->cpu[0] || !rb) return false;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->rb_waiting || t->rb_handle != rb->handle) continue;
+
+        uint32_t size = 0u;
+        uint32_t item = ringbuffer_borrow_locked(rb, t->rb_max_size, &size);
+        if (!item) return false;
+        if (t->rb_size_out)
+            mem_write32(frt->cpu[0]->mem, t->rb_size_out, size);
+        t->ar[t->ret_ar_slot] = item;
+        t->rb_waiting = false;
+        t->rb_handle = 0u;
+
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
+        return true;
+    }
+    return false;
+}
+
+static void ringbuffer_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                            bool from_isr) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item = frt_arg(cpu, 1);
+    uint32_t size = frt_arg(cpu, 2);
+    uint32_t woken_out = from_isr ? frt_arg(cpu, 3) : 0u;
+
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    bool sent = ringbuffer_append_locked(cpu, rb, item, size);
+    bool woke = sent && wake_ringbuffer_waiter_locked(frt, rb);
+    pthread_mutex_unlock(&frt->lock);
+
+    /* FreeRTOS FromISR APIs accumulate this flag across several operations
+     * in one ISR, so a non-waking send must not clear an earlier pdTRUE. */
+    if (woken_out && woke) mem_write32(cpu->mem, woken_out, pdTRUE);
+    frt_return(cpu, sent ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferSend(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_send(cpu, ctx, false);
+}
+
+void stub_xRingbufferSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_send(cpu, ctx, true);
+}
+
+static void ringbuffer_receive(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                               bool from_isr, bool up_to) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t size_out = frt_arg(cpu, 1);
+    uint32_t timeout = from_isr ? 0u : frt_arg(cpu, 2);
+    uint32_t max_size = up_to ? frt_arg(cpu, from_isr ? 2 : 3)
+                              : UINT32_MAX;
+    int core_id = cpu->core_id;
+    if (!from_isr && timeout != 0u)
+        frt_refresh_cpu_frequency(frt, cpu);
+
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    uint32_t size = 0u;
+    uint32_t item = ringbuffer_borrow_locked(rb, max_size, &size);
+    if (item) {
+        pthread_mutex_unlock(&frt->lock);
+        if (size_out) mem_write32(cpu->mem, size_out, size);
+        frt_return(cpu, item);
+        return;
+    }
+
+    if (!from_isr && timeout != 0u && rb && !rb->borrowed &&
+        frt->scheduler_started && frt->current_task[core_id] >= 0) {
+        task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+        t->ret_ar_slot = frt_return_slot(cpu);
+        frt_return(cpu, 0u);
+        sched_save_context(frt, core_id);
+        t->rb_handle = handle;
+        t->rb_size_out = size_out;
+        t->rb_max_size = max_size;
+        t->rb_waiting = true;
+        if (timeout == UINT32_MAX) {
+            t->state = TASK_BLOCKED_QUEUE;
+        } else {
+            uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+            if (advance > 200000000ULL) advance = 200000000ULL;
+            t->state = TASK_SLEEPING;
+            t->wake_cycle = cpu->cycle_count + advance;
+        }
+        sched_switch(frt, core_id);
+        pthread_mutex_unlock(&frt->lock);
+        return;
+    }
+
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, 0u);
+}
+
+void stub_xRingbufferReceive(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, false, false);
+}
+
+void stub_xRingbufferReceiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, true, false);
+}
+
+void stub_xRingbufferReceiveUpTo(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, false, true);
+}
+
+void stub_xRingbufferReceiveUpToFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, true, true);
+}
+
+static void ringbuffer_return_item(xtensa_cpu_t *cpu,
+                                   freertos_stubs_t *frt,
+                                   uint32_t woken_out) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item = frt_arg(cpu, 1);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb && rb->borrowed && rb->borrowed_len <= rb->used &&
+        item == rb->storage) {
+        uint32_t consumed = rb->borrowed_len;
+        uint32_t remaining = rb->used - consumed;
+        for (uint32_t i = 0; i < remaining; i++)
+            mem_write8(cpu->mem, rb->storage + i,
+                       mem_read8(cpu->mem, rb->storage + consumed + i));
+        rb->used = remaining;
+        if (rb->type != RINGBUF_TYPE_BYTEBUF && rb->item_count != 0u) {
+            for (unsigned i = 1; i < rb->item_count; i++)
+                rb->item_len[i - 1] = rb->item_len[i];
+            rb->item_count--;
+        }
+        rb->borrowed = false;
+        rb->borrowed_len = 0u;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    /* No blocked-send model is needed yet, so this call cannot newly request
+     * a yield. Preserve any pdTRUE already accumulated by the ISR. */
+    (void)woken_out;
+    frt_return_void(cpu);
+}
+
+void stub_vRingbufferReturnItem(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_return_item(cpu, ctx, 0u);
+}
+
+void stub_vRingbufferReturnItemFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_return_item(cpu, ctx, frt_arg(cpu, 2));
+}
+
+void stub_xRingbufferSendAcquire(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item_out = frt_arg(cpu, 1);
+    uint32_t size = frt_arg(cpu, 2);
+    uint32_t item = 0u;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb && rb->used <= rb->capacity &&
+        rb->type == RINGBUF_TYPE_NOSPLIT && !rb->acquired &&
+        !rb->borrowed && size <= rb->capacity - rb->used &&
+        rb->item_count < MAX_RINGBUFFER_ITEMS) {
+        item = rb->storage + rb->used;
+        rb->acquired = true;
+        rb->acquired_len = size;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    if (item_out) mem_write32(cpu->mem, item_out, item);
+    frt_return(cpu, item ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferSendComplete(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item = frt_arg(cpu, 1);
+    bool sent = false;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb && rb->acquired && item == rb->storage + rb->used) {
+        rb->used += rb->acquired_len;
+        rb->item_len[rb->item_count++] = rb->acquired_len;
+        rb->acquired = false;
+        rb->acquired_len = 0u;
+        sent = true;
+        (void)wake_ringbuffer_waiter_locked(frt, rb);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, sent ? pdTRUE : pdFALSE);
+}
+
+static void ringbuffer_receive_split(xtensa_cpu_t *cpu,
+                                     freertos_stubs_t *frt) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t head_out = frt_arg(cpu, 1);
+    uint32_t tail_out = frt_arg(cpu, 2);
+    uint32_t head_size_out = frt_arg(cpu, 3);
+    uint32_t tail_size_out = frt_arg(cpu, 4);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    uint32_t size = 0u;
+    uint32_t item = ringbuffer_borrow_locked(rb, UINT32_MAX, &size);
+    pthread_mutex_unlock(&frt->lock);
+    if (head_out) mem_write32(cpu->mem, head_out, item);
+    if (tail_out) mem_write32(cpu->mem, tail_out, 0u);
+    if (item && head_size_out) mem_write32(cpu->mem, head_size_out, size);
+    if (tail_size_out) mem_write32(cpu->mem, tail_size_out, 0u);
+    frt_return(cpu, item ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferReceiveSplit(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive_split(cpu, ctx);
+}
+
+void stub_xRingbufferReceiveSplitFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive_split(cpu, ctx);
+}
+
+static void ringbuffer_delete(xtensa_cpu_t *cpu, freertos_stubs_t *frt) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t storage = 0u;
+    bool owns_storage = false;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb) {
+        storage = rb->storage;
+        owns_storage = rb->owns_storage;
+        memset(rb, 0, sizeof(*rb));
+    }
+    pthread_mutex_unlock(&frt->lock);
+    esp32_rom_stubs_t *rom = frt->rom;
+    if (!rom) rom = cpu->pc_hook_ctx;
+    if (owns_storage) rom_stubs_heap_free(rom, storage);
+    frt_return_void(cpu);
+}
+
+void stub_vRingbufferDelete(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_delete(cpu, ctx);
+}
+
+void stub_vRingbufferDeleteWithCaps(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_delete(cpu, ctx);
+}
+
+void stub_xRingbufferGetMaxItemSize(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    uint32_t size = rb ? rb->capacity : 0u;
+    if (rb && rb->type == RINGBUF_TYPE_NOSPLIT)
+        size = rb->capacity > 16u ? rb->capacity / 2u - 8u : 0u;
+    else if (rb && rb->type == RINGBUF_TYPE_ALLOWSPLIT)
+        size = rb->capacity > 8u ? rb->capacity - 8u : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, size);
+}
+
+void stub_xRingbufferGetCurFreeSize(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    uint32_t size = rb && rb->used <= rb->capacity &&
+                    rb->acquired_len <= rb->capacity - rb->used
+                  ? rb->capacity - rb->used - rb->acquired_len : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, size);
+}
+
+void stub_xRingbufferGetStaticBuffer(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t storage_out = frt_arg(cpu, 1);
+    uint32_t control_out = frt_arg(cpu, 2);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    bool is_static = rb && rb->static_control != 0u;
+    uint32_t storage = is_static ? rb->storage : 0u;
+    uint32_t control = is_static ? rb->static_control : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    if (is_static) {
+        if (storage_out) mem_write32(cpu->mem, storage_out, storage);
+        if (control_out) mem_write32(cpu->mem, control_out, control);
+    }
+    frt_return(cpu, is_static ? pdTRUE : pdFALSE);
+}
+
+void stub_vRingbufferGetInfo(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t out[5];
+    for (unsigned i = 0; i < 5; i++) out[i] = frt_arg(cpu, (int)i + 1);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    uint32_t values[5] = {0};
+    if (rb) {
+        values[0] = rb->used;
+        values[1] = 0u;
+        values[2] = rb->used;
+        values[3] = rb->used + rb->acquired_len;
+        values[4] = rb->type == RINGBUF_TYPE_BYTEBUF ? rb->used
+                                                     : rb->item_count;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    for (unsigned i = 0; i < 5; i++)
+        if (out[i]) mem_write32(cpu->mem, out[i], values[i]);
+    frt_return_void(cpu);
+}
+
+void stub_xRingbufferQueueSetNoop(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    bool valid = find_ringbuffer(frt, frt_arg(cpu, 0)) != NULL;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, valid ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferPrintInfo(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return_void(cpu);
+}
+
 /* xQueueGenericSend (underlying implementation) */
 void stub_xQueueGenericSend(xtensa_cpu_t *cpu, void *ctx) {
     stub_queue_send(cpu, ctx, frt_arg(cpu, 3));
@@ -2884,6 +3399,31 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xQueueGenericReset",            stub_xQueueGenericReset },
         { "xQueueGenericGetStaticBuffers", stub_xQueueGenericGetStaticBuffers },
         { "vQueueDelete",                  stub_vQueueDelete },
+        { "xRingbufferCreate",             stub_xRingbufferCreate },
+        { "xRingbufferCreateWithCaps",     stub_xRingbufferCreateWithCaps },
+        { "xRingbufferCreateStatic",       stub_xRingbufferCreateStatic },
+        { "xRingbufferCreateNoSplit",      stub_xRingbufferCreateNoSplit },
+        { "xRingbufferSend",               stub_xRingbufferSend },
+        { "xRingbufferSendFromISR",        stub_xRingbufferSendFromISR },
+        { "xRingbufferSendAcquire",        stub_xRingbufferSendAcquire },
+        { "xRingbufferSendComplete",       stub_xRingbufferSendComplete },
+        { "xRingbufferReceive",            stub_xRingbufferReceive },
+        { "xRingbufferReceiveFromISR",     stub_xRingbufferReceiveFromISR },
+        { "xRingbufferReceiveUpTo",        stub_xRingbufferReceiveUpTo },
+        { "xRingbufferReceiveUpToFromISR", stub_xRingbufferReceiveUpToFromISR },
+        { "xRingbufferReceiveSplit",       stub_xRingbufferReceiveSplit },
+        { "xRingbufferReceiveSplitFromISR", stub_xRingbufferReceiveSplitFromISR },
+        { "vRingbufferReturnItem",         stub_vRingbufferReturnItem },
+        { "vRingbufferReturnItemFromISR",  stub_vRingbufferReturnItemFromISR },
+        { "vRingbufferDelete",             stub_vRingbufferDelete },
+        { "vRingbufferDeleteWithCaps",     stub_vRingbufferDeleteWithCaps },
+        { "xRingbufferGetMaxItemSize",     stub_xRingbufferGetMaxItemSize },
+        { "xRingbufferGetCurFreeSize",     stub_xRingbufferGetCurFreeSize },
+        { "xRingbufferGetStaticBuffer",    stub_xRingbufferGetStaticBuffer },
+        { "vRingbufferGetInfo",            stub_vRingbufferGetInfo },
+        { "xRingbufferAddToQueueSetRead",  stub_xRingbufferQueueSetNoop },
+        { "xRingbufferRemoveFromQueueSetRead", stub_xRingbufferQueueSetNoop },
+        { "xRingbufferPrintInfo",          stub_xRingbufferPrintInfo },
         { "pvPortMalloc",                  stub_pvPortMalloc },
         { "vPortFree",                     stub_vPortFree },
         { "xTaskGetCurrentTaskHandle",     stub_xTaskGetCurrentTaskHandle },
@@ -3036,6 +3576,11 @@ int freertos_stubs_save_state(const freertos_stubs_t *frt, FILE *f) {
     if (fwrite(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
     if (fwrite(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
 
+    /* Save ring-buffer metadata. Payload bytes live in guest memory and are
+     * already covered by the surrounding machine-memory snapshot. */
+    if (fwrite(&frt->ringbuffer_count, sizeof(frt->ringbuffer_count), 1, f) != 1) return -1;
+    if (fwrite(frt->ringbuffers, sizeof(frt->ringbuffers), 1, f) != 1) return -1;
+
     /* Save event groups */
     if (fwrite(&frt->event_group_count, sizeof(frt->event_group_count), 1, f) != 1) return -1;
     if (fwrite(frt->event_groups, sizeof(frt->event_groups), 1, f) != 1) return -1;
@@ -3070,7 +3615,23 @@ int freertos_stubs_restore_state(freertos_stubs_t *frt, FILE *f) {
 
     /* Restore queue storage */
     if (fread(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
+    if (frt->queue_count < 0 || frt->queue_count > MAX_QUEUES) return -1;
     if (fread(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
+
+    /* Restore ring-buffer metadata after its guest-visible payload. */
+    if (fread(&frt->ringbuffer_count, sizeof(frt->ringbuffer_count), 1, f) != 1) return -1;
+    if (frt->ringbuffer_count < 0 ||
+        frt->ringbuffer_count > MAX_RINGBUFFERS) return -1;
+    if (fread(frt->ringbuffers, sizeof(frt->ringbuffers), 1, f) != 1) return -1;
+    for (int i = 0; i < frt->ringbuffer_count; i++) {
+        const ringbuffer_t *rb = &frt->ringbuffers[i];
+        if (rb->handle == 0u) continue;
+        if (rb->type > RINGBUF_TYPE_BYTEBUF || rb->used > rb->capacity ||
+            rb->borrowed_len > rb->used ||
+            rb->acquired_len > rb->capacity - rb->used ||
+            rb->item_count > MAX_RINGBUFFER_ITEMS)
+            return -1;
+    }
 
     /* Restore event groups */
     if (fread(&frt->event_group_count, sizeof(frt->event_group_count), 1, f) != 1) return -1;

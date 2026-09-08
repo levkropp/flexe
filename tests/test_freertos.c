@@ -129,6 +129,124 @@ TEST(test_static_queue_buffers_round_trip_for_capability_wrappers) {
     frt_teardown(&cpu, rom, frt);
 }
 
+TEST(test_ringbuffer_byte_stream_crosses_isr_boundary) {
+    /* The legacy ESP-IDF I2C slave driver receives bus bytes in an ISR and
+     * consumes them from a task. Both sides must share one model: allowing
+     * the native ring buffer to operate on host-backed FreeRTOS state enters
+     * native event lists and either asserts or loses the data. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    extern void stub_xRingbufferCreate(xtensa_cpu_t *, void *);
+    extern void stub_xRingbufferSend(xtensa_cpu_t *, void *);
+    extern void stub_xRingbufferSendFromISR(xtensa_cpu_t *, void *);
+    extern void stub_xRingbufferReceiveUpTo(xtensa_cpu_t *, void *);
+    extern void stub_xRingbufferReceiveUpToFromISR(xtensa_cpu_t *, void *);
+    extern void stub_vRingbufferReturnItem(xtensa_cpu_t *, void *);
+    extern void stub_vRingbufferReturnItemFromISR(xtensa_cpu_t *, void *);
+    extern void stub_xRingbufferGetCurFreeSize(xtensa_cpu_t *, void *);
+    extern void stub_vRingbufferDelete(xtensa_cpu_t *, void *);
+
+    const uint32_t a_create = 0x400D0000u;
+    const uint32_t a_send = 0x400D0010u;
+    const uint32_t a_send_isr = 0x400D0020u;
+    const uint32_t a_receive = 0x400D0030u;
+    const uint32_t a_receive_isr = 0x400D0040u;
+    const uint32_t a_return = 0x400D0050u;
+    const uint32_t a_return_isr = 0x400D0060u;
+    const uint32_t a_free = 0x400D0070u;
+    const uint32_t a_delete = 0x400D0080u;
+    rom_stubs_register_ctx(rom, a_create,
+        (rom_stub_fn)stub_xRingbufferCreate, "xRingbufferCreate", frt);
+    rom_stubs_register_ctx(rom, a_send,
+        (rom_stub_fn)stub_xRingbufferSend, "xRingbufferSend", frt);
+    rom_stubs_register_ctx(rom, a_send_isr,
+        (rom_stub_fn)stub_xRingbufferSendFromISR,
+        "xRingbufferSendFromISR", frt);
+    rom_stubs_register_ctx(rom, a_receive,
+        (rom_stub_fn)stub_xRingbufferReceiveUpTo,
+        "xRingbufferReceiveUpTo", frt);
+    rom_stubs_register_ctx(rom, a_receive_isr,
+        (rom_stub_fn)stub_xRingbufferReceiveUpToFromISR,
+        "xRingbufferReceiveUpToFromISR", frt);
+    rom_stubs_register_ctx(rom, a_return,
+        (rom_stub_fn)stub_vRingbufferReturnItem,
+        "vRingbufferReturnItem", frt);
+    rom_stubs_register_ctx(rom, a_return_isr,
+        (rom_stub_fn)stub_vRingbufferReturnItemFromISR,
+        "vRingbufferReturnItemFromISR", frt);
+    rom_stubs_register_ctx(rom, a_free,
+        (rom_stub_fn)stub_xRingbufferGetCurFreeSize,
+        "xRingbufferGetCurFreeSize", frt);
+    rom_stubs_register_ctx(rom, a_delete,
+        (rom_stub_fn)stub_vRingbufferDelete, "vRingbufferDelete", frt);
+
+    uint32_t create[2] = { 8u, 2u }; /* RINGBUF_TYPE_BYTEBUF */
+    uint32_t rb = frt_call_stub(&cpu, a_create, create, 2);
+    ASSERT_TRUE(rb != 0u);
+    uint32_t one[1] = { rb };
+    ASSERT_EQ(frt_call_stub(&cpu, a_free, one, 1), 8u);
+
+    const uint32_t tx = 0x3FFB2000u;
+    mem_write8(cpu.mem, tx + 0u, 0x11u);
+    mem_write8(cpu.mem, tx + 1u, 0x22u);
+    mem_write8(cpu.mem, tx + 2u, 0x33u);
+    uint32_t send[4] = { rb, tx, 3u, 0u };
+    ASSERT_EQ(frt_call_stub(&cpu, a_send, send, 4), 1u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_free, one, 1), 5u);
+
+    const uint32_t size_out = 0x3FFB2100u;
+    uint32_t receive_isr[3] = { rb, size_out, 8u };
+    uint32_t item = frt_call_stub(&cpu, a_receive_isr, receive_isr, 3);
+    ASSERT_TRUE(item != 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, size_out), 3u);
+    ASSERT_EQ(mem_read8(cpu.mem, item + 0u), 0x11u);
+    ASSERT_EQ(mem_read8(cpu.mem, item + 1u), 0x22u);
+    ASSERT_EQ(mem_read8(cpu.mem, item + 2u), 0x33u);
+
+    const uint32_t woken_out = 0x3FFB2104u;
+    mem_write32(cpu.mem, woken_out, 0u);
+    uint32_t return_isr[3] = { rb, item, woken_out };
+    (void)frt_call_stub(&cpu, a_return_isr, return_isr, 3);
+    ASSERT_EQ(mem_read32(cpu.mem, woken_out), 0u);
+    ASSERT_EQ(frt_call_stub(&cpu, a_free, one, 1), 8u);
+
+    const uint32_t rx = 0x3FFB2200u;
+    mem_write8(cpu.mem, rx + 0u, 0xDEu);
+    mem_write8(cpu.mem, rx + 1u, 0xADu);
+    mem_write8(cpu.mem, rx + 2u, 0xBEu);
+    mem_write8(cpu.mem, rx + 3u, 0xEFu);
+    uint32_t send_isr[4] = { rb, rx, 4u, woken_out };
+    ASSERT_EQ(frt_call_stub(&cpu, a_send_isr, send_isr, 4), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, woken_out), 0u);
+
+    /* Receive and return in two chunks to exercise byte-buffer compaction. */
+    uint32_t receive[4] = { rb, size_out, 0u, 3u };
+    item = frt_call_stub(&cpu, a_receive, receive, 4);
+    ASSERT_TRUE(item != 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, size_out), 3u);
+    ASSERT_EQ(mem_read8(cpu.mem, item + 0u), 0xDEu);
+    ASSERT_EQ(mem_read8(cpu.mem, item + 1u), 0xADu);
+    ASSERT_EQ(mem_read8(cpu.mem, item + 2u), 0xBEu);
+    uint32_t return_item[2] = { rb, item };
+    (void)frt_call_stub(&cpu, a_return, return_item, 2);
+
+    receive[3] = 4u;
+    item = frt_call_stub(&cpu, a_receive, receive, 4);
+    ASSERT_TRUE(item != 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, size_out), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, item), 0xEFu);
+    return_item[1] = item;
+    (void)frt_call_stub(&cpu, a_return, return_item, 2);
+    ASSERT_EQ(frt_call_stub(&cpu, a_free, one, 1), 8u);
+
+    (void)frt_call_stub(&cpu, a_delete, one, 1);
+    ASSERT_EQ(frt_call_stub(&cpu, a_free, one, 1), 0u);
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_delay_until_deadline_is_absolute) {
     /* vTaskDelayUntil's wake time advances by the increment regardless of how
      * long the body took, which is what keeps a fixed-rate loop from drifting
@@ -1211,6 +1329,7 @@ static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
     RUN_TEST(test_recursive_mutex_reentry_and_ownership);
     RUN_TEST(test_static_queue_buffers_round_trip_for_capability_wrappers);
+    RUN_TEST(test_ringbuffer_byte_stream_crosses_isr_boundary);
     RUN_TEST(test_delay_until_deadline_is_absolute);
     RUN_TEST(test_queue_accessors_read_flexe_storage);
     RUN_TEST(test_event_group_bits);

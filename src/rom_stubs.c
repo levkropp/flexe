@@ -2523,6 +2523,17 @@ static void heap_free(xtensa_cpu_t *cpu, esp32_rom_stubs_t *s,
     region->free_list = block;
 }
 
+uint32_t rom_stubs_heap_alloc_caps(esp32_rom_stubs_t *stubs, uint32_t size,
+                                   uint32_t caps) {
+    if (!stubs || !stubs->cpu) return 0;
+    return heap_alloc(stubs->cpu, heap_region_for_caps(stubs, caps), size);
+}
+
+void rom_stubs_heap_free(esp32_rom_stubs_t *stubs, uint32_t ptr) {
+    if (!stubs || !stubs->cpu) return;
+    heap_free(stubs->cpu, stubs, ptr);
+}
+
 /* malloc(size) -> pointer or NULL */
 static void stub_malloc(xtensa_cpu_t *cpu, void *ctx) {
     esp32_rom_stubs_t *s = ctx;
