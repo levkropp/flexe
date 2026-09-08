@@ -20,6 +20,10 @@
 #define TEST_HS_SYNC_LITERAL         0x4010B4B4u
 #define TEST_HS_PUBLIC_LITERAL       0x4010B5DCu
 #define TEST_BLE_EVENT_ADDR          0x50001C00u
+#define TEST_MESHTASTIC_ENTRY        0x400836F0u
+#define TEST_MESHTASTIC_HCI_ADDR     0x400F1DB0u
+#define TEST_MESHTASTIC_CONN_ADDR    0x400F1D50u
+#define TEST_MESHTASTIC_SYNC_WAIT    0x4010CDE0u
 
 typedef struct {
     uint64_t calls;
@@ -434,9 +438,109 @@ TEST(v1121_cyd2usb_observes_nimble_238_entries) {
     teardown(&cpu);
 }
 
+TEST(meshtastic_tbeam_completes_nimble_hci_startup) {
+    static const uint8_t hci_cmd_tx[] = {
+        0x36, 0x61, 0x00, 0x71, 0x83, 0x7F, 0x70, 0xA7,
+        0x20, 0x25, 0xEF, 0xE0, 0x40, 0xC4, 0x20, 0xBD,
+    };
+    static const uint8_t sync_wait[] = {
+        0x21, 0x30, 0x17, 0x32, 0x02, 0x00, 0x39, 0x61,
+        0x56, 0xC3, 0x0C, 0x81, 0x2D, 0x14, 0xE0, 0x08,
+        0x00, 0x86, 0xFB, 0xFF, 0x00,
+    };
+    const uint32_t rsp = 0x3FFB3200u;
+
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    bt_stubs_t *bt = bt_stubs_create(&cpu);
+
+    /* The entry point alone must never select a symbol-less layout. */
+    ASSERT_EQ(bt_stubs_hook_firmware_addrs(bt, TEST_MESHTASTIC_ENTRY), 0);
+    put_test_bytes(&cpu, TEST_MESHTASTIC_HCI_ADDR,
+                   hci_cmd_tx, sizeof(hci_cmd_tx));
+    put_test_bytes(&cpu, TEST_MESHTASTIC_SYNC_WAIT,
+                   sync_wait, sizeof(sync_wait));
+    put_insn3(&cpu, TEST_MESHTASTIC_CONN_ADDR, 0x004136u);
+    ASSERT_EQ(bt_stubs_hook_firmware_addrs(bt, TEST_MESHTASTIC_ENTRY), 2);
+
+    uint32_t args[] = {0x1001u, 0, 0, rsp, 8};
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    ASSERT_EQ(ar_read(&cpu, 10), 0);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp), 8);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp + 3u), 8);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp + 4u), 0xE5);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp + 5u), 0x02);
+
+    for (unsigned i = 0; i < 64; i++)
+        mem_write8(cpu.mem, rsp + i, 0xA5);
+    args[0] = 0x1002u;
+    args[4] = 64;
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    for (unsigned i = 0; i < 64; i++)
+        ASSERT_EQ(mem_read8(cpu.mem, rsp + i), 0);
+
+    args[0] = 0x1003u;
+    args[4] = 8;
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp + 4u), 0x60);
+
+    args[0] = 0x2002u;
+    args[4] = 3;
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp), 0xFB);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp + 1u), 0);
+    ASSERT_EQ(mem_read8(cpu.mem, rsp + 2u), 10);
+
+    args[0] = 0x1009u;
+    args[4] = 6;
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    static const uint8_t address[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+    for (unsigned i = 0; i < sizeof(address); i++)
+        ASSERT_EQ(mem_read8(cpu.mem, rsp + i), address[i]);
+
+    uint8_t first_random[8];
+    args[0] = 0x2018u;
+    args[4] = 8;
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    bool any_random = false;
+    for (unsigned i = 0; i < sizeof(first_random); i++) {
+        first_random[i] = mem_read8(cpu.mem, rsp + i);
+        any_random |= first_random[i] != 0;
+    }
+    ASSERT_TRUE(any_random);
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    bool random_changed = false;
+    for (unsigned i = 0; i < sizeof(first_random); i++)
+        random_changed |= mem_read8(cpu.mem, rsp + i) != first_random[i];
+    ASSERT_TRUE(random_changed);
+
+    /* Controller configuration commands with no return parameters complete
+     * immediately instead of waiting on the absent ESP32 radio task. */
+    args[0] = 0x0C03u;
+    args[3] = 0;
+    args[4] = 0;
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_HCI_ADDR, args, 5);
+    ASSERT_EQ(ar_read(&cpu, 10), 0);
+
+    invoke_observed_call8(&cpu, TEST_MESHTASTIC_CONN_ADDR, NULL, 0);
+    ASSERT_EQ(ar_read(&cpu, 10), 1);
+
+    bt_stubs_stats_t stats = {0};
+    bt_stubs_get_stats(bt, &stats);
+    ASSERT_EQ64(stats.hci_command_calls, 8);
+    ASSERT_EQ64(stats.hci_virtual_completions, 8);
+    ASSERT_EQ64(stats.connection_capacity_queries, 1);
+
+    bt_stubs_destroy(bt);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static void run_bt_stub_tests(void) {
     TEST_SUITE("Bluetooth stubs");
     RUN_TEST(production_scan_delivers_nimble_gap_advertisement);
     RUN_TEST(v11423_fingerprint_selects_shifted_nimble_entries);
     RUN_TEST(v1121_cyd2usb_observes_nimble_238_entries);
+    RUN_TEST(meshtastic_tbeam_completes_nimble_hci_startup);
 }

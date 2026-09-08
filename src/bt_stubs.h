@@ -32,6 +32,7 @@ typedef struct {
     uint64_t advertisement_frames;
     uint64_t advertisement_callback_failures;
     uint64_t hci_command_calls;
+    uint64_t hci_virtual_completions;
     uint64_t advertising_data_calls;
     uint64_t advertising_scan_response_calls;
     uint64_t advertising_parameters_calls;

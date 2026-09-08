@@ -38,6 +38,10 @@
 #define MARAUDER_BOARD_ENTRY 0x400830D0u
 #define MARAUDER_V114_ENTRY 0x400831D8u
 #define MARAUDER_V1121_CYD2USB_ENTRY 0x40081E90u
+#define MESHTASTIC_TBEAM_2726_ENTRY 0x400836F0u
+#define MESHTASTIC_TBEAM_2726_HCI_CMD_TX 0x400F1DB0u
+#define MESHTASTIC_TBEAM_2726_CONN_CAN_ALLOC 0x400F1D50u
+#define MESHTASTIC_TBEAM_2726_SYNC_WAIT 0x4010CDE0u
 typedef struct {
     uint32_t scan_start;
     uint32_t scan_stop;
@@ -123,6 +127,17 @@ static const marauder_bt_layout_t marauder_v1151_bt = {
 #define BLE_HCI_LE_SET_SCAN_ENABLE   0x200Cu
 #define BLE_HCI_ERR_INVALID_PARAMS   0x0012u
 
+/* Controller and information commands required by NimBLE host startup. */
+#define BLE_HCI_RESET                0x0C03u
+#define BLE_HCI_READ_LOCAL_VERSION   0x1001u
+#define BLE_HCI_READ_SUPPORTED_CMDS  0x1002u
+#define BLE_HCI_READ_LOCAL_FEATURES  0x1003u
+#define BLE_HCI_READ_BUFFER_SIZE     0x1005u
+#define BLE_HCI_READ_BD_ADDR         0x1009u
+#define BLE_HCI_LE_READ_BUFFER_SIZE  0x2002u
+#define BLE_HCI_LE_READ_FEATURES     0x2003u
+#define BLE_HCI_LE_RAND              0x2018u
+
 /* Synthetic BLE devices */
 typedef struct {
     char     name[32];
@@ -164,6 +179,8 @@ struct bt_stubs {
     uint32_t           connected_peers_addr;
     xtensa_cpu_t      *scan_cpu;
     bool               production_observer;
+    bool               virtual_hci_all;
+    uint64_t            hci_random_state;
     uint8_t            advertisement_data[BLE_DATA_MAX_LEN];
     uint8_t            advertisement_len;
     uint8_t            scan_response_data[BLE_DATA_MAX_LEN];
@@ -443,6 +460,91 @@ static bool capture_hci_advertising_data(bt_stubs_t *bt, uint32_t cmd,
     return true;
 }
 
+static void write_hci_response(xtensa_cpu_t *cpu, uint32_t rsp,
+                               uint32_t rsp_len, const uint8_t *data,
+                               size_t data_len)
+{
+    if (!rsp)
+        return;
+    for (uint32_t i = 0; i < rsp_len; i++)
+        mem_write8(cpu->mem, rsp + i, i < data_len ? data[i] : 0);
+}
+
+/* Complete a synchronous NimBLE HCI transaction against the virtual
+ * controller.  Keep the advertised capabilities conservative (Bluetooth
+ * 4.2 LE, no optional commands) so the genuine host only enables operations
+ * implemented at this boundary. */
+static void complete_virtual_hci_command(bt_stubs_t *bt, xtensa_cpu_t *cpu,
+                                         uint32_t opcode, uint32_t rsp,
+                                         uint32_t rsp_len)
+{
+    static const uint8_t local_version[] = {
+        8,          /* Bluetooth Core 4.2 */
+        0, 0,       /* HCI revision */
+        8,          /* LMP version */
+        0xE5, 0x02, /* Espressif Systems company identifier */
+        0, 0,       /* LMP subversion */
+    };
+    static const uint8_t local_features[] = {
+        0, 0, 0, 0, 0x60, 0, 0, 0, /* LE supported; BR/EDR unsupported */
+    };
+    static const uint8_t le_buffer_size[] = {
+        0xFB, 0x00, /* 251-byte ACL payload */
+        10,         /* ten controller packets */
+    };
+    static const uint8_t classic_buffer_size[] = {
+        0xFB, 0x00, 0, 10, 0, 0, 0,
+    };
+    uint8_t random_data[8];
+    uint64_t random_value;
+
+    switch (opcode) {
+    case BLE_HCI_READ_LOCAL_VERSION:
+        write_hci_response(cpu, rsp, rsp_len, local_version,
+                           sizeof(local_version));
+        break;
+    case BLE_HCI_READ_LOCAL_FEATURES:
+        write_hci_response(cpu, rsp, rsp_len, local_features,
+                           sizeof(local_features));
+        break;
+    case BLE_HCI_LE_READ_BUFFER_SIZE:
+        write_hci_response(cpu, rsp, rsp_len, le_buffer_size,
+                           sizeof(le_buffer_size));
+        break;
+    case BLE_HCI_READ_BUFFER_SIZE:
+        write_hci_response(cpu, rsp, rsp_len, classic_buffer_size,
+                           sizeof(classic_buffer_size));
+        break;
+    case BLE_HCI_READ_BD_ADDR:
+        write_hci_response(cpu, rsp, rsp_len, bt->ble_addr,
+                           sizeof(bt->ble_addr));
+        break;
+    case BLE_HCI_LE_RAND:
+        /* xorshift64* gives deterministic but non-degenerate controller
+         * entropy.  NimBLE uses this during identity and privacy setup and
+         * legitimately retries when a controller returns unusable zeros. */
+        random_value = bt->hci_random_state;
+        random_value ^= random_value >> 12;
+        random_value ^= random_value << 25;
+        random_value ^= random_value >> 27;
+        bt->hci_random_state = random_value;
+        random_value *= UINT64_C(0x2545F4914F6CDD1D);
+        for (uint32_t i = 0; i < sizeof(random_data); i++)
+            random_data[i] = (uint8_t)(random_value >> (i * 8u));
+        write_hci_response(cpu, rsp, rsp_len, random_data,
+                           sizeof(random_data));
+        break;
+    case BLE_HCI_RESET:
+    case BLE_HCI_READ_SUPPORTED_CMDS:
+    case BLE_HCI_LE_READ_FEATURES:
+    default:
+        /* Zero is both a valid empty capability set and a deterministic
+         * response for commands whose return parameters are unused. */
+        write_hci_response(cpu, rsp, rsp_len, NULL, 0);
+        break;
+    }
+}
+
 /* Virtualize the controller-facing commands used by legacy scanning and
  * advertising.  This is the lowest stable boundary shared by
  * NimBLEAdvertising's structured and raw-data APIs. */
@@ -452,6 +554,8 @@ static int conditional_ble_hs_hci_cmd_tx(xtensa_cpu_t *cpu, void *ctx)
     uint32_t opcode = bt_arg(cpu, 0) & 0xFFFFu;
     uint32_t cmd = bt_arg(cpu, 1);
     uint32_t cmd_len = bt_arg(cpu, 2) & 0xFFu;
+    uint32_t rsp = bt_arg(cpu, 3);
+    uint32_t rsp_len = bt_arg(cpu, 4) & 0xFFu;
     bt->stats.hci_command_calls++;
 
     if (opcode == BLE_HCI_LE_SET_ADV_DATA) {
@@ -500,8 +604,18 @@ static int conditional_ble_hs_hci_cmd_tx(xtensa_cpu_t *cpu, void *ctx)
         bt_return(cpu, result);
         return 1;
     }
-    if (opcode != BLE_HCI_LE_SET_ADV_ENABLE)
+    if (opcode != BLE_HCI_LE_SET_ADV_ENABLE) {
+        if (bt->virtual_hci_all) {
+            complete_virtual_hci_command(bt, cpu, opcode, rsp, rsp_len);
+            bt->stats.hci_virtual_completions++;
+            if (bt->event_log || bt->stats.hci_virtual_completions <= 12)
+                bt_log(bt, "HCI command 0x%04x completed by virtual "
+                       "controller\n", opcode);
+            bt_return(cpu, 0);
+            return 1;
+        }
         return 0;
+    }
     if (!cmd || cmd_len < 1) {
         bt->stats.advertisement_tx_failures++;
         bt_return(cpu, BLE_HCI_ERR_INVALID_PARAMS);
@@ -643,6 +757,7 @@ bt_stubs_t *bt_stubs_create(xtensa_cpu_t *cpu)
     if (!bt) return NULL;
     bt->cpu = cpu;
     bt->bt_status = ESP_BT_CONTROLLER_STATUS_IDLE;
+    bt->hci_random_state = UINT64_C(0x6A09E667F3BCC909);
 
     /* Default BLE address (locally-administered random) */
     bt->ble_addr[0] = 0xDE; bt->ble_addr[1] = 0xAD;
@@ -661,7 +776,7 @@ int bt_stubs_hook_symbols(bt_stubs_t *bt, const elf_symbols_t *syms)
 {
     if (!bt || !syms) return 0;
 
-    /* The supported Marauder build runs its real NimBLE host.  Replacing the
+    /* Supported production builds run their real NimBLE host.  Replacing the
      * same functions merely because a companion ELF was supplied would make
      * symbol-assisted runs less faithful than raw stock-ROM runs. */
     if (bt->production_observer)
@@ -803,16 +918,63 @@ int bt_stubs_hook_symbols(bt_stubs_t *bt, const elf_symbols_t *syms)
     return hooked;
 }
 
+static bool firmware_bytes_match(xtensa_mem_t *mem, uint32_t addr,
+                                 const uint8_t *expected, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        if (mem_read8(mem, addr + (uint32_t)i) != expected[i])
+            return false;
+    }
+    return true;
+}
+
+static bool is_meshtastic_tbeam_2726(bt_stubs_t *bt, uint32_t entry_point)
+{
+    static const uint8_t hci_cmd_tx[] = {
+        0x36, 0x61, 0x00, 0x71, 0x83, 0x7F, 0x70, 0xA7,
+        0x20, 0x25, 0xEF, 0xE0, 0x40, 0xC4, 0x20, 0xBD,
+    };
+    static const uint8_t sync_wait[] = {
+        0x21, 0x30, 0x17, 0x32, 0x02, 0x00, 0x39, 0x61,
+        0x56, 0xC3, 0x0C, 0x81, 0x2D, 0x14, 0xE0, 0x08,
+        0x00, 0x86, 0xFB, 0xFF, 0x00,
+    };
+    xtensa_mem_t *mem = bt->cpu->mem;
+    return entry_point == MESHTASTIC_TBEAM_2726_ENTRY &&
+           firmware_bytes_match(mem, MESHTASTIC_TBEAM_2726_HCI_CMD_TX,
+                                hci_cmd_tx, sizeof(hci_cmd_tx)) &&
+           firmware_bytes_match(mem, MESHTASTIC_TBEAM_2726_SYNC_WAIT,
+                                sync_wait, sizeof(sync_wait));
+}
+
 int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
 {
-    /* v1.14/v1.15 for the 2432S028 share one entry point; the other CYD
-     * boards are a separate link with their own. */
-    if (!bt || (entry_point != MARAUDER_V114_ENTRY &&
-                entry_point != MARAUDER_BOARD_ENTRY &&
-                entry_point != MARAUDER_V1121_CYD2USB_ENTRY))
+    if (!bt || !bt->cpu || !bt->cpu->mem)
         return 0;
     esp32_rom_stubs_t *rom = bt->cpu->pc_hook_ctx;
     if (!rom)
+        return 0;
+
+    if (is_meshtastic_tbeam_2726(bt, entry_point)) {
+        bt->rom = rom;
+        bt->production_observer = true;
+        bt->virtual_hci_all = true;
+        rom_stubs_register_conditional_ctx(
+                rom, MESHTASTIC_TBEAM_2726_HCI_CMD_TX + 3u,
+                conditional_ble_hs_hci_cmd_tx, "ble_hs_hci_cmd_tx", bt);
+        rom_stubs_register_ctx(rom,
+                MESHTASTIC_TBEAM_2726_CONN_CAN_ALLOC + 3u,
+                stub_ble_hs_conn_can_alloc, "ble_hs_conn_can_alloc", bt);
+        fprintf(stderr, "[bt] attached Meshtastic T-Beam virtual "
+                        "NimBLE controller\n");
+        return 2;
+    }
+
+    /* v1.14/v1.15 for the 2432S028 share one entry point; the other CYD
+     * boards are a separate link with their own. */
+    if (entry_point != MARAUDER_V114_ENTRY &&
+        entry_point != MARAUDER_BOARD_ENTRY &&
+        entry_point != MARAUDER_V1121_CYD2USB_ENTRY)
         return 0;
 
     const marauder_bt_layout_t *layout = NULL;
