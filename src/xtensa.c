@@ -2827,12 +2827,13 @@ int g_dbg_tcount;          /* remaining insns in current fire */
 int g_dbg_tfires = 3;      /* max fires */
 int g_dbg_winlog;          /* FLEXE_WINLOG: window-ops trace */
 int g_dbg_c1ilog;          /* FLEXE_C1ILOG: log garbage s32c1i reads */
-/* Single gate for every per-instruction diagnostic below. None of them is
+/* Single gates for every per-instruction diagnostic below. None of them is
  * armed unless the matching FLEXE_* variable is set, but the checks themselves
- * used to run unconditionally: `perf annotate -s xtensa_run` put the arm-test
- * loads and the g_dbg_core store among the ten hottest instructions in the
- * interpreter, which is pure waste in every normal run. */
+ * used to run unconditionally: profiling put the arm-test loads and debug
+ * state stores among the hottest instructions in the interpreter, which is
+ * pure waste in every normal run. */
 int g_dbg_step_trace;
+static int g_dbg_step_slow;
 int g_flexe_shadow_fill;   /* FLEXE_SHADOWFILL */
 
 __attribute__((constructor))
@@ -2886,11 +2887,17 @@ static void g_dbg_watch_init(void) {
     g_dbg_mem_watch = (g_dbg_watch_en || g_dbg_pcwatch_en ||
                        g_dbg_watch_val) ? 1 : 0;
     g_dbg_step_trace = (g_dbg_tarm || g_dbg_mem_watch) ? 1 : 0;
+    /* g_dbg_pc is consumed only by the step trace, memory watchpoints, and
+     * opt-in peripheral/SD logging. Do not publish it on every instruction in
+     * normal runs: that cross-translation-unit store is measurable in the
+     * interpreter's innermost loop. */
+    g_dbg_step_slow = (g_dbg_step_trace || getenv("FLEXE_PERIPHDBG") ||
+                       getenv("FLEXE_SDDBG")) ? 1 : 0;
 }
 
 /* Per-instruction diagnostics: the PC-armed instruction trace, and publishing
  * the current core for the memory watchpoints in memory.h. Out of line and
- * cold, so the hot path pays a single predictable test of g_dbg_step_trace. */
+ * cold, so the hot path pays a single predictable test of g_dbg_step_slow. */
 static __attribute__((noinline, cold))
 void xtensa_dbg_step_trace(xtensa_cpu_t *cpu) {
     static uint32_t ring[DBG_RING_MAX];
@@ -2953,10 +2960,12 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
                      uint32_t *restrict prev_pc) {
     uint32_t insn;
     const uint32_t last_pc = *prev_pc;
-    g_dbg_pc = cpu->pc;
     *prev_pc = cpu->pc;
-    if (__builtin_expect(g_dbg_step_trace, 0))
-        xtensa_dbg_step_trace(cpu);
+    if (__builtin_expect(g_dbg_step_slow, 0)) {
+        g_dbg_pc = cpu->pc;
+        if (g_dbg_step_trace)
+            xtensa_dbg_step_trace(cpu);
+    }
     if (__builtin_expect(cpu->halted, 0)) {
         cpu->ccount++;
         ++*local_cc;
