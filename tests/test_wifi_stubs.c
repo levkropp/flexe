@@ -7,6 +7,7 @@
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -35,6 +36,7 @@
 #define TEST_TASMOTA_BIND            0x4019BA54u
 #define TEST_TASMOTA_LISTEN          0x4019BD10u
 #define TEST_TASMOTA_RECV            0x4019BE5Cu
+#define TEST_REENT_ERRNO              0x3FFE3C00u
 
 typedef struct {
     uint64_t calls;
@@ -501,8 +503,28 @@ TEST(tasmota_recv_peek_preserves_http_request) {
                         recv_addr, 1u, 0x08u);
     ASSERT_EQ(ar_read(&cpu, 2), 1u);
     ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'E');
+    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+                        recv_addr, 1u, 0x08u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'T');
 
+    shutdown(host_fd, SHUT_RDWR);
     close(host_fd);
+    /* The accepted host descriptor is private to wifi_stubs, so wait for the
+     * FIN through the guest boundary below; a short scheduling race may still
+     * report EWOULDBLOCK once before the EOF becomes visible. */
+    /* A preceding empty nonblocking read commonly leaves EWOULDBLOCK in the
+     * guest. Orderly EOF must clear it or NetworkClient::connected() treats
+     * the closed peer as live forever. */
+    mem_write32(cpu.mem, TEST_REENT_ERRNO, 11u);
+    for (int attempt = 0; attempt < 100; attempt++) {
+        invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+                            recv_addr, 1u, 0x09u);
+        if (ar_read(&cpu, 2) == 0u) break;
+        poll(NULL, 0, 1);
+    }
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, TEST_REENT_ERRNO), 0u);
     invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, client_fd);
     invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, listen_fd);
     wifi_stubs_destroy(wifi);

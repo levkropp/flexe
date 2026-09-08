@@ -709,6 +709,12 @@ static void stub_lwip_receive(xtensa_cpu_t *cpu, void *ctx,
         ws_return(cpu, (uint32_t)-1);
         return;
     }
+    /* lwIP clears the socket's errno on a successful receive, including an
+     * orderly EOF. Leaving a previous EWOULDBLOCK behind makes Arduino's
+     * NetworkClient::connected() interpret recv(..., MSG_PEEK) == 0 as a
+     * still-open connection, so HTTP servers never finish a request after
+     * the browser closes it. */
+    set_firmware_errno(cpu, 0);
     ws_return(cpu, (uint32_t)n);
 }
 
