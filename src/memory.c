@@ -31,6 +31,8 @@
 #define SRAM_INSN_END   0x400C0000u
 #define ROM_DATA_BASE   0x3FF90000u
 #define ROM_DATA_END    0x3FFA0000u
+#define ROM_CTYPE_PTR   0x3FF96350u
+#define ROM_CTYPE_TABLE 0x3FF96354u
 #define ROM_BASE        0x40000000u
 #define ROM_END         0x40070000u
 #define FLASH_DATA_BASE 0x3F400000u
@@ -78,6 +80,48 @@ static void page_table_init(xtensa_mem_t *mem) {
     page_table_map(mem, RTC_SLOW_BASE, RTC_SLOW_END, mem->rtc_slow);
 }
 
+/* ESP32 rev3's newlib routines execute partly from IRAM but still consult
+ * immutable data in the ROM D-bus window.  In particular, String::trim() and
+ * strtol() reach __ctype_ptr__/_ctype_ even when all callable ROM routines are
+ * replaced by Flexe stubs.  A zero-filled ROM therefore makes whitespace stop
+ * being whitespace and breaks ordinary HTTP parsing.
+ *
+ * Seed this small architectural dependency for runs without a ROM ELF.  An
+ * official ROM ELF is loaded after mem_create() and overwrites these bytes
+ * with the same values. */
+static uint8_t esp32_rom_ctype(unsigned ch) {
+    enum {
+        CTYPE_UPPER = 0x01,
+        CTYPE_LOWER = 0x02,
+        CTYPE_DIGIT = 0x04,
+        CTYPE_SPACE = 0x08,
+        CTYPE_PUNCT = 0x10,
+        CTYPE_CNTRL = 0x20,
+        CTYPE_HEX   = 0x40,
+        CTYPE_BLANK = 0x80,
+    };
+
+    if (ch < 0x20u)
+        return (uint8_t)(CTYPE_CNTRL |
+                         (ch >= '\t' && ch <= '\r' ? CTYPE_SPACE : 0));
+    if (ch == ' ') return CTYPE_SPACE | CTYPE_BLANK;
+    if (ch >= '0' && ch <= '9') return CTYPE_DIGIT;
+    if (ch >= 'A' && ch <= 'Z')
+        return (uint8_t)(CTYPE_UPPER | (ch <= 'F' ? CTYPE_HEX : 0));
+    if (ch >= 'a' && ch <= 'z')
+        return (uint8_t)(CTYPE_LOWER | (ch <= 'f' ? CTYPE_HEX : 0));
+    if (ch >= 0x21u && ch <= 0x7eu) return CTYPE_PUNCT;
+    if (ch == 0x7fu) return CTYPE_CNTRL;
+    return 0;
+}
+
+static void init_builtin_rom_data(xtensa_mem_t *mem) {
+    mem_write32(mem, ROM_CTYPE_PTR, ROM_CTYPE_TABLE);
+    mem_write8(mem, ROM_CTYPE_TABLE, 0); /* reserved EOF/signed-char entry */
+    for (unsigned ch = 0; ch <= UINT8_MAX; ch++)
+        mem_write8(mem, ROM_CTYPE_TABLE + 1u + ch, esp32_rom_ctype(ch));
+}
+
 xtensa_mem_t *mem_create(void) {
     xtensa_mem_t *mem = calloc(1, sizeof(xtensa_mem_t));
     if (!mem) return NULL;
@@ -104,6 +148,7 @@ xtensa_mem_t *mem_create(void) {
     memset(mem->flash_insn, 0xFF, FLASH_SIZE);
 
     page_table_init(mem);
+    init_builtin_rom_data(mem);
 
     /* Pre-populate the ESP32 ROM spiflash chip struct (ROM BSS, fixed
      * address 0x3FFAE270). On hardware the boot ROM fills this during its

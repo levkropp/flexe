@@ -3632,11 +3632,18 @@ int main(int argc, char **argv)
          * everything that happens once WiFi is actually up was previously
          * unreachable, because the scenario left the firmware sitting in its
          * captive portal forever. */
-        static const char save_req[] =
-            "GET /wifisave?s=flexe-net&p=flexe-secret"
-            "&Poolurl=127.0.0.1&Poolport=21496&btcAddress=bc1qflexe"
-            "&TimeZone=0 HTTP/1.0\r\n"
-            "Host: 192.168.4.1\r\nConnection: close\r\n\r\n";
+        static const char save_body[] =
+            "s=flexe-net&p=flexe-secret&Poolurl=127.0.0.1&Poolport=21496"
+            "&btcAddress=bc1qflexe&TimeZone=0";
+        char save_req[512];
+        int save_req_len = snprintf(
+                save_req, sizeof(save_req),
+                "POST /wifisave HTTP/1.1\r\n"
+                "Host: 192.168.4.1\r\n"
+                "Content-Type: application/x-www-form-urlencoded\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: close\r\n\r\n%s",
+                sizeof(save_body) - 1u, save_body);
         struct sockaddr_in sv;
         memset(&sv, 0, sizeof(sv));
         sv.sin_family = AF_INET;
@@ -3647,8 +3654,10 @@ int main(int argc, char **argv)
         size_t save_len = 0;
         int saved = 0;
         uint64_t connect_calls = 0;
-        if (sfd >= 0 && connect(sfd, (struct sockaddr *)&sv, sizeof(sv)) == 0 &&
-            host_socket_send_all(sfd, save_req, sizeof(save_req) - 1) == 0 &&
+        if (sfd >= 0 && save_req_len > 0 &&
+            (size_t)save_req_len < sizeof(save_req) &&
+            connect(sfd, (struct sockaddr *)&sv, sizeof(sv)) == 0 &&
+            host_socket_send_all(sfd, save_req, (size_t)save_req_len) == 0 &&
             host_socket_nonblocking(sfd) == 0) {
             for (int i = 0; i < 8000; i++) {
                 if (flexe_session_run_core(session, 0, 100000) < 0) break;

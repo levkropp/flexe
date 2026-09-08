@@ -65,6 +65,35 @@ TEST(mem_full_esp32_rom_map) {
     mem_destroy(mem);
 }
 
+TEST(mem_builtin_rom_ctype_table) {
+    static const uint32_t ptr_addr = 0x3FF96350u;
+    static const uint32_t table_addr = 0x3FF96354u;
+    xtensa_mem_t *mem = mem_create();
+
+    ASSERT_EQ(mem_read32(mem, ptr_addr), table_addr);
+    ASSERT_EQ(mem_read8(mem, table_addr), 0u); /* reserved first entry */
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + '\0'), 0x20u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + '\t'), 0x28u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + ' '), 0x88u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + '!'), 0x10u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + '0'), 0x04u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 'A'), 0x41u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 'F'), 0x41u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 'G'), 0x01u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 'a'), 0x42u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 'f'), 0x42u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 'g'), 0x02u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 0x7Fu), 0x20u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 0x80u), 0u);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + 0xFFu), 0u);
+
+    /* Reset clears volatile RAM, not immutable ROM D-bus contents. */
+    mem_reset(mem);
+    ASSERT_EQ(mem_read32(mem, ptr_addr), table_addr);
+    ASSERT_EQ(mem_read8(mem, table_addr + 1u + ' '), 0x88u);
+    mem_destroy(mem);
+}
+
 /* ===== Flash data/instruction regions ===== */
 
 TEST(mem_rw32_flash_data) {
@@ -244,6 +273,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw32_sram_data);
     RUN_TEST(mem_sram_alias);
     RUN_TEST(mem_full_esp32_rom_map);
+    RUN_TEST(mem_builtin_rom_ctype_table);
     RUN_TEST(mem_rw32_flash_data);
     RUN_TEST(mem_flash_erased_at_reset);
     RUN_TEST(mem_flash_alias);
