@@ -76,6 +76,59 @@ TEST(test_recursive_mutex_reentry_and_ownership) {
     frt_teardown(&cpu, rom, frt);
 }
 
+TEST(test_static_queue_buffers_round_trip_for_capability_wrappers) {
+    /* IDF 5.x creates capability-tagged semaphores by heap-allocating a
+     * StaticQueue_t, then later recovers that same pointer before deletion.
+     * Both the static mutex constructor and the accessor must retain the
+     * guest allocation identity even though queue state lives on the host. */
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    freertos_stubs_t *frt;
+    frt_setup(&cpu, &rom, &frt);
+
+    extern void stub_xQueueCreateMutexStatic(xtensa_cpu_t *, void *);
+    extern void stub_xQueueGenericCreateStatic(xtensa_cpu_t *, void *);
+    extern void stub_xQueueGenericGetStaticBuffers(xtensa_cpu_t *, void *);
+    uint32_t a_mutex = 0x400D0000u;
+    uint32_t a_queue = 0x400D0010u;
+    uint32_t a_get = 0x400D0020u;
+    rom_stubs_register_ctx(rom, a_mutex,
+        (rom_stub_fn)stub_xQueueCreateMutexStatic,
+        "xQueueCreateMutexStatic", frt);
+    rom_stubs_register_ctx(rom, a_queue,
+        (rom_stub_fn)stub_xQueueGenericCreateStatic,
+        "xQueueGenericCreateStatic", frt);
+    rom_stubs_register_ctx(rom, a_get,
+        (rom_stub_fn)stub_xQueueGenericGetStaticBuffers,
+        "xQueueGenericGetStaticBuffers", frt);
+
+    const uint32_t mutex_buffer = 0x3FFB1000u;
+    uint32_t mutex_args[2] = { 1u, mutex_buffer };
+    ASSERT_EQ(frt_call_stub(&cpu, a_mutex, mutex_args, 2), mutex_buffer);
+
+    const uint32_t storage_out = 0x3FFB1100u;
+    const uint32_t queue_out = 0x3FFB1104u;
+    mem_write32(cpu.mem, storage_out, 0xDEADBEEFu);
+    mem_write32(cpu.mem, queue_out, 0xDEADBEEFu);
+    uint32_t get_mutex[3] = { mutex_buffer, storage_out, queue_out };
+    ASSERT_EQ(frt_call_stub(&cpu, a_get, get_mutex, 3), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, storage_out), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, queue_out), mutex_buffer);
+
+    const uint32_t item_storage = 0x3FFB1200u;
+    const uint32_t queue_buffer = 0x3FFB1300u;
+    uint32_t queue_args[5] = {
+        4u, 4u, item_storage, queue_buffer, 0u
+    };
+    ASSERT_EQ(frt_call_stub(&cpu, a_queue, queue_args, 5), queue_buffer);
+    uint32_t get_queue[3] = { queue_buffer, storage_out, queue_out };
+    ASSERT_EQ(frt_call_stub(&cpu, a_get, get_queue, 3), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, storage_out), item_storage);
+    ASSERT_EQ(mem_read32(cpu.mem, queue_out), queue_buffer);
+
+    frt_teardown(&cpu, rom, frt);
+}
+
 TEST(test_delay_until_deadline_is_absolute) {
     /* vTaskDelayUntil's wake time advances by the increment regardless of how
      * long the body took, which is what keeps a fixed-rate loop from drifting
@@ -1157,6 +1210,7 @@ TEST(test_vPortFree_noop) {
 static void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
     RUN_TEST(test_recursive_mutex_reentry_and_ownership);
+    RUN_TEST(test_static_queue_buffers_round_trip_for_capability_wrappers);
     RUN_TEST(test_delay_until_deadline_is_absolute);
     RUN_TEST(test_queue_accessors_read_flexe_storage);
     RUN_TEST(test_event_group_bits);

@@ -60,6 +60,7 @@
 
 typedef struct {
     uint32_t handle;       /* address returned as handle */
+    uint32_t static_storage; /* caller-owned item storage, when static */
     int      item_size;
     int      max_items;
     int      count;
@@ -70,6 +71,7 @@ typedef struct {
      * already holds it, so the owner and depth have to be tracked; a plain
      * semaphore has neither. */
     bool     is_mutex;
+    bool     is_static;
     uint32_t mutex_owner;    /* task handle, 0 when free */
     int      mutex_depth;
 } queue_t;
@@ -1848,6 +1850,31 @@ void stub_xSemaphoreCreateMutex(xtensa_cpu_t *cpu, void *ctx) {
     frt_return(cpu, handle);
 }
 
+/* xQueueCreateMutexStatic(type, StaticQueue_t *buffer) uses the supplied
+ * StaticQueue_t as both its allocation and its public handle. Keeping that
+ * identity matters to IDF 5.x's capability-aware semaphore wrappers: their
+ * delete path asks xQueueGenericGetStaticBuffers() for the allocation and
+ * frees it after vQueueDelete(). Treating this constructor like the dynamic
+ * one left the guest looking at Flexe's four-byte bump handle, so the native
+ * accessor rejected it and asserted during otherwise-successful driver
+ * teardown. */
+void stub_xQueueCreateMutexStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t static_queue = frt_arg(cpu, 1);
+    uint32_t handle = 0u;
+    if (static_queue) {
+        pthread_mutex_lock(&frt->lock);
+        handle = queue_create_locked(frt, 1, 0, 1, static_queue);
+        queue_t *q = find_queue(frt, handle);
+        if (q) {
+            q->is_mutex = true;
+            q->is_static = true;
+        }
+        pthread_mutex_unlock(&frt->lock);
+    }
+    frt_return(cpu, handle);
+}
+
 /* ===== Recursive mutexes =====
  *
  * xQueueTakeMutexRecursive and xQueueGiveMutexRecursive were not hooked, so
@@ -1967,6 +1994,8 @@ void stub_xQueueCreateCountingSemaphoreStatic(xtensa_cpu_t *cpu, void *ctx) {
         pthread_mutex_lock(&frt->lock);
         handle = queue_create_locked(frt, maximum, 0u, (int)initial,
                                      storage);
+        queue_t *q = find_queue(frt, handle);
+        if (q) q->is_static = true;
         pthread_mutex_unlock(&frt->lock);
     }
     frt_return(cpu, handle);
@@ -2475,8 +2504,39 @@ void stub_xQueueGenericCreateStatic(xtensa_cpu_t *cpu, void *ctx) {
     pthread_mutex_lock(&frt->lock);
     uint32_t handle = queue_create_locked(frt, length, item_size,
                                           initial_count, static_queue);
+    queue_t *q = find_queue(frt, handle);
+    if (q) {
+        q->is_static = true;
+        q->static_storage = frt_arg(cpu, 2);
+    }
     pthread_mutex_unlock(&frt->lock);
     frt_return(cpu, handle);
+}
+
+/* Report the caller-owned buffers behind a statically-created queue. This is
+ * a public FreeRTOS accessor in newer IDF releases and is used by
+ * vSemaphoreDeleteWithCaps() before freeing the StaticQueue_t allocation. */
+void stub_xQueueGenericGetStaticBuffers(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t storage_out = frt_arg(cpu, 1);
+    uint32_t queue_out = frt_arg(cpu, 2);
+    uint32_t static_storage = 0u;
+    bool is_static = false;
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q && q->is_static) {
+        is_static = true;
+        static_storage = q->static_storage;
+    }
+    pthread_mutex_unlock(&frt->lock);
+
+    if (is_static) {
+        if (storage_out) mem_write32(cpu->mem, storage_out, static_storage);
+        if (queue_out) mem_write32(cpu->mem, queue_out, handle);
+    }
+    frt_return(cpu, is_static ? pdTRUE : pdFALSE);
 }
 
 /* xQueueGenericSend (underlying implementation) */
@@ -2811,7 +2871,7 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xSemaphoreCreateMutex",         stub_xSemaphoreCreateMutex },
         { "xQueueCreateMutex",             stub_xSemaphoreCreateMutex },
         { "xSemaphoreCreateRecursiveMutex", stub_xSemaphoreCreateMutex },
-        { "xQueueCreateMutexStatic",       stub_xSemaphoreCreateMutex },
+        { "xQueueCreateMutexStatic",       stub_xQueueCreateMutexStatic },
         { "xQueueTakeMutexRecursive",      stub_xQueueTakeMutexRecursive },
         { "xQueueGiveMutexRecursive",      stub_xQueueGiveMutexRecursive },
         { "xSemaphoreCreateBinary",        stub_xSemaphoreCreateBinary },
@@ -2822,6 +2882,7 @@ int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms
         { "xQueueSemaphoreTake",           stub_xSemaphoreTake },
         { "xSemaphoreGive",                stub_xSemaphoreGive },
         { "xQueueGenericReset",            stub_xQueueGenericReset },
+        { "xQueueGenericGetStaticBuffers", stub_xQueueGenericGetStaticBuffers },
         { "vQueueDelete",                  stub_vQueueDelete },
         { "pvPortMalloc",                  stub_pvPortMalloc },
         { "vPortFree",                     stub_vPortFree },
