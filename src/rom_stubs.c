@@ -105,6 +105,8 @@ struct esp32_rom_stubs {
     bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
     bool             real_rom;                /* execute unregistered loaded ROM code */
     rom_firmware_profile_t firmware_profile;  /* exact symbol-less ROM layout */
+    uint32_t         wled_old_state_addr;      /* resolved v0.16.0.1 per-core PS array */
+    uint32_t         wled_nesting_addr;        /* resolved v0.16.0.1 nesting array */
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     stub_irq_t irq[71];
     /* Per-pin handlers registered through gpio_isr_handler_add(). See
@@ -4039,7 +4041,7 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             s->total_calls++;
             (*de->call_count)++;
             if (de->conditional_fn)
-                return de->conditional_fn(cpu, de->ctx) ? 1 : 0;
+                return de->conditional_fn(cpu, de->ctx);
             de->fn(cpu, de->ctx);
             if (de->spy)
                 return 0; /* spy: let original instruction execute */
@@ -4056,7 +4058,7 @@ static int rom_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             s->log_fn(s->log_ctx, pc, s->entries[idx].name, cpu);
         void *ectx = s->entries[idx].user_ctx ? s->entries[idx].user_ctx : s;
         if (s->entries[idx].conditional_fn)
-            return s->entries[idx].conditional_fn(cpu, ectx) ? 1 : 0;
+            return s->entries[idx].conditional_fn(cpu, ectx);
         s->entries[idx].fn(cpu, ectx);
         if (s->entries[idx].spy)
             return 0; /* spy: let original function execute */
@@ -4951,6 +4953,167 @@ static const fw_addr_hook_t fw_wled_v1601_hooks[] = {
     { 0, NULL, NULL, 0 }
 };
 
+/* WLED spends most of its remaining interpreter time in the native IDF 4.4
+ * spinlock wrappers around heap and event-loop operations.  These addresses
+ * and globals come from the same exact, independently fingerprinted v0.16.0.1
+ * link as fw_wled_v1601_hooks above:
+ *
+ *   xPortEnterCriticalTimeout  0x4008EC28
+ *   vPortExitCritical          0x4008ED10
+ *   port_uxOldInterruptState   literal at 0x40080D50
+ *   port_uxCriticalNesting     literal at 0x40080D4C
+ *
+ * Collapse only the uncontended path.  A lock owned by the other core, an
+ * external-RAM lock, or inconsistent bookkeeping falls through to the real
+ * firmware implementation.  That preserves its timeout loop, cooperative
+ * S32C1I handoff, and assertions instead of hiding a real synchronization
+ * problem behind a permissive host lock.
+ *
+ * The cycle charges are the exact instruction counts of the paths this
+ * replaces, including the already-stubbed _xtos_set_intlevel call on the
+ * outermost exit.  They keep timer/scheduler time unchanged while retiring a
+ * single host-side service operation, like the other ROM accelerators. */
+#define WLED_V1601_ENTER_CRITICAL       0x4008EC28u
+#define WLED_V1601_EXIT_CRITICAL        0x4008ED10u
+#define WLED_V1601_NESTING_LITERAL      0x40080D4Cu
+#define WLED_V1601_OLD_STATE_LITERAL    0x40080D50u
+
+static void fw_charge_stub_path(xtensa_cpu_t *cpu, uint32_t insns) {
+    if (insns <= 1u)
+        return;
+    cpu->ccount += insns - 1u;
+    cpu->cycle_count += (uint64_t)(insns - 1u);
+}
+
+static bool fw_wled_internal_spinlock(uint32_t mux) {
+    /* This is the range test used by the release's function before choosing
+     * inline S32C1I instead of compare_and_set_extram(). */
+    return mux + 0xC0800000u > 0x003FFFFFu;
+}
+
+static bool fw_wled_resolve_critical_globals(esp32_rom_stubs_t *stubs) {
+    xtensa_mem_t *mem = stubs->cpu->mem;
+    if (!mem_get_ptr(mem, WLED_V1601_NESTING_LITERAL) ||
+        !mem_get_ptr(mem, WLED_V1601_OLD_STATE_LITERAL))
+        return false;
+
+    uint32_t nesting = mem_read32(mem, WLED_V1601_NESTING_LITERAL);
+    uint32_t old_state = mem_read32(mem, WLED_V1601_OLD_STATE_LITERAL);
+    if ((nesting & 3u) != 0u || (old_state & 3u) != 0u ||
+        nesting < 0x3FF80000u || nesting >= 0x40000000u ||
+        old_state < 0x3FF80000u || old_state >= 0x40000000u)
+        return false;
+    if (!mem_get_ptr_w(mem, nesting) || !mem_get_ptr_w(mem, nesting + 4u) ||
+        !mem_get_ptr_w(mem, old_state) ||
+        !mem_get_ptr_w(mem, old_state + 4u))
+        return false;
+
+    /* These literals belong to the fingerprinted IRAM image and cannot move
+     * at runtime. Resolve them once instead of rereading and revalidating four
+     * guest-memory mappings on every critical-section operation. */
+    stubs->wled_nesting_addr = nesting;
+    stubs->wled_old_state_addr = old_state;
+    return true;
+}
+
+static int stub_fw_wled_enter_critical(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *stubs = ctx;
+    xtensa_mem_t *mem = cpu->mem;
+    uint32_t mux = rom_arg(cpu, 0);
+    uint32_t timeout = rom_arg(cpu, 1);
+    uint32_t core = (cpu->prid >> 13) & 1u;
+    uint32_t nesting_base = stubs->wled_nesting_addr;
+    uint32_t old_state_base = stubs->wled_old_state_addr;
+
+    if (nesting_base == 0u || old_state_base == 0u || (mux & 3u) != 0u ||
+        (cpu->prid != XTENSA_SPINLOCK_OWNER_CORE0 &&
+         cpu->prid != XTENSA_SPINLOCK_OWNER_CORE1) ||
+        !fw_wled_internal_spinlock(mux) ||
+        !mem_get_ptr_w(mem, mux) || !mem_get_ptr_w(mem, mux + 4u))
+        return 0;
+    uint32_t nesting_addr = nesting_base + core * 4u;
+    uint32_t old_state_addr = old_state_base + core * 4u;
+
+    uint32_t owner = mem_read32(mem, mux);
+    uint32_t lock_count = mem_read32(mem, mux + 4u);
+    uint32_t nesting = mem_read32(mem, nesting_addr);
+
+    if (owner == XTENSA_SPINLOCK_FREE) {
+        if (lock_count != 0u)
+            return 0;
+    } else if (owner == cpu->prid) {
+        if (lock_count == 0u)
+            return 0;
+    } else {
+        return 0;
+    }
+    if (lock_count == UINT32_MAX || nesting == UINT32_MAX)
+        return 0;
+
+    uint32_t old_ps = cpu->ps;
+    XT_PS_SET_CALLINC(old_ps, 0);
+    XT_PS_SET_INTLEVEL(cpu->ps, 3);
+    cpu->scompare1 = XTENSA_SPINLOCK_FREE;
+    cpu->irq_check = true;
+
+    if (owner == XTENSA_SPINLOCK_FREE)
+        mem_write32(mem, mux, cpu->prid);
+    mem_write32(mem, mux + 4u, lock_count + 1u);
+    mem_write32(mem, nesting_addr, nesting + 1u);
+    if (nesting == 0u)
+        mem_write32(mem, old_state_addr, old_ps);
+
+    /* The finite-timeout form reads CCOUNT once before attempting the CAS. */
+    uint32_t insns = (timeout == UINT32_MAX ? 37u : 38u) +
+                     (nesting == 0u ? 4u : 0u);
+    fw_charge_stub_path(cpu, insns);
+    rom_return(cpu, 1u);
+    return (int)insns;
+}
+
+static int stub_fw_wled_exit_critical(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *stubs = ctx;
+    xtensa_mem_t *mem = cpu->mem;
+    uint32_t mux = rom_arg(cpu, 0);
+    uint32_t core = (cpu->prid >> 13) & 1u;
+    uint32_t nesting_base = stubs->wled_nesting_addr;
+    uint32_t old_state_base = stubs->wled_old_state_addr;
+
+    if (nesting_base == 0u || old_state_base == 0u || (mux & 3u) != 0u ||
+        (cpu->prid != XTENSA_SPINLOCK_OWNER_CORE0 &&
+         cpu->prid != XTENSA_SPINLOCK_OWNER_CORE1) ||
+        !mem_get_ptr_w(mem, mux) || !mem_get_ptr_w(mem, mux + 4u))
+        return 0;
+    uint32_t nesting_addr = nesting_base + core * 4u;
+    uint32_t old_state_addr = old_state_base + core * 4u;
+
+    uint32_t owner = mem_read32(mem, mux);
+    uint32_t lock_count = mem_read32(mem, mux + 4u);
+    uint32_t nesting = mem_read32(mem, nesting_addr);
+    if (owner != cpu->prid || lock_count == 0u || nesting == 0u)
+        return 0;
+
+    XT_PS_SET_INTLEVEL(cpu->ps, 3);
+    cpu->irq_check = true;
+
+    lock_count--;
+    nesting--;
+    mem_write32(mem, mux + 4u, lock_count);
+    if (lock_count == 0u)
+        mem_write32(mem, mux, XTENSA_SPINLOCK_FREE);
+    mem_write32(mem, nesting_addr, nesting);
+
+    if (nesting == 0u) {
+        uint32_t old_ps = mem_read32(mem, old_state_addr);
+        XT_PS_SET_INTLEVEL(cpu->ps, XT_PS_INTLEVEL(old_ps));
+    }
+
+    uint32_t insns = nesting == 0u ? 29u : 20u;
+    fw_charge_stub_path(cpu, insns);
+    rom_return_void(cpu);
+    return (int)insns;
+}
+
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
@@ -4991,9 +5154,25 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
         n++;
     }
     /* WLED has no fixed-address PHY hook. Keep the structural discovery that
-     * was used before it acquired a profile-specific acceleration table. */
-    if (profile == ROM_FIRMWARE_WLED_V1601)
+     * was used before it acquired a profile-specific acceleration table, and
+     * collapse the fully modeled uncontended FreeRTOS critical boundary. */
+    if (profile == ROM_FIRMWARE_WLED_V1601) {
+        if (fw_wled_resolve_critical_globals(stubs)) {
+            rom_stubs_register_conditional_ctx(
+                    stubs, WLED_V1601_ENTER_CRITICAL,
+                    stub_fw_wled_enter_critical,
+                    "xPortEnterCriticalTimeout", NULL);
+            rom_stubs_register_conditional_ctx(
+                    stubs, WLED_V1601_EXIT_CRITICAL,
+                    stub_fw_wled_exit_critical, "vPortExitCritical", NULL);
+            /* The callbacks above return complete guest spans. Use the exact-
+             * work batch loop even without the JIT so neither emulated core
+             * can overrun its native-FreeRTOS timeslice. */
+            stubs->cpu->accelerated_blocks = true;
+            n += 2;
+        }
         n += fw_hook_scanned_phy(stubs);
+    }
     if (n)
         fprintf(stderr, "[flexe] hooked %d firmware driver stub(s) at entry 0x%08X\n",
                 n, entry_point);

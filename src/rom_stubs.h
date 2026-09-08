@@ -10,8 +10,9 @@ typedef struct esp32_periph esp32_periph_t;
 
 typedef struct esp32_rom_stubs esp32_rom_stubs_t;
 typedef void (*rom_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
-/* Return nonzero after fully handling the call (including the guest return),
- * or zero to observe it and let the firmware implementation execute. */
+/* Return the number of guest instructions represented after fully handling
+ * the call (including the guest return), or zero to observe it and let the
+ * firmware implementation execute. */
 typedef int (*rom_conditional_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
 
 typedef enum {

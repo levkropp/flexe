@@ -678,7 +678,7 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     teardown(&cpu);
 }
 
-TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy) {
+TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
@@ -702,7 +702,15 @@ TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy) {
     mem_write32(cpu.mem, rom_literal, 0x40004100u);
     mem_write32(cpu.mem, global_literal, phy_global);
 
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 2);
+    const uint32_t enter_critical = 0x4008EC28u;
+    const uint32_t exit_critical = 0x4008ED10u;
+    const uint32_t mux = 0x3FFB1000u;
+    const uint32_t old_state = 0x3FFCDDF0u;
+    const uint32_t nesting = 0x3FFCDDF8u;
+    mem_write32(cpu.mem, 0x40080D4Cu, nesting);
+    mem_write32(cpu.mem, 0x40080D50u, old_state);
+
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 4);
 
     const uint32_t lhs = 0x3FFB0100u;
     const uint32_t rhs = 0x3FFB0200u;
@@ -728,6 +736,112 @@ TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy) {
     xtensa_step(&cpu);
     ASSERT_EQ(cpu.pc, BASE);
     ASSERT_EQ(mem_read32(cpu.mem, phy_global), 0x50001900u);
+
+    cpu.prid = XTENSA_SPINLOCK_OWNER_CORE0;
+    cpu.ps = (1u << 18) | 1u;
+    cpu.ccount = 100u;
+    cpu.cycle_count = 200u;
+    cpu.insn_count = 0u;
+    mem_write32(cpu.mem, mux, XTENSA_SPINLOCK_FREE);
+    mem_write32(cpu.mem, mux + 4u, 0u);
+    mem_write32(cpu.mem, old_state, 0xDEADBEEFu);
+    mem_write32(cpu.mem, nesting, 0u);
+
+    cpu.pc = enter_critical;
+    cpu._pc_written = true;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, mux);
+    ar_write(&cpu, 3, UINT32_MAX);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE0);
+    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, old_state), (1u << 18) | 1u);
+    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 3u);
+    ASSERT_EQ(cpu.scompare1, XTENSA_SPINLOCK_FREE);
+    ASSERT_EQ(cpu.ccount, 141u);
+    ASSERT_EQ64(cpu.cycle_count, 241u);
+    ASSERT_EQ64(cpu.insn_count, 41u);
+
+    /* Recursive acquisition preserves the outer saved interrupt state. */
+    cpu.pc = enter_critical;
+    cpu._pc_written = true;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, mux);
+    ar_write(&cpu, 3, UINT32_MAX);
+    xtensa_step(&cpu);
+    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 2u);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 2u);
+    ASSERT_EQ(mem_read32(cpu.mem, old_state), (1u << 18) | 1u);
+    ASSERT_EQ(cpu.ccount, 178u);
+    ASSERT_EQ64(cpu.cycle_count, 278u);
+    ASSERT_EQ64(cpu.insn_count, 78u);
+
+    cpu.pc = exit_critical;
+    cpu._pc_written = true;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, mux);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE0);
+    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
+    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 3u);
+    ASSERT_EQ(cpu.ccount, 198u);
+    ASSERT_EQ64(cpu.cycle_count, 298u);
+    ASSERT_EQ64(cpu.insn_count, 98u);
+
+    cpu.pc = exit_critical;
+    cpu._pc_written = true;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, mux);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_FREE);
+    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 0u);
+    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 1u);
+    ASSERT_EQ(cpu.ccount, 227u);
+    ASSERT_EQ64(cpu.cycle_count, 327u);
+    ASSERT_EQ64(cpu.insn_count, 127u);
+
+    /* Contention is deliberately not consumed: the real S32C1I loop remains
+     * responsible for yielding to the other emulated core. */
+    put_insn3(&cpu, enter_critical, rom_nop_insn());
+    mem_write32(cpu.mem, mux, XTENSA_SPINLOCK_OWNER_CORE1);
+    cpu.pc = enter_critical;
+    cpu._pc_written = true;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, mux);
+    ar_write(&cpu, 3, UINT32_MAX);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, enter_critical + 3u);
+    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE1);
+    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 0u);
+
+    /* The batch runner must consume the complete native span as one unit,
+     * rather than counting it as one dispatch and overrunning a core's
+     * scheduler slice. */
+    mem_write32(cpu.mem, mux, XTENSA_SPINLOCK_FREE);
+    cpu.pc = enter_critical;
+    cpu._pc_written = true;
+    cpu.running = true;
+    cpu.ccount = 0u;
+    cpu.cycle_count = 0u;
+    cpu.insn_count = 0u;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, mux);
+    ar_write(&cpu, 3, UINT32_MAX);
+    ASSERT_EQ(xtensa_run(&cpu, 41), 41);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(cpu.ccount, 41u);
+    ASSERT_EQ64(cpu.cycle_count, 41u);
+    ASSERT_EQ64(cpu.insn_count, 41u);
+    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 1u);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
 
     rom_stubs_destroy(rom);
     teardown(&cpu);
@@ -1105,7 +1219,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_dispatches_through_guest_syscall_table);
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
-    RUN_TEST(test_wled_v1601_hooks_iram_memcmp_and_scanned_phy);
+    RUN_TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy);
     RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
     RUN_TEST(test_tasmota32_requires_complete_fingerprint);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);
