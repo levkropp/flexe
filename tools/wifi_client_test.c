@@ -28,7 +28,7 @@
 
 #define SUCCESS_MARKER 0x9F1C0C0Bu
 #define MAX_CYCLES     8000000000ull
-#define RESULT_COUNT   12u
+#define RESULT_COUNT   19u
 #define PAYLOAD_LEN    1000
 
 #define TEST_SSID "flexe-net"
@@ -185,10 +185,12 @@ int main(int argc, char **argv) {
 
     printf("engine=%s stage=0x%08X ssid=%u/%08X status=%u@%ums ping=%u/%08X "
            "echo=%u/%08X vs %08X ip=%08X begin=%u joined=%08X "
+           "mac_errors=%u mac=%08X/%08X/%08X/%08X/%08X/%08X "
            "accepted=%d server_bytes=%zu unhandled=%d unregistered=%d\n",
            flexe_session_jit(session) ? "jit" : "interp", stage,
            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
-           r[11], sv.accepted, sv.echoed, unhandled, unregistered);
+           r[11], r[12], r[13], r[14], r[15], r[16], r[17], r[18],
+           sv.accepted, sv.echoed, unhandled, unregistered);
 
     /* The guest saw exactly the credentials the host provisioned, both as
      * saved config before connecting and as the associated AP afterwards. */
@@ -205,14 +207,16 @@ int main(int argc, char **argv) {
 
     /* WiFi.begin() -- the Arduino path real firmware uses -- also associated. */
     bool begin_ok = r[10] >= 1u;
+    bool mac_ok = r[12] == 0u && r[13] == r[14] && r[14] == r[17] &&
+                  r[17] == r[18] && r[15] != r[14] && r[16] != r[15];
     int ok = stage == SUCCESS_MARKER && ssid_ok && status_ok && ping_ok &&
-             echo_ok && server_ok && begin_ok &&
+             echo_ok && server_ok && begin_ok && mac_ok &&
              unhandled == 0 && unregistered == 0;
     if (!ok)
         fprintf(stderr, "[wifi-client] ssid=%d status=%d ping=%d echo=%d "
-                        "server=%d begin=%d (want ssid %zu/%08X)\n",
+                        "server=%d begin=%d mac=%d (want ssid %zu/%08X)\n",
                 ssid_ok, status_ok, ping_ok, echo_ok, server_ok, begin_ok,
-                strlen(TEST_SSID), want_ssid_hash);
+                mac_ok, strlen(TEST_SSID), want_ssid_hash);
 
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);

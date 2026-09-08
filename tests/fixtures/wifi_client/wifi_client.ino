@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
+#include <esp_mac.h>
 
 #define SUCCESS_MARKER 0x9F1C0C0Bu
 #define FAIL_BASE      0xBAD00000u
@@ -26,7 +27,7 @@
 
 volatile uint32_t flexe_wifi_stage = 0;
 volatile uint32_t flexe_wifi_port = 0;      /* host writes the port here */
-volatile uint32_t flexe_wifi_result[12];
+volatile uint32_t flexe_wifi_result[19];
 
 static void fail(uint32_t code) { flexe_wifi_stage = FAIL_BASE | code; }
 
@@ -63,6 +64,43 @@ static uint32_t fnv1a_fwd(const uint8_t *p, size_t n) { return fnv1a(p, n); }
 
 void setup() {
   WiFi.mode(WIFI_STA);
+
+  /* These APIs have three distinct ABIs: interface-before-buffer for
+   * esp_wifi_get_mac(), buffer-before-type for esp_read_mac(), and a single
+   * buffer for esp_efuse_mac_get_default(). Keep all three on the real
+   * symbol boundary so the emulator cannot accidentally share one adapter. */
+  uint8_t wifi_sta[6] = {0};
+  uint8_t read_sta[6] = {0};
+  uint8_t read_ap[6] = {0};
+  uint8_t read_bt[6] = {0};
+  uint8_t base[6] = {0};
+  uint8_t factory[6] = {0};
+  uint32_t mac_errors = 0;
+  if (esp_wifi_get_mac(WIFI_IF_STA, wifi_sta) != ESP_OK) mac_errors |= 1u;
+  if (esp_read_mac(read_sta, ESP_MAC_WIFI_STA) != ESP_OK) mac_errors |= 2u;
+  if (esp_read_mac(read_ap, ESP_MAC_WIFI_SOFTAP) != ESP_OK) mac_errors |= 4u;
+  if (esp_read_mac(read_bt, ESP_MAC_BT) != ESP_OK) mac_errors |= 8u;
+  if (esp_base_mac_addr_get(base) != ESP_OK) mac_errors |= 16u;
+  if (esp_efuse_mac_get_default(factory) != ESP_OK) mac_errors |= 32u;
+  flexe_wifi_result[12] = mac_errors;
+  flexe_wifi_result[13] = fnv1a(wifi_sta, sizeof(wifi_sta));
+  flexe_wifi_result[14] = fnv1a(read_sta, sizeof(read_sta));
+  flexe_wifi_result[15] = fnv1a(read_ap, sizeof(read_ap));
+  flexe_wifi_result[16] = fnv1a(read_bt, sizeof(read_bt));
+  flexe_wifi_result[17] = fnv1a(base, sizeof(base));
+  flexe_wifi_result[18] = fnv1a(factory, sizeof(factory));
+  uint8_t derived_ap[6];
+  uint8_t derived_bt[6];
+  memcpy(derived_ap, base, sizeof(base));
+  memcpy(derived_bt, base, sizeof(base));
+  derived_ap[5]++;
+  derived_bt[5] += 2u;
+  if (mac_errors != 0 || memcmp(wifi_sta, read_sta, 6) != 0 ||
+      memcmp(read_sta, base, 6) != 0 || memcmp(read_ap, derived_ap, 6) != 0 ||
+      memcmp(read_bt, derived_bt, 6) != 0 || memcmp(factory, base, 6) != 0) {
+    fail(12);
+    return;
+  }
 
   /* The credentials a previous run would have saved. This is the check
    * WiFiManager and everything built on it makes to decide whether to start a

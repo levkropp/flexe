@@ -114,12 +114,26 @@ typedef struct {
 #define WIFI_AUTH_WPA_WPA2_PSK 4
 #define WIFI_AUTH_WPA3_PSK     6
 
+/* ESP-IDF esp_err_t values and classic ESP32 MAC interface numbering. */
+#define ESP_ERR_INVALID_ARG_VALUE   0x102u
+#define ESP_ERR_NOT_SUPPORTED_VALUE 0x106u
+#define ESP_ERR_WIFI_IF_VALUE       0x3004u
+#define ESP_MAC_WIFI_STA_VALUE      0u
+#define ESP_MAC_WIFI_SOFTAP_VALUE   1u
+#define ESP_MAC_BT_VALUE            2u
+#define ESP_MAC_ETH_VALUE           3u
+#define ESP_MAC_BASE_VALUE          5u
+#define ESP_MAC_EFUSE_FACTORY_VALUE 6u
+
 /* Scan done event dispatch delay (cycles after scan_start) */
 #define SCAN_DONE_DELAY 10000
 
 /* Event handler table */
 #define MAX_EVENT_HANDLERS 16
 #define WIFI_RAW_FRAME_MAX 4095u
+#define ESP_APP_DESC_ADDR  0x3F400020u
+#define ESP_APP_DESC_MAGIC 0xABCD5432u
+#define ESP_APP_DESC_IDF_VERSION_OFFSET 112u
 
 typedef struct {
     uint32_t handler_addr;   /* firmware callback address */
@@ -200,6 +214,8 @@ struct wifi_stubs {
     uint8_t            sta_mac[6];      /* STA MAC */
     uint8_t            ap_mac[6];       /* AP MAC */
     uint8_t            base_mac[6];     /* Base MAC */
+    uint8_t            factory_mac[6];  /* Factory eFuse base MAC */
+    unsigned           idf_major;       /* Event ABI generation, 0 = unknown */
 
     /* Promiscuous mode */
     bool               promisc_enabled;
@@ -1811,30 +1827,34 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
             mem_write8(cpu->mem, p + 40u, (uint8_t)(int8_t)-55);
         }
     } else if (kind == EVT_DATA_GOT_IP) {
-        /* ip_event_got_ip_t on IDF 4.x leads with if_index, *then* the netif
-         * pointer, then ip/netmask/gw, then ip_changed. Getting that wrong is
-         * silent: the guest reads a neighbouring field and sees a plausible
-         * address (it read the netmask as its IP). */
-        mem_write32(cpu->mem, p + 0u, 0);            /* if_index */
-        mem_write32(cpu->mem, p + 4u, 0);            /* esp_netif */
-        mem_write32(cpu->mem, p + 8u, 0x0A00020Fu);  /* 10.0.2.15, LE u32 */
-        mem_write32(cpu->mem, p + 12u, 0x00FFFFFFu); /* 255.255.255.0 */
-        mem_write32(cpu->mem, p + 16u, 0x0A000202u); /* 10.0.2.2 */
-        mem_write32(cpu->mem, p + 20u, 1);           /* ip_changed */
+        /* IDF 5 removed IDF 4's leading legacy if_index from
+         * ip_event_got_ip_t. Getting this wrong is silent: callbacks still
+         * run, but read an adjacent zero or the netmask as their address. */
+        uint32_t netif_offset = ws->idf_major >= 5u ? 0u : 4u;
+        mem_write32(cpu->mem, p + 0u, 0); /* if_index on IDF 4, netif on 5 */
+        mem_write32(cpu->mem, p + netif_offset, 0); /* esp_netif */
+        mem_write32(cpu->mem, p + netif_offset + 4u,
+                    0x0A00020Fu);  /* 10.0.2.15, LE u32 */
+        mem_write32(cpu->mem, p + netif_offset + 8u,
+                    0x00FFFFFFu); /* 255.255.255.0 */
+        mem_write32(cpu->mem, p + netif_offset + 12u,
+                    0x0A000202u); /* 10.0.2.2 */
+        mem_write32(cpu->mem, p + netif_offset + 16u, 1); /* ip_changed */
     } else {
         return 0;
     }
     return p;
 }
 
-static uint32_t wifi_event_data_size(evt_data_kind_t kind) {
+static uint32_t wifi_event_data_size(const wifi_stubs_t *ws,
+                                     evt_data_kind_t kind) {
     switch (kind) {
     case EVT_DATA_STA_CONNECTED:
         return 44u; /* sizeof(wifi_event_sta_connected_t), IDF 4.x */
     case EVT_DATA_STA_DISCONNECTED:
         return 41u; /* sizeof(wifi_event_sta_disconnected_t), IDF 4.x */
     case EVT_DATA_GOT_IP:
-        return 24u; /* sizeof(ip_event_got_ip_t), IDF 4.x */
+        return ws->idf_major >= 5u ? 20u : 24u;
     default:
         return 0u;
     }
@@ -1870,7 +1890,7 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
             base,
             (uint32_t)e->event_id,
             data,
-            wifi_event_data_size(e->data_kind),
+            wifi_event_data_size(ws, e->data_kind),
             0u, /* do not block if the real event queue is temporarily full */
         };
         uint32_t result = UINT32_MAX;
@@ -2203,11 +2223,17 @@ static void stub_esp_wifi_get_mac(xtensa_cpu_t *cpu, void *ctx)
     wifi_stubs_t *ws = ctx;
     uint32_t iface   = ws_arg(cpu, 0);
     uint32_t mac_ptr = ws_arg(cpu, 1);
-    const uint8_t *mac = (iface == 1) ? ws->ap_mac : ws->sta_mac;
-    if (mac_ptr) {
-        for (int i = 0; i < 6; i++)
-            mem_write8(cpu->mem, mac_ptr + (uint32_t)i, mac[i]);
+    if (!mac_ptr) {
+        ws_return(cpu, ESP_ERR_INVALID_ARG_VALUE);
+        return;
     }
+    if (iface > 1u) {
+        ws_return(cpu, ESP_ERR_WIFI_IF_VALUE);
+        return;
+    }
+    const uint8_t *mac = (iface == 1) ? ws->ap_mac : ws->sta_mac;
+    for (int i = 0; i < 6; i++)
+        mem_write8(cpu->mem, mac_ptr + (uint32_t)i, mac[i]);
     ws_return(cpu, 0);
 }
 
@@ -2314,10 +2340,12 @@ static void stub_esp_base_mac_addr_set(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     uint32_t mac_ptr = ws_arg(cpu, 0);
-    if (mac_ptr) {
-        for (int i = 0; i < 6; i++)
-            ws->base_mac[i] = mem_read8(cpu->mem, mac_ptr + (uint32_t)i);
+    if (!mac_ptr || (mem_read8(cpu->mem, mac_ptr) & 1u) != 0) {
+        ws_return(cpu, ESP_ERR_INVALID_ARG_VALUE);
+        return;
     }
+    for (int i = 0; i < 6; i++)
+        ws->base_mac[i] = mem_read8(cpu->mem, mac_ptr + (uint32_t)i);
     ws_return(cpu, 0);
 }
 
@@ -2325,10 +2353,63 @@ static void stub_esp_base_mac_addr_get(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     uint32_t mac_ptr = ws_arg(cpu, 0);
-    if (mac_ptr) {
-        for (int i = 0; i < 6; i++)
-            mem_write8(cpu->mem, mac_ptr + (uint32_t)i, ws->base_mac[i]);
+    if (!mac_ptr) {
+        ws_return(cpu, ESP_ERR_INVALID_ARG_VALUE);
+        return;
     }
+    for (int i = 0; i < 6; i++)
+        mem_write8(cpu->mem, mac_ptr + (uint32_t)i, ws->base_mac[i]);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_read_mac(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t mac_ptr = ws_arg(cpu, 0);
+    uint32_t type = ws_arg(cpu, 1);
+    if (!mac_ptr) {
+        ws_return(cpu, ESP_ERR_INVALID_ARG_VALUE);
+        return;
+    }
+
+    uint8_t mac[6];
+    memcpy(mac, ws->base_mac, sizeof(mac));
+    switch (type) {
+    case ESP_MAC_WIFI_STA_VALUE:
+    case ESP_MAC_BASE_VALUE:
+        break;
+    case ESP_MAC_WIFI_SOFTAP_VALUE:
+        mac[5]++;
+        break;
+    case ESP_MAC_BT_VALUE:
+        mac[5] += 2u;
+        break;
+    case ESP_MAC_ETH_VALUE:
+        mac[5] += 3u;
+        break;
+    case ESP_MAC_EFUSE_FACTORY_VALUE:
+        memcpy(mac, ws->factory_mac, sizeof(mac));
+        break;
+    default:
+        ws_return(cpu, ESP_ERR_NOT_SUPPORTED_VALUE);
+        return;
+    }
+
+    for (int i = 0; i < 6; i++)
+        mem_write8(cpu->mem, mac_ptr + (uint32_t)i, mac[i]);
+    ws_return(cpu, 0);
+}
+
+static void stub_esp_efuse_mac_get_default(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t mac_ptr = ws_arg(cpu, 0);
+    if (!mac_ptr) {
+        ws_return(cpu, ESP_ERR_INVALID_ARG_VALUE);
+        return;
+    }
+    for (int i = 0; i < 6; i++)
+        mem_write8(cpu->mem, mac_ptr + (uint32_t)i, ws->factory_mac[i]);
     ws_return(cpu, 0);
 }
 
@@ -2460,6 +2541,24 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
     ws->ap_mac[2]  = 0x28; ws->ap_mac[3]  = 0xAA;
     ws->ap_mac[4]  = 0xBB; ws->ap_mac[5]  = 0xCD;
     memcpy(ws->base_mac, ws->sta_mac, 6);
+    memcpy(ws->factory_mac, ws->sta_mac, 6);
+
+    /* esp_app_desc_t is pinned at the start of classic ESP32 DROM. Its
+     * idf_ver member has remained stable while the public event payload ABI
+     * changed between IDF 4 and 5. Detect the producer instead of guessing
+     * from a handler address or requiring symbols in stripped images. */
+    if (cpu && cpu->mem &&
+        mem_read32(cpu->mem, ESP_APP_DESC_ADDR) == ESP_APP_DESC_MAGIC) {
+        uint32_t version = ESP_APP_DESC_ADDR +
+                           ESP_APP_DESC_IDF_VERSION_OFFSET;
+        for (unsigned i = 0; i < 32u; i++) {
+            uint8_t ch = mem_read8(cpu->mem, version + i);
+            if (ch >= '0' && ch <= '9') {
+                ws->idf_major = ch - '0';
+                break;
+            }
+        }
+    }
 
     for (int i = 0; i < MAX_EMU_SOCKETS; i++)
         ws->sockets[i].host_fd = -1;
@@ -2581,8 +2680,8 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "esp_wifi_restore",             stub_esp_wifi_restore },
         { "esp_base_mac_addr_set",        stub_esp_base_mac_addr_set },
         { "esp_base_mac_addr_get",        stub_esp_base_mac_addr_get },
-        { "esp_read_mac",                 stub_esp_wifi_get_mac },
-        { "esp_efuse_mac_get_default",    stub_esp_wifi_get_mac },
+        { "esp_read_mac",                 stub_esp_read_mac },
+        { "esp_efuse_mac_get_default",    stub_esp_efuse_mac_get_default },
 
         /* Tier 8: Event system */
         { "esp_event_loop_create_default",        stub_esp_event_loop_create_default },
