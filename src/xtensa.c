@@ -792,7 +792,11 @@ static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
                                        int ilen) {
     uint32_t ws = cpu->windowstart & 0xFFFFu;
     unsigned sh = ((unsigned)cpu->windowbase + 1u) & 0xFu;
-    uint32_t rot = ((ws >> sh) | (ws << (16u - sh))) & 0xFFFFu;
+    /* Duplicating the 16-bit bitmap makes its rotate a single variable shift.
+     * Only the low three result bits are consumed below. This is equivalent to
+     * (ws >> sh) | (ws << (16 - sh)), but materially cheaper in the interpreter
+     * hot path on hosts without a native 16-bit rotate. */
+    uint32_t rot = (ws | (ws << 16)) >> sh;
     if (__builtin_expect((rot & 7u) == 0u, 1))
         return false;
 
