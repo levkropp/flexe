@@ -169,6 +169,12 @@ static mmio_handler_t *mmio_lookup(xtensa_mem_t *mem, uint32_t addr) {
 /* MMIO slow-path functions (called from inline fast paths on page table miss) */
 
 uint8_t mem_read8_slow(xtensa_mem_t *mem, uint32_t addr) {
+    /* A verifier replay cannot reproduce a device read reliably: registers
+     * may be live counters, clear-on-read FIFOs, or otherwise stateful. The
+     * write journal already rejects MMIO stores through mem_journal_note();
+     * reject slow-path reads for the same reason. Mapped RAM/ROM reads never
+     * reach this path and remain fully comparable. */
+    if (__builtin_expect(g_mem_journal_en, 0)) g_mem_journal_unsafe = 1;
     uint32_t xaddr = translate_ahb_alias(addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
     if (h && h->read) return (uint8_t)h->read(h->ctx, xaddr);
@@ -176,6 +182,7 @@ uint8_t mem_read8_slow(xtensa_mem_t *mem, uint32_t addr) {
 }
 
 uint16_t mem_read16_slow(xtensa_mem_t *mem, uint32_t addr) {
+    if (__builtin_expect(g_mem_journal_en, 0)) g_mem_journal_unsafe = 1;
     uint32_t xaddr = translate_ahb_alias(addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
     if (h && h->read) return (uint16_t)h->read(h->ctx, xaddr);
@@ -201,6 +208,7 @@ static void note_unmapped(xtensa_mem_t *mem, uint32_t addr) {
 }
 
 uint32_t mem_read32_slow(xtensa_mem_t *mem, uint32_t addr) {
+    if (__builtin_expect(g_mem_journal_en, 0)) g_mem_journal_unsafe = 1;
     uint32_t xaddr = translate_ahb_alias(addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
     if (h && h->read) return h->read(h->ctx, xaddr);

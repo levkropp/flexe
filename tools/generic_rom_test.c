@@ -205,7 +205,7 @@ static uint32_t uart_digest(const uart_state_t *u)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--no-jit] [--cycles N] [--min-insns N] "
+            "usage: %s [--no-jit | --verify] [--cycles N] [--min-insns N] "
             "[--min-uart N] [--max-unmapped N] [--batch N] "
             "[--rom-elf ESP32_ROM.elf] [--dump-uart] FIRMWARE.bin\n", argv0);
 }
@@ -213,7 +213,7 @@ static void usage(const char *argv0)
 int main(int argc, char **argv)
 {
     int argi = 1;
-    int disable_jit = 0, dump_uart = 0;
+    int disable_jit = 0, verify_jit = 0, dump_uart = 0;
     const char *rom_elf_path = NULL;
     /* A bounded quantum keeps callback latency realistic and gives the peer
      * core regular opportunities even when no contended spinlock is visible. */
@@ -227,6 +227,7 @@ int main(int argc, char **argv)
 
     while (argi < argc && argv[argi][0] == '-') {
         if (strcmp(argv[argi], "--no-jit") == 0) { disable_jit = 1; argi++; }
+        else if (strcmp(argv[argi], "--verify") == 0) { verify_jit = 1; argi++; }
         else if (strcmp(argv[argi], "--dump-uart") == 0) { dump_uart = 1; argi++; }
         else if (strcmp(argv[argi], "--rom-elf") == 0 && argi + 1 < argc) {
             rom_elf_path = argv[argi + 1]; argi += 2;
@@ -250,6 +251,7 @@ int main(int argc, char **argv)
         } else { usage(argv[0]); return 2; }
     }
     if (argc - argi != 1) { usage(argv[0]); return 2; }
+    if (disable_jit && verify_jit) { usage(argv[0]); return 2; }
 
     const char *rom_path = argv[argi];
     uart_state_t uart = {0};
@@ -279,6 +281,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "FAIL image=%s reason=load-failed\n", rom_path);
         return 1;
     }
+
+    jit_state_t *jit = flexe_session_jit(session);
+    if (verify_jit) jit_set_verify(jit, true);
 
     xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
     uint64_t target = cpu0->cycle_count + budget;
@@ -319,9 +324,11 @@ int main(int argc, char **argv)
             pc_ok = false;
     }
 
+    uint64_t verify_mismatches = jit_verify_mismatch_count(jit);
     bool ok = strcmp(stop, "budget") == 0 && uart.panic < 0 &&
               unhandled == 0 && unregistered == 0 && retired >= min_insns &&
-              uart.count >= min_uart && unmapped <= max_unmapped && pc_ok;
+              uart.count >= min_uart && unmapped <= max_unmapped && pc_ok &&
+              verify_mismatches == 0;
 
     printf("%s image=%s engine=%s stop=%s retired=%llu uart_bytes=%llu "
            "uart_digest=%08X unhandled=%d unregistered=%d "
@@ -339,7 +346,8 @@ int main(int argc, char **argv)
     if (!ok)
         fprintf(stderr, "  budget_ok=%d panic=%s unhandled=%d unregistered=%d "
                         "retired=%llu (min %llu) uart=%llu (min %llu) "
-                        "unmapped=%llu (max %llu) pc_ok=%d\n",
+                        "unmapped=%llu (max %llu) pc_ok=%d "
+                        "verify_mismatches=%llu\n",
                 strcmp(stop, "budget") == 0,
                 uart.panic >= 0 ? PANIC_MARKERS[uart.panic] : "none",
                 unhandled, unregistered,
@@ -347,7 +355,7 @@ int main(int argc, char **argv)
                 (unsigned long long)uart.count, (unsigned long long)min_uart,
                 (unsigned long long)unmapped,
                 (unsigned long long)max_unmapped,
-                pc_ok);
+                pc_ok, (unsigned long long)verify_mismatches);
 
     if (dump_uart || !ok) {
         fprintf(stderr, "--- UART (%zu bytes) ---\n", uart.len);
@@ -360,8 +368,9 @@ int main(int argc, char **argv)
      * ask of a production image that boots and then goes quiet. */
     xtensa_profile_report();
 
-    if (getenv("FLEXE_JIT_STATS") && flexe_session_jit(session))
-        jit_print_stats(flexe_session_jit(session), retired);
+    jit_verify_summary(jit);
+    if (getenv("FLEXE_JIT_STATS") && jit)
+        jit_print_stats(jit, retired);
 
     flexe_session_destroy(session);
     return ok ? 0 : 1;

@@ -147,6 +147,48 @@ TEST(mem_periph_returns_zero) {
     mem_destroy(mem);
 }
 
+static uint32_t journal_mmio_read(void *ctx, uint32_t addr) {
+    unsigned *reads = ctx;
+    (*reads)++;
+    return addr ^ 0xA5A5A5A5u;
+}
+
+TEST(mem_journal_rejects_mmio_reads) {
+    xtensa_mem_t *mem = mem_create();
+    unsigned reads = 0;
+    const uint32_t addr = 0x3FF50020u;
+    ASSERT_EQ(mem_register_mmio(mem, 0x50, journal_mmio_read, NULL, &reads), 0);
+
+    /* Ordinary mapped reads are deterministic and remain replayable. */
+    mem_journal_begin();
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0u);
+    ASSERT_FALSE(g_mem_journal_unsafe);
+    mem_journal_end();
+
+    /* Every slow read width is potentially stateful. In particular, live
+     * TIMG/LACT counters can advance between a native run and its interpreter
+     * replay even though neither execution wrote memory. */
+    mem_journal_begin();
+    ASSERT_EQ(mem_read8(mem, addr),
+              (uint8_t)(addr ^ 0xA5A5A5A5u));
+    ASSERT_TRUE(g_mem_journal_unsafe);
+    mem_journal_end();
+
+    mem_journal_begin();
+    ASSERT_EQ(mem_read16(mem, addr),
+              (uint16_t)(addr ^ 0xA5A5A5A5u));
+    ASSERT_TRUE(g_mem_journal_unsafe);
+    mem_journal_end();
+
+    mem_journal_begin();
+    ASSERT_EQ(mem_read32(mem, addr), addr ^ 0xA5A5A5A5u);
+    ASSERT_TRUE(g_mem_journal_unsafe);
+    mem_journal_end();
+
+    ASSERT_EQ(reads, 3u);
+    mem_destroy(mem);
+}
+
 /* ===== mem_load bulk copy ===== */
 
 TEST(mem_load_basic) {
@@ -187,6 +229,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_unmapped_read_zero);
     RUN_TEST(mem_unmapped_write_silent);
     RUN_TEST(mem_periph_returns_zero);
+    RUN_TEST(mem_journal_rejects_mmio_reads);
     RUN_TEST(mem_load_basic);
     RUN_TEST(mem_load_unmapped_fails);
 }
