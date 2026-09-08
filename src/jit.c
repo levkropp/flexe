@@ -3735,7 +3735,7 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
     if (n_jit > 0) jit_apply_block_exit(cpu);
     int unsafe = g_mem_journal_unsafe;
     int nwrites = g_mem_journal_count;
-    g_mem_journal_en = 0;
+    mem_journal_pause();
 
     if (n_jit <= 0) {
         mem_journal_end();
@@ -3790,7 +3790,7 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
                                                : MEM_JOURNAL_MAX_COMPARE;
     for (int i = 0; i < in; i++)
         ionly[i] = i;
-    g_mem_journal_en = 0;
+    mem_journal_pause();
 
     /* An interrupt or exception taken by the reference run is not a
      * miscompile: a native block defers interrupts to its exit, while

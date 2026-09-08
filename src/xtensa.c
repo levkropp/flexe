@@ -2922,6 +2922,7 @@ static void g_dbg_watch_init(void) {
      * the instruction trace, so arm the gate for either. */
     g_dbg_mem_watch = (g_dbg_watch_en || g_dbg_pcwatch_en ||
                        g_dbg_watch_val) ? 1 : 0;
+    mem_write32_observers_refresh();
     g_dbg_step_trace = (g_dbg_tarm || g_dbg_mem_watch) ? 1 : 0;
     /* g_dbg_pc is consumed only by the step trace, memory watchpoints, and
      * opt-in peripheral/SD logging. Do not publish it on every instruction in

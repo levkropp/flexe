@@ -154,6 +154,7 @@ void mem_write16_journaled(xtensa_mem_t *mem, uint32_t addr, uint16_t val);
 void mem_write32_journaled(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
 
 void mem_journal_begin(void);
+void mem_journal_pause(void);
 void mem_journal_rollback(xtensa_mem_t *mem);
 void mem_journal_end(void);
 
@@ -209,16 +210,17 @@ extern uint32_t g_dbg_watch_addr2;
 extern uint32_t g_dbg_watch_val;
 
 /* Address / value / storing-PC watchpoints (FLEXE_WATCH, FLEXE_WATCHVAL,
- * FLEXE_PCWATCH). This is the hottest store path in the emulator, so the three
- * separate arm-tests that used to sit here — none of which can fire unless the
- * matching variable is set — are collapsed into one gate, and the reporting
- * itself lives out of line in memory.c. */
+ * FLEXE_PCWATCH). This is the hottest store path in the emulator, so every
+ * optional observer is collapsed into one gate and the work lives out of line
+ * in memory.c. */
 extern int g_dbg_mem_watch;
-void mem_watch_report32(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
+extern int g_mem_write32_observe;
+void mem_write32_observers_refresh(void);
+void mem_write32_observed(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
 
 static inline __attribute__((always_inline)) void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
-    if (__builtin_expect(g_dbg_mem_watch, 0)) mem_watch_report32(mem, addr, val);
-    if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 4);
+    if (__builtin_expect(g_mem_write32_observe, 0))
+        mem_write32_observed(mem, addr, val);
     uint8_t *page = mem->page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         memcpy(page + (addr & 0xFFF), &val, 4);

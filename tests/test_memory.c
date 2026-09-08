@@ -189,6 +189,30 @@ TEST(mem_journal_rejects_mmio_reads) {
     mem_destroy(mem);
 }
 
+TEST(mem_journal_pause_preserves_recorded_writes) {
+    xtensa_mem_t *mem = mem_create();
+    const uint32_t recorded = 0x3FFB0000u;
+    const uint32_t unrecorded = recorded + 4u;
+
+    mem_write32(mem, recorded, 0x11111111u);
+    mem_write32(mem, unrecorded, 0x22222222u);
+    mem_journal_begin();
+    mem_write32(mem, recorded, 0xAAAAAAAAu);
+    ASSERT_EQ(g_mem_journal_count, 1);
+
+    mem_journal_pause();
+    ASSERT_FALSE(g_mem_journal_en);
+    ASSERT_EQ(g_mem_journal_count, 1);
+    mem_write32(mem, unrecorded, 0xBBBBBBBBu);
+    ASSERT_EQ(g_mem_journal_count, 1);
+
+    mem_journal_rollback(mem);
+    ASSERT_EQ(mem_read32(mem, recorded), 0x11111111u);
+    ASSERT_EQ(mem_read32(mem, unrecorded), 0xBBBBBBBBu);
+    mem_journal_end();
+    mem_destroy(mem);
+}
+
 /* ===== mem_load bulk copy ===== */
 
 TEST(mem_load_basic) {
@@ -230,6 +254,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_unmapped_write_silent);
     RUN_TEST(mem_periph_returns_zero);
     RUN_TEST(mem_journal_rejects_mmio_reads);
+    RUN_TEST(mem_journal_pause_preserves_recorded_writes);
     RUN_TEST(mem_load_basic);
     RUN_TEST(mem_load_unmapped_fails);
 }

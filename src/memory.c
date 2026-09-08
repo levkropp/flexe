@@ -284,12 +284,23 @@ int mem_register_mmio_range(xtensa_mem_t *mem, uint32_t base, uint32_t size,
 int      g_mem_journal_en = 0;
 int      g_mem_journal_unsafe = 0;
 int      g_mem_journal_count = 0;
+int      g_mem_write32_observe = 0;
 mem_journal_entry_t g_mem_journal[MEM_JOURNAL_MAX];
+
+void mem_write32_observers_refresh(void) {
+    g_mem_write32_observe = g_dbg_mem_watch || g_mem_journal_en;
+}
 
 void mem_journal_begin(void) {
     g_mem_journal_count = 0;
     g_mem_journal_unsafe = 0;
     g_mem_journal_en = 1;
+    mem_write32_observers_refresh();
+}
+
+void mem_journal_pause(void) {
+    g_mem_journal_en = 0;
+    mem_write32_observers_refresh();
 }
 
 /* Undo in reverse so the earliest recorded value for a repeatedly-written
@@ -305,16 +316,15 @@ void mem_journal_rollback(xtensa_mem_t *mem) {
 }
 
 void mem_journal_end(void) {
-    g_mem_journal_en = 0;
+    mem_journal_pause();
     g_mem_journal_count = 0;
 }
 
-/* Watchpoint reporting for mem_write32. Reached only when g_dbg_mem_watch is
- * armed, so the individual arm-tests can be re-checked here at no hot-path
- * cost. Kept out of line to keep the store path a single predicted branch. */
+/* Optional 32-bit store observers. Kept out of line so ordinary stores pay for
+ * one predicted branch regardless of how many diagnostics are available. */
 int g_dbg_mem_watch;
 
-void mem_watch_report32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
+void mem_write32_observed(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
     if (g_dbg_watch_en &&
         (addr == g_dbg_watch_addr || addr == g_dbg_watch_addr2)) {
         uint32_t old = mem_read32(mem, addr);
@@ -330,6 +340,7 @@ void mem_watch_report32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
         fprintf(stderr, "[PW] pc=0x%08X store 0x%08X <- 0x%08X core%d\n",
                 g_dbg_pc, addr, val, g_dbg_core);
     }
+    if (g_mem_journal_en) mem_journal_note(mem, addr, 4);
 }
 
 /* Out-of-line stores for the JIT's verification mode.
