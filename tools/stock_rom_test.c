@@ -40,6 +40,13 @@
 #define STOCK_SD_BYTES           (16u * 1024u * 1024u)
 #define STOCK_SD_SECTORS         (STOCK_SD_BYTES / 512u)
 #define STOCK_SD_ROOT_SECTOR     65u
+#define WLED_REALTIME_PORT        21324u
+#define WLED_RMT_CHANNELS         8u
+#define WLED_LED_COUNT            30u
+#define WLED_LED_BYTES            (WLED_LED_COUNT * 3u)
+#define WLED_RMT_EXPECTED_ITEMS   (8u + WLED_LED_BYTES * 8u)
+#define WLED_RMT_FRAME_ITEMS      1024u
+#define WLED_RMT_FRAME_BYTES      128u
 
 /* Extra cycles run after the scripted steps, to catch a firmware that passes
  * every check and then panics. Sized to cover the observed failure at roughly
@@ -157,6 +164,28 @@ typedef struct {
     uint8_t scan_response[31];
     size_t scan_response_len;
 } bt_tx_probe_t;
+
+typedef struct {
+    uint32_t items[WLED_RMT_FRAME_ITEMS];
+    size_t count;
+    bool overflow;
+} wled_rmt_partial_t;
+
+typedef struct {
+    wled_rmt_partial_t partial[WLED_RMT_CHANNELS];
+    uint64_t chunks;
+    uint64_t frames;
+    uint64_t items;
+    uint64_t overflows;
+    uint64_t malformed_frames;
+    int last_channel;
+    uint32_t tick_hz;
+    uint32_t carrier_hz;
+    uint32_t last_digest;
+    size_t last_item_count;
+    uint8_t last_bytes[WLED_RMT_FRAME_BYTES];
+    size_t last_byte_count;
+} wled_rmt_probe_t;
 
 #define MAX_UNREGISTERED_ROM_ADDRS 32
 typedef struct {
@@ -502,6 +531,77 @@ static void capture_bt_advertisement_tx(void *ctx,
     memcpy(probe->scan_response, scan_response, scan_response_len);
 }
 
+/* Reassemble one physical RMT transmission and decode ordinary WS2812 bits.
+ * WLED's default ESP32 driver prefixes eight low-level reset items, then emits
+ * one high/low item per data bit in GRB byte order. Keeping the pulse-level
+ * capture in the assertion path proves more than a write to WLED's RAM: the
+ * real firmware configured RMT, serviced its threshold interrupts, and
+ * completed a waveform that an attached strip could consume. */
+static void capture_wled_rmt(void *ctx, int channel, const uint32_t *items,
+                             size_t count, uint32_t tick_hz,
+                             uint32_t carrier_hz, bool finished)
+{
+    wled_rmt_probe_t *probe = ctx;
+    if (channel < 0 || channel >= (int)WLED_RMT_CHANNELS)
+        return;
+
+    wled_rmt_partial_t *partial = &probe->partial[channel];
+    probe->chunks++;
+    probe->items += count;
+    for (size_t i = 0; i < count; i++) {
+        if (partial->count < WLED_RMT_FRAME_ITEMS)
+            partial->items[partial->count++] = items[i];
+        else
+            partial->overflow = true;
+    }
+    if (!finished)
+        return;
+
+    probe->frames++;
+    probe->last_channel = channel;
+    probe->tick_hz = tick_hz;
+    probe->carrier_hz = carrier_hz;
+    probe->last_item_count = partial->count;
+    if (partial->overflow)
+        probe->overflows++;
+
+    size_t byte_count = 0;
+    unsigned bit_count = 0;
+    uint8_t byte = 0;
+    for (size_t i = 0; i < partial->count; i++) {
+        uint32_t item = partial->items[i];
+        uint32_t duration0 = item & 0x7FFFu;
+        uint32_t duration1 = (item >> 16) & 0x7FFFu;
+        bool level0 = (item & (1u << 15)) != 0;
+        bool level1 = (item & (1u << 31)) != 0;
+
+        /* Ignore reset/terminator entries. WLED's non-inverted WS2812 stream
+         * has a high first half and low second half; the longer half says
+         * whether the data bit is one. */
+        if (duration0 == 0 || duration1 == 0 || !level0 || level1)
+            continue;
+        byte = (uint8_t)((byte << 1) | (duration0 > duration1));
+        if (++bit_count == 8) {
+            if (byte_count < WLED_RMT_FRAME_BYTES)
+                probe->last_bytes[byte_count++] = byte;
+            bit_count = 0;
+            byte = 0;
+        }
+    }
+    probe->last_byte_count = byte_count;
+    uint32_t digest = 2166136261u;
+    for (size_t i = 0; i < byte_count; i++)
+        digest = (digest ^ probe->last_bytes[i]) * 16777619u;
+    probe->last_digest = digest;
+    if (partial->overflow || partial->count != WLED_RMT_EXPECTED_ITEMS ||
+        byte_count != WLED_LED_BYTES || tick_hz != 40000000u ||
+        carrier_hz != 0u)
+        probe->malformed_frames++;
+
+    partial->count = 0;
+    partial->overflow = false;
+}
+
 static void audit_rom_call(void *ctx, uint32_t addr, const char *name,
                            const xtensa_cpu_t *cpu)
 {
@@ -747,6 +847,113 @@ static int run_for_virtual_cycles(flexe_session_t *session, uint64_t cycles)
         run_one_batch(session);
     }
     return 0;
+}
+
+static bool wled_frame_has_primary_sentinel(const wled_rmt_probe_t *probe)
+{
+    if (probe->last_byte_count < WLED_LED_BYTES)
+        return false;
+    for (size_t pixel = 0; pixel < WLED_LED_COUNT; pixel++) {
+        const uint8_t *grb = &probe->last_bytes[pixel * 3u];
+        switch (pixel % 3u) {
+        case 0: /* red, encoded GRB */
+            if (grb[0] != 0 || grb[1] == 0 || grb[2] != 0) return false;
+            break;
+        case 1: /* green */
+            if (grb[0] == 0 || grb[1] != 0 || grb[2] != 0) return false;
+            break;
+        default: /* blue */
+            if (grb[0] != 0 || grb[1] != 0 || grb[2] == 0) return false;
+            break;
+        }
+    }
+    return true;
+}
+
+static int run_until_wled_ready(flexe_session_t *session,
+                                wled_rmt_probe_t *probe,
+                                uint64_t max_cycles, uint16_t *host_port_out,
+                                uint64_t *cycles_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    uint64_t start = cpu0->cycle_count;
+    uint16_t host_port = 0;
+
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        if (wifi_stubs_get_bound_host_port(wifi, WLED_REALTIME_PORT, true,
+                                           &host_port) == 0 &&
+            probe->frames != 0 &&
+            probe->last_byte_count >= WLED_LED_BYTES) {
+            *host_port_out = host_port;
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+        run_one_batch(session);
+    }
+
+    *host_port_out = host_port;
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
+}
+
+static int send_wled_realtime_frame(uint16_t host_port, size_t *bytes_out)
+{
+    /* DNRGB: protocol, timeout seconds, big-endian starting pixel, RGB data.
+     * Fill the complete default 30-pixel strip with a deterministic repeating
+     * primary pattern, so no animation state can leak into the output digest. */
+    uint8_t packet[4u + WLED_LED_BYTES] = {4u, 5u, 0u, 0u};
+    for (size_t pixel = 0; pixel < WLED_LED_COUNT; pixel++)
+        packet[4u + pixel * 3u + pixel % 3u] = 255u;
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(host_port);
+    ssize_t sent = sendto(fd, packet, sizeof(packet), 0,
+                          (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+    *bytes_out = sent > 0 ? (size_t)sent : 0;
+    return sent == (ssize_t)sizeof(packet) ? 0 : -1;
+}
+
+static int run_until_wled_realtime(flexe_session_t *session,
+                                   wled_rmt_probe_t *probe,
+                                   uint16_t host_port, uint64_t max_cycles,
+                                   wifi_stubs_stats_t *stats_out,
+                                   uint64_t *cycles_out,
+                                   size_t *packet_bytes_out)
+{
+    xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
+    wifi_stubs_t *wifi = flexe_session_wifi(session);
+    wifi_stubs_stats_t before = {0};
+    wifi_stubs_get_stats(wifi, &before);
+    uint64_t first_frame = probe->frames;
+    uint64_t start = cpu0->cycle_count;
+
+    if (send_wled_realtime_frame(host_port, packet_bytes_out) != 0)
+        return -2;
+    while (cpu0->cycle_count - start < max_cycles) {
+        if (!session_alive(session)) return -1;
+        run_one_batch(session);
+        wifi_stubs_get_stats(wifi, stats_out);
+        if (stats_out->recvfrom_bytes >=
+                    before.recvfrom_bytes + *packet_bytes_out &&
+            probe->frames > first_frame &&
+            wled_frame_has_primary_sentinel(probe)) {
+            *cycles_out = cpu0->cycle_count - start;
+            return 0;
+        }
+    }
+
+    wifi_stubs_get_stats(wifi, stats_out);
+    *cycles_out = cpu0->cycle_count - start;
+    return 1;
 }
 
 static int run_until_touch_commands(flexe_session_t *session,
@@ -1262,7 +1469,7 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s [--no-jit] [--verify] [--rom-elf ESP32_ROM.elf] "
-            "bruce|marauder|nerdminer <firmware.bin>\n",
+            "bruce|marauder|nerdminer|wled <firmware.bin>\n",
             argv0);
 }
 
@@ -1298,7 +1505,8 @@ int main(int argc, char **argv)
     int is_bruce = strcmp(profile, "bruce") == 0;
     int is_marauder = strcmp(profile, "marauder") == 0;
     int is_nerdminer = strcmp(profile, "nerdminer") == 0;
-    if (!is_bruce && !is_marauder && !is_nerdminer) {
+    int is_wled = strcmp(profile, "wled") == 0;
+    if (!is_bruce && !is_marauder && !is_nerdminer && !is_wled) {
         usage(argv[0]);
         return 2;
     }
@@ -1332,6 +1540,7 @@ int main(int argc, char **argv)
     uart_state_t gps_uart = {0};
     raw_tx_probe_t raw_tx_probe = {0};
     bt_tx_probe_t bt_tx_probe = {0};
+    wled_rmt_probe_t wled_rmt_probe = {.last_channel = -1};
     rom_audit_t rom_audit = {0};
     flexe_session_config_t cfg = {
         .bin_path = rom_path,
@@ -1388,6 +1597,23 @@ int main(int argc, char **argv)
         free(framebuf);
         return 1;
     }
+    if (is_wled) {
+        for (int channel = 0; channel < (int)WLED_RMT_CHANNELS; channel++) {
+            if (periph_set_rmt_tx_callback(flexe_session_periph(session),
+                                           channel, capture_wled_rmt,
+                                           &wled_rmt_probe) != 0) {
+                fprintf(stderr,
+                        "FAIL profile=wled reason=rmt-endpoint channel=%d\n",
+                        channel);
+                flexe_session_destroy(session);
+                pthread_mutex_destroy(&framebuffer_mutex);
+                unlink(sd_path);
+                free(before);
+                free(framebuf);
+                return 1;
+            }
+        }
+    }
     flexe_session_set_rom_log_cb(session, audit_rom_call, &rom_audit);
     if (is_marauder) {
         rom_firmware_profile_t firmware_profile =
@@ -1430,9 +1656,16 @@ int main(int argc, char **argv)
                           8000000000ull : 2000000000ull;
     int nonblack = 0;
     uint64_t boot_cycles = 0;
-    int screen_result = run_until_screen(session, framebuf, &framebuffer_mutex,
-                                         min_nonblack, boot_limit, &nonblack,
-                                         &boot_cycles);
+    uint16_t wled_host_port = 0;
+    int screen_result;
+    if (is_wled)
+        screen_result = run_until_wled_ready(session, &wled_rmt_probe,
+                                             boot_limit, &wled_host_port,
+                                             &boot_cycles);
+    else
+        screen_result = run_until_screen(session, framebuf,
+                                         &framebuffer_mutex, min_nonblack,
+                                         boot_limit, &nonblack, &boot_cycles);
     if (screen_result != 0) {
         xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
         xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
@@ -1442,7 +1675,8 @@ int main(int argc, char **argv)
                 "ccount=%u/%u next_timer=%u/%u int=0x%08x/0x%08x "
                 "ena=0x%08x/0x%08x ps=0x%08x/0x%08x "
                 "unhandled_mmio=%d unregistered_rom=%d\n",
-                profile, screen_result < 0 ? "cpus-stopped" : "screen-timeout",
+                profile, screen_result < 0 ? "cpus-stopped" :
+                         (is_wled ? "udp-or-rmt-timeout" : "screen-timeout"),
                 nonblack, (unsigned long long)boot_cycles,
                 cpu0 ? cpu0->pc : 0, cpu1 ? cpu1->pc : 0,
                 cpu0 ? cpu0->running : 0, cpu1 ? cpu1->running : 0,
@@ -1455,6 +1689,18 @@ int main(int argc, char **argv)
                 cpu0 ? cpu0->ps : 0, cpu1 ? cpu1->ps : 0,
                 periph_unhandled_count(flexe_session_periph(session)),
                 rom_stubs_unregistered_count(flexe_session_rom(session)));
+        if (is_wled)
+            fprintf(stderr,
+                    "WLED readiness: host_port=%u rmt_frames=%llu "
+                    "rmt_chunks=%llu rmt_items=%llu last_items=%zu "
+                    "last_bytes=%zu overflows=%llu\n",
+                    wled_host_port,
+                    (unsigned long long)wled_rmt_probe.frames,
+                    (unsigned long long)wled_rmt_probe.chunks,
+                    (unsigned long long)wled_rmt_probe.items,
+                    wled_rmt_probe.last_item_count,
+                    wled_rmt_probe.last_byte_count,
+                    (unsigned long long)wled_rmt_probe.overflows);
         fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
         fwrite(uart.log, 1, uart.log_len, stderr);
         fputc('\n', stderr);
@@ -1498,8 +1744,58 @@ int main(int argc, char **argv)
     uint64_t marauder_bt_tx_bytes = 0;
     uint32_t marauder_mgmt_frames = 0;
     uint32_t marauder_beacon_frames = 0;
+    uint64_t wled_realtime_cycles = 0;
+    uint64_t wled_rmt_frames_at_match = 0;
+    uint32_t wled_led_digest = 0;
+    size_t wled_packet_bytes = 0;
     bt_stubs_stats_t bt_stats = {0};
     nerd_network_probe_t network_probe = {.tcp_fd = -1, .udp_fd = -1};
+    if (is_wled) {
+        int realtime_result = run_until_wled_realtime(
+                session, &wled_rmt_probe, wled_host_port, 1000000000ull,
+                &wifi_stats, &wled_realtime_cycles, &wled_packet_bytes);
+        if (realtime_result != 0) {
+            fprintf(stderr,
+                    "FAIL profile=wled reason=%s host_port=%u sent=%zu "
+                    "cycles=%llu udp_rx=%llu recvfrom_calls=%llu "
+                    "rmt_frames=%llu chunks=%llu items=%llu "
+                    "last_channel=%d tick_hz=%u carrier_hz=%u "
+                    "last_items=%zu last_bytes=%zu led=%08X "
+                    "prefix=%02X%02X%02X-%02X%02X%02X-%02X%02X%02X\n",
+                    realtime_result == -2 ? "udp-send" :
+                    realtime_result < 0 ? "cpus-stopped-during-realtime" :
+                                          "udp-to-rmt-timeout",
+                    wled_host_port, wled_packet_bytes,
+                    (unsigned long long)wled_realtime_cycles,
+                    (unsigned long long)wifi_stats.recvfrom_bytes,
+                    (unsigned long long)wifi_stats.recvfrom_calls,
+                    (unsigned long long)wled_rmt_probe.frames,
+                    (unsigned long long)wled_rmt_probe.chunks,
+                    (unsigned long long)wled_rmt_probe.items,
+                    wled_rmt_probe.last_channel, wled_rmt_probe.tick_hz,
+                    wled_rmt_probe.carrier_hz,
+                    wled_rmt_probe.last_item_count,
+                    wled_rmt_probe.last_byte_count,
+                    wled_rmt_probe.last_digest,
+                    wled_rmt_probe.last_bytes[0],
+                    wled_rmt_probe.last_bytes[1],
+                    wled_rmt_probe.last_bytes[2],
+                    wled_rmt_probe.last_bytes[3],
+                    wled_rmt_probe.last_bytes[4],
+                    wled_rmt_probe.last_bytes[5],
+                    wled_rmt_probe.last_bytes[6],
+                    wled_rmt_probe.last_bytes[7],
+                    wled_rmt_probe.last_bytes[8]);
+            flexe_session_destroy(session);
+            pthread_mutex_destroy(&framebuffer_mutex);
+            unlink(sd_path);
+            free(before);
+            free(framebuf);
+            return 1;
+        }
+        wled_led_digest = wled_rmt_probe.last_digest;
+        wled_rmt_frames_at_match = wled_rmt_probe.frames;
+    }
     if (is_bruce) {
         if (!uart_contains(&uart, "SDCARD mounted successfully")) {
             fprintf(stderr, "FAIL profile=bruce reason=sd-fat-mount-failed\n");
@@ -2379,6 +2675,28 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (is_wled &&
+        (wled_rmt_probe.malformed_frames != 0 ||
+         wled_rmt_probe.overflows != 0)) {
+        fprintf(stderr,
+                "FAIL profile=wled reason=malformed-rmt-waveform "
+                "frames=%llu malformed=%llu overflows=%llu "
+                "last_items=%zu last_bytes=%zu tick_hz=%u carrier_hz=%u\n",
+                (unsigned long long)wled_rmt_probe.frames,
+                (unsigned long long)wled_rmt_probe.malformed_frames,
+                (unsigned long long)wled_rmt_probe.overflows,
+                wled_rmt_probe.last_item_count,
+                wled_rmt_probe.last_byte_count, wled_rmt_probe.tick_hz,
+                wled_rmt_probe.carrier_hz);
+        nerd_probe_close(&network_probe);
+        flexe_session_destroy(session);
+        pthread_mutex_destroy(&framebuffer_mutex);
+        unlink(sd_path);
+        free(before);
+        free(framebuf);
+        return 1;
+    }
+
     /* How much the firmware actually did during the soak, and whether its
      * display moved. A ROM that retires billions of instructions without its
      * framebuffer changing is busy but not progressing -- which is a
@@ -2555,6 +2873,23 @@ int main(int argc, char **argv)
                (unsigned long long)marauder_bt_tx_frames,
                (unsigned long long)marauder_bt_tx_bytes,
                (unsigned long long)bt_tx_probe.frames);
+    if (is_wled)
+        printf(" ap_udp=%u udp_tx=%zu udp_rx=%llu realtime_cycles=%llu "
+               "rmt_channel=%d rmt_tick_hz=%u rmt_frames=%llu "
+               "rmt_frames_total=%llu rmt_chunks=%llu rmt_items=%llu "
+               "rmt_frame_items=%zu led_bytes=%zu malformed=%llu led=%08X",
+               wled_host_port, wled_packet_bytes,
+               (unsigned long long)wifi_stats.recvfrom_bytes,
+               (unsigned long long)wled_realtime_cycles,
+               wled_rmt_probe.last_channel, wled_rmt_probe.tick_hz,
+               (unsigned long long)wled_rmt_frames_at_match,
+               (unsigned long long)wled_rmt_probe.frames,
+               (unsigned long long)wled_rmt_probe.chunks,
+               (unsigned long long)wled_rmt_probe.items,
+               wled_rmt_probe.last_item_count,
+               wled_rmt_probe.last_byte_count,
+               (unsigned long long)wled_rmt_probe.malformed_frames,
+               wled_led_digest);
     if (is_nerdminer) {
         if (stratum_up)
             printf(" stratum=mining jobs=%d shares=%d",

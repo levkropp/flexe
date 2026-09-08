@@ -5792,6 +5792,61 @@ TEST(rmt_large_time_jump_drains_all_due_tx_events) {
     mem_destroy(mem);
 }
 
+TEST(rmt_delayed_threshold_isr_resumes_after_refill_ack) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    rmt_capture_t capture = {0};
+    ASSERT_EQ(periph_set_rmt_tx_callback(p, 0, capture_rmt, &capture), 0);
+    for (unsigned i = 0; i < 4u; i++)
+        mem_write32(mem, TEST_RMT_BASE + 0x800u + i * 4u,
+                    test_rmt_item(1, true, 1, false));
+
+    /* Ping-pong refill interrupt every two items. A large host-side time jump
+     * must stop at the first enabled threshold until guest code acknowledges
+     * it. Otherwise several hardware events collapse into one IRQ and the
+     * driver's alternating half-buffer refill gets permanently out of phase. */
+    mem_write32(mem, TEST_RMT_BASE + 0x20u, (1u << 24) | 1u);
+    mem_write32(mem, TEST_RMT_BASE + 0xD0u, 2u);
+    mem_write32(mem, TEST_RMT_BASE + 0xA8u, 1u << 24);
+    mem_write32(mem, TEST_RMT_BASE + 0x24u, (1u << 17) | 1u);
+
+    cpu.ccount = 24u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 2u);
+    ASSERT_EQ(capture.chunks, 1u);
+    ASSERT_EQ(capture.finishes, 0u);
+    ASSERT_TRUE(mem_read32(mem, TEST_RMT_BASE + 0x24u) & 1u);
+
+    /* The ISR refills the consumed half and clears THRESHOLD before the other
+     * half may be consumed. Repeat that handshake at the next boundary. */
+    mem_write32(mem, TEST_RMT_BASE + 0xACu, 1u << 24);
+    cpu.ccount += 12u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 4u);
+    ASSERT_EQ(capture.chunks, 2u);
+    ASSERT_EQ(capture.finishes, 0u);
+
+    mem_write32(mem, TEST_RMT_BASE + 0x810u,
+                test_rmt_item(1, true, 1, false));
+    mem_write32(mem, TEST_RMT_BASE + 0x814u, 0u);
+    mem_write32(mem, TEST_RMT_BASE + 0xACu, 1u << 24);
+    cpu.ccount += 6u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 5u);
+    ASSERT_EQ(capture.chunks, 3u);
+    ASSERT_EQ(capture.finishes, 1u);
+    ASSERT_EQ(mem_read32(mem, TEST_RMT_BASE + 0x24u) & 1u, 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(rmt_tx_deadline_tracks_runtime_cpu_frequency) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -6040,6 +6095,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(rmt_register_file_shared_ram_and_apb_fifo);
     RUN_TEST(rmt_timed_tx_threshold_and_completion_interrupts);
     RUN_TEST(rmt_large_time_jump_drains_all_due_tx_events);
+    RUN_TEST(rmt_delayed_threshold_isr_resumes_after_refill_ack);
     RUN_TEST(rmt_tx_deadline_tracks_runtime_cpu_frequency);
     RUN_TEST(rmt_rx_injection_uses_channel_memory_and_interrupts);
     RUN_TEST(rmt_dport_module_reset_clears_hardware_and_preserves_endpoint);

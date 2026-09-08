@@ -2775,6 +2775,12 @@ static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
  * reference, and it is the call8 target following the L32R of
  * WIFI_INIT_CONFIG_MAGIC (0x1F2F3F4F) in WLED's wifiLowLevelInit.
  *
+ * The socket entries come from a complete v16.0.1 esp32dev build made with
+ * WLED's pinned Tasmota Arduino 2.0.18 platform. Each 32-byte masked signature
+ * is unique in the official image, and all fifteen linked routines retain the
+ * same address. This exposes WiFiUDP at the host boundary while AsyncTCP can
+ * continue to use its firmware-side raw lwIP implementation.
+ *
  * Deliberately absent: esp_wifi_set_mac, esp_wifi_set_promiscuous{,_filter,
  * _rx_cb} and esp_wifi_80211_tx. Those did not match uniquely, and they are
  * the packet-injection API a lighting controller has no reason to call. If
@@ -2783,6 +2789,21 @@ static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
  * what check-firmware.sh is for, rather than assuming.
  */
 static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
+    { 0x40156A98u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
+    { 0x40157D50u, stub_lwip_bind,          "lwip_bind" },
+    { 0x40157E04u, stub_lwip_close,         "lwip_close" },
+    { 0x40157F28u, stub_lwip_recvfrom,      "lwip_recvfrom" },
+    { 0x40157FF4u, stub_lwip_read,          "lwip_read" },
+    { 0x40158010u, stub_lwip_sendto,        "lwip_sendto" },
+    { 0x40158184u, stub_lwip_send,          "lwip_send" },
+    { 0x4015820Cu, stub_lwip_socket,        "lwip_socket" },
+    { 0x401582B8u, stub_lwip_write,         "lwip_write" },
+    { 0x401582D0u, stub_lwip_getsockopt,    "lwip_getsockopt" },
+    { 0x40158370u, stub_lwip_setsockopt,    "lwip_setsockopt" },
+    { 0x401583FCu, stub_lwip_ioctl,         "lwip_ioctl" },
+    { 0x4015849Cu, stub_lwip_fcntl,         "lwip_fcntl" },
+    { 0x4015975Cu, stub_dns_gethostbyname,  "dns_gethostbyname" },
+    { 0x401B1838u, stub_errno,              "__errno" },
     { 0x401561B8u, stub_esp_wifi_init,             "esp_wifi_init" },
     { 0x401561A0u, stub_esp_wifi_deinit,           "esp_wifi_deinit" },
     { 0x40182CD8u, stub_esp_wifi_set_mode,         "esp_wifi_set_mode" },

@@ -68,6 +68,7 @@ The curated scenarios require external images:
 BRUCE_BIN=/path/to/bruce.bin \
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
+WLED_BIN=/path/to/wled.bin \
 ./scripts/check-stock-roms.sh
 ```
 

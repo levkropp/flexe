@@ -18,7 +18,7 @@ Booting to one UART line is not considered a pass.
 | Meshtastic 2.7.26 (T-Beam) | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
 | openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand display and network interaction coverage |
 | Tasmota 15.6.0 | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
-| WLED 16.0.1 | Interpreter + JIT | Pass | Expand LED and protocol interaction coverage |
+| WLED 16.0.1 | Interpreter + JIT | Pass | DNRGB-to-RMT is covered; expand HTTP, DDP, and E1.31 coverage |
 
 ROM images are not stored in this repository. Results are tied to the image
 versions above and should be rechecked when a release changes.
@@ -33,10 +33,11 @@ into this repository.
 
 ## Curated CYD scenarios
 
-`scripts/check-stock-roms.sh` drives unmodified Bruce, Marauder, and NerdMiner
-images through board-level scenarios on both engines. It checks completion,
-modeled I/O, and identical final framebuffers. Known official image hashes also
-have a pinned framebuffer digest, so a display-model change is explicit.
+`scripts/check-stock-roms.sh` drives unmodified Bruce, Marauder, NerdMiner, and
+WLED images through board-level scenarios on both engines. It checks
+completion, modeled I/O, and identical final framebuffer or LED-waveform
+digests. Known official image hashes have pinned output digests, so a model
+change is explicit.
 
 The Bruce scenario covers:
 
@@ -58,12 +59,20 @@ The NerdMiner scenario covers:
 - captive-portal HTTP and DNS traffic
 - host-backed pool networking and the mining task path
 
+The WLED scenario covers:
+
+- access-point startup and the production WiFiUDP socket bound on port 21324
+- a host-sent DNRGB frame parsed by WLED's own realtime protocol path
+- the resulting 30-pixel GRB stream through RMT ping-pong refill interrupts
+  and the completed 40 MHz WS2812 waveform endpoint
+
 Run the scenarios with:
 
 ```sh
 BRUCE_BIN=/path/to/bruce.bin \
 MARAUDER_BIN=/path/to/marauder.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
+WLED_BIN=/path/to/wled.bin \
 ./scripts/check-stock-roms.sh
 ```
 

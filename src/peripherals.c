@@ -1619,6 +1619,8 @@ typedef struct {
     bool tx_active;
     bool rx_active;
     bool tx_event_armed;
+    /* Native ping-pong drivers refill RAM before acknowledging THRESHOLD. */
+    bool tx_waiting_for_threshold_clear;
     uint64_t next_tx_cycle;
 
     rmt_tx_event_kind_t pending_kind;
@@ -5576,6 +5578,7 @@ static void rmt_kick(esp32_periph_t *p) {
 static void rmt_tx_cancel(rmt_channel_state_t *channel) {
     channel->tx_active = false;
     channel->tx_event_armed = false;
+    channel->tx_waiting_for_threshold_clear = false;
     channel->pending_kind = RMT_TX_EVENT_NONE;
     channel->pending_count = 0;
     channel->conf1 &= ~RMT_CONF1_TX_START;
@@ -5758,12 +5761,27 @@ static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 
             switch (kind) {
             case RMT_TX_EVENT_THRESHOLD:
-                p->rmt.int_raw |= RMT_TX_THRESHOLD_INT(index);
-                /* The compatibility dispatcher runs the refill ISR inline. */
+            {
+                uint32_t threshold_bit = RMT_TX_THRESHOLD_INT(index);
+                bool threshold_irq_enabled =
+                        (p->rmt.int_ena & threshold_bit) != 0;
+                p->rmt.int_raw |= threshold_bit;
+                /* A compatibility dispatcher may run the refill ISR inline.
+                 * A native guest ISR runs after this event hook returns. Do
+                 * not let an overshot host time slice consume another half
+                 * first: two thresholds would collapse into one level IRQ,
+                 * leaving alternating ping-pong refills out of phase and
+                 * repeating stale LED data. INT_CLR resumes transmission
+                 * after the guest has written the consumed half. */
                 rmt_irq_update(p);
-                if (channel->tx_active)
+                if (channel->tx_active &&
+                    (!threshold_irq_enabled ||
+                     !(p->rmt.int_raw & threshold_bit)))
                     rmt_plan_tx_segment_at(p, index, event_cycle);
+                else if (channel->tx_active)
+                    channel->tx_waiting_for_threshold_clear = true;
                 break;
+            }
             case RMT_TX_EVENT_END:
                 rmt_tx_cancel(channel);
                 p->rmt.int_raw |= RMT_TX_END_INT(index);
@@ -5919,7 +5937,17 @@ static void rmt_write(void *ctx, uint32_t addr, uint32_t value) {
     }
     if (off == RMT_INT_CLR_OFF) {
         rmt->int_raw &= ~value;
+        for (unsigned index = 0; index < RMT_CHANNEL_COUNT; index++) {
+            rmt_channel_state_t *channel = &rmt->channel[index];
+            if (!(value & RMT_TX_THRESHOLD_INT(index)) ||
+                !channel->tx_waiting_for_threshold_clear)
+                continue;
+            channel->tx_waiting_for_threshold_clear = false;
+            if (channel->tx_active && !channel->tx_event_armed)
+                rmt_plan_tx_segment(p, index);
+        }
         rmt_irq_update(p);
+        rmt_kick(p);
         return;
     }
     if (off >= RMT_CARRIER_DUTY_OFF && off < RMT_TX_LIMIT_OFF) {

@@ -14,6 +14,8 @@
 #define TEST_WLED_ENTRY              0x40083E68u
 #define TEST_WLED_EVENT_REGISTER     0x40150E34u
 #define TEST_WLED_EVENT_POST         0x40151768u
+#define TEST_WLED_SOCKET             0x4015820Cu
+#define TEST_WLED_CLOSE              0x40157E04u
 #define TEST_WLED_DISCONNECT         0x40182F54u
 
 typedef struct {
@@ -289,10 +291,17 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     const uint32_t event_base = 0x3FFB1000u;
     static const char name[] = "WIFI_EVENT";
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_WLED_ENTRY), 18);
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_WLED_ENTRY), 33);
     ASSERT_EQ(rom_stubs_register_ctx(rom, TEST_WLED_EVENT_POST,
                                      capture_native_event_post,
                                      "test_event_post", &capture), 0);
+
+    /* The symbol-less production image's WiFiUDP boundary is hooked too. */
+    invoke_wifi_call0_4(&cpu, TEST_WLED_SOCKET, 2u, 2u, 0u, 0u);
+    uint32_t socket_fd = ar_read(&cpu, 2);
+    ASSERT_EQ(socket_fd, 46u); /* first ESP-IDF/LWIP_SOCKET_OFFSET slot */
+    invoke_wifi_call0(&cpu, TEST_WLED_CLOSE, socket_fd);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
     for (size_t i = 0; i < sizeof(name); i++)
         mem_write8(cpu.mem, event_base + (uint32_t)i, (uint8_t)name[i]);
 
@@ -320,6 +329,9 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     wifi_stubs_stats_t stats = {0};
     wifi_stubs_get_stats(wifi, &stats);
     ASSERT_EQ64(stats.events_delivered, 1u);
+    ASSERT_EQ64(stats.socket_calls, 1u);
+    ASSERT_EQ64(stats.socket_successes, 1u);
+    ASSERT_EQ64(stats.close_calls, 1u);
 
     wifi_stubs_destroy(wifi);
     rom_stubs_destroy(rom);
