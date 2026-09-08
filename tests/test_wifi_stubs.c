@@ -487,9 +487,15 @@ TEST(tasmota_recv_peek_preserves_http_request) {
     /* lwIP's MSG_PEEK=0x01 and MSG_DONTWAIT=0x08 are not Darwin's flag
      * values. Two NetworkClient::connected() probes must leave the first
      * byte untouched for WebServer's parser. */
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
-                        recv_addr, 1u, 0x09u);
-    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    uint32_t first_recv = 0;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+                            recv_addr, 1u, 0x09u);
+        first_recv = ar_read(&cpu, 2);
+        if (first_recv != UINT32_MAX) break;
+        poll(NULL, 0, 1);
+    }
+    ASSERT_EQ(first_recv, 1u);
     ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'G');
     invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
                         recv_addr, 1u, 0x09u);
