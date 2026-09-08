@@ -8,6 +8,7 @@
  */
 
 #include "flexe_session.h"
+#include "axp192.h"
 #include "jit.h"
 #include "spi_display.h"
 #include "sx127x.h"
@@ -54,6 +55,7 @@
 #define MESHTASTIC_RADIO_CS       18
 #define MESHTASTIC_RADIO_SCK      5
 #define MESHTASTIC_RADIO_DIO0     26
+#define MESHTASTIC_PMU_ADDRESS    0x34u
 
 /* Extra cycles run after the scripted steps, to catch a firmware that passes
  * every check and then panics. Sized to cover the observed failure at roughly
@@ -939,6 +941,7 @@ static int run_until_wled_ready(flexe_session_t *session,
 
 static int run_until_meshtastic_radio(flexe_session_t *session,
                                       sx127x_t *radio,
+                                      axp192_t *pmu,
                                       uint64_t max_cycles,
                                       uint64_t *cycles_out)
 {
@@ -949,10 +952,15 @@ static int run_until_meshtastic_radio(flexe_session_t *session,
         if (!session_alive(session)) return -1;
         sx127x_stats_t stats;
         sx127x_get_stats(radio, &stats);
+        axp192_stats_t pmu_stats;
+        axp192_get_stats(pmu, &pmu_stats);
         uint8_t op_mode = sx127x_register(radio, 0x01u);
         uint8_t mode = op_mode & 0x07u;
+        uint8_t outputs = axp192_register(pmu, 0x12u);
         if (stats.version_reads != 0 && (op_mode & 0x80u) != 0 &&
-            (mode == 0x05u || mode == 0x06u)) {
+            (mode == 0x05u || mode == 0x06u) &&
+            pmu_stats.chip_id_reads != 0 && (outputs & 0x05u) == 0x05u &&
+            (outputs & 0x10u) == 0) {
             *cycles_out = cpu0->cycle_count - start;
             return 0;
         }
@@ -1911,6 +1919,7 @@ int main(int argc, char **argv)
     bt_tx_probe_t bt_tx_probe = {0};
     wled_rmt_probe_t wled_rmt_probe = {.last_channel = -1};
     sx127x_t *meshtastic_radio = NULL;
+    axp192_t *meshtastic_pmu = NULL;
     rom_audit_t rom_audit = {0};
     flexe_session_config_t cfg = {
         .bin_path = rom_path,
@@ -1972,17 +1981,29 @@ int main(int argc, char **argv)
             .periph = flexe_session_periph(session),
             .dio0_pin = MESHTASTIC_RADIO_DIO0,
         };
+        axp192_config_t pmu_config = {
+            .battery_present = true,
+            .vbus_present = true,
+            .battery_mv = 3970,
+            .vbus_mv = 5000,
+        };
         meshtastic_radio = sx127x_create(&radio_config);
-        if (!meshtastic_radio ||
+        meshtastic_pmu = axp192_create(&pmu_config);
+        if (!meshtastic_radio || !meshtastic_pmu ||
             periph_spi_attach_device_ex(flexe_session_periph(session),
                                         MESHTASTIC_RADIO_HOST,
                                         MESHTASTIC_RADIO_CS,
                                         MESHTASTIC_RADIO_SCK,
                                         sx127x_spi_transfer,
                                         sx127x_spi_select,
-                                        meshtastic_radio) != 0) {
+                                        meshtastic_radio) != 0 ||
+            periph_i2c_attach_device(flexe_session_periph(session), 0,
+                                     MESHTASTIC_PMU_ADDRESS,
+                                     axp192_i2c_transfer,
+                                     meshtastic_pmu) != 0) {
             fprintf(stderr,
-                    "FAIL profile=meshtastic reason=radio-endpoint\n");
+                    "FAIL profile=meshtastic reason=board-endpoint\n");
+            axp192_destroy(meshtastic_pmu);
             sx127x_destroy(meshtastic_radio);
             flexe_session_destroy(session);
             pthread_mutex_destroy(&framebuffer_mutex);
@@ -2068,7 +2089,8 @@ int main(int argc, char **argv)
                 &boot_cycles);
     else if (is_meshtastic)
         screen_result = run_until_meshtastic_radio(
-                session, meshtastic_radio, boot_limit, &boot_cycles);
+                session, meshtastic_radio, meshtastic_pmu, boot_limit,
+                &boot_cycles);
     else
         screen_result = run_until_screen(session, framebuf,
                                          &framebuffer_mutex, min_nonblack,
@@ -2113,7 +2135,9 @@ int main(int argc, char **argv)
                     (unsigned long long)wled_rmt_probe.overflows);
         if (is_meshtastic) {
             sx127x_stats_t radio_stats;
+            axp192_stats_t pmu_stats;
             sx127x_get_stats(meshtastic_radio, &radio_stats);
+            axp192_get_stats(meshtastic_pmu, &pmu_stats);
             fprintf(stderr,
                     "Meshtastic radio: spi=%llu frames=%llu reads=%llu "
                     "writes=%llu version_reads=%llu tx=%llu rx=%llu "
@@ -2127,6 +2151,15 @@ int main(int argc, char **argv)
                     (unsigned long long)radio_stats.rx_packets,
                     sx127x_register(meshtastic_radio, 0x01u),
                     sx127x_register(meshtastic_radio, 0x42u));
+            fprintf(stderr,
+                    "Meshtastic PMU: i2c=%llu reads=%llu writes=%llu "
+                    "chip_id_reads=%llu port=%d outputs=0x%02X\n",
+                    (unsigned long long)pmu_stats.transfers,
+                    (unsigned long long)pmu_stats.register_reads,
+                    (unsigned long long)pmu_stats.register_writes,
+                    (unsigned long long)pmu_stats.chip_id_reads,
+                    pmu_stats.last_port,
+                    axp192_register(meshtastic_pmu, 0x12u));
         }
         fprintf(stderr, "UART0 log (%zu bytes):\n", uart.log_len);
         fwrite(uart.log, 1, uart.log_len, stderr);
@@ -2135,6 +2168,7 @@ int main(int argc, char **argv)
         freertos_stubs_dump_tasks(flexe_session_frt(session), task_dump,
                                   sizeof(task_dump));
         fprintf(stderr, "FreeRTOS tasks:\n%s", task_dump);
+        axp192_destroy(meshtastic_pmu);
         sx127x_destroy(meshtastic_radio);
         flexe_session_destroy(session);
         pthread_mutex_destroy(&framebuffer_mutex);
@@ -3472,7 +3506,9 @@ int main(int argc, char **argv)
                (unsigned long long)bt_tx_probe.frames);
     if (is_meshtastic) {
         sx127x_stats_t radio_stats;
+        axp192_stats_t pmu_stats;
         sx127x_get_stats(meshtastic_radio, &radio_stats);
+        axp192_get_stats(meshtastic_pmu, &pmu_stats);
         printf(" radio=sx1276 spi=%llu frames=%llu reads=%llu writes=%llu "
                "tx=%llu rx=%llu op_mode=0x%02X",
                (unsigned long long)radio_stats.spi_transfers,
@@ -3482,6 +3518,12 @@ int main(int argc, char **argv)
                (unsigned long long)radio_stats.tx_packets,
                (unsigned long long)radio_stats.rx_packets,
                sx127x_register(meshtastic_radio, 0x01u));
+        printf(" pmu=axp192 i2c=%llu reads=%llu writes=%llu outputs=0x%02X "
+               "battery_mv=3970 vbus_mv=5000",
+               (unsigned long long)pmu_stats.transfers,
+               (unsigned long long)pmu_stats.register_reads,
+               (unsigned long long)pmu_stats.register_writes,
+               axp192_register(meshtastic_pmu, 0x12u));
     }
     if (is_wled)
         printf(" ap_udp=%u udp_tx=%zu udp_rx=%llu realtime_cycles=%llu "
@@ -3560,6 +3602,7 @@ int main(int argc, char **argv)
     putchar('\n');
 
     nerd_probe_close(&network_probe);
+    axp192_destroy(meshtastic_pmu);
     sx127x_destroy(meshtastic_radio);
     flexe_session_destroy(session);
     pthread_mutex_destroy(&framebuffer_mutex);

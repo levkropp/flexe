@@ -22,6 +22,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_fp_arith.c"
 #include "test_peripherals.c"
 #include "test_sx127x.c"
+#include "test_axp192.c"
 #include "test_crypto.c"
 #include "test_wifi_stubs.c"
 #include "test_bt_stubs.c"
@@ -60,6 +61,7 @@ int main(void) {
     run_fp_arith_tests();
     run_peripheral_tests();
     run_sx127x_tests();
+    run_axp192_tests();
     run_crypto_tests();
     run_wifi_stub_tests();
     run_bt_stub_tests();
