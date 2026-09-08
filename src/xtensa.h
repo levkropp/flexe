@@ -299,6 +299,10 @@ struct xtensa_cpu {
      * address depends on the frame size the guest picks, so it can only be
      * written once that ENTRY has run. */
     bool     seed_entry_link;
+    /* Cached WINDOWSTART bits for WB+1..WB+3. Window state changes only at
+     * comparatively rare control/privileged boundaries, so the interpreter
+     * need not rotate the architectural bitmap before every instruction. */
+    uint8_t  window_hazard;
     int      breakpoint_count;
 
     /* --- CL 5-6: pointers, cycle count, window --- */

@@ -29,6 +29,20 @@ static int g_dbg_wvlog;
             (cpu)->core_id, __func__, (cpu)->pc, (cpu)->windowbase, \
             (cpu)->windowstart, ##__VA_ARGS__); } while (0)
 
+/* Cache the only WINDOWSTART bits the per-instruction operand guard needs.
+ * Public callers may edit the exposed CPU state between runs, so xtensa_run
+ * and xtensa_step refresh this too; internal mutations refresh in place. */
+static inline __attribute__((always_inline))
+void window_hazard_refresh(xtensa_cpu_t *cpu) {
+    if (!cpu->real_window_vectors) {
+        cpu->window_hazard = 0;
+        return;
+    }
+    uint32_t ws = cpu->windowstart & 0xFFFFu;
+    unsigned sh = (cpu->windowbase + 1u) & 0xFu;
+    cpu->window_hazard = (uint8_t)(((ws | (ws << 16)) >> sh) & 7u);
+}
+
 /* Recompute the nearest ccompare value for timer batching.
  * A ccompare in the past (wrapped distance >= 2^31) is due NOW — give it
  * distance 0 so it is picked and fired at the next opportunity. A ccompare
@@ -194,6 +208,7 @@ void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
     /* Window registers */
     cpu->windowbase = 0;
     cpu->windowstart = 1;   /* Window 0 is valid */
+    window_hazard_refresh(cpu);
     /* Default every slot to call8 (the near-universal IDF/GCC call size);
      * ENTRY records the real callsize as windows are created. */
     memset(cpu->window_callsize, 2, sizeof(cpu->window_callsize));
@@ -400,8 +415,14 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_MR1:         cpu->mr[1] = val; break;
     case XT_SR_MR2:         cpu->mr[2] = val; break;
     case XT_SR_MR3:         cpu->mr[3] = val; break;
-    case XT_SR_WINDOWBASE:  cpu->windowbase = val & 0xF; break;
-    case XT_SR_WINDOWSTART: cpu->windowstart = val & 0xFFFF; break;
+    case XT_SR_WINDOWBASE:
+        cpu->windowbase = val & 0xF;
+        window_hazard_refresh(cpu);
+        break;
+    case XT_SR_WINDOWSTART:
+        cpu->windowstart = val & 0xFFFF;
+        window_hazard_refresh(cpu);
+        break;
     case XT_SR_IBREAKENABLE:cpu->ibreakenable = val; break;
     case XT_SR_MEMCTL:      cpu->memctl = val; break;
     case XT_SR_ATOMCTL:     cpu->atomctl = val; break;
@@ -564,6 +585,7 @@ static void raise_window_exception(xtensa_cpu_t *cpu, uint32_t fault_pc,
     XT_PS_SET_OWB(cpu->ps, cpu->windowbase);
     XT_PS_SET_EXCM(cpu->ps, 1);
     cpu->windowbase = handler_wb & 0xF;
+    window_hazard_refresh(cpu);
     WINLOG(cpu, "WINDOW EXC +0x%03X owb=%d wb=%d epc=%08X ws=%04X\n",
            vecofs, XT_PS_OWB(cpu->ps), cpu->windowbase, fault_pc,
            cpu->windowstart);
@@ -789,17 +811,7 @@ unsigned xtensa_window_operand_need(const xtensa_cpu_t *cpu,
 }
 
 static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
-                                       int ilen) {
-    uint32_t ws = cpu->windowstart & 0xFFFFu;
-    unsigned sh = ((unsigned)cpu->windowbase + 1u) & 0xFu;
-    /* Duplicating the 16-bit bitmap makes its rotate a single variable shift.
-     * Only the low three result bits are consumed below. This is equivalent to
-     * (ws >> sh) | (ws << (16 - sh)), but materially cheaper in the interpreter
-     * hot path on hosts without a native 16-bit rotate. */
-    uint32_t rot = (ws | (ws << 16)) >> sh;
-    if (__builtin_expect((rot & 7u) == 0u, 1))
-        return false;
-
+                                       int ilen, unsigned hazard) {
     /* Exception handlers run with EXCM set and cannot take a nested window
      * fault.  Reject that state before decoding the instruction's register
      * operands; window spill/fill handlers otherwise pay the full decoder on
@@ -808,9 +820,9 @@ static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
         return false;
 
     unsigned need = window_operand_need(cpu, insn, ilen);
-    if (need == 0u || (rot & ((1u << need) - 1u)) == 0u)
+    if (need == 0u || (hazard & ((1u << need) - 1u)) == 0u)
         return false;
-    int j = (rot & 1u) ? 1 : ((rot & 2u) ? 2 : 3);
+    int j = (hazard & 1u) ? 1 : ((hazard & 2u) ? 2 : 3);
     int w = (cpu->windowbase + j) & 0xF;
     uint32_t vecofs = window_overflow_vec(cpu, w);
     if (!window_vectors_ready(cpu, vecofs))
@@ -1102,6 +1114,7 @@ static void synth_spill_window(xtensa_cpu_t *cpu, int widx) {
 
     /* Clear windowstart bit for this window */
     cpu->windowstart &= ~(1u << (widx & 0xF));
+    window_hazard_refresh(cpu);
     WINLOG(cpu, "SPILL w%d callee=w%d base=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
            widx, callee, base, phys_read(cpu, widx, 0), phys_read(cpu, widx, 1),
            phys_read(cpu, widx, 2), phys_read(cpu, widx, 3));
@@ -1339,6 +1352,7 @@ static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int cal
 
     /* Set windowstart bit */
     cpu->windowstart |= (1u << (ret_wb & 0xF));
+    window_hazard_refresh(cpu);
     WINLOG(cpu, "FILL w%d base=%08X match=%d/%d a0=%08X a1=%08X a2=%08X a3=%08X\n",
            ret_wb, base, m_si, m_d, phys_read(cpu, ret_wb, 0),
            phys_read(cpu, ret_wb, 1), phys_read(cpu, ret_wb, 2),
@@ -1402,6 +1416,7 @@ static void exec_retw(xtensa_cpu_t *cpu, int retw_len) {
 
     /* Rotate back */
     cpu->windowbase = ret_wb;
+    window_hazard_refresh(cpu);
 
     BRANCH_TO(cpu, next_pc);
 }
@@ -1779,6 +1794,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         cpu->irq_check = true;  /* may unmask; see WSR PS */
                         cpu->windowstart &= ~(1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
+                        window_hazard_refresh(cpu);
                         BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     case 5: /* RFWU */
@@ -1787,6 +1803,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         cpu->irq_check = true;  /* may unmask; see WSR PS */
                         cpu->windowstart |= (1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
+                        window_hazard_refresh(cpu);
                         BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     default: break;
@@ -1908,6 +1925,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 if (!cpu->real_window_vectors && XT_PS_WOE(cpu->ps))
                     synth_overflow_check(cpu, 0);
                 cpu->windowbase = (cpu->windowbase + (int32_t)sign_extend(t, 4)) & 0xF;
+                window_hazard_refresh(cpu);
                 break;
             case 14: /* NSA: normalized shift amount */
                 { uint32_t val = ar_read(cpu, s);
@@ -2555,6 +2573,7 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
               uint32_t owb = cpu->windowbase;
               cpu->windowbase = (owb + callinc) & 0xF;
               cpu->windowstart |= (1u << cpu->windowbase);
+              window_hazard_refresh(cpu);
               cpu->window_callsize[cpu->windowbase] = (uint8_t)callinc;
               XT_PS_SET_OWB(cpu->ps, owb);
               /* ENTRY must NOT clear PS.CALLINC. Only CALLn/CALLXn write it,
@@ -3047,6 +3066,8 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
                 if (cpu->interrupt & cpu->intenable)
                     xtensa_check_interrupts(cpu);
             }
+            /* Native hooks may switch task/window context. */
+            window_hazard_refresh(cpu);
             *local_cc = cpu->cycle_count;  /* reload (stub may advance time) */
             /* Positive values are internal batch-accounting metadata: the
              * public xtensa_step() API still maps successful execution to 0. */
@@ -3107,6 +3128,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
                 cpu->cycle_count = *local_cc;
                 int n = fn(cpu);
                 if (n > 0) {
+                    window_hazard_refresh(cpu);
                     cpu->ccount += (uint32_t)n;
                     *local_cc = cpu->cycle_count + (uint64_t)n;
                     if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0))
@@ -3155,8 +3177,9 @@ have_insn:
     if (pc_written)
         cpu->_pc_written = false;
 
-    if (__builtin_expect(cpu->real_window_vectors, 0) &&
-        window_access_check(cpu, insn, ilen)) {
+    unsigned window_hazard = cpu->window_hazard;
+    if (__builtin_expect(window_hazard != 0u, 0) &&
+        window_access_check(cpu, insn, ilen, window_hazard)) {
         /* Faulted into a window vector; the instruction has not run and RFWO
          * returns to it. */
         cpu->ccount++;
@@ -3246,6 +3269,7 @@ have_insn:
 /* External entry point (for single-step / trace callers).
  * Always checks timers + interrupts unconditionally (no batching). */
 int xtensa_step(xtensa_cpu_t *cpu) {
+    window_hazard_refresh(cpu);
     uint64_t cc = cpu->cycle_count;
     uint32_t prev_pc = cpu->dbg_prev_pc;
     const bool was_halted = cpu->halted;
@@ -3323,6 +3347,7 @@ static inline int xtensa_run_halted(xtensa_cpu_t *cpu, uint64_t *local_cc,
  * (avoids per-instruction 64-bit memory increment). */
 
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
+    window_hazard_refresh(cpu);
     uint64_t cc = cpu->cycle_count;
     uint32_t prev_pc = cpu->dbg_prev_pc;
     int idle_total = 0;   /* skipped time: advances the clock, retires nothing */
