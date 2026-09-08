@@ -69,6 +69,7 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 #define CPU_OFF_HOOK_BITMAP offsetof(xtensa_cpu_t, pc_hook_bitmap)
 #define CPU_OFF_PREDECODE   offsetof(xtensa_cpu_t, predecode)
 #define CPU_OFF_WINDOWSTART offsetof(xtensa_cpu_t, windowstart)
+#define CPU_OFF_REAL_WINDOW_VECTORS offsetof(xtensa_cpu_t, real_window_vectors)
 #define CPU_OFF_WINDOW_CALLSIZE offsetof(xtensa_cpu_t, window_callsize)
 #define CPU_OFF_MISC        offsetof(xtensa_cpu_t, misc)
 #define CPU_OFF_EPC         offsetof(xtensa_cpu_t, epc)
@@ -2578,17 +2579,78 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 int entry_s = XT_S(insn);
                 uint32_t frame_size = (uint32_t)XT_IMM12(insn) << 3;
 
-                /* ENTRY's interpreter path spills every live window that the
-                 * new frame could overlap.  The native fast path is safe when
-                 * only the current window is live; defer more complex window
-                 * rings to that exact spill implementation. */
-                emit_load_cpu32(e, RDX, (int32_t)CPU_OFF_WINDOWSTART);
+                /* Load PS → RAX; extract runtime CALLINC → RCX.  CALLINC is
+                 * deliberately not part of the block key: a bare ENTRY is
+                 * used by xthal_window_spill and can reach the same (PC, WB)
+                 * with a different value than the one present at compile
+                 * time. */
+                emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                emit_mov_reg32_reg32(e, RCX, RAX);
+                emit_shr_reg32_imm(e, RCX, 16);
+                emit_and_reg32_imm32(e, RCX, 3);
+
+                /* Hardware faults only if ENTRY crosses a live window (or a
+                 * high source operand reaches one). Test that exact runtime
+                 * prefix. The block-wide guard excludes ENTRY because using
+                 * its compile-time CALLINC here would make block reuse both
+                 * over-conservative and potentially unsafe. */
+                int overflow_fb[8];
+                int overflow_fb_count = 0;
+                unsigned source_need = (unsigned)entry_s >> 2;
+                emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_WINDOWSTART);
+                for (unsigned adjacent = 1; adjacent <= 3; adjacent++) {
+                    int skip_test = -1;
+                    if (source_need < adjacent) {
+                        emit_cmp_reg32_imm32(e, RCX, (int32_t)adjacent);
+                        skip_test = emit_jcc_rel32(e, CC_B);
+                    }
+                    emit_test_reg32_imm32(
+                        e, RBX,
+                        1u << ((((unsigned)wb4 >> 2) + adjacent) & 15u));
+                    overflow_fb[overflow_fb_count++] =
+                        emit_jcc_rel32(e, CC_NE);
+                    if (skip_test >= 0)
+                        emit_patch_rel32(e, skip_test);
+                }
+
+                /* Before guest vectors are ready, Flexe's compatibility path
+                 * eagerly synthesizes spills for the callee's reachable
+                 * windows. Preserve that behavior whenever another window is
+                 * live. Once architectural vectors are active and mapped,
+                 * unrelated caller frames may remain resident exactly as they
+                 * do on hardware; the callee block will guard any a4-a15
+                 * access that actually reaches them. */
+                emit_mov_reg32_reg32(e, RDX, RBX);
                 emit_and_reg32_imm32(e, RDX,
                                      (int32_t)~(1u << ((unsigned)wb4 >> 2)));
                 emit_test_reg32(e, RDX, RDX);
-                int overflow_fb = emit_jcc_rel32(e, CC_NE);
+                int no_other_windows = emit_jcc_rel32(e, CC_E);
 
-                /* Load PS → RAX; extract CALLINC → RCX */
+                emit_load_cpu32(e, RAX,
+                                (int32_t)CPU_OFF_REAL_WINDOW_VECTORS);
+                emit_and_reg32_imm32(e, RAX, 0xFF);
+                emit_test_reg32(e, RAX, RAX);
+                overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_E);
+
+                emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                emit_and_reg32_imm32(e, RAX, (1u << 18) | (1u << 4));
+                emit_cmp_reg32_imm32(e, RAX, 1u << 18); /* WOE && !EXCM */
+                overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_NE);
+
+                emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_VECBASE);
+                emit_cmp_reg32_imm32(e, RAX, 0x40070000u);
+                overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_B);
+                emit_cmp_reg32_imm32(e, RAX, 0x40400000u);
+                overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_AE);
+                emit_mov_reg32_reg32(e, RCX, RAX);
+                emit_shr_reg32_imm(e, RCX, 12);
+                emit_pt_load(e, RCX); /* WindowOverflow4 at VECBASE + 0. */
+                emit_test_reg64(e, RAX, RAX);
+                overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_E);
+                emit_patch_rel32(e, no_other_windows);
+
+                /* The readiness checks use both scratch registers, so reload
+                 * the architectural value needed by the ENTRY body. */
                 emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
                 emit_mov_reg32_reg32(e, RCX, RAX);
                 emit_shr_reg32_imm(e, RCX, 16);
@@ -2654,7 +2716,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 emit_jmp_to_epilogue(e, jit);
 
                 /* Overflow fallback: interpreter handles it */
-                emit_patch_rel32(e, overflow_fb);
+                for (int i = 0; i < overflow_fb_count; i++)
+                    emit_patch_rel32(e, overflow_fb[i]);
                 /* Dirty bits deliberately survive the main-path ra_flush(),
                  * so this emits the same valid writeback without storing
                  * host registers that were never loaded on the fallback. */
@@ -3202,7 +3265,15 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     unsigned window_need = 0;
     bool writes_ps = false;
     for (int i = 0; i < scan->count; i++) {
-        unsigned need = xtensa_window_operand_need(cpu, scan->insns[i],
+        /* ENTRY depends on runtime PS.CALLINC and has a dedicated dynamic
+         * guard in its emitter. Specializing the block-wide mask from the
+         * compile-time value would make reuse at another CALLINC incorrect. */
+        bool is_entry = scan->ilens[i] == 3 &&
+                        XT_OP0(scan->insns[i]) == 6 &&
+                        XT_N(scan->insns[i]) == 3 &&
+                        XT_M(scan->insns[i]) == 0;
+        unsigned need = is_entry ? 0u :
+                        xtensa_window_operand_need(cpu, scan->insns[i],
                                                    scan->ilens[i]);
         if (need > window_need) window_need = need;
         if (scan->ilens[i] == 3 && XT_OP0(scan->insns[i]) == 0 &&

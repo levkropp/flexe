@@ -2320,6 +2320,69 @@ TEST(test_jit_entry_windowed) {
     teardown(&cpu);
 }
 
+/* ENTRY's collision prefix comes from runtime CALLINC, not the value seen
+ * when the block was compiled. A live window beyond that prefix is an
+ * unrelated caller frame and must not force the prologue back through the
+ * interpreter once architectural window vectors are active. */
+TEST(test_jit_entry_ignores_unrelated_live_window) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.windowbase = 2;
+    cpu.windowstart = 1u << 2;
+    cpu.ps = (1u << 18) | (2u << 16); /* Compile while CALLINC=2. */
+    ar_write(&cpu, 1, BASE + 0x2000);
+    jit_put_three_nops(&cpu);
+    put_insn3(&cpu, BASE + 6, jit_entry_insn(1, 32));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+
+    /* Runtime CALLINC=1 reaches only bit 3. Bit 4 may stay live. */
+    cpu.ps = (1u << 18) | (1u << 16);
+    cpu.windowstart = (1u << 2) | (1u << 4);
+    cpu.pc = BASE;
+    ASSERT_EQ(fn(&cpu), 4);
+    ASSERT_EQ(cpu.pc, BASE + 9u);
+    ASSERT_EQ(cpu.windowbase, 3u);
+    ASSERT_EQ(cpu.windowstart, (1u << 2) | (1u << 3) | (1u << 4));
+    ASSERT_EQ(ar_read(&cpu, 1), BASE + 0x2000u - 32u);
+
+    /* Reuse that same compiled block with a larger CALLINC. The now-reached
+     * bit 5 is a real collision, so ENTRY itself must remain unexecuted for
+     * the interpreter/window vector to handle precisely. */
+    cpu.ps = (1u << 18) | (3u << 16);
+    cpu.windowbase = 2;
+    cpu.windowstart = (1u << 2) | (1u << 5);
+    cpu.pc = BASE;
+    ar_write(&cpu, 1, BASE + 0x2000);
+    ASSERT_EQ(fn(&cpu), 3);
+    ASSERT_EQ(cpu.pc, BASE + 6u);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.windowstart, (1u << 2) | (1u << 5));
+
+    /* The pre-vector compatibility path intentionally spills farther ahead
+     * than architectural ENTRY. Keep routing that state through the exact C
+     * implementation rather than silently changing startup behavior. */
+    cpu.real_window_vectors = false;
+    cpu.ps = (1u << 18) | (1u << 16);
+    cpu.windowbase = 2;
+    cpu.windowstart = (1u << 2) | (1u << 4);
+    cpu.pc = BASE;
+    ASSERT_EQ(fn(&cpu), 3);
+    ASSERT_EQ(cpu.pc, BASE + 6u);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.windowstart, (1u << 2) | (1u << 4));
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_retw_windowed) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2538,6 +2601,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);
     RUN_TEST(test_jit_entry_windowed);
+    RUN_TEST(test_jit_entry_ignores_unrelated_live_window);
     RUN_TEST(test_jit_retw_windowed);
     RUN_TEST(test_jit_retw_n_windowed);
     RUN_TEST(test_jit_retw_tail_call_fallback);
