@@ -17,6 +17,9 @@ typedef int (*rom_conditional_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
 typedef enum {
     ROM_FIRMWARE_UNKNOWN = 0,
     ROM_FIRMWARE_NERDMINER_V183,
+    /* Official v1.12.1 CYD 2432S028 2-USB image, built with
+     * Arduino-ESP32 3.3.4 / ESP-IDF 5.5.1 and NimBLE-Arduino 2.3.8. */
+    ROM_FIRMWARE_MARAUDER_V1121_CYD2USB,
     ROM_FIRMWARE_MARAUDER_V1140_1,
     ROM_FIRMWARE_MARAUDER_V1142_3,
     ROM_FIRMWARE_MARAUDER_V1151,

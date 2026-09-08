@@ -65,9 +65,23 @@ static inline void put_test_bytes(xtensa_cpu_t *cpu, uint32_t addr,
         mem_write8(cpu->mem, addr + (uint32_t)i, bytes[i]);
 }
 
-/* The Marauder release series reused one ESP image entry point for two
- * incompatible link layouts.  Tests seed the same independent instruction
- * anchors used by production profile detection. */
+/* Tests seed the same independent instruction anchors used by production
+ * profile detection. */
+static inline void seed_marauder_v1121_cyd2usb_profile(xtensa_cpu_t *cpu) {
+    static const uint8_t phy[] = {
+        0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
+        0x00, 0x81, 0x5A, 0xF8, 0xA9, 0x08, 0x3D, 0xF0,
+    };
+    static const uint8_t wifi_start[] = {
+        0x36, 0x41, 0x00, 0x10, 0x11, 0x20, 0xE5, 0x7C,
+        0xFF, 0x21, 0xDC, 0xEA, 0xAC, 0xAA, 0xA2, 0xA0,
+    };
+    put_test_bytes(cpu, 0x401C374Cu, phy, sizeof(phy));
+    put_test_bytes(cpu, 0x401A861Cu, wifi_start, sizeof(wifi_start));
+}
+
+/* The later Marauder release series reused one ESP image entry point for
+ * incompatible link layouts. */
 static inline void seed_marauder_v11401_profile(xtensa_cpu_t *cpu) {
     static const uint8_t phy[] = {
         0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,

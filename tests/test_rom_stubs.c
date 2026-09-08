@@ -683,6 +683,70 @@ TEST(test_marauder_same_entry_uses_instruction_fingerprint) {
     teardown(&cpu);
 }
 
+TEST(test_marauder_v1121_cyd2usb_uses_independent_fingerprint) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x40081E90u),
+              ROM_FIRMWARE_UNKNOWN);
+    seed_marauder_v1121_cyd2usb_profile(&cpu);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x40081E90u),
+              ROM_FIRMWARE_MARAUDER_V1121_CYD2USB);
+
+    /* The entry point is not sufficient evidence: one damaged anchor must
+     * reject the profile and all of its fixed-address hooks. */
+    mem_write8(cpu.mem, 0x401A861Cu, 0u);
+    ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x40081E90u),
+              ROM_FIRMWARE_UNKNOWN);
+    mem_write8(cpu.mem, 0x401C374Cu, 0u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081E90u), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_marauder_v1121_virtualizes_only_its_phy_and_sync_state) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v1121_cyd2usb_profile(&cpu);
+
+    const uint32_t phy_global = 0x3FFD003Cu;
+    const uint32_t old_table_global = 0x3FFCD974u;
+    const uint32_t old_shifted_table_global = 0x3FFCD984u;
+    mem_write32(cpu.mem, 0x401C3748u, 0x40004100u);
+    mem_write32(cpu.mem, 0x401C18C0u, phy_global);
+    mem_write32(cpu.mem, old_table_global, 0xA5A5A5A5u);
+    mem_write32(cpu.mem, old_shifted_table_global, 0x5A5A5A5Au);
+
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081E90u), 5);
+    cpu.pc = 0x401C374Cu;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(mem_read32(cpu.mem, phy_global), 0x50001900u);
+    ASSERT_EQ(mem_read32(cpu.mem, old_table_global), 0xA5A5A5A5u);
+    ASSERT_EQ(mem_read32(cpu.mem, old_shifted_table_global), 0x5A5A5A5Au);
+
+    /* The IDF 5.5 wait loop loads m_synced through a7.  A deliberately wrong
+     * a2 catches accidental reuse of the older profile's register-based spy. */
+    put_insn3(&cpu, 0x4010EF53u, 0x000722u); /* l8ui a2, a7, 0 */
+    mem_write8(cpu.mem, 0x3FFC9060u, 0);
+    ar_write(&cpu, 2, 0x3FFB1000u);
+    ar_write(&cpu, 7, 0x3FFC9060u);
+    cpu.pc = 0x4010EF53u;
+    cpu._pc_written = true;
+    xtensa_step(&cpu);
+    ASSERT_EQ(mem_read8(cpu.mem, 0x3FFC9060u), 1);
+    ASSERT_EQ(ar_read(&cpu, 2), 1);
+    ASSERT_EQ(cpu.pc, 0x4010EF56u);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_marauder_v1151_hooks_use_third_layout) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -916,6 +980,8 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);
+    RUN_TEST(test_marauder_v1121_cyd2usb_uses_independent_fingerprint);
+    RUN_TEST(test_marauder_v1121_virtualizes_only_its_phy_and_sync_state);
     RUN_TEST(test_marauder_v11423_hooks_use_shifted_phy_and_data_layout);
     RUN_TEST(test_marauder_v1151_hooks_use_third_layout);
     RUN_TEST(test_marauder_nimble_deinit_preserves_cpp_lists);

@@ -256,6 +256,29 @@ TEST(v11423_fingerprint_selects_shifted_wifi_entries) {
     teardown(&cpu);
 }
 
+TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v1121_cyd2usb_profile(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+
+    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, 0x40081E90u), 15);
+    invoke_wifi_call0(&cpu, 0x401730CCu, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+    invoke_wifi_call0(&cpu, 0x401A861Cu, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.wifi_init_calls, 1u);
+    ASSERT_EQ64(stats.wifi_start_calls, 1u);
+
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(wled_posts_disconnect_on_native_event_loop) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -309,5 +332,6 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);
     RUN_TEST(raw_tx_crosses_host_radio_boundary);
     RUN_TEST(v11423_fingerprint_selects_shifted_wifi_entries);
+    RUN_TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries);
     RUN_TEST(wled_posts_disconnect_on_native_event_loop);
 }

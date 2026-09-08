@@ -59,6 +59,9 @@ typedef struct {
 static const marauder_state_layout_t marauder_v11401_state = {
     0x3FFC8C98u, 0x3FFC8C9Cu, 0x3FFC8CA0u, 0x3FFC9384u,
 };
+static const marauder_state_layout_t marauder_v1121_cyd2usb_state = {
+    0x3FFC87E4u, 0x3FFC87E8u, 0x3FFC87ECu, 0x3FFC8EF0u,
+};
 static const marauder_state_layout_t marauder_v11423_state = {
     0x3FFC8CA8u, 0x3FFC8CACu, 0x3FFC8CB0u, 0x3FFC9394u,
 };
@@ -1364,7 +1367,9 @@ int main(int argc, char **argv)
     if (is_marauder) {
         rom_firmware_profile_t firmware_profile =
                 rom_stubs_firmware_profile(flexe_session_rom(session));
-        if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1140_1)
+        if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1121_CYD2USB)
+            marauder_state = &marauder_v1121_cyd2usb_state;
+        else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1140_1)
             marauder_state = &marauder_v11401_state;
         else if (firmware_profile == ROM_FIRMWARE_MARAUDER_V1142_3)
             marauder_state = &marauder_v11423_state;

@@ -37,6 +37,7 @@
  * shifted both code and DRAM, so the entry point alone is not an identity. */
 #define MARAUDER_BOARD_ENTRY 0x400830D0u
 #define MARAUDER_V114_ENTRY 0x400831D8u
+#define MARAUDER_V1121_CYD2USB_ENTRY 0x40081E90u
 typedef struct {
     uint32_t scan_start;
     uint32_t scan_stop;
@@ -58,6 +59,17 @@ static const marauder_bt_layout_t marauder_v11401_bt = {
     0x401096E0u, 0x40110254u, 0x4010FC58u, 0x40110CC0u,
     0x4010B4A8u, 0x4010B4B4u, 0x4010B5DCu,
     0x3FFC9534u, 0x3FFC9540u,
+};
+
+/* NimBLE-Arduino 2.3.8 renamed setAdvertisedDeviceCallbacks() to
+ * setScanCallbacks().  The observer contract is otherwise the same.  The
+ * state literal slots and all function entries were verified against the
+ * official v1.12.1 2-USB release after an exact tagged-source rebuild. */
+static const marauder_bt_layout_t marauder_v1121_cyd2usb_bt = {
+    0x4010F264u, 0x4010F238u, 0x4010F380u, 0x4010F110u,
+    0x40116BF4u, 0x4011B340u, 0x4011ACE4u, 0x4011BFCCu,
+    0x401113C8u, 0x401113D4u, 0x401114D8u,
+    0, 0,
 };
 
 static const marauder_bt_layout_t marauder_v11423_bt = {
@@ -796,7 +808,8 @@ int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
     /* v1.14/v1.15 for the 2432S028 share one entry point; the other CYD
      * boards are a separate link with their own. */
     if (!bt || (entry_point != MARAUDER_V114_ENTRY &&
-                entry_point != MARAUDER_BOARD_ENTRY))
+                entry_point != MARAUDER_BOARD_ENTRY &&
+                entry_point != MARAUDER_V1121_CYD2USB_ENTRY))
         return 0;
     esp32_rom_stubs_t *rom = bt->cpu->pc_hook_ctx;
     if (!rom)
@@ -805,7 +818,9 @@ int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point)
     const marauder_bt_layout_t *layout = NULL;
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
             rom, entry_point);
-    if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
+    if (profile == ROM_FIRMWARE_MARAUDER_V1121_CYD2USB)
+        layout = &marauder_v1121_cyd2usb_bt;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
         layout = &marauder_v11401_bt;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
         layout = &marauder_v11423_bt;
@@ -901,7 +916,8 @@ int bt_stubs_inject_advertisement(bt_stubs_t *bt, const uint8_t addr[6],
                 mem_read32(mem, bt->scan_obj_addr + 0x14u),
                 mem_read32(mem, bt->scan_obj_addr + 0x18u),
                 mem_read8(mem, bt->scan_obj_addr + 0x0Eu));
-    if (getenv("FLEXE_BTDBG"))
+    if (getenv("FLEXE_BTDBG") && bt->ignore_list_addr &&
+        bt->connected_peers_addr)
         fprintf(stderr,
                 "[bt] ignore-list={0x%08X,0x%08X,%u} "
                 "connected={0x%08X,0x%08X,%u}\n",

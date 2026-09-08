@@ -4372,6 +4372,24 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
     rom_firmware_profile_t profile = ROM_FIRMWARE_UNKNOWN;
     if (entry_point == 0x40089268u) {
         profile = ROM_FIRMWARE_NERDMINER_V183;
+    } else if (entry_point == 0x40081E90u) {
+        /* Official Marauder v1.12.1 CYD 2432S028 2-USB release.  This is an
+         * Arduino-ESP32 3.3.4 / IDF 5.5.1 link, independently rebuilt from
+         * the tagged sources.  Both anchors and all hooked entry points are
+         * byte-identical in that ELF and the distributed image. */
+        static const uint8_t phy[] = {
+            0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
+            0x00, 0x81, 0x5A, 0xF8, 0xA9, 0x08, 0x3D, 0xF0,
+        };
+        static const uint8_t wifi_start[] = {
+            0x36, 0x41, 0x00, 0x10, 0x11, 0x20, 0xE5, 0x7C,
+            0xFF, 0x21, 0xDC, 0xEA, 0xAC, 0xAA, 0xA2, 0xA0,
+        };
+        xtensa_mem_t *mem = stubs->cpu->mem;
+        if (fw_signature_matches(mem, 0x401C374Cu, phy, sizeof(phy)) &&
+            fw_signature_matches(mem, 0x401A861Cu, wifi_start,
+                                 sizeof(wifi_start)))
+            profile = ROM_FIRMWARE_MARAUDER_V1121_CYD2USB;
     } else if (entry_point == 0x400831D8u) {
         static const uint8_t old_phy[] = {
             0x36, 0x41, 0x00, 0x81, 0xFE, 0xFF, 0xE0, 0x08,
@@ -4735,12 +4753,29 @@ static void stub_fw_marauder_phy_init(xtensa_cpu_t *cpu, void *ctx) {
     rom_return_void(cpu);
 }
 
+/* IDF 5.5 carries the controller's initialized dispatch data in the official
+ * ROM ELF, so this link needs only the PHY boundary virtualized.  In
+ * particular, do not plant the older releases' synthetic handler tables into
+ * unrelated v1.12.1 globals. */
+static void stub_fw_marauder_v1121_phy_init(xtensa_cpu_t *cpu, void *ctx) {
+    fw_virtualize_phy_table(cpu, ctx);
+    rom_return_void(cpu);
+}
+
 /* The virtual HCI controller has no asynchronous transport thread to emit
  * NimBLE's initial host-sync event. Plant the event's completion flag at the
  * firmware wait-loop head, then let the original load/branch execute. */
 static void stub_fw_marauder_ble_synced(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     mem_write8(cpu->mem, ar_read(cpu, 2), 1);
+}
+
+/* NimBLE-Arduino 2.3.8's init wait loop keeps m_synced in a7, unlike the
+ * older builds whose pointer arrives in a2.  Use the symbol-verified global
+ * for this exact profile and allow the genuine load/branch to continue. */
+static void stub_fw_marauder_v1121_ble_synced(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    mem_write8(cpu->mem, 0x3FFC9060u, 1);
 }
 
 /* Marauder suspends NimBLE while switching back to WiFi-only modes. The
@@ -4774,6 +4809,20 @@ static const fw_addr_hook_t fw_marauder_hooks[] = {
     { 0x401BDE2C, stub_fw_marauder_phy_init, "phy_get_romfunc_addr", 0 },
     { 0x40104595, stub_fw_marauder_ble_synced, "nimble_synced_flag", 1 },
     { 0x4010463C, stub_fw_marauder_nimble_deinit,
+      "NimBLEDevice::deinit", 0 },
+    { 0, NULL, NULL, 0 }
+};
+
+static const fw_addr_hook_t fw_marauder_v1121_cyd2usb_hooks[] = {
+    { 0x40083AE0, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_start", 0 },
+    { 0x40083AD8, stub_void_unregistered,
+      "esp_dport_access_stall_other_cpu_end", 0 },
+    { 0x401C374C, stub_fw_marauder_v1121_phy_init,
+      "phy_get_romfunc_addr", 0 },
+    { 0x4010EF53, stub_fw_marauder_v1121_ble_synced,
+      "nimble_synced_flag", 1 },
+    { 0x4010EF6C, stub_fw_marauder_nimble_deinit,
       "NimBLEDevice::deinit", 0 },
     { 0, NULL, NULL, 0 }
 };
@@ -4851,7 +4900,9 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
     const fw_addr_hook_t *tbl = NULL;
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
             stubs, entry_point);
-    if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
+    if (profile == ROM_FIRMWARE_MARAUDER_V1121_CYD2USB)
+        tbl = fw_marauder_v1121_cyd2usb_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
         tbl = fw_marauder_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)
         tbl = fw_marauder_v11423_hooks;
@@ -4864,7 +4915,8 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
     else if (profile == ROM_FIRMWARE_NERDMINER_V183)
         tbl = fw_nerdminer_hooks;
     if (!tbl) {
-        if (entry_point == 0x400831D8u)
+        if (entry_point == 0x40081E90u || entry_point == 0x400831D8u ||
+            entry_point == 0x400830D0u)
             fprintf(stderr,
                     "[flexe] unsupported Marauder image signature at "
                     "entry 0x%08X; refusing address-based hooks\n",

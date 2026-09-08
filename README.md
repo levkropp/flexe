@@ -92,7 +92,7 @@ The committed corpus currently establishes these outcomes:
 
 | Firmware | Current result |
 |---|---|
-| ESP32 Marauder 1.14.x/1.15.x CYD builds | Scripted display, touch, UART, GPS, Wi-Fi, BLE, and storage scenarios pass |
+| ESP32 Marauder 1.12.1/1.14.x/1.15.x CYD builds | Scripted display, touch, UART, GPS, Wi-Fi, BLE, and storage scenarios pass |
 | NerdMiner 1.8.3 | Captive portal, DNS, pool connection, and mining path pass |
 | Meshtastic 2.7.26 | Boots and both engines agree |
 | openHASP 0.7.0-rc13 | Boots and both engines agree |

@@ -9,6 +9,7 @@ Booting to one UART line is not considered a pass.
 
 | Firmware | Engines | Result | Remaining work |
 |---|---|---|---|
+| ESP32 Marauder 1.12.1 (CYD 2432S028 2USB) | Interpreter + JIT | Pass | None in the scripted scenario; requires the official ESP32 ROM ELF |
 | ESP32 Marauder 1.14.3 (CYD) | Interpreter + JIT | Pass | None in the scripted scenario |
 | ESP32 Marauder 1.15.1 (CYD 2432S028) | Interpreter + JIT | Pass | None in the scripted scenario |
 | ESP32 Marauder 1.14.3 (3.5-inch and Guition variants) | Interpreter + JIT | Pass | None in the scripted scenario |
@@ -17,7 +18,6 @@ Booting to one UART line is not considered a pass.
 | openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand display and network interaction coverage |
 | Tasmota 15.6.0 | Interpreter + JIT | Pass | Expand device-specific interaction coverage |
 | WLED 16.0.1 | Interpreter + JIT | Pass | Expand LED and protocol interaction coverage |
-| ESP32 Marauder 1.12.1 (CYD 2432S028 2USB) | Interpreter + JIT | Generic boot pass | Add a fingerprinted board-interaction scenario |
 
 ROM images are not stored in this repository. Results are tied to the image
 versions above and should be rechecked when a release changes.

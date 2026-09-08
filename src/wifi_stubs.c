@@ -2648,6 +2648,28 @@ static const wifi_fw_hook_t marauder_v114_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
+/* Official Marauder v1.12.1 CYD 2432S028 2-USB image.  Every address below
+ * comes from the exact tagged-source rebuild and retains an identical 32-byte
+ * function signature in the distributed image. */
+static const wifi_fw_hook_t marauder_v1121_cyd2usb_wifi_hooks[] = {
+    { 0x401730CCu, stub_esp_wifi_init,                  "esp_wifi_init" },
+    { 0x401730B0u, stub_esp_wifi_deinit,                "esp_wifi_deinit" },
+    { 0x401A861Cu, stub_esp_wifi_start,                 "esp_wifi_start" },
+    { 0x401A867Cu, stub_esp_wifi_stop,                  "esp_wifi_stop" },
+    { 0x401A85A4u, stub_esp_wifi_set_mode,              "esp_wifi_set_mode" },
+    { 0x401A85E4u, stub_esp_wifi_get_mode,              "esp_wifi_get_mode" },
+    { 0x401A8F5Cu, stub_esp_wifi_set_channel,           "esp_wifi_set_channel" },
+    { 0x401A8FBCu, stub_esp_wifi_get_channel,           "esp_wifi_get_channel" },
+    { 0x401A90E4u, stub_esp_wifi_get_mac,               "esp_wifi_get_mac" },
+    { 0x401A9078u, stub_esp_wifi_set_mac,               "esp_wifi_set_mac" },
+    { 0x401A91C8u, stub_esp_wifi_set_promiscuous,       "esp_wifi_set_promiscuous" },
+    { 0x401A9178u, stub_esp_wifi_set_promiscuous_filter,"esp_wifi_set_promiscuous_filter" },
+    { 0x401A9234u, stub_esp_wifi_set_promiscuous_rx_cb, "esp_wifi_set_promiscuous_rx_cb" },
+    { 0x401A9250u, stub_esp_wifi_noop,                   "esp_wifi_set_storage" },
+    { 0x401977ACu, stub_esp_wifi_80211_tx,              "esp_wifi_80211_tx" },
+    { 0, NULL, NULL },
+};
+
 /* Marauder v1.14.2/v1.14.3 rebuilt the same CYD target after adding
  * application objects.  Its ESP image entry stayed constant, but the linked
  * WiFi wrappers moved; keep a separately fingerprinted layout so an old hook
@@ -2793,6 +2815,8 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
             rom, entry_point);
     if (profile == ROM_FIRMWARE_NERDMINER_V183)
         hooks = nerdminer_wifi_hooks;
+    else if (profile == ROM_FIRMWARE_MARAUDER_V1121_CYD2USB)
+        hooks = marauder_v1121_cyd2usb_wifi_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1140_1)
         hooks = marauder_v114_wifi_hooks;
     else if (profile == ROM_FIRMWARE_MARAUDER_V1142_3)

@@ -393,8 +393,50 @@ TEST(v11423_fingerprint_selects_shifted_nimble_entries) {
     teardown(&cpu);
 }
 
+TEST(v1121_cyd2usb_observes_nimble_238_entries) {
+    const uint32_t scan_callbacks = 0x4010F110u;
+    const uint32_t scan_start = 0x4010F264u;
+    const uint32_t enabled_literal = 0x401113C8u;
+    const uint32_t sync_literal = 0x401113D4u;
+    const uint32_t public_literal = 0x401114D8u;
+
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    seed_marauder_v1121_cyd2usb_profile(&cpu);
+    bt_stubs_t *bt = bt_stubs_create(&cpu);
+
+    put_insn3(&cpu, scan_callbacks, 0x004136u);
+    put_insn2(&cpu, scan_callbacks + 3u, 0xF01Du);
+    put_insn3(&cpu, scan_start, 0x004136u);
+    put_insn2(&cpu, scan_start + 3u, 0xF01Du);
+    mem_write32(cpu.mem, enabled_literal, TEST_HS_ENABLED_STATE_ADDR);
+    mem_write32(cpu.mem, sync_literal, TEST_HS_SYNC_STATE_ADDR);
+    mem_write32(cpu.mem, public_literal, TEST_HS_PUBLIC_ADDR);
+
+    ASSERT_EQ(bt_stubs_hook_firmware_addrs(bt, 0x40081E90u), 7);
+    const uint32_t scan_addr = 0x3FFDF844u;
+    const uint32_t callback_addr = 0x3FFDFFECu;
+    const uint32_t callback_args[] = {scan_addr, callback_addr, 0};
+    invoke_observed_call8(&cpu, scan_callbacks, callback_args, 3);
+    const uint32_t scan_args[] = {scan_addr, 0, 0, 0};
+    invoke_observed_call8(&cpu, scan_start, scan_args, 4);
+
+    ASSERT_EQ(mem_read8(cpu.mem, TEST_HS_SYNC_STATE_ADDR), 2);
+    ASSERT_EQ(mem_read8(cpu.mem, TEST_HS_ENABLED_STATE_ADDR), 2);
+    bt_stubs_stats_t stats = {0};
+    bt_stubs_get_stats(bt, &stats);
+    ASSERT_EQ64(stats.scan_callback_config_calls, 1);
+    ASSERT_EQ64(stats.scan_start_calls, 1);
+
+    bt_stubs_destroy(bt);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 static void run_bt_stub_tests(void) {
     TEST_SUITE("Bluetooth stubs");
     RUN_TEST(production_scan_delivers_nimble_gap_advertisement);
     RUN_TEST(v11423_fingerprint_selects_shifted_nimble_entries);
+    RUN_TEST(v1121_cyd2usb_observes_nimble_238_entries);
 }
