@@ -42,7 +42,11 @@ void setup() {
   const timer_idx_t timers[4] = {TIMER_0, TIMER_1, TIMER_0, TIMER_1};
   const timer_count_dir_t directions[4] = {
       TIMER_COUNT_UP, TIMER_COUNT_UP, TIMER_COUNT_DOWN, TIMER_COUNT_UP};
-  const bool autoreload[4] = {true, false, true, true};
+  /* TIMER_GROUP_1/TIMER_0 exercises a one-shot countdown. The counter-value
+   * API performs a temporary software reload and then restores the configured
+   * reload register; it does not make that initial value the autoreload value.
+   * Enabling autoreload here would therefore reload zero after the first hit. */
+  const bool autoreload[4] = {true, false, false, true};
   const uint64_t initial[4] = {0, 0, 1000, 0};
   const uint64_t alarms[4] = {1000, 2500, 0, 2000};
 
@@ -88,7 +92,7 @@ void setup() {
   }
   if (flexe_timer_group_calls[0] < 10u ||
       flexe_timer_group_calls[1] != 4u ||
-      flexe_timer_group_calls[2] < 10u ||
+      flexe_timer_group_calls[2] != 1u ||
       flexe_timer_group_calls[3] < 5u) {
     fail(3, flexe_timer_group_calls[1]);
     return;
@@ -126,7 +130,7 @@ void setup() {
   flexe_timer_group_result[30] = (uint32_t)(wideReadback >> 32);
   if (flexe_timer_group_result[26] != ESP_OK || readback.divider != 80u ||
       readback.counter_dir != TIMER_COUNT_DOWN ||
-      readback.auto_reload != TIMER_AUTORELOAD_EN ||
+      readback.auto_reload != TIMER_AUTORELOAD_DIS ||
       readback.counter_en != TIMER_PAUSE || alarmReadback != 10000u ||
       wideReadback != kWideCounter) {
     fail(5, flexe_timer_group_result[27]);

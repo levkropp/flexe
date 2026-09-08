@@ -113,11 +113,11 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 20u; i++)
         if (result[i] != 0u) api_ok = 0;
     int callbacks_ok = result[20] >= 10u && result[21] == 4u &&
-                       result[22] >= 10u && result[23] >= 5u;
+                       result[22] == 1u && result[23] >= 5u;
     int behavior_ok = result[24] == result[25] && result[26] == 0u &&
                       (result[27] & 0xFFFFu) == 80u &&
                       ((result[27] >> 16) & 1u) == 0u &&
-                      ((result[27] >> 20) & 1u) == 1u &&
+                      ((result[27] >> 20) & 1u) == 0u &&
                       ((result[27] >> 24) & 1u) == 0u &&
                       result[28] == 10000u && result[29] == 0x42u &&
                       result[30] == 0x12345678u;
