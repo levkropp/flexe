@@ -745,6 +745,39 @@ static void stub_mbedtls_md5_free(xtensa_cpu_t *cpu, void *ctx) {
     sha_return_void(cpu);
 }
 
+int sha_stubs_hook_firmware_addrs(sha_stubs_t *ss, uint32_t entry_point) {
+    if (!ss || !ss->cpu)
+        return 0;
+    esp32_rom_stubs_t *rom = ss->cpu->pc_hook_ctx;
+    if (!rom || rom_stubs_identify_firmware(rom, entry_point) !=
+                    ROM_FIRMWARE_TASMOTA32_V1560)
+        return 0;
+
+    /* Tasmota 15.6.0's mbedTLS 3 SHA-256 entries, independently relocated
+     * from a symbol-bearing build of the exact release tag. Keeping the
+     * starts/update/finish boundary together means the native OpenSSL context
+     * is never mixed with a partially interpreted guest context. */
+    struct {
+        uint32_t addr;
+        rom_stub_fn fn;
+        const char *name;
+    } hooks[] = {
+        { 0x401E11B4u, stub_mbedtls_sha256_free,   "mbedtls_sha256_free" },
+        { 0x401E11C8u, stub_mbedtls_sha256_starts, "mbedtls_sha256_starts" },
+        { 0x401E1AACu, stub_mbedtls_sha256_update, "mbedtls_sha256_update" },
+        { 0x401E1B3Cu, stub_mbedtls_sha256_finish, "mbedtls_sha256_finish" },
+        { 0, NULL, NULL },
+    };
+    ss->rom = rom;
+    int hooked = 0;
+    for (int i = 0; hooks[i].fn; i++) {
+        rom_stubs_register_ctx(rom, hooks[i].addr, hooks[i].fn,
+                               hooks[i].name, ss);
+        hooked++;
+    }
+    return hooked;
+}
+
 int sha_stubs_hook_symbols(sha_stubs_t *ss, const elf_symbols_t *syms) {
     if (!ss || !syms) return 0;
 

@@ -250,8 +250,11 @@ static int session_build(flexe_session_t *s)
 
     /* SHA hardware accelerator stubs */
     s->shstubs = sha_stubs_create(&s->cpu[0]);
-    if (s->shstubs && s->syms)
-        sha_stubs_hook_symbols(s->shstubs, s->syms);
+    if (s->shstubs) {
+        sha_stubs_hook_firmware_addrs(s->shstubs, res.entry_point);
+        if (s->syms)
+            sha_stubs_hook_symbols(s->shstubs, s->syms);
+    }
 
     /* AES hardware accelerator stubs */
     s->astubs = aes_stubs_create(&s->cpu[0]);
