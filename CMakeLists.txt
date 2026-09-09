@@ -74,7 +74,6 @@ set(LIB_SOURCES
     src/sx127x.c
     src/axp192.c
     src/ublox_gps.c
-    src/tlsf_accel.c
     src/rom_stubs.c
     src/elf_symbols.c
     src/freertos_stubs.c

@@ -943,6 +943,177 @@ TEST(test_structural_abi_accels_do_not_require_firmware_profile) {
     teardown(&cpu);
 }
 
+TEST(test_newlib_memcmp_is_relocated_and_cycle_exact) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t addr = 0x4007D100u;
+    const uint32_t lhs = 0x3FFB0100u;
+    const uint32_t rhs = 0x3FFB0200u;
+    static const uint8_t lhs_bytes[] = { 0x11, 0x20, 0x33, 0x44 };
+    static const uint8_t rhs_bytes[] = { 0x11, 0x40, 0x33, 0x44 };
+
+    seed_newlib_optimized_memcmp(&cpu, addr);
+    mem_write8(cpu.mem, addr + 81u, 0u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081234u), 0u);
+
+    seed_newlib_optimized_memcmp(&cpu, addr);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081234u), 1u);
+    ASSERT_TRUE(cpu.accelerated_blocks);
+    put_test_bytes(&cpu, lhs, lhs_bytes, sizeof(lhs_bytes));
+    put_test_bytes(&cpu, rhs, rhs_bytes, sizeof(rhs_bytes));
+
+    cpu.pc = addr;
+    cpu._pc_written = true;
+    cpu.running = true;
+    cpu.windowbase = 0u;
+    cpu.windowstart = 1u;
+    cpu.next_timer_event = UINT32_MAX;
+    XT_PS_SET_CALLINC(cpu.ps, 2u);
+    ar_write(&cpu, 8, (2u << 30) | (BASE & 0x3FFFFFFFu));
+    ar_write(&cpu, 10, lhs);
+    ar_write(&cpu, 11, rhs);
+    ar_write(&cpu, 12, sizeof(lhs_bytes));
+    /* One unequal aligned word falls back to one equal and one unequal byte:
+     * the canonical implementation retires exactly 32 instructions. */
+    ASSERT_EQ(xtensa_run(&cpu, 32), 32u);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 10), (uint32_t)-0x20);
+    ASSERT_EQ(cpu.ccount, 32u);
+    ASSERT_EQ64(cpu.cycle_count, 32u);
+    ASSERT_EQ64(cpu.insn_count, 32u);
+
+    mem_write8(cpu.mem, rhs + 1u, 0x20u);
+    cpu.pc = addr;
+    cpu._pc_written = true;
+    cpu.ccount = 100u;
+    cpu.cycle_count = 100u;
+    cpu.insn_count = 0u;
+    XT_PS_SET_CALLINC(cpu.ps, 2u);
+    ar_write(&cpu, 8, (2u << 30) | (BASE & 0x3FFFFFFFu));
+    ar_write(&cpu, 10, lhs);
+    ar_write(&cpu, 11, rhs);
+    ar_write(&cpu, 12, sizeof(lhs_bytes));
+    ASSERT_EQ(xtensa_run(&cpu, 23), 23u);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 10), 0u);
+    ASSERT_EQ(cpu.ccount, 123u);
+    ASSERT_EQ64(cpu.cycle_count, 123u);
+    ASSERT_EQ64(cpu.insn_count, 23u);
+    ASSERT_EQ(rom_stubs_total_calls(rom), 2u);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+static void init_newlib_memcmp_call(xtensa_cpu_t *cpu, uint32_t addr,
+                                    uint32_t lhs, uint32_t rhs,
+                                    uint32_t size, unsigned callinc) {
+    for (unsigned i = 0u; i < 64u; i++)
+        cpu->ar[i] = 0xA5000000u + i;
+    cpu->pc = addr;
+    cpu->_pc_written = true;
+    cpu->windowbase = 3u;
+    cpu->windowstart = 1u << 3;
+    cpu->ps = (1u << 18) | (9u << 8) | 1u;
+    XT_PS_SET_CALLINC(cpu->ps, callinc);
+    cpu->window_callsize[(3u + callinc) & 15u] = 0xBu;
+    cpu->ccount = 1000u;
+    cpu->cycle_count = 2000u;
+    cpu->insn_count = 0u;
+    cpu->next_timer_event = UINT32_MAX;
+    cpu->running = true;
+    cpu->halted = false;
+    cpu->exception = false;
+    cpu->seed_entry_link = false;
+    cpu->breakpoint_count = 0;
+    ar_write(cpu, 1, 0x3FFB7000u);
+    ar_write(cpu, (int)(callinc * 4u),
+             (callinc << 30) | (BASE & 0x3FFFFFFFu));
+    ar_write(cpu, (int)(callinc * 4u + 2u), lhs);
+    ar_write(cpu, (int)(callinc * 4u + 3u), rhs);
+    ar_write(cpu, (int)(callinc * 4u + 4u), size);
+}
+
+TEST(test_newlib_memcmp_hook_matches_original_routine) {
+    xtensa_cpu_t reference;
+    xtensa_cpu_t accelerated;
+    setup(&reference);
+    setup(&accelerated);
+    const uint32_t addr = 0x4007D100u;
+    const uint32_t lhs = 0x3FFB0100u;
+    const uint32_t rhs = 0x3FFB0200u;
+    static const uint8_t lhs_bytes[] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+    };
+    static const uint8_t rhs_bytes[] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+    };
+    static const struct {
+        uint8_t lhs_offset;
+        uint8_t rhs_offset;
+        uint8_t size;
+        uint8_t callinc;
+        uint8_t same_buffer;
+        int32_t result;
+    } cases[] = {
+        { 0u, 0u, 0u, 1u, 0u, 0 },     /* short, empty */
+        { 1u, 1u, 3u, 2u, 0u, 0 },     /* short, all equal */
+        { 1u, 1u, 5u, 1u, 0u, 0x20 },  /* unaligned byte mismatch */
+        { 4u, 4u, 4u, 2u, 0u, 0x20 },  /* first word mismatch */
+        { 0u, 0u, 8u, 1u, 0u, 0x20 },  /* later word mismatch */
+        { 0u, 0u, 8u, 2u, 1u, 0 },     /* complete equal word loop */
+    };
+
+    seed_newlib_optimized_memcmp(&reference, addr);
+    seed_newlib_optimized_memcmp(&accelerated, addr);
+    put_test_bytes(&reference, lhs, lhs_bytes, sizeof(lhs_bytes));
+    put_test_bytes(&reference, rhs, rhs_bytes, sizeof(rhs_bytes));
+    put_test_bytes(&accelerated, lhs, lhs_bytes, sizeof(lhs_bytes));
+    put_test_bytes(&accelerated, rhs, rhs_bytes, sizeof(rhs_bytes));
+    esp32_rom_stubs_t *rom = rom_stubs_create(&accelerated);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081234u), 1u);
+
+    for (unsigned c = 0u; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        uint32_t case_lhs = lhs + cases[c].lhs_offset;
+        uint32_t case_rhs = cases[c].same_buffer
+                          ? lhs + cases[c].rhs_offset
+                          : rhs + cases[c].rhs_offset;
+        init_newlib_memcmp_call(&reference, addr, case_lhs, case_rhs,
+                                cases[c].size, cases[c].callinc);
+        init_newlib_memcmp_call(&accelerated, addr, case_lhs, case_rhs,
+                                cases[c].size, cases[c].callinc);
+        for (unsigned step = 0u; step < 150u && reference.pc != BASE; step++)
+            ASSERT_EQ(xtensa_step(&reference), 0u);
+        ASSERT_EQ(reference.pc, BASE);
+        ASSERT_EQ(xtensa_step(&accelerated), 0u);
+        ASSERT_EQ(ar_read(&accelerated, (int)(cases[c].callinc * 4u + 2u)),
+                  (uint32_t)cases[c].result);
+
+        ASSERT_EQ(accelerated.pc, reference.pc);
+        ASSERT_EQ(accelerated.ccount, reference.ccount);
+        ASSERT_EQ64(accelerated.cycle_count, reference.cycle_count);
+        ASSERT_EQ64(accelerated.insn_count, reference.insn_count);
+        ASSERT_EQ(accelerated.ps, reference.ps);
+        ASSERT_EQ(accelerated.windowbase, reference.windowbase);
+        ASSERT_EQ(accelerated.windowstart, reference.windowstart);
+        ASSERT_EQ(accelerated._pc_written, reference._pc_written);
+        for (unsigned i = 0u; i < 64u; i++)
+            ASSERT_EQ(accelerated.ar[i], reference.ar[i]);
+        for (unsigned i = 0u; i < 16u; i++)
+            ASSERT_EQ(accelerated.window_callsize[i],
+                      reference.window_callsize[i]);
+    }
+    ASSERT_EQ(rom_stubs_total_calls(rom),
+              sizeof(cases) / sizeof(cases[0]));
+
+    rom_stubs_destroy(rom);
+    teardown(&accelerated);
+    teardown(&reference);
+}
+
 TEST(test_standard_xthal_spill_is_discovered_at_any_iram_address) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -975,7 +1146,7 @@ TEST(test_standard_xthal_spill_is_discovered_at_any_iram_address) {
     teardown(&cpu);
 }
 
-TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
+TEST(test_wled_v1601_uses_structural_memcmp_and_scanned_phy) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
@@ -986,9 +1157,7 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     const uint32_t rom_literal = wrapper - 0x104u;
     const uint32_t global_literal = wrapper - 0x100u;
     const uint32_t phy_global = 0x3FFB2000u;
-    /* Match the release's memcmp prologue and provide one structurally
-     * discoverable phy_get_romfunc_addr wrapper. */
-    put_insn3(&cpu, memcmp_entry, 0x004136u); /* entry a1, 32 */
+    seed_newlib_optimized_memcmp(&cpu, memcmp_entry);
     seed_flash_poll_loop(&cpu, 0x40083A68u);
     seed_flash_poll_loop(&cpu, 0x40083B29u);
     put_insn3(&cpu, wrapper, 0x004136u);
@@ -1000,18 +1169,7 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     mem_write32(cpu.mem, rom_literal, 0x40004100u);
     mem_write32(cpu.mem, global_literal, phy_global);
 
-    const uint32_t enter_critical = 0x4008EC28u;
-    const uint32_t exit_critical = 0x4008ED10u;
-    const uint32_t heap_lock = 0x40091E3Cu;
-    const uint32_t heap_unlock = 0x40091E4Cu;
-    const uint32_t mux = 0x3FFB1000u;
-    const uint32_t heap = 0x3FFB3000u;
-    const uint32_t old_state = 0x3FFCDDF0u;
-    const uint32_t nesting = 0x3FFCDDF8u;
-    mem_write32(cpu.mem, 0x40080D4Cu, nesting);
-    mem_write32(cpu.mem, 0x40080D50u, old_state);
-
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 6);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 2);
     ASSERT_EQ(cpu.poll_spin_count, 2u);
     ASSERT_EQ(cpu.poll_spin_pc[0], 0x40083A68u);
     ASSERT_EQ(cpu.poll_spin_pc[1], 0x40083B29u);
@@ -1025,177 +1183,26 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     put_test_bytes(&cpu, rhs, rhs_bytes, sizeof(rhs_bytes));
     cpu.pc = memcmp_entry;
     cpu._pc_written = true;
-    XT_PS_SET_CALLINC(cpu.ps, 0);
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, lhs);
-    ar_write(&cpu, 3, rhs);
-    ar_write(&cpu, 4, sizeof(lhs_bytes));
+    cpu.windowbase = 0u;
+    cpu.windowstart = 1u;
+    cpu.next_timer_event = UINT32_MAX;
+    XT_PS_SET_CALLINC(cpu.ps, 2u);
+    ar_write(&cpu, 8, (2u << 30) | (BASE & 0x3FFFFFFFu));
+    ar_write(&cpu, 10, lhs);
+    ar_write(&cpu, 11, rhs);
+    ar_write(&cpu, 12, sizeof(lhs_bytes));
     xtensa_step(&cpu);
     ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(ar_read(&cpu, 2), (uint32_t)-0x20);
+    ASSERT_EQ(ar_read(&cpu, 10), (uint32_t)-0x20);
 
     cpu.pc = wrapper;
     cpu._pc_written = true;
-    XT_PS_SET_CALLINC(cpu.ps, 0);
+    XT_PS_SET_CALLINC(cpu.ps, 0u);
     ar_write(&cpu, 0, BASE);
     xtensa_step(&cpu);
     ASSERT_EQ(cpu.pc, BASE);
     ASSERT_EQ(mem_read32(cpu.mem, phy_global), 0x50001900u);
-
-    cpu.prid = XTENSA_SPINLOCK_OWNER_CORE0;
-    cpu.ps = (1u << 18) | 1u;
-    cpu.ccount = 100u;
-    cpu.cycle_count = 200u;
-    cpu.insn_count = 0u;
-    mem_write32(cpu.mem, mux, XTENSA_SPINLOCK_FREE);
-    mem_write32(cpu.mem, mux + 4u, 0u);
-    mem_write32(cpu.mem, old_state, 0xDEADBEEFu);
-    mem_write32(cpu.mem, nesting, 0u);
-
-    cpu.pc = enter_critical;
-    cpu._pc_written = true;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, mux);
-    ar_write(&cpu, 3, UINT32_MAX);
-    xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(ar_read(&cpu, 2), 1u);
-    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE0);
-    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 1u);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
-    ASSERT_EQ(mem_read32(cpu.mem, old_state), (1u << 18) | 1u);
-    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 3u);
-    ASSERT_EQ(cpu.scompare1, XTENSA_SPINLOCK_FREE);
-    ASSERT_EQ(cpu.ccount, 141u);
-    ASSERT_EQ64(cpu.cycle_count, 241u);
-    ASSERT_EQ64(cpu.insn_count, 41u);
-
-    /* Recursive acquisition preserves the outer saved interrupt state. */
-    cpu.pc = enter_critical;
-    cpu._pc_written = true;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, mux);
-    ar_write(&cpu, 3, UINT32_MAX);
-    xtensa_step(&cpu);
-    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 2u);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 2u);
-    ASSERT_EQ(mem_read32(cpu.mem, old_state), (1u << 18) | 1u);
-    ASSERT_EQ(cpu.ccount, 178u);
-    ASSERT_EQ64(cpu.cycle_count, 278u);
-    ASSERT_EQ64(cpu.insn_count, 78u);
-
-    cpu.pc = exit_critical;
-    cpu._pc_written = true;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, mux);
-    xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE0);
-    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 1u);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
-    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 3u);
-    ASSERT_EQ(cpu.ccount, 198u);
-    ASSERT_EQ64(cpu.cycle_count, 298u);
-    ASSERT_EQ64(cpu.insn_count, 98u);
-
-    cpu.pc = exit_critical;
-    cpu._pc_written = true;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, mux);
-    xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_FREE);
-    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 0u);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 0u);
-    ASSERT_EQ(XT_PS_INTLEVEL(cpu.ps), 1u);
-    ASSERT_EQ(cpu.ccount, 227u);
-    ASSERT_EQ64(cpu.cycle_count, 327u);
-    ASSERT_EQ64(cpu.insn_count, 127u);
-
-    /* Contention is deliberately not consumed: the real S32C1I loop remains
-     * responsible for yielding to the other emulated core. */
-    put_insn3(&cpu, enter_critical, rom_nop_insn());
-    mem_write32(cpu.mem, mux, XTENSA_SPINLOCK_OWNER_CORE1);
-    cpu.pc = enter_critical;
-    cpu._pc_written = true;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, mux);
-    ar_write(&cpu, 3, UINT32_MAX);
-    xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, enter_critical + 3u);
-    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE1);
-    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 0u);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 0u);
-
-    /* The batch runner must consume the complete native span as one unit,
-     * rather than counting it as one dispatch and overrunning a core's
-     * scheduler slice. */
-    mem_write32(cpu.mem, mux, XTENSA_SPINLOCK_FREE);
-    cpu.pc = enter_critical;
-    cpu._pc_written = true;
-    cpu.running = true;
-    cpu.ccount = 0u;
-    cpu.cycle_count = 0u;
-    cpu.insn_count = 0u;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, mux);
-    ar_write(&cpu, 3, UINT32_MAX);
-    ASSERT_EQ(xtensa_run(&cpu, 41), 41);
-    ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(cpu.ccount, 41u);
-    ASSERT_EQ64(cpu.cycle_count, 41u);
-    ASSERT_EQ64(cpu.insn_count, 41u);
-    ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 1u);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
-
-    /* The multi-heap wrappers consume the same modeled critical operation
-     * without exposing their extra window frame, while retaining the exact
-     * combined instruction/cycle span. */
-    mem_write32(cpu.mem, heap, mux);
-    cpu.pc = heap_unlock;
-    cpu._pc_written = true;
-    cpu.ccount = 0u;
-    cpu.cycle_count = 0u;
-    cpu.insn_count = 0u;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, heap);
-    xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(cpu.ccount, 34u);
-    ASSERT_EQ64(cpu.cycle_count, 34u);
-    ASSERT_EQ64(cpu.insn_count, 34u);
-    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_FREE);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 0u);
-
-    cpu.pc = heap_lock;
-    cpu._pc_written = true;
-    cpu.ccount = 0u;
-    cpu.cycle_count = 0u;
-    cpu.insn_count = 0u;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, heap);
-    xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(cpu.ccount, 47u);
-    ASSERT_EQ64(cpu.cycle_count, 47u);
-    ASSERT_EQ64(cpu.insn_count, 47u);
-    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE0);
-    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
-
-    /* A heap configured without a mutex takes its four-instruction fast path. */
-    mem_write32(cpu.mem, heap, 0u);
-    cpu.pc = heap_lock;
-    cpu._pc_written = true;
-    cpu.ccount = 0u;
-    cpu.cycle_count = 0u;
-    cpu.insn_count = 0u;
-    ar_write(&cpu, 0, BASE);
-    ar_write(&cpu, 2, heap);
-    xtensa_step(&cpu);
-    ASSERT_EQ(cpu.pc, BASE);
-    ASSERT_EQ(cpu.ccount, 4u);
-    ASSERT_EQ64(cpu.cycle_count, 4u);
-    ASSERT_EQ64(cpu.insn_count, 4u);
+    ASSERT_EQ(rom_stubs_total_calls(rom), 2u);
 
     rom_stubs_destroy(rom);
     teardown(&cpu);
@@ -1279,7 +1286,7 @@ TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
     setup(&unsigned_cpu);
     esp32_rom_stubs_t *unsigned_rom = rom_stubs_create(&unsigned_cpu);
     seed_wled_v1601_profile(&unsigned_cpu);
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(unsigned_rom, 0x40083E68u), 1u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(unsigned_rom, 0x40083E68u), 0u);
     rom_stubs_destroy(unsigned_rom);
     teardown(&unsigned_cpu);
 
@@ -1292,7 +1299,7 @@ TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
         seed_wled_v1601_profile(&accelerated);
         seed_wled_v1601_watchpoint(&accelerated);
         esp32_rom_stubs_t *rom = rom_stubs_create(&accelerated);
-        ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 2u);
+        ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 1u);
 
         init_wled_watchpoint_call(&reference, cases[c].id,
                                   cases[c].address, cases[c].size,
@@ -1341,7 +1348,7 @@ TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
     seed_wled_v1601_profile(&boundary);
     seed_wled_v1601_watchpoint(&boundary);
     esp32_rom_stubs_t *boundary_rom = rom_stubs_create(&boundary);
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(boundary_rom, 0x40083E68u), 2u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(boundary_rom, 0x40083E68u), 1u);
     init_wled_watchpoint_call(&boundary, 0u, 0x3FFB1234u, 4u, 2u);
     boundary.next_timer_event = boundary.ccount + 40u;
     ASSERT_EQ(xtensa_step(&boundary), 0u);
@@ -1360,7 +1367,7 @@ TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
     seed_wled_v1601_profile(&batch_edge);
     seed_wled_v1601_watchpoint(&batch_edge);
     esp32_rom_stubs_t *batch_rom = rom_stubs_create(&batch_edge);
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(batch_rom, 0x40083E68u), 2u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(batch_rom, 0x40083E68u), 1u);
     init_wled_watchpoint_call(&batch_edge, 0u, 0x3FFB1234u, 4u, 2u);
     ASSERT_EQ(xtensa_run(&batch_edge, 39), 39u);
     ASSERT_EQ(batch_edge.pc, 0x400903EDu);
@@ -1761,8 +1768,10 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_structural_abi_accels_do_not_require_firmware_profile);
+    RUN_TEST(test_newlib_memcmp_is_relocated_and_cycle_exact);
+    RUN_TEST(test_newlib_memcmp_hook_matches_original_routine);
     RUN_TEST(test_standard_xthal_spill_is_discovered_at_any_iram_address);
-    RUN_TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy);
+    RUN_TEST(test_wled_v1601_uses_structural_memcmp_and_scanned_phy);
     RUN_TEST(test_wled_v1601_watchpoint_hook_matches_original_routine);
     RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
     RUN_TEST(test_tasmota32_requires_complete_fingerprint);
