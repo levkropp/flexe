@@ -1,4 +1,5 @@
 #include "sha_stubs.h"
+#include "firmware_scan.h"
 #include "rom_stubs.h"
 #include "memory.h"
 #include <stdbool.h>
@@ -32,6 +33,7 @@
 
 /* ESP32 has 3 SHA hardware engines; SHA-384 and SHA-512 share one */
 #define SHA_NUM_ENGINES 3
+#define MBED_SHA256_FAMILY_MAX 4
 
 static int sha_engine_index(uint32_t sha_type) {
     switch (sha_type) {
@@ -76,6 +78,8 @@ struct sha_stubs {
         uint32_t    guest_addr;  /* 0 = empty */
         SHA256_CTX  ctx;
     } mbed_sha256[MBED_CTX_SLOTS];
+    uint32_t firmware_sha256_starts[MBED_SHA256_FAMILY_MAX];
+    unsigned firmware_sha256_count;
     struct {
         uint32_t    guest_addr;
         SHA_CTX     ctx;
@@ -745,36 +749,271 @@ static void stub_mbedtls_md5_free(xtensa_cpu_t *cpu, void *ctx) {
     sha_return_void(cpu);
 }
 
-int sha_stubs_hook_firmware_addrs(sha_stubs_t *ss, uint32_t entry_point) {
-    if (!ss || !ss->cpu)
+/* ===== stripped mbedTLS 3 SHA-256 discovery =====
+ *
+ * A native replacement is safe only when every API entry uses the expected
+ * context ABI and every path feeds the same compression implementation. The
+ * old accelerator selected four PCs from one Tasmota release. This matcher
+ * instead fingerprints all six complete functions (including process and
+ * platform zeroize), normalizing only decoded CALLn/L32R relocation bits,
+ * then verifies every relocation's semantic target. The fingerprint follows
+ * this exact mbedTLS implementation across links without following a firmware
+ * name, entry point, or absolute application address. */
+
+#define MBED_SHA256_FREE_DELTA       0x014u
+#define MBED_SHA256_FREE_SIZE        0x012u
+#define MBED_SHA256_STARTS_SIZE      0x06Bu
+#define MBED_SHA256_PROCESS_DELTA    0x06Cu
+#define MBED_SHA256_PROCESS_SIZE     0x876u
+#define MBED_SHA256_UPDATE_DELTA     0x8E4u
+#define MBED_SHA256_UPDATE_SIZE      0x08Du
+#define MBED_SHA256_FINISH_DELTA     0x974u
+#define MBED_SHA256_FINISH_SIZE      0x1BCu
+#define MBED_SHA256_ZEROIZE_DELTA    0xB30u
+#define MBED_SHA256_ZEROIZE_SIZE     0x018u
+#define MBED_SHA256_FAMILY_SIZE      0xB48u
+
+typedef struct {
+    uint32_t free_entry;
+    uint32_t starts_entry;
+    uint32_t process_entry;
+    uint32_t update_entry;
+    uint32_t finish_entry;
+    uint32_t zeroize_entry;
+} mbed_sha256_family_t;
+
+static bool mbed_sha256_l32r_value(xtensa_mem_t *mem, uint32_t pc,
+                                  uint32_t *value_out) {
+    uint32_t literal;
+    return value_out &&
+           firmware_xtensa_l32r_target(mem, pc, &literal) &&
+           firmware_peek(mem, literal, 4u, value_out);
+}
+
+static bool mbed_sha256_l32r_is(xtensa_mem_t *mem, uint32_t pc,
+                               uint32_t expected) {
+    uint32_t value;
+    return mbed_sha256_l32r_value(mem, pc, &value) && value == expected;
+}
+
+static bool mbed_sha256_call_is(xtensa_mem_t *mem, uint32_t pc,
+                               uint32_t expected) {
+    unsigned callinc;
+    uint32_t target;
+    return firmware_xtensa_call_target(mem, pc, &callinc, &target) &&
+           callinc == 2u && target == expected;
+}
+
+static bool mbed_sha256_iv_matches(xtensa_mem_t *mem, uint32_t first_l32r,
+                                  const uint32_t expected[8]) {
+    for (unsigned i = 0u; i < 8u; i++)
+        if (!mbed_sha256_l32r_is(
+                    mem, first_l32r + i * 3u, expected[i]))
+            return false;
+    return true;
+}
+
+static bool mbed_sha256_family_matches(xtensa_mem_t *mem, uint32_t starts,
+                                      mbed_sha256_family_t *family_out) {
+    static const uint32_t sha224_iv[8] = {
+        0xC1059ED8u, 0x367CD507u, 0x3070DD17u, 0xF70E5939u,
+        0xFFC00B31u, 0x68581511u, 0x64F98FA7u, 0xBEFA4FA4u,
+    };
+    static const uint32_t sha256_iv[8] = {
+        0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+        0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u,
+    };
+    static const uint32_t finish_bswap_l32rs[] = {
+        0x03Cu, 0x05Du, 0x085u, 0x0A6u, 0x0C7u,
+        0x0E8u, 0x109u, 0x12Au, 0x14Bu, 0x171u,
+    };
+    const uint32_t rom_bswap32 = 0x40064AE0u;
+
+    if (!mem || !family_out || starts < MBED_SHA256_FREE_DELTA ||
+        starts > UINT32_MAX - MBED_SHA256_FAMILY_SIZE)
+        return false;
+
+    mbed_sha256_family_t family = {
+        .free_entry = starts - MBED_SHA256_FREE_DELTA,
+        .starts_entry = starts,
+        .process_entry = starts + MBED_SHA256_PROCESS_DELTA,
+        .update_entry = starts + MBED_SHA256_UPDATE_DELTA,
+        .finish_entry = starts + MBED_SHA256_FINISH_DELTA,
+        .zeroize_entry = starts + MBED_SHA256_ZEROIZE_DELTA,
+    };
+
+    if (!firmware_xtensa_crc32_matches(
+                mem, family.free_entry, MBED_SHA256_FREE_SIZE,
+                0xBDEC3621u) ||
+        !firmware_xtensa_crc32_matches(
+                mem, family.starts_entry, MBED_SHA256_STARTS_SIZE,
+                0x8BDD1D33u) ||
+        !firmware_xtensa_crc32_matches(
+                mem, family.process_entry, MBED_SHA256_PROCESS_SIZE,
+                0x442D8BE9u) ||
+        !firmware_xtensa_crc32_matches(
+                mem, family.update_entry, MBED_SHA256_UPDATE_SIZE,
+                0x547BE768u) ||
+        !firmware_xtensa_crc32_matches(
+                mem, family.finish_entry, MBED_SHA256_FINISH_SIZE,
+                0xA54ABEFAu) ||
+        !firmware_xtensa_crc32_matches(
+                mem, family.zeroize_entry, MBED_SHA256_ZEROIZE_SIZE,
+                0x2BBFDF6Cu))
+        return false;
+
+    if (!mbed_sha256_iv_matches(
+                mem, family.starts_entry + 0x0Eu, sha224_iv) ||
+        !mbed_sha256_iv_matches(
+                mem, family.starts_entry + 0x50u, sha256_iv) ||
+        !mbed_sha256_call_is(
+                mem, family.free_entry + 0x0Cu, family.zeroize_entry) ||
+        !mbed_sha256_call_is(
+                mem, family.process_entry + 0x866u,
+                family.zeroize_entry) ||
+        !mbed_sha256_call_is(
+                mem, family.update_entry + 0x3Fu,
+                family.process_entry) ||
+        !mbed_sha256_call_is(
+                mem, family.update_entry + 0x56u,
+                family.process_entry) ||
+        !mbed_sha256_call_is(
+                mem, family.finish_entry + 0x7Fu,
+                family.process_entry) ||
+        !mbed_sha256_call_is(
+                mem, family.finish_entry + 0x191u,
+                family.free_entry) ||
+        !mbed_sha256_call_is(
+                mem, family.finish_entry + 0x1B0u,
+                family.process_entry))
+        return false;
+
+    uint32_t memcpy_entry;
+    uint32_t update_memcpy_first;
+    uint32_t update_memcpy_last;
+    uint32_t memset_entry;
+    uint32_t finish_memset_last;
+    uint32_t helper_insn;
+    if (!mbed_sha256_l32r_value(
+                mem, family.process_entry + 0x12u, &memcpy_entry) ||
+        !mbed_sha256_l32r_value(
+                mem, family.update_entry + 0x30u,
+                &update_memcpy_first) ||
+        !mbed_sha256_l32r_value(
+                mem, family.update_entry + 0x80u,
+                &update_memcpy_last) ||
+        update_memcpy_first != memcpy_entry ||
+        update_memcpy_last != memcpy_entry ||
+        !firmware_peek(mem, memcpy_entry, 3u, &helper_insn) ||
+        !firmware_xtensa_is_entry(helper_insn) ||
+        !mbed_sha256_l32r_value(
+                mem, family.finish_entry + 0x2Au, &memset_entry) ||
+        !mbed_sha256_l32r_value(
+                mem, family.finish_entry + 0x1A4u,
+                &finish_memset_last) ||
+        finish_memset_last != memset_entry ||
+        !firmware_peek(mem, memset_entry, 3u, &helper_insn) ||
+        !firmware_xtensa_is_entry(helper_insn) ||
+        !mbed_sha256_l32r_is(
+                mem, family.process_entry + 0x41u, rom_bswap32))
+        return false;
+    for (size_t i = 0u;
+         i < sizeof(finish_bswap_l32rs) /
+                 sizeof(finish_bswap_l32rs[0]); i++)
+        if (!mbed_sha256_l32r_is(
+                    mem, family.finish_entry + finish_bswap_l32rs[i],
+                    rom_bswap32))
+            return false;
+
+    uint32_t constants;
+    uint32_t zeroize_slot;
+    uint32_t zeroize_fn;
+    if (!mbed_sha256_l32r_value(
+                mem, family.process_entry + 0x4Cu, &constants) ||
+        !firmware_crc32_matches(
+                mem, constants, 64u * sizeof(uint32_t), 0x296FDE2Au) ||
+        !mbed_sha256_l32r_value(
+                mem, family.zeroize_entry + 0x07u, &zeroize_slot) ||
+        !firmware_peek(mem, zeroize_slot, 4u, &zeroize_fn) ||
+        zeroize_fn != memset_entry)
+        return false;
+
+    *family_out = family;
+    return true;
+}
+
+static bool mbed_sha256_family_already_hooked(
+        const sha_stubs_t *ss, uint32_t starts) {
+    for (unsigned i = 0u; i < ss->firmware_sha256_count; i++)
+        if (ss->firmware_sha256_starts[i] == starts)
+            return true;
+    return false;
+}
+
+static int mbed_sha256_scan_range(sha_stubs_t *ss,
+                                  uint32_t start, uint32_t end) {
+    static const uint8_t starts_prefix[] = {
+        0x36, 0x41, 0x00, 0x8D, 0x02, 0x22,
+        0xAF, 0x8C, 0xF6, 0x23, 0x3F, 0x16,
+    };
+    int hooked = 0;
+    uint32_t cursor = start;
+    uint32_t starts;
+    while (ss->firmware_sha256_count < MBED_SHA256_FAMILY_MAX &&
+           firmware_find_xtensa_crc32_body(
+                ss->cpu->mem, cursor, end, starts_prefix,
+                sizeof(starts_prefix), MBED_SHA256_STARTS_SIZE,
+                0x8BDD1D33u, &starts)) {
+        mbed_sha256_family_t family;
+        if (!mbed_sha256_family_already_hooked(ss, starts) &&
+            mbed_sha256_family_matches(ss->cpu->mem, starts, &family)) {
+            struct {
+                uint32_t addr;
+                rom_stub_fn fn;
+                const char *name;
+            } hooks[] = {
+                {family.free_entry, stub_mbedtls_sha256_free,
+                 "mbedtls_sha256_free"},
+                {family.starts_entry, stub_mbedtls_sha256_starts,
+                 "mbedtls_sha256_starts"},
+                {family.update_entry, stub_mbedtls_sha256_update,
+                 "mbedtls_sha256_update"},
+                {family.finish_entry, stub_mbedtls_sha256_finish,
+                 "mbedtls_sha256_finish"},
+            };
+            bool installed = true;
+            for (size_t i = 0u; i < sizeof(hooks) / sizeof(hooks[0]); i++)
+                installed &= rom_stubs_register_exact_ctx(
+                        ss->rom, hooks[i].addr, hooks[i].fn,
+                        hooks[i].name, ss) == 0;
+            if (installed) {
+                ss->firmware_sha256_starts[
+                    ss->firmware_sha256_count++] = starts;
+                hooked += 4;
+                fprintf(stderr,
+                        "[sha] discovered mbedTLS SHA-256 family at "
+                        "0x%08X\n", starts);
+            }
+        }
+        cursor = starts + 1u;
+    }
+    return hooked;
+}
+
+int sha_stubs_hook_firmware(sha_stubs_t *ss) {
+    if (!ss || !ss->cpu || !ss->cpu->mem)
         return 0;
     esp32_rom_stubs_t *rom = ss->cpu->pc_hook_ctx;
-    if (!rom || rom_stubs_identify_firmware(rom, entry_point) !=
-                    ROM_FIRMWARE_TASMOTA32_V1560)
+    if (!rom)
         return 0;
-
-    /* Tasmota 15.6.0's mbedTLS 3 SHA-256 entries, independently relocated
-     * from a symbol-bearing build of the exact release tag. Keeping the
-     * starts/update/finish boundary together means the native OpenSSL context
-     * is never mixed with a partially interpreted guest context. */
-    struct {
-        uint32_t addr;
-        rom_stub_fn fn;
-        const char *name;
-    } hooks[] = {
-        { 0x401E11B4u, stub_mbedtls_sha256_free,   "mbedtls_sha256_free" },
-        { 0x401E11C8u, stub_mbedtls_sha256_starts, "mbedtls_sha256_starts" },
-        { 0x401E1AACu, stub_mbedtls_sha256_update, "mbedtls_sha256_update" },
-        { 0x401E1B3Cu, stub_mbedtls_sha256_finish, "mbedtls_sha256_finish" },
-        { 0, NULL, NULL },
-    };
     ss->rom = rom;
-    int hooked = 0;
-    for (int i = 0; hooks[i].fn; i++) {
-        rom_stubs_register_ctx(rom, hooks[i].addr, hooks[i].fn,
-                               hooks[i].name, ss);
-        hooked++;
-    }
+
+    int hooked = mbed_sha256_scan_range(
+            ss, ESP32_FIRMWARE_INSN_ADDR_LOW,
+            ESP32_IRAM_INSN_ADDR_HIGH);
+    hooked += mbed_sha256_scan_range(
+            ss, ESP32_FLASH_INSN_ADDR_LOW,
+            ESP32_FLASH_INSN_ADDR_HIGH);
     return hooked;
 }
 

@@ -15,6 +15,7 @@ typedef struct xtensa_cpu xtensa_cpu_t;
 #define ESP32_FIRMWARE_INSN_ADDR_LOW 0x40070000u
 #define ESP32_IRAM_INSN_ADDR_HIGH    0x400C0000u
 #define ESP32_FLASH_INSN_ADDR_LOW    0x400D0000u
+#define ESP32_FLASH_INSN_ADDR_HIGH   0x40400000u
 #define ESP32_INSN_ADDR_HIGH         0x40C00000u
 
 /* Structurally discovered ESP-IDF cross-core flash wait loops. Keep the set

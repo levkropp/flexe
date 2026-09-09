@@ -60,10 +60,11 @@ bool firmware_signature_matches_except(xtensa_mem_t *mem, uint32_t addr,
     return true;
 }
 
-static bool firmware_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
-                                   size_t size, uint32_t expected) {
+bool firmware_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
+                            size_t size, uint32_t expected) {
     if (!mem || size == 0u || size - 1u > UINT32_MAX - addr)
         return false;
+
     uLong crc = crc32(0L, Z_NULL, 0);
     for (size_t i = 0u; i < size; i++) {
         const uint8_t *byte = mem_get_ptr(mem, addr + (uint32_t)i);
@@ -74,10 +75,50 @@ static bool firmware_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
     return (uint32_t)crc == expected;
 }
 
-bool firmware_find_crc32_body(xtensa_mem_t *mem, uint32_t start,
-                              uint32_t end, const uint8_t *prefix,
-                              size_t prefix_size, size_t body_size,
-                              uint32_t expected_crc, uint32_t *addr_out) {
+bool firmware_xtensa_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
+                                   size_t size, uint32_t expected) {
+    if (!mem || size == 0u || size - 1u > UINT32_MAX - addr)
+        return false;
+
+    uLong crc = crc32(0L, Z_NULL, 0);
+    size_t offset = 0u;
+    while (offset < size) {
+        uint8_t bytes[3];
+        const uint8_t *first = mem_get_ptr(mem, addr + (uint32_t)offset);
+        if (!first)
+            return false;
+        size_t length = (*first & 0x08u) ? 2u : 3u;
+        if (length > size - offset)
+            return false;
+        for (size_t i = 0u; i < length; i++) {
+            const uint8_t *byte = mem_get_ptr(
+                    mem, addr + (uint32_t)(offset + i));
+            if (!byte)
+                return false;
+            bytes[i] = *byte;
+        }
+
+        if (length == 3u && (bytes[0] & 0x0Fu) == 1u) {
+            /* L32R: preserve its opcode and destination register. */
+            bytes[1] = 0u;
+            bytes[2] = 0u;
+        } else if (length == 3u && (bytes[0] & 0x0Fu) == 5u) {
+            /* CALLn: preserve op0 and CALLINC (bits 4..5), normalize the
+             * 18-bit PC-relative offset in bits 6..23. */
+            bytes[0] &= 0x3Fu;
+            bytes[1] = 0u;
+            bytes[2] = 0u;
+        }
+        crc = crc32(crc, bytes, (uInt)length);
+        offset += length;
+    }
+    return (uint32_t)crc == expected;
+}
+
+static bool firmware_find_crc32_body_kind(
+        xtensa_mem_t *mem, uint32_t start, uint32_t end,
+        const uint8_t *prefix, size_t prefix_size, size_t body_size,
+        uint32_t expected_crc, uint32_t *addr_out, bool xtensa_body) {
     if (!mem || !prefix || !addr_out || prefix_size == 0u ||
         prefix_size > body_size || start >= end ||
         body_size > (size_t)(end - start))
@@ -87,13 +128,37 @@ bool firmware_find_crc32_body(xtensa_mem_t *mem, uint32_t start,
     for (uint32_t addr = start; addr <= last; addr++) {
         const uint8_t *first = mem_get_ptr(mem, addr);
         if (!first || *first != prefix[0] ||
-            !firmware_signature_matches(mem, addr, prefix, prefix_size) ||
-            !firmware_crc32_matches(mem, addr, body_size, expected_crc))
+            !firmware_signature_matches(mem, addr, prefix, prefix_size))
+            continue;
+        bool matches = xtensa_body
+                     ? firmware_xtensa_crc32_matches(
+                            mem, addr, body_size, expected_crc)
+                     : firmware_crc32_matches(
+                            mem, addr, body_size, expected_crc);
+        if (!matches)
             continue;
         *addr_out = addr;
         return true;
     }
     return false;
+}
+
+bool firmware_find_crc32_body(xtensa_mem_t *mem, uint32_t start,
+                              uint32_t end, const uint8_t *prefix,
+                              size_t prefix_size, size_t body_size,
+                              uint32_t expected_crc, uint32_t *addr_out) {
+    return firmware_find_crc32_body_kind(
+            mem, start, end, prefix, prefix_size, body_size, expected_crc,
+            addr_out, false);
+}
+
+bool firmware_find_xtensa_crc32_body(
+        xtensa_mem_t *mem, uint32_t start, uint32_t end,
+        const uint8_t *prefix, size_t prefix_size, size_t body_size,
+        uint32_t expected_crc, uint32_t *addr_out) {
+    return firmware_find_crc32_body_kind(
+            mem, start, end, prefix, prefix_size, body_size, expected_crc,
+            addr_out, true);
 }
 
 bool firmware_xtensa_is_entry(uint32_t insn) {

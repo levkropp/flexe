@@ -283,48 +283,27 @@ TEST(sha_accelerator_matches_known_answers) {
     teardown(&cpu);
 }
 
-static void invoke_sha_call0_3(xtensa_cpu_t *cpu, uint32_t addr,
-                               uint32_t arg0, uint32_t arg1, uint32_t arg2) {
-    cpu->pc = addr;
-    cpu->_pc_written = true;
-    XT_PS_SET_CALLINC(cpu->ps, 0);
-    ar_write(cpu, 0, BASE + 0x100u);
-    ar_write(cpu, 2, arg0);
-    ar_write(cpu, 3, arg1);
-    ar_write(cpu, 4, arg2);
-    xtensa_step(cpu);
-    ASSERT_EQ(cpu->pc, BASE + 0x100u);
-}
-
-TEST(tasmota_profile_accelerates_mbedtls_sha256) {
+TEST(firmware_profile_does_not_authorize_mbedtls_sha256) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
     sha_stubs_t *ss = sha_stubs_create(&cpu);
     ASSERT_TRUE(ss != NULL);
-    ASSERT_EQ(sha_stubs_hook_firmware_addrs(ss, 0x40082A58u), 0);
+    int initial_stub_count = rom_stubs_stub_count(rom);
+    ASSERT_EQ(sha_stubs_hook_firmware(ss), 0);
 
+    /* A recognized release profile and bytes at its former absolute entries
+     * are no longer sufficient. Only the complete relocation-normalized
+     * implementation family can install native SHA hooks. */
     seed_tasmota32_v1560_profile(&cpu);
-    ASSERT_EQ(sha_stubs_hook_firmware_addrs(ss, 0x40082A58u), 4);
-
-    const uint32_t ctx = 0x3FFB1000u;
-    const uint32_t input = 0x3FFB1FFEu; /* deliberately crosses a page */
-    const uint32_t output = 0x3FFB3000u;
-    static const uint8_t message[] = { 'a', 'b', 'c' };
-    static const uint8_t expected[32] = {
-        0xBA, 0x78, 0x16, 0xBF, 0x8F, 0x01, 0xCF, 0xEA,
-        0x41, 0x41, 0x40, 0xDE, 0x5D, 0xAE, 0x22, 0x23,
-        0xB0, 0x03, 0x61, 0xA3, 0x96, 0x17, 0x7A, 0x9C,
-        0xB4, 0x10, 0xFF, 0x61, 0xF2, 0x00, 0x15, 0xAD,
+    static const uint8_t former_starts_prefix[] = {
+        0x36, 0x41, 0x00, 0x8D, 0x02, 0x22,
+        0xAF, 0x8C, 0xF6, 0x23, 0x3F, 0x16,
     };
-    put_test_bytes(&cpu, input, message, sizeof(message));
-
-    invoke_sha_call0_3(&cpu, 0x401E11C8u, ctx, 0u, 0u);
-    invoke_sha_call0_3(&cpu, 0x401E1AACu, ctx, input, sizeof(message));
-    invoke_sha_call0_3(&cpu, 0x401E1B3Cu, ctx, output, 0u);
-    for (size_t i = 0; i < sizeof(expected); i++)
-        ASSERT_EQ(mem_read8(cpu.mem, output + (uint32_t)i), expected[i]);
-    invoke_sha_call0_3(&cpu, 0x401E11B4u, ctx, 0u, 0u);
+    put_test_bytes(&cpu, 0x401E11C8u, former_starts_prefix,
+                   sizeof(former_starts_prefix));
+    ASSERT_EQ(sha_stubs_hook_firmware(ss), 0);
+    ASSERT_EQ(rom_stubs_stub_count(rom), initial_stub_count);
 
     sha_stubs_destroy(ss);
     rom_stubs_destroy(rom);
@@ -334,7 +313,7 @@ TEST(tasmota_profile_accelerates_mbedtls_sha256) {
 static void run_crypto_tests(void) {
     TEST_SUITE("Crypto MMIO");
     RUN_TEST(sha_accelerator_matches_known_answers);
-    RUN_TEST(tasmota_profile_accelerates_mbedtls_sha256);
+    RUN_TEST(firmware_profile_does_not_authorize_mbedtls_sha256);
     RUN_TEST(raw_aes_128_encrypt_decrypt);
     RUN_TEST(raw_aes_192_encrypt_decrypt);
     RUN_TEST(raw_aes_256_encrypt_decrypt);
