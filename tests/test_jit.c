@@ -1582,6 +1582,46 @@ TEST(test_jit_window_guard_checks_only_touched_windows) {
     teardown(&cpu);
 }
 
+TEST(test_jit_head_window_collision_raises_guest_vector) {
+    xtensa_cpu_t expected, actual;
+    setup(&expected);
+    expected.real_window_vectors = true;
+    expected.vecbase = BASE;
+    expected.ps = 1u << 18; /* WOE, outside an exception */
+    expected.windowbase = 1u;
+    /* MOV.N a9,a3 reaches WB+2. The nearest collision is WB+1, whose
+     * following live window selects the Overflow8 vector. */
+    expected.windowstart = (1u << 1) | (1u << 2) | (1u << 4);
+    ar_write(&expected, 3, 0x12345678u);
+    put_insn2(&expected, BASE, narrow(0xD, 0, 3, 9));
+    memcpy(&actual, &expected, sizeof(actual));
+
+    ASSERT_EQ(xtensa_step(&expected), 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        teardown(&expected);
+        return;
+    }
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &actual, BASE);
+    jit_block_fn fn = jit_get_block(jit, &actual, BASE);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_EQ(fn(&actual), 1);
+
+    ASSERT_EQ(compare_state(&expected, &actual,
+                            "head_window_overflow_vector"), 0);
+    ASSERT_EQ(actual.pc, BASE + VECOFS_WINDOW_OVERFLOW8);
+    ASSERT_EQ(actual.epc[0], BASE);
+    ASSERT_EQ(actual.windowbase, 2u);
+    ASSERT_EQ(XT_PS_OWB(actual.ps), 1u);
+    ASSERT_TRUE(XT_PS_EXCM(actual.ps));
+
+    jit_destroy(jit);
+    teardown(&expected);
+}
+
 /* WSR PS can enable window exceptions in the middle of a block. When a later
  * high-register operand collides, the entry guard must not rely only on the
  * old PS value; it returns to the interpreter so the precise access faults. */
@@ -2951,16 +2991,19 @@ TEST(test_jit_entry_ignores_unrelated_live_window) {
     ASSERT_EQ(ar_read(&cpu, 1), BASE + 0x2000u - 32u);
 
     /* Reuse that same compiled block with a larger CALLINC. The now-reached
-     * bit 5 is a real collision, so ENTRY itself must remain unexecuted for
-     * the interpreter/window vector to handle precisely. */
+     * bit 5 is a real collision, so compiled ENTRY must take the architectural
+     * transition without modifying its destination window first. */
     cpu.ps = (1u << 18) | (3u << 16);
     cpu.windowbase = 2;
     cpu.windowstart = (1u << 2) | (1u << 5);
     cpu.pc = BASE;
     ar_write(&cpu, 1, BASE + 0x2000);
-    ASSERT_EQ(fn(&cpu), 3);
-    ASSERT_EQ(cpu.pc, BASE + 6u);
-    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(fn(&cpu), 4);
+    ASSERT_EQ(cpu.pc, BASE + VECOFS_WINDOW_OVERFLOW12);
+    ASSERT_EQ(cpu.epc[0], BASE + 6u);
+    ASSERT_EQ(cpu.windowbase, 5u);
+    ASSERT_EQ(XT_PS_OWB(cpu.ps), 2u);
+    ASSERT_TRUE(XT_PS_EXCM(cpu.ps));
     ASSERT_EQ(cpu.windowstart, (1u << 2) | (1u << 5));
 
     /* The pre-vector compatibility path intentionally spills farther ahead
@@ -3197,6 +3240,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);
     RUN_TEST(test_jit_call8_return_address_survives_the_exit_flush);
     RUN_TEST(test_jit_window_guard_checks_only_touched_windows);
+    RUN_TEST(test_jit_head_window_collision_raises_guest_vector);
     RUN_TEST(test_jit_window_guard_handles_mid_block_woe_enable);
     RUN_TEST(test_jit_window_collision_falls_back_before_callx8);
     RUN_TEST(test_jit_self_loop_early_exit_flushes_later_writes);

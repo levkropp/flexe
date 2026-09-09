@@ -633,6 +633,55 @@ static inline uint32_t window_overflow_vec(xtensa_cpu_t *cpu, int w) {
     return VECOFS_WINDOW_OVERFLOW4 + (uint32_t)(d - 1) * 0x80u;
 }
 
+bool xtensa_try_window_overflow_exception(xtensa_cpu_t *cpu,
+                                          uint32_t fault_pc,
+                                          unsigned window_need) {
+    if (!cpu || window_need == 0u || !cpu->real_window_vectors ||
+        !XT_PS_WOE(cpu->ps) || XT_PS_EXCM(cpu->ps))
+        return false;
+
+    if (window_need > 3u) window_need = 3u;
+    int hit = -1;
+    for (unsigned adjacent = 1; adjacent <= window_need; adjacent++) {
+        int w = ((int)cpu->windowbase + (int)adjacent) & 0xF;
+        if (cpu->windowstart & (1u << w)) {
+            hit = w;
+            break;
+        }
+    }
+    if (hit < 0) return false;
+
+    uint32_t vecofs = window_overflow_vec(cpu, hit);
+    if (!window_vectors_ready(cpu, vecofs))
+        return false;
+    raise_window_exception(cpu, fault_pc, hit, vecofs);
+    return true;
+}
+
+bool xtensa_try_entry_overflow_exception(xtensa_cpu_t *cpu,
+                                         uint32_t fault_pc) {
+    if (!cpu || !cpu->real_window_vectors || !XT_PS_WOE(cpu->ps) ||
+        XT_PS_EXCM(cpu->ps))
+        return false;
+
+    unsigned callinc = (unsigned)XT_PS_CALLINC(cpu->ps);
+    int hit = -1;
+    for (unsigned adjacent = 1; adjacent <= callinc; adjacent++) {
+        int w = ((int)cpu->windowbase + (int)adjacent) & 0xF;
+        if (cpu->windowstart & (1u << w)) {
+            hit = w;
+            break;
+        }
+    }
+    if (hit < 0) return false;
+
+    uint32_t vecofs = window_overflow_vec(cpu, hit);
+    if (!window_vectors_ready(cpu, vecofs))
+        return false;
+    raise_window_exception(cpu, fault_pc, hit, vecofs);
+    return true;
+}
+
 static inline unsigned window_need2(unsigned a, unsigned b) {
     return (a > b ? a : b) >> 2;
 }
@@ -822,13 +871,7 @@ static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
     unsigned need = window_operand_need(cpu, insn, ilen);
     if (need == 0u || (hazard & ((1u << need) - 1u)) == 0u)
         return false;
-    int j = (hazard & 1u) ? 1 : ((hazard & 2u) ? 2 : 3);
-    int w = (cpu->windowbase + j) & 0xF;
-    uint32_t vecofs = window_overflow_vec(cpu, w);
-    if (!window_vectors_ready(cpu, vecofs))
-        return false;   /* pre-vector startup: the synthesized check carries it */
-    raise_window_exception(cpu, cpu->pc, w, vecofs);
-    return true;
+    return xtensa_try_window_overflow_exception(cpu, cpu->pc, need);
 }
 
 
@@ -2577,19 +2620,13 @@ bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                              window_vectors_ready(cpu,
                                                   VECOFS_WINDOW_OVERFLOW4);
               if (ent_vec) {
-                  int hit = -1;
-                  for (int i = 1; i <= callinc; i++) {
-                      int w = (cpu->windowbase + i) & 0xF;
-                      if (cpu->windowstart & (1u << w)) { hit = w; break; }
-                  }
-                  if (hit >= 0) {
+                  if (xtensa_try_entry_overflow_exception(
+                          cpu, cpu->pc - 3u)) {
                       /* ENTRY is restartable.  In particular, its destination
                        * a(4*CALLINC+s) is part of the window that just
                        * collided.  Writing the new SP before taking the
                        * exception destroys that live frame before the guest's
                        * overflow vector can save it. */
-                      raise_window_exception(cpu, cpu->pc - 3, hit,
-                                             window_overflow_vec(cpu, hit));
                       return false;
                   }
               } else {

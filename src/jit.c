@@ -1034,6 +1034,13 @@ static uint32_t jit_retw_underflow_helper(xtensa_cpu_t *cpu,
     return xtensa_try_retw_underflow_exception(cpu, fault_pc) ? 1u : 0u;
 }
 
+static uint32_t jit_entry_overflow_helper(xtensa_cpu_t *cpu,
+                                          uint32_t fault_pc,
+                                          uint32_t unused) {
+    (void)unused;
+    return xtensa_try_entry_overflow_exception(cpu, fault_pc) ? 1u : 0u;
+}
+
 /* Integer divide. QUOU alone accounts for 1,042 of the 1,639 instructions the
  * scanner could not compile on a Marauder run -- the single largest reason
  * blocks get truncated after the LOOP family.
@@ -2887,13 +2894,26 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                                      entry_chain_site);
                 }
 
-                /* Overflow fallback: interpreter handles it */
+                /* A real ENTRY collision is an architectural control-flow
+                 * transition, so enter the guest's vector without decoding
+                 * ENTRY a second time. Pre-vector and synthetic compatibility
+                 * states still resume at the exact instruction in C. */
                 for (int i = 0; i < overflow_fb_count; i++)
                     emit_patch_rel32(e, overflow_fb[i]);
                 /* Dirty bits deliberately survive the main-path ra_flush(),
                  * so this emits the same valid writeback without storing
                  * host registers that were never loaded on the fallback. */
                 ra_flush(e, ra, wb4);
+                emit_mov_reg_imm32(e, RAX, pc);
+                emit_mov_reg_imm32(e, RBX, 0);
+                emit_call_cpu3(e,
+                    (void *)(uintptr_t)jit_entry_overflow_helper, RAX, RBX);
+                emit_test_reg32(e, RAX, RAX);
+                int legacy_overflow = emit_jcc_rel32(e, CC_E);
+                emit_acc_add(e, insn_idx + 1);
+                emit_jmp_to_epilogue(e, jit);
+
+                emit_patch_rel32(e, legacy_overflow);
                 emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc);
                 emit_acc_add(e, insn_idx);  /* ENTRY itself didn't run */
                 emit_jmp_to_epilogue(e, jit);
@@ -3423,14 +3443,15 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     emit_fwd_barrier(&e);   /* chained blocks enter here */
     uint8_t *chain_entry = e.ptr;
 
-    /* Native blocks address the physical AR file directly, so they cannot
-     * discover a register-window collision the way xtensa_step() does before
-     * each instruction. Determine the highest adjacent window this block's
-     * actual AR operands touch and guard only that prefix. A block confined
-     * to a0-a3 needs no check; a block reaching a4-a7 checks WB+1, and so on.
-     * If a guarded collision exists, execute from this block head in the
-     * interpreter until the exact accessing instruction raises its guest
-     * vector. This check is at the chain entry as well as the C entry:
+    /* Native blocks address the physical AR file directly, so they must test
+     * register-window collisions before touching an aliased high register.
+     * Determine the highest adjacent window this block's actual operands
+     * reach. A block confined to a0-a3 needs no check; a block reaching a4-a7
+     * checks WB+1, and so on. If the first instruction is itself the faulting
+     * access, take the architectural exception here and enter the arbitrary
+     * guest vector directly. A later fault still resumes in the interpreter,
+     * which preserves every prefix side effect before raising at the precise
+     * PC. This guard is at the chain entry as well as the C entry:
      * CALL8/CALLX8 commonly reaches a compiled callee without returning to
      * the dispatcher.
      *
@@ -3440,6 +3461,7 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
      * instruction that really crosses the boundary.  Collisions occur only
      * when the 64-register ring wraps, so this slow path is cold. */
     unsigned window_need = 0;
+    unsigned head_window_need = 0;
     bool writes_ps = false;
     for (int i = 0; i < scan->count; i++) {
         /* ENTRY depends on runtime PS.CALLINC and has a dedicated dynamic
@@ -3452,19 +3474,21 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         unsigned need = is_entry ? 0u :
                         xtensa_window_operand_need(cpu, scan->insns[i],
                                                    scan->ilens[i]);
+        if (i == 0) head_window_need = need;
         if (need > window_need) window_need = need;
         if (scan->ilens[i] == 3 && XT_OP0(scan->insns[i]) == 0 &&
             XT_OP1(scan->insns[i]) == 3 && XT_OP2(scan->insns[i]) == 1 &&
             XT_SR_NUM(scan->insns[i]) == XT_SR_PS)
             writes_ps = true;
     }
+    int window_collision = -1;
     if (window_need > 0) {
         const uint32_t w = (uint32_t)wb4 >> 2;
         uint32_t collision_mask = 0;
         for (unsigned adjacent = 1; adjacent <= window_need; adjacent++)
             collision_mask |= 1u << ((w + adjacent) & 15u);
 
-        int window_safe[2];
+        int window_safe[1];
         int window_safe_count = 0;
         /* A mid-block WSR PS can enable WOE before a later high-register
          * access. In that rare case, a live collision always falls back so
@@ -3477,10 +3501,7 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         }
         emit_load_cpu32(&e, RAX, (int32_t)CPU_OFF_WINDOWSTART);
         emit_test_reg32_imm32(&e, RAX, collision_mask);
-        window_safe[window_safe_count++] = emit_jcc_rel32(&e, CC_E);
-        emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_PC, pc);
-        emit_store32_disp_imm(&e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
-        emit_jmp_to_epilogue(&e, jit);
+        window_collision = emit_jcc_rel32(&e, CC_NE);
         for (int i = 0; i < window_safe_count; i++)
             emit_patch_rel32(&e, window_safe[i]);
     }
@@ -3619,6 +3640,35 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         } else {
             emit_side_exit_body(&e, &ra, wb4, &sx[k], jit);
         }
+    }
+
+    /* Keep the uncommon register-window transition out of the hot block
+     * layout. The prologue's single collision branch lands here only when a
+     * live aliased window exists; ordinary execution falls straight into the
+     * register allocator and body above. */
+    if (window_collision >= 0) {
+        emit_patch_rel32(&e, window_collision);
+        if (head_window_need > 0u) {
+            /* Ask the CPU model whether the head instruction is the precise
+             * fault. A collision first reached later in the block makes the
+             * helper decline and retains the interpreter's prefix effects. */
+            emit_mov_reg_imm32(&e, RAX, pc);
+            emit_mov_reg_imm32(&e, RBX, head_window_need);
+            emit_call_cpu3(
+                &e, (void *)(uintptr_t)xtensa_try_window_overflow_exception,
+                RAX, RBX);
+            emit_test_reg32(&e, RAX, RAX);
+            int exact_fallback = emit_jcc_rel32(&e, CC_E);
+            emit_acc_add(&e, 1);
+            emit_jmp_to_epilogue(&e, jit);
+            emit_patch_rel32(&e, exact_fallback);
+        }
+        /* The helper declines later faults, legacy mode, disabled WOE and
+         * unavailable guest vectors without mutation. */
+        emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_PC, pc);
+        emit_store32_disp_imm(&e, REG_CPU,
+                              (int32_t)CPU_OFF_PC_WRITTEN, 1);
+        emit_jmp_to_epilogue(&e, jit);
     }
 
     if (!emit_ok(&e)) { jit_wx_write_end(code_start, 0); return NULL; }

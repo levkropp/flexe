@@ -621,6 +621,17 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
 void xtensa_check_interrupts(xtensa_cpu_t *cpu);
 void xtensa_flush_windows(xtensa_cpu_t *cpu);
 
+/* Perform the architectural exception transition for a high-register access
+ * that reaches a live aliased window, or for ENTRY crossing a live window.
+ * The access form is expressed as the highest adjacent logical window touched
+ * (a4-a7 => 1, a8-a11 => 2, a12-a15 => 3). Both return false without changing
+ * state when no exception applies or guest vectors are unavailable. */
+bool xtensa_try_window_overflow_exception(xtensa_cpu_t *cpu,
+                                          uint32_t fault_pc,
+                                          unsigned window_need);
+bool xtensa_try_entry_overflow_exception(xtensa_cpu_t *cpu,
+                                         uint32_t fault_pc);
+
 /* Perform the architectural exception transition for a RETW whose caller
  * window is not resident. Returns false without changing state when the guest
  * vectors are unavailable or the legacy shadow-fill path is authoritative. */
