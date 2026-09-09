@@ -91,9 +91,11 @@ and `MAX_UNMAPPED` override its 10,000-instruction scheduling quantum and
 
 ## JIT coverage
 
-The current WLED run executes about 97% of retired instructions in native
-blocks. Coverage is workload-specific and is not itself a speed score; use an
-interleaved A/B and compare observable output when evaluating JIT changes.
+In a six-billion-cycle WLED 16.0.1 scenario on 2026-09-09, compiled blocks
+execute 80.6% of retired instructions. The remaining count includes work
+performed by architectural and service hooks, so it is not all interpreter
+dispatch. Coverage is workload-specific and is not itself a speed score; use
+an interleaved A/B and compare observable output when evaluating JIT changes.
 
 ## Profiling
 

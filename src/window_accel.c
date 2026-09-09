@@ -10,8 +10,6 @@
 #include <limits.h>
 #include <string.h>
 
-extern int g_flexe_shadow_fill;
-
 /* These are the Xtensa windowed-ABI handlers shipped by classic ESP32
  * toolchains. They contain no link-specific addresses: each body consists
  * only of the architecturally defined S32E/L32E save-area accesses followed
@@ -88,33 +86,6 @@ bool xtensa_window_vectors_are_canonical(xtensa_mem_t *mem, uint32_t base) {
                    canonical_underflow12, sizeof(canonical_underflow12));
 }
 
-static inline uint32_t phys_read_accel(const xtensa_cpu_t *cpu, int window,
-                                       int reg) {
-    return cpu->ar[((window * 4) + reg) & 63];
-}
-
-static int window_callsize_accel(const xtensa_cpu_t *cpu, int window) {
-    int callsize = cpu->window_callsize[window & 15];
-    if (callsize == 0)
-        callsize = (int)(phys_read_accel(cpu, window, 0) >> 30) & 3;
-    return callsize == 0 ? 2 : callsize;
-}
-
-static int find_callee_accel(const xtensa_cpu_t *cpu, int caller) {
-    int window = (int)cpu->windowbase;
-    for (int steps = 0; steps < 16; steps++) {
-        int previous = (window - window_callsize_accel(cpu, window)) & 15;
-        if (previous == caller) return window;
-        window = previous;
-        if (window == (int)cpu->windowbase) break;
-    }
-    for (int distance = 1; distance < 16; distance++) {
-        int candidate = (caller + distance) & 15;
-        if (cpu->windowstart & (1u << candidate)) return candidate;
-    }
-    return caller;
-}
-
 static void window_hazard_refresh_accel(xtensa_cpu_t *cpu) {
     if (!cpu->real_window_vectors) {
         cpu->window_hazard = 0u;
@@ -124,16 +95,6 @@ static void window_hazard_refresh_accel(xtensa_cpu_t *cpu) {
     unsigned shift = (cpu->windowbase + 1u) & 15u;
     cpu->window_hazard =
         (uint8_t)(((windows | (windows << 16)) >> shift) & 7u);
-}
-
-static bool word_mapped(xtensa_mem_t *mem, uint32_t addr, bool write) {
-    if (addr > UINT32_MAX - 3u) return false;
-    if (write) {
-        return mem_get_ptr_w(mem, addr) != NULL &&
-               mem_get_ptr_w(mem, addr + 3u) != NULL;
-    }
-    return mem_get_ptr(mem, addr) != NULL &&
-           mem_get_ptr(mem, addr + 3u) != NULL;
 }
 
 static uint8_t *ram_range(xtensa_mem_t *mem, uint32_t addr,
@@ -234,47 +195,5 @@ bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
     window_hazard_refresh_accel(cpu);
     cpu->pc = cpu->epc[0];
     cpu->_pc_written = true;
-    return true;
-}
-
-bool xtensa_fast_spill_all_windows(xtensa_cpu_t *cpu) {
-    if (!cpu || !cpu->mem || !cpu->real_window_vectors ||
-        g_flexe_shadow_fill || cpu->spill_verify || cpu->window_trace ||
-        cpu->vecbase < 0x40070000u || cpu->vecbase >= 0x40400000u ||
-        !mem_get_ptr(cpu->mem,
-                     cpu->vecbase + VECOFS_WINDOW_UNDERFLOW4))
-        return false;
-
-    /* Validate every save-area link before the first store.  Malformed task
-     * stacks continue in guest code with its original fault behavior. */
-    for (unsigned distance = 1u; distance < 16u; distance++) {
-        int window = ((int)cpu->windowbase + (int)distance) & 15;
-        if ((cpu->windowstart & (1u << window)) == 0u) continue;
-        int callee = find_callee_accel(cpu, window);
-        int callsize = window_callsize_accel(cpu, callee);
-        uint32_t top = phys_read_accel(cpu, callee, 1);
-        if (top < 16u) return false;
-        for (unsigned i = 0; i < 4u; i++)
-            if (!word_mapped(cpu->mem, top - 16u + i * 4u, true))
-                return false;
-        if (callsize >= 2) {
-            uint32_t stack = phys_read_accel(cpu, window, 1);
-            if (stack < 12u || !word_mapped(cpu->mem, stack - 12u, false))
-                return false;
-            uint32_t extra_top = mem_read32(cpu->mem, stack - 12u);
-            uint32_t offset = callsize == 3 ? 48u : 32u;
-            unsigned count = callsize == 3 ? 8u : 4u;
-            if (extra_top < offset) return false;
-            for (unsigned i = 0; i < count; i++)
-                if (!word_mapped(cpu->mem,
-                                 extra_top - offset + i * 4u, true))
-                    return false;
-        }
-    }
-
-    uint32_t saved_spill_base[16];
-    memcpy(saved_spill_base, cpu->spill_base, sizeof(saved_spill_base));
-    xtensa_flush_windows(cpu);
-    memcpy(cpu->spill_base, saved_spill_base, sizeof(saved_spill_base));
     return true;
 }

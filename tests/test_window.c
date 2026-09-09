@@ -1191,52 +1191,6 @@ TEST(call12_linked_spill_area) {
     linked_spill_round_trip(3);
 }
 
-TEST(fast_spill_all_uses_guest_abi_without_shadow_state) {
-    xtensa_cpu_t cpu; setup_windowed(&cpu);
-    const uint32_t caller_sp = BASE + 0x7800u;
-    const uint32_t callee_sp = BASE + 0x7000u;
-    const uint32_t extra_top = BASE + 0x6400u;
-    uint32_t expected[8];
-
-    cpu.real_window_vectors = true;
-    cpu.vecbase = BASE;
-    cpu.windowbase = 2u;
-    cpu.windowstart = (1u << 0) | (1u << 2);
-    cpu.window_callsize[2] = 2u;
-    for (unsigned i = 0; i < 8u; i++) {
-        expected[i] = 0xBC000000u + i;
-        phys_wr(&cpu, 0, (int)i, expected[i]);
-    }
-    phys_wr(&cpu, 0, 1, caller_sp);
-    expected[1] = caller_sp;
-    phys_wr(&cpu, 2, 1, callee_sp);
-    mem_write32(cpu.mem, caller_sp - 12u, extra_top);
-    cpu.spill_base[0] = 0x13572468u;
-
-    ASSERT_TRUE(xtensa_fast_spill_all_windows(&cpu));
-    ASSERT_EQ(cpu.windowstart, 1u << 2);
-    ASSERT_EQ(cpu.windowbase, 2u);
-    ASSERT_EQ(cpu.spill_base[0], 0x13572468u);
-    ASSERT_EQ(cpu.spill_stack[0].depth, 0u);
-    for (unsigned i = 0; i < 4u; i++)
-        ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16u + i * 4u),
-                  expected[i]);
-    for (unsigned i = 0; i < 4u; i++)
-        ASSERT_EQ(mem_read32(cpu.mem, extra_top - 32u + i * 4u),
-                  expected[i + 4u]);
-
-    /* An invalid linked save area is rejected before any WindowStart or
-     * destination-memory change. */
-    cpu.windowstart = (1u << 0) | (1u << 2);
-    mem_write32(cpu.mem, caller_sp - 12u, 0u);
-    mem_write32(cpu.mem, callee_sp - 16u, 0xCAFEBABEu);
-    ASSERT_FALSE(xtensa_fast_spill_all_windows(&cpu));
-    ASSERT_EQ(cpu.windowstart, (1u << 0) | (1u << 2));
-    ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16u), 0xCAFEBABEu);
-
-    teardown(&cpu);
-}
-
 /* The IDF high-priority interrupt prologue executes SPILL_ALL_WINDOWS using
  * the architectural overflow vectors. Flexe must enter the interrupt with
  * the interrupted call chain intact; pre-flushing it in the host clears the
@@ -1509,7 +1463,6 @@ static void run_window_tests(void) {
     RUN_TEST(factorial_windowed);
     RUN_TEST(call8_linked_spill_area);
     RUN_TEST(call12_linked_spill_area);
-    RUN_TEST(fast_spill_all_uses_guest_abi_without_shadow_state);
     RUN_TEST(interrupt_vector_entry_preserves_live_windows);
     RUN_TEST(interrupt_flush_round_trip);
     RUN_TEST(interrupt_flush_stale_callsize);

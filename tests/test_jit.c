@@ -2471,6 +2471,63 @@ TEST(test_jit_wsr_windowbase_flushes_old_mapping_before_dispatch) {
     teardown(&cpu);
 }
 
+TEST(test_jit_wsr_windowbase_chains_under_runtime_destination) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE + 5u;
+
+    cpu.real_window_vectors = true;
+    cpu.windowbase = 0u;
+    ar_write(&cpu, 2, 0u);
+    /* Keep the WSR source dirty so this covers both the old-window flush and
+     * the dynamic chain selector. */
+    put_insn2(&cpu, BASE, narrow(0xB, 2, 2, 1)); /* ADDI.N a2, a2, 1 */
+    put_insn3(&cpu, BASE + 2u,
+              rrr(1, 3, XT_SR_WINDOWBASE >> 4,
+                  XT_SR_WINDOWBASE & 15, 2));
+    for (unsigned i = 0; i < 4u; i++)
+        put_insn2(&cpu, target + i * 2u,
+                  narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, target + 8u,
+              narrow(0xD, 15, 0, 2)); /* ILL.N ends the target block */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    /* Every leaf has its own physical-register mapping and patchable chain
+     * site. Compile all sixteen so the test exercises the complete selector,
+     * including its wraparound value. */
+    for (uint32_t dest_wb = 0u; dest_wb < 16u; dest_wb++) {
+        cpu.windowbase = dest_wb;
+        for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+            (void)jit_get_block(jit, &cpu, target);
+        ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    }
+
+    cpu.windowbase = 0u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+    ASSERT_TRUE(jit_get_stats(jit)->chains_patched > 0u);
+
+    for (uint32_t dest_wb = 0u; dest_wb < 16u; dest_wb++) {
+        cpu.windowbase = 0u;
+        ar_write(&cpu, 2, dest_wb - 1u); /* ADDI.N produces dest_wb */
+        uint64_t hooks_before = jit_get_stats(jit)->hook_calls;
+        cpu.pc = BASE;
+        cpu._pc_written = true;
+        cpu.running = true;
+        ASSERT_EQ(xtensa_run(&cpu, 6), 6);
+        ASSERT_EQ(cpu.windowbase, dest_wb);
+        ASSERT_EQ(cpu.pc, target + 8u);
+        ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
+    }
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_rsr_prid_wsr_ps) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -3287,6 +3344,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_rsr_wsr_cpenable);
     RUN_TEST(test_jit_wsr_windowstart_terminates_at_new_guard_context);
     RUN_TEST(test_jit_wsr_windowbase_flushes_old_mapping_before_dispatch);
+    RUN_TEST(test_jit_wsr_windowbase_chains_under_runtime_destination);
     RUN_TEST(test_jit_rsr_prid_wsr_ps);
     RUN_TEST(test_jit_rsr_ccount_observes_instruction_position);
     RUN_TEST(test_jit_wsr_ps_rearms_irq_check);

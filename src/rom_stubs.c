@@ -81,24 +81,6 @@ typedef struct {
     bool pending;
 } stub_irq_t;
 
-#define FW_ACCEL_PATH_CACHE_SIZE 64u
-
-typedef struct {
-    uint32_t key;
-    uint32_t final_a3;
-    uint16_t insns;
-    uint8_t observations;
-    uint8_t final_owb;
-    uint8_t final_sar;
-} window_spill_path_t;
-
-typedef struct {
-    bool active;
-    uint8_t windowbase;
-    uint32_t key;
-    uint32_t start_ccount;
-} window_spill_training_t;
-
 #define TWDT_MAX_TASKS_DECL 16
 
 struct esp32_rom_stubs {
@@ -132,8 +114,6 @@ struct esp32_rom_stubs {
     bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
     bool             real_rom;                /* execute unregistered loaded ROM code */
     rom_firmware_profile_t firmware_profile;  /* exact symbol-less ROM layout */
-    window_spill_path_t window_spill_paths[FW_ACCEL_PATH_CACHE_SIZE];
-    window_spill_training_t window_spill_training[2];
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     stub_irq_t irq[71];
     /* Per-pin handlers registered through gpio_isr_handler_add(). See
@@ -5546,12 +5526,6 @@ static int fw_add_idf_watchpoint_hooks(esp32_rom_stubs_t *stubs) {
     return hooked;
 }
 
-static int fw_core_index(const xtensa_cpu_t *cpu) {
-    if (cpu->prid == XTENSA_SPINLOCK_OWNER_CORE0) return 0;
-    if (cpu->prid == XTENSA_SPINLOCK_OWNER_CORE1) return 1;
-    return -1;
-}
-
 /* Native execution of the linker-independent newlib memcmp below. Besides
  * returning the C result, reproduce the exact dynamic instruction count of
  * this implementation: aligned inputs compare words first and fall back to
@@ -5774,147 +5748,10 @@ static int fw_add_canonical_window_vector_hooks(esp32_rom_stubs_t *stubs) {
     return hooked;
 }
 
-static window_spill_path_t *fw_window_spill_path_find(
-        window_spill_path_t *paths, uint32_t key, bool create) {
-    unsigned slot = (key * 2654435761u) >> 26;
-    for (unsigned probe = 0; probe < 8u; probe++) {
-        window_spill_path_t *path = &paths[(slot + probe) &
-                                           (FW_ACCEL_PATH_CACHE_SIZE - 1u)];
-        if (path->observations == 0u)
-            return create ? path : NULL;
-        if (path->key == key) return path;
-    }
-    return NULL;
-}
-
-static int stub_xthal_window_spill(xtensa_cpu_t *cpu, void *ctx) {
-    esp32_rom_stubs_t *stubs = ctx;
-    int core = fw_core_index(cpu);
-    if (core < 0 || XT_PS_CALLINC(cpu->ps) != 0u || cpu->seed_entry_link ||
-        cpu->breakpoint_count != 0 || cpu->window_trace)
-        return 0;
-
-    uint32_t key = ((cpu->windowbase & 15u) << 16) |
-                   (cpu->windowstart & 0xFFFFu);
-    window_spill_path_t *path = fw_window_spill_path_find(
-            stubs->window_spill_paths, key, false);
-    if (path && path->observations >= 2u &&
-        path->observations != UINT8_MAX) {
-        if (!fw_native_span_safe(cpu, path->insns) ||
-            !xtensa_fast_spill_all_windows(cpu))
-            return 0;
-        ar_write(cpu, 3, path->final_a3);
-        cpu->sar = path->final_sar;
-        XT_PS_SET_OWB(cpu->ps, path->final_owb);
-        rom_return(cpu, 0u);
-        fw_charge_stub_path(cpu, path->insns);
-        return path->insns;
-    }
-
-    window_spill_training_t *training =
-            &stubs->window_spill_training[core];
-    training->active = true;
-    training->windowbase = cpu->windowbase & 15u;
-    training->key = key;
-    training->start_ccount = cpu->ccount;
-    return 0;
-}
-
-static int stub_xthal_spill_finish(xtensa_cpu_t *cpu, void *ctx) {
-    esp32_rom_stubs_t *stubs = ctx;
-    int core = fw_core_index(cpu);
-    if (core < 0) return 0;
-    window_spill_training_t *training =
-            &stubs->window_spill_training[core];
-    if (!training->active) return 0;
-
-    /* The success branch lands here with all save-area stores complete.  Its
-     * nine-instruction suffix rotates back to the entry WB, publishes the
-     * one remaining live window, returns zero, and RET.Ns to a0.  Completing
-     * that deterministic tail here makes it a usable observer even though
-     * the final RET.N is reached by straight-line fallthrough. */
-    const uint32_t suffix_insns = 9u;
-    unsigned final_wb = (cpu->windowbase + 1u) & 15u;
-    uint32_t insns = cpu->ccount - training->start_ccount + suffix_insns;
-    if (final_wb != training->windowbase || insns > UINT16_MAX ||
-        !fw_native_span_safe(cpu, suffix_insns)) {
-        training->active = false;
-        return 0;
-    }
-
-    cpu->windowbase = final_wb;
-    cpu->sar = 32u - final_wb;
-    cpu->windowstart = 1u << final_wb;
-    uint32_t final_a3 = ar_read(cpu, 3);
-    uint8_t final_owb = (uint8_t)XT_PS_OWB(cpu->ps);
-    rom_return(cpu, 0u);
-    fw_charge_stub_path(cpu, suffix_insns);
-
-    if (insns > 0u) {
-        window_spill_path_t *path = fw_window_spill_path_find(
-                stubs->window_spill_paths, training->key, true);
-        if (path) {
-            if (path->observations == 0u) {
-                path->key = training->key;
-                path->final_a3 = final_a3;
-                path->insns = (uint16_t)insns;
-                path->final_owb = final_owb;
-                path->final_sar = (uint8_t)cpu->sar;
-                path->observations = 1u;
-            } else if (path->insns == insns &&
-                       path->final_owb == final_owb &&
-                       path->final_sar == cpu->sar &&
-                       path->final_a3 == final_a3 &&
-                       path->observations < UINT8_MAX - 1u) {
-                path->observations++;
-            } else {
-                path->observations = UINT8_MAX;
-            }
-        }
-    }
-    training->active = false;
-    return (int)suffix_insns;
-}
-
-/* This linker-independent xthal_window_spill_nw implementation is emitted by
- * the classic ESP32 Xtensa HAL in every production image in the regression
- * corpus. It has no literals or external calls, so relocation leaves all 273
- * bytes unchanged. Discover it by a distinctive entry prefix and validate
- * the complete body before installing the learned, cycle-preserving path. */
-#define XTHAL_WINDOW_SPILL_SIZE          273u
-#define XTHAL_WINDOW_SPILL_FINISH_OFFSET 0xBCu
-#define XTHAL_WINDOW_SPILL_CRC32         0x3DA50F6Cu
-
-static int fw_add_xthal_spill_hooks(esp32_rom_stubs_t *stubs) {
-    static const uint8_t prefix[] = {
-        0x20, 0x48, 0x03, 0x1B, 0x22, 0x00, 0x02, 0x40,
-        0x30, 0x49, 0x03, 0x30, 0x20, 0x91, 0x00, 0x33,
-        0xA1, 0xD6, 0xF3, 0x0B,
-    };
-    int hooked = 0;
-    uint32_t cursor = ESP32_FIRMWARE_INSN_ADDR_LOW;
-    uint32_t addr;
-    while (firmware_find_crc32_body(
-            stubs->cpu->mem, cursor, ESP32_IRAM_INSN_ADDR_HIGH,
-            prefix, sizeof(prefix), XTHAL_WINDOW_SPILL_SIZE,
-            XTHAL_WINDOW_SPILL_CRC32, &addr)) {
-        rom_stubs_register_conditional_exact_ctx(
-                stubs, addr, stub_xthal_window_spill,
-                "xthal_window_spill_nw", NULL);
-        rom_stubs_register_conditional_exact_ctx(
-                stubs, addr + XTHAL_WINDOW_SPILL_FINISH_OFFSET,
-                stub_xthal_spill_finish, "xthal_window_spill_finish", NULL);
-        hooked += 2;
-        cursor = addr + XTHAL_WINDOW_SPILL_SIZE;
-    }
-    return hooked;
-}
-
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
     int n = fw_add_canonical_window_vector_hooks(stubs);
     n += fw_add_newlib_memcmp_hooks(stubs);
-    n += fw_add_xthal_spill_hooks(stubs);
     n += fw_add_idf_watchpoint_hooks(stubs);
     if (n != 0)
         stubs->cpu->accelerated_blocks = true;

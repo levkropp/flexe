@@ -648,9 +648,6 @@ bool xtensa_window_vectors_are_canonical(xtensa_mem_t *mem, uint32_t base);
 bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
                                bool underflow);
 
-/* Flush every non-current live window using the architectural stack layout,
- * without retaining legacy host-only spill metadata. */
-bool xtensa_fast_spill_all_windows(xtensa_cpu_t *cpu);
 void xtensa_recompute_next_timer(xtensa_cpu_t *cpu);
 
 /* Raise any ccompare/peripheral timer interrupts whose ccount has arrived and

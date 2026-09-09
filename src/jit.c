@@ -1323,6 +1323,30 @@ static void emit_jmp_to_epilogue(emit_t *e, jit_state_t *jit);
 static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
                              uint32_t target_wb, uint8_t *jmp_site);
 
+/* Emit a balanced runtime selector for a control transfer whose destination
+ * PC is static but whose WINDOWBASE is architectural data. Each leaf is a
+ * normal patchable chain site keyed by the exact destination window, so the
+ * compiled successor can keep its constant physical-AR mapping. The value is
+ * already masked to 0..15 by the caller; four unsigned comparisons select any
+ * of the sixteen leaves. */
+static void emit_windowbase_chain_tree(emit_t *e, jit_state_t *jit,
+                                       uint32_t target_pc, int wb_reg,
+                                       uint32_t first, uint32_t end) {
+    if (end - first == 1u) {
+        uint8_t *chain_site = e->ptr;
+        emit_jmp_to_epilogue(e, jit);
+        jit_chain_record(jit, target_pc, first, chain_site);
+        return;
+    }
+
+    uint32_t middle = first + (end - first) / 2u;
+    emit_cmp_reg32_imm32(e, wb_reg, (int32_t)middle);
+    int lower_half = emit_jcc_rel32(e, CC_B);
+    emit_windowbase_chain_tree(e, jit, target_pc, wb_reg, middle, end);
+    emit_patch_rel32(e, lower_half);
+    emit_windowbase_chain_tree(e, jit, target_pc, wb_reg, first, middle);
+}
+
 /* Side exit: a conditional branch in the middle of a trace. The taken
  * path jumps to a stub emitted after the block body; the fall-through
  * path keeps compiling. ar[] is flushed inline BEFORE the jcc so the
@@ -2150,9 +2174,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 if (sr_num == XT_SR_WINDOWBASE) {
                     /* The source may be dirty in the current block. Publish
                      * all logical registers while the old mapping is still
-                     * active, then reload and mask the architectural value.
-                     * The destination window is runtime data, so this is a
-                     * dispatcher exit like ENTRY rather than a static chain. */
+                     * active, then reload and mask the architectural value. */
                     ra_flush(e, ra, wb4);
                     emit_load32_disp(e, RAX, REG_CPU, ar_offset(wb4, t));
                     emit_and_reg32_imm32(e, RAX, 0xFu);
@@ -2161,7 +2183,17 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_store32_disp_imm(e, REG_CPU,
                                           (int32_t)CPU_OFF_PC_WRITTEN, 1);
                     emit_acc_add(e, insn_idx + 1);
-                    emit_jmp_to_epilogue(e, jit);
+
+                    /* WINDOWBASE is runtime data, but it has only sixteen
+                     * architectural values. Give each destination its own
+                     * ordinary chain site instead of always returning to the
+                     * C dispatcher. This benefits any code that restores or
+                     * rotates the register file through WSR WINDOWBASE while
+                     * preserving the JIT's compile-time physical-AR mapping:
+                     * every successor is still compiled under its exact WB
+                     * cache key. An unavailable successor retains the normal
+                     * epilogue jump and is patched when it becomes hot. */
+                    emit_windowbase_chain_tree(e, jit, next_pc, RAX, 0u, 16u);
                     return 1;
                 }
                 if (sr_num == XT_SR_WINDOWSTART) {
@@ -4259,11 +4291,8 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
      * effect; relaxing it for chain targets without saying so explicitly
      * crashed NerdMiner inside the code cache. */
     /* Compile every non-empty hot trace, including one-instruction return and
-     * ENTRY tails. Before the set-associative cache correctly used its free
-     * ways, singletons appeared 1.8% slower because they amplified cache
-     * thrashing. With that bug fixed they raise WLED coverage from 90.1% to
-     * 94.6% and improve an interleaved ten-pair median by 4.0%, while using
-     * only 2.8 MB of the 128 MB code cache. */
+     * ENTRY tails. The set-associative cache keeps these small but frequently
+     * reached blocks from evicting an already compiled neighbour. */
     if (scan.count == 0) {
         /* Nothing compilable at this PC. Record it, or every later execution
          * pays for the same scan again. */
