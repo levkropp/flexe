@@ -1233,6 +1233,37 @@ static bool have_spill_record(const xtensa_cpu_t *cpu, uint32_t base) {
     return false;
 }
 
+static bool try_retw_underflow_exception(xtensa_cpu_t *cpu, uint32_t a0,
+                                         int owb, int ret_wb,
+                                         uint32_t fault_pc) {
+    uint32_t vecofs = window_vec_offset(a0, true);
+    if (!cpu->real_window_vectors || !XT_PS_WOE(cpu->ps) ||
+        XT_PS_EXCM(cpu->ps) ||
+        (g_flexe_shadow_fill &&
+         have_spill_record(cpu, phys_read(cpu, owb, 1))) ||
+        !window_vectors_ready(cpu, vecofs))
+        return false;
+
+    raise_window_exception(cpu, fault_pc, ret_wb, vecofs);
+    return true;
+}
+
+bool xtensa_try_retw_underflow_exception(xtensa_cpu_t *cpu,
+                                         uint32_t fault_pc) {
+    if (!cpu) return false;
+    uint32_t a0 = ar_read(cpu, 0);
+    int n = (int)(a0 >> 30) & 3;
+    if (n == 0) {
+        n = cpu->window_callsize[cpu->windowbase & 15u];
+        if (n == 0) n = 4;
+    }
+    int owb = (int)cpu->windowbase;
+    int ret_wb = (owb - n) & 15;
+    if (cpu->windowstart & (1u << ret_wb))
+        return false;
+    return try_retw_underflow_exception(cpu, a0, owb, ret_wb, fault_pc);
+}
+
 static void synth_underflow_fill(xtensa_cpu_t *cpu, int ret_wb, int owb, int callsize) {
     uint32_t base = phys_read(cpu, owb, 1);  /* callee SP (hardware convention) */
 
@@ -1390,17 +1421,14 @@ static void exec_retw(xtensa_cpu_t *cpu, int retw_len) {
     WINLOG(cpu, "RETW n=%d owb=%d ret_wb=%d a0=%08X a1=%08X fill=%d\n",
            n, owb, ret_wb, a0, ar_read(cpu, 1), (int)need_fill);
 
-    if (need_fill && __builtin_expect(cpu->real_window_vectors, 0) &&
-        XT_PS_WOE(cpu->ps) && !XT_PS_EXCM(cpu->ps) &&
-        !(g_flexe_shadow_fill &&
-          have_spill_record(cpu, phys_read(cpu, owb, 1))) &&
-        window_vectors_ready(cpu, window_vec_offset(a0, true))) {
+    if (need_fill &&
+        __builtin_expect(try_retw_underflow_exception(
+                             cpu, a0, owb, ret_wb,
+                             cpu->pc - (uint32_t)retw_len), 0)) {
         /* The guest's WindowUnderflow handler reads the frame back from the
          * stack the ABI put it on; RFWU sets the bit and returns to this
          * RETW, which then takes the normal path. cpu->pc is already past the
          * instruction, so back it up by the length the caller decoded. */
-        raise_window_exception(cpu, cpu->pc - (uint32_t)retw_len, ret_wb,
-                               window_vec_offset(a0, true));
         return;
     }
 

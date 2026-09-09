@@ -3006,6 +3006,46 @@ TEST(test_jit_retw_n_windowed) {
     teardown(&cpu);
 }
 
+TEST(test_jit_retw_underflow_raises_guest_vector) {
+    xtensa_cpu_t expected, actual;
+    setup(&expected);
+    expected.real_window_vectors = true;
+    expected.vecbase = BASE;
+    expected.ps = 1u << 18; /* WOE, outside an exception */
+    expected.windowbase = 3u;
+    expected.windowstart = 1u << 3; /* call4 caller at WB=2 is spilled */
+    expected.window_callsize[3] = 1u;
+    ar_write(&expected, 0,
+             (1u << 30) | ((BASE + 0x200u) & 0x3FFFFFFFu));
+    ar_write(&expected, 1, DATA_BASE + 0xC00u);
+    put_insn3(&expected, BASE, jit_retw_insn());
+    memcpy(&actual, &expected, sizeof(actual));
+
+    ASSERT_EQ(xtensa_step(&expected), 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        teardown(&expected);
+        return;
+    }
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &actual, BASE);
+    jit_block_fn fn = jit_get_block(jit, &actual, BASE);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_EQ(fn(&actual), 1);
+
+    ASSERT_EQ(compare_state(&expected, &actual, "retw_underflow_vector"), 0);
+    ASSERT_EQ(actual.pc, BASE + VECOFS_WINDOW_UNDERFLOW4);
+    ASSERT_EQ(actual.epc[0], BASE);
+    ASSERT_EQ(actual.windowbase, 2u);
+    ASSERT_EQ(XT_PS_OWB(actual.ps), 3u);
+    ASSERT_TRUE(XT_PS_EXCM(actual.ps));
+
+    jit_destroy(jit);
+    teardown(&expected);
+}
+
 TEST(test_jit_retw_tail_call_fallback) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -3222,6 +3262,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_entry_ignores_unrelated_live_window);
     RUN_TEST(test_jit_retw_windowed);
     RUN_TEST(test_jit_retw_n_windowed);
+    RUN_TEST(test_jit_retw_underflow_raises_guest_vector);
     RUN_TEST(test_jit_retw_tail_call_fallback);
     RUN_TEST(test_jit_entry_overflow_fallback);
     RUN_TEST(test_jit_window_overflow_vector_is_native);

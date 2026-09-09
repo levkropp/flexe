@@ -1023,6 +1023,17 @@ static uint32_t jit_s32c1i_helper(xtensa_cpu_t *cpu, uint32_t addr,
     return old;
 }
 
+/* RETW underflow is an architectural control-flow transition, not an
+ * untranslatable instruction. Let the CPU model decide whether this state
+ * vectors through the guest's handler; legacy synthetic fills remain an
+ * exact interpreter fallback. */
+static uint32_t jit_retw_underflow_helper(xtensa_cpu_t *cpu,
+                                          uint32_t fault_pc,
+                                          uint32_t unused) {
+    (void)unused;
+    return xtensa_try_retw_underflow_exception(cpu, fault_pc) ? 1u : 0u;
+}
+
 /* Integer divide. QUOU alone accounts for 1,042 of the 1,639 instructions the
  * scanner could not compile on a Marauder run -- the single largest reason
  * blocks get truncated after the LOOP family.
@@ -3049,11 +3060,25 @@ compile_retw: ;
         /* No chain slot — dynamic target */
         emit_jmp_to_epilogue(e, jit);
 
-        /* Fill fallback: interpreter handles it */
+        /* Missing caller window: take the architectural underflow exception
+         * directly, but leave synthetic/legacy fills to the interpreter. */
         emit_patch_rel32(e, fill_fb);
+        ra_flush(e, ra, wb4);
+        emit_mov_reg_imm32(e, RAX, pc);
+        emit_mov_reg_imm32(e, RBX, 0);
+        emit_call_cpu3(e,
+            (void *)(uintptr_t)jit_retw_underflow_helper, RAX, RBX);
+        emit_test_reg32(e, RAX, RAX);
+        int legacy_fill = emit_jcc_rel32(e, CC_E);
+        emit_acc_add(e, insn_idx + 1);
+        emit_jmp_to_epilogue(e, jit);
+
+        /* Dirty bits survive the main-path ra_flush(), allowing these side
+         * exits to write back exactly the guest registers touched by the
+         * prefix. The fill path already flushed before calling the helper;
+         * emitting the same stores twice is harmless on its cold fallback. */
+        emit_patch_rel32(e, legacy_fill);
         emit_patch_rel32(e, callsize_fb);
-        /* Dirty bits survive the main-path ra_flush(), allowing this side exit
-         * to write back exactly the guest registers touched by the prefix. */
         ra_flush(e, ra, wb4);
         emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc);
         emit_acc_add(e, insn_idx);  /* RETW itself didn't run */

@@ -621,6 +621,12 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
 void xtensa_check_interrupts(xtensa_cpu_t *cpu);
 void xtensa_flush_windows(xtensa_cpu_t *cpu);
 
+/* Perform the architectural exception transition for a RETW whose caller
+ * window is not resident. Returns false without changing state when the guest
+ * vectors are unavailable or the legacy shadow-fill path is authoritative. */
+bool xtensa_try_retw_underflow_exception(xtensa_cpu_t *cpu,
+                                         uint32_t fault_pc);
+
 /* True when `base` contains all six canonical classic-ESP32 window vectors.
  * This is an ABI property, not a firmware-version fingerprint. */
 bool xtensa_window_vectors_are_canonical(xtensa_mem_t *mem, uint32_t base);
