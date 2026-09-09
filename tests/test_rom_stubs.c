@@ -167,6 +167,49 @@ TEST(test_rom_conditional_stub) {
     teardown(&cpu);
 }
 
+TEST(test_rom_registration_backscans_only_post_entry_symbols) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    conditional_hook_test_t test = {0, BASE + 0x700u};
+
+    /* An exact ENTRY must not cause a coincidental preceding ENTRY encoding
+     * to inherit its hook. */
+    uint32_t exact_entry = BASE + 0x500u;
+    put_insn3(&cpu, exact_entry, 0x004136u);
+    put_insn3(&cpu, exact_entry - 8u, 0x004136u);
+    ASSERT_EQ(rom_stubs_register_conditional_ctx(
+                      rom, exact_entry, test_conditional_stub,
+                      "exact-entry", &test), 0u);
+    cpu.pc = exact_entry - 8u;
+    cpu._pc_written = true;
+    cpu.windowbase = 0u;
+    cpu.windowstart = 1u;
+    XT_PS_SET_CALLINC(cpu.ps, 0u);
+    ar_write(&cpu, 1, 0x3FFB7000u);
+    ASSERT_EQ(xtensa_step(&cpu), 0u);
+    ASSERT_EQ(cpu.pc, exact_entry - 5u);
+    ASSERT_EQ(test.calls, 0u);
+
+    /* Preserve the narrowly scoped legacy case: a symbol immediately after
+     * ENTRY receives an alias at the actual call target. */
+    uint32_t aliased_entry = BASE + 0x600u;
+    put_insn3(&cpu, aliased_entry, 0x004136u);
+    put_insn3(&cpu, aliased_entry + 3u, rom_nop_insn());
+    ASSERT_EQ(rom_stubs_register_conditional_ctx(
+                      rom, aliased_entry + 3u, test_conditional_stub,
+                      "post-entry-symbol", &test), 0u);
+    cpu.pc = aliased_entry;
+    cpu._pc_written = true;
+    ar_write(&cpu, 2, 1u);
+    ASSERT_EQ(xtensa_step(&cpu), 0u);
+    ASSERT_EQ(cpu.pc, test.handled_pc);
+    ASSERT_EQ(test.calls, 1u);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 /* ===== Test: rom_arg with CALL4 ===== */
 
 TEST(test_rom_arg_call4) {
@@ -1208,7 +1251,7 @@ TEST(test_wled_v1601_uses_structural_memcmp_and_scanned_phy) {
     teardown(&cpu);
 }
 
-static const uint8_t wled_v1601_watchpoint_code[] = {
+static const uint8_t idf_watchpoint_code[] = {
     0x36, 0x41, 0x00, 0x0C, 0x18, 0xBD, 0x05, 0xCD,
     0x08, 0x8C, 0xB5, 0x0B, 0x55, 0x92, 0xA0, 0x00,
     0x50, 0x98, 0x93, 0x90, 0xC0, 0x74, 0xBD, 0x08,
@@ -1223,19 +1266,26 @@ static const uint8_t wled_v1601_watchpoint_code[] = {
     0xFF,
 };
 
-static void seed_wled_v1601_watchpoint(xtensa_cpu_t *cpu) {
-    put_test_bytes(cpu, 0x400903A0u, wled_v1601_watchpoint_code,
-                   sizeof(wled_v1601_watchpoint_code));
-    mem_write32(cpu->mem, 0x40080524u, 0x40000000u);
-    mem_write32(cpu->mem, 0x40080544u, 0x80000000u);
+static void seed_idf_watchpoint(xtensa_cpu_t *cpu, uint32_t addr) {
+    const uint32_t read_literal = (addr - 0x100u) & ~3u;
+    const uint32_t write_literal = read_literal + 4u;
+    put_test_bytes(cpu, addr, idf_watchpoint_code,
+                   sizeof(idf_watchpoint_code));
+    put_insn3(cpu, addr + 55u,
+              encode_test_l32r(addr + 55u, read_literal, 5));
+    put_insn3(cpu, addr + 63u,
+              encode_test_l32r(addr + 63u, write_literal, 5));
+    mem_write32(cpu->mem, read_literal, 0x40000000u);
+    mem_write32(cpu->mem, write_literal, 0x80000000u);
 }
 
-static void init_wled_watchpoint_call(xtensa_cpu_t *cpu, uint32_t id,
+static void init_idf_watchpoint_call(xtensa_cpu_t *cpu, uint32_t addr,
+                                      uint32_t id,
                                       uint32_t address, uint32_t size,
                                       uint32_t trigger) {
     for (unsigned i = 0u; i < 64u; i++)
         cpu->ar[i] = 0xA5000000u + i;
-    cpu->pc = 0x400903A0u;
+    cpu->pc = addr;
     cpu->_pc_written = true;
     cpu->windowbase = 3u;
     cpu->windowstart = 1u << 3;
@@ -1267,7 +1317,8 @@ static void init_wled_watchpoint_call(xtensa_cpu_t *cpu, uint32_t id,
     ar_write(cpu, 13, trigger);
 }
 
-TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
+TEST(test_idf_watchpoint_is_relocated_and_matches_original_routine) {
+    const uint32_t addr = 0x4007D300u;
     struct watchpoint_case {
         uint32_t id;
         uint32_t address;
@@ -1280,33 +1331,97 @@ TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
         { 7u, 0x3FFB9ABCu, 3u, 1u, 59u },
     };
 
-    /* The independently identified profile cannot authorize this entry
-     * unless the complete routine and both of its literals also match. */
-    xtensa_cpu_t unsigned_cpu;
-    setup(&unsigned_cpu);
-    esp32_rom_stubs_t *unsigned_rom = rom_stubs_create(&unsigned_cpu);
-    seed_wled_v1601_profile(&unsigned_cpu);
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(unsigned_rom, 0x40083E68u), 0u);
-    rom_stubs_destroy(unsigned_rom);
-    teardown(&unsigned_cpu);
+    /* Neither a bad relocation target nor one corrupt body byte may authorize
+     * a native substitute, regardless of firmware identity. */
+    xtensa_cpu_t invalid;
+    setup(&invalid);
+    esp32_rom_stubs_t *invalid_rom = rom_stubs_create(&invalid);
+    seed_idf_watchpoint(&invalid, addr);
+    mem_write32(invalid.mem, (addr - 0x100u) & ~3u, 0u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                      invalid_rom, 0x40081234u), 0u);
+    seed_idf_watchpoint(&invalid, addr);
+    mem_write8(invalid.mem, addr + 20u, 0u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                      invalid_rom, 0x40081234u), 0u);
+    rom_stubs_destroy(invalid_rom);
+    teardown(&invalid);
+
+    /* A structurally known ENTRY is exact. A coincidental ENTRY encoding
+     * immediately before it must never acquire a second hook. */
+    xtensa_cpu_t exact;
+    setup(&exact);
+    seed_idf_watchpoint(&exact, addr);
+    put_insn3(&exact, addr - 8u, 0x004136u);
+    esp32_rom_stubs_t *exact_rom = rom_stubs_create(&exact);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                      exact_rom, 0x40081234u), 1u);
+    exact.pc = addr - 8u;
+    exact._pc_written = true;
+    exact.windowbase = 0u;
+    exact.windowstart = 1u;
+    XT_PS_SET_CALLINC(exact.ps, 0u);
+    ar_write(&exact, 1, 0x3FFB7000u);
+    ASSERT_EQ(xtensa_step(&exact), 0u);
+    ASSERT_EQ(exact.pc, addr - 5u);
+    ASSERT_EQ(rom_stubs_total_calls(exact_rom), 0u);
+    rom_stubs_destroy(exact_rom);
+    teardown(&exact);
+
+    /* A native span must not postpone an interrupt that guest execution
+     * would take after its first instruction. */
+    xtensa_cpu_t irq_reference;
+    xtensa_cpu_t irq_accelerated;
+    setup(&irq_reference);
+    setup(&irq_accelerated);
+    seed_idf_watchpoint(&irq_reference, addr);
+    seed_idf_watchpoint(&irq_accelerated, addr);
+    esp32_rom_stubs_t *irq_rom = rom_stubs_create(&irq_accelerated);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                      irq_rom, 0x40081234u), 1u);
+    init_idf_watchpoint_call(
+            &irq_reference, addr, 0u, 0x3FFB1234u, 4u, 2u);
+    init_idf_watchpoint_call(
+            &irq_accelerated, addr, 0u, 0x3FFB1234u, 4u, 2u);
+    irq_reference.interrupt = irq_accelerated.interrupt = 1u << 11;
+    irq_reference.intenable = irq_accelerated.intenable = 1u << 11;
+    irq_reference.irq_check = irq_accelerated.irq_check = true;
+    ASSERT_EQ(xtensa_step(&irq_reference), (uint32_t)-1);
+    ASSERT_EQ(xtensa_step(&irq_accelerated), (uint32_t)-1);
+    ASSERT_EQ(irq_accelerated.pc, irq_reference.pc);
+    ASSERT_EQ(irq_accelerated.ps, irq_reference.ps);
+    ASSERT_EQ(irq_accelerated.windowbase, irq_reference.windowbase);
+    ASSERT_EQ(irq_accelerated.windowstart, irq_reference.windowstart);
+    ASSERT_EQ(irq_accelerated.epc[2], irq_reference.epc[2]);
+    ASSERT_EQ(irq_accelerated.eps[2], irq_reference.eps[2]);
+    ASSERT_EQ(irq_accelerated.exception, irq_reference.exception);
+    ASSERT_EQ(irq_accelerated.running, irq_reference.running);
+    ASSERT_EQ(irq_accelerated.ccount, irq_reference.ccount);
+    ASSERT_EQ64(irq_accelerated.cycle_count, irq_reference.cycle_count);
+    ASSERT_EQ64(irq_accelerated.insn_count, irq_reference.insn_count);
+    for (unsigned i = 0u; i < 64u; i++)
+        ASSERT_EQ(irq_accelerated.ar[i], irq_reference.ar[i]);
+    rom_stubs_destroy(irq_rom);
+    teardown(&irq_accelerated);
+    teardown(&irq_reference);
 
     for (unsigned c = 0u; c < sizeof(cases) / sizeof(cases[0]); c++) {
         xtensa_cpu_t reference;
         xtensa_cpu_t accelerated;
         setup(&reference);
         setup(&accelerated);
-        seed_wled_v1601_watchpoint(&reference);
-        seed_wled_v1601_profile(&accelerated);
-        seed_wled_v1601_watchpoint(&accelerated);
+        seed_idf_watchpoint(&reference, addr);
+        seed_idf_watchpoint(&accelerated, addr);
         esp32_rom_stubs_t *rom = rom_stubs_create(&accelerated);
-        ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 1u);
+        ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                          rom, 0x40081234u), 1u);
 
-        init_wled_watchpoint_call(&reference, cases[c].id,
-                                  cases[c].address, cases[c].size,
-                                  cases[c].trigger);
-        init_wled_watchpoint_call(&accelerated, cases[c].id,
-                                  cases[c].address, cases[c].size,
-                                  cases[c].trigger);
+        init_idf_watchpoint_call(&reference, addr, cases[c].id,
+                                 cases[c].address, cases[c].size,
+                                 cases[c].trigger);
+        init_idf_watchpoint_call(&accelerated, addr, cases[c].id,
+                                 cases[c].address, cases[c].size,
+                                 cases[c].trigger);
 
         for (unsigned step = 0u; step < 100u && reference.pc != BASE; step++)
             ASSERT_EQ(xtensa_step(&reference), 0u);
@@ -1345,14 +1460,15 @@ TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
      * routine, so the accelerator must leave that invocation to the guest. */
     xtensa_cpu_t boundary;
     setup(&boundary);
-    seed_wled_v1601_profile(&boundary);
-    seed_wled_v1601_watchpoint(&boundary);
+    seed_idf_watchpoint(&boundary, addr);
     esp32_rom_stubs_t *boundary_rom = rom_stubs_create(&boundary);
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(boundary_rom, 0x40083E68u), 1u);
-    init_wled_watchpoint_call(&boundary, 0u, 0x3FFB1234u, 4u, 2u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                      boundary_rom, 0x40081234u), 1u);
+    init_idf_watchpoint_call(
+            &boundary, addr, 0u, 0x3FFB1234u, 4u, 2u);
     boundary.next_timer_event = boundary.ccount + 40u;
     ASSERT_EQ(xtensa_step(&boundary), 0u);
-    ASSERT_EQ(boundary.pc, 0x400903A3u);
+    ASSERT_EQ(boundary.pc, addr + 3u);
     ASSERT_EQ(boundary.ccount, 1001u);
     ASSERT_EQ64(boundary.insn_count, 1u);
     ASSERT_EQ(boundary.dbreaka[0], 0x11111111u);
@@ -1364,13 +1480,14 @@ TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
      * returns on the first instruction of the next one. */
     xtensa_cpu_t batch_edge;
     setup(&batch_edge);
-    seed_wled_v1601_profile(&batch_edge);
-    seed_wled_v1601_watchpoint(&batch_edge);
+    seed_idf_watchpoint(&batch_edge, addr);
     esp32_rom_stubs_t *batch_rom = rom_stubs_create(&batch_edge);
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(batch_rom, 0x40083E68u), 1u);
-    init_wled_watchpoint_call(&batch_edge, 0u, 0x3FFB1234u, 4u, 2u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                      batch_rom, 0x40081234u), 1u);
+    init_idf_watchpoint_call(
+            &batch_edge, addr, 0u, 0x3FFB1234u, 4u, 2u);
     ASSERT_EQ(xtensa_run(&batch_edge, 39), 39u);
-    ASSERT_EQ(batch_edge.pc, 0x400903EDu);
+    ASSERT_EQ(batch_edge.pc, addr + 0x4Du);
     ASSERT_EQ(batch_edge.ccount, 1039u);
     ASSERT_EQ64(batch_edge.insn_count, 39u);
     ASSERT_EQ(xtensa_run(&batch_edge, 1), 1u);
@@ -1750,6 +1867,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_loaded_rom_executes_unregistered_entry);
     RUN_TEST(test_rom_stub_dispatch);
     RUN_TEST(test_rom_conditional_stub);
+    RUN_TEST(test_rom_registration_backscans_only_post_entry_symbols);
     RUN_TEST(test_rom_arg_call4);
     RUN_TEST(test_rom_arg_call0);
     RUN_TEST(test_stub_write_char);
@@ -1772,7 +1890,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_newlib_memcmp_hook_matches_original_routine);
     RUN_TEST(test_standard_xthal_spill_is_discovered_at_any_iram_address);
     RUN_TEST(test_wled_v1601_uses_structural_memcmp_and_scanned_phy);
-    RUN_TEST(test_wled_v1601_watchpoint_hook_matches_original_routine);
+    RUN_TEST(test_idf_watchpoint_is_relocated_and_matches_original_routine);
     RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
     RUN_TEST(test_tasmota32_requires_complete_fingerprint);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);

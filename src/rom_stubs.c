@@ -168,6 +168,15 @@ struct esp32_rom_stubs {
     int      nvs_handle_count;        /* next handle index = count + 1 */
 };
 
+/* Structurally discovered bodies already identify their exact ENTRY address.
+ * Their registrations must not use the legacy symbol-address backscan. */
+static int rom_stubs_register_exact_ctx(
+        esp32_rom_stubs_t *stubs, uint32_t addr, rom_stub_fn fn,
+        const char *name, void *user_ctx);
+static int rom_stubs_register_conditional_exact_ctx(
+        esp32_rom_stubs_t *stubs, uint32_t addr,
+        rom_conditional_stub_fn fn, const char *name, void *user_ctx);
+
 /* ===== Calling convention helpers ===== */
 
 static uint32_t rom_arg(xtensa_cpu_t *cpu, int n) {
@@ -4759,6 +4768,29 @@ static bool fw_signature_matches(xtensa_mem_t *mem, uint32_t addr,
     return true;
 }
 
+/* Compare a complete function body while ignoring only explicitly listed
+ * relocation bytes. This keeps structural accelerators independent of link
+ * address without weakening validation of the instructions around them. */
+static bool fw_signature_matches_except(xtensa_mem_t *mem, uint32_t addr,
+                                        const uint8_t *signature, size_t size,
+                                        const uint8_t *ignored,
+                                        size_t ignored_count) {
+    for (size_t j = 0u; j < ignored_count; j++) {
+        if (ignored[j] >= size)
+            return false;
+    }
+    for (size_t i = 0u; i < size; i++) {
+        bool skip = false;
+        for (size_t j = 0u; j < ignored_count; j++)
+            skip |= i == ignored[j];
+        if (skip)
+            continue;
+        if (mem_read8(mem, addr + (uint32_t)i) != signature[i])
+            return false;
+    }
+    return true;
+}
+
 static bool fw_crc32_matches(xtensa_mem_t *mem, uint32_t addr, size_t size,
                              uint32_t expected) {
     uLong crc = crc32(0L, Z_NULL, 0);
@@ -5114,17 +5146,25 @@ static bool fw_peek(xtensa_cpu_t *cpu, uint32_t addr, int n, uint32_t *out) {
 static bool fw_insn_is_entry(uint32_t insn) {
     return (insn & 0xFu) == 6u &&        /* op0 = SI  */
            ((insn >> 4) & 3u) == 3u &&   /* n  = BI1  */
-           ((insn >> 6) & 3u) == 0u;     /* m  = 0    */
+           ((insn >> 6) & 3u) == 0u &&   /* m  = 0    */
+           ((insn >> 8) & 0xFu) == 1u;   /* s  = a1   */
 }
 
 /* Does an L32R at pc resolve to the literal at lit? */
-static bool fw_l32r_targets(xtensa_cpu_t *cpu, uint32_t pc, uint32_t lit) {
+static bool fw_l32r_target(xtensa_cpu_t *cpu, uint32_t pc,
+                           uint32_t *target_out) {
     uint32_t insn;
-    if (!fw_peek(cpu, pc, 3, &insn)) return false;
-    if ((insn & 0xFu) != 1u) return false;
-    uint32_t target = ((pc + 3u) & ~3u) +
-                      (0xFFFC0000u | ((uint32_t)XT_IMM16(insn) << 2));
-    return target == lit;
+    if (!target_out || !fw_peek(cpu, pc, 3, &insn) ||
+        (insn & 0xFu) != 1u)
+        return false;
+    *target_out = ((pc + 3u) & ~3u) +
+                  (0xFFFC0000u | ((uint32_t)XT_IMM16(insn) << 2));
+    return true;
+}
+
+static bool fw_l32r_targets(xtensa_cpu_t *cpu, uint32_t pc, uint32_t lit) {
+    uint32_t target;
+    return fw_l32r_target(cpu, pc, &target) && target == lit;
 }
 
 static uint32_t fw_scan_phy_romfunc_addr(xtensa_cpu_t *cpu) {
@@ -5180,8 +5220,8 @@ static int fw_hook_scanned_phy(esp32_rom_stubs_t *stubs) {
                 "but holds no table global; not hooking\n", addr);
         return 0;
     }
-    rom_stubs_register_ctx(stubs, addr, stub_fw_virtual_phy_init,
-                           "phy_get_romfunc_addr", stubs);
+    rom_stubs_register_exact_ctx(stubs, addr, stub_fw_virtual_phy_init,
+                                 "phy_get_romfunc_addr", stubs);
     fprintf(stderr,
             "[flexe] virtual PHY: located phy_get_romfunc_addr at 0x%08X "
             "(table global 0x%08X) by signature\n", addr, global);
@@ -5407,11 +5447,9 @@ static unsigned fw_discover_flash_poll_loops(esp32_rom_stubs_t *stubs) {
     return found;
 }
 
-/* Remaining profile-specific optimization. The full function body and its
- * constants are fingerprinted before this hook is installed. */
-#define WLED_V1601_SET_WATCHPOINT       0x400903A0u
-#define WLED_V1601_DBREAK_READ_LITERAL  0x40080524u
-#define WLED_V1601_DBREAK_WRITE_LITERAL 0x40080544u
+#define IDF_WATCHPOINT_SIZE              89u
+#define IDF_WATCHPOINT_READ_L32R_OFFSET  55u
+#define IDF_WATCHPOINT_WRITE_L32R_OFFSET 63u
 
 static void fw_charge_stub_path(xtensa_cpu_t *cpu, uint32_t insns) {
     if (insns <= 1u)
@@ -5420,9 +5458,19 @@ static void fw_charge_stub_path(xtensa_cpu_t *cpu, uint32_t insns) {
     cpu->cycle_count += (uint64_t)(insns - 1u);
 }
 
+static bool fw_native_span_safe(const xtensa_cpu_t *cpu, uint32_t insns) {
+    if (cpu->native_span_room != 0u && cpu->native_span_room < insns)
+        return false;
+    if (cpu->irq_check && (cpu->interrupt & cpu->intenable))
+        return false;
+    return cpu->next_timer_event == UINT32_MAX ||
+           ((int32_t)(cpu->ccount - cpu->next_timer_event) < 0 &&
+           cpu->next_timer_event - cpu->ccount > insns);
+}
+
 /* cpu_hal_set_watchpoint() is called by IDF's heap-poisoning checks often
- * enough to be a material interpreter hotspot.  This exact WLED link uses a
- * seven-iteration LOOP to turn sizes 1..64 into DBREAKC mask bits.  Preserve
+ * enough to be a material interpreter hotspot. This implementation uses a
+ * seven-iteration LOOP to turn sizes 1..64 into DBREAKC mask bits. Preserve
  * every architectural and window-model side effect of the original routine,
  * including its caller-clobbered registers and phase-dependent path length.
  *
@@ -5430,10 +5478,11 @@ static void fw_charge_stub_path(xtensa_cpu_t *cpu, uint32_t insns) {
  * fault and spill.  Those paths remain in guest code, as does any invocation
  * whose instruction span crosses a timer boundary or contains a debugger
  * breakpoint. */
-static int stub_fw_wled_set_watchpoint(xtensa_cpu_t *cpu, void *ctx) {
+static int stub_idf_cpu_hal_set_watchpoint(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
+    uint32_t entry = cpu->pc;
     if (XT_PS_CALLINC(cpu->ps) != 2u || cpu->seed_entry_link ||
-        cpu->breakpoint_count != 0)
+        cpu->breakpoint_count != 0u || cpu->window_trace)
         return 0;
 
     unsigned wb = cpu->windowbase & 15u;
@@ -5470,11 +5519,7 @@ static int stub_fw_wled_set_watchpoint(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t suffix_insns = (id == 0u ? 8u : 7u) +
                             (read ? 2u : 0u) + (write ? 2u : 0u);
     uint32_t insns = prefix_insns + loop_insns + suffix_insns;
-    if (cpu->native_span_room != 0u && cpu->native_span_room < insns)
-        return 0;
-    if (cpu->next_timer_event != UINT32_MAX &&
-        ((int32_t)(cpu->ccount - cpu->next_timer_event) >= 0 ||
-         cpu->next_timer_event - cpu->ccount <= insns))
+    if (!fw_native_span_safe(cpu, insns))
         return 0;
 
     unsigned loop_index = match < 7u ? match : 6u;
@@ -5494,8 +5539,8 @@ static int stub_fw_wled_set_watchpoint(xtensa_cpu_t *cpu, void *ctx) {
     ar_write(cpu, 21, loop_value);
 
     cpu->sar = 32u - loop_index; /* final SSL a10 */
-    cpu->lbeg = 0x400903C4u;
-    cpu->lend = 0x400903D2u;
+    cpu->lbeg = entry + 0x24u;
+    cpu->lend = entry + 0x32u;
     cpu->lcount = match < 7u ? 6u - match : 0u;
     unsigned slot = id == 0u ? 0u : 1u;
     cpu->dbreaka[slot] = address;
@@ -5513,7 +5558,7 @@ static int stub_fw_wled_set_watchpoint(xtensa_cpu_t *cpu, void *ctx) {
     return (int)insns;
 }
 
-static bool fw_wled_add_watchpoint_hook(esp32_rom_stubs_t *stubs) {
+static bool fw_idf_watchpoint_matches(xtensa_cpu_t *cpu, uint32_t addr) {
     static const uint8_t signature[] = {
         0x36, 0x41, 0x00, 0x0C, 0x18, 0xBD, 0x05, 0xCD,
         0x08, 0x8C, 0xB5, 0x0B, 0x55, 0x92, 0xA0, 0x00,
@@ -5528,31 +5573,58 @@ static bool fw_wled_add_watchpoint_hook(esp32_rom_stubs_t *stubs) {
         0x30, 0x90, 0x13, 0x80, 0xA0, 0x13, 0xC6, 0xFC,
         0xFF,
     };
-    xtensa_mem_t *mem = stubs->cpu->mem;
-    if (!fw_signature_matches(mem, WLED_V1601_SET_WATCHPOINT,
-                              signature, sizeof(signature)) ||
-        mem_read32(mem, WLED_V1601_DBREAK_READ_LITERAL) != 0x40000000u ||
-        mem_read32(mem, WLED_V1601_DBREAK_WRITE_LITERAL) != 0x80000000u)
+    static const uint8_t relocation_bytes[] = {
+        IDF_WATCHPOINT_READ_L32R_OFFSET + 1u,
+        IDF_WATCHPOINT_READ_L32R_OFFSET + 2u,
+        IDF_WATCHPOINT_WRITE_L32R_OFFSET + 1u,
+        IDF_WATCHPOINT_WRITE_L32R_OFFSET + 2u,
+    };
+    _Static_assert(sizeof(signature) == IDF_WATCHPOINT_SIZE,
+                   "watchpoint implementation size");
+    if (!fw_signature_matches_except(
+                cpu->mem, addr, signature, sizeof(signature),
+                relocation_bytes, sizeof(relocation_bytes)))
         return false;
 
-    rom_stubs_register_conditional_ctx(
-            stubs, WLED_V1601_SET_WATCHPOINT,
-            stub_fw_wled_set_watchpoint, "cpu_hal_set_watchpoint", NULL);
-    return true;
+    uint32_t read_literal;
+    uint32_t write_literal;
+    uint32_t read_mask;
+    uint32_t write_mask;
+    return fw_l32r_target(
+                   cpu, addr + IDF_WATCHPOINT_READ_L32R_OFFSET,
+                   &read_literal) &&
+           fw_l32r_target(
+                   cpu, addr + IDF_WATCHPOINT_WRITE_L32R_OFFSET,
+                   &write_literal) &&
+           fw_peek(cpu, read_literal, 4, &read_mask) &&
+           fw_peek(cpu, write_literal, 4, &write_mask) &&
+           read_mask == 0x40000000u && write_mask == 0x80000000u;
+}
+
+/* Discover the complete IDF cpu_hal_set_watchpoint implementation wherever
+ * the linker placed it. Only its two L32R displacements may vary, and their
+ * decoded literals must still supply the architectural read/write mask bits.
+ * All branch, loop, WSR, ENTRY, and RETW bytes are matched exactly. */
+static int fw_add_idf_watchpoint_hooks(esp32_rom_stubs_t *stubs) {
+    int hooked = 0;
+    uint32_t last = ESP32_IRAM_INSN_ADDR_HIGH - IDF_WATCHPOINT_SIZE;
+    for (uint32_t addr = ESP32_FIRMWARE_INSN_ADDR_LOW; addr <= last; addr++) {
+        if (mem_read8(stubs->cpu->mem, addr) != 0x36u ||
+            !fw_idf_watchpoint_matches(stubs->cpu, addr))
+            continue;
+        if (rom_stubs_register_conditional_exact_ctx(
+                    stubs, addr, stub_idf_cpu_hal_set_watchpoint,
+                    "cpu_hal_set_watchpoint", NULL) == 0)
+            hooked++;
+        addr += IDF_WATCHPOINT_SIZE - 1u;
+    }
+    return hooked;
 }
 
 static int fw_core_index(const xtensa_cpu_t *cpu) {
     if (cpu->prid == XTENSA_SPINLOCK_OWNER_CORE0) return 0;
     if (cpu->prid == XTENSA_SPINLOCK_OWNER_CORE1) return 1;
     return -1;
-}
-
-static bool fw_native_span_safe(const xtensa_cpu_t *cpu, uint32_t insns) {
-    if (cpu->native_span_room != 0u && cpu->native_span_room < insns)
-        return false;
-    return cpu->next_timer_event == UINT32_MAX ||
-           ((int32_t)(cpu->ccount - cpu->next_timer_event) < 0 &&
-           cpu->next_timer_event - cpu->ccount > insns);
 }
 
 /* Native execution of the linker-independent newlib memcmp below. Besides
@@ -5691,7 +5763,7 @@ static int fw_add_newlib_memcmp_hooks(esp32_rom_stubs_t *stubs) {
             stubs->cpu->mem, cursor, ESP32_IRAM_INSN_ADDR_HIGH,
             prefix, sizeof(prefix), NEWLIB_MEMCMP_SIZE,
             NEWLIB_MEMCMP_CRC32, &addr)) {
-        if (rom_stubs_register_conditional_ctx(
+        if (rom_stubs_register_conditional_exact_ctx(
                     stubs, addr, stub_newlib_optimized_memcmp,
                     "newlib_memcmp", NULL) == 0)
             hooked++;
@@ -5754,22 +5826,22 @@ static int fw_add_canonical_window_vector_hooks(esp32_rom_stubs_t *stubs) {
          base += 0x400u) {
         if (!xtensa_window_vectors_are_canonical(stubs->cpu->mem, base))
             continue;
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, base + VECOFS_WINDOW_OVERFLOW4,
                 stub_canonical_window_overflow4, "WindowOverflow4", NULL);
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, base + VECOFS_WINDOW_UNDERFLOW4,
                 stub_canonical_window_underflow4, "WindowUnderflow4", NULL);
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, base + VECOFS_WINDOW_OVERFLOW8,
                 stub_canonical_window_overflow8, "WindowOverflow8", NULL);
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, base + VECOFS_WINDOW_UNDERFLOW8,
                 stub_canonical_window_underflow8, "WindowUnderflow8", NULL);
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, base + VECOFS_WINDOW_OVERFLOW12,
                 stub_canonical_window_overflow12, "WindowOverflow12", NULL);
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, base + VECOFS_WINDOW_UNDERFLOW12,
                 stub_canonical_window_underflow12, "WindowUnderflow12", NULL);
         hooked += 6;
@@ -5901,10 +5973,10 @@ static int fw_add_xthal_spill_hooks(esp32_rom_stubs_t *stubs) {
             stubs->cpu->mem, cursor, ESP32_IRAM_INSN_ADDR_HIGH,
             prefix, sizeof(prefix), XTHAL_WINDOW_SPILL_SIZE,
             XTHAL_WINDOW_SPILL_CRC32, &addr)) {
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, addr, stub_xthal_window_spill,
                 "xthal_window_spill_nw", NULL);
-        rom_stubs_register_conditional_ctx(
+        rom_stubs_register_conditional_exact_ctx(
                 stubs, addr + XTHAL_WINDOW_SPILL_FINISH_OFFSET,
                 stub_xthal_spill_finish, "xthal_window_spill_finish", NULL);
         hooked += 2;
@@ -5918,6 +5990,7 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
     int n = fw_add_canonical_window_vector_hooks(stubs);
     n += fw_add_newlib_memcmp_hooks(stubs);
     n += fw_add_xthal_spill_hooks(stubs);
+    n += fw_add_idf_watchpoint_hooks(stubs);
     if (n != 0)
         stubs->cpu->accelerated_blocks = true;
     fw_discover_flash_poll_loops(stubs);
@@ -5960,15 +6033,10 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
             n++;
         }
     }
-    /* WLED has no fixed-address PHY hook. Keep structural PHY discovery and
-     * the independently fingerprinted watchpoint optimization. FreeRTOS
-     * synchronization and allocator code always execute in the guest: their
-     * cross-core ordering cannot be replaced safely at a function boundary. */
+    /* WLED has no fixed-address PHY hook. FreeRTOS synchronization and
+     * allocator code always execute in the guest: their cross-core ordering
+     * cannot be replaced safely at a function boundary. */
     if (profile == ROM_FIRMWARE_WLED_V1601) {
-        if (fw_wled_add_watchpoint_hook(stubs)) {
-            stubs->cpu->accelerated_blocks = true;
-            n++;
-        }
         n += fw_hook_scanned_phy(stubs);
     }
     if (n)
@@ -7048,7 +7116,8 @@ int rom_stubs_register_spy(esp32_rom_stubs_t *stubs, uint32_t addr,
 static int rom_stubs_register_any(esp32_rom_stubs_t *stubs, uint32_t addr,
                                   rom_stub_fn fn,
                                   rom_conditional_stub_fn conditional_fn,
-                                  const char *name, void *user_ctx) {
+                                  const char *name, void *user_ctx,
+                                  bool scan_preceding_entry) {
     if (stubs->count >= MAX_ROM_STUBS) return -1;
     stubs->entries[stubs->count].addr = addr;
     stubs->entries[stubs->count].fn = fn;
@@ -7058,18 +7127,22 @@ static int rom_stubs_register_any(esp32_rom_stubs_t *stubs, uint32_t addr,
     stubs->count++;
     hook_ht_insert(stubs, addr, stubs->count - 1);
 
-    /* Xtensa windowed ABI: ELF symbols sometimes point past the ENTRY
-     * instruction (which is 3 bytes, op0 = 0x6, s field = a1).  CALL8/CALL12
-     * target the ENTRY itself, so the hook at 'addr' never fires.  Scan the
-     * preceding bytes for an ENTRY and register a second hook there.
-     * Only do this for firmware addresses (not ROM, which uses ILL placeholders). */
-    if (addr >= 0x40080000u && addr < 0x40200000u && stubs->cpu && stubs->cpu->mem) {
+    /* Some legacy ELF inputs place a symbol just after the function's ENTRY.
+     * Only when the supplied address is not itself a complete ENTRY, scan the
+     * preceding eight bytes for one and register the compatibility alias.
+     * Structurally discovered addresses bypass this path altogether. */
+    uint32_t supplied_insn = 0u;
+    bool supplied_is_entry = stubs->cpu &&
+            fw_peek(stubs->cpu, addr, 3, &supplied_insn) &&
+            fw_insn_is_entry(supplied_insn);
+    if (scan_preceding_entry && !supplied_is_entry &&
+        addr >= 0x40080000u && addr < 0x40200000u &&
+        stubs->cpu && stubs->cpu->mem) {
         for (int off = 1; off <= 8; off++) {
             uint32_t ea = addr - (uint32_t)off;
-            uint8_t b0 = mem_read8(stubs->cpu->mem, ea);
-            uint8_t b1 = mem_read8(stubs->cpu->mem, ea + 1);
-            /* ENTRY: op0 = 6, s = a1 (bits 3:0 of byte1 = 1) */
-            if ((b0 & 0xF) == 0x6 && (b1 & 0xF) == 1) {
+            uint32_t entry_insn;
+            if (fw_peek(stubs->cpu, ea, 3, &entry_insn) &&
+                fw_insn_is_entry(entry_insn)) {
                 if (stubs->count < MAX_ROM_STUBS) {
                     stubs->entries[stubs->count].addr = ea;
                     stubs->entries[stubs->count].fn = fn;
@@ -7089,7 +7162,8 @@ static int rom_stubs_register_any(esp32_rom_stubs_t *stubs, uint32_t addr,
 
 int rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
                             rom_stub_fn fn, const char *name, void *user_ctx) {
-    return rom_stubs_register_any(stubs, addr, fn, NULL, name, user_ctx);
+    return rom_stubs_register_any(
+            stubs, addr, fn, NULL, name, user_ctx, true);
 }
 
 int rom_stubs_register_conditional_ctx(
@@ -7097,7 +7171,23 @@ int rom_stubs_register_conditional_ctx(
                             rom_conditional_stub_fn fn, const char *name,
                             void *user_ctx) {
     if (!fn) return -1;
-    return rom_stubs_register_any(stubs, addr, NULL, fn, name, user_ctx);
+    return rom_stubs_register_any(
+            stubs, addr, NULL, fn, name, user_ctx, true);
+}
+
+static int rom_stubs_register_exact_ctx(
+        esp32_rom_stubs_t *stubs, uint32_t addr, rom_stub_fn fn,
+        const char *name, void *user_ctx) {
+    return rom_stubs_register_any(
+            stubs, addr, fn, NULL, name, user_ctx, false);
+}
+
+static int rom_stubs_register_conditional_exact_ctx(
+        esp32_rom_stubs_t *stubs, uint32_t addr,
+        rom_conditional_stub_fn fn, const char *name, void *user_ctx) {
+    if (!fn) return -1;
+    return rom_stubs_register_any(
+            stubs, addr, NULL, fn, name, user_ctx, false);
 }
 
 int rom_stubs_output_count(const esp32_rom_stubs_t *stubs) {
