@@ -15,7 +15,7 @@ Booting to one UART line is not considered a pass.
 | ESP32 Marauder 1.14.3 (3.5-inch and Guition variants) | Interpreter + JIT | Pass | None in the scripted scenario |
 | NerdMiner 1.8.3 | Interpreter + JIT | Pass | None in the scripted scenario |
 | Bruce 1.16.1 (CYD 2432S028) | Interpreter + JIT | Pass | Expand radio interaction coverage; requires the official ESP32 ROM ELF |
-| Meshtastic 2.7.26 (T-Beam) | Interpreter + JIT | Pass | Expand LoRa packet exchange; requires the official ESP32 ROM ELF |
+| Meshtastic 2.7.26 (T-Beam) | Interpreter + JIT | Pass | None in the scripted scenario; requires the official ESP32 ROM ELF |
 | openHASP 0.7.0-rc13 (Lanbon L8) | Interpreter + JIT | Pass | Expand FT6336 touch and HTTP/MQTT interaction coverage |
 | Tasmota 15.6.0 | Interpreter + JIT | Pass | HTTP Status and Berry-to-GPIO are covered; expand MQTT and device drivers |
 | WLED 16.0.1 | Interpreter + JIT | Pass | DNRGB-to-RMT is covered; expand HTTP, DDP, and E1.31 coverage |
@@ -57,6 +57,8 @@ The Meshtastic scenario covers:
 
 - T-Beam AXP192 power detection and rail configuration
 - SX1276 discovery and complete LoRa radio initialization over board SPI
+- serial API configuration, encrypted LoRa transmit, and loopback receive
+  through the SX1276 FIFO and the firmware's RadioLib interrupt path
 - NimBLE host/controller synchronization and BLE advertising
 - u-blox NEO-M8 detection, UBX configuration/ACK traffic, and an accepted
   NMEA position and time fix over UART1

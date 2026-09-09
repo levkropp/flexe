@@ -62,6 +62,7 @@ Useful overrides are `BENCH_ROUNDS`, `BENCH_REPS`, and `MIN_REALTIME`.
 Use the scripted stock scenarios when the image has one:
 
 ```sh
+BRUCE_BIN=/path/to/bruce.bin \
 MARAUDER_BIN=/path/to/marauder.bin \
 MESHTASTIC_BIN=/path/to/meshtastic.bin \
 NERDMINER_BIN=/path/to/nerdminer.bin \
