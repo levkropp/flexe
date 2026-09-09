@@ -3891,6 +3891,83 @@ TEST(timg_dual_core_time_uses_monotonic_maximum) {
     mem_destroy(mem);
 }
 
+TEST(timg_lact_uses_apb_clock_pause_load_and_alarm) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    const uint32_t config = TEST_TIMG0_BASE + 0x70u;
+    const uint32_t count_lo = TEST_TIMG0_BASE + 0x78u;
+    const uint32_t alarm_lo = TEST_TIMG0_BASE + 0x84u;
+    const uint32_t load_lo = TEST_TIMG0_BASE + 0x8Cu;
+    const uint32_t load_hi = TEST_TIMG0_BASE + 0x90u;
+    const uint32_t load = TEST_TIMG0_BASE + 0x94u;
+    const uint32_t int_ena = TEST_TIMG0_BASE + 0x98u;
+    const uint32_t int_raw = TEST_TIMG0_BASE + 0x9Cu;
+    const uint32_t int_clr = TEST_TIMG0_BASE + 0xA4u;
+    const uint32_t lact_en = 1u << 31;
+    const uint32_t lact_increase = 1u << 30;
+    const uint32_t lact_level = 1u << 11;
+    const uint32_t lact_alarm = 1u << 10;
+
+    mem_write32(mem, 0x3FFE01E0u, 160u);
+    mem_write32(mem, 0x3FF000C0u, 1u << 13);
+    mem_write32(mem, load_lo, 0u);
+    mem_write32(mem, load_hi, 0u);
+    mem_write32(mem, load, 1u);
+    mem_write32(mem, config, lact_en | lact_increase | (40u << 13));
+
+    /* APB / 40 is 2 MHz regardless of CPU frequency. At 160 MHz, 1600
+     * CCOUNT cycles therefore advance LACT by 20 ticks (10 us), not 40. */
+    cpu.ccount += 1600u;
+    ASSERT_EQ(mem_read32(mem, count_lo), 20u);
+
+    mem_write32(mem, config, lact_increase | (40u << 13));
+    cpu.ccount += 1600u;
+    ASSERT_EQ(mem_read32(mem, count_lo), 20u);
+
+    /* Resume at 240 MHz, then change the divider while preserving count. */
+    mem_write32(mem, 0x3FFE01E0u, 240u);
+    mem_write32(mem, config, lact_en | lact_increase | (40u << 13));
+    cpu.ccount += 2400u;
+    ASSERT_EQ(mem_read32(mem, count_lo), 40u);
+    mem_write32(mem, config, lact_en | lact_increase | (80u << 13));
+    cpu.ccount += 2400u;
+    ASSERT_EQ(mem_read32(mem, count_lo), 50u);
+
+    /* LOAD replaces the live value. A one-shot alarm fires at the exact APB
+     * boundary, clears ALARM_EN, and does not reassert merely because the
+     * counter remains beyond the compare value. */
+    mem_write32(mem, config, lact_increase | (40u << 13));
+    mem_write32(mem, load_lo, 100u);
+    mem_write32(mem, load_hi, 0u);
+    mem_write32(mem, load, 1u);
+    mem_write32(mem, alarm_lo, 102u);
+    mem_write32(mem, int_ena, 1u << 3);
+    mem_write32(mem, config, lact_en | lact_increase | (40u << 13) |
+                             lact_level | lact_alarm);
+    ASSERT_EQ(cpu.next_timer_event, cpu.ccount + 240u);
+    cpu.ccount += 239u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, int_raw) & (1u << 3), 0u);
+    cpu.ccount += 1u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, count_lo), 102u);
+    ASSERT_EQ(mem_read32(mem, int_raw) & (1u << 3), 1u << 3);
+    ASSERT_TRUE(periph_interrupt_pending(p, 17));
+    ASSERT_EQ(mem_read32(mem, config) & lact_alarm, 0u);
+    mem_write32(mem, int_clr, 1u << 3);
+    ASSERT_FALSE(periph_interrupt_pending(p, 17));
+    ASSERT_EQ(mem_read32(mem, int_raw) & (1u << 3), 0u);
+
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(wdt_disable) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -6156,6 +6233,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(timg_general_timers_count_capture_pause_and_reset);
     RUN_TEST(timg_alarm_autoreload_mask_clear_and_sources);
     RUN_TEST(timg_dual_core_time_uses_monotonic_maximum);
+    RUN_TEST(timg_lact_uses_apb_clock_pause_load_and_alarm);
     RUN_TEST(wdt_disable);
     RUN_TEST(rtc_reset_cause);
     RUN_TEST(sens_adc_single_conversions);

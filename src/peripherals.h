@@ -316,6 +316,14 @@ bool periph_app_cpu_released(const esp32_periph_t *p);
 /* Attach CPU pointers for interrupt delivery (call after cpu init) */
 void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1);
 
+/* Predict a LACT counter read after `ccount_ahead` cycles on one attached
+ * core, without advancing peripheral state. Profile-verified accelerators use
+ * this to collapse ESP-IDF's mandatory update/poll sequence while preserving
+ * the exact value each original MMIO read would observe. */
+bool periph_lact_counter_at_ccount(const esp32_periph_t *p,
+                                   const xtensa_cpu_t *cpu, int group,
+                                   uint32_t ccount_ahead, uint64_t *counter);
+
 /* Schedule or cancel a one-shot callback. Re-scheduling the same fn/ctx pair
  * replaces its deadline. The deadline participates in WAITI fast-forwarding,
  * so a sleeping guest still observes the completion at the right time. */

@@ -162,6 +162,8 @@ static int session_build(flexe_session_t *s)
             esp_timer_stubs_set_sleep_fn(s->etimer, session_sleep_us, s->frt);
         if (s->syms)
             esp_timer_stubs_hook_symbols(s->etimer, s->syms);
+        esp_timer_stubs_hook_firmware_profile(
+                s->etimer, rom_stubs_firmware_profile(s->rom));
     }
 
     /* Display stubs */

@@ -6,6 +6,7 @@
 #include "rom_stubs.h"
 #include "memory.h"
 #include "guest_call.h"
+#include "peripherals.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -14,6 +15,11 @@
 #define ESP_OK    0
 #define MAX_TIMERS 16
 #define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
+
+#define WLED_V1601_ESP_TIMER_GET_TIME 0x40086738u
+#define WLED_V1601_LACT_CONFIG        0x3FF5F070u
+#define WLED_V1601_LACT_DIVIDER       40u
+#define WLED_V1601_GET_TIME_MAX_INSNS 160u
 
 /* Instruction budget for one esp_timer callback. */
 #define ESP_TIMER_CALLBACK_INSNS 100000u
@@ -330,6 +336,110 @@ void stub_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     }
 }
 
+/* WLED 16.0.1's stripped IDF 4.4 timer accessor is a pure wrapper around the
+ * timer-group LACT counter. The inner routine deliberately polls until an
+ * APB/divider tick arrives, so its dynamic length is phase-dependent (33 to
+ * 153 instructions at divider 40, plus one possible 7-insn consistency
+ * retry). Reproduce those reads and their exact instruction positions in C;
+ * this preserves both the returned counter and guest time while avoiding the
+ * interpreter-dispatch cost of the spin. Decline if either nested ENTRY could
+ * expose a live register window or an event belongs inside the maximum span. */
+static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    if (XT_PS_CALLINC(cpu->ps) != 2 || cpu->seed_entry_link)
+        return 0;
+
+    for (unsigned i = 1; i <= 6u; i++) {
+        unsigned window = (cpu->windowbase + i) & 0xFu;
+        if (cpu->windowstart & (1u << window))
+            return 0;
+    }
+
+    uint32_t distance = cpu->next_timer_event - cpu->ccount;
+    if (distance <= WLED_V1601_GET_TIME_MAX_INSNS)
+        return 0;
+
+    uint32_t config = mem_read32(cpu->mem, WLED_V1601_LACT_CONFIG);
+    uint32_t divider = (config >> 13) & 0xFFFFu;
+    if (divider != WLED_V1601_LACT_DIVIDER ||
+        (config & (3u << 30)) != (3u << 30))
+        return 0;
+
+    esp32_periph_t *periph = cpu->periph_event_ctx;
+    uint64_t snapshot;
+    if (!periph_lact_counter_at_ccount(periph, cpu, 0, 7u, &snapshot))
+        return 0;
+    uint32_t low_start = (uint32_t)snapshot;
+
+    /* LOW is sampled by every third instruction starting at instruction 18.
+     * The predicate is monotone over this tiny span, so locate the first
+     * changed sample in at most six pure counter predictions. */
+    uint32_t lo_iteration = 0u;
+    uint32_t hi_iteration = divider;
+    uint32_t poll_delta = 17u + 3u * hi_iteration;
+    if (!periph_lact_counter_at_ccount(
+            periph, cpu, 0, poll_delta, &snapshot))
+        return 0;
+    if ((uint32_t)snapshot != low_start) {
+        while (lo_iteration < hi_iteration) {
+            uint32_t mid = lo_iteration +
+                           (hi_iteration - lo_iteration) / 2u;
+            uint32_t delta = 17u + 3u * mid;
+            if (!periph_lact_counter_at_ccount(
+                    periph, cpu, 0, delta, &snapshot))
+                return 0;
+            if ((uint32_t)snapshot == low_start)
+                lo_iteration = mid + 1u;
+            else
+                hi_iteration = mid;
+        }
+        poll_delta = 17u + 3u * lo_iteration;
+        if (!periph_lact_counter_at_ccount(
+                periph, cpu, 0, poll_delta, &snapshot))
+            return 0;
+    }
+    uint32_t low = (uint32_t)snapshot;
+
+    /* Read a consistent HIGH:LOW pair. A rollover between the two LOW reads
+     * takes the seven-instruction retry path before checking again. */
+    uint32_t high = 0u;
+    uint32_t low_delta = 0u;
+    for (uint32_t retry = 0u; retry < 2u; retry++) {
+        uint32_t high_delta = poll_delta + 5u + 7u * retry;
+        low_delta = high_delta + 2u;
+        if (!periph_lact_counter_at_ccount(
+                periph, cpu, 0, high_delta, &snapshot))
+            return 0;
+        high = (uint32_t)(snapshot >> 32);
+        if (!periph_lact_counter_at_ccount(
+                periph, cpu, 0, low_delta, &snapshot))
+            return 0;
+        uint32_t checked_low = (uint32_t)snapshot;
+        if (checked_low == low) {
+            low = checked_low;
+            break;
+        }
+        low = checked_low;
+        if (retry == 1u) return 0;
+    }
+
+    uint64_t us = (((uint64_t)high << 32) | low) >> 1;
+
+    int ci = XT_PS_CALLINC(cpu->ps);
+    ar_write(cpu, ci * 4 + 2, (uint32_t)us);
+    ar_write(cpu, ci * 4 + 3, (uint32_t)(us >> 32));
+    uint32_t a0 = ar_read(cpu, ci * 4);
+    cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+
+    /* Nine instructions follow the final LOW read, including the intercepted
+     * ENTRY charged by the dispatcher. */
+    uint32_t total = low_delta + 9u;
+    cpu->ccount += total - 1u;
+    cpu->cycle_count += total - 1u;
+    return (int)total;
+}
+
 /* esp_timer_dump(FILE *stream) — print timer list to stdout */
 void stub_esp_timer_dump(xtensa_cpu_t *cpu, void *ctx) {
     esp_timer_stubs_t *et = ctx;
@@ -455,6 +565,36 @@ int esp_timer_stubs_hook_symbols(esp_timer_stubs_t *et, const elf_symbols_t *sym
     }
 
     return hooked;
+}
+
+int esp_timer_stubs_hook_firmware_profile(
+        esp_timer_stubs_t *et, rom_firmware_profile_t profile) {
+    if (!et || profile != ROM_FIRMWARE_WLED_V1601)
+        return 0;
+
+    static const uint8_t signature[] = {
+        0x36, 0x41, 0x00, 0x25, 0xFB, 0xFF, 0x10, 0x2B,
+        0x01, 0xA0, 0xA1, 0x41, 0xA0, 0x22, 0x20, 0xB0,
+    };
+    const uint8_t *code = mem_get_ptr(et->cpu->mem,
+                                      WLED_V1601_ESP_TIMER_GET_TIME);
+    if (!code || memcmp(code, signature, sizeof(signature)) != 0)
+        return 0;
+
+    esp32_rom_stubs_t *rom = et->rom;
+    if (!rom)
+        rom = et->cpu->pc_hook_ctx;
+    if (!rom)
+        return 0;
+    et->rom = rom;
+
+    if (rom_stubs_register_conditional_ctx(
+            rom, WLED_V1601_ESP_TIMER_GET_TIME,
+            stub_wled_v1601_esp_timer_get_time,
+            "esp_timer_get_time", et) != 0)
+        return 0;
+    et->cpu->accelerated_blocks = true;
+    return 1;
 }
 
 int esp_timer_stubs_timer_count(const esp_timer_stubs_t *et) {

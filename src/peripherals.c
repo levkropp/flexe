@@ -1247,16 +1247,17 @@ typedef struct {
 } frc_timer_state_t;
 
 /* TG LACT (low-alarm-counter) state — the esp_timer hardware timebase.
- * The 64-bit counter ticks at ccount/DIVIDER (DIVIDER from LACTCONFIG);
- * when the counter reaches the 64-bit alarm with ALARM_EN set, the
- * TGn_LACT_LEVEL interrupt source asserts (level). */
+ * Like the general-purpose timers, LACT is clocked from the fixed 80 MHz APB
+ * domain.  last_cycles/tick_remainder convert the shared CPU CCOUNT timeline
+ * without losing fractional APB/divider ticks. */
 typedef struct {
     uint32_t config;        /* LACTCONFIG */
     uint32_t rtc;           /* LACTRTC */
+    uint64_t counter;       /* live 64-bit timer value */
     uint64_t alarm;         /* LACTALARMHI:LO */
     uint64_t load;          /* LACTLOADHI:LO pending value */
-    uint64_t load_ccount;   /* shared timg cycle when LACTLOAD fired */
-    bool     loaded;        /* a LACTLOAD has occurred */
+    uint64_t last_cycles;   /* shared CPU-cycle timeline at last sync */
+    uint64_t tick_remainder;
     bool     level;         /* interrupt level currently asserted */
 } lact_state_t;
 
@@ -3702,6 +3703,8 @@ static void efuse_write(void *ctx, uint32_t addr, uint32_t val) {
 #define TIMG_INT_VALID_MASK       0xFu
 #define TIMG_WDT_INT_BIT          (1u << 2)
 #define LACT_CFG_EN               (1u << 31) /* TIMG_LACT_EN */
+#define LACT_CFG_INCREASE         (1u << 30)
+#define LACT_CFG_AUTORELOAD       (1u << 29)
 #define LACT_CFG_EDGE_INT_EN      (1u << 12)
 #define LACT_CFG_LEVEL_INT_EN     (1u << 11)
 #define LACT_CFG_ALARM_EN         (1u << 10) /* TIMG_LACT_ALARM_EN */
@@ -4001,6 +4004,7 @@ static void timg_reset_group(esp32_periph_t *p, unsigned group) {
     memset(&p->rtc_cal[group], 0, sizeof(p->rtc_cal[group]));
     p->timg[group].date = 0x01604290u;
     p->lact[group].config = 0x60002300u;
+    p->lact[group].last_cycles = p->timg_clock.cycles;
     for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++) {
         p->timg[group].timer[timer].config = TIMG_TIMER_CONFIG_RESET;
         p->timg[group].timer[timer].last_cycles = p->timg_clock.cycles;
@@ -4009,31 +4013,107 @@ static void timg_reset_group(esp32_periph_t *p, unsigned group) {
 
 static uint32_t lact_divider(const lact_state_t *l) {
     uint32_t d = (l->config >> 13) & 0xFFFF;
-    return d ? d : 1;
+    if (d == 0u) return 65536u;
+    return d < 2u ? 2u : d;
 }
 
-/* Live 64-bit LACT counter in timer ticks (shared cycle / DIVIDER).
- * LACT is part of the timer group, so it shares timg's clock: sampling from
- * either core advances the same timeline. */
-static uint64_t lact_counter(esp32_periph_t *p, int group) {
-    const lact_state_t *l = &p->lact[group];
-    uint64_t cc = timg_now_cycles(p);
-    uint32_t div = lact_divider(l);
-    uint64_t ticks = cc / div;
-    if (l->loaded) {
-        uint64_t base = l->load_ccount / div;
-        ticks = ticks - base + l->load;
+bool periph_lact_counter_at_ccount(const esp32_periph_t *p,
+                                   const xtensa_cpu_t *cpu, int group,
+                                   uint32_t ccount_ahead, uint64_t *counter) {
+    if (!p || !cpu || !counter || group < 0 || group >= 2)
+        return false;
+
+    const periph_clock_t *clock = &p->timg_clock;
+    uint64_t now = periph_clock_peek(p, clock);
+    bool attached = false;
+    for (unsigned core = 0; core < 2u; core++) {
+        if (p->cpu[core] != cpu) continue;
+        attached = true;
+        if (!clock->valid[core]) break;
+        uint32_t future = cpu->ccount + ccount_ahead;
+        uint32_t elapsed = future - clock->last_ccount[core];
+        if (elapsed >= (uint32_t)INT32_MAX) return false;
+        uint64_t candidate = clock->core_cycles[core] >
+            UINT64_MAX - elapsed ? UINT64_MAX :
+            clock->core_cycles[core] + elapsed;
+        if (candidate > now) now = candidate;
+        break;
     }
-    return ticks;
+    if (!attached) return false;
+
+    const lact_state_t *l = &p->lact[group];
+    uint64_t value = l->counter;
+    if ((l->config & LACT_CFG_EN) != 0u &&
+        timg_group_clocked(p, (unsigned)group)) {
+        uint64_t elapsed = now >= l->last_cycles ?
+                           now - l->last_cycles : 0u;
+        uint64_t denominator =
+            (uint64_t)timg_cpu_mhz(p) * lact_divider(l);
+        uint64_t product = elapsed >
+            (UINT64_MAX - l->tick_remainder) / TIMG_APB_CLOCK_MHZ ?
+            UINT64_MAX : l->tick_remainder +
+                         elapsed * TIMG_APB_CLOCK_MHZ;
+        uint64_t ticks = product / denominator;
+        value = l->config & LACT_CFG_INCREASE ? value + ticks :
+                                                 value - ticks;
+    }
+    *counter = value;
+    return true;
+}
+
+static void lact_sync_to(esp32_periph_t *p, int group, uint64_t now) {
+    lact_state_t *l = &p->lact[group];
+    uint64_t elapsed = now >= l->last_cycles ? now - l->last_cycles : 0u;
+    l->last_cycles = now;
+    if (!(l->config & LACT_CFG_EN) ||
+        !timg_group_clocked(p, (unsigned)group))
+        return;
+
+    uint64_t denominator = (uint64_t)timg_cpu_mhz(p) * lact_divider(l);
+    uint64_t product = elapsed >
+        (UINT64_MAX - l->tick_remainder) / TIMG_APB_CLOCK_MHZ ?
+        UINT64_MAX : l->tick_remainder + elapsed * TIMG_APB_CLOCK_MHZ;
+    uint64_t ticks = product / denominator;
+    l->tick_remainder = product % denominator;
+    if (ticks == 0u) return;
+
+    bool increase = (l->config & LACT_CFG_INCREASE) != 0u;
+    uint64_t distance = increase ? l->alarm - l->counter :
+                                   l->counter - l->alarm;
+    bool fire = (l->config & LACT_CFG_ALARM_EN) != 0u &&
+                distance != 0u && ticks >= distance;
+    if (!fire) {
+        l->counter = increase ? l->counter + ticks : l->counter - ticks;
+        return;
+    }
+
+    l->counter = l->alarm;
+    ticks -= distance;
+    bool autoreload = (l->config & LACT_CFG_AUTORELOAD) != 0u;
+    l->config &= ~LACT_CFG_ALARM_EN;
+    if (autoreload) l->counter = l->load;
+    p->timg[group].int_raw |= LACT_INT_BIT;
+    timg_update_lact_irq(p, (unsigned)group);
+
+    /* ALARM_EN is one-shot. Any cycles left after the compare still advance
+     * the live counter (from LOAD when autoreload is selected). */
+    increase = (l->config & LACT_CFG_INCREASE) != 0u;
+    l->counter = increase ? l->counter + ticks : l->counter - ticks;
+}
+
+/* Live 64-bit LACT counter in APB/DIVIDER ticks. Sampling from either core
+ * advances the same shared timeline without double-counting dual-core work. */
+static uint64_t lact_counter(esp32_periph_t *p, int group) {
+    uint64_t now = timg_now_cycles(p);
+    lact_sync_to(p, group, now);
+    return p->lact[group].counter;
 }
 
 /* Re-evaluate the alarm condition and drive the level interrupt source.
  * Hardware: INT_RAW sets when counter >= alarm with ALARM_EN; the source
  * line asserts while (INT_RAW & INT_ENA). */
 static void lact_latch_alarm(esp32_periph_t *p, int group) {
-    lact_state_t *l = &p->lact[group];
-    if ((l->config & LACT_CFG_ALARM_EN) && lact_counter(p, group) >= l->alarm)
-        p->timg[group].int_raw |= LACT_INT_BIT;
+    (void)lact_counter(p, group);
 }
 
 static void lact_eval_irq(esp32_periph_t *p, int group) {
@@ -4046,15 +4126,31 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     uint64_t best = UINT32_MAX;
     for (int group = 0; group < 2; group++) {
         lact_state_t *l = &p->lact[group];
-        if (!(l->config & LACT_CFG_ALARM_EN)) continue;
+        if (!(l->config & LACT_CFG_ALARM_EN) ||
+            !(l->config & LACT_CFG_EN) ||
+            !timg_group_clocked(p, (unsigned)group))
+            continue;
         if (p->timg[group].int_raw & LACT_INT_BIT) {
             continue; /* event already latched */
         }
         uint64_t now = lact_counter(p, group);
-        if (now >= l->alarm) {
-            return cpu->ccount;   /* fire now */
+        bool increase = (l->config & LACT_CFG_INCREASE) != 0u;
+        if ((increase && l->alarm <= now) ||
+            (!increase && l->alarm >= now))
+            continue; /* hardware does not retrigger an already-past compare */
+        uint64_t ticks = increase ? l->alarm - now : now - l->alarm;
+        uint64_t denominator =
+            (uint64_t)timg_cpu_mhz(p) * lact_divider(l);
+        uint64_t needed = ticks > UINT64_MAX / denominator ? UINT64_MAX :
+                          ticks * denominator;
+        uint64_t cycles;
+        if (needed <= l->tick_remainder) {
+            cycles = 1u;
+        } else {
+            needed -= l->tick_remainder;
+            cycles = needed / TIMG_APB_CLOCK_MHZ +
+                     (needed % TIMG_APB_CLOCK_MHZ != 0u);
         }
-        uint64_t cycles = (l->alarm - now) * lact_divider(l);
         uint64_t event = (uint64_t)cpu->ccount + cycles;
         if (event > UINT32_MAX) event = UINT32_MAX;
         if (event < best) best = event;
@@ -4559,7 +4655,16 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
         break;
     }
     /* LACT (low-alarm-counter) — esp_timer hardware timebase */
-    case 0x070: l->config = val; lact_eval_irq(p, group); lact_kick(p); break;
+    case 0x070: {
+        lact_sync_to(p, group, now);
+        uint32_t old_config = l->config;
+        l->config = val;
+        if (((old_config ^ l->config) & (0xFFFFu << 13)) != 0u)
+            l->tick_remainder = 0u;
+        lact_eval_irq(p, group);
+        lact_kick(p);
+        break;
+    }
     case 0x074: l->rtc = val; break;
     case 0x080: break;               /* LACTUPDATE: reads are live, no latch needed */
     case 0x084: l->alarm = (l->alarm & 0xFFFFFFFF00000000ull) | val;
@@ -4569,8 +4674,9 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
     case 0x08C: l->load = (l->load & 0xFFFFFFFF00000000ull) | val; break;
     case 0x090: l->load = (l->load & 0xFFFFFFFFull) | ((uint64_t)val << 32); break;
     case 0x094:                    /* LACTLOAD: counter := load value */
-        l->loaded = true;
-        l->load_ccount = timg_now_cycles(p);
+        l->counter = l->load;
+        l->last_cycles = now;
+        l->tick_remainder = 0u;
         lact_eval_irq(p, group); lact_kick(p);
         break;
     case 0x098:
@@ -14033,6 +14139,12 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
                         p, (int)core, p->intr_matrix[core][source]);
             }
         }
+    }
+    for (unsigned group = 0; group < 2u; group++) {
+        p->lact[group].last_cycles = p->timg_clock.cycles;
+        for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++)
+            p->timg[group].timer[timer].last_cycles =
+                p->timg_clock.cycles;
     }
     for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
         p->frc_timer[timer].last_cycles = p->timg_clock.cycles;

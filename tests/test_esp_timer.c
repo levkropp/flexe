@@ -3,6 +3,7 @@
  */
 #include "esp_timer_stubs.h"
 #include "rom_stubs.h"
+#include "peripherals.h"
 
 /* Forward declarations of stub functions for direct testing */
 extern void stub_esp_timer_create(xtensa_cpu_t *, void *);
@@ -163,6 +164,92 @@ TEST(test_esp_timer_get_time) {
     et_teardown(&cpu, rom, et);
 }
 
+TEST(test_wled_stripped_timer_hook_is_exact_and_guarded) {
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    esp_timer_stubs_t *et;
+    et_setup(&cpu, &rom, &et);
+
+    const uint32_t addr = 0x40086738u;
+    static const uint8_t signature[] = {
+        0x36, 0x41, 0x00, 0x25, 0xFB, 0xFF, 0x10, 0x2B,
+        0x01, 0xA0, 0xA1, 0x41, 0xA0, 0x22, 0x20, 0xB0,
+    };
+
+    /* A profile name alone must never install an address hook. */
+    ASSERT_EQ(esp_timer_stubs_hook_firmware_profile(
+                      et, ROM_FIRMWARE_WLED_V1601), 0u);
+    put_test_bytes(&cpu, addr, signature, sizeof(signature));
+    ASSERT_EQ(esp_timer_stubs_hook_firmware_profile(
+                      et, ROM_FIRMWARE_WLED_V1601), 1u);
+    ASSERT_TRUE(cpu.accelerated_blocks);
+
+    esp32_periph_t *periph = periph_create(cpu.mem);
+    ASSERT_TRUE(periph != NULL);
+    periph_attach_cpus(periph, &cpu, NULL);
+    mem_write32(cpu.mem, 0x3FFE01E0u, 160u);
+    mem_write32(cpu.mem, 0x3FF000C0u, 1u << 13);
+    mem_write32(cpu.mem, 0x3FF5F08Cu, 0u);
+    mem_write32(cpu.mem, 0x3FF5F090u, 0u);
+    mem_write32(cpu.mem, 0x3FF5F094u, 1u);
+    mem_write32(cpu.mem, 0x3FF5F070u,
+                (1u << 31) | (1u << 30) | (40u << 13) | (1u << 11));
+    cpu.pc = addr;
+    cpu._pc_written = true;
+    cpu.windowbase = 0u;
+    cpu.windowstart = 1u;
+    cpu.ccount = 160000u;
+    cpu.cycle_count = 160000u;
+    cpu.virtual_time_us = 500u;
+    cpu.next_timer_event = UINT32_MAX;
+    XT_PS_SET_CALLINC(cpu.ps, 2);
+    ar_write(&cpu, 8, (2u << 30) | (BASE & 0x3FFFFFFFu));
+
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(ar_read(&cpu, 10), 1000u);
+    ASSERT_EQ(ar_read(&cpu, 11), 0u);
+    ASSERT_EQ(cpu.ccount, 160096u);
+    ASSERT_EQ64(cpu.cycle_count, 160096u);
+    ASSERT_EQ64(cpu.insn_count, 96u);
+
+    /* A live window the nested calls could touch makes the hook decline. */
+    cpu.pc = addr;
+    cpu._pc_written = true;
+    cpu.windowbase = 0u;
+    cpu.windowstart = 1u | (1u << 6);
+    cpu.ccount = 200000u;
+    cpu.cycle_count = 200000u;
+    cpu.next_timer_event = UINT32_MAX;
+    cpu.insn_count = 0u;
+    cpu.seed_entry_link = false;
+    XT_PS_SET_CALLINC(cpu.ps, 2);
+    ar_write(&cpu, 1, 0x3FFB4000u);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, addr + 3u);
+    ASSERT_EQ(cpu.ccount, 200001u);
+    ASSERT_EQ64(cpu.insn_count, 1u);
+
+    /* So does a timer event that belongs anywhere inside the 33-insn span. */
+    cpu.pc = addr;
+    cpu._pc_written = true;
+    cpu.windowbase = 0u;
+    cpu.windowstart = 1u;
+    cpu.ccount = 300000u;
+    cpu.cycle_count = 300000u;
+    cpu.next_timer_event = 300033u;
+    cpu.insn_count = 0u;
+    XT_PS_SET_CALLINC(cpu.ps, 2);
+    ar_write(&cpu, 1, 0x3FFB4000u);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, addr + 3u);
+    ASSERT_EQ(cpu.ccount, 300001u);
+    ASSERT_EQ64(cpu.insn_count, 1u);
+
+    periph_destroy(periph);
+    et_teardown(&cpu, rom, et);
+}
+
 TEST(test_esp_timer_start_once) {
     xtensa_cpu_t cpu;
     esp32_rom_stubs_t *rom;
@@ -273,6 +360,7 @@ static void run_esp_timer_tests(void) {
     RUN_TEST(test_esp_timer_start_stop);
     RUN_TEST(test_esp_timer_delete);
     RUN_TEST(test_esp_timer_get_time);
+    RUN_TEST(test_wled_stripped_timer_hook_is_exact_and_guarded);
     RUN_TEST(test_esp_timer_start_once);
     RUN_TEST(test_esp_timer_multiple_creates);
     RUN_TEST(test_delay_advances_virtual_time_and_ccount_at_runtime_frequency);
