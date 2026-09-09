@@ -604,6 +604,16 @@ int  xtensa_disasm(const xtensa_cpu_t *cpu, uint32_t addr, char *buf, int bufsiz
 void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr);
 void xtensa_check_interrupts(xtensa_cpu_t *cpu);
 void xtensa_flush_windows(xtensa_cpu_t *cpu);
+
+/* Execute one canonical ESP32 register-window spill/fill vector as a single
+ * host operation.  The caller remains responsible for instruction/time
+ * accounting and for verifying the firmware bytes at the vector address. */
+bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
+                               bool underflow);
+
+/* Flush every non-current live window using the architectural stack layout,
+ * without retaining legacy host-only spill metadata. */
+bool xtensa_fast_spill_all_windows(xtensa_cpu_t *cpu);
 void xtensa_recompute_next_timer(xtensa_cpu_t *cpu);
 
 /* Raise any ccompare/peripheral timer interrupts whose ccount has arrived and

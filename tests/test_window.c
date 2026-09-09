@@ -832,6 +832,137 @@ TEST(rfwu_basic) {
     teardown(&cpu);
 }
 
+/* Compare the native vector primitive against the exact six instruction
+ * sequences used by the classic ESP32 vectors.  Wider vectors follow the
+ * linked save-area pointer at [a1-12], so this also checks the temporary
+ * a0/a7/a11 register behavior and both halves of call8/call12 frames. */
+TEST(fast_window_vectors_match_guest_code) {
+    static const uint8_t overflow4[] = {
+        0x00, 0xC5, 0x49, 0x10, 0xD5, 0x49, 0x20, 0xE5, 0x49,
+        0x30, 0xF5, 0x49, 0x00, 0x34, 0x00,
+    };
+    static const uint8_t underflow4[] = {
+        0x00, 0xC5, 0x09, 0x10, 0xD5, 0x09, 0x20, 0xE5, 0x09,
+        0x30, 0xF5, 0x09, 0x00, 0x35, 0x00,
+    };
+    static const uint8_t overflow8[] = {
+        0x00, 0xC9, 0x49, 0x00, 0xD1, 0x09, 0x10, 0xD9, 0x49,
+        0x20, 0xE9, 0x49, 0x30, 0xF9, 0x49, 0x40, 0x80, 0x49,
+        0x50, 0x90, 0x49, 0x60, 0xA0, 0x49, 0x70, 0xB0, 0x49,
+        0x00, 0x34, 0x00,
+    };
+    static const uint8_t underflow8[] = {
+        0x00, 0xC9, 0x09, 0x10, 0xD9, 0x09, 0x20, 0xE9, 0x09,
+        0x70, 0xD1, 0x09, 0x30, 0xF9, 0x09, 0x40, 0x87, 0x09,
+        0x50, 0x97, 0x09, 0x60, 0xA7, 0x09, 0x70, 0xB7, 0x09,
+        0x00, 0x35, 0x00,
+    };
+    static const uint8_t overflow12[] = {
+        0x00, 0xCD, 0x49, 0x00, 0xD1, 0x09, 0x10, 0xDD, 0x49,
+        0x20, 0xED, 0x49, 0x30, 0xFD, 0x49, 0x40, 0x40, 0x49,
+        0x50, 0x50, 0x49, 0x60, 0x60, 0x49, 0x70, 0x70, 0x49,
+        0x80, 0x80, 0x49, 0x90, 0x90, 0x49, 0xA0, 0xA0, 0x49,
+        0xB0, 0xB0, 0x49, 0x00, 0x34, 0x00,
+    };
+    static const uint8_t underflow12[] = {
+        0x00, 0xCD, 0x09, 0x10, 0xDD, 0x09, 0x20, 0xED, 0x09,
+        0xB0, 0xD1, 0x09, 0x30, 0xFD, 0x09, 0x40, 0x4B, 0x09,
+        0x50, 0x5B, 0x09, 0x60, 0x6B, 0x09, 0x70, 0x7B, 0x09,
+        0x80, 0x8B, 0x09, 0x90, 0x9B, 0x09, 0xA0, 0xAB, 0x09,
+        0xB0, 0xBB, 0x09, 0x00, 0x35, 0x00,
+    };
+    const struct {
+        unsigned regs;
+        bool underflow;
+        const uint8_t *code;
+        size_t code_size;
+    } cases[] = {
+        {4u, false, overflow4, sizeof(overflow4)},
+        {4u, true, underflow4, sizeof(underflow4)},
+        {8u, false, overflow8, sizeof(overflow8)},
+        {8u, true, underflow8, sizeof(underflow8)},
+        {12u, false, overflow12, sizeof(overflow12)},
+        {12u, true, underflow12, sizeof(underflow12)},
+    };
+
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        xtensa_cpu_t reference, native;
+        setup_windowed(&reference);
+        setup_windowed(&native);
+        reference.real_window_vectors = true;
+        native.real_window_vectors = true;
+        reference.windowbase = native.windowbase = 5u;
+        reference.windowstart = native.windowstart =
+            cases[c].underflow ? (1u << 2) : (1u << 2) | (1u << 5);
+        reference.ps = native.ps = (1u << 18) | (1u << 4);
+        XT_PS_SET_OWB(reference.ps, 2u);
+        XT_PS_SET_OWB(native.ps, 2u);
+        reference.epc[0] = native.epc[0] = BASE + 0x700u;
+        reference.pc = native.pc = BASE;
+
+        for (unsigned i = 0; i < 64u; i++)
+            reference.ar[i] = native.ar[i] = 0xA5000000u + i * 0x101u;
+
+        const uint32_t frame_top = 0x3FFB6000u;
+        const uint32_t extra_top = 0x3FFB7000u;
+        const uint32_t stack = 0x3FFB8000u;
+        ar_write(&reference, (int)cases[c].regs + 1, frame_top);
+        ar_write(&native, (int)cases[c].regs + 1, frame_top);
+        if (cases[c].underflow) {
+            for (unsigned i = 0; i < 4u; i++) {
+                uint32_t value = i == 1u ? stack : 0xC0001000u + i;
+                mem_write32(reference.mem, frame_top - 16u + i * 4u, value);
+                mem_write32(native.mem, frame_top - 16u + i * 4u, value);
+            }
+        } else {
+            ar_write(&reference, 1, stack);
+            ar_write(&native, 1, stack);
+        }
+        mem_write32(reference.mem, stack - 12u, extra_top);
+        mem_write32(native.mem, stack - 12u, extra_top);
+        if (cases[c].regs > 4u) {
+            uint32_t offset = cases[c].regs == 8u ? 32u : 48u;
+            for (unsigned i = 0; i < cases[c].regs - 4u; i++) {
+                uint32_t value = 0xD0002000u + i;
+                mem_write32(reference.mem, extra_top - offset + i * 4u,
+                            value);
+                mem_write32(native.mem, extra_top - offset + i * 4u, value);
+            }
+        }
+
+        put_test_bytes(&reference, BASE, cases[c].code, cases[c].code_size);
+        for (unsigned i = 0; i < cases[c].code_size / 3u; i++)
+            xtensa_step(&reference);
+        ASSERT_TRUE(xtensa_fast_window_vector(
+                &native, cases[c].regs, cases[c].underflow));
+        /* xtensa_step() consumes irq_check after RFWO/RFWU when no interrupt
+         * is pending; the native primitive returns at that same boundary. */
+        native.irq_check = false;
+
+        ASSERT_EQ(native.pc, reference.pc);
+        ASSERT_EQ(native.ps, reference.ps);
+        ASSERT_EQ(native.windowbase, reference.windowbase);
+        ASSERT_EQ(native.windowstart, reference.windowstart);
+        ASSERT_EQ(native.window_hazard, reference.window_hazard);
+        for (unsigned i = 0; i < 64u; i++)
+            ASSERT_EQ(native.ar[i], reference.ar[i]);
+        for (unsigned i = 0; i < 4u; i++)
+            ASSERT_EQ(mem_read32(native.mem, frame_top - 16u + i * 4u),
+                      mem_read32(reference.mem,
+                                 frame_top - 16u + i * 4u));
+        if (cases[c].regs > 4u) {
+            uint32_t offset = cases[c].regs == 8u ? 32u : 48u;
+            for (unsigned i = 0; i < cases[c].regs - 4u; i++)
+                ASSERT_EQ(mem_read32(native.mem,
+                                     extra_top - offset + i * 4u),
+                          mem_read32(reference.mem,
+                                     extra_top - offset + i * 4u));
+        }
+        teardown(&reference);
+        teardown(&native);
+    }
+}
+
 /* ===== RETW.N ===== */
 
 TEST(retw_n_basic) {
@@ -1058,6 +1189,52 @@ TEST(call8_linked_spill_area) {
 
 TEST(call12_linked_spill_area) {
     linked_spill_round_trip(3);
+}
+
+TEST(fast_spill_all_uses_guest_abi_without_shadow_state) {
+    xtensa_cpu_t cpu; setup_windowed(&cpu);
+    const uint32_t caller_sp = BASE + 0x7800u;
+    const uint32_t callee_sp = BASE + 0x7000u;
+    const uint32_t extra_top = BASE + 0x6400u;
+    uint32_t expected[8];
+
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.windowbase = 2u;
+    cpu.windowstart = (1u << 0) | (1u << 2);
+    cpu.window_callsize[2] = 2u;
+    for (unsigned i = 0; i < 8u; i++) {
+        expected[i] = 0xBC000000u + i;
+        phys_wr(&cpu, 0, (int)i, expected[i]);
+    }
+    phys_wr(&cpu, 0, 1, caller_sp);
+    expected[1] = caller_sp;
+    phys_wr(&cpu, 2, 1, callee_sp);
+    mem_write32(cpu.mem, caller_sp - 12u, extra_top);
+    cpu.spill_base[0] = 0x13572468u;
+
+    ASSERT_TRUE(xtensa_fast_spill_all_windows(&cpu));
+    ASSERT_EQ(cpu.windowstart, 1u << 2);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.spill_base[0], 0x13572468u);
+    ASSERT_EQ(cpu.spill_stack[0].depth, 0u);
+    for (unsigned i = 0; i < 4u; i++)
+        ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16u + i * 4u),
+                  expected[i]);
+    for (unsigned i = 0; i < 4u; i++)
+        ASSERT_EQ(mem_read32(cpu.mem, extra_top - 32u + i * 4u),
+                  expected[i + 4u]);
+
+    /* An invalid linked save area is rejected before any WindowStart or
+     * destination-memory change. */
+    cpu.windowstart = (1u << 0) | (1u << 2);
+    mem_write32(cpu.mem, caller_sp - 12u, 0u);
+    mem_write32(cpu.mem, callee_sp - 16u, 0xCAFEBABEu);
+    ASSERT_FALSE(xtensa_fast_spill_all_windows(&cpu));
+    ASSERT_EQ(cpu.windowstart, (1u << 0) | (1u << 2));
+    ASSERT_EQ(mem_read32(cpu.mem, callee_sp - 16u), 0xCAFEBABEu);
+
+    teardown(&cpu);
 }
 
 /* The IDF high-priority interrupt prologue executes SPILL_ALL_WINDOWS using
@@ -1326,11 +1503,13 @@ static void run_window_tests(void) {
     RUN_TEST(l32e_s32e_round_trip);
     RUN_TEST(rfwo_basic);
     RUN_TEST(rfwu_basic);
+    RUN_TEST(fast_window_vectors_match_guest_code);
     RUN_TEST(retw_underflow_marks_window_live);
     RUN_TEST(retw_n_basic);
     RUN_TEST(factorial_windowed);
     RUN_TEST(call8_linked_spill_area);
     RUN_TEST(call12_linked_spill_area);
+    RUN_TEST(fast_spill_all_uses_guest_abi_without_shadow_state);
     RUN_TEST(interrupt_vector_entry_preserves_live_windows);
     RUN_TEST(interrupt_flush_round_trip);
     RUN_TEST(interrupt_flush_stale_callsize);

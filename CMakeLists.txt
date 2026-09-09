@@ -63,6 +63,7 @@ endif()
 # Library (core emulator)
 set(LIB_SOURCES
     src/xtensa.c
+    src/window_accel.c
     src/profile.c
     src/xtensa_disasm.c
     src/memory.c
@@ -134,7 +135,8 @@ else()
         PREDECODE_FLASH_MB=${PREDECODE_FLASH_MB})
 
     # Disable stack protector on hot-path files (saves ~3-4% from canary checks)
-    set_source_files_properties(src/xtensa.c src/memory.c src/jit.c
+    set_source_files_properties(src/xtensa.c src/window_accel.c src/memory.c
+        src/jit.c
         PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 endif()
 
