@@ -22,12 +22,7 @@
 #define TEST_WLED_ENTRY              0x40083E68u
 #define TEST_WLED_EVENT_REGISTER     0x40150E34u
 #define TEST_WLED_EVENT_POST         0x40151768u
-#define TEST_WLED_SOCKET             0x4015820Cu
-#define TEST_WLED_CLOSE              0x40157E04u
 #define TEST_WLED_DISCONNECT         0x40182F54u
-#define TEST_OPENHASP_ENTRY          0x40086E2Cu
-#define TEST_OPENHASP_SOCKET         0x4015CD70u
-#define TEST_OPENHASP_CLOSE          0x4015C80Cu
 #define TEST_TASMOTA_ENTRY           0x40082A58u
 #define TEST_TASMOTA_SOCKET          0x4019C06Cu
 #define TEST_TASMOTA_CLOSE           0x4019BB14u
@@ -96,7 +91,63 @@ static void seed_relocated_idf4_lwip_family(xtensa_cpu_t *cpu,
         put_test_bytes(cpu, base + functions[i].offset, functions[i].bytes,
                        functions[i].size);
 }
+
+static void seed_relocated_idf4_socket_members(xtensa_cpu_t *cpu,
+                                                uint32_t base) {
+    static const uint8_t close_fn[] = {
+        0x36, 0xA1, 0x00, 0x20, 0xA2, 0x20, 0x25, 0x3E,
+        0xFF, 0x20, 0x62, 0x20, 0xA0, 0x4A, 0x20, 0x7C,
+        0xF2, 0x16, 0x1A, 0x10, 0x28, 0x0A, 0x0C, 0x05,
+        0x57, 0x12, 0x0F, 0x38, 0x02, 0x22, 0xA0, 0xF0,
+    };
+    static const uint8_t socket_fn[] = {
+        0x36, 0x41, 0x00, 0x26, 0x23, 0x29, 0x26, 0x33,
+        0x12, 0x66, 0x13, 0x4F, 0x22, 0xC2, 0xFE, 0xC1,
+        0x3F, 0xD4, 0x0C, 0x0B, 0x1C, 0x0A, 0x1C, 0x83,
+        0x46, 0x03, 0x00, 0x00, 0xC1, 0x3C,
+    };
+    static const uint8_t errno_template[] = {
+        0x36, 0x41, 0x00, 0x81, 0x78, 0xD5, 0xE0, 0x08,
+        0x00, 0x2D, 0x0A, 0x1D, 0xF0, 0x00, 0x00, 0x00,
+        0x36, 0x41, 0x00, 0x20, 0xA2, 0x20, 0xB2, 0xA0,
+        0x00, 0x25, 0xBD, 0x07, 0x81, 0x73, 0xD5,
+    };
+    static const uint8_t errno_target_template[] = {
+        0x36, 0x41, 0x00,             /* ENTRY */
+        0x21, 0x00, 0x00,             /* L32R a2, task errno literal */
+        0x1D, 0xF0,                   /* RETW.N */
+    };
+    const uint32_t errno_fn_addr = base + 0x100u;
+    const uint32_t errno_fn_literal = base + 0x0F0u;
+    const uint32_t errno_target = base + 0x180u;
+    const uint32_t errno_target_literal = base + 0x170u;
+    uint8_t errno_fn[sizeof(errno_template)];
+    uint8_t errno_target_fn[sizeof(errno_target_template)];
+    memcpy(errno_fn, errno_template, sizeof(errno_fn));
+    memcpy(errno_target_fn, errno_target_template, sizeof(errno_target_fn));
+
+    /* Relocate both L32Rs. Their immediate fields are intentionally absent
+     * from the structural hash, while the destination register and every
+     * executable byte remain authenticated. */
+    uint32_t displacement = errno_fn_literal - ((errno_fn_addr + 6u) & ~3u);
+    uint16_t immediate = (uint16_t)(displacement >> 2);
+    errno_fn[4] = (uint8_t)immediate;
+    errno_fn[5] = (uint8_t)(immediate >> 8);
+    displacement = errno_target_literal - ((errno_target + 6u) & ~3u);
+    immediate = (uint16_t)(displacement >> 2);
+    errno_target_fn[4] = (uint8_t)immediate;
+    errno_target_fn[5] = (uint8_t)(immediate >> 8);
+
+    put_test_bytes(cpu, base, close_fn, sizeof(close_fn));
+    put_test_bytes(cpu, base + 0x80u, socket_fn, sizeof(socket_fn));
+    put_test_bytes(cpu, errno_fn_addr, errno_fn, sizeof(errno_fn));
+    put_test_bytes(cpu, errno_target, errno_target_fn,
+                   sizeof(errno_target_fn));
+    mem_write32(cpu->mem, errno_fn_literal, errno_target);
+    mem_write32(cpu->mem, errno_target_literal, 0x3FFE3D00u);
+}
 #define TEST_REENT_ERRNO              0x3FFE3C00u
+#define TEST_TASK_ERRNO               0x3FFE3D00u
 
 typedef struct {
     uint64_t calls;
@@ -329,7 +380,7 @@ TEST(dns_override_applies_to_raw_lwip_dns_api) {
 
     memcpy(&loopback, loopback_bytes, sizeof(loopback));
     seed_relocated_idf4_lwip_family(&cpu, family);
-    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_NERDMINER_ENTRY), 31);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_NERDMINER_ENTRY), 16);
     wifi_stubs_set_dns_override(wifi, loopback);
     put_test_bytes(&cpu, name_addr, (const uint8_t *)hostname,
                    sizeof(hostname));
@@ -457,19 +508,21 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
     test_event_post_capture_t capture = {0};
     const uint32_t event_base = 0x3FFB1000u;
+    const uint32_t sockets = BASE + 0x1400u;
     static const char name[] = "WIFI_EVENT";
 
     seed_relocated_idf4_lwip_family(&cpu, BASE + 0x1000u);
-    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_WLED_ENTRY), 33);
+    seed_relocated_idf4_socket_members(&cpu, sockets);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_WLED_ENTRY), 26);
     ASSERT_EQ(rom_stubs_register_ctx(rom, TEST_WLED_EVENT_POST,
                                      capture_native_event_post,
                                      "test_event_post", &capture), 0);
 
     /* The symbol-less production image's WiFiUDP boundary is hooked too. */
-    invoke_wifi_call0_4(&cpu, TEST_WLED_SOCKET, 2u, 2u, 0u, 0u);
+    invoke_wifi_call0_4(&cpu, sockets + 0x80u, 2u, 2u, 0u, 0u);
     uint32_t socket_fd = ar_read(&cpu, 2);
     ASSERT_EQ(socket_fd, 46u); /* first ESP-IDF/LWIP_SOCKET_OFFSET slot */
-    invoke_wifi_call0(&cpu, TEST_WLED_CLOSE, socket_fd);
+    invoke_wifi_call0(&cpu, sockets, socket_fd);
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
     for (size_t i = 0; i < sizeof(name); i++)
         mem_write8(cpu.mem, event_base + (uint32_t)i, (uint8_t)name[i]);
@@ -507,20 +560,34 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     teardown(&cpu);
 }
 
-TEST(openhasp_profile_hooks_production_socket_boundary) {
+TEST(stripped_idf4_socket_members_need_no_application_profile) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
-    seed_openhasp_v070rc13_profile(&cpu);
-    seed_relocated_idf4_lwip_family(&cpu, BASE + 0x1000u);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    const uint32_t family = BASE + 0x1000u;
+    const uint32_t sockets = BASE + 0x1400u;
 
-    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_OPENHASP_ENTRY), 20);
-    invoke_wifi_call0_4(&cpu, TEST_OPENHASP_SOCKET, 10u, 1u, 0u, 0u);
+    seed_relocated_idf4_lwip_family(&cpu, family);
+    seed_relocated_idf4_socket_members(&cpu, sockets);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 8);
+    invoke_wifi_call0_4(&cpu, sockets + 0x80u, 10u, 1u, 0u, 0u);
     uint32_t socket_fd = ar_read(&cpu, 2);
     ASSERT_EQ(socket_fd, 46u);
-    invoke_wifi_call0(&cpu, TEST_OPENHASP_CLOSE, socket_fd);
+    invoke_wifi_call0(&cpu, sockets, socket_fd);
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    /* A native socket error is written through the firmware's relocated
+     * __errno accessor. The compatibility scratch word must remain untouched,
+     * proving that discovering socket acceleration did not replace newlib's
+     * process-wide accessor or collapse task-local errno state. */
+    mem_write32(cpu.mem, TEST_REENT_ERRNO, 0x11223344u);
+    mem_write32(cpu.mem, TEST_TASK_ERRNO, 0u);
+    invoke_wifi_call0_4(&cpu, family + 0x80u, 123u,
+                        BASE + 0x1C00u, 1u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+    ASSERT_EQ(mem_read32(cpu.mem, TEST_TASK_ERRNO), 9u);
+    ASSERT_EQ(mem_read32(cpu.mem, TEST_REENT_ERRNO), 0x11223344u);
 
     wifi_stubs_stats_t stats = {0};
     wifi_stubs_get_stats(wifi, &stats);
@@ -597,9 +664,14 @@ TEST(tasmota_recv_peek_preserves_http_request) {
     ASSERT_EQ(send(host_fd, "GET", 3, 0), 3);
 
     mem_write32(cpu.mem, sockaddr_len_addr, 16u);
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_ACCEPT, listen_fd,
-                        sockaddr_addr, sockaddr_len_addr, 0u);
-    uint32_t client_fd = ar_read(&cpu, 2);
+    uint32_t client_fd = UINT32_MAX;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        invoke_wifi_call0_4(&cpu, TEST_TASMOTA_ACCEPT, listen_fd,
+                            sockaddr_addr, sockaddr_len_addr, 0u);
+        client_fd = ar_read(&cpu, 2);
+        if (client_fd != UINT32_MAX) break;
+        poll(NULL, 0, 1);
+    }
     ASSERT_EQ(client_fd, 47u);
 
     /* lwIP's MSG_PEEK=0x01 and MSG_DONTWAIT=0x08 are not Darwin's flag
@@ -667,7 +739,7 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(v11423_fingerprint_selects_shifted_wifi_entries);
     RUN_TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries);
     RUN_TEST(wled_posts_disconnect_on_native_event_loop);
-    RUN_TEST(openhasp_profile_hooks_production_socket_boundary);
+    RUN_TEST(stripped_idf4_socket_members_need_no_application_profile);
     RUN_TEST(tasmota_profile_hooks_production_socket_boundary);
     RUN_TEST(tasmota_recv_peek_preserves_http_request);
 }

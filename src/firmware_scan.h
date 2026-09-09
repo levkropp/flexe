@@ -38,6 +38,20 @@ bool firmware_xtensa_reloc_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
                                          size_t size,
                                          uint32_t expected_crc);
 
+typedef struct {
+    size_t size;
+    uint32_t crc32;
+    uint32_t addr;       /* output: nonzero only for one unique match */
+    unsigned matches;    /* output: 0, 1, or 2 for ambiguous */
+} firmware_xtensa_function_match_t;
+
+/* Resolve a whole set of fingerprints in one address-space pass. This is the
+ * scalable path for library families: adding another API adds hashing at
+ * ENTRY candidates, not another multi-megabyte linear scan. */
+void firmware_scan_xtensa_functions(
+        xtensa_mem_t *mem, uint32_t start, uint32_t end,
+        firmware_xtensa_function_match_t *fingerprints, size_t count);
+
 /* Search function ENTRY sites and count matches for one relocatable
  * fingerprint. `unique_addr_out` receives the address only when exactly one
  * match exists, and zero otherwise. The count is saturated at two because

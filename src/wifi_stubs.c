@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -61,6 +62,7 @@ static inline int fcntl(int fd, int cmd, ...)
 /* ===== Constants ===== */
 
 #define MAX_EMU_SOCKETS 16
+#define GUEST_ERRNO_CACHE_SLOTS 16
 
 /* Socket fd offset — matches ESP-IDF's LWIP_SOCKET_OFFSET (46).
  * The VFS layer assigns file descriptors 0-45 for stdio, SPIFFS, NVS, etc.
@@ -100,6 +102,11 @@ typedef struct {
     SSL     *ssl;               /* OpenSSL TLS session, or NULL for plain TCP */
     SSL_CTX *ssl_ctx;           /* OpenSSL context (owned per-socket) */
 } emu_socket_t;
+
+typedef struct {
+    uint32_t threadptr;
+    uint32_t addr;
+} guest_errno_cache_t;
 
 /* ESP-IDF wifi_mode_t values */
 #define WIFI_MODE_NULL  0
@@ -188,6 +195,12 @@ static const fake_ap_t fake_aps[] = {
 struct wifi_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
+    /* The firmware's own __errno routine. Calling it preserves newlib's
+     * per-task reentrancy instead of redirecting every subsystem to a global
+     * emulator scratch word. */
+    uint32_t           guest_errno_fn;
+    guest_errno_cache_t errno_cache[GUEST_ERRNO_CACHE_SLOTS];
+    unsigned           errno_cache_next;
     emu_socket_t       sockets[MAX_EMU_SOCKETS];
 
     /* Static buffer for gethostbyname result written into emulator memory.
@@ -425,9 +438,50 @@ static void stub_lwip_socket(xtensa_cpu_t *cpu, void *ctx)
     ws_return(cpu, (uint32_t)idx);
 }
 
-static void set_firmware_errno(xtensa_cpu_t *cpu, int eno)
+static uint32_t firmware_errno_addr(wifi_stubs_t *ws, xtensa_cpu_t *cpu)
 {
-    mem_write32(cpu->mem, REENT_ADDR + REENT_ERRNO_OFS, (uint32_t)eno);
+    if (ws && ws->guest_errno_fn != 0u) {
+        /* ESP-IDF switches THREADPTR with the task-local storage block. It is
+         * therefore a stable, firmware-provided cache key for the address
+         * returned by __errno. A zero THREADPTR is not task identity, so keep
+         * the fully general (uncached) path for older runtimes. */
+        uint32_t threadptr = cpu->threadptr;
+        if (threadptr != 0u)
+            for (size_t i = 0u; i < GUEST_ERRNO_CACHE_SLOTS; i++)
+                if (ws->errno_cache[i].threadptr == threadptr)
+                    return ws->errno_cache[i].addr;
+
+        uint32_t addr = 0u;
+        if (guest_call8(cpu, ws->guest_errno_fn, NULL, 0u, 256u, &addr) == 0 &&
+            addr <= UINT32_MAX - (sizeof(uint32_t) - 1u) &&
+            mem_get_ptr(cpu->mem, addr) &&
+            mem_get_ptr(cpu->mem, addr + sizeof(uint32_t) - 1u)) {
+            if (threadptr != 0u) {
+                size_t slot = ws->errno_cache_next++ %
+                              GUEST_ERRNO_CACHE_SLOTS;
+                ws->errno_cache[slot].threadptr = threadptr;
+                ws->errno_cache[slot].addr = addr;
+            }
+            return addr;
+        }
+        if (getenv("FLEXE_SCANDBG"))
+            fprintf(stderr,
+                    "[wifi] firmware __errno at 0x%08" PRIX32
+                    " did not return writable memory\n",
+                    ws->guest_errno_fn);
+        return 0u;
+    }
+
+    /* Compatibility fallback for address-based profiles whose __errno has
+     * not yet been structurally identified. */
+    return REENT_ADDR + REENT_ERRNO_OFS;
+}
+
+static void set_firmware_errno(wifi_stubs_t *ws, xtensa_cpu_t *cpu, int eno)
+{
+    uint32_t addr = firmware_errno_addr(ws, cpu);
+    if (addr != 0u)
+        mem_write32(cpu->mem, addr, (uint32_t)eno);
 }
 
 
@@ -439,9 +493,9 @@ static void set_firmware_errno(xtensa_cpu_t *cpu, int eno)
  * "nothing to read" and logs an error for anything else, so a stale value
  * turned quiet polling into an error logged thousands of times a second --
  * over a megabyte of UART in one run. */
-static void ws_fail(xtensa_cpu_t *cpu, int err)
+static void ws_fail(wifi_stubs_t *ws, xtensa_cpu_t *cpu, int err)
 {
-    set_firmware_errno(cpu, err);
+    set_firmware_errno(ws, cpu, err);
     ws_return(cpu, (uint32_t)-1);
 }
 
@@ -471,7 +525,7 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -501,7 +555,7 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
             /* Firmware expects non-blocking connect: return -1/EINPROGRESS.
              * Firmware will call select() then getsockopt(SO_ERROR). */
             wifi_log(ws, "connect: non-blocking, EINPROGRESS\n");
-            set_firmware_errno(cpu, NEWLIB_EINPROGRESS);
+            set_firmware_errno(ws, cpu, NEWLIB_EINPROGRESS);
             ws_return(cpu, (uint32_t)-1);
             return;
         }
@@ -529,7 +583,7 @@ static void stub_lwip_connect(xtensa_cpu_t *cpu, void *ctx)
         wifi_log(ws, "connect failed: %s\n", strerror(errno));
     }
 
-    set_firmware_errno(cpu, ret < 0 ? errno : 0);
+    set_firmware_errno(ws, cpu, ret < 0 ? errno : 0);
     if (ret == 0)
         ws->stats.connect_successes++;
     ws_return(cpu, (uint32_t)(ret < 0 ? -1 : 0));
@@ -571,7 +625,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
 
     /* Copy data from emulator memory */
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
+    if (!tmp) { ws_fail(ws, cpu, NEWLIB_ENOMEM); return; }
     for (uint32_t i = 0; i < len; i++)
         tmp[i] = mem_read8(cpu->mem, buf + i);
 
@@ -587,7 +641,7 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
     free(tmp);
 
     if (n < 0) {
-        set_firmware_errno(cpu, saved_errno);
+        set_firmware_errno(ws, cpu, saved_errno);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -618,7 +672,7 @@ static void stub_lwip_receive(xtensa_cpu_t *cpu, void *ctx,
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -630,7 +684,7 @@ static void stub_lwip_receive(xtensa_cpu_t *cpu, void *ctx,
     }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
+    if (!tmp) { ws_fail(ws, cpu, NEWLIB_ENOMEM); return; }
 
     bool peek = (guest_flags & LWIP_MSG_PEEK_FLAG) != 0;
     bool dontwait = s->nonblocking ||
@@ -706,7 +760,7 @@ static void stub_lwip_receive(xtensa_cpu_t *cpu, void *ctx,
     free(tmp);
 
     if (n < 0) {
-        set_firmware_errno(cpu, NEWLIB_EAGAIN);
+        set_firmware_errno(ws, cpu, NEWLIB_EAGAIN);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -715,7 +769,7 @@ static void stub_lwip_receive(xtensa_cpu_t *cpu, void *ctx,
      * NetworkClient::connected() interpret recv(..., MSG_PEEK) == 0 as a
      * still-open connection, so HTTP servers never finish a request after
      * the browser closes it. */
-    set_firmware_errno(cpu, 0);
+    set_firmware_errno(ws, cpu, 0);
     ws_return(cpu, (uint32_t)n);
 }
 
@@ -957,7 +1011,7 @@ static void stub_lwip_ioctl(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -983,7 +1037,7 @@ static void stub_lwip_setsockopt(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1002,7 +1056,7 @@ static void stub_lwip_getsockopt(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1027,7 +1081,7 @@ static void stub_lwip_fcntl(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1059,7 +1113,7 @@ static void stub_lwip_getsockname(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1087,14 +1141,14 @@ static void stub_lwip_getpeername(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
     struct sockaddr_in sa;
     socklen_t slen = sizeof(sa);
     if (getpeername(s->host_fd, (struct sockaddr *)&sa, &slen) < 0) {
-        ws_fail(cpu, errno);
+        ws_fail(ws, cpu, errno);
         return;
     }
 
@@ -1118,7 +1172,7 @@ static void stub_lwip_bind(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1178,7 +1232,7 @@ static void stub_lwip_listen(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
     int bl = (int)backlog;
@@ -1186,7 +1240,7 @@ static void stub_lwip_listen(xtensa_cpu_t *cpu, void *ctx)
     int ret = listen(s->host_fd, bl);
     if (ret < 0) {
         wifi_log(ws, "listen(slot %u) failed: %s\n", fd, strerror(errno));
-        set_firmware_errno(cpu, errno);
+        set_firmware_errno(ws, cpu, errno);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -1205,7 +1259,7 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
@@ -1218,7 +1272,7 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
     struct pollfd pfd = { .fd = s->host_fd, .events = POLLIN };
     int pr = poll(&pfd, 1, 0);
     if (pr <= 0) {
-        set_firmware_errno(cpu, NEWLIB_EAGAIN);
+        set_firmware_errno(ws, cpu, NEWLIB_EAGAIN);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -1228,7 +1282,8 @@ static void stub_lwip_accept(xtensa_cpu_t *cpu, void *ctx)
     int chfd = accept(s->host_fd, (struct sockaddr *)&csa, &clen);
     if (chfd < 0) {
         wifi_log(ws, "accept(slot %u) failed: %s\n", fd, strerror(errno));
-        set_firmware_errno(cpu, errno == EWOULDBLOCK ? NEWLIB_EAGAIN : errno);
+        set_firmware_errno(ws, cpu,
+                           errno == EWOULDBLOCK ? NEWLIB_EAGAIN : errno);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -1267,12 +1322,12 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
+    if (!tmp) { ws_fail(ws, cpu, NEWLIB_ENOMEM); return; }
     for (uint32_t i = 0; i < len; i++)
         tmp[i] = mem_read8(cpu->mem, buf + i);
 
@@ -1310,7 +1365,7 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
     }
 
     if (n < 0) {
-        set_firmware_errno(cpu, saved_errno);
+        set_firmware_errno(ws, cpu, saved_errno);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -1331,12 +1386,12 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
 
     emu_socket_t *s = slot_get(ws, (int)fd);
     if (!s) {
-        ws_fail(cpu, NEWLIB_EBADF);
+        ws_fail(ws, cpu, NEWLIB_EBADF);
         return;
     }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
+    if (!tmp) { ws_fail(ws, cpu, NEWLIB_ENOMEM); return; }
 
     struct sockaddr_in source;
     socklen_t source_len = sizeof(source);
@@ -1355,7 +1410,7 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
     free(tmp);
 
     if (n < 0) {
-        set_firmware_errno(cpu, NEWLIB_EAGAIN);
+        set_firmware_errno(ws, cpu, NEWLIB_EAGAIN);
         ws_return(cpu, (uint32_t)-1);
         return;
     }
@@ -1549,7 +1604,7 @@ static void stub_send_ssl_data(xtensa_cpu_t *cpu, void *ctx)
     if (!s) { ws_return(cpu, (uint32_t)-1); return; }
 
     uint8_t *tmp = malloc(len);
-    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
+    if (!tmp) { ws_fail(ws, cpu, NEWLIB_ENOMEM); return; }
     for (uint32_t i = 0; i < len; i++)
         tmp[i] = mem_read8(cpu->mem, buf_addr + i);
 
@@ -1585,7 +1640,7 @@ static void stub_get_ssl_receive(xtensa_cpu_t *cpu, void *ctx)
     if (!s || len <= 0) { ws_return(cpu, (uint32_t)-1); return; }
 
     uint8_t *tmp = malloc((size_t)len);
-    if (!tmp) { ws_fail(cpu, NEWLIB_ENOMEM); return; }
+    if (!tmp) { ws_fail(ws, cpu, NEWLIB_ENOMEM); return; }
 
     ssize_t n;
     if (s->ssl) {
@@ -2059,26 +2114,6 @@ static void stub_esp_netif_get_ip_info(xtensa_cpu_t *cpu, void *ctx)
 /* esp_wifi_sta_get_ap_info(wifi_ap_record_t *) -- what Arduino's WiFi.SSID()
  * and WiFi.RSSI() read. Not modelled before, so firmware could never report
  * or display which network it was on. */
-/* __errno() -> &errno.
- *
- * Newlib's errno lives inside the reentrancy structure, reached through this
- * function, while this emulator's socket layer writes errno to a fixed
- * scratch word. Those were different addresses, so every errno the model set
- * was invisible to the firmware, which read whatever happened to be in its
- * own slot.
- *
- * That is not cosmetic. Arduino's WiFiUDP::parsePacket() treats EWOULDBLOCK
- * as "nothing to read" and logs an error for anything else, so a UDP socket
- * with no data pending -- the normal case, on every poll -- was reported as a
- * hard failure. It logged that thousands of times a second.
- *
- * Point the firmware at the same word the model writes, so the two agree. */
-static void stub_errno(xtensa_cpu_t *cpu, void *ctx)
-{
-    (void)ctx;
-    ws_return(cpu, REENT_ADDR + REENT_ERRNO_OFS);
-}
-
 static void stub_esp_wifi_sta_get_ap_info(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
@@ -2592,6 +2627,14 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
     if (!rom) return 0;
     ws->rom = rom;
 
+    /* Native socket calls must update the calling task's own newlib errno.
+     * Remember the real accessor and invoke it only when a socket operation
+     * needs it; replacing __errno globally also changes filesystem and every
+     * other newlib consumer. */
+    uint32_t errno_fn = 0u;
+    if (elf_symbols_find(syms, "__errno", &errno_fn) == 0)
+        ws->guest_errno_fn = errno_fn;
+
     int hooked = 0;
 
     struct {
@@ -2658,7 +2701,6 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "esp_wifi_get_config",          stub_esp_wifi_get_config },
         { "esp_wifi_connect",             stub_esp_wifi_connect },
         { "esp_wifi_sta_get_ap_info",     stub_esp_wifi_sta_get_ap_info },
-        { "__errno",                      stub_errno },
         { "esp_netif_dhcpc_start",        stub_esp_netif_dhcpc_start },
         { "esp_netif_dhcpc_stop",         stub_esp_netif_ok },
         { "esp_netif_dhcps_start",        stub_esp_netif_ok },
@@ -2755,6 +2797,30 @@ typedef struct {
     uint32_t addr;
 } wifi_fw_fingerprint_t;
 
+/* Resolve alternative compiler/configuration forms of one logical API. */
+static int wifi_resolve_fingerprint_variants(
+        const wifi_fw_fingerprint_t *variants,
+        const firmware_xtensa_function_match_t *matches,
+        size_t variant_count, wifi_fw_fingerprint_t *result) {
+    uint32_t resolved = 0u;
+    const wifi_fw_fingerprint_t *selected = NULL;
+    for (size_t i = 0u; i < variant_count; i++) {
+        if (matches[i].matches > 1u)
+            return -1;
+        if (matches[i].matches == 0u)
+            continue;
+        if (resolved != 0u && resolved != matches[i].addr)
+            return -1;
+        resolved = matches[i].addr;
+        selected = &variants[i];
+    }
+    if (!selected)
+        return 0;
+    *result = *selected;
+    result->addr = resolved;
+    return 1;
+}
+
 static int wifi_discover_idf4_lwip_family(
         wifi_stubs_t *ws, wifi_fw_fingerprint_t *found,
         size_t found_capacity) {
@@ -2776,23 +2842,89 @@ static int wifi_discover_idf4_lwip_family(
          * forwarding wrapper has the same 24-byte fingerprint. */
         { 30u, 0x188638AAu, stub_lwip_write, "lwip_write", 0u },
     };
+    /* Optional APIs are installed only after the six-member core has proved
+     * the library family. Alternative hashes are ordinary ESP-IDF build
+     * configurations, not application profiles. Keep variants for one API
+     * adjacent so the loop below can resolve them as a group. */
+    static const wifi_fw_fingerprint_t optional[] = {
+        { 30u, 0x9F599D8Au, stub_lwip_accept, "lwip_accept", 0u },
+        { 31u, 0x96D6F41Au, stub_lwip_accept, "lwip_accept", 0u },
+        { 31u, 0x6BCA6593u, stub_lwip_bind, "lwip_bind", 0u },
+        { 31u, 0x797FCA7Du, stub_lwip_bind, "lwip_bind", 0u },
+        { 31u, 0x93052789u, stub_lwip_close, "lwip_close", 0u },
+        { 32u, 0x71A234C5u, stub_lwip_close, "lwip_close", 0u },
+        { 32u, 0x301BC334u, stub_lwip_close, "lwip_close", 0u },
+        { 32u, 0x609B787Du, stub_lwip_connect, "lwip_connect", 0u },
+        { 30u, 0x7B5E3AB8u, stub_lwip_listen, "lwip_listen", 0u },
+        { 32u, 0xBBDCA5E7u, stub_lwip_recvfrom, "lwip_recvfrom", 0u },
+        { 32u, 0x729A1BF6u, stub_lwip_recvfrom, "lwip_recvfrom", 0u },
+        { 28u, 0x615CFA2Fu, stub_lwip_recv, "lwip_recv", 0u },
+        { 30u, 0x1F51EA2Fu, stub_lwip_socket, "lwip_socket", 0u },
+        { 30u, 0x6756238Du, stub_lwip_socket, "lwip_socket", 0u },
+        { 30u, 0xE3DA3876u, stub_lwip_socket, "lwip_socket", 0u },
+        { 32u, 0xE0E53019u, stub_lwip_select, "lwip_select", 0u },
+        { 32u, 0x51695208u, stub_lwip_getsockname,
+                              "lwip_getsockname", 0u },
+        { 32u, 0x012BA756u, stub_lwip_getsockopt, "lwip_getsockopt", 0u },
+        { 30u, 0x1282E72Au, stub_lwip_getsockopt, "lwip_getsockopt", 0u },
+        { 31u, 0x37461583u, stub_lwip_setsockopt, "lwip_setsockopt", 0u },
+        { 31u, 0x99D9929Du, stub_lwip_setsockopt, "lwip_setsockopt", 0u },
+        { 31u, 0xC8F2F4E2u, stub_lwip_ioctl, "lwip_ioctl", 0u },
+        { 30u, 0x3BC80CD3u, stub_lwip_ioctl, "lwip_ioctl", 0u },
+        { 30u, 0x8705748Bu, stub_lwip_ioctl, "lwip_ioctl", 0u },
+        { 32u, 0xB75C747Au, stub_lwip_fcntl, "lwip_fcntl", 0u },
+        { 32u, 0x866081CFu, stub_lwip_fcntl, "lwip_fcntl", 0u },
+    };
+    /* __errno is discovered with the same authenticated library family, but
+     * is never replaced. Socket failures call the firmware accessor so errno
+     * remains task-local and all non-network users keep their native path. */
+    static const wifi_fw_fingerprint_t errno_variants[] = {
+        { 31u, 0x95913C95u, NULL, "__errno", 0u },
+        { 31u, 0x34126EEAu, NULL, "__errno", 0u },
+    };
     const size_t core_count = sizeof(family) / sizeof(family[0]);
+    const size_t write_count =
+            sizeof(write_variants) / sizeof(write_variants[0]);
+    const size_t optional_count = sizeof(optional) / sizeof(optional[0]);
+    const size_t errno_count =
+            sizeof(errno_variants) / sizeof(errno_variants[0]);
+    const size_t candidate_count =
+            core_count + write_count + optional_count + errno_count;
     const size_t count = core_count + 1u;
     if (!ws || !ws->cpu || !ws->cpu->mem || !found ||
         found_capacity < count)
         return 0;
 
+    enum { MAX_IDF4_LWIP_FINGERPRINTS = 64 };
+    if (candidate_count > MAX_IDF4_LWIP_FINGERPRINTS)
+        return 0;
+    wifi_fw_fingerprint_t candidates[MAX_IDF4_LWIP_FINGERPRINTS];
+    firmware_xtensa_function_match_t scan[MAX_IDF4_LWIP_FINGERPRINTS];
+    memcpy(candidates, family, sizeof(family));
+    memcpy(&candidates[core_count], write_variants,
+           sizeof(write_variants));
+    memcpy(&candidates[core_count + write_count], optional,
+           sizeof(optional));
+    memcpy(&candidates[core_count + write_count + optional_count],
+           errno_variants, sizeof(errno_variants));
+    for (size_t i = 0u; i < candidate_count; i++) {
+        scan[i].size = candidates[i].size;
+        scan[i].crc32 = candidates[i].crc32;
+        scan[i].addr = 0u;
+        scan[i].matches = 0u;
+    }
+    firmware_scan_xtensa_functions(
+            ws->cpu->mem, ESP32_FIRMWARE_INSN_ADDR_LOW,
+            ESP32_FLASH_INSN_ADDR_HIGH, scan, candidate_count);
+
     for (size_t i = 0u; i < core_count; i++) {
-        found[i] = family[i];
-        unsigned matches = firmware_find_unique_xtensa_function(
-                ws->cpu->mem, ESP32_FIRMWARE_INSN_ADDR_LOW,
-                ESP32_FLASH_INSN_ADDR_HIGH, found[i].size,
-                found[i].crc32, &found[i].addr);
-        if (matches != 1u) {
+        found[i] = candidates[i];
+        found[i].addr = scan[i].addr;
+        if (scan[i].matches != 1u) {
             if (getenv("FLEXE_SCANDBG"))
                 fprintf(stderr,
                         "[wifi] stripped lwIP fingerprint %s: %u match(es)\n",
-                        found[i].name, matches);
+                        found[i].name, scan[i].matches);
             return 0;
         }
         for (size_t j = 0u; j < i; j++)
@@ -2800,32 +2932,70 @@ static int wifi_discover_idf4_lwip_family(
                 return 0;
     }
 
-    uint32_t write_addr = 0u;
-    for (size_t i = 0u;
-         i < sizeof(write_variants) / sizeof(write_variants[0]); i++) {
-        uint32_t candidate = 0u;
-        unsigned matches = firmware_find_unique_xtensa_function(
-                ws->cpu->mem, ESP32_FIRMWARE_INSN_ADDR_LOW,
-                ESP32_FLASH_INSN_ADDR_HIGH, write_variants[i].size,
-                write_variants[i].crc32, &candidate);
-        if (matches > 1u || (matches == 1u && write_addr != 0u &&
-                             write_addr != candidate))
-            return 0;
-        if (matches == 1u)
-            write_addr = candidate;
-    }
-    if (write_addr == 0u)
+    if (wifi_resolve_fingerprint_variants(
+                &candidates[core_count], &scan[core_count], write_count,
+                &found[core_count]) != 1)
         return 0;
-    found[core_count] = write_variants[0];
-    found[core_count].addr = write_addr;
 
-    for (size_t i = 0u; i < count; i++)
+    size_t found_count = count;
+    for (size_t begin = 0u;
+         begin < optional_count;) {
+        size_t end = begin + 1u;
+        while (end < optional_count &&
+               strcmp(optional[begin].name, optional[end].name) == 0)
+            end++;
+        wifi_fw_fingerprint_t member;
+        int resolution = wifi_resolve_fingerprint_variants(
+                &candidates[core_count + write_count + begin],
+                &scan[core_count + write_count + begin],
+                end - begin, &member);
+        if (resolution == 1 && found_count < found_capacity) {
+            bool duplicate = false;
+            for (size_t i = 0u; i < found_count; i++)
+                duplicate |= found[i].addr == member.addr;
+            if (!duplicate)
+                found[found_count++] = member;
+        } else if (resolution < 0 && getenv("FLEXE_SCANDBG")) {
+            fprintf(stderr,
+                    "[wifi] stripped lwIP member %s is ambiguous; skipping\n",
+                    optional[begin].name);
+        }
+        begin = end;
+    }
+
+    const size_t errno_offset = core_count + write_count + optional_count;
+    wifi_fw_fingerprint_t errno_member;
+    int errno_resolution = wifi_resolve_fingerprint_variants(
+            &candidates[errno_offset], &scan[errno_offset], errno_count,
+            &errno_member);
+    if (errno_resolution == 1) {
+        bool duplicate = false;
+        for (size_t i = 0u; i < found_count; i++)
+            duplicate |= found[i].addr == errno_member.addr;
+        if (!duplicate) {
+            ws->guest_errno_fn = errno_member.addr;
+            if (getenv("FLEXE_SCANDBG"))
+                fprintf(stderr,
+                        "[wifi] using firmware __errno at 0x%08" PRIX32 "\n",
+                        ws->guest_errno_fn);
+        }
+    } else if (errno_resolution < 0 && getenv("FLEXE_SCANDBG")) {
+        fprintf(stderr,
+                "[wifi] stripped __errno fingerprint is ambiguous; "
+                "using compatibility storage\n");
+    }
+
+    for (size_t i = 0u; i < found_count; i++) {
+        if (getenv("FLEXE_SCANDBG"))
+            fprintf(stderr, "[wifi] stripped lwIP %s at 0x%08" PRIX32 "\n",
+                    found[i].name, found[i].addr);
         rom_stubs_register_exact_ctx(ws->rom, found[i].addr, found[i].fn,
                                      found[i].name, ws);
+    }
     fprintf(stderr,
             "[wifi] discovered stripped ESP-IDF 4.x lwIP family "
-            "(%zu entries)\n", count);
-    return (int)count;
+            "(%zu entries)\n", found_count);
+    return (int)found_count;
 }
 
 static bool wifi_hook_was_discovered(
@@ -2841,20 +3011,6 @@ static bool wifi_hook_was_discovered(
 /* Remaining NerdMiner ESP32-2432S028R compatibility entries. Shared lwIP
  * functions are discovered above and deliberately do not appear here. */
 static const wifi_fw_hook_t nerdminer_wifi_hooks[] = {
-    { 0x4011F530u, stub_lwip_accept,        "lwip_accept" },
-    { 0x4011F740u, stub_lwip_bind,          "lwip_bind" },
-    { 0x4011F7F4u, stub_lwip_close,         "lwip_close" },
-    { 0x4011F92Cu, stub_lwip_connect,       "lwip_connect" },
-    { 0x4011F9ECu, stub_lwip_listen,        "lwip_listen" },
-    { 0x4011FA54u, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x4011FB40u, stub_lwip_recv,          "lwip_recv" },
-    { 0x4011FD68u, stub_lwip_socket,        "lwip_socket" },
-    { 0x4011FE2Cu, stub_lwip_select,        "lwip_select" },
-    { 0x40120190u, stub_lwip_getsockname,   "lwip_getsockname" },
-    { 0x401201A8u, stub_lwip_getsockopt,    "lwip_getsockopt" },
-    { 0x40120250u, stub_lwip_setsockopt,    "lwip_setsockopt" },
-    { 0x401202E4u, stub_lwip_ioctl,         "lwip_ioctl" },
-    { 0x4012038Cu, stub_lwip_fcntl,         "lwip_fcntl" },
     { 0x401156ACu, stub_vfs_select,         "esp_vfs_select" },
     { 0x40134844u, stub_vfs_fcntl,          "fcntl" },
     /* esp_event_handler_instance_register. Arduino registers its WiFi/IP
@@ -2866,7 +3022,6 @@ static const wifi_fw_hook_t nerdminer_wifi_hooks[] = {
      * 0x401B3110 takes concrete event ids with a null handler. */
     { 0x401B30CCu, stub_esp_event_handler_instance_register,
                    "esp_event_handler_instance_register" },
-    { 0x4019832Cu, stub_errno,              "__errno" },
     { 0x401643ECu, stub_esp_wifi_connect,   "esp_wifi_connect" },
     { 0x401645ACu, stub_esp_wifi_scan_start,"esp_wifi_scan_start" },
     { 0x40196404u, stub_start_ssl_client,   "start_ssl_client" },
@@ -3026,12 +3181,9 @@ static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
  * reference, and it is the call8 target following the L32R of
  * WIFI_INIT_CONFIG_MAGIC (0x1F2F3F4F) in WLED's wifiLowLevelInit.
  *
- * The remaining socket entries come from a complete v16.0.1 esp32dev build
- * made with WLED's pinned Tasmota Arduino 2.0.18 platform. Shared IDF 4.x
- * routines are discovered as a library family above; only the variants not
- * yet generalized remain in this application profile. This exposes WiFiUDP
- * at the host boundary while AsyncTCP continues to use firmware-side raw
- * lwIP.
+ * Its entire socket boundary is now discovered as the IDF 4.x library family
+ * above. Only ESP WiFi driver APIs and event-loop integration remain in this
+ * application profile.
  *
  * Deliberately absent: esp_wifi_set_mac, esp_wifi_set_promiscuous{,_filter,
  * _rx_cb} and esp_wifi_80211_tx. Those did not match uniquely, and they are
@@ -3041,15 +3193,6 @@ static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
  * what check-firmware.sh is for, rather than assuming.
  */
 static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
-    { 0x40157D50u, stub_lwip_bind,          "lwip_bind" },
-    { 0x40157E04u, stub_lwip_close,         "lwip_close" },
-    { 0x40157F28u, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x4015820Cu, stub_lwip_socket,        "lwip_socket" },
-    { 0x401582D0u, stub_lwip_getsockopt,    "lwip_getsockopt" },
-    { 0x40158370u, stub_lwip_setsockopt,    "lwip_setsockopt" },
-    { 0x401583FCu, stub_lwip_ioctl,         "lwip_ioctl" },
-    { 0x4015849Cu, stub_lwip_fcntl,         "lwip_fcntl" },
-    { 0x401B1838u, stub_errno,              "__errno" },
     { 0x401561B8u, stub_esp_wifi_init,             "esp_wifi_init" },
     { 0x401561A0u, stub_esp_wifi_deinit,           "esp_wifi_deinit" },
     { 0x40182CD8u, stub_esp_wifi_set_mode,         "esp_wifi_set_mode" },
@@ -3067,28 +3210,6 @@ static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
     { 0x40183604u, stub_esp_wifi_get_mac,          "esp_wifi_get_mac" },
     { 0x40183634u, stub_esp_wifi_sta_get_ap_info,  "esp_wifi_sta_get_ap_info" },
     { 0x401836F4u, stub_esp_wifi_noop,             "esp_wifi_set_storage" },
-    { 0, NULL, NULL },
-};
-
-/* Remaining openHASP 0.7.0-rc13 Lanbon L8 compatibility entries. The shared
- * IDF 4.x lwIP family is structurally discovered above. These variants were
- * relocated from a symbol-bearing build of the exact release commit and
- * pinned 2.0.14 core to the official OTA image. */
-static const wifi_fw_hook_t openhasp_v070rc13_wifi_hooks[] = {
-    { 0x4015C574u, stub_lwip_accept,        "lwip_accept" },
-    { 0x4015C758u, stub_lwip_bind,          "lwip_bind" },
-    { 0x4015C80Cu, stub_lwip_close,         "lwip_close" },
-    { 0x4015C934u, stub_lwip_connect,       "lwip_connect" },
-    { 0x4015C9F4u, stub_lwip_listen,        "lwip_listen" },
-    { 0x4015CA5Cu, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x4015CB48u, stub_lwip_recv,          "lwip_recv" },
-    { 0x4015CD70u, stub_lwip_socket,        "lwip_socket" },
-    { 0x4015CE38u, stub_lwip_select,        "lwip_select" },
-    { 0x4015D23Cu, stub_lwip_getsockopt,    "lwip_getsockopt" },
-    { 0x4015D2E4u, stub_lwip_setsockopt,    "lwip_setsockopt" },
-    { 0x4015D378u, stub_lwip_ioctl,         "lwip_ioctl" },
-    { 0x4015D420u, stub_lwip_fcntl,         "lwip_fcntl" },
-    { 0x401D21D0u, stub_errno,              "__errno" },
     { 0, NULL, NULL },
 };
 
@@ -3127,7 +3248,7 @@ int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point)
     if (!rom) return 0;
     ws->rom = rom;
 
-    wifi_fw_fingerprint_t discovered[6];
+    wifi_fw_fingerprint_t discovered[32];
     int discovered_count = wifi_discover_idf4_lwip_family(
             ws, discovered, sizeof(discovered) / sizeof(discovered[0]));
 
@@ -3150,8 +3271,6 @@ int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = marauder_35inch_wifi_hooks;
     else if (profile == ROM_FIRMWARE_WLED_V1601)
         hooks = wled_v1601_wifi_hooks;
-    else if (profile == ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8)
-        hooks = openhasp_v070rc13_wifi_hooks;
     else if (profile == ROM_FIRMWARE_TASMOTA32_V1560)
         hooks = tasmota32_v1560_wifi_hooks;
     else

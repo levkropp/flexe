@@ -135,37 +135,62 @@ bool firmware_xtensa_reloc_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
             mem, addr, size, expected, true);
 }
 
-unsigned firmware_find_unique_xtensa_function(
-        xtensa_mem_t *mem, uint32_t start, uint32_t end, size_t size,
-        uint32_t expected_crc, uint32_t *unique_addr_out) {
-    if (unique_addr_out)
-        *unique_addr_out = 0u;
-    if (!mem || !unique_addr_out || size < 3u || start >= end ||
-        size > (size_t)(end - start))
-        return 0u;
+void firmware_scan_xtensa_functions(
+        xtensa_mem_t *mem, uint32_t start, uint32_t end,
+        firmware_xtensa_function_match_t *fingerprints, size_t count) {
+    if (fingerprints)
+        for (size_t i = 0u; i < count; i++) {
+            fingerprints[i].addr = 0u;
+            fingerprints[i].matches = 0u;
+        }
+    if (!mem || !fingerprints || count == 0u || start >= end ||
+        end - start < 3u)
+        return;
 
-    unsigned matches = 0u;
-    uint32_t found = 0u;
-    const uint32_t last = end - (uint32_t)size;
+    const uint32_t last = end - 3u;
     for (uint32_t addr = start; addr <= last; addr++) {
         const uint8_t *first = mem_get_ptr(mem, addr);
         if (!first || *first != 0x36u)
             continue;
         uint32_t insn;
         if (!firmware_peek(mem, addr, 3u, &insn) ||
-            !firmware_xtensa_is_entry(insn) ||
-            !firmware_xtensa_reloc_crc32_matches(
-                    mem, addr, size, expected_crc))
+            !firmware_xtensa_is_entry(insn))
             continue;
-        found = addr;
-        if (++matches == 2u) {
-            *unique_addr_out = 0u;
-            return matches;
+
+        for (size_t i = 0u; i < count; i++) {
+            firmware_xtensa_function_match_t *match = &fingerprints[i];
+            if (match->matches >= 2u || match->size < 3u ||
+                match->size > (size_t)(end - addr) ||
+                !firmware_xtensa_reloc_crc32_matches(
+                        mem, addr, match->size, match->crc32))
+                continue;
+            if (match->matches == 0u) {
+                match->addr = addr;
+                match->matches = 1u;
+            } else if (match->addr != addr) {
+                match->addr = 0u;
+                match->matches = 2u;
+            }
         }
     }
-    if (matches == 1u)
-        *unique_addr_out = found;
-    return matches;
+}
+
+unsigned firmware_find_unique_xtensa_function(
+        xtensa_mem_t *mem, uint32_t start, uint32_t end, size_t size,
+        uint32_t expected_crc, uint32_t *unique_addr_out) {
+    if (!unique_addr_out)
+        return 0u;
+    *unique_addr_out = 0u;
+    if (!mem || size < 3u || start >= end ||
+        size > (size_t)(end - start))
+        return 0u;
+    firmware_xtensa_function_match_t match = {
+        .size = size,
+        .crc32 = expected_crc,
+    };
+    firmware_scan_xtensa_functions(mem, start, end, &match, 1u);
+    *unique_addr_out = match.addr;
+    return match.matches;
 }
 
 static bool firmware_find_crc32_body_kind(

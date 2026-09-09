@@ -92,8 +92,43 @@ TEST(relocatable_function_fingerprint_normalizes_jump_and_requires_unique) {
     teardown(&cpu);
 }
 
+TEST(function_family_fingerprints_resolve_in_one_pass) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    static const uint8_t first_body[] = {
+        0x36, 0x41, 0x00, 0x0C, 0x12, 0x3D, 0xF0,
+    };
+    static const uint8_t second_body[] = {
+        0x36, 0x61, 0x00, 0x0C, 0x23, 0x3D, 0xF0,
+    };
+    const uint32_t first = BASE + 0x240u;
+    const uint32_t second = BASE + 0x2C0u;
+    const uint32_t duplicate = BASE + 0x340u;
+    put_test_bytes(&cpu, first, first_body, sizeof(first_body));
+    put_test_bytes(&cpu, second, second_body, sizeof(second_body));
+    put_test_bytes(&cpu, duplicate, first_body, sizeof(first_body));
+
+    /* CRCs are over these complete relocation-free instruction bodies. */
+    firmware_xtensa_function_match_t family[] = {
+        { sizeof(first_body), 0x10FAE4DBu, 0u, 0u },
+        { sizeof(second_body), 0x32FF6E4Au, 0u, 0u },
+        { sizeof(first_body), 0xDEADBEEFu, 0u, 0u },
+    };
+    firmware_scan_xtensa_functions(cpu.mem, BASE, BASE + 0x1000u,
+                                    family, 3u);
+    ASSERT_EQ(family[0].matches, 2u);
+    ASSERT_EQ(family[0].addr, 0u);
+    ASSERT_EQ(family[1].matches, 1u);
+    ASSERT_EQ(family[1].addr, second);
+    ASSERT_EQ(family[2].matches, 0u);
+    ASSERT_EQ(family[2].addr, 0u);
+
+    teardown(&cpu);
+}
+
 static void run_firmware_scan_tests(void) {
     TEST_SUITE("Firmware scanning");
     RUN_TEST(xtensa_firmware_fingerprint_normalizes_relocations);
     RUN_TEST(relocatable_function_fingerprint_normalizes_jump_and_requires_unique);
+    RUN_TEST(function_family_fingerprints_resolve_in_one_pass);
 }
