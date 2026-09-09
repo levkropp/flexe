@@ -3,7 +3,6 @@
 
 #include "xtensa.h"
 #include "elf_symbols.h"
-#include "rom_stubs.h"
 
 typedef struct esp_timer_stubs esp_timer_stubs_t;
 
@@ -13,9 +12,8 @@ void esp_timer_stubs_destroy(esp_timer_stubs_t *et);
 /* Look up ELF symbols and register PC hooks */
 int esp_timer_stubs_hook_symbols(esp_timer_stubs_t *et, const elf_symbols_t *syms);
 
-/* Register fingerprinted timer accessors in stripped production images. */
-int esp_timer_stubs_hook_firmware_profile(
-        esp_timer_stubs_t *et, rom_firmware_profile_t profile);
+/* Discover complete, fingerprinted timer accessors in stripped firmware. */
+int esp_timer_stubs_hook_firmware(esp_timer_stubs_t *et);
 
 /* Access timer count for testing */
 int esp_timer_stubs_timer_count(const esp_timer_stubs_t *et);

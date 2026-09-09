@@ -4,6 +4,7 @@
 
 #include "esp_timer_stubs.h"
 #include "rom_stubs.h"
+#include "firmware_scan.h"
 #include "memory.h"
 #include "guest_call.h"
 #include "peripherals.h"
@@ -16,10 +17,14 @@
 #define MAX_TIMERS 16
 #define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
 
-#define WLED_V1601_ESP_TIMER_GET_TIME 0x40086738u
-#define WLED_V1601_LACT_CONFIG        0x3FF5F070u
-#define WLED_V1601_LACT_DIVIDER       40u
-#define WLED_V1601_GET_TIME_MAX_INSNS 160u
+#define ESP32_TIMG0_BASE                 0x3FF5F000u
+#define ESP32_TIMG1_BASE                 0x3FF60000u
+#define ESP32_TIMG_LACT_CONFIG_OFFSET    0x70u
+#define IDF_LACT_TIME_DIVIDER            40u
+#define IDF_LACT_TIME_MAX_INSNS          160u
+#define IDF_LACT_READER_SIZE             74u
+#define IDF_LACT_ACCESSOR_SIZE           20u
+#define MAX_NATIVE_LACT_ACCESSORS        8u
 
 /* Instruction budget for one esp_timer callback. */
 #define ESP_TIMER_CALLBACK_INSNS 100000u
@@ -33,6 +38,13 @@ typedef struct {
     uint64_t alarm_us;     /* absolute time in microseconds */
     uint32_t handle;       /* address returned as handle */
 } emu_timer_t;
+
+typedef struct {
+    uint32_t accessor_entry;
+    uint32_t reader_entry;
+    uint32_t config_addr;
+    int group;
+} native_lact_accessor_t;
 
 struct esp_timer_stubs {
     xtensa_cpu_t      *cpu;
@@ -60,6 +72,11 @@ struct esp_timer_stubs {
     /* Optional blocking-wait delegate (the FreeRTOS scheduler). */
     esp_timer_sleep_fn sleep_fn;
     void              *sleep_ctx;
+
+    /* Complete IDF implementations found structurally in stripped images.
+     * Each hook keeps the timer group decoded from its own L32R literals. */
+    native_lact_accessor_t native_lact[MAX_NATIVE_LACT_ACCESSORS];
+    unsigned native_lact_count;
 };
 
 #define TIMER_BUMP_BASE  0x3FFE8000u
@@ -336,21 +353,24 @@ void stub_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     }
 }
 
-/* WLED 16.0.1's stripped IDF 4.4 timer accessor is a pure wrapper around the
- * timer-group LACT counter. The inner routine deliberately polls until an
- * APB/divider tick arrives, so its dynamic length is phase-dependent (33 to
- * 153 instructions at divider 40, plus one possible 7-insn consistency
- * retry). Reproduce those reads and their exact instruction positions in C;
- * this preserves both the returned counter and guest time while avoiding the
- * interpreter-dispatch cost of the spin. Decline if either nested ENTRY could
- * expose a live register window or an event belongs inside the maximum span. */
-static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
-    (void)ctx;
-    if (XT_PS_CALLINC(cpu->ps) != 2 || cpu->seed_entry_link)
+/* This IDF timer accessor is a pure wrapper around a timer-group LACT
+ * counter. The inner routine deliberately polls until an APB/divider tick
+ * arrives, so its dynamic length is phase-dependent (33 to 153 instructions
+ * at divider 40, plus one possible 7-insn consistency retry). Reproduce
+ * those reads and their exact instruction positions in C, but only after the
+ * complete outer and inner routines have been discovered and their MMIO
+ * literals decoded. */
+static int stub_idf_lact_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
+    const native_lact_accessor_t *native = ctx;
+    if (!native || XT_PS_CALLINC(cpu->ps) != 2u || cpu->seed_entry_link ||
+        cpu->breakpoint_count != 0u || cpu->window_trace ||
+        (cpu->irq_check && (cpu->interrupt & cpu->intenable)))
         return 0;
 
+    unsigned wb = cpu->windowbase & 15u;
+    uint32_t caller_sp = ar_read(cpu, 1);
     for (unsigned i = 1; i <= 6u; i++) {
-        unsigned window = (cpu->windowbase + i) & 0xFu;
+        unsigned window = (wb + i) & 0xFu;
         if (cpu->windowstart & (1u << window))
             return 0;
     }
@@ -358,18 +378,19 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     if (cpu->next_timer_event != UINT32_MAX &&
         ((int32_t)(cpu->ccount - cpu->next_timer_event) >= 0 ||
          cpu->next_timer_event - cpu->ccount <=
-             WLED_V1601_GET_TIME_MAX_INSNS))
+             IDF_LACT_TIME_MAX_INSNS))
         return 0;
 
-    uint32_t config = mem_read32(cpu->mem, WLED_V1601_LACT_CONFIG);
+    uint32_t config = mem_read32(cpu->mem, native->config_addr);
     uint32_t divider = (config >> 13) & 0xFFFFu;
-    if (divider != WLED_V1601_LACT_DIVIDER ||
+    if (divider != IDF_LACT_TIME_DIVIDER ||
         (config & (3u << 30)) != (3u << 30))
         return 0;
 
     esp32_periph_t *periph = cpu->periph_event_ctx;
     uint64_t snapshot;
-    if (!periph_lact_counter_at_ccount(periph, cpu, 0, 7u, &snapshot))
+    if (!periph_lact_counter_at_ccount(
+            periph, cpu, native->group, 7u, &snapshot))
         return 0;
     uint32_t low_start = (uint32_t)snapshot;
 
@@ -380,7 +401,7 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t hi_iteration = divider;
     uint32_t poll_delta = 17u + 3u * hi_iteration;
     if (!periph_lact_counter_at_ccount(
-            periph, cpu, 0, poll_delta, &snapshot))
+            periph, cpu, native->group, poll_delta, &snapshot))
         return 0;
     if ((uint32_t)snapshot != low_start) {
         while (lo_iteration < hi_iteration) {
@@ -388,7 +409,7 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
                            (hi_iteration - lo_iteration) / 2u;
             uint32_t delta = 17u + 3u * mid;
             if (!periph_lact_counter_at_ccount(
-                    periph, cpu, 0, delta, &snapshot))
+                    periph, cpu, native->group, delta, &snapshot))
                 return 0;
             if ((uint32_t)snapshot == low_start)
                 lo_iteration = mid + 1u;
@@ -397,7 +418,7 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
         }
         poll_delta = 17u + 3u * lo_iteration;
         if (!periph_lact_counter_at_ccount(
-                periph, cpu, 0, poll_delta, &snapshot))
+                periph, cpu, native->group, poll_delta, &snapshot))
             return 0;
     }
     uint32_t low = (uint32_t)snapshot;
@@ -410,11 +431,11 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
         uint32_t high_delta = poll_delta + 5u + 7u * retry;
         low_delta = high_delta + 2u;
         if (!periph_lact_counter_at_ccount(
-                periph, cpu, 0, high_delta, &snapshot))
+                periph, cpu, native->group, high_delta, &snapshot))
             return 0;
         high = (uint32_t)(snapshot >> 32);
         if (!periph_lact_counter_at_ccount(
-                periph, cpu, 0, low_delta, &snapshot))
+                periph, cpu, native->group, low_delta, &snapshot))
             return 0;
         uint32_t checked_low = (uint32_t)snapshot;
         if (checked_low == low) {
@@ -437,13 +458,126 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     int ci = XT_PS_CALLINC(cpu->ps);
     ar_write(cpu, ci * 4 + 2, (uint32_t)us);
     ar_write(cpu, ci * 4 + 3, (uint32_t)(us >> 32));
+
+    /* Reproduce state that survives both RETWs. Inactive physical windows
+     * are architectural state: a later spill can expose them, so returning
+     * only a2:a3 is not equivalent to executing the function. */
+    ar_write(cpu, 9, caller_sp - 32u);           /* outer a1 */
+    ar_write(cpu, 16, (2u << 30) |
+             ((cpu->pc + 6u) & 0x3FFFFFFFu));    /* inner a0 */
+    ar_write(cpu, 17, caller_sp - 64u);          /* inner a1 */
+    ar_write(cpu, 18, (uint32_t)us);             /* outer a10 */
+    ar_write(cpu, 19, high);                     /* outer a11 / inner a3 */
+    ar_write(cpu, 24, low);                      /* inner a8 */
+    ar_write(cpu, 25, native->config_addr + 8u); /* inner a9 */
+    ar_write(cpu, 26, native->config_addr + 12u);/* inner a10 */
+
+    cpu->lbeg = native->reader_entry + 37u;
+    cpu->lend = native->reader_entry + 45u;
+    cpu->lcount = divider - lo_iteration;
+    cpu->window_callsize[(wb + 2u) & 15u] = 2u;
+    cpu->window_callsize[(wb + 4u) & 15u] = 2u;
+    XT_PS_SET_OWB(cpu->ps, (wb + 2u) & 15u);
     uint32_t a0 = ar_read(cpu, ci * 4);
     cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
-    XT_PS_SET_CALLINC(cpu->ps, 0);
 
     cpu->ccount += total - 1u;
     cpu->cycle_count += total - 1u;
     return (int)total;
+}
+
+static bool idf_l32r_value(xtensa_mem_t *mem, uint32_t pc,
+                           uint32_t *value_out) {
+    uint32_t literal;
+    return firmware_xtensa_l32r_target(mem, pc, &literal) &&
+           firmware_peek(mem, literal, 4u, value_out);
+}
+
+static bool idf_lact_group(uint32_t config_addr, int *group_out) {
+    if (!group_out)
+        return false;
+    if (config_addr == ESP32_TIMG0_BASE + ESP32_TIMG_LACT_CONFIG_OFFSET) {
+        *group_out = 0;
+        return true;
+    }
+    if (config_addr == ESP32_TIMG1_BASE + ESP32_TIMG_LACT_CONFIG_OFFSET) {
+        *group_out = 1;
+        return true;
+    }
+    return false;
+}
+
+/* Match both complete routines while allowing only address-bearing fields to
+ * vary: the outer CALL8 displacement and five inner L32R displacements. The
+ * decoded literals must describe one real ESP32 timer group's LACT register
+ * block, which prevents an instruction lookalike from authorizing MMIO. */
+static bool idf_lact_accessor_matches(xtensa_mem_t *mem, uint32_t entry,
+                                      native_lact_accessor_t *native_out) {
+    static const uint8_t outer_entry[] = {0x36, 0x41, 0x00};
+    static const uint8_t outer_suffix[] = {
+        0x10, 0x2B, 0x01, 0xA0, 0xA1, 0x41, 0xA0,
+        0x22, 0x20, 0xB0, 0x31, 0x41, 0x1D, 0xF0,
+    };
+    static const uint8_t reader[] = {
+        0x36, 0x41, 0x00, 0x21, 0xD3, 0xE8, 0x0C, 0x1A,
+        0x91, 0xD1, 0xE8, 0xC0, 0x20, 0x00, 0x38, 0x09,
+        0xC0, 0x20, 0x00, 0x88, 0x02, 0x80, 0x8D, 0xF4,
+        0xAA, 0x88, 0x21, 0xCE, 0xE8, 0xC0, 0x20, 0x00,
+        0xA9, 0x02, 0x76, 0x88, 0x07, 0xC0, 0x20, 0x00,
+        0x28, 0x09, 0x27, 0x93, 0xFF, 0xA1, 0xCA, 0xE8,
+        0x91, 0xC7, 0xE8, 0xC0, 0x20, 0x00, 0x38, 0x0A,
+        0xC0, 0x20, 0x00, 0x88, 0x09, 0x87, 0x92, 0x04,
+        0xC0, 0x20, 0x00, 0x1D, 0xF0, 0x2D, 0x08, 0x06,
+        0xFA, 0xFF,
+    };
+    static const size_t reader_relocations[] = {
+        4u, 5u, 9u, 10u, 27u, 28u, 46u, 47u, 49u, 50u,
+    };
+    _Static_assert(sizeof(reader) == IDF_LACT_READER_SIZE,
+                   "IDF LACT reader size");
+    _Static_assert(sizeof(outer_entry) + 3u + sizeof(outer_suffix) ==
+                       IDF_LACT_ACCESSOR_SIZE,
+                   "IDF LACT accessor size");
+
+    if (!native_out ||
+        !firmware_signature_matches(
+            mem, entry, outer_entry, sizeof(outer_entry)) ||
+        !firmware_signature_matches(
+            mem, entry + 6u, outer_suffix, sizeof(outer_suffix)))
+        return false;
+
+    unsigned callinc;
+    uint32_t reader_entry;
+    if (!firmware_xtensa_call_target(
+            mem, entry + 3u, &callinc, &reader_entry) || callinc != 2u ||
+        !firmware_signature_matches_except(
+            mem, reader_entry, reader, sizeof(reader), reader_relocations,
+            sizeof(reader_relocations) / sizeof(reader_relocations[0])))
+        return false;
+
+    uint32_t config_addr;
+    uint32_t count_low_addr;
+    uint32_t update_addr;
+    uint32_t count_high_addr;
+    uint32_t count_low_again;
+    int group;
+    if (!idf_l32r_value(mem, reader_entry + 3u, &config_addr) ||
+        !idf_l32r_value(mem, reader_entry + 8u, &count_low_addr) ||
+        !idf_l32r_value(mem, reader_entry + 26u, &update_addr) ||
+        !idf_l32r_value(mem, reader_entry + 45u, &count_high_addr) ||
+        !idf_l32r_value(mem, reader_entry + 48u, &count_low_again) ||
+        !idf_lact_group(config_addr, &group) ||
+        count_low_addr != config_addr + 8u ||
+        count_high_addr != config_addr + 12u ||
+        update_addr != config_addr + 16u ||
+        count_low_again != count_low_addr)
+        return false;
+
+    native_out->accessor_entry = entry;
+    native_out->reader_entry = reader_entry;
+    native_out->config_addr = config_addr;
+    native_out->group = group;
+    return true;
 }
 
 /* esp_timer_dump(FILE *stream) — print timer list to stdout */
@@ -573,18 +707,8 @@ int esp_timer_stubs_hook_symbols(esp_timer_stubs_t *et, const elf_symbols_t *sym
     return hooked;
 }
 
-int esp_timer_stubs_hook_firmware_profile(
-        esp_timer_stubs_t *et, rom_firmware_profile_t profile) {
-    if (!et || profile != ROM_FIRMWARE_WLED_V1601)
-        return 0;
-
-    static const uint8_t signature[] = {
-        0x36, 0x41, 0x00, 0x25, 0xFB, 0xFF, 0x10, 0x2B,
-        0x01, 0xA0, 0xA1, 0x41, 0xA0, 0x22, 0x20, 0xB0,
-    };
-    const uint8_t *code = mem_get_ptr(et->cpu->mem,
-                                      WLED_V1601_ESP_TIMER_GET_TIME);
-    if (!code || memcmp(code, signature, sizeof(signature)) != 0)
+int esp_timer_stubs_hook_firmware(esp_timer_stubs_t *et) {
+    if (!et || !et->cpu || !et->cpu->mem)
         return 0;
 
     esp32_rom_stubs_t *rom = et->rom;
@@ -594,13 +718,40 @@ int esp_timer_stubs_hook_firmware_profile(
         return 0;
     et->rom = rom;
 
-    if (rom_stubs_register_conditional_ctx(
-            rom, WLED_V1601_ESP_TIMER_GET_TIME,
-            stub_wled_v1601_esp_timer_get_time,
-            "esp_timer_get_time", et) != 0)
-        return 0;
-    et->cpu->accelerated_blocks = true;
-    return 1;
+    int hooked = 0;
+    uint32_t last = ESP32_IRAM_INSN_ADDR_HIGH - IDF_LACT_ACCESSOR_SIZE;
+    for (uint32_t entry = ESP32_FIRMWARE_INSN_ADDR_LOW;
+         entry <= last; entry++) {
+        const uint8_t *first = mem_get_ptr(et->cpu->mem, entry);
+        if (!first || *first != 0x36u)
+            continue;
+
+        native_lact_accessor_t native;
+        if (!idf_lact_accessor_matches(et->cpu->mem, entry, &native))
+            continue;
+        bool already_hooked = false;
+        for (unsigned i = 0u; i < et->native_lact_count; i++)
+            already_hooked |=
+                et->native_lact[i].accessor_entry == native.accessor_entry;
+        if (already_hooked)
+            continue;
+        if (et->native_lact_count >= MAX_NATIVE_LACT_ACCESSORS)
+            break;
+
+        native_lact_accessor_t *installed =
+            &et->native_lact[et->native_lact_count];
+        *installed = native;
+        if (rom_stubs_register_conditional_exact_ctx(
+                rom, entry, stub_idf_lact_esp_timer_get_time,
+                "esp_timer_get_time", installed) != 0)
+            continue;
+        et->native_lact_count++;
+        hooked++;
+        entry += IDF_LACT_ACCESSOR_SIZE - 1u;
+    }
+    if (hooked != 0)
+        et->cpu->accelerated_blocks = true;
+    return hooked;
 }
 
 int esp_timer_stubs_timer_count(const esp_timer_stubs_t *et) {

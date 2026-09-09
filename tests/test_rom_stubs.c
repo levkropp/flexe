@@ -873,13 +873,6 @@ TEST(test_rom_open_fails_when_syscall_table_is_uninitialized) {
     teardown(&cpu);
 }
 
-static uint32_t encode_test_l32r(uint32_t pc, uint32_t literal, int reg) {
-    uint32_t base = (pc + 3u) & ~3u;
-    uint32_t delta = literal - base;
-    return 1u | ((uint32_t)reg << 4) |
-           (((delta >> 2) & 0xFFFFu) << 8);
-}
-
 TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     xtensa_cpu_t cpu;
     setup(&cpu);

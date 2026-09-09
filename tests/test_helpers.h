@@ -65,6 +65,20 @@ static inline void put_test_bytes(xtensa_cpu_t *cpu, uint32_t addr,
         mem_write8(cpu->mem, addr + (uint32_t)i, bytes[i]);
 }
 
+static inline uint32_t encode_test_l32r(uint32_t pc, uint32_t literal,
+                                        unsigned reg) {
+    uint32_t base = (pc + 3u) & ~3u;
+    uint32_t delta = literal - base;
+    return 1u | ((reg & 0xFu) << 4) |
+           (((delta >> 2) & 0xFFFFu) << 8);
+}
+
+static inline uint32_t encode_test_calln(uint32_t pc, uint32_t target,
+                                         unsigned callinc) {
+    uint32_t offset = ((target >> 2) - (pc >> 2) - 1u) & 0x3FFFFu;
+    return 5u | ((callinc & 3u) << 4) | (offset << 6);
+}
+
 static inline void seed_flash_poll_loop(xtensa_cpu_t *cpu, uint32_t addr) {
     static const uint8_t loop[] = {
         0xC0, 0x20, 0x00, 0x82, 0x09, 0x00,

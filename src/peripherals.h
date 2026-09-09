@@ -317,9 +317,9 @@ bool periph_app_cpu_released(const esp32_periph_t *p);
 void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1);
 
 /* Predict a LACT counter read after `ccount_ahead` cycles on one attached
- * core, without advancing peripheral state. Profile-verified accelerators use
- * this to collapse ESP-IDF's mandatory update/poll sequence while preserving
- * the exact value each original MMIO read would observe. */
+ * core, without advancing peripheral state. Structurally verified
+ * accelerators use this to collapse ESP-IDF's mandatory update/poll sequence
+ * while preserving the exact value each original MMIO read would observe. */
 bool periph_lact_counter_at_ccount(const esp32_periph_t *p,
                                    const xtensa_cpu_t *cpu, int group,
                                    uint32_t ccount_ahead, uint64_t *counter);

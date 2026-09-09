@@ -53,6 +53,16 @@ int  rom_stubs_register_conditional_ctx(
                              esp32_rom_stubs_t *stubs, uint32_t addr,
                              rom_conditional_stub_fn fn, const char *name,
                              void *user_ctx);
+/* Structurally discovered bodies already identify the exact ENTRY address;
+ * these variants deliberately bypass the legacy post-ENTRY ELF-symbol
+ * compatibility scan. */
+int  rom_stubs_register_exact_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
+                                  rom_stub_fn fn, const char *name,
+                                  void *user_ctx);
+int  rom_stubs_register_conditional_exact_ctx(
+                             esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_conditional_stub_fn fn, const char *name,
+                             void *user_ctx);
 
 /* Output capture (ets_printf / ets_write_char go here) */
 int  rom_stubs_output_count(const esp32_rom_stubs_t *stubs);

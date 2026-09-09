@@ -1,6 +1,7 @@
 #include "rom_stubs.h"
 #include "elf_symbols.h"
 #include "memory.h"
+#include "firmware_scan.h"
 #include "peripherals.h"
 #include "sandbox_events.h"
 #include "guest_call.h"
@@ -167,15 +168,6 @@ struct esp32_rom_stubs {
     char     nvs_handle_ns[16][16];   /* up to 16 open handles */
     int      nvs_handle_count;        /* next handle index = count + 1 */
 };
-
-/* Structurally discovered bodies already identify their exact ENTRY address.
- * Their registrations must not use the legacy symbol-address backscan. */
-static int rom_stubs_register_exact_ctx(
-        esp32_rom_stubs_t *stubs, uint32_t addr, rom_stub_fn fn,
-        const char *name, void *user_ctx);
-static int rom_stubs_register_conditional_exact_ctx(
-        esp32_rom_stubs_t *stubs, uint32_t addr,
-        rom_conditional_stub_fn fn, const char *name, void *user_ctx);
 
 /* ===== Calling convention helpers ===== */
 
@@ -4759,74 +4751,6 @@ typedef struct {
                              * the real instruction (rom_stubs_register_spy) */
 } fw_addr_hook_t;
 
-static bool fw_signature_matches(xtensa_mem_t *mem, uint32_t addr,
-                                 const uint8_t *signature, size_t size) {
-    for (size_t i = 0; i < size; i++) {
-        if (mem_read8(mem, addr + (uint32_t)i) != signature[i])
-            return false;
-    }
-    return true;
-}
-
-/* Compare a complete function body while ignoring only explicitly listed
- * relocation bytes. This keeps structural accelerators independent of link
- * address without weakening validation of the instructions around them. */
-static bool fw_signature_matches_except(xtensa_mem_t *mem, uint32_t addr,
-                                        const uint8_t *signature, size_t size,
-                                        const uint8_t *ignored,
-                                        size_t ignored_count) {
-    for (size_t j = 0u; j < ignored_count; j++) {
-        if (ignored[j] >= size)
-            return false;
-    }
-    for (size_t i = 0u; i < size; i++) {
-        bool skip = false;
-        for (size_t j = 0u; j < ignored_count; j++)
-            skip |= i == ignored[j];
-        if (skip)
-            continue;
-        if (mem_read8(mem, addr + (uint32_t)i) != signature[i])
-            return false;
-    }
-    return true;
-}
-
-static bool fw_crc32_matches(xtensa_mem_t *mem, uint32_t addr, size_t size,
-                             uint32_t expected) {
-    uLong crc = crc32(0L, Z_NULL, 0);
-    for (size_t i = 0; i < size; i++) {
-        const uint8_t byte = mem_read8(mem, addr + (uint32_t)i);
-        crc = crc32(crc, &byte, 1u);
-    }
-    return (uint32_t)crc == expected;
-}
-
-/* Find a relocatable guest-code body without relying on a symbol table or a
- * firmware link address. The prefix makes the bytewise scan cheap; the CRC
- * still covers the complete implementation before a native substitute is
- * allowed to run. `end` is exclusive. */
-static bool fw_find_crc32_body(xtensa_mem_t *mem, uint32_t start,
-                               uint32_t end, const uint8_t *prefix,
-                               size_t prefix_size, size_t body_size,
-                               uint32_t expected_crc, uint32_t *addr_out) {
-    if (!mem || !prefix || !addr_out || prefix_size == 0u ||
-        prefix_size > body_size || start >= end ||
-        body_size > (size_t)(end - start))
-        return false;
-
-    uint32_t last = end - (uint32_t)body_size;
-    for (uint32_t addr = start; addr <= last; addr++) {
-        if (mem_read8(mem, addr) != prefix[0] ||
-            !fw_signature_matches(mem, addr, prefix, prefix_size))
-            continue;
-        if (!fw_crc32_matches(mem, addr, body_size, expected_crc))
-            continue;
-        *addr_out = addr;
-        return true;
-    }
-    return false;
-}
-
 rom_firmware_profile_t rom_stubs_identify_firmware(
         esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     if (!stubs || !stubs->cpu || !stubs->cpu->mem)
@@ -4849,8 +4773,8 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             0xFF, 0x21, 0xDC, 0xEA, 0xAC, 0xAA, 0xA2, 0xA0,
         };
         xtensa_mem_t *mem = stubs->cpu->mem;
-        if (fw_signature_matches(mem, 0x401C374Cu, phy, sizeof(phy)) &&
-            fw_signature_matches(mem, 0x401A861Cu, wifi_start,
+        if (firmware_signature_matches(mem, 0x401C374Cu, phy, sizeof(phy)) &&
+            firmware_signature_matches(mem, 0x401A861Cu, wifi_start,
                                  sizeof(wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1121_CYD2USB;
     } else if (entry_point == 0x400831D8u) {
@@ -4873,19 +4797,19 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             0xFE, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0x9B, 0xFE,
         };
         xtensa_mem_t *mem = stubs->cpu->mem;
-        if (fw_signature_matches(mem, 0x401BDE2Cu,
+        if (firmware_signature_matches(mem, 0x401BDE2Cu,
                                  old_phy, sizeof(old_phy)) &&
-            fw_signature_matches(mem, 0x401988A8u,
+            firmware_signature_matches(mem, 0x401988A8u,
                                  wifi_start, sizeof(wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1140_1;
-        else if (fw_signature_matches(mem, 0x401BE628u,
+        else if (firmware_signature_matches(mem, 0x401BE628u,
                                       new_phy, sizeof(new_phy)) &&
-                 fw_signature_matches(mem, 0x401990A0u,
+                 firmware_signature_matches(mem, 0x401990A0u,
                                       wifi_start, sizeof(wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1142_3;
-        else if (fw_signature_matches(mem, 0x401C1438u,
+        else if (firmware_signature_matches(mem, 0x401C1438u,
                                       v115_phy, sizeof(v115_phy)) &&
-                 fw_signature_matches(mem, 0x4019BE94u,
+                 firmware_signature_matches(mem, 0x4019BE94u,
                                       wifi_start, sizeof(wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1151;
     } else if (entry_point == 0x400830D0u) {
@@ -4901,14 +4825,14 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             0xFE, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0x9B, 0xFE,
         };
         xtensa_mem_t *mem = stubs->cpu->mem;
-        if (fw_signature_matches(mem, 0x401BE0E8u,
+        if (firmware_signature_matches(mem, 0x401BE0E8u,
                                  board_phy, sizeof(board_phy)) &&
-            fw_signature_matches(mem, 0x40198B64u, board_wifi_start,
+            firmware_signature_matches(mem, 0x40198B64u, board_wifi_start,
                                  sizeof(board_wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1143_GUITION;
-        else if (fw_signature_matches(mem, 0x401BE274u,
+        else if (firmware_signature_matches(mem, 0x401BE274u,
                                       board_phy, sizeof(board_phy)) &&
-                 fw_signature_matches(mem, 0x40198CF0u, board_wifi_start,
+                 firmware_signature_matches(mem, 0x40198CF0u, board_wifi_start,
                                       sizeof(board_wifi_start)))
             profile = ROM_FIRMWARE_MARAUDER_V1143_35INCH;
     } else if (entry_point == 0x40083E68u) {
@@ -4924,9 +4848,9 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             0x29, 0xAC, 0x5A, 0x1C, 0x8A, 0x21, 0xE8, 0xF6,
         };
         xtensa_mem_t *mem = stubs->cpu->mem;
-        if (fw_signature_matches(mem, 0x401561B8u,
+        if (firmware_signature_matches(mem, 0x401561B8u,
                                  wifi_init, sizeof(wifi_init)) &&
-            fw_signature_matches(mem, 0x40182D44u,
+            firmware_signature_matches(mem, 0x40182D44u,
                                  wifi_start, sizeof(wifi_start)))
             profile = ROM_FIRMWARE_WLED_V1601;
     } else if (entry_point == 0x40086E2Cu) {
@@ -4943,9 +4867,9 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             0x5D, 0x0A, 0x7C, 0xF2, 0x16, 0xEA, 0x04, 0x22,
         };
         xtensa_mem_t *mem = stubs->cpu->mem;
-        if (fw_signature_matches(mem, 0x4015CD70u,
+        if (firmware_signature_matches(mem, 0x4015CD70u,
                                  socket_entry, sizeof(socket_entry)) &&
-            fw_signature_matches(mem, 0x4015C758u,
+            firmware_signature_matches(mem, 0x4015C758u,
                                  bind_entry, sizeof(bind_entry)))
             profile = ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8;
     } else if (entry_point == 0x40082A58u) {
@@ -4961,9 +4885,9 @@ rom_firmware_profile_t rom_stubs_identify_firmware(
             0xFE, 0xA0, 0x2A, 0x20, 0x16, 0x1A, 0x05, 0x82,
         };
         xtensa_mem_t *mem = stubs->cpu->mem;
-        if (fw_signature_matches(mem, 0x4019C06Cu,
+        if (firmware_signature_matches(mem, 0x4019C06Cu,
                                  socket_entry, sizeof(socket_entry)) &&
-            fw_signature_matches(mem, 0x4019BA54u,
+            firmware_signature_matches(mem, 0x4019BA54u,
                                  bind_entry, sizeof(bind_entry)))
             profile = ROM_FIRMWARE_TASMOTA32_V1560;
     }
@@ -5133,33 +5057,17 @@ static void stub_fw_virtual_phy_init(xtensa_cpu_t *cpu, void *ctx) {
 /* Read n bytes of guest memory without disturbing the unmapped-access counter,
  * which exists to report firmware bugs and should not log a scan's probes. */
 static bool fw_peek(xtensa_cpu_t *cpu, uint32_t addr, int n, uint32_t *out) {
-    uint32_t v = 0;
-    for (int i = 0; i < n; i++) {
-        const uint8_t *p = mem_get_ptr(cpu->mem, addr + (uint32_t)i);
-        if (!p) return false;
-        v |= (uint32_t)*p << (8 * i);
-    }
-    *out = v;
-    return true;
+    return n > 0 && firmware_peek(cpu->mem, addr, (size_t)n, out);
 }
 
 static bool fw_insn_is_entry(uint32_t insn) {
-    return (insn & 0xFu) == 6u &&        /* op0 = SI  */
-           ((insn >> 4) & 3u) == 3u &&   /* n  = BI1  */
-           ((insn >> 6) & 3u) == 0u &&   /* m  = 0    */
-           ((insn >> 8) & 0xFu) == 1u;   /* s  = a1   */
+    return firmware_xtensa_is_entry(insn);
 }
 
 /* Does an L32R at pc resolve to the literal at lit? */
 static bool fw_l32r_target(xtensa_cpu_t *cpu, uint32_t pc,
                            uint32_t *target_out) {
-    uint32_t insn;
-    if (!target_out || !fw_peek(cpu, pc, 3, &insn) ||
-        (insn & 0xFu) != 1u)
-        return false;
-    *target_out = ((pc + 3u) & ~3u) +
-                  (0xFFFC0000u | ((uint32_t)XT_IMM16(insn) << 2));
-    return true;
+    return firmware_xtensa_l32r_target(cpu->mem, pc, target_out);
 }
 
 static bool fw_l32r_targets(xtensa_cpu_t *cpu, uint32_t pc, uint32_t lit) {
@@ -5419,7 +5327,7 @@ static bool fw_add_flash_poll_loop(esp32_rom_stubs_t *stubs, uint32_t addr) {
         0x16, 0x38, 0xFF, /* beqz a8, -13 */
     };
     xtensa_cpu_t *cpu = stubs->cpu;
-    if (!fw_signature_matches(cpu->mem, addr, loop, sizeof(loop)))
+    if (!firmware_signature_matches(cpu->mem, addr, loop, sizeof(loop)))
         return false;
     for (unsigned i = 0; i < cpu->poll_spin_count; i++) {
         if (cpu->poll_spin_pc[i] == addr)
@@ -5573,7 +5481,7 @@ static bool fw_idf_watchpoint_matches(xtensa_cpu_t *cpu, uint32_t addr) {
         0x30, 0x90, 0x13, 0x80, 0xA0, 0x13, 0xC6, 0xFC,
         0xFF,
     };
-    static const uint8_t relocation_bytes[] = {
+    static const size_t relocation_bytes[] = {
         IDF_WATCHPOINT_READ_L32R_OFFSET + 1u,
         IDF_WATCHPOINT_READ_L32R_OFFSET + 2u,
         IDF_WATCHPOINT_WRITE_L32R_OFFSET + 1u,
@@ -5581,9 +5489,10 @@ static bool fw_idf_watchpoint_matches(xtensa_cpu_t *cpu, uint32_t addr) {
     };
     _Static_assert(sizeof(signature) == IDF_WATCHPOINT_SIZE,
                    "watchpoint implementation size");
-    if (!fw_signature_matches_except(
+    if (!firmware_signature_matches_except(
                 cpu->mem, addr, signature, sizeof(signature),
-                relocation_bytes, sizeof(relocation_bytes)))
+                relocation_bytes,
+                sizeof(relocation_bytes) / sizeof(relocation_bytes[0])))
         return false;
 
     uint32_t read_literal;
@@ -5759,7 +5668,7 @@ static int fw_add_newlib_memcmp_hooks(esp32_rom_stubs_t *stubs) {
     int hooked = 0;
     uint32_t cursor = ESP32_FIRMWARE_INSN_ADDR_LOW;
     uint32_t addr;
-    while (fw_find_crc32_body(
+    while (firmware_find_crc32_body(
             stubs->cpu->mem, cursor, ESP32_IRAM_INSN_ADDR_HIGH,
             prefix, sizeof(prefix), NEWLIB_MEMCMP_SIZE,
             NEWLIB_MEMCMP_CRC32, &addr)) {
@@ -5969,7 +5878,7 @@ static int fw_add_xthal_spill_hooks(esp32_rom_stubs_t *stubs) {
     int hooked = 0;
     uint32_t cursor = ESP32_FIRMWARE_INSN_ADDR_LOW;
     uint32_t addr;
-    while (fw_find_crc32_body(
+    while (firmware_find_crc32_body(
             stubs->cpu->mem, cursor, ESP32_IRAM_INSN_ADDR_HIGH,
             prefix, sizeof(prefix), XTHAL_WINDOW_SPILL_SIZE,
             XTHAL_WINDOW_SPILL_CRC32, &addr)) {
@@ -7175,14 +7084,14 @@ int rom_stubs_register_conditional_ctx(
             stubs, addr, NULL, fn, name, user_ctx, true);
 }
 
-static int rom_stubs_register_exact_ctx(
+int rom_stubs_register_exact_ctx(
         esp32_rom_stubs_t *stubs, uint32_t addr, rom_stub_fn fn,
         const char *name, void *user_ctx) {
     return rom_stubs_register_any(
             stubs, addr, fn, NULL, name, user_ctx, false);
 }
 
-static int rom_stubs_register_conditional_exact_ctx(
+int rom_stubs_register_conditional_exact_ctx(
         esp32_rom_stubs_t *stubs, uint32_t addr,
         rom_conditional_stub_fn fn, const char *name, void *user_ctx) {
     if (!fn) return -1;
