@@ -23,13 +23,6 @@
 #define TEST_WLED_EVENT_REGISTER     0x40150E34u
 #define TEST_WLED_EVENT_POST         0x40151768u
 #define TEST_WLED_DISCONNECT         0x40182F54u
-#define TEST_TASMOTA_ENTRY           0x40082A58u
-#define TEST_TASMOTA_SOCKET          0x4019C06Cu
-#define TEST_TASMOTA_CLOSE           0x4019BB14u
-#define TEST_TASMOTA_ACCEPT          0x4019B8B4u
-#define TEST_TASMOTA_BIND            0x4019BA54u
-#define TEST_TASMOTA_LISTEN          0x4019BD10u
-#define TEST_TASMOTA_RECV            0x4019BE5Cu
 
 typedef struct {
     const uint8_t *bytes;
@@ -146,8 +139,131 @@ static void seed_relocated_idf4_socket_members(xtensa_cpu_t *cpu,
     mem_write32(cpu->mem, errno_fn_literal, errno_target);
     mem_write32(cpu->mem, errno_target_literal, 0x3FFE3D00u);
 }
+
+/* Relocated ESP-IDF 5.5/picolibc implementations from an ordinary release
+ * link. None of the original application's addresses are retained. */
+static void seed_relocated_idf5_lwip_family(xtensa_cpu_t *cpu,
+                                            uint32_t base) {
+    static const uint8_t gethostbyname[] = {
+        0x36, 0x81, 0x00, 0xC2, 0xA0, 0x18, 0xB2, 0xA0,
+        0x00, 0x10, 0xA1, 0x20, 0x81, 0x4C, 0xB8, 0xE0,
+        0x08, 0x00, 0x0C, 0x2C, 0xBD, 0x01, 0xAD, 0x02,
+        0xA5, 0xA7, 0x12, 0x7D, 0x0A, 0x56, 0xCA, 0x04,
+    };
+    static const uint8_t read_fn[] = {
+        0x36, 0x41, 0x00, 0x20, 0xA2, 0x20, 0x30, 0xB3,
+        0x20, 0x40, 0xC4, 0x20, 0x0C, 0x0F, 0x0C, 0x0E,
+        0x0C, 0x0D, 0xA5, 0xF2, 0xFF, 0x2D, 0x0A, 0xC0,
+        0x20, 0x00, 0x1D, 0xF0,
+    };
+    static const uint8_t sendto_fn[] = {
+        0x36, 0xC1, 0x00, 0x20, 0xA2, 0x20, 0x79, 0xC1,
+        0x25, 0xBD, 0xFE, 0x7D, 0x0A, 0x16, 0xDA, 0x03,
+        0x98, 0x0A, 0xC8, 0x09, 0xC0, 0x94, 0x34, 0x88,
+        0xC1, 0x66, 0x19, 0x14, 0xA5, 0xB4, 0xFE,
+    };
+    static const uint8_t send_fn[] = {
+        0x36, 0x61, 0x00, 0x20, 0xA2, 0x20, 0xE5, 0xA6,
+        0xFE, 0x40, 0x74, 0x20, 0xA0, 0x4A, 0x20, 0xCC,
+        0x5A, 0x7C, 0xF2, 0xC0, 0x20, 0x00, 0x1D, 0xF0,
+        0xA2, 0x2A, 0x00, 0x82, 0xA0, 0xF0,
+    };
+    static const uint8_t write_fn[] = {
+        0x36, 0x41, 0x00, 0x20, 0xA2, 0x20, 0x30, 0xB3,
+        0x20, 0x40, 0xC4, 0x20, 0x0C, 0x0D, 0x25, 0xEC,
+        0xFF, 0x2D, 0x0A, 0xC0, 0x20, 0x00, 0x1D, 0xF0,
+        0x36, 0x21, 0x01, 0x22, 0x61, 0x18, 0x4C, 0x08,
+    };
+    static const uint8_t dns[] = {
+        0x36, 0x81, 0x00, 0x90, 0xF3, 0x40, 0x49, 0x21,
+        0x7D, 0x03, 0x60, 0x60, 0x74, 0x90, 0x95, 0x41,
+        0x59, 0x31, 0x16, 0x33, 0x34, 0x0C, 0x18, 0x20,
+        0x89, 0x93, 0x56, 0xB8, 0x33, 0x92, 0x02, 0x00,
+    };
+    static const test_lwip_fingerprint_t functions[] = {
+        { gethostbyname, sizeof(gethostbyname), 0x000u },
+        { read_fn,       sizeof(read_fn),       0x080u },
+        { sendto_fn,     sizeof(sendto_fn),     0x100u },
+        { send_fn,       sizeof(send_fn),       0x180u },
+        { write_fn,      sizeof(write_fn),      0x200u },
+        { dns,           sizeof(dns),           0x280u },
+    };
+    for (size_t i = 0u; i < sizeof(functions) / sizeof(functions[0]); i++)
+        put_test_bytes(cpu, base + functions[i].offset, functions[i].bytes,
+                       functions[i].size);
+}
+
+#define TEST_IDF5_CLOSE_OFS   0x000u
+#define TEST_IDF5_SOCKET_OFS  0x080u
+#define TEST_IDF5_ACCEPT_OFS  0x100u
+#define TEST_IDF5_BIND_OFS    0x180u
+#define TEST_IDF5_LISTEN_OFS  0x200u
+#define TEST_IDF5_RECV_OFS    0x280u
+
+static void seed_relocated_idf5_server_members(xtensa_cpu_t *cpu,
+                                               uint32_t base) {
+    static const uint8_t close_fn[] = {
+        0x36, 0xA1, 0x00, 0x20, 0xA2, 0x20, 0xA5, 0xF3,
+        0xFE, 0x20, 0x42, 0x20, 0x7D, 0x0A, 0x16, 0xFA,
+        0x0F, 0x88, 0x0A, 0x0C, 0x06, 0x8C, 0xE8, 0x98,
+        0x08, 0x82, 0xA0, 0xF0, 0x90, 0x88, 0x10,
+    };
+    static const uint8_t socket_template[] = {
+        0x36, 0x41, 0x00, 0x26, 0x23, 0x3D, 0x26, 0x33,
+        0x15, 0x26, 0x13, 0x56, 0x91, 0x00, 0x00, 0x70,
+        0x8E, 0xE3, 0x9A, 0x88, 0x1C, 0x69, 0x99, 0x08,
+        0x7C, 0xF2, 0xC0, 0x20, 0x00, 0x1D, 0xF0,
+    };
+    static const uint8_t accept_fn[] = {
+        0x36, 0xC1, 0x00, 0x82, 0xA0, 0x00, 0xAD, 0x02,
+        0x82, 0x51, 0x1C, 0xC0, 0x20, 0x00, 0x25, 0x19,
+        0xFF, 0x7D, 0x03, 0x6D, 0x04, 0x3D, 0x0A, 0xAC,
+        0x4A, 0xA8, 0x0A, 0xB2, 0xC1, 0x34,
+    };
+    static const uint8_t bind_fn[] = {
+        0x36, 0x81, 0x00, 0x20, 0xA2, 0x20, 0xA5, 0xFF,
+        0xFE, 0xA0, 0x2A, 0x20, 0x16, 0x1A, 0x05, 0x82,
+        0x03, 0x01, 0x66, 0x28, 0x24, 0x82, 0x2A, 0x00,
+        0x88, 0x08, 0x37, 0xE8, 0x26, 0x26, 0xB4, 0x04,
+    };
+    static const uint8_t listen_fn[] = {
+        0x36, 0x41, 0x00, 0x20, 0xA2, 0x20, 0xE5, 0xD3,
+        0xFE, 0x2D, 0x0A, 0xAC, 0xCA, 0x0C, 0x08, 0x80,
+        0x33, 0x53, 0xB2, 0xA0, 0xFF, 0xA8, 0x0A, 0xB0,
+        0xB3, 0x43, 0xE5, 0xC0, 0x10, 0x16, 0x0A, 0x04,
+    };
+    static const uint8_t recv_fn[] = {
+        0x36, 0x41, 0x00, 0x20, 0xA2, 0x20, 0x30, 0xB3,
+        0x20, 0x40, 0xC4, 0x20, 0xDD, 0x05, 0x0C, 0x0F,
+        0x0C, 0x0E, 0xE5, 0xF0, 0xFF, 0x2D, 0x0A, 0x1D,
+        0xF0, 0x00, 0x00, 0x00,
+    };
+    const uint32_t socket_addr = base + TEST_IDF5_SOCKET_OFS;
+    const uint32_t literal_addr = base + 0x060u;
+    uint8_t socket_fn[sizeof(socket_template)];
+    memcpy(socket_fn, socket_template, sizeof(socket_fn));
+    uint32_t displacement = literal_addr - ((socket_addr + 15u) & ~3u);
+    uint16_t immediate = (uint16_t)(displacement >> 2);
+    socket_fn[13] = (uint8_t)immediate;
+    socket_fn[14] = (uint8_t)(immediate >> 8);
+
+    put_test_bytes(cpu, base + TEST_IDF5_CLOSE_OFS,
+                   close_fn, sizeof(close_fn));
+    put_test_bytes(cpu, socket_addr, socket_fn, sizeof(socket_fn));
+    put_test_bytes(cpu, base + TEST_IDF5_ACCEPT_OFS,
+                   accept_fn, sizeof(accept_fn));
+    put_test_bytes(cpu, base + TEST_IDF5_BIND_OFS,
+                   bind_fn, sizeof(bind_fn));
+    put_test_bytes(cpu, base + TEST_IDF5_LISTEN_OFS,
+                   listen_fn, sizeof(listen_fn));
+    put_test_bytes(cpu, base + TEST_IDF5_RECV_OFS,
+                   recv_fn, sizeof(recv_fn));
+    mem_write32(cpu->mem, literal_addr, 8u);
+}
 #define TEST_REENT_ERRNO              0x3FFE3C00u
 #define TEST_TASK_ERRNO               0x3FFE3D00u
+#define TEST_TASK_TLS                 0x3FFE3E00u
+#define TEST_TASK_TLS_ERRNO           (TEST_TASK_TLS + 8u)
 
 typedef struct {
     uint64_t calls;
@@ -600,19 +716,47 @@ TEST(stripped_idf4_socket_members_need_no_application_profile) {
     teardown(&cpu);
 }
 
-TEST(tasmota_profile_hooks_production_socket_boundary) {
+TEST(stripped_idf5_picolibc_family_relocates_without_profile) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
-    seed_tasmota32_v1560_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    const uint32_t family = BASE + 0x1000u;
+    const uint32_t sockets = BASE + 0x1400u;
 
-    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_TASMOTA_ENTRY), 21);
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_SOCKET, 2u, 1u, 0u, 0u);
+    seed_relocated_idf5_lwip_family(&cpu, family);
+    seed_relocated_idf5_server_members(&cpu, sockets);
+    cpu.threadptr = TEST_TASK_TLS;
+
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, family, 32u, 0x1C9CFE9Eu));
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, sockets + TEST_IDF5_SOCKET_OFS, 31u, 0x5D6DBF97u));
+
+    /* The code fingerprints alone cannot authorize a bridge whose task-local
+     * errno ABI cannot be recovered. Literal contents are link data and are
+     * deliberately outside the normalized instruction hash. */
+    mem_write32(cpu.mem, sockets + 0x060u, 0x3FF00000u);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 0);
+    mem_write32(cpu.mem, sockets + 0x060u, 8u);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 12);
+
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_SOCKET_OFS,
+                        2u, 1u, 0u, 0u);
     uint32_t socket_fd = ar_read(&cpu, 2);
     ASSERT_EQ(socket_fd, 46u);
-    invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, socket_fd);
+    invoke_wifi_call0(&cpu, sockets + TEST_IDF5_CLOSE_OFS, socket_fd);
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    /* The linked TLS literal, not a profile or fixed RAM word, selects the
+     * calling task's picolibc errno slot. */
+    mem_write32(cpu.mem, TEST_REENT_ERRNO, 0x11223344u);
+    mem_write32(cpu.mem, TEST_TASK_TLS_ERRNO, 0u);
+    invoke_wifi_call0_4(&cpu, family + 0x080u, 123u,
+                        BASE + 0x1C00u, 1u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+    ASSERT_EQ(mem_read32(cpu.mem, TEST_TASK_TLS_ERRNO), 9u);
+    ASSERT_EQ(mem_read32(cpu.mem, TEST_REENT_ERRNO), 0x11223344u);
 
     wifi_stubs_stats_t stats = {0};
     wifi_stubs_get_stats(wifi, &stats);
@@ -625,19 +769,24 @@ TEST(tasmota_profile_hooks_production_socket_boundary) {
     teardown(&cpu);
 }
 
-TEST(tasmota_recv_peek_preserves_http_request) {
+TEST(idf5_picolibc_recv_peek_preserves_http_request) {
 #ifndef _WIN32
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
-    seed_tasmota32_v1560_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    const uint32_t family = BASE + 0x1000u;
+    const uint32_t sockets = BASE + 0x1400u;
     const uint32_t sockaddr_addr = 0x3FFB1000u;
     const uint32_t sockaddr_len_addr = 0x3FFB1020u;
     const uint32_t recv_addr = 0x3FFB1040u;
 
-    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_TASMOTA_ENTRY), 21);
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_SOCKET, 2u, 1u, 0u, 0u);
+    seed_relocated_idf5_lwip_family(&cpu, family);
+    seed_relocated_idf5_server_members(&cpu, sockets);
+    cpu.threadptr = TEST_TASK_TLS;
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 12);
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_SOCKET_OFS,
+                        2u, 1u, 0u, 0u);
     uint32_t listen_fd = ar_read(&cpu, 2);
     ASSERT_EQ(listen_fd, 46u);
 
@@ -645,10 +794,11 @@ TEST(tasmota_recv_peek_preserves_http_request) {
     mem_write8(cpu.mem, sockaddr_addr + 1u, 2u);
     mem_write16(cpu.mem, sockaddr_addr + 2u, htons(80));
     mem_write32(cpu.mem, sockaddr_addr + 4u, htonl(INADDR_ANY));
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_BIND, listen_fd,
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_BIND_OFS, listen_fd,
                         sockaddr_addr, 16u, 0u);
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_LISTEN, listen_fd, 1u, 0u, 0u);
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_LISTEN_OFS,
+                        listen_fd, 1u, 0u, 0u);
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
 
     uint16_t host_port = 0;
@@ -666,7 +816,7 @@ TEST(tasmota_recv_peek_preserves_http_request) {
     mem_write32(cpu.mem, sockaddr_len_addr, 16u);
     uint32_t client_fd = UINT32_MAX;
     for (int attempt = 0; attempt < 100; attempt++) {
-        invoke_wifi_call0_4(&cpu, TEST_TASMOTA_ACCEPT, listen_fd,
+        invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_ACCEPT_OFS, listen_fd,
                             sockaddr_addr, sockaddr_len_addr, 0u);
         client_fd = ar_read(&cpu, 2);
         if (client_fd != UINT32_MAX) break;
@@ -679,7 +829,7 @@ TEST(tasmota_recv_peek_preserves_http_request) {
      * byte untouched for WebServer's parser. */
     uint32_t first_recv = 0;
     for (int attempt = 0; attempt < 100; attempt++) {
-        invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+        invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_RECV_OFS, client_fd,
                             recv_addr, 1u, 0x09u);
         first_recv = ar_read(&cpu, 2);
         if (first_recv != UINT32_MAX) break;
@@ -687,19 +837,19 @@ TEST(tasmota_recv_peek_preserves_http_request) {
     }
     ASSERT_EQ(first_recv, 1u);
     ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'G');
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_RECV_OFS, client_fd,
                         recv_addr, 1u, 0x09u);
     ASSERT_EQ(ar_read(&cpu, 2), 1u);
     ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'G');
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_RECV_OFS, client_fd,
                         recv_addr, 1u, 0x08u);
     ASSERT_EQ(ar_read(&cpu, 2), 1u);
     ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'G');
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_RECV_OFS, client_fd,
                         recv_addr, 1u, 0x08u);
     ASSERT_EQ(ar_read(&cpu, 2), 1u);
     ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'E');
-    invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_RECV_OFS, client_fd,
                         recv_addr, 1u, 0x08u);
     ASSERT_EQ(ar_read(&cpu, 2), 1u);
     ASSERT_EQ(mem_read8(cpu.mem, recv_addr), 'T');
@@ -712,17 +862,19 @@ TEST(tasmota_recv_peek_preserves_http_request) {
     /* A preceding empty nonblocking read commonly leaves EWOULDBLOCK in the
      * guest. Orderly EOF must clear it or NetworkClient::connected() treats
      * the closed peer as live forever. */
-    mem_write32(cpu.mem, TEST_REENT_ERRNO, 11u);
+    mem_write32(cpu.mem, TEST_REENT_ERRNO, 0x11223344u);
+    mem_write32(cpu.mem, TEST_TASK_TLS_ERRNO, 11u);
     for (int attempt = 0; attempt < 100; attempt++) {
-        invoke_wifi_call0_4(&cpu, TEST_TASMOTA_RECV, client_fd,
+        invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_RECV_OFS, client_fd,
                             recv_addr, 1u, 0x09u);
         if (ar_read(&cpu, 2) == 0u) break;
         poll(NULL, 0, 1);
     }
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
-    ASSERT_EQ(mem_read32(cpu.mem, TEST_REENT_ERRNO), 0u);
-    invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, client_fd);
-    invoke_wifi_call0(&cpu, TEST_TASMOTA_CLOSE, listen_fd);
+    ASSERT_EQ(mem_read32(cpu.mem, TEST_TASK_TLS_ERRNO), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, TEST_REENT_ERRNO), 0x11223344u);
+    invoke_wifi_call0(&cpu, sockets + TEST_IDF5_CLOSE_OFS, client_fd);
+    invoke_wifi_call0(&cpu, sockets + TEST_IDF5_CLOSE_OFS, listen_fd);
     wifi_stubs_destroy(wifi);
     rom_stubs_destroy(rom);
     teardown(&cpu);
@@ -740,6 +892,6 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries);
     RUN_TEST(wled_posts_disconnect_on_native_event_loop);
     RUN_TEST(stripped_idf4_socket_members_need_no_application_profile);
-    RUN_TEST(tasmota_profile_hooks_production_socket_boundary);
-    RUN_TEST(tasmota_recv_peek_preserves_http_request);
+    RUN_TEST(stripped_idf5_picolibc_family_relocates_without_profile);
+    RUN_TEST(idf5_picolibc_recv_peek_preserves_http_request);
 }

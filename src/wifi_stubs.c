@@ -199,6 +199,12 @@ struct wifi_stubs {
      * per-task reentrancy instead of redirecting every subsystem to a global
      * emulator scratch word. */
     uint32_t           guest_errno_fn;
+    /* Picolibc keeps errno at a link-selected offset from THREADPTR rather
+     * than behind __errno(). The offset is read from an authenticated lwIP
+     * implementation's L32R literal, so it follows the linked runtime ABI
+     * without assuming a DRAM address or even a fixed TLS layout. */
+    int32_t            guest_errno_threadptr_offset;
+    bool               guest_errno_threadptr_valid;
     guest_errno_cache_t errno_cache[GUEST_ERRNO_CACHE_SLOTS];
     unsigned           errno_cache_next;
     emu_socket_t       sockets[MAX_EMU_SOCKETS];
@@ -440,6 +446,26 @@ static void stub_lwip_socket(xtensa_cpu_t *cpu, void *ctx)
 
 static uint32_t firmware_errno_addr(wifi_stubs_t *ws, xtensa_cpu_t *cpu)
 {
+    if (ws && ws->guest_errno_threadptr_valid) {
+        int64_t resolved = (int64_t)(uint64_t)cpu->threadptr +
+                           ws->guest_errno_threadptr_offset;
+        if (cpu->threadptr != 0u && resolved >= 0 &&
+            resolved <= (int64_t)UINT32_MAX -
+                        (int64_t)(sizeof(uint32_t) - 1u)) {
+            uint32_t addr = (uint32_t)resolved;
+            if (mem_get_ptr(cpu->mem, addr) &&
+                mem_get_ptr(cpu->mem, addr + sizeof(uint32_t) - 1u))
+                return addr;
+        }
+        if (getenv("FLEXE_SCANDBG"))
+            fprintf(stderr,
+                    "[wifi] THREADPTR-relative errno does not resolve to "
+                    "writable memory (THREADPTR=0x%08" PRIX32 ", offset=%" PRId32
+                    ")\n",
+                    cpu->threadptr, ws->guest_errno_threadptr_offset);
+        return 0u;
+    }
+
     if (ws && ws->guest_errno_fn != 0u) {
         /* ESP-IDF switches THREADPTR with the task-local storage block. It is
          * therefore a stable, firmware-provided cache key for the address
@@ -2821,181 +2847,367 @@ static int wifi_resolve_fingerprint_variants(
     return 1;
 }
 
-static int wifi_discover_idf4_lwip_family(
+/* Required and optional members are grouped by logical name. Adjacent rows
+ * with the same name are compiler/configuration variants of that API. */
+static const wifi_fw_fingerprint_t idf4_lwip_core[] = {
+    { 32u, 0xC5D40426u, stub_lwip_gethostbyname,
+                          "lwip_gethostbyname", 0u },
+    { 28u, 0xCF4C91E4u, stub_lwip_read, "lwip_read", 0u },
+    { 32u, 0xC9D7E309u, stub_lwip_sendto, "lwip_sendto", 0u },
+    { 31u, 0x0A84DC55u, stub_lwip_send, "lwip_send", 0u },
+    /* ESP-IDF 4.4.5/4.4.6 and 4.4.8 place different functions after this
+     * short forwarding wrapper, so authenticate both complete prefixes. */
+    { 31u, 0xCADB7A47u, stub_lwip_write, "lwip_write", 0u },
+    { 30u, 0x188638AAu, stub_lwip_write, "lwip_write", 0u },
+    { 30u, 0xCDFF35FFu, stub_dns_gethostbyname,
+                          "dns_gethostbyname", 0u },
+};
+
+static const wifi_fw_fingerprint_t idf4_lwip_optional[] = {
+    { 30u, 0x9F599D8Au, stub_lwip_accept, "lwip_accept", 0u },
+    { 31u, 0x96D6F41Au, stub_lwip_accept, "lwip_accept", 0u },
+    { 31u, 0x6BCA6593u, stub_lwip_bind, "lwip_bind", 0u },
+    { 31u, 0x797FCA7Du, stub_lwip_bind, "lwip_bind", 0u },
+    { 31u, 0x93052789u, stub_lwip_close, "lwip_close", 0u },
+    { 32u, 0x71A234C5u, stub_lwip_close, "lwip_close", 0u },
+    { 32u, 0x301BC334u, stub_lwip_close, "lwip_close", 0u },
+    { 32u, 0x609B787Du, stub_lwip_connect, "lwip_connect", 0u },
+    { 30u, 0x7B5E3AB8u, stub_lwip_listen, "lwip_listen", 0u },
+    { 32u, 0xBBDCA5E7u, stub_lwip_recvfrom, "lwip_recvfrom", 0u },
+    { 32u, 0x729A1BF6u, stub_lwip_recvfrom, "lwip_recvfrom", 0u },
+    { 28u, 0x615CFA2Fu, stub_lwip_recv, "lwip_recv", 0u },
+    { 30u, 0x1F51EA2Fu, stub_lwip_socket, "lwip_socket", 0u },
+    { 30u, 0x6756238Du, stub_lwip_socket, "lwip_socket", 0u },
+    { 30u, 0xE3DA3876u, stub_lwip_socket, "lwip_socket", 0u },
+    { 32u, 0xE0E53019u, stub_lwip_select, "lwip_select", 0u },
+    { 32u, 0x51695208u, stub_lwip_getsockname,
+                          "lwip_getsockname", 0u },
+    { 32u, 0x012BA756u, stub_lwip_getsockopt, "lwip_getsockopt", 0u },
+    { 30u, 0x1282E72Au, stub_lwip_getsockopt, "lwip_getsockopt", 0u },
+    { 31u, 0x37461583u, stub_lwip_setsockopt, "lwip_setsockopt", 0u },
+    { 31u, 0x99D9929Du, stub_lwip_setsockopt, "lwip_setsockopt", 0u },
+    { 31u, 0xC8F2F4E2u, stub_lwip_ioctl, "lwip_ioctl", 0u },
+    { 30u, 0x3BC80CD3u, stub_lwip_ioctl, "lwip_ioctl", 0u },
+    { 30u, 0x8705748Bu, stub_lwip_ioctl, "lwip_ioctl", 0u },
+    { 32u, 0xB75C747Au, stub_lwip_fcntl, "lwip_fcntl", 0u },
+    { 32u, 0x866081CFu, stub_lwip_fcntl, "lwip_fcntl", 0u },
+};
+
+/* __errno is discovered with the authenticated IDF 4 family but never
+ * replaced. Native socket failures call the firmware accessor lazily. */
+static const wifi_fw_fingerprint_t idf4_errno_variants[] = {
+    { 31u, 0x95913C95u, NULL, "__errno", 0u },
+    { 31u, 0x34126EEAu, NULL, "__errno", 0u },
+};
+
+/* Arduino-ESP32 3.3.x / ESP-IDF 5.5 with picolibc. These are the linked lwIP
+ * implementations, not Tasmota application functions: CALL, J and L32R
+ * displacements are normalized, and the required family is independent of
+ * its final address. */
+static const wifi_fw_fingerprint_t idf5_picolibc_lwip_core[] = {
+    { 32u, 0x1C9CFE9Eu, stub_lwip_gethostbyname,
+                          "lwip_gethostbyname", 0u },
+    { 28u, 0x2E38E615u, stub_lwip_read, "lwip_read", 0u },
+    { 31u, 0xFC2A5577u, stub_lwip_sendto, "lwip_sendto", 0u },
+    { 30u, 0x2EA9407Bu, stub_lwip_send, "lwip_send", 0u },
+    { 32u, 0x307DE34Au, stub_lwip_write, "lwip_write", 0u },
+    { 32u, 0x8073525Eu, stub_dns_gethostbyname,
+                          "dns_gethostbyname_addrtype", 0u },
+};
+
+static const wifi_fw_fingerprint_t idf5_picolibc_lwip_optional[] = {
+    { 30u, 0xED1A517Au, stub_lwip_accept, "lwip_accept", 0u },
+    { 32u, 0x4CE8FD11u, stub_lwip_bind, "lwip_bind", 0u },
+    { 31u, 0xCD964173u, stub_lwip_close, "lwip_close", 0u },
+    { 32u, 0xE1AFA07Bu, stub_lwip_connect, "lwip_connect", 0u },
+    { 32u, 0x49EE8AFAu, stub_lwip_listen, "lwip_listen", 0u },
+    { 31u, 0x28AF94FCu, stub_lwip_recvfrom, "lwip_recvfrom", 0u },
+    { 28u, 0x226F0CF7u, stub_lwip_recv, "lwip_recv", 0u },
+    { 31u, 0x5D6DBF97u, stub_lwip_socket, "lwip_socket", 0u },
+    { 32u, 0x29F50189u, stub_lwip_select, "lwip_select", 0u },
+    { 30u, 0x44CEFD44u, stub_lwip_getpeername,
+                          "lwip_getpeername", 0u },
+    { 30u, 0xA290B834u, stub_lwip_getsockname,
+                          "lwip_getsockname", 0u },
+    { 32u, 0xECC3C672u, stub_lwip_getsockopt, "lwip_getsockopt", 0u },
+    { 32u, 0xCB4E7ADFu, stub_lwip_setsockopt, "lwip_setsockopt", 0u },
+    { 31u, 0x09E405A0u, stub_lwip_ioctl, "lwip_ioctl", 0u },
+    { 31u, 0xA659CDBEu, stub_lwip_fcntl, "lwip_fcntl", 0u },
+};
+
+typedef struct {
+    const char *version;
+    const wifi_fw_fingerprint_t *core;
+    size_t core_count;
+    const wifi_fw_fingerprint_t *optional;
+    size_t optional_count;
+    const wifi_fw_fingerprint_t *errno_variants;
+    size_t errno_count;
+    /* When non-NULL, errno is a THREADPTR-relative TLS object. The named
+     * authenticated member contains an L32R at this byte offset whose linked
+     * literal is the signed TLS offset. */
+    const char *threadptr_errno_member;
+    size_t threadptr_errno_l32r_offset;
+} wifi_lwip_family_t;
+
+#define WIFI_ARRAY_COUNT(a) (sizeof(a) / sizeof((a)[0]))
+
+static const wifi_lwip_family_t lwip_families[] = {
+    {
+        "ESP-IDF 4.x/newlib",
+        idf4_lwip_core, WIFI_ARRAY_COUNT(idf4_lwip_core),
+        idf4_lwip_optional, WIFI_ARRAY_COUNT(idf4_lwip_optional),
+        idf4_errno_variants, WIFI_ARRAY_COUNT(idf4_errno_variants),
+        NULL, 0u,
+    },
+    {
+        "ESP-IDF 5.5/picolibc",
+        idf5_picolibc_lwip_core,
+        WIFI_ARRAY_COUNT(idf5_picolibc_lwip_core),
+        idf5_picolibc_lwip_optional,
+        WIFI_ARRAY_COUNT(idf5_picolibc_lwip_optional),
+        NULL, 0u,
+        "lwip_socket", 12u,
+    },
+};
+
+typedef struct {
+    size_t core;
+    size_t optional;
+    size_t error;
+} wifi_lwip_scan_offsets_t;
+
+typedef struct {
+    const wifi_lwip_family_t *family;
+    wifi_fw_fingerprint_t hooks[32];
+    size_t hook_count;
+    uint32_t guest_errno_fn;
+    int32_t threadptr_errno_offset;
+    bool threadptr_errno_valid;
+} wifi_lwip_family_match_t;
+
+static bool wifi_member_addr_is_new(const wifi_lwip_family_match_t *result,
+                                    uint32_t addr) {
+    for (size_t i = 0u; i < result->hook_count; i++)
+        if (result->hooks[i].addr == addr)
+            return false;
+    return true;
+}
+
+static int wifi_resolve_fingerprint_groups(
+        const char *version, const wifi_fw_fingerprint_t *members,
+        const firmware_xtensa_function_match_t *matches, size_t member_count,
+        bool required, wifi_lwip_family_match_t *result) {
+    for (size_t begin = 0u; begin < member_count;) {
+        size_t end = begin + 1u;
+        while (end < member_count &&
+               strcmp(members[begin].name, members[end].name) == 0)
+            end++;
+
+        wifi_fw_fingerprint_t member;
+        int resolution = wifi_resolve_fingerprint_variants(
+                &members[begin], &matches[begin], end - begin, &member);
+        if (resolution != 1) {
+            if (required) {
+                if (getenv("FLEXE_SCANDBG"))
+                    fprintf(stderr,
+                            "[wifi] %s required lwIP member %s: %s\n",
+                            version, members[begin].name,
+                            resolution < 0 ? "ambiguous" : "missing");
+                return 0;
+            }
+            if (resolution < 0 && getenv("FLEXE_SCANDBG"))
+                fprintf(stderr,
+                        "[wifi] %s optional lwIP member %s is ambiguous; "
+                        "skipping\n",
+                        version, members[begin].name);
+            begin = end;
+            continue;
+        }
+
+        if (!wifi_member_addr_is_new(result, member.addr)) {
+            if (required)
+                return 0;
+        } else if (result->hook_count < WIFI_ARRAY_COUNT(result->hooks)) {
+            result->hooks[result->hook_count++] = member;
+        } else if (required) {
+            return 0;
+        }
+        begin = end;
+    }
+    return 1;
+}
+
+static const wifi_fw_fingerprint_t *wifi_find_resolved_member(
+        const wifi_lwip_family_match_t *result, const char *name) {
+    for (size_t i = 0u; i < result->hook_count; i++)
+        if (strcmp(result->hooks[i].name, name) == 0)
+            return &result->hooks[i];
+    return NULL;
+}
+
+static bool wifi_derive_threadptr_errno(
+        wifi_stubs_t *ws, const wifi_lwip_family_t *family,
+        wifi_lwip_family_match_t *result) {
+    if (!family->threadptr_errno_member)
+        return true;
+    const wifi_fw_fingerprint_t *anchor = wifi_find_resolved_member(
+            result, family->threadptr_errno_member);
+    if (!anchor || family->threadptr_errno_l32r_offset + 3u > anchor->size)
+        return false;
+
+    uint32_t literal_addr = 0u;
+    uint32_t raw_offset = 0u;
+    if (!firmware_xtensa_l32r_target(
+                ws->cpu->mem,
+                anchor->addr + (uint32_t)family->threadptr_errno_l32r_offset,
+                &literal_addr) ||
+        !firmware_peek(ws->cpu->mem, literal_addr, sizeof(raw_offset),
+                       &raw_offset))
+        return false;
+
+    int32_t offset = (int32_t)raw_offset;
+    if (offset < -0x10000 || offset > 0x10000)
+        return false;
+    result->threadptr_errno_offset = offset;
+    result->threadptr_errno_valid = true;
+    return true;
+}
+
+/* Scan every supported library family together. Adding an IDF/configuration
+ * variant increases the hashes evaluated at each ENTRY site but never adds a
+ * second multi-megabyte address-space pass. A family is resolved completely
+ * before it can mutate the hook table, and multiple complete families are
+ * treated as ambiguous rather than guessed. */
+static int wifi_discover_lwip_family(
         wifi_stubs_t *ws, wifi_fw_fingerprint_t *found,
         size_t found_capacity) {
-    static const wifi_fw_fingerprint_t family[] = {
-        { 32u, 0xC5D40426u, stub_lwip_gethostbyname,
-                              "lwip_gethostbyname", 0u },
-        { 28u, 0xCF4C91E4u, stub_lwip_read, "lwip_read", 0u },
-        { 32u, 0xC9D7E309u, stub_lwip_sendto, "lwip_sendto", 0u },
-        { 31u, 0x0A84DC55u, stub_lwip_send, "lwip_send", 0u },
-        { 30u, 0xCDFF35FFu, stub_dns_gethostbyname,
-                              "dns_gethostbyname", 0u },
+    enum {
+        MAX_LWIP_FAMILIES = 8,
+        MAX_LWIP_FINGERPRINTS = 128,
     };
-    static const wifi_fw_fingerprint_t write_variants[] = {
-        /* ESP-IDF 4.4.5/4.4.6: the 21-byte forwarding function followed by
-         * padding and the start of lwip_select. */
-        { 31u, 0xCADB7A47u, stub_lwip_write, "lwip_write", 0u },
-        /* ESP-IDF 4.4.8: the same function followed by lwip_getsockopt. The
-         * short function alone is intentionally not used: another lwIP
-         * forwarding wrapper has the same 24-byte fingerprint. */
-        { 30u, 0x188638AAu, stub_lwip_write, "lwip_write", 0u },
-    };
-    /* Optional APIs are installed only after the six-member core has proved
-     * the library family. Alternative hashes are ordinary ESP-IDF build
-     * configurations, not application profiles. Keep variants for one API
-     * adjacent so the loop below can resolve them as a group. */
-    static const wifi_fw_fingerprint_t optional[] = {
-        { 30u, 0x9F599D8Au, stub_lwip_accept, "lwip_accept", 0u },
-        { 31u, 0x96D6F41Au, stub_lwip_accept, "lwip_accept", 0u },
-        { 31u, 0x6BCA6593u, stub_lwip_bind, "lwip_bind", 0u },
-        { 31u, 0x797FCA7Du, stub_lwip_bind, "lwip_bind", 0u },
-        { 31u, 0x93052789u, stub_lwip_close, "lwip_close", 0u },
-        { 32u, 0x71A234C5u, stub_lwip_close, "lwip_close", 0u },
-        { 32u, 0x301BC334u, stub_lwip_close, "lwip_close", 0u },
-        { 32u, 0x609B787Du, stub_lwip_connect, "lwip_connect", 0u },
-        { 30u, 0x7B5E3AB8u, stub_lwip_listen, "lwip_listen", 0u },
-        { 32u, 0xBBDCA5E7u, stub_lwip_recvfrom, "lwip_recvfrom", 0u },
-        { 32u, 0x729A1BF6u, stub_lwip_recvfrom, "lwip_recvfrom", 0u },
-        { 28u, 0x615CFA2Fu, stub_lwip_recv, "lwip_recv", 0u },
-        { 30u, 0x1F51EA2Fu, stub_lwip_socket, "lwip_socket", 0u },
-        { 30u, 0x6756238Du, stub_lwip_socket, "lwip_socket", 0u },
-        { 30u, 0xE3DA3876u, stub_lwip_socket, "lwip_socket", 0u },
-        { 32u, 0xE0E53019u, stub_lwip_select, "lwip_select", 0u },
-        { 32u, 0x51695208u, stub_lwip_getsockname,
-                              "lwip_getsockname", 0u },
-        { 32u, 0x012BA756u, stub_lwip_getsockopt, "lwip_getsockopt", 0u },
-        { 30u, 0x1282E72Au, stub_lwip_getsockopt, "lwip_getsockopt", 0u },
-        { 31u, 0x37461583u, stub_lwip_setsockopt, "lwip_setsockopt", 0u },
-        { 31u, 0x99D9929Du, stub_lwip_setsockopt, "lwip_setsockopt", 0u },
-        { 31u, 0xC8F2F4E2u, stub_lwip_ioctl, "lwip_ioctl", 0u },
-        { 30u, 0x3BC80CD3u, stub_lwip_ioctl, "lwip_ioctl", 0u },
-        { 30u, 0x8705748Bu, stub_lwip_ioctl, "lwip_ioctl", 0u },
-        { 32u, 0xB75C747Au, stub_lwip_fcntl, "lwip_fcntl", 0u },
-        { 32u, 0x866081CFu, stub_lwip_fcntl, "lwip_fcntl", 0u },
-    };
-    /* __errno is discovered with the same authenticated library family, but
-     * is never replaced. Socket failures call the firmware accessor so errno
-     * remains task-local and all non-network users keep their native path. */
-    static const wifi_fw_fingerprint_t errno_variants[] = {
-        { 31u, 0x95913C95u, NULL, "__errno", 0u },
-        { 31u, 0x34126EEAu, NULL, "__errno", 0u },
-    };
-    const size_t core_count = sizeof(family) / sizeof(family[0]);
-    const size_t write_count =
-            sizeof(write_variants) / sizeof(write_variants[0]);
-    const size_t optional_count = sizeof(optional) / sizeof(optional[0]);
-    const size_t errno_count =
-            sizeof(errno_variants) / sizeof(errno_variants[0]);
-    const size_t candidate_count =
-            core_count + write_count + optional_count + errno_count;
-    const size_t count = core_count + 1u;
+    const size_t family_count = WIFI_ARRAY_COUNT(lwip_families);
     if (!ws || !ws->cpu || !ws->cpu->mem || !found ||
-        found_capacity < count)
+        family_count > MAX_LWIP_FAMILIES)
         return 0;
 
-    enum { MAX_IDF4_LWIP_FINGERPRINTS = 64 };
-    if (candidate_count > MAX_IDF4_LWIP_FINGERPRINTS)
-        return 0;
-    wifi_fw_fingerprint_t candidates[MAX_IDF4_LWIP_FINGERPRINTS];
-    firmware_xtensa_function_match_t scan[MAX_IDF4_LWIP_FINGERPRINTS];
-    memcpy(candidates, family, sizeof(family));
-    memcpy(&candidates[core_count], write_variants,
-           sizeof(write_variants));
-    memcpy(&candidates[core_count + write_count], optional,
-           sizeof(optional));
-    memcpy(&candidates[core_count + write_count + optional_count],
-           errno_variants, sizeof(errno_variants));
-    for (size_t i = 0u; i < candidate_count; i++) {
-        scan[i].size = candidates[i].size;
-        scan[i].crc32 = candidates[i].crc32;
-        scan[i].addr = 0u;
-        scan[i].matches = 0u;
+    firmware_xtensa_function_match_t scan[MAX_LWIP_FINGERPRINTS];
+    wifi_lwip_scan_offsets_t offsets[MAX_LWIP_FAMILIES];
+    size_t candidate_count = 0u;
+    for (size_t f = 0u; f < family_count; f++) {
+        const wifi_lwip_family_t *family = &lwip_families[f];
+        size_t family_candidates = family->core_count +
+                                   family->optional_count +
+                                   family->errno_count;
+        if (family_candidates > MAX_LWIP_FINGERPRINTS - candidate_count)
+            return 0;
+        offsets[f].core = candidate_count;
+        for (size_t i = 0u; i < family->core_count; i++) {
+            scan[candidate_count].size = family->core[i].size;
+            scan[candidate_count].crc32 = family->core[i].crc32;
+            candidate_count++;
+        }
+        offsets[f].optional = candidate_count;
+        for (size_t i = 0u; i < family->optional_count; i++) {
+            scan[candidate_count].size = family->optional[i].size;
+            scan[candidate_count].crc32 = family->optional[i].crc32;
+            candidate_count++;
+        }
+        offsets[f].error = candidate_count;
+        for (size_t i = 0u; i < family->errno_count; i++) {
+            scan[candidate_count].size = family->errno_variants[i].size;
+            scan[candidate_count].crc32 =
+                    family->errno_variants[i].crc32;
+            candidate_count++;
+        }
     }
+
     firmware_scan_xtensa_functions(
             ws->cpu->mem, ESP32_FIRMWARE_INSN_ADDR_LOW,
             ESP32_FLASH_INSN_ADDR_HIGH, scan, candidate_count);
 
-    for (size_t i = 0u; i < core_count; i++) {
-        found[i] = candidates[i];
-        found[i].addr = scan[i].addr;
-        if (scan[i].matches != 1u) {
+    wifi_lwip_family_match_t resolved[MAX_LWIP_FAMILIES];
+    size_t resolved_count = 0u;
+    for (size_t f = 0u; f < family_count; f++) {
+        const wifi_lwip_family_t *family = &lwip_families[f];
+        wifi_lwip_family_match_t candidate = {
+            .family = family,
+        };
+        if (!wifi_resolve_fingerprint_groups(
+                    family->version, family->core, &scan[offsets[f].core],
+                    family->core_count, true, &candidate))
+            continue;
+        (void)wifi_resolve_fingerprint_groups(
+                family->version, family->optional,
+                &scan[offsets[f].optional], family->optional_count, false,
+                &candidate);
+
+        if (family->errno_count != 0u) {
+            wifi_fw_fingerprint_t errno_member;
+            int resolution = wifi_resolve_fingerprint_variants(
+                    family->errno_variants, &scan[offsets[f].error],
+                    family->errno_count, &errno_member);
+            if (resolution == 1 &&
+                wifi_member_addr_is_new(&candidate, errno_member.addr))
+                candidate.guest_errno_fn = errno_member.addr;
+            else if (resolution < 0 && getenv("FLEXE_SCANDBG"))
+                fprintf(stderr,
+                        "[wifi] %s __errno is ambiguous; compatibility "
+                        "storage remains available\n",
+                        family->version);
+        }
+
+        if (!wifi_derive_threadptr_errno(ws, family, &candidate)) {
             if (getenv("FLEXE_SCANDBG"))
                 fprintf(stderr,
-                        "[wifi] stripped lwIP fingerprint %s: %u match(es)\n",
-                        found[i].name, scan[i].matches);
-            return 0;
+                        "[wifi] %s cannot derive task-local errno; rejecting "
+                        "family\n",
+                        family->version);
+            continue;
         }
-        for (size_t j = 0u; j < i; j++)
-            if (found[j].addr == found[i].addr)
-                return 0;
+        resolved[resolved_count++] = candidate;
     }
 
-    if (wifi_resolve_fingerprint_variants(
-                &candidates[core_count], &scan[core_count], write_count,
-                &found[core_count]) != 1)
-        return 0;
-
-    size_t found_count = count;
-    for (size_t begin = 0u;
-         begin < optional_count;) {
-        size_t end = begin + 1u;
-        while (end < optional_count &&
-               strcmp(optional[begin].name, optional[end].name) == 0)
-            end++;
-        wifi_fw_fingerprint_t member;
-        int resolution = wifi_resolve_fingerprint_variants(
-                &candidates[core_count + write_count + begin],
-                &scan[core_count + write_count + begin],
-                end - begin, &member);
-        if (resolution == 1 && found_count < found_capacity) {
-            bool duplicate = false;
-            for (size_t i = 0u; i < found_count; i++)
-                duplicate |= found[i].addr == member.addr;
-            if (!duplicate)
-                found[found_count++] = member;
-        } else if (resolution < 0 && getenv("FLEXE_SCANDBG")) {
+    if (resolved_count != 1u) {
+        if (resolved_count > 1u && getenv("FLEXE_SCANDBG"))
             fprintf(stderr,
-                    "[wifi] stripped lwIP member %s is ambiguous; skipping\n",
-                    optional[begin].name);
-        }
-        begin = end;
+                    "[wifi] multiple complete stripped lwIP families found; "
+                    "installing none\n");
+        return 0;
     }
 
-    const size_t errno_offset = core_count + write_count + optional_count;
-    wifi_fw_fingerprint_t errno_member;
-    int errno_resolution = wifi_resolve_fingerprint_variants(
-            &candidates[errno_offset], &scan[errno_offset], errno_count,
-            &errno_member);
-    if (errno_resolution == 1) {
-        bool duplicate = false;
-        for (size_t i = 0u; i < found_count; i++)
-            duplicate |= found[i].addr == errno_member.addr;
-        if (!duplicate) {
-            ws->guest_errno_fn = errno_member.addr;
-            if (getenv("FLEXE_SCANDBG"))
-                fprintf(stderr,
-                        "[wifi] using firmware __errno at 0x%08" PRIX32 "\n",
-                        ws->guest_errno_fn);
-        }
-    } else if (errno_resolution < 0 && getenv("FLEXE_SCANDBG")) {
-        fprintf(stderr,
-                "[wifi] stripped __errno fingerprint is ambiguous; "
-                "using compatibility storage\n");
+    wifi_lwip_family_match_t *selected = &resolved[0];
+    if (selected->hook_count > found_capacity)
+        return 0;
+    if (selected->guest_errno_fn != 0u)
+        ws->guest_errno_fn = selected->guest_errno_fn;
+    if (selected->threadptr_errno_valid) {
+        ws->guest_errno_threadptr_offset =
+                selected->threadptr_errno_offset;
+        ws->guest_errno_threadptr_valid = true;
     }
 
-    for (size_t i = 0u; i < found_count; i++) {
+    memcpy(found, selected->hooks,
+           selected->hook_count * sizeof(selected->hooks[0]));
+    for (size_t i = 0u; i < selected->hook_count; i++) {
         if (getenv("FLEXE_SCANDBG"))
             fprintf(stderr, "[wifi] stripped lwIP %s at 0x%08" PRIX32 "\n",
                     found[i].name, found[i].addr);
         rom_stubs_register_exact_ctx(ws->rom, found[i].addr, found[i].fn,
                                      found[i].name, ws);
     }
-    fprintf(stderr,
-            "[wifi] discovered stripped ESP-IDF 4.x lwIP family "
-            "(%zu entries)\n", found_count);
-    return (int)found_count;
+    if (getenv("FLEXE_SCANDBG")) {
+        if (selected->guest_errno_fn != 0u)
+            fprintf(stderr, "[wifi] using firmware __errno at 0x%08" PRIX32
+                            "\n", selected->guest_errno_fn);
+        if (selected->threadptr_errno_valid)
+            fprintf(stderr, "[wifi] derived THREADPTR errno offset %" PRId32
+                            "\n", selected->threadptr_errno_offset);
+    }
+    fprintf(stderr, "[wifi] discovered stripped %s lwIP family "
+                    "(%zu entries)\n",
+            selected->family->version, selected->hook_count);
+    return (int)selected->hook_count;
 }
 
 static bool wifi_hook_was_discovered(
@@ -3213,34 +3425,6 @@ static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
-/* Tasmota 15.6.0, official tasmota32 release. All entries were
- * relocated by unique 32-byte masked signatures from an independent build of
- * the exact release tag and its pinned Arduino-ESP32 3.3.8 platform. */
-static const wifi_fw_hook_t tasmota32_v1560_wifi_hooks[] = {
-    { 0x4019A358u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
-    { 0x4019B8B4u, stub_lwip_accept,        "lwip_accept" },
-    { 0x4019BA54u, stub_lwip_bind,          "lwip_bind" },
-    { 0x4019BB14u, stub_lwip_close,         "lwip_close" },
-    { 0x4019BC40u, stub_lwip_connect,       "lwip_connect" },
-    { 0x4019BD10u, stub_lwip_listen,        "lwip_listen" },
-    { 0x4019BD7Cu, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x4019BE40u, stub_lwip_read,          "lwip_read" },
-    { 0x4019BE5Cu, stub_lwip_recv,          "lwip_recv" },
-    { 0x4019BE78u, stub_lwip_sendto,        "lwip_sendto" },
-    { 0x4019BFE0u, stub_lwip_send,          "lwip_send" },
-    { 0x4019C06Cu, stub_lwip_socket,        "lwip_socket" },
-    { 0x4019C110u, stub_lwip_write,         "lwip_write" },
-    { 0x4019C128u, stub_lwip_select,        "lwip_select" },
-    { 0x4019C40Cu, stub_lwip_getpeername,   "lwip_getpeername" },
-    { 0x4019C424u, stub_lwip_getsockname,   "lwip_getsockname" },
-    { 0x4019C43Cu, stub_lwip_getsockopt,    "lwip_getsockopt" },
-    { 0x4019C4E0u, stub_lwip_setsockopt,    "lwip_setsockopt" },
-    { 0x4019C56Cu, stub_lwip_ioctl,         "lwip_ioctl" },
-    { 0x4019C608u, stub_lwip_fcntl,         "lwip_fcntl" },
-    { 0x4019D448u, stub_dns_gethostbyname,  "dns_gethostbyname_addrtype" },
-    { 0, NULL, NULL },
-};
-
 int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point)
 {
     if (!ws) return 0;
@@ -3249,7 +3433,7 @@ int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point)
     ws->rom = rom;
 
     wifi_fw_fingerprint_t discovered[32];
-    int discovered_count = wifi_discover_idf4_lwip_family(
+    int discovered_count = wifi_discover_lwip_family(
             ws, discovered, sizeof(discovered) / sizeof(discovered[0]));
 
     const wifi_fw_hook_t *hooks = NULL;
@@ -3271,8 +3455,6 @@ int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point)
         hooks = marauder_35inch_wifi_hooks;
     else if (profile == ROM_FIRMWARE_WLED_V1601)
         hooks = wled_v1601_wifi_hooks;
-    else if (profile == ROM_FIRMWARE_TASMOTA32_V1560)
-        hooks = tasmota32_v1560_wifi_hooks;
     else
         return discovered_count;
     /* No firmware_status_addr for any profile.
