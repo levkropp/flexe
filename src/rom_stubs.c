@@ -5488,6 +5488,9 @@ static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
 #define WLED_V1601_POISON_TAIL_LITERAL    0x40080E50u
 #define WLED_V1601_HEAP_MALLOC             0x40091F60u
 #define WLED_V1601_HEAP_MALLOC_FINISH      0x40091F8Bu
+#define WLED_V1601_HEAP_CAPS_SCAN           0x40084CE1u
+#define WLED_V1601_HEAP_CAPS_MATCH          0x40084D0Fu
+#define WLED_V1601_HEAP_LIST_LITERAL        0x40080854u
 #define WLED_V1601_NESTING_LITERAL      0x40080D4Cu
 #define WLED_V1601_OLD_STATE_LITERAL    0x40080D50u
 #define WLED_V1601_DBREAK_READ_LITERAL  0x40080524u
@@ -5840,7 +5843,8 @@ static bool fw_wled_heap_code_matches(xtensa_mem_t *mem) {
            fw_crc32_matches(mem, WLED_V1601_POISON_ALLOCATED, 69u,
                             0x6DED211Fu) &&
            fw_crc32_matches(mem, WLED_V1601_HEAP_MALLOC, 45u,
-                            0xFB6D794Fu);
+                            0xFB6D794Fu) &&
+           fw_crc32_matches(mem, 0x40084CB0u, 155u, 0x770CC5E6u);
 }
 
 static int fw_wled_core_index(const xtensa_cpu_t *cpu) {
@@ -5990,6 +5994,102 @@ static bool fw_wled_heap_span_safe(const xtensa_cpu_t *cpu,
     return cpu->next_timer_event == UINT32_MAX ||
            ((int32_t)(cpu->ccount - cpu->next_timer_event) < 0 &&
            cpu->next_timer_event - cpu->ccount > insns);
+}
+
+static bool fw_wled_readable_span(xtensa_mem_t *mem, uint32_t addr,
+                                  uint32_t size) {
+    return size != 0u && addr <= UINT32_MAX - (size - 1u) &&
+           mem_get_ptr(mem, addr) != NULL &&
+           mem_get_ptr(mem, addr + size - 1u) != NULL;
+}
+
+/* Collapse heap_caps_malloc_base's linked-list capability search while
+ * leaving the selected allocation and all of its failure/retry behavior in
+ * guest code.  This models the exact 4.4 layout fingerprinted above: three
+ * priority passes, capabilities at descriptor +0/+4/+8, heap at +28, next at
+ * +32. No architectural state changes until a matching descriptor has been
+ * found and the complete skipped instruction count is known. */
+static int stub_fw_wled_heap_caps_scan(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t requested = ar_read(cpu, 3);
+    uint32_t descriptor = ar_read(cpu, 4);
+    uint32_t priority_offset = ar_read(cpu, 5);
+    uint32_t priority = ar_read(cpu, 6);
+    uint32_t insns = 0u;
+    uint32_t final_caps = 0u;
+    uint32_t final_cap2 = 0u;
+    uint32_t heap = 0u;
+
+    if (cpu->breakpoint_count != 0 || priority >= 3u ||
+        priority_offset != priority * 4u ||
+        !mem_get_ptr(cpu->mem, WLED_V1601_HEAP_LIST_LITERAL) ||
+        (cpu->irq_check && (cpu->interrupt & cpu->intenable)))
+        return 0;
+    uint32_t list_global = mem_read32(
+            cpu->mem, WLED_V1601_HEAP_LIST_LITERAL);
+    if ((list_global & 3u) != 0u ||
+        !fw_wled_readable_span(cpu->mem, list_global, 4u))
+        return 0;
+
+    for (unsigned traversed = 0; traversed < 64u; traversed++) {
+        if (descriptor == 0u) {
+            /* bnez; addi priority; bnei; l32r; l32i head; slli offset */
+            insns += 3u;
+            priority++;
+            if (priority >= 3u) return 0;
+            descriptor = mem_read32(cpu->mem, list_global);
+            priority_offset = priority * 4u;
+            insns += 3u;
+            continue;
+        }
+        if ((descriptor & 3u) != 0u ||
+            !fw_wled_readable_span(cpu->mem, descriptor, 36u))
+            return 0;
+
+        insns++; /* bnez descriptor */
+        heap = mem_read32(cpu->mem, descriptor + 28u);
+        insns++; /* l32i heap */
+        if (heap == 0u) {
+            /* bnez heap; l32i next; j scan */
+            insns += 3u;
+            descriptor = mem_read32(cpu->mem, descriptor + 32u);
+            continue;
+        }
+
+        insns++; /* bnez heap */
+        uint32_t priority_caps = mem_read32(
+                cpu->mem, descriptor + priority_offset);
+        insns += 3u; /* add descriptor+offset; l32i caps; bnone */
+        if ((requested & priority_caps) == 0u) {
+            insns += 2u; /* l32i next; j scan */
+            descriptor = mem_read32(cpu->mem, descriptor + 32u);
+            continue;
+        }
+
+        uint32_t cap0 = mem_read32(cpu->mem, descriptor);
+        uint32_t cap1 = mem_read32(cpu->mem, descriptor + 4u);
+        final_cap2 = mem_read32(cpu->mem, descriptor + 8u);
+        final_caps = (cap0 | cap1 | final_cap2) & requested;
+        insns += 7u; /* three loads, two ORs, AND, BNE */
+        if (final_caps != requested) {
+            insns += 2u; /* l32i next; j scan */
+            descriptor = mem_read32(cpu->mem, descriptor + 32u);
+            continue;
+        }
+
+        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        ar_write(cpu, 4, descriptor);
+        ar_write(cpu, 5, priority_offset);
+        ar_write(cpu, 6, priority);
+        ar_write(cpu, 8, final_caps);
+        ar_write(cpu, 9, final_cap2);
+        ar_write(cpu, 10, heap);
+        cpu->pc = WLED_V1601_HEAP_CAPS_MATCH;
+        cpu->_pc_written = true;
+        fw_charge_stub_path(cpu, insns);
+        return (int)insns;
+    }
+    return 0;
 }
 
 static bool fw_wled_writable_span(xtensa_mem_t *mem, uint32_t addr,
@@ -6710,6 +6810,9 @@ static bool fw_wled_add_heap_impl_hooks(esp32_rom_stubs_t *stubs) {
             stubs, WLED_V1601_HEAP_MALLOC_FINISH,
             stub_fw_wled_outer_malloc_finish,
             "multi_heap_malloc_observe", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_HEAP_CAPS_SCAN,
+            stub_fw_wled_heap_caps_scan, "heap_caps_malloc_scan", NULL);
     return true;
 }
 
@@ -6781,7 +6884,7 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
                     stub_fw_wled_heap_unlock,
                     "multi_heap_internal_unlock", NULL);
             if (fw_wled_add_heap_impl_hooks(stubs))
-                n += 11;
+                n += 12;
             /* The callbacks above return complete guest spans. Use the exact-
              * work batch loop even without the JIT so neither emulated core
              * can overrun its native-FreeRTOS timeslice. */
