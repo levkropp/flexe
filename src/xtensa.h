@@ -475,6 +475,12 @@ struct xtensa_cpu {
      * its epilogue, so it is deliberately not serialized in savestates. */
     uint32_t jit_acc;
 
+    /* Remaining guest-instruction room in the current interpreter batch.
+     * Conditional native spans use it to decline rather than cross the
+     * scheduler boundary. Zero means execution is not inside xtensa_run().
+     * Transient: it is neither architectural nor serialized. */
+    uint32_t native_span_room;
+
     /* Peripheral timer-event hooks (TIMG LACT): fold peripheral alarms into
      * the next_timer_event mechanism so alarm interrupts fire on time and
      * can wake the core from WAITI. */

@@ -3455,7 +3455,9 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
          * keep timer/preemption cadence and throughput accounting honest. */
         if (__builtin_expect(cpu->accelerated_blocks, 0)) {
             for (; executed < remaining; executed++) {
+                cpu->native_span_room = (uint32_t)(remaining - executed);
                 int step_result = xtensa_step_impl(cpu, &cc, &prev_pc);
+                cpu->native_span_room = 0u;
                 if (__builtin_expect(step_result != 0, 0)) {
                     if (step_result < 0) { executed++; break; }
                     if (step_result == 1)
@@ -3493,6 +3495,7 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
                 if (__builtin_expect(cpu->core_handoff, 0)) { executed++; break; }
             }
         }
+        cpu->native_span_room = 0u;
         exec_total += executed;
         /* No progress, or the CPU stopped: either way do not spin. */
         if (executed == 0 || !cpu->running || cpu->core_handoff) break;

@@ -1113,6 +1113,179 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     teardown(&cpu);
 }
 
+static const uint8_t wled_v1601_watchpoint_code[] = {
+    0x36, 0x41, 0x00, 0x0C, 0x18, 0xBD, 0x05, 0xCD,
+    0x08, 0x8C, 0xB5, 0x0B, 0x55, 0x92, 0xA0, 0x00,
+    0x50, 0x98, 0x93, 0x90, 0xC0, 0x74, 0xBD, 0x08,
+    0x3C, 0xF8, 0x0C, 0x0A, 0x52, 0xA0, 0x01, 0x0C,
+    0x79, 0x76, 0x89, 0x0D, 0x00, 0x1A, 0x40, 0x00,
+    0xD5, 0xA1, 0xD7, 0x14, 0x04, 0xF0, 0x88, 0x11,
+    0x1B, 0xAA, 0x80, 0x80, 0x54, 0x8C, 0x4C, 0x51,
+    0x53, 0xC0, 0x50, 0x88, 0x20, 0x8C, 0x4B, 0x51,
+    0x59, 0xC0, 0x50, 0x88, 0x20, 0x8C, 0x72, 0x30,
+    0x91, 0x13, 0x80, 0xA1, 0x13, 0x1D, 0xF0, 0x00,
+    0x30, 0x90, 0x13, 0x80, 0xA0, 0x13, 0xC6, 0xFC,
+    0xFF,
+};
+
+static void seed_wled_v1601_watchpoint(xtensa_cpu_t *cpu) {
+    put_test_bytes(cpu, 0x400903A0u, wled_v1601_watchpoint_code,
+                   sizeof(wled_v1601_watchpoint_code));
+    mem_write32(cpu->mem, 0x40080524u, 0x40000000u);
+    mem_write32(cpu->mem, 0x40080544u, 0x80000000u);
+}
+
+static void init_wled_watchpoint_call(xtensa_cpu_t *cpu, uint32_t id,
+                                      uint32_t address, uint32_t size,
+                                      uint32_t trigger) {
+    for (unsigned i = 0u; i < 64u; i++)
+        cpu->ar[i] = 0xA5000000u + i;
+    cpu->pc = 0x400903A0u;
+    cpu->_pc_written = true;
+    cpu->windowbase = 3u;
+    cpu->windowstart = 1u << 3;
+    cpu->ps = (1u << 18) | (9u << 8) | 1u;
+    XT_PS_SET_CALLINC(cpu->ps, 2u);
+    cpu->window_callsize[5] = 0xBu;
+    cpu->sar = 11u;
+    cpu->lbeg = 0x41234560u;
+    cpu->lend = 0x41234570u;
+    cpu->lcount = 17u;
+    cpu->dbreaka[0] = 0x11111111u;
+    cpu->dbreaka[1] = 0x22222222u;
+    cpu->dbreakc[0] = 0x33333333u;
+    cpu->dbreakc[1] = 0x44444444u;
+    cpu->ccount = 1000u;
+    cpu->cycle_count = 2000u;
+    cpu->insn_count = 0u;
+    cpu->next_timer_event = UINT32_MAX;
+    cpu->running = true;
+    cpu->halted = false;
+    cpu->exception = false;
+    cpu->seed_entry_link = false;
+    cpu->breakpoint_count = 0;
+    ar_write(cpu, 1, 0x3FFB7000u);
+    ar_write(cpu, 8, (2u << 30) | (BASE & 0x3FFFFFFFu));
+    ar_write(cpu, 10, id);
+    ar_write(cpu, 11, address);
+    ar_write(cpu, 12, size);
+    ar_write(cpu, 13, trigger);
+}
+
+TEST(test_wled_v1601_watchpoint_hook_matches_original_routine) {
+    struct watchpoint_case {
+        uint32_t id;
+        uint32_t address;
+        uint32_t size;
+        uint32_t trigger;
+        uint32_t insns;
+    } cases[] = {
+        { 0u, 0x3FFB1234u, 4u, 2u, 40u },
+        { 1u, 0x3FFB5678u, 1u, 0u, 22u },
+        { 7u, 0x3FFB9ABCu, 3u, 1u, 59u },
+    };
+
+    /* The independently identified profile cannot authorize this entry
+     * unless the complete routine and both of its literals also match. */
+    xtensa_cpu_t unsigned_cpu;
+    setup(&unsigned_cpu);
+    esp32_rom_stubs_t *unsigned_rom = rom_stubs_create(&unsigned_cpu);
+    seed_wled_v1601_profile(&unsigned_cpu);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(unsigned_rom, 0x40083E68u), 1u);
+    rom_stubs_destroy(unsigned_rom);
+    teardown(&unsigned_cpu);
+
+    for (unsigned c = 0u; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        xtensa_cpu_t reference;
+        xtensa_cpu_t accelerated;
+        setup(&reference);
+        setup(&accelerated);
+        seed_wled_v1601_watchpoint(&reference);
+        seed_wled_v1601_profile(&accelerated);
+        seed_wled_v1601_watchpoint(&accelerated);
+        esp32_rom_stubs_t *rom = rom_stubs_create(&accelerated);
+        ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 2u);
+
+        init_wled_watchpoint_call(&reference, cases[c].id,
+                                  cases[c].address, cases[c].size,
+                                  cases[c].trigger);
+        init_wled_watchpoint_call(&accelerated, cases[c].id,
+                                  cases[c].address, cases[c].size,
+                                  cases[c].trigger);
+
+        for (unsigned step = 0u; step < 100u && reference.pc != BASE; step++)
+            ASSERT_EQ(xtensa_step(&reference), 0u);
+        ASSERT_EQ(reference.pc, BASE);
+        ASSERT_EQ64(reference.insn_count, cases[c].insns);
+
+        ASSERT_EQ(xtensa_step(&accelerated), 0u);
+        ASSERT_EQ(accelerated.pc, reference.pc);
+        ASSERT_EQ(accelerated.ccount, reference.ccount);
+        ASSERT_EQ64(accelerated.cycle_count, reference.cycle_count);
+        ASSERT_EQ64(accelerated.insn_count, reference.insn_count);
+        ASSERT_EQ(accelerated.ps, reference.ps);
+        ASSERT_EQ(accelerated.sar, reference.sar);
+        ASSERT_EQ(accelerated.lbeg, reference.lbeg);
+        ASSERT_EQ(accelerated.lend, reference.lend);
+        ASSERT_EQ(accelerated.lcount, reference.lcount);
+        ASSERT_EQ(accelerated.windowbase, reference.windowbase);
+        ASSERT_EQ(accelerated.windowstart, reference.windowstart);
+        ASSERT_EQ(accelerated._pc_written, reference._pc_written);
+        ASSERT_EQ(accelerated.dbreaka[0], reference.dbreaka[0]);
+        ASSERT_EQ(accelerated.dbreaka[1], reference.dbreaka[1]);
+        ASSERT_EQ(accelerated.dbreakc[0], reference.dbreakc[0]);
+        ASSERT_EQ(accelerated.dbreakc[1], reference.dbreakc[1]);
+        for (unsigned i = 0u; i < 64u; i++)
+            ASSERT_EQ(accelerated.ar[i], reference.ar[i]);
+        for (unsigned i = 0u; i < 16u; i++)
+            ASSERT_EQ(accelerated.window_callsize[i],
+                      reference.window_callsize[i]);
+
+        rom_stubs_destroy(rom);
+        teardown(&accelerated);
+        teardown(&reference);
+    }
+
+    /* A timer due at the final instruction is observable inside the original
+     * routine, so the accelerator must leave that invocation to the guest. */
+    xtensa_cpu_t boundary;
+    setup(&boundary);
+    seed_wled_v1601_profile(&boundary);
+    seed_wled_v1601_watchpoint(&boundary);
+    esp32_rom_stubs_t *boundary_rom = rom_stubs_create(&boundary);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(boundary_rom, 0x40083E68u), 2u);
+    init_wled_watchpoint_call(&boundary, 0u, 0x3FFB1234u, 4u, 2u);
+    boundary.next_timer_event = boundary.ccount + 40u;
+    ASSERT_EQ(xtensa_step(&boundary), 0u);
+    ASSERT_EQ(boundary.pc, 0x400903A3u);
+    ASSERT_EQ(boundary.ccount, 1001u);
+    ASSERT_EQ64(boundary.insn_count, 1u);
+    ASSERT_EQ(boundary.dbreaka[0], 0x11111111u);
+    rom_stubs_destroy(boundary_rom);
+    teardown(&boundary);
+
+    /* Nor may a native span cross the dual-core scheduler's batch edge. The
+     * 40-instruction call executes 39 real instructions in this batch and
+     * returns on the first instruction of the next one. */
+    xtensa_cpu_t batch_edge;
+    setup(&batch_edge);
+    seed_wled_v1601_profile(&batch_edge);
+    seed_wled_v1601_watchpoint(&batch_edge);
+    esp32_rom_stubs_t *batch_rom = rom_stubs_create(&batch_edge);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(batch_rom, 0x40083E68u), 2u);
+    init_wled_watchpoint_call(&batch_edge, 0u, 0x3FFB1234u, 4u, 2u);
+    ASSERT_EQ(xtensa_run(&batch_edge, 39), 39u);
+    ASSERT_EQ(batch_edge.pc, 0x400903EDu);
+    ASSERT_EQ(batch_edge.ccount, 1039u);
+    ASSERT_EQ64(batch_edge.insn_count, 39u);
+    ASSERT_EQ(xtensa_run(&batch_edge, 1), 1u);
+    ASSERT_EQ(batch_edge.pc, BASE);
+    ASSERT_EQ(batch_edge.ccount, 1040u);
+    ASSERT_EQ64(batch_edge.insn_count, 40u);
+    rom_stubs_destroy(batch_rom);
+    teardown(&batch_edge);
+}
+
 TEST(test_openhasp_lanbon_requires_complete_fingerprint) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1500,6 +1673,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy);
+    RUN_TEST(test_wled_v1601_watchpoint_hook_matches_original_routine);
     RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
     RUN_TEST(test_tasmota32_requires_complete_fingerprint);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);

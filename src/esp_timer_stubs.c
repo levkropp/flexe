@@ -355,8 +355,10 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
             return 0;
     }
 
-    uint32_t distance = cpu->next_timer_event - cpu->ccount;
-    if (distance <= WLED_V1601_GET_TIME_MAX_INSNS)
+    if (cpu->next_timer_event != UINT32_MAX &&
+        ((int32_t)(cpu->ccount - cpu->next_timer_event) >= 0 ||
+         cpu->next_timer_event - cpu->ccount <=
+             WLED_V1601_GET_TIME_MAX_INSNS))
         return 0;
 
     uint32_t config = mem_read32(cpu->mem, WLED_V1601_LACT_CONFIG);
@@ -423,6 +425,13 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
         if (retry == 1u) return 0;
     }
 
+    /* Nine instructions follow the final LOW read, including the intercepted
+     * ENTRY charged by the dispatcher. Decline before changing any caller
+     * state when the complete path does not fit in this scheduler batch. */
+    uint32_t total = low_delta + 9u;
+    if (cpu->native_span_room != 0u && cpu->native_span_room < total)
+        return 0;
+
     uint64_t us = (((uint64_t)high << 32) | low) >> 1;
 
     int ci = XT_PS_CALLINC(cpu->ps);
@@ -432,9 +441,6 @@ static int stub_wled_v1601_esp_timer_get_time(xtensa_cpu_t *cpu, void *ctx) {
     cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
     XT_PS_SET_CALLINC(cpu->ps, 0);
 
-    /* Nine instructions follow the final LOW read, including the intercepted
-     * ENTRY charged by the dispatcher. */
-    uint32_t total = low_delta + 9u;
     cpu->ccount += total - 1u;
     cpu->cycle_count += total - 1u;
     return (int)total;

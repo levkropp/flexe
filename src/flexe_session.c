@@ -387,6 +387,11 @@ static int session_build(flexe_session_t *s)
         s->cpu[1].pc_hook = s->cpu[0].pc_hook;
         s->cpu[1].pc_hook_ctx = s->cpu[0].pc_hook_ctx;
         s->cpu[1].pc_hook_bitmap = s->cpu[0].pc_hook_bitmap;
+        /* Address hooks are shared by both cores. Some conditionally consume
+         * a complete verified firmware path and return its guest-instruction
+         * span, so APP_CPU must use the same exact-work batch accounting as
+         * PRO_CPU even before a JIT backend is installed. */
+        s->cpu[1].accelerated_blocks = s->cpu[0].accelerated_blocks;
     }
 
     /* Keep execution-engine ownership in the shared session so the CLI and

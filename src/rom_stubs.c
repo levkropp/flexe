@@ -5388,10 +5388,13 @@ static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
  * single host-side service operation, like the other ROM accelerators. */
 #define WLED_V1601_ENTER_CRITICAL       0x4008EC28u
 #define WLED_V1601_EXIT_CRITICAL        0x4008ED10u
+#define WLED_V1601_SET_WATCHPOINT       0x400903A0u
 #define WLED_V1601_HEAP_LOCK             0x40091E3Cu
 #define WLED_V1601_HEAP_UNLOCK           0x40091E4Cu
 #define WLED_V1601_NESTING_LITERAL      0x40080D4Cu
 #define WLED_V1601_OLD_STATE_LITERAL    0x40080D50u
+#define WLED_V1601_DBREAK_READ_LITERAL  0x40080524u
+#define WLED_V1601_DBREAK_WRITE_LITERAL 0x40080544u
 
 static void fw_charge_stub_path(xtensa_cpu_t *cpu, uint32_t insns) {
     if (insns <= 1u)
@@ -5404,6 +5407,127 @@ static bool fw_wled_internal_spinlock(uint32_t mux) {
     /* This is the range test used by the release's function before choosing
      * inline S32C1I instead of compare_and_set_extram(). */
     return mux + 0xC0800000u > 0x003FFFFFu;
+}
+
+/* cpu_hal_set_watchpoint() is called by IDF's heap-poisoning checks often
+ * enough to be a material interpreter hotspot.  This exact WLED link uses a
+ * seven-iteration LOOP to turn sizes 1..64 into DBREAKC mask bits.  Preserve
+ * every architectural and window-model side effect of the original routine,
+ * including its caller-clobbered registers and phase-dependent path length.
+ *
+ * A live register window can make either ENTRY or a later a4..a13 operand
+ * fault and spill.  Those paths remain in guest code, as does any invocation
+ * whose instruction span crosses a timer boundary or contains a debugger
+ * breakpoint. */
+static int stub_fw_wled_set_watchpoint(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    if (XT_PS_CALLINC(cpu->ps) != 2u || cpu->seed_entry_link ||
+        cpu->breakpoint_count != 0)
+        return 0;
+
+    unsigned wb = cpu->windowbase & 15u;
+    uint32_t live = cpu->windowstart;
+    if ((live & (1u << wb)) == 0u)
+        return 0;
+    for (unsigned i = 1u; i <= 5u; i++) {
+        if (live & (1u << ((wb + i) & 15u)))
+            return 0;
+    }
+
+    uint32_t id = rom_arg(cpu, 0);
+    uint32_t address = rom_arg(cpu, 1);
+    uint32_t size = rom_arg(cpu, 2);
+    uint32_t trigger = rom_arg(cpu, 3);
+    bool read = trigger != 1u;
+    bool write = trigger != 0u;
+
+    unsigned match = 7u;
+    for (unsigned i = 0u; i < 7u; i++) {
+        if (size == (1u << i)) {
+            match = i;
+            break;
+        }
+    }
+
+    unsigned shifts = match < 7u ? match : 7u;
+    uint32_t control = (0x3Fu << shifts) & 0x3Fu;
+    if (read) control |= 0x40000000u;
+    if (write) control |= 0x80000000u;
+
+    uint32_t prefix_insns = trigger == 0u ? 10u : 15u;
+    uint32_t loop_insns = match < 7u ? 5u * match + 3u : 35u;
+    uint32_t suffix_insns = (id == 0u ? 8u : 7u) +
+                            (read ? 2u : 0u) + (write ? 2u : 0u);
+    uint32_t insns = prefix_insns + loop_insns + suffix_insns;
+    if (cpu->native_span_room != 0u && cpu->native_span_room < insns)
+        return 0;
+    if (cpu->next_timer_event != UINT32_MAX &&
+        ((int32_t)(cpu->ccount - cpu->next_timer_event) >= 0 ||
+         cpu->next_timer_event - cpu->ccount <= insns))
+        return 0;
+
+    unsigned loop_index = match < 7u ? match : 6u;
+    uint32_t loop_value = 1u << loop_index;
+
+    /* ENTRY a1,32 writes the callee stack pointer before rotating WB.  The
+     * remaining writes name callee a5/a8..a13 through their overlapping
+     * caller registers, so the caller-clobbered physical register file is
+     * byte-for-byte the same after RETW.N. */
+    ar_write(cpu, 9, ar_read(cpu, 1) - 32u);
+    ar_write(cpu, 13, write ? 0x80000000u : 0x40000000u);
+    ar_write(cpu, 16, control);
+    ar_write(cpu, 17, 7u);
+    ar_write(cpu, 18, match < 7u ? match : 7u);
+    ar_write(cpu, 19, write ? 1u : 0u);
+    ar_write(cpu, 20, read ? 1u : 0u);
+    ar_write(cpu, 21, loop_value);
+
+    cpu->sar = 32u - loop_index; /* final SSL a10 */
+    cpu->lbeg = 0x400903C4u;
+    cpu->lend = 0x400903D2u;
+    cpu->lcount = match < 7u ? 6u - match : 0u;
+    unsigned slot = id == 0u ? 0u : 1u;
+    cpu->dbreaka[slot] = address;
+    cpu->dbreakc[slot] = control;
+
+    /* ENTRY records the destination frame's call size and OWB. RETW clears
+     * that frame's WINDOWSTART bit and rotates back, so WB/WS are unchanged
+     * under the no-collision guard above. CALLINC itself remains two. */
+    cpu->window_callsize[(wb + 2u) & 15u] = 2u;
+    XT_PS_SET_OWB(cpu->ps, wb);
+    uint32_t return_link = ar_read(cpu, 8);
+    cpu->pc = 0x40000000u | (return_link & 0x3FFFFFFFu);
+
+    fw_charge_stub_path(cpu, insns);
+    return (int)insns;
+}
+
+static bool fw_wled_add_watchpoint_hook(esp32_rom_stubs_t *stubs) {
+    static const uint8_t signature[] = {
+        0x36, 0x41, 0x00, 0x0C, 0x18, 0xBD, 0x05, 0xCD,
+        0x08, 0x8C, 0xB5, 0x0B, 0x55, 0x92, 0xA0, 0x00,
+        0x50, 0x98, 0x93, 0x90, 0xC0, 0x74, 0xBD, 0x08,
+        0x3C, 0xF8, 0x0C, 0x0A, 0x52, 0xA0, 0x01, 0x0C,
+        0x79, 0x76, 0x89, 0x0D, 0x00, 0x1A, 0x40, 0x00,
+        0xD5, 0xA1, 0xD7, 0x14, 0x04, 0xF0, 0x88, 0x11,
+        0x1B, 0xAA, 0x80, 0x80, 0x54, 0x8C, 0x4C, 0x51,
+        0x53, 0xC0, 0x50, 0x88, 0x20, 0x8C, 0x4B, 0x51,
+        0x59, 0xC0, 0x50, 0x88, 0x20, 0x8C, 0x72, 0x30,
+        0x91, 0x13, 0x80, 0xA1, 0x13, 0x1D, 0xF0, 0x00,
+        0x30, 0x90, 0x13, 0x80, 0xA0, 0x13, 0xC6, 0xFC,
+        0xFF,
+    };
+    xtensa_mem_t *mem = stubs->cpu->mem;
+    if (!fw_signature_matches(mem, WLED_V1601_SET_WATCHPOINT,
+                              signature, sizeof(signature)) ||
+        mem_read32(mem, WLED_V1601_DBREAK_READ_LITERAL) != 0x40000000u ||
+        mem_read32(mem, WLED_V1601_DBREAK_WRITE_LITERAL) != 0x80000000u)
+        return false;
+
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_SET_WATCHPOINT,
+            stub_fw_wled_set_watchpoint, "cpu_hal_set_watchpoint", NULL);
+    return true;
 }
 
 static bool fw_wled_resolve_critical_globals(esp32_rom_stubs_t *stubs) {
@@ -5636,6 +5760,10 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
      * was used before it acquired a profile-specific acceleration table, and
      * collapse the fully modeled uncontended FreeRTOS critical boundary. */
     if (profile == ROM_FIRMWARE_WLED_V1601) {
+        if (fw_wled_add_watchpoint_hook(stubs)) {
+            stubs->cpu->accelerated_blocks = true;
+            n++;
+        }
         if (fw_wled_resolve_critical_globals(stubs)) {
             rom_stubs_register_conditional_ctx(
                     stubs, WLED_V1601_ENTER_CRITICAL,
