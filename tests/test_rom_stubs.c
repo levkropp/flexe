@@ -914,13 +914,16 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
 
     const uint32_t enter_critical = 0x4008EC28u;
     const uint32_t exit_critical = 0x4008ED10u;
+    const uint32_t heap_lock = 0x40091E3Cu;
+    const uint32_t heap_unlock = 0x40091E4Cu;
     const uint32_t mux = 0x3FFB1000u;
+    const uint32_t heap = 0x3FFB3000u;
     const uint32_t old_state = 0x3FFCDDF0u;
     const uint32_t nesting = 0x3FFCDDF8u;
     mem_write32(cpu.mem, 0x40080D4Cu, nesting);
     mem_write32(cpu.mem, 0x40080D50u, old_state);
 
-    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 4);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 6);
     ASSERT_EQ(cpu.poll_spin_count, 2u);
     ASSERT_EQ(cpu.poll_spin_pc[0], 0x40083A68u);
     ASSERT_EQ(cpu.poll_spin_pc[1], 0x40083B29u);
@@ -1056,6 +1059,55 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     ASSERT_EQ64(cpu.insn_count, 41u);
     ASSERT_EQ(mem_read32(cpu.mem, mux + 4u), 1u);
     ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
+
+    /* The multi-heap wrappers consume the same modeled critical operation
+     * without exposing their extra window frame, while retaining the exact
+     * combined instruction/cycle span. */
+    mem_write32(cpu.mem, heap, mux);
+    cpu.pc = heap_unlock;
+    cpu._pc_written = true;
+    cpu.ccount = 0u;
+    cpu.cycle_count = 0u;
+    cpu.insn_count = 0u;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, heap);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(cpu.ccount, 34u);
+    ASSERT_EQ64(cpu.cycle_count, 34u);
+    ASSERT_EQ64(cpu.insn_count, 34u);
+    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_FREE);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 0u);
+
+    cpu.pc = heap_lock;
+    cpu._pc_written = true;
+    cpu.ccount = 0u;
+    cpu.cycle_count = 0u;
+    cpu.insn_count = 0u;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, heap);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(cpu.ccount, 47u);
+    ASSERT_EQ64(cpu.cycle_count, 47u);
+    ASSERT_EQ64(cpu.insn_count, 47u);
+    ASSERT_EQ(mem_read32(cpu.mem, mux), XTENSA_SPINLOCK_OWNER_CORE0);
+    ASSERT_EQ(mem_read32(cpu.mem, nesting), 1u);
+
+    /* A heap configured without a mutex takes its four-instruction fast path. */
+    mem_write32(cpu.mem, heap, 0u);
+    cpu.pc = heap_lock;
+    cpu._pc_written = true;
+    cpu.ccount = 0u;
+    cpu.cycle_count = 0u;
+    cpu.insn_count = 0u;
+    ar_write(&cpu, 0, BASE);
+    ar_write(&cpu, 2, heap);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(cpu.ccount, 4u);
+    ASSERT_EQ64(cpu.cycle_count, 4u);
+    ASSERT_EQ64(cpu.insn_count, 4u);
 
     rom_stubs_destroy(rom);
     teardown(&cpu);

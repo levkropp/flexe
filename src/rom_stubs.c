@@ -5388,6 +5388,8 @@ static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
  * single host-side service operation, like the other ROM accelerators. */
 #define WLED_V1601_ENTER_CRITICAL       0x4008EC28u
 #define WLED_V1601_EXIT_CRITICAL        0x4008ED10u
+#define WLED_V1601_HEAP_LOCK             0x40091E3Cu
+#define WLED_V1601_HEAP_UNLOCK           0x40091E4Cu
 #define WLED_V1601_NESTING_LITERAL      0x40080D4Cu
 #define WLED_V1601_OLD_STATE_LITERAL    0x40080D50u
 
@@ -5527,6 +5529,69 @@ static int stub_fw_wled_exit_critical(xtensa_cpu_t *cpu, void *ctx) {
     return (int)insns;
 }
 
+static void fw_wled_set_arg(xtensa_cpu_t *cpu, int n, uint32_t value) {
+    int reg = XT_PS_CALLINC(cpu->ps) * 4 + 2 + n;
+    if (reg < 16)
+        ar_write(cpu, reg, value);
+}
+
+/* multi_heap_internal_{lock,unlock} only load the heap's mux and wrap the
+ * critical-section functions above. Consume both call levels when that
+ * already-verified critical path is safe; otherwise restore the incoming
+ * argument and let the firmware execute unchanged. */
+static int stub_fw_wled_heap_lock(xtensa_cpu_t *cpu, void *ctx) {
+    uint32_t heap = rom_arg(cpu, 0);
+    if ((heap & 3u) != 0u || !mem_get_ptr(cpu->mem, heap))
+        return 0;
+    uint32_t mux = mem_read32(cpu->mem, heap);
+    if (mux == 0u) {
+        fw_charge_stub_path(cpu, 4u); /* entry, l32i, beqz, retw */
+        rom_return_void(cpu);
+        return 4;
+    }
+
+    uint32_t saved_arg1 = rom_arg(cpu, 1);
+    fw_wled_set_arg(cpu, 0, mux);
+    fw_wled_set_arg(cpu, 1, UINT32_MAX);
+    int critical_insns = stub_fw_wled_enter_critical(cpu, ctx);
+    if (critical_insns == 0) {
+        fw_wled_set_arg(cpu, 0, heap);
+        fw_wled_set_arg(cpu, 1, saved_arg1);
+        return 0;
+    }
+
+    /* Six wrapper instructions surround the complete critical function.
+     * Its helper already charged all but its dispatch; the outer hook will
+     * charge one more, so add the six wrapper instructions verbatim. */
+    cpu->ccount += 6u;
+    cpu->cycle_count += 6u;
+    return critical_insns + 6;
+}
+
+static int stub_fw_wled_heap_unlock(xtensa_cpu_t *cpu, void *ctx) {
+    uint32_t heap = rom_arg(cpu, 0);
+    if ((heap & 3u) != 0u || !mem_get_ptr(cpu->mem, heap))
+        return 0;
+    uint32_t mux = mem_read32(cpu->mem, heap);
+    if (mux == 0u) {
+        fw_charge_stub_path(cpu, 4u); /* entry, l32i, beqz, retw */
+        rom_return_void(cpu);
+        return 4;
+    }
+
+    fw_wled_set_arg(cpu, 0, mux);
+    int critical_insns = stub_fw_wled_exit_critical(cpu, ctx);
+    if (critical_insns == 0) {
+        fw_wled_set_arg(cpu, 0, heap);
+        return 0;
+    }
+
+    /* entry, l32i, beqz, call8, retw */
+    cpu->ccount += 5u;
+    cpu->cycle_count += 5u;
+    return critical_insns + 5;
+}
+
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
@@ -5579,11 +5644,18 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
             rom_stubs_register_conditional_ctx(
                     stubs, WLED_V1601_EXIT_CRITICAL,
                     stub_fw_wled_exit_critical, "vPortExitCritical", NULL);
+            rom_stubs_register_conditional_ctx(
+                    stubs, WLED_V1601_HEAP_LOCK,
+                    stub_fw_wled_heap_lock, "multi_heap_internal_lock", NULL);
+            rom_stubs_register_conditional_ctx(
+                    stubs, WLED_V1601_HEAP_UNLOCK,
+                    stub_fw_wled_heap_unlock,
+                    "multi_heap_internal_unlock", NULL);
             /* The callbacks above return complete guest spans. Use the exact-
              * work batch loop even without the JIT so neither emulated core
              * can overrun its native-FreeRTOS timeslice. */
             stubs->cpu->accelerated_blocks = true;
-            n += 2;
+            n += 4;
         }
         n += fw_hook_scanned_phy(stubs);
     }
