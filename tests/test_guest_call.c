@@ -104,18 +104,24 @@ TEST(sync_call_uses_only_transient_private_stack)
     const uint32_t rtc_slow_guard = 0x50001FFCu;
     const uint32_t arg = 0x89ABCDEFu;
 
-    /* ENTRY a1,16; S32I a2,a1,0; RETW.N. The store proves that callback
-     * frames can really use the temporary page rather than merely returning
-     * before touching their fabricated stack. */
+    /* ENTRY a1,16; WSR a2,CPENABLE; S32I a2,a1,0; RETW.N. The store proves
+     * that callback frames can really use the temporary page rather than
+     * merely returning before touching their fabricated stack. CPENABLE is
+     * task context too, so the injected frame must not leak its value. */
     put_insn3(&cpu, callback, async_test_entry(1, 16));
-    put_insn3(&cpu, callback + 3u, guest_call_test_rri8(0x6, 1, 2, 0));
-    put_insn2(&cpu, callback + 6u, narrow(0xD, 15, 0, 1));
+    put_insn3(&cpu, callback + 3u,
+              rrr(1, 3, XT_SR_CPENABLE >> 4,
+                  XT_SR_CPENABLE & 15, 2));
+    put_insn3(&cpu, callback + 6u, guest_call_test_rri8(0x6, 1, 2, 0));
+    put_insn2(&cpu, callback + 9u, narrow(0xD, 15, 0, 1));
     mem_write32(cpu.mem, rtc_slow_guard, 0xA5A55A5Au);
+    cpu.cpenable = 0x5Au;
 
     ASSERT_TRUE(mem_get_ptr(cpu.mem, private_stack) == NULL);
     ASSERT_EQ(guest_call8(&cpu, callback, &arg, 1, 100u, NULL), 0);
     ASSERT_TRUE(mem_get_ptr(cpu.mem, private_stack) == NULL);
     ASSERT_EQ(mem_read32(cpu.mem, rtc_slow_guard), 0xA5A55A5Au);
+    ASSERT_EQ(cpu.cpenable, 0x5Au);
 
     teardown(&cpu);
 }
@@ -137,10 +143,46 @@ TEST(sync_call_builds_linked_window_root)
     teardown(&cpu);
 }
 
+TEST(sync_injection_requires_all_live_cores_to_be_quiescent)
+{
+    xtensa_cpu_t target;
+    xtensa_cpu_t peer;
+    setup(&target);
+    setup(&peer);
+
+    target.running = true;
+    target.halted = true;
+    target.ps = 1u << 18; /* WOE, INTLEVEL=0, EXCM=0 */
+    peer.running = true;
+    peer.halted = true;
+    peer.ps = 1u << 18;
+
+    ASSERT_TRUE(guest_call_injection_is_quiescent(&target, &peer));
+
+    target.halted = false;
+    ASSERT_FALSE(guest_call_injection_is_quiescent(&target, &peer));
+    target.halted = true;
+
+    peer.halted = false;
+    ASSERT_FALSE(guest_call_injection_is_quiescent(&target, &peer));
+    peer.running = false;
+    ASSERT_TRUE(guest_call_injection_is_quiescent(&target, &peer));
+
+    target.exception = true;
+    ASSERT_FALSE(guest_call_injection_is_quiescent(&target, &peer));
+    target.exception = false;
+    XT_PS_SET_INTLEVEL(target.ps, 1);
+    ASSERT_FALSE(guest_call_injection_is_quiescent(&target, &peer));
+
+    teardown(&peer);
+    teardown(&target);
+}
+
 static void run_guest_call_tests(void)
 {
     TEST_SUITE("Guest Calls");
     RUN_TEST(async_call_preserves_window_spill_area);
     RUN_TEST(sync_call_uses_only_transient_private_stack);
     RUN_TEST(sync_call_builds_linked_window_root);
+    RUN_TEST(sync_injection_requires_all_live_cores_to_be_quiescent);
 }

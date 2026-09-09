@@ -20,6 +20,23 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
                 const uint32_t *args, size_t arg_count,
                 uint32_t instruction_limit, uint32_t *retval_out);
 
+/* True when a host-originated callback can safely use guest_call8().
+ *
+ * A private-stack call is appropriate for code invoked synchronously by a
+ * guest hook: that guest call site is already a valid execution boundary.
+ * An external event injected between emulator batches is different. If it
+ * interrupts either core in the middle of a scheduler or list operation, it
+ * can re-enter FreeRTOS with an inconsistent data structure even when
+ * PS.INTLEVEL is zero (vTaskSuspendAll does not raise it).
+ *
+ * WAITI is the architectural, symbol-free quiescence signal available to the
+ * emulator. The target must be a live core parked in WAITI, and every live
+ * peer must be parked too. Stopped peers do not own guest locks. Callers
+ * should retain their pending event and try again after a later batch when
+ * this returns false. */
+bool guest_call_injection_is_quiescent(const xtensa_cpu_t *target,
+                                       const xtensa_cpu_t *peer);
+
 /* Run a firmware function that is allowed to block.
  *
  * guest_call8() cannot deliver an IDF event handler. It runs the callee on a

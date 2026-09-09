@@ -18,6 +18,21 @@
 #define GUEST_CALL_SENTINEL  0x40001FF8u
 #define GUEST_CALL_MAX_ARGS  6u
 
+static bool guest_core_is_quiescent(const xtensa_cpu_t *cpu)
+{
+    return cpu && cpu->running && cpu->halted && !cpu->exception &&
+           !cpu->in_guest_call && XT_PS_INTLEVEL(cpu->ps) == 0 &&
+           !XT_PS_EXCM(cpu->ps);
+}
+
+bool guest_call_injection_is_quiescent(const xtensa_cpu_t *target,
+                                       const xtensa_cpu_t *peer)
+{
+    if (!guest_core_is_quiescent(target))
+        return false;
+    return !peer || !peer->running || guest_core_is_quiescent(peer);
+}
+
 int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
                 const uint32_t *args, size_t arg_count,
                 uint32_t instruction_limit, uint32_t *retval_out)
@@ -52,6 +67,7 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     uint32_t save_f64r_lo = cpu->f64r_lo;
     uint32_t save_f64r_hi = cpu->f64r_hi;
     uint32_t save_f64s = cpu->f64s;
+    uint32_t save_cpenable = cpu->cpenable;
     float save_fr[16];
     uint8_t save_window_callsize[sizeof(cpu->window_callsize)];
     uint8_t save_spill_stack[sizeof(cpu->spill_stack)];
@@ -155,6 +171,7 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     cpu->f64r_lo = save_f64r_lo;
     cpu->f64r_hi = save_f64r_hi;
     cpu->f64s = save_f64s;
+    cpu->cpenable = save_cpenable;
     cpu->running = save_running;
     /* A completed asynchronous guest callback represents interrupt/event
      * delivery. Interrupt entry wakes WAITI, so do not reinstate a halted

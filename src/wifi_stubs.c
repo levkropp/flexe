@@ -1973,6 +1973,12 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
         uint32_t base = wifi_event_base(ws, e->base_name);
         if (base == 0u) return; /* registration has not run yet */
 
+        /* This call originates outside guest execution. Posting while either
+         * core is midway through a FreeRTOS operation can re-enter the kernel
+         * on inconsistent state. Keep the event queued until both live cores
+         * reach the architecture-defined idle boundary instead. */
+        if (!guest_call_injection_is_quiescent(cpu, peer)) return;
+
         uint32_t data = wifi_write_event_data(ws, cpu, e->data_kind);
         uint32_t args[5] = {
             base,
@@ -2033,17 +2039,24 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
      * blocking the one task FreeRTOS requires to stay runnable would be worse
      * than not delivering.
      *
-     * When neither core has a task, fall back to the private-stack call. That
-     * is how every image delivered its events before, and the ones that are
-     * idle whenever an event is ready -- NerdMiner is, every time -- still
-     * need it. Waiting for a task instead breaks their provisioning. */
-    if (guest_call_async(cpu, ws->dispatch[0].handler,
-                         ws->dispatch[0].args, 4) != 0 &&
-        (!peer || guest_call_async(peer, ws->dispatch[0].handler,
-                                   ws->dispatch[0].args, 4) != 0) &&
-        guest_call8(cpu, ws->dispatch[0].handler,
-                    ws->dispatch[0].args, 4, 2000000u, NULL) != 0)
-        return;
+     * When neither core has a borrowable task, a private-stack call still
+     * serves firmware whose provisioning loop is waiting in idle. The
+     * quiescence check below distinguishes that safe case from an active or
+     * critical guest context and otherwise leaves the callback queued. */
+    int delivered = guest_call_async(cpu, ws->dispatch[0].handler,
+                                     ws->dispatch[0].args, 4);
+    if (delivered != 0 && peer)
+        delivered = guest_call_async(peer, ws->dispatch[0].handler,
+                                     ws->dispatch[0].args, 4);
+    if (delivered != 0) {
+        /* async refusal commonly means that both cores are idle or that the
+         * sampled core is unsafe to borrow. Only the former permits the
+         * private-stack fallback. In every other state, defer intact. */
+        if (!guest_call_injection_is_quiescent(cpu, peer)) return;
+        delivered = guest_call8(cpu, ws->dispatch[0].handler,
+                                ws->dispatch[0].args, 4, 2000000u, NULL);
+    }
+    if (delivered != 0) return;
     ws->stats.events_delivered++;
     for (int i = 1; i < ws->dispatch_count; i++)
         ws->dispatch[i - 1] = ws->dispatch[i];

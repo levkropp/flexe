@@ -652,6 +652,21 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     ASSERT_EQ(cpu.pc, BASE + 0x100u);
 
     invoke_wifi_call0(&cpu, TEST_WLED_DISCONNECT, 0);
+
+    /* Event production is independent from delivery. An external callback
+     * must remain queued while guest code is active, then wake a core only at
+     * a genuine WAITI boundary. */
+    cpu.running = true;
+    cpu.halted = false;
+    cpu.exception = false;
+    cpu.ps = 1u << 18; /* WOE, INTLEVEL=0, EXCM=0 */
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ64(capture.calls, 0u);
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.events_delivered, 0u);
+
+    cpu.halted = true;
     wifi_stubs_tick(wifi, &cpu, NULL);
 
     ASSERT_EQ64(capture.calls, 1u);
@@ -664,7 +679,6 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     ASSERT_EQ(capture.payload[39], 8u);    /* WIFI_REASON_ASSOC_LEAVE */
     ASSERT_EQ(capture.payload[40], (uint8_t)(int8_t)-55);
 
-    wifi_stubs_stats_t stats = {0};
     wifi_stubs_get_stats(wifi, &stats);
     ASSERT_EQ64(stats.events_delivered, 1u);
     ASSERT_EQ64(stats.socket_calls, 1u);
