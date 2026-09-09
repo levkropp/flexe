@@ -1215,10 +1215,9 @@ TEST(test_jit_loop_backedge_dispatches_native_body) {
     teardown(&cpu);
 }
 
-/* LOOP itself remains interpreted because it establishes LBEG/LEND/LCOUNT,
- * but that must not strand its first body iteration in the interpreter. A
- * one-iteration loop has no back-edge at all, making it an exact regression
- * test for the private fallthrough dispatch boundary. */
+/* A cold LOOP setup must not strand its first body iteration in the
+ * interpreter. A one-iteration loop has no back-edge at all, making it an
+ * exact regression test for the private fallthrough dispatch boundary. */
 TEST(test_jit_loop_fallthrough_dispatches_first_body) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1259,6 +1258,92 @@ TEST(test_jit_loop_fallthrough_dispatches_first_body) {
     ASSERT_EQ(cpu.pc, done);
     ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - jitted_before, 2u);
     ASSERT_FALSE(cpu.jit_fallthrough_dispatch);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+static uint32_t jit_loop_setup_insn(unsigned kind, unsigned source,
+                                    uint32_t pc, uint32_t lend)
+{
+    uint32_t offset = lend - (pc + 4u);
+    return 0x76u | (((kind << 4) | source) << 8) | (offset << 16);
+}
+
+TEST(test_jit_compiles_loop_setup_family) {
+    const uint32_t lend = BASE + 0x23u;
+    struct {
+        unsigned kind;
+        uint32_t count;
+        uint32_t initial_lcount;
+        uint32_t expected_pc;
+        uint32_t expected_lcount;
+        const char *name;
+    } cases[] = {
+        { 8, 4u,          99u, BASE + 3u, 3u, "loop" },
+        { 9, 1u,          99u, BASE + 3u, 0u, "loopnez_enter" },
+        { 9, 0u,          99u, lend,       99u, "loopnez_skip" },
+        { 10, 2u,         99u, BASE + 3u, 1u, "loopgtz_enter" },
+        { 10, 0u,         99u, lend,       99u, "loopgtz_zero" },
+        { 10, UINT32_MAX, 99u, lend,       99u, "loopgtz_negative" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        xtensa_cpu_t cpu;
+        setup(&cpu);
+        put_insn3(&cpu, BASE,
+                  jit_loop_setup_insn(cases[i].kind, 3u, BASE, lend));
+        ar_write(&cpu, 3, cases[i].count);
+        cpu.lcount = cases[i].initial_lcount;
+        test_run_differential(&cpu, 1, cases[i].name);
+        cpu.running = true;
+        ASSERT_EQ(xtensa_step(&cpu), 0);
+        ASSERT_EQ(cpu.pc, cases[i].expected_pc);
+        ASSERT_EQ(cpu.lbeg, BASE + 3u);
+        ASSERT_EQ(cpu.lend, lend);
+        ASSERT_EQ(cpu.lcount, cases[i].expected_lcount);
+        teardown(&cpu);
+    }
+}
+
+TEST(test_jit_loopnez_uses_dirty_prefix_value) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t loop_pc = BASE + 2u;
+    const uint32_t lend = BASE + 0x25u;
+    put_insn2(&cpu, BASE, narrow(0xB, 3, 3, 1)); /* ADDI.N a3,a3,1 */
+    put_insn3(&cpu, loop_pc,
+              jit_loop_setup_insn(9u, 3u, loop_pc, lend));
+    ar_write(&cpu, 3, UINT32_MAX); /* prefix produces zero, so skip */
+    cpu.lcount = 0xA5A5u;
+    test_run_differential(&cpu, 2, "loopnez_dirty_prefix_skip");
+    teardown(&cpu);
+}
+
+TEST(test_jit_loop_setup_clears_architectural_edge) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t lend = BASE + 0x23u;
+    put_insn3(&cpu, BASE, jit_loop_setup_insn(8u, 3u, BASE, lend));
+    ar_write(&cpu, 3, 2u);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        teardown(&cpu);
+        return;
+    }
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_step(&cpu), 0);
+    ASSERT_EQ(cpu.pc, BASE + 3u);
+    ASSERT_FALSE(cpu._pc_written);
+    ASSERT_TRUE(cpu.jit_fallthrough_dispatch);
 
     jit_destroy(jit);
     teardown(&cpu);
@@ -2994,6 +3079,9 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_chained_run_accounts_every_block);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
     RUN_TEST(test_jit_loop_fallthrough_dispatches_first_body);
+    RUN_TEST(test_jit_compiles_loop_setup_family);
+    RUN_TEST(test_jit_loopnez_uses_dirty_prefix_value);
+    RUN_TEST(test_jit_loop_setup_clears_architectural_edge);
     RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);
     RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
     RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);

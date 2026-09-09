@@ -60,6 +60,7 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 #define CPU_OFF_HALTED      offsetof(xtensa_cpu_t, halted)
 #define CPU_OFF_EXCEPTION   offsetof(xtensa_cpu_t, exception)
 #define CPU_OFF_PC_WRITTEN  offsetof(xtensa_cpu_t, _pc_written)
+#define CPU_OFF_JIT_FALLTHROUGH offsetof(xtensa_cpu_t, jit_fallthrough_dispatch)
 #define CPU_OFF_LOOP_EXIT   offsetof(xtensa_cpu_t, jit_loop_exit)
 #define CPU_OFF_IRQ_CHECK   offsetof(xtensa_cpu_t, irq_check)
 #define CPU_OFF_CYCLE_COUNT offsetof(xtensa_cpu_t, cycle_count)
@@ -548,7 +549,7 @@ static int classify_for_jit(uint32_t insn, int ilen) {
         if (m == 1) {
             int r = (insn >> 12) & 0xF;
             if (r == 0 || r == 1) return 3;  /* BF/BT — conditional */
-            if (r >= 8 && r <= 10) return 2; /* LOOP/LOOPNEZ/LOOPGTZ — fallback */
+            if (r >= 8 && r <= 10) return 1; /* LOOP family — context terminator */
             return 2;
         }
         return 3;  /* BLTUI/BGEUI — conditional */
@@ -2595,7 +2596,52 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                                       target, insn_idx + 1, sx, sx_count, jit);
                     return 1;
                 }
-                return 0; /* LOOP */
+                if (lr >= 8 && lr <= 10) {
+                    /* LOOP establishes context for the instructions after
+                     * it. End this block after publishing that context, so
+                     * the next block is selected with the runtime loop
+                     * variant and bound. Conditional forms branch directly
+                     * to LEND when their count rejects the body. */
+                    uint32_t loop_end = next_pc + (uint32_t)imm8 + 1u;
+                    ra_load_ar(e, ra, RAX, wb4, s);
+                    ra_flush(e, ra, wb4);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_LBEG, next_pc);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_LEND, loop_end);
+
+                    int skip_body = -1;
+                    if (lr == 9) {
+                        emit_test_reg32(e, RAX, RAX); /* LOOPNEZ */
+                        skip_body = emit_jcc_rel32(e, CC_E);
+                    } else if (lr == 10) {
+                        emit_cmp_reg32_imm32(e, RAX, 0); /* LOOPGTZ */
+                        skip_body = emit_jcc_rel32(e, CC_LE);
+                    }
+
+                    emit_add_reg32_imm32(e, RAX, (uint32_t)-1);
+                    emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_LCOUNT);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, next_pc);
+                    /* The hook which entered this block was reached through
+                     * the previous instruction's architectural PC write.
+                     * LOOP's body is ordinary fallthrough, so do not let
+                     * that stale edge escape across this context boundary. */
+                    emit_store32_disp_imm(e, REG_CPU,
+                                          (int32_t)CPU_OFF_PC_WRITTEN, 0);
+                    emit_store32_disp_imm(e, REG_CPU,
+                                          (int32_t)CPU_OFF_JIT_FALLTHROUGH, 1);
+                    emit_acc_add(e, insn_idx + 1);
+                    emit_jmp_to_epilogue(e, jit);
+
+                    if (skip_body >= 0) {
+                        emit_patch_rel32(e, skip_body);
+                        emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, loop_end);
+                        emit_store32_disp_imm(e, REG_CPU,
+                                              (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                        emit_acc_add(e, insn_idx + 1);
+                        emit_jmp_to_epilogue(e, jit);
+                    }
+                    return 1;
+                }
+                return 0;
             }
             if (m == 2 || m == 3) {
                 /* BLTUI / BGEUI */
