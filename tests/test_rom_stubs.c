@@ -898,10 +898,16 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     const uint32_t rom_literal = wrapper - 0x104u;
     const uint32_t global_literal = wrapper - 0x100u;
     const uint32_t phy_global = 0x3FFB2000u;
+    static const uint8_t flash_poll_loop[] = {
+        0xC0, 0x20, 0x00, 0x82, 0x09, 0x00,
+        0x80, 0x80, 0x74, 0x16, 0x38, 0xFF,
+    };
 
     /* Match the release's memcmp prologue and provide one structurally
      * discoverable phy_get_romfunc_addr wrapper. */
     put_insn3(&cpu, memcmp_entry, 0x004136u); /* entry a1, 32 */
+    put_test_bytes(&cpu, 0x40083B29u, flash_poll_loop,
+                   sizeof(flash_poll_loop));
     put_insn3(&cpu, wrapper, 0x004136u);
     put_insn3(&cpu, wrapper + 3u,
               encode_test_l32r(wrapper + 3u, rom_literal, 8));
@@ -920,6 +926,8 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     mem_write32(cpu.mem, 0x40080D50u, old_state);
 
     ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 4);
+    ASSERT_EQ(cpu.poll_spin_pc, 0x40083B29u);
+    ASSERT_EQ(cpu.poll_spin_insns, 4u);
 
     const uint32_t lhs = 0x3FFB0100u;
     const uint32_t rhs = 0x3FFB0200u;

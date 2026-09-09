@@ -244,6 +244,46 @@ TEST(br_beqz_not_taken) {
     teardown(&cpu);
 }
 
+TEST(br_configured_poll_loop_batches_repeated_iterations) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    put_insn3(&cpu, BASE,     0x002F00u); /* nop */
+    put_insn3(&cpu, BASE + 3, 0x002F00u); /* nop */
+    put_insn3(&cpu, BASE + 6, 0x002F00u); /* nop */
+    /* From BASE+9, imm12=-13 branches back to BASE. */
+    put_insn3(&cpu, BASE + 9, bri12(0, 4, -13));
+    cpu.poll_spin_pc = BASE;
+    cpu.poll_spin_insns = 4u;
+    cpu.running = true;
+    ar_write(&cpu, 4, 0);
+    ASSERT_EQ(xtensa_run(&cpu, 40), 40);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(cpu.ccount, 40u);
+    ASSERT_EQ64(cpu.cycle_count, 40u);
+    ASSERT_EQ64(cpu.insn_count, 40u);
+    ASSERT_FALSE(cpu.core_handoff);
+    teardown(&cpu);
+}
+
+TEST(br_configured_poll_loop_preserves_timer_boundary) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    put_insn3(&cpu, BASE,     0x002F00u); /* nop */
+    put_insn3(&cpu, BASE + 3, 0x002F00u); /* nop */
+    put_insn3(&cpu, BASE + 6, 0x002F00u); /* nop */
+    put_insn3(&cpu, BASE + 9, bri12(0, 4, -13));
+    cpu.poll_spin_pc = BASE;
+    cpu.poll_spin_insns = 4u;
+    cpu.running = true;
+    cpu.intenable = 0u;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 7u);
+    ar_write(&cpu, 4, 0);
+    ASSERT_EQ(xtensa_run(&cpu, 40), 40);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(cpu.ccount, 40u);
+    ASSERT_TRUE(cpu.interrupt & (1u << 6));
+    ASSERT_EQ(cpu.next_timer_event, UINT32_MAX);
+    teardown(&cpu);
+}
+
 TEST(br_bnez_taken) {
     xtensa_cpu_t cpu; setup(&cpu);
     put_insn3(&cpu, BASE, bri12(1, 4, 8));
@@ -614,6 +654,8 @@ void run_branch_tests(void) {
     RUN_TEST(br_bgeu_taken);
     RUN_TEST(br_beqz_taken);
     RUN_TEST(br_beqz_not_taken);
+    RUN_TEST(br_configured_poll_loop_batches_repeated_iterations);
+    RUN_TEST(br_configured_poll_loop_preserves_timer_boundary);
     RUN_TEST(br_bnez_taken);
     RUN_TEST(br_bnez_not_taken);
     RUN_TEST(br_bltz_taken);

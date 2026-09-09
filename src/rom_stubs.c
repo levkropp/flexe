@@ -5318,6 +5318,23 @@ static const fw_addr_hook_t fw_wled_v1601_hooks[] = {
     { 0, NULL, NULL, 0 }
 };
 
+/* spi_flash_op_block_func waits here for the peer core to finish the flash
+ * operation. With deterministic core timeslices, continuing to interpret the
+ * back-edge cannot make the flag change. Batch its four-instruction polling
+ * body while retaining the complete guest cycle/retirement accounting. */
+#define WLED_V1601_FLASH_POLL_LOOP      0x40083B29u
+
+static bool fw_wled_has_flash_poll_loop(xtensa_mem_t *mem) {
+    static const uint8_t loop[] = {
+        0xC0, 0x20, 0x00, /* memw */
+        0x82, 0x09, 0x00, /* l8ui a8, a9, 0 */
+        0x80, 0x80, 0x74, /* extui a8, a8, 0, 8 */
+        0x16, 0x38, 0xFF, /* beqz a8, -13 */
+    };
+    return fw_signature_matches(mem, WLED_V1601_FLASH_POLL_LOOP,
+                                loop, sizeof(loop));
+}
+
 /* WLED spends most of its remaining interpreter time in the native IDF 4.4
  * spinlock wrappers around heap and event-loop operations.  These addresses
  * and globals come from the same exact, independently fingerprinted v0.16.0.1
@@ -5522,6 +5539,10 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
      * was used before it acquired a profile-specific acceleration table, and
      * collapse the fully modeled uncontended FreeRTOS critical boundary. */
     if (profile == ROM_FIRMWARE_WLED_V1601) {
+        if (fw_wled_has_flash_poll_loop(stubs->cpu->mem)) {
+            stubs->cpu->poll_spin_pc = WLED_V1601_FLASH_POLL_LOOP;
+            stubs->cpu->poll_spin_insns = 4u;
+        }
         if (fw_wled_resolve_critical_globals(stubs)) {
             rom_stubs_register_conditional_ctx(
                     stubs, WLED_V1601_ENTER_CRITICAL,

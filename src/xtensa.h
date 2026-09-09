@@ -291,6 +291,11 @@ struct xtensa_cpu {
      * the other ESP32 core as owner sets this flag so the runner hands over
      * early. It is deliberately not architectural or serialized. */
     bool     core_handoff;
+    /* Optional verified polling loop. A taken BEQZ back-edge to this PC can
+     * batch complete iterations until the next scheduler/timer boundary:
+     * nothing inside the deterministic timeslice can change its DRAM flag. */
+    uint32_t poll_spin_pc;
+    uint8_t  poll_spin_insns;
     /* Set by the session before the first instruction; consumed by the first
      * ENTRY. The windowed ABI wants a caller's stack pointer at [sp-12] of
      * every frame, and hardware's bootloader leaves one because it *calls*

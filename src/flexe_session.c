@@ -347,6 +347,8 @@ static int session_build(flexe_session_t *s)
     s->cpu[1].window_trace = cfg->window_trace;
     s->cpu[1].window_trace_active = false;
     s->cpu[1].spill_verify = cfg->spill_verify;
+    s->cpu[1].poll_spin_pc = s->cpu[0].poll_spin_pc;
+    s->cpu[1].poll_spin_insns = s->cpu[0].poll_spin_insns;
     /* Core 1 needs a valid stack before its boot entry runs: the APP CPU
      * entry point begins with `entry a1, 32` and never sets one itself, so
      * whatever we put here carries its whole startup.

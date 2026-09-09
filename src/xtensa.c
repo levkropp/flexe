@@ -2470,10 +2470,11 @@ void exec_calln(xtensa_cpu_t *cpu, uint32_t insn) {
 
 /* Execute op0=6 (SI) - J, BRI12, BRI8, LOOP, ENTRY */
 static inline __attribute__((always_inline))
-void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
+bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
     int nn = XT_N(insn);
     int m = XT_M(insn);
     int s = XT_S(insn);
+    bool poll_spin = false;
 
     switch (nn) {
     case 0: /* J - unconditional jump */
@@ -2486,7 +2487,14 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
           uint32_t target = cpu->pc + (uint32_t)imm12 + 1;
           int32_t val = (int32_t)ar_read(cpu, s);
           switch (m) {
-          case 0: if (val == 0) BRANCH_TO(cpu, target); break;  /* BEQZ */
+          case 0: /* BEQZ */
+              if (val == 0) {
+                  BRANCH_TO(cpu, target);
+                  if (__builtin_expect(cpu->poll_spin_pc != 0u &&
+                                       cpu->poll_spin_pc == target, 0))
+                      poll_spin = true;
+              }
+              break;
           case 1: if (val != 0) BRANCH_TO(cpu, target); break;  /* BNEZ */
           case 2: if (val < 0)  BRANCH_TO(cpu, target); break;  /* BLTZ */
           case 3: if (val >= 0) BRANCH_TO(cpu, target); break;  /* BGEZ */
@@ -2543,7 +2551,7 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                        * overflow vector can save it. */
                       raise_window_exception(cpu, cpu->pc - 3, hit,
                                              window_overflow_vec(cpu, hit));
-                      return;
+                      return false;
                   }
               } else {
                   /* The legacy synthesized spill derives a colliding frame's
@@ -2673,6 +2681,7 @@ void exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
           }
         } break;
     }
+    return poll_spin;
 }
 
 /* Execute op0=7 (B) - RRI8 conditional branches */
@@ -3233,7 +3242,24 @@ have_insn:
             } break;
         case 4: exec_mac16(cpu, insn); break;
         case 5: exec_calln(cpu, insn); break;
-        case 6: exec_si(cpu, insn); break;
+        case 6:
+            if (__builtin_expect(exec_si(cpu, insn), 0)) {
+                /* Signal the batch runner without adding a test to every
+                 * ordinary instruction. Value 1 is intentionally not a
+                 * native-span count; public xtensa_step() already maps it to
+                 * one successfully retired instruction. */
+                cpu->ccount++;
+                ++*local_cc;
+                if (__builtin_expect(cpu->ccount >= cpu->next_timer_event, 0))
+                    xtensa_fire_timers(cpu);
+                if (__builtin_expect(cpu->irq_check, 0)) {
+                    cpu->irq_check = false;
+                    if (cpu->interrupt & cpu->intenable)
+                        xtensa_check_interrupts(cpu);
+                }
+                return cpu->exception ? -1 : 1;
+            }
+            break;
         case 7: exec_b(cpu, insn); break;
         default: break;
         }
@@ -3342,6 +3368,37 @@ static inline int xtensa_run_halted(xtensa_cpu_t *cpu, uint64_t *local_cc,
     return executed;
 }
 
+/* Collapse complete repetitions of a profile-verified DRAM polling loop.
+ * The other core and peripheral callbacks run only at the outer batch
+ * boundary, so rereading the same byte inside this timeslice cannot observe a
+ * change. Keep the architectural PC/register state at the loop head and
+ * charge every skipped guest instruction. Never cross a timer boundary or a
+ * debugger breakpoint: either can make an intermediate instruction visible. */
+static inline int xtensa_run_poll_spin(xtensa_cpu_t *cpu,
+                                       uint64_t *local_cc, int room) {
+    unsigned width = cpu->poll_spin_insns;
+    if (width == 0u || room < (int)width || cpu->breakpoint_count > 0 ||
+        g_dbg_step_slow || cpu->pc != cpu->poll_spin_pc)
+        return 0;
+
+    int skip = room - room % (int)width;
+    if (cpu->next_timer_event != UINT32_MAX) {
+        uint32_t distance = (int32_t)(cpu->ccount - cpu->next_timer_event) >= 0
+                          ? 0u : cpu->next_timer_event - cpu->ccount;
+        if (distance <= 1u)
+            return 0;
+        uint32_t safe = distance - 1u;
+        if ((uint32_t)skip > safe)
+            skip = (int)(safe - safe % width);
+    }
+    if (skip <= 0)
+        return 0;
+
+    cpu->ccount += (uint32_t)skip;
+    *local_cc += (uint64_t)skip;
+    return skip;
+}
+
 /* Batch execution: step_impl is always_inline → entire decode/execute loop
  * lives in this function body, eliminating per-instruction call overhead.
  * cycle_count is cached in a local to stay in a register across iterations
@@ -3399,7 +3456,11 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
                 int step_result = xtensa_step_impl(cpu, &cc, &prev_pc);
                 if (__builtin_expect(step_result != 0, 0)) {
                     if (step_result < 0) { executed++; break; }
-                    executed += step_result - 1;
+                    if (step_result == 1)
+                        executed += xtensa_run_poll_spin(
+                                cpu, &cc, remaining - executed - 1);
+                    else
+                        executed += step_result - 1;
                 }
                 if (__builtin_expect(!cpu->running, 0)) {
                     executed++;   /* include the dispatch that stopped the CPU */
@@ -3416,10 +3477,14 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
             }
         } else {
             for (; executed < remaining; executed++) {
-                if (__builtin_expect(xtensa_step_impl(cpu, &cc, &prev_pc) != 0,
-                                     0)) {
-                    executed++;
-                    break;
+                int step_result = xtensa_step_impl(cpu, &cc, &prev_pc);
+                if (__builtin_expect(step_result != 0, 0)) {
+                    if (step_result < 0 || step_result > 1) {
+                        executed++;
+                        break;
+                    }
+                    executed += xtensa_run_poll_spin(
+                            cpu, &cc, remaining - executed - 1);
                 }
                 if (__builtin_expect(!cpu->running, 0)) { executed++; break; }
                 if (__builtin_expect(cpu->halted, 0)) { executed++; break; }
