@@ -13,6 +13,7 @@
 #include "guest_call.h"
 #include "rom_stubs.h"
 #include "memory.h"
+#include "firmware_scan.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -2735,30 +2736,125 @@ typedef struct {
     const char *name;
 } wifi_fw_hook_t;
 
-/* NerdMiner ESP32-2432S028R production image. These entries are
- * signature-matched library routine entries for the stock factory image used
- * by the integration profile. */
+/* A stripped static link does not retain lwIP's symbol names, but it does
+ * retain the library implementations. Identify a compatibility family from
+ * several independently relocatable functions instead of identifying an
+ * application and borrowing that application's old addresses.
+ *
+ * This first family is shared byte-for-byte (apart from L32R/CALL/J link
+ * relocations) by Arduino-ESP32 / ESP-IDF 4.x images in the corpus: three
+ * unrelated applications and three unrelated final links. The six members
+ * jointly cover 177 instruction bytes. Every member must occur exactly once
+ * before any hook is installed, so neither a short prologue nor a CRC hit can
+ * authorize a native replacement on its own. */
+typedef struct {
+    size_t size;
+    uint32_t crc32;
+    rom_stub_fn fn;
+    const char *name;
+    uint32_t addr;
+} wifi_fw_fingerprint_t;
+
+static int wifi_discover_idf4_lwip_family(
+        wifi_stubs_t *ws, wifi_fw_fingerprint_t *found,
+        size_t found_capacity) {
+    static const wifi_fw_fingerprint_t family[] = {
+        { 32u, 0xC5D40426u, stub_lwip_gethostbyname,
+                              "lwip_gethostbyname", 0u },
+        { 28u, 0xCF4C91E4u, stub_lwip_read, "lwip_read", 0u },
+        { 32u, 0xC9D7E309u, stub_lwip_sendto, "lwip_sendto", 0u },
+        { 31u, 0x0A84DC55u, stub_lwip_send, "lwip_send", 0u },
+        { 30u, 0xCDFF35FFu, stub_dns_gethostbyname,
+                              "dns_gethostbyname", 0u },
+    };
+    static const wifi_fw_fingerprint_t write_variants[] = {
+        /* ESP-IDF 4.4.5/4.4.6: the 21-byte forwarding function followed by
+         * padding and the start of lwip_select. */
+        { 31u, 0xCADB7A47u, stub_lwip_write, "lwip_write", 0u },
+        /* ESP-IDF 4.4.8: the same function followed by lwip_getsockopt. The
+         * short function alone is intentionally not used: another lwIP
+         * forwarding wrapper has the same 24-byte fingerprint. */
+        { 30u, 0x188638AAu, stub_lwip_write, "lwip_write", 0u },
+    };
+    const size_t core_count = sizeof(family) / sizeof(family[0]);
+    const size_t count = core_count + 1u;
+    if (!ws || !ws->cpu || !ws->cpu->mem || !found ||
+        found_capacity < count)
+        return 0;
+
+    for (size_t i = 0u; i < core_count; i++) {
+        found[i] = family[i];
+        unsigned matches = firmware_find_unique_xtensa_function(
+                ws->cpu->mem, ESP32_FIRMWARE_INSN_ADDR_LOW,
+                ESP32_FLASH_INSN_ADDR_HIGH, found[i].size,
+                found[i].crc32, &found[i].addr);
+        if (matches != 1u) {
+            if (getenv("FLEXE_SCANDBG"))
+                fprintf(stderr,
+                        "[wifi] stripped lwIP fingerprint %s: %u match(es)\n",
+                        found[i].name, matches);
+            return 0;
+        }
+        for (size_t j = 0u; j < i; j++)
+            if (found[j].addr == found[i].addr)
+                return 0;
+    }
+
+    uint32_t write_addr = 0u;
+    for (size_t i = 0u;
+         i < sizeof(write_variants) / sizeof(write_variants[0]); i++) {
+        uint32_t candidate = 0u;
+        unsigned matches = firmware_find_unique_xtensa_function(
+                ws->cpu->mem, ESP32_FIRMWARE_INSN_ADDR_LOW,
+                ESP32_FLASH_INSN_ADDR_HIGH, write_variants[i].size,
+                write_variants[i].crc32, &candidate);
+        if (matches > 1u || (matches == 1u && write_addr != 0u &&
+                             write_addr != candidate))
+            return 0;
+        if (matches == 1u)
+            write_addr = candidate;
+    }
+    if (write_addr == 0u)
+        return 0;
+    found[core_count] = write_variants[0];
+    found[core_count].addr = write_addr;
+
+    for (size_t i = 0u; i < count; i++)
+        rom_stubs_register_exact_ctx(ws->rom, found[i].addr, found[i].fn,
+                                     found[i].name, ws);
+    fprintf(stderr,
+            "[wifi] discovered stripped ESP-IDF 4.x lwIP family "
+            "(%zu entries)\n", count);
+    return (int)count;
+}
+
+static bool wifi_hook_was_discovered(
+        const wifi_fw_hook_t *hook, const wifi_fw_fingerprint_t *found,
+        int found_count) {
+    for (int i = 0; i < found_count; i++)
+        if (found[i].fn == hook->fn &&
+            strcmp(found[i].name, hook->name) == 0)
+            return true;
+    return false;
+}
+
+/* Remaining NerdMiner ESP32-2432S028R compatibility entries. Shared lwIP
+ * functions are discovered above and deliberately do not appear here. */
 static const wifi_fw_hook_t nerdminer_wifi_hooks[] = {
-    { 0x4011DC24u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
     { 0x4011F530u, stub_lwip_accept,        "lwip_accept" },
     { 0x4011F740u, stub_lwip_bind,          "lwip_bind" },
     { 0x4011F7F4u, stub_lwip_close,         "lwip_close" },
     { 0x4011F92Cu, stub_lwip_connect,       "lwip_connect" },
     { 0x4011F9ECu, stub_lwip_listen,        "lwip_listen" },
     { 0x4011FA54u, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x4011FB24u, stub_lwip_read,          "lwip_read" },
     { 0x4011FB40u, stub_lwip_recv,          "lwip_recv" },
-    { 0x4011FB5Cu, stub_lwip_sendto,        "lwip_sendto" },
-    { 0x4011FCDCu, stub_lwip_send,          "lwip_send" },
     { 0x4011FD68u, stub_lwip_socket,        "lwip_socket" },
-    { 0x4011FE14u, stub_lwip_write,         "lwip_write" },
     { 0x4011FE2Cu, stub_lwip_select,        "lwip_select" },
     { 0x40120190u, stub_lwip_getsockname,   "lwip_getsockname" },
     { 0x401201A8u, stub_lwip_getsockopt,    "lwip_getsockopt" },
     { 0x40120250u, stub_lwip_setsockopt,    "lwip_setsockopt" },
     { 0x401202E4u, stub_lwip_ioctl,         "lwip_ioctl" },
     { 0x4012038Cu, stub_lwip_fcntl,         "lwip_fcntl" },
-    { 0x401216E8u, stub_dns_gethostbyname,  "dns_gethostbyname" },
     { 0x401156ACu, stub_vfs_select,         "esp_vfs_select" },
     { 0x40134844u, stub_vfs_fcntl,          "fcntl" },
     /* esp_event_handler_instance_register. Arduino registers its WiFi/IP
@@ -2930,11 +3026,12 @@ static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
  * reference, and it is the call8 target following the L32R of
  * WIFI_INIT_CONFIG_MAGIC (0x1F2F3F4F) in WLED's wifiLowLevelInit.
  *
- * The socket entries come from a complete v16.0.1 esp32dev build made with
- * WLED's pinned Tasmota Arduino 2.0.18 platform. Each 32-byte masked signature
- * is unique in the official image, and all fifteen linked routines retain the
- * same address. This exposes WiFiUDP at the host boundary while AsyncTCP can
- * continue to use its firmware-side raw lwIP implementation.
+ * The remaining socket entries come from a complete v16.0.1 esp32dev build
+ * made with WLED's pinned Tasmota Arduino 2.0.18 platform. Shared IDF 4.x
+ * routines are discovered as a library family above; only the variants not
+ * yet generalized remain in this application profile. This exposes WiFiUDP
+ * at the host boundary while AsyncTCP continues to use firmware-side raw
+ * lwIP.
  *
  * Deliberately absent: esp_wifi_set_mac, esp_wifi_set_promiscuous{,_filter,
  * _rx_cb} and esp_wifi_80211_tx. Those did not match uniquely, and they are
@@ -2944,20 +3041,14 @@ static const wifi_fw_hook_t marauder_v1151_wifi_hooks[] = {
  * what check-firmware.sh is for, rather than assuming.
  */
 static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
-    { 0x40156A98u, stub_lwip_gethostbyname, "lwip_gethostbyname" },
     { 0x40157D50u, stub_lwip_bind,          "lwip_bind" },
     { 0x40157E04u, stub_lwip_close,         "lwip_close" },
     { 0x40157F28u, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x40157FF4u, stub_lwip_read,          "lwip_read" },
-    { 0x40158010u, stub_lwip_sendto,        "lwip_sendto" },
-    { 0x40158184u, stub_lwip_send,          "lwip_send" },
     { 0x4015820Cu, stub_lwip_socket,        "lwip_socket" },
-    { 0x401582B8u, stub_lwip_write,         "lwip_write" },
     { 0x401582D0u, stub_lwip_getsockopt,    "lwip_getsockopt" },
     { 0x40158370u, stub_lwip_setsockopt,    "lwip_setsockopt" },
     { 0x401583FCu, stub_lwip_ioctl,         "lwip_ioctl" },
     { 0x4015849Cu, stub_lwip_fcntl,         "lwip_fcntl" },
-    { 0x4015975Cu, stub_dns_gethostbyname,  "dns_gethostbyname" },
     { 0x401B1838u, stub_errno,              "__errno" },
     { 0x401561B8u, stub_esp_wifi_init,             "esp_wifi_init" },
     { 0x401561A0u, stub_esp_wifi_deinit,           "esp_wifi_deinit" },
@@ -2979,30 +3070,24 @@ static const wifi_fw_hook_t wled_v1601_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
-/* openHASP 0.7.0-rc13, Lanbon L8. The addresses below were relocated from a
- * symbol-bearing build of the exact release commit and pinned 2.0.14 core to
- * the official OTA image. All twenty masked code signatures matched uniquely;
- * the same application is embedded in the distributed full-flash image. */
+/* Remaining openHASP 0.7.0-rc13 Lanbon L8 compatibility entries. The shared
+ * IDF 4.x lwIP family is structurally discovered above. These variants were
+ * relocated from a symbol-bearing build of the exact release commit and
+ * pinned 2.0.14 core to the official OTA image. */
 static const wifi_fw_hook_t openhasp_v070rc13_wifi_hooks[] = {
-    { 0x4015ABFCu, stub_lwip_gethostbyname, "lwip_gethostbyname" },
     { 0x4015C574u, stub_lwip_accept,        "lwip_accept" },
     { 0x4015C758u, stub_lwip_bind,          "lwip_bind" },
     { 0x4015C80Cu, stub_lwip_close,         "lwip_close" },
     { 0x4015C934u, stub_lwip_connect,       "lwip_connect" },
     { 0x4015C9F4u, stub_lwip_listen,        "lwip_listen" },
     { 0x4015CA5Cu, stub_lwip_recvfrom,      "lwip_recvfrom" },
-    { 0x4015CB2Cu, stub_lwip_read,          "lwip_read" },
     { 0x4015CB48u, stub_lwip_recv,          "lwip_recv" },
-    { 0x4015CB64u, stub_lwip_sendto,        "lwip_sendto" },
-    { 0x4015CCE4u, stub_lwip_send,          "lwip_send" },
     { 0x4015CD70u, stub_lwip_socket,        "lwip_socket" },
-    { 0x4015CE20u, stub_lwip_write,         "lwip_write" },
     { 0x4015CE38u, stub_lwip_select,        "lwip_select" },
     { 0x4015D23Cu, stub_lwip_getsockopt,    "lwip_getsockopt" },
     { 0x4015D2E4u, stub_lwip_setsockopt,    "lwip_setsockopt" },
     { 0x4015D378u, stub_lwip_ioctl,         "lwip_ioctl" },
     { 0x4015D420u, stub_lwip_fcntl,         "lwip_fcntl" },
-    { 0x4015E980u, stub_dns_gethostbyname,  "dns_gethostbyname" },
     { 0x401D21D0u, stub_errno,              "__errno" },
     { 0, NULL, NULL },
 };
@@ -3035,12 +3120,16 @@ static const wifi_fw_hook_t tasmota32_v1560_wifi_hooks[] = {
     { 0, NULL, NULL },
 };
 
-int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
+int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point)
 {
     if (!ws) return 0;
     esp32_rom_stubs_t *rom = ws->cpu->pc_hook_ctx;
     if (!rom) return 0;
     ws->rom = rom;
+
+    wifi_fw_fingerprint_t discovered[6];
+    int discovered_count = wifi_discover_idf4_lwip_family(
+            ws, discovered, sizeof(discovered) / sizeof(discovered[0]));
 
     const wifi_fw_hook_t *hooks = NULL;
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
@@ -3066,7 +3155,7 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
     else if (profile == ROM_FIRMWARE_TASMOTA32_V1560)
         hooks = tasmota32_v1560_wifi_hooks;
     else
-        return 0;
+        return discovered_count;
     /* No firmware_status_addr for any profile.
      *
      * This used to write WL_CONNECTED into 0x3FFC5C78 on esp_wifi_connect()
@@ -3083,8 +3172,10 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
      * Firmware learns it is connected the way hardware tells it: through the
      * WIFI_EVENT/IP_EVENT handlers that wifi_stubs_tick() now delivers. */
 
-    int hooked = 0;
+    int hooked = discovered_count;
     for (const wifi_fw_hook_t *h = hooks; h->fn; h++) {
+        if (wifi_hook_was_discovered(h, discovered, discovered_count))
+            continue;
         rom_stubs_register_ctx(rom, h->addr, h->fn, h->name, ws);
         hooked++;
     }
@@ -3100,7 +3191,8 @@ int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point)
         ws->native_event_post_addr = 0x40151768u;
         hooked++;
     }
-    fprintf(stderr, "[wifi] hooked %d verified production-ROM entries\n", hooked);
+    fprintf(stderr, "[wifi] hooked %d verified stripped-firmware entries\n",
+            hooked);
     return hooked;
 }
 

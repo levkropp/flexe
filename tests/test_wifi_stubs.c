@@ -19,7 +19,6 @@
 #define TEST_PROMISC_PACKET_ADDR     0x50001D00u
 #define TEST_PROMISC_RX_CTRL_SIZE    28u
 #define TEST_NERDMINER_ENTRY         0x40089268u
-#define TEST_NERDMINER_DNS           0x401216E8u
 #define TEST_WLED_ENTRY              0x40083E68u
 #define TEST_WLED_EVENT_REGISTER     0x40150E34u
 #define TEST_WLED_EVENT_POST         0x40151768u
@@ -36,6 +35,67 @@
 #define TEST_TASMOTA_BIND            0x4019BA54u
 #define TEST_TASMOTA_LISTEN          0x4019BD10u
 #define TEST_TASMOTA_RECV            0x4019BE5Cu
+
+typedef struct {
+    const uint8_t *bytes;
+    size_t size;
+    uint32_t offset;
+} test_lwip_fingerprint_t;
+
+/* Instruction prefixes from one ordinary ESP-IDF 4.x link. The production
+ * matcher hashes their normalized instructions; placing them at unrelated
+ * addresses here proves that application identity and final link position
+ * are not inputs to discovery. */
+static void seed_relocated_idf4_lwip_family(xtensa_cpu_t *cpu,
+                                            uint32_t base) {
+    static const uint8_t gethostbyname[] = {
+        0x36, 0x81, 0x00, 0x0C, 0x2C, 0x8B, 0xB1, 0xAD,
+        0x02, 0x25, 0x26, 0x12, 0xA0, 0x30, 0x74, 0x8C,
+        0xD3, 0x21, 0x06, 0xDA, 0x32, 0xA0, 0xD2, 0x39,
+        0x02, 0x0C, 0x02, 0xC0, 0x20, 0x00, 0x1D, 0xF0,
+    };
+    static const uint8_t read_fn[] = {
+        0x36, 0x41, 0x00, 0xF2, 0xA0, 0x00, 0xF0, 0xEF,
+        0x20, 0xF0, 0xDF, 0x20, 0xCD, 0x04, 0xBD, 0x03,
+        0xAD, 0x02, 0x25, 0xF2, 0xFF, 0x2D, 0x0A, 0x1D,
+        0xF0, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t sendto_fn[] = {
+        0x36, 0xC1, 0x00, 0x20, 0xA2, 0x20, 0x72, 0x61,
+        0x03, 0xC0, 0x20, 0x00, 0xE5, 0x1C, 0xFF, 0xA0,
+        0x7A, 0x20, 0x88, 0x31, 0xCC, 0x5A, 0x7C, 0xF2,
+        0x86, 0x08, 0x00, 0x00, 0x00, 0x92, 0x2A, 0x00,
+    };
+    static const uint8_t send_fn[] = {
+        0x36, 0x61, 0x00, 0xAD, 0x02, 0x25, 0x06, 0xFF,
+        0x6D, 0x0A, 0xCC, 0x3A, 0x7C, 0xF2, 0x1D, 0xF0,
+        0x00, 0xA2, 0x2A, 0x00, 0xD2, 0xA0, 0xF0, 0x82,
+        0x2A, 0x00, 0x80, 0xDD, 0x10, 0x26, 0xBD,
+    };
+    static const uint8_t write_fn[] = {
+        0x36, 0x41, 0x00, 0xD2, 0xA0, 0x00, 0x40, 0xC4,
+        0x20, 0x30, 0xB3, 0x20, 0xAD, 0x02, 0xE5, 0xEB,
+        0xFF, 0x2D, 0x0A, 0x1D, 0xF0, 0x00, 0x00, 0x00,
+        0x36, 0x81, 0x00, 0x20, 0xA2, 0x20,
+    };
+    static const uint8_t dns[] = {
+        0x36, 0x41, 0x00, 0x0C, 0x2E, 0xDD, 0x05, 0xCD,
+        0x04, 0xBD, 0x03, 0xAD, 0x02, 0xE5, 0xBC, 0xFF,
+        0xA0, 0x20, 0x74, 0x1D, 0xF0, 0x00, 0x00, 0x00,
+        0x36, 0x41, 0x00, 0x25, 0x10, 0x0E,
+    };
+    static const test_lwip_fingerprint_t functions[] = {
+        { gethostbyname, sizeof(gethostbyname), 0x000u },
+        { read_fn,       sizeof(read_fn),       0x080u },
+        { sendto_fn,     sizeof(sendto_fn),     0x100u },
+        { send_fn,       sizeof(send_fn),       0x180u },
+        { write_fn,      sizeof(write_fn),      0x200u },
+        { dns,           sizeof(dns),           0x280u },
+    };
+    for (size_t i = 0u; i < sizeof(functions) / sizeof(functions[0]); i++)
+        put_test_bytes(cpu, base + functions[i].offset, functions[i].bytes,
+                       functions[i].size);
+}
 #define TEST_REENT_ERRNO              0x3FFE3C00u
 
 typedef struct {
@@ -136,7 +196,7 @@ TEST(promiscuous_frame_runs_callback_and_restores_cpu) {
     seed_marauder_v11401_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_MARAUDER_ENTRY), 15);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_MARAUDER_ENTRY), 15);
 
     /* A minimal windowed callback: entry a1, 32; retw.n. */
     put_insn3(&cpu, BASE, 0x004136u);
@@ -216,7 +276,7 @@ TEST(raw_tx_crosses_host_radio_boundary) {
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
     test_raw_tx_capture_t capture = {0};
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_MARAUDER_ENTRY), 15);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_MARAUDER_ENTRY), 15);
     wifi_stubs_set_raw_tx_callback(wifi, capture_raw_tx, &capture);
 
     static const uint8_t beacon[] = {
@@ -265,19 +325,75 @@ TEST(dns_override_applies_to_raw_lwip_dns_api) {
     static const char hostname[] = "must-not-resolve.invalid";
     static const uint8_t loopback_bytes[] = {127u, 0u, 0u, 1u};
     uint32_t loopback = 0;
+    const uint32_t family = BASE + 0x1000u;
 
     memcpy(&loopback, loopback_bytes, sizeof(loopback));
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_NERDMINER_ENTRY), 31);
+    seed_relocated_idf4_lwip_family(&cpu, family);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_NERDMINER_ENTRY), 31);
     wifi_stubs_set_dns_override(wifi, loopback);
     put_test_bytes(&cpu, name_addr, (const uint8_t *)hostname,
                    sizeof(hostname));
     mem_write32(cpu.mem, result_addr, 0xA5A5A5A5u);
 
-    invoke_wifi_call0_4(&cpu, TEST_NERDMINER_DNS, name_addr, result_addr,
+    invoke_wifi_call0_4(&cpu, family + 0x280u, name_addr, result_addr,
                         0u, 0u);
 
     ASSERT_EQ(ar_read(&cpu, 2), 0u); /* lwIP ERR_OK */
     ASSERT_EQ(mem_read32(cpu.mem, result_addr), loopback);
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.dns_calls, 1u);
+
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(stripped_idf4_lwip_family_relocates_without_firmware_profile) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    const uint32_t family = BASE + 0x1000u;
+    const uint32_t dns_addr = family + 0x280u;
+    const uint32_t name_addr = 0x3FFB1000u;
+    const uint32_t result_addr = 0x3FFB1100u;
+    static const char hostname[] = "relocated.invalid";
+    static const uint8_t loopback_bytes[] = {127u, 0u, 0u, 1u};
+    uint32_t loopback = 0u;
+
+    seed_relocated_idf4_lwip_family(&cpu, family);
+
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, family + 0x000u, 32u, 0xC5D40426u));
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, family + 0x080u, 28u, 0xCF4C91E4u));
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, family + 0x100u, 32u, 0xC9D7E309u));
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, family + 0x180u, 31u, 0x0A84DC55u));
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, family + 0x200u, 30u, 0x188638AAu));
+    ASSERT_TRUE(firmware_xtensa_reloc_crc32_matches(
+            cpu.mem, family + 0x280u, 30u, 0xCDFF35FFu));
+
+    /* Five correct functions and one damaged instruction are not a family;
+     * discovery is transactional and installs none of them. */
+    mem_write8(cpu.mem, family + 0x200u + 3u, 0xC2u);
+    ASSERT_EQ(wifi_stubs_hook_firmware(
+                      wifi, 0x40081234u), 0);
+    mem_write8(cpu.mem, family + 0x200u + 3u, 0xD2u);
+
+    ASSERT_EQ(wifi_stubs_hook_firmware(
+                      wifi, 0x40081234u), 6);
+    memcpy(&loopback, loopback_bytes, sizeof(loopback));
+    wifi_stubs_set_dns_override(wifi, loopback);
+    put_test_bytes(&cpu, name_addr, (const uint8_t *)hostname,
+                   sizeof(hostname));
+    invoke_wifi_call0_4(&cpu, dns_addr, name_addr, result_addr, 0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, result_addr), loopback);
+
     wifi_stubs_stats_t stats = {0};
     wifi_stubs_get_stats(wifi, &stats);
     ASSERT_EQ64(stats.dns_calls, 1u);
@@ -294,7 +410,7 @@ TEST(v11423_fingerprint_selects_shifted_wifi_entries) {
     seed_marauder_v11423_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_MARAUDER_ENTRY), 15);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_MARAUDER_ENTRY), 15);
     invoke_wifi_call0(&cpu, 0x4013B518u, 0u);
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
     invoke_wifi_call0(&cpu, 0x401990A0u, 0u);
@@ -317,7 +433,7 @@ TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries) {
     seed_marauder_v1121_cyd2usb_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, 0x40081E90u), 15);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081E90u), 15);
     invoke_wifi_call0(&cpu, 0x401730CCu, 0u);
     ASSERT_EQ(ar_read(&cpu, 2), 0u);
     invoke_wifi_call0(&cpu, 0x401A861Cu, 0u);
@@ -343,7 +459,8 @@ TEST(wled_posts_disconnect_on_native_event_loop) {
     const uint32_t event_base = 0x3FFB1000u;
     static const char name[] = "WIFI_EVENT";
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_WLED_ENTRY), 33);
+    seed_relocated_idf4_lwip_family(&cpu, BASE + 0x1000u);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_WLED_ENTRY), 33);
     ASSERT_EQ(rom_stubs_register_ctx(rom, TEST_WLED_EVENT_POST,
                                      capture_native_event_post,
                                      "test_event_post", &capture), 0);
@@ -395,9 +512,10 @@ TEST(openhasp_profile_hooks_production_socket_boundary) {
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
     seed_openhasp_v070rc13_profile(&cpu);
+    seed_relocated_idf4_lwip_family(&cpu, BASE + 0x1000u);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_OPENHASP_ENTRY), 20);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_OPENHASP_ENTRY), 20);
     invoke_wifi_call0_4(&cpu, TEST_OPENHASP_SOCKET, 10u, 1u, 0u, 0u);
     uint32_t socket_fd = ar_read(&cpu, 2);
     ASSERT_EQ(socket_fd, 46u);
@@ -422,7 +540,7 @@ TEST(tasmota_profile_hooks_production_socket_boundary) {
     seed_tasmota32_v1560_profile(&cpu);
     wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_TASMOTA_ENTRY), 21);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_TASMOTA_ENTRY), 21);
     invoke_wifi_call0_4(&cpu, TEST_TASMOTA_SOCKET, 2u, 1u, 0u, 0u);
     uint32_t socket_fd = ar_read(&cpu, 2);
     ASSERT_EQ(socket_fd, 46u);
@@ -451,7 +569,7 @@ TEST(tasmota_recv_peek_preserves_http_request) {
     const uint32_t sockaddr_len_addr = 0x3FFB1020u;
     const uint32_t recv_addr = 0x3FFB1040u;
 
-    ASSERT_EQ(wifi_stubs_hook_firmware_addrs(wifi, TEST_TASMOTA_ENTRY), 21);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, TEST_TASMOTA_ENTRY), 21);
     invoke_wifi_call0_4(&cpu, TEST_TASMOTA_SOCKET, 2u, 1u, 0u, 0u);
     uint32_t listen_fd = ar_read(&cpu, 2);
     ASSERT_EQ(listen_fd, 46u);
@@ -545,6 +663,7 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);
     RUN_TEST(raw_tx_crosses_host_radio_boundary);
     RUN_TEST(dns_override_applies_to_raw_lwip_dns_api);
+    RUN_TEST(stripped_idf4_lwip_family_relocates_without_firmware_profile);
     RUN_TEST(v11423_fingerprint_selects_shifted_wifi_entries);
     RUN_TEST(v1121_cyd2usb_fingerprint_selects_idf55_wifi_entries);
     RUN_TEST(wled_posts_disconnect_on_native_event_loop);

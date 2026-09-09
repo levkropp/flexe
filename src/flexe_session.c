@@ -273,7 +273,7 @@ static int session_build(flexe_session_t *s)
     /* WiFi / lwip socket bridge */
     s->wstubs = wifi_stubs_create(&s->cpu[0]);
     if (s->wstubs) {
-        wifi_stubs_hook_firmware_addrs(s->wstubs, res.entry_point);
+        wifi_stubs_hook_firmware(s->wstubs, res.entry_point);
         if (s->syms)
             wifi_stubs_hook_symbols(s->wstubs, s->syms);
     }

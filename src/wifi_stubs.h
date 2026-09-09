@@ -56,8 +56,9 @@ void wifi_stubs_destroy(wifi_stubs_t *ws);
 /* Look up ELF symbols and register PC hooks for lwip socket functions */
 int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms);
 
-/* Register verified entry points for supported symbol-less production ROMs. */
-int wifi_stubs_hook_firmware_addrs(wifi_stubs_t *ws, uint32_t entry_point);
+/* Discover stripped library boundaries where possible, then add any remaining
+ * compatibility hooks for an exactly verified legacy firmware profile. */
+int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point);
 
 /* Snapshot host-network and virtual-radio activity for integration gates. */
 void wifi_stubs_get_stats(const wifi_stubs_t *ws, wifi_stubs_stats_t *stats);

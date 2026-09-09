@@ -28,6 +28,24 @@ bool firmware_crc32_matches(xtensa_mem_t *mem, uint32_t addr, size_t size,
 bool firmware_xtensa_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
                                    size_t size, uint32_t expected_crc);
 
+/* Match a relocatable function prefix. In addition to L32R and CALLn, this
+ * form normalizes J's link-time displacement. It is intended for identifying
+ * a family of stripped library functions whose public ABI is stable while
+ * their final link addresses are not. A single prefix is not sufficient
+ * evidence for a native replacement; callers should require several related
+ * functions to resolve coherently. */
+bool firmware_xtensa_reloc_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
+                                         size_t size,
+                                         uint32_t expected_crc);
+
+/* Search function ENTRY sites and count matches for one relocatable
+ * fingerprint. `unique_addr_out` receives the address only when exactly one
+ * match exists, and zero otherwise. The count is saturated at two because
+ * callers only need to distinguish missing, unique, and ambiguous. */
+unsigned firmware_find_unique_xtensa_function(
+        xtensa_mem_t *mem, uint32_t start, uint32_t end, size_t size,
+        uint32_t expected_crc, uint32_t *unique_addr_out);
+
 /* Locate complete, address-independent bodies. The short prefix makes the
  * bytewise search cheap; CRC still covers every byte before a native
  * substitute is authorized. `end` is exclusive. */

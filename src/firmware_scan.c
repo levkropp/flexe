@@ -75,8 +75,9 @@ bool firmware_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
     return (uint32_t)crc == expected;
 }
 
-bool firmware_xtensa_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
-                                   size_t size, uint32_t expected) {
+static bool firmware_xtensa_crc32_matches_kind(
+        xtensa_mem_t *mem, uint32_t addr, size_t size, uint32_t expected,
+        bool normalize_jump) {
     if (!mem || size == 0u || size - 1u > UINT32_MAX - addr)
         return false;
 
@@ -108,11 +109,63 @@ bool firmware_xtensa_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
             bytes[0] &= 0x3Fu;
             bytes[1] = 0u;
             bytes[2] = 0u;
+        } else if (normalize_jump && length == 3u &&
+                   (bytes[0] & 0x3Fu) == 6u) {
+            /* J has the same relocation shape as CALLn. Preserve its six
+             * opcode bits and normalize the high two displacement bits too. */
+            bytes[0] &= 0x3Fu;
+            bytes[1] = 0u;
+            bytes[2] = 0u;
         }
         crc = crc32(crc, bytes, (uInt)length);
         offset += length;
     }
     return (uint32_t)crc == expected;
+}
+
+bool firmware_xtensa_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
+                                   size_t size, uint32_t expected) {
+    return firmware_xtensa_crc32_matches_kind(
+            mem, addr, size, expected, false);
+}
+
+bool firmware_xtensa_reloc_crc32_matches(xtensa_mem_t *mem, uint32_t addr,
+                                         size_t size, uint32_t expected) {
+    return firmware_xtensa_crc32_matches_kind(
+            mem, addr, size, expected, true);
+}
+
+unsigned firmware_find_unique_xtensa_function(
+        xtensa_mem_t *mem, uint32_t start, uint32_t end, size_t size,
+        uint32_t expected_crc, uint32_t *unique_addr_out) {
+    if (unique_addr_out)
+        *unique_addr_out = 0u;
+    if (!mem || !unique_addr_out || size < 3u || start >= end ||
+        size > (size_t)(end - start))
+        return 0u;
+
+    unsigned matches = 0u;
+    uint32_t found = 0u;
+    const uint32_t last = end - (uint32_t)size;
+    for (uint32_t addr = start; addr <= last; addr++) {
+        const uint8_t *first = mem_get_ptr(mem, addr);
+        if (!first || *first != 0x36u)
+            continue;
+        uint32_t insn;
+        if (!firmware_peek(mem, addr, 3u, &insn) ||
+            !firmware_xtensa_is_entry(insn) ||
+            !firmware_xtensa_reloc_crc32_matches(
+                    mem, addr, size, expected_crc))
+            continue;
+        found = addr;
+        if (++matches == 2u) {
+            *unique_addr_out = 0u;
+            return matches;
+        }
+    }
+    if (matches == 1u)
+        *unique_addr_out = found;
+    return matches;
 }
 
 static bool firmware_find_crc32_body_kind(
