@@ -2607,7 +2607,7 @@ bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                * windowbase. This is deliberately distinct from _pc_written:
                * the fallthrough is not a guest control-flow edge and must not
                * invoke firmware observers registered at the post-ENTRY PC. */
-              if (__builtin_expect(cpu->accelerated_blocks, 0))
+              if (__builtin_expect(cpu->record_branch_targets, 0))
                   cpu->jit_fallthrough_dispatch = true;
           } break;
           case 1: /* B1: BF, BT, LOOP, LOOPNEZ, LOOPGTZ */
@@ -2660,7 +2660,7 @@ bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                    * for the first architectural back-edge. A skipped
                    * LOOPNEZ/LOOPGTZ wrote PC and already has a real dispatch
                    * boundary, so it must not acquire the private marker. */
-                  if (__builtin_expect(cpu->accelerated_blocks, 0) &&
+                  if (__builtin_expect(cpu->record_branch_targets, 0) &&
                       !cpu->_pc_written)
                       cpu->jit_fallthrough_dispatch = true;
                   break;
@@ -3005,7 +3005,7 @@ void xtensa_dbg_step_trace(xtensa_cpu_t *cpu) {
  * in the profile. */
 static inline __attribute__((always_inline))
 int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
-                     uint32_t *restrict prev_pc) {
+                     uint32_t *restrict prev_pc, uint32_t native_span_room) {
     uint32_t insn;
     const uint32_t last_pc = *prev_pc;
     *prev_pc = cpu->pc;
@@ -3047,8 +3047,10 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
     const bool pc_written = cpu->_pc_written != 0;
     const bool dispatch_boundary = pc_written || accelerator_fallthrough;
     if (__builtin_expect(dispatch_boundary, 0)) {
-        cpu->br_ring[cpu->br_ring_idx & (XT_BR_RING_SIZE - 1)] = cpu->pc;
-        cpu->br_ring_idx++;
+        if (__builtin_expect(cpu->record_branch_targets, 0)) {
+            cpu->br_ring[cpu->br_ring_idx & (XT_BR_RING_SIZE - 1)] = cpu->pc;
+            cpu->br_ring_idx++;
+        }
         /* Return from a guest_call_async() callee. Only reachable through the
          * return address that call planted, so the compare is enough. */
         if (pc_written &&
@@ -3058,7 +3060,12 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
     if (dispatch_boundary && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
+        /* Only hooks consume the scheduler-room hint. Publishing it around
+         * the hook call instead of on every interpreted instruction removes
+         * two hot-path stores while preserving the exact same hook contract. */
+        cpu->native_span_room = native_span_room;
         int hook_insns = cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx);
+        cpu->native_span_room = 0u;
         if (hook_insns) {
             if (accelerator_fallthrough)
                 cpu->jit_fallthrough_dispatch = false;
@@ -3302,7 +3309,7 @@ int xtensa_step(xtensa_cpu_t *cpu) {
     uint64_t cc = cpu->cycle_count;
     uint32_t prev_pc = cpu->dbg_prev_pc;
     const bool was_halted = cpu->halted;
-    int r = xtensa_step_impl(cpu, &cc, &prev_pc);
+    int r = xtensa_step_impl(cpu, &cc, &prev_pc, 0u);
     cpu->dbg_prev_pc = prev_pc;
     cpu->cycle_count = cc;
     /* One dispatch can retire many instructions when a native block runs, and
@@ -3455,9 +3462,9 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
          * keep timer/preemption cadence and throughput accounting honest. */
         if (__builtin_expect(cpu->accelerated_blocks, 0)) {
             for (; executed < remaining; executed++) {
-                cpu->native_span_room = (uint32_t)(remaining - executed);
-                int step_result = xtensa_step_impl(cpu, &cc, &prev_pc);
-                cpu->native_span_room = 0u;
+                int step_result = xtensa_step_impl(
+                        cpu, &cc, &prev_pc,
+                        (uint32_t)(remaining - executed));
                 if (__builtin_expect(step_result != 0, 0)) {
                     if (step_result < 0) { executed++; break; }
                     if (step_result == 1)
@@ -3481,7 +3488,7 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
             }
         } else {
             for (; executed < remaining; executed++) {
-                int step_result = xtensa_step_impl(cpu, &cc, &prev_pc);
+                int step_result = xtensa_step_impl(cpu, &cc, &prev_pc, 0u);
                 if (__builtin_expect(step_result != 0, 0)) {
                     if (step_result < 0 || step_result > 1) {
                         executed++;

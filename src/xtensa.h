@@ -432,6 +432,9 @@ struct xtensa_cpu {
      * taken transfer and gives the JIT real candidates. */
     uint32_t br_ring[XT_BR_RING_SIZE];
     uint8_t  br_ring_idx;
+    /* jit_run() samples this ring to discover profitable block entries.
+     * Interpreter-only sessions have no consumer and leave recording off. */
+    bool     record_branch_targets;
 
     /* ================================================================
      * COLD SECTION — large arrays, rarely accessed per-instruction.

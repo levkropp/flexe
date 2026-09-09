@@ -4006,6 +4006,7 @@ void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) {
     cpu->pc_hook = jit_pc_hook;
     cpu->pc_hook_ctx = jit;
     cpu->accelerated_blocks = true;
+    cpu->record_branch_targets = true;
     cpu->code_invalidate = jit_code_invalidate;
     cpu->code_invalidate_ctx = jit;
 

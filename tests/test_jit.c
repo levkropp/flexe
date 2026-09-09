@@ -689,6 +689,34 @@ TEST(test_jit_init_destroy) {
     jit_destroy(jit);
 }
 
+TEST(test_branch_target_ring_is_disabled_without_a_jit_consumer) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3)); /* NOP.N */
+
+    /* The initial PC is a dispatch boundary, but an interpreter-only CPU has
+     * no consumer for the branch-target discovery ring. */
+    cpu.running = true;
+    cpu._pc_written = true;
+    ASSERT_FALSE(cpu.record_branch_targets);
+    ASSERT_EQ(xtensa_run(&cpu, 1), 1);
+    ASSERT_EQ(cpu.br_ring_idx, 0u);
+
+    /* Installing a JIT turns discovery on and records that same boundary. */
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    ASSERT_TRUE(cpu.record_branch_targets);
+    ASSERT_EQ(xtensa_run(&cpu, 1), 1);
+    ASSERT_EQ(cpu.br_ring_idx, 1u);
+    ASSERT_EQ(cpu.br_ring[0], BASE);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_verify_toggle_recompiles_blocks) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2875,6 +2903,7 @@ TEST(test_jit_window_underflow_vector_is_native) {
 static void run_jit_tests(void) {
     TEST_SUITE("jit");
     RUN_TEST(test_jit_init_destroy);
+    RUN_TEST(test_branch_target_ring_is_disabled_without_a_jit_consumer);
     RUN_TEST(test_jit_verify_toggle_recompiles_blocks);
     RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
     RUN_TEST(test_jit_hot_threshold);
