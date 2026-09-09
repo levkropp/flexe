@@ -83,6 +83,7 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 #define CPU_OFF_VECBASE     offsetof(xtensa_cpu_t, vecbase)
 #define CPU_OFF_EXCCAUSE    offsetof(xtensa_cpu_t, exccause)
 #define CPU_OFF_EXCVADDR    offsetof(xtensa_cpu_t, excvaddr)
+#define CPU_OFF_CPENABLE    offsetof(xtensa_cpu_t, cpenable)
 
 /* Memory struct offsets */
 #define MEM_OFF_PAGE_TABLE  offsetof(xtensa_mem_t, page_table)
@@ -493,6 +494,8 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                 case XT_SR_PS:
                 case XT_SR_DEPC:
                     return 0;  /* Direct fields, or side effects emitted below */
+                case XT_SR_CPENABLE:
+                    return 0;
                 case XT_SR_WINDOWBASE: case XT_SR_WINDOWSTART:
                     /* Changing the register-window context invalidates the
                      * block's compile-time mapping or entry guard. Compile
@@ -2055,6 +2058,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     off = (int32_t)(CPU_OFF_MR + (sr_num - XT_SR_MR0) * 4); break;
                 case XT_SR_LITBASE: off = CPU_OFF_LITBASE; break;
                 case XT_SR_DEPC:    off = (int32_t)offsetof(xtensa_cpu_t, depc); break;
+                case XT_SR_CPENABLE: off = CPU_OFF_CPENABLE; break;
                 default: return 0; /* Unknown SR: fall back */
                 }
                 emit_load_cpu32(e, RAX, off);
@@ -2133,6 +2137,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 case XT_SR_EXCCAUSE: off = CPU_OFF_EXCCAUSE; break;
                 case XT_SR_EXCVADDR: off = CPU_OFF_EXCVADDR; break;
                 case XT_SR_DEPC:     off = (int32_t)offsetof(xtensa_cpu_t, depc); break;
+                case XT_SR_CPENABLE: off = CPU_OFF_CPENABLE; break;
                 case XT_SR_PS:
                     /* Restoring PS is the exit half of every ESP-IDF
                      * critical section. It can lower INTLEVEL and thereby
@@ -3645,7 +3650,7 @@ static void jit_bitmap_set(jit_state_t *jit, uint32_t pc) {
 typedef struct {
     uint32_t ar[64];
     uint32_t pc, sar, ps, lbeg, lend, lcount, windowbase, windowstart;
-    uint32_t expstate, threadptr, fcr, fsr, f64r_lo, f64r_hi, f64s;
+    uint32_t expstate, threadptr, fcr, fsr, f64r_lo, f64r_hi, f64s, cpenable;
     uint16_t br;
 } jit_arch_state_t;
 
@@ -3660,6 +3665,7 @@ static void jit_arch_capture(const xtensa_cpu_t *cpu, jit_arch_state_t *st) {
     st->fcr = cpu->fcr;             st->fsr = cpu->fsr;
     st->f64r_lo = cpu->f64r_lo;     st->f64r_hi = cpu->f64r_hi;
     st->f64s = cpu->f64s;
+    st->cpenable = cpu->cpenable;
     st->br = cpu->br;
 }
 
@@ -3701,6 +3707,7 @@ static int jit_arch_report(const jit_arch_state_t *ref,
     JV_CMP(expstate, "%08X") JV_CMP(threadptr, "%08X")
     JV_CMP(fcr, "%08X") JV_CMP(fsr, "%08X")
     JV_CMP(f64r_lo, "%08X") JV_CMP(f64r_hi, "%08X") JV_CMP(f64s, "%08X")
+    JV_CMP(cpenable, "%08X")
 #undef JV_CMP
     if (ref->br != got->br) {
         fprintf(stderr, "[jit-verify] block %08X: br interp=%04X jit=%04X\n",

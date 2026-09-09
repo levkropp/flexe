@@ -101,6 +101,7 @@ static int compare_state(const xtensa_cpu_t *a, const xtensa_cpu_t *b,
     COMPARE_U32(f64r_lo);
     COMPARE_U32(f64r_hi);
     COMPARE_U32(f64s);
+    COMPARE_U32(cpenable);
 #undef COMPARE_U32
 
     return diffs;
@@ -2233,6 +2234,21 @@ TEST(test_jit_rsr_wsr_sar) {
     teardown(&cpu);
 }
 
+TEST(test_jit_rsr_wsr_cpenable) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.cpenable = 1u;
+    ar_write(&cpu, 2, 0xA5A55A5Au);
+    put_insn3(&cpu, BASE,
+              rrr(1, 3, XT_SR_CPENABLE >> 4,
+                  XT_SR_CPENABLE & 15, 2));  /* WSR CPENABLE, a2 */
+    put_insn3(&cpu, BASE + 3u,
+              rrr(0, 3, XT_SR_CPENABLE >> 4,
+                  XT_SR_CPENABLE & 15, 5));  /* RSR a5, CPENABLE */
+    test_run_differential(&cpu, 2, "rsr_wsr_cpenable");
+    teardown(&cpu);
+}
+
 TEST(test_jit_wsr_windowstart_terminates_at_new_guard_context) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -3026,6 +3042,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_addx2);
     RUN_TEST(test_jit_rsil);
     RUN_TEST(test_jit_rsr_wsr_sar);
+    RUN_TEST(test_jit_rsr_wsr_cpenable);
     RUN_TEST(test_jit_wsr_windowstart_terminates_at_new_guard_context);
     RUN_TEST(test_jit_wsr_windowbase_flushes_old_mapping_before_dispatch);
     RUN_TEST(test_jit_rsr_prid_wsr_ps);
