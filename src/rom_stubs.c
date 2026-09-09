@@ -4961,48 +4961,45 @@ static const fw_tbl_patch_t fw_marauder_v1151_ble_tbls[] = {
     {0x3FFD06E0u, FW_FAKE_TBL_WIFI},
 };
 
-/* Decode an L32R's literal and return it when it points to firmware DRAM.
- * phy_get_romfunc_addr starts with two L32Rs: the first literal is the ROM
- * accessor (0x40004100), while the second is the writable global into which
- * libphy stores the returned table pointer. */
+#define PHY_GET_ROMFUNCS_ROM_ADDR  0x40004100u
+
+/* Decode the complete phy_get_romfunc_addr wrapper and return its writable
+ * table global.  Both L32R displacements are link relocations; every opcode,
+ * register, store, and return must otherwise match, and the first literal
+ * must resolve to the ESP32 ROM's phy_get_romfuncs entry. */
 static bool fw_find_phy_global(xtensa_cpu_t *cpu, uint32_t entry,
                                uint32_t *global_out) {
-    uint32_t pc = entry;
-    for (int bytes = 0; bytes < 30;) {
-        uint32_t insn = 0;
-        int len = xtensa_fetch(cpu, pc, &insn);
-        if (len != 2 && len != 3)
-            break;
-        if (len == 3 && XT_OP0(insn) == 1 && XT_T(insn) == 8) {
-            uint32_t next_pc = pc + 3u;
-            uint32_t literal = (next_pc & ~3u) +
-                (0xFFFC0000u | ((uint32_t)XT_IMM16(insn) << 2));
-            uint32_t value = mem_read32(cpu->mem, literal);
-            if (value >= 0x3FFA0000u && value < 0x40000000u) {
-                *global_out = value;
-                return true;
-            }
-        }
-        pc += (uint32_t)len;
-        bytes += len;
-    }
+    static const uint8_t wrapper[] = {
+        0x36, 0x41, 0x00,             /* entry a1, 32 */
+        0x81, 0x00, 0x00,             /* l32r a8, phy_get_romfuncs */
+        0xE0, 0x08, 0x00,             /* callx8 a8 */
+        0x81, 0x00, 0x00,             /* l32r a8, table global */
+        0xA9, 0x08,                   /* s32i.n a10, a8, 0 */
+        0x3D, 0xF0,                   /* retw.n */
+    };
+    static const size_t relocations[] = {4u, 5u, 10u, 11u};
+    if (!cpu || !cpu->mem || !global_out ||
+        !firmware_signature_matches_except(
+                cpu->mem, entry, wrapper, sizeof(wrapper), relocations,
+                sizeof(relocations) / sizeof(relocations[0])))
+        return false;
 
-    /* Symbol-less stock-ROM profiles are fixed builds.  Keep their verified
-     * globals as a guarded fallback if instruction decoding ever encounters
-     * an image whose executable page is not readable through xtensa_fetch. */
-    if (entry == 0x40189A2Cu) {
-        *global_out = 0x3FFC87ECu;
-        return true;
-    }
-    if (entry == 0x401BDE2Cu) {
-        *global_out = 0x3FFCD99Cu;
-        return true;
-    }
-    if (entry == 0x401BE628u) {
-        *global_out = 0x3FFCD9ACu;
-        return true;
-    }
-    return false;
+    uint32_t rom_literal;
+    uint32_t global_literal;
+    uint32_t rom_entry;
+    uint32_t global;
+    if (!firmware_xtensa_l32r_target(
+                cpu->mem, entry + 3u, &rom_literal) ||
+        !firmware_xtensa_l32r_target(
+                cpu->mem, entry + 9u, &global_literal) ||
+        !firmware_peek(cpu->mem, rom_literal, 4u, &rom_entry) ||
+        rom_entry != PHY_GET_ROMFUNCS_ROM_ADDR ||
+        !firmware_peek(cpu->mem, global_literal, 4u, &global) ||
+        global < 0x3FFA0000u || global >= 0x40000000u)
+        return false;
+
+    *global_out = global;
+    return true;
 }
 
 static bool fw_virtualize_phy_table(xtensa_cpu_t *cpu,
@@ -5047,7 +5044,6 @@ static void stub_fw_virtual_phy_init(xtensa_cpu_t *cpu, void *ctx) {
  * the wrong address executes emulator code in place of firmware code, and a
  * missing hook is a hang while a misplaced one is silent corruption.
  */
-#define PHY_GET_ROMFUNCS_ROM_ADDR  0x40004100u
 #define PHY_SCAN_TEXT_LO           0x400C0000u
 #define PHY_SCAN_TEXT_HI           0x40400000u
 /* How far past its literal pool the referencing L32R may sit. An L32R reaches

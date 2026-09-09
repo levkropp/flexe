@@ -883,14 +883,15 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     const uint32_t global_literal = wrapper - 0x100u;
     const uint32_t phy_global = 0x3FFB2000u;
 
-    /* Minimal version of the production wrapper's instruction pattern:
-     * NOP; L32R a8, phy_get_romfuncs; NOP; L32R a8, table_global. */
-    put_insn3(&cpu, wrapper, rom_nop_insn());
+    /* Complete production wrapper with only its two L32R relocations moved. */
+    put_insn3(&cpu, wrapper, 0x004136u); /* entry a1, 32 */
     put_insn3(&cpu, wrapper + 3u,
               encode_test_l32r(wrapper + 3u, rom_literal, 8));
-    put_insn3(&cpu, wrapper + 6u, rom_nop_insn());
+    put_insn3(&cpu, wrapper + 6u, 0x0008E0u); /* callx8 a8 */
     put_insn3(&cpu, wrapper + 9u,
               encode_test_l32r(wrapper + 9u, global_literal, 8));
+    put_insn2(&cpu, wrapper + 12u, 0x08A9u); /* s32i.n a10, a8, 0 */
+    put_insn2(&cpu, wrapper + 14u, 0xF03Du); /* retw.n */
     mem_write32(cpu.mem, rom_literal, 0x40004100u);
     mem_write32(cpu.mem, global_literal, phy_global);
 
@@ -918,6 +919,30 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     ASSERT_EQ(cpu.pc, BASE);
     ASSERT_EQ(ar_read(&cpu, 2), 0);
     ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_firmware_phy_wrapper_has_no_address_fallback) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t wrapper = 0x40189A2Cu;
+    const uint32_t former_fallback_global = 0x3FFC87ECu;
+
+    /* NerdMiner's historical entry point still selects its compatibility
+     * hooks, but an absent/corrupt wrapper must not authorize a guessed DRAM
+     * write merely because the PC happens to equal an old release address. */
+    mem_write32(cpu.mem, former_fallback_global, 0xA5A5A5A5u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40089268u), 4);
+    cpu.pc = wrapper;
+    cpu._pc_written = true;
+    XT_PS_SET_CALLINC(cpu.ps, 0);
+    ar_write(&cpu, 0, BASE);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, BASE);
+    ASSERT_EQ(mem_read32(cpu.mem, former_fallback_global), 0xA5A5A5A5u);
 
     rom_stubs_destroy(rom);
     teardown(&cpu);
@@ -1199,9 +1224,11 @@ TEST(test_wled_v1601_uses_structural_memcmp_and_scanned_phy) {
     put_insn3(&cpu, wrapper, 0x004136u);
     put_insn3(&cpu, wrapper + 3u,
               encode_test_l32r(wrapper + 3u, rom_literal, 8));
-    put_insn3(&cpu, wrapper + 6u, rom_nop_insn());
+    put_insn3(&cpu, wrapper + 6u, 0x0008E0u); /* callx8 a8 */
     put_insn3(&cpu, wrapper + 9u,
               encode_test_l32r(wrapper + 9u, global_literal, 8));
+    put_insn2(&cpu, wrapper + 12u, 0x08A9u); /* s32i.n a10, a8, 0 */
+    put_insn2(&cpu, wrapper + 14u, 0xF03Du); /* retw.n */
     mem_write32(cpu.mem, rom_literal, 0x40004100u);
     mem_write32(cpu.mem, global_literal, phy_global);
 
@@ -1681,6 +1708,8 @@ TEST(test_marauder_v11423_hooks_use_shifted_phy_and_data_layout) {
     const uint32_t old_table_global = 0x3FFCD974u;
     const uint32_t phy_global = 0x3FFCD9ACu;
     const uint32_t new_table_global = 0x3FFCD984u;
+    mem_write32(cpu.mem, 0x401BE624u, 0x40004100u);
+    mem_write32(cpu.mem, 0x401BA944u, phy_global);
     mem_write32(cpu.mem, old_table_global, 0xA5A5A5A5u);
     ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x400831D8u), 5);
 
@@ -1878,6 +1907,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_dispatches_through_guest_syscall_table);
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
+    RUN_TEST(test_firmware_phy_wrapper_has_no_address_fallback);
     RUN_TEST(test_structural_abi_accels_do_not_require_firmware_profile);
     RUN_TEST(test_newlib_memcmp_is_relocated_and_cycle_exact);
     RUN_TEST(test_newlib_memcmp_hook_matches_original_routine);
