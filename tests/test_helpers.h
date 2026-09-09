@@ -65,6 +65,14 @@ static inline void put_test_bytes(xtensa_cpu_t *cpu, uint32_t addr,
         mem_write8(cpu->mem, addr + (uint32_t)i, bytes[i]);
 }
 
+static inline void seed_flash_poll_loop(xtensa_cpu_t *cpu, uint32_t addr) {
+    static const uint8_t loop[] = {
+        0xC0, 0x20, 0x00, 0x82, 0x09, 0x00,
+        0x80, 0x80, 0x74, 0x16, 0x38, 0xFF,
+    };
+    put_test_bytes(cpu, addr, loop, sizeof(loop));
+}
+
 /* Tests seed the same independent instruction anchors used by production
  * profile detection. */
 static inline void seed_marauder_v1121_cyd2usb_profile(xtensa_cpu_t *cpu) {

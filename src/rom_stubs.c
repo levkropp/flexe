@@ -5318,21 +5318,52 @@ static const fw_addr_hook_t fw_wled_v1601_hooks[] = {
     { 0, NULL, NULL, 0 }
 };
 
-/* spi_flash_op_block_func waits here for the peer core to finish the flash
- * operation. With deterministic core timeslices, continuing to interpret the
- * back-edge cannot make the flag change. Batch its four-instruction polling
- * body while retaining the complete guest cycle/retirement accounting. */
-#define WLED_V1601_FLASH_POLL_LOOP      0x40083B29u
+/* ESP-IDF's cross-core flash guards wait for the peer CPU with this exact
+ * four-instruction body. With deterministic core timeslices, continuing to
+ * interpret the back-edge cannot make its DRAM flag change. Production
+ * profiles provide the candidate addresses; only byte-exact instances enter
+ * the bounded CPU loop set. */
+#define FW_FLASH_POLL_LOOP_INSNS 4u
 
-static bool fw_wled_has_flash_poll_loop(xtensa_mem_t *mem) {
+static bool fw_add_flash_poll_loop(esp32_rom_stubs_t *stubs, uint32_t addr) {
     static const uint8_t loop[] = {
         0xC0, 0x20, 0x00, /* memw */
         0x82, 0x09, 0x00, /* l8ui a8, a9, 0 */
         0x80, 0x80, 0x74, /* extui a8, a8, 0, 8 */
         0x16, 0x38, 0xFF, /* beqz a8, -13 */
     };
-    return fw_signature_matches(mem, WLED_V1601_FLASH_POLL_LOOP,
-                                loop, sizeof(loop));
+    xtensa_cpu_t *cpu = stubs->cpu;
+    if (!fw_signature_matches(cpu->mem, addr, loop, sizeof(loop)))
+        return false;
+    for (unsigned i = 0; i < cpu->poll_spin_count; i++) {
+        if (cpu->poll_spin_pc[i] == addr)
+            return true;
+    }
+    if (cpu->poll_spin_count >= XTENSA_POLL_SPIN_MAX)
+        return false;
+    cpu->poll_spin_pc[cpu->poll_spin_count++] = addr;
+    cpu->poll_spin_insns = FW_FLASH_POLL_LOOP_INSNS;
+    return true;
+}
+
+static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
+                                          rom_firmware_profile_t profile) {
+    switch (profile) {
+    case ROM_FIRMWARE_MARAUDER_V1121_CYD2USB:
+        fw_add_flash_poll_loop(stubs, 0x40081A5Du);
+        fw_add_flash_poll_loop(stubs, 0x40081B0Du);
+        break;
+    case ROM_FIRMWARE_TASMOTA32_V1560:
+        fw_add_flash_poll_loop(stubs, 0x400826D5u);
+        fw_add_flash_poll_loop(stubs, 0x40082740u);
+        break;
+    case ROM_FIRMWARE_WLED_V1601:
+        fw_add_flash_poll_loop(stubs, 0x40083A68u);
+        fw_add_flash_poll_loop(stubs, 0x40083B29u);
+        break;
+    default:
+        break;
+    }
 }
 
 /* WLED spends most of its remaining interpreter time in the native IDF 4.4
@@ -5516,6 +5547,7 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
         tbl = fw_nerdminer_hooks;
     else if (profile == ROM_FIRMWARE_WLED_V1601)
         tbl = fw_wled_v1601_hooks;
+    fw_configure_flash_poll_loops(stubs, profile);
     if (!tbl) {
         if (entry_point == 0x40081E90u || entry_point == 0x400831D8u ||
             entry_point == 0x400830D0u)
@@ -5539,10 +5571,6 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
      * was used before it acquired a profile-specific acceleration table, and
      * collapse the fully modeled uncontended FreeRTOS critical boundary. */
     if (profile == ROM_FIRMWARE_WLED_V1601) {
-        if (fw_wled_has_flash_poll_loop(stubs->cpu->mem)) {
-            stubs->cpu->poll_spin_pc = WLED_V1601_FLASH_POLL_LOOP;
-            stubs->cpu->poll_spin_insns = 4u;
-        }
         if (fw_wled_resolve_critical_globals(stubs)) {
             rom_stubs_register_conditional_ctx(
                     stubs, WLED_V1601_ENTER_CRITICAL,

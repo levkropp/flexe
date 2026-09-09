@@ -251,7 +251,9 @@ TEST(br_configured_poll_loop_batches_repeated_iterations) {
     put_insn3(&cpu, BASE + 6, 0x002F00u); /* nop */
     /* From BASE+9, imm12=-13 branches back to BASE. */
     put_insn3(&cpu, BASE + 9, bri12(0, 4, -13));
-    cpu.poll_spin_pc = BASE;
+    cpu.poll_spin_pc[0] = BASE + 0x100u;
+    cpu.poll_spin_pc[1] = BASE;
+    cpu.poll_spin_count = 2u;
     cpu.poll_spin_insns = 4u;
     cpu.running = true;
     ar_write(&cpu, 4, 0);
@@ -270,7 +272,8 @@ TEST(br_configured_poll_loop_preserves_timer_boundary) {
     put_insn3(&cpu, BASE + 3, 0x002F00u); /* nop */
     put_insn3(&cpu, BASE + 6, 0x002F00u); /* nop */
     put_insn3(&cpu, BASE + 9, bri12(0, 4, -13));
-    cpu.poll_spin_pc = BASE;
+    cpu.poll_spin_pc[0] = BASE;
+    cpu.poll_spin_count = 1u;
     cpu.poll_spin_insns = 4u;
     cpu.running = true;
     cpu.intenable = 0u;

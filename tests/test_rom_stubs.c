@@ -898,16 +898,11 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     const uint32_t rom_literal = wrapper - 0x104u;
     const uint32_t global_literal = wrapper - 0x100u;
     const uint32_t phy_global = 0x3FFB2000u;
-    static const uint8_t flash_poll_loop[] = {
-        0xC0, 0x20, 0x00, 0x82, 0x09, 0x00,
-        0x80, 0x80, 0x74, 0x16, 0x38, 0xFF,
-    };
-
     /* Match the release's memcmp prologue and provide one structurally
      * discoverable phy_get_romfunc_addr wrapper. */
     put_insn3(&cpu, memcmp_entry, 0x004136u); /* entry a1, 32 */
-    put_test_bytes(&cpu, 0x40083B29u, flash_poll_loop,
-                   sizeof(flash_poll_loop));
+    seed_flash_poll_loop(&cpu, 0x40083A68u);
+    seed_flash_poll_loop(&cpu, 0x40083B29u);
     put_insn3(&cpu, wrapper, 0x004136u);
     put_insn3(&cpu, wrapper + 3u,
               encode_test_l32r(wrapper + 3u, rom_literal, 8));
@@ -926,7 +921,9 @@ TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     mem_write32(cpu.mem, 0x40080D50u, old_state);
 
     ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40083E68u), 4);
-    ASSERT_EQ(cpu.poll_spin_pc, 0x40083B29u);
+    ASSERT_EQ(cpu.poll_spin_count, 2u);
+    ASSERT_EQ(cpu.poll_spin_pc[0], 0x40083A68u);
+    ASSERT_EQ(cpu.poll_spin_pc[1], 0x40083B29u);
     ASSERT_EQ(cpu.poll_spin_insns, 4u);
 
     const uint32_t lhs = 0x3FFB0100u;
@@ -1094,6 +1091,12 @@ TEST(test_tasmota32_requires_complete_fingerprint) {
     seed_tasmota32_v1560_profile(&cpu);
     ASSERT_EQ(rom_stubs_identify_firmware(rom, 0x40082A58u),
               ROM_FIRMWARE_TASMOTA32_V1560);
+    seed_flash_poll_loop(&cpu, 0x400826D5u);
+    seed_flash_poll_loop(&cpu, 0x40082740u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40082A58u), 0);
+    ASSERT_EQ(cpu.poll_spin_count, 2u);
+    ASSERT_EQ(cpu.poll_spin_pc[0], 0x400826D5u);
+    ASSERT_EQ(cpu.poll_spin_pc[1], 0x40082740u);
 
     /* The entry point alone cannot authorize fixed production addresses. */
     mem_write8(cpu.mem, 0x4019BA54u, 0u);
@@ -1171,12 +1174,17 @@ TEST(test_marauder_v1121_virtualizes_only_its_phy_and_sync_state) {
     const uint32_t phy_global = 0x3FFD003Cu;
     const uint32_t old_table_global = 0x3FFCD974u;
     const uint32_t old_shifted_table_global = 0x3FFCD984u;
+    seed_flash_poll_loop(&cpu, 0x40081A5Du);
+    seed_flash_poll_loop(&cpu, 0x40081B0Du);
     mem_write32(cpu.mem, 0x401C3748u, 0x40004100u);
     mem_write32(cpu.mem, 0x401C18C0u, phy_global);
     mem_write32(cpu.mem, old_table_global, 0xA5A5A5A5u);
     mem_write32(cpu.mem, old_shifted_table_global, 0x5A5A5A5Au);
 
     ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081E90u), 5);
+    ASSERT_EQ(cpu.poll_spin_count, 2u);
+    ASSERT_EQ(cpu.poll_spin_pc[0], 0x40081A5Du);
+    ASSERT_EQ(cpu.poll_spin_pc[1], 0x40081B0Du);
     cpu.pc = 0x401C374Cu;
     XT_PS_SET_CALLINC(cpu.ps, 0);
     ar_write(&cpu, 0, BASE);

@@ -16,6 +16,11 @@ typedef struct xtensa_cpu xtensa_cpu_t;
 #define ESP32_FLASH_INSN_ADDR_LOW    0x400D0000u
 #define ESP32_INSN_ADDR_HIGH         0x40C00000u
 
+/* A production profile may identify both sides of the ESP-IDF cross-core
+ * flash handshake. Keep this bounded: matching is on the rare taken BEQZ
+ * path, and every entry must first pass an exact instruction signature. */
+#define XTENSA_POLL_SPIN_MAX         2u
+
 /* Called when guest-visible instruction bytes change (flash-MMU remap,
  * self-programming flash, etc.). Execution engines can discard translated
  * code while the interpreter invalidates its predecode entries. */
@@ -294,7 +299,8 @@ struct xtensa_cpu {
     /* Optional verified polling loop. A taken BEQZ back-edge to this PC can
      * batch complete iterations until the next scheduler/timer boundary:
      * nothing inside the deterministic timeslice can change its DRAM flag. */
-    uint32_t poll_spin_pc;
+    uint32_t poll_spin_pc[XTENSA_POLL_SPIN_MAX];
+    uint8_t  poll_spin_count;
     uint8_t  poll_spin_insns;
     /* Set by the session before the first instruction; consumed by the first
      * ENTRY. The windowed ABI wants a caller's stack pointer at [sp-12] of

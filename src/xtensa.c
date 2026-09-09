@@ -2490,8 +2490,10 @@ bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
           case 0: /* BEQZ */
               if (val == 0) {
                   BRANCH_TO(cpu, target);
-                  if (__builtin_expect(cpu->poll_spin_pc != 0u &&
-                                       cpu->poll_spin_pc == target, 0))
+                  if (__builtin_expect(cpu->poll_spin_pc[0] != 0u, 0) &&
+                      (cpu->poll_spin_pc[0] == target ||
+                       (cpu->poll_spin_count > 1u &&
+                        cpu->poll_spin_pc[1] == target)))
                       poll_spin = true;
               }
               break;
@@ -3378,7 +3380,7 @@ static inline int xtensa_run_poll_spin(xtensa_cpu_t *cpu,
                                        uint64_t *local_cc, int room) {
     unsigned width = cpu->poll_spin_insns;
     if (width == 0u || room < (int)width || cpu->breakpoint_count > 0 ||
-        g_dbg_step_slow || cpu->pc != cpu->poll_spin_pc)
+        g_dbg_step_slow)
         return 0;
 
     int skip = room - room % (int)width;
