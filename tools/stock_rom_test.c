@@ -2839,19 +2839,26 @@ int main(int argc, char **argv)
     uint64_t tasmota_http_cycles = 0;
     size_t tasmota_commands = 0;
     if (is_tasmota) {
+        /* This pinned release ships with HTTP_API disabled. /cm still runs
+         * commands, but deliberately returns an empty JSON object instead of
+         * exposing their result. Prove execution independently through the
+         * serial result and, for Berry, the modeled GPIO side effect. */
         static const struct {
             const char *encoded;
             const char *response;
+            const char *uart_response;
             int gpio_level;
         } commands[] = {
-            { "Status%200", "{}", -1 },
+            { "Status%200", "{}",
+              "STATUS2 = {\"StatusFWR\":{\"Version\":\"15.6.0", -1 },
             { "Br%20import%20gpio%3B%20gpio.pin_mode%284%2Cgpio.OUTPUT%29%3B%20gpio.digital_write%284%2C1%29",
-              "\"Br\":\"nil\"", 1 },
+              "{}", "RSL: RESULT = {\"Br\":\"nil\"}", 1 },
             { "Br%20import%20gpio%3B%20gpio.pin_mode%284%2Cgpio.OUTPUT%29%3B%20gpio.digital_write%284%2C0%29",
-              "\"Br\":\"nil\"", 0 },
+              "{}", "RSL: RESULT = {\"Br\":\"nil\"}", 0 },
         };
         for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
             uint64_t command_cycles = 0;
+            size_t command_uart_start = uart.log_len;
             int http_result = run_tasmota_http_command(
                     session, &tasmota_http, commands[i].encoded,
                     commands[i].response, commands[i].gpio_level,
@@ -2895,7 +2902,6 @@ int main(int argc, char **argv)
                 free(framebuf);
                 return 1;
             }
-            tasmota_commands = i + 1;
             if (run_for_virtual_cycles(session, 10000000u) != 0) {
                 fprintf(stderr,
                         "FAIL profile=tasmota reason=cpus-stopped-after-http "
@@ -2907,6 +2913,21 @@ int main(int argc, char **argv)
                 free(framebuf);
                 return 1;
             }
+            if (!uart_contains_from(&uart, command_uart_start,
+                                    commands[i].uart_response)) {
+                fprintf(stderr,
+                        "FAIL profile=tasmota reason=command-not-executed "
+                        "command=%zu marker=%s\n",
+                        i + 1, commands[i].uart_response);
+                tasmota_http_close(&tasmota_http);
+                flexe_session_destroy(session);
+                pthread_mutex_destroy(&framebuffer_mutex);
+                unlink(sd_path);
+                free(before);
+                free(framebuf);
+                return 1;
+            }
+            tasmota_commands = i + 1;
         }
         if (!uart_contains(&uart,
                 "STATUS2 = {\"StatusFWR\":{\"Version\":\"15.6.0")) {
