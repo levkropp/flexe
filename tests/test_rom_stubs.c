@@ -943,6 +943,38 @@ TEST(test_structural_abi_accels_do_not_require_firmware_profile) {
     teardown(&cpu);
 }
 
+TEST(test_standard_xthal_spill_is_discovered_at_any_iram_address) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t addr = 0x4007D200u;
+
+    seed_standard_xthal_window_spill(&cpu, addr);
+    mem_write8(cpu.mem, addr + 272u, 0u);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081234u), 0u);
+    ASSERT_FALSE(cpu.accelerated_blocks);
+
+    /* Restore the complete body at the same deliberately non-production
+     * address. Neither firmware identity nor the WLED link address is part of
+     * discovery. */
+    seed_standard_xthal_window_spill(&cpu, addr);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081234u), 2u);
+    ASSERT_TRUE(cpu.accelerated_blocks);
+
+    cpu.pc = addr;
+    cpu._pc_written = true;
+    cpu.prid = XTENSA_SPINLOCK_OWNER_CORE0;
+    cpu.windowbase = 0u;
+    cpu.windowstart = 1u;
+    XT_PS_SET_CALLINC(cpu.ps, 0u);
+    xtensa_step(&cpu);
+    ASSERT_EQ(cpu.pc, addr + 3u);
+    ASSERT_EQ(rom_stubs_total_calls(rom), 1u);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1729,6 +1761,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
     RUN_TEST(test_structural_abi_accels_do_not_require_firmware_profile);
+    RUN_TEST(test_standard_xthal_spill_is_discovered_at_any_iram_address);
     RUN_TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy);
     RUN_TEST(test_wled_v1601_watchpoint_hook_matches_original_routine);
     RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
