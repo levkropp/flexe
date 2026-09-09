@@ -12,6 +12,82 @@
 
 extern int g_flexe_shadow_fill;
 
+/* These are the Xtensa windowed-ABI handlers shipped by classic ESP32
+ * toolchains. They contain no link-specific addresses: each body consists
+ * only of the architecturally defined S32E/L32E save-area accesses followed
+ * by RFWO/RFWU. Recognizing the complete table therefore identifies an ABI
+ * implementation, rather than a particular application or IDF link. */
+static const uint8_t canonical_overflow4[] = {
+    0x00, 0xC5, 0x49, 0x10, 0xD5, 0x49, 0x20, 0xE5, 0x49,
+    0x30, 0xF5, 0x49, 0x00, 0x34, 0x00,
+};
+static const uint8_t canonical_underflow4[] = {
+    0x00, 0xC5, 0x09, 0x10, 0xD5, 0x09, 0x20, 0xE5, 0x09,
+    0x30, 0xF5, 0x09, 0x00, 0x35, 0x00,
+};
+static const uint8_t canonical_overflow8[] = {
+    0x00, 0xC9, 0x49, 0x00, 0xD1, 0x09, 0x10, 0xD9, 0x49,
+    0x20, 0xE9, 0x49, 0x30, 0xF9, 0x49, 0x40, 0x80, 0x49,
+    0x50, 0x90, 0x49, 0x60, 0xA0, 0x49, 0x70, 0xB0, 0x49,
+    0x00, 0x34, 0x00,
+};
+static const uint8_t canonical_underflow8[] = {
+    0x00, 0xC9, 0x09, 0x10, 0xD9, 0x09, 0x20, 0xE9, 0x09,
+    0x70, 0xD1, 0x09, 0x30, 0xF9, 0x09, 0x40, 0x87, 0x09,
+    0x50, 0x97, 0x09, 0x60, 0xA7, 0x09, 0x70, 0xB7, 0x09,
+    0x00, 0x35, 0x00,
+};
+static const uint8_t canonical_overflow12[] = {
+    0x00, 0xCD, 0x49, 0x00, 0xD1, 0x09, 0x10, 0xDD, 0x49,
+    0x20, 0xED, 0x49, 0x30, 0xFD, 0x49, 0x40, 0x40, 0x49,
+    0x50, 0x50, 0x49, 0x60, 0x60, 0x49, 0x70, 0x70, 0x49,
+    0x80, 0x80, 0x49, 0x90, 0x90, 0x49, 0xA0, 0xA0, 0x49,
+    0xB0, 0xB0, 0x49, 0x00, 0x34, 0x00,
+};
+static const uint8_t canonical_underflow12[] = {
+    0x00, 0xCD, 0x09, 0x10, 0xDD, 0x09, 0x20, 0xED, 0x09,
+    0xB0, 0xD1, 0x09, 0x30, 0xFD, 0x09, 0x40, 0x4B, 0x09,
+    0x50, 0x5B, 0x09, 0x60, 0x6B, 0x09, 0x70, 0x7B, 0x09,
+    0x80, 0x8B, 0x09, 0x90, 0x9B, 0x09, 0xA0, 0xAB, 0x09,
+    0xB0, 0xBB, 0x09, 0x00, 0x35, 0x00,
+};
+
+static bool canonical_code_matches(xtensa_mem_t *mem, uint32_t addr,
+                                   const uint8_t *code, size_t size) {
+    if (!mem || !code || size == 0u || addr > UINT32_MAX - (size - 1u))
+        return false;
+    for (size_t i = 0; i < size; i++) {
+        if (mem_read8(mem, addr + (uint32_t)i) != code[i])
+            return false;
+    }
+    return true;
+}
+
+bool xtensa_window_vectors_are_canonical(xtensa_mem_t *mem, uint32_t base) {
+    /* VECBASE is 1 KiB aligned on LX6. Rejecting unaligned candidates also
+     * keeps structural discovery bounded to actual vector-table locations. */
+    if ((base & 0x3FFu) != 0u || base > UINT32_MAX - 0x16Au)
+        return false;
+    return canonical_code_matches(
+                   mem, base + VECOFS_WINDOW_OVERFLOW4,
+                   canonical_overflow4, sizeof(canonical_overflow4)) &&
+           canonical_code_matches(
+                   mem, base + VECOFS_WINDOW_UNDERFLOW4,
+                   canonical_underflow4, sizeof(canonical_underflow4)) &&
+           canonical_code_matches(
+                   mem, base + VECOFS_WINDOW_OVERFLOW8,
+                   canonical_overflow8, sizeof(canonical_overflow8)) &&
+           canonical_code_matches(
+                   mem, base + VECOFS_WINDOW_UNDERFLOW8,
+                   canonical_underflow8, sizeof(canonical_underflow8)) &&
+           canonical_code_matches(
+                   mem, base + VECOFS_WINDOW_OVERFLOW12,
+                   canonical_overflow12, sizeof(canonical_overflow12)) &&
+           canonical_code_matches(
+                   mem, base + VECOFS_WINDOW_UNDERFLOW12,
+                   canonical_underflow12, sizeof(canonical_underflow12));
+}
+
 static inline uint32_t phys_read_accel(const xtensa_cpu_t *cpu, int window,
                                        int reg) {
     return cpu->ar[((window * 4) + reg) & 63];

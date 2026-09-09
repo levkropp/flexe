@@ -13,13 +13,14 @@ typedef struct xtensa_cpu xtensa_cpu_t;
  * instruction buses after internal IRAM: IRAM0, IRAM1, and IROM0. */
 #define ESP32_INSN_ADDR_LOW          0x40000000u
 #define ESP32_FIRMWARE_INSN_ADDR_LOW 0x40070000u
+#define ESP32_IRAM_INSN_ADDR_HIGH    0x400C0000u
 #define ESP32_FLASH_INSN_ADDR_LOW    0x400D0000u
 #define ESP32_INSN_ADDR_HIGH         0x40C00000u
 
-/* A production profile may identify both sides of the ESP-IDF cross-core
- * flash handshake. Keep this bounded: matching is on the rare taken BEQZ
- * path, and every entry must first pass an exact instruction signature. */
-#define XTENSA_POLL_SPIN_MAX         2u
+/* Structurally discovered ESP-IDF cross-core flash wait loops. Keep the set
+ * bounded: matching is on the rare taken BEQZ path, and every entry must
+ * first pass the complete canonical instruction signature. */
+#define XTENSA_POLL_SPIN_MAX         8u
 
 /* Called when guest-visible instruction bytes change (flash-MMU remap,
  * self-programming flash, etc.). Execution engines can discard translated
@@ -605,9 +606,13 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
 void xtensa_check_interrupts(xtensa_cpu_t *cpu);
 void xtensa_flush_windows(xtensa_cpu_t *cpu);
 
+/* True when `base` contains all six canonical classic-ESP32 window vectors.
+ * This is an ABI property, not a firmware-version fingerprint. */
+bool xtensa_window_vectors_are_canonical(xtensa_mem_t *mem, uint32_t base);
+
 /* Execute one canonical ESP32 register-window spill/fill vector as a single
- * host operation.  The caller remains responsible for instruction/time
- * accounting and for verifying the firmware bytes at the vector address. */
+ * host operation. The caller remains responsible for instruction/time
+ * accounting and must first validate the vector table above. */
 bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
                                bool underflow);
 

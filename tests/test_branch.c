@@ -256,6 +256,7 @@ TEST(br_configured_poll_loop_batches_repeated_iterations) {
     cpu.poll_spin_count = 2u;
     cpu.poll_spin_insns = 4u;
     cpu.running = true;
+    ar_write(&cpu, 9, BASE); /* structurally verified loop reads mapped RAM */
     ar_write(&cpu, 4, 0);
     ASSERT_EQ(xtensa_run(&cpu, 40), 40);
     ASSERT_EQ(cpu.pc, BASE);
@@ -276,6 +277,7 @@ TEST(br_configured_poll_loop_preserves_timer_boundary) {
     cpu.poll_spin_count = 1u;
     cpu.poll_spin_insns = 4u;
     cpu.running = true;
+    ar_write(&cpu, 9, BASE); /* structurally verified loop reads mapped RAM */
     cpu.intenable = 0u;
     sr_write(&cpu, XT_SR_CCOMPARE0, 7u);
     ar_write(&cpu, 4, 0);

@@ -2490,11 +2490,20 @@ bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
           case 0: /* BEQZ */
               if (val == 0) {
                   BRANCH_TO(cpu, target);
-                  if (__builtin_expect(cpu->poll_spin_pc[0] != 0u, 0) &&
-                      (cpu->poll_spin_pc[0] == target ||
-                       (cpu->poll_spin_count > 1u &&
-                        cpu->poll_spin_pc[1] == target)))
-                      poll_spin = true;
+                  if (__builtin_expect(cpu->poll_spin_count != 0u, 0)) {
+                      for (unsigned i = 0; i < cpu->poll_spin_count; i++) {
+                          if (cpu->poll_spin_pc[i] != target)
+                              continue;
+                          /* Structural discovery proves this loop only reads
+                           * through a9. Mapped memory is stable until the
+                           * deterministic scheduler runs the peer core;
+                           * MMIO/unmapped reads retain cycle-by-cycle
+                           * execution because a device may change itself. */
+                          poll_spin = mem_get_ptr(
+                                  cpu->mem, ar_read(cpu, 9)) != NULL;
+                          break;
+                      }
+                  }
               }
               break;
           case 1: if (val != 0) BRANCH_TO(cpu, target); break;  /* BNEZ */
@@ -3377,7 +3386,7 @@ static inline int xtensa_run_halted(xtensa_cpu_t *cpu, uint64_t *local_cc,
     return executed;
 }
 
-/* Collapse complete repetitions of a profile-verified DRAM polling loop.
+/* Collapse complete repetitions of a structurally verified polling loop.
  * The other core and peripheral callbacks run only at the outer batch
  * boundary, so rereading the same byte inside this timeslice cannot observe a
  * change. Keep the architectural PC/register state at the loop head and

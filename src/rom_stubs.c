@@ -5396,9 +5396,9 @@ static const fw_addr_hook_t fw_wled_v1601_hooks[] = {
 
 /* ESP-IDF's cross-core flash guards wait for the peer CPU with this exact
  * four-instruction body. With deterministic core timeslices, continuing to
- * interpret the back-edge cannot make its DRAM flag change. Production
- * profiles provide the candidate addresses; only byte-exact instances enter
- * the bounded CPU loop set. */
+ * interpret the back-edge cannot make its mapped-memory flag change. Discover
+ * complete instances in IRAM so this optimization follows the IDF routine
+ * across firmware links instead of relying on application addresses. */
 #define FW_FLASH_POLL_LOOP_INSNS 4u
 
 static bool fw_add_flash_poll_loop(esp32_rom_stubs_t *stubs, uint32_t addr) {
@@ -5422,24 +5422,19 @@ static bool fw_add_flash_poll_loop(esp32_rom_stubs_t *stubs, uint32_t addr) {
     return true;
 }
 
-static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
-                                          rom_firmware_profile_t profile) {
-    switch (profile) {
-    case ROM_FIRMWARE_MARAUDER_V1121_CYD2USB:
-        fw_add_flash_poll_loop(stubs, 0x40081A5Du);
-        fw_add_flash_poll_loop(stubs, 0x40081B0Du);
-        break;
-    case ROM_FIRMWARE_TASMOTA32_V1560:
-        fw_add_flash_poll_loop(stubs, 0x400826D5u);
-        fw_add_flash_poll_loop(stubs, 0x40082740u);
-        break;
-    case ROM_FIRMWARE_WLED_V1601:
-        fw_add_flash_poll_loop(stubs, 0x40083A68u);
-        fw_add_flash_poll_loop(stubs, 0x40083B29u);
-        break;
-    default:
-        break;
+static unsigned fw_discover_flash_poll_loops(esp32_rom_stubs_t *stubs) {
+    static const uint8_t first_byte = 0xC0u; /* MEMW */
+    unsigned found = 0u;
+    const uint32_t last = ESP32_IRAM_INSN_ADDR_HIGH - 12u;
+    for (uint32_t addr = ESP32_FIRMWARE_INSN_ADDR_LOW;
+         addr <= last && stubs->cpu->poll_spin_count < XTENSA_POLL_SPIN_MAX;
+         addr++) {
+        if (mem_read8(stubs->cpu->mem, addr) != first_byte)
+            continue;
+        if (fw_add_flash_poll_loop(stubs, addr))
+            found++;
     }
+    return found;
 }
 
 /* WLED spends most of its remaining interpreter time in the native IDF 4.4
@@ -5475,12 +5470,6 @@ static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
 #define WLED_V1601_TLSF_FREE_RETURN       0x400917D9u
 #define WLED_V1601_TLSF_MALLOC            0x40091880u
 #define WLED_V1601_TLSF_MALLOC_RETURN     0x40091A6Du
-#define WLED_V1601_WINDOW_OVERFLOW4       0x40080000u
-#define WLED_V1601_WINDOW_UNDERFLOW4      0x40080040u
-#define WLED_V1601_WINDOW_OVERFLOW8       0x40080080u
-#define WLED_V1601_WINDOW_UNDERFLOW8      0x400800C0u
-#define WLED_V1601_WINDOW_OVERFLOW12      0x40080100u
-#define WLED_V1601_WINDOW_UNDERFLOW12     0x40080140u
 #define WLED_V1601_XTHAL_WINDOW_SPILL     0x40093920u
 #define WLED_V1601_XTHAL_SPILL_FINISH     0x400939DCu
 #define WLED_V1601_POISON_ALLOCATED       0x40091FE8u
@@ -5991,8 +5980,7 @@ static void fw_wled_heap_path_observe(wled_heap_path_t *paths, uint32_t key,
     }
 }
 
-static bool fw_wled_heap_span_safe(const xtensa_cpu_t *cpu,
-                                    uint32_t insns) {
+static bool fw_native_span_safe(const xtensa_cpu_t *cpu, uint32_t insns) {
     if (cpu->native_span_room != 0u && cpu->native_span_room < insns)
         return false;
     return cpu->next_timer_event == UINT32_MAX ||
@@ -6064,7 +6052,7 @@ static int stub_fw_wled_find_heap(xtensa_cpu_t *cpu, void *ctx) {
         descriptor = mem_read32(cpu->mem, descriptor + 32u);
         insns += 2u;
     }
-    if (!found || !fw_wled_heap_span_safe(cpu, insns)) return 0;
+    if (!found || !fw_native_span_safe(cpu, insns)) return 0;
 
     unsigned wb = cpu->windowbase & 15u;
     uint32_t final_ps = cpu->ps;
@@ -6160,7 +6148,7 @@ static int stub_fw_wled_heap_caps_scan(xtensa_cpu_t *cpu, void *ctx) {
             continue;
         }
 
-        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        if (!fw_native_span_safe(cpu, insns)) return 0;
         ar_write(cpu, 4, descriptor);
         ar_write(cpu, 5, priority_offset);
         ar_write(cpu, 6, priority);
@@ -6254,7 +6242,7 @@ static int stub_fw_wled_poison_allocated(xtensa_cpu_t *cpu, void *ctx) {
         return 0;
 
     uint32_t insns = fw_wled_poison_plan_insns(&poison);
-    if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+    if (!fw_native_span_safe(cpu, insns)) return 0;
 
     fw_wled_poison_plan_commit(cpu->mem, &poison);
     rom_return(cpu, poison.user);
@@ -6390,7 +6378,7 @@ static int stub_fw_wled_outer_malloc(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t insns = fw_wled_heap_path_ready(
             stubs->wled_outer_malloc_paths, key);
     if (insns != 0u) {
-        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        if (!fw_native_span_safe(cpu, insns)) return 0;
         return fw_wled_outer_malloc_native(
                 cpu, heap, size, &plan, &poison, insns, has_mux, mux,
                 old_state_addr, final_ps);
@@ -6450,64 +6438,81 @@ static int stub_fw_wled_outer_malloc_finish(xtensa_cpu_t *cpu, void *ctx) {
     return 0; /* observe RETW.N, then execute it unchanged */
 }
 
-static bool fw_wled_window_vector_code_matches(xtensa_mem_t *mem) {
-    return fw_crc32_matches(mem, WLED_V1601_WINDOW_OVERFLOW4, 15u,
-                            0xFAD7CE79u) &&
-           fw_crc32_matches(mem, WLED_V1601_WINDOW_UNDERFLOW4, 15u,
-                            0x1FE44477u) &&
-           fw_crc32_matches(mem, WLED_V1601_WINDOW_OVERFLOW8, 30u,
-                            0xF888D302u) &&
-           fw_crc32_matches(mem, WLED_V1601_WINDOW_UNDERFLOW8, 30u,
-                            0x7C7CB2E8u) &&
-           fw_crc32_matches(mem, WLED_V1601_WINDOW_OVERFLOW12, 42u,
-                            0x1A5FEB4Cu) &&
-           fw_crc32_matches(mem, WLED_V1601_WINDOW_UNDERFLOW12, 42u,
-                            0x8F492598u) &&
-           fw_crc32_matches(mem, WLED_V1601_XTHAL_WINDOW_SPILL, 273u,
-                            0x3DA50F6Cu);
-}
-
-static int stub_fw_wled_window_vector(xtensa_cpu_t *cpu,
-                                      unsigned register_count,
-                                      bool underflow) {
+static int stub_canonical_window_vector(xtensa_cpu_t *cpu,
+                                        unsigned register_count,
+                                        bool underflow) {
     const uint32_t insns = register_count == 4u
                          ? 5u : register_count + 2u;
     if (cpu->breakpoint_count != 0 || cpu->window_trace ||
-        !fw_wled_heap_span_safe(cpu, insns) ||
+        !fw_native_span_safe(cpu, insns) ||
         !xtensa_fast_window_vector(cpu, register_count, underflow))
         return 0;
     fw_charge_stub_path(cpu, insns);
     return (int)insns;
 }
 
-static int stub_fw_wled_window_overflow4(xtensa_cpu_t *cpu, void *ctx) {
+static int stub_canonical_window_overflow4(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    return stub_fw_wled_window_vector(cpu, 4u, false);
+    return stub_canonical_window_vector(cpu, 4u, false);
 }
 
-static int stub_fw_wled_window_underflow4(xtensa_cpu_t *cpu, void *ctx) {
+static int stub_canonical_window_underflow4(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    return stub_fw_wled_window_vector(cpu, 4u, true);
+    return stub_canonical_window_vector(cpu, 4u, true);
 }
 
-static int stub_fw_wled_window_overflow8(xtensa_cpu_t *cpu, void *ctx) {
+static int stub_canonical_window_overflow8(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    return stub_fw_wled_window_vector(cpu, 8u, false);
+    return stub_canonical_window_vector(cpu, 8u, false);
 }
 
-static int stub_fw_wled_window_underflow8(xtensa_cpu_t *cpu, void *ctx) {
+static int stub_canonical_window_underflow8(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    return stub_fw_wled_window_vector(cpu, 8u, true);
+    return stub_canonical_window_vector(cpu, 8u, true);
 }
 
-static int stub_fw_wled_window_overflow12(xtensa_cpu_t *cpu, void *ctx) {
+static int stub_canonical_window_overflow12(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    return stub_fw_wled_window_vector(cpu, 12u, false);
+    return stub_canonical_window_vector(cpu, 12u, false);
 }
 
-static int stub_fw_wled_window_underflow12(xtensa_cpu_t *cpu, void *ctx) {
+static int stub_canonical_window_underflow12(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
-    return stub_fw_wled_window_vector(cpu, 12u, true);
+    return stub_canonical_window_vector(cpu, 12u, true);
+}
+
+/* VECBASE is 1 KiB aligned and the complete internal-IRAM range contains only
+ * 320 candidates. Register every exact canonical table found so a relocated
+ * application VECBASE works without an image profile or symbol file. */
+static int fw_add_canonical_window_vector_hooks(esp32_rom_stubs_t *stubs) {
+    int hooked = 0;
+    for (uint32_t base = ESP32_FIRMWARE_INSN_ADDR_LOW;
+         base + VECOFS_WINDOW_UNDERFLOW12 + 42u <=
+             ESP32_IRAM_INSN_ADDR_HIGH;
+         base += 0x400u) {
+        if (!xtensa_window_vectors_are_canonical(stubs->cpu->mem, base))
+            continue;
+        rom_stubs_register_conditional_ctx(
+                stubs, base + VECOFS_WINDOW_OVERFLOW4,
+                stub_canonical_window_overflow4, "WindowOverflow4", NULL);
+        rom_stubs_register_conditional_ctx(
+                stubs, base + VECOFS_WINDOW_UNDERFLOW4,
+                stub_canonical_window_underflow4, "WindowUnderflow4", NULL);
+        rom_stubs_register_conditional_ctx(
+                stubs, base + VECOFS_WINDOW_OVERFLOW8,
+                stub_canonical_window_overflow8, "WindowOverflow8", NULL);
+        rom_stubs_register_conditional_ctx(
+                stubs, base + VECOFS_WINDOW_UNDERFLOW8,
+                stub_canonical_window_underflow8, "WindowUnderflow8", NULL);
+        rom_stubs_register_conditional_ctx(
+                stubs, base + VECOFS_WINDOW_OVERFLOW12,
+                stub_canonical_window_overflow12, "WindowOverflow12", NULL);
+        rom_stubs_register_conditional_ctx(
+                stubs, base + VECOFS_WINDOW_UNDERFLOW12,
+                stub_canonical_window_underflow12, "WindowUnderflow12", NULL);
+        hooked += 6;
+    }
+    return hooked;
 }
 
 static wled_spill_path_t *fw_wled_spill_path_find(
@@ -6536,7 +6541,7 @@ static int stub_fw_wled_xthal_window_spill(xtensa_cpu_t *cpu, void *ctx) {
             stubs->wled_spill_paths, key, false);
     if (path && path->observations >= 2u &&
         path->observations != UINT8_MAX) {
-        if (!fw_wled_heap_span_safe(cpu, path->insns) ||
+        if (!fw_native_span_safe(cpu, path->insns) ||
             !xtensa_fast_spill_all_windows(cpu))
             return 0;
         ar_write(cpu, 3, path->final_a3);
@@ -6571,7 +6576,7 @@ static int stub_fw_wled_xthal_spill_finish(xtensa_cpu_t *cpu, void *ctx) {
     unsigned final_wb = (cpu->windowbase + 1u) & 15u;
     uint32_t insns = cpu->ccount - training->start_ccount + suffix_insns;
     if (final_wb != training->windowbase || insns > UINT16_MAX ||
-        !fw_wled_heap_span_safe(cpu, suffix_insns)) {
+        !fw_native_span_safe(cpu, suffix_insns)) {
         training->active = false;
         return 0;
     }
@@ -6610,26 +6615,11 @@ static int stub_fw_wled_xthal_spill_finish(xtensa_cpu_t *cpu, void *ctx) {
     return (int)suffix_insns;
 }
 
-static bool fw_wled_add_window_vector_hooks(esp32_rom_stubs_t *stubs) {
-    if (!fw_wled_window_vector_code_matches(stubs->cpu->mem)) return false;
-    rom_stubs_register_conditional_ctx(
-            stubs, WLED_V1601_WINDOW_OVERFLOW4,
-            stub_fw_wled_window_overflow4, "WindowOverflow4", NULL);
-    rom_stubs_register_conditional_ctx(
-            stubs, WLED_V1601_WINDOW_UNDERFLOW4,
-            stub_fw_wled_window_underflow4, "WindowUnderflow4", NULL);
-    rom_stubs_register_conditional_ctx(
-            stubs, WLED_V1601_WINDOW_OVERFLOW8,
-            stub_fw_wled_window_overflow8, "WindowOverflow8", NULL);
-    rom_stubs_register_conditional_ctx(
-            stubs, WLED_V1601_WINDOW_UNDERFLOW8,
-            stub_fw_wled_window_underflow8, "WindowUnderflow8", NULL);
-    rom_stubs_register_conditional_ctx(
-            stubs, WLED_V1601_WINDOW_OVERFLOW12,
-            stub_fw_wled_window_overflow12, "WindowOverflow12", NULL);
-    rom_stubs_register_conditional_ctx(
-            stubs, WLED_V1601_WINDOW_UNDERFLOW12,
-            stub_fw_wled_window_underflow12, "WindowUnderflow12", NULL);
+static bool fw_wled_add_xthal_spill_hooks(esp32_rom_stubs_t *stubs) {
+    if (!fw_crc32_matches(stubs->cpu->mem,
+                          WLED_V1601_XTHAL_WINDOW_SPILL, 273u,
+                          0x3DA50F6Cu))
+        return false;
     rom_stubs_register_conditional_ctx(
             stubs, WLED_V1601_XTHAL_WINDOW_SPILL,
             stub_fw_wled_xthal_window_spill, "xthal_window_spill_nw", NULL);
@@ -6674,7 +6664,7 @@ static int stub_fw_wled_heap_malloc_impl(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t insns = fw_wled_heap_path_ready(stubs->wled_malloc_paths,
                                              plan.path_key);
     if (insns != 0u) {
-        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        if (!fw_native_span_safe(cpu, insns)) return 0;
         return fw_wled_heap_native_return(cpu, &plan, insns, has_mux, true);
     }
 
@@ -6702,7 +6692,7 @@ static int stub_fw_wled_heap_free_impl(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t insns = fw_wled_heap_path_ready(stubs->wled_free_paths,
                                              plan.path_key);
     if (insns != 0u) {
-        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        if (!fw_native_span_safe(cpu, insns)) return 0;
         return fw_wled_heap_native_return(cpu, &plan, insns, has_mux, false);
     }
 
@@ -6762,7 +6752,7 @@ static int stub_fw_wled_tlsf_malloc(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t insns = fw_wled_heap_path_ready(
             stubs->wled_tlsf_malloc_paths, plan.path_key);
     if (insns != 0u) {
-        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        if (!fw_native_span_safe(cpu, insns)) return 0;
         return fw_wled_tlsf_native_return(cpu, &plan, insns, true);
     }
 
@@ -6789,7 +6779,7 @@ static int stub_fw_wled_tlsf_free(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t insns = fw_wled_heap_path_ready(
             stubs->wled_tlsf_free_paths, plan.path_key);
     if (insns != 0u) {
-        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        if (!fw_native_span_safe(cpu, insns)) return 0;
         return fw_wled_tlsf_native_return(cpu, &plan, insns, false);
     }
 
@@ -6904,6 +6894,11 @@ static bool fw_wled_add_heap_impl_hooks(esp32_rom_stubs_t *stubs) {
 
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
+    int n = fw_add_canonical_window_vector_hooks(stubs);
+    if (n != 0)
+        stubs->cpu->accelerated_blocks = true;
+    fw_discover_flash_poll_loops(stubs);
+
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
             stubs, entry_point);
     if (profile == ROM_FIRMWARE_MARAUDER_V1121_CYD2USB)
@@ -6922,7 +6917,6 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
         tbl = fw_nerdminer_hooks;
     else if (profile == ROM_FIRMWARE_WLED_V1601)
         tbl = fw_wled_v1601_hooks;
-    fw_configure_flash_poll_loops(stubs, profile);
     if (!tbl) {
         if (entry_point == 0x40081E90u || entry_point == 0x400831D8u ||
             entry_point == 0x400830D0u)
@@ -6932,9 +6926,9 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
                     entry_point);
         /* No profile is not the same as nothing to do: the PHY boundary can
          * be found by signature in any image. */
-        return fw_hook_scanned_phy(stubs);
+        n += fw_hook_scanned_phy(stubs);
+        return n;
     }
-    int n = 0;
     for (const fw_addr_hook_t *h = tbl; h->fn; h++) {
         if (h->spy)
             rom_stubs_register_spy(stubs, h->addr, h->fn, h->name, NULL);
@@ -6946,9 +6940,9 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
      * was used before it acquired a profile-specific acceleration table, and
      * collapse the fully modeled uncontended FreeRTOS critical boundary. */
     if (profile == ROM_FIRMWARE_WLED_V1601) {
-        if (fw_wled_add_window_vector_hooks(stubs)) {
+        if (fw_wled_add_xthal_spill_hooks(stubs)) {
             stubs->cpu->accelerated_blocks = true;
-            n += 8;
+            n += 2;
         }
         if (fw_wled_add_watchpoint_hook(stubs)) {
             stubs->cpu->accelerated_blocks = true;

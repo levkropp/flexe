@@ -887,6 +887,62 @@ TEST(test_firmware_phy_wrapper_installs_virtual_table) {
     teardown(&cpu);
 }
 
+TEST(test_structural_abi_accels_do_not_require_firmware_profile) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t vector_base = 0x4007C000u;
+    const uint32_t poll0 = 0x4007A123u;
+    const uint32_t poll1 = 0x4007B234u;
+
+    seed_canonical_window_vectors(&cpu, vector_base);
+    seed_flash_poll_loop(&cpu, poll0);
+    seed_flash_poll_loop(&cpu, poll1);
+    ASSERT_TRUE(xtensa_window_vectors_are_canonical(cpu.mem, vector_base));
+    mem_write8(cpu.mem, vector_base + VECOFS_WINDOW_UNDERFLOW12 + 1u, 0u);
+    ASSERT_FALSE(xtensa_window_vectors_are_canonical(cpu.mem, vector_base));
+    seed_canonical_window_vectors(&cpu, vector_base);
+
+    /* The entry is deliberately unknown. Discovery depends only on complete
+     * ABI instruction bodies, not an application fingerprint or fixed PC. */
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(rom, 0x40081234u), 6u);
+    ASSERT_EQ(cpu.poll_spin_count, 2u);
+    ASSERT_EQ(cpu.poll_spin_pc[0], poll0);
+    ASSERT_EQ(cpu.poll_spin_pc[1], poll1);
+    ASSERT_EQ(cpu.poll_spin_insns, 4u);
+    ASSERT_TRUE(cpu.accelerated_blocks);
+
+    const uint32_t frame_top = 0x3FFB6000u;
+    const uint32_t resume = BASE + 0x600u;
+    const uint32_t saved[] = {
+        0x40001234u, 0x3FFB7000u, 0xA5A50002u, 0xA5A50003u,
+    };
+    cpu.real_window_vectors = true;
+    cpu.vecbase = vector_base;
+    cpu.windowbase = 5u;
+    cpu.windowstart = (1u << 2) | (1u << 5);
+    cpu.ps = 0u;
+    XT_PS_SET_EXCM(cpu.ps, 1u);
+    XT_PS_SET_OWB(cpu.ps, 2u);
+    cpu.epc[0] = resume;
+    for (unsigned i = 0; i < 4u; i++)
+        ar_write(&cpu, (int)i, saved[i]);
+    ar_write(&cpu, 5, frame_top);
+    cpu.pc = vector_base + VECOFS_WINDOW_OVERFLOW4;
+    cpu._pc_written = true;
+    cpu.running = true;
+
+    ASSERT_EQ(xtensa_run(&cpu, 5), 5u);
+    ASSERT_EQ(cpu.pc, resume);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_FALSE(cpu.windowstart & (1u << 5));
+    for (unsigned i = 0; i < 4u; i++)
+        ASSERT_EQ(mem_read32(cpu.mem, frame_top - 16u + i * 4u), saved[i]);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1672,6 +1728,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_open_dispatches_through_guest_syscall_table);
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);
+    RUN_TEST(test_structural_abi_accels_do_not_require_firmware_profile);
     RUN_TEST(test_wled_v1601_hooks_memcmp_critical_sections_and_scanned_phy);
     RUN_TEST(test_wled_v1601_watchpoint_hook_matches_original_routine);
     RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
