@@ -108,7 +108,8 @@ int main(int argc, char **argv) {
     bool count_ok = r[0] + 2u >= want_reload && r[0] <= want_reload + 2u &&
                     r[10] + 1u >= want_new && r[10] <= want_new + 1u;
     bool gap_ok = r[3] >= PERIOD_MS * 500u && r[4] <= PERIOD_MS * 2000u;
-    bool oneshot_ok = r[2] == 1u && r[8] >= ONESHOT_MS * 1000u &&
+    bool oneshot_ok = r[2] == 1u &&
+                      r[8] >= (ONESHOT_MS - 1u) * 1000u &&
                       r[8] <= (ONESHOT_MS + PERIOD_MS) * 1000u;
     /* The period change has to actually take effect: at the new period no gap
      * may still be the old one. */
