@@ -2511,6 +2511,15 @@ int main(int argc, char **argv)
                 cpu0 ? cpu0->ps : 0, cpu1 ? cpu1->ps : 0,
                 periph_unhandled_count(flexe_session_periph(session)),
                 rom_stubs_unregistered_count(flexe_session_rom(session)));
+        if (rom_audit.used > 0) {
+            fprintf(stderr, "Unregistered ROM addresses: ");
+            for (int i = 0; i < rom_audit.used; i++) {
+                fprintf(stderr, "%s0x%08X@0x%08X(x%u)", i ? "," : "",
+                        rom_audit.addr[i], rom_audit.caller[i],
+                        rom_audit.count[i]);
+            }
+            fputc('\n', stderr);
+        }
         if (is_wled)
             fprintf(stderr,
                     "WLED readiness: host_port=%u rmt_frames=%llu "

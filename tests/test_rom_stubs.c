@@ -523,6 +523,18 @@ static uint32_t call_builtin_rom0(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+static uint32_t call_builtin_rom_args(xtensa_cpu_t *cpu, uint32_t addr,
+                                      const uint32_t *args, size_t count) {
+    cpu->pc = addr;
+    cpu->_pc_written = true;
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, BASE);
+    for (size_t i = 0; i < count; i++)
+        ar_write(cpu, 2 + (int)i, args[i]);
+    xtensa_step(cpu);
+    return ar_read(cpu, 2);
+}
+
 TEST(test_cpu_frequency_rom_pair) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -540,6 +552,11 @@ TEST(test_cpu_frequency_rom_pair) {
 
 static uint32_t rom_syscall_test_reent;
 static uint32_t rom_syscall_test_args[4];
+static uint32_t rom_syscall_test_alloc_next;
+static uint32_t rom_syscall_test_alloc_args[2];
+static uint32_t rom_syscall_test_lock_arg;
+static int rom_syscall_test_alloc_calls;
+static int rom_syscall_test_lock_calls;
 
 static void return_from_test_call8(xtensa_cpu_t *cpu, uint32_t value) {
     ar_write(cpu, 10, value);
@@ -557,6 +574,198 @@ static void test_rom_open_r_handler(xtensa_cpu_t *cpu, void *ctx) {
     for (int i = 0; i < 4; i++)
         rom_syscall_test_args[i] = ar_read(cpu, 10 + i);
     return_from_test_call8(cpu, 37u);
+}
+
+static void test_rom_malloc_r_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_syscall_test_alloc_args[0] = ar_read(cpu, 10);
+    rom_syscall_test_alloc_args[1] = ar_read(cpu, 11);
+    uint32_t result = rom_syscall_test_alloc_next;
+    rom_syscall_test_alloc_next += 0x100u;
+    rom_syscall_test_alloc_calls++;
+    return_from_test_call8(cpu, result);
+}
+
+static void test_rom_lock_init_recursive_handler(xtensa_cpu_t *cpu,
+                                                 void *ctx) {
+    (void)ctx;
+    rom_syscall_test_lock_arg = ar_read(cpu, 10);
+    rom_syscall_test_lock_calls++;
+    mem_write32(cpu->mem, rom_syscall_test_lock_arg,
+                0xF17E0000u + (uint32_t)rom_syscall_test_lock_calls);
+    return_from_test_call8(cpu, 0);
+}
+
+TEST(test_rom_newlib_scalar_helpers) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t buf = 0x3FFB1000u;
+    const uint32_t reent = 0x3FFB2000u;
+    const uint32_t offset = 0x3FFB2100u;
+
+    uint32_t utoa_args[] = { 0xDEADBEEFu, buf, 16u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40056258u, utoa_args, 3), buf);
+    ASSERT_TRUE(strcmp((const char *)mem_get_ptr(cpu.mem, buf),
+                       "deadbeef") == 0);
+
+    uint32_t itoa_args[] = { 0x80000000u, buf, 10u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400566B4u, itoa_args, 3), buf);
+    ASSERT_TRUE(strcmp((const char *)mem_get_ptr(cpu.mem, buf),
+                       "-2147483648") == 0);
+
+    uint32_t div_args[] = { (uint32_t)-17, 5u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40056348u, div_args, 2),
+              (uint32_t)-3);
+    ASSERT_EQ(ar_read(&cpu, 3), (uint32_t)-2);
+
+    mem_write32(cpu.mem, offset, 0xA5A5A5A5u);
+    uint32_t findenv_args[] = { reent, buf, offset };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001F44u, findenv_args, 3), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, offset), 0xA5A5A5A5u);
+
+    uint32_t wctomb_args[] = { reent, buf, 0xE9u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40058EF0u, wctomb_args, 3), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, buf), 0xE9u);
+    wctomb_args[2] = 0x100u;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40058EF0u, wctomb_args, 3),
+              (uint32_t)-1);
+    ASSERT_EQ(mem_read32(cpu.mem, reent), 138u);
+    wctomb_args[1] = 0;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40058EF0u, wctomb_args, 3), 0u);
+
+    const uint32_t first = 0x3FFB1100u;
+    const uint32_t second = 0x3FFB1200u;
+    mem_load(cpu.mem, first, (const uint8_t *)"alpha-beta", 11u);
+    mem_load(cpu.mem, second, (const uint8_t *)"alpha-zeta", 11u);
+    uint32_t memchr_args[] = { first, '-', 10u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C244u, memchr_args, 3),
+              first + 5u);
+    uint32_t strchr_args[] = { first, 'b' };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C53Cu, strchr_args, 2),
+              first + 6u);
+    strchr_args[1] = 0;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C53Cu, strchr_args, 2),
+              first + 10u);
+    uint32_t strncmp_args[] = { first, second, 6u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C5F4u, strncmp_args, 3), 0u);
+    strncmp_args[2] = 10u;
+    ASSERT_TRUE((int32_t)call_builtin_rom_args(
+                    &cpu, 0x4000C5F4u, strncmp_args, 3) < 0);
+
+    uint32_t getenv_args[] = { reent, first };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001FBCu, getenv_args, 2), 0u);
+
+    const uint32_t env_table = 0x3FFB1300u;
+    const uint32_t env_entry = 0x3FFB1400u;
+    const uint32_t env_name = 0x3FFB1500u;
+    mem_load(cpu.mem, env_entry, (const uint8_t *)"MODE=production", 16u);
+    mem_load(cpu.mem, env_name, (const uint8_t *)"MODE", 5u);
+    mem_write32(cpu.mem, env_table, env_entry);
+    mem_write32(cpu.mem, env_table + 4u, 0u);
+    mem_write32(cpu.mem, 0x3FFAE0B4u, env_table);
+    mem_write32(cpu.mem, offset, 0xA5A5A5A5u);
+    uint32_t populated_findenv_args[] = { reent, env_name, offset };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001F44u,
+                                    populated_findenv_args, 3),
+              env_entry + 5u);
+    ASSERT_EQ(mem_read32(cpu.mem, offset), 0u);
+    getenv_args[1] = env_name;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001FBCu, getenv_args, 2),
+              env_entry + 5u);
+    uint32_t lock_args[] = { reent };
+    (void)call_builtin_rom_args(&cpu, 0x40001E08u, lock_args, 1);
+    (void)call_builtin_rom_args(&cpu, 0x40001E14u, lock_args, 1);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_rom_strdup_uses_guest_allocator) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t table = 0x3FFB1000u;
+    const uint32_t getreent = 0x400D0100u;
+    const uint32_t malloc_r = 0x400D0300u;
+    const uint32_t src = 0x3FFB2000u;
+    const uint32_t dst = 0x3FFB3000u;
+    rom_syscall_test_reent = 0x3FFB4000u;
+    rom_syscall_test_alloc_next = dst;
+    rom_syscall_test_alloc_calls = 0;
+
+    mem_write32(cpu.mem, 0x3FFAE024u, table);
+    mem_write32(cpu.mem, table + 0x00u, getreent);
+    mem_write32(cpu.mem, table + 0x04u, malloc_r);
+    mem_load(cpu.mem, src, (const uint8_t *)"bruce.cfg", 10u);
+    rom_stubs_register(rom, getreent, test_rom_getreent_handler,
+                       "test_getreent");
+    rom_stubs_register(rom, malloc_r, test_rom_malloc_r_handler,
+                       "test_malloc_r");
+
+    uint32_t args[] = { src };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000143Cu, args, 1), dst);
+    ASSERT_TRUE(strcmp((const char *)mem_get_ptr(cpu.mem, dst),
+                       "bruce.cfg") == 0);
+    ASSERT_EQ(rom_syscall_test_alloc_calls, 1);
+    ASSERT_EQ(rom_syscall_test_alloc_args[0], rom_syscall_test_reent);
+    ASSERT_EQ(rom_syscall_test_alloc_args[1], 10u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_rom_sfp_initializes_and_reuses_guest_files) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t table = 0x3FFB1000u;
+    const uint32_t malloc_r = 0x400D0300u;
+    const uint32_t lock_init = 0x400D0400u;
+    const uint32_t reent = 0x3FFB2000u;
+    const uint32_t first = 0x3FFB3000u;
+    rom_syscall_test_alloc_next = first;
+    rom_syscall_test_alloc_calls = 0;
+    rom_syscall_test_lock_calls = 0;
+    rom_syscall_test_lock_arg = 0;
+
+    mem_write32(cpu.mem, 0x3FFAE024u, table);
+    mem_write32(cpu.mem, table + 0x04u, malloc_r);
+    mem_write32(cpu.mem, table + 0x64u, lock_init);
+    rom_stubs_register(rom, malloc_r, test_rom_malloc_r_handler,
+                       "test_malloc_r");
+    rom_stubs_register(rom, lock_init, test_rom_lock_init_recursive_handler,
+                       "test_lock_init_recursive");
+
+    uint32_t args[] = { reent };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001E90u, args, 1), first);
+    ASSERT_EQ(rom_syscall_test_alloc_args[0], reent);
+    ASSERT_EQ(rom_syscall_test_alloc_args[1], 104u);
+    ASSERT_EQ(mem_read16(cpu.mem, first + 12u), 1u);
+    ASSERT_EQ(mem_read16(cpu.mem, first + 14u), 0xFFFFu);
+    ASSERT_EQ(rom_syscall_test_lock_arg, first + 88u);
+    ASSERT_EQ(mem_read32(cpu.mem, first + 88u), 0xF17E0001u);
+    ASSERT_EQ(mem_read32(cpu.mem, first + 100u), 0u);
+
+    /* An active FILE consumes a second slot. */
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001E90u, args, 1),
+              first + 0x100u);
+    ASSERT_EQ(rom_syscall_test_alloc_calls, 2);
+
+    /* fclose marks _flags free; __sfp must reuse and reinitialize that slot. */
+    mem_write16(cpu.mem, first + 12u, 0u);
+    mem_write32(cpu.mem, first + 4u, 0xA5A5A5A5u);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001E90u, args, 1), first);
+    ASSERT_EQ(rom_syscall_test_alloc_calls, 2);
+    ASSERT_EQ(rom_syscall_test_lock_calls, 3);
+    ASSERT_EQ(mem_read32(cpu.mem, first + 4u), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, first + 88u), 0xF17E0003u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
 }
 
 TEST(test_rom_open_dispatches_through_guest_syscall_table) {
@@ -1216,6 +1425,9 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses);
     RUN_TEST(test_stub_memcpy);
     RUN_TEST(test_cpu_frequency_rom_pair);
+    RUN_TEST(test_rom_newlib_scalar_helpers);
+    RUN_TEST(test_rom_strdup_uses_guest_allocator);
+    RUN_TEST(test_rom_sfp_initializes_and_reuses_guest_files);
     RUN_TEST(test_rom_open_dispatches_through_guest_syscall_table);
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);

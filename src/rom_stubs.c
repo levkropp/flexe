@@ -34,6 +34,14 @@ static inline int rom_gpio_dbg(void) {
 #define HEAP_FREE          0x46524545u  /* "FREE" */
 #define HEAP_HDR_SZ        8u
 
+/* newlib's ESP32 __sFILE is 104 bytes.  Keep enough returned FILE objects to
+ * reuse slots after fclose clears _flags, matching the ROM's glue-list pool. */
+#define ROM_FILE_SIZE       104u
+#define ROM_FILE_FLAGS_OFS   12u
+#define ROM_FILE_FD_OFS      14u
+#define ROM_FILE_LOCK_OFS    88u
+#define ROM_FILE_POOL_SIZE   64u
+
 #define MALLOC_CAP_DMA_BIT      (1u << 3)
 #define MALLOC_CAP_EXEC_BIT     (1u << 4)
 #define MALLOC_CAP_INTERNAL_BIT (1u << 11)
@@ -115,6 +123,8 @@ struct esp32_rom_stubs {
     bool gpio_isr_installed;
     stub_heap_region_t heap;
     stub_heap_region_t internal_heap;
+    uint32_t sfp_files[ROM_FILE_POOL_SIZE];
+    uint32_t sfp_file_count;
     struct {
         uint32_t addr;     /* 0 = empty */
         int      idx;      /* index into entries[] */
@@ -468,6 +478,36 @@ static void stub_memcmp(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
+static void stub_memchr(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t addr = rom_arg(cpu, 0);
+    uint8_t value = (uint8_t)rom_arg(cpu, 1);
+    uint32_t len = rom_arg(cpu, 2);
+    uint32_t off = 0;
+    while (off < len) {
+        const uint8_t *ptr = mem_get_ptr(cpu->mem, addr + off);
+        uint32_t chunk = len - off;
+        uint32_t page_left = 0x1000u - ((addr + off) & 0xFFFu);
+        if (chunk > page_left)
+            chunk = page_left;
+        if (ptr) {
+            const uint8_t *found = memchr(ptr, value, chunk);
+            if (found) {
+                rom_return(cpu, addr + off + (uint32_t)(found - ptr));
+                return;
+            }
+            off += chunk;
+        } else {
+            if (mem_read8(cpu->mem, addr + off) == value) {
+                rom_return(cpu, addr + off);
+                return;
+            }
+            off++;
+        }
+    }
+    rom_return(cpu, 0);
+}
+
 static void stub_bzero(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t dst = rom_arg(cpu, 0);
@@ -508,6 +548,57 @@ static void stub_strcmp(xtensa_cpu_t *cpu, void *ctx) {
                 rom_return(cpu, (uint32_t)(int32_t)(a - b));
                 return;
             }
+        }
+    }
+}
+
+static void stub_strncmp(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t s1 = rom_arg(cpu, 0);
+    uint32_t s2 = rom_arg(cpu, 1);
+    uint32_t len = rom_arg(cpu, 2);
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t a = mem_read8(cpu->mem, s1 + i);
+        uint8_t b = mem_read8(cpu->mem, s2 + i);
+        if (a != b || a == 0) {
+            rom_return(cpu, (uint32_t)(int32_t)(a - b));
+            return;
+        }
+    }
+    rom_return(cpu, 0);
+}
+
+static void stub_strchr(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t addr = rom_arg(cpu, 0);
+    uint8_t value = (uint8_t)rom_arg(cpu, 1);
+    uint32_t off = 0;
+    while (1) {
+        const uint8_t *ptr = mem_get_ptr(cpu->mem, addr + off);
+        if (ptr) {
+            uint32_t chunk = 0x1000u - ((addr + off) & 0xFFFu);
+            const uint8_t *found = memchr(ptr, value, chunk);
+            const uint8_t *nul = memchr(ptr, 0, chunk);
+            if (found && (!nul || found <= nul)) {
+                rom_return(cpu, addr + off + (uint32_t)(found - ptr));
+                return;
+            }
+            if (nul) {
+                rom_return(cpu, 0);
+                return;
+            }
+            off += chunk;
+        } else {
+            uint8_t current = mem_read8(cpu->mem, addr + off);
+            if (current == value) {
+                rom_return(cpu, addr + off);
+                return;
+            }
+            if (current == 0) {
+                rom_return(cpu, 0);
+                return;
+            }
+            off++;
         }
     }
 }
@@ -920,30 +1011,134 @@ static void stub_moddi3(xtensa_cpu_t *cpu, void *ctx) {
     rom_return64(cpu, (uint64_t)(b ? a % b : 0));
 }
 
-/* itoa — integer to string conversion */
+static uint32_t write_integer_string(xtensa_cpu_t *cpu, uint32_t value,
+                                     uint32_t buf, uint32_t base,
+                                     bool negative) {
+    char tmp[34];
+    if (base < 2 || base > 36) {
+        mem_write8(cpu->mem, buf, 0);
+        return buf;
+    }
+
+    int i = 0;
+    if (value == 0) tmp[i++] = '0';
+    else while (value > 0) {
+        uint32_t d = value % base;
+        tmp[i++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        value /= base;
+    }
+    if (negative) tmp[i++] = '-';
+    /* reverse and write to memory */
+    for (int j = 0; j < i; j++)
+        mem_write8(cpu->mem, buf + (uint32_t)j, (uint8_t)tmp[i - 1 - j]);
+    mem_write8(cpu->mem, buf + (uint32_t)i, 0);
+    return buf;
+}
+
+/* itoa — signed integer to string conversion */
 static void stub_itoa(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     int32_t val = (int32_t)rom_arg(cpu, 0);
     uint32_t buf = rom_arg(cpu, 1);
     uint32_t base = rom_arg(cpu, 2);
-    char tmp[34];
-    int neg = 0;
-    uint32_t uval;
-    if (base == 10 && val < 0) { neg = 1; uval = (uint32_t)(-val); }
-    else uval = (uint32_t)val;
-    int i = 0;
-    if (uval == 0) tmp[i++] = '0';
-    else while (uval > 0) {
-        uint32_t d = uval % base;
-        tmp[i++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
-        uval /= base;
+    bool negative = base == 10 && val < 0;
+    uint32_t value = negative ? 0u - (uint32_t)val : (uint32_t)val;
+    rom_return(cpu, write_integer_string(cpu, value, buf, base, negative));
+}
+
+/* utoa — unsigned integer to string conversion */
+static void stub_utoa(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t value = rom_arg(cpu, 0);
+    uint32_t buf = rom_arg(cpu, 1);
+    uint32_t base = rom_arg(cpu, 2);
+    rom_return(cpu, write_integer_string(cpu, value, buf, base, false));
+}
+
+/* div returns div_t in a2:a3 on the 32-bit Xtensa ABI. */
+static void stub_div(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    int64_t numerator = (int32_t)rom_arg(cpu, 0);
+    int64_t denominator = (int32_t)rom_arg(cpu, 1);
+    int32_t quotient = 0;
+    int32_t remainder = 0;
+    if (denominator != 0) {
+        quotient = (int32_t)(numerator / denominator);
+        remainder = (int32_t)(numerator % denominator);
     }
-    if (neg) tmp[i++] = '-';
-    /* reverse and write to memory */
-    for (int j = 0; j < i; j++)
-        mem_write8(cpu->mem, buf + (uint32_t)j, (uint8_t)tmp[i - 1 - j]);
-    mem_write8(cpu->mem, buf + (uint32_t)i, 0);
-    rom_return(cpu, buf);
+    rom_return64(cpu, (uint32_t)quotient |
+                      ((uint64_t)(uint32_t)remainder << 32));
+}
+
+/* The ROM owns a guest environ pointer in its D-bus data window.  Consult
+ * that table without ever exposing the host process environment. */
+#define ROM_ENVIRON_ADDR 0x3FFAE0B4u
+#define ROM_ENV_ENTRY_LIMIT 1024u
+#define ROM_ENV_NAME_LIMIT  4096u
+
+static uint32_t find_guest_env(xtensa_cpu_t *cpu, uint32_t name,
+                               uint32_t offset) {
+    if (name == 0)
+        return 0;
+    uint32_t name_len = 0;
+    while (name_len < ROM_ENV_NAME_LIMIT) {
+        uint8_t ch = mem_read8(cpu->mem, name + name_len);
+        if (ch == '=')
+            return 0;
+        if (ch == 0)
+            break;
+        name_len++;
+    }
+    if (name_len == ROM_ENV_NAME_LIMIT)
+        return 0;
+
+    uint32_t environ = mem_read32(cpu->mem, ROM_ENVIRON_ADDR);
+    if (environ == 0)
+        return 0;
+    for (uint32_t index = 0; index < ROM_ENV_ENTRY_LIMIT; index++) {
+        uint32_t entry = mem_read32(cpu->mem, environ + index * 4u);
+        if (entry == 0)
+            return 0;
+        uint32_t i = 0;
+        while (i < name_len &&
+               mem_read8(cpu->mem, entry + i) ==
+                   mem_read8(cpu->mem, name + i))
+            i++;
+        if (i == name_len && mem_read8(cpu->mem, entry + i) == '=') {
+            if (offset != 0)
+                mem_write32(cpu->mem, offset, index);
+            return entry + name_len + 1u;
+        }
+    }
+    return 0;
+}
+
+static void stub_findenv_r(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, find_guest_env(cpu, rom_arg(cpu, 1), rom_arg(cpu, 2)));
+}
+
+static void stub_getenv_r(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, find_guest_env(cpu, rom_arg(cpu, 1), 0));
+}
+
+/* ASCII locale conversion used by newlib's printf paths. */
+static void stub_ascii_wctomb(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t reent = rom_arg(cpu, 0);
+    uint32_t dst = rom_arg(cpu, 1);
+    uint32_t wc = rom_arg(cpu, 2) & 0xFFFFu;
+    if (dst == 0) {
+        rom_return(cpu, 0);
+    } else if (wc <= 0xFFu) {
+        mem_write8(cpu->mem, dst, (uint8_t)wc);
+        rom_return(cpu, 1);
+    } else {
+        if (reent != 0)
+            mem_write32(cpu->mem, reent, 138u); /* EILSEQ in ESP newlib */
+        rom_return(cpu, (uint32_t)-1);
+    }
 }
 
 /* strcat */
@@ -3086,8 +3281,12 @@ static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
 #define ROM_SYSCALL_TABLE_APP_PTR 0x3FFAE020u
 #define ROM_SYSCALL_TABLE_PRO_PTR 0x3FFAE024u
 #define ROM_SYSCALL_GETREENT_OFF  0x00u
+#define ROM_SYSCALL_MALLOC_R_OFF   0x04u
+#define ROM_SYSCALL_FREE_R_OFF     0x08u
 #define ROM_SYSCALL_OPEN_R_OFF    0x50u
+#define ROM_SYSCALL_LOCK_INIT_RECURSIVE_OFF 0x64u
 #define ROM_SYSCALL_CALL_LIMIT    2000000u
+#define ROM_STRING_SCAN_LIMIT     (16u * 1024u * 1024u)
 
 static bool rom_syscall_target_valid(uint32_t target) {
     return (target >= 0x40070000u && target < 0x400A0000u) ||
@@ -3102,6 +3301,160 @@ static bool rom_syscall_table(xtensa_cpu_t *cpu, uint32_t *table_out) {
         return false;
     *table_out = table;
     return true;
+}
+
+static bool guest_range_writable(xtensa_cpu_t *cpu, uint32_t addr,
+                                 uint32_t size) {
+    if (addr == 0 || size == 0 || addr > UINT32_MAX - (size - 1u))
+        return false;
+    uint32_t end_page = (addr + size - 1u) & ~0xFFFu;
+    for (uint32_t page = addr & ~0xFFFu;; page += 0x1000u) {
+        if (!mem_get_ptr_w(cpu->mem, page))
+            return false;
+        if (page == end_page)
+            return true;
+    }
+}
+
+static void rom_free_guest_alloc(xtensa_cpu_t *cpu, uint32_t table,
+                                 uint32_t reent, uint32_t ptr) {
+    uint32_t free_r = mem_read32(cpu->mem, table + ROM_SYSCALL_FREE_R_OFF);
+    if (!rom_syscall_target_valid(free_r))
+        return;
+    uint32_t args[] = { reent, ptr };
+    (void)guest_call8(cpu, free_r, args, 2, ROM_SYSCALL_CALL_LIMIT, NULL);
+}
+
+/* strdup is a ROM veneer over the firmware-provided reentrant allocator.
+ * Allocate through that table so a later firmware free() owns the pointer. */
+static void stub_rom_strdup(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t src = rom_arg(cpu, 0);
+    uint32_t table;
+    uint32_t reent;
+    uint32_t dst;
+    uint32_t len = 0;
+
+    if (src == 0 || !rom_syscall_table(cpu, &table)) {
+        rom_return(cpu, 0);
+        return;
+    }
+    while (len < ROM_STRING_SCAN_LIMIT) {
+        if (src > UINT32_MAX - len || !mem_get_ptr(cpu->mem, src + len)) {
+            rom_return(cpu, 0);
+            return;
+        }
+        if (mem_read8(cpu->mem, src + len) == 0)
+            break;
+        len++;
+    }
+    if (len == ROM_STRING_SCAN_LIMIT) {
+        rom_return(cpu, 0);
+        return;
+    }
+
+    uint32_t getreent = mem_read32(cpu->mem,
+                                   table + ROM_SYSCALL_GETREENT_OFF);
+    uint32_t malloc_r = mem_read32(cpu->mem,
+                                   table + ROM_SYSCALL_MALLOC_R_OFF);
+    if (!rom_syscall_target_valid(getreent) ||
+        !rom_syscall_target_valid(malloc_r) ||
+        guest_call8(cpu, getreent, NULL, 0, ROM_SYSCALL_CALL_LIMIT,
+                    &reent) != 0) {
+        rom_return(cpu, 0);
+        return;
+    }
+    uint32_t args[] = { reent, len + 1u };
+    if (guest_call8(cpu, malloc_r, args, 2, ROM_SYSCALL_CALL_LIMIT,
+                    &dst) != 0) {
+        rom_return(cpu, 0);
+        return;
+    }
+    if (!guest_range_writable(cpu, dst, len + 1u)) {
+        if (dst != 0)
+            rom_free_guest_alloc(cpu, table, reent, dst);
+        rom_return(cpu, 0);
+        return;
+    }
+    for (uint32_t i = 0; i <= len; i++)
+        mem_write8(cpu->mem, dst + i, mem_read8(cpu->mem, src + i));
+    rom_return(cpu, dst);
+}
+
+/* Allocate and initialize a newlib FILE far enough for firmware stdio to own
+ * it.  The ROM obtains storage and locks through ESP-IDF's syscall table;
+ * doing the same keeps FILE lifetime and lock semantics in the guest. */
+static void stub_sfp(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t reent = rom_arg(cpu, 0);
+    uint32_t table;
+    uint32_t fp = 0;
+    bool allocated = false;
+
+    if (!rom_syscall_table(cpu, &table)) {
+        rom_return(cpu, 0);
+        return;
+    }
+    uint32_t lock_init = mem_read32(
+        cpu->mem, table + ROM_SYSCALL_LOCK_INIT_RECURSIVE_OFF);
+    if (!rom_syscall_target_valid(lock_init)) {
+        rom_return(cpu, 0);
+        return;
+    }
+
+    for (uint32_t i = 0; i < s->sfp_file_count; i++) {
+        if (mem_read16(cpu->mem, s->sfp_files[i] + ROM_FILE_FLAGS_OFS) == 0) {
+            fp = s->sfp_files[i];
+            break;
+        }
+    }
+    if (fp == 0) {
+        if (s->sfp_file_count >= ROM_FILE_POOL_SIZE) {
+            if (reent != 0)
+                mem_write32(cpu->mem, reent, 12u); /* ENOMEM */
+            rom_return(cpu, 0);
+            return;
+        }
+        uint32_t malloc_r = mem_read32(cpu->mem,
+                                       table + ROM_SYSCALL_MALLOC_R_OFF);
+        uint32_t args[] = { reent, ROM_FILE_SIZE };
+        if (!rom_syscall_target_valid(malloc_r) ||
+            guest_call8(cpu, malloc_r, args, 2, ROM_SYSCALL_CALL_LIMIT,
+                        &fp) != 0) {
+            if (reent != 0)
+                mem_write32(cpu->mem, reent, 12u);
+            rom_return(cpu, 0);
+            return;
+        }
+        if (!guest_range_writable(cpu, fp, ROM_FILE_SIZE)) {
+            if (fp != 0)
+                rom_free_guest_alloc(cpu, table, reent, fp);
+            if (reent != 0)
+                mem_write32(cpu->mem, reent, 12u);
+            rom_return(cpu, 0);
+            return;
+        }
+        allocated = true;
+    }
+
+    for (uint32_t i = 0; i < ROM_FILE_SIZE; i++)
+        mem_write8(cpu->mem, fp + i, 0);
+    mem_write16(cpu->mem, fp + ROM_FILE_FLAGS_OFS, 1u);
+    mem_write16(cpu->mem, fp + ROM_FILE_FD_OFS, 0xFFFFu);
+
+    uint32_t lock_arg = fp + ROM_FILE_LOCK_OFS;
+    if (guest_call8(cpu, lock_init, &lock_arg, 1, ROM_SYSCALL_CALL_LIMIT,
+                    NULL) != 0 ||
+        mem_read32(cpu->mem, lock_arg) == 0) {
+        mem_write16(cpu->mem, fp + ROM_FILE_FLAGS_OFS, 0u);
+        if (allocated)
+            rom_free_guest_alloc(cpu, table, reent, fp);
+        rom_return(cpu, 0);
+        return;
+    }
+    if (allocated)
+        s->sfp_files[s->sfp_file_count++] = fp;
+    rom_return(cpu, fp);
 }
 
 static void stub_rom_open(xtensa_cpu_t *cpu, void *ctx) {
@@ -4146,9 +4499,12 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
 
     /* String/memory functions */
     rom_stubs_register(s, 0x4000c3c0, stub_memmove,             "memmove");
+    rom_stubs_register(s, 0x4000c244, stub_memchr,              "memchr");
     rom_stubs_register(s, 0x4000c260, stub_memcmp,              "memcmp");
     rom_stubs_register(s, 0x4000c1f4, stub_bzero,               "bzero");
     rom_stubs_register(s, 0x40001274, stub_strcmp,               "strcmp");
+    rom_stubs_register(s, 0x4000c5f4, stub_strncmp,             "strncmp");
+    rom_stubs_register(s, 0x4000c53c, stub_strchr,              "strchr");
     rom_stubs_register(s, 0x400013ac, stub_strcpy,              "strcpy");
     rom_stubs_register(s, 0x400015d4, stub_strncpy,             "strncpy");
     rom_stubs_register(s, 0x4000c584, stub_strlcpy,             "strlcpy");
@@ -4247,16 +4603,25 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x400095e0, stub_cache_flash_mmu_set, "cache_flash_mmu_set");
 
     /* C library functions */
+    rom_stubs_register(s, 0x4000143c, stub_rom_strdup,         "strdup");
+    rom_stubs_register(s, 0x40001f44, stub_findenv_r,          "_findenv_r");
     rom_stubs_register(s, 0x40056424, stub_qsort,              "qsort");
+    rom_stubs_register(s, 0x40056258, stub_utoa,               "utoa");
+    rom_stubs_register(s, 0x40056348, stub_div,                "div");
     rom_stubs_register(s, 0x400566b4, stub_itoa,               "itoa");
     rom_stubs_register(s, 0x40056678, stub_itoa,               "__itoa");
+    rom_stubs_register(s, 0x40058ef0, stub_ascii_wctomb,       "__ascii_wctomb");
     rom_stubs_register(s, 0x4000c518, stub_strcat,             "strcat");
 
     /* Newlib stdio initialization */
     rom_stubs_register(s, 0x40001E38, stub_sinit,               "__sinit");
+    rom_stubs_register(s, 0x40001E90, stub_sfp,                 "__sfp");
     rom_stubs_register(s, 0x40001150, stub_swrite,              "__swrite");
+    rom_stubs_register(s, 0x40001E08, stub_void_unregistered,   "__sfp_lock_acquire");
+    rom_stubs_register(s, 0x40001E14, stub_void_unregistered,   "__sfp_lock_release");
     rom_stubs_register(s, 0x40001E20, stub_void_unregistered,   "__sinit_lock_acquire");
     rom_stubs_register(s, 0x40001E2C, stub_void_unregistered,   "__sinit_lock_release");
+    rom_stubs_register(s, 0x40001FBC, stub_getenv_r,            "_getenv_r");
 
     /* Newlib stdio flush */
     rom_stubs_register(s, 0x40059320, stub_fflush_r,             "_fflush_r");
