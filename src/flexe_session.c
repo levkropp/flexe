@@ -386,6 +386,8 @@ static int session_build(flexe_session_t *s)
         s->cpu[1].pc_hook = s->cpu[0].pc_hook;
         s->cpu[1].pc_hook_ctx = s->cpu[0].pc_hook_ctx;
         s->cpu[1].pc_hook_bitmap = s->cpu[0].pc_hook_bitmap;
+        s->cpu[1].pc_hook_contains = s->cpu[0].pc_hook_contains;
+        s->cpu[1].pc_hook_contains_ctx = s->cpu[0].pc_hook_contains_ctx;
         /* Address hooks are shared by both cores. Some conditionally consume
          * a complete verified firmware path and return its guest-instruction
          * span, so APP_CPU must use the same exact-work batch accounting as

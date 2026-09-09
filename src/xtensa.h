@@ -33,6 +33,12 @@ typedef void (*xtensa_code_invalidate_fn)(void *ctx, uint32_t addr, size_t len);
  * return more so the batch runner can account without rereading CCOUNT. */
 typedef int (*xtensa_pc_hook_fn)(xtensa_cpu_t *cpu, uint32_t pc, void *ctx);
 
+/* Optional exact membership query for a PC hook. The dispatch bitmap is a
+ * deliberately lossy fast filter: addresses share a bit every 2 MiB and
+ * adjacent unaligned Xtensa PCs can share a word. Translation engines must
+ * not mistake those false positives for real hook boundaries. */
+typedef bool (*xtensa_pc_hook_contains_fn)(uint32_t pc, void *ctx);
+
 /* Pre-decoded instruction table: entire firmware decoded at load time.
  * Direct-indexed by (pc - PREDECODE_BASE), no tags, no cache misses.
  * Packed: bits 0-23 = instruction word, bits 24-25 = ilen (2 or 3).
@@ -496,6 +502,14 @@ struct xtensa_cpu {
     /* Optional execution-engine code-cache invalidation hook. */
     xtensa_code_invalidate_fn code_invalidate;
     void *code_invalidate_ctx;
+
+    /* Cold companion to pc_hook_bitmap. Kept at the end so adding an exact
+     * translation-time query does not disturb the interpreter's hot layout.
+     * It has its own context because pc_hook/pc_hook_ctx may be wrapped by a
+     * JIT, tracer, or debugger while this still describes the underlying
+     * address hooks. NULL means the bitmap is the best information available. */
+    xtensa_pc_hook_contains_fn pc_hook_contains;
+    void *pc_hook_contains_ctx;
 };
 
 /* ESP-IDF's Xtensa spinlock owner words are the raw PRID values. Restrict

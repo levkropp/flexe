@@ -4368,6 +4368,19 @@ static int hook_ht_lookup(const esp32_rom_stubs_t *s, uint32_t pc) {
     return -1;
 }
 
+/* Exact counterpart to hook_bitmap. The bitmap only says that a hook might
+ * exist at a PC; its compact modulo index necessarily produces collisions.
+ * Registered hooks are always barriers even when they are spies or
+ * conditional hooks and ultimately let the guest instruction execute. When
+ * no ROM ELF is loaded, every otherwise-unregistered ROM entry is also
+ * consumed by the fallback stub. */
+static bool rom_pc_hook_contains(uint32_t pc, void *ctx) {
+    const esp32_rom_stubs_t *s = ctx;
+    if (hook_ht_lookup(s, pc) >= 0)
+        return true;
+    return !s->real_rom && pc >= ROM_BASE && pc < ROM_END;
+}
+
 static void hook_bitmap_set(esp32_rom_stubs_t *s, uint32_t addr) {
     uint32_t idx = (addr >> 2) & (HOOK_BITMAP_BITS - 1);
     s->hook_bitmap[idx / 64] |= 1ULL << (idx & 63);
@@ -4480,6 +4493,8 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* Install PC hook */
     cpu->pc_hook = rom_pc_hook;
     cpu->pc_hook_ctx = s;
+    cpu->pc_hook_contains = rom_pc_hook_contains;
+    cpu->pc_hook_contains_ctx = s;
 
     /* Pre-populate bitmap for entire ROM range (unregistered calls also intercepted) */
     for (uint32_t a = ROM_BASE; a < ROM_END; a += 4)
@@ -4733,6 +4748,11 @@ void rom_stubs_destroy(esp32_rom_stubs_t *stubs) {
         stubs->cpu->pc_hook = NULL;
         stubs->cpu->pc_hook_ctx = NULL;
         stubs->cpu->pc_hook_bitmap = NULL;
+    }
+    if (stubs->cpu->pc_hook_contains == rom_pc_hook_contains &&
+        stubs->cpu->pc_hook_contains_ctx == stubs) {
+        stubs->cpu->pc_hook_contains = NULL;
+        stubs->cpu->pc_hook_contains_ctx = NULL;
     }
     free(stubs->direct);
     free(stubs);

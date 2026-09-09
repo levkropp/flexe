@@ -308,16 +308,15 @@ typedef struct {
     bool     ends_at_lend; /* Truncated at LEND: fall-through is a loop back-edge */
 } jit_scan_t;
 
-/* Check if a PC is a ROM stub hook address (NOT a JIT block bit) */
-/* Only *ROM stub* hooks may terminate a scan. Falling back to the CPU's
- * live bitmap when there is no ROM bitmap -- which is the case whenever the
- * emulator runs without stubs, as the unit tests do -- reads the merged
- * bitmap instead, so a PC that already has a compiled block looks like a hook
- * and can never be scanned again. That silently prevents a second
- * compilation of the same PC, which is exactly what the loop-variant key
- * needs to do. */
+/* Check if a PC is an underlying address-hook boundary (NOT a JIT block).
+ * The optional exact query is authoritative. A hook bitmap is only a fast
+ * "maybe": its modulo index aliases every 2 MiB (and PCs in the same aligned
+ * word), so treating a set bit as exact can make unrelated guest functions
+ * permanently untranslatable. Keep the bitmap fallback for embedders whose
+ * custom hooks do not provide the richer contract. */
 static int is_hook_addr(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
-    (void)cpu;
+    if (cpu->pc_hook_contains)
+        return cpu->pc_hook_contains(pc, cpu->pc_hook_contains_ctx);
     const uint64_t *bm = jit->orig_bitmap;
     if (!bm) return 0;
     uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);

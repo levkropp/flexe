@@ -2582,6 +2582,66 @@ typedef struct {
     uint32_t last_pc;
 } jit_entry_spy_t;
 
+typedef struct {
+    uint32_t exact_pc;
+    unsigned queries;
+} jit_exact_hook_t;
+
+static bool jit_exact_hook_contains(uint32_t pc, void *ctx) {
+    jit_exact_hook_t *hook = ctx;
+    hook->queries++;
+    return pc == hook->exact_pc;
+}
+
+TEST(test_jit_exact_hook_query_distinguishes_bitmap_collisions) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    const uint32_t false_positive_pc = BASE;
+    const uint32_t exact_hook_pc = BASE + 0x100u;
+    put_insn2(&cpu, false_positive_pc, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, false_positive_pc + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, exact_hook_pc, narrow(0xD, 15, 0, 3));
+
+    uint64_t *hook_bitmap = calloc(HOOK_BITMAP_WORDS, sizeof(*hook_bitmap));
+    ASSERT_TRUE(hook_bitmap != NULL);
+    if (!hook_bitmap) {
+        teardown(&cpu);
+        return;
+    }
+    uint32_t false_bit = (false_positive_pc >> 2) & (HOOK_BITMAP_BITS - 1);
+    uint32_t exact_bit = (exact_hook_pc >> 2) & (HOOK_BITMAP_BITS - 1);
+    hook_bitmap[false_bit / 64] |= 1ULL << (false_bit & 63);
+    hook_bitmap[exact_bit / 64] |= 1ULL << (exact_bit & 63);
+
+    jit_exact_hook_t exact = {.exact_pc = exact_hook_pc};
+    cpu.pc_hook_bitmap = hook_bitmap;
+    cpu.pc_hook_contains = jit_exact_hook_contains;
+    cpu.pc_hook_contains_ctx = &exact;
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        free(hook_bitmap);
+        teardown(&cpu);
+        return;
+    }
+    jit_install_hook(jit, &cpu);
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, false_positive_pc);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, false_positive_pc) != NULL);
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, exact_hook_pc);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, exact_hook_pc) == NULL);
+    ASSERT_TRUE(exact.queries > 0);
+
+    jit_destroy(jit);
+    free(hook_bitmap);
+    teardown(&cpu);
+}
+
 static int jit_entry_spy_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     (void)cpu;
     jit_entry_spy_t *spy = ctx;
@@ -2980,6 +3040,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_rotw_legacy_woe_falls_back);
     RUN_TEST(test_jit_rotw_chains_under_destination_window);
     RUN_TEST(test_jit_entry_fallthrough_does_not_repeat_original_hook);
+    RUN_TEST(test_jit_exact_hook_query_distinguishes_bitmap_collisions);
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);
     RUN_TEST(test_jit_entry_windowed);
