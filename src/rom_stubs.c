@@ -5491,6 +5491,8 @@ static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
 #define WLED_V1601_HEAP_CAPS_SCAN           0x40084CE1u
 #define WLED_V1601_HEAP_CAPS_MATCH          0x40084D0Fu
 #define WLED_V1601_HEAP_LIST_LITERAL        0x40080854u
+#define WLED_V1601_FIND_HEAP                0x40084C8Cu
+#define WLED_V1601_FIND_HEAP_RETURN         0x40084C96u
 #define WLED_V1601_NESTING_LITERAL      0x40080D4Cu
 #define WLED_V1601_OLD_STATE_LITERAL    0x40080D50u
 #define WLED_V1601_DBREAK_READ_LITERAL  0x40080524u
@@ -5844,7 +5846,9 @@ static bool fw_wled_heap_code_matches(xtensa_mem_t *mem) {
                             0x6DED211Fu) &&
            fw_crc32_matches(mem, WLED_V1601_HEAP_MALLOC, 45u,
                             0xFB6D794Fu) &&
-           fw_crc32_matches(mem, 0x40084CB0u, 155u, 0x770CC5E6u);
+           fw_crc32_matches(mem, 0x40084CB0u, 155u, 0x770CC5E6u) &&
+           fw_crc32_matches(mem, WLED_V1601_FIND_HEAP, 33u,
+                            0x12F05EFAu);
 }
 
 static int fw_wled_core_index(const xtensa_cpu_t *cpu) {
@@ -6001,6 +6005,85 @@ static bool fw_wled_readable_span(xtensa_mem_t *mem, uint32_t addr,
     return size != 0u && addr <= UINT32_MAX - (size - 1u) &&
            mem_get_ptr(mem, addr) != NULL &&
            mem_get_ptr(mem, addr + size - 1u) != NULL;
+}
+
+/* Native prefix for find_containing_heap().  Stop at its shared MOV/RETW
+ * epilogue with the real callee window live, so interrupts, CALLINC, and
+ * register-file residue are identical to guest execution. */
+static int stub_fw_wled_find_heap(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t ptr = rom_arg(cpu, 0);
+    uint32_t caller_stack = ar_read(cpu, 1);
+    uint32_t insns = 3u; /* ENTRY; L32R list global; L32I head */
+    uint32_t final_a9 = ar_read(cpu, 17);
+
+    if (cpu->window_trace || cpu->spill_verify ||
+        !fw_wled_tlsf_window_safe(cpu, false) ||
+        !mem_get_ptr(cpu->mem, WLED_V1601_HEAP_LIST_LITERAL) ||
+        (cpu->irq_check && (cpu->interrupt & cpu->intenable)))
+        return 0;
+    uint32_t list_global = mem_read32(
+            cpu->mem, WLED_V1601_HEAP_LIST_LITERAL);
+    if ((list_global & 3u) != 0u ||
+        !fw_wled_readable_span(cpu->mem, list_global, 4u))
+        return 0;
+    uint32_t descriptor = mem_read32(cpu->mem, list_global);
+
+    bool found = false;
+    for (unsigned traversed = 0; traversed < 64u; traversed++) {
+        insns++; /* BNEZ descriptor */
+        if (descriptor == 0u) {
+            found = true; /* shared return block returns zero */
+            break;
+        }
+        if ((descriptor & 3u) != 0u ||
+            !fw_wled_readable_span(cpu->mem, descriptor, 36u))
+            return 0;
+
+        final_a9 = mem_read32(cpu->mem, descriptor + 28u);
+        insns += 2u; /* L32I heap; BEQZ */
+        if (final_a9 == 0u) {
+            descriptor = mem_read32(cpu->mem, descriptor + 32u);
+            insns += 2u; /* L32I next; J loop */
+            continue;
+        }
+
+        final_a9 = mem_read32(cpu->mem, descriptor + 12u);
+        insns += 2u; /* L32I start; BLT */
+        if ((int32_t)ptr < (int32_t)final_a9) {
+            descriptor = mem_read32(cpu->mem, descriptor + 32u);
+            insns += 2u;
+            continue;
+        }
+        final_a9 = mem_read32(cpu->mem, descriptor + 16u);
+        insns += 2u; /* L32I end; BLT */
+        if ((int32_t)ptr < (int32_t)final_a9) {
+            found = true;
+            break;
+        }
+        descriptor = mem_read32(cpu->mem, descriptor + 32u);
+        insns += 2u;
+    }
+    if (!found || !fw_wled_heap_span_safe(cpu, insns)) return 0;
+
+    unsigned wb = cpu->windowbase & 15u;
+    uint32_t final_ps = cpu->ps;
+    XT_PS_SET_OWB(final_ps, wb);
+    cpu->windowbase = (wb + 2u) & 15u;
+    cpu->windowstart |= 1u << cpu->windowbase;
+    cpu->window_callsize[cpu->windowbase] = 2u;
+    cpu->ps = final_ps;
+    ar_write(cpu, 1, caller_stack - 32u);
+    ar_write(cpu, 8, descriptor);
+    ar_write(cpu, 9, final_a9);
+    uint32_t windows = cpu->windowstart & 0xFFFFu;
+    unsigned shift = (cpu->windowbase + 1u) & 15u;
+    cpu->window_hazard =
+        (uint8_t)(((windows | (windows << 16)) >> shift) & 7u);
+    cpu->pc = WLED_V1601_FIND_HEAP_RETURN;
+    cpu->_pc_written = true;
+    fw_charge_stub_path(cpu, insns);
+    return (int)insns;
 }
 
 /* Collapse heap_caps_malloc_base's linked-list capability search while
@@ -6813,6 +6896,9 @@ static bool fw_wled_add_heap_impl_hooks(esp32_rom_stubs_t *stubs) {
     rom_stubs_register_conditional_ctx(
             stubs, WLED_V1601_HEAP_CAPS_SCAN,
             stub_fw_wled_heap_caps_scan, "heap_caps_malloc_scan", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_FIND_HEAP,
+            stub_fw_wled_find_heap, "find_containing_heap", NULL);
     return true;
 }
 
@@ -6884,7 +6970,7 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
                     stub_fw_wled_heap_unlock,
                     "multi_heap_internal_unlock", NULL);
             if (fw_wled_add_heap_impl_hooks(stubs))
-                n += 12;
+                n += 13;
             /* The callbacks above return complete guest spans. Use the exact-
              * work batch loop even without the JIT so neither emulated core
              * can overrun its native-FreeRTOS timeslice. */
