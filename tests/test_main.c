@@ -25,6 +25,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_axp192.c"
 #include "test_ublox_gps.c"
 #include "test_crypto.c"
+#include "test_tlsf_accel.c"
 #include "test_wifi_stubs.c"
 #include "test_bt_stubs.c"
 #include "test_rom_stubs.c"
@@ -65,6 +66,7 @@ int main(void) {
     run_axp192_tests();
     run_ublox_gps_tests();
     run_crypto_tests();
+    run_tlsf_accel_tests();
     run_wifi_stub_tests();
     run_bt_stub_tests();
     run_rom_stub_tests();

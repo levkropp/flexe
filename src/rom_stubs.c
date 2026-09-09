@@ -4,6 +4,7 @@
 #include "peripherals.h"
 #include "sandbox_events.h"
 #include "guest_call.h"
+#include "tlsf_accel.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -80,6 +81,21 @@ typedef struct {
     bool pending;
 } stub_irq_t;
 
+#define WLED_HEAP_PATH_CACHE_SIZE 64u
+
+typedef struct {
+    uint32_t key;
+    uint16_t insns;
+    uint8_t observations;
+} wled_heap_path_t;
+
+typedef struct {
+    bool active;
+    uint8_t operation;
+    uint32_t start_ccount;
+    tlsf_accel_plan_t plan;
+} wled_heap_training_t;
+
 #define TWDT_MAX_TASKS_DECL 16
 
 struct esp32_rom_stubs {
@@ -115,6 +131,11 @@ struct esp32_rom_stubs {
     rom_firmware_profile_t firmware_profile;  /* exact symbol-less ROM layout */
     uint32_t         wled_old_state_addr;      /* resolved v0.16.0.1 per-core PS array */
     uint32_t         wled_nesting_addr;        /* resolved v0.16.0.1 nesting array */
+    wled_heap_path_t wled_malloc_paths[WLED_HEAP_PATH_CACHE_SIZE];
+    wled_heap_path_t wled_free_paths[WLED_HEAP_PATH_CACHE_SIZE];
+    wled_heap_path_t wled_tlsf_malloc_paths[WLED_HEAP_PATH_CACHE_SIZE];
+    wled_heap_path_t wled_tlsf_free_paths[WLED_HEAP_PATH_CACHE_SIZE];
+    wled_heap_training_t wled_heap_training[2];
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     stub_irq_t irq[71];
     /* Per-pin handlers registered through gpio_isr_handler_add(). See
@@ -4741,6 +4762,16 @@ static bool fw_signature_matches(xtensa_mem_t *mem, uint32_t addr,
     return true;
 }
 
+static bool fw_crc32_matches(xtensa_mem_t *mem, uint32_t addr, size_t size,
+                             uint32_t expected) {
+    uLong crc = crc32(0L, Z_NULL, 0);
+    for (size_t i = 0; i < size; i++) {
+        const uint8_t byte = mem_read8(mem, addr + (uint32_t)i);
+        crc = crc32(crc, &byte, 1u);
+    }
+    return (uint32_t)crc == expected;
+}
+
 rom_firmware_profile_t rom_stubs_identify_firmware(
         esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     if (!stubs || !stubs->cpu || !stubs->cpu->mem)
@@ -5389,8 +5420,16 @@ static void fw_configure_flash_poll_loops(esp32_rom_stubs_t *stubs,
 #define WLED_V1601_ENTER_CRITICAL       0x4008EC28u
 #define WLED_V1601_EXIT_CRITICAL        0x4008ED10u
 #define WLED_V1601_SET_WATCHPOINT       0x400903A0u
+#define WLED_V1601_HEAP_FREE_IMPL        0x40091DE0u
 #define WLED_V1601_HEAP_LOCK             0x40091E3Cu
 #define WLED_V1601_HEAP_UNLOCK           0x40091E4Cu
+#define WLED_V1601_HEAP_MALLOC_IMPL      0x40091E58u
+#define WLED_V1601_HEAP_FREE_RETURN      0x40091E2Cu
+#define WLED_V1601_HEAP_MALLOC_RETURN    0x40091EA6u
+#define WLED_V1601_TLSF_FREE              0x40091638u
+#define WLED_V1601_TLSF_FREE_RETURN       0x400917D9u
+#define WLED_V1601_TLSF_MALLOC            0x40091880u
+#define WLED_V1601_TLSF_MALLOC_RETURN     0x40091A6Du
 #define WLED_V1601_NESTING_LITERAL      0x40080D4Cu
 #define WLED_V1601_OLD_STATE_LITERAL    0x40080D50u
 #define WLED_V1601_DBREAK_READ_LITERAL  0x40080524u
@@ -5716,6 +5755,387 @@ static int stub_fw_wled_heap_unlock(xtensa_cpu_t *cpu, void *ctx) {
     return critical_insns + 5;
 }
 
+enum {
+    WLED_HEAP_TRAIN_MALLOC = 1,
+    WLED_HEAP_TRAIN_FREE = 2,
+    WLED_HEAP_TRAIN_TLSF_MALLOC = 3,
+    WLED_HEAP_TRAIN_TLSF_FREE = 4,
+};
+
+/* The native allocator translator is deliberately tied to the complete IDF
+ * 4.4.8 routines in this WLED link.  The profile anchors identify the image;
+ * these CRCs independently cover every instruction which defines the TLSF
+ * and multi_heap state transitions being replaced. */
+static bool fw_wled_heap_code_matches(xtensa_mem_t *mem) {
+    return fw_crc32_matches(mem, WLED_V1601_HEAP_MALLOC_IMPL, 89u,
+                            0x756FC406u) &&
+           fw_crc32_matches(mem, WLED_V1601_HEAP_FREE_IMPL, 78u,
+                            0x5C6E1819u) &&
+           fw_crc32_matches(mem, 0x40091880u, 594u, 0x8690DEC8u) &&
+           fw_crc32_matches(mem, 0x40091638u, 566u, 0x921F4469u) &&
+           fw_crc32_matches(mem, 0x40091608u, 22u, 0x1A3C0E4Bu) &&
+           fw_crc32_matches(mem, 0x40091620u, 24u, 0xE0147376u) &&
+           fw_crc32_matches(mem, WLED_V1601_HEAP_LOCK, 14u,
+                            0x5CAB20DAu) &&
+           fw_crc32_matches(mem, WLED_V1601_HEAP_UNLOCK, 12u,
+                            0x78E08F74u);
+}
+
+static int fw_wled_core_index(const xtensa_cpu_t *cpu) {
+    if (cpu->prid == XTENSA_SPINLOCK_OWNER_CORE0) return 0;
+    if (cpu->prid == XTENSA_SPINLOCK_OWNER_CORE1) return 1;
+    return -1;
+}
+
+/* At an impl entry the public poisoning wrapper already owns this heap's
+ * recursive mux.  Requiring that state means the skipped inner lock/unlock
+ * pair has no net guest-memory or interrupt-level effect. */
+static bool fw_wled_heap_outer_lock_held(esp32_rom_stubs_t *stubs,
+                                         xtensa_cpu_t *cpu, uint32_t heap,
+                                         bool *has_mux) {
+    if ((heap & 3u) != 0u || !mem_get_ptr(cpu->mem, heap)) return false;
+    uint32_t mux = mem_read32(cpu->mem, heap);
+    *has_mux = mux != 0u;
+    if (mux == 0u) return true;
+
+    int core = fw_wled_core_index(cpu);
+    if (core < 0 || stubs->wled_nesting_addr == 0u ||
+        !fw_wled_internal_spinlock(mux) || !mem_get_ptr(cpu->mem, mux) ||
+        !mem_get_ptr(cpu->mem, mux + 4u))
+        return false;
+    uint32_t nesting_addr = stubs->wled_nesting_addr + (uint32_t)core * 4u;
+    return mem_read32(cpu->mem, mux) == cpu->prid &&
+           mem_read32(cpu->mem, mux + 4u) > 0u &&
+           mem_read32(cpu->mem, nesting_addr) > 0u;
+}
+
+/* The translated impl contains nested CALL8 routines.  Only collapse a call
+ * whose complete register-window span is empty, so the original could not
+ * have taken an overflow vector or exposed an intermediate stack frame. */
+static bool fw_wled_heap_window_safe(const xtensa_cpu_t *cpu) {
+    if (XT_PS_CALLINC(cpu->ps) != 2u || cpu->seed_entry_link ||
+        cpu->breakpoint_count != 0)
+        return false;
+    unsigned wb = cpu->windowbase & 15u;
+    uint32_t live = cpu->windowstart & 0xFFFFu;
+    if ((live & (1u << wb)) == 0u) return false;
+    uint32_t relative = ((live >> wb) | (live << (16u - wb))) & 0xFFFFu;
+    return (relative & 0x03FEu) == 0u; /* WB+1 through WB+9 */
+}
+
+/* The inner TLSF functions have a much shallower call graph than their
+ * multi_heap wrappers. tlsf_free has one ENTRY frame; tlsf_malloc also calls
+ * the one-frame tlsf_block_size_max helper. */
+static bool fw_wled_tlsf_window_safe(const xtensa_cpu_t *cpu,
+                                     bool malloc_path) {
+    if (XT_PS_CALLINC(cpu->ps) != 2u || cpu->seed_entry_link ||
+        cpu->breakpoint_count != 0)
+        return false;
+    unsigned wb = cpu->windowbase & 15u;
+    uint32_t live = cpu->windowstart & 0xFFFFu;
+    if ((live & (1u << wb)) == 0u) return false;
+    uint32_t relative = ((live >> wb) | (live << (16u - wb))) & 0xFFFFu;
+    /* ENTRY crosses +1/+2; the callee's a4-a15 operands reach through +5.
+     * malloc's nested helper reaches +6. Any live slot in that span would
+     * make the original take a window-overflow path with visible spills. */
+    uint32_t touched = malloc_path ? 0x007Eu : 0x003Eu;
+    return (relative & touched) == 0u;
+}
+
+static wled_heap_path_t *fw_wled_heap_path_find(wled_heap_path_t *paths,
+                                                 uint32_t key,
+                                                 bool create) {
+    unsigned slot = (key * 2654435761u) >> 26;
+    for (unsigned probe = 0; probe < 8u; probe++) {
+        wled_heap_path_t *path = &paths[(slot + probe) &
+                                        (WLED_HEAP_PATH_CACHE_SIZE - 1u)];
+        if (path->observations == 0u)
+            return create ? path : NULL;
+        if (path->key == key) return path;
+    }
+    return NULL;
+}
+
+static uint32_t fw_wled_heap_path_ready(wled_heap_path_t *paths,
+                                        uint32_t key) {
+    wled_heap_path_t *path = fw_wled_heap_path_find(paths, key, false);
+    return path && path->observations >= 2u && path->observations != UINT8_MAX
+         ? path->insns : 0u;
+}
+
+static void fw_wled_heap_path_observe(wled_heap_path_t *paths, uint32_t key,
+                                      uint32_t insns) {
+    if (insns == 0u || insns > UINT16_MAX) return;
+    wled_heap_path_t *path = fw_wled_heap_path_find(paths, key, true);
+    if (!path) return;
+    if (path->observations == 0u) {
+        path->key = key;
+        path->insns = (uint16_t)insns;
+        path->observations = 1u;
+    } else if (path->insns == insns && path->observations < UINT8_MAX - 1u) {
+        path->observations++;
+    } else {
+        /* A key which ever produces two timings is not a complete path key.
+         * Permanently leave it in guest code instead of guessing. */
+        path->observations = UINT8_MAX;
+    }
+}
+
+static bool fw_wled_heap_span_safe(const xtensa_cpu_t *cpu,
+                                    uint32_t insns) {
+    if (cpu->native_span_room != 0u && cpu->native_span_room < insns)
+        return false;
+    return cpu->next_timer_event == UINT32_MAX ||
+           ((int32_t)(cpu->ccount - cpu->next_timer_event) < 0 &&
+            cpu->next_timer_event - cpu->ccount > insns);
+}
+
+static int fw_wled_heap_native_return(xtensa_cpu_t *cpu,
+                                      const tlsf_accel_plan_t *plan,
+                                      uint32_t insns, bool has_mux,
+                                      bool returns_pointer) {
+    tlsf_accel_plan_commit(plan);
+    if (has_mux) {
+        cpu->scompare1 = XTENSA_SPINLOCK_FREE;
+        cpu->irq_check = true;
+    }
+
+    if (returns_pointer)
+        rom_return(cpu, plan->result);
+    else
+        rom_return_void(cpu);
+    fw_charge_stub_path(cpu, insns);
+    return (int)insns;
+}
+
+static int stub_fw_wled_heap_malloc_impl(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *stubs = ctx;
+    int core = fw_wled_core_index(cpu);
+    uint32_t heap = rom_arg(cpu, 0);
+    uint32_t size = rom_arg(cpu, 1);
+    bool has_mux;
+    tlsf_accel_plan_t plan;
+    if (core < 0 || !fw_wled_heap_window_safe(cpu) ||
+        !fw_wled_heap_outer_lock_held(stubs, cpu, heap, &has_mux) ||
+        !tlsf_accel_plan_idf44_malloc(cpu->mem, heap, size, &plan))
+        return 0;
+    if (has_mux) plan.path_key |= 1u << 20;
+
+    uint32_t insns = fw_wled_heap_path_ready(stubs->wled_malloc_paths,
+                                             plan.path_key);
+    if (insns != 0u) {
+        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        return fw_wled_heap_native_return(cpu, &plan, insns, has_mux, true);
+    }
+
+    wled_heap_training_t *training = &stubs->wled_heap_training[core];
+    training->active = true;
+    training->operation = WLED_HEAP_TRAIN_MALLOC;
+    training->start_ccount = cpu->ccount;
+    training->plan = plan;
+    return 0;
+}
+
+static int stub_fw_wled_heap_free_impl(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *stubs = ctx;
+    int core = fw_wled_core_index(cpu);
+    uint32_t heap = rom_arg(cpu, 0);
+    uint32_t ptr = rom_arg(cpu, 1);
+    bool has_mux;
+    tlsf_accel_plan_t plan;
+    if (core < 0 || !fw_wled_heap_window_safe(cpu) ||
+        !fw_wled_heap_outer_lock_held(stubs, cpu, heap, &has_mux) ||
+        !tlsf_accel_plan_idf44_free(cpu->mem, heap, ptr, &plan))
+        return 0;
+    if (has_mux) plan.path_key |= 1u << 20;
+
+    uint32_t insns = fw_wled_heap_path_ready(stubs->wled_free_paths,
+                                             plan.path_key);
+    if (insns != 0u) {
+        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        return fw_wled_heap_native_return(cpu, &plan, insns, has_mux, false);
+    }
+
+    wled_heap_training_t *training = &stubs->wled_heap_training[core];
+    training->active = true;
+    training->operation = WLED_HEAP_TRAIN_FREE;
+    training->start_ccount = cpu->ccount;
+    training->plan = plan;
+    return 0;
+}
+
+static bool fw_wled_tlsf_lock_held(esp32_rom_stubs_t *stubs,
+                                    xtensa_cpu_t *cpu, uint32_t control) {
+    if (control < 20u) return false;
+    uint32_t heap = control - 20u;
+    if (!mem_get_ptr(cpu->mem, heap + 16u) ||
+        mem_read32(cpu->mem, heap + 16u) != control)
+        return false;
+    bool has_mux;
+    return fw_wled_heap_outer_lock_held(stubs, cpu, heap, &has_mux);
+}
+
+static int fw_wled_tlsf_native_return(xtensa_cpu_t *cpu,
+                                      const tlsf_accel_plan_t *plan,
+                                      uint32_t insns, bool malloc_path) {
+    unsigned wb = cpu->windowbase & 15u;
+    tlsf_accel_plan_commit(plan);
+    if (malloc_path)
+        rom_return(cpu, plan->result);
+    else
+        rom_return_void(cpu);
+
+    /* Both routines execute ENTRY/RETW with CALL8. malloc's size-limit
+     * helper adds one nested frame and is the last instruction to write OWB.
+     * RETW does not alter CALLINC or OWB. */
+    cpu->window_callsize[(wb + 2u) & 15u] = 2u;
+    if (malloc_path)
+        cpu->window_callsize[(wb + 4u) & 15u] = 2u;
+    XT_PS_SET_CALLINC(cpu->ps, 2u);
+    XT_PS_SET_OWB(cpu->ps, malloc_path ? (wb + 2u) & 15u : wb);
+    fw_charge_stub_path(cpu, insns);
+    return (int)insns;
+}
+
+static int stub_fw_wled_tlsf_malloc(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *stubs = ctx;
+    int core = fw_wled_core_index(cpu);
+    uint32_t control = rom_arg(cpu, 0);
+    uint32_t size = rom_arg(cpu, 1);
+    tlsf_accel_plan_t plan;
+    if (core < 0 || !fw_wled_tlsf_window_safe(cpu, true) ||
+        !fw_wled_tlsf_lock_held(stubs, cpu, control) ||
+        !tlsf_accel_plan_idf44_raw_malloc(
+                cpu->mem, control, size, &plan))
+        return 0;
+
+    uint32_t insns = fw_wled_heap_path_ready(
+            stubs->wled_tlsf_malloc_paths, plan.path_key);
+    if (insns != 0u) {
+        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        return fw_wled_tlsf_native_return(cpu, &plan, insns, true);
+    }
+
+    wled_heap_training_t *training = &stubs->wled_heap_training[core];
+    if (training->active) return 0;
+    training->active = true;
+    training->operation = WLED_HEAP_TRAIN_TLSF_MALLOC;
+    training->start_ccount = cpu->ccount;
+    training->plan = plan;
+    return 0;
+}
+
+static int stub_fw_wled_tlsf_free(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *stubs = ctx;
+    int core = fw_wled_core_index(cpu);
+    uint32_t control = rom_arg(cpu, 0);
+    uint32_t ptr = rom_arg(cpu, 1);
+    tlsf_accel_plan_t plan;
+    if (core < 0 || !fw_wled_tlsf_window_safe(cpu, false) ||
+        !fw_wled_tlsf_lock_held(stubs, cpu, control) ||
+        !tlsf_accel_plan_idf44_raw_free(cpu->mem, control, ptr, &plan))
+        return 0;
+
+    uint32_t insns = fw_wled_heap_path_ready(
+            stubs->wled_tlsf_free_paths, plan.path_key);
+    if (insns != 0u) {
+        if (!fw_wled_heap_span_safe(cpu, insns)) return 0;
+        return fw_wled_tlsf_native_return(cpu, &plan, insns, false);
+    }
+
+    wled_heap_training_t *training = &stubs->wled_heap_training[core];
+    if (training->active) return 0;
+    training->active = true;
+    training->operation = WLED_HEAP_TRAIN_TLSF_FREE;
+    training->start_ccount = cpu->ccount;
+    training->plan = plan;
+    return 0;
+}
+
+static int stub_fw_wled_heap_training_return(xtensa_cpu_t *cpu, void *ctx,
+                                              unsigned operation,
+                                              uint32_t remaining_insns) {
+    esp32_rom_stubs_t *stubs = ctx;
+    int core = fw_wled_core_index(cpu);
+    if (core < 0) return 0;
+    wled_heap_training_t *training = &stubs->wled_heap_training[core];
+    if (!training->active || training->operation != operation) return 0;
+
+    bool result_matches = true;
+    if (operation == WLED_HEAP_TRAIN_MALLOC)
+        result_matches = ar_read(cpu, 3) == training->plan.result;
+    else if (operation == WLED_HEAP_TRAIN_TLSF_MALLOC)
+        result_matches = ar_read(cpu, 2) == training->plan.result;
+    uint32_t insns = cpu->ccount - training->start_ccount + remaining_insns;
+    if (result_matches && tlsf_accel_plan_matches(&training->plan)) {
+        wled_heap_path_t *paths;
+        if (operation == WLED_HEAP_TRAIN_MALLOC)
+            paths = stubs->wled_malloc_paths;
+        else if (operation == WLED_HEAP_TRAIN_FREE)
+            paths = stubs->wled_free_paths;
+        else if (operation == WLED_HEAP_TRAIN_TLSF_MALLOC)
+            paths = stubs->wled_tlsf_malloc_paths;
+        else
+            paths = stubs->wled_tlsf_free_paths;
+        fw_wled_heap_path_observe(paths, training->plan.path_key, insns);
+    }
+    training->active = false;
+    return 0; /* observe the epilogue, then execute it unchanged */
+}
+
+static int stub_fw_wled_heap_malloc_return(xtensa_cpu_t *cpu, void *ctx) {
+    /* MOV a2,a3; RETW */
+    return stub_fw_wled_heap_training_return(
+            cpu, ctx, WLED_HEAP_TRAIN_MALLOC, 2u);
+}
+
+static int stub_fw_wled_heap_free_return(xtensa_cpu_t *cpu, void *ctx) {
+    /* RETW.N */
+    return stub_fw_wled_heap_training_return(
+            cpu, ctx, WLED_HEAP_TRAIN_FREE, 1u);
+}
+
+static int stub_fw_wled_tlsf_malloc_return(xtensa_cpu_t *cpu, void *ctx) {
+    /* MEMW; RETW.N */
+    return stub_fw_wled_heap_training_return(
+            cpu, ctx, WLED_HEAP_TRAIN_TLSF_MALLOC, 2u);
+}
+
+static int stub_fw_wled_tlsf_free_return(xtensa_cpu_t *cpu, void *ctx) {
+    /* MEMW; RETW.N */
+    return stub_fw_wled_heap_training_return(
+            cpu, ctx, WLED_HEAP_TRAIN_TLSF_FREE, 2u);
+}
+
+static bool fw_wled_add_heap_impl_hooks(esp32_rom_stubs_t *stubs) {
+    if (!fw_wled_heap_code_matches(stubs->cpu->mem)) return false;
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_HEAP_MALLOC_IMPL,
+            stub_fw_wled_heap_malloc_impl, "multi_heap_malloc_impl", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_HEAP_MALLOC_RETURN,
+            stub_fw_wled_heap_malloc_return, "multi_heap_malloc_observe", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_HEAP_FREE_IMPL,
+            stub_fw_wled_heap_free_impl, "multi_heap_free_impl", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_HEAP_FREE_RETURN,
+            stub_fw_wled_heap_free_return, "multi_heap_free_observe", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_TLSF_MALLOC,
+            stub_fw_wled_tlsf_malloc, "tlsf_malloc", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_TLSF_MALLOC_RETURN,
+            stub_fw_wled_tlsf_malloc_return, "tlsf_malloc_observe", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_TLSF_FREE,
+            stub_fw_wled_tlsf_free, "tlsf_free", NULL);
+    rom_stubs_register_conditional_ctx(
+            stubs, WLED_V1601_TLSF_FREE_RETURN,
+            stub_fw_wled_tlsf_free_return, "tlsf_free_observe", NULL);
+    return true;
+}
+
 int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point) {
     const fw_addr_hook_t *tbl = NULL;
     rom_firmware_profile_t profile = rom_stubs_identify_firmware(
@@ -5779,6 +6199,8 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
                     stubs, WLED_V1601_HEAP_UNLOCK,
                     stub_fw_wled_heap_unlock,
                     "multi_heap_internal_unlock", NULL);
+            if (fw_wled_add_heap_impl_hooks(stubs))
+                n += 8;
             /* The callbacks above return complete guest spans. Use the exact-
              * work batch loop even without the JIT so neither emulated core
              * can overrun its native-FreeRTOS timeslice. */
