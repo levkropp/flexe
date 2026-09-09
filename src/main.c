@@ -1801,6 +1801,9 @@ int main(int argc, char *argv[]) {
                              (stats_core1 ? xtensa_retired_insns(stats_core1) : 0));
     }
     jit_verify_summary(jit);
+#if FLEXE_PROFILE_BUILD
+    xtensa_profile_report();
+#endif
 
     /* Cleanup */
     ring_destroy(g_ring);
