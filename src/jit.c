@@ -382,7 +382,7 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                     if (m == 3) return 1;
                     return 2;
                 }
-                if (r == 1) return 2;  /* MOVSP — complex */
+                if (r == 1) return 0;  /* MOVSP — guarded architectural move */
                 if (r == 2) return 0;  /* SYNC group (NOP, etc.) */
                 if (r == 3) {
                     /* The architectural window spill/fill vectors end in
@@ -1452,6 +1452,52 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             switch (op2) {
             case 0: { /* ST0 specials */
                 if (r == 2) return 1; /* NOP/SYNC — no-op */
+                if (r == 1) { /* MOVSP */
+                    /* In architectural window mode MOVSP is a plain register
+                     * move unless WOE is active outside an exception and all
+                     * three possible caller windows have been spilled. That
+                     * last case must raise AllocaCause at this exact opcode,
+                     * so leave it to the interpreter. Legacy window mode has
+                     * additional synthetic spill/copy bookkeeping and takes
+                     * the same precise fallback. */
+                    emit_load_cpu32(e, RAX,
+                                    (int32_t)CPU_OFF_REAL_WINDOW_VECTORS);
+                    emit_and_reg32_imm32(e, RAX, 0xFF);
+                    emit_test_reg32(e, RAX, RAX);
+                    int legacy_fallback = emit_jcc_rel32(e, CC_E);
+
+                    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
+                    emit_and_reg32_imm32(e, RAX,
+                                         (1u << 18) | (1u << 4));
+                    emit_cmp_reg32_imm32(e, RAX, 1u << 18);
+                    int no_alloca_check = emit_jcc_rel32(e, CC_NE);
+
+                    uint32_t wb = (uint32_t)wb4 >> 2;
+                    uint32_t callers =
+                        (1u << ((wb - 1u) & 15u)) |
+                        (1u << ((wb - 2u) & 15u)) |
+                        (1u << ((wb - 3u) & 15u));
+                    emit_load_cpu32(e, RAX,
+                                    (int32_t)CPU_OFF_WINDOWSTART);
+                    emit_test_reg32_imm32(e, RAX, callers);
+                    int caller_live = emit_jcc_rel32(e, CC_NE);
+
+                    /* Execute a preceding native prefix, if any, then let
+                     * xtensa_step_impl() retry MOVSP itself. Do not mark a PC
+                     * write: returning to this opcode is an implementation
+                     * split, not guest control flow. */
+                    emit_patch_rel32(e, legacy_fallback);
+                    ra_flush(e, ra, wb4);
+                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc);
+                    emit_acc_add(e, insn_idx);
+                    emit_jmp_to_epilogue(e, jit);
+
+                    emit_patch_rel32(e, no_alloca_check);
+                    emit_patch_rel32(e, caller_live);
+                    ra_load_ar(e, ra, RAX, wb4, s);
+                    ra_store_ar(e, ra, RAX, wb4, t);
+                    return 1;
+                }
                 if (r == 6) {
                     /* RSIL: at = PS; PS.INTLEVEL = s */
                     emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_PS);

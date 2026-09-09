@@ -1349,6 +1349,73 @@ TEST(test_jit_loop_setup_clears_architectural_edge) {
     teardown(&cpu);
 }
 
+static uint32_t jit_movsp_insn(unsigned destination, unsigned source) {
+    return rrr(0, 0, 1, (int)source, (int)destination);
+}
+
+TEST(test_jit_movsp_architectural_move) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.ps = 1u << 18; /* WOE, outside an exception */
+    cpu.windowbase = 4u;
+    cpu.windowstart = (1u << 2) | (1u << 4); /* call8 caller is live */
+    ar_write(&cpu, 2, DATA_BASE + 0x800u);
+    put_insn3(&cpu, BASE, jit_movsp_insn(1u, 2u));
+    put_insn2(&cpu, BASE + 3u, narrow(0xD, 15, 0, 3));
+    test_block_differential(&cpu, 2, "movsp_architectural_move");
+    teardown(&cpu);
+}
+
+TEST(test_jit_movsp_alloca_falls_back_at_opcode) {
+    xtensa_cpu_t expected, actual;
+    setup(&expected);
+    expected.real_window_vectors = true;
+    expected.vecbase = BASE;
+    expected.ps = (1u << 18) | (1u << 5); /* WOE + user mode */
+    expected.windowbase = 4u;
+    expected.windowstart = 1u << 4; /* every possible caller is spilled */
+    ar_write(&expected, 1, DATA_BASE + 0x900u);
+    ar_write(&expected, 2, DATA_BASE + 0xA00u);
+    put_insn3(&expected, BASE, jit_movsp_insn(1u, 2u));
+    memcpy(&actual, &expected, sizeof(actual));
+
+    ASSERT_EQ(xtensa_step(&expected), 0);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        teardown(&expected);
+        return;
+    }
+    jit_install_hook(jit, &actual);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &actual, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &actual, BASE) != NULL);
+    actual._pc_written = true;
+    ASSERT_EQ(xtensa_step(&actual), 0);
+
+    ASSERT_EQ(compare_state(&expected, &actual, "movsp_alloca_fallback"), 0);
+    ASSERT_EQ(actual.exccause, EXCCAUSE_ALLOCA);
+    ASSERT_EQ(actual.epc[0], BASE);
+    ASSERT_EQ(ar_read(&actual, 1), DATA_BASE + 0x900u);
+
+    jit_destroy(jit);
+    teardown(&expected);
+}
+
+TEST(test_jit_movsp_legacy_mode_falls_back) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.real_window_vectors = false;
+    cpu.ps = (1u << 18) | (1u << 4);
+    ar_write(&cpu, 1, DATA_BASE + 0xB00u);
+    ar_write(&cpu, 2, DATA_BASE + 0xB00u);
+    put_insn3(&cpu, BASE, jit_movsp_insn(1u, 2u));
+    test_run_differential(&cpu, 1, "movsp_legacy_fallback");
+    teardown(&cpu);
+}
+
 /* The same flush obligation, but with the branch *before* the registers it
  * has to write back -- which is the case the obvious test misses.
  *
@@ -3082,6 +3149,9 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_compiles_loop_setup_family);
     RUN_TEST(test_jit_loopnez_uses_dirty_prefix_value);
     RUN_TEST(test_jit_loop_setup_clears_architectural_edge);
+    RUN_TEST(test_jit_movsp_architectural_move);
+    RUN_TEST(test_jit_movsp_alloca_falls_back_at_opcode);
+    RUN_TEST(test_jit_movsp_legacy_mode_falls_back);
     RUN_TEST(test_jit_loop_body_sampled_under_another_loop_still_compiles);
     RUN_TEST(test_jit_self_loop_side_exit_flushes_resident_registers);
     RUN_TEST(test_jit_self_loop_block_declines_a_different_loop);
