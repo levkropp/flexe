@@ -97,6 +97,12 @@ performed by architectural and service hooks, so it is not all interpreter
 dispatch. Coverage is workload-specific and is not itself a speed score; use
 an interleaved A/B and compare observable output when evaluating JIT changes.
 
+The same firmware also exposed a host-boundary cost: 353,092 empty guest UDP
+polls in a four-billion-cycle run. Coalescing only the host syscalls for those
+polls, with a 100-microsecond guest-time latency bound, reduced the count to
+176,886. Six alternating ARM64 JIT A/B pairs reduced mean CPU time from 3.488
+to 3.315 seconds (4.97%) with identical retired state and firmware output.
+
 ## Profiling
 
 Build the sampling profiler separately so its dispatch-loop layout does not

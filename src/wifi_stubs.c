@@ -64,6 +64,13 @@ static inline int fcntl(int fd, int cmd, ...)
 #define MAX_EMU_SOCKETS 16
 #define GUEST_ERRNO_CACHE_SLOTS 16
 
+/* A guest can poll a nonblocking UDP socket much faster than either a real
+ * ESP32 network stack or the host can produce packets. Preserve EAGAIN on
+ * every guest call, but cross into the host kernel at most once per interval.
+ * The deadline is measured in guest time so benchmark speed cannot change
+ * firmware-visible behavior, and bounds packet visibility latency to 100 us. */
+#define HOST_RX_EMPTY_POLL_US 100u
+
 /* Socket fd offset — matches ESP-IDF's LWIP_SOCKET_OFFSET (46).
  * The VFS layer assigns file descriptors 0-45 for stdio, SPIFFS, NVS, etc.
  * Socket fds start at 46 to avoid collision with VFS fds, which prevents
@@ -99,6 +106,7 @@ typedef struct {
     bool     nonblocking;
     uint64_t total_received;     /* bytes received so far (for timeout policy) */
     bool     awaiting_response;  /* true after send(), cleared after recv() */
+    uint64_t recvfrom_poll_after_us; /* next host poll after empty recvfrom */
     SSL     *ssl;               /* OpenSSL TLS session, or NULL for plain TCP */
     SSL_CTX *ssl_ctx;           /* OpenSSL context (owned per-socket) */
 } emu_socket_t;
@@ -329,6 +337,7 @@ static int slot_alloc(wifi_stubs_t *ws, int host_fd)
             ws->sockets[i].nonblocking = false;
             ws->sockets[i].total_received = 0;
             ws->sockets[i].awaiting_response = false;
+            ws->sockets[i].recvfrom_poll_after_us = 0;
             ws->sockets[i].ssl = NULL;
             ws->sockets[i].ssl_ctx = NULL;
             return i + SOCKET_FD_BASE;  /* return firmware fd */
@@ -362,6 +371,7 @@ static void slot_free(wifi_stubs_t *ws, int fd)
         ws->sockets[idx].nonblocking = false;
         ws->sockets[idx].total_received = 0;
         ws->sockets[idx].awaiting_response = false;
+        ws->sockets[idx].recvfrom_poll_after_us = 0;
         ws->sockets[idx].ssl = NULL;
         ws->sockets[idx].ssl_ctx = NULL;
     }
@@ -663,6 +673,8 @@ static void stub_lwip_write(xtensa_cpu_t *cpu, void *ctx)
         s->awaiting_response = true;
         ws->stats.send_bytes += (uint64_t)n;
     }
+    if (n >= 0)
+        s->recvfrom_poll_after_us = 0;
 
     free(tmp);
 
@@ -1389,6 +1401,8 @@ static void stub_lwip_sendto(xtensa_cpu_t *cpu, void *ctx)
         wifi_log(ws, "sendto(slot %u, %zd bytes)\n", fd, n);
         ws->stats.sendto_bytes += (uint64_t)n;
     }
+    if (n >= 0)
+        s->recvfrom_poll_after_us = 0;
 
     if (n < 0) {
         set_firmware_errno(ws, cpu, saved_errno);
@@ -1416,13 +1430,35 @@ static void stub_lwip_recvfrom(xtensa_cpu_t *cpu, void *ctx)
         return;
     }
 
+    uint64_t now_us = xtensa_guest_time_us(cpu, xtensa_cpu_freq_mhz(cpu));
+    uint64_t poll_after_us = s->recvfrom_poll_after_us;
+    if (poll_after_us > now_us &&
+        poll_after_us - now_us <= HOST_RX_EMPTY_POLL_US) {
+        ws->stats.recvfrom_polls_coalesced++;
+        set_firmware_errno(ws, cpu, NEWLIB_EAGAIN);
+        ws_return(cpu, (uint32_t)-1);
+        return;
+    }
+
     uint8_t *tmp = malloc(len);
     if (!tmp) { ws_fail(ws, cpu, NEWLIB_ENOMEM); return; }
 
     struct sockaddr_in source;
     socklen_t source_len = sizeof(source);
+    ws->stats.recvfrom_host_polls++;
     ssize_t n = recvfrom(s->host_fd, tmp, len, MSG_DONTWAIT,
                          (struct sockaddr *)&source, &source_len);
+
+#ifdef _WIN32
+    bool would_block = n < 0 && WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    bool would_block = n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+#endif
+
+    if (would_block)
+        s->recvfrom_poll_after_us = now_us + HOST_RX_EMPTY_POLL_US;
+    else
+        s->recvfrom_poll_after_us = 0;
 
     if (n > 0) {
         ws->stats.recvfrom_bytes += (uint64_t)n;

@@ -199,6 +199,7 @@ static void seed_relocated_idf5_lwip_family(xtensa_cpu_t *cpu,
 #define TEST_IDF5_BIND_OFS    0x180u
 #define TEST_IDF5_LISTEN_OFS  0x200u
 #define TEST_IDF5_RECV_OFS    0x280u
+#define TEST_IDF5_RECVFROM_OFS 0x300u
 
 static void seed_relocated_idf5_server_members(xtensa_cpu_t *cpu,
                                                uint32_t base) {
@@ -238,6 +239,12 @@ static void seed_relocated_idf5_server_members(xtensa_cpu_t *cpu,
         0x0C, 0x0E, 0xE5, 0xF0, 0xFF, 0x2D, 0x0A, 0x1D,
         0xF0, 0x00, 0x00, 0x00,
     };
+    static const uint8_t recvfrom_fn[] = {
+        0x36, 0xA1, 0x00, 0xAD, 0x02, 0x25, 0xCD, 0xFE,
+        0x2D, 0x03, 0x3D, 0x05, 0x5D, 0x06, 0x6D, 0x0A,
+        0x16, 0x4A, 0x09, 0x88, 0x0A, 0x88, 0x08, 0x80,
+        0x84, 0x34, 0x66, 0x18, 0x35, 0xBD, 0x02,
+    };
     const uint32_t socket_addr = base + TEST_IDF5_SOCKET_OFS;
     const uint32_t literal_addr = base + 0x060u;
     uint8_t socket_fn[sizeof(socket_template)];
@@ -258,6 +265,8 @@ static void seed_relocated_idf5_server_members(xtensa_cpu_t *cpu,
                    listen_fn, sizeof(listen_fn));
     put_test_bytes(cpu, base + TEST_IDF5_RECV_OFS,
                    recv_fn, sizeof(recv_fn));
+    put_test_bytes(cpu, base + TEST_IDF5_RECVFROM_OFS,
+                   recvfrom_fn, sizeof(recvfrom_fn));
     mem_write32(cpu->mem, literal_addr, 8u);
 }
 #define TEST_REENT_ERRNO              0x3FFE3C00u
@@ -338,6 +347,23 @@ static void invoke_wifi_call0_4(xtensa_cpu_t *cpu, uint32_t addr,
     ar_write(cpu, 3, arg1);
     ar_write(cpu, 4, arg2);
     ar_write(cpu, 5, arg3);
+    xtensa_step(cpu);
+}
+
+static void invoke_wifi_call0_6(xtensa_cpu_t *cpu, uint32_t addr,
+                                uint32_t arg0, uint32_t arg1,
+                                uint32_t arg2, uint32_t arg3,
+                                uint32_t arg4, uint32_t arg5)
+{
+    cpu->pc = addr;
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, BASE + 0x100u);
+    ar_write(cpu, 2, arg0);
+    ar_write(cpu, 3, arg1);
+    ar_write(cpu, 4, arg2);
+    ar_write(cpu, 5, arg3);
+    ar_write(cpu, 6, arg4);
+    ar_write(cpu, 7, arg5);
     xtensa_step(cpu);
 }
 
@@ -753,7 +779,7 @@ TEST(stripped_idf5_picolibc_family_relocates_without_profile) {
     mem_write32(cpu.mem, sockets + 0x060u, 0x3FF00000u);
     ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 0);
     mem_write32(cpu.mem, sockets + 0x060u, 8u);
-    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 12);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 13);
 
     invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_SOCKET_OFS,
                         2u, 1u, 0u, 0u);
@@ -798,7 +824,7 @@ TEST(idf5_picolibc_recv_peek_preserves_http_request) {
     seed_relocated_idf5_lwip_family(&cpu, family);
     seed_relocated_idf5_server_members(&cpu, sockets);
     cpu.threadptr = TEST_TASK_TLS;
-    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 12);
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 13);
     invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_SOCKET_OFS,
                         2u, 1u, 0u, 0u);
     uint32_t listen_fd = ar_read(&cpu, 2);
@@ -895,6 +921,99 @@ TEST(idf5_picolibc_recv_peek_preserves_http_request) {
 #endif
 }
 
+TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time) {
+#ifndef _WIN32
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    const uint32_t family = BASE + 0x1000u;
+    const uint32_t sockets = BASE + 0x1400u;
+    const uint32_t sockaddr_addr = 0x3FFB1000u;
+    const uint32_t sockaddr_len_addr = 0x3FFB1020u;
+    const uint32_t recv_addr = 0x3FFB1040u;
+
+    seed_relocated_idf5_lwip_family(&cpu, family);
+    seed_relocated_idf5_server_members(&cpu, sockets);
+    cpu.threadptr = TEST_TASK_TLS;
+    ASSERT_EQ(wifi_stubs_hook_firmware(wifi, 0x40081234u), 13);
+
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_SOCKET_OFS,
+                        2u, 2u, 0u, 0u);
+    uint32_t socket_fd = ar_read(&cpu, 2);
+    ASSERT_EQ(socket_fd, 46u);
+
+    mem_write8(cpu.mem, sockaddr_addr + 0u, 16u);
+    mem_write8(cpu.mem, sockaddr_addr + 1u, 2u);
+    mem_write16(cpu.mem, sockaddr_addr + 2u, htons(0));
+    mem_write32(cpu.mem, sockaddr_addr + 4u, htonl(INADDR_ANY));
+    invoke_wifi_call0_4(&cpu, sockets + TEST_IDF5_BIND_OFS, socket_fd,
+                        sockaddr_addr, 16u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    uint16_t host_port = 0;
+    ASSERT_EQ(wifi_stubs_get_bound_host_port(wifi, 0, true, &host_port), 0);
+
+    mem_write32(cpu.mem, sockaddr_len_addr, 16u);
+    invoke_wifi_call0_6(&cpu, sockets + TEST_IDF5_RECVFROM_OFS, socket_fd,
+                        recv_addr, 16u, 0u, sockaddr_addr,
+                        sockaddr_len_addr);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+    invoke_wifi_call0_6(&cpu, sockets + TEST_IDF5_RECVFROM_OFS, socket_fd,
+                        recv_addr, 16u, 0u, sockaddr_addr,
+                        sockaddr_len_addr);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.recvfrom_calls, 2u);
+    ASSERT_EQ64(stats.recvfrom_host_polls, 1u);
+    ASSERT_EQ64(stats.recvfrom_polls_coalesced, 1u);
+
+    int host_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_TRUE(host_fd >= 0);
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_port = htons(host_port),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    ASSERT_EQ(sendto(host_fd, "UDP", 3, 0,
+                     (struct sockaddr *)&peer, sizeof(peer)), 3);
+    /* Let the host network thread enqueue the loopback datagram before this
+     * test starts measuring guest-time visibility. */
+    poll(NULL, 0, 1);
+
+    /* A packet arriving just after an empty host poll remains bounded by the
+     * explicit 100 us guest-time interval; it cannot turn tight guest polling
+     * back into one syscall per call. */
+    invoke_wifi_call0_6(&cpu, sockets + TEST_IDF5_RECVFROM_OFS, socket_fd,
+                        recv_addr, 16u, 0u, sockaddr_addr,
+                        sockaddr_len_addr);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+    cpu.cycle_count +=
+            100u * (uint64_t)xtensa_cpu_freq_mhz(&cpu);
+    invoke_wifi_call0_6(&cpu, sockets + TEST_IDF5_RECVFROM_OFS, socket_fd,
+                        recv_addr, 16u, 0u, sockaddr_addr,
+                        sockaddr_len_addr);
+    ASSERT_EQ(ar_read(&cpu, 2), 3u);
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr + 0u), 'U');
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr + 1u), 'D');
+    ASSERT_EQ(mem_read8(cpu.mem, recv_addr + 2u), 'P');
+
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.recvfrom_calls, 4u);
+    ASSERT_EQ64(stats.recvfrom_host_polls, 2u);
+    ASSERT_EQ64(stats.recvfrom_polls_coalesced, 2u);
+    ASSERT_EQ64(stats.recvfrom_bytes, 3u);
+
+    close(host_fd);
+    invoke_wifi_call0(&cpu, sockets + TEST_IDF5_CLOSE_OFS, socket_fd);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+#endif
+}
+
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
@@ -908,4 +1027,5 @@ static void run_wifi_stub_tests(void) {
     RUN_TEST(stripped_idf4_socket_members_need_no_application_profile);
     RUN_TEST(stripped_idf5_picolibc_family_relocates_without_profile);
     RUN_TEST(idf5_picolibc_recv_peek_preserves_http_request);
+    RUN_TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time);
 }

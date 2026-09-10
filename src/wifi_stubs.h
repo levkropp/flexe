@@ -31,6 +31,8 @@ typedef struct {
     uint64_t sendto_calls;
     uint64_t sendto_bytes;
     uint64_t recvfrom_calls;
+    uint64_t recvfrom_host_polls;
+    uint64_t recvfrom_polls_coalesced;
     uint64_t recvfrom_bytes;
     uint64_t dns_calls;
     uint64_t wifi_connect_calls;

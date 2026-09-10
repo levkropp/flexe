@@ -7,6 +7,7 @@
 #include "memory.h"
 #include "peripherals.h"
 #include "rom_stubs.h"
+#include "wifi_stubs.h"
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
 #include "savestate.h"
@@ -1731,6 +1732,16 @@ int main(int argc, char *argv[]) {
     }
     if (first_stat) fprintf(stderr, "(none)");
     fprintf(stderr, "\n");
+
+    wifi_stubs_stats_t wifi_stats = {0};
+    wifi_stubs_get_stats(flexe_session_wifi(session), &wifi_stats);
+    if (wifi_stats.recvfrom_calls != 0) {
+        fprintf(stderr,
+                "UDP polls:  %llu guest, %llu host, %llu coalesced\n",
+                (unsigned long long)wifi_stats.recvfrom_calls,
+                (unsigned long long)wifi_stats.recvfrom_host_polls,
+                (unsigned long long)wifi_stats.recvfrom_polls_coalesced);
+    }
     if (rom_stubs_unregistered_count(rom) > 0)
         fprintf(stderr, "Unregistered ROM calls: %d\n", rom_stubs_unregistered_count(rom));
 
