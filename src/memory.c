@@ -205,6 +205,37 @@ uint8_t *mem_backing_ptr(xtensa_mem_t *mem, flexe_mem_backing_t backing) {
     return slot ? *slot : NULL;
 }
 
+int mem_map_backing_range(xtensa_mem_t *mem, uint32_t virtual_addr,
+                          flexe_mem_backing_t backing,
+                          uint32_t backing_offset, uint32_t size) {
+    if (!mem || (unsigned)backing >= FLEXE_MEM_BACKING_COUNT || size == 0 ||
+        ((virtual_addr | backing_offset | size) & (PAGE_SIZE - 1u)) != 0 ||
+        virtual_addr > UINT32_MAX - (size - 1u))
+        return -1;
+
+    uint8_t *host = mem_backing_ptr(mem, backing);
+    uint32_t backing_size = mem_backing_size(mem, backing);
+    if (!host || backing_offset > backing_size ||
+        size > backing_size - backing_offset)
+        return -1;
+
+    for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE)
+        mem->page_table[(virtual_addr + offset) >> 12] =
+            host + backing_offset + offset;
+    return 0;
+}
+
+int mem_unmap_range(xtensa_mem_t *mem, uint32_t virtual_addr, uint32_t size) {
+    if (!mem || size == 0 ||
+        ((virtual_addr | size) & (PAGE_SIZE - 1u)) != 0 ||
+        virtual_addr > UINT32_MAX - (size - 1u))
+        return -1;
+
+    for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE)
+        mem->page_table[(virtual_addr + offset) >> 12] = NULL;
+    return 0;
+}
+
 /* The ESP32 exposes the entire 256 KiB APB peripheral window through a
  * second AHB-Lite address window. ESP-IDF uses it for UART FIFO accesses and
  * recent proprietary PHY blobs use it for radio register traffic. Preserve

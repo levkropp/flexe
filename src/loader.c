@@ -397,12 +397,6 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
  * whose PRO and APP values differ — PRO-only seeding is wiped out by it.
  *
  * The mem_write32 path also remaps the corresponding cache window pages. */
-static void loader_clear_window(xtensa_mem_t *mem, uint32_t start,
-                                uint32_t end) {
-    for (uint32_t addr = start; addr < end; addr += 4096u)
-        mem->page_table[addr >> 12] = NULL;
-}
-
 /* The image loader may be used by tools which do not instantiate a complete
  * SoC. Keep its host mappings self-contained, while mirroring bootloader MMU
  * state into a device model when one is present. Skipping an absent handler
@@ -418,36 +412,20 @@ static void loader_write_mmio_if_modeled(xtensa_mem_t *mem, uint32_t addr,
         mem_write32(mem, addr, value);
 }
 
-static int loader_map_mmu_page(xtensa_mem_t *mem, uint32_t virtual_addr,
-                               flexe_mem_backing_t backing,
-                               uint32_t physical_addr, uint32_t page_size) {
-    uint8_t *host = mem_backing_ptr(mem, backing);
-    uint32_t size = mem_backing_size(mem, backing);
-    if (!host || page_size == 0 ||
-        (page_size & (page_size - 1u)) != 0 ||
-        (page_size & 4095u) != 0 ||
-        (virtual_addr & (page_size - 1u)) != 0 ||
-        (physical_addr & (page_size - 1u)) != 0 ||
-        virtual_addr > UINT32_MAX - (page_size - 1u) ||
-        physical_addr > size || page_size > size - physical_addr)
-        return -1;
-    for (uint32_t offset = 0; offset < page_size; offset += 4096u)
-        mem->page_table[(virtual_addr + offset) >> 12] =
-            host + physical_addr + offset;
-    return 0;
-}
-
 static int loader_seed_esp32_flash_mmu(xtensa_mem_t *mem,
                                        const load_result_t *res,
                                        uint32_t app_flash_offset) {
     const flexe_target_desc_t *target = mem_target(mem);
     const flexe_flash_mmu_desc_t *mmu = &target->flash_mmu;
     /* Remove constructor mappings, then install only the bootloader's active
-     * entries. Direct page-table updates keep the image loader self-contained;
-     * MMIO writes also seed the firmware-visible DPORT tables when that device
-     * model has already been attached. */
-    loader_clear_window(mem, target->drom_start, target->drom_end);
-    loader_clear_window(mem, target->irom_start, target->irom_end);
+     * entries. Memory's mapping API keeps the loader independent of a SoC
+     * device; MMIO writes also seed the firmware-visible DPORT tables when
+     * that device model has already been attached. */
+    if (mem_unmap_range(mem, target->drom_start,
+                        target->drom_end - target->drom_start) != 0 ||
+        mem_unmap_range(mem, target->irom_start,
+                        target->irom_end - target->irom_start) != 0)
+        return -1;
     for (uint32_t e = 0; e < mmu->entry_count; e++) {
         loader_write_mmio_if_modeled(mem, mmu->table_base[0] + e * 4u,
                                      mmu->invalid_entry); /* PRO invalid */
@@ -472,11 +450,11 @@ static int loader_seed_esp32_flash_mmu(xtensa_mem_t *mem,
                                      physical); /* PRO */
         loader_write_mmio_if_modeled(mem, mmu->table_base[1] + e * 4,
                                      physical); /* APP */
-        if (loader_map_mmu_page(mem,
-                                target->drom_start + e * mmu->page_size,
-                                FLEXE_MEM_FLASH_DATA,
-                                physical * mmu->page_size,
-                                mmu->page_size) != 0)
+        if (mem_map_backing_range(mem,
+                                  target->drom_start + e * mmu->page_size,
+                                  FLEXE_MEM_FLASH_DATA,
+                                  physical * mmu->page_size,
+                                  mmu->page_size) != 0)
             return -1;
     }
 
@@ -502,10 +480,10 @@ static int loader_seed_esp32_flash_mmu(xtensa_mem_t *mem,
                     mem, mmu->table_base[0] + e * 4, page); /* PRO */
                 loader_write_mmio_if_modeled(
                     mem, mmu->table_base[1] + e * 4, page); /* APP */
-                if (loader_map_mmu_page(mem, vbase,
-                                        FLEXE_MEM_FLASH_INSN,
-                                        page * mmu->page_size,
-                                        mmu->page_size) != 0)
+                if (mem_map_backing_range(mem, vbase,
+                                          FLEXE_MEM_FLASH_INSN,
+                                          page * mmu->page_size,
+                                          mmu->page_size) != 0)
                     return -1;
             }
         }
@@ -573,19 +551,20 @@ static int loader_seed_shared_flash_mmu(xtensa_mem_t *mem,
         }
     }
 
-    loader_clear_window(mem, target->drom_start, target->drom_end);
-    loader_clear_window(mem, target->irom_start, target->irom_end);
+    if (mem_unmap_range(mem, target->drom_start,
+                        target->drom_end - target->drom_start) != 0 ||
+        mem_unmap_range(mem, target->irom_start,
+                        target->irom_end - target->irom_start) != 0)
+        return -1;
     for (uint32_t entry = 0; entry < mmu->entry_count; entry++) {
         if (!valid[entry]) continue;
         uint32_t physical = physical_page[entry] * mmu->page_size;
-        if (loader_map_mmu_page(mem,
-                                target->drom_start + entry * mmu->page_size,
-                                FLEXE_MEM_FLASH_DATA, physical,
-                                mmu->page_size) != 0 ||
-            loader_map_mmu_page(mem,
-                                target->irom_start + entry * mmu->page_size,
-                                FLEXE_MEM_FLASH_INSN, physical,
-                                mmu->page_size) != 0)
+        if (mem_map_backing_range(
+                mem, target->drom_start + entry * mmu->page_size,
+                FLEXE_MEM_FLASH_DATA, physical, mmu->page_size) != 0 ||
+            mem_map_backing_range(
+                mem, target->irom_start + entry * mmu->page_size,
+                FLEXE_MEM_FLASH_INSN, physical, mmu->page_size) != 0)
             return -1;
     }
     return 0;

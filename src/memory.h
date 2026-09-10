@@ -59,6 +59,14 @@ uint32_t mem_backing_size(const xtensa_mem_t *mem,
                           flexe_mem_backing_t backing);
 uint8_t *mem_backing_ptr(xtensa_mem_t *mem, flexe_mem_backing_t backing);
 
+/* Install or remove page-table mappings without exposing page_table to SoC
+ * devices. All arguments are 4 KiB aligned and size is non-zero. A mapping
+ * aliases an existing target backing; it never allocates or copies bytes. */
+int mem_map_backing_range(xtensa_mem_t *mem, uint32_t virtual_addr,
+                          flexe_mem_backing_t backing,
+                          uint32_t backing_offset, uint32_t size);
+int mem_unmap_range(xtensa_mem_t *mem, uint32_t virtual_addr, uint32_t size);
+
 /* Bulk load */
 int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len);
 int mem_load_flash(xtensa_mem_t *mem, const uint8_t *data, size_t len);

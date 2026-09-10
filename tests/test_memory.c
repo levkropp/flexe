@@ -199,6 +199,34 @@ TEST(mem_flash_alias) {
     mem_destroy(mem);
 }
 
+TEST(mem_backing_ranges_can_be_remapped_and_unmapped) {
+    xtensa_mem_t *mem = mem_create();
+    const uint32_t guest = 0x3F600000u;
+    const uint32_t flash_offset = 0x00020000u;
+
+    mem->flash_data[flash_offset + 0x123u] = 0x5Au;
+    ASSERT_EQ(mem_map_backing_range(mem, guest, FLEXE_MEM_FLASH_DATA,
+                                    flash_offset, 0x10000u), 0);
+    ASSERT_EQ(mem_read8(mem, guest + 0x123u), 0x5Au);
+    ASSERT_TRUE(mem_get_ptr(mem, guest) ==
+                mem->flash_data + flash_offset);
+
+    ASSERT_EQ(mem_unmap_range(mem, guest, 0x10000u), 0);
+    ASSERT_TRUE(mem_get_ptr(mem, guest) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, guest + 0xF000u) == NULL);
+
+    /* Reject partial pages, wraparound, and mappings beyond a backing. */
+    ASSERT_EQ(mem_map_backing_range(mem, guest + 1u,
+                                    FLEXE_MEM_FLASH_DATA,
+                                    flash_offset, 0x1000u), -1);
+    ASSERT_EQ(mem_map_backing_range(mem, guest, FLEXE_MEM_FLASH_DATA,
+                                    mem_backing_size(
+                                        mem, FLEXE_MEM_FLASH_DATA),
+                                    0x1000u), -1);
+    ASSERT_EQ(mem_unmap_range(mem, 0xFFFFF000u, 0x2000u), -1);
+    mem_destroy(mem);
+}
+
 TEST(mem_flash_instruction_window_boundary) {
     xtensa_mem_t *mem = mem_create();
     ASSERT_TRUE(mem_get_ptr(mem, 0x400CFFFFu) == NULL);
@@ -356,6 +384,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw32_flash_data);
     RUN_TEST(mem_flash_erased_at_reset);
     RUN_TEST(mem_flash_alias);
+    RUN_TEST(mem_backing_ranges_can_be_remapped_and_unmapped);
     RUN_TEST(mem_flash_instruction_window_boundary);
     RUN_TEST(mem_rw32_rtc_slow);
     RUN_TEST(mem_ahb_window_is_not_rtc_memory);
