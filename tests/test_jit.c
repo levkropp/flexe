@@ -102,6 +102,14 @@ static int compare_state(const xtensa_cpu_t *a, const xtensa_cpu_t *b,
     COMPARE_U32(f64r_hi);
     COMPARE_U32(f64s);
     COMPARE_U32(cpenable);
+    COMPARE_U32(scompare1);
+    COMPARE_U32(litbase);
+    COMPARE_U32(acclo);
+    COMPARE_U32(acchi);
+    COMPARE_U32(mr[0]);
+    COMPARE_U32(mr[1]);
+    COMPARE_U32(mr[2]);
+    COMPARE_U32(mr[3]);
 #undef COMPARE_U32
 
     return diffs;
@@ -2418,11 +2426,54 @@ TEST(test_jit_run_does_not_count_delay_ccount_as_instructions) {
 TEST(test_jit_rsr_wsr_sar) {
     xtensa_cpu_t cpu;
     setup(&cpu);
-    ar_write(&cpu, 2, 17);
+    ar_write(&cpu, 2, 0xFEDCBA7Fu);
     /* sr occupies bits 15:8. SAR=3 therefore encodes r=0, s=3. */
     put_insn3(&cpu, BASE, rrr(1, 3, 0, 3, 2));  /* WSR SAR, a2 */
     put_insn3(&cpu, BASE + 3, rrr(0, 3, 0, 3, 5));  /* RSR a5, SAR */
     test_block_differential(&cpu, 2, "rsr_wsr_sar");
+    teardown(&cpu);
+}
+
+TEST(test_jit_rsr_wsr_mac16_state) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    static const uint8_t sr[] = {
+        XT_SR_ACCLO, XT_SR_ACCHI,
+        XT_SR_MR0, XT_SR_MR1, XT_SR_MR2, XT_SR_MR3,
+    };
+    static const uint32_t value[] = {
+        0x11223344u, 0xA5A5FE7Bu,
+        0x01020304u, 0x55667788u, 0x89ABCDEFu, 0xDEADBEEFu,
+    };
+
+    /* These are ordinary architectural context-save fields. Exercise every
+     * write followed by its matching read in one compiled block; ACCHI also
+     * proves that the JIT applies the interpreter's eight-bit write mask. */
+    uint32_t pc = BASE;
+    for (unsigned i = 0; i < sizeof(sr) / sizeof(sr[0]); i++) {
+        ar_write(&cpu, 2 + (int)i, value[i]);
+        put_insn3(&cpu, pc,
+                  rrr(1, 3, sr[i] >> 4, sr[i] & 15, 2 + (int)i));
+        pc += 3u;
+    }
+    for (unsigned i = 0; i < sizeof(sr) / sizeof(sr[0]); i++) {
+        put_insn3(&cpu, pc,
+                  rrr(0, 3, sr[i] >> 4, sr[i] & 15, 8 + (int)i));
+        pc += 3u;
+    }
+    test_block_differential(&cpu, 12, "rsr_wsr_mac16_state");
+    teardown(&cpu);
+}
+
+TEST(test_jit_wsr_br_applies_architectural_mask) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    ar_write(&cpu, 2, 0xDEADBEEFu);
+    put_insn3(&cpu, BASE,
+              rrr(1, 3, XT_SR_BR >> 4, XT_SR_BR & 15, 2));
+    put_insn3(&cpu, BASE + 3u,
+              rrr(0, 3, XT_SR_BR >> 4, XT_SR_BR & 15, 5));
+    test_block_differential(&cpu, 2, "wsr_br_mask");
     teardown(&cpu);
 }
 
@@ -3439,6 +3490,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_addx2);
     RUN_TEST(test_jit_rsil);
     RUN_TEST(test_jit_rsr_wsr_sar);
+    RUN_TEST(test_jit_rsr_wsr_mac16_state);
+    RUN_TEST(test_jit_wsr_br_applies_architectural_mask);
     RUN_TEST(test_jit_rsr_wsr_cpenable);
     RUN_TEST(test_jit_wsr_windowstart_terminates_at_new_guard_context);
     RUN_TEST(test_jit_wsr_windowbase_flushes_old_mapping_before_dispatch);

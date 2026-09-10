@@ -86,6 +86,62 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 #define CPU_OFF_EXCVADDR    offsetof(xtensa_cpu_t, excvaddr)
 #define CPU_OFF_CPENABLE    offsetof(xtensa_cpu_t, cpenable)
 
+/* Special registers whose interpreter semantics are a masked write to a CPU
+ * field with no additional side effect. Keep this description shared by the
+ * scanner and both the read/write emitters: maintaining three independent
+ * switch lists previously made RSR ACCLO/ACCHI/M0..M3 compilable while the
+ * corresponding WSR forms were silently left in the interpreter. */
+typedef struct {
+    int32_t offset;
+    uint32_t write_mask;
+} jit_plain_sr_t;
+
+static bool jit_plain_sr(int sr, jit_plain_sr_t *out) {
+    int32_t offset;
+    uint32_t write_mask = UINT32_MAX;
+
+    switch (sr) {
+    case XT_SR_LBEG:      offset = CPU_OFF_LBEG; break;
+    case XT_SR_LEND:      offset = CPU_OFF_LEND; break;
+    case XT_SR_LCOUNT:    offset = CPU_OFF_LCOUNT; break;
+    case XT_SR_SAR:       offset = CPU_OFF_SAR; write_mask = 0x3Fu; break;
+    case XT_SR_BR:        offset = CPU_OFF_BR; write_mask = 0xFFFFu; break;
+    case XT_SR_LITBASE:   offset = CPU_OFF_LITBASE; break;
+    case XT_SR_SCOMPARE1: offset = CPU_OFF_SCOMPARE1; break;
+    case XT_SR_ACCLO:     offset = CPU_OFF_ACCLO; break;
+    case XT_SR_ACCHI:     offset = CPU_OFF_ACCHI; write_mask = 0xFFu; break;
+    case XT_SR_MR0: case XT_SR_MR1: case XT_SR_MR2: case XT_SR_MR3:
+        offset = (int32_t)(CPU_OFF_MR + (sr - XT_SR_MR0) * 4); break;
+    case XT_SR_MISC0: case XT_SR_MISC1: case XT_SR_MISC2: case XT_SR_MISC3:
+        offset = (int32_t)(CPU_OFF_MISC + (sr - XT_SR_MISC0) * 4); break;
+    case XT_SR_EPC1: case XT_SR_EPC2: case XT_SR_EPC3:
+    case XT_SR_EPC4: case XT_SR_EPC5: case XT_SR_EPC6: case XT_SR_EPC7:
+        offset = (int32_t)(CPU_OFF_EPC + (sr - XT_SR_EPC1) * 4); break;
+    case XT_SR_EPS2: case XT_SR_EPS3: case XT_SR_EPS4:
+    case XT_SR_EPS5: case XT_SR_EPS6: case XT_SR_EPS7:
+        offset = (int32_t)(offsetof(xtensa_cpu_t, eps) +
+                           (sr - XT_SR_EPS2 + 1) * 4); break;
+    case XT_SR_EXCSAVE1: case XT_SR_EXCSAVE2: case XT_SR_EXCSAVE3:
+    case XT_SR_EXCSAVE4: case XT_SR_EXCSAVE5: case XT_SR_EXCSAVE6:
+    case XT_SR_EXCSAVE7:
+        offset = (int32_t)(CPU_OFF_EXCSAVE +
+                           (sr - XT_SR_EXCSAVE1) * 4); break;
+    case XT_SR_DEPC:      offset = (int32_t)offsetof(xtensa_cpu_t, depc); break;
+    case XT_SR_CPENABLE:  offset = CPU_OFF_CPENABLE; break;
+    case XT_SR_VECBASE:   offset = CPU_OFF_VECBASE; break;
+    case XT_SR_EXCCAUSE:  offset = CPU_OFF_EXCCAUSE; break;
+    case XT_SR_EXCVADDR:  offset = CPU_OFF_EXCVADDR; break;
+    default:
+        return false;
+    }
+
+    if (out) {
+        out->offset = offset;
+        out->write_mask = write_mask;
+    }
+    return true;
+}
+
 /* Memory struct offsets */
 #define MEM_OFF_PAGE_TABLE  offsetof(xtensa_mem_t, page_table)
 
@@ -509,23 +565,11 @@ static int classify_for_jit(uint32_t insn, int ilen) {
             case 0: return 0;  /* RSR */
             case 1: { /* WSR — some have side effects */
                 int sr = ((insn >> 8) & 0xFF);
-                switch (sr) {
-                case XT_SR_SAR: case XT_SR_LBEG: case XT_SR_LEND:
-                case XT_SR_LCOUNT: case XT_SR_BR: case XT_SR_SCOMPARE1:
-                case XT_SR_MISC0: case XT_SR_MISC1: case XT_SR_MISC2: case XT_SR_MISC3:
-                case XT_SR_EPC1: case XT_SR_EPC2: case XT_SR_EPC3:
-                case XT_SR_EPC4: case XT_SR_EPC5: case XT_SR_EPC6: case XT_SR_EPC7:
-                case XT_SR_EXCSAVE1: case XT_SR_EXCSAVE2: case XT_SR_EXCSAVE3:
-                case XT_SR_EXCSAVE4: case XT_SR_EXCSAVE5: case XT_SR_EXCSAVE6:
-                case XT_SR_EXCSAVE7:
-                case XT_SR_EPS2: case XT_SR_EPS3: case XT_SR_EPS4:
-                case XT_SR_EPS5: case XT_SR_EPS6: case XT_SR_EPS7:
-                case XT_SR_VECBASE: case XT_SR_EXCCAUSE: case XT_SR_EXCVADDR:
-                case XT_SR_PS:
-                case XT_SR_DEPC:
-                    return 0;  /* Direct fields, or side effects emitted below */
-                case XT_SR_CPENABLE:
+                if (jit_plain_sr(sr, NULL))
                     return 0;
+                switch (sr) {
+                case XT_SR_PS:
+                    return 0;  /* Side effects emitted below. */
                 case XT_SR_WINDOWBASE: case XT_SR_WINDOWSTART:
                     /* Changing the register-window context invalidates the
                      * block's compile-time mapping or entry guard. Compile
@@ -2136,13 +2180,11 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             switch (op2) {
             case 0: { /* RSR: at = SR[sr] */
                 int sr_num = XT_SR_NUM(insn);
-                int32_t off = -1;
-                switch (sr_num) {
-                case XT_SR_SAR:      off = CPU_OFF_SAR; break;
-                case XT_SR_LBEG:     off = CPU_OFF_LBEG; break;
-                case XT_SR_LEND:     off = CPU_OFF_LEND; break;
-                case XT_SR_LCOUNT:   off = CPU_OFF_LCOUNT; break;
-                case XT_SR_BR:       off = CPU_OFF_BR; break;
+                jit_plain_sr_t field;
+                int32_t off;
+                if (jit_plain_sr(sr_num, &field)) {
+                    off = field.offset;
+                } else switch (sr_num) {
                 case XT_SR_PS:       off = CPU_OFF_PS; break;
                 case XT_SR_WINDOWBASE: off = CPU_OFF_WINDOWBASE; break;
                 case XT_SR_WINDOWSTART: off = CPU_OFF_WINDOWSTART; break;
@@ -2151,33 +2193,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 case XT_SR_CCOUNT:   off = CPU_OFF_CCOUNT; break;
                 case XT_SR_PRID:
                     off = (int32_t)offsetof(xtensa_cpu_t, prid); break;
-                case XT_SR_VECBASE:  off = CPU_OFF_VECBASE; break;
-                case XT_SR_EXCCAUSE: off = CPU_OFF_EXCCAUSE; break;
-                case XT_SR_EXCVADDR: off = CPU_OFF_EXCVADDR; break;
-                case XT_SR_SCOMPARE1: off = CPU_OFF_SCOMPARE1; break;
-                case XT_SR_MISC0: off = (int32_t)(CPU_OFF_MISC + 0); break;
-                case XT_SR_MISC1: off = (int32_t)(CPU_OFF_MISC + 4); break;
-                case XT_SR_MISC2: off = (int32_t)(CPU_OFF_MISC + 8); break;
-                case XT_SR_MISC3: off = (int32_t)(CPU_OFF_MISC + 12); break;
-                case XT_SR_EPC1: case XT_SR_EPC2: case XT_SR_EPC3:
-                case XT_SR_EPC4: case XT_SR_EPC5: case XT_SR_EPC6: case XT_SR_EPC7:
-                    off = (int32_t)(CPU_OFF_EPC + (sr_num - XT_SR_EPC1) * 4); break;
-                case XT_SR_EPS2: case XT_SR_EPS3: case XT_SR_EPS4:
-                case XT_SR_EPS5: case XT_SR_EPS6: case XT_SR_EPS7:
-                    off = (int32_t)(offsetof(xtensa_cpu_t, eps) + (sr_num - XT_SR_EPS2 + 1) * 4); break;
-                case XT_SR_EXCSAVE1: case XT_SR_EXCSAVE2: case XT_SR_EXCSAVE3:
-                case XT_SR_EXCSAVE4: case XT_SR_EXCSAVE5: case XT_SR_EXCSAVE6:
-                case XT_SR_EXCSAVE7:
-                    off = (int32_t)(CPU_OFF_EXCSAVE + (sr_num - XT_SR_EXCSAVE1) * 4); break;
                 case XT_SR_CCOMPARE0: case XT_SR_CCOMPARE1: case XT_SR_CCOMPARE2:
                     off = (int32_t)(CPU_OFF_CCOMPARE + (sr_num - XT_SR_CCOMPARE0) * 4); break;
-                case XT_SR_ACCLO:   off = CPU_OFF_ACCLO; break;
-                case XT_SR_ACCHI:   off = CPU_OFF_ACCHI; break;
-                case XT_SR_MR0: case XT_SR_MR1: case XT_SR_MR2: case XT_SR_MR3:
-                    off = (int32_t)(CPU_OFF_MR + (sr_num - XT_SR_MR0) * 4); break;
-                case XT_SR_LITBASE: off = CPU_OFF_LITBASE; break;
-                case XT_SR_DEPC:    off = (int32_t)offsetof(xtensa_cpu_t, depc); break;
-                case XT_SR_CPENABLE: off = CPU_OFF_CPENABLE; break;
                 default: return 0; /* Unknown SR: fall back */
                 }
                 emit_load_cpu32(e, RAX, off);
@@ -2238,34 +2255,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                                        jit, false);
                     return 1;
                 }
-                int32_t off = -1;
-                switch (sr_num) {
-                case XT_SR_SAR:      off = CPU_OFF_SAR; break;
-                case XT_SR_LBEG:     off = CPU_OFF_LBEG; break;
-                case XT_SR_LEND:     off = CPU_OFF_LEND; break;
-                case XT_SR_LCOUNT:   off = CPU_OFF_LCOUNT; break;
-                case XT_SR_BR:       off = CPU_OFF_BR; break;
-                case XT_SR_SCOMPARE1: off = CPU_OFF_SCOMPARE1; break;
-                case XT_SR_MISC0: off = (int32_t)(CPU_OFF_MISC + 0); break;
-                case XT_SR_MISC1: off = (int32_t)(CPU_OFF_MISC + 4); break;
-                case XT_SR_MISC2: off = (int32_t)(CPU_OFF_MISC + 8); break;
-                case XT_SR_MISC3: off = (int32_t)(CPU_OFF_MISC + 12); break;
-                case XT_SR_EPC1: case XT_SR_EPC2: case XT_SR_EPC3:
-                case XT_SR_EPC4: case XT_SR_EPC5: case XT_SR_EPC6: case XT_SR_EPC7:
-                    off = (int32_t)(CPU_OFF_EPC + (sr_num - XT_SR_EPC1) * 4); break;
-                case XT_SR_EPS2: case XT_SR_EPS3: case XT_SR_EPS4:
-                case XT_SR_EPS5: case XT_SR_EPS6: case XT_SR_EPS7:
-                    off = (int32_t)(offsetof(xtensa_cpu_t, eps) + (sr_num - XT_SR_EPS2 + 1) * 4); break;
-                case XT_SR_EXCSAVE1: case XT_SR_EXCSAVE2: case XT_SR_EXCSAVE3:
-                case XT_SR_EXCSAVE4: case XT_SR_EXCSAVE5: case XT_SR_EXCSAVE6:
-                case XT_SR_EXCSAVE7:
-                    off = (int32_t)(CPU_OFF_EXCSAVE + (sr_num - XT_SR_EXCSAVE1) * 4); break;
-                case XT_SR_VECBASE:  off = CPU_OFF_VECBASE; break;
-                case XT_SR_EXCCAUSE: off = CPU_OFF_EXCCAUSE; break;
-                case XT_SR_EXCVADDR: off = CPU_OFF_EXCVADDR; break;
-                case XT_SR_DEPC:     off = (int32_t)offsetof(xtensa_cpu_t, depc); break;
-                case XT_SR_CPENABLE: off = CPU_OFF_CPENABLE; break;
-                case XT_SR_PS:
+                if (sr_num == XT_SR_PS) {
                     /* Restoring PS is the exit half of every ESP-IDF
                      * critical section. It can lower INTLEVEL and thereby
                      * unmask an already-pending interrupt, so mirror
@@ -2297,10 +2287,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_jmp_to_epilogue(e, jit);
                     emit_patch_rel32(e, no_pending_irq);
                     return 1;
-                default: return 0;
                 }
+                jit_plain_sr_t field;
+                if (!jit_plain_sr(sr_num, &field))
+                    return 0;
                 ra_load_ar(e, ra,RAX, wb4, t);
-                emit_store_cpu32(e, RAX, off);
+                if (field.write_mask != UINT32_MAX)
+                    emit_and_reg32_imm32(e, RAX, field.write_mask);
+                emit_store_cpu32(e, RAX, field.offset);
                 return 1;
             }
             case 2: { /* SEXT: ar = sign_extend(as, t+8) */
