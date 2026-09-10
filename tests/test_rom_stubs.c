@@ -167,6 +167,34 @@ TEST(test_rom_conditional_stub) {
     teardown(&cpu);
 }
 
+TEST(test_rom_conditional_fallback_preserves_existing_hook) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    conditional_hook_test_t fallback = {0, BASE + 0x480u};
+    uint32_t hook_addr = BASE + 0x400u;
+    put_insn3(&cpu, hook_addr, 0x004136u);
+
+    dispatch_called = 0;
+    ASSERT_EQ(rom_stubs_register_exact_ctx(
+                  rom, hook_addr, test_dispatch_stub,
+                  "authoritative", NULL), 0u);
+    ASSERT_EQ(rom_stubs_register_conditional_exact_if_absent_ctx(
+                  rom, hook_addr, test_conditional_stub,
+                  "discovered-fallback", &fallback), 1u);
+
+    cpu.pc = hook_addr;
+    cpu._pc_written = true;
+    ar_write(&cpu, 2, 1u);
+    ASSERT_EQ(xtensa_step(&cpu), 0u);
+    ASSERT_TRUE(dispatch_called);
+    ASSERT_EQ(fallback.calls, 0u);
+    ASSERT_EQ(cpu.pc, BASE);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_rom_registration_backscans_only_post_entry_symbols) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1857,6 +1885,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_loaded_rom_executes_unregistered_entry);
     RUN_TEST(test_rom_stub_dispatch);
     RUN_TEST(test_rom_conditional_stub);
+    RUN_TEST(test_rom_conditional_fallback_preserves_existing_hook);
     RUN_TEST(test_rom_registration_backscans_only_post_entry_symbols);
     RUN_TEST(test_rom_arg_call4);
     RUN_TEST(test_rom_arg_call0);

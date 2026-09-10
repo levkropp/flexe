@@ -63,6 +63,15 @@ int  rom_stubs_register_conditional_exact_ctx(
                              esp32_rom_stubs_t *stubs, uint32_t addr,
                              rom_conditional_stub_fn fn, const char *name,
                              void *user_ctx);
+/* Register a structurally discovered accelerator without replacing a hook
+ * already installed at the same entry point.  Explicit/symbol-backed hooks
+ * therefore retain semantic ownership regardless of discovery order.
+ * Returns 0 when installed, 1 when an existing hook was retained, and -1 on
+ * invalid input or capacity exhaustion. */
+int  rom_stubs_register_conditional_exact_if_absent_ctx(
+                             esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_conditional_stub_fn fn, const char *name,
+                             void *user_ctx);
 
 /* Output capture (ets_printf / ets_write_char go here) */
 int  rom_stubs_output_count(const esp32_rom_stubs_t *stubs);

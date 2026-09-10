@@ -741,7 +741,7 @@ int esp_timer_stubs_hook_firmware(esp_timer_stubs_t *et) {
         native_lact_accessor_t *installed =
             &et->native_lact[et->native_lact_count];
         *installed = native;
-        if (rom_stubs_register_conditional_exact_ctx(
+        if (rom_stubs_register_conditional_exact_if_absent_ctx(
                 rom, entry, stub_idf_lact_esp_timer_get_time,
                 "esp_timer_get_time", installed) != 0)
             continue;

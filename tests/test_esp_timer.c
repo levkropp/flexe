@@ -344,6 +344,40 @@ TEST(test_stripped_idf_lact_timer_is_discovered_structurally) {
     et_teardown(&cpu, rom, et);
 }
 
+TEST(test_structural_idf_lact_timer_preserves_registered_semantics) {
+    xtensa_cpu_t cpu;
+    esp32_rom_stubs_t *rom;
+    esp_timer_stubs_t *et;
+    et_setup(&cpu, &rom, &et);
+
+    const uint32_t reader = 0x4007D200u;
+    const uint32_t addr = 0x4007D300u;
+    const uint32_t config = 0x3FF60070u;
+    seed_idf_lact_accessor(&cpu, reader, addr, config);
+
+    /* Symbol-backed time virtualization owns this entry.  A later structural
+     * scan may recognize the native body, but must not displace the semantic
+     * hook and turn an unsupported native context into raw guest execution. */
+    ASSERT_EQ(rom_stubs_register_ctx(
+                  rom, addr, stub_esp_timer_get_time,
+                  "esp_timer_get_time", et), 0u);
+    ASSERT_EQ(esp_timer_stubs_hook_firmware(et), 0u);
+    ASSERT_FALSE(cpu.accelerated_blocks);
+
+    cpu.cycle_count = 0u;
+    cpu.virtual_time_us = 0x12345678u;
+    cpu.pc = addr;
+    cpu._pc_written = true;
+    XT_PS_SET_CALLINC(cpu.ps, 0u);
+    ar_write(&cpu, 0, BASE + 0x100u);
+    ASSERT_EQ(xtensa_step(&cpu), 0u);
+    ASSERT_EQ(cpu.pc, BASE + 0x100u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0x12345678u);
+    ASSERT_EQ(ar_read(&cpu, 3), 0u);
+
+    et_teardown(&cpu, rom, et);
+}
+
 static esp32_periph_t *init_idf_lact_call(xtensa_cpu_t *cpu,
                                           uint32_t entry,
                                           uint32_t config,
@@ -559,6 +593,7 @@ static void run_esp_timer_tests(void) {
     RUN_TEST(test_esp_timer_delete);
     RUN_TEST(test_esp_timer_get_time);
     RUN_TEST(test_stripped_idf_lact_timer_is_discovered_structurally);
+    RUN_TEST(test_structural_idf_lact_timer_preserves_registered_semantics);
     RUN_TEST(test_idf_lact_timer_native_path_matches_guest_execution);
     RUN_TEST(test_esp_timer_start_once);
     RUN_TEST(test_esp_timer_multiple_creates);

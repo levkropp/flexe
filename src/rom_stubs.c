@@ -6952,6 +6952,22 @@ int rom_stubs_register_conditional_exact_ctx(
             stubs, addr, NULL, fn, name, user_ctx, false);
 }
 
+int rom_stubs_register_conditional_exact_if_absent_ctx(
+        esp32_rom_stubs_t *stubs, uint32_t addr,
+        rom_conditional_stub_fn fn, const char *name, void *user_ctx) {
+    if (!stubs || !fn) return -1;
+    /* Registration is a cold startup path, so inspect the authoritative
+     * entry list instead of relying on the bounded-probe dispatch hash.  The
+     * latter is intentionally optimized for execution and its direct-table
+     * fallback can still contain a valid hook after an extreme hash cluster. */
+    for (int i = 0; i < stubs->count; i++) {
+        if (stubs->entries[i].addr == addr)
+            return 1;
+    }
+    return rom_stubs_register_any(
+            stubs, addr, NULL, fn, name, user_ctx, false);
+}
+
 int rom_stubs_output_count(const esp32_rom_stubs_t *stubs) {
     return stubs->output_len;
 }
