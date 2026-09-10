@@ -93,6 +93,36 @@ TEST(mmio_complete_ahb_alias_window) {
 
 /* ===== ESP32 peripheral stubs ===== */
 
+static void test_deferred_event_fire(void *ctx) {
+    unsigned *fires = ctx;
+    (*fires)++;
+}
+
+TEST(peripheral_event_source_reactivates_after_idle) {
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    /* The first empty query prunes every dormant deadline producer. A later
+     * state transition must put its producer back into the scheduler. */
+    ASSERT_EQ(cpu.periph_next_event(&cpu), UINT32_MAX);
+    unsigned fires = 0;
+    ASSERT_EQ(periph_schedule_deferred_us(
+                  p, 1u, test_deferred_event_fire, &fires), 0);
+    uint32_t event = cpu.periph_next_event(&cpu);
+    ASSERT_TRUE(event != UINT32_MAX);
+
+    cpu.ccount = event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(fires, 1u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(uart_tx_capture) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -5545,6 +5575,16 @@ TEST(ledc_timer_overflow_pause_and_clear) {
     mem_write32(mem, 0x3FFE01E0u, 240u);
     uint32_t conf = test_ledc_timer_conf(8u, 16000u);
     mem_write32(mem, base + 0x140, conf);
+
+    /* RAW latches independently of INT_ENA. With no enabled interrupt there
+     * is no CPU wake deadline, but the free-running evaluator must survive
+     * deadline-source pruning and still advance the hardware. */
+    ASSERT_EQ(cpu.periph_next_event(&cpu), UINT32_MAX);
+    ledc_advance(&cpu, 48000u);
+    ASSERT_EQ(mem_read32(mem, base + 0x180) & 1u, 1u);
+    ASSERT_EQ(mem_read32(mem, base + 0x184) & 1u, 0u);
+    mem_write32(mem, base + 0x18C, 1u);
+
     mem_write32(mem, base + 0x188, 1u); /* timer0 overflow */
     ledc_advance(&cpu, 47999u);
     ASSERT_EQ(mem_read32(mem, base + 0x180) & 1u, 0u);
@@ -6177,6 +6217,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(mmio_range_registration);
     RUN_TEST(mmio_no_handler_returns_zero);
     RUN_TEST(mmio_complete_ahb_alias_window);
+    RUN_TEST(peripheral_event_source_reactivates_after_idle);
     RUN_TEST(uart_tx_capture);
     RUN_TEST(uhci_reset_register_file_dual_instance_and_dport);
     RUN_TEST(uhci_transparent_tx_dma_wire_timing_quick_send_and_interrupt);

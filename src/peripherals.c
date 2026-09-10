@@ -1129,6 +1129,35 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define MCPWM_UPDATE_EVENT_TEA       (1u << 3)
 #define MCPWM_UPDATE_EVENT_TEB       (1u << 4)
 
+/* Deadline producers share one scheduler. This single registry generates the
+ * source IDs and the two direct-call hot paths below. A producer stays a
+ * candidate until its next-fire query reports no armed event, then sleeps
+ * until its own state transition marks it dirty again. The final field says
+ * that a free-running model still needs evaluation without a wake deadline. */
+#define PERIPH_EVENT_SOURCE_LIST(X) \
+    X(TIMG,     timg_next_fire,     timg_eval_events,     false) \
+    X(LACT,     lact_next_fire,     lact_eval_events,     true)  \
+    X(FRC,      frc_next_fire,      frc_eval_events,      false) \
+    X(UHCI,     uhci_next_fire,     uhci_eval_events,     false) \
+    X(SDMMC,    sdmmc_next_fire,    sdmmc_eval_events,    false) \
+    X(TWAI,     twai_next_fire,     twai_eval_events,     false) \
+    X(I2S,      i2s_next_fire,      i2s_eval_events,      false) \
+    X(RMT,      rmt_next_fire,      rmt_eval_events,      false) \
+    X(LEDC,     ledc_next_fire,     ledc_eval_events,     true)  \
+    X(PCNT,     pcnt_next_fire,     pcnt_eval_events,     false) \
+    X(MCPWM,    mcpwm_next_fire,    mcpwm_eval_events,    true)  \
+    X(DEFERRED, deferred_next_fire, deferred_eval_events, false)
+
+typedef enum {
+#define PERIPH_EVENT_ENUM(name, next, eval, continuous) PERIPH_EVENT_##name,
+    PERIPH_EVENT_SOURCE_LIST(PERIPH_EVENT_ENUM)
+#undef PERIPH_EVENT_ENUM
+    PERIPH_EVENT_SOURCE_COUNT,
+} periph_event_source_t;
+
+#define PERIPH_EVENT_ALL_MASK \
+    ((1u << PERIPH_EVENT_SOURCE_COUNT) - 1u)
+
 static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
 static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -1190,6 +1219,8 @@ static void mcpwm_gpio_input_changed(esp32_periph_t *p, int gpio);
 static uint32_t deferred_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void deferred_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void deferred_kick(esp32_periph_t *p);
+static void periph_event_source_changed(esp32_periph_t *p,
+                                        periph_event_source_t source);
 
 /* WDT shadow registers per timer group */
 typedef struct {
@@ -1857,6 +1888,9 @@ struct esp32_periph {
     /* CPU pointers for interrupt delivery */
     xtensa_cpu_t *cpu[2];
 
+    /* Per-core set of deadline producers which may currently be armed. */
+    uint32_t event_source_candidates[2];
+
     /* Cross-core interrupt pending state */
     uint32_t from_cpu_intr[4]; /* FROM_CPU_INTR0..3 registers */
 
@@ -1948,6 +1982,14 @@ struct esp32_periph {
     uint16_t flash_mmu_effective[FLASH_MMU_ENTRY_COUNT];
 };
 
+static void periph_event_source_changed(esp32_periph_t *p,
+                                        periph_event_source_t source) {
+    if (!p || (unsigned)source >= PERIPH_EVENT_SOURCE_COUNT) return;
+    uint32_t bit = 1u << (unsigned)source;
+    p->event_source_candidates[0] |= bit;
+    p->event_source_candidates[1] |= bit;
+}
+
 /* ===== Shared monotonic peripheral cycle clock =====
  *
  * The two emulated cores advance their own CCOUNT independently:
@@ -2015,6 +2057,7 @@ static uint32_t periph_deadline_ccount(esp32_periph_t *p, periph_clock_t *c,
 }
 
 static void deferred_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_DEFERRED);
     for (int core = 0; core < 2; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -3983,6 +4026,7 @@ static void timg_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 
 static void timg_kick(esp32_periph_t *p) {
     timg_refresh_alarm_active(p);
+    periph_event_source_changed(p, PERIPH_EVENT_TIMG);
     for (unsigned core = 0; core < 2u; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -4158,6 +4202,12 @@ static uint32_t lact_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     return (uint32_t)best;
 }
 
+static void lact_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
+    (void)cpu;
+    for (int group = 0; group < 2; group++)
+        lact_eval_irq(p, group);
+}
+
 /* ---- FRC1/FRC2 legacy APB timers ---- */
 
 #define FRC_TIMER_COUNT          2u
@@ -4202,6 +4252,7 @@ static void frc_refresh_event_active(esp32_periph_t *p) {
 
 static void frc_kick(esp32_periph_t *p) {
     frc_refresh_event_active(p);
+    periph_event_source_changed(p, PERIPH_EVENT_FRC);
     for (unsigned core = 0; core < 2u; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -4453,57 +4504,61 @@ static void frc_reset(esp32_periph_t *p) {
     p->frc_event_active = false;
 }
 
+static int periph_event_core(const esp32_periph_t *p,
+                             const xtensa_cpu_t *cpu) {
+    if (p && cpu == p->cpu[0]) return 0;
+    if (p && cpu == p->cpu[1]) return 1;
+    return -1;
+}
+
 /* CPU hooks (registered on both cores, wired into next_timer_event). */
 static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
-    uint32_t events[] = {
-        timg_next_fire(p, cpu),
-        lact_next_fire(p, cpu),
-        frc_next_fire(p, cpu),
-        uhci_next_fire(p, cpu),
-        sdmmc_next_fire(p, cpu),
-        twai_next_fire(p, cpu),
-        i2s_next_fire(p, cpu),
-        rmt_next_fire(p, cpu),
-        ledc_next_fire(p, cpu),
-        pcnt_next_fire(p, cpu),
-        mcpwm_next_fire(p, cpu),
-        deferred_next_fire(p, cpu),
-    };
+    int core = periph_event_core(p, cpu);
+    if (core < 0) return UINT32_MAX;
+
+    uint32_t candidates = p->event_source_candidates[core];
     bool have = false;
     uint32_t best = UINT32_MAX;
     uint32_t best_distance = 0;
-    for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); i++) {
-        if (events[i] == UINT32_MAX) continue;
-        uint32_t distance = events[i] - cpu->ccount;
-        if ((int32_t)distance < 0) distance = 0;
-        if (!have || distance < best_distance) {
-            have = true;
-            best = events[i];
-            best_distance = distance;
-        }
-    }
+#define PERIPH_CONSIDER_EVENT(name, next, eval, continuous) do {             \
+        const uint32_t bit = 1u << PERIPH_EVENT_##name;                      \
+        if (candidates & bit) {                                               \
+            uint32_t event = next(p, cpu);                                    \
+            if (event == UINT32_MAX) {                                        \
+                p->event_source_candidates[core] &= ~bit;                     \
+            } else {                                                          \
+                uint32_t distance = event - cpu->ccount;                      \
+                if ((int32_t)distance < 0) distance = 0;                      \
+                if (!have || distance < best_distance) {                     \
+                    have = true;                                              \
+                    best = event;                                             \
+                    best_distance = distance;                                 \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+    } while (0);
+    PERIPH_EVENT_SOURCE_LIST(PERIPH_CONSIDER_EVENT)
+#undef PERIPH_CONSIDER_EVENT
     return have ? best : UINT32_MAX;
 }
 static void periph_event_hook(xtensa_cpu_t *cpu) {
     esp32_periph_t *p = (esp32_periph_t *)cpu->periph_event_ctx;
-    timg_eval_events(p, cpu);
-    for (int group = 0; group < 2; group++)
-        lact_eval_irq(p, group);
-    frc_eval_events(p, cpu);
-    uhci_eval_events(p, cpu);
-    sdmmc_eval_events(p, cpu);
-    twai_eval_events(p, cpu);
-    i2s_eval_events(p, cpu);
-    rmt_eval_events(p, cpu);
-    ledc_eval_events(p, cpu);
-    pcnt_eval_events(p, cpu);
-    mcpwm_eval_events(p, cpu);
-    deferred_eval_events(p, cpu);
+    int core = periph_event_core(p, cpu);
+    if (core < 0) return;
+
+    uint32_t candidates = p->event_source_candidates[core];
+#define PERIPH_EVAL_EVENT(name, next, eval, continuous) do {                 \
+        if ((candidates & (1u << PERIPH_EVENT_##name)) || (continuous))       \
+            eval(p, cpu);                                                     \
+    } while (0);
+    PERIPH_EVENT_SOURCE_LIST(PERIPH_EVAL_EVENT)
+#undef PERIPH_EVAL_EVENT
 }
 
 /* Recompute both cores' next_timer_event after LACT state changes. */
 static void lact_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_LACT);
     for (int core = 0; core < 2; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -5783,6 +5838,7 @@ static void rmt_irq_update(esp32_periph_t *p) {
 }
 
 static void rmt_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_RMT);
     for (int core = 0; core < 2; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -6238,6 +6294,7 @@ static uint32_t pcnt_cpu_mhz(const esp32_periph_t *p) {
 }
 
 static void pcnt_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_PCNT);
     for (int core = 0; core < 2; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -6899,6 +6956,7 @@ static void mcpwm_update_irq(esp32_periph_t *p, unsigned unit) {
 }
 
 static void mcpwm_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_MCPWM);
     for (int core = 0; core < 2; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -8501,6 +8559,7 @@ static void ledc_sync_timer_overflows(esp32_periph_t *p) {
 }
 
 static void ledc_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_LEDC);
     for (int core = 0; core < 2; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -8946,6 +9005,7 @@ static xtensa_cpu_t *uhci_event_cpu(esp32_periph_t *p) {
 }
 
 static void uhci_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_UHCI);
     for (int core = 0; core < 2; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -10813,6 +10873,7 @@ static xtensa_cpu_t *sdmmc_event_cpu(esp32_periph_t *p) {
 }
 
 static void sdmmc_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_SDMMC);
     for (unsigned core = 0; core < 2u; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -11604,6 +11665,7 @@ static xtensa_cpu_t *twai_event_cpu(esp32_periph_t *p) {
 }
 
 static void twai_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_TWAI);
     for (unsigned core = 0; core < 2u; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
@@ -13198,6 +13260,7 @@ static int i2s_ring_descriptor_count(esp32_periph_t *p, uint32_t first) {
 }
 
 static void i2s_kick(esp32_periph_t *p) {
+    periph_event_source_changed(p, PERIPH_EVENT_I2S);
     if (p->cpu[0]) xtensa_recompute_next_timer(p->cpu[0]);
 }
 
@@ -14118,6 +14181,8 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     if (!p) return;
     p->cpu[0] = cpu0;
     p->cpu[1] = cpu1;
+    p->event_source_candidates[0] = PERIPH_EVENT_ALL_MASK;
+    p->event_source_candidates[1] = PERIPH_EVENT_ALL_MASK;
     /* Re-anchor every shared clock against the newly attached cores. Listing
      * them here rather than open-coding each one keeps a clock that is added
      * later from being silently left un-anchored. */
