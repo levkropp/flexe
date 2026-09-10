@@ -380,7 +380,8 @@ static int session_build(flexe_session_t *s)
     XT_PS_SET_EXCM(s->cpu[0].ps, 0);
 
     /* Set initial stack pointer */
-    uint32_t sp = cfg->initial_sp ? cfg->initial_sp : 0x3FFE0000u;
+    uint32_t sp = cfg->initial_sp ? cfg->initial_sp :
+                  flexe_target_bootstrap_stack(target, 0);
     ar_write(&s->cpu[0], 1, sp);
     s->cpu[0].seed_entry_link = true;
 
@@ -399,23 +400,15 @@ static int session_build(flexe_session_t *s)
            sizeof(s->cpu[1].poll_spin_pc));
     s->cpu[1].poll_spin_count = s->cpu[0].poll_spin_count;
     s->cpu[1].poll_spin_insns = s->cpu[0].poll_spin_insns;
-    /* Core 1 needs a valid stack before its boot entry runs: the APP CPU
-     * entry point begins with `entry a1, 32` and never sets one itself, so
-     * whatever we put here carries its whole startup.
-     *
-     * *Above* core 0's stack, not below. Below put it 16 KB under core 0 at
-     * 0x3FFDC000, which is inside the application heap -- static data ends
-     * around 0x3FFC4C00 and the heap grows from there toward core 0's stack.
-     * A firmware that allocates enough eventually writes over core 1's
-     * startup frame. Meshtastic does: the saved a0 in call_start_cpu1's frame
-     * became 0x0000000A, its RETW computed 0x4000000A, and core 1 spent the
-     * rest of the run spinning in unregistered ROM -- 98% of all instructions
-     * retired, with core 0 stalled waiting for a core that never came up.
-     *
-     * The ROM data region above core 0's stack is where hardware's APP CPU
-     * startup stack lives, and the heap does not reach it during startup, so
-     * this is both the safer choice and the more faithful one. */
-    ar_write(&s->cpu[1], 1, sp + 0x8000);
+    /* Core 1 needs a valid stack before its boot entry runs: APP CPU startup
+     * begins with ENTRY and does not establish one first. Keep both defaults
+     * in the target descriptor because the safe internal-RAM windows differ
+     * between LX6 ESP32 and LX7 ESP32-S3. The classic values deliberately put
+     * core 1 above core 0, outside the application heap; this prevents the
+     * Meshtastic startup corruption that originally exposed the requirement. */
+    uint32_t sp1 = cfg->initial_sp ? sp + 0x8000u :
+                   flexe_target_bootstrap_stack(target, 1);
+    ar_write(&s->cpu[1], 1, sp1);
     s->cpu[1].seed_entry_link = true;
 
     /* Attach CPUs to peripherals for interrupt delivery */

@@ -36,7 +36,7 @@ typedef struct {
 
     /* CPU configuration */
     uint32_t    entry_override;     /* Override entry point (0 = use .bin) */
-    uint32_t    initial_sp;         /* Override initial SP (0 = 0x3FFE0000) */
+    uint32_t    initial_sp;         /* Override core-0 initial SP (0 = target default) */
     int         single_core;        /* 1 = no APP_CPU */
     int         window_trace;       /* Enable window spill/fill trace */
     int         spill_verify;       /* Enable spill/fill verification */

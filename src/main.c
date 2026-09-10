@@ -1496,7 +1496,8 @@ int main(int argc, char *argv[]) {
                 uint32_t param;
                 uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
                 if (fn) {
-                    ar_write(cpu, 1, 0x3FFE0000u);
+                    ar_write(cpu, 1,
+                             flexe_target_bootstrap_stack(cpu->target, 0));
                     ar_write(cpu, 2, param);
                     cpu->pc = fn;
                     cpu->ps = 0x00040020u;
@@ -1545,7 +1546,8 @@ int main(int argc, char *argv[]) {
                 uint32_t param;
                 uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
                 if (fn) {
-                    ar_write(cpu, 1, 0x3FFE0000u);
+                    ar_write(cpu, 1,
+                             flexe_target_bootstrap_stack(cpu->target, 0));
                     ar_write(cpu, 2, param);
                     cpu->pc = fn;
                     cpu->ps = 0x00040020u;

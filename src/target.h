@@ -14,7 +14,7 @@
 
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 4u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 5u
 
 typedef enum {
     FLEXE_TARGET_AUTO = 0,
@@ -89,6 +89,10 @@ typedef struct {
     uint32_t                    configid1;
     uint8_t                     interrupt_level[32];
 
+    /* Safe scratch stacks for direct-to-application startup. Frontends may
+     * override core 0; these defaults must lie in writable internal RAM. */
+    uint32_t                    bootstrap_stack_top[2];
+
     /* SoC address geometry. Ranges are inclusive/exclusive. */
     uint32_t                    iram_start;
     uint32_t                    iram_end;
@@ -133,5 +137,9 @@ int flexe_target_parse(const char *name, flexe_target_id_t *id_out);
 /* True when pc is inside one of the descriptor's executable windows. */
 bool flexe_target_pc_is_executable(const flexe_target_desc_t *target,
                                    uint32_t pc);
+
+/* Return a descriptor-provided direct-start stack, or zero for bad input. */
+uint32_t flexe_target_bootstrap_stack(const flexe_target_desc_t *target,
+                                      unsigned core);
 
 #endif /* FLEXE_TARGET_H */

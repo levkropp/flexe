@@ -3504,7 +3504,8 @@ static void stub_deferred_task_trampoline(xtensa_cpu_t *cpu, void *ctx) {
         frt->deferred_task_fn = 0;  /* one-shot */
         pthread_mutex_unlock(&frt->lock);
         /* Set up a fresh call context for the task function */
-        ar_write(cpu, 1, 0x3FFE0000u);  /* SP */
+        ar_write(cpu, 1,
+                 flexe_target_bootstrap_stack(cpu->target, 0));
         ar_write(cpu, 2, param);
         cpu->pc = fn;
         cpu->ps = 0x00040020u;  /* WOE=1, UM=1 */
@@ -3559,7 +3560,8 @@ void freertos_stubs_start_scheduler(freertos_stubs_t *frt) {
         uint32_t fn = frt->deferred_task_fn;
         uint32_t param = frt->deferred_task_param;
         frt->deferred_task_fn = 0;
-        ar_write(frt->cpu[0], 1, 0x3FFE0000u);
+        ar_write(frt->cpu[0], 1,
+                 flexe_target_bootstrap_stack(frt->cpu[0]->target, 0));
         ar_write(frt->cpu[0], 2, param);
         frt->cpu[0]->pc = fn;
         frt->cpu[0]->ps = 0x00040020u;

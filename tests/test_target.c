@@ -15,6 +15,9 @@ TEST(target_reset_uses_lx7_core_configuration) {
     ASSERT_EQ(cpu.configid0, 0xC2F0FFFEu);
     ASSERT_EQ(cpu.configid1, 0x23090F1Fu);
     ASSERT_EQ(cpu.int_level[14], 7u);
+    ASSERT_EQ(flexe_target_bootstrap_stack(s3, 0), 0x3FCE0000u);
+    ASSERT_EQ(flexe_target_bootstrap_stack(s3, 1), 0x3FCF0000u);
+    ASSERT_EQ(flexe_target_bootstrap_stack(s3, 2), 0u);
 }
 
 TEST(target_lx7_interprets_common_isa_in_s3_iram) {

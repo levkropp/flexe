@@ -21,6 +21,7 @@ static const flexe_target_desc_t TARGETS[] = {
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2BCFFFEu,
         .configid1 = 0x1CC5FE96u,
+        .bootstrap_stack_top = { 0x3FFE0000u, 0x3FFE8000u },
         .interrupt_level = {
             1, 1, 1, 1, 1, 1, 1, 1,
             1, 1, 1, 3, 1, 1, 7, 3,
@@ -92,6 +93,7 @@ static const flexe_target_desc_t TARGETS[] = {
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
         .configid1 = 0x23090F1Fu,
+        .bootstrap_stack_top = { 0x3FCE0000u, 0x3FCF0000u },
         .interrupt_level = {
             1, 1, 1, 1, 1, 1, 1, 1,
             1, 1, 1, 3, 1, 1, 7, 3,
@@ -203,4 +205,11 @@ bool flexe_target_pc_is_executable(const flexe_target_desc_t *target,
             return true;
     }
     return false;
+}
+
+uint32_t flexe_target_bootstrap_stack(const flexe_target_desc_t *target,
+                                      unsigned core)
+{
+    if (!target || core >= target->core_count || core >= 2u) return 0;
+    return target->bootstrap_stack_top[core];
 }
