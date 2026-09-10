@@ -841,6 +841,16 @@ static inline void emit_bt_reg_reg(emit_t *e, int reg, int bit_reg) {
     emit32(e, 0x6A00001Fu | (9u << 16) | ((uint32_t)(reg & 31) << 5));
 }
 
+/* Clear a runtime-selected bit: reg &= ~(1u << (bit_reg & 31)). */
+static inline void emit_btr_reg_reg(emit_t *e, int reg, int bit_reg) {
+    /* MOV W9, #1; LSLV W9, W9, Wbit; BIC Wreg, Wreg, W9. */
+    emit32(e, 0x52800029u);
+    emit32(e, 0x1AC02000u | ((uint32_t)(bit_reg & 31) << 16)
+             | (9u << 5) | 9u);
+    emit32(e, 0x0A200000u | (9u << 16)
+             | ((uint32_t)(reg & 31) << 5) | (uint32_t)(reg & 31));
+}
+
 /* TST Xn, Xm (64-bit) — ANDS XZR, Xn, Xm. For pointer null checks. */
 static inline void emit_test_reg64(emit_t *e, int a, int b) {
     emit32(e, 0xEA00001Fu | ((uint32_t)(b & 31) << 16)

@@ -299,13 +299,15 @@ static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb,
 /* Resolve a runtime control-flow target to the guarded entry of an already
  * compiled block. Static exits are patched directly, but RETW computes both
  * its PC and windowbase from architectural state and therefore needs this
- * exact lookup at runtime. A miss simply returns through the normal C
- * dispatcher, which hot-counts and compiles the target as before. */
-static void *jit_dynamic_chain_lookup(jit_state_t *jit, xtensa_cpu_t *cpu) {
+ * exact lookup at runtime. Generated RETW code passes the values it already
+ * computed instead of storing and immediately reloading them here. A miss
+ * simply returns through the normal C dispatcher, which hot-counts and
+ * compiles the target as before. */
+static void *jit_dynamic_chain_lookup(jit_state_t *jit, xtensa_cpu_t *cpu,
+                                      uint32_t windowbase, uint32_t pc) {
     if (jit->no_chain || jit->invalidate_pending)
         return NULL;
 
-    uint32_t pc = cpu->pc;
     if (pc < ESP32_FIRMWARE_INSN_ADDR_LOW || pc >= ESP32_INSN_ADDR_HIGH)
         return NULL;
 
@@ -313,7 +315,7 @@ static void *jit_dynamic_chain_lookup(jit_state_t *jit, xtensa_cpu_t *cpu) {
     if (lv != 0u)
         return NULL;
 
-    jit_block_t *block = jit_lookup(jit, pc, cpu->windowbase, 0u);
+    jit_block_t *block = jit_lookup(jit, pc, windowbase, 0u);
     if (!block || !block->chain_entry)
         return NULL;
 
@@ -3118,6 +3120,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
     /* RETW / RETW.N handler — reached via goto from RETW and RETW.N cases */
     if (0) {
 compile_retw: ;
+        /* Keep the computed destination in the native ABI registers used by
+         * jit_dynamic_chain_lookup(). The compatibility register names map
+         * to X3 on AArch64 and RCX on x86-64 respectively. */
+#ifdef JIT_ARCH_ARM64
+        const int return_pc_reg = RBX;
+#else
+        const int return_pc_reg = RCX;
+#endif
         /* 1. Load a0 directly (spilled, not in regalloc) */
         emit_load32_disp(e, RAX, REG_CPU, ar_offset(wb4, 0));
 
@@ -3132,39 +3142,37 @@ compile_retw: ;
         emit_test_reg32(e, RCX, RCX);
         int callsize_fb = emit_jcc_rel32(e, CC_E);
 
-        /* 3. Compute return_pc = (a0 & 0x3FFFFFFF) */
-        emit_and_reg32_imm32(e, RAX, 0x3FFFFFFF);
-        /* Add high bits from current PC */
-        emit_or_reg32_imm32(e, RAX, (int32_t)(pc & 0xC0000000u));
-        emit_mov_reg32_reg32(e, RSI, RAX);  /* RSI = return_pc */
-
-        /* 4. Compute ret_wb = (windowbase - nn) & 15 */
+        /* 3. Compute ret_wb = (windowbase - nn) & 15. RDX is the
+         * third integer argument register on both supported hosts. */
         emit_load_cpu32(e, RDX, (int32_t)CPU_OFF_WINDOWBASE);
         emit_sub_reg32(e, RDX, RCX);
         emit_and_reg32_imm32(e, RDX, 15);  /* RDX = ret_wb */
 
-        /* 5. Underflow guard: check WS[ret_wb], fallback if clear */
-        emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_WINDOWSTART);
-        emit_bt_reg_reg(e, RBX, RDX);  /* test bit ret_wb of WS */
+        /* 4. Compute return_pc = (a0 & 0x3FFFFFFF), in the fourth
+         * integer argument register for the dynamic-target lookup. */
+        emit_and_reg32_imm32(e, RAX, 0x3FFFFFFF);
+        emit_or_reg32_imm32(e, RAX, (int32_t)(pc & 0xC0000000u));
+        emit_mov_reg32_reg32(e, return_pc_reg, RAX);
+
+        /* 5. Underflow guard: check WS[ret_wb], fallback if clear. */
+        emit_load_cpu32(e, RSI, (int32_t)CPU_OFF_WINDOWSTART);
+        emit_bt_reg_reg(e, RSI, RDX);  /* test bit ret_wb of WS */
         int fill_fb = emit_jcc_rel32(e, JIT_CC_BIT_CLEAR);  /* bit clear → need fill */
 
         /* 6. Flush dirty regs BEFORE window rotation */
         ra_flush(e, ra, wb4);
 
         /* 7. Clear WS[current_wb] */
-        emit_load_cpu32(e, RCX, (int32_t)CPU_OFF_WINDOWBASE);
-        emit_mov_reg_imm32(e, RAX, 1);
-        emit_shl_reg32_cl(e, RAX);
-        emit_not_reg32(e, RAX);
-        emit_and_reg32(e, RBX, RAX);
-        emit_store_cpu32(e, RBX, (int32_t)CPU_OFF_WINDOWSTART);
+        emit_load_cpu32(e, RDI, (int32_t)CPU_OFF_WINDOWBASE);
+        emit_btr_reg_reg(e, RSI, RDI);
+        emit_store_cpu32(e, RSI, (int32_t)CPU_OFF_WINDOWSTART);
 
         /* 8. Store ret_wb → WINDOWBASE */
         emit_store_cpu32(e, RDX, (int32_t)CPU_OFF_WINDOWBASE);
 
         /* 9. Store return_pc → cpu->pc, exit with insn_count. RETW does
          * not change PS.OWB; that field belongs to exception/window traps. */
-        emit_store_cpu32(e, RSI, (int32_t)CPU_OFF_PC);
+        emit_store_cpu32(e, return_pc_reg, (int32_t)CPU_OFF_PC);
         emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
         emit_acc_add(e, insn_idx + 1);
         /* RETW's target is dynamic. Resolve it against the same exact

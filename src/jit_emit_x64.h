@@ -737,6 +737,14 @@ static inline void emit_bt_reg_reg(emit_t *e, int reg, int bit_reg) {
     emit8(e, modrm(3, bit_reg, reg));
 }
 
+/* btr reg32, reg32 -- clear a runtime-selected bit in place. */
+static inline void emit_btr_reg_reg(emit_t *e, int reg, int bit_reg) {
+    emit_rex(e, 0, bit_reg, reg);
+    emit8(e, 0x0F);
+    emit8(e, 0xB3);
+    emit8(e, modrm(3, bit_reg, reg));
+}
+
 /* or [base64 + disp32], reg32 */
 static inline void emit_or_mem32_reg(emit_t *e, int base, int32_t disp, int src) {
     emit_rex(e, 0, src, base);
