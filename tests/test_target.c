@@ -1,5 +1,6 @@
 /* Target/core-descriptor tests. */
 #include "test_helpers.h"
+#include "savestate.h"
 
 TEST(target_reset_uses_lx7_core_configuration) {
     const flexe_target_desc_t *s3 =
@@ -23,14 +24,10 @@ TEST(target_lx7_interprets_common_isa_in_s3_iram) {
     xtensa_cpu_t cpu;
 
     xtensa_cpu_reset_for_target(&cpu, s3);
-    cpu.mem = mem_create();
+    cpu.mem = mem_create_for_target(s3);
     ASSERT_TRUE(cpu.mem != NULL);
     if (!cpu.mem) return;
 
-    /* Until the target-aware memory constructor lands, map one official S3
-     * IRAM page onto test backing. This tests the core's target validity and
-     * shared LX6/LX7 decoder without pretending the complete S3 SoC exists. */
-    cpu.mem->page_table[pc >> 12] = cpu.mem->sram;
     cpu.pc = pc;
     XT_PS_SET_EXCM(cpu.ps, 0);
     put_insn3(&cpu, pc, rrr(8, 0, 3, 4, 5)); /* ADD a3, a4, a5 */
@@ -61,10 +58,49 @@ TEST(target_lx7_does_not_build_classic_predecode_table) {
     mem_destroy(cpu.mem);
 }
 
+TEST(target_lx7_savestate_uses_descriptor_backing_sizes) {
+    const char *path = "/tmp/flexe-s3-savestate-unit.bin";
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_cpu_t saved;
+    xtensa_cpu_t restored;
+
+    xtensa_cpu_init_for_target(&saved, s3);
+    xtensa_cpu_init_for_target(&restored, s3);
+    saved.mem = mem_create_for_target(s3);
+    restored.mem = mem_create_for_target(s3);
+    ASSERT_TRUE(saved.mem != NULL);
+    ASSERT_TRUE(restored.mem != NULL);
+    if (!saved.mem || !restored.mem) {
+        mem_destroy(saved.mem);
+        mem_destroy(restored.mem);
+        return;
+    }
+
+    saved.pc = 0x403752F4u;
+    saved.insn_count = 12345u;
+    mem_write32(saved.mem, 0x3FC92300u, 0xA1B2C3D4u);
+    mem_write32(saved.mem, 0x40374000u, 0x55667788u);
+    mem_write32(saved.mem, 0x600FE000u, 0x0BADCAFEu);
+    ASSERT_EQ(savestate_save(&saved, NULL, path, "esp32-s3-unit"), 0);
+    ASSERT_EQ(savestate_restore(&restored, NULL, path), 0);
+    ASSERT_TRUE(restored.target == s3);
+    ASSERT_EQ(restored.pc, 0x403752F4u);
+    ASSERT_EQ(restored.insn_count, 12345u);
+    ASSERT_EQ(mem_read32(restored.mem, 0x3FC92300u), 0xA1B2C3D4u);
+    ASSERT_EQ(mem_read32(restored.mem, 0x40374000u), 0x55667788u);
+    ASSERT_EQ(mem_read32(restored.mem, 0x600FE000u), 0x0BADCAFEu);
+
+    remove(path);
+    mem_destroy(saved.mem);
+    mem_destroy(restored.mem);
+}
+
 void run_target_tests(void) {
     TEST_SUITE("Xtensa target descriptors");
 
     RUN_TEST(target_reset_uses_lx7_core_configuration);
     RUN_TEST(target_lx7_interprets_common_isa_in_s3_iram);
     RUN_TEST(target_lx7_does_not_build_classic_predecode_table);
+    RUN_TEST(target_lx7_savestate_uses_descriptor_backing_sizes);
 }

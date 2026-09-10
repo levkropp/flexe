@@ -9,7 +9,7 @@
  * feeding a valid image to the wrong SoC model. */
 static const flexe_target_desc_t TARGETS[] = {
     {
-        .descriptor_version = 2,
+        .descriptor_version = FLEXE_TARGET_DESCRIPTOR_VERSION,
         .id = FLEXE_TARGET_ESP32,
         .name = "esp32",
         .display_name = "ESP32",
@@ -35,6 +35,33 @@ static const flexe_target_desc_t TARGETS[] = {
         .drom_end = 0x3F800000u,
         .irom_start = 0x400D0000u,
         .irom_end = 0x40400000u,
+        .backing_size = {
+            [FLEXE_MEM_SRAM] = 0x000B0000u,
+            [FLEXE_MEM_ROM] = 0x00080000u,
+            [FLEXE_MEM_FLASH_DATA] = 0x00400000u,
+            [FLEXE_MEM_FLASH_INSN] = 0x00400000u,
+            [FLEXE_MEM_RTC_FAST] = 0x00002000u,
+            [FLEXE_MEM_RTC_SLOW] = 0x00002000u,
+            [FLEXE_MEM_PSRAM] = 0x00400000u,
+        },
+        .memory_region_count = 10,
+        .memory_region = {
+            { 0x3F400000u, 0x3F800000u, FLEXE_MEM_FLASH_DATA, 0, "flash_data" },
+            { 0x3F800000u, 0x3FC00000u, FLEXE_MEM_PSRAM, 0, "psram" },
+            { 0x3FF80000u, 0x3FF82000u, FLEXE_MEM_RTC_FAST, 0, "rtc_dram" },
+            { 0x3FF90000u, 0x3FFA0000u, FLEXE_MEM_ROM, 0x00070000u, "rom_data" },
+            { 0x3FFA0000u, 0x40000000u, FLEXE_MEM_SRAM, 0, "sram_data" },
+            { 0x40000000u, 0x40070000u, FLEXE_MEM_ROM, 0, "rom" },
+            { 0x40070000u, 0x400C0000u, FLEXE_MEM_SRAM, 0x00060000u, "sram_insn" },
+            { 0x400C0000u, 0x400C2000u, FLEXE_MEM_RTC_FAST, 0, "rtc_iram" },
+            { 0x400D0000u, 0x40400000u, FLEXE_MEM_FLASH_INSN, 0, "flash_insn" },
+            { 0x50000000u, 0x50002000u, FLEXE_MEM_RTC_SLOW, 0, "rtc_slow" },
+        },
+        .peripheral_start = 0x3FF00000u,
+        .peripheral_end = 0x3FF80000u,
+        .peripheral_alias_start = 0x60000000u,
+        .peripheral_alias_end = 0x60040000u,
+        .peripheral_alias_delta = -0x200C0000,
         .executable_range_count = 3,
         .executable = {
             { 0x40000000u, 0x400C2000u }, /* ROM, cache, IRAM, RTC fast */
@@ -43,7 +70,7 @@ static const flexe_target_desc_t TARGETS[] = {
         },
     },
     {
-        .descriptor_version = 2,
+        .descriptor_version = FLEXE_TARGET_DESCRIPTOR_VERSION,
         .id = FLEXE_TARGET_ESP32S3,
         .name = "esp32s3",
         .display_name = "ESP32-S3",
@@ -69,6 +96,29 @@ static const flexe_target_desc_t TARGETS[] = {
         .drom_end = 0x3E000000u,
         .irom_start = 0x42000000u,
         .irom_end = 0x44000000u,
+        .backing_size = {
+            [FLEXE_MEM_SRAM] = 0x00080000u,
+            [FLEXE_MEM_ROM] = 0x00060000u,
+            [FLEXE_MEM_FLASH_DATA] = 0x00400000u,
+            [FLEXE_MEM_FLASH_INSN] = 0x00400000u,
+            [FLEXE_MEM_RTC_FAST] = 0x00002000u,
+            [FLEXE_MEM_RTC_SLOW] = 0x00002000u,
+        },
+        .memory_region_count = 8,
+        .memory_region = {
+            { 0x3C000000u, 0x3C400000u, FLEXE_MEM_FLASH_DATA, 0, "flash_data" },
+            { 0x3FC88000u, 0x3FD00000u, FLEXE_MEM_SRAM, 0, "sram_data" },
+            { 0x40000000u, 0x40060000u, FLEXE_MEM_ROM, 0, "rom" },
+            /* 0x40370000..0x40377fff is cache SRAM. The remaining IRAM
+             * aliases 0x3fc88000..0x3fceffff byte-for-byte. */
+            { 0x40370000u, 0x40378000u, FLEXE_MEM_SRAM, 0x00078000u, "sram_insn" },
+            { 0x40378000u, 0x403E0000u, FLEXE_MEM_SRAM, 0, "sram_insn" },
+            { 0x42000000u, 0x42400000u, FLEXE_MEM_FLASH_INSN, 0, "flash_insn" },
+            { 0x50000000u, 0x50002000u, FLEXE_MEM_RTC_SLOW, 0, "rtc_slow" },
+            { 0x600FE000u, 0x60100000u, FLEXE_MEM_RTC_FAST, 0, "rtc_fast" },
+        },
+        .peripheral_start = 0x60000000u,
+        .peripheral_end = 0x600D1000u,
         .executable_range_count = 5,
         .executable = {
             { 0x40000000u, 0x40060000u }, /* mask ROM */

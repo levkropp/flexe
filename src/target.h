@@ -13,6 +13,8 @@
 #include <stdint.h>
 
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
+#define FLEXE_TARGET_MEM_REGION_MAX 10u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 3u
 
 typedef enum {
     FLEXE_TARGET_AUTO = 0,
@@ -35,6 +37,27 @@ typedef struct {
     uint32_t start;
     uint32_t end;   /* exclusive */
 } flexe_addr_range_t;
+
+/* Host allocations used by the target's memory map. Multiple guest regions
+ * may reference the same backing (for example S3 D/IRAM aliases). */
+typedef enum {
+    FLEXE_MEM_SRAM = 0,
+    FLEXE_MEM_ROM,
+    FLEXE_MEM_FLASH_DATA,
+    FLEXE_MEM_FLASH_INSN,
+    FLEXE_MEM_RTC_FAST,
+    FLEXE_MEM_RTC_SLOW,
+    FLEXE_MEM_PSRAM,
+    FLEXE_MEM_BACKING_COUNT,
+} flexe_mem_backing_t;
+
+typedef struct {
+    uint32_t              start;
+    uint32_t              end;       /* exclusive */
+    flexe_mem_backing_t   backing;
+    uint32_t              backing_offset;
+    const char           *name;
+} flexe_target_mem_region_t;
 
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
@@ -65,6 +88,20 @@ typedef struct {
     uint32_t                    drom_end;
     uint32_t                    irom_start;
     uint32_t                    irom_end;
+
+    /* Initial address map. Flash cache windows are initially linear so an
+     * image can be loaded; the target MMU replaces those mappings at boot. */
+    uint32_t                    backing_size[FLEXE_MEM_BACKING_COUNT];
+    uint8_t                     memory_region_count;
+    flexe_target_mem_region_t   memory_region[FLEXE_TARGET_MEM_REGION_MAX];
+
+    /* Canonical MMIO window and an optional address alias. alias_delta is
+     * added to an address in the alias window before handler dispatch. */
+    uint32_t                    peripheral_start;
+    uint32_t                    peripheral_end;
+    uint32_t                    peripheral_alias_start;
+    uint32_t                    peripheral_alias_end;
+    int32_t                     peripheral_alias_delta;
 
     /* All architecturally executable windows, including reset/RTC memory. */
     uint8_t                     executable_range_count;

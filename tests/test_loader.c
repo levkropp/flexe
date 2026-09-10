@@ -156,7 +156,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     const flexe_target_desc_t *s3 = flexe_target_by_name("esp32-s3");
     ASSERT_TRUE(esp32 != NULL);
     ASSERT_TRUE(s3 != NULL);
-    ASSERT_EQ(esp32->descriptor_version, 2u);
+    ASSERT_EQ(esp32->descriptor_version, FLEXE_TARGET_DESCRIPTOR_VERSION);
     ASSERT_EQ(esp32->core_generation, FLEXE_XTENSA_LX6);
     ASSERT_EQ(esp32->support_level, FLEXE_TARGET_STABLE);
     ASSERT_EQ(s3->image_chip_id, 9u);

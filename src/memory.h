@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
+#include "target.h"
 
 #ifdef _MSC_VER
 #include "msvc_compat.h"
@@ -15,7 +16,6 @@ typedef uint32_t (*mmio_read_fn)(void *ctx, uint32_t addr);
 typedef void     (*mmio_write_fn)(void *ctx, uint32_t addr, uint32_t val);
 
 /* Constants for struct definition */
-#define MEM_PERIPH_PAGES    128         /* 512KB / 4KB */
 #define MEM_PAGE_TABLE_SIZE (1u << 20)  /* 1M pages covering 4GB */
 
 typedef struct {
@@ -26,6 +26,7 @@ typedef struct {
 
 /* Full struct exposed for inline access in hot path */
 struct xtensa_mem {
+    const flexe_target_desc_t *target;
     uint8_t *sram;
     uint8_t *rom;
     uint8_t *flash_data;
@@ -33,7 +34,9 @@ struct xtensa_mem {
     uint8_t *rtc_dram;
     uint8_t *rtc_slow;
     uint8_t *psram;
-    mmio_handler_t mmio[MEM_PERIPH_PAGES];
+    uint32_t backing_size[FLEXE_MEM_BACKING_COUNT];
+    mmio_handler_t *mmio;
+    uint32_t mmio_page_count;
 
     /* Accesses matching no RAM page and no MMIO handler. Reads return 0 and
      * writes are dropped -- see note_unmapped() for why that is deliberate and
@@ -47,8 +50,14 @@ typedef struct xtensa_mem xtensa_mem_t;
 
 /* Lifecycle */
 xtensa_mem_t *mem_create(void);
+xtensa_mem_t *mem_create_for_target(const flexe_target_desc_t *target);
 void mem_destroy(xtensa_mem_t *mem);
 void mem_reset(xtensa_mem_t *mem);
+
+const flexe_target_desc_t *mem_target(const xtensa_mem_t *mem);
+uint32_t mem_backing_size(const xtensa_mem_t *mem,
+                          flexe_mem_backing_t backing);
+uint8_t *mem_backing_ptr(xtensa_mem_t *mem, flexe_mem_backing_t backing);
 
 /* Bulk load */
 int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len);

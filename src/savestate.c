@@ -8,14 +8,6 @@
 #include <time.h>
 #include <errno.h>
 
-/* Memory region sizes (from memory.c) */
-#define SRAM_SIZE       (704 * 1024)
-#define ROM_SIZE        (512 * 1024)
-#define FLASH_SIZE      (4 * 1024 * 1024)
-#define PSRAM_SIZE      (4 * 1024 * 1024)
-#define RTC_DRAM_SIZE   (8 * 1024)
-#define RTC_SLOW_SIZE   (8 * 1024)
-
 /* Helper macros for safe file I/O */
 #define WRITE_OR_FAIL(f, ptr, size, msg) \
     do { \
@@ -39,7 +31,7 @@
  * Save complete emulator state to file.
  */
 int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, const char *description) {
-    if (!cpu || !path) {
+    if (!cpu || !cpu->mem || !mem_target(cpu->mem) || !path) {
         fprintf(stderr, "savestate_save: null argument\n");
         return -1;
     }
@@ -67,10 +59,10 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
                  (unsigned long long)hdr.cycle_count);
     }
 
-    hdr.iram_size = SRAM_SIZE;
-    hdr.dram_size = SRAM_SIZE;  /* SRAM is used for both IRAM and DRAM */
-    hdr.flash_size = FLASH_SIZE;
-    hdr.psram_size = PSRAM_SIZE;
+    hdr.target_id = (uint32_t)mem_target(cpu->mem)->id;
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++)
+        hdr.backing_size[i] =
+            mem_backing_size(cpu->mem, (flexe_mem_backing_t)i);
     hdr.compressed = 0;
     hdr.differential = 0;
 
@@ -157,63 +149,20 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
     WRITE_OR_FAIL(f, &cpu->virtual_time_us, sizeof(cpu->virtual_time_us), "VIRTUAL_TIME_US");
 
     /* === Memory Regions === */
-    if (cpu->mem) {
-        /* SRAM (704KB) */
-        if (cpu->mem->sram) {
-            WRITE_OR_FAIL(f, cpu->mem->sram, SRAM_SIZE, "SRAM");
-        } else {
-            fprintf(stderr, "savestate_save: SRAM is NULL\n");
+    static const char *const backing_name[FLEXE_MEM_BACKING_COUNT] = {
+        "SRAM", "ROM", "FLASH_DATA", "FLASH_INSN",
+        "RTC_FAST", "RTC_SLOW", "PSRAM",
+    };
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
+        uint32_t size = hdr.backing_size[i];
+        uint8_t *ptr = mem_backing_ptr(cpu->mem, (flexe_mem_backing_t)i);
+        if (size != 0 && !ptr) {
+            fprintf(stderr, "savestate_save: %s is NULL\n", backing_name[i]);
             fclose(f);
             return -1;
         }
-
-        /* ESP32 instruction ROM (448KB) plus data ROM (64KB). */
-        if (cpu->mem->rom) {
-            WRITE_OR_FAIL(f, cpu->mem->rom, ROM_SIZE, "ROM");
-        } else {
-            fprintf(stderr, "savestate_save: ROM is NULL\n");
-            fclose(f);
-            return -1;
-        }
-
-        /* Flash data (4MB) */
-        if (cpu->mem->flash_data) {
-            WRITE_OR_FAIL(f, cpu->mem->flash_data, FLASH_SIZE, "FLASH_DATA");
-        } else {
-            fprintf(stderr, "savestate_save: FLASH_DATA is NULL\n");
-            fclose(f);
-            return -1;
-        }
-
-        /* Flash instruction (4MB) */
-        if (cpu->mem->flash_insn) {
-            WRITE_OR_FAIL(f, cpu->mem->flash_insn, FLASH_SIZE, "FLASH_INSN");
-        } else {
-            fprintf(stderr, "savestate_save: FLASH_INSN is NULL\n");
-            fclose(f);
-            return -1;
-        }
-
-        /* PSRAM (4MB) */
-        if (cpu->mem->psram) {
-            WRITE_OR_FAIL(f, cpu->mem->psram, PSRAM_SIZE, "PSRAM");
-        } else {
-            fprintf(stderr, "savestate_save: PSRAM is NULL\n");
-            fclose(f);
-            return -1;
-        }
-
-        /* RTC memory regions */
-        if (cpu->mem->rtc_dram) {
-            WRITE_OR_FAIL(f, cpu->mem->rtc_dram, RTC_DRAM_SIZE, "RTC_DRAM");
-        }
-        if (cpu->mem->rtc_slow) {
-            WRITE_OR_FAIL(f, cpu->mem->rtc_slow, RTC_SLOW_SIZE, "RTC_SLOW");
-        }
-    } else {
-        fprintf(stderr, "savestate_save: memory subsystem is NULL\n");
-        fclose(f);
-        return -1;
+        if (size != 0)
+            WRITE_OR_FAIL(f, ptr, size, backing_name[i]);
     }
 
     /* === FreeRTOS State === */
@@ -242,7 +191,7 @@ int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, c
  * Restore emulator state from checkpoint file.
  */
 int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path) {
-    if (!cpu || !path) {
+    if (!cpu || !cpu->mem || !mem_target(cpu->mem) || !path) {
         fprintf(stderr, "savestate_restore: null argument\n");
         return -1;
     }
@@ -271,16 +220,24 @@ int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path
         return -1;
     }
 
-    /* Validate memory sizes */
-    if (hdr.iram_size != SRAM_SIZE || hdr.dram_size != SRAM_SIZE ||
-        hdr.flash_size != FLASH_SIZE || hdr.psram_size != PSRAM_SIZE) {
-        fprintf(stderr, "savestate_restore: memory size mismatch\n");
-        fprintf(stderr, "  Expected: SRAM=%u, FLASH=%u, PSRAM=%u\n",
-                SRAM_SIZE, FLASH_SIZE, PSRAM_SIZE);
-        fprintf(stderr, "  Got:      IRAM=%u, DRAM=%u, FLASH=%u, PSRAM=%u\n",
-                hdr.iram_size, hdr.dram_size, hdr.flash_size, hdr.psram_size);
+    if (hdr.target_id != (uint32_t)mem_target(cpu->mem)->id) {
+        fprintf(stderr,
+                "savestate_restore: target mismatch (state=%u, emulator=%u)\n",
+                hdr.target_id, (unsigned)mem_target(cpu->mem)->id);
         fclose(f);
         return -1;
+    }
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
+        uint32_t expected =
+            mem_backing_size(cpu->mem, (flexe_mem_backing_t)i);
+        if (hdr.backing_size[i] != expected) {
+            fprintf(stderr,
+                    "savestate_restore: backing %u size mismatch "
+                    "(state=%u, emulator=%u)\n",
+                    i, hdr.backing_size[i], expected);
+            fclose(f);
+            return -1;
+        }
     }
 
     fprintf(stderr, "Restoring checkpoint: %s\n", hdr.description);
@@ -359,19 +316,22 @@ int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path
     READ_OR_FAIL(f, &cpu->virtual_time_us, sizeof(cpu->virtual_time_us), "VIRTUAL_TIME_US");
 
     /* === Restore Memory Regions === */
-    if (!cpu->mem) {
-        fprintf(stderr, "savestate_restore: memory subsystem is NULL\n");
-        fclose(f);
-        return -1;
+    static const char *const backing_name[FLEXE_MEM_BACKING_COUNT] = {
+        "SRAM", "ROM", "FLASH_DATA", "FLASH_INSN",
+        "RTC_FAST", "RTC_SLOW", "PSRAM",
+    };
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
+        uint32_t size = hdr.backing_size[i];
+        uint8_t *ptr = mem_backing_ptr(cpu->mem, (flexe_mem_backing_t)i);
+        if (size != 0 && !ptr) {
+            fprintf(stderr, "savestate_restore: %s is NULL\n",
+                    backing_name[i]);
+            fclose(f);
+            return -1;
+        }
+        if (size != 0)
+            READ_OR_FAIL(f, ptr, size, backing_name[i]);
     }
-
-    READ_OR_FAIL(f, cpu->mem->sram, SRAM_SIZE, "SRAM");
-    READ_OR_FAIL(f, cpu->mem->rom, ROM_SIZE, "ROM");
-    READ_OR_FAIL(f, cpu->mem->flash_data, FLASH_SIZE, "FLASH_DATA");
-    READ_OR_FAIL(f, cpu->mem->flash_insn, FLASH_SIZE, "FLASH_INSN");
-    READ_OR_FAIL(f, cpu->mem->psram, PSRAM_SIZE, "PSRAM");
-    READ_OR_FAIL(f, cpu->mem->rtc_dram, RTC_DRAM_SIZE, "RTC_DRAM");
-    READ_OR_FAIL(f, cpu->mem->rtc_slow, RTC_SLOW_SIZE, "RTC_SLOW");
 
     /* === Restore FreeRTOS State === */
     uint32_t freertos_marker;

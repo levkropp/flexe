@@ -2,13 +2,14 @@
 #define SAVESTATE_H
 
 #include <stdint.h>
+#include "target.h"
 
 /* Forward declarations */
 typedef struct xtensa_cpu xtensa_cpu_t;
 typedef struct freertos_stubs freertos_stubs_t;
 
 /* File format version (increment when structure changes) */
-#define SAVESTATE_VERSION 8
+#define SAVESTATE_VERSION 9
 
 /* Savestate file magic (ASCII: "XTST") */
 #define SAVESTATE_MAGIC 0x54535458
@@ -22,11 +23,9 @@ typedef struct {
     uint64_t timestamp;       /* Unix timestamp of save */
     char description[256];    /* Human-readable checkpoint name */
 
-    /* Memory region sizes (for validation and allocation) */
-    uint32_t iram_size;       /* IRAM size in bytes */
-    uint32_t dram_size;       /* DRAM size in bytes */
-    uint32_t flash_size;      /* Flash data size in bytes */
-    uint32_t psram_size;      /* PSRAM size in bytes */
+    /* Target identity and descriptor-sized host backings. */
+    uint32_t target_id;
+    uint32_t backing_size[FLEXE_MEM_BACKING_COUNT];
 
     /* Compression/optimization flags (for future use) */
     uint8_t compressed;       /* 0=raw, 1=zlib (reserved) */

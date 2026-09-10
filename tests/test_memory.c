@@ -4,6 +4,17 @@
 #include "test_helpers.h"
 #include <string.h>
 
+typedef struct {
+    uint32_t last_addr;
+    uint32_t value;
+} target_mmio_probe_t;
+
+static uint32_t target_mmio_read(void *ctx, uint32_t addr) {
+    target_mmio_probe_t *probe = ctx;
+    probe->last_addr = addr;
+    return probe->value;
+}
+
 /* ===== SRAM data region ===== */
 
 TEST(mem_rw8_sram_data) {
@@ -39,6 +50,72 @@ TEST(mem_sram_alias) {
     ASSERT_EQ(mem_read32(mem, 0x40070000), 0x12345678);
     /* Verify they are independent */
     ASSERT_EQ(mem_read32(mem, 0x3FFB0000), 0xCAFEBABE);
+    mem_destroy(mem);
+}
+
+TEST(mem_esp32s3_native_map_and_diram_alias) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+
+    ASSERT_TRUE(mem_target(mem) == s3);
+    ASSERT_EQ(mem_backing_size(mem, FLEXE_MEM_SRAM), 0x80000u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FC87FFFu) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FC88000u) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FCFFFFFu) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FD00000u) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x4036FFFFu) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40370000u) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x403DFFFFu) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x403E0000u) == NULL);
+
+    /* S3 D/IRAM is a real alias above the 32 KiB cache-SRAM prefix. */
+    mem_write32(mem, 0x3FC88000u, 0x12345678u);
+    ASSERT_EQ(mem_read32(mem, 0x40378000u), 0x12345678u);
+    mem_write32(mem, 0x4037FFF0u, 0xA5A55A5Au);
+    ASSERT_EQ(mem_read32(mem, 0x3FC8FFF0u), 0xA5A55A5Au);
+    mem_write32(mem, 0x40370000u, 0xC001CAFEu);
+    ASSERT_EQ(mem_read32(mem, 0x3FC88000u), 0x12345678u);
+
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3C000000u) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3C3FFFFFu) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3C400000u) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x42000000u) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x423FFFFFu) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x42400000u) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x600FE000u) != NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x600FFFFFu) != NULL);
+
+    mem_destroy(mem);
+}
+
+TEST(mem_esp32s3_mmio_is_native_not_classic_alias) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    target_mmio_probe_t low = {0, 0x11223344u};
+    target_mmio_probe_t high = {0, 0x55667788u};
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+
+    ASSERT_EQ(mem_register_mmio_range(mem, 0x60000000u, 0x1000u,
+                                      target_mmio_read, NULL, &low), 0);
+    ASSERT_EQ(mem_register_mmio_range(mem, 0x600C5000u, 0x1000u,
+                                      target_mmio_read, NULL, &high), 0);
+    ASSERT_EQ(mem_read32(mem, 0x60000020u), 0x11223344u);
+    ASSERT_EQ(low.last_addr, 0x60000020u);
+    ASSERT_EQ(mem_read32(mem, 0x600C5000u), 0x55667788u);
+    ASSERT_EQ(high.last_addr, 0x600C5000u);
+
+    /* On classic ESP32, 0x60000020 mirrors 0x3ff40020. On S3 it is the
+     * canonical UART address, and the classic APB address is unmapped. */
+    ASSERT_EQ(mem_read32(mem, 0x3FF40020u), 0u);
+    ASSERT_EQ(low.last_addr, 0x60000020u);
+    ASSERT_EQ(mem_register_mmio_range(mem, 0x600D1000u, 0x1000u,
+                                      target_mmio_read, NULL, &high), -1);
+
     mem_destroy(mem);
 }
 
@@ -272,6 +349,8 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw16_sram_data);
     RUN_TEST(mem_rw32_sram_data);
     RUN_TEST(mem_sram_alias);
+    RUN_TEST(mem_esp32s3_native_map_and_diram_alias);
+    RUN_TEST(mem_esp32s3_mmio_is_native_not_classic_alias);
     RUN_TEST(mem_full_esp32_rom_map);
     RUN_TEST(mem_builtin_rom_ctype_table);
     RUN_TEST(mem_rw32_flash_data);
