@@ -155,10 +155,49 @@ TEST(peripherals_compose_s3_devices_without_classic_aliases) {
     mem_destroy(mem);
 }
 
+TEST(peripherals_compose_target_described_s3_uarts) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    int before = periph_unhandled_count(periph);
+    mem_write32(mem, 0x60000000u, 'S');
+    mem_write32(mem, 0x60010000u, '3');
+    mem_write32(mem, 0x6002E000u, '!');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 1);
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 1), 1);
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 2), 1);
+    ASSERT_EQ(periph_uart_tx_buf_num(periph, 0)[0], 'S');
+    ASSERT_EQ(periph_uart_tx_buf_num(periph, 1)[0], '3');
+    ASSERT_EQ(periph_uart_tx_buf_num(periph, 2)[0], '!');
+
+    static const uint8_t rx[] = { 'O', 'K' };
+    ASSERT_EQ(periph_uart_rx_inject_num(periph, 0, rx, sizeof(rx)),
+              sizeof(rx));
+    ASSERT_EQ(mem_read32(mem, 0x6000001Cu) & 0x3FFu, 2u);
+    ASSERT_EQ(mem_read32(mem, 0x60000068u), 2u << 11);
+    ASSERT_EQ(mem_read32(mem, 0x60000000u), 'O');
+    ASSERT_EQ(mem_read32(mem, 0x60000068u), 1u | (2u << 11));
+    ASSERT_EQ(mem_read32(mem, 0x6000007Cu), 0x02008270u);
+    ASSERT_EQ(periph_unhandled_count(periph), before);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_esp32s3_extmem_tests(void) {
     TEST_SUITE("ESP32-S3 EXTMEM");
     RUN_TEST(esp32s3_extmem_exposes_documented_reset_state);
     RUN_TEST(esp32s3_extmem_application_handoff_enables_cache_buses);
     RUN_TEST(esp32s3_extmem_operations_complete_and_invalidate_code);
     RUN_TEST(peripherals_compose_s3_devices_without_classic_aliases);
+    RUN_TEST(peripherals_compose_target_described_s3_uarts);
 }

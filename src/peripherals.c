@@ -27,9 +27,6 @@ static inline int gpio_dbg(void) {
 /* ESP32 peripheral base addresses */
 #define PERIPH_BASE     0x3FF00000u
 #define DPORT_BASE      0x3FF00000u
-#define UART0_BASE      0x3FF40000u
-#define UART1_BASE      0x3FF50000u
-#define UART2_BASE      0x3FF6E000u
 #define UHCI0_BASE      0x3FF54000u
 #define UHCI1_BASE      0x3FF4C000u
 #define HINF_BASE       0x3FF4B000u
@@ -265,7 +262,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 /* UART FIFOs / host capture. ESP32 UART hardware has 128-byte FIFOs. */
 #define UART_TX_BUF_SIZE 4096
 #define UART_RX_FIFO_SIZE 128
-#define UART_COUNT 3
+#define UART_COUNT FLEXE_TARGET_UART_MAX
 
 /* Classic ESP32 has two UART DMA (UHCI) controllers shared by UART0/1/2.
  * Descriptor words use the same lldesc layout as the SPI/I2S DMA engines. */
@@ -2574,15 +2571,22 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
 
 /* ---- UART0/UART1/UART2 ---- */
 
-static const uint32_t uart_bases[UART_COUNT] = {
-    UART0_BASE, UART1_BASE, UART2_BASE
-};
+static bool uart_num_valid(const esp32_periph_t *p, int uart_num) {
+    return p && uart_num >= 0 &&
+           uart_num < (int)p->target->uart_count && uart_num < UART_COUNT;
+}
 
-static const int uart_intr_sources[UART_COUNT] = {34, 35, 36};
+static const flexe_uart_instance_desc_t *uart_desc(const esp32_periph_t *p,
+                                                    int uart_num) {
+    return uart_num_valid(p, uart_num) ? &p->target->uart[uart_num] : NULL;
+}
 
-static int uart_num_from_addr(uint32_t addr) {
-    for (int i = 0; i < UART_COUNT; i++) {
-        if (addr >= uart_bases[i] && addr < uart_bases[i] + PAGE_SIZE)
+static int uart_num_from_addr(const esp32_periph_t *p, uint32_t addr) {
+    if (!p || p->target->uart_count > UART_COUNT) return -1;
+    for (int i = 0; i < (int)p->target->uart_count; i++) {
+        const flexe_uart_instance_desc_t *desc = &p->target->uart[i];
+        if (addr >= desc->base &&
+            addr - desc->base < p->target->uart_ip.register_size)
             return i;
     }
     return -1;
@@ -2593,8 +2597,18 @@ static int uart_num_from_addr(uint32_t addr) {
  * interrupts that ESP-IDF's buffered UART driver relies on to dequeue its
  * transmit ring buffer. */
 static void uart_intr_update(esp32_periph_t *p, int uart_num) {
+    const flexe_uart_instance_desc_t *desc = uart_desc(p, uart_num);
+    if (!desc) return;
     uart_state_t *uart = &p->uart[uart_num];
-    int source = uart_intr_sources[uart_num];
+    int source = (int)desc->interrupt_source;
+
+    /* The S3 interrupt matrix has its own register layout and is composed as
+     * a separate target device. Until that model is installed, retain UART
+     * raw/masked state but never deliver it through classic DPORT routing. */
+    if (!(p->target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
+        return;
+
     uint32_t mask = 1u << (source % 32);
     bool active = (uart->int_raw & uart->int_ena) != 0;
     if (active) {
@@ -2608,9 +2622,12 @@ static void uart_intr_update(esp32_periph_t *p, int uart_num) {
     (void)mask;
 }
 
-static void uart_refresh_level_conditions(uart_state_t *uart) {
+static void uart_refresh_level_conditions(esp32_periph_t *p, int uart_num) {
+    const flexe_uart_ip_desc_t *ip = p ? &p->target->uart_ip : NULL;
+    if (!uart_num_valid(p, uart_num)) return;
+    uart_state_t *uart = &p->uart[uart_num];
     uint32_t conf1 = uart->shadow[0x24 / 4];
-    uint32_t full_threshold = conf1 & 0x7Fu;
+    uint32_t full_threshold = conf1 & ip->rx_full_threshold_mask;
     if (full_threshold > 0 && uart->rx_count >= full_threshold)
         uart->int_raw |= UART_RXFIFO_FULL_INT;
     if (uart->int_ena & UART_TXFIFO_EMPTY_INT)
@@ -2619,7 +2636,7 @@ static void uart_refresh_level_conditions(uart_state_t *uart) {
 
 static void uart_emit_tx_byte(esp32_periph_t *p, int uart_num, uint8_t byte,
                               bool apb_fifo_write) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return;
+    if (!uart_num_valid(p, uart_num)) return;
     uart_state_t *uart = &p->uart[uart_num];
     if (uart->tx_len < UART_TX_BUF_SIZE)
         uart->tx[uart->tx_len++] = byte;
@@ -2638,17 +2655,19 @@ static void uart_emit_tx_byte(esp32_periph_t *p, int uart_num, uint8_t byte,
 }
 
 static void uart_dma_tx_done(esp32_periph_t *p, int uart_num) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return;
+    if (!uart_num_valid(p, uart_num)) return;
     p->uart[uart_num].int_raw |= UART_TXFIFO_EMPTY_INT | UART_TX_DONE_INT;
     uart_intr_update(p, uart_num);
 }
 
 static uint32_t uart_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    int uart_num = uart_num_from_addr(addr);
+    int uart_num = uart_num_from_addr(p, addr);
     if (uart_num < 0) return 0;
+    const flexe_uart_instance_desc_t *desc = uart_desc(p, uart_num);
+    const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
     uart_state_t *uart = &p->uart[uart_num];
-    uint32_t off = addr - uart_bases[uart_num];
+    uint32_t off = addr - desc->base;
     switch (off) {
     case 0x00: {                    /* FIFO read */
         if (uart->rx_count == 0) return 0;
@@ -2661,11 +2680,14 @@ static uint32_t uart_read(void *ctx, uint32_t addr) {
     case 0x08: return uart->int_raw & uart->int_ena;    /* INT_ST */
     case 0x0C: return uart->int_ena;                    /* INT_ENA */
     case 0x10: return 0;            /* INT_CLR is write-only */
-    case 0x1C: return uart->rx_count; /* STATUS: RX count; TX count is zero */
-    case 0x60:                      /* MEM_RX_STATUS */
-        return ((uint32_t)(uart->rx_tail & 0x7FFu) << 2) |
-               ((uint32_t)(uart->rx_head & 0x7FFu) << 13);
+    case 0x1C:                       /* STATUS: TX FIFO drains immediately */
+        return ip->status_idle_value | uart->rx_count;
     default:
+        if (off == ip->mem_rx_status_offset)
+            return ((uint32_t)(uart->rx_tail & ip->fifo_address_mask)
+                    << ip->mem_rx_read_shift) |
+                   ((uint32_t)(uart->rx_head & ip->fifo_address_mask)
+                    << ip->mem_rx_write_shift);
         if (off / 4 < 64) return uart->shadow[off / 4];
         return 0;
     }
@@ -2673,33 +2695,54 @@ static uint32_t uart_read(void *ctx, uint32_t addr) {
 
 static void uart_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
-    int uart_num = uart_num_from_addr(addr);
+    int uart_num = uart_num_from_addr(p, addr);
     if (uart_num < 0) return;
+    const flexe_uart_instance_desc_t *desc = uart_desc(p, uart_num);
+    const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
     uart_state_t *uart = &p->uart[uart_num];
-    uint32_t off = addr - uart_bases[uart_num];
+    uint32_t off = addr - desc->base;
     if (off == 0x00) {
         /* FIFO write: TX byte */
         uint8_t byte = (uint8_t)(val & 0xFF);
         uart_emit_tx_byte(p, uart_num, byte, true);
     } else if (off == 0x0C) {       /* INT_ENA */
-        uart->int_ena = val & UART_INT_VALID_MASK;
+        uart->int_ena = val & ip->interrupt_valid_mask;
         /* Enabling TXFIFO_EMPTY while the FIFO is empty raises it at once. */
-        uart_refresh_level_conditions(uart);
+        uart_refresh_level_conditions(p, uart_num);
         uart_intr_update(p, uart_num);
     } else if (off == 0x10) {       /* INT_CLR (W1TC) */
-        uart->int_raw &= ~(val & UART_INT_VALID_MASK);
+        uart->int_raw &= ~(val & ip->interrupt_valid_mask);
         /* FIFO threshold and TX empty are level-triggered. */
-        uart_refresh_level_conditions(uart);
+        uart_refresh_level_conditions(p, uart_num);
         uart_intr_update(p, uart_num);
     } else {
         if (off / 4 < 64) uart->shadow[off / 4] = val;
         if (off == 0x24) {          /* CONF1 threshold/timeout controls */
-            uart_refresh_level_conditions(uart);
-            if (uart->rx_count > 0 && (val & (1u << 31)))
+            uart_refresh_level_conditions(p, uart_num);
+            if (uart->rx_count > 0 &&
+                (val & ip->rx_timeout_enable_mask))
                 uart->int_raw |= UART_RXFIFO_TOUT_INT;
             uart_intr_update(p, uart_num);
         }
     }
+}
+
+static int uart_register_target(esp32_periph_t *p) {
+    if (!p || p->target->uart_count > UART_COUNT) return -1;
+    const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
+    for (int uart_num = 0; uart_num < (int)p->target->uart_count;
+         uart_num++) {
+        const flexe_uart_instance_desc_t *desc = uart_desc(p, uart_num);
+        if (!desc || ip->register_size == 0u ||
+            ip->date_offset >= sizeof(p->uart[uart_num].shadow) ||
+            mem_register_mmio_range(p->mem, desc->base,
+                                    ip->register_size,
+                                    uart_read, uart_write, p) != 0)
+            return -1;
+        p->uart[uart_num].int_raw = ip->interrupt_raw_reset;
+        p->uart[uart_num].shadow[ip->date_offset / 4u] = ip->date_reset;
+    }
+    return 0;
 }
 
 /* ---- GPIO sigma-delta / pulse-density modulator ---- */
@@ -13519,6 +13562,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     for (uint32_t i = 0; i < mem->mmio_page_count; i++)
         mem_register_mmio(mem, (int)i, default_read, default_write, p);
 
+    if (uart_register_target(p) != 0) {
+        periph_destroy(p);
+        return NULL;
+    }
+
     if (!(target->capabilities &
           FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)) {
         if (target->flash_mmu.shared_instruction_data)
@@ -13640,11 +13688,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* Two adjacent 8 KiB DPORT flash-MMU register windows. */
     mem_register_mmio_range(mem, 0x3FF10000u, 0x4000u,
                             dport_read, dport_write, p);
-
-    /* Three independent UART controllers (interrupt sources 34/35/36). */
-    mem_register_mmio(mem, (int)PAGE_OF(UART0_BASE), uart_read, uart_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(UART1_BASE), uart_read, uart_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(UART2_BASE), uart_read, uart_write, p);
 
     /* Dual UART DMA controllers (UHCI0/UHCI1, interrupt sources 12/13). */
     mem_register_mmio(mem, (int)PAGE_OF(UHCI0_BASE), uhci_read, uhci_write, p);
@@ -13927,26 +13970,27 @@ const uint8_t *periph_uart_tx_buf(const esp32_periph_t *p) {
 
 void periph_set_uart_callback_num(esp32_periph_t *p, int uart_num,
                                   uart_tx_cb cb, void *ctx) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return;
+    if (!uart_num_valid(p, uart_num)) return;
     p->uart[uart_num].cb = cb;
     p->uart[uart_num].cb_ctx = ctx;
 }
 
 int periph_uart_tx_count_num(const esp32_periph_t *p, int uart_num) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return 0;
+    if (!uart_num_valid(p, uart_num)) return 0;
     return p->uart[uart_num].tx_len;
 }
 
 const uint8_t *periph_uart_tx_buf_num(const esp32_periph_t *p,
                                       int uart_num) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return NULL;
+    if (!uart_num_valid(p, uart_num)) return NULL;
     return p->uart[uart_num].tx;
 }
 
 size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
                                  const uint8_t *data, size_t len) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT ||
+    if (!uart_num_valid(p, uart_num) ||
         (!data && len != 0)) return 0;
+    const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
     uart_state_t *uart = &p->uart[uart_num];
     size_t dma_accepted = uhci_uart_rx_feed(p, uart_num, data, len, true);
     size_t accepted = dma_accepted;
@@ -13956,12 +14000,13 @@ size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
         uart->rx_count++;
     }
 
-    /* CONF1: RXFIFO_FULL_THRHD[6:0], RX_TOUT_EN[31]. The host injection
-     * represents already-arrived bytes, so publish the timeout condition at
-     * once for short packets; larger bursts also assert the FIFO threshold. */
+    /* Host injection represents already-arrived bytes, so publish the
+     * target-described timeout condition at once for short packets; larger
+     * bursts also assert the FIFO threshold. */
     uint32_t conf1 = uart->shadow[0x24 / 4];
-    uart_refresh_level_conditions(uart);
-    if (accepted > dma_accepted && (conf1 & (1u << 31)))
+    uart_refresh_level_conditions(p, uart_num);
+    if (accepted > dma_accepted &&
+        (conf1 & ip->rx_timeout_enable_mask))
         uart->int_raw |= UART_RXFIFO_TOUT_INT;
     if (accepted < len)
         uart->int_raw |= UART_RXFIFO_OVF_INT;
@@ -13970,7 +14015,7 @@ size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
 }
 
 bool periph_uart_rx_break_num(esp32_periph_t *p, int uart_num) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return false;
+    if (!uart_num_valid(p, uart_num)) return false;
     return uhci_uart_rx_break(p, uart_num);
 }
 
@@ -13980,7 +14025,7 @@ size_t periph_uart_rx_inject(esp32_periph_t *p, const uint8_t *data,
 }
 
 size_t periph_uart_rx_pending_num(const esp32_periph_t *p, int uart_num) {
-    if (!p || uart_num < 0 || uart_num >= UART_COUNT) return 0;
+    if (!uart_num_valid(p, uart_num)) return 0;
     return p->uart[uart_num].rx_count;
 }
 

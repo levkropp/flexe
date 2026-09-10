@@ -275,6 +275,17 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->flash_mmu.shared_instruction_data);
     ASSERT_EQ(s3->cache_control_base, 0x600C4000u);
     ASSERT_EQ(s3->cache_control_size, 0x1000u);
+    ASSERT_EQ(esp32->uart_count, 3u);
+    ASSERT_EQ(esp32->uart[0].base, 0x3FF40000u);
+    ASSERT_EQ(esp32->uart[2].interrupt_source, 36u);
+    ASSERT_EQ(s3->uart_count, 3u);
+    ASSERT_EQ(s3->uart[0].base, 0x60000000u);
+    ASSERT_EQ(s3->uart[1].base, 0x60010000u);
+    ASSERT_EQ(s3->uart[2].base, 0x6002E000u);
+    ASSERT_EQ(s3->uart[0].interrupt_source, 27u);
+    ASSERT_EQ(s3->uart[2].interrupt_source, 29u);
+    ASSERT_EQ(s3->uart_ip.mem_rx_status_offset, 0x68u);
+    ASSERT_EQ(s3->uart_ip.rx_timeout_enable_mask, 1u << 23);
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x40370000u));
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x42000000u));
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x600FE000u));

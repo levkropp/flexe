@@ -14,7 +14,8 @@
 
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 6u
+#define FLEXE_TARGET_UART_MAX 3
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 7u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -79,6 +80,30 @@ typedef struct {
     bool     shared_instruction_data;
 } flexe_flash_mmu_desc_t;
 
+/* UART register geometry shared by the functional UART model. The ESP32 and
+ * ESP32-S3 use closely related UART IP, but details after the common FIFO and
+ * interrupt registers differ. Keeping those differences here lets another
+ * target reuse the device without inheriting either chip's address map. */
+typedef struct {
+    uint32_t register_size;
+    uint32_t interrupt_valid_mask;
+    uint32_t interrupt_raw_reset;
+    uint32_t status_idle_value;
+    uint32_t rx_full_threshold_mask;
+    uint32_t rx_timeout_enable_mask;
+    uint32_t mem_rx_status_offset;
+    uint32_t fifo_address_mask;
+    uint8_t  mem_rx_read_shift;
+    uint8_t  mem_rx_write_shift;
+    uint32_t date_offset;
+    uint32_t date_reset;
+} flexe_uart_ip_desc_t;
+
+typedef struct {
+    uint32_t base;
+    uint32_t interrupt_source;
+} flexe_uart_instance_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -122,6 +147,12 @@ typedef struct {
      * target descriptor rather than leaking into generic machine setup. */
     uint32_t                    cache_control_base;
     uint32_t                    cache_control_size;
+
+    /* Reusable on-chip UART instances. A zero count means the target has no
+     * registered UART model, independently of its overall support level. */
+    uint8_t                     uart_count;
+    flexe_uart_ip_desc_t        uart_ip;
+    flexe_uart_instance_desc_t  uart[FLEXE_TARGET_UART_MAX];
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */
