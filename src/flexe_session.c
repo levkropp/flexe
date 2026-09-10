@@ -110,13 +110,16 @@ static int session_build(flexe_session_t *s)
         periph_gpio_set_input(s->periph, s->touch_irq_pin, 1);
 
     /* Load firmware */
-    load_result_t res = loader_load_bin(s->mem, cfg->bin_path);
+    load_result_t res = loader_load_bin_for_target(s->mem, cfg->bin_path,
+                                                    cfg->target);
     if (res.result != 0) {
         fprintf(stderr, "flexe: load error: %s\n", res.error);
         return -1;
     }
-    fprintf(stderr, "Loaded %s: %d segments, entry=0x%08X\n",
-            cfg->bin_path, res.segment_count, res.entry_point);
+    const flexe_target_desc_t *target = flexe_target_by_id(res.image.target);
+    fprintf(stderr, "Loaded %s image %s: %d segments, entry=0x%08X\n",
+            target ? target->display_name : "unknown", cfg->bin_path,
+            res.segment_count, res.entry_point);
     for (int i = 0; i < res.segment_count; i++) {
         fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
                 i, res.segments[i].addr, res.segments[i].size,

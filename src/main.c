@@ -582,6 +582,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -J              Enable JIT (default: on where supported)\n");
     fprintf(stderr, "  --no-jit        Disable JIT, run fully interpreted\n");
     fprintf(stderr, "  --jit-stats     Print JIT block/coverage statistics on exit\n");
+    fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -927,6 +928,7 @@ int main(int argc, char *argv[]) {
     int sandbox_events = 0;
     /* AOT statically-recompiled firmware dylib */
     const char *aot_dylib_path = NULL;
+    flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
 
     /* Manual parsing for long options (--checkpoint-*, --restore) */
     int i = 1;
@@ -972,6 +974,17 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--aot") == 0 && i + 1 < argc) {
             aot_dylib_path = argv[i + 1];
             memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            if (flexe_target_parse(argv[i + 1], &target_id) != 0) {
+                fprintf(stderr,
+                        "Invalid target '%s' (expected auto, esp32, or esp32s3)\n",
+                        argv[i + 1]);
+                return 1;
+            }
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
             continue;
         }
@@ -1115,6 +1128,7 @@ int main(int argc, char *argv[]) {
         .single_core = single_core,
         .native_freertos = native_freertos,
         .disable_jit = !jit_enabled,
+        .target = target_id,
         .window_trace = window_trace,
         .spill_verify = spill_verify,
         .uart_cb = uart_stdout_cb,

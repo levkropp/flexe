@@ -18,6 +18,7 @@
 #include "bt_stubs.h"
 #include "peripherals.h"
 #include "jit.h"
+#include "target.h"
 #include <stdint.h>
 #include <pthread.h>
 
@@ -41,6 +42,7 @@ typedef struct {
     int         spill_verify;       /* Enable spill/fill verification */
     int         native_freertos;    /* -N: let firmware run real FreeRTOS */
     int         disable_jit;        /* 1 = interpreter only; default is native JIT */
+    flexe_target_id_t target;       /* AUTO (zero) = detect from image header */
 
     /* UART output callback (NULL = no UART output) */
     void      (*uart_cb)(void *ctx, uint8_t byte);

@@ -62,6 +62,7 @@ endif()
 
 # Library (core emulator)
 set(LIB_SOURCES
+    src/target.c
     src/xtensa.c
     src/window_accel.c
     src/profile.c

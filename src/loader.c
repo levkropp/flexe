@@ -4,6 +4,87 @@
 #include <stdlib.h>
 #include <openssl/md5.h>
 
+#define ESP_IMAGE_HEADER_SIZE 24u
+
+static uint16_t read_le16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static int loader_read_image_header(FILE *f, long offset, uint8_t hdr[24],
+                                    char *error, size_t error_size) {
+    if (fseek(f, offset, SEEK_SET) != 0) {
+        snprintf(error, error_size, "Seek to 0x%lX failed", offset);
+        return -1;
+    }
+    if (fread(hdr, 1, ESP_IMAGE_HEADER_SIZE, f) != ESP_IMAGE_HEADER_SIZE) {
+        snprintf(error, error_size, "Header too short at 0x%lX", offset);
+        return -1;
+    }
+    if (hdr[0] != 0xE9) {
+        snprintf(error, error_size,
+                 "Bad magic: 0x%02X at offset 0x%lX (expected 0xE9)",
+                 hdr[0], offset);
+        return -1;
+    }
+    return 0;
+}
+
+int loader_probe_bin(const char *path, loader_image_info_t *info,
+                     char *error, size_t error_size) {
+    if (!path || !info || !error || error_size == 0) return -1;
+    memset(info, 0, sizeof(*info));
+    error[0] = '\0';
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(error, error_size, "Cannot open file: %s", path);
+        return -1;
+    }
+
+    uint8_t hdr[ESP_IMAGE_HEADER_SIZE];
+    long offset = 0;
+    if (fread(hdr, 1, 1, f) != 1) {
+        snprintf(error, error_size, "File too short");
+        fclose(f);
+        return -1;
+    }
+    if (hdr[0] != 0xE9) {
+        if (fseek(f, 0, SEEK_END) != 0 || ftell(f) < 0x10000 + 24) {
+            snprintf(error, error_size,
+                     "Bad magic 0x%02X and file too small for factory image",
+                     hdr[0]);
+            fclose(f);
+            return -1;
+        }
+        offset = 0x10000;
+    }
+    if (loader_read_image_header(f, offset, hdr, error, error_size) != 0) {
+        if (offset != 0)
+            snprintf(error, error_size,
+                     "No ESP app image at factory offset 0x10000");
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    uint16_t chip_id = read_le16(&hdr[12]);
+    const flexe_target_desc_t *target =
+        flexe_target_by_image_chip_id(chip_id);
+    if (!target) {
+        snprintf(error, error_size,
+                 "Unknown ESP image chip ID 0x%04X", chip_id);
+        return -1;
+    }
+
+    info->target = target->id;
+    info->chip_id = chip_id;
+    info->min_chip_rev = hdr[14];
+    info->min_chip_rev_full = read_le16(&hdr[15]);
+    info->max_chip_rev_full = read_le16(&hdr[17]);
+    info->image_offset = (uint32_t)offset;
+    return 0;
+}
+
 /* ---- default partition table for app-only images ------------------------
  * A bare app .bin carries no partition table, but IDF reads one from flash
  * offset 0x8000 during startup (load_partitions, esp_ota_get_running_
@@ -335,7 +416,8 @@ static void loader_seed_flash_mmu(xtensa_mem_t *mem, const load_result_t *res) {
         fprintf(stderr, "[PT] flash MMU: %u DROM entries used, rest free\n", drom_pages);
 }
 
-load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
+load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
+                                         flexe_target_id_t expected_target) {
     load_result_t res = {0};
 
     if (!path) {
@@ -347,6 +429,39 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
     if (!mem) {
         res.result = -1;
         snprintf(res.error, sizeof(res.error), "NULL memory");
+        return res;
+    }
+
+    if (loader_probe_bin(path, &res.image, res.error, sizeof(res.error)) != 0) {
+        res.result = -1;
+        return res;
+    }
+    const flexe_target_desc_t *detected = flexe_target_by_id(res.image.target);
+    if (!detected) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "No descriptor for detected target %d", res.image.target);
+        return res;
+    }
+    if (expected_target != FLEXE_TARGET_AUTO &&
+        expected_target != detected->id) {
+        const flexe_target_desc_t *expected =
+            flexe_target_by_id(expected_target);
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "Image targets %s (chip ID 0x%04X), not requested target %s",
+                 detected->display_name, detected->image_chip_id,
+                 expected ? expected->display_name : "unknown");
+        return res;
+    }
+    if (detected->support_level == FLEXE_TARGET_UNAVAILABLE) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "%s/%s image recognized (chip ID 0x%04X), but execution "
+                 "support is not implemented yet",
+                 detected->display_name,
+                 detected->core_generation == FLEXE_XTENSA_LX7 ? "LX7" : "Xtensa",
+                 detected->image_chip_id);
         return res;
     }
 
@@ -505,6 +620,10 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
     res.result = 0;
     fclose(f);
     return res;
+}
+
+load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
+    return loader_load_bin_for_target(mem, path, FLEXE_TARGET_AUTO);
 }
 
 const char *loader_region_name(uint32_t addr) {

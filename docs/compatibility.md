@@ -5,6 +5,16 @@ image must keep executing useful work, interact through modeled hardware or
 service boundaries, and produce equivalent results in the interpreter and JIT.
 Booting to one UART line is not considered a pass.
 
+## Target selection
+
+Flexe reads the Espressif chip ID and revision bounds from each image header.
+`--target auto` is the default; `--target esp32` or `--target esp32s3` turns
+the selection into an assertion suitable for CI. Classic ESP32 execution is
+supported. ESP32-S3 chip ID `0x0009`, its LX7 core generation, and its mapped
+flash windows are recognized, but execution remains unavailable and fails
+with an explicit diagnostic rather than loading the image into the ESP32
+machine model.
+
 ## Current corpus
 
 | Firmware | Engines | Result | Remaining work |

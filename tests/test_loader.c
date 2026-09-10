@@ -15,6 +15,11 @@ static void put_le32(uint8_t *buf, uint32_t val) {
     buf[3] = (uint8_t)(val >> 24);
 }
 
+static void put_le16(uint8_t *buf, uint16_t val) {
+    buf[0] = (uint8_t)val;
+    buf[1] = (uint8_t)(val >> 8);
+}
+
 static uint32_t get_le32(const uint8_t *buf) {
     return (uint32_t)buf[0] |
            ((uint32_t)buf[1] << 8) |
@@ -53,8 +58,113 @@ TEST(loader_single_segment) {
     ASSERT_EQ(res.result, 0);
     ASSERT_EQ(res.entry_point, 0x40080000);
     ASSERT_EQ(res.segment_count, 1);
+    ASSERT_EQ(res.image.target, FLEXE_TARGET_ESP32);
+    ASSERT_EQ(res.image.chip_id, 0);
     ASSERT_EQ(mem_read32(mem, 0x3FFB0000), 0xDEADBEEF);
     mem_destroy(mem);
+}
+
+TEST(loader_reports_image_revision_metadata) {
+    uint8_t bin[64] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 1;
+    put_le32(&bin[4], 0x40080000u);
+    put_le16(&bin[12], 0x0000u);
+    bin[14] = 3;
+    put_le16(&bin[15], 301u);
+    put_le16(&bin[17], 399u);
+    put_le32(&bin[24], 0x3FFB0000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x12345678u);
+
+    const char *path = write_temp(bin, 36);
+    ASSERT_TRUE(path != NULL);
+    loader_image_info_t info;
+    char error[256];
+    ASSERT_EQ(loader_probe_bin(path, &info, error, sizeof(error)), 0);
+    ASSERT_EQ(info.target, FLEXE_TARGET_ESP32);
+    ASSERT_EQ(info.min_chip_rev, 3u);
+    ASSERT_EQ(info.min_chip_rev_full, 301u);
+    ASSERT_EQ(info.max_chip_rev_full, 399u);
+    ASSERT_EQ(info.image_offset, 0u);
+}
+
+TEST(loader_recognizes_s3_before_rejecting_unimplemented_execution) {
+    uint8_t bin[64] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 1;
+    put_le32(&bin[4], 0x40370000u);
+    put_le16(&bin[12], 0x0009u);
+    put_le32(&bin[24], 0x3FC88000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0xA5A55A5Au);
+
+    const char *path = write_temp(bin, 36);
+    ASSERT_TRUE(path != NULL);
+    loader_image_info_t info;
+    char error[256];
+    ASSERT_EQ(loader_probe_bin(path, &info, error, sizeof(error)), 0);
+    ASSERT_EQ(info.target, FLEXE_TARGET_ESP32S3);
+    ASSERT_EQ(info.chip_id, 9u);
+
+    xtensa_mem_t *mem = mem_create();
+    load_result_t res = loader_load_bin(mem, path);
+    ASSERT_EQ(res.result, -1);
+    ASSERT_TRUE(strstr(res.error, "ESP32-S3/LX7 image recognized") != NULL);
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0u);
+    mem_destroy(mem);
+}
+
+TEST(loader_rejects_target_mismatch_before_loading) {
+    uint8_t bin[64] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 1;
+    put_le32(&bin[4], 0x40080000u);
+    put_le32(&bin[24], 0x3FFB0000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0xDEADBEEFu);
+
+    const char *path = write_temp(bin, 36);
+    ASSERT_TRUE(path != NULL);
+    xtensa_mem_t *mem = mem_create();
+    load_result_t res = loader_load_bin_for_target(
+        mem, path, FLEXE_TARGET_ESP32S3);
+    ASSERT_EQ(res.result, -1);
+    ASSERT_TRUE(strstr(res.error, "not requested target ESP32-S3") != NULL);
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0u);
+    mem_destroy(mem);
+}
+
+TEST(loader_rejects_unknown_image_chip_id) {
+    uint8_t bin[64] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 1;
+    put_le32(&bin[4], 0x40080000u);
+    put_le16(&bin[12], 0x1234u);
+
+    const char *path = write_temp(bin, 24);
+    ASSERT_TRUE(path != NULL);
+    loader_image_info_t info;
+    char error[256];
+    ASSERT_EQ(loader_probe_bin(path, &info, error, sizeof(error)), -1);
+    ASSERT_TRUE(strstr(error, "Unknown ESP image chip ID 0x1234") != NULL);
+}
+
+TEST(target_descriptors_are_stable_and_parse_aliases) {
+    const flexe_target_desc_t *esp32 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32);
+    const flexe_target_desc_t *s3 = flexe_target_by_name("esp32-s3");
+    ASSERT_TRUE(esp32 != NULL);
+    ASSERT_TRUE(s3 != NULL);
+    ASSERT_EQ(esp32->descriptor_version, 1u);
+    ASSERT_EQ(esp32->core_generation, FLEXE_XTENSA_LX6);
+    ASSERT_EQ(esp32->support_level, FLEXE_TARGET_STABLE);
+    ASSERT_EQ(s3->image_chip_id, 9u);
+    ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
+    ASSERT_EQ(s3->support_level, FLEXE_TARGET_UNAVAILABLE);
+    flexe_target_id_t parsed = FLEXE_TARGET_AUTO;
+    ASSERT_EQ(flexe_target_parse("esp32s3", &parsed), 0);
+    ASSERT_EQ(parsed, FLEXE_TARGET_ESP32S3);
 }
 
 TEST(loader_multi_segment) {
@@ -177,6 +287,11 @@ void run_loader_tests(void) {
     TEST_SUITE("ESP32 .bin Loader");
 
     RUN_TEST(loader_single_segment);
+    RUN_TEST(loader_reports_image_revision_metadata);
+    RUN_TEST(loader_recognizes_s3_before_rejecting_unimplemented_execution);
+    RUN_TEST(loader_rejects_target_mismatch_before_loading);
+    RUN_TEST(loader_rejects_unknown_image_chip_id);
+    RUN_TEST(target_descriptors_are_stable_and_parse_aliases);
     RUN_TEST(loader_multi_segment);
     RUN_TEST(loader_nerdminer_reconstructs_huge_app_partitions);
     RUN_TEST(loader_replaces_temporary_flash_maps_with_boot_mmu);
