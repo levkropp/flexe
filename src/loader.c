@@ -551,6 +551,14 @@ static int loader_seed_shared_flash_mmu(xtensa_mem_t *mem,
         }
     }
 
+    /* Seed the firmware-visible table as well as the host page map whenever
+     * a target MMU device is attached. This is the state a second-stage
+     * bootloader hands to the application, and lets later IDF mmap calls
+     * inspect and replace the same entries. */
+    for (uint32_t entry = 0; entry < mmu->entry_count; entry++)
+        loader_write_mmio_if_modeled(mem, mmu->table_base[0] + entry * 4u,
+                                     mmu->invalid_entry);
+
     if (mem_unmap_range(mem, target->drom_start,
                         target->drom_end - target->drom_start) != 0 ||
         mem_unmap_range(mem, target->irom_start,
@@ -559,6 +567,9 @@ static int loader_seed_shared_flash_mmu(xtensa_mem_t *mem,
     for (uint32_t entry = 0; entry < mmu->entry_count; entry++) {
         if (!valid[entry]) continue;
         uint32_t physical = physical_page[entry] * mmu->page_size;
+        loader_write_mmio_if_modeled(mem,
+                                     mmu->table_base[0] + entry * 4u,
+                                     physical_page[entry]);
         if (mem_map_backing_range(
                 mem, target->drom_start + entry * mmu->page_size,
                 FLEXE_MEM_FLASH_DATA, physical, mmu->page_size) != 0 ||

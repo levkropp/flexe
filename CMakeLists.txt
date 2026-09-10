@@ -68,6 +68,7 @@ set(LIB_SOURCES
     src/profile.c
     src/xtensa_disasm.c
     src/memory.c
+    src/flash_mmu.c
     src/firmware_scan.c
     src/loader.c
     src/rom_elf.c

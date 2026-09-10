@@ -4,6 +4,7 @@
 #include "test_helpers.h"
 #include "loader.h"
 #include "peripherals.h"
+#include "flash_mmu.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -147,6 +148,12 @@ TEST(loader_loads_s3_segments_through_shared_flash_mmu) {
     xtensa_mem_t *mem = mem_create_for_target(s3);
     ASSERT_TRUE(mem != NULL);
     if (!mem) return;
+    flexe_flash_mmu_t *mmu = flexe_flash_mmu_create(mem);
+    ASSERT_TRUE(mmu != NULL);
+    if (!mmu) {
+        mem_destroy(mem);
+        return;
+    }
 
     load_result_t res = loader_load_bin(mem, path);
     ASSERT_EQ(res.result, 0);
@@ -165,6 +172,10 @@ TEST(loader_loads_s3_segments_through_shared_flash_mmu) {
                 mem->flash_insn + 0x10000u);
     ASSERT_TRUE(mem_get_ptr(mem, 0x3C010000u) == NULL);
     ASSERT_TRUE(mem_get_ptr(mem, 0x42010000u) == NULL);
+    ASSERT_EQ(mem_read32(mem, 0x600C5000u), 1u);
+    ASSERT_EQ(mem_read32(mem, 0x600C5004u), 0x4000u);
+    ASSERT_EQ(mem_read32(mem, 0x600C5008u), 1u);
+    flexe_flash_mmu_destroy(mmu);
     mem_destroy(mem);
 }
 
