@@ -135,7 +135,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_REGI2C |
                         FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1 |
                         FLEXE_TARGET_CAP_SYSTIMER_V1 |
-                        FLEXE_TARGET_CAP_SPI_MEM,
+                        FLEXE_TARGET_CAP_SPI_MEM |
+                        FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -202,6 +203,27 @@ static const flexe_target_desc_t TARGETS[] = {
             .reset_mask = 1u << 2,
             .clock_gate_mask = 1u << 1,
             .runstall_mask = 1u << 0,
+        },
+        .interrupt_matrix = {
+            .base = 0x600C2000u,
+            .register_size = 0x1000u,
+            .source_count = 99u,
+            .map_offset = { 0x000u, 0x800u },
+            .status_offset = { 0x18Cu, 0x98Cu },
+            .clock_gate_offset = { 0x19Cu, 0x99Cu },
+            .date_offset = { 0x7FCu, 0xFFCu },
+            .map_reset = 16u,
+            .map_writable_mask = 0x1Fu,
+            .clock_gate_reset = 1u,
+            .clock_gate_writable_mask = 1u,
+            .date_reset = 0x02012300u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            .software_interrupt_base = 0x600C0000u,
+            .software_interrupt_offset = 0x030u,
+            .software_interrupt_stride = 4u,
+            .software_interrupt_source_base = 79u,
+            .software_interrupt_count = 4u,
+            .software_interrupt_writable_mask = 1u,
         },
         .rtc_calibration = {
             .group_count = 2,

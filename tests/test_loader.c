@@ -274,10 +274,16 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSTIMER_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
     ASSERT_EQ(s3->secondary_core.boot_address_offset, 4u);
+    ASSERT_EQ(s3->interrupt_matrix.base, 0x600C2000u);
+    ASSERT_EQ(s3->interrupt_matrix.source_count, 99u);
+    ASSERT_EQ(s3->interrupt_matrix.map_offset[1], 0x800u);
+    ASSERT_EQ(s3->interrupt_matrix.status_offset[1], 0x98Cu);
+    ASSERT_EQ(s3->interrupt_matrix.software_interrupt_source_base, 79u);
     ASSERT_EQ(s3->rtc_calibration.group_count, 2u);
     ASSERT_EQ(s3->rtc_calibration.base[0], 0x6001F000u);
     ASSERT_EQ(s3->rtc_calibration.base[1], 0x60020000u);

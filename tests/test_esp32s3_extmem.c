@@ -231,6 +231,110 @@ TEST(peripherals_model_target_described_secondary_core_control) {
     mem_destroy(mem);
 }
 
+TEST(peripherals_model_target_described_s3_interrupt_fabric) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_interrupt_matrix_desc_t *desc = &s3->interrupt_matrix;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu[2];
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    for (unsigned core = 0; core < 2u; core++) {
+        xtensa_cpu_init_for_target(&cpu[core], s3);
+        cpu[core].mem = mem;
+        cpu[core].core_id = (int)core;
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->map_offset[core]),
+                  desc->map_reset);
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->map_offset[core] +
+                                 (desc->source_count - 1u) * 4u),
+                  desc->map_reset);
+        ASSERT_EQ(mem_read32(mem,
+                             desc->base + desc->clock_gate_offset[core]),
+                  desc->clock_gate_reset);
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->date_offset[core]),
+                  desc->date_reset);
+    }
+    periph_attach_cpus(periph, &cpu[0], &cpu[1]);
+
+    const unsigned from0 = desc->software_interrupt_source_base;
+    const unsigned from1 = from0 + 1u;
+    const uint32_t map0 = desc->base + desc->map_offset[0];
+    const uint32_t map1 = desc->base + desc->map_offset[1];
+    const uint32_t software = desc->software_interrupt_base +
+                              desc->software_interrupt_offset;
+
+    /* Each core owns an independent source-to-CPU-line map. */
+    mem_write32(mem, map0 + from0 * 4u, 2u);
+    mem_write32(mem, map1 + from1 * 4u, 0u);
+    ASSERT_EQ(mem_read32(mem, map0 + from0 * 4u), 2u);
+    ASSERT_EQ(mem_read32(mem, map1 + from1 * 4u), 0u);
+    ASSERT_EQ(periph_intr_matrix_get(periph, 0, 2), (int)from0);
+    ASSERT_EQ(periph_intr_matrix_get(periph, 1, 0), (int)from1);
+
+    /* Software generators are one-bit, level-triggered sources. Unrouted
+     * cores observe raw status but do not receive a CPU interrupt. */
+    mem_write32(mem, software, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, software), 1u);
+    ASSERT_TRUE(periph_interrupt_pending(periph, (int)from0));
+    ASSERT_EQ(cpu[0].interrupt & (1u << 2), 1u << 2);
+    ASSERT_EQ(cpu[1].interrupt & (1u << 2), 0u);
+
+    mem_write32(mem, software + desc->software_interrupt_stride, 1u);
+    ASSERT_EQ(cpu[0].interrupt & 1u, 0u);
+    ASSERT_EQ(cpu[1].interrupt & 1u, 1u);
+    uint32_t status_bits = (1u << (from0 - 64u)) |
+                           (1u << (from1 - 64u));
+    for (unsigned core = 0; core < 2u; core++)
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->status_offset[core] +
+                                 2u * 4u), status_bits);
+
+    /* Remapping a live level transfers it, and clock gating suppresses only
+     * delivery: raw status and pending state survive until the source clears. */
+    mem_write32(mem, map0 + from0 * 4u, 3u);
+    ASSERT_EQ(cpu[0].interrupt & (1u << 2), 0u);
+    ASSERT_EQ(cpu[0].interrupt & (1u << 3), 1u << 3);
+    mem_write32(mem, desc->base + desc->clock_gate_offset[0], 0u);
+    ASSERT_EQ(cpu[0].interrupt & (1u << 3), 0u);
+    ASSERT_TRUE(periph_interrupt_pending(periph, (int)from0));
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->status_offset[0] + 8u),
+              status_bits);
+    mem_write32(mem, desc->base + desc->clock_gate_offset[0], UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->clock_gate_offset[0]), 1u);
+    ASSERT_EQ(cpu[0].interrupt & (1u << 3), 1u << 3);
+
+    /* Status is hardware-owned; the version word obeys its documented mask. */
+    mem_write32(mem, desc->base + desc->status_offset[0] + 8u, 0u);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->status_offset[0] + 8u),
+              status_bits);
+    mem_write32(mem, desc->base + desc->date_offset[1], UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->date_offset[1]),
+              desc->date_writable_mask);
+
+    mem_write32(mem, software, 0u);
+    ASSERT_FALSE(periph_interrupt_pending(periph, (int)from0));
+    ASSERT_EQ(cpu[0].interrupt & (1u << 3), 0u);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->status_offset[0] + 8u),
+              1u << (from1 - 64u));
+    mem_write32(mem, software + desc->software_interrupt_stride, 0u);
+    ASSERT_EQ(cpu[1].interrupt & 1u, 0u);
+
+    int before = periph_unhandled_count(periph);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x1A0u), 0u);
+    mem_write32(mem, desc->base + 0x1A0u, 1u);
+    ASSERT_EQ(periph_unhandled_count(periph), before + 2);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(peripherals_model_target_described_rtc_calibration) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -416,6 +520,7 @@ void run_esp32s3_extmem_tests(void) {
     RUN_TEST(peripherals_compose_s3_devices_without_classic_aliases);
     RUN_TEST(peripherals_compose_target_described_s3_uarts);
     RUN_TEST(peripherals_model_target_described_secondary_core_control);
+    RUN_TEST(peripherals_model_target_described_s3_interrupt_fabric);
     RUN_TEST(peripherals_model_target_described_rtc_calibration);
     RUN_TEST(peripherals_model_target_described_internal_regi2c);
     RUN_TEST(peripherals_model_sensitive_memory_protection_registers);

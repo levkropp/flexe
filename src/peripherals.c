@@ -1885,22 +1885,29 @@ struct esp32_periph {
     /* Interrupt matrix: each peripheral source owns one five-bit CPU interrupt
      * selection register per core.  Multiple sources may feed the same CPU
      * line, so store the hardware's source -> CPU-interrupt direction. */
-    uint8_t intr_matrix[2][71];
+    uint8_t intr_matrix[FLEXE_TARGET_INTERRUPT_CORE_MAX]
+                       [FLEXE_TARGET_INTERRUPT_SOURCE_MAX];
 
     /* Pending peripheral interrupt sources (level-triggered) */
-    uint32_t pending_sources[3]; /* 71 sources in 3 words (0-31, 32-63, 64-70) */
+    uint32_t pending_sources[(FLEXE_TARGET_INTERRUPT_SOURCE_MAX + 31u) / 32u];
 
     /* Compatibility-mode guest ISR dispatch. source_level supplies edge
      * detection independently of interrupt-matrix routing.  Per-core levels
      * retain GPIO's asymmetric routing and make fan-in/remapping coherent. */
-    bool source_level[71];
-    bool source_level_core[2][71];
+    bool source_level[FLEXE_TARGET_INTERRUPT_SOURCE_MAX];
+    bool source_level_core[FLEXE_TARGET_INTERRUPT_CORE_MAX]
+                          [FLEXE_TARGET_INTERRUPT_SOURCE_MAX];
     /* Last enabled-status mask seen for each source, so a *new* condition
      * arriving while the line is already high can be re-dispatched. See
      * periph_assert_interrupt_status(). */
-    uint32_t source_status[71];
-    periph_irq_dispatch_fn irq_dispatch[71];
-    void *irq_dispatch_ctx[71];
+    uint32_t source_status[FLEXE_TARGET_INTERRUPT_SOURCE_MAX];
+    periph_irq_dispatch_fn irq_dispatch[FLEXE_TARGET_INTERRUPT_SOURCE_MAX];
+    void *irq_dispatch_ctx[FLEXE_TARGET_INTERRUPT_SOURCE_MAX];
+
+    /* Target-described matrix register state. Classic ESP32 keeps these
+     * controls inside DPORT and therefore does not use these shadows. */
+    uint32_t intr_matrix_clock_gate[FLEXE_TARGET_INTERRUPT_CORE_MAX];
+    uint32_t intr_matrix_date[FLEXE_TARGET_INTERRUPT_CORE_MAX];
 
     /* CPU pointers for interrupt delivery */
     xtensa_cpu_t *cpu[2];
@@ -2220,7 +2227,47 @@ static void flash_mmu_init_bootloader(esp32_periph_t *p) {
 #define DPORT_PRO_INTR_MAP_BASE_OFF    0x104u
 #define DPORT_APP_INTR_MAP_BASE_OFF    0x218u
 #define DPORT_INTR_MAP_SOURCE_COUNT    69u
+#define ESP32_INTERRUPT_SOURCE_COUNT   71u
 #define DPORT_INTR_MAP_RESET           16u
+
+static unsigned intr_matrix_source_count(const esp32_periph_t *p)
+{
+    if (!p || !p->target) return 0u;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1)
+        return p->target->interrupt_matrix.source_count;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)
+        return ESP32_INTERRUPT_SOURCE_COUNT;
+    return 0u;
+}
+
+static unsigned intr_matrix_core_count(const esp32_periph_t *p)
+{
+    if (!p || !p->target) return 0u;
+    unsigned count = p->target->core_count;
+    return count < FLEXE_TARGET_INTERRUPT_CORE_MAX ?
+        count : FLEXE_TARGET_INTERRUPT_CORE_MAX;
+}
+
+static uint32_t intr_matrix_map_reset(const esp32_periph_t *p)
+{
+    if (p && p->target &&
+        (p->target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1))
+        return p->target->interrupt_matrix.map_reset;
+    return DPORT_INTR_MAP_RESET;
+}
+
+static bool intr_matrix_core_enabled(const esp32_periph_t *p, int core)
+{
+    if (!p || core < 0 || (unsigned)core >= intr_matrix_core_count(p))
+        return false;
+    if (!(p->target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1))
+        return true;
+    const flexe_interrupt_matrix_desc_t *desc =
+        &p->target->interrupt_matrix;
+    return desc->clock_gate_writable_mask == 0u ||
+           (p->intr_matrix_clock_gate[core] &
+            desc->clock_gate_writable_mask) != 0u;
+}
 
 /* Xtensa CPU interrupts 6/15/16 are internal CCOMPARE timers, 7/29 are
  * software interrupts, and 11 is the profiling interrupt.  The DPORT map
@@ -2237,12 +2284,15 @@ static bool intr_matrix_cpu_line_is_routeable(int cpu_int) {
 
 static void intr_matrix_refresh_cpu_line(esp32_periph_t *p, int core,
                                          int cpu_int) {
-    if (core < 0 || core > 1 ||
+    if (core < 0 || (unsigned)core >= intr_matrix_core_count(p) ||
         !intr_matrix_cpu_line_is_routeable(cpu_int) || !p->cpu[core])
         return;
 
     bool asserted = false;
-    for (int source = 0; source < 71; source++) {
+    unsigned source_count = intr_matrix_source_count(p);
+    for (unsigned source = 0;
+         intr_matrix_core_enabled(p, core) && source < source_count;
+         source++) {
         if (p->intr_matrix[core][source] == (uint8_t)cpu_int &&
             p->source_level_core[core][source]) {
             asserted = true;
@@ -2259,9 +2309,18 @@ static void intr_matrix_refresh_cpu_line(esp32_periph_t *p, int core,
     }
 }
 
+static void intr_matrix_refresh_core(esp32_periph_t *p, int core)
+{
+    if (!p || core < 0 || (unsigned)core >= intr_matrix_core_count(p))
+        return;
+    for (int cpu_int = 0; cpu_int < 32; cpu_int++)
+        intr_matrix_refresh_cpu_line(p, core, cpu_int);
+}
+
 static void intr_matrix_map_source(esp32_periph_t *p, int core, int source,
                                    int cpu_int) {
-    if (core < 0 || core > 1 || source < 0 || source >= 71 ||
+    if (!p || core < 0 || (unsigned)core >= intr_matrix_core_count(p) ||
+        source < 0 || (unsigned)source >= intr_matrix_source_count(p) ||
         cpu_int < 0 || cpu_int > 31)
         return;
     int old_cpu_int = p->intr_matrix[core][source];
@@ -2272,13 +2331,14 @@ static void intr_matrix_map_source(esp32_periph_t *p, int core, int source,
 
 /* Internal: set/clear CPU interrupt bits for one peripheral source. */
 static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert) {
-    if (source < 0 || source >= 71)
+    if (!p || source < 0 ||
+        (unsigned)source >= intr_matrix_source_count(p))
         return;
     bool rising = assert && !p->source_level[source];
     p->source_level[source] = assert;
-    for (int core = 0; core < 2; core++) {
+    for (unsigned core = 0; core < intr_matrix_core_count(p); core++) {
         p->source_level_core[core][source] = assert;
-        intr_matrix_refresh_cpu_line(p, core,
+        intr_matrix_refresh_cpu_line(p, (int)core,
                                      p->intr_matrix[core][source]);
     }
     if (rising && p->irq_dispatch[source])
@@ -2289,7 +2349,9 @@ static void intr_matrix_update_source(esp32_periph_t *p, int source, bool assert
  * one core without being asserted on the other. */
 static void intr_matrix_update_source_core(esp32_periph_t *p, int core,
                                            int source, bool assert) {
-    if (core < 0 || core > 1 || source < 0 || source >= 71) return;
+    if (!p || core < 0 || (unsigned)core >= intr_matrix_core_count(p) ||
+        source < 0 || (unsigned)source >= intr_matrix_source_count(p))
+        return;
     p->source_level_core[core][source] = assert;
     intr_matrix_refresh_cpu_line(p, core, p->intr_matrix[core][source]);
 
@@ -2298,8 +2360,9 @@ static void intr_matrix_update_source_core(esp32_periph_t *p, int core,
      * called, which is why no GPIO interrupt ever reached the guest however
      * it was registered: the pin latched status and the CPU line was raised,
      * and nothing ran. */
-    bool now = p->source_level_core[0][source] ||
-               p->source_level_core[1][source];
+    bool now = false;
+    for (unsigned i = 0; i < intr_matrix_core_count(p); i++)
+        now = now || p->source_level_core[i][source];
     bool rising = now && !p->source_level[source];
     p->source_level[source] = now;
     if (rising && p->irq_dispatch[source])
@@ -2623,11 +2686,10 @@ static void uart_intr_update(esp32_periph_t *p, int uart_num) {
     uart_state_t *uart = &p->uart[uart_num];
     int source = (int)desc->interrupt_source;
 
-    /* The S3 interrupt matrix has its own register layout and is composed as
-     * a separate target device. Until that model is installed, retain UART
-     * raw/masked state but never deliver it through classic DPORT routing. */
-    if (!(p->target->capabilities &
-          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
+    /* Targets without an interrupt fabric retain UART raw/masked state but
+     * cannot deliver it. A target-described matrix uses the same source-level
+     * path as classic DPORT rather than a UART-specific shortcut. */
+    if (source < 0 || (unsigned)source >= intr_matrix_source_count(p))
         return;
 
     uint32_t mask = 1u << (source % 32);
@@ -13231,6 +13293,195 @@ static void default_write(void *ctx, uint32_t addr, uint32_t val) {
         fprintf(stderr, "[PERIPH] unhandled write 0x%08X <- 0x%08X pc=0x%08X\n", addr, val, g_dbg_pc);
 }
 
+/* ---- Target-described peripheral interrupt matrix ---- */
+
+static bool intr_matrix_span_valid(uint32_t offset, uint32_t count,
+                                   uint32_t register_size)
+{
+    if ((offset & 3u) != 0u || count == 0u ||
+        count > UINT32_MAX / sizeof(uint32_t))
+        return false;
+    uint32_t bytes = count * (uint32_t)sizeof(uint32_t);
+    return offset <= register_size && bytes <= register_size - offset;
+}
+
+static bool intr_matrix_geometry_valid(const flexe_target_desc_t *target)
+{
+    if (!target || !(target->capabilities &
+                     FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1))
+        return false;
+    const flexe_interrupt_matrix_desc_t *desc =
+        &target->interrupt_matrix;
+    if (target->core_count == 0u ||
+        target->core_count > FLEXE_TARGET_INTERRUPT_CORE_MAX ||
+        desc->source_count == 0u ||
+        desc->source_count > FLEXE_TARGET_INTERRUPT_SOURCE_MAX ||
+        desc->register_size == 0u ||
+        ((desc->base | desc->register_size) & 0xFFFu) != 0u ||
+        desc->base < target->peripheral_start ||
+        desc->base >= target->peripheral_end ||
+        desc->register_size > target->peripheral_end - desc->base ||
+        desc->map_writable_mask == 0u ||
+        (desc->map_writable_mask & ~0x1Fu) != 0u ||
+        (desc->map_reset & ~desc->map_writable_mask) != 0u ||
+        desc->clock_gate_writable_mask == 0u ||
+        (desc->clock_gate_reset &
+         ~desc->clock_gate_writable_mask) != 0u ||
+        (desc->date_reset & ~desc->date_writable_mask) != 0u)
+        return false;
+
+    uint32_t status_words = (desc->source_count + 31u) / 32u;
+    for (unsigned core = 0; core < target->core_count; core++) {
+        if (!intr_matrix_span_valid(desc->map_offset[core],
+                                    desc->source_count,
+                                    desc->register_size) ||
+            !intr_matrix_span_valid(desc->status_offset[core],
+                                    status_words,
+                                    desc->register_size) ||
+            !intr_matrix_span_valid(desc->clock_gate_offset[core], 1u,
+                                    desc->register_size) ||
+            !intr_matrix_span_valid(desc->date_offset[core], 1u,
+                                    desc->register_size))
+            return false;
+    }
+
+    if (desc->software_interrupt_count == 0u) return true;
+    if (desc->software_interrupt_count >
+            FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX ||
+        desc->software_interrupt_stride < sizeof(uint32_t) ||
+        (desc->software_interrupt_stride & 3u) != 0u ||
+        desc->software_interrupt_writable_mask == 0u ||
+        desc->software_interrupt_source_base >= desc->source_count ||
+        desc->software_interrupt_count >
+            desc->source_count - desc->software_interrupt_source_base ||
+        !(target->capabilities & FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL))
+        return false;
+
+    const flexe_secondary_core_desc_t *system = &target->secondary_core;
+    if (desc->software_interrupt_base != system->base ||
+        system->register_size < sizeof(uint32_t) ||
+        desc->software_interrupt_offset >
+            system->register_size - sizeof(uint32_t))
+        return false;
+    uint32_t last = (uint32_t)(desc->software_interrupt_count - 1u) *
+                    desc->software_interrupt_stride;
+    return last <= system->register_size - sizeof(uint32_t) -
+                   desc->software_interrupt_offset;
+}
+
+static bool intr_matrix_decode_register(uint32_t off, uint32_t first,
+                                        uint32_t count, unsigned *index)
+{
+    if (off < first || ((off - first) & 3u) != 0u) return false;
+    uint32_t candidate = (off - first) / sizeof(uint32_t);
+    if (candidate >= count) return false;
+    *index = candidate;
+    return true;
+}
+
+static uint32_t intr_matrix_status_word(const esp32_periph_t *p,
+                                        unsigned core, unsigned word)
+{
+    uint32_t value = 0u;
+    unsigned first = word * 32u;
+    unsigned count = intr_matrix_source_count(p);
+    for (unsigned bit = 0; bit < 32u && first + bit < count; bit++)
+        if (p->source_level_core[core][first + bit]) value |= 1u << bit;
+    return value;
+}
+
+static uint32_t target_intr_matrix_read(void *ctx, uint32_t addr)
+{
+    esp32_periph_t *p = ctx;
+    const flexe_interrupt_matrix_desc_t *desc =
+        &p->target->interrupt_matrix;
+    uint32_t off = addr - desc->base;
+    uint32_t status_words = (desc->source_count + 31u) / 32u;
+
+    for (unsigned core = 0; core < intr_matrix_core_count(p); core++) {
+        unsigned index;
+        if (intr_matrix_decode_register(off, desc->map_offset[core],
+                                        desc->source_count, &index))
+            return p->intr_matrix[core][index];
+        if (intr_matrix_decode_register(off, desc->status_offset[core],
+                                        status_words, &index))
+            return intr_matrix_status_word(p, core, index);
+        if (off == desc->clock_gate_offset[core])
+            return p->intr_matrix_clock_gate[core];
+        if (off == desc->date_offset[core])
+            return p->intr_matrix_date[core];
+    }
+    return default_read(ctx, addr);
+}
+
+static void target_intr_matrix_write(void *ctx, uint32_t addr,
+                                     uint32_t value)
+{
+    esp32_periph_t *p = ctx;
+    const flexe_interrupt_matrix_desc_t *desc =
+        &p->target->interrupt_matrix;
+    uint32_t off = addr - desc->base;
+    uint32_t status_words = (desc->source_count + 31u) / 32u;
+
+    for (unsigned core = 0; core < intr_matrix_core_count(p); core++) {
+        unsigned index;
+        if (intr_matrix_decode_register(off, desc->map_offset[core],
+                                        desc->source_count, &index)) {
+            intr_matrix_map_source(p, (int)core, (int)index,
+                                   (int)(value & desc->map_writable_mask));
+            return;
+        }
+        if (intr_matrix_decode_register(off, desc->status_offset[core],
+                                        status_words, &index))
+            return; /* Raw source status is read-only. */
+        if (off == desc->clock_gate_offset[core]) {
+            uint32_t next = value & desc->clock_gate_writable_mask;
+            if (next != p->intr_matrix_clock_gate[core]) {
+                p->intr_matrix_clock_gate[core] = next;
+                intr_matrix_refresh_core(p, (int)core);
+            }
+            return;
+        }
+        if (off == desc->date_offset[core]) {
+            p->intr_matrix_date[core] = value & desc->date_writable_mask;
+            return;
+        }
+    }
+    default_write(ctx, addr, value);
+}
+
+static int intr_matrix_software_interrupt_index(const esp32_periph_t *p,
+                                                uint32_t addr)
+{
+    if (!p || !(p->target->capabilities &
+                FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1))
+        return -1;
+    const flexe_interrupt_matrix_desc_t *desc =
+        &p->target->interrupt_matrix;
+    if (desc->software_interrupt_count == 0u ||
+        addr < desc->software_interrupt_base)
+        return -1;
+    uint32_t off = addr - desc->software_interrupt_base;
+    if (off < desc->software_interrupt_offset) return -1;
+    off -= desc->software_interrupt_offset;
+    if (off % desc->software_interrupt_stride != 0u) return -1;
+    uint32_t index = off / desc->software_interrupt_stride;
+    return index < desc->software_interrupt_count ? (int)index : -1;
+}
+
+static void intr_matrix_write_software_interrupt(esp32_periph_t *p,
+                                                 unsigned index,
+                                                 uint32_t value)
+{
+    const flexe_interrupt_matrix_desc_t *desc =
+        &p->target->interrupt_matrix;
+    value &= desc->software_interrupt_writable_mask;
+    p->from_cpu_intr[index] = value;
+    int source = (int)desc->software_interrupt_source_base + (int)index;
+    if (value != 0u) periph_assert_interrupt(p, source);
+    else             periph_deassert_interrupt(p, source);
+}
+
 /* ---- Target-described system timer ---- */
 
 static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu)
@@ -13300,6 +13551,8 @@ static uint32_t secondary_core_read(void *ctx, uint32_t addr)
     if (off == desc->control_offset) return p->secondary_core_control;
     if (off == desc->boot_address_offset)
         return p->secondary_core_boot_addr;
+    int software = intr_matrix_software_interrupt_index(p, addr);
+    if (software >= 0) return p->from_cpu_intr[software];
     return default_read(ctx, addr);
 }
 
@@ -13316,6 +13569,11 @@ static void secondary_core_write(void *ctx, uint32_t addr, uint32_t value)
     }
     if (off == desc->boot_address_offset) {
         p->secondary_core_boot_addr = value;
+        return;
+    }
+    int software = intr_matrix_software_interrupt_index(p, addr);
+    if (software >= 0) {
+        intr_matrix_write_software_interrupt(p, (unsigned)software, value);
         return;
     }
     default_write(ctx, addr, value);
@@ -13502,6 +13760,27 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                                     target->secondary_core.register_size,
                                     secondary_core_read,
                                     secondary_core_write, p) != 0) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
+    if (target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) {
+        if (!intr_matrix_geometry_valid(target)) {
+            periph_destroy(p);
+            return NULL;
+        }
+        const flexe_interrupt_matrix_desc_t *desc =
+            &target->interrupt_matrix;
+        memset(p->intr_matrix, (int)desc->map_reset,
+               sizeof(p->intr_matrix));
+        for (unsigned core = 0; core < target->core_count; core++) {
+            p->intr_matrix_clock_gate[core] = desc->clock_gate_reset;
+            p->intr_matrix_date[core] = desc->date_reset;
+        }
+        if (mem_register_mmio_range(mem, desc->base, desc->register_size,
+                                    target_intr_matrix_read,
+                                    target_intr_matrix_write, p) != 0) {
             periph_destroy(p);
             return NULL;
         }
@@ -13864,6 +14143,10 @@ void periph_destroy(esp32_periph_t *p) {
         (void)mem_register_mmio_range(
             p->mem, p->target->secondary_core.base,
             p->target->secondary_core.register_size, NULL, NULL, NULL);
+    if (p->target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->interrupt_matrix.base,
+            p->target->interrupt_matrix.register_size, NULL, NULL, NULL);
     flexe_esp32s3_extmem_destroy(p->s3_extmem);
     flexe_flash_mmu_destroy(p->shared_flash_mmu);
     periph_disable_spi_display(p);
@@ -14170,7 +14453,8 @@ size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel_index,
 
 int periph_set_irq_dispatch(esp32_periph_t *p, int source,
                             periph_irq_dispatch_fn fn, void *ctx) {
-    if (!p || source < 0 || source >= 71)
+    if (!p || source < 0 ||
+        (unsigned)source >= intr_matrix_source_count(p))
         return -1;
     p->irq_dispatch[source] = fn;
     p->irq_dispatch_ctx[source] = fn ? ctx : NULL;
@@ -14178,7 +14462,9 @@ int periph_set_irq_dispatch(esp32_periph_t *p, int source,
 }
 
 bool periph_interrupt_pending(const esp32_periph_t *p, int source) {
-    if (!p || source < 0 || source >= 71) return false;
+    if (!p || source < 0 ||
+        (unsigned)source >= intr_matrix_source_count(p))
+        return false;
     return (p->pending_sources[source / 32] &
             (1u << (source % 32))) != 0;
 }
@@ -14314,9 +14600,10 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         uhci_dport_update(p);
     }
 
-    for (unsigned core = 0; core < 2u; core++) {
+    for (unsigned core = 0; core < intr_matrix_core_count(p); core++) {
         if (!p->cpu[core]) continue;
-        for (int source = 0; source < 71; source++) {
+        for (unsigned source = 0;
+             source < intr_matrix_source_count(p); source++) {
             if (p->source_level_core[core][source])
                 intr_matrix_refresh_cpu_line(
                     p, (int)core, p->intr_matrix[core][source]);
@@ -14335,14 +14622,18 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
 }
 
 void periph_assert_interrupt(esp32_periph_t *p, int source) {
-    if (!p || source < 0 || source > 70) return;
+    if (!p || source < 0 ||
+        (unsigned)source >= intr_matrix_source_count(p))
+        return;
     p->pending_sources[source / 32] |= (1u << (source % 32));
     intr_matrix_update_source(p, source, true);
 }
 
 void periph_assert_interrupt_status(esp32_periph_t *p, int source,
                                     uint32_t status) {
-    if (!p || source < 0 || source > 70) return;
+    if (!p || source < 0 ||
+        (unsigned)source >= intr_matrix_source_count(p))
+        return;
     p->pending_sources[source / 32] |= (1u << (source % 32));
 
     bool was = p->source_level[source];
@@ -14367,7 +14658,9 @@ void periph_assert_interrupt_status(esp32_periph_t *p, int source,
 }
 
 void periph_deassert_interrupt(esp32_periph_t *p, int source) {
-    if (!p || source < 0 || source > 70) return;
+    if (!p || source < 0 ||
+        (unsigned)source >= intr_matrix_source_count(p))
+        return;
     p->pending_sources[source / 32] &= ~(1u << (source % 32));
     p->source_status[source] = 0;
     intr_matrix_update_source(p, source, false);
@@ -14434,20 +14727,24 @@ void periph_pad_hold_restore(esp32_periph_t *p, const periph_pad_hold_t *in)
 }
 
 void periph_intr_matrix_set(esp32_periph_t *p, int core, int cpu_int, int source) {
-    if (!p || source < 0 || source >= 71) return;
+    if (!p || source < 0 ||
+        (unsigned)source >= intr_matrix_source_count(p))
+        return;
     intr_matrix_map_source(p, core, source, cpu_int);
 }
 
 int periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int) {
-    if (!p || core < 0 || core > 1 || cpu_int < 0 || cpu_int > 31)
-        return DPORT_INTR_MAP_RESET;
+    if (!p || core < 0 || (unsigned)core >= intr_matrix_core_count(p) ||
+        cpu_int < 0 || cpu_int > 31)
+        return (int)intr_matrix_map_reset(p);
     if (!intr_matrix_cpu_line_is_routeable(cpu_int))
-        return DPORT_INTR_MAP_RESET;
-    for (int source = 0; source < 71; source++) {
+        return (int)intr_matrix_map_reset(p);
+    for (unsigned source = 0;
+         source < intr_matrix_source_count(p); source++) {
         if (p->intr_matrix[core][source] == (uint8_t)cpu_int)
-            return source;
+            return (int)source;
     }
-    return DPORT_INTR_MAP_RESET;
+    return (int)intr_matrix_map_reset(p);
 }
 
 void periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw) {

@@ -21,8 +21,11 @@
 #define FLEXE_TARGET_SYSTIMER_COUNTER_MAX 2u
 #define FLEXE_TARGET_SYSTIMER_ALARM_MAX 3u
 #define FLEXE_TARGET_SPI_MEM_HOST_MAX 2u
+#define FLEXE_TARGET_INTERRUPT_CORE_MAX 2u
+#define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
+#define FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX 4u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 13u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 14u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -37,6 +40,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1       = 1ull << 6,
     FLEXE_TARGET_CAP_SYSTIMER_V1                = 1ull << 7,
     FLEXE_TARGET_CAP_SPI_MEM                    = 1ull << 8,
+    FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1        = 1ull << 9,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -132,6 +136,34 @@ typedef struct {
     uint32_t clock_gate_mask;
     uint32_t runstall_mask;
 } flexe_secondary_core_desc_t;
+
+/* Peripheral interrupt fabric used by newer ESP32-family targets. Each
+ * source has one CPU-interrupt selector per core. Raw source status remains
+ * visible independently of routing, while the per-core clock gate controls
+ * delivery. Software-generated sources can live in a separate system-control
+ * block, so their address is described independently from the matrix page. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint16_t source_count;
+    uint32_t map_offset[FLEXE_TARGET_INTERRUPT_CORE_MAX];
+    uint32_t status_offset[FLEXE_TARGET_INTERRUPT_CORE_MAX];
+    uint32_t clock_gate_offset[FLEXE_TARGET_INTERRUPT_CORE_MAX];
+    uint32_t date_offset[FLEXE_TARGET_INTERRUPT_CORE_MAX];
+    uint32_t map_reset;
+    uint32_t map_writable_mask;
+    uint32_t clock_gate_reset;
+    uint32_t clock_gate_writable_mask;
+    uint32_t date_reset;
+    uint32_t date_writable_mask;
+
+    uint32_t software_interrupt_base;
+    uint32_t software_interrupt_offset;
+    uint32_t software_interrupt_stride;
+    uint16_t software_interrupt_source_base;
+    uint8_t  software_interrupt_count;
+    uint32_t software_interrupt_writable_mask;
+} flexe_interrupt_matrix_desc_t;
 
 /* RTC slow-clock calibration is embedded in each timer-group register block.
  * The surrounding timer IP changes across ESP32-family targets, so exposing
@@ -301,6 +333,9 @@ typedef struct {
 
     /* Optional SoC register block controlling the secondary CPU. */
     flexe_secondary_core_desc_t secondary_core;
+
+    /* Optional V1 peripheral interrupt matrix and software generators. */
+    flexe_interrupt_matrix_desc_t interrupt_matrix;
 
     /* Optional timer-group RTC slow-clock calibration interface. */
     flexe_rtc_calibration_desc_t rtc_calibration;
