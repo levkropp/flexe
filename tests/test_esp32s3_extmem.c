@@ -351,6 +351,63 @@ TEST(peripherals_model_target_described_internal_regi2c) {
     mem_destroy(mem);
 }
 
+TEST(peripherals_model_sensitive_memory_protection_registers) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    uint32_t base = s3->sensitive_memprot.base;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* The split-line fields are stored exactly as ESP-IDF prepares them;
+     * reserved bits do not read back. */
+    mem_write32(mem, base + 0x0C4u, 0xFF88FFF8u);
+    ASSERT_EQ(mem_read32(mem, base + 0x0C4u), 0x0008FFF8u);
+    mem_write32(mem, base + 0x0D0u, 0x0008FFF8u);
+    ASSERT_EQ(mem_read32(mem, base + 0x0D0u), 0x0008FFF8u);
+
+    mem_write32(mem, base + 0x0E0u, 0xFFFFFFFFu);
+    ASSERT_EQ(mem_read32(mem, base + 0x0E0u), 0x001FFFFFu);
+    mem_write32(mem, base + 0x100u, 0xFFFFFFFFu);
+    ASSERT_EQ(mem_read32(mem, base + 0x100u), 0x0FFFFFFFu);
+
+    /* Locks are sticky and affect only their documented register group. */
+    mem_write32(mem, base + 0x0C0u, 1u);
+    mem_write32(mem, base + 0x0C0u, 0u);
+    mem_write32(mem, base + 0x0C4u, 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x0C0u), 1u);
+    ASSERT_EQ(mem_read32(mem, base + 0x0C4u), 0x0008FFF8u);
+    mem_write32(mem, base + 0x0D0u, 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x0D0u), 0x0008FFF8u);
+
+    mem_write32(mem, base + 0x148u, 0x003AD2CDu);
+    mem_write32(mem, base + 0x1F4u, 0x00123456u);
+    mem_write32(mem, base + 0x124u, 1u);
+    mem_write32(mem, base + 0x148u, 0u);
+    mem_write32(mem, base + 0x1F4u, 0x00222222u);
+    ASSERT_EQ(mem_read32(mem, base + 0x148u), 0x003AD2CDu);
+    ASSERT_EQ(mem_read32(mem, base + 0x1F4u), 0x00222222u);
+
+    /* Violation status is hardware-owned until access enforcement is added. */
+    mem_write32(mem, base + 0x0ECu, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, base + 0x0ECu), 0u);
+
+    int before = periph_unhandled_count(periph);
+    ASSERT_EQ(mem_read32(mem, base + 0x0BCu), 0u);
+    mem_write32(mem, base + 0x0BCu, 1u);
+    ASSERT_EQ(periph_unhandled_count(periph), before + 2);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_esp32s3_extmem_tests(void) {
     TEST_SUITE("ESP32-S3 EXTMEM");
     RUN_TEST(esp32s3_extmem_exposes_documented_reset_state);
@@ -361,4 +418,5 @@ void run_esp32s3_extmem_tests(void) {
     RUN_TEST(peripherals_model_target_described_secondary_core_control);
     RUN_TEST(peripherals_model_target_described_rtc_calibration);
     RUN_TEST(peripherals_model_target_described_internal_regi2c);
+    RUN_TEST(peripherals_model_sensitive_memory_protection_registers);
 }

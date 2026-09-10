@@ -2,6 +2,7 @@
 #include "esp32s3_extmem.h"
 #include "flash_mmu.h"
 #include "regi2c.h"
+#include "sensitive_memprot.h"
 #include "spi_display.h"
 #include "sandbox_events.h"
 #include "xtensa.h"
@@ -1824,6 +1825,7 @@ struct esp32_periph {
     flexe_flash_mmu_t *shared_flash_mmu;
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_regi2c_t *regi2c;
+    flexe_sensitive_memprot_t *sensitive_memprot;
 
     /* Three independent ESP32 UART controllers. */
     uart_state_t uart[UART_COUNT];
@@ -13837,6 +13839,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1) {
+        p->sensitive_memprot = flexe_sensitive_memprot_create(
+            mem, default_read, default_write, p);
+        if (!p->sensitive_memprot) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     if (!(target->capabilities &
           FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)) {
         if (target->flash_mmu.shared_instruction_data)
@@ -14123,6 +14134,7 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
     if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION) {
         const flexe_rtc_calibration_desc_t *desc =

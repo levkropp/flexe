@@ -18,7 +18,7 @@
 #define FLEXE_TARGET_RTC_CAL_GROUP_MAX 2u
 #define FLEXE_TARGET_RTC_CAL_CLOCK_MAX 4u
 #define FLEXE_TARGET_REGI2C_HOST_MAX 2u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 10u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 11u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -30,6 +30,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL     = 1ull << 3,
     FLEXE_TARGET_CAP_RTC_CALIBRATION            = 1ull << 4,
     FLEXE_TARGET_CAP_REGI2C                     = 1ull << 5,
+    FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1       = 1ull << 6,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -189,6 +190,14 @@ typedef struct {
     uint32_t bbpll_done_mask;
 } flexe_regi2c_desc_t;
 
+/* Security/memory-protection register IP shared by compatible targets. The
+ * capability selects the register layout; the descriptor supplies only its
+ * target address aperture. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+} flexe_sensitive_memprot_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -247,6 +256,9 @@ typedef struct {
 
     /* Optional internal analog-register I2C fabric. */
     flexe_regi2c_desc_t           regi2c;
+
+    /* Optional SENSITIVE v1 memory-protection configuration block. */
+    flexe_sensitive_memprot_desc_t sensitive_memprot;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

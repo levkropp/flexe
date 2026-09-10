@@ -270,6 +270,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
                 FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_REGI2C);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
     ASSERT_EQ(s3->secondary_core.boot_address_offset, 4u);
     ASSERT_EQ(s3->rtc_calibration.group_count, 2u);
@@ -279,6 +280,8 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->regi2c.base, 0x6000E000u);
     ASSERT_EQ(s3->regi2c.host_count, 2u);
     ASSERT_EQ(s3->regi2c.bbpll_done_mask, 1u << 24);
+    ASSERT_EQ(s3->sensitive_memprot.base, 0x600C1000u);
+    ASSERT_EQ(s3->sensitive_memprot.register_size, 0x1000u);
     ASSERT_EQ(s3->reset_vector, 0x40000400u);
     ASSERT_EQ(s3->vecbase_reset, 0x40000000u);
     ASSERT_EQ(s3->configid0, 0xC2F0FFFEu);

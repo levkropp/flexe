@@ -115,7 +115,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT |
                         FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL |
                         FLEXE_TARGET_CAP_RTC_CALIBRATION |
-                        FLEXE_TARGET_CAP_REGI2C,
+                        FLEXE_TARGET_CAP_REGI2C |
+                        FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -231,6 +232,10 @@ static const flexe_target_desc_t TARGETS[] = {
             .bbpll_stop_high_mask = 1u << 2,
             .bbpll_stop_low_mask = 1u << 3,
             .bbpll_done_mask = 1u << 24,
+        },
+        .sensitive_memprot = {
+            .base = 0x600C1000u,
+            .register_size = 0x1000u,
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x00080000u,
