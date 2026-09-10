@@ -147,6 +147,21 @@ TEST(test_loader_region_names) {
     ASSERT_TRUE(strcmp(loader_region_name(0x6003FFFF), "peripheral") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x60040000), "unmapped") == 0);
     ASSERT_TRUE(strcmp(loader_region_name(0x10000000), "unmapped") == 0);
+
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    ASSERT_TRUE(strcmp(loader_region_name_for_target(s3, 0x3C020020u),
+                       "flash_data") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name_for_target(s3, 0x3FC92300u),
+                       "sram_data") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name_for_target(s3, 0x40374000u),
+                       "sram_insn") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name_for_target(s3, 0x42000020u),
+                       "flash_insn") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name_for_target(s3, 0x600C5000u),
+                       "peripheral") == 0);
+    ASSERT_TRUE(strcmp(loader_region_name_for_target(s3, 0x600FE000u),
+                       "rtc_fast") == 0);
 }
 
 /* ====== Loader segment info test ====== */

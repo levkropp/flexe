@@ -36,12 +36,16 @@ typedef struct {
 int loader_probe_bin(const char *path, loader_image_info_t *info,
                      char *error, size_t error_size);
 
-/* Auto-detect by default, or require an explicit target. */
+/* Auto-detect by default, or require an explicit target. The memory object
+ * must have been constructed for that target. Loading itself is permitted for
+ * recognized experimental targets; execution readiness belongs to sessions. */
 load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path);
 load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
                                          flexe_target_id_t expected_target);
 
 /* Describe what memory region an address falls in (for diagnostics) */
 const char *loader_region_name(uint32_t addr);
+const char *loader_region_name_for_target(const flexe_target_desc_t *target,
+                                          uint32_t addr);
 
 #endif /* LOADER_H */

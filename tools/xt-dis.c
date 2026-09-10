@@ -24,6 +24,7 @@ static void usage(void) {
         "  -n <count>        Number of instructions to disassemble (default: 100)\n"
         "  -b <base>         Base address for raw binary (default: 0x40080000)\n"
         "  -r                Raw mode: treat input as flat binary, not ESP32 image\n"
+        "  --target <name>   auto, esp32, or esp32s3 (default: auto)\n"
         "\n"
         "Examples:\n"
         "  xt-dis firmware.bin                           # Disassemble from entry point\n"
@@ -83,6 +84,7 @@ int main(int argc, char *argv[]) {
     int max_insns = 100;
     uint32_t raw_base = 0x40080000;
     int raw_mode = 0;
+    flexe_target_id_t requested_target = FLEXE_TARGET_AUTO;
 
     /* Parse all flags and collect positional args (flags can appear anywhere) */
     const char *positional[8];
@@ -104,6 +106,11 @@ int main(int argc, char *argv[]) {
                 raw_base = (uint32_t)strtoul(argv[++i], NULL, 0);
             } else if (strcmp(flag, "-r") == 0) {
                 raw_mode = 1;
+            } else if (strcmp(flag, "--target") == 0 && i + 1 < argc) {
+                if (flexe_target_parse(argv[++i], &requested_target) != 0) {
+                    fprintf(stderr, "Unknown target: %s\n", argv[i]);
+                    return 1;
+                }
             } else if (strcmp(flag, "-h") == 0 || strcmp(flag, "--help") == 0) {
                 usage();
                 return 0;
@@ -133,10 +140,34 @@ int main(int argc, char *argv[]) {
         max_insns = atoi(positional[2]);
     }
 
-    /* Create CPU + memory */
+    const flexe_target_desc_t *target = NULL;
+    if (!raw_mode) {
+        loader_image_info_t image;
+        char error[256];
+        if (loader_probe_bin(bin_path, &image, error, sizeof(error)) != 0) {
+            fprintf(stderr, "Failed to identify %s: %s\n", bin_path, error);
+            return 1;
+        }
+        target = flexe_target_by_id(image.target);
+        if (requested_target != FLEXE_TARGET_AUTO &&
+            (!target || requested_target != target->id)) {
+            fprintf(stderr, "Image target does not match requested target\n");
+            return 1;
+        }
+    } else {
+        flexe_target_id_t id = requested_target == FLEXE_TARGET_AUTO ?
+                               FLEXE_TARGET_ESP32 : requested_target;
+        target = flexe_target_by_id(id);
+    }
+    if (!target) {
+        fprintf(stderr, "No target descriptor available\n");
+        return 1;
+    }
+
+    /* Create CPU + target-native memory. */
     xtensa_cpu_t cpu;
-    xtensa_cpu_init(&cpu);
-    cpu.mem = mem_create();
+    xtensa_cpu_init_for_target(&cpu, target);
+    cpu.mem = mem_create_for_target(target);
     if (!cpu.mem) {
         fprintf(stderr, "Failed to create memory\n");
         return 1;
@@ -146,11 +177,14 @@ int main(int argc, char *argv[]) {
      * Install the same DPORT model as the emulator before loading, otherwise
      * cached IROM addresses still point at linear raw-flash offsets and the
      * disassembler silently shows unrelated bytes for factory images. */
-    esp32_periph_t *periph = periph_create(cpu.mem);
-    if (!periph) {
-        fprintf(stderr, "Failed to create peripherals\n");
-        mem_destroy(cpu.mem);
-        return 1;
+    esp32_periph_t *periph = NULL;
+    if (target->id == FLEXE_TARGET_ESP32) {
+        periph = periph_create(cpu.mem);
+        if (!periph) {
+            fprintf(stderr, "Failed to create peripherals\n");
+            mem_destroy(cpu.mem);
+            return 1;
+        }
     }
 
     uint32_t entry_point = raw_base;
@@ -180,7 +214,8 @@ int main(int argc, char *argv[]) {
         free(data);
     } else {
         /* ESP32 .bin image: use segment loader */
-        load_result_t res = loader_load_bin(cpu.mem, bin_path);
+        load_result_t res = loader_load_bin_for_target(cpu.mem, bin_path,
+                                                       requested_target);
         if (res.result != 0) {
             fprintf(stderr, "Failed to load %s: %s\n", bin_path, res.error);
             return 1;
@@ -191,7 +226,8 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < res.segment_count; i++) {
             fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
                     i, res.segments[i].addr, res.segments[i].size,
-                    loader_region_name(res.segments[i].addr));
+                    loader_region_name_for_target(target,
+                                                  res.segments[i].addr));
         }
     }
 

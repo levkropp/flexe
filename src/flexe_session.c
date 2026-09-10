@@ -37,6 +37,7 @@
 struct flexe_session {
     xtensa_cpu_t       cpu[2];
     xtensa_mem_t      *mem;
+    const flexe_target_desc_t *target;
     esp32_periph_t    *periph;
     elf_symbols_t     *syms;
     esp32_rom_stubs_t *rom;
@@ -75,6 +76,48 @@ struct flexe_session {
 static bool session_sleep_us(void *ctx, xtensa_cpu_t *cpu, uint64_t us)
 {
     return freertos_stubs_sleep_us((freertos_stubs_t *)ctx, cpu, us);
+}
+
+static const flexe_target_desc_t *
+session_resolve_target(const flexe_session_config_t *cfg)
+{
+    loader_image_info_t image;
+    char error[256];
+    if (loader_probe_bin(cfg->bin_path, &image, error, sizeof(error)) != 0) {
+        fprintf(stderr, "flexe: load error: %s\n", error);
+        return NULL;
+    }
+
+    const flexe_target_desc_t *target = flexe_target_by_id(image.target);
+    if (!target) {
+        fprintf(stderr, "flexe: no descriptor for detected target %d\n",
+                image.target);
+        return NULL;
+    }
+    if (cfg->target != FLEXE_TARGET_AUTO && cfg->target != target->id) {
+        const flexe_target_desc_t *requested =
+            flexe_target_by_id(cfg->target);
+        fprintf(stderr,
+                "flexe: image targets %s (chip ID 0x%04X), not requested "
+                "target %s\n",
+                target->display_name, target->image_chip_id,
+                requested ? requested->display_name : "unknown");
+        return NULL;
+    }
+    if (target->support_level == FLEXE_TARGET_UNAVAILABLE) {
+        fprintf(stderr,
+                "flexe: %s/%s image recognized (chip ID 0x%04X), but "
+                "execution support is not implemented yet\n",
+                target->display_name,
+                target->core_generation == FLEXE_XTENSA_LX7 ? "LX7" :
+                                                               "Xtensa",
+                target->image_chip_id);
+        return NULL;
+    }
+    if (target->support_level == FLEXE_TARGET_EXPERIMENTAL)
+        fprintf(stderr, "flexe: warning: %s support is experimental\n",
+                target->display_name);
+    return target;
 }
 
 /* Build every emulated subsystem on top of an already-created memory.
@@ -116,14 +159,14 @@ static int session_build(flexe_session_t *s)
         fprintf(stderr, "flexe: load error: %s\n", res.error);
         return -1;
     }
-    const flexe_target_desc_t *target = flexe_target_by_id(res.image.target);
+    const flexe_target_desc_t *target = s->target;
     fprintf(stderr, "Loaded %s image %s: %d segments, entry=0x%08X\n",
             target ? target->display_name : "unknown", cfg->bin_path,
             res.segment_count, res.entry_point);
     for (int i = 0; i < res.segment_count; i++) {
         fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
                 i, res.segments[i].addr, res.segments[i].size,
-                loader_region_name(res.segments[i].addr));
+                loader_region_name_for_target(target, res.segments[i].addr));
     }
 
     /* Initialize CPU core 0 */
@@ -426,6 +469,24 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     s->touch_irq_pin = cfg->spi_touch_irq_pin ? cfg->spi_touch_irq_pin : 36;
     s->touch_irq_level = 1;
 
+    s->cfg = *cfg;
+    snprintf(s->bin_path, sizeof(s->bin_path), "%s", cfg->bin_path);
+    s->cfg.bin_path = s->bin_path;
+    const char *rom_elf_path = cfg->rom_elf_path;
+    if (!rom_elf_path) rom_elf_path = getenv("FLEXE_ROM_ELF");
+    if (rom_elf_path && *rom_elf_path) {
+        snprintf(s->rom_elf_path, sizeof(s->rom_elf_path), "%s", rom_elf_path);
+        s->cfg.rom_elf_path = s->rom_elf_path;
+    } else {
+        s->cfg.rom_elf_path = NULL;
+    }
+
+    s->target = session_resolve_target(&s->cfg);
+    if (!s->target) {
+        flexe_session_destroy(s);
+        return NULL;
+    }
+
     /* Load ELF symbols */
     if (cfg->elf_path) {
         s->syms = elf_symbols_load(cfg->elf_path);
@@ -438,24 +499,13 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     }
 
     /* Create memory */
-    s->mem = mem_create();
+    s->mem = mem_create_for_target(s->target);
     if (!s->mem) {
         fprintf(stderr, "flexe: failed to allocate memory\n");
         flexe_session_destroy(s);
         return NULL;
     }
 
-    s->cfg = *cfg;
-    snprintf(s->bin_path, sizeof(s->bin_path), "%s", cfg->bin_path);
-    s->cfg.bin_path = s->bin_path;
-    const char *rom_elf_path = cfg->rom_elf_path;
-    if (!rom_elf_path) rom_elf_path = getenv("FLEXE_ROM_ELF");
-    if (rom_elf_path && *rom_elf_path) {
-        snprintf(s->rom_elf_path, sizeof(s->rom_elf_path), "%s", rom_elf_path);
-        s->cfg.rom_elf_path = s->rom_elf_path;
-    } else {
-        s->cfg.rom_elf_path = NULL;
-    }
     if (session_build(s) != 0) {
         flexe_session_destroy(s);
         return NULL;

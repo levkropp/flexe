@@ -89,7 +89,7 @@ TEST(loader_reports_image_revision_metadata) {
     ASSERT_EQ(info.image_offset, 0u);
 }
 
-TEST(loader_recognizes_s3_before_rejecting_unimplemented_execution) {
+TEST(loader_recognizes_s3_before_rejecting_classic_memory) {
     uint8_t bin[64] = {0};
     bin[0] = 0xE9;
     bin[1] = 1;
@@ -110,8 +110,97 @@ TEST(loader_recognizes_s3_before_rejecting_unimplemented_execution) {
     xtensa_mem_t *mem = mem_create();
     load_result_t res = loader_load_bin(mem, path);
     ASSERT_EQ(res.result, -1);
-    ASSERT_TRUE(strstr(res.error, "ESP32-S3/LX7 image recognized") != NULL);
+    ASSERT_TRUE(strstr(res.error,
+                       "memory is configured for ESP32") != NULL);
     ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0u);
+    mem_destroy(mem);
+}
+
+TEST(loader_loads_s3_segments_through_shared_flash_mmu) {
+    uint8_t bin[96] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 4;
+    put_le32(&bin[4], 0x40374000u);
+    put_le16(&bin[12], 0x0009u);
+
+    /* DROM data starts at image offset 0x20, matching vaddr low bits. */
+    put_le32(&bin[24], 0x3C020020u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x11111111u);
+    /* Internal DRAM and cache SRAM are copied directly. */
+    put_le32(&bin[36], 0x3FC92300u);
+    put_le32(&bin[40], 4u);
+    put_le32(&bin[44], 0x22222222u);
+    put_le32(&bin[48], 0x40374000u);
+    put_le32(&bin[52], 4u);
+    put_le32(&bin[56], 0x33333333u);
+    /* This segment's data is at image offset 0x44, so preserve the S3 MMU's
+     * required physical/virtual low-bit congruence. */
+    put_le32(&bin[60], 0x42000044u);
+    put_le32(&bin[64], 4u);
+    put_le32(&bin[68], 0x44444444u);
+
+    const char *path = write_temp(bin, 72);
+    ASSERT_TRUE(path != NULL);
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+
+    load_result_t res = loader_load_bin(mem, path);
+    ASSERT_EQ(res.result, 0);
+    ASSERT_EQ(res.image.target, FLEXE_TARGET_ESP32S3);
+    ASSERT_EQ(res.entry_point, 0x40374000u);
+    ASSERT_EQ(res.segment_count, 4);
+    ASSERT_EQ(mem_read32(mem, 0x3C020020u), 0x11111111u);
+    ASSERT_EQ(mem_read32(mem, 0x3FC92300u), 0x22222222u);
+    ASSERT_EQ(mem_read32(mem, 0x40374000u), 0x33333333u);
+    ASSERT_EQ(mem_read32(mem, 0x42000044u), 0x44444444u);
+
+    /* One S3 MMU entry is visible through both cache buses. */
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3C000000u) ==
+                mem->flash_data + 0x10000u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x42020000u) ==
+                mem->flash_insn + 0x10000u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3C010000u) == NULL);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x42010000u) == NULL);
+    mem_destroy(mem);
+}
+
+TEST(loader_maps_classic_flash_without_peripheral_model) {
+    uint8_t bin[64] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 2;
+    put_le32(&bin[4], 0x400D002Cu);
+
+    /* Segment data begins at image offset 0x20. */
+    put_le32(&bin[24], 0x3F400020u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x11223344u);
+    /* The second payload begins at image offset 0x2c. */
+    put_le32(&bin[36], 0x400D002Cu);
+    put_le32(&bin[40], 4u);
+    put_le32(&bin[44], 0x55667788u);
+
+    const char *path = write_temp(bin, 48);
+    ASSERT_TRUE(path != NULL);
+    xtensa_mem_t *mem = mem_create();
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+
+    /* No esp32_periph_t is attached: the loader must still produce the same
+     * boot mappings, without manufacturing unmapped guest accesses. */
+    load_result_t res = loader_load_bin(mem, path);
+    ASSERT_EQ(res.result, 0);
+    ASSERT_EQ(mem_read32(mem, 0x3F400020u), 0x11223344u);
+    ASSERT_EQ(mem_read32(mem, 0x400D002Cu), 0x55667788u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3F400000u) ==
+                mem->flash_data + 0x10000u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x400D0000u) ==
+                mem->flash_insn + 0x10000u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3F410000u) == NULL);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
     mem_destroy(mem);
 }
 
@@ -167,6 +256,9 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->configid0, 0xC2F0FFFEu);
     ASSERT_EQ(s3->configid1, 0x23090F1Fu);
     ASSERT_EQ(s3->interrupt_level[14], 7u);
+    ASSERT_EQ(s3->flash_mmu.entry_count, 512u);
+    ASSERT_EQ(s3->flash_mmu.table_base[0], 0x600C5000u);
+    ASSERT_TRUE(s3->flash_mmu.shared_instruction_data);
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x40370000u));
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x42000000u));
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x600FE000u));
@@ -297,7 +389,9 @@ void run_loader_tests(void) {
 
     RUN_TEST(loader_single_segment);
     RUN_TEST(loader_reports_image_revision_metadata);
-    RUN_TEST(loader_recognizes_s3_before_rejecting_unimplemented_execution);
+    RUN_TEST(loader_recognizes_s3_before_rejecting_classic_memory);
+    RUN_TEST(loader_loads_s3_segments_through_shared_flash_mmu);
+    RUN_TEST(loader_maps_classic_flash_without_peripheral_model);
     RUN_TEST(loader_rejects_target_mismatch_before_loading);
     RUN_TEST(loader_rejects_unknown_image_chip_id);
     RUN_TEST(target_descriptors_are_stable_and_parse_aliases);

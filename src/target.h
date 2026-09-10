@@ -14,7 +14,7 @@
 
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 3u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 4u
 
 typedef enum {
     FLEXE_TARGET_AUTO = 0,
@@ -60,6 +60,18 @@ typedef struct {
 } flexe_target_mem_region_t;
 
 typedef struct {
+    uint32_t page_size;
+    uint16_t entry_count;
+    uint32_t linear_addr_mask;
+    uint32_t table_base[2];
+    uint32_t invalid_entry;
+    uint32_t invalid_mask;
+    uint32_t physical_page_mask;
+    uint32_t target_mask;
+    bool     shared_instruction_data;
+} flexe_flash_mmu_desc_t;
+
+typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
     flexe_target_id_t           id;
@@ -88,6 +100,9 @@ typedef struct {
     uint32_t                    drom_end;
     uint32_t                    irom_start;
     uint32_t                    irom_end;
+    uint32_t                    default_app_offset;
+    uint32_t                    partition_table_offset;
+    flexe_flash_mmu_desc_t      flash_mmu;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

@@ -92,8 +92,6 @@ int loader_probe_bin(const char *path, loader_image_info_t *info,
  * at 0x10000 covering the loaded image, plus nvs/phy_init/coredump data
  * partitions, followed by MD5 and CRC32 digests exactly as esptool emits.
  * The nvs/phy_init/coredump flash regions are pre-set to erased (0xFF). */
-#define PT_OFFSET        0x8000u
-#define PT_FLASH_SIZE    (4u * 1024 * 1024)
 #define PT_TYPE_APP      0x00u
 #define PT_TYPE_DATA     0x01u
 #define PT_SUB_FACTORY   0x00u
@@ -126,21 +124,29 @@ static void pt_entry(uint8_t *p, uint8_t type, uint8_t subtype,
     memset(p + 28, 0, 4);                   /* flags */
 }
 
-static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
-                                              uint32_t entry_point) {
+static int loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
+                                             uint32_t entry_point) {
+    const flexe_target_desc_t *target = mem_target(mem);
+    uint32_t flash_size = mem_backing_size(mem, FLEXE_MEM_FLASH_DATA);
+    uint32_t pt_offset = target ? target->partition_table_offset : 0;
+    if (!target || pt_offset > flash_size || flash_size - pt_offset < 0x1000u)
+        return -1;
+
     /* Respect a pre-existing valid table (shouldn't happen for app-only
      * images, but cheap insurance against clobbering real data). */
-    if (mem->flash_data[PT_OFFSET] == 0xAA && mem->flash_data[PT_OFFSET + 1] == 0x50)
-        return;
+    if (mem->flash_data[pt_offset] == 0xAA &&
+        mem->flash_data[pt_offset + 1] == 0x50)
+        return 0;
 
     uint8_t pt[0x1000];
     memset(pt, 0xFF, sizeof(pt));
 
     uint32_t factory_size = ((uint32_t)app_size + 0xFFFFu) & ~0xFFFFu;
-    uint32_t off = 0x10000u;
+    uint32_t off = target->default_app_offset;
     int n = 0;
     uint32_t nvs_off = 0, nvs_size = 0, phy_off = 0, cd_off = 0;
-    if (entry_point == 0x40089268u && app_size <= 0x300000l) {
+    if (target->id == FLEXE_TARGET_ESP32 &&
+        entry_point == 0x40089268u && app_size <= 0x300000l) {
         /* NerdMiner v1.8.3 ESP32-2432S028R uses Arduino's huge_app.csv.
          * Reconstruct it exactly so its unmodified SPIFFS mount/format path
          * sees the same partition as it does on a flashed CYD. */
@@ -157,7 +163,8 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
                  0x310000u, 0x0E0000u, "spiffs");
         pt_entry(pt + n++ * 32, PT_TYPE_DATA, PT_SUB_COREDUMP,
                  cd_off, 0x10000u, "coredump");
-    } else if (entry_point == 0x400831D8u && app_size <= 0x1E0000l) {
+    } else if (target->id == FLEXE_TARGET_ESP32 &&
+               entry_point == 0x400831D8u && app_size <= 0x1E0000l) {
         /* ESP32 Marauder v1.14 CYD production partition table. */
         nvs_off = 0x9000u;
         nvs_size = 0x5000u;
@@ -179,20 +186,20 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
                  "factory");
         n++;
         off += factory_size;
-        if (off + 0x6000u <= PT_FLASH_SIZE) {
+        if (off <= flash_size && flash_size - off >= 0x6000u) {
             nvs_off = off;
             nvs_size = 0x6000u;
             pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_NVS, off, nvs_size,
                      "nvs");
             n++; off += 0x6000u;
         }
-        if (off + 0x1000u <= PT_FLASH_SIZE) {
+        if (off <= flash_size && flash_size - off >= 0x1000u) {
             phy_off = off;
             pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_PHY, off, 0x1000u,
                      "phy_init");
             n++; off += 0x1000u;
         }
-        if (off + 0x10000u <= PT_FLASH_SIZE) {
+        if (off <= flash_size && flash_size - off >= 0x10000u) {
             cd_off = off;
             pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_COREDUMP, off,
                      0x10000u, "coredump");
@@ -207,9 +214,9 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
          * serves either. Aligned to 64 KiB because a filesystem partition has
          * to start on a flash erase-block boundary. */
         off = (off + 0xFFFFu) & ~0xFFFFu;
-        if (off + 0x10000u <= PT_FLASH_SIZE) {
+        if (off <= flash_size && flash_size - off >= 0x10000u) {
             pt_entry(pt + n * 32, PT_TYPE_DATA, PT_SUB_SPIFFS, off,
-                     PT_FLASH_SIZE - off, "spiffs");
+                     flash_size - off, "spiffs");
             n++;
         }
     }
@@ -235,8 +242,8 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
     uint32_t crc = pt_crc32_le(0, pt, (size_t)n * 32 + 32);
     memcpy(pt + n * 32 + 32, &crc, 4);
 
-    memcpy(mem->flash_data + PT_OFFSET, pt, sizeof(pt));
-    memcpy(mem->flash_insn + PT_OFFSET, pt, sizeof(pt));
+    memcpy(mem->flash_data + pt_offset, pt, sizeof(pt));
+    memcpy(mem->flash_insn + pt_offset, pt, sizeof(pt));
     if (nvs_off) memset(mem->flash_data + nvs_off, 0xFF, nvs_size);
     if (phy_off) memset(mem->flash_data + phy_off, 0xFF, 0x1000u);
     if (cd_off)  memset(mem->flash_data + cd_off,  0xFF, 0x10000u);
@@ -244,17 +251,30 @@ static void loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
         fprintf(stderr, "[PT] synthesized %d entries, factory_size=0x%X crc=0x%08X\n",
                 n, factory_size, crc);
         fprintf(stderr, "[PT] flash[0x8000..0x8010]:");
-        for (int i = 0; i < 16; i++) fprintf(stderr, " %02X", mem->flash_data[PT_OFFSET + i]);
+        for (int i = 0; i < 16; i++)
+            fprintf(stderr, " %02X", mem->flash_data[pt_offset + i]);
         fprintf(stderr, "\n");
     }
+    return 0;
 }
 
 
-/* Parse an ESP32 image header at the given file offset, loading segments into memory.
+static int addr_in_range(uint32_t addr, uint32_t start, uint32_t end) {
+    return addr >= start && addr < end;
+}
+
+static int range_fits(uint32_t addr, uint32_t size,
+                      uint32_t start, uint32_t end) {
+    return addr >= start && (uint64_t)addr + size <= end;
+}
+
+/* Parse an ESP image header at the given file offset, loading internal-memory
+ * segments. Flash segments remain in the raw flash image and are exposed by
+ * the target's MMU mappings after parsing.
  * The image header (24 bytes) is also written to flash_hdr_out if non-NULL. */
 static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
-                              load_result_t *res, uint8_t *flash_hdr_out,
-                              int skip_drom) {
+                              const flexe_target_desc_t *target,
+                              load_result_t *res, uint8_t *flash_hdr_out) {
     if (fseek(f, offset, SEEK_SET) != 0) {
         snprintf(res->error, sizeof(res->error), "Seek to 0x%lX failed", offset);
         return -1;
@@ -327,15 +347,26 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
             res->segments[i].image_off = (uint32_t)(data_off - offset);
         }
 
-        /* Factory mode: DROM segments live in the whole-flash image already
-         * (and the DROM cache window is remapped onto it), so don't load
-         * them again at their cache vaddrs — that would clobber the
-         * partition table and other sub-0x10000 regions. */
-        int is_drom = (load_addr >= 0x3F400000u && load_addr < 0x3F800000u);
-        if (!(skip_drom && is_drom) && mem_load(mem, load_addr, buf, data_len) != 0) {
+        int is_drom = addr_in_range(load_addr, target->drom_start,
+                                    target->drom_end);
+        int is_irom = addr_in_range(load_addr, target->irom_start,
+                                    target->irom_end);
+        if ((is_drom && !range_fits(load_addr, data_len, target->drom_start,
+                                    target->drom_end)) ||
+            (is_irom && !range_fits(load_addr, data_len, target->irom_start,
+                                    target->irom_end))) {
+            snprintf(res->error, sizeof(res->error),
+                     "Segment %d crosses its flash window at 0x%08X (%u bytes)",
+                     i, load_addr, data_len);
+            free(buf);
+            return -1;
+        }
+        if (!is_drom && !is_irom &&
+            mem_load(mem, load_addr, buf, data_len) != 0) {
             snprintf(res->error, sizeof(res->error),
                      "Segment %d load failed at 0x%08X (%u bytes, region: %s)",
-                     i, load_addr, data_len, loader_region_name(load_addr));
+                     i, load_addr, data_len,
+                     loader_region_name_for_target(target, load_addr));
             free(buf);
             return -1;
         }
@@ -366,13 +397,62 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
  * whose PRO and APP values differ — PRO-only seeding is wiped out by it.
  *
  * The mem_write32 path also remaps the corresponding cache window pages. */
-static void loader_seed_flash_mmu(xtensa_mem_t *mem, const load_result_t *res) {
-    /* mem_create supplies temporary linear cache mappings so loader_parse_image
-     * can copy segments before their physical offsets are known. Remove every
-     * temporary page now, then install only the bootloader's active entries. */
-    for (uint32_t e = 0; e < 256u; e++) {
-        mem_write32(mem, 0x3FF10000u + e * 4u, 0x100u); /* PRO invalid */
-        mem_write32(mem, 0x3FF12000u + e * 4u, 0x100u); /* APP invalid */
+static void loader_clear_window(xtensa_mem_t *mem, uint32_t start,
+                                uint32_t end) {
+    for (uint32_t addr = start; addr < end; addr += 4096u)
+        mem->page_table[addr >> 12] = NULL;
+}
+
+/* The image loader may be used by tools which do not instantiate a complete
+ * SoC. Keep its host mappings self-contained, while mirroring bootloader MMU
+ * state into a device model when one is present. Skipping an absent handler
+ * also keeps loader-only use from looking like guest unmapped-MMIO traffic. */
+static void loader_write_mmio_if_modeled(xtensa_mem_t *mem, uint32_t addr,
+                                         uint32_t value) {
+    const flexe_target_desc_t *target = mem_target(mem);
+    if (!target || addr < target->peripheral_start ||
+        addr >= target->peripheral_end)
+        return;
+    uint32_t page = (addr - target->peripheral_start) >> 12;
+    if (page < mem->mmio_page_count && mem->mmio[page].write)
+        mem_write32(mem, addr, value);
+}
+
+static int loader_map_mmu_page(xtensa_mem_t *mem, uint32_t virtual_addr,
+                               flexe_mem_backing_t backing,
+                               uint32_t physical_addr, uint32_t page_size) {
+    uint8_t *host = mem_backing_ptr(mem, backing);
+    uint32_t size = mem_backing_size(mem, backing);
+    if (!host || page_size == 0 ||
+        (page_size & (page_size - 1u)) != 0 ||
+        (page_size & 4095u) != 0 ||
+        (virtual_addr & (page_size - 1u)) != 0 ||
+        (physical_addr & (page_size - 1u)) != 0 ||
+        virtual_addr > UINT32_MAX - (page_size - 1u) ||
+        physical_addr > size || page_size > size - physical_addr)
+        return -1;
+    for (uint32_t offset = 0; offset < page_size; offset += 4096u)
+        mem->page_table[(virtual_addr + offset) >> 12] =
+            host + physical_addr + offset;
+    return 0;
+}
+
+static int loader_seed_esp32_flash_mmu(xtensa_mem_t *mem,
+                                       const load_result_t *res,
+                                       uint32_t app_flash_offset) {
+    const flexe_target_desc_t *target = mem_target(mem);
+    const flexe_flash_mmu_desc_t *mmu = &target->flash_mmu;
+    /* Remove constructor mappings, then install only the bootloader's active
+     * entries. Direct page-table updates keep the image loader self-contained;
+     * MMIO writes also seed the firmware-visible DPORT tables when that device
+     * model has already been attached. */
+    loader_clear_window(mem, target->drom_start, target->drom_end);
+    loader_clear_window(mem, target->irom_start, target->irom_end);
+    for (uint32_t e = 0; e < mmu->entry_count; e++) {
+        loader_write_mmio_if_modeled(mem, mmu->table_base[0] + e * 4u,
+                                     mmu->invalid_entry); /* PRO invalid */
+        loader_write_mmio_if_modeled(mem, mmu->table_base[1] + e * 4u,
+                                     mmu->invalid_entry); /* APP invalid */
     }
 
     uint32_t drom_pages = 0;
@@ -387,8 +467,17 @@ static void loader_seed_flash_mmu(xtensa_mem_t *mem, const load_result_t *res) {
     if (drom_pages == 0) drom_pages = 1;   /* image header at 0x3F400000 */
     if (drom_pages > 64) drom_pages = 64;
     for (uint32_t e = 0; e < drom_pages; e++) {
-        mem_write32(mem, 0x3FF10000u + e * 4, e + 1);   /* PRO table */
-        mem_write32(mem, 0x3FF12000u + e * 4, e + 1);   /* APP table */
+        uint32_t physical = e + app_flash_offset / mmu->page_size;
+        loader_write_mmio_if_modeled(mem, mmu->table_base[0] + e * 4,
+                                     physical); /* PRO */
+        loader_write_mmio_if_modeled(mem, mmu->table_base[1] + e * 4,
+                                     physical); /* APP */
+        if (loader_map_mmu_page(mem,
+                                target->drom_start + e * mmu->page_size,
+                                FLEXE_MEM_FLASH_DATA,
+                                physical * mmu->page_size,
+                                mmu->page_size) != 0)
+            return -1;
     }
 
     /* IROM: mark entries covering flash text segments, with true flash
@@ -406,14 +495,109 @@ static void loader_seed_flash_mmu(xtensa_mem_t *mem, const load_result_t *res) {
             uint32_t last  = 64 + (((a + sz - 1) & 0x3FFFFFu) >> 16);
             for (uint32_t e = first; e <= last && e < 128; e++) {
                 uint32_t vbase = 0x40000000u + (e - 64) * 0x10000u;
-                uint32_t page = (0x10000u + foff + (vbase - a)) / 0x10000u;
-                mem_write32(mem, 0x3FF10000u + e * 4, page);   /* PRO */
-                mem_write32(mem, 0x3FF12000u + e * 4, page);   /* APP */
+                uint32_t page =
+                    (app_flash_offset + foff + (vbase - a)) /
+                    mmu->page_size;
+                loader_write_mmio_if_modeled(
+                    mem, mmu->table_base[0] + e * 4, page); /* PRO */
+                loader_write_mmio_if_modeled(
+                    mem, mmu->table_base[1] + e * 4, page); /* APP */
+                if (loader_map_mmu_page(mem, vbase,
+                                        FLEXE_MEM_FLASH_INSN,
+                                        page * mmu->page_size,
+                                        mmu->page_size) != 0)
+                    return -1;
             }
         }
     }
     if (getenv("FLEXE_PTDBG"))
         fprintf(stderr, "[PT] flash MMU: %u DROM entries used, rest free\n", drom_pages);
+    return 0;
+}
+
+/* ESP32-S3 has one 512-entry, 64 KiB MMU table shared by the I- and D-cache
+ * virtual windows. App-image segment offsets are constrained to have the same
+ * low 16 bits as their virtual addresses. Rebuild that table directly in the
+ * page map for now; the S3 MMIO table model will make runtime writes use the
+ * same operation. */
+static int loader_seed_shared_flash_mmu(xtensa_mem_t *mem,
+                                        const load_result_t *res,
+                                        uint32_t app_flash_offset) {
+    const flexe_target_desc_t *target = mem_target(mem);
+    const flexe_flash_mmu_desc_t *mmu = &target->flash_mmu;
+    uint32_t physical_page[512] = {0};
+    uint8_t valid[512] = {0};
+    uint32_t flash_data_size =
+        mem_backing_size(mem, FLEXE_MEM_FLASH_DATA);
+    uint32_t flash_insn_size =
+        mem_backing_size(mem, FLEXE_MEM_FLASH_INSN);
+
+    if (!mmu->shared_instruction_data || mmu->page_size == 0 ||
+        (mmu->page_size & (mmu->page_size - 1u)) != 0 ||
+        mmu->entry_count == 0 || mmu->entry_count > 512 ||
+        target->drom_end - target->drom_start !=
+            (uint32_t)mmu->entry_count * mmu->page_size ||
+        target->irom_end - target->irom_start !=
+            (uint32_t)mmu->entry_count * mmu->page_size)
+        return -1;
+
+    for (int i = 0; i < res->segment_count && i < MAX_SEGMENTS; i++) {
+        uint32_t addr = res->segments[i].addr;
+        uint32_t size = res->segments[i].size;
+        uint32_t image_off = res->segments[i].image_off;
+        int flash_segment =
+            addr_in_range(addr, target->drom_start, target->drom_end) ||
+            addr_in_range(addr, target->irom_start, target->irom_end);
+        if (!flash_segment || size == 0) continue;
+
+        uint64_t physical = (uint64_t)app_flash_offset + image_off;
+        uint32_t linear = addr & mmu->linear_addr_mask;
+        if ((physical & (mmu->page_size - 1u)) !=
+                (linear & (mmu->page_size - 1u)) ||
+            (uint64_t)linear + size >
+                (uint64_t)mmu->entry_count * mmu->page_size) {
+            return -1;
+        }
+
+        uint32_t first = linear / mmu->page_size;
+        uint32_t last = (linear + size - 1u) / mmu->page_size;
+        uint32_t first_physical = (uint32_t)(physical / mmu->page_size);
+        for (uint32_t entry = first; entry <= last; entry++) {
+            uint32_t page = first_physical + entry - first;
+            if (((uint64_t)page + 1u) * mmu->page_size > flash_data_size ||
+                ((uint64_t)page + 1u) * mmu->page_size > flash_insn_size ||
+                (valid[entry] && physical_page[entry] != page))
+                return -1;
+            valid[entry] = 1;
+            physical_page[entry] = page;
+        }
+    }
+
+    loader_clear_window(mem, target->drom_start, target->drom_end);
+    loader_clear_window(mem, target->irom_start, target->irom_end);
+    for (uint32_t entry = 0; entry < mmu->entry_count; entry++) {
+        if (!valid[entry]) continue;
+        uint32_t physical = physical_page[entry] * mmu->page_size;
+        if (loader_map_mmu_page(mem,
+                                target->drom_start + entry * mmu->page_size,
+                                FLEXE_MEM_FLASH_DATA, physical,
+                                mmu->page_size) != 0 ||
+            loader_map_mmu_page(mem,
+                                target->irom_start + entry * mmu->page_size,
+                                FLEXE_MEM_FLASH_INSN, physical,
+                                mmu->page_size) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int loader_seed_flash_mmu(xtensa_mem_t *mem,
+                                 const load_result_t *res,
+                                 uint32_t app_flash_offset) {
+    const flexe_target_desc_t *target = mem_target(mem);
+    if (target->flash_mmu.shared_instruction_data)
+        return loader_seed_shared_flash_mmu(mem, res, app_flash_offset);
+    return loader_seed_esp32_flash_mmu(mem, res, app_flash_offset);
 }
 
 load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
@@ -454,14 +638,25 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
                  expected ? expected->display_name : "unknown");
         return res;
     }
-    if (detected->support_level == FLEXE_TARGET_UNAVAILABLE) {
+    const flexe_target_desc_t *memory_target = mem_target(mem);
+    if (!memory_target || memory_target->id != detected->id) {
         res.result = -1;
         snprintf(res.error, sizeof(res.error),
-                 "%s/%s image recognized (chip ID 0x%04X), but execution "
-                 "support is not implemented yet",
-                 detected->display_name,
-                 detected->core_generation == FLEXE_XTENSA_LX7 ? "LX7" : "Xtensa",
-                 detected->image_chip_id);
+                 "Image targets %s (chip ID 0x%04X), but memory is "
+                 "configured for %s",
+                 detected->display_name, detected->image_chip_id,
+                 memory_target ? memory_target->display_name : "no target");
+        return res;
+    }
+
+    uint32_t flash_capacity =
+        mem_backing_size(mem, FLEXE_MEM_FLASH_DATA);
+    if (mem_backing_size(mem, FLEXE_MEM_FLASH_INSN) < flash_capacity)
+        flash_capacity = mem_backing_size(mem, FLEXE_MEM_FLASH_INSN);
+    if (flash_capacity == 0 || !mem->flash_data || !mem->flash_insn) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "%s memory has no flash backing", detected->display_name);
         return res;
     }
 
@@ -484,13 +679,27 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
     if (magic != 0xE9) {
         /* Not a standalone app image — check if this is a factory (merged flash)
          * image with bootloader at 0x1000 and app at 0x10000 */
-        fseek(f, 0, SEEK_END);
+        if (fseek(f, 0, SEEK_END) != 0) {
+            res.result = -1;
+            snprintf(res.error, sizeof(res.error), "Cannot size factory image");
+            fclose(f);
+            return res;
+        }
         long file_size = ftell(f);
 
         if (file_size < 0x10000 + 24) {
             res.result = -1;
             snprintf(res.error, sizeof(res.error),
                      "Bad magic 0x%02X and file too small for factory image", magic);
+            fclose(f);
+            return res;
+        }
+        if ((uint64_t)file_size > flash_capacity) {
+            res.result = -1;
+            snprintf(res.error, sizeof(res.error),
+                     "Factory image is %ld bytes, larger than %s flash "
+                     "capacity %u", file_size, detected->display_name,
+                     flash_capacity);
             fclose(f);
             return res;
         }
@@ -525,39 +734,32 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
             return res;
         }
 
-        mem_load_flash(mem, flash_buf, flash_len);
-
-        /* Remap the DROM cache window (0x3F400000-0x3F800000) onto the app
-         * at flash offset 0x10000 — this is what the ESP32 flash MMU does
-         * for an app flashed at 0x10000. Bootloader and partition table
-         * stay at their raw offsets for SPI (esp_flash_read) access. */
-        for (uint32_t page = 0x3F400000u; page < 0x3F800000u; page += 4096) {
-            uint32_t off = 0x10000u + (page - 0x3F400000u);
-            if (off + 4096 <= (4u * 1024 * 1024))
-                mem->page_table[page >> 12] = mem->flash_data + off;
-        }
-
-        /* Parse the app image at 0x10000 for SRAM segment loading;
-         * skip DROM segments (already in the raw image, now remapped) */
-        uint8_t hdr[24];
-        if (loader_parse_image(mem, f, 0x10000, &res, hdr, 1) != 0) {
+        if (mem_load_flash(mem, flash_buf, flash_len) != 0) {
             res.result = -1;
+            snprintf(res.error, sizeof(res.error), "Flash image load failed");
             free(flash_buf);
             fclose(f);
             return res;
         }
-
-        /* Re-pristine flash_insn: parsing's mem_load of the IROM segment
-         * writes through the vaddr-linear page table into the same backing
-         * as the flash image copy, clobbering the overlap. The flash MMU
-         * IROM entries (and cache2phys) need a pristine flash image. */
-        memcpy(mem->flash_insn, flash_buf, flash_len);
         free(flash_buf);
 
-        /* Write the app header at flash data base so firmware can verify magic */
-        mem_load(mem, 0x3F400000u, hdr, 24);
-
-        loader_seed_flash_mmu(mem, &res);
+        /* Flash segments already live in the raw image. Parse only copies
+         * internal-memory segments, then the MMU exposes flash segments. */
+        uint32_t app_flash_offset = res.image.image_offset;
+        if (loader_parse_image(mem, f, (long)app_flash_offset, detected,
+                               &res, NULL) != 0) {
+            res.result = -1;
+            fclose(f);
+            return res;
+        }
+        if (loader_seed_flash_mmu(mem, &res, app_flash_offset) != 0) {
+            res.result = -1;
+            snprintf(res.error, sizeof(res.error),
+                     "%s flash MMU mapping rejected the image layout",
+                     detected->display_name);
+            fclose(f);
+            return res;
+        }
 
         res.result = 0;
         fclose(f);
@@ -570,52 +772,69 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
      * app by reading the image at the partition offset via SPI flash
      * reads, so the image must exist at 0x10000 (not just at the DROM
      * cache vaddrs). */
-    fseek(f, 0, SEEK_END);
-    long app_size = ftell(f);
-    uint8_t *img = NULL;
-    if (app_size > 0 && app_size + 0x10000 <= (long)PT_FLASH_SIZE) {
-        img = malloc((size_t)app_size);
-        if (img) {
-            fseek(f, 0, SEEK_SET);
-            if (fread(img, 1, (size_t)app_size, f) == (size_t)app_size)
-                memcpy(mem->flash_data + 0x10000, img, (size_t)app_size);
-        }
-        /* Remap the DROM cache window (0x3F400000-0x3F800000) onto the app
-         * at flash offset 0x10000 — same as the factory-image path. */
-        for (uint32_t page = 0x3F400000u; page < 0x3F800000u; page += 4096) {
-            uint32_t off = 0x10000u + (page - 0x3F400000u);
-            if (off + 4096 <= PT_FLASH_SIZE)
-                mem->page_table[page >> 12] = mem->flash_data + off;
-        }
-    }
-
-    /* Standalone app image — parse from offset 0 */
-    uint8_t hdr[24];
-    if (loader_parse_image(mem, f, 0, &res, hdr, 0) != 0) {
+    if (fseek(f, 0, SEEK_END) != 0) {
         res.result = -1;
+        snprintf(res.error, sizeof(res.error), "Cannot size app image");
+        fclose(f);
+        return res;
+    }
+    long app_size = ftell(f);
+    uint32_t app_flash_offset = detected->default_app_offset;
+    if (app_size <= 0 || app_flash_offset > flash_capacity ||
+        (uint64_t)app_size > flash_capacity - app_flash_offset) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "App image size %ld does not fit %s flash at offset 0x%X",
+                 app_size, detected->display_name, app_flash_offset);
+        fclose(f);
+        return res;
+    }
+    uint8_t *img = malloc((size_t)app_size);
+    if (!img) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "App image malloc failed (%ld bytes)", app_size);
+        fclose(f);
+        return res;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0 ||
+        fread(img, 1, (size_t)app_size, f) != (size_t)app_size) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error), "App image read truncated");
         free(img);
         fclose(f);
         return res;
     }
+    memcpy(mem->flash_data + app_flash_offset, img, (size_t)app_size);
+    memcpy(mem->flash_insn + app_flash_offset, img, (size_t)app_size);
+    free(img);
 
-    /* Copy the image into flash_insn only AFTER segment loading: parsing's
-     * mem_load of the IROM segment writes through the vaddr-linear page
-     * table into this same backing, clobbering the overlap. flash MMU IROM
-     * entries (and cache2phys) need a pristine flash image. */
-    if (img) {
-        memcpy(mem->flash_insn + 0x10000, img, (size_t)app_size);
-        free(img);
+    /* Standalone app image — parse from offset 0 */
+    if (loader_parse_image(mem, f, 0, detected, &res, NULL) != 0) {
+        res.result = -1;
+        fclose(f);
+        return res;
     }
 
-    /* Write the 24-byte image header at 0x3F400000 so firmware can
-     * verify its own magic byte via the flash data cache mapping */
-    mem_load(mem, 0x3F400000u, hdr, 24);
-
     /* Bare app images carry no partition table; synthesize one at 0x8000 */
-    if (app_size > 0)
-        loader_synthesize_partition_table(mem, app_size, res.entry_point);
+    if (loader_synthesize_partition_table(mem, app_size,
+                                          res.entry_point) != 0) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "Cannot synthesize %s partition table",
+                 detected->display_name);
+        fclose(f);
+        return res;
+    }
 
-    loader_seed_flash_mmu(mem, &res);
+    if (loader_seed_flash_mmu(mem, &res, app_flash_offset) != 0) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "%s flash MMU mapping rejected the image layout",
+                 detected->display_name);
+        fclose(f);
+        return res;
+    }
 
     res.result = 0;
     fclose(f);
@@ -626,17 +845,31 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {
     return loader_load_bin_for_target(mem, path, FLEXE_TARGET_AUTO);
 }
 
-const char *loader_region_name(uint32_t addr) {
-    if (addr >= 0x3F400000u && addr < 0x3F800000u) return "flash_data";
-    if (addr >= 0x3FF00000u && addr < 0x3FF80000u) return "peripheral";
-    if (addr >= 0x3FF80000u && addr < 0x3FF82000u) return "rtc_dram";
-    if (addr >= 0x3FF90000u && addr < 0x3FFA0000u) return "rom_data";
-    if (addr >= 0x3FFB0000u && addr < 0x40000000u) return "sram_data";
-    if (addr >= 0x40000000u && addr < 0x40070000u) return "rom";
-    if (addr >= 0x40070000u && addr < 0x400C0000u) return "sram_insn";
-    if (addr >= 0x400C0000u && addr < 0x400C2000u) return "rtc_iram";
-    if (addr >= 0x400D0000u && addr < 0x40C00000u) return "flash_insn";
-    if (addr >= 0x50000000u && addr < 0x50002000u) return "rtc_slow";
-    if (addr >= 0x60000000u && addr < 0x60040000u) return "peripheral";
+const char *loader_region_name_for_target(const flexe_target_desc_t *target,
+                                          uint32_t addr) {
+    if (!target) return "unmapped";
+    if (addr_in_range(addr, target->drom_start, target->drom_end))
+        return "flash_data";
+    if (addr_in_range(addr, target->peripheral_start,
+                      target->peripheral_end) ||
+        addr_in_range(addr, target->peripheral_alias_start,
+                      target->peripheral_alias_end))
+        return "peripheral";
+    for (unsigned i = 0; i < target->memory_region_count; i++) {
+        const flexe_target_mem_region_t *region = &target->memory_region[i];
+        if (addr_in_range(addr, region->start, region->end))
+            return region->name;
+    }
+    /* Classic ESP32 can map flash into upper instruction buses which app
+     * image segments do not normally occupy. Keep diagnostics accurate for
+     * those runtime MMU mappings without widening the loader's image range. */
+    if (addr >= target->irom_start &&
+        flexe_target_pc_is_executable(target, addr))
+        return "flash_insn";
     return "unmapped";
+}
+
+const char *loader_region_name(uint32_t addr) {
+    return loader_region_name_for_target(
+        flexe_target_by_id(FLEXE_TARGET_ESP32), addr);
 }
