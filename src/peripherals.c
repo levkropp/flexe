@@ -3,6 +3,7 @@
 #include "flash_mmu.h"
 #include "regi2c.h"
 #include "sensitive_memprot.h"
+#include "systimer.h"
 #include "spi_display.h"
 #include "sandbox_events.h"
 #include "xtensa.h"
@@ -1136,6 +1137,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
  * until its own state transition marks it dirty again. The final field says
  * that a free-running model still needs evaluation without a wake deadline. */
 #define PERIPH_EVENT_SOURCE_LIST(X) \
+    X(SYSTIMER, systimer_next_fire, systimer_eval_events, false) \
     X(TIMG,     timg_next_fire,     timg_eval_events,     false) \
     X(LACT,     lact_next_fire,     lact_eval_events,     true)  \
     X(FRC,      frc_next_fire,      frc_eval_events,      false) \
@@ -1161,6 +1163,10 @@ typedef enum {
 
 static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
+static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void systimer_state_changed(void *ctx);
+static void systimer_irq_changed(void *ctx, unsigned alarm, bool level);
 static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_reset_state(esp32_periph_t *p, unsigned port);
@@ -1826,6 +1832,7 @@ struct esp32_periph {
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_regi2c_t *regi2c;
     flexe_sensitive_memprot_t *sensitive_memprot;
+    flexe_systimer_t *systimer;
 
     /* Three independent ESP32 UART controllers. */
     uart_state_t uart[UART_COUNT];
@@ -13566,6 +13573,38 @@ static void default_write(void *ctx, uint32_t addr, uint32_t val) {
         fprintf(stderr, "[PERIPH] unhandled write 0x%08X <- 0x%08X pc=0x%08X\n", addr, val, g_dbg_pc);
 }
 
+/* ---- Target-described system timer ---- */
+
+static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu)
+{
+    return p && p->systimer ?
+        flexe_systimer_next_event(p->systimer, cpu) : UINT32_MAX;
+}
+
+static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu)
+{
+    (void)cpu;
+    if (p && p->systimer) flexe_systimer_eval(p->systimer);
+}
+
+static void systimer_state_changed(void *ctx)
+{
+    esp32_periph_t *p = ctx;
+    if (!p) return;
+    periph_event_source_changed(p, PERIPH_EVENT_SYSTIMER);
+    for (unsigned core = 0; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void systimer_irq_changed(void *ctx, unsigned alarm, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || alarm >= p->target->systimer.alarm_count) return;
+    int source = p->target->systimer.interrupt_source[alarm];
+    if (level) periph_assert_interrupt(p, source);
+    else periph_deassert_interrupt(p, source);
+}
+
 /* ---- Target-described secondary-core control ---- */
 
 static bool secondary_core_geometry_valid(const flexe_target_desc_t *target)
@@ -13779,6 +13818,10 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     p->mem = mem;
     p->target = target;
     p->app_cpu_in_reset = true;
+    /* Every target starts with peripheral sources disconnected from CPU
+     * lines. Target-specific interrupt-matrix models replace these routes as
+     * firmware programs them. */
+    memset(p->intr_matrix, DPORT_INTR_MAP_RESET, sizeof(p->intr_matrix));
 
     /* First install an explicit catch-all for this target's native MMIO
      * aperture. Individual device models replace only the pages they own. */
@@ -13843,6 +13886,16 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         p->sensitive_memprot = flexe_sensitive_memprot_create(
             mem, default_read, default_write, p);
         if (!p->sensitive_memprot) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
+    if (target->capabilities & FLEXE_TARGET_CAP_SYSTIMER_V1) {
+        p->systimer = flexe_systimer_create(
+            mem, default_read, default_write, p,
+            systimer_state_changed, p, systimer_irq_changed, p);
+        if (!p->systimer) {
             periph_destroy(p);
             return NULL;
         }
@@ -13921,9 +13974,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
      * tied to these pins (e.g. Marauder's BOOT-button on GPIO0) — leaving
      * them low looks like a permanently held button. */
     p->gpio.in = (1u << 0) | (1u << 5) | (1u << 15);
-
-    /* Initialize every source route to CPU interrupt 16 (disabled). */
-    memset(p->intr_matrix, DPORT_INTR_MAP_RESET, sizeof(p->intr_matrix));
 
     /* General-purpose timers reset with count-up and auto-reload selected,
      * but remain stopped until firmware enables their group clock and Tx_EN. */
@@ -14134,6 +14184,7 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
     if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION) {
@@ -14561,47 +14612,57 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     p->cpu[1] = cpu1;
     flexe_flash_mmu_attach_cpus(p->shared_flash_mmu, cpu0, cpu1);
     flexe_esp32s3_extmem_attach_cpus(p->s3_extmem, cpu0, cpu1);
-    if (!(p->target->capabilities &
-          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
-        return;
-    p->event_source_candidates[0] = PERIPH_EVENT_ALL_MASK;
-    p->event_source_candidates[1] = PERIPH_EVENT_ALL_MASK;
-    /* Re-anchor every shared clock against the newly attached cores. Listing
-     * them here rather than open-coding each one keeps a clock that is added
-     * later from being silently left un-anchored. */
-    periph_clock_t *clocks[] = {
-        &p->timg_clock, &p->mcpwm.clock, &p->sigmadelta.clock,
-        &p->ledc_clock, &p->event_clock,
-    };
-    for (unsigned core = 0; core < 2u; core++) {
-        xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;
-        for (size_t i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
-            clocks[i]->core_cycles[core] = clocks[i]->cycles;
-            clocks[i]->last_ccount[core] = cpu ? cpu->ccount : 0u;
-            clocks[i]->valid[core] = cpu != NULL;
-        }
-        if (cpu) {
-            for (int source = 0; source < 71; source++) {
-                if (p->source_level_core[core][source])
-                    intr_matrix_refresh_cpu_line(
-                        p, (int)core, p->intr_matrix[core][source]);
+    flexe_systimer_attach_cpus(p->systimer, cpu0, cpu1);
+
+    bool classic = (p->target->capabilities &
+                    FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
+    uint32_t candidates = classic ?
+        (PERIPH_EVENT_ALL_MASK & ~(1u << PERIPH_EVENT_SYSTIMER)) : 0u;
+    if (p->systimer) candidates |= 1u << PERIPH_EVENT_SYSTIMER;
+    p->event_source_candidates[0] = candidates;
+    p->event_source_candidates[1] = candidates;
+
+    if (classic) {
+        /* Re-anchor every shared clock against the newly attached cores.
+         * Listing them here rather than open-coding each one keeps a clock
+         * added later from being silently left un-anchored. */
+        periph_clock_t *clocks[] = {
+            &p->timg_clock, &p->mcpwm.clock, &p->sigmadelta.clock,
+            &p->ledc_clock, &p->event_clock,
+        };
+        for (unsigned core = 0; core < 2u; core++) {
+            xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;
+            for (size_t i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+                clocks[i]->core_cycles[core] = clocks[i]->cycles;
+                clocks[i]->last_ccount[core] = cpu ? cpu->ccount : 0u;
+                clocks[i]->valid[core] = cpu != NULL;
             }
         }
+        for (unsigned group = 0; group < 2u; group++) {
+            p->lact[group].last_cycles = p->timg_clock.cycles;
+            for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++)
+                p->timg[group].timer[timer].last_cycles =
+                    p->timg_clock.cycles;
+        }
+        for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
+            p->frc_timer[timer].last_cycles = p->timg_clock.cycles;
+        uhci_dport_update(p);
     }
-    for (unsigned group = 0; group < 2u; group++) {
-        p->lact[group].last_cycles = p->timg_clock.cycles;
-        for (unsigned timer = 0; timer < TIMG_TIMER_COUNT; timer++)
-            p->timg[group].timer[timer].last_cycles =
-                p->timg_clock.cycles;
+
+    for (unsigned core = 0; core < 2u; core++) {
+        if (!p->cpu[core]) continue;
+        for (int source = 0; source < 71; source++) {
+            if (p->source_level_core[core][source])
+                intr_matrix_refresh_cpu_line(
+                    p, (int)core, p->intr_matrix[core][source]);
+        }
     }
-    for (unsigned timer = 0; timer < FRC_TIMER_COUNT; timer++)
-        p->frc_timer[timer].last_cycles = p->timg_clock.cycles;
-    uhci_dport_update(p);
-    /* Wire Timer Group, LACT, and other timed-peripheral event hooks into
-     * both cores so alarms fire on time and can wake a core from WAITI. */
+
+    /* Wire every available timed device into each execution engine so its
+     * alarms participate in WAITI fast-forwarding and interrupt delivery. */
     for (int i = 0; i < 2; i++) {
         xtensa_cpu_t *c = i == 0 ? cpu0 : cpu1;
-        if (!c) continue;
+        if (!c || candidates == 0u) continue;
         c->periph_event_ctx = p;
         c->periph_next_event = periph_next_event_hook;
         c->periph_event = periph_event_hook;

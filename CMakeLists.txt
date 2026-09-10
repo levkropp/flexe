@@ -72,6 +72,7 @@ set(LIB_SOURCES
     src/esp32s3_extmem.c
     src/regi2c.c
     src/sensitive_memprot.c
+    src/systimer.c
     src/firmware_scan.c
     src/loader.c
     src/rom_elf.c

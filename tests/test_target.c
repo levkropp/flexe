@@ -63,6 +63,28 @@ TEST(target_lx7_interprets_common_isa_in_s3_iram) {
     mem_destroy(cpu.mem);
 }
 
+TEST(target_cpu_frequency_uses_target_rom_abi_word) {
+    const flexe_target_desc_t *classic =
+        flexe_target_by_id(FLEXE_TARGET_ESP32);
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_cpu_t cpu;
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem_create_for_target(s3);
+    ASSERT_TRUE(cpu.mem != NULL);
+    if (!cpu.mem) return;
+
+    ASSERT_EQ(xtensa_cpu_freq_mhz(&cpu), 160u);
+    mem_write32(cpu.mem, s3->cpu_frequency_word, 240u);
+    ASSERT_EQ(xtensa_cpu_freq_mhz(&cpu), 240u);
+    /* A classic-only address must not override S3's ROM-maintained word. */
+    mem_write32(cpu.mem, classic->cpu_frequency_word, 80u);
+    ASSERT_EQ(xtensa_cpu_freq_mhz(&cpu), 240u);
+
+    mem_destroy(cpu.mem);
+}
+
 TEST(target_lx7_does_not_build_classic_predecode_table) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -123,6 +145,7 @@ void run_target_tests(void) {
     RUN_TEST(target_reset_uses_lx7_core_configuration);
     RUN_TEST(target_backing_ranges_cover_complete_regions);
     RUN_TEST(target_lx7_interprets_common_isa_in_s3_iram);
+    RUN_TEST(target_cpu_frequency_uses_target_rom_abi_word);
     RUN_TEST(target_lx7_does_not_build_classic_predecode_table);
     RUN_TEST(target_lx7_savestate_uses_descriptor_backing_sizes);
 }

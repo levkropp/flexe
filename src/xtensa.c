@@ -117,13 +117,13 @@ void xtensa_fire_due_timers(xtensa_cpu_t *cpu) {
     xtensa_fire_timers(cpu);
 }
 
-/* Where the ROM keeps ticks-per-microsecond; the same word esp_timer_stubs.c,
- * freertos_stubs.c and peripherals.c each read for the current CPU clock. */
-#define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
-
 uint32_t xtensa_cpu_freq_mhz(const xtensa_cpu_t *cpu) {
-    uint32_t mhz = cpu->mem ? mem_read32(cpu->mem, ESP32_CPU_TICKS_PER_US_ADDR) : 0;
-    return (mhz >= 10u && mhz <= 240u) ? mhz : 160u;
+    const flexe_target_desc_t *target = cpu ? cpu->target : NULL;
+    uint32_t fallback = target && target->default_cpu_frequency_mhz ?
+                        target->default_cpu_frequency_mhz : 160u;
+    uint32_t mhz = cpu && cpu->mem && target && target->cpu_frequency_word ?
+                   mem_read32(cpu->mem, target->cpu_frequency_word) : 0u;
+    return (mhz >= 10u && mhz <= 240u) ? mhz : fallback;
 }
 
 /* Move a core's CCOUNT forward across time it did not execute, firing each

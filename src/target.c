@@ -22,6 +22,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2BCFFFEu,
         .configid1 = 0x1CC5FE96u,
+        .default_cpu_frequency_mhz = 160u,
+        .cpu_frequency_word = 0x3FFE01E0u,
         .bootstrap_stack_top = { 0x3FFE0000u, 0x3FFE8000u },
         .interrupt_level = {
             1, 1, 1, 1, 1, 1, 1, 1,
@@ -116,11 +118,14 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL |
                         FLEXE_TARGET_CAP_RTC_CALIBRATION |
                         FLEXE_TARGET_CAP_REGI2C |
-                        FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1,
+                        FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1 |
+                        FLEXE_TARGET_CAP_SYSTIMER_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
         .configid1 = 0x23090F1Fu,
+        .default_cpu_frequency_mhz = 160u,
+        .cpu_frequency_word = 0x3FCEF758u,
         .bootstrap_stack_top = { 0x3FCE0000u, 0x3FCF0000u },
         .interrupt_level = {
             1, 1, 1, 1, 1, 1, 1, 1,
@@ -236,6 +241,17 @@ static const flexe_target_desc_t TARGETS[] = {
         .sensitive_memprot = {
             .base = 0x600C1000u,
             .register_size = 0x1000u,
+        },
+        .systimer = {
+            .base = 0x60023000u,
+            .register_size = 0x1000u,
+            .counter_frequency_hz = 16000000u,
+            .config_reset = 0x46000000u,
+            .date_reset = 0x02012251u,
+            .counter_count = 2u,
+            .alarm_count = 3u,
+            .counter_width = 52u,
+            .interrupt_source = { 57u, 58u, 59u },
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x00080000u,

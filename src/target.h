@@ -18,7 +18,9 @@
 #define FLEXE_TARGET_RTC_CAL_GROUP_MAX 2u
 #define FLEXE_TARGET_RTC_CAL_CLOCK_MAX 4u
 #define FLEXE_TARGET_REGI2C_HOST_MAX 2u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 11u
+#define FLEXE_TARGET_SYSTIMER_COUNTER_MAX 2u
+#define FLEXE_TARGET_SYSTIMER_ALARM_MAX 3u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 12u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -31,6 +33,7 @@ typedef enum {
     FLEXE_TARGET_CAP_RTC_CALIBRATION            = 1ull << 4,
     FLEXE_TARGET_CAP_REGI2C                     = 1ull << 5,
     FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1       = 1ull << 6,
+    FLEXE_TARGET_CAP_SYSTIMER_V1                = 1ull << 7,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -198,6 +201,22 @@ typedef struct {
     uint32_t register_size;
 } flexe_sensitive_memprot_desc_t;
 
+/* System-timer IP used by newer ESP32-family SoCs. V1 has two 52-bit
+ * counters and three comparators; counts and field widths remain described
+ * so machine construction rejects an incompatible target rather than
+ * quietly applying S3 semantics to it. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t counter_frequency_hz;
+    uint32_t config_reset;
+    uint32_t date_reset;
+    uint8_t  counter_count;
+    uint8_t  alarm_count;
+    uint8_t  counter_width;
+    uint8_t  interrupt_source[FLEXE_TARGET_SYSTIMER_ALARM_MAX];
+} flexe_systimer_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -216,6 +235,12 @@ typedef struct {
     uint32_t                    configid0;
     uint32_t                    configid1;
     uint8_t                     interrupt_level[32];
+
+    /* CPU clock state at direct application handoff. The ROM-maintained
+     * ticks-per-microsecond word lets frequency changes remain visible to
+     * target-independent timers and idle-time accounting. */
+    uint32_t                    default_cpu_frequency_mhz;
+    uint32_t                    cpu_frequency_word;
 
     /* Safe scratch stacks for direct-to-application startup. Frontends may
      * override core 0; these defaults must lie in writable internal RAM. */
@@ -259,6 +284,9 @@ typedef struct {
 
     /* Optional SENSITIVE v1 memory-protection configuration block. */
     flexe_sensitive_memprot_desc_t sensitive_memprot;
+
+    /* Optional V1 system-timer register block. */
+    flexe_systimer_desc_t         systimer;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */
