@@ -712,6 +712,91 @@ static void stub_strlcpy(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, slen);
 }
 
+static bool guest_string_contains(xtensa_cpu_t *cpu, uint32_t string,
+                                  uint8_t value) {
+    uint32_t off = 0;
+    while (1) {
+        uint8_t current = mem_read8(cpu->mem, string + off);
+        if (current == value)
+            return true;
+        if (current == 0)
+            return false;
+        off++;
+    }
+}
+
+static uint32_t guest_string_length(xtensa_cpu_t *cpu, uint32_t string) {
+    uint32_t len = 0;
+    while (1) {
+        const uint8_t *ptr = mem_get_ptr(cpu->mem, string + len);
+        if (ptr) {
+            uint32_t chunk = 0x1000u - ((string + len) & 0xFFFu);
+            const uint8_t *nul = memchr(ptr, 0, chunk);
+            if (nul)
+                return len + (uint32_t)(nul - ptr);
+            len += chunk;
+        } else {
+            if (mem_read8(cpu->mem, string + len) == 0)
+                return len;
+            len++;
+        }
+    }
+}
+
+static void stub_strspn(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t string = rom_arg(cpu, 0);
+    uint32_t accept = rom_arg(cpu, 1);
+    uint32_t len = 0;
+    while (1) {
+        uint8_t current = mem_read8(cpu->mem, string + len);
+        if (current == 0 ||
+            !guest_string_contains(cpu, accept, current))
+            break;
+        len++;
+    }
+    rom_return(cpu, len);
+}
+
+static void stub_strcspn(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t string = rom_arg(cpu, 0);
+    uint32_t reject = rom_arg(cpu, 1);
+    uint32_t len = 0;
+    while (1) {
+        uint8_t current = mem_read8(cpu->mem, string + len);
+        if (current == 0 || guest_string_contains(cpu, reject, current))
+            break;
+        len++;
+    }
+    rom_return(cpu, len);
+}
+
+static void stub_strlcat(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t dst = rom_arg(cpu, 0);
+    uint32_t src = rom_arg(cpu, 1);
+    uint32_t size = rom_arg(cpu, 2);
+    uint32_t dst_len = 0;
+
+    while (dst_len < size && mem_read8(cpu->mem, dst + dst_len) != 0)
+        dst_len++;
+
+    uint32_t src_len = guest_string_length(cpu, src);
+    if (dst_len == size) {
+        rom_return(cpu, size + src_len);
+        return;
+    }
+
+    uint32_t available = size - dst_len - 1u;
+    uint32_t copy = src_len < available ? src_len : available;
+    for (uint32_t i = 0; i < copy; i++)
+        mem_write8(cpu->mem, dst + dst_len + i,
+                   mem_read8(cpu->mem, src + i));
+    mem_write8(cpu->mem, dst + dst_len + copy, 0);
+    rom_return(cpu, dst_len + src_len);
+}
+
 /* ===== ROM function stubs ===== */
 
 static void stub_ets_write_char_uart(xtensa_cpu_t *cpu, void *ctx) {
@@ -4522,6 +4607,9 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x400013ac, stub_strcpy,              "strcpy");
     rom_stubs_register(s, 0x400015d4, stub_strncpy,             "strncpy");
     rom_stubs_register(s, 0x4000c584, stub_strlcpy,             "strlcpy");
+    rom_stubs_register(s, 0x40001470, stub_strlcat,             "strlcat");
+    rom_stubs_register(s, 0x4000c558, stub_strcspn,             "strcspn");
+    rom_stubs_register(s, 0x4000c648, stub_strspn,              "strspn");
 
     /* Compiler builtins */
     rom_stubs_register(s, 0x40002ed0, stub_popcountsi2,        "__popcountsi2");

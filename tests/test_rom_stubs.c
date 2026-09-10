@@ -606,6 +606,55 @@ static uint32_t call_builtin_rom_args(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+TEST(test_rom_string_spans_and_bounded_concat) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t string = 0x3FFB1000u;
+    const uint32_t set = 0x3FFB1100u;
+    const uint32_t dst = 0x3FFB1200u;
+    const uint32_t src = 0x3FFB1300u;
+
+    static const uint8_t span_string[] = "aaab42";
+    static const uint8_t accept[] = "ab";
+    mem_load(cpu.mem, string, span_string, sizeof(span_string));
+    mem_load(cpu.mem, set, accept, sizeof(accept));
+    uint32_t span_args[] = { string, set };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C648u, span_args, 2), 4u);
+
+    static const uint8_t reject_string[] = "alpha,beta";
+    static const uint8_t reject[] = ",;";
+    mem_load(cpu.mem, string, reject_string, sizeof(reject_string));
+    mem_load(cpu.mem, set, reject, sizeof(reject));
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C558u, span_args, 2), 5u);
+
+    static const uint8_t flex[] = "flex";
+    static const uint8_t suffix[] = "e-s3";
+    mem_load(cpu.mem, dst, flex, sizeof(flex));
+    mem_load(cpu.mem, src, suffix, sizeof(suffix));
+    uint32_t concat_args[] = { dst, src, 12u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001470u, concat_args, 3), 8u);
+    ASSERT_TRUE(strcmp((const char *)mem_get_ptr(cpu.mem, dst),
+                       "flexe-s3") == 0);
+
+    static const uint8_t short_dst[] = "abc";
+    static const uint8_t long_src[] = "defghi";
+    mem_load(cpu.mem, dst, short_dst, sizeof(short_dst));
+    mem_load(cpu.mem, src, long_src, sizeof(long_src));
+    concat_args[2] = 6u;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001470u, concat_args, 3), 9u);
+    ASSERT_TRUE(strcmp((const char *)mem_get_ptr(cpu.mem, dst), "abcde") == 0);
+
+    mem_load(cpu.mem, dst, short_dst, sizeof(short_dst));
+    concat_args[2] = 2u;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001470u, concat_args, 3), 8u);
+    ASSERT_TRUE(strcmp((const char *)mem_get_ptr(cpu.mem, dst), "abc") == 0);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_cpu_frequency_rom_pair) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1897,6 +1946,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_cache_noop);
     RUN_TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses);
     RUN_TEST(test_stub_memcpy);
+    RUN_TEST(test_rom_string_spans_and_bounded_concat);
     RUN_TEST(test_cpu_frequency_rom_pair);
     RUN_TEST(test_rom_newlib_scalar_helpers);
     RUN_TEST(test_rom_strdup_uses_guest_allocator);
