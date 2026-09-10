@@ -15,7 +15,9 @@
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
 #define FLEXE_TARGET_UART_MAX 3
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 8u
+#define FLEXE_TARGET_RTC_CAL_GROUP_MAX 2u
+#define FLEXE_TARGET_RTC_CAL_CLOCK_MAX 4u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 9u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -25,6 +27,7 @@ typedef enum {
     FLEXE_TARGET_CAP_ESP32S3_EXTMEM             = 1ull << 1,
     FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT       = 1ull << 2,
     FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL     = 1ull << 3,
+    FLEXE_TARGET_CAP_RTC_CALIBRATION            = 1ull << 4,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -121,6 +124,36 @@ typedef struct {
     uint32_t runstall_mask;
 } flexe_secondary_core_desc_t;
 
+/* RTC slow-clock calibration is embedded in each timer-group register block.
+ * The surrounding timer IP changes across ESP32-family targets, so exposing
+ * this small common contract avoids registering a classic timer-group model
+ * at an incompatible address. Clock frequencies are nominal functional-mode
+ * values; calibrated timing profiles can replace them in accurate modes. */
+typedef struct {
+    uint8_t  group_count;
+    uint32_t base[FLEXE_TARGET_RTC_CAL_GROUP_MAX];
+    uint32_t register_size;
+    uint32_t config_offset;
+    uint32_t value_offset;
+    uint32_t timeout_offset;
+    uint32_t config_reset;
+    uint32_t timeout_reset;
+    uint32_t config_writable_mask;
+    uint32_t timeout_writable_mask;
+    uint32_t start_mask;
+    uint32_t cycling_mask;
+    uint32_t ready_mask;
+    uint32_t timeout_mask;
+    uint32_t cycles_mask;
+    uint32_t clock_select_mask;
+    uint32_t result_mask;
+    uint8_t  cycles_shift;
+    uint8_t  clock_select_shift;
+    uint8_t  result_shift;
+    uint32_t reference_clock_hz;
+    uint32_t source_clock_hz[FLEXE_TARGET_RTC_CAL_CLOCK_MAX];
+} flexe_rtc_calibration_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -173,6 +206,9 @@ typedef struct {
 
     /* Optional SoC register block controlling the secondary CPU. */
     flexe_secondary_core_desc_t secondary_core;
+
+    /* Optional timer-group RTC slow-clock calibration interface. */
+    flexe_rtc_calibration_desc_t rtc_calibration;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

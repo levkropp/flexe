@@ -1354,6 +1354,15 @@ typedef struct {
     int      reads_since;    /* reads since cal_started */
 } rtc_cal_state_t;
 
+typedef struct {
+    uint32_t config;
+    uint32_t timeout;
+    uint32_t result;
+    unsigned reads_since;
+    bool active;
+    bool ready;
+} target_rtc_cal_state_t;
+
 /* The ESP32 WiFi/BT binary blobs directly program several undocumented RF,
  * PHY, baseband, and controller windows while calibrating the radio. Most of
  * this traffic is ordinary read/modify/write configuration. Retain an
@@ -1859,6 +1868,10 @@ struct esp32_periph {
 
     /* RTC calibration state */
     rtc_cal_state_t rtc_cal[2];
+
+    /* Target-described RTC calibration blocks used when the surrounding
+     * timer-group register layout is not the classic ESP32 layout. */
+    target_rtc_cal_state_t target_rtc_cal[FLEXE_TARGET_RTC_CAL_GROUP_MAX];
 
     /* APP_CPU reset/stall/clock state from classic DPORT or the target's
      * descriptor-driven secondary-core controller. */
@@ -13607,6 +13620,151 @@ static void secondary_core_write(void *ctx, uint32_t addr, uint32_t value)
     default_write(ctx, addr, value);
 }
 
+/* ---- Target-described RTC slow-clock calibration ---- */
+
+static bool rtc_calibration_geometry_valid(const flexe_target_desc_t *target)
+{
+    if (!target || !(target->capabilities &
+                     FLEXE_TARGET_CAP_RTC_CALIBRATION))
+        return false;
+    const flexe_rtc_calibration_desc_t *desc = &target->rtc_calibration;
+    if (desc->group_count == 0u ||
+        desc->group_count > FLEXE_TARGET_RTC_CAL_GROUP_MAX ||
+        desc->register_size < 4u || desc->reference_clock_hz == 0u ||
+        desc->cycles_shift >= 32u || desc->clock_select_shift >= 32u ||
+        desc->result_shift >= 32u || desc->cycles_mask == 0u ||
+        desc->clock_select_mask == 0u || desc->result_mask == 0u ||
+        desc->start_mask == 0u || desc->ready_mask == 0u ||
+        desc->timeout_mask == 0u ||
+        (desc->config_offset & 3u) != 0u ||
+        (desc->value_offset & 3u) != 0u ||
+        (desc->timeout_offset & 3u) != 0u ||
+        desc->config_offset > desc->register_size - 4u ||
+        desc->value_offset > desc->register_size - 4u ||
+        desc->timeout_offset > desc->register_size - 4u ||
+        (desc->config_writable_mask & desc->ready_mask) != 0u ||
+        (desc->timeout_writable_mask & desc->timeout_mask) != 0u ||
+        (desc->config_reset & ~desc->config_writable_mask) != 0u ||
+        (desc->timeout_reset &
+         ~(desc->timeout_writable_mask | desc->timeout_mask)) != 0u)
+        return false;
+
+    uint32_t max_selector =
+        desc->clock_select_mask >> desc->clock_select_shift;
+    if (max_selector >= FLEXE_TARGET_RTC_CAL_CLOCK_MAX)
+        return false;
+    for (uint32_t i = 0; i <= max_selector; i++)
+        if (desc->source_clock_hz[i] == 0u) return false;
+
+    for (unsigned group = 0; group < desc->group_count; group++) {
+        uint32_t base = desc->base[group];
+        if ((base & 0xFFFu) != 0u ||
+            base < target->peripheral_start ||
+            base >= target->peripheral_end ||
+            desc->register_size > target->peripheral_end - base)
+            return false;
+    }
+    return true;
+}
+
+static uint32_t rtc_calibration_result(
+    const flexe_rtc_calibration_desc_t *desc, uint32_t config)
+{
+    uint32_t cycles = (config & desc->cycles_mask) >> desc->cycles_shift;
+    uint32_t selector = (config & desc->clock_select_mask) >>
+                        desc->clock_select_shift;
+    uint32_t source_hz = desc->source_clock_hz[selector];
+    uint64_t numerator = (uint64_t)desc->reference_clock_hz * cycles;
+    uint64_t count = (numerator + source_hz / 2u) / source_hz;
+    uint32_t max_count = desc->result_mask >> desc->result_shift;
+    if (count > max_count) count = max_count;
+    return ((uint32_t)count << desc->result_shift) & desc->result_mask;
+}
+
+static void rtc_calibration_start(
+    esp32_periph_t *p, unsigned group)
+{
+    const flexe_rtc_calibration_desc_t *desc =
+        &p->target->rtc_calibration;
+    target_rtc_cal_state_t *state = &p->target_rtc_cal[group];
+    state->result = rtc_calibration_result(desc, state->config);
+    state->reads_since = 0u;
+    state->active = true;
+    state->ready = false;
+}
+
+static int rtc_calibration_group(
+    const flexe_rtc_calibration_desc_t *desc, uint32_t addr,
+    uint32_t *offset)
+{
+    for (unsigned group = 0; group < desc->group_count; group++) {
+        uint32_t base = desc->base[group];
+        if (addr >= base && addr - base < desc->register_size) {
+            *offset = addr - base;
+            return (int)group;
+        }
+    }
+    return -1;
+}
+
+static uint32_t rtc_calibration_read(void *ctx, uint32_t addr)
+{
+    esp32_periph_t *p = ctx;
+    const flexe_rtc_calibration_desc_t *desc =
+        &p->target->rtc_calibration;
+    uint32_t off = 0u;
+    int group = rtc_calibration_group(desc, addr, &off);
+    if (group < 0) return default_read(ctx, addr);
+    target_rtc_cal_state_t *state = &p->target_rtc_cal[group];
+
+    if (off == desc->config_offset) {
+        if (state->active && ++state->reads_since >= 2u) {
+            state->active = false;
+            state->ready = true;
+        }
+        return state->config | (state->ready ? desc->ready_mask : 0u);
+    }
+    if (off == desc->value_offset) return state->result;
+    if (off == desc->timeout_offset)
+        return state->timeout; /* Supported sources complete successfully. */
+    return default_read(ctx, addr);
+}
+
+static void rtc_calibration_write(void *ctx, uint32_t addr, uint32_t value)
+{
+    esp32_periph_t *p = ctx;
+    const flexe_rtc_calibration_desc_t *desc =
+        &p->target->rtc_calibration;
+    uint32_t off = 0u;
+    int group = rtc_calibration_group(desc, addr, &off);
+    if (group < 0) {
+        default_write(ctx, addr, value);
+        return;
+    }
+    target_rtc_cal_state_t *state = &p->target_rtc_cal[group];
+
+    if (off == desc->config_offset) {
+        uint32_t old = state->config;
+        state->config = value & desc->config_writable_mask;
+        uint32_t trigger_mask = desc->start_mask | desc->cycling_mask;
+        bool rising = (state->config & trigger_mask & ~old) != 0u;
+        if (rising) {
+            rtc_calibration_start(p, (unsigned)group);
+        } else if ((state->config & trigger_mask) == 0u) {
+            state->active = false;
+            state->ready = false;
+            state->reads_since = 0u;
+        }
+        return;
+    }
+    if (off == desc->timeout_offset) {
+        state->timeout = value & desc->timeout_writable_mask;
+        return;
+    }
+    if (off == desc->value_offset) return; /* Read-only result. */
+    default_write(ctx, addr, value);
+}
+
 /* ---- Public API ---- */
 
 esp32_periph_t *periph_create(xtensa_mem_t *mem) {
@@ -13641,6 +13799,31 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                                     secondary_core_write, p) != 0) {
             periph_destroy(p);
             return NULL;
+        }
+    }
+
+    if (target->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION) {
+        if (!rtc_calibration_geometry_valid(target)) {
+            periph_destroy(p);
+            return NULL;
+        }
+        const flexe_rtc_calibration_desc_t *desc =
+            &target->rtc_calibration;
+        for (unsigned group = 0; group < desc->group_count; group++) {
+            target_rtc_cal_state_t *state = &p->target_rtc_cal[group];
+            state->config = desc->config_reset;
+            state->timeout = desc->timeout_reset &
+                             desc->timeout_writable_mask;
+            state->result = rtc_calibration_result(desc, state->config);
+            if (state->config & desc->cycling_mask)
+                rtc_calibration_start(p, group);
+            if (mem_register_mmio_range(mem, desc->base[group],
+                                        desc->register_size,
+                                        rtc_calibration_read,
+                                        rtc_calibration_write, p) != 0) {
+                periph_destroy(p);
+                return NULL;
+            }
         }
     }
 
@@ -13930,6 +14113,14 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION) {
+        const flexe_rtc_calibration_desc_t *desc =
+            &p->target->rtc_calibration;
+        for (unsigned group = 0; group < desc->group_count; group++)
+            (void)mem_register_mmio_range(
+                p->mem, desc->base[group], desc->register_size,
+                NULL, NULL, NULL);
+    }
     if (p->target->capabilities & FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL)
         (void)mem_register_mmio_range(
             p->mem, p->target->secondary_core.base,

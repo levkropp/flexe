@@ -113,7 +113,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .support_level = FLEXE_TARGET_UNAVAILABLE,
         .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM |
                         FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT |
-                        FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL,
+                        FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL |
+                        FLEXE_TARGET_CAP_RTC_CALIBRATION,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -178,6 +179,32 @@ static const flexe_target_desc_t TARGETS[] = {
             .reset_mask = 1u << 2,
             .clock_gate_mask = 1u << 1,
             .runstall_mask = 1u << 0,
+        },
+        .rtc_calibration = {
+            .group_count = 2,
+            .base = { 0x6001F000u, 0x60020000u },
+            .register_size = 0x1000u,
+            .config_offset = 0x068u,
+            .value_offset = 0x06Cu,
+            .timeout_offset = 0x080u,
+            .config_reset = 0x00013000u,
+            .timeout_reset = 0xFFFFFF98u,
+            .config_writable_mask = 0xFFFF7000u,
+            .timeout_writable_mask = 0xFFFFFFF8u,
+            .start_mask = 1u << 31,
+            .cycling_mask = 1u << 12,
+            .ready_mask = 1u << 15,
+            .timeout_mask = 1u << 0,
+            .cycles_mask = 0x7FFFu << 16,
+            .clock_select_mask = 3u << 13,
+            .result_mask = 0x01FFFFFFu << 7,
+            .cycles_shift = 16,
+            .clock_select_shift = 13,
+            .result_shift = 7,
+            .reference_clock_hz = 40000000u,
+            /* ESP-IDF's nominal RC_SLOW, RC_FAST/256, XTAL32K, and
+             * INTERNAL_OSC selections for ESP32-S3 functional mode. */
+            .source_clock_hz = { 136000u, 68359u, 32768u, 136000u },
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x00080000u,
