@@ -111,7 +111,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .core_generation = FLEXE_XTENSA_LX7,
         .core_count = 2,
         .support_level = FLEXE_TARGET_UNAVAILABLE,
-        .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM,
+        .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM |
+                        FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,

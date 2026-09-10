@@ -198,8 +198,9 @@ TEST(rom_elf_loads_immutable_sections_and_data_images) {
     ASSERT_EQ(mem_read32(mem, 0x40002004u), 0x55667788u);
     ASSERT_EQ(mem_read32(mem, 0x40003000u), 0x0BADF00Du);
     ASSERT_EQ(mem_read32(mem, 0x40003004u), 0u); /* padding was not copied */
-    /* DRAM is initialized later by ROM startup/controller code. */
+    /* Classic's established ROM-stub bootstrap owns its live ROM state. */
     ASSERT_EQ(mem_read32(mem, 0x3FFAE6E0u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0u);
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
     mem_destroy(mem);
 }
@@ -226,7 +227,10 @@ TEST(rom_elf_uses_s3_descriptor_rom_apertures) {
     ASSERT_EQ(mem_read32(mem, 0x40002000u), 0xA1B2C3D4u);
     ASSERT_EQ(mem_read32(mem, 0x40003000u), 0x0BADF00Du);
     ASSERT_EQ(mem_read32(mem, 0x3FCEFFC4u), 0x3FF10000u);
-    ASSERT_EQ(mem_read32(mem, 0x3FCEF174u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEF174u), 0xA1B2C3D4u);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEF178u), 0x55667788u);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEF130u), 0x0BADF00Du);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEF134u), 0u); /* padding was not copied */
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
     mem_destroy(mem);
 }

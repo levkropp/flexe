@@ -23,6 +23,7 @@
 typedef enum {
     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS = 1ull << 0,
     FLEXE_TARGET_CAP_ESP32S3_EXTMEM             = 1ull << 1,
+    FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT       = 1ull << 2,
 } flexe_target_capability_t;
 
 typedef enum {

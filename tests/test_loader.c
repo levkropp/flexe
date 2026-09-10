@@ -265,6 +265,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
     ASSERT_EQ(s3->support_level, FLEXE_TARGET_UNAVAILABLE);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT);
     ASSERT_EQ(s3->reset_vector, 0x40000400u);
     ASSERT_EQ(s3->vecbase_reset, 0x40000000u);
     ASSERT_EQ(s3->configid0, 0xC2F0FFFEu);

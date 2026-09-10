@@ -401,6 +401,19 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
             free(buf);
             return res;
         }
+        const flexe_target_desc_t *target = mem_target(mem);
+        if ((target->capabilities &
+             FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT) != 0u &&
+            (!target_range_uses_backing(mem, section->addr, image_size,
+                                        FLEXE_MEM_SRAM) ||
+             !guest_range_mapped(mem, section->addr, image_size) ||
+             mem_load(mem, section->addr, buf + section->offset,
+                      image_size) != 0)) {
+            rom_error(&res, "Cannot initialize live ROM data for %s",
+                      section->name);
+            free(buf);
+            return res;
+        }
         res.data_images_loaded++;
         res.data_image_bytes += image_size;
     }
