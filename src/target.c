@@ -136,7 +136,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1 |
                         FLEXE_TARGET_CAP_SYSTIMER_V1 |
                         FLEXE_TARGET_CAP_SPI_MEM |
-                        FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1,
+                        FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1 |
+                        FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -300,6 +301,22 @@ static const flexe_target_desc_t TARGETS[] = {
             .flash_chip_select = 0u,
             .psram_chip_select = FLEXE_SPI_MEM_CS_NONE,
             .layout = FLEXE_SPI_MEM_LAYOUT_S2_S3,
+        },
+        .usb_serial_jtag = {
+            .base = 0x60038000u,
+            .register_size = 0x1000u,
+            .interrupt_source = 96u,
+            .interrupt_valid_mask = 0x00000FFFu,
+            .interrupt_raw_reset = 1u << 3,
+            .conf0_reset = (1u << 14) | (1u << 9),
+            .conf0_writable_mask = 0x0001FFFFu,
+            .test_writable_mask = 0x0000000Fu,
+            .misc_conf_writable_mask = 1u,
+            .mem_conf_reset = 1u << 1,
+            .mem_conf_writable_mask = 3u,
+            .date_reset = 0x02101200u,
+            .date_writable_mask = UINT32_MAX,
+            .endpoint_size = 64u,
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x00080000u,

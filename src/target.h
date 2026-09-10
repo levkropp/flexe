@@ -25,7 +25,7 @@
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
 #define FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX 4u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 14u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 15u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -41,6 +41,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SYSTIMER_V1                = 1ull << 7,
     FLEXE_TARGET_CAP_SPI_MEM                    = 1ull << 8,
     FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1        = 1ull << 9,
+    FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1          = 1ull << 10,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -275,6 +276,28 @@ typedef struct {
     flexe_spi_mem_layout_t  layout;
 } flexe_spi_mem_desc_t;
 
+/* Native USB Serial/JTAG device shared by newer ESP32-family targets. V1
+ * fixes the register layout while the descriptor supplies target placement,
+ * reset values, masks, interrupt routing, and endpoint geometry. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t interrupt_source;
+    uint32_t interrupt_valid_mask;
+    uint32_t interrupt_raw_reset;
+    uint32_t conf0_reset;
+    uint32_t conf0_writable_mask;
+    uint32_t test_reset;
+    uint32_t test_writable_mask;
+    uint32_t misc_conf_reset;
+    uint32_t misc_conf_writable_mask;
+    uint32_t mem_conf_reset;
+    uint32_t mem_conf_writable_mask;
+    uint32_t date_reset;
+    uint32_t date_writable_mask;
+    uint8_t  endpoint_size;
+} flexe_usb_serial_jtag_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -351,6 +374,9 @@ typedef struct {
 
     /* Optional SPI memory controllers and their default attached devices. */
     flexe_spi_mem_desc_t          spi_mem;
+
+    /* Optional native USB Serial/JTAG endpoint controller. */
+    flexe_usb_serial_jtag_desc_t  usb_serial_jtag;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

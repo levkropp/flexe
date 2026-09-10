@@ -168,6 +168,10 @@ static int session_build(flexe_session_t *s)
     }
     if (cfg->uart_cb)
         periph_set_uart_callback(s->periph, cfg->uart_cb, cfg->uart_ctx);
+    if (cfg->usb_serial_jtag_cb)
+        periph_set_usb_serial_jtag_callback(
+            s->periph, cfg->usb_serial_jtag_cb,
+            cfg->usb_serial_jtag_ctx);
     if (s->touch_fn && s->touch_irq_pin >= 0)
         periph_gpio_set_input(s->periph, s->touch_irq_pin, 1);
 

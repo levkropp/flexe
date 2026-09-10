@@ -12,12 +12,21 @@ Flexe reads the Espressif chip ID and revision bounds from each image header.
 the selection into an assertion suitable for CI. Classic ESP32 execution is
 supported. ESP32-S3 chip ID `0x0009` has experimental interpreter support for
 the LX7 core, native memory map, flash/cache-MMU windows, mask ROM, dual-core
-startup, system timer, SPI-memory controllers, UARTs, and interrupt matrix.
+startup, system timer, SPI-memory controllers, UARTs, native USB Serial/JTAG,
+and interrupt matrix.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
 addresses belong to the classic target. Missing S3 devices remain explicit
 and S3 is not yet a production-supported target.
+
+The experimental USB Serial/JTAG model implements the 64-byte serial endpoint
+FIFOs, packet flush and backpressure behavior, host RX/TX, interrupt
+enable/status/clear routing, connection state, and fast-mode SOF liveness.
+`--usb-console` routes CLI output from this endpoint instead of UART0. It does
+not yet implement JTAG transport, USB descriptors, line signaling, or timed
+1 ms SOF generation; fast mode coalesces connected-host SOFs when firmware
+observes the controller.
 
 ## Current corpus
 

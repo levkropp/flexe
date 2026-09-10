@@ -583,6 +583,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --no-jit        Disable JIT, run fully interpreted\n");
     fprintf(stderr, "  --jit-stats     Print JIT block/coverage statistics on exit\n");
     fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
+    fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -926,6 +927,7 @@ int main(int argc, char *argv[]) {
     const char *restore_file = NULL;
     /* Sandbox event stream (litegraph.js frontend) */
     int sandbox_events = 0;
+    int usb_console = 0;
     /* AOT statically-recompiled firmware dylib */
     const char *aot_dylib_path = NULL;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
@@ -969,6 +971,12 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--sandbox-events") == 0) {
             sandbox_events = 1;
             memmove(&argv[i], &argv[i + 1], (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--usb-console") == 0) {
+            usb_console = 1;
+            memmove(&argv[i], &argv[i + 1],
+                    (size_t)(argc - i) * sizeof(char *));
             argc -= 1;
             continue;
         } else if (strcmp(argv[i], "--aot") == 0 && i + 1 < argc) {
@@ -1131,7 +1139,8 @@ int main(int argc, char *argv[]) {
         .target = target_id,
         .window_trace = window_trace,
         .spill_verify = spill_verify,
-        .uart_cb = uart_stdout_cb,
+        .uart_cb = usb_console ? NULL : uart_stdout_cb,
+        .usb_serial_jtag_cb = usb_console ? uart_stdout_cb : NULL,
         /* Sandbox touch hand-off — get_state callback reads volatiles
          * mutated by sandbox_drain_stdin() each batch. Always installed,
          * not gated on --sandbox-events, since the function is harmless
@@ -1731,6 +1740,8 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr, "UART TX:    %d bytes\n", periph_uart_tx_count(periph));
+    fprintf(stderr, "USB TX:     %zu bytes\n",
+            periph_usb_serial_jtag_tx_count(periph));
 
     /* ROM stub call stats */
     int nstubs = rom_stubs_stub_count(rom);

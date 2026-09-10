@@ -48,6 +48,12 @@ typedef struct {
     void      (*uart_cb)(void *ctx, uint8_t byte);
     void       *uart_ctx;
 
+    /* Native USB Serial/JTAG output (NULL = capture only). This remains
+     * independent from UART0 so firmware which mirrors logs to both does not
+     * produce duplicate host output. */
+    void      (*usb_serial_jtag_cb)(void *ctx, uint8_t byte);
+    void       *usb_serial_jtag_ctx;
+
     /* Display framebuffer (NULL = headless / no rendering) */
     uint16_t   *framebuf;
     pthread_mutex_t *framebuf_mutex;

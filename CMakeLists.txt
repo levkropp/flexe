@@ -73,6 +73,7 @@ set(LIB_SOURCES
     src/regi2c.c
     src/sensitive_memprot.c
     src/systimer.c
+    src/usb_serial_jtag.c
     src/spi_mem.c
     src/firmware_scan.c
     src/loader.c

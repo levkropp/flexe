@@ -168,6 +168,22 @@ void periph_set_uart_callback_num(esp32_periph_t *p, int uart_num,
 int  periph_uart_tx_count_num(const esp32_periph_t *p, int uart_num);
 const uint8_t *periph_uart_tx_buf_num(const esp32_periph_t *p, int uart_num);
 
+/* Native USB Serial/JTAG host endpoint. Complete guest TX packets are
+ * captured and delivered through the optional byte callback; host RX data is
+ * injected as one endpoint packet. Targets without this capability return
+ * empty results and ignore configuration calls. */
+void periph_set_usb_serial_jtag_callback(esp32_periph_t *p,
+                                         uart_tx_cb cb, void *ctx);
+size_t periph_usb_serial_jtag_tx_count(const esp32_periph_t *p);
+const uint8_t *periph_usb_serial_jtag_tx_buf(const esp32_periph_t *p);
+size_t periph_usb_serial_jtag_rx_inject(esp32_periph_t *p,
+                                        const uint8_t *data, size_t len);
+size_t periph_usb_serial_jtag_rx_pending(const esp32_periph_t *p);
+void periph_usb_serial_jtag_set_connected(esp32_periph_t *p,
+                                          bool connected);
+bool periph_usb_serial_jtag_connected(const esp32_periph_t *p);
+void periph_usb_serial_jtag_host_sof(esp32_periph_t *p);
+
 /* Inject bytes arriving from the host. Returns the number accepted by the
  * selected 128-byte hardware RX FIFO; the normal ESP32 RX interrupt path then
  * moves them into the firmware driver's ring buffer. */

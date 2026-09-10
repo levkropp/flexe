@@ -81,6 +81,7 @@ Common options:
 | `--jit-verify` | Replay compiled blocks in the interpreter and compare state |
 | `-s ELF` | Load symbols and firmware hooks from an ELF image |
 | `-R ROM_ELF` | Load official ESP32 ROM code and data images |
+| `--usb-console` | Use native USB Serial/JTAG instead of UART0 for console output |
 | `-c N` | Stop after `N` aggregate emulated cycles |
 | `-q` | Suppress emulator diagnostics |
 | `-T` | Emit an instruction trace to stderr |

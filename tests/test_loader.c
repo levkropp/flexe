@@ -275,6 +275,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSTIMER_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
@@ -311,6 +312,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->spi_mem.date_reset, 0x02101040u);
     ASSERT_EQ(s3->spi_mem.flash_chip_select, 0u);
     ASSERT_EQ(s3->spi_mem.psram_chip_select, FLEXE_SPI_MEM_CS_NONE);
+    ASSERT_EQ(s3->usb_serial_jtag.base, 0x60038000u);
+    ASSERT_EQ(s3->usb_serial_jtag.interrupt_source, 96u);
+    ASSERT_EQ(s3->usb_serial_jtag.endpoint_size, 64u);
+    ASSERT_EQ(s3->usb_serial_jtag.interrupt_raw_reset, 1u << 3);
     ASSERT_EQ(s3->reset_vector, 0x40000400u);
     ASSERT_EQ(s3->vecbase_reset, 0x40000000u);
     ASSERT_EQ(s3->configid0, 0xC2F0FFFEu);

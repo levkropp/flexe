@@ -5,6 +5,7 @@
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
 #include "systimer.h"
+#include "usb_serial_jtag.h"
 #include "spi_display.h"
 #include "sandbox_events.h"
 #include "xtensa.h"
@@ -1165,6 +1166,7 @@ static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_state_changed(void *ctx);
 static void systimer_irq_changed(void *ctx, unsigned alarm, bool level);
+static void usb_serial_jtag_irq_changed(void *ctx, bool level);
 static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_reset_state(esp32_periph_t *p, unsigned port);
@@ -1817,6 +1819,7 @@ struct esp32_periph {
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_systimer_t *systimer;
     flexe_spi_mem_t *spi_mem;
+    flexe_usb_serial_jtag_t *usb_serial_jtag;
 
     /* Three independent ESP32 UART controllers. */
     uart_state_t uart[UART_COUNT];
@@ -13514,6 +13517,17 @@ static void systimer_irq_changed(void *ctx, unsigned alarm, bool level)
     else periph_deassert_interrupt(p, source);
 }
 
+static void usb_serial_jtag_irq_changed(void *ctx, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !(p->target->capabilities &
+                FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1))
+        return;
+    int source = (int)p->target->usb_serial_jtag.interrupt_source;
+    if (level) periph_assert_interrupt(p, source);
+    else periph_deassert_interrupt(p, source);
+}
+
 /* ---- Target-described secondary-core control ---- */
 
 static bool secondary_core_geometry_valid(const flexe_target_desc_t *target)
@@ -13838,6 +13852,16 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1) {
+        p->usb_serial_jtag = flexe_usb_serial_jtag_create(
+            mem, default_read, default_write, p,
+            usb_serial_jtag_irq_changed, p);
+        if (!p->usb_serial_jtag) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     bool classic = (target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     if (!classic) {
@@ -14127,6 +14151,7 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    flexe_usb_serial_jtag_destroy(p->usb_serial_jtag);
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
@@ -14260,6 +14285,44 @@ int periph_uart_tx_count(const esp32_periph_t *p) {
 
 const uint8_t *periph_uart_tx_buf(const esp32_periph_t *p) {
     return periph_uart_tx_buf_num(p, 0);
+}
+
+void periph_set_usb_serial_jtag_callback(esp32_periph_t *p,
+                                         uart_tx_cb cb, void *ctx) {
+    if (!p) return;
+    flexe_usb_serial_jtag_set_tx_callback(p->usb_serial_jtag, cb, ctx);
+}
+
+size_t periph_usb_serial_jtag_tx_count(const esp32_periph_t *p) {
+    return p ? flexe_usb_serial_jtag_tx_count(p->usb_serial_jtag) : 0u;
+}
+
+const uint8_t *periph_usb_serial_jtag_tx_buf(const esp32_periph_t *p) {
+    return p ? flexe_usb_serial_jtag_tx_buf(p->usb_serial_jtag) : NULL;
+}
+
+size_t periph_usb_serial_jtag_rx_inject(esp32_periph_t *p,
+                                        const uint8_t *data, size_t len) {
+    return p ? flexe_usb_serial_jtag_rx_inject(
+        p->usb_serial_jtag, data, len) : 0u;
+}
+
+size_t periph_usb_serial_jtag_rx_pending(const esp32_periph_t *p) {
+    return p ? flexe_usb_serial_jtag_rx_pending(p->usb_serial_jtag) : 0u;
+}
+
+void periph_usb_serial_jtag_set_connected(esp32_periph_t *p,
+                                          bool connected) {
+    if (p) flexe_usb_serial_jtag_set_connected(
+        p->usb_serial_jtag, connected);
+}
+
+bool periph_usb_serial_jtag_connected(const esp32_periph_t *p) {
+    return p ? flexe_usb_serial_jtag_connected(p->usb_serial_jtag) : false;
+}
+
+void periph_usb_serial_jtag_host_sof(esp32_periph_t *p) {
+    if (p) flexe_usb_serial_jtag_host_sof(p->usb_serial_jtag);
 }
 
 void periph_set_uart_callback_num(esp32_periph_t *p, int uart_num,
