@@ -159,8 +159,12 @@ void xtensa_advance_idle_cycles(xtensa_cpu_t *cpu, uint64_t cycles) {
     }
 }
 
-void xtensa_cpu_init(xtensa_cpu_t *cpu) {
+void xtensa_cpu_init_for_target(xtensa_cpu_t *cpu,
+                                const flexe_target_desc_t *target) {
+    if (!target)
+        target = flexe_target_by_id(FLEXE_TARGET_ESP32);
     memset(cpu, 0, sizeof(*cpu));
+    cpu->target = target;
     cpu->core_id = 0;
     {   /* Read once, per CPU, so the hot paths test a field, never getenv(). */
         static int enabled = -1;
@@ -179,30 +183,20 @@ void xtensa_cpu_init(xtensa_cpu_t *cpu) {
      * AOT bitmap gates fire on the initial PC (entry vector). */
     cpu->_pc_written = true;
 
-    /* ESP32 CPU interrupt level table (matches hardware):
-     * Level 1: 0-5, 8-10, 12-13, 17-18
-     * Level 2: 19-21
-     * Level 3: 11, 15, 22-23, 27, 29
-     * Level 4: 24-25, 28, 30
-     * Level 5: 16, 26, 31
-     * Level 6: 14 (debug)
-     * Level 7: 7 (NMI — software, keep at 1 for compat) */
-    static const uint8_t esp32_int_level[32] = {
-        1, 1, 1, 1, 1, 1, 1, 1,   /* 0-7:   all level 1 (int 7 = software/NMI) */
-        1, 1, 1, 3, 1, 1, 6, 3,   /* 8-15:  11=L3, 14=debug(L6), 15=L3(CCOMPARE1) */
-        5, 1, 1, 2, 2, 2, 3, 3,   /* 16-23: 16=L5(CCOMPARE2), 19-21=L2, 22-23=L3 */
-        4, 4, 5, 3, 4, 3, 4, 5,   /* 24-31: see ESP32 TRM Table 1-4 */
-    };
-    for (int i = 0; i < 32; i++)
-        cpu->int_level[i] = esp32_int_level[i];
+    memcpy(cpu->int_level, target->interrupt_level, sizeof(cpu->int_level));
 }
 
+void xtensa_cpu_init(xtensa_cpu_t *cpu) {
+    xtensa_cpu_init_for_target(cpu, flexe_target_by_id(FLEXE_TARGET_ESP32));
+}
 
-void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
-    xtensa_cpu_init(cpu);
+void xtensa_cpu_reset_for_target(xtensa_cpu_t *cpu,
+                                 const flexe_target_desc_t *target) {
+    if (!target)
+        target = flexe_target_by_id(FLEXE_TARGET_ESP32);
+    xtensa_cpu_init_for_target(cpu, target);
 
-    /* ESP32 reset vector */
-    cpu->pc = 0x40000400;
+    cpu->pc = target->reset_vector;
 
     /* PS: WOE=1, EXCM=1, INTLEVEL=15 */
     cpu->ps = (1 << 18)    /* WOE */
@@ -222,15 +216,19 @@ void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
     cpu->lcount = 0;
     cpu->ccount = 0;
 
-    /* ESP32 defaults */
-    cpu->vecbase = 0x40000000;
+    /* Core-configuration defaults. */
+    cpu->vecbase = target->vecbase_reset;
     cpu->prid = 0xCDCD;        /* PRO_CPU */
     cpu->cpenable = 0;
     cpu->atomctl = 0x28;
-    cpu->configid0 = 0;
-    cpu->configid1 = 0;
+    cpu->configid0 = target->configid0;
+    cpu->configid1 = target->configid1;
 
     cpu->running = true;
+}
+
+void xtensa_cpu_reset(xtensa_cpu_t *cpu) {
+    xtensa_cpu_reset_for_target(cpu, flexe_target_by_id(FLEXE_TARGET_ESP32));
 }
 
 /* Fast inline fetch for the hot path — avoids function call overhead */
@@ -283,6 +281,12 @@ void xtensa_predecode_build(xtensa_cpu_t *cpu) {
     (void)cpu;
     return;
 #else
+    /* The current direct-index table is deliberately optimized around the
+     * classic ESP32's compact 0x4000... instruction geometry. Never build a
+     * misleading table for another target; its interpreter fetch path remains
+     * correct until predecode storage becomes descriptor-driven. */
+    if (!cpu || !cpu->target || cpu->target->id != FLEXE_TARGET_ESP32)
+        return;
     if (!cpu->predecode) {
         size_t sz = (size_t)PREDECODE_SIZE * sizeof(uint32_t);
         cpu->predecode = calloc(PREDECODE_SIZE, sizeof(uint32_t));
@@ -498,8 +502,8 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
 
 void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uint32_t vaddr) {
     /* Trap: catch exceptions with out-of-range fault PC */
-    if (__builtin_expect(fault_pc < ESP32_INSN_ADDR_LOW ||
-                         fault_pc >= ESP32_INSN_ADDR_HIGH, 0)) {
+    if (__builtin_expect(!flexe_target_pc_is_executable(cpu->target,
+                                                        fault_pc), 0)) {
         fprintf(stderr, "[EXC-TRAP] cause=%d fault_pc=0x%08X vaddr=0x%08X cycle=%llu core=%d\n",
                 cause, fault_pc, vaddr, (unsigned long long)cpu->cycle_count, cpu->prid ? 1 : 0);
         fprintf(stderr, "  PS=0x%08X SAR=%u WB=%u WS=0x%X\n",
@@ -2911,9 +2915,8 @@ void xtensa_invalid_pc_trap(xtensa_cpu_t *cpu) {
     cpu->exception = true;
 }
 
-static inline bool xtensa_pc_is_valid(uint32_t pc) {
-    return (uint32_t)(pc - ESP32_INSN_ADDR_LOW) <
-           (ESP32_INSN_ADDR_HIGH - ESP32_INSN_ADDR_LOW);
+static inline bool xtensa_pc_is_valid(const xtensa_cpu_t *cpu, uint32_t pc) {
+    return flexe_target_pc_is_executable(cpu->target, pc);
 }
 
 static __attribute__((noinline, cold))
@@ -3178,7 +3181,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
         /* Preserve invalid-PC-before-breakpoint ordering for debugger runs.
          * Normal predecoded execution proves the PC range with its table
          * bounds below and avoids this check entirely. */
-        if (__builtin_expect(!xtensa_pc_is_valid(cpu->pc), 0))
+        if (__builtin_expect(!xtensa_pc_is_valid(cpu, cpu->pc), 0))
             return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
         cpu->breakpoint_hit = false;
         for (int i = 0; i < cpu->breakpoint_count; i++) {
@@ -3209,7 +3212,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
          * PC before the table proves it is in range. Keep invalid addresses
          * from reaching its bitmap while leaving straight-line interpreter
          * dispatch free of a redundant range check. */
-        if (__builtin_expect(!xtensa_pc_is_valid(cpu->pc), 0))
+        if (__builtin_expect(!xtensa_pc_is_valid(cpu, cpu->pc), 0))
             return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
         if (rom_stubs_hook_bitmap_test(cpu->aot_bitmap, cpu->pc) &&
             !(cpu->pc_hook_bitmap &&
@@ -3253,7 +3256,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
     /* A populated predecode entry is indexed from ESP32_INSN_ADDR_LOW and is
      * therefore also the common-path PC validity proof. Misses still take the
      * architectural invalid-PC trap before the fallback fetch. */
-    if (__builtin_expect(!xtensa_pc_is_valid(cpu->pc), 0))
+    if (__builtin_expect(!xtensa_pc_is_valid(cpu, cpu->pc), 0))
         return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
     ilen = xtensa_fetch_inline(cpu, cpu->pc, &insn);
     if (__builtin_expect(ilen == 0, 0)) {

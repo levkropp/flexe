@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "target.h"
 
 /* Forward declarations */
 typedef struct xtensa_mem xtensa_mem_t;
@@ -521,6 +522,10 @@ struct xtensa_cpu {
      * address hooks. NULL means the bitmap is the best information available. */
     xtensa_pc_hook_contains_fn pc_hook_contains;
     void *pc_hook_contains_ctx;
+
+    /* Immutable core/SoC geometry. Kept cold so the classic predecode fast
+     * path does not pay for target generality on every instruction. */
+    const flexe_target_desc_t *target;
 };
 
 /* Native execution caches its event horizon for the duration of a short JIT
@@ -644,12 +649,16 @@ void     sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val);
  * Public API
  */
 void xtensa_cpu_init(xtensa_cpu_t *cpu);
+void xtensa_cpu_init_for_target(xtensa_cpu_t *cpu,
+                                const flexe_target_desc_t *target);
 
 /* Guest instructions this core retired. See cycle_count / insn_count. */
 static inline uint64_t xtensa_retired_insns(const xtensa_cpu_t *cpu) {
     return cpu->insn_count;
 }
 void xtensa_cpu_reset(xtensa_cpu_t *cpu);
+void xtensa_cpu_reset_for_target(xtensa_cpu_t *cpu,
+                                 const flexe_target_desc_t *target);
 void xtensa_predecode_build(xtensa_cpu_t *cpu);  /* Pre-decode instruction memory */
 void xtensa_invalidate_code(xtensa_cpu_t *cpu, uint32_t addr, size_t len);
 int  xtensa_step(xtensa_cpu_t *cpu);

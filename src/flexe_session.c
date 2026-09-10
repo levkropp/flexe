@@ -127,8 +127,7 @@ static int session_build(flexe_session_t *s)
     }
 
     /* Initialize CPU core 0 */
-    xtensa_cpu_init(&s->cpu[0]);
-    xtensa_cpu_reset(&s->cpu[0]);
+    xtensa_cpu_reset_for_target(&s->cpu[0], target);
     s->cpu[0].mem = s->mem;
     s->cpu[0].window_trace = cfg->window_trace;
     s->cpu[0].window_trace_active = cfg->window_trace;
@@ -343,8 +342,7 @@ static int session_build(flexe_session_t *s)
     s->cpu[0].seed_entry_link = true;
 
     /* Initialize CPU core 1 */
-    xtensa_cpu_init(&s->cpu[1]);
-    xtensa_cpu_reset(&s->cpu[1]);
+    xtensa_cpu_reset_for_target(&s->cpu[1], target);
     s->cpu[1].mem = s->mem;
     s->cpu[1].predecode = s->cpu[0].predecode;  /* Share predecode table */
     s->cpu[1].core_id = 1;

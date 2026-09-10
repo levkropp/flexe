@@ -4392,6 +4392,14 @@ static void jit_code_invalidate(void *ctx, uint32_t addr, size_t len) {
 
 /* Install JIT as a pc_hook, chaining with the existing hook */
 void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) {
+    if (!jit || !cpu) return;
+    if (!cpu->target ||
+        cpu->target->core_generation != FLEXE_XTENSA_LX6) {
+        fprintf(stderr,
+                "[jit] %s native translation is not validated; using the interpreter\n",
+                cpu->target ? cpu->target->display_name : "unknown-target");
+        return;
+    }
     /* Save the original hook */
     jit->original_hook = cpu->pc_hook;
     jit->original_hook_ctx = cpu->pc_hook_ctx;
@@ -4599,6 +4607,9 @@ static jit_block_fn jit_consider_block(jit_state_t *jit, xtensa_cpu_t *cpu,
 }
 
 jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
+    if (!jit || !cpu || !cpu->target ||
+        cpu->target->core_generation != FLEXE_XTENSA_LX6)
+        return NULL;
     uint32_t wb = cpu->windowbase;
     uint32_t lv = jit_loop_variant(cpu, pc);
     /* A cold or merely hot-counted PC needs an entry anyway. Probing first
@@ -4615,6 +4626,13 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
  * and compilation work in mostly-cold production firmware. */
 __attribute__((hot))
 int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
+    /* LX7 shares much of the ISA, but native blocks must not be emitted until
+     * its differing opcodes and architectural state have differential tests.
+     * The interpreter is an intentional, useful fallback in the meantime. */
+    if (!jit || !cpu || !cpu->target ||
+        cpu->target->core_generation != FLEXE_XTENSA_LX6)
+        return xtensa_run(cpu, max_cycles);
+
     int executed = 0;
     uint64_t jit_insns_before = jit->stats.insns_jitted;
 
