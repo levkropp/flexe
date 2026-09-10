@@ -1860,8 +1860,11 @@ struct esp32_periph {
     /* RTC calibration state */
     rtc_cal_state_t rtc_cal[2];
 
-    /* APP_CPU reset state for DPORT */
-    bool app_cpu_in_reset;   /* true = core 1 held in reset */
+    /* APP_CPU reset/stall/clock state from classic DPORT or the target's
+     * descriptor-driven secondary-core controller. */
+    bool app_cpu_in_reset;
+    uint32_t secondary_core_control;
+    uint32_t secondary_core_boot_addr;
 
     /* DPORT peripheral clock/reset register shadows.  Individual modeled
      * peripherals apply their reset semantics when their bit is asserted. */
@@ -13546,6 +13549,64 @@ static void default_write(void *ctx, uint32_t addr, uint32_t val) {
         fprintf(stderr, "[PERIPH] unhandled write 0x%08X <- 0x%08X pc=0x%08X\n", addr, val, g_dbg_pc);
 }
 
+/* ---- Target-described secondary-core control ---- */
+
+static bool secondary_core_geometry_valid(const flexe_target_desc_t *target)
+{
+    if (!target || !(target->capabilities &
+                     FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL))
+        return false;
+    const flexe_secondary_core_desc_t *desc = &target->secondary_core;
+    return target->core_count > 1u && desc->register_size >= 4u &&
+           (desc->base & 0xFFFu) == 0u &&
+           (desc->control_offset & 3u) == 0u &&
+           (desc->boot_address_offset & 3u) == 0u &&
+           desc->control_offset <= desc->register_size - 4u &&
+           desc->boot_address_offset <= desc->register_size - 4u &&
+           desc->base >= target->peripheral_start &&
+           desc->base < target->peripheral_end &&
+           desc->register_size <= target->peripheral_end - desc->base;
+}
+
+static void secondary_core_update_release(esp32_periph_t *p)
+{
+    const flexe_secondary_core_desc_t *desc = &p->target->secondary_core;
+    uint32_t control = p->secondary_core_control;
+    bool clocked = desc->clock_gate_mask == 0u ||
+                   (control & desc->clock_gate_mask) != 0u;
+    bool held = (control & (desc->reset_mask | desc->runstall_mask)) != 0u;
+    p->app_cpu_in_reset = !clocked || held;
+}
+
+static uint32_t secondary_core_read(void *ctx, uint32_t addr)
+{
+    esp32_periph_t *p = ctx;
+    const flexe_secondary_core_desc_t *desc = &p->target->secondary_core;
+    uint32_t off = addr - desc->base;
+    if (off == desc->control_offset) return p->secondary_core_control;
+    if (off == desc->boot_address_offset)
+        return p->secondary_core_boot_addr;
+    return default_read(ctx, addr);
+}
+
+static void secondary_core_write(void *ctx, uint32_t addr, uint32_t value)
+{
+    esp32_periph_t *p = ctx;
+    const flexe_secondary_core_desc_t *desc = &p->target->secondary_core;
+    uint32_t off = addr - desc->base;
+    if (off == desc->control_offset) {
+        p->secondary_core_control = value &
+            (desc->reset_mask | desc->clock_gate_mask | desc->runstall_mask);
+        secondary_core_update_release(p);
+        return;
+    }
+    if (off == desc->boot_address_offset) {
+        p->secondary_core_boot_addr = value;
+        return;
+    }
+    default_write(ctx, addr, value);
+}
+
 /* ---- Public API ---- */
 
 esp32_periph_t *periph_create(xtensa_mem_t *mem) {
@@ -13565,6 +13626,22 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     if (uart_register_target(p) != 0) {
         periph_destroy(p);
         return NULL;
+    }
+
+    if (target->capabilities & FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL) {
+        if (!secondary_core_geometry_valid(target)) {
+            periph_destroy(p);
+            return NULL;
+        }
+        p->secondary_core_control = target->secondary_core.control_reset;
+        secondary_core_update_release(p);
+        if (mem_register_mmio_range(mem, target->secondary_core.base,
+                                    target->secondary_core.register_size,
+                                    secondary_core_read,
+                                    secondary_core_write, p) != 0) {
+            periph_destroy(p);
+            return NULL;
+        }
     }
 
     if (!(target->capabilities &
@@ -13853,6 +13930,10 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->secondary_core.base,
+            p->target->secondary_core.register_size, NULL, NULL, NULL);
     flexe_esp32s3_extmem_destroy(p->s3_extmem);
     flexe_flash_mmu_destroy(p->shared_flash_mmu);
     periph_disable_spi_display(p);
@@ -14250,6 +14331,10 @@ bool periph_take_reset_request(esp32_periph_t *p)
 
 int periph_unhandled_count(const esp32_periph_t *p) {
     return p ? p->unhandled_count : 0;
+}
+
+uint32_t periph_app_cpu_boot_addr(const esp32_periph_t *p) {
+    return p ? p->secondary_core_boot_addr : 0u;
 }
 
 bool periph_app_cpu_released(const esp32_periph_t *p) {

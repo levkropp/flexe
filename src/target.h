@@ -15,7 +15,7 @@
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
 #define FLEXE_TARGET_UART_MAX 3
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 7u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 8u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -24,6 +24,7 @@ typedef enum {
     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS = 1ull << 0,
     FLEXE_TARGET_CAP_ESP32S3_EXTMEM             = 1ull << 1,
     FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT       = 1ull << 2,
+    FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL     = 1ull << 3,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -105,6 +106,21 @@ typedef struct {
     uint32_t interrupt_source;
 } flexe_uart_instance_desc_t;
 
+/* Register interface used to start a target's secondary CPU. Bit positions
+ * and register locations vary by SoC even when the Xtensa boot contract does
+ * not, so machine construction consumes this descriptor rather than addresses
+ * from firmware or target-name checks. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t control_offset;
+    uint32_t boot_address_offset;
+    uint32_t control_reset;
+    uint32_t reset_mask;
+    uint32_t clock_gate_mask;
+    uint32_t runstall_mask;
+} flexe_secondary_core_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -154,6 +170,9 @@ typedef struct {
     uint8_t                     uart_count;
     flexe_uart_ip_desc_t        uart_ip;
     flexe_uart_instance_desc_t  uart[FLEXE_TARGET_UART_MAX];
+
+    /* Optional SoC register block controlling the secondary CPU. */
+    flexe_secondary_core_desc_t secondary_core;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

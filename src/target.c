@@ -112,7 +112,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .core_count = 2,
         .support_level = FLEXE_TARGET_UNAVAILABLE,
         .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM |
-                        FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT,
+                        FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT |
+                        FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -167,6 +168,16 @@ static const flexe_target_desc_t TARGETS[] = {
             { .base = 0x60000000u, .interrupt_source = 27u },
             { .base = 0x60010000u, .interrupt_source = 28u },
             { .base = 0x6002E000u, .interrupt_source = 29u },
+        },
+        .secondary_core = {
+            .base = 0x600C0000u,
+            .register_size = 0x1000u,
+            .control_offset = 0x000u,
+            .boot_address_offset = 0x004u,
+            .control_reset = 1u << 2,
+            .reset_mask = 1u << 2,
+            .clock_gate_mask = 1u << 1,
+            .runstall_mask = 1u << 0,
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x00080000u,

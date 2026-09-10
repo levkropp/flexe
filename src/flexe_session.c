@@ -750,11 +750,16 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     if (s->frt && !s->native_freertos)
         freertos_stubs_check_preempt(s->frt);
 
-    /* Dual-core: check if core 1 should start */
+    /* Dual-core: check if core 1 should start. Newer targets expose the boot
+     * address through their hardware controller; classic ESP32 currently
+     * obtains the same value from its ROM service shim. */
+    uint32_t app_cpu_boot_addr = periph_app_cpu_boot_addr(s->periph);
+    if (app_cpu_boot_addr == 0u)
+        app_cpu_boot_addr = rom_stubs_app_cpu_boot_addr(s->rom);
     if (!s->single_core && !s->cpu[1].running &&
         periph_app_cpu_released(s->periph) &&
-        rom_stubs_app_cpu_boot_addr(s->rom) != 0) {
-        s->cpu[1].pc = rom_stubs_app_cpu_boot_addr(s->rom);
+        app_cpu_boot_addr != 0u) {
+        s->cpu[1].pc = app_cpu_boot_addr;
         s->cpu[1].running = true;
         fprintf(stderr, "[%10llu] CORE1 started at 0x%08X\n",
                 (unsigned long long)s->cpu[0].cycle_count, s->cpu[1].pc);

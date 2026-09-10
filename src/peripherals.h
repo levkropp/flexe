@@ -310,8 +310,10 @@ int periph_set_irq_dispatch(esp32_periph_t *p, int source,
                             periph_irq_dispatch_fn fn, void *ctx);
 bool periph_interrupt_pending(const esp32_periph_t *p, int source);
 
-/* Returns true once the APP_CPU has been released from reset (DPORT write) */
+/* Target-visible secondary-core control state. A zero boot address means
+ * firmware has not programmed one yet. */
 bool periph_app_cpu_released(const esp32_periph_t *p);
+uint32_t periph_app_cpu_boot_addr(const esp32_periph_t *p);
 
 /* Attach CPU pointers for interrupt delivery (call after cpu init) */
 void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1);

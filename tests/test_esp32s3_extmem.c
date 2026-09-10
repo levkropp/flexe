@@ -193,6 +193,44 @@ TEST(peripherals_compose_target_described_s3_uarts) {
     mem_destroy(mem);
 }
 
+TEST(peripherals_model_target_described_secondary_core_control) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    const uint32_t control = s3->secondary_core.base +
+                             s3->secondary_core.control_offset;
+    const uint32_t boot = s3->secondary_core.base +
+                          s3->secondary_core.boot_address_offset;
+    ASSERT_EQ(mem_read32(mem, control), 1u << 2);
+    ASSERT_EQ(mem_read32(mem, boot), 0u);
+    ASSERT_FALSE(periph_app_cpu_released(periph));
+
+    mem_write32(mem, boot, 0x403751E4u);
+    ASSERT_EQ(periph_app_cpu_boot_addr(periph), 0x403751E4u);
+    mem_write32(mem, control, (1u << 2) | (1u << 1));
+    ASSERT_FALSE(periph_app_cpu_released(periph));
+    mem_write32(mem, control, 1u << 1);
+    ASSERT_TRUE(periph_app_cpu_released(periph));
+    mem_write32(mem, control, (1u << 1) | (1u << 0));
+    ASSERT_FALSE(periph_app_cpu_released(periph));
+
+    int before = periph_unhandled_count(periph);
+    ASSERT_EQ(mem_read32(mem, s3->secondary_core.base + 8u), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), before + 1);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_esp32s3_extmem_tests(void) {
     TEST_SUITE("ESP32-S3 EXTMEM");
     RUN_TEST(esp32s3_extmem_exposes_documented_reset_state);
@@ -200,4 +238,5 @@ void run_esp32s3_extmem_tests(void) {
     RUN_TEST(esp32s3_extmem_operations_complete_and_invalidate_code);
     RUN_TEST(peripherals_compose_s3_devices_without_classic_aliases);
     RUN_TEST(peripherals_compose_target_described_s3_uarts);
+    RUN_TEST(peripherals_model_target_described_secondary_core_control);
 }
