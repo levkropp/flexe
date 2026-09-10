@@ -1086,14 +1086,33 @@ static void emit_call_cpu3(emit_t *e, void *fn, int addr_reg, int val_reg) {
  * conditional store, and going through mem_write32() also keeps the verifier's
  * write journal able to see the store, which the inline page-table path
  * cannot. */
-static uint32_t jit_s32c1i_helper(xtensa_cpu_t *cpu, uint32_t addr,
-                                  uint32_t val) {
+typedef struct {
+    uint64_t old;
+    uint64_t handoff;
+} jit_s32c1i_result_t;
+
+/* A two-word integer aggregate is returned in X0/X1 by AAPCS64 and in
+ * RAX/RDX by the SysV x86-64 ABI. Keep the handoff result out of the CPU
+ * object's hot state-to-branch dependency without making either emitter
+ * understand a C structure layout. */
+#ifdef JIT_ARCH_ARM64
+#define JIT_HELPER_RESULT1 RCX
+#else
+#define JIT_HELPER_RESULT1 RDX
+#endif
+
+static jit_s32c1i_result_t jit_s32c1i_helper(xtensa_cpu_t *cpu,
+                                              uint32_t addr,
+                                              uint32_t val) {
     uint32_t old = mem_read32(cpu->mem, addr);
+    bool handoff = false;
     if (old == cpu->scompare1)
         mem_write32(cpu->mem, addr, val);
-    else if (__builtin_expect(xtensa_s32c1i_needs_handoff(cpu, old), 0))
+    else if (__builtin_expect(xtensa_s32c1i_needs_handoff(cpu, old), 0)) {
         cpu->core_handoff = true;
-    return old;
+        handoff = true;
+    }
+    return (jit_s32c1i_result_t){ old, handoff };
 }
 
 /* RETW underflow is an architectural control-flow transition, not an
@@ -2599,6 +2618,21 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             ra_load_ar(e, ra, RBX, wb4, t);
             emit_call_cpu3(e, (void *)(uintptr_t)jit_s32c1i_helper, areg, RBX);
             ra_store_ar(e, ra, RAX, wb4, t);
+
+            /* A failed CAS against a lock owned by the other emulated core
+             * requests an immediate deterministic scheduler handoff. The
+             * interpreter observes that request after this instruction; a
+             * native chain must do the same rather than executing up to the
+             * 400-instruction chain cap while the lock owner cannot run. */
+            emit_test_reg32(e, JIT_HELPER_RESULT1, JIT_HELPER_RESULT1);
+            int no_handoff = emit_jcc_rel32(e, CC_E);
+            ra_flush(e, ra, wb4);
+            emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, next_pc);
+            emit_store32_disp_imm(e, REG_CPU,
+                                  (int32_t)CPU_OFF_PC_WRITTEN, 1);
+            emit_acc_add(e, insn_idx + 1);
+            emit_jmp_to_epilogue(e, jit);
+            emit_patch_rel32(e, no_handoff);
             return 1;
         }
         case 0xF: { /* S32RI (release = no-op, same as S32I) */

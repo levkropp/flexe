@@ -1052,8 +1052,8 @@ TEST(test_jit_contended_spinlock_returns_to_scheduler) {
     setup(&cpu);
 
     /* Four-instruction CAS retry loop, matching ESP-IDF's spinlock shape.
-     * The native self-chain may finish its bounded run, but jit_run() must
-     * return well before the caller's batch so core 1 gets a turn. */
+     * The deterministic scheduler cannot run the lock-owning core until this
+     * core returns, so native execution must yield at the failed CAS itself. */
     put_insn3(&cpu, BASE, 0x00E432u); /* S32C1I a3, a4, 0 */
     put_insn2(&cpu, BASE + 3, narrow(0xD, 15, 0, 3)); /* NOP.N */
     put_insn2(&cpu, BASE + 5, narrow(0xD, 15, 0, 3)); /* NOP.N */
@@ -1075,8 +1075,8 @@ TEST(test_jit_contended_spinlock_returns_to_scheduler) {
     cpu._pc_written = true;
     const int budget = 5000;
     int ran = jit_run(jit, &cpu, budget);
-    ASSERT_TRUE(ran > 0);
-    ASSERT_TRUE(ran < budget);
+    ASSERT_EQ(ran, 1);
+    ASSERT_EQ(cpu.pc, BASE + 3u);
     ASSERT_TRUE(cpu.core_handoff);
     ASSERT_EQ(mem_read32(cpu.mem, DATA_BASE), XTENSA_SPINLOCK_OWNER_CORE1);
     ASSERT_TRUE(jit_get_stats(jit)->insns_jitted > 0);
