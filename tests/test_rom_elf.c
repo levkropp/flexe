@@ -139,7 +139,10 @@ static const char *build_rom_test_elf(bool s3)
         .sh_addr = 0x40001000u, .sh_offset = TEXT_OFF, .sh_size = 0x20,
     };
     sh[2] = (rom_test_shdr_t){
-        .sh_name = SHN_RODATA, .sh_type = 1, .sh_flags = 0x2,
+        /* Espressif's S3 .rodata.interface has this unconventional WRITE,
+         * non-ALLOC combination despite living in the mask-ROM D-bus map. */
+        .sh_name = SHN_RODATA, .sh_type = 1,
+        .sh_flags = s3 ? 0x1 : 0x2,
         .sh_addr = rodata_addr, .sh_offset = RODATA_OFF, .sh_size = 4,
     };
     sh[3] = (rom_test_shdr_t){

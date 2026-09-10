@@ -288,9 +288,13 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
             return res;
         }
 
-        if ((sh.sh_flags & SHF_ALLOC) && !(sh.sh_flags & SHF_WRITE)) {
-            if (!rom_range_contains(mem, sh.sh_addr, sh.sh_size) ||
-                !guest_range_mapped(mem, sh.sh_addr, sh.sh_size) ||
+        /* The target map, not section flags, is authoritative for mask-ROM
+         * contents. Espressif's S3 .rodata.interface is ROM-resident
+         * PROGBITS but is marked WRITE and not ALLOC, so filtering only for
+         * conventional ELF read-only sections loses required ROM ABI data. */
+        int in_rom = rom_range_contains(mem, sh.sh_addr, sh.sh_size);
+        if (in_rom) {
+            if (!guest_range_mapped(mem, sh.sh_addr, sh.sh_size) ||
                 mem_load(mem, sh.sh_addr, buf + sh.sh_offset, sh.sh_size) != 0) {
                 rom_error(&res, "ROM section %s does not fit at 0x%08X",
                           name, sh.sh_addr);
@@ -299,6 +303,12 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
             }
             res.sections_loaded++;
             res.bytes_loaded += sh.sh_size;
+        } else if ((sh.sh_flags & SHF_ALLOC) &&
+                   !(sh.sh_flags & SHF_WRITE)) {
+            rom_error(&res, "ROM section %s does not fit at 0x%08X",
+                      name, sh.sh_addr);
+            free(buf);
+            return res;
         }
 
         /* Espressif ROM ELFs expose stable ROM/application ABI pointers as
