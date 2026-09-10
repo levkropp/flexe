@@ -1915,12 +1915,12 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 cpu->debug_break = true;
                 break;
             case 5: /* SYSCALL */
-                if (XT_PS_WOE(cpu->ps)) {
-                    /* Synthesized window spill-all.  The firmware's SYSCALL
-                     * handler uses ROTW to walk all windows and trigger
-                     * overflow exceptions.  Our emulator doesn't raise
-                     * overflows on ROTW, so intercept here and do the
-                     * spill in C. */
+                if (!cpu->real_window_vectors && XT_PS_WOE(cpu->ps)) {
+                    /* Legacy fallback for guests whose window vectors are
+                     * not available yet.  Architectural-vector mode must
+                     * deliver the syscall normally: libc uses it to enter
+                     * the guest's spill-all routine, whose ROTW/register
+                     * accesses raise the required overflow exceptions. */
                     for (unsigned w = 0; w < 16; w++) {
                         if (w != cpu->windowbase &&
                             (cpu->windowstart & (1u << w)))

@@ -4,10 +4,7 @@
 
 /* Instruction encodings */
 #define INSN_ILL        rrr(0, 0, 0, 0, 0)       /* ILL: op0=0,op1=0,op2=0,r=0,s=0,t=0 */
-#define INSN_SYSCALL    rrr(0, 0, 0, 0, 5)        /* SYSCALL: op2=0,op1=0,r=0,s=0,t=5 -> t in low nibble... */
-/* Actually: SYSCALL is RRR: op0=0, t=5, s=0, r=0, op1=0, op2=0
-   encoding: byte0 = (t<<4)|op0 = 0x50, byte1 = (r<<4)|s = 0x00, byte2 = (op2<<4)|op1 = 0x00
-   = 0x000050 */
+#define INSN_SYSCALL    rrr(0, 0, 5, 0, 0)
 
 /* Helper: build a NOP (for padding handler code) */
 /* NOP: op0=0, op1=0, op2=0, r=2, s=0, t=15 */
@@ -112,12 +109,35 @@ TEST(exc_syscall_dispatch) {
     setup_exc(&cpu);
     cpu.ps = 0;
     uint32_t fault_pc = BASE;
-    /* SYSCALL: op2=0, op1=0, r=5, s=0, t=0 */
-    put_insn3(&cpu, BASE, rrr(0, 0, 5, 0, 0));
+    put_insn3(&cpu, BASE, INSN_SYSCALL);
     xtensa_step(&cpu);
     ASSERT_EQ(cpu.pc, TEST_VECBASE + VECOFS_KERNEL_EXC);
     ASSERT_EQ(cpu.epc[0], fault_pc);
     ASSERT_EQ(cpu.exccause, EXCCAUSE_SYSCALL);
+    teardown(&cpu);
+}
+
+/* A WOE-enabled application with architectural window vectors still takes a
+ * normal syscall exception. Newlib setjmp relies on the guest handler to
+ * spill windows through the architectural overflow vectors; clearing live
+ * windows in the emulator before dispatch corrupts unrelated stack/heap data. */
+TEST(exc_syscall_woe_preserves_windows) {
+    xtensa_cpu_t cpu;
+    setup_exc(&cpu);
+    cpu.real_window_vectors = true;
+    cpu.ps = 1u << 18; /* WOE=1, EXCM=0 */
+    cpu.windowbase = 2u;
+    cpu.windowstart = (1u << 0) | (1u << 2);
+    uint32_t fault_pc = BASE;
+    put_insn3(&cpu, BASE, INSN_SYSCALL);
+
+    xtensa_step(&cpu);
+
+    ASSERT_EQ(cpu.pc, TEST_VECBASE + VECOFS_KERNEL_EXC);
+    ASSERT_EQ(cpu.epc[0], fault_pc);
+    ASSERT_EQ(cpu.exccause, EXCCAUSE_SYSCALL);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.windowstart, (1u << 0) | (1u << 2));
     teardown(&cpu);
 }
 
@@ -205,7 +225,7 @@ TEST(exc_syscall_rfe_roundtrip) {
     cpu.ps = 0;
     uint32_t fault_pc = BASE;
     /* SYSCALL at BASE */
-    put_insn3(&cpu, BASE, rrr(0, 0, 5, 0, 0));
+    put_insn3(&cpu, BASE, INSN_SYSCALL);
     /* RFE at kernel vector */
     place_rfe_handler(&cpu, TEST_VECBASE + VECOFS_KERNEL_EXC);
     /* NOP at BASE+3 */
@@ -673,6 +693,7 @@ void run_exception_tests(void) {
     RUN_TEST(exc_ill_kernel);
     RUN_TEST(exc_ill_user);
     RUN_TEST(exc_syscall_dispatch);
+    RUN_TEST(exc_syscall_woe_preserves_windows);
     RUN_TEST(exc_div_zero_dispatch);
     RUN_TEST(exc_double);
     RUN_TEST(exc_no_vector_halts);
