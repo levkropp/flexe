@@ -14,7 +14,15 @@
 
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 5u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 6u
+
+/* Device-model capabilities are architectural properties of a target, not
+ * guesses derived from a firmware image. Keep each bit tied to a reusable IP
+ * model so machine construction remains data-driven as the family grows. */
+typedef enum {
+    FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS = 1ull << 0,
+    FLEXE_TARGET_CAP_ESP32S3_EXTMEM             = 1ull << 1,
+} flexe_target_capability_t;
 
 typedef enum {
     FLEXE_TARGET_AUTO = 0,
@@ -81,6 +89,7 @@ typedef struct {
     flexe_xtensa_generation_t   core_generation;
     uint8_t                     core_count;
     flexe_target_support_t      support_level;
+    uint64_t                    capabilities;
 
     /* Xtensa core identity and reset state from the official core config. */
     uint32_t                    reset_vector;
@@ -107,6 +116,12 @@ typedef struct {
     uint32_t                    default_app_offset;
     uint32_t                    partition_table_offset;
     flexe_flash_mmu_desc_t      flash_mmu;
+
+    /* Optional cache/external-memory control register block. Its register
+     * semantics are selected by a capability above; addresses stay in the
+     * target descriptor rather than leaking into generic machine setup. */
+    uint32_t                    cache_control_base;
+    uint32_t                    cache_control_size;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

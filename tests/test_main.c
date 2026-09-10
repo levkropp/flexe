@@ -9,6 +9,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_loadstore.c"
 #include "test_memory.c"
 #include "test_flash_mmu.c"
+#include "test_esp32s3_extmem.c"
 #include "test_firmware_scan.c"
 #include "test_loader.c"
 #include "test_target.c"
@@ -52,6 +53,7 @@ int main(void) {
     run_loadstore_tests();
     run_memory_tests();
     run_flash_mmu_tests();
+    run_esp32s3_extmem_tests();
     run_firmware_scan_tests();
     run_loader_tests();
     run_target_tests();

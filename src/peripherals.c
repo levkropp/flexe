@@ -1,4 +1,6 @@
 #include "peripherals.h"
+#include "esp32s3_extmem.h"
+#include "flash_mmu.h"
 #include "spi_display.h"
 #include "sandbox_events.h"
 #include "xtensa.h"
@@ -1807,6 +1809,13 @@ struct esp32_periph {
     /* Set when firmware writes a software-reset bit to RTC_CNTL_OPTIONS0. */
     bool reset_requested;
     xtensa_mem_t *mem;
+    const flexe_target_desc_t *target;
+
+    /* Target-specific external-memory devices. Classic ESP32 retains the
+     * mature DPORT cache/MMU model below; shared-MMU targets compose these
+     * independent devices instead of inheriting classic register aliases. */
+    flexe_flash_mmu_t *shared_flash_mmu;
+    flexe_esp32s3_extmem_t *s3_extmem;
 
     /* Three independent ESP32 UART controllers. */
     uart_state_t uart[UART_COUNT];
@@ -13497,10 +13506,37 @@ static void default_write(void *ctx, uint32_t addr, uint32_t val) {
 /* ---- Public API ---- */
 
 esp32_periph_t *periph_create(xtensa_mem_t *mem) {
+    const flexe_target_desc_t *target = mem_target(mem);
+    if (!mem || !target) return NULL;
     esp32_periph_t *p = calloc(1, sizeof(esp32_periph_t));
     if (!p) return NULL;
     p->mem = mem;
+    p->target = target;
     p->app_cpu_in_reset = true;
+
+    /* First install an explicit catch-all for this target's native MMIO
+     * aperture. Individual device models replace only the pages they own. */
+    for (uint32_t i = 0; i < mem->mmio_page_count; i++)
+        mem_register_mmio(mem, (int)i, default_read, default_write, p);
+
+    if (!(target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)) {
+        if (target->flash_mmu.shared_instruction_data)
+            p->shared_flash_mmu = flexe_flash_mmu_create(mem);
+        if (target->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM) {
+            p->s3_extmem = flexe_esp32s3_extmem_create(mem);
+            flexe_esp32s3_extmem_application_handoff(p->s3_extmem);
+        }
+        if ((target->flash_mmu.shared_instruction_data &&
+             !p->shared_flash_mmu) ||
+            ((target->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM) &&
+             !p->s3_extmem)) {
+            periph_destroy(p);
+            return NULL;
+        }
+        return p;
+    }
+
     p->dport_wifi_clk_en = 0xFFFCE030u;
     /* Flexe loads an application image directly, after the second-stage
      * bootloader would have selected the SDK's default 160 MHz PLL clock.
@@ -13594,10 +13630,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     /* Bootloader-style initial flash MMU contents (app at flash 0x10000) */
     flash_mmu_init_bootloader(p);
-
-    /* Register default handler on all 128 peripheral pages */
-    for (int i = 0; i < 128; i++)
-        mem_register_mmio(mem, i, default_read, default_write, p);
 
     /* Override specific peripherals */
     /* DPORT control registers occupy page 0. Pages 1/2/3 are the independent
@@ -13778,6 +13810,8 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    flexe_esp32s3_extmem_destroy(p->s3_extmem);
+    flexe_flash_mmu_destroy(p->shared_flash_mmu);
     periph_disable_spi_display(p);
     for (int port = 0; port < I2C_PORT_COUNT; port++)
         free(p->i2c[port].pending_write);
@@ -14181,6 +14215,11 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     if (!p) return;
     p->cpu[0] = cpu0;
     p->cpu[1] = cpu1;
+    flexe_flash_mmu_attach_cpus(p->shared_flash_mmu, cpu0, cpu1);
+    flexe_esp32s3_extmem_attach_cpus(p->s3_extmem, cpu0, cpu1);
+    if (!(p->target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
+        return;
     p->event_source_candidates[0] = PERIPH_EVENT_ALL_MASK;
     p->event_source_candidates[1] = PERIPH_EVENT_ALL_MASK;
     /* Re-anchor every shared clock against the newly attached cores. Listing

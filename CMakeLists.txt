@@ -69,6 +69,7 @@ set(LIB_SOURCES
     src/xtensa_disasm.c
     src/memory.c
     src/flash_mmu.c
+    src/esp32s3_extmem.c
     src/firmware_scan.c
     src/loader.c
     src/rom_elf.c

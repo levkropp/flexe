@@ -259,9 +259,12 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(esp32->descriptor_version, FLEXE_TARGET_DESCRIPTOR_VERSION);
     ASSERT_EQ(esp32->core_generation, FLEXE_XTENSA_LX6);
     ASSERT_EQ(esp32->support_level, FLEXE_TARGET_STABLE);
+    ASSERT_TRUE(esp32->capabilities &
+                FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS);
     ASSERT_EQ(s3->image_chip_id, 9u);
     ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
     ASSERT_EQ(s3->support_level, FLEXE_TARGET_UNAVAILABLE);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM);
     ASSERT_EQ(s3->reset_vector, 0x40000400u);
     ASSERT_EQ(s3->vecbase_reset, 0x40000000u);
     ASSERT_EQ(s3->configid0, 0xC2F0FFFEu);
@@ -270,6 +273,8 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->flash_mmu.entry_count, 512u);
     ASSERT_EQ(s3->flash_mmu.table_base[0], 0x600C5000u);
     ASSERT_TRUE(s3->flash_mmu.shared_instruction_data);
+    ASSERT_EQ(s3->cache_control_base, 0x600C4000u);
+    ASSERT_EQ(s3->cache_control_size, 0x1000u);
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x40370000u));
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x42000000u));
     ASSERT_TRUE(flexe_target_pc_is_executable(s3, 0x600FE000u));
