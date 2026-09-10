@@ -4541,6 +4541,19 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     if (!s) return NULL;
     s->cpu = cpu;
     s->cpu_freq_mhz = 160;
+
+    /* This module describes the classic ESP32 ROM ABI and its compatibility
+     * services. Newer family members reuse portions of the 0x40000000 address
+     * space for different ROM routines, so installing the classic address
+     * table on them silently replaces unrelated target code. Keep a valid,
+     * empty statistics object for common session plumbing, but leave the CPU
+     * entirely unhooked until that target has its own ROM service provider.
+     * An official ROM ELF can then execute without accidental LX6 aliases. */
+    if (!cpu || !cpu->target ||
+        !(cpu->target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
+        return s;
+
     s->heap = (stub_heap_region_t){
         .base = HEAP_BASE,
         .end = HEAP_END,

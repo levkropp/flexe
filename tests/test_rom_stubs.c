@@ -91,6 +91,29 @@ TEST(test_loaded_rom_executes_unregistered_entry) {
     teardown(&cpu);
 }
 
+TEST(test_classic_rom_abi_is_not_installed_on_s3) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    xtensa_cpu_t cpu;
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+
+    xtensa_cpu_reset_for_target(&cpu, s3);
+    cpu.mem = mem;
+    uint64_t unmapped = mem_unmapped_count(mem);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    ASSERT_TRUE(rom != NULL);
+    ASSERT_EQ(rom_stubs_stub_count(rom), 0);
+    ASSERT_TRUE(cpu.pc_hook == NULL);
+    ASSERT_TRUE(cpu.pc_hook_bitmap == NULL);
+    ASSERT_EQ(mem_unmapped_count(mem), unmapped);
+
+    rom_stubs_destroy(rom);
+    mem_destroy(mem);
+}
+
 /* ===== Test: rom_stub_dispatch ===== */
 
 static int dispatch_called;
@@ -1932,6 +1955,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_pc_hook_fires);
     RUN_TEST(test_pc_hook_skips_non_match);
     RUN_TEST(test_loaded_rom_executes_unregistered_entry);
+    RUN_TEST(test_classic_rom_abi_is_not_installed_on_s3);
     RUN_TEST(test_rom_stub_dispatch);
     RUN_TEST(test_rom_conditional_stub);
     RUN_TEST(test_rom_conditional_fallback_preserves_existing_hook);

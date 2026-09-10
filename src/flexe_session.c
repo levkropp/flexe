@@ -117,6 +117,22 @@ session_resolve_target(const flexe_session_config_t *cfg)
     if (target->support_level == FLEXE_TARGET_EXPERIMENTAL)
         fprintf(stderr, "flexe: warning: %s support is experimental\n",
                 target->display_name);
+    if (!(target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) &&
+        !cfg->native_freertos) {
+        fprintf(stderr,
+                "flexe: experimental %s execution currently requires "
+                "native FreeRTOS mode (-N)\n",
+                target->display_name);
+        return NULL;
+    }
+    if (target->id == FLEXE_TARGET_ESP32S3 &&
+        (!cfg->rom_elf_path || !*cfg->rom_elf_path)) {
+        fprintf(stderr,
+                "flexe: experimental ESP32-S3 execution requires a matching "
+                "official ROM ELF (-R or FLEXE_ROM_ELF)\n");
+        return NULL;
+    }
     return target;
 }
 
@@ -163,6 +179,9 @@ static int session_build(flexe_session_t *s)
         return -1;
     }
     const flexe_target_desc_t *target = s->target;
+    const bool classic_compat =
+        (target->capabilities &
+         FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     fprintf(stderr, "Loaded %s image %s: %d segments, entry=0x%08X\n",
             target ? target->display_name : "unknown", cfg->bin_path,
             res.segment_count, res.entry_point);
@@ -190,31 +209,40 @@ static int session_build(flexe_session_t *s)
     rom_stubs_set_periph(s->rom, s->periph);
     rom_stubs_set_real_rom(s->rom,
                            cfg->rom_elf_path && *cfg->rom_elf_path);
-    rom_stubs_hook_firmware_addrs(s->rom, res.entry_point);
-    if (s->syms)
-        rom_stubs_hook_symbols(s->rom, s->syms);
 
-    /* FreeRTOS stubs — skip in native mode (firmware runs its own FreeRTOS) */
-    if (!cfg->native_freertos) {
-        s->frt = freertos_stubs_create(&s->cpu[0]);
-        if (s->frt && s->syms)
-            freertos_stubs_hook_symbols(s->frt, s->syms);
+    /* The compatibility providers below implement the classic ESP32 ABI and
+     * several classic peripheral shortcuts. A different target may export
+     * identical symbol names at unrelated addresses, so composing them based
+     * on an ELF alone corrupts otherwise valid guest execution. Target
+     * capabilities, rather than firmware identity, own this boundary. */
+    if (classic_compat) {
+        rom_stubs_hook_firmware_addrs(s->rom, res.entry_point);
+        if (s->syms)
+            rom_stubs_hook_symbols(s->rom, s->syms);
+
+        /* FreeRTOS stubs — skip in native mode (firmware runs its own FreeRTOS) */
+        if (!cfg->native_freertos) {
+            s->frt = freertos_stubs_create(&s->cpu[0]);
+            if (s->frt && s->syms)
+                freertos_stubs_hook_symbols(s->frt, s->syms);
+        }
     }
 
     /* esp_timer stubs */
-    s->etimer = esp_timer_stubs_create(&s->cpu[0]);
+    s->etimer = classic_compat ? esp_timer_stubs_create(&s->cpu[0]) : NULL;
     if (s->etimer) {
         if (cfg->native_freertos)
             esp_timer_stubs_set_virtual_time(s->etimer, 1);
         if (s->frt)
-            esp_timer_stubs_set_sleep_fn(s->etimer, session_sleep_us, s->frt);
+            esp_timer_stubs_set_sleep_fn(s->etimer, session_sleep_us,
+                                         s->frt);
         if (s->syms)
             esp_timer_stubs_hook_symbols(s->etimer, s->syms);
         esp_timer_stubs_hook_firmware(s->etimer);
     }
 
     /* Display stubs */
-    s->dstubs = display_stubs_create(&s->cpu[0]);
+    s->dstubs = classic_compat ? display_stubs_create(&s->cpu[0]) : NULL;
     if (s->dstubs) {
         if (cfg->framebuf)
             display_stubs_set_framebuf(s->dstubs, cfg->framebuf,
@@ -230,16 +258,18 @@ static int session_build(flexe_session_t *s)
     }
 
     /* Touch stubs */
-    s->tstubs = touch_stubs_create(&s->cpu[0]);
+    s->tstubs = classic_compat ? touch_stubs_create(&s->cpu[0]) : NULL;
     if (s->tstubs) {
-        if (cfg->touch_fn)            touch_stubs_set_state_fn(s->tstubs, cfg->touch_fn, cfg->touch_ctx);
+        if (cfg->touch_fn)
+            touch_stubs_set_state_fn(s->tstubs, cfg->touch_fn,
+                                     cfg->touch_ctx);
         if (s->syms)
             touch_stubs_hook_symbols(s->tstubs, s->syms);
     }
 
     /* Raw SPI display/touch capture (SPI2/SPI3 sniffing for symbol-less
      * firmware). Pins default to CYD 2432S028R; -1 disables. */
-    {
+    if (classic_compat) {
         bool openhasp_lanbon = rom_stubs_firmware_profile(s->rom) ==
                 ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8;
         spi_display_config_t scfg = {
@@ -285,7 +315,7 @@ static int session_build(flexe_session_t *s)
     }
 
     /* SD card stubs */
-    s->sstubs = sdcard_stubs_create(&s->cpu[0]);
+    s->sstubs = classic_compat ? sdcard_stubs_create(&s->cpu[0]) : NULL;
     if (s->sstubs) {
         if (cfg->sdcard_path)
             sdcard_stubs_set_image(s->sstubs, cfg->sdcard_path);
@@ -298,7 +328,7 @@ static int session_build(flexe_session_t *s)
     }
 
     /* SHA hardware accelerator stubs */
-    s->shstubs = sha_stubs_create(&s->cpu[0]);
+    s->shstubs = classic_compat ? sha_stubs_create(&s->cpu[0]) : NULL;
     if (s->shstubs) {
         sha_stubs_hook_firmware(s->shstubs);
         if (s->syms)
@@ -306,12 +336,12 @@ static int session_build(flexe_session_t *s)
     }
 
     /* AES hardware accelerator stubs */
-    s->astubs = aes_stubs_create(&s->cpu[0]);
+    s->astubs = classic_compat ? aes_stubs_create(&s->cpu[0]) : NULL;
     if (s->astubs && s->syms)
         aes_stubs_hook_symbols(s->astubs, s->syms);
 
     /* MPI (RSA) hardware accelerator stubs */
-    s->mstubs = mpi_stubs_create(&s->cpu[0]);
+    s->mstubs = classic_compat ? mpi_stubs_create(&s->cpu[0]) : NULL;
     if (s->mstubs) {
         mpi_stubs_set_peripheral(s->mstubs, s->periph);
         if (s->syms)
@@ -319,7 +349,7 @@ static int session_build(flexe_session_t *s)
     }
 
     /* WiFi / lwip socket bridge */
-    s->wstubs = wifi_stubs_create(&s->cpu[0]);
+    s->wstubs = classic_compat ? wifi_stubs_create(&s->cpu[0]) : NULL;
     if (s->wstubs) {
         wifi_stubs_hook_firmware(s->wstubs, res.entry_point);
         if (s->syms)
@@ -328,12 +358,12 @@ static int session_build(flexe_session_t *s)
 
     /* VFS / SPIFFS / FATFS stubs (host-backed file I/O).
      * Hook AFTER rom_stubs so we override the rom_stubs ESP_FAIL stubs. */
-    s->vstubs = vfs_stubs_create(&s->cpu[0]);
+    s->vstubs = classic_compat ? vfs_stubs_create(&s->cpu[0]) : NULL;
     if (s->vstubs && s->syms)
         vfs_stubs_hook_symbols(s->vstubs, s->syms);
 
     /* Bluetooth / NimBLE stubs */
-    s->bstubs = bt_stubs_create(&s->cpu[0]);
+    s->bstubs = classic_compat ? bt_stubs_create(&s->cpu[0]) : NULL;
     if (s->bstubs) {
         bt_stubs_hook_firmware_addrs(s->bstubs, res.entry_point);
         if (s->syms)
@@ -440,13 +470,19 @@ static int session_build(flexe_session_t *s)
      * backend exists; jit_init() returns NULL on unsupported hosts. */
     /* FLEXE_DISABLE_JIT is an operational escape hatch for embedded
      * frontends that do not expose the config flag on their own CLI. */
-    if (!cfg->disable_jit && getenv("FLEXE_DISABLE_JIT") == NULL) {
+    if (classic_compat && !cfg->disable_jit &&
+        getenv("FLEXE_DISABLE_JIT") == NULL) {
         s->jit = jit_init();
         if (s->jit) {
             jit_install_hook(s->jit, &s->cpu[0]);
             if (!cfg->single_core)
                 jit_install_hook(s->jit, &s->cpu[1]);
         }
+    } else if (!classic_compat && !cfg->disable_jit &&
+               getenv("FLEXE_DISABLE_JIT") == NULL) {
+        fprintf(stderr,
+                "flexe: %s JIT is not enabled yet; using the interpreter\n",
+                target->display_name);
     }
 
     return 0;

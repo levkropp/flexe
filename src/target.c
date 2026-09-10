@@ -127,7 +127,7 @@ static const flexe_target_desc_t TARGETS[] = {
         .image_chip_id = 0x0009,
         .core_generation = FLEXE_XTENSA_LX7,
         .core_count = 2,
-        .support_level = FLEXE_TARGET_UNAVAILABLE,
+        .support_level = FLEXE_TARGET_EXPERIMENTAL,
         .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM |
                         FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT |
                         FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL |

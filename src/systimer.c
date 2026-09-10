@@ -49,8 +49,10 @@ typedef struct {
     uint64_t staged_target;
     uint64_t real_target;
     uint32_t config;
+    uint32_t period;
     bool loaded;
     bool irq_level;
+    bool target_dirty;
 } systimer_alarm_t;
 
 typedef struct {
@@ -184,7 +186,7 @@ static void systimer_evaluate_alarms(flexe_systimer_t *systimer)
 
         systimer->int_raw |= 1u << index;
         if (alarm->config & SYSTIMER_TARGET_PERIOD_MODE) {
-            uint64_t period = alarm->config & SYSTIMER_TARGET_PERIOD_MASK;
+            uint64_t period = alarm->period;
             if (period == 0u) {
                 systimer->config &= ~SYSTIMER_ALARM_ENABLE(index);
                 continue;
@@ -383,6 +385,7 @@ static void systimer_write(void *ctx, uint32_t addr, uint32_t value)
                       ((uint64_t)(value & SYSTIMER_HIGH_MASK) << 32);
         else
             *target = (*target & (UINT64_C(0xFFFFF) << 32)) | value;
+        systimer->alarm[index].target_dirty = true;
         goto changed;
     }
     if (off >= SYSTIMER_TARGET_CONF_OFF &&
@@ -403,9 +406,17 @@ static void systimer_write(void *ctx, uint32_t addr, uint32_t value)
             systimer_alarm_t *alarm = &systimer->alarm[alarm_index];
             unsigned unit =
                 (alarm->config & SYSTIMER_TARGET_UNIT_SELECT) ? 1u : 0u;
-            if (alarm->config & SYSTIMER_TARGET_PERIOD_MODE) {
-                uint64_t period = alarm->config &
-                                  SYSTIMER_TARGET_PERIOD_MASK;
+            alarm->period = alarm->config & SYSTIMER_TARGET_PERIOD_MASK;
+            /* COMPn_LOAD synchronizes both target and period shadows. The
+             * ESP-IDF HAL deliberately writes a period and pulses LOAD while
+             * PERIOD_MODE is still clear, then enables the comparator before
+             * selecting periodic mode. When no one-shot target was staged,
+             * the loaded comparator must therefore point one period into the
+             * future; treating its untouched target shadow as zero raises an
+             * immediate one-shot and clears WORK_EN during scheduler setup. */
+            if ((alarm->config & SYSTIMER_TARGET_PERIOD_MODE) ||
+                !alarm->target_dirty) {
+                uint64_t period = alarm->period;
                 alarm->real_target =
                     (systimer->counter[unit].value + period) &
                     systimer_mask(systimer);
@@ -413,6 +424,7 @@ static void systimer_write(void *ctx, uint32_t addr, uint32_t value)
                 alarm->real_target = alarm->staged_target &
                                      systimer_mask(systimer);
             }
+            alarm->target_dirty = false;
             alarm->loaded = true;
             systimer_evaluate_alarms(systimer);
         }

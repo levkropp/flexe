@@ -158,11 +158,20 @@ TEST(systimer_oneshot_periodic_alarms_and_interrupt_status) {
     st_write(mem, ST_UNIT1_LOAD_HI, 0u);
     st_write(mem, ST_UNIT1_LOAD_LO, 0u);
     st_write(mem, ST_UNIT1_LOAD, 1u);
-    st_write(mem, ST_TARGET1_CONF, ST_UNIT1_SELECT | ST_PERIOD_MODE | 8u);
+    /* Match ESP-IDF's HAL ordering: it synchronizes the period while the
+     * comparator is still in one-shot mode, enables WORK_EN, and selects
+     * periodic mode afterward. The untouched one-shot target must not cause
+     * an immediate interrupt that disables the alarm. */
+    st_write(mem, ST_TARGET1_CONF, ST_UNIT1_SELECT | 8u);
     st_write(mem, ST_COMP1_LOAD, 1u);
     st_write(mem, ST_INT_ENA, 1u << 1);
     st_write(mem, ST_CONF, st_read(mem, ST_CONF) |
              ST_COUNTER1_ENABLE | ST_TARGET1_ENABLE);
+    ASSERT_EQ(st_read(mem, ST_INT_RAW), 0u);
+    ASSERT_TRUE(st_read(mem, ST_CONF) & ST_TARGET1_ENABLE);
+    ASSERT_EQ(st_read(mem, ST_REAL_TARGET1_LO), 8u);
+    st_write(mem, ST_TARGET1_CONF,
+             ST_UNIT1_SELECT | ST_PERIOD_MODE | 8u);
     ASSERT_EQ(cpu.next_timer_event, 240u);
 
     cpu.ccount = 240u;
