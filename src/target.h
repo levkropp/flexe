@@ -20,7 +20,9 @@
 #define FLEXE_TARGET_REGI2C_HOST_MAX 2u
 #define FLEXE_TARGET_SYSTIMER_COUNTER_MAX 2u
 #define FLEXE_TARGET_SYSTIMER_ALARM_MAX 3u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 12u
+#define FLEXE_TARGET_SPI_MEM_HOST_MAX 2u
+#define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 13u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -34,6 +36,7 @@ typedef enum {
     FLEXE_TARGET_CAP_REGI2C                     = 1ull << 5,
     FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1       = 1ull << 6,
     FLEXE_TARGET_CAP_SYSTIMER_V1                = 1ull << 7,
+    FLEXE_TARGET_CAP_SPI_MEM                    = 1ull << 8,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -217,6 +220,29 @@ typedef struct {
     uint8_t  interrupt_source[FLEXE_TARGET_SYSTIMER_ALARM_MAX];
 } flexe_systimer_desc_t;
 
+/* SPI0/SPI1 memory-controller generations share command semantics but move
+ * the transaction and data-buffer registers. The selected architectural
+ * layout supplies those register definitions; target data identifies the
+ * instantiated hosts and devices attached to their hardware chip selects,
+ * keeping board defaults out of the controller implementation. */
+typedef enum {
+    FLEXE_SPI_MEM_LAYOUT_NONE = 0,
+    FLEXE_SPI_MEM_LAYOUT_ESP32,
+    FLEXE_SPI_MEM_LAYOUT_S2_S3,
+} flexe_spi_mem_layout_t;
+
+typedef struct {
+    uint32_t                base[FLEXE_TARGET_SPI_MEM_HOST_MAX];
+    uint32_t                register_size;
+    uint32_t                default_jedec_id;
+    uint32_t                date_reset;
+    uint64_t                default_psram_id;
+    uint8_t                 host_count;
+    uint8_t                 flash_chip_select;
+    uint8_t                 psram_chip_select;
+    flexe_spi_mem_layout_t  layout;
+} flexe_spi_mem_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -287,6 +313,9 @@ typedef struct {
 
     /* Optional V1 system-timer register block. */
     flexe_systimer_desc_t         systimer;
+
+    /* Optional SPI memory controllers and their default attached devices. */
+    flexe_spi_mem_desc_t          spi_mem;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

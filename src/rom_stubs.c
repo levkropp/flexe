@@ -6143,8 +6143,8 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
      * flash INIT path (esp_flash_init_main, esp_flash_init_default_chip,
      * spi_flash_init_chip_state, esp_flash_read_chip_id) is deliberately NOT
      * stubbed: the emulated SPI flash controller answers RDID with a valid
-     * JEDEC ID (EMU_FLASH_JEDEC_ID, GD25Q32/4MB), and the guest's spi_flash
-     * size probe needs the real init + RDID to detect the flash size.
+     * descriptor-provided JEDEC ID (GD25Q32/4MB by default), and the guest's
+     * spi_flash size probe needs the real init + RDID to detect the flash size.
      * Stubbing the init path made the probe report "Detected size(0k)" and
      * abort the boot. */
     /* Also no-op the cross-core cache-disable handshake

@@ -20,4 +20,9 @@ void flexe_flash_mmu_attach_cpus(flexe_flash_mmu_t *mmu,
                                  xtensa_cpu_t *cpu0,
                                  xtensa_cpu_t *cpu1);
 
+/* Invalidate translated instruction mappings which alias a physical flash
+ * range changed by a program or erase transaction. */
+void flexe_flash_mmu_flash_changed(flexe_flash_mmu_t *mmu,
+                                   uint32_t offset, uint32_t size);
+
 #endif /* FLEXE_FLASH_MMU_H */

@@ -3,11 +3,11 @@
 #include "flash_mmu.h"
 #include "regi2c.h"
 #include "sensitive_memprot.h"
+#include "spi_mem.h"
 #include "systimer.h"
 #include "spi_display.h"
 #include "sandbox_events.h"
 #include "xtensa.h"
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -35,8 +35,6 @@ static inline int gpio_dbg(void) {
 #define HINF_BASE       0x3FF4B000u
 #define SLCHOST_BASE    0x3FF55000u
 #define SLC_BASE        0x3FF58000u
-#define SPI1_BASE       0x3FF42000u
-#define SPI0_BASE       0x3FF43000u
 #define I2C0_BASE       0x3FF53000u
 #define I2C1_BASE       0x3FF67000u
 #define SDMMC_BASE      0x3FF68000u
@@ -1341,21 +1339,6 @@ typedef struct {
     periph_clock_t clock;
 } sigmadelta_state_t;
 
-/* SPI0 (cache flash controller) / SPI1 (memspi host) state.
- * Enough of the register file is modelled for ESP-IDF's esp_flash probe
- * (memspi_host_driver.c) plus NVS/SPIFFS read/write/erase traffic. */
-typedef struct {
-    uint32_t addr;       /* SPI_ADDR_REG */
-    uint32_t user;       /* SPI_USER_REG */
-    uint32_t user1;      /* SPI_USER1_REG (addr/dummy bit lengths) */
-    uint32_t user2;      /* SPI_USER2_REG (command value/bitlen) */
-    uint32_t mosi_dlen;  /* SPI_MOSI_DLEN_REG */
-    uint32_t miso_dlen;  /* SPI_MISO_DLEN_REG */
-    uint32_t rd_status;  /* SPI_RD_STATUS_REG (ROM-style RDSR result) */
-    uint32_t w[16];      /* SPI_W0..W15 data buffer */
-    uint8_t  sr[3];      /* emulated flash status registers SR1/SR2/SR3 */
-} spi_state_t;
-
 /* RTC calibration state machine per timer group */
 typedef struct {
     int      cal_started;    /* write to RTCCALICFG detected */
@@ -1833,6 +1816,7 @@ struct esp32_periph {
     flexe_regi2c_t *regi2c;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_systimer_t *systimer;
+    flexe_spi_mem_t *spi_mem;
 
     /* Three independent ESP32 UART controllers. */
     uart_state_t uart[UART_COUNT];
@@ -1968,9 +1952,6 @@ struct esp32_periph {
     uint32_t rtc_reset_cause;
     bool     sleep_requested;
     bool     sleep_deep;
-
-    /* SPI flash controllers: [0] = SPI0 (cache), [1] = SPI1 (memspi) */
-    spi_state_t spi[2];
 
     /* Radio/PHY register state used by the closed-source WiFi/BT HAL. */
     radio_state_t radio;
@@ -2423,6 +2404,19 @@ static void flash_mmu_invalidate_physical(esp32_periph_t *p, uint32_t offset,
                          (entry - 64u) * FLASH_MMU_PAGE_SIZE;
         flash_mmu_invalidate_code(p, vbase, FLASH_MMU_PAGE_SIZE);
     }
+}
+
+/* NOR mutations originate in the target-described SPI-memory device. Route
+ * translated-code invalidation through the MMU implementation belonging to
+ * this target rather than teaching the flash controller either address map. */
+static void periph_flash_changed(void *ctx, uint32_t offset, uint32_t len) {
+    esp32_periph_t *p = ctx;
+    if (!p || len == 0u) return;
+    if (p->target->capabilities &
+        FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)
+        flash_mmu_invalidate_physical(p, offset, len);
+    else
+        flexe_flash_mmu_flash_changed(p->shared_flash_mmu, offset, len);
 }
 
 static uint32_t dport_read(void *ctx, uint32_t addr) {
@@ -4828,342 +4822,6 @@ static void timg_write(void *ctx, uint32_t addr, uint32_t val) {
     case 0x0F8: state->date = val & 0x0FFFFFFFu; break;
     case 0x0FC: state->regclk = val & (1u << 31); break;
     default: break;
-    }
-}
-
-/* ---- SPI0/SPI1 (flash controllers) ---- */
-
-#define SPI_CMD_REG      0x00
-#define SPI_ADDR_REG     0x04
-#define SPI_STATUS_REG   0x10   /* SPI_RD_STATUS_REG */
-#define SPI_USER_REG     0x1C
-#define SPI_USER1_REG    0x20
-#define SPI_USER2_REG    0x24
-#define SPI_MOSI_DLEN_REG 0x28
-#define SPI_MISO_DLEN_REG 0x2C
-#define SPI_W0_REG       0x80
-
-/* SPI_CMD_REG bits */
-#define SPI_CMD_USR        (1u << 18)
-#define SPI_CMD_FLASH_CE   (1u << 22)
-#define SPI_CMD_FLASH_BE   (1u << 23)
-#define SPI_CMD_FLASH_SE   (1u << 24)
-#define SPI_CMD_FLASH_PP   (1u << 25)
-#define SPI_CMD_FLASH_WRSR (1u << 26)
-#define SPI_CMD_FLASH_RDSR (1u << 27)
-#define SPI_CMD_FLASH_RDID (1u << 28)
-#define SPI_CMD_FLASH_WRDI (1u << 29)
-#define SPI_CMD_FLASH_WREN (1u << 30)
-#define SPI_CMD_FLASH_READ (1u << 31)
-
-/* SPI_USER_REG bits */
-#define SPI_USER_USR_MOSI  (1u << 27)
-#define SPI_USER_USR_MISO  (1u << 28)
-#define SPI_USER_USR_ADDR  (1u << 30)
-
-/* Status-register bits managed by the flash itself.  In particular, ESP-IDF
- * verifies every WREN/WRDI by reading SR1.WEL back before it attempts a
- * program or erase.  Treating those commands as no-ops makes the generic
- * flash driver return ESP_ERR_NOT_FOUND even though the chip was detected. */
-#define FLASH_SR_WIP       (1u << 0)
-#define FLASH_SR_WEL       (1u << 1)
-
-/* JEDEC ID of a GigaDevice GD25Q32 (4 MB) — matches ESP-IDF's GD chip
- * table (mfg 0xC8, type 0x40, capacity 0x16). First byte on the wire is
- * the manufacturer ID, so it sits in the low byte of W0. */
-#define EMU_FLASH_JEDEC_ID 0x001640C8u
-
-/* FLEXE_SPIDBG is deliberately range-filtered: filesystem probes can issue
- * thousands of reads, so an unconditional transaction dump is rarely useful.
- * Accepted values are "all", a single offset, or START-END (base 0).  The
- * historical bare setting keeps tracing the boot/partition area below 128 KB.
- */
-/* Resolved once. getenv() is a linear scan of environ, and this is asked on
- * every flash read, program, erase and SPI command -- 3.7% of host CPU on a
- * Marauder run, for a variable that is almost never set. Same fix and same
- * reason as the display path's spi_dbg_* flags.
- *
- * Unlike the GPIO case this was not measurable on these ROMs; it is the same
- * known-costly pattern on a path flash-heavy firmware would make hot. */
-enum { SPI_DBG_OFF, SPI_DBG_BOOT, SPI_DBG_ALL, SPI_DBG_RANGE };
-static int           spi_dbg_mode = -1;
-static unsigned long spi_dbg_first, spi_dbg_last;
-
-static void spi_debug_resolve(void) {
-    const char *spec = getenv("FLEXE_SPIDBG");
-    if (!spec)                    { spi_dbg_mode = SPI_DBG_OFF;  return; }
-    if (*spec == '\0')            { spi_dbg_mode = SPI_DBG_BOOT; return; }
-    if (strcmp(spec, "all") == 0) { spi_dbg_mode = SPI_DBG_ALL;  return; }
-
-    spi_dbg_mode = SPI_DBG_BOOT;   /* every parse failure falls back to this */
-    errno = 0;
-    char *end = NULL;
-    unsigned long first = strtoul(spec, &end, 0);
-    if (errno || end == spec) return;
-    unsigned long last = first;
-    if (*end == '-') {
-        const char *tail = end + 1;
-        errno = 0;
-        last = strtoul(tail, &end, 0);
-        if (errno || end == tail) return;
-    }
-    if (*end != '\0') return;
-    spi_dbg_first = first;
-    spi_dbg_last  = last;
-    spi_dbg_mode  = SPI_DBG_RANGE;
-}
-
-static bool spi_debug_offset(uint32_t off) {
-    if (__builtin_expect(spi_dbg_mode < 0, 0)) spi_debug_resolve();
-    switch (spi_dbg_mode) {
-    case SPI_DBG_OFF:   return false;
-    case SPI_DBG_ALL:   return true;
-    case SPI_DBG_RANGE: return (unsigned long)off >= spi_dbg_first &&
-                               (unsigned long)off <= spi_dbg_last;
-    default:            return off < 0x20000u;   /* SPI_DBG_BOOT */
-    }
-}
-
-static void spi_debug_command(const esp32_periph_t *p, const spi_state_t *s,
-                              uint8_t opcode, uint32_t off, int mosi, int miso) {
-    if (!spi_debug_offset(off)) return;
-    int host = s == &p->spi[0] ? 0 : 1;
-    fprintf(stderr,
-            "[SPI%d] op=%02X off=0x%06X mosi=%d miso=%d pc=%08X/%08X "
-            "user=%08X user1=%08X addr=%08X\n",
-            host, opcode, off, mosi, miso,
-            p->cpu[0] ? p->cpu[0]->pc : 0,
-            p->cpu[1] ? p->cpu[1]->pc : 0,
-            s->user, s->user1, s->addr);
-}
-
-static uint32_t spi_flash_offset(const spi_state_t *s) {
-    int bitlen = (int)((s->user1 >> 26) & 0x3F) + 1;
-    /* ESP32 appends dual/quad-I/O mode bits to USER1.USR_ADDR_BITLEN.  The
-     * HAL still left-aligns only the whole-byte (24- or 32-bit) flash address
-     * in SPI_ADDR, then leaves the low padding bits high.  Round the wire
-     * phase down to its address bytes so those mode bits do not become a
-     * spurious low address nibble (for example 0x3100FC -> 0x3100FCF). */
-    int address_bits = bitlen & ~7;
-    if (address_bits <= 0) return 0;
-    if (address_bits >= 32) return s->addr;
-    return s->addr >> (32 - address_bits);
-}
-
-static int spi_data_bytes(uint32_t dlen_reg) {
-    int bits = (int)(dlen_reg & 0xFFFFFF) + 1;
-    int bytes = (bits + 7) / 8;
-    return bytes > 64 ? 64 : bytes;
-}
-
-/* The classic ESP32's dedicated FLASH_PP command packs its byte count in
- * SPI_ADDR[31:24] and the 24-bit flash offset below it. USER transactions use
- * SPI_MOSI_DLEN instead. Preserve a dlen fallback for ROM code which starts a
- * dedicated command without the HAL's packed length. */
-static int spi_flash_page_program_bytes(const spi_state_t *s) {
-    int bytes = (int)(s->addr >> 24);
-    if (bytes == 0) bytes = spi_data_bytes(s->mosi_dlen);
-    return bytes > 64 ? 64 : bytes;
-}
-
-static void spi_flash_read_data(esp32_periph_t *p, spi_state_t *s,
-                                uint32_t off, int bytes) {
-    memset(s->w, 0xFF, sizeof(s->w));   /* erased flash reads as 0xFF */
-    if (off < EMU_FLASH_SIZE && p->mem->flash_data) {
-        uint32_t avail = EMU_FLASH_SIZE - off;
-        if ((uint32_t)bytes > avail) bytes = (int)avail;
-        memcpy(s->w, p->mem->flash_data + off, (size_t)bytes);
-    }
-    const uint8_t *dst = (const uint8_t *)s->w;
-    if (spi_debug_offset(off)) {
-        fprintf(stderr, "[SPIRD] off=0x%X bytes=%d w0=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                off, bytes, dst[0], dst[1], dst[2], dst[3],
-                dst[4], dst[5], dst[6], dst[7]);
-    }
-}
-
-/* Program: real flash can only clear bits, model with AND */
-static void spi_flash_program(esp32_periph_t *p, spi_state_t *s,
-                              uint32_t off, int bytes) {
-    if (off >= EMU_FLASH_SIZE || !p->mem->flash_data) return;
-    uint32_t avail = EMU_FLASH_SIZE - off;
-    if ((uint32_t)bytes > avail) bytes = (int)avail;
-    const uint8_t *src = (const uint8_t *)s->w;
-    if (spi_debug_offset(off)) {
-        fprintf(stderr,
-                "[SPIWR] off=0x%X bytes=%d w0=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                off, bytes, src[0], src[1], src[2], src[3],
-                src[4], src[5], src[6], src[7]);
-    }
-    for (int i = 0; i < bytes; i++) {
-        p->mem->flash_data[off + i] &= src[i];
-        p->mem->flash_insn[off + i] &= src[i];
-    }
-    flash_mmu_invalidate_physical(p, off, (uint32_t)bytes);
-}
-
-static void spi_flash_erase(esp32_periph_t *p, uint32_t off, uint32_t len) {
-    if (off >= EMU_FLASH_SIZE || !p->mem->flash_data) return;
-    if (len > EMU_FLASH_SIZE - off) len = EMU_FLASH_SIZE - off;
-    if (spi_debug_offset(off))
-        fprintf(stderr, "[SPIERASE] off=0x%X bytes=%u\n", off, len);
-    memset(p->mem->flash_data + off, 0xFF, len);
-    memset(p->mem->flash_insn + off, 0xFF, len);
-    flash_mmu_invalidate_physical(p, off, len);
-}
-
-/* Execute a flash command started via SPI_CMD_REG. The emulated controller
- * completes instantly: SPI_CMD_REG always reads back 0 (not busy) and
- * SPI_EXT2_REG reads 0 (state machine idle). */
-static void spi_flash_execute(esp32_periph_t *p, spi_state_t *s, uint32_t cmd) {
-    if (cmd & SPI_CMD_USR) {
-        uint8_t fc = (uint8_t)(s->user2 & 0xFF);  /* SPI_USR_COMMAND_VALUE */
-        uint32_t off = spi_flash_offset(s);
-        int mosi = spi_data_bytes(s->mosi_dlen);
-        int miso = spi_data_bytes(s->miso_dlen);
-        spi_debug_command(p, s, fc, off, mosi, miso);
-        switch (fc) {
-        case 0x9F:                      /* RDID */
-        case 0x90:                      /* REMID */
-        case 0xAB:                      /* RES / release power-down */
-            s->w[0] = EMU_FLASH_JEDEC_ID;
-            break;
-        case 0x05: s->w[0] = s->sr[0]; break;   /* RDSR1 */
-        case 0x35: s->w[0] = s->sr[1]; break;   /* RDSR2 */
-        case 0x15: s->w[0] = s->sr[2]; break;   /* RDSR3 */
-        case 0x01:                              /* WRSR */
-            if (!(s->sr[0] & FLASH_SR_WEL)) break;
-            s->sr[0] = (uint8_t)((s->sr[0] & (FLASH_SR_WIP | FLASH_SR_WEL)) |
-                                 (s->w[0] & ~(FLASH_SR_WIP | FLASH_SR_WEL)));
-            if (mosi >= 2) s->sr[1] = (uint8_t)((s->w[0] >> 8) & 0xFF);
-            s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            break;
-        case 0x31:                              /* WRSR2 */
-            if (s->sr[0] & FLASH_SR_WEL) {
-                s->sr[1] = (uint8_t)(s->w[0] & 0xFF);
-                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            }
-            break;
-        case 0x11:                              /* WRSR3 */
-            if (s->sr[0] & FLASH_SR_WEL) {
-                s->sr[2] = (uint8_t)(s->w[0] & 0xFF);
-                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            }
-            break;
-        case 0x06: s->sr[0] |= FLASH_SR_WEL; break;   /* WREN */
-        case 0x04: s->sr[0] &= (uint8_t)~FLASH_SR_WEL; break; /* WRDI */
-        case 0x03: case 0x0B: case 0x3B:        /* READ / FAST_READ / DUAL */
-        case 0x6B: case 0xBB: case 0xEB:        /* QUAD variants */
-            spi_flash_read_data(p, s, off, miso);
-            break;
-        case 0x02: case 0x32:                   /* PP / quad PP */
-            if (s->sr[0] & FLASH_SR_WEL) {
-                spi_flash_program(p, s, off, mosi);
-                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            }
-            break;
-        case 0x20:                              /* SE */
-            if (s->sr[0] & FLASH_SR_WEL) {
-                spi_flash_erase(p, off & ~0xFFFu, 0x1000);
-                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            }
-            break;
-        case 0x52:                              /* BE32 */
-            if (s->sr[0] & FLASH_SR_WEL) {
-                spi_flash_erase(p, off & ~0x7FFFu, 0x8000);
-                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            }
-            break;
-        case 0xD8:                              /* BE64 */
-            if (s->sr[0] & FLASH_SR_WEL) {
-                spi_flash_erase(p, off & ~0xFFFFu, 0x10000);
-                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            }
-            break;
-        case 0x60: case 0xC7:                   /* chip erase */
-            if (s->sr[0] & FLASH_SR_WEL) {
-                spi_flash_erase(p, 0, EMU_FLASH_SIZE);
-                s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-            }
-            break;
-        default: break;
-        }
-        return;
-    }
-
-    /* ROM-style dedicated command bits (ROM functions are mostly hooked,
-     * but handle them anyway for unhooked paths) */
-    if (cmd & SPI_CMD_FLASH_RDID) s->w[0] = EMU_FLASH_JEDEC_ID;
-    if (cmd & SPI_CMD_FLASH_RDSR) s->rd_status = s->sr[0] | (s->sr[1] << 8) | (s->sr[2] << 16);
-    if (cmd & SPI_CMD_FLASH_WRDI) s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-    if (cmd & SPI_CMD_FLASH_WREN) s->sr[0] |= FLASH_SR_WEL;
-    if ((cmd & SPI_CMD_FLASH_WRSR) && (s->sr[0] & FLASH_SR_WEL)) {
-        s->sr[0] = (uint8_t)((s->sr[0] & (FLASH_SR_WIP | FLASH_SR_WEL)) |
-                             (s->w[0] & ~(FLASH_SR_WIP | FLASH_SR_WEL)));
-        s->sr[1] = (uint8_t)((s->w[0] >> 8) & 0xFF);
-        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-    }
-    uint32_t dedicated_off = s->addr & 0x00FFFFFFu;
-    if (cmd & SPI_CMD_FLASH_READ)
-        spi_flash_read_data(p, s, dedicated_off,
-                            spi_data_bytes(s->miso_dlen));
-    if ((cmd & SPI_CMD_FLASH_PP) && (s->sr[0] & FLASH_SR_WEL)) {
-        spi_flash_program(p, s, dedicated_off,
-                          spi_flash_page_program_bytes(s));
-        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-    }
-    if ((cmd & SPI_CMD_FLASH_SE) && (s->sr[0] & FLASH_SR_WEL)) {
-        spi_flash_erase(p, dedicated_off & ~0xFFFu, 0x1000);
-        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-    }
-    if ((cmd & SPI_CMD_FLASH_BE) && (s->sr[0] & FLASH_SR_WEL)) {
-        spi_flash_erase(p, dedicated_off & ~0xFFFFu, 0x10000);
-        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-    }
-    if ((cmd & SPI_CMD_FLASH_CE) && (s->sr[0] & FLASH_SR_WEL)) {
-        spi_flash_erase(p, 0, EMU_FLASH_SIZE);
-        s->sr[0] &= (uint8_t)~FLASH_SR_WEL;
-    }
-}
-
-static uint32_t spi_read(void *ctx, uint32_t addr) {
-    esp32_periph_t *p = ctx;
-    spi_state_t *s = &p->spi[(addr >= SPI0_BASE) ? 0 : 1];
-    uint32_t base = (addr >= SPI0_BASE) ? SPI0_BASE : SPI1_BASE;
-    uint32_t off = addr - base;
-    switch (off) {
-    case SPI_CMD_REG:      return 0;           /* command done (not busy) */
-    case SPI_ADDR_REG:     return s->addr;
-    case SPI_STATUS_REG:   return s->rd_status;
-    case SPI_USER_REG:     return s->user;
-    case SPI_USER1_REG:    return s->user1;
-    case SPI_USER2_REG:    return s->user2;
-    case SPI_MOSI_DLEN_REG: return s->mosi_dlen;
-    case SPI_MISO_DLEN_REG: return s->miso_dlen;
-    default:
-        if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))
-            return s->w[(off - SPI_W0_REG) / 4];
-        return 0;   /* incl. SPI_EXT2_REG (0xF8): state machine idle */
-    }
-}
-
-static void spi_write(void *ctx, uint32_t addr, uint32_t val) {
-    esp32_periph_t *p = ctx;
-    spi_state_t *s = &p->spi[(addr >= SPI0_BASE) ? 0 : 1];
-    uint32_t base = (addr >= SPI0_BASE) ? SPI0_BASE : SPI1_BASE;
-    uint32_t off = addr - base;
-    switch (off) {
-    case SPI_CMD_REG:      spi_flash_execute(p, s, val); break;
-    case SPI_ADDR_REG:     s->addr = val; break;
-    case SPI_USER_REG:     s->user = val; break;
-    case SPI_USER1_REG:    s->user1 = val; break;
-    case SPI_USER2_REG:    s->user2 = val; break;
-    case SPI_MOSI_DLEN_REG: s->mosi_dlen = val; break;
-    case SPI_MISO_DLEN_REG: s->miso_dlen = val; break;
-    default:
-        if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))
-            s->w[(off - SPI_W0_REG) / 4] = val;
-        break;
     }
 }
 
@@ -13901,8 +13559,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
-    if (!(target->capabilities &
-          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)) {
+    bool classic = (target->capabilities &
+                    FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
+    if (!classic) {
         if (target->flash_mmu.shared_instruction_data)
             p->shared_flash_mmu = flexe_flash_mmu_create(mem);
         if (target->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM) {
@@ -13916,8 +13575,19 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             periph_destroy(p);
             return NULL;
         }
-        return p;
     }
+
+    if (target->capabilities & FLEXE_TARGET_CAP_SPI_MEM) {
+        p->spi_mem = flexe_spi_mem_create(
+            mem, default_read, default_write, p,
+            periph_flash_changed, p);
+        if (!p->spi_mem) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
+    if (!classic) return p;
 
     p->dport_wifi_clk_en = 0xFFFCE030u;
     /* Flexe loads an application image directly, after the second-stage
@@ -14049,12 +13719,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     mem_register_mmio(mem, (int)PAGE_OF(EMAC_MAC_BASE),
                       emac_read, emac_write, p);
 
-    /* SPI1 (general SPI) */
-    mem_register_mmio(mem, (int)PAGE_OF(SPI1_BASE), spi_read, spi_write, p);
-
-    /* SPI0 (flash controller) */
-    mem_register_mmio(mem, (int)PAGE_OF(SPI0_BASE), spi_read, spi_write, p);
-
     /* GPIO: page 68 + page 69 (FUNC_OUT_SEL extends beyond 4096) */
     mem_register_mmio(mem, (int)PAGE_OF(GPIO_BASE), gpio_read, gpio_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(GPIO_BASE) + 1, gpio_read, gpio_write, p);
@@ -14184,6 +13848,7 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    flexe_spi_mem_destroy(p->spi_mem);
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);

@@ -83,9 +83,12 @@ static inline int spi_dbg(const int *flag) {
 #define SPI_OUTLINK_DSCR_REG     0x13C
 #define SPI_OUTLINK_DSCR_BF0_REG 0x140
 #define SPI_OUTLINK_DSCR_BF1_REG 0x144
+#define SPI_EXT2_REG             0xF8
 #define SPI_DATE_REG             0x3FC
 
 #define SPI_CMD_USR       (1u << 18)
+#define SPI_CMD_DEDICATED_MASK (0xFFFF0000u & ~SPI_CMD_USR)
+#define SPI_FSM_COMMAND    2u
 #define SPI_TRANS_DONE    (1u << 4)
 #define SPI_TRANS_INTEN   (1u << 9)
 #define SPI_USER_USR_MOSI (1u << 27)
@@ -149,6 +152,7 @@ typedef struct {
     uint32_t pin;                /* SPI_PIN_REG: active hardware CS line */
     uint32_t slave;              /* SPI_SLAVE_REG shadow (config bits) */
     int      trans_done;         /* SPI_TRANS_DONE flag (slave reg bit 4) */
+    uint8_t  fsm_observation;    /* next SPI_EXT2 state observation */
     uint32_t w[16];
 
     /* Classic ESP32 GP-SPI DMA register file and descriptor progress. */
@@ -1093,6 +1097,16 @@ static uint32_t gp_spi_read(void *ctx, uint32_t addr) {
     case SPI_MISO_DLEN_REG: return s->miso_dlen;
     case SPI_PIN_REG:      return s->pin;
     case SPI_SLAVE_REG:    return s->slave | (s->trans_done ? SPI_TRANS_DONE : 0);
+    case SPI_EXT2_REG: {
+        /* Fast mode completes transfers synchronously, but real software can
+         * deliberately sample the read-only FSM while a dedicated command is
+         * in flight. Preserve one observable command-phase state before the
+         * controller becomes idle. This is register semantics, independent of
+         * the attached device or the firmware issuing the command. */
+        uint32_t state = s->fsm_observation;
+        s->fsm_observation = 0;
+        return state;
+    }
     case SPI_DMA_CONF_REG: return s->dma_conf;
     case SPI_DMA_OUT_LINK_REG: return s->dma_out_link;
     case SPI_DMA_IN_LINK_REG: return s->dma_in_link;
@@ -1117,7 +1131,7 @@ static uint32_t gp_spi_read(void *ctx, uint32_t addr) {
     default:
         if (off >= SPI_W0_REG && off < SPI_W0_REG + sizeof(s->w))
             return s->w[(off - SPI_W0_REG) / 4];
-        return 0;   /* incl. SPI_EXT2_REG: idle */
+        return 0;
     }
 }
 
@@ -1128,6 +1142,8 @@ static void gp_spi_write(void *ctx, uint32_t addr, uint32_t val) {
     switch (off) {
     case SPI_CMD_REG:
         if (val & SPI_CMD_USR) gp_spi_transact(s);
+        if (val & SPI_CMD_DEDICATED_MASK)
+            s->fsm_observation = SPI_FSM_COMMAND;
         break;
     case SPI_ADDR_REG:     s->addr = val; break;
     case SPI_USER_REG:     s->user = val; break;

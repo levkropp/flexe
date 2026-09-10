@@ -2500,6 +2500,7 @@ TEST(irq_dispatch_delivers_new_conditions_on_a_held_line) {
 #define TEST_SPI_CMD_REG     (TEST_SPI1_BASE + 0x00)
 #define TEST_SPI_ADDR_REG    (TEST_SPI1_BASE + 0x04)
 #define TEST_SPI_STATUS_REG  (TEST_SPI1_BASE + 0x10)
+#define TEST_SPI_USER_REG    (TEST_SPI1_BASE + 0x1C)
 #define TEST_SPI_USER1_REG   (TEST_SPI1_BASE + 0x20)
 #define TEST_SPI_USER2_REG   (TEST_SPI1_BASE + 0x24)
 #define TEST_SPI_MOSI_DLEN   (TEST_SPI1_BASE + 0x28)
@@ -2520,7 +2521,10 @@ static void test_flash_code_invalidate(void *ctx, uint32_t addr, size_t len) {
 }
 
 static uint8_t test_flash_status(xtensa_mem_t *mem) {
-    mem_write32(mem, TEST_SPI_USER2_REG, 0x05);       /* RDSR1 */
+    mem_write32(mem, TEST_SPI_USER_REG,
+                (1u << 31) | (1u << 28)); /* command + MISO */
+    mem_write32(mem, TEST_SPI_USER2_REG,
+                (7u << 28) | 0x05u);                  /* RDSR1 */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 18);    /* USR */
     return (uint8_t)mem_read32(mem, TEST_SPI_W0_REG);
 }
@@ -2539,10 +2543,14 @@ TEST(spi_flash_write_enable_latch) {
     ASSERT_EQ(test_flash_status(mem) & (1u << 1), 0u);
 
     /* Generic USER commands must expose the same device latch. */
-    mem_write32(mem, TEST_SPI_USER2_REG, 0x06);       /* WREN */
+    mem_write32(mem, TEST_SPI_USER_REG, 1u << 31);   /* command */
+    mem_write32(mem, TEST_SPI_USER2_REG,
+                (7u << 28) | 0x06u);                 /* WREN */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 18);
     ASSERT_EQ(test_flash_status(mem) & (1u << 1), 1u << 1);
-    mem_write32(mem, TEST_SPI_USER2_REG, 0x04);       /* WRDI */
+    mem_write32(mem, TEST_SPI_USER_REG, 1u << 31);   /* command */
+    mem_write32(mem, TEST_SPI_USER2_REG,
+                (7u << 28) | 0x04u);                 /* WRDI */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 18);
     ASSERT_EQ(test_flash_status(mem) & (1u << 1), 0u);
 
@@ -2748,7 +2756,10 @@ TEST(spi_flash_dual_io_mode_bits_are_not_address_bits) {
      * left-aligned by eight, not by four. */
     mem_write32(mem, TEST_SPI_USER1_REG, 27u << 26);
     mem_write32(mem, TEST_SPI_ADDR_REG, (off << 8) | 0xFFu);
-    mem_write32(mem, TEST_SPI_USER2_REG, 0xBB);       /* DIO read */
+    mem_write32(mem, TEST_SPI_USER_REG,
+                (1u << 31) | (1u << 30) | (1u << 28));
+    mem_write32(mem, TEST_SPI_USER2_REG,
+                (7u << 28) | 0xBBu);                 /* DIO read */
     mem_write32(mem, TEST_SPI_MISO_DLEN, 15);        /* two bytes */
     mem_write32(mem, TEST_SPI_CMD_REG, 1u << 18);    /* USR */
     ASSERT_EQ(mem_read32(mem, TEST_SPI_W0_REG) & 0xFFFFu, 0x04C9u);
@@ -2992,6 +3003,44 @@ TEST(gp_spi_routes_explicit_board_device) {
     ASSERT_EQ(periph_spi_attach_device(p, 3, 18, 5, NULL, NULL), 0);
     test_gp_spi_bytes(mem, spi3, request, response, sizeof(request));
     ASSERT_EQ(device.calls, 1u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(gp_spi_dedicated_command_exposes_fsm_progress) {
+    const uint32_t spi2 = 0x3FF64000u;
+    const uint32_t cmd = spi2 + 0x00u;
+    const uint32_t ext2 = spi2 + 0xF8u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    spi_display_config_t cfg = {
+        .dc_pin = 2,
+        .display_cs_pin = 15,
+        .display_sck_pin = 14,
+        .touch_cs_pin = 33,
+        .touch_sck_pin = 25,
+        .sd_cs_pin = 5,
+        .sd_sck_pin = 18,
+    };
+    periph_enable_spi_display(p, &cfg);
+
+    ASSERT_EQ(mem_read32(mem, ext2), 0u);
+
+    /* Dedicated flash commands enter the documented command state before
+     * returning to idle. ESP-IDF observes this transition when it borrows a
+     * GP-SPI clock for the original 32-Mbit PSRAM at 80 MHz. */
+    mem_write32(mem, cmd, 1u << 31); /* FLASH_READ */
+    ASSERT_EQ(mem_read32(mem, cmd), 0u); /* completed in fast mode */
+    ASSERT_EQ(mem_read32(mem, ext2), 2u);
+    ASSERT_EQ(mem_read32(mem, ext2), 0u);
+
+    /* The transition belongs to the dedicated-command mechanism, not to one
+     * hard-coded opcode or address. */
+    mem_write32(mem, cmd, 1u << 30); /* FLASH_WREN */
+    ASSERT_EQ(mem_read32(mem, ext2), 2u);
+    ASSERT_EQ(mem_read32(mem, ext2), 0u);
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
     periph_destroy(p);
@@ -6260,6 +6309,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(wifi_mac_init_ready_handshake);
     RUN_TEST(radio_phy_calibration_register_files);
     RUN_TEST(gp_spi_routes_explicit_board_device);
+    RUN_TEST(gp_spi_dedicated_command_exposes_fsm_progress);
     RUN_TEST(xpt2046_pipelined_conversions);
     RUN_TEST(xpt2046_gpio_bitbang_conversions);
     RUN_TEST(gp_spi_matrix_routing_and_hardware_cs);

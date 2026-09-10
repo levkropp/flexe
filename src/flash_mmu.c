@@ -159,3 +159,25 @@ void flexe_flash_mmu_attach_cpus(flexe_flash_mmu_t *mmu,
     mmu->cpu[0] = cpu0;
     mmu->cpu[1] = cpu1;
 }
+
+void flexe_flash_mmu_flash_changed(flexe_flash_mmu_t *mmu,
+                                   uint32_t offset, uint32_t size) {
+    if (!mmu || size == 0u) return;
+    const flexe_flash_mmu_desc_t *desc = &mmu->target->flash_mmu;
+    uint64_t first_page = offset / desc->page_size;
+    uint64_t last_page =
+        ((uint64_t)offset + (uint64_t)size - 1u) / desc->page_size;
+
+    for (uint32_t index = 0; index < desc->entry_count; index++) {
+        uint32_t value = mmu->entry[index];
+        if ((value & desc->invalid_mask) != 0u ||
+            (desc->target_mask != 0u &&
+             (value & desc->target_mask) != 0u))
+            continue;
+        uint64_t page = value & desc->physical_page_mask;
+        if (page < first_page || page > last_page) continue;
+        flexe_flash_mmu_invalidate_code(
+            mmu, mmu->target->irom_start + index * desc->page_size,
+            desc->page_size);
+    }
+}

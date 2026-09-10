@@ -17,7 +17,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .core_generation = FLEXE_XTENSA_LX6,
         .core_count = 2,
         .support_level = FLEXE_TARGET_STABLE,
-        .capabilities = FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS,
+        .capabilities = FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS |
+                        FLEXE_TARGET_CAP_SPI_MEM,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2BCFFFEu,
@@ -70,6 +71,20 @@ static const flexe_target_desc_t TARGETS[] = {
             { .base = 0x3FF50000u, .interrupt_source = 35u },
             { .base = 0x3FF6E000u, .interrupt_source = 36u },
         },
+        .spi_mem = {
+            .base = { 0x3FF43000u, 0x3FF42000u },
+            .register_size = 0x1000u,
+            .default_jedec_id = 0x001640C8u,
+            .date_reset = 0x01604270u,
+            /* AP Memory's original 32-Mbit device: MFID 0x0D, KGD 0x5D,
+             * EID 0x20. This matches the existing 4-MiB PSRAM backing used
+             * by the default classic-ESP32 board profile. */
+            .default_psram_id = UINT64_C(0x0000000000205D0D),
+            .host_count = 2u,
+            .flash_chip_select = 0u,
+            .psram_chip_select = 1u,
+            .layout = FLEXE_SPI_MEM_LAYOUT_ESP32,
+        },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x000B0000u,
             [FLEXE_MEM_ROM] = 0x00080000u,
@@ -119,7 +134,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_RTC_CALIBRATION |
                         FLEXE_TARGET_CAP_REGI2C |
                         FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1 |
-                        FLEXE_TARGET_CAP_SYSTIMER_V1,
+                        FLEXE_TARGET_CAP_SYSTIMER_V1 |
+                        FLEXE_TARGET_CAP_SPI_MEM,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -252,6 +268,16 @@ static const flexe_target_desc_t TARGETS[] = {
             .alarm_count = 3u,
             .counter_width = 52u,
             .interrupt_source = { 57u, 58u, 59u },
+        },
+        .spi_mem = {
+            .base = { 0x60003000u, 0x60002000u },
+            .register_size = 0x1000u,
+            .default_jedec_id = 0x001640C8u,
+            .date_reset = 0x02101040u,
+            .host_count = 2u,
+            .flash_chip_select = 0u,
+            .psram_chip_select = FLEXE_SPI_MEM_CS_NONE,
+            .layout = FLEXE_SPI_MEM_LAYOUT_S2_S3,
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x00080000u,

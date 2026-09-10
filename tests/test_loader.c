@@ -261,6 +261,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(esp32->support_level, FLEXE_TARGET_STABLE);
     ASSERT_TRUE(esp32->capabilities &
                 FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
     ASSERT_EQ(s3->image_chip_id, 9u);
     ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
     ASSERT_EQ(s3->support_level, FLEXE_TARGET_UNAVAILABLE);
@@ -272,6 +273,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_REGI2C);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSTIMER_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
@@ -289,6 +291,20 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->systimer.counter_frequency_hz, 16000000u);
     ASSERT_EQ(s3->systimer.counter_count, 2u);
     ASSERT_EQ(s3->systimer.alarm_count, 3u);
+    ASSERT_EQ(esp32->spi_mem.base[0], 0x3FF43000u);
+    ASSERT_EQ(esp32->spi_mem.layout, FLEXE_SPI_MEM_LAYOUT_ESP32);
+    ASSERT_EQ(esp32->spi_mem.default_psram_id,
+              UINT64_C(0x0000000000205D0D));
+    ASSERT_EQ(esp32->spi_mem.flash_chip_select, 0u);
+    ASSERT_EQ(esp32->spi_mem.psram_chip_select, 1u);
+    ASSERT_EQ(s3->spi_mem.base[0], 0x60003000u);
+    ASSERT_EQ(s3->spi_mem.base[1], 0x60002000u);
+    ASSERT_EQ(s3->spi_mem.host_count, 2u);
+    ASSERT_EQ(s3->spi_mem.layout, FLEXE_SPI_MEM_LAYOUT_S2_S3);
+    ASSERT_EQ(s3->spi_mem.default_jedec_id, 0x001640C8u);
+    ASSERT_EQ(s3->spi_mem.date_reset, 0x02101040u);
+    ASSERT_EQ(s3->spi_mem.flash_chip_select, 0u);
+    ASSERT_EQ(s3->spi_mem.psram_chip_select, FLEXE_SPI_MEM_CS_NONE);
     ASSERT_EQ(s3->reset_vector, 0x40000400u);
     ASSERT_EQ(s3->vecbase_reset, 0x40000000u);
     ASSERT_EQ(s3->configid0, 0xC2F0FFFEu);
