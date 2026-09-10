@@ -4063,6 +4063,13 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
     return n_jit;
 }
 
+/* Continue hot counting from metadata the dispatcher already found. Keeping
+ * this separate lets the miss path reuse its exact way-table match instead of
+ * entering jit_get_block() and probing the same set a second time. */
+static jit_block_fn jit_consider_block(jit_state_t *jit, xtensa_cpu_t *cpu,
+                                       uint32_t pc, uint32_t wb,
+                                       jit_block_t *block);
+
 /* JIT pc_hook: called by the interpreter for every bitmap-marked PC.
  * Direct hash lookup (no JIT bitmap check) — O(1) with one memory access.
  * Flow: check JIT hash → if hit, run block; if miss, forward to ROM stubs. */
@@ -4101,13 +4108,23 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     jit_block_t *set = jit_set_of(jit, pc, wb, lv);
     uint32_t tag = jit_make_tag(pc, wb, lv);
     jit_block_t *b = set;
+    jit_block_t *known = b;
     /* Way scan. A hit is overwhelmingly in way 0 because a compiled block is
      * only displaced within its set when every way holds compiled code, so the
      * common case is one compare. */
     if (__builtin_expect(!(b->code && b->pc == tag), 0)) {
         b = NULL;
-        for (unsigned w = 1; w < JIT_WAYS; w++)
-            if (set[w].code && set[w].pc == tag) { b = &set[w]; break; }
+        known = NULL;
+        for (unsigned w = 0; w < JIT_WAYS; w++) {
+            jit_block_t *candidate = &set[w];
+            if ((candidate->flags & JIT_BLK_VALID) &&
+                candidate->pc == tag) {
+                known = candidate;
+                if (candidate->code)
+                    b = candidate;
+                break;
+            }
+        }
     }
 
     jit_block_fn fn = NULL;
@@ -4125,8 +4142,12 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             jit->stats.loop_bound_rejects++;
         } else
             fn = (jit_block_fn)b->code;
+    } else if (known) {
+        /* The way scan already found this exact cold or uncompileable key. */
+        if (!(known->flags & JIT_BLK_UNCOMPILABLE))
+            fn = jit_consider_block(jit, cpu, pc, wb, known);
     } else {
-        /* Hash miss — try hot-counting and compilation */
+        /* New hash key — create metadata, then hot-count it. */
         fn = jit_get_block(jit, cpu, pc);
     }
 
@@ -4368,28 +4389,38 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     }
 }
 
-jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
-    uint32_t wb = cpu->windowbase;
-    uint32_t lv = jit_loop_variant(cpu, pc);
-    /* A cold or merely hot-counted PC needs an entry anyway. Probing first
-     * repeated the hash, tag, and way scan on every such miss. */
-    jit_block_t *b = jit_get_or_create(jit, pc, wb, lv);
+static jit_block_fn jit_consider_block(jit_state_t *jit, xtensa_cpu_t *cpu,
+                                       uint32_t pc, uint32_t wb,
+                                       jit_block_t *b) {
     if (b->code)
         return (jit_block_fn)b->code;
-    b->exec_count++;
+    /* A translation-time rejection is permanent until jit_flush(): neither
+     * the instruction bytes nor the exact architectural cache key changed.
+     * Do not dirty the two-megabyte metadata table just to grow a counter that
+     * can never trigger another compile. */
+    if (b->flags & JIT_BLK_UNCOMPILABLE)
+        return NULL;
 
     /* Cache-pressure adaptive threshold: the last quarter of the cache is
      * reserved for code that is hot for real. */
     uint32_t threshold = JIT_HOT_THRESHOLD;
     if (jit->code_size > (jit->code_capacity * 3) / 4)
         threshold = 64;
+    b->exec_count++;
     if (b->exec_count < threshold)
         return NULL;  /* Not hot yet */
-    if (b->flags & JIT_BLK_UNCOMPILABLE)
-        return NULL;  /* Already scanned and declined */
 
     jit_compile_now(jit, cpu, pc, wb, 0);
     return (b->code) ? (jit_block_fn)b->code : NULL;
+}
+
+jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
+    uint32_t wb = cpu->windowbase;
+    uint32_t lv = jit_loop_variant(cpu, pc);
+    /* A cold or merely hot-counted PC needs an entry anyway. Probing first
+     * repeated the hash, tag, and way scan on every such miss. */
+    jit_block_t *b = jit_get_or_create(jit, pc, wb, lv);
+    return jit_consider_block(jit, cpu, pc, wb, b);
 }
 
 /* Main JIT execution loop.

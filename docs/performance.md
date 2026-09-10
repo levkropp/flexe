@@ -103,6 +103,14 @@ polls, with a 100-microsecond guest-time latency bound, reduced the count to
 176,886. Six alternating ARM64 JIT A/B pairs reduced mean CPU time from 3.488
 to 3.315 seconds (4.97%) with identical retired state and firmware output.
 
+WLED also revisits many JIT entries that have already been hot-counted or
+proven uncompileable. Reusing the dispatcher's exact set-and-way match avoids a
+second full-table probe and stops rewriting dead hot counters. Eight alternating
+four-billion-cycle ARM64 pairs reduced mean CPU time from 3.140 to 3.074 seconds
+(2.1%); all retired and JIT instruction counts were identical. Three shorter
+pairs across all seven production images were neutral within timer resolution
+except WLED, which improved by 5.5%.
+
 ## Profiling
 
 Build the sampling profiler separately so its dispatch-loop layout does not
