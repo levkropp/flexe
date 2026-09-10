@@ -4277,10 +4277,8 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
      * hot code may compile (the last quarter is reserved for it). */
     if (jit->code_size > (jit->code_capacity * 3) / 4 && depth > 0) return;
     uint32_t lv = jit_loop_variant(cpu, pc);
-    jit_block_t *b = jit_lookup(jit, pc, wb, lv);
-    if (b && b->code) return;
-
-    b = jit_get_or_create(jit, pc, wb, lv);
+    jit_block_t *b = jit_get_or_create(jit, pc, wb, lv);
+    if (b->code) return;
 
     jit_scan_t scan;
     jit_scan_block(jit, cpu, pc, &scan);
@@ -4373,12 +4371,11 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
 jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
     uint32_t wb = cpu->windowbase;
     uint32_t lv = jit_loop_variant(cpu, pc);
-    jit_block_t *b = jit_lookup(jit, pc, wb, lv);
-    if (b && b->code)
+    /* A cold or merely hot-counted PC needs an entry anyway. Probing first
+     * repeated the hash, tag, and way scan on every such miss. */
+    jit_block_t *b = jit_get_or_create(jit, pc, wb, lv);
+    if (b->code)
         return (jit_block_fn)b->code;
-
-    /* Get or create entry */
-    b = jit_get_or_create(jit, pc, wb, lv);
     b->exec_count++;
 
     /* Cache-pressure adaptive threshold: the last quarter of the cache is
