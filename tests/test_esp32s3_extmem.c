@@ -113,6 +113,15 @@ TEST(esp32s3_extmem_operations_complete_and_invalidate_code) {
     mem_write32(mem, S3_EXTMEM_BASE + 0x040u, 5u);
     ASSERT_EQ(mem_read32(mem, S3_EXTMEM_BASE + 0x040u), 6u);
 
+    mem_write32(mem, S3_EXTMEM_BASE + 0x150u, 1u);
+    ASSERT_EQ(mem_read32(mem, S3_EXTMEM_BASE + 0x150u), 5u);
+    mem_write32(mem, S3_EXTMEM_BASE + 0x150u, 4u);
+    ASSERT_EQ(mem_read32(mem, S3_EXTMEM_BASE + 0x150u), 0u);
+    mem_write32(mem, S3_EXTMEM_BASE + 0x154u, 3u);
+    ASSERT_EQ(mem_read32(mem, S3_EXTMEM_BASE + 0x154u), 7u);
+    mem_write32(mem, S3_EXTMEM_BASE + 0x154u, 6u);
+    ASSERT_EQ(mem_read32(mem, S3_EXTMEM_BASE + 0x154u), 2u);
+
     flexe_esp32s3_extmem_destroy(extmem);
     mem_destroy(mem);
 }
@@ -136,10 +145,11 @@ TEST(peripherals_compose_s3_devices_without_classic_aliases) {
     ASSERT_EQ(mem_read32(mem, 0x600C5000u), 0x4000u);
     ASSERT_TRUE(mem_get_ptr(mem, 0x42000000u) == NULL);
 
-    /* A classic DPORT address is not aliased into S3's native MMIO map. */
+    /* A classic DPORT address is S3 D-ROM, not an alias into native MMIO. */
+    mem_write32(mem, 0x40040000u, 0xA55A1234u);
     uint64_t before = mem_unmapped_count(mem);
-    (void)mem_read32(mem, 0x3FF00000u);
-    ASSERT_EQ(mem_unmapped_count(mem), before + 1u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF00000u), 0xA55A1234u);
+    ASSERT_EQ(mem_unmapped_count(mem), before);
 
     periph_destroy(periph);
     mem_destroy(mem);

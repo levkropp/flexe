@@ -1,4 +1,4 @@
-/* Tests for loading Espressif's ESP32 ROM ELF data into guest ROM. */
+/* Tests for loading Espressif Xtensa ROM ELF data into target ROM maps. */
 #include "test_helpers.h"
 #include "rom_elf.h"
 
@@ -48,7 +48,7 @@ typedef struct {
 } rom_test_sym_t;
 #pragma pack(pop)
 
-static const char *build_rom_test_elf(void)
+static const char *build_rom_test_elf(bool s3)
 {
     static const char path[] = "/tmp/flexe-rom-elf-test.elf";
     enum {
@@ -59,28 +59,34 @@ static const char *build_rom_test_elf(void)
     static const char strtab[] =
         "\0_data_start_btdm_rom\0_data_start\0_data_end\0";
     static const char shstrtab[] =
-        "\0.text\0.rodata\0.data_btdm\0.data_test\0.symtab\0.strtab\0"
-        ".shstrtab\0";
+        "\0.text\0.rodata\0.data_btdm\0.data_test\0.data.interface.cache\0"
+        ".symtab\0.strtab\0.shstrtab\0";
     enum {
         SHN_TEXT = 1,
         SHN_RODATA = SHN_TEXT + sizeof(".text"),
         SHN_DATA_BTDM = SHN_RODATA + sizeof(".rodata"),
         SHN_DATA_TEST = SHN_DATA_BTDM + sizeof(".data_btdm"),
-        SHN_SYMTAB = SHN_DATA_TEST + sizeof(".data_test"),
+        SHN_DATA_INTERFACE = SHN_DATA_TEST + sizeof(".data_test"),
+        SHN_SYMTAB = SHN_DATA_INTERFACE + sizeof(".data.interface.cache"),
         SHN_STRTAB = SHN_SYMTAB + sizeof(".symtab"),
         SHN_SHSTRTAB = SHN_STRTAB + sizeof(".strtab"),
         TEXT_OFF = 0x100,
         RODATA_OFF = 0x120,
         DATA_OFF = 0x130,
         DATA_TEST_OFF = 0x140,
+        DATA_INTERFACE_OFF = 0x148,
         SYMTAB_OFF = 0x150,
         STRTAB_OFF = 0x1A0,
         SHSTRTAB_OFF = 0x1E0,
         SHDR_OFF = 0x240,
-        SECTION_COUNT = 8,
+        SECTION_COUNT = 9,
         FILE_SIZE = SHDR_OFF + SECTION_COUNT * sizeof(rom_test_shdr_t),
     };
 
+    const uint32_t rodata_addr = s3 ? 0x3FF10000u : 0x3FF96000u;
+    const uint32_t btdm_addr = s3 ? 0x3FCEF174u : 0x3FFAE6E0u;
+    const uint32_t data_test_addr = s3 ? 0x3FCEF130u : 0x3FFB0000u;
+    const uint32_t interface_addr = s3 ? 0x3FCEFFC4u : 0x3FFAE020u;
     uint8_t *buf = calloc(1, FILE_SIZE);
     if (!buf) return NULL;
 
@@ -97,17 +103,19 @@ static const char *build_rom_test_elf(void)
     ehdr->e_ehsize = sizeof(*ehdr);
     ehdr->e_shentsize = sizeof(rom_test_shdr_t);
     ehdr->e_shnum = SECTION_COUNT;
-    ehdr->e_shstrndx = 7;
+    ehdr->e_shstrndx = 8;
 
     put_le32(buf + TEXT_OFF, 0x40002000u); /* BT data source pointer */
-    put_le32(buf + TEXT_OFF + 0x10, 0x3FFB0000u);
-    put_le32(buf + TEXT_OFF + 0x14, 0x3FFB0004u); /* logical, not padded end */
+    put_le32(buf + TEXT_OFF + 0x10, data_test_addr);
+    put_le32(buf + TEXT_OFF + 0x14,
+             data_test_addr + 4u); /* logical, not padded end */
     put_le32(buf + TEXT_OFF + 0x18, 0x40003000u);
     put_le32(buf + RODATA_OFF, 0x11223344u);
     put_le32(buf + DATA_OFF, 0xA1B2C3D4u);
     put_le32(buf + DATA_OFF + 4, 0x55667788u);
     put_le32(buf + DATA_TEST_OFF, 0x0BADF00Du);
     put_le32(buf + DATA_TEST_OFF + 4, 0xCAFEBABEu); /* alignment padding */
+    put_le32(buf + DATA_INTERFACE_OFF, 0x3FF10000u);
     rom_test_sym_t syms[4] = {0};
     syms[1].st_name = STR_BTDM_ROM;
     syms[1].st_value = 0x40001000u;
@@ -132,26 +140,31 @@ static const char *build_rom_test_elf(void)
     };
     sh[2] = (rom_test_shdr_t){
         .sh_name = SHN_RODATA, .sh_type = 1, .sh_flags = 0x2,
-        .sh_addr = 0x3FF96000u, .sh_offset = RODATA_OFF, .sh_size = 4,
+        .sh_addr = rodata_addr, .sh_offset = RODATA_OFF, .sh_size = 4,
     };
     sh[3] = (rom_test_shdr_t){
         .sh_name = SHN_DATA_BTDM, .sh_type = 1, .sh_flags = 0x1,
-        .sh_addr = 0x3FFAE6E0u, .sh_offset = DATA_OFF, .sh_size = 8,
+        .sh_addr = btdm_addr, .sh_offset = DATA_OFF, .sh_size = 8,
     };
     sh[4] = (rom_test_shdr_t){
         .sh_name = SHN_DATA_TEST, .sh_type = 1, .sh_flags = 0x1,
-        .sh_addr = 0x3FFB0000u, .sh_offset = DATA_TEST_OFF, .sh_size = 8,
+        .sh_addr = data_test_addr, .sh_offset = DATA_TEST_OFF, .sh_size = 8,
     };
     sh[5] = (rom_test_shdr_t){
-        .sh_name = SHN_SYMTAB, .sh_type = 2, .sh_offset = SYMTAB_OFF,
-        .sh_size = sizeof(syms), .sh_link = 6,
-        .sh_entsize = sizeof(rom_test_sym_t),
+        .sh_name = SHN_DATA_INTERFACE, .sh_type = 1, .sh_flags = 0x1,
+        .sh_addr = interface_addr, .sh_offset = DATA_INTERFACE_OFF,
+        .sh_size = s3 ? 4u : 0u,
     };
     sh[6] = (rom_test_shdr_t){
+        .sh_name = SHN_SYMTAB, .sh_type = 2, .sh_offset = SYMTAB_OFF,
+        .sh_size = sizeof(syms), .sh_link = 7,
+        .sh_entsize = sizeof(rom_test_sym_t),
+    };
+    sh[7] = (rom_test_shdr_t){
         .sh_name = SHN_STRTAB, .sh_type = 3, .sh_offset = STRTAB_OFF,
         .sh_size = sizeof(strtab),
     };
-    sh[7] = (rom_test_shdr_t){
+    sh[8] = (rom_test_shdr_t){
         .sh_name = SHN_SHSTRTAB, .sh_type = 3, .sh_offset = SHSTRTAB_OFF,
         .sh_size = sizeof(shstrtab),
     };
@@ -168,7 +181,7 @@ static const char *build_rom_test_elf(void)
 }
 
 TEST(rom_elf_loads_immutable_sections_and_data_images) {
-    const char *path = build_rom_test_elf();
+    const char *path = build_rom_test_elf(false);
     ASSERT_TRUE(path != NULL);
     xtensa_mem_t *mem = mem_create();
     rom_elf_load_result_t res = rom_elf_load(mem, path);
@@ -178,6 +191,7 @@ TEST(rom_elf_loads_immutable_sections_and_data_images) {
     ASSERT_EQ(res.bytes_loaded, 36u);
     ASSERT_EQ(res.data_images_loaded, 2u);
     ASSERT_EQ(res.data_image_bytes, 12u);
+    ASSERT_EQ(res.interface_sections_loaded, 0u);
     ASSERT_EQ(mem_read32(mem, 0x40001000u), 0x40002000u);
     ASSERT_EQ(mem_read32(mem, 0x3FF96000u), 0x11223344u);
     ASSERT_EQ(mem_read32(mem, 0x40002000u), 0xA1B2C3D4u);
@@ -190,8 +204,35 @@ TEST(rom_elf_loads_immutable_sections_and_data_images) {
     mem_destroy(mem);
 }
 
+TEST(rom_elf_uses_s3_descriptor_rom_apertures) {
+    const char *path = build_rom_test_elf(true);
+    ASSERT_TRUE(path != NULL);
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rom_elf_load_result_t res = rom_elf_load(mem, path);
+
+    ASSERT_EQ(res.result, 0);
+    ASSERT_EQ(res.sections_loaded, 2u);
+    ASSERT_EQ(res.bytes_loaded, 36u);
+    ASSERT_EQ(res.data_images_loaded, 2u);
+    ASSERT_EQ(res.data_image_bytes, 12u);
+    ASSERT_EQ(res.interface_sections_loaded, 1u);
+    ASSERT_EQ(res.interface_bytes_loaded, 4u);
+    ASSERT_EQ(mem_read32(mem, 0x40001000u), 0x40002000u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF10000u), 0x11223344u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FF10000u) ==
+                mem_backing_ptr(mem, FLEXE_MEM_ROM) + 0x50000u);
+    ASSERT_EQ(mem_read32(mem, 0x40002000u), 0xA1B2C3D4u);
+    ASSERT_EQ(mem_read32(mem, 0x40003000u), 0x0BADF00Du);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEFFC4u), 0x3FF10000u);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEF174u), 0u);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+    mem_destroy(mem);
+}
+
 TEST(rom_elf_rejects_truncated_section) {
-    const char *path = build_rom_test_elf();
+    const char *path = build_rom_test_elf(false);
     ASSERT_TRUE(path != NULL);
     FILE *f = fopen(path, "r+b");
     ASSERT_TRUE(f != NULL);
@@ -214,7 +255,7 @@ TEST(rom_elf_rejects_truncated_section) {
 }
 
 TEST(rom_elf_rejects_non_xtensa_elf) {
-    const char *path = build_rom_test_elf();
+    const char *path = build_rom_test_elf(false);
     ASSERT_TRUE(path != NULL);
     FILE *f = fopen(path, "r+b");
     ASSERT_TRUE(f != NULL);
@@ -234,8 +275,9 @@ TEST(rom_elf_rejects_non_xtensa_elf) {
 
 static void run_rom_elf_tests(void)
 {
-    TEST_SUITE("ESP32 ROM ELF Loader");
+    TEST_SUITE("Target ROM ELF Loader");
     RUN_TEST(rom_elf_loads_immutable_sections_and_data_images);
+    RUN_TEST(rom_elf_uses_s3_descriptor_rom_apertures);
     RUN_TEST(rom_elf_rejects_truncated_section);
     RUN_TEST(rom_elf_rejects_non_xtensa_elf);
 }

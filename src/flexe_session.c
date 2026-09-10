@@ -134,11 +134,14 @@ static int session_build(flexe_session_t *s)
             return -1;
         }
         fprintf(stderr,
-                "Loaded ESP32 ROM %s: %u immutable sections (%u bytes), "
-                "%u data images (%u bytes)\n",
-                cfg->rom_elf_path, rom_res.sections_loaded,
+                "Loaded %s ROM %s: %u immutable sections (%u bytes), "
+                "%u data images (%u bytes), %u interface sections "
+                "(%u bytes)\n",
+                mem_target(s->mem)->display_name, cfg->rom_elf_path,
+                rom_res.sections_loaded,
                 rom_res.bytes_loaded, rom_res.data_images_loaded,
-                rom_res.data_image_bytes);
+                rom_res.data_image_bytes, rom_res.interface_sections_loaded,
+                rom_res.interface_bytes_loaded);
     }
 
     /* Create peripherals */

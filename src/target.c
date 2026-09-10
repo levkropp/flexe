@@ -135,10 +135,14 @@ static const flexe_target_desc_t TARGETS[] = {
             [FLEXE_MEM_RTC_FAST] = 0x00002000u,
             [FLEXE_MEM_RTC_SLOW] = 0x00002000u,
         },
-        .memory_region_count = 8,
+        .memory_region_count = 9,
         .memory_region = {
             { 0x3C000000u, 0x3C400000u, FLEXE_MEM_FLASH_DATA, 0, "flash_data" },
             { 0x3FC88000u, 0x3FD00000u, FLEXE_MEM_SRAM, 0, "sram_data" },
+            /* The S3 mask ROM exposes its final 128 KiB through the D-bus.
+             * Espressif's ROM ELF gives .rodata a VMA in this window and an
+             * LMA in the matching 0x4004_0000 instruction-ROM aperture. */
+            { 0x3FF00000u, 0x3FF20000u, FLEXE_MEM_ROM, 0x00040000u, "rom_data" },
             { 0x40000000u, 0x40060000u, FLEXE_MEM_ROM, 0, "rom" },
             /* 0x40370000..0x40377fff is cache SRAM. The remaining IRAM
              * aliases 0x3fc88000..0x3fceffff byte-for-byte. */

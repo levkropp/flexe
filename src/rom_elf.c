@@ -15,11 +15,6 @@
 #define SHF_WRITE    0x1u
 #define SHF_ALLOC    0x2u
 
-#define ROM_I_BASE 0x40000000u
-#define ROM_I_END  0x40070000u
-#define ROM_D_BASE 0x3FF90000u
-#define ROM_D_END  0x3FFA0000u
-
 #define ROM_ELF_MAX_BYTES         (64u * 1024u * 1024u)
 #define ROM_ELF_MAX_DATA_SECTIONS 32u
 #define ROM_DATA_DESC_SIZE        16u
@@ -115,11 +110,29 @@ static int section_name(const uint8_t *buf, size_t file_size,
     return 1;
 }
 
-static int rom_range_contains(uint32_t addr, uint32_t size)
+/* ROM bus apertures are part of the target's address map. This admits both
+ * classic ESP32's 0x3ff9 data alias and ESP32-S3's 0x3ff0 data alias without
+ * teaching the ELF parser either chip's addresses. */
+static int target_range_uses_backing(const xtensa_mem_t *mem,
+                                     uint32_t addr, uint32_t size,
+                                     flexe_mem_backing_t backing)
 {
+    const flexe_target_desc_t *target = mem_target(mem);
     uint64_t end = (uint64_t)addr + size;
-    return (addr >= ROM_I_BASE && end <= ROM_I_END) ||
-           (addr >= ROM_D_BASE && end <= ROM_D_END);
+    if (!target || end > (UINT64_C(1) << 32)) return 0;
+    for (unsigned i = 0; i < target->memory_region_count; i++) {
+        const flexe_target_mem_region_t *region = &target->memory_region[i];
+        if (region->backing == backing && addr >= region->start &&
+            end <= region->end)
+            return 1;
+    }
+    return 0;
+}
+
+static int rom_range_contains(const xtensa_mem_t *mem,
+                              uint32_t addr, uint32_t size)
+{
+    return target_range_uses_backing(mem, addr, size, FLEXE_MEM_ROM);
 }
 
 static int guest_range_mapped(xtensa_mem_t *mem, uint32_t addr, uint32_t size)
@@ -294,7 +307,7 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
         }
 
         if ((sh.sh_flags & SHF_ALLOC) && !(sh.sh_flags & SHF_WRITE)) {
-            if (!rom_range_contains(sh.sh_addr, sh.sh_size) ||
+            if (!rom_range_contains(mem, sh.sh_addr, sh.sh_size) ||
                 !guest_range_mapped(mem, sh.sh_addr, sh.sh_size) ||
                 mem_load(mem, sh.sh_addr, buf + sh.sh_offset, sh.sh_size) != 0) {
                 rom_error(&res, "ROM section %s does not fit at 0x%08X",
@@ -304,6 +317,25 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
             }
             res.sections_loaded++;
             res.bytes_loaded += sh.sh_size;
+        }
+
+        /* Espressif ROM ELFs expose stable ROM/application ABI pointers as
+         * .data.interface.* snapshots at their live SRAM VMAs. They are not
+         * part of the ROM startup-copy table: a direct application handoff
+         * must install them explicitly, while BSS remains calloc-zeroed. */
+        if (strncmp(name, ".data.interface.", 16) == 0) {
+            if (!target_range_uses_backing(mem, sh.sh_addr, sh.sh_size,
+                                           FLEXE_MEM_SRAM) ||
+                !guest_range_mapped(mem, sh.sh_addr, sh.sh_size) ||
+                mem_load(mem, sh.sh_addr, buf + sh.sh_offset, sh.sh_size) != 0) {
+                rom_error(&res,
+                          "ROM interface section %s does not fit SRAM at "
+                          "0x%08X", name, sh.sh_addr);
+                free(buf);
+                return res;
+            }
+            res.interface_sections_loaded++;
+            res.interface_bytes_loaded += sh.sh_size;
         }
 
         if (strncmp(name, ".data_", 6) == 0) {
@@ -321,7 +353,7 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
         }
     }
     if (res.sections_loaded == 0) {
-        rom_error(&res, "ELF contains no mapped ESP32 ROM sections");
+        rom_error(&res, "ELF contains no sections in the target ROM map");
         free(buf);
         return res;
     }
@@ -362,7 +394,7 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
             while (j < section->size && bytes[j] == 0) j++;
             if (j == section->size) continue;
         }
-        if (found != 1 || !rom_range_contains(source, image_size) ||
+        if (found != 1 || !rom_range_contains(mem, source, image_size) ||
             !guest_range_mapped(mem, source, image_size) ||
             mem_load(mem, source, buf + section->offset, image_size) != 0) {
             rom_error(&res, "Cannot locate ROM initializer for %s", section->name);

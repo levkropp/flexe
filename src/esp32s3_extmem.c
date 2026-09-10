@@ -172,7 +172,10 @@ static void extmem_write(void *ctx, uint32_t addr, uint32_t value)
         return;
     case DCACHE_FREEZE_OFF:
     case ICACHE_FREEZE_OFF:
-        *reg = (value & 0x3u) | CACHE_FREEZE_DONE;
+        /* DONE acknowledges entry into freeze mode. ROM code clears ENA and
+         * waits for DONE to deassert when resuming cache traffic. */
+        *reg = value & 0x3u;
+        if (value & CACHE_OPERATION_ENABLE) *reg |= CACHE_FREEZE_DONE;
         return;
     case CACHE_STATE_OFF:
     case CORE0_DBUS_REJECT_ADDR_OFF:

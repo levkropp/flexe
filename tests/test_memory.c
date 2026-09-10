@@ -79,6 +79,12 @@ TEST(mem_esp32s3_native_map_and_diram_alias) {
     mem_write32(mem, 0x40370000u, 0xC001CAFEu);
     ASSERT_EQ(mem_read32(mem, 0x3FC88000u), 0x12345678u);
 
+    /* The ROM D-bus window aliases the last 128 KiB of mask ROM. */
+    mem_write32(mem, 0x40058C00u, 0x0BADF00Du);
+    ASSERT_EQ(mem_read32(mem, 0x3FF18C00u), 0x0BADF00Du);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x3FF00000u) ==
+                mem_backing_ptr(mem, FLEXE_MEM_ROM) + 0x40000u);
+
     ASSERT_TRUE(mem_get_ptr(mem, 0x3C000000u) != NULL);
     ASSERT_TRUE(mem_get_ptr(mem, 0x3C3FFFFFu) != NULL);
     ASSERT_TRUE(mem_get_ptr(mem, 0x3C400000u) == NULL);
