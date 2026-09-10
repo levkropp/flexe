@@ -462,6 +462,44 @@ TEST(timer_ccompare_write_clears) {
     teardown(&cpu);
 }
 
+TEST(native_chain_horizon_tracks_observable_events) {
+    xtensa_cpu_t cpu;
+    setup_exc(&cpu);
+
+    /* A masked interrupt still requests a dispatcher recheck, but it cannot
+     * affect the currently executing native chain. */
+    cpu.int_level[6] = 1;
+    cpu.interrupt = 1u << 6;
+    cpu.intenable = 1u << 6;
+    cpu.ps = 1u;
+    cpu.jit_chain_limit = 123u;
+    cpu.irq_check = false;
+    xtensa_request_irq_check(&cpu);
+    ASSERT_TRUE(cpu.irq_check);
+    ASSERT_EQ(cpu.jit_chain_limit, 123u);
+
+    /* Lowering the architectural mask makes the same source observable, so
+     * the next compiled-block boundary must return to the dispatcher. */
+    cpu.ps = 0u;
+    cpu.jit_chain_limit = 123u;
+    cpu.irq_check = false;
+    xtensa_request_irq_check(&cpu);
+    ASSERT_TRUE(cpu.irq_check);
+    ASSERT_EQ(cpu.jit_chain_limit, 0u);
+
+    /* Moving the nearest timer likewise invalidates a horizon derived from
+     * the previous schedule. */
+    cpu.interrupt = 0u;
+    cpu.irq_check = false;
+    cpu.jit_chain_limit = 123u;
+    cpu.ccount = 10u;
+    sr_write(&cpu, XT_SR_CCOMPARE0, 100u);
+    ASSERT_EQ(cpu.next_timer_event, 100u);
+    ASSERT_EQ(cpu.jit_chain_limit, 0u);
+
+    teardown(&cpu);
+}
+
 /* ===== INTSET/INTCLEAR register tests ===== */
 
 TEST(intset_register) {
@@ -659,6 +697,7 @@ void run_exception_tests(void) {
     RUN_TEST(timer_latched_compare_is_not_rescheduled);
     RUN_TEST(timer_ccompare_dispatch);
     RUN_TEST(timer_ccompare_write_clears);
+    RUN_TEST(native_chain_horizon_tracks_observable_events);
 
     TEST_SUITE("INTSET/INTCLEAR");
     RUN_TEST(intset_register);

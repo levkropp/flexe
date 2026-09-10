@@ -2239,7 +2239,7 @@ static void intr_matrix_refresh_cpu_line(esp32_periph_t *p, int core,
     uint32_t mask = 1u << cpu_int;
     if (asserted) {
         p->cpu[core]->interrupt |= mask;
-        p->cpu[core]->irq_check = true;
+        xtensa_request_irq_check(p->cpu[core]);
     } else {
         p->cpu[core]->interrupt &= ~mask;
     }

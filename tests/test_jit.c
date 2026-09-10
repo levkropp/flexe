@@ -941,6 +941,44 @@ TEST(test_jit_precompiled_fallthrough_chain_is_not_overwritten) {
     teardown(&cpu);
 }
 
+TEST(test_jit_static_chain_stops_at_timer_deadline) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE;
+    const uint32_t source = BASE + 0x40u;
+
+    put_insn2(&cpu, target, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, target + 2u, narrow(0xD, 15, 0, 0)); /* RET.N */
+    for (unsigned i = 0; i < 3u; i++)
+        put_insn2(&cpu, source + i * 2u,
+                  narrow(0xD, 15, 0, 3)); /* NOP.N */
+    int32_t joff = (int32_t)target - (int32_t)(source + 6u + 3u) - 1;
+    put_insn3(&cpu, source + 6u,
+              (((uint32_t)joff & 0x3FFFFu) << 6) | 6u);
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, source);
+    jit_block_fn source_fn = jit_get_block(jit, &cpu, source);
+    ASSERT_TRUE(source_fn != NULL);
+
+    /* The source reaches the timer exactly at its static successor. The
+     * successor must not execute before xtensa_step_impl() fires the event. */
+    cpu.pc = source;
+    cpu.ccount = 100u;
+    cpu.next_timer_event = 104u;
+    cpu.jit_chain_limit = 4u; /* dispatcher-computed event horizon */
+    ASSERT_EQ(source_fn(&cpu), 4);
+    ASSERT_EQ(cpu.pc, target);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_precompiled_side_exit_chain_is_not_overwritten) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2688,6 +2726,11 @@ static uint32_t jit_calln_insn(int nn, int32_t offset) {
     return (off18 << 6) | ((nn & 3) << 4) | 5;
 }
 
+static uint32_t jit_callx_insn(int nn, int source) {
+    return ((uint32_t)source << 8) |
+           ((uint32_t)((3 << 2) | (nn & 3)) << 4);
+}
+
 static uint32_t jit_entry_insn(int s, uint32_t framesize) {
     uint32_t imm12 = (framesize >> 3) & 0xFFF;
     return (imm12 << 12) | ((uint32_t)s << 8) | (3u << 4) | 6u;
@@ -3048,6 +3091,175 @@ TEST(test_jit_call0_full_return_address) {
     jit_put_three_nops(&cpu);
     put_insn3(&cpu, BASE + 6, jit_calln_insn(0, 0));
     test_block_differential(&cpu, 4, "call0_full_return_address");
+    teardown(&cpu);
+}
+
+static void jit_callx_chain_case(int nn, int source) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE + 0x80u;
+
+    put_insn3(&cpu, BASE, jit_callx_insn(nn, source));
+    for (unsigned i = 0; i < 4u; i++)
+        put_insn2(&cpu, target + i * 2u,
+                  narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, target + 8u,
+              narrow(0xD, 15, 0, 2));     /* ILL.N ends the block */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.windowbase = 2u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 2u;
+    cpu.windowstart = 1u << 2;
+    ar_write(&cpu, source, target);
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    cpu.running = true;
+
+    uint64_t hooks_before = jit_get_stats(jit)->hook_calls;
+    uint64_t insns_before = jit_get_stats(jit)->insns_jitted;
+    ASSERT_EQ(xtensa_run(&cpu, 5), 5);
+    ASSERT_EQ(cpu.pc, target + 8u);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(XT_PS_CALLINC(cpu.ps), (uint32_t)nn);
+    ASSERT_EQ(ar_read(&cpu, nn * 4),
+              nn == 0 ? BASE + 3u
+                      : ((uint32_t)nn << 30) |
+                        ((BASE + 3u) & 0x3FFFFFFFu));
+    ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - insns_before, 5u);
+    ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_callx_chains_to_runtime_callee) {
+    /* CALLX0 covers the call0 ABI; CALLX8 also makes the source and link
+     * register alias, the ordinary windowed function-pointer call shape. */
+    jit_callx_chain_case(0, 2);
+    jit_callx_chain_case(2, 8);
+}
+
+TEST(test_jit_dynamic_call_stops_at_timer_deadline) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE + 0x80u;
+
+    put_insn3(&cpu, BASE, jit_callx_insn(2, 8));
+    put_insn2(&cpu, target, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, target + 2u,
+              narrow(0xD, 15, 0, 2)); /* ILL.N ends the block */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    cpu.windowbase = 2u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn source_fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(source_fn != NULL);
+
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 2u;
+    cpu.windowstart = 1u << 2;
+    ar_write(&cpu, 8, target);
+    cpu.pc = BASE;
+    cpu.ccount = 100u;
+    cpu.next_timer_event = 101u;
+    cpu.jit_chain_limit = 1u; /* dispatcher-computed event horizon */
+
+    /* CALLX itself reaches the deadline. Its dynamically resolved callee must
+     * remain at the published target until the dispatcher services the timer. */
+    ASSERT_EQ(source_fn(&cpu), 1);
+    ASSERT_EQ(cpu.pc, target);
+    ASSERT_EQ(cpu.windowbase, 2u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_windowed_indirect_call_round_trip) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t callee = BASE + 0x80u;
+    const uint32_t body = callee + 3u;
+    const uint32_t continuation = BASE + 3u;
+
+    /* Exercise the complete windowed indirect-call path as three separately
+     * compiled blocks: CALLX8 selects the callee at runtime, ENTRY rotates to
+     * its register window, and RETW resolves the runtime continuation back in
+     * the caller. This is the architectural cycle used by C++ virtual calls
+     * and function pointers, independent of any particular firmware image. */
+    put_insn3(&cpu, BASE, jit_callx_insn(2, 8));
+    for (unsigned i = 0; i < 4u; i++)
+        put_insn2(&cpu, continuation + i * 2u,
+                  narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, continuation + 8u,
+              narrow(0xD, 15, 0, 2));     /* ILL.N ends the block */
+
+    put_insn3(&cpu, callee, jit_entry_insn(1, 32));
+    put_insn2(&cpu, body, narrow(0xB, 2, 2, 1)); /* ADDI.N a2, a2, 1 */
+    put_insn2(&cpu, body + 2u, jit_retw_n_insn());
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    /* Compile every destination under the window in which it executes, then
+     * restore the caller state before entering the native chain. */
+    cpu.windowbase = 2u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, continuation);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, continuation) != NULL);
+
+    cpu.windowbase = 4u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, body);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, body) != NULL);
+
+    cpu.windowbase = 2u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, callee);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, callee) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 2u;
+    cpu.windowstart = 1u << 2;
+    ar_write(&cpu, 1, DATA_BASE + 0x800u);
+    ar_write(&cpu, 2, 41u);
+    ar_write(&cpu, 8, callee); /* CALLX8 target aliases its link register. */
+    cpu.ar[4u * 4u + 2u] = 41u;
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    cpu.running = true;
+
+    uint64_t hooks_before = jit_get_stats(jit)->hook_calls;
+    uint64_t insns_before = jit_get_stats(jit)->insns_jitted;
+    ASSERT_EQ(xtensa_run(&cpu, 8), 8);
+    ASSERT_EQ(cpu.pc, continuation + 8u);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.windowstart, 1u << 2);
+    ASSERT_EQ(ar_read(&cpu, 2), 41u);
+    ASSERT_EQ(cpu.ar[4u * 4u + 2u], 42u);
+    ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - insns_before, 8u);
+    ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
+
+    jit_destroy(jit);
     teardown(&cpu);
 }
 
@@ -3428,6 +3640,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_one_instruction_straight_line_compiles_when_hot);
     RUN_TEST(test_jit_single_instruction_chain_target_is_native);
     RUN_TEST(test_jit_precompiled_fallthrough_chain_is_not_overwritten);
+    RUN_TEST(test_jit_static_chain_stops_at_timer_deadline);
     RUN_TEST(test_jit_precompiled_side_exit_chain_is_not_overwritten);
     RUN_TEST(test_jit_short_backedge_loop_is_native);
     RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);
@@ -3511,6 +3724,9 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_exact_hook_query_distinguishes_bitmap_collisions);
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);
+    RUN_TEST(test_jit_callx_chains_to_runtime_callee);
+    RUN_TEST(test_jit_dynamic_call_stops_at_timer_deadline);
+    RUN_TEST(test_jit_windowed_indirect_call_round_trip);
     RUN_TEST(test_jit_entry_windowed);
     RUN_TEST(test_jit_entry_ignores_unrelated_live_window);
     RUN_TEST(test_jit_retw_windowed);

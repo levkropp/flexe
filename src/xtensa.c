@@ -82,7 +82,10 @@ static inline void xtensa_recompute_next_timer_impl(xtensa_cpu_t *cpu) {
             }
         }
     }
-    cpu->next_timer_event = have_event ? best_event : UINT32_MAX;
+    uint32_t next = have_event ? best_event : UINT32_MAX;
+    if (next != cpu->next_timer_event)
+        xtensa_native_chain_barrier(cpu);
+    cpu->next_timer_event = next;
 }
 
 void xtensa_recompute_next_timer(xtensa_cpu_t *cpu) {
@@ -104,7 +107,7 @@ static inline void xtensa_fire_timers(xtensa_cpu_t *cpu) {
         cpu->interrupt |= (1u << 15);
     if (cpu->ccompare[2] && (int32_t)(cpu->ccount - cpu->ccompare[2]) >= 0)
         cpu->interrupt |= (1u << 16);
-    if (cpu->interrupt != old) cpu->irq_check = true;
+    if (cpu->interrupt != old) xtensa_request_irq_check(cpu);
     /* Peripheral timer events (TIMG LACT alarms) */
     if (cpu->periph_event) cpu->periph_event(cpu);
     xtensa_recompute_next_timer_impl(cpu);
@@ -171,6 +174,7 @@ void xtensa_cpu_init(xtensa_cpu_t *cpu) {
         cpu->real_window_vectors = enabled != 0;
     }
     cpu->next_timer_event = UINT32_MAX;  /* No timer pending until ccompare is written */
+    cpu->jit_chain_limit = UINT32_MAX;   /* Direct JIT-block callers are unbounded */
     /* First step counts as a control-flow transfer so the PC hook /
      * AOT bitmap gates fire on the initial PC (entry vector). */
     cpu->_pc_written = true;
@@ -454,9 +458,9 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
     case XT_SR_EXCSAVE6:    cpu->excsave[5] = val; break;
     case XT_SR_EXCSAVE7:    cpu->excsave[6] = val; break;
     case XT_SR_CPENABLE:    cpu->cpenable = val; break;
-    case XT_SR_INTSET:   cpu->interrupt |= val; cpu->irq_check = true; break;
+    case XT_SR_INTSET:   cpu->interrupt |= val; xtensa_request_irq_check(cpu); break;
     case XT_SR_INTCLEAR: cpu->interrupt &= ~val; break;
-    case XT_SR_INTENABLE:   cpu->intenable = val; cpu->irq_check = true; break;
+    case XT_SR_INTENABLE:   cpu->intenable = val; xtensa_request_irq_check(cpu); break;
     /* PS carries the interrupt mask (INTLEVEL) and EXCM, so writing it can
      * unmask an interrupt that is already pending. `irq_check` is the hint
      * that says "re-evaluate", and it used to be set only when `interrupt`
@@ -467,7 +471,7 @@ void sr_write(xtensa_cpu_t *cpu, int sr, uint32_t val) {
      * this; the re-evaluation itself re-tests everything, so setting it
      * where nothing was unmasked costs only the store. */
     case XT_SR_PS:          cpu->ps = val;
-                            cpu->irq_check = true;
+                            xtensa_request_irq_check(cpu);
                             break;
     case XT_SR_VECBASE:     cpu->vecbase = val; break;
     case XT_SR_EXCCAUSE:    cpu->exccause = val; break;
@@ -528,8 +532,6 @@ void xtensa_raise_exception(xtensa_cpu_t *cpu, int cause, uint32_t fault_pc, uin
     }
     BRANCH_TO(cpu, vec);
 }
-
-#define EXCMLEVEL 3  /* ESP32 XCHAL_EXCM_LEVEL=3: when EXCM=1, levels 1-3 masked */
 
 static void synth_spill_window(xtensa_cpu_t *cpu, int widx);
 extern int g_flexe_shadow_fill;
@@ -916,8 +918,8 @@ void xtensa_check_interrupts(xtensa_cpu_t *cpu) {
     if (!pending) return;
 
     int eff_level = XT_PS_INTLEVEL(cpu->ps);
-    if (XT_PS_EXCM(cpu->ps) && EXCMLEVEL > eff_level)
-        eff_level = EXCMLEVEL;
+    if (XT_PS_EXCM(cpu->ps) && XTENSA_EXCM_LEVEL > eff_level)
+        eff_level = XTENSA_EXCM_LEVEL;
 
     /* Find highest-level pending interrupt using bit scan */
     int best_level = 0;
@@ -1856,13 +1858,13 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         WINLOG(cpu, "RFE epc=%08X ps=%08X a1=%08X\n",
                                cpu->epc[0], cpu->ps, ar_read(cpu, 1));
                         XT_PS_SET_EXCM(cpu->ps, 0);
-                        cpu->irq_check = true;  /* may unmask; see WSR PS */
+                        xtensa_request_irq_check(cpu); /* may unmask; see WSR PS */
                         BRANCH_TO(cpu, cpu->epc[0]);
                         return;
                     case 4: /* RFWO */
                         WINLOG(cpu, "RFWO epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
-                        cpu->irq_check = true;  /* may unmask; see WSR PS */
+                        xtensa_request_irq_check(cpu); /* may unmask; see WSR PS */
                         cpu->windowstart &= ~(1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
                         window_hazard_refresh(cpu);
@@ -1871,7 +1873,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                     case 5: /* RFWU */
                         WINLOG(cpu, "RFWU epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
-                        cpu->irq_check = true;  /* may unmask; see WSR PS */
+                        xtensa_request_irq_check(cpu); /* may unmask; see WSR PS */
                         cpu->windowstart |= (1u << cpu->windowbase);
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
                         window_hazard_refresh(cpu);
@@ -1922,7 +1924,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             case 6: /* RSIL - read/set interrupt level */
                 ar_write(cpu, t, cpu->ps);
                 cpu->ps = (cpu->ps & ~0xF) | (s & 0xF);
-                cpu->irq_check = true;   /* may unmask; see WSR PS */
+                xtensa_request_irq_check(cpu); /* may unmask; see WSR PS */
                 break;
             case 7: /* WAITI */
                 XT_PS_SET_INTLEVEL(cpu->ps, s);

@@ -241,6 +241,9 @@ typedef enum {
 #define XT_PS_CALLINC(ps)   (((ps) >> 16) & 3)
 #define XT_PS_WOE(ps)       (((ps) >> 18) & 1)
 
+/* ESP32 XCHAL_EXCM_LEVEL: exception mode masks interrupt levels 1-3. */
+#define XTENSA_EXCM_LEVEL 3
+
 #define XT_PS_SET_CALLINC(ps, v) ((ps) = ((ps) & ~(3u << 16)) | (((v) & 3u) << 16))
 #define XT_PS_SET_OWB(ps, v)     ((ps) = ((ps) & ~(0xFu << 8)) | (((v) & 0xFu) << 8))
 #define XT_PS_SET_EXCM(ps, v)    ((ps) = ((ps) & ~(1u << 4)) | (((v) & 1u) << 4))
@@ -486,6 +489,14 @@ struct xtensa_cpu {
      * its epilogue, so it is deliberately not serialized in savestates. */
     uint32_t jit_acc;
 
+    /* Maximum accumulated guest instructions the current native JIT chain
+     * may execute before returning to the dispatcher. The JIT derives it
+     * from its ordinary chain cap, the nearest timer, and the remaining
+     * scheduler span. A newly deliverable interrupt or timer-schedule change
+     * clears it so the next compiled-block boundary becomes a safepoint.
+     * Transient: like jit_acc, it is never serialized. */
+    uint32_t jit_chain_limit;
+
     /* Remaining guest-instruction room in the current interpreter batch.
      * Conditional native spans use it to decline rather than cross the
      * scheduler boundary. Zero means execution is not inside xtensa_run().
@@ -511,6 +522,37 @@ struct xtensa_cpu {
     xtensa_pc_hook_contains_fn pc_hook_contains;
     void *pc_hook_contains_ctx;
 };
+
+/* Native execution caches its event horizon for the duration of a short JIT
+ * chain. Any change which can make an interrupt observable must invalidate
+ * that horizon; interpreted execution simply pays this cold extra store. */
+static inline void xtensa_native_chain_barrier(xtensa_cpu_t *cpu) {
+    cpu->jit_chain_limit = 0u;
+}
+
+static inline bool xtensa_irq_is_deliverable(const xtensa_cpu_t *cpu) {
+    uint32_t pending = cpu->interrupt & cpu->intenable;
+    if (!pending)
+        return false;
+
+    int effective_level = XT_PS_INTLEVEL(cpu->ps);
+    if (XT_PS_EXCM(cpu->ps) && XTENSA_EXCM_LEVEL > effective_level)
+        effective_level = XTENSA_EXCM_LEVEL;
+
+    while (pending) {
+        int source = __builtin_ctz(pending);
+        if (cpu->int_level[source] > effective_level)
+            return true;
+        pending &= pending - 1u;
+    }
+    return false;
+}
+
+static inline void xtensa_request_irq_check(xtensa_cpu_t *cpu) {
+    cpu->irq_check = true;
+    if (xtensa_irq_is_deliverable(cpu))
+        xtensa_native_chain_barrier(cpu);
+}
 
 /* ESP-IDF's Xtensa spinlock owner words are the raw PRID values. Restrict
  * cooperative handoff to its exact "free -> this core" CAS shape: arbitrary

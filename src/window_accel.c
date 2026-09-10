@@ -186,7 +186,7 @@ bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
 
     unsigned vector_window = cpu->windowbase & 15u;
     XT_PS_SET_EXCM(cpu->ps, 0);
-    cpu->irq_check = true;
+    xtensa_request_irq_check(cpu);
     if (underflow)
         cpu->windowstart |= 1u << vector_window;
     else

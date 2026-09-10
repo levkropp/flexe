@@ -3072,7 +3072,7 @@ static void stub_xtos_set_intlevel(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t old_ps = cpu->ps;
     uint32_t level = rom_arg(cpu, 0);
     cpu->ps = (cpu->ps & ~0xFu) | (level & 0xFu);
-    cpu->irq_check = true;
+    xtensa_request_irq_check(cpu);
     rom_return(cpu, old_ps);
 }
 
