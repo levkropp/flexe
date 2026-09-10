@@ -2660,7 +2660,11 @@ bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
                * architectural overflow check. */
               if (__builtin_expect(cpu->seed_entry_link, 0)) {
                   cpu->seed_entry_link = false;
-                  if (new_sp >= 0x3FF80000u && new_sp < 0x40000000u &&
+                  if (new_sp >= 16u &&
+                      flexe_target_range_uses_backing(
+                          cpu->target, new_sp - 16u, 16u, FLEXE_MEM_SRAM) &&
+                      mem_get_ptr_w(cpu->mem, new_sp - 16u) != NULL &&
+                      mem_get_ptr_w(cpu->mem, new_sp - 1u) != NULL &&
                       mem_read32(cpu->mem, new_sp - 12u) == 0u) {
                       mem_write32(cpu->mem, new_sp - 16u, 0u);  /* ends unwind */
                       mem_write32(cpu->mem, new_sp - 12u, caller_sp);

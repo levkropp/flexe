@@ -258,6 +258,24 @@ bool flexe_target_pc_is_executable(const flexe_target_desc_t *target,
     return false;
 }
 
+bool flexe_target_range_uses_backing(const flexe_target_desc_t *target,
+                                     uint32_t addr, uint32_t size,
+                                     flexe_mem_backing_t backing)
+{
+    uint64_t end = (uint64_t)addr + size;
+    if (!target || backing >= FLEXE_MEM_BACKING_COUNT ||
+        target->memory_region_count > FLEXE_TARGET_MEM_REGION_MAX ||
+        end > (UINT64_C(1) << 32))
+        return false;
+    for (unsigned i = 0; i < target->memory_region_count; i++) {
+        const flexe_target_mem_region_t *region = &target->memory_region[i];
+        if (region->backing == backing && addr >= region->start &&
+            end <= region->end)
+            return true;
+    }
+    return false;
+}
+
 uint32_t flexe_target_bootstrap_stack(const flexe_target_desc_t *target,
                                       unsigned core)
 {

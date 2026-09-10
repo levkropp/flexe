@@ -185,6 +185,13 @@ int flexe_target_parse(const char *name, flexe_target_id_t *id_out);
 bool flexe_target_pc_is_executable(const flexe_target_desc_t *target,
                                    uint32_t pc);
 
+/* True when the complete guest range belongs to one initial-map region backed
+ * by `backing`. Empty linker-described ranges are valid. This describes target
+ * geometry; callers after MMU changes must separately validate live mappings. */
+bool flexe_target_range_uses_backing(const flexe_target_desc_t *target,
+                                     uint32_t addr, uint32_t size,
+                                     flexe_mem_backing_t backing);
+
 /* Return a descriptor-provided direct-start stack, or zero for bad input. */
 uint32_t flexe_target_bootstrap_stack(const flexe_target_desc_t *target,
                                       unsigned core);

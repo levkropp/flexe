@@ -247,6 +247,44 @@ TEST(entry_frame_alloc) {
     teardown(&cpu);
 }
 
+/* A direct-to-application frontend jumps to a function which expects to have
+ * been called by the bootloader. The first ENTRY therefore builds a synthetic
+ * root link using the target's own SRAM map. In particular, S3 DRAM lives at
+ * 0x3fc..., outside the classic-only range this path originally recognized. */
+TEST(direct_entry_seeds_target_sram_root) {
+    const flexe_target_id_t targets[] = {
+        FLEXE_TARGET_ESP32,
+        FLEXE_TARGET_ESP32S3,
+    };
+
+    for (unsigned i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        const flexe_target_desc_t *target = flexe_target_by_id(targets[i]);
+        xtensa_cpu_t cpu;
+        uint32_t pc = target->iram_start;
+        uint32_t initial_sp = flexe_target_bootstrap_stack(target, 0);
+        uint32_t frame_sp = initial_sp - 112u;
+
+        xtensa_cpu_reset_for_target(&cpu, target);
+        cpu.mem = mem_create_for_target(target);
+        ASSERT_TRUE(cpu.mem != NULL);
+        if (!cpu.mem) continue;
+        cpu.pc = pc;
+        cpu.real_window_vectors = false;
+        XT_PS_SET_EXCM(cpu.ps, 0);
+        ar_write(&cpu, 1, initial_sp);
+        cpu.seed_entry_link = true;
+        put_insn3(&cpu, pc, entry_insn(1, 112u));
+
+        ASSERT_EQ(xtensa_step(&cpu), 0);
+        ASSERT_EQ(ar_read(&cpu, 1), frame_sp);
+        ASSERT_FALSE(cpu.seed_entry_link);
+        ASSERT_EQ(mem_read32(cpu.mem, frame_sp - 16u), 0u);
+        ASSERT_EQ(mem_read32(cpu.mem, frame_sp - 12u), initial_sp);
+        ASSERT_EQ(mem_unmapped_count(cpu.mem), 0u);
+        mem_destroy(cpu.mem);
+    }
+}
+
 /* ===== RETW restores window ===== */
 
 TEST(retw_restores_window) {
@@ -1440,6 +1478,7 @@ static void run_window_tests(void) {
     RUN_TEST(call12_entry_retw);
     RUN_TEST(callx4_round_trip);
     RUN_TEST(entry_frame_alloc);
+    RUN_TEST(direct_entry_seeds_target_sram_root);
     RUN_TEST(retw_restores_window);
     RUN_TEST(deep_call4_chain);
     RUN_TEST(deep_call4_return);

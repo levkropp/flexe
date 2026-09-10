@@ -110,29 +110,11 @@ static int section_name(const uint8_t *buf, size_t file_size,
     return 1;
 }
 
-/* ROM bus apertures are part of the target's address map. This admits both
- * classic ESP32's 0x3ff9 data alias and ESP32-S3's 0x3ff0 data alias without
- * teaching the ELF parser either chip's addresses. */
-static int target_range_uses_backing(const xtensa_mem_t *mem,
-                                     uint32_t addr, uint32_t size,
-                                     flexe_mem_backing_t backing)
-{
-    const flexe_target_desc_t *target = mem_target(mem);
-    uint64_t end = (uint64_t)addr + size;
-    if (!target || end > (UINT64_C(1) << 32)) return 0;
-    for (unsigned i = 0; i < target->memory_region_count; i++) {
-        const flexe_target_mem_region_t *region = &target->memory_region[i];
-        if (region->backing == backing && addr >= region->start &&
-            end <= region->end)
-            return 1;
-    }
-    return 0;
-}
-
 static int rom_range_contains(const xtensa_mem_t *mem,
                               uint32_t addr, uint32_t size)
 {
-    return target_range_uses_backing(mem, addr, size, FLEXE_MEM_ROM);
+    return flexe_target_range_uses_backing(mem_target(mem), addr, size,
+                                           FLEXE_MEM_ROM);
 }
 
 static int guest_range_mapped(xtensa_mem_t *mem, uint32_t addr, uint32_t size)
@@ -324,8 +306,8 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
          * part of the ROM startup-copy table: a direct application handoff
          * must install them explicitly, while BSS remains calloc-zeroed. */
         if (strncmp(name, ".data.interface.", 16) == 0) {
-            if (!target_range_uses_backing(mem, sh.sh_addr, sh.sh_size,
-                                           FLEXE_MEM_SRAM) ||
+            if (!flexe_target_range_uses_backing(mem_target(mem), sh.sh_addr,
+                                                 sh.sh_size, FLEXE_MEM_SRAM) ||
                 !guest_range_mapped(mem, sh.sh_addr, sh.sh_size) ||
                 mem_load(mem, sh.sh_addr, buf + sh.sh_offset, sh.sh_size) != 0) {
                 rom_error(&res,
@@ -404,8 +386,8 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
         const flexe_target_desc_t *target = mem_target(mem);
         if ((target->capabilities &
              FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT) != 0u &&
-            (!target_range_uses_backing(mem, section->addr, image_size,
-                                        FLEXE_MEM_SRAM) ||
+            (!flexe_target_range_uses_backing(mem_target(mem), section->addr,
+                                              image_size, FLEXE_MEM_SRAM) ||
              !guest_range_mapped(mem, section->addr, image_size) ||
              mem_load(mem, section->addr, buf + section->offset,
                       image_size) != 0)) {

@@ -20,6 +20,24 @@ TEST(target_reset_uses_lx7_core_configuration) {
     ASSERT_EQ(flexe_target_bootstrap_stack(s3, 2), 0u);
 }
 
+TEST(target_backing_ranges_cover_complete_regions) {
+    const flexe_target_desc_t *classic =
+        flexe_target_by_id(FLEXE_TARGET_ESP32);
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+
+    ASSERT_TRUE(flexe_target_range_uses_backing(
+        classic, 0x3FFB0000u, 16u, FLEXE_MEM_SRAM));
+    ASSERT_TRUE(flexe_target_range_uses_backing(
+        s3, 0x3FCDFF80u, 16u, FLEXE_MEM_SRAM));
+    ASSERT_FALSE(flexe_target_range_uses_backing(
+        s3, 0x3FC87FFCu, 8u, FLEXE_MEM_SRAM));
+    ASSERT_FALSE(flexe_target_range_uses_backing(
+        s3, UINT32_MAX - 3u, 8u, FLEXE_MEM_SRAM));
+    ASSERT_TRUE(flexe_target_range_uses_backing(
+        s3, 0x3FC88000u, 0u, FLEXE_MEM_SRAM));
+}
+
 TEST(target_lx7_interprets_common_isa_in_s3_iram) {
     const uint32_t pc = 0x40370000u;
     const flexe_target_desc_t *s3 =
@@ -103,6 +121,7 @@ void run_target_tests(void) {
     TEST_SUITE("Xtensa target descriptors");
 
     RUN_TEST(target_reset_uses_lx7_core_configuration);
+    RUN_TEST(target_backing_ranges_cover_complete_regions);
     RUN_TEST(target_lx7_interprets_common_isa_in_s3_iram);
     RUN_TEST(target_lx7_does_not_build_classic_predecode_table);
     RUN_TEST(target_lx7_savestate_uses_descriptor_backing_sizes);
