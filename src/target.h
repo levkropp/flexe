@@ -17,7 +17,8 @@
 #define FLEXE_TARGET_UART_MAX 3
 #define FLEXE_TARGET_RTC_CAL_GROUP_MAX 2u
 #define FLEXE_TARGET_RTC_CAL_CLOCK_MAX 4u
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 9u
+#define FLEXE_TARGET_REGI2C_HOST_MAX 2u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 10u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -28,6 +29,7 @@ typedef enum {
     FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT       = 1ull << 2,
     FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL     = 1ull << 3,
     FLEXE_TARGET_CAP_RTC_CALIBRATION            = 1ull << 4,
+    FLEXE_TARGET_CAP_REGI2C                     = 1ull << 5,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -154,6 +156,39 @@ typedef struct {
     uint32_t source_clock_hz[FLEXE_TARGET_RTC_CAL_CLOCK_MAX];
 } flexe_rtc_calibration_desc_t;
 
+/* Internal analog-register I2C fabric used by ROM clock, bias, PHY, and ADC
+ * code. This is distinct from the externally routed I2C controllers. The ROM
+ * command ABI is described here so the same device model can serve targets
+ * whose host count, register locations, or bit fields differ. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint8_t  host_count;
+    uint32_t command_offset;
+    uint32_t command_stride;
+    uint32_t analog_control_offset;
+    uint32_t config_offset;
+    uint32_t config2_offset;
+    uint32_t analog_control_reset;
+    uint32_t config_reset;
+    uint32_t config2_reset;
+    uint32_t analog_control_writable_mask;
+    uint32_t config_writable_mask;
+    uint32_t config2_writable_mask;
+    uint32_t command_start_mask;
+    uint32_t command_busy_mask;
+    uint32_t command_write_mask;
+    uint32_t slave_mask;
+    uint32_t address_mask;
+    uint32_t data_mask;
+    uint8_t  slave_shift;
+    uint8_t  address_shift;
+    uint8_t  data_shift;
+    uint32_t bbpll_stop_high_mask;
+    uint32_t bbpll_stop_low_mask;
+    uint32_t bbpll_done_mask;
+} flexe_regi2c_desc_t;
+
 typedef struct {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
@@ -209,6 +244,9 @@ typedef struct {
 
     /* Optional timer-group RTC slow-clock calibration interface. */
     flexe_rtc_calibration_desc_t rtc_calibration;
+
+    /* Optional internal analog-register I2C fabric. */
+    flexe_regi2c_desc_t           regi2c;
 
     /* Initial address map. Flash cache windows are initially linear so an
      * image can be loaded; the target MMU replaces those mappings at boot. */

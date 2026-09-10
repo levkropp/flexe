@@ -114,7 +114,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM |
                         FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT |
                         FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL |
-                        FLEXE_TARGET_CAP_RTC_CALIBRATION,
+                        FLEXE_TARGET_CAP_RTC_CALIBRATION |
+                        FLEXE_TARGET_CAP_REGI2C,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -205,6 +206,31 @@ static const flexe_target_desc_t TARGETS[] = {
             /* ESP-IDF's nominal RC_SLOW, RC_FAST/256, XTAL32K, and
              * INTERNAL_OSC selections for ESP32-S3 functional mode. */
             .source_clock_hz = { 136000u, 68359u, 32768u, 136000u },
+        },
+        .regi2c = {
+            .base = 0x6000E000u,
+            .register_size = 0x1000u,
+            .host_count = 2,
+            .command_offset = 0x000u,
+            .command_stride = 0x004u,
+            .analog_control_offset = 0x040u,
+            .config_offset = 0x044u,
+            .config2_offset = 0x048u,
+            .analog_control_writable_mask = (1u << 2) | (1u << 3),
+            .config_writable_mask = UINT32_MAX,
+            .config2_writable_mask = UINT32_MAX,
+            .command_start_mask = 1u << 26,
+            .command_busy_mask = 1u << 25,
+            .command_write_mask = 1u << 24,
+            .slave_mask = 0xFFu,
+            .address_mask = 0xFFu << 8,
+            .data_mask = 0xFFu << 16,
+            .slave_shift = 0,
+            .address_shift = 8,
+            .data_shift = 16,
+            .bbpll_stop_high_mask = 1u << 2,
+            .bbpll_stop_low_mask = 1u << 3,
+            .bbpll_done_mask = 1u << 24,
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x00080000u,

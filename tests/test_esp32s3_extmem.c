@@ -291,6 +291,66 @@ TEST(peripherals_model_target_described_rtc_calibration) {
     mem_destroy(mem);
 }
 
+TEST(peripherals_model_target_described_internal_regi2c) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_regi2c_desc_t *desc = &s3->regi2c;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t host0 = desc->base + desc->command_offset;
+    uint32_t host1 = host0 + desc->command_stride;
+    uint32_t write = desc->command_start_mask | desc->command_write_mask |
+                     0x66u | (3u << desc->address_shift) |
+                     (0xA5u << desc->data_shift);
+    mem_write32(mem, host1, write | desc->command_busy_mask);
+    ASSERT_EQ(mem_read32(mem, host1), write);
+
+    uint32_t read = desc->command_start_mask | 0x66u |
+                    (3u << desc->address_shift);
+    mem_write32(mem, host0, read);
+    ASSERT_EQ(mem_read32(mem, host0),
+              read | (0xA5u << desc->data_shift));
+    ASSERT_EQ(mem_read32(mem, host0) & desc->command_busy_mask, 0u);
+
+    /* A different internal slave/register has independent storage. */
+    mem_write32(mem, host0, desc->command_start_mask | 0x69u |
+                            (3u << desc->address_shift));
+    ASSERT_EQ((mem_read32(mem, host0) & desc->data_mask) >>
+              desc->data_shift, 0u);
+
+    uint32_t control = desc->base + desc->analog_control_offset;
+    mem_write32(mem, control, desc->bbpll_stop_low_mask);
+    ASSERT_EQ(mem_read32(mem, control), desc->bbpll_stop_low_mask);
+    ASSERT_EQ(mem_read32(mem, control),
+              desc->bbpll_stop_low_mask | desc->bbpll_done_mask);
+    mem_write32(mem, control, desc->bbpll_stop_high_mask);
+    ASSERT_EQ(mem_read32(mem, control), desc->bbpll_stop_high_mask);
+
+    uint32_t config = desc->base + desc->config_offset;
+    uint32_t config2 = desc->base + desc->config2_offset;
+    mem_write32(mem, config, 0xFFFFBFFFu);
+    mem_write32(mem, config2, 0x0001FF40u);
+    ASSERT_EQ(mem_read32(mem, config), 0xFFFFBFFFu);
+    ASSERT_EQ(mem_read32(mem, config2), 0x0001FF40u);
+
+    int before = periph_unhandled_count(periph);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x04Cu), 0u);
+    mem_write32(mem, desc->base + 0x04Cu, 1u);
+    ASSERT_EQ(periph_unhandled_count(periph), before + 2);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_esp32s3_extmem_tests(void) {
     TEST_SUITE("ESP32-S3 EXTMEM");
     RUN_TEST(esp32s3_extmem_exposes_documented_reset_state);
@@ -300,4 +360,5 @@ void run_esp32s3_extmem_tests(void) {
     RUN_TEST(peripherals_compose_target_described_s3_uarts);
     RUN_TEST(peripherals_model_target_described_secondary_core_control);
     RUN_TEST(peripherals_model_target_described_rtc_calibration);
+    RUN_TEST(peripherals_model_target_described_internal_regi2c);
 }

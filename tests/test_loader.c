@@ -269,12 +269,16 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities &
                 FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_REGI2C);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
     ASSERT_EQ(s3->secondary_core.boot_address_offset, 4u);
     ASSERT_EQ(s3->rtc_calibration.group_count, 2u);
     ASSERT_EQ(s3->rtc_calibration.base[0], 0x6001F000u);
     ASSERT_EQ(s3->rtc_calibration.base[1], 0x60020000u);
     ASSERT_EQ(s3->rtc_calibration.reference_clock_hz, 40000000u);
+    ASSERT_EQ(s3->regi2c.base, 0x6000E000u);
+    ASSERT_EQ(s3->regi2c.host_count, 2u);
+    ASSERT_EQ(s3->regi2c.bbpll_done_mask, 1u << 24);
     ASSERT_EQ(s3->reset_vector, 0x40000400u);
     ASSERT_EQ(s3->vecbase_reset, 0x40000000u);
     ASSERT_EQ(s3->configid0, 0xC2F0FFFEu);
