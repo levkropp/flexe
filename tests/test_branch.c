@@ -90,7 +90,7 @@ TEST(br_call0_ret_roundtrip) {
     /* CALL0 at BASE, target = BASE+16 */
     put_insn3(&cpu, BASE, call0_insn(3));
     /* NOP at BASE+3 (for return target) */
-    put_insn3(&cpu, BASE + 3, 0x002F00);
+    put_insn3(&cpu, BASE + 3, 0x0020F0);
     /* RET at target (BASE+16): op0=0, op1=0, op2=0, r=0, m=2, n=0 */
     /* RET encoding: 0x000080 actually... let me build it properly */
     /* RET: SNM0 m=2, n=0 -> (m<<6)|(n<<4) = 0x80, r=0, s=0, t=0, op2=0, op1=0 */
@@ -246,9 +246,9 @@ TEST(br_beqz_not_taken) {
 
 TEST(br_configured_poll_loop_batches_repeated_iterations) {
     xtensa_cpu_t cpu; setup(&cpu);
-    put_insn3(&cpu, BASE,     0x002F00u); /* nop */
-    put_insn3(&cpu, BASE + 3, 0x002F00u); /* nop */
-    put_insn3(&cpu, BASE + 6, 0x002F00u); /* nop */
+    put_insn3(&cpu, BASE,     0x0020F0u); /* nop */
+    put_insn3(&cpu, BASE + 3, 0x0020F0u); /* nop */
+    put_insn3(&cpu, BASE + 6, 0x0020F0u); /* nop */
     /* From BASE+9, imm12=-13 branches back to BASE. */
     put_insn3(&cpu, BASE + 9, bri12(0, 4, -13));
     cpu.poll_spin_pc[0] = BASE + 0x100u;
@@ -269,9 +269,9 @@ TEST(br_configured_poll_loop_batches_repeated_iterations) {
 
 TEST(br_configured_poll_loop_preserves_timer_boundary) {
     xtensa_cpu_t cpu; setup(&cpu);
-    put_insn3(&cpu, BASE,     0x002F00u); /* nop */
-    put_insn3(&cpu, BASE + 3, 0x002F00u); /* nop */
-    put_insn3(&cpu, BASE + 6, 0x002F00u); /* nop */
+    put_insn3(&cpu, BASE,     0x0020F0u); /* nop */
+    put_insn3(&cpu, BASE + 3, 0x0020F0u); /* nop */
+    put_insn3(&cpu, BASE + 6, 0x0020F0u); /* nop */
     put_insn3(&cpu, BASE + 9, bri12(0, 4, -13));
     cpu.poll_spin_pc[0] = BASE;
     cpu.poll_spin_count = 1u;

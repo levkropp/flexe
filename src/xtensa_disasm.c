@@ -144,20 +144,19 @@ static int disasm_qrst(uint32_t insn, uint32_t pc, char *buf, int bufsize) {
                 } break;
             case 1: EMIT("movsp\ta%d, a%d", t, s); break;
             case 2: /* SYNC */
-                switch (t) {
-                case 0: /* SYNC0 */
-                    switch (s) {
-                    case 0: EMIT("isync"); break;
-                    case 1: EMIT("rsync"); break;
-                    case 2: EMIT("esync"); break;
-                    case 3: EMIT("dsync"); break;
-                    case 8: EMIT("excw"); break;
-                    case 12: EMIT("memw"); break;
-                    case 13: EMIT("extw"); break;
-                    case 15: EMIT("nop"); break;
-                    default: EMIT("??sync0 s=%d", s); break;
-                    }
+                if (s != 0) {
+                    EMIT("??sync s=%d t=%d", s, t);
                     break;
+                }
+                switch (t) {
+                case 0: EMIT("isync"); break;
+                case 1: EMIT("rsync"); break;
+                case 2: EMIT("esync"); break;
+                case 3: EMIT("dsync"); break;
+                case 8: EMIT("excw"); break;
+                case 12: EMIT("memw"); break;
+                case 13: EMIT("extw"); break;
+                case 15: EMIT("nop"); break;
                 default: EMIT("??sync t=%d", t); break;
                 }
                 break;

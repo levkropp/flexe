@@ -393,11 +393,19 @@ TEST(exec_movi_n_negative) {
 
 TEST(exec_nop) {
     xtensa_cpu_t cpu; setup(&cpu);
-    put_insn3(&cpu, BASE, 0x002F00); /* NOP */
+    put_insn3(&cpu, BASE, 0x0020F0); /* NOP */
     ar_write(&cpu, 3, 42);
     xtensa_step(&cpu);
     ASSERT_EQ(ar_read(&cpu, 3), 42); /* unchanged */
     ASSERT_EQ(cpu.pc, BASE + 3);
+    teardown(&cpu);
+}
+
+TEST(exec_reserved_sync_is_illegal) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    put_insn3(&cpu, BASE, 0x002F00); /* reserved: SYNC requires S=0 */
+    xtensa_step(&cpu);
+    ASSERT_TRUE(cpu.exception);
     teardown(&cpu);
 }
 
@@ -721,6 +729,7 @@ void run_alu_tests(void) {
     RUN_TEST(exec_movi_n_90);
     RUN_TEST(exec_movi_n_negative);
     RUN_TEST(exec_nop);
+    RUN_TEST(exec_reserved_sync_is_illegal);
     RUN_TEST(exec_nop_n);
     RUN_TEST(exec_ill);
     RUN_TEST(exec_break);

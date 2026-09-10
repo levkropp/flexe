@@ -70,7 +70,7 @@ static uint32_t rotw_insn(int imm4) {
 
 /* NOP: for padding */
 static uint32_t nop_insn(void) {
-    return rrr(0, 0, 2, 15, 0);
+    return rrr(0, 0, 2, 0, 15);
 }
 
 /* Helper: set up cpu for windowed tests.

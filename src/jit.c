@@ -471,7 +471,8 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                     return 2;
                 }
                 if (r == 1) return 0;  /* MOVSP — guarded architectural move */
-                if (r == 2) return 0;  /* SYNC group (NOP, etc.) */
+                if (r == 2)
+                    return xtensa_sync_encoding_valid(insn) ? 0 : 2;
                 if (r == 3) {
                     /* The architectural window spill/fill vectors end in
                      * RFWO/RFWU. They are self-contained block terminators;
@@ -1622,7 +1623,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         case 0: { /* RST0 */
             switch (op2) {
             case 0: { /* ST0 specials */
-                if (r == 2) return 1; /* NOP/SYNC — no-op */
+                if (r == 2)
+                    return xtensa_sync_encoding_valid(insn); /* functional no-op */
                 if (r == 1) { /* MOVSP */
                     /* In architectural window mode MOVSP is a plain register
                      * move unless WOE is active outside an exception and all

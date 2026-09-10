@@ -231,7 +231,7 @@ static const char *build_test_elf(void) {
 /* ===== NOP instruction builder ===== */
 
 static uint32_t dbg_nop_insn(void) {
-    return rrr(0, 0, 2, 15, 0);
+    return rrr(0, 0, 2, 0, 15);
 }
 
 /* ===== ELF Symbol Tests ===== */

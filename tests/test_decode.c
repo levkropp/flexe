@@ -146,14 +146,37 @@ TEST(test_nop) {
     xtensa_cpu_t cpu;
     xtensa_cpu_init(&cpu);
     cpu.mem = mem_create();
-    /* NOP: op2=0, op1=0, r=2, s=0, t=15(=SYNC0,s=15->nop? No.)
-       NOP encoding: op2=0000, op1=0000, r=0010, s=0000, t=1111, op0=0000
-       Wait. From opcode tables:
-       RST0 -> op2=0 -> ST0 -> r=2 -> SYNC -> t=0 -> SYNC0 -> s=15 -> NOP
-       So: op2=0, op1=0, r=2, s=15, t=0, op0=0
-       insn = (0<<20)|(0<<16)|(2<<12)|(15<<8)|(0<<4)|0 = 0x002F00 */
-    put_insn3(&cpu, BASE, 0x002F00);
+    /* RST0/ST0/SYNC has S=0 and selects NOP with T=15. */
+    put_insn3(&cpu, BASE, 0x0020F0);
     ASSERT_TRUE(check_disasm(&cpu, BASE, "nop", 3));
+    mem_destroy(cpu.mem);
+}
+
+TEST(test_sync_family) {
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem_create();
+    static const struct {
+        uint32_t insn;
+        const char *name;
+    } cases[] = {
+        { 0x002000u, "isync" },
+        { 0x002010u, "rsync" },
+        { 0x002020u, "esync" },
+        { 0x002030u, "dsync" },
+        { 0x002080u, "excw" },
+        { 0x0020C0u, "memw" },
+        { 0x0020D0u, "extw" },
+        { 0x0020F0u, "nop" },
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        put_insn3(&cpu, BASE, cases[i].insn);
+        ASSERT_TRUE(check_disasm(&cpu, BASE, cases[i].name, 3));
+    }
+
+    /* This was previously mislabeled as NOP despite its reserved S field. */
+    put_insn3(&cpu, BASE, 0x002F00u);
+    ASSERT_TRUE(check_disasm(&cpu, BASE, "??sync s=15 t=0", 3));
     mem_destroy(cpu.mem);
 }
 
@@ -691,6 +714,7 @@ void run_decode_tests(void) {
     RUN_TEST(test_fetch_rejects_missing_boundary_page);
     RUN_TEST(test_predecode_invalidation_is_range_safe);
     RUN_TEST(test_nop);
+    RUN_TEST(test_sync_family);
     RUN_TEST(test_add);
     RUN_TEST(test_sub);
     RUN_TEST(test_and_or_xor);

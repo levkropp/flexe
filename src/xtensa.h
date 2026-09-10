@@ -218,6 +218,26 @@ typedef enum {
 #define XT_IMM16(i)     (((i) >> 8) & 0xFFFF)
 #define XT_SR_NUM(i)    (((i) >> 8) & 0xFF)  /* sr = s || r for RSR/WSR */
 
+/* RST0/SYNC encodes the operation in T and reserves S as zero. Keep this
+ * shared between the interpreter, disassembler, and translation gate so a
+ * reserved encoding cannot silently become a different instruction. */
+static inline bool xtensa_sync_encoding_valid(uint32_t insn) {
+    if (XT_S(insn) != 0u) return false;
+    switch (XT_T(insn)) {
+    case 0:  /* ISYNC */
+    case 1:  /* RSYNC */
+    case 2:  /* ESYNC */
+    case 3:  /* DSYNC */
+    case 8:  /* EXCW */
+    case 12: /* MEMW */
+    case 13: /* EXTW */
+    case 15: /* NOP */
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* CALL format fields */
 #define XT_N(i)         (((i) >> 4) & 0x3)
 #define XT_OFFSET18(i)  (((i) >> 6) & 0x3FFFF)

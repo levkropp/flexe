@@ -7,9 +7,9 @@
 #include "rom_stubs.h"
 #include <string.h>
 
-/* NOP: op0=0, op1=0, op2=0, r=2, t=0, s=15 */
+/* NOP: op0=0, op1=0, op2=0, r=2, s=0, t=15 */
 static uint32_t rom_nop_insn(void) {
-    return rrr(0, 0, 2, 15, 0);
+    return rrr(0, 0, 2, 0, 15);
 }
 
 /* ===== Test: pc_hook fires ===== */

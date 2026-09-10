@@ -1851,8 +1851,15 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 ar_write(cpu, t, new_sp);
             } break;
             case 2: /* SYNC group */
-                /* NOP, ISYNC, RSYNC, ESYNC, DSYNC, EXTW, MEMW, EXCW */
-                /* All no-ops for emulation purposes */
+                if (!xtensa_sync_encoding_valid(insn)) {
+                    xtensa_raise_exception(cpu, EXCCAUSE_ILLEGAL,
+                                           cpu->pc - 3u, 0);
+                    return;
+                }
+                /* Fast mode has a single strongly ordered host timeline, so
+                 * ISYNC/RSYNC/ESYNC/DSYNC/EXTW/MEMW/EXCW need no additional
+                 * operation here. Accurate schedulers will use these as
+                 * synchronization boundaries. */
                 break;
             case 3: /* RFEI group */
                 switch (t) {

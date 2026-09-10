@@ -10,8 +10,8 @@
    = 0x000050 */
 
 /* Helper: build a NOP (for padding handler code) */
-/* NOP: op0=0, op1=0, op2=0, r=2, s=15, t=0 */
-#define INSN_NOP        rrr(0, 0, 2, 15, 0)
+/* NOP: op0=0, op1=0, op2=0, r=2, s=0, t=15 */
+#define INSN_NOP        rrr(0, 0, 2, 0, 15)
 
 /* RFE: op0=0, op1=0, op2=0, r=3, s=0, t=0 */
 #define INSN_RFE        rrr(0, 0, 3, 0, 0)
