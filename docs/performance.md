@@ -111,6 +111,16 @@ four-billion-cycle ARM64 pairs reduced mean CPU time from 3.140 to 3.074 seconds
 pairs across all seven production images were neutral within timer resolution
 except WLED, which improved by 5.5%.
 
+Windowed `RETW` is another frequent dispatch boundary because its destination
+PC and windowbase come from architectural state rather than the opcode. An
+exact runtime lookup can enter an already-compiled target's guarded chain entry
+while retaining the normal loop, timer, invalidation, and verification bounds.
+Eight alternating four-billion-cycle WLED pairs reduced mean CPU time from
+3.140 to 2.583 seconds (17.8%) and hook dispatches from 97.3 million to 38.5
+million. Across three two-billion-cycle pairs for all seven production images,
+retired-instruction throughput improved by 1.6% to 21.9%; every scripted JIT
+and interpreter artifact remained unchanged.
+
 ## Profiling
 
 Build the sampling profiler separately so its dispatch-loop layout does not

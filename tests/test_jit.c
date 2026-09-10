@@ -3106,6 +3106,104 @@ TEST(test_jit_retw_n_windowed) {
     teardown(&cpu);
 }
 
+TEST(test_jit_retw_chains_to_runtime_caller) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t caller = BASE + 0x80u;
+
+    /* A RETW target is carried in the callee's a0 rather than in the opcode.
+     * Compile the continuation under its caller window first, then prove the
+     * callee can resolve and enter it without a second C hook dispatch. */
+    put_insn3(&cpu, BASE, jit_retw_insn());
+    for (unsigned i = 0; i < 4u; i++)
+        put_insn2(&cpu, caller + i * 2u,
+                  narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn2(&cpu, caller + 8u,
+              narrow(0xD, 15, 0, 2));     /* ILL.N ends the block */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.windowbase = 2u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, caller);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, caller) != NULL);
+
+    cpu.windowbase = 3u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 3u;
+    cpu.windowstart = (1u << 2) | (1u << 3);
+    ar_write(&cpu, 0,
+             (1u << 30) | (caller & 0x3FFFFFFFu)); /* call4 caller */
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    cpu.running = true;
+
+    uint64_t hooks_before = jit_get_stats(jit)->hook_calls;
+    uint64_t insns_before = jit_get_stats(jit)->insns_jitted;
+    ASSERT_EQ(xtensa_run(&cpu, 5), 5);
+    ASSERT_EQ(cpu.pc, caller + 8u);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.windowstart, 1u << 2);
+    ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - insns_before, 5u);
+    ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_retw_does_not_chain_into_live_loop) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t caller = BASE + 0x80u;
+    const uint32_t lend = caller + 8u;
+
+    put_insn3(&cpu, BASE, jit_retw_insn());
+    for (unsigned i = 0; i < 4u; i++)
+        put_insn2(&cpu, caller + i * 2u,
+                  narrow(0xD, 15, 0, 3)); /* NOP.N */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+
+    /* Compile a loop-bounded target with a valid chain entry. RETW itself is
+     * outside the loop, so its block is the ordinary unbounded variant; the
+     * runtime resolver is responsible for rejecting the incompatible target. */
+    cpu.lbeg = caller;
+    cpu.lend = lend;
+    cpu.lcount = 3u;
+    cpu.windowbase = 2u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, caller);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, caller) != NULL);
+
+    cpu.windowbase = 3u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn retw = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(retw != NULL);
+
+    cpu.ps = (1u << 18) | (1u << 4); /* WOE + EXCM */
+    cpu.windowbase = 3u;
+    cpu.windowstart = (1u << 2) | (1u << 3);
+    ar_write(&cpu, 0,
+             (1u << 30) | (caller & 0x3FFFFFFFu)); /* call4 caller */
+    cpu.pc = BASE;
+
+    ASSERT_EQ(retw(&cpu), 1);
+    ASSERT_EQ(cpu.pc, caller);
+    ASSERT_EQ(cpu.windowbase, 2u);
+    ASSERT_EQ(cpu.lcount, 3u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_retw_underflow_raises_guest_vector) {
     xtensa_cpu_t expected, actual;
     setup(&expected);
@@ -3364,6 +3462,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_entry_ignores_unrelated_live_window);
     RUN_TEST(test_jit_retw_windowed);
     RUN_TEST(test_jit_retw_n_windowed);
+    RUN_TEST(test_jit_retw_chains_to_runtime_caller);
+    RUN_TEST(test_jit_retw_does_not_chain_into_live_loop);
     RUN_TEST(test_jit_retw_underflow_raises_guest_vector);
     RUN_TEST(test_jit_retw_tail_call_fallback);
     RUN_TEST(test_jit_entry_overflow_fallback);

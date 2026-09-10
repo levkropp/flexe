@@ -240,6 +240,35 @@ static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb,
     return NULL;
 }
 
+/* Resolve a runtime control-flow target to the guarded entry of an already
+ * compiled block. Static exits are patched directly, but RETW computes both
+ * its PC and windowbase from architectural state and therefore needs this
+ * exact lookup at runtime. A miss simply returns through the normal C
+ * dispatcher, which hot-counts and compiles the target as before. */
+static void *jit_dynamic_chain_lookup(jit_state_t *jit, xtensa_cpu_t *cpu) {
+    if (jit->no_chain || jit->invalidate_pending)
+        return NULL;
+
+    uint32_t pc = cpu->pc;
+    if (pc < ESP32_FIRMWARE_INSN_ADDR_LOW || pc >= ESP32_INSN_ADDR_HIGH)
+        return NULL;
+
+    uint32_t lv = jit_loop_variant(cpu, pc);
+    if (lv != 0u)
+        return NULL;
+
+    jit_block_t *block = jit_lookup(jit, pc, cpu->windowbase, 0u);
+    if (!block || !block->chain_entry)
+        return NULL;
+
+    /* Variant zero also covers a target before the live loop's LBEG. Do the
+     * same rare cross-boundary rejection as jit_pc_hook before entering a
+     * block that would otherwise run across LEND. */
+    if (cpu->lcount != 0u && cpu->lend > pc && cpu->lend < block->end_pc)
+        return NULL;
+    return block->chain_entry;
+}
+
 static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc,
                                       uint32_t wb, uint32_t lv) {
     jit_block_t *set = jit_set_of(jit, pc, wb, lv);
@@ -1320,6 +1349,7 @@ static void emit_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
                                uint32_t exit_pc, int insn_count,
                                jit_state_t *jit, bool loop_end_exit);
 static void emit_jmp_to_epilogue(emit_t *e, jit_state_t *jit);
+static void emit_dynamic_chain_or_epilogue(emit_t *e, jit_state_t *jit);
 static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
                              uint32_t target_wb, uint8_t *jmp_site);
 
@@ -3109,8 +3139,15 @@ compile_retw: ;
         emit_store_cpu32(e, RSI, (int32_t)CPU_OFF_PC);
         emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
         emit_acc_add(e, insn_idx + 1);
-        /* No chain slot — dynamic target */
-        emit_jmp_to_epilogue(e, jit);
+        /* RETW's target is dynamic. Resolve it against the same exact
+         * (PC, windowbase, loop-context) table as the C dispatcher and enter
+         * the target's guarded chain entry when it is already compiled. A
+         * loop-bounded source must still return through C so LEND semantics
+         * remain visible there. */
+        if (jit->cur_lv == 0u && !jit->no_chain)
+            emit_dynamic_chain_or_epilogue(e, jit);
+        else
+            emit_jmp_to_epilogue(e, jit);
 
         /* Missing caller window: take the architectural underflow exception
          * directly, but leave synthetic/legacy fills to the interpreter. */
@@ -3144,6 +3181,39 @@ compile_retw: ;
 /* Jump to shared epilogue stub */
 static void emit_jmp_to_epilogue(emit_t *e, jit_state_t *jit) {
     emit_jmp_rel32_to(e, jit->epilogue_stub);
+}
+
+/* Call the exact dynamic-target resolver while the block's native frame is
+ * still live, then tail-jump to the returned chain entry. Callee-saved guest
+ * registers survive the helper; x86's caller-saved allocated registers need
+ * the same four-register save used by the memory slow paths. */
+static void emit_dynamic_chain_or_epilogue(emit_t *e, jit_state_t *jit) {
+#ifdef JIT_ARCH_ARM64
+    emit_mov_reg_reg(e, RCX, REG_CPU); /* X1 = cpu */
+    emit_mov_reg_imm64(e, RAX, (uint64_t)(uintptr_t)jit); /* X0 = jit */
+    emit_mov_reg_imm64(e, ARM64_SCRATCH,
+                       (uint64_t)(uintptr_t)jit_dynamic_chain_lookup);
+    emit_call_reg(e, ARM64_SCRATCH);
+#else
+    emit_push(e, R8); emit_push(e, R9); emit_push(e, R10); emit_push(e, R11);
+    emit_mov_reg_imm64(e, RDI, (uint64_t)(uintptr_t)jit);
+    emit_mov_reg_reg(e, RSI, REG_CPU);
+    emit_mov_reg_imm64(e, RAX,
+                       (uint64_t)(uintptr_t)jit_dynamic_chain_lookup);
+    emit_call_reg(e, RAX);
+    emit_pop(e, R11); emit_pop(e, R10); emit_pop(e, R9); emit_pop(e, R8);
+#endif
+
+    emit_test_reg64(e, RAX, RAX);
+    int miss = emit_jcc_rel32(e, CC_E);
+#ifdef JIT_ARCH_ARM64
+    emit32(e, 0xD61F0000u | ((uint32_t)(RAX & 31) << 5)); /* BR X0 */
+#else
+    emit8(e, 0xFF);
+    emit8(e, modrm(3, 4, RAX)); /* JMP RAX */
+#endif
+    emit_patch_rel32(e, miss);
+    emit_jmp_to_epilogue(e, jit);
 }
 
 /* Emit a side-exit stub body (no ra flush — done inline at the branch).
