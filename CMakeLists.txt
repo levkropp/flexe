@@ -70,6 +70,7 @@ set(LIB_SOURCES
     src/memory.c
     src/flash_mmu.c
     src/esp32s3_extmem.c
+    src/efuse.c
     src/io_mux.c
     src/rtc_storage.c
     src/regi2c.c

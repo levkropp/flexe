@@ -170,7 +170,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_TIMER_GROUP_V1 |
                         FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1 |
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
-                        FLEXE_TARGET_CAP_RTC_STORAGE_V1,
+                        FLEXE_TARGET_CAP_RTC_STORAGE_V1 |
+                        FLEXE_TARGET_CAP_EFUSE_READ_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -290,6 +291,21 @@ static const flexe_target_desc_t TARGETS[] = {
             .store_offset = {
                 0x050u, 0x054u, 0x058u, 0x05Cu,
                 0x0C0u, 0x0C4u, 0x0C8u, 0x0CCu,
+            },
+        },
+        .efuse = {
+            .base = 0x60007000u,
+            .register_size = 0x1000u,
+            .read_data_offset = 0x02Cu,
+            .read_data_word_count = 84u,
+            .date_offset = 0x1FCu,
+            .date_reset = 0x02101290u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            /* ESP32-S3 revision 0.0, no embedded flash/PSRAM, and the
+             * locally administered unicast MAC 02:00:00:00:00:01. */
+            .read_data = {
+                [6] = 0x00000002u, /* RD_MAC_SPI_SYS_0 */
+                [7] = 0x00000100u, /* RD_MAC_SPI_SYS_1 */
             },
         },
         .interrupt_matrix = {

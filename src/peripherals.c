@@ -1,5 +1,6 @@
 #include "peripherals.h"
 #include "esp32s3_extmem.h"
+#include "efuse.h"
 #include "flash_mmu.h"
 #include "io_mux.h"
 #include "rtc_storage.h"
@@ -1829,6 +1830,7 @@ struct esp32_periph {
      * independent devices instead of inheriting classic register aliases. */
     flexe_flash_mmu_t *shared_flash_mmu;
     flexe_esp32s3_extmem_t *s3_extmem;
+    flexe_efuse_t *target_efuse;
     flexe_io_mux_t *io_mux;
     flexe_rtc_storage_t *rtc_storage;
     flexe_regi2c_t *regi2c;
@@ -13964,6 +13966,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     bool classic = (target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     if (!classic) {
+        if (target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)
+            p->target_efuse = flexe_efuse_create(
+                mem, default_read, default_write, p);
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1) {
             p->rtc_storage = flexe_rtc_storage_create(
                 mem, default_read, default_write, p);
@@ -13976,7 +13981,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             p->s3_extmem = flexe_esp32s3_extmem_create(mem);
             flexe_esp32s3_extmem_application_handoff(p->s3_extmem);
         }
-        if (((target->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1) &&
+        if (((target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1) &&
+             !p->target_efuse) ||
+            ((target->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1) &&
              !p->rtc_storage) ||
             (target->flash_mmu.shared_instruction_data &&
              !p->shared_flash_mmu) ||
@@ -14249,6 +14256,11 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
+    flexe_efuse_destroy(p->target_efuse);
+    if (p->target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->efuse.base,
+            p->target->efuse.register_size, NULL, NULL, NULL);
     flexe_rtc_storage_destroy(p->rtc_storage);
     if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1)
         (void)mem_register_mmio_range(

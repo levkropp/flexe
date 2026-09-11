@@ -31,8 +31,9 @@
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
+#define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 19u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 20u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -53,6 +54,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1             = 1ull << 12,
     FLEXE_TARGET_CAP_IO_MUX_V1                   = 1ull << 13,
     FLEXE_TARGET_CAP_RTC_STORAGE_V1               = 1ull << 14,
+    FLEXE_TARGET_CAP_EFUSE_READ_V1                = 1ull << 15,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -198,6 +200,20 @@ typedef struct {
     uint16_t store_offset[FLEXE_TARGET_RTC_STORE_MAX];
     uint32_t store_reset[FLEXE_TARGET_RTC_STORE_MAX];
 } flexe_rtc_storage_desc_t;
+
+/* Read views of a virtual chip's one-time-programmable fuse blocks. Burning
+ * fuses is intentionally a separate capability: a read-only profile must not
+ * silently accept irreversible programming commands. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t read_data_offset;
+    uint16_t read_data_word_count;
+    uint32_t date_offset;
+    uint32_t date_reset;
+    uint32_t date_writable_mask;
+    uint32_t read_data[FLEXE_TARGET_EFUSE_READ_WORD_MAX];
+} flexe_efuse_desc_t;
 
 /* Peripheral interrupt fabric used by newer ESP32-family targets. Each
  * source has one CPU-interrupt selector per core. Raw source status remains
@@ -452,6 +468,9 @@ typedef struct {
 
     /* Optional RTC-domain scratch registers used across boot stages. */
     flexe_rtc_storage_desc_t     rtc_storage;
+
+    /* Optional read-only virtual-silicon eFuse profile. */
+    flexe_efuse_desc_t           efuse;
 
     /* Optional V1 peripheral interrupt matrix and software generators. */
     flexe_interrupt_matrix_desc_t interrupt_matrix;

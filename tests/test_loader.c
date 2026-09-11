@@ -281,6 +281,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
@@ -296,6 +297,9 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_storage.base, 0x60008000u);
     ASSERT_EQ(s3->rtc_storage.store_offset[4], 0xC0u);
     ASSERT_EQ(s3->rtc_storage.xtal_frequency_mhz, 40u);
+    ASSERT_EQ(s3->efuse.base, 0x60007000u);
+    ASSERT_EQ(s3->efuse.read_data_word_count, 84u);
+    ASSERT_EQ(s3->efuse.read_data[6], 0x00000002u);
     ASSERT_EQ(s3->interrupt_matrix.base, 0x600C2000u);
     ASSERT_EQ(s3->interrupt_matrix.source_count, 99u);
     ASSERT_EQ(s3->interrupt_matrix.map_offset[1], 0x800u);
