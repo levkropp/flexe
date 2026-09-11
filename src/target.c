@@ -138,7 +138,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SPI_MEM |
                         FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1 |
                         FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1 |
-                        FLEXE_TARGET_CAP_TIMER_GROUP_V1,
+                        FLEXE_TARGET_CAP_TIMER_GROUP_V1 |
+                        FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -205,6 +206,16 @@ static const flexe_target_desc_t TARGETS[] = {
             .reset_mask = 1u << 2,
             .clock_gate_mask = 1u << 1,
             .runstall_mask = 1u << 0,
+        },
+        .system_clock = {
+            .base = 0x600C0000u,
+            .register_size = 0x1000u,
+            .cpu_per_conf_offset = 0x010u,
+            .cpu_per_conf_reset = 0x0000000Cu,
+            .cpu_per_conf_writable_mask = 0x000000FFu,
+            .sysclk_conf_offset = 0x060u,
+            .sysclk_conf_reset = 0x00000001u,
+            .sysclk_conf_writable_mask = 0x00000FFFu,
         },
         .interrupt_matrix = {
             .base = 0x600C2000u,

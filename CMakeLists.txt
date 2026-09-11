@@ -72,6 +72,7 @@ set(LIB_SOURCES
     src/esp32s3_extmem.c
     src/regi2c.c
     src/sensitive_memprot.c
+    src/system_clock.c
     src/systimer.c
     src/timer_group.c
     src/usb_serial_jtag.c

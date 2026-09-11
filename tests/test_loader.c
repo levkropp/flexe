@@ -277,10 +277,16 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
     ASSERT_EQ(s3->secondary_core.boot_address_offset, 4u);
+    ASSERT_EQ(s3->system_clock.base, 0x600C0000u);
+    ASSERT_EQ(s3->system_clock.cpu_per_conf_offset, 0x10u);
+    ASSERT_EQ(s3->system_clock.cpu_per_conf_reset, 0x0Cu);
+    ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
+    ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->interrupt_matrix.base, 0x600C2000u);
     ASSERT_EQ(s3->interrupt_matrix.source_count, 99u);
     ASSERT_EQ(s3->interrupt_matrix.map_offset[1], 0x800u);

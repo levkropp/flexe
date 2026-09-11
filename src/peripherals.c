@@ -4,6 +4,7 @@
 #include "regi2c.h"
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
+#include "system_clock.h"
 #include "systimer.h"
 #include "timer_group.h"
 #include "usb_serial_jtag.h"
@@ -1829,6 +1830,7 @@ struct esp32_periph {
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_regi2c_t *regi2c;
     flexe_sensitive_memprot_t *sensitive_memprot;
+    flexe_system_clock_t *system_clock;
     flexe_systimer_t *systimer;
     flexe_timer_group_t *target_timer_group;
     flexe_spi_mem_t *spi_mem;
@@ -13840,6 +13842,39 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1) {
+        mmio_read_fn fallback_read = default_read;
+        mmio_write_fn fallback_write = default_write;
+        if (target->capabilities &
+            FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL) {
+            const flexe_system_clock_desc_t *clock =
+                &target->system_clock;
+            const flexe_secondary_core_desc_t *core =
+                &target->secondary_core;
+            bool overlap = clock->base <= core->base ?
+                clock->register_size > core->base - clock->base :
+                core->register_size > clock->base - core->base;
+            /* MMIO dispatch is page-granular. Shared owners must describe
+             * the same aperture so fallback restoration cannot leave a
+             * partially overwritten or dangling handler. */
+            if (overlap && (clock->base != core->base ||
+                            clock->register_size != core->register_size)) {
+                periph_destroy(p);
+                return NULL;
+            }
+            if (overlap) {
+                fallback_read = secondary_core_read;
+                fallback_write = secondary_core_write;
+            }
+        }
+        p->system_clock = flexe_system_clock_create(
+            mem, fallback_read, fallback_write, p);
+        if (!p->system_clock) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) {
         if (!intr_matrix_geometry_valid(target)) {
             periph_destroy(p);
@@ -14236,6 +14271,11 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
+    flexe_system_clock_destroy(p->system_clock);
+    if (p->target->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->system_clock.base,
+            p->target->system_clock.register_size, NULL, NULL, NULL);
     if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION) {
         const flexe_rtc_calibration_desc_t *desc =
             &p->target->rtc_calibration;

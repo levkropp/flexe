@@ -28,7 +28,7 @@
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
 #define FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX 4u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 16u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 17u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -46,6 +46,7 @@ typedef enum {
     FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1        = 1ull << 9,
     FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1          = 1ull << 10,
     FLEXE_TARGET_CAP_TIMER_GROUP_V1              = 1ull << 11,
+    FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1             = 1ull << 12,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -141,6 +142,21 @@ typedef struct {
     uint32_t clock_gate_mask;
     uint32_t runstall_mask;
 } flexe_secondary_core_desc_t;
+
+/* CPU/system-clock selection registers used by S2/S3-style clock trees.
+ * The first version preserves the architectural register state firmware uses
+ * to derive CPU and APB frequencies. Clock propagation into target-cycle
+ * timing is deliberately a separate, calibrated-mode concern. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t cpu_per_conf_offset;
+    uint32_t cpu_per_conf_reset;
+    uint32_t cpu_per_conf_writable_mask;
+    uint32_t sysclk_conf_offset;
+    uint32_t sysclk_conf_reset;
+    uint32_t sysclk_conf_writable_mask;
+} flexe_system_clock_desc_t;
 
 /* Peripheral interrupt fabric used by newer ESP32-family targets. Each
  * source has one CPU-interrupt selector per core. Raw source status remains
@@ -386,6 +402,9 @@ typedef struct {
 
     /* Optional SoC register block controlling the secondary CPU. */
     flexe_secondary_core_desc_t secondary_core;
+
+    /* Optional CPU/system-clock selection register block. */
+    flexe_system_clock_desc_t    system_clock;
 
     /* Optional V1 peripheral interrupt matrix and software generators. */
     flexe_interrupt_matrix_desc_t interrupt_matrix;

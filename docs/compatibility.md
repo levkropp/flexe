@@ -13,7 +13,8 @@ the selection into an assertion suitable for CI. Classic ESP32 execution is
 supported. ESP32-S3 chip ID `0x0009` has experimental interpreter support for
 the LX7 core, native memory map, flash/cache-MMU windows, mask ROM, dual-core
 startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
-UARTs, native USB Serial/JTAG, and interrupt matrix.
+CPU/system-clock selection, UARTs, native USB Serial/JTAG, and interrupt
+matrix.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
@@ -26,7 +27,8 @@ capture/load, one-shot and autoreload alarms, interrupt status and routing,
 and the four-stage main watchdog with prescaling, feed, write protection,
 interrupt, and reset actions. It runs Espressif's unmodified ESP-IDF 5.3.2
 `gptimer` example through its stop, autoreload, and dynamically rearmed alarm
-scenarios. This remains functional fast-mode timing: peripheral clock/reset
+scenarios at the requested 1 MHz resolution and one-second alarm cadence. This
+remains functional fast-mode timing: peripheral clock/reset
 gating and silicon-calibrated interrupt latency are not modeled yet, and an
 MWDT CPU-reset action currently requests the same whole-machine reset as a
 system-reset action.
