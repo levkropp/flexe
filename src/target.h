@@ -27,8 +27,11 @@
 #define FLEXE_TARGET_INTERRUPT_CORE_MAX 2u
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
 #define FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX 4u
+#define FLEXE_TARGET_GPIO_MAX 54u
+#define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
+#define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 17u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 18u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -47,6 +50,7 @@ typedef enum {
     FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1          = 1ull << 10,
     FLEXE_TARGET_CAP_TIMER_GROUP_V1              = 1ull << 11,
     FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1             = 1ull << 12,
+    FLEXE_TARGET_CAP_IO_MUX_V1                   = 1ull << 13,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -157,6 +161,26 @@ typedef struct {
     uint32_t sysclk_conf_reset;
     uint32_t sysclk_conf_writable_mask;
 } flexe_system_clock_desc_t;
+
+/* Digital pad configuration register file. GPIO-to-register routing belongs
+ * to the target because package pin maps differ even when the IO_MUX fields
+ * are shared by an IP generation. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint8_t  register_count;
+    uint8_t  gpio_count;
+    uint8_t  function_shift;
+    uint32_t control_offset;
+    uint32_t control_reset;
+    uint32_t control_writable_mask;
+    uint32_t register_reset;
+    uint32_t register_writable_mask;
+    uint32_t function_mask;
+    uint32_t date_offset;
+    uint32_t date_reset;
+    uint16_t gpio_register_offset[FLEXE_TARGET_GPIO_MAX];
+} flexe_io_mux_desc_t;
 
 /* Peripheral interrupt fabric used by newer ESP32-family targets. Each
  * source has one CPU-interrupt selector per core. Raw source status remains
@@ -405,6 +429,9 @@ typedef struct {
 
     /* Optional CPU/system-clock selection register block. */
     flexe_system_clock_desc_t    system_clock;
+
+    /* Optional digital pad configuration register file. */
+    flexe_io_mux_desc_t          io_mux;
 
     /* Optional V1 peripheral interrupt matrix and software generators. */
     flexe_interrupt_matrix_desc_t interrupt_matrix;

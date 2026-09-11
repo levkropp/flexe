@@ -1,6 +1,7 @@
 #include "peripherals.h"
 #include "esp32s3_extmem.h"
 #include "flash_mmu.h"
+#include "io_mux.h"
 #include "regi2c.h"
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
@@ -59,7 +60,6 @@ static inline int gpio_dbg(void) {
 #define RTCIO_BASE      0x3FF48400u
 #define SENS_BASE       0x3FF48800u
 #define RTC_I2C_BASE    0x3FF48C00u
-#define IO_MUX_BASE     0x3FF49000u
 #define BT_BASE         0x3FF51000u
 #define EFUSE_BASE      0x3FF5A000u
 #define NRX_PRIVATE_BASE 0x3FF5C000u /* includes documented NRX at +0xC00 */
@@ -1828,6 +1828,7 @@ struct esp32_periph {
      * independent devices instead of inheriting classic register aliases. */
     flexe_flash_mmu_t *shared_flash_mmu;
     flexe_esp32s3_extmem_t *s3_extmem;
+    flexe_io_mux_t *io_mux;
     flexe_regi2c_t *regi2c;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_system_clock_t *system_clock;
@@ -1858,11 +1859,6 @@ struct esp32_periph {
 
     /* Eight always-on classic GPIO sigma-delta/PDM channels. */
     sigmadelta_state_t sigmadelta;
-
-    /* IO_MUX pin configuration registers. Keep a written bitmap so reset
-     * defaults are not mistaken for an explicitly selected native function. */
-    uint32_t io_mux[64];
-    uint64_t io_mux_written;
 
     /* Timer groups: two APB general-purpose timers plus WDT/LACT functions. */
     timg_group_state_t timg[2];
@@ -3841,28 +3837,6 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     default:
         return;
-    }
-}
-
-/* ---- IO_MUX ---- */
-
-static uint32_t io_mux_read(void *ctx, uint32_t addr) {
-    esp32_periph_t *p = ctx;
-    uint32_t off = addr - IO_MUX_BASE;
-    uint32_t index = off / 4u;
-    if ((off & 3u) == 0 && index < 64u &&
-        (p->io_mux_written & (1ULL << index)))
-        return p->io_mux[index];
-    return 0x1800;   /* Reset/default pin configuration */
-}
-
-static void io_mux_write(void *ctx, uint32_t addr, uint32_t val) {
-    esp32_periph_t *p = ctx;
-    uint32_t off = addr - IO_MUX_BASE;
-    uint32_t index = off / 4u;
-    if ((off & 3u) == 0 && index < 64u) {
-        p->io_mux[index] = val;
-        p->io_mux_written |= 1ULL << index;
     }
 }
 
@@ -13875,6 +13849,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1) {
+        p->io_mux = flexe_io_mux_create(
+            mem, default_read, default_write, p);
+        if (!p->io_mux) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) {
         if (!intr_matrix_geometry_valid(target)) {
             periph_destroy(p);
@@ -14147,12 +14130,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* RTC_CNTL */
     mem_register_mmio(mem, (int)PAGE_OF(RTC_CNTL_BASE), rtc_cntl_read, rtc_cntl_write, p);
 
-    /* SENS (sensor) — shares 4KB page with RTC_CNTL (0x3FF48800 is in page 72) */
-    /* 0x3FF48800 falls in page 72 same as RTC_CNTL, but page 73 (0x3FF49000) is IO_MUX */
-    /* SENS is at offset 0x800 within the RTC_CNTL page — handled by rtc_cntl read/write */
-
-    /* IO_MUX */
-    mem_register_mmio(mem, (int)PAGE_OF(IO_MUX_BASE), io_mux_read, io_mux_write, p);
+    /* SENS is at offset 0x800 within the RTC_CNTL page and is dispatched by
+     * rtc_cntl_read/write. IO_MUX is installed from the target descriptor. */
 
     /* EFUSE */
     mem_register_mmio(mem, (int)PAGE_OF(EFUSE_BASE), efuse_read, efuse_write, p);
@@ -14248,19 +14227,8 @@ int periph_gpio_out_signal(const esp32_periph_t *p, int pin) {
 }
 
 int periph_iomux_function(const esp32_periph_t *p, int pin) {
-    /* Offsets from the classic ESP32 GPIO_PIN_MUX_REG table. GPIO28..31 are
-     * not bonded as general-purpose pins and therefore have no entries. */
-    static const uint8_t offsets[40] = {
-        0x44, 0x88, 0x40, 0x84, 0x48, 0x6C, 0x60, 0x64,
-        0x68, 0x54, 0x58, 0x5C, 0x34, 0x38, 0x30, 0x3C,
-        0x4C, 0x50, 0x70, 0x74, 0x78, 0x7C, 0x80, 0x8C,
-        0x90, 0x24, 0x28, 0x2C, 0xFF, 0xFF, 0xFF, 0xFF,
-        0x1C, 0x20, 0x14, 0x18, 0x04, 0x08, 0x0C, 0x10,
-    };
-    if (!p || pin < 0 || pin > 39 || offsets[pin] == 0xFF) return -1;
-    uint32_t index = offsets[pin] / 4u;
-    if (!(p->io_mux_written & (1ULL << index))) return -1;
-    return (int)((p->io_mux[index] >> 12) & 7u);
+    if (!p || pin < 0) return -1;
+    return flexe_io_mux_function(p->io_mux, (unsigned)pin);
 }
 
 void periph_destroy(esp32_periph_t *p) {
@@ -14271,6 +14239,11 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
+    flexe_io_mux_destroy(p->io_mux);
+    if (p->target->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->io_mux.base,
+            p->target->io_mux.register_size, NULL, NULL, NULL);
     flexe_system_clock_destroy(p->system_clock);
     if (p->target->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1)
         (void)mem_register_mmio_range(
