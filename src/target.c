@@ -354,6 +354,18 @@ static const flexe_target_desc_t TARGETS[] = {
             .slow_clock_source_hz = {
                 136000u, 32768u, 68359u, 0u,
             },
+            .interrupt_enable_offset = 0x040u,
+            .interrupt_raw_offset = 0x044u,
+            .interrupt_status_offset = 0x048u,
+            .interrupt_clear_offset = 0x04Cu,
+            .interrupt_enable_reset = 0u,
+            .interrupt_raw_reset = 0u,
+            .interrupt_valid_mask = 0x001FFFFFu,
+            /* TOUCH_APPROACH_LOOP_DONE is the sole software-writable raw
+             * source on S3; device producers update all valid raw bits
+             * through the controller API. */
+            .interrupt_raw_writable_mask = 1u << 20,
+            .interrupt_source = 39u,
         },
         .efuse = {
             .base = 0x60007000u,

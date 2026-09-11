@@ -1171,6 +1171,7 @@ static void default_write(void *ctx, uint32_t addr, uint32_t val);
 static void system_clock_gate_changed(
     void *ctx, flexe_system_device_t device, unsigned instance,
     bool clock_enabled, bool reset_asserted);
+static void target_rtc_cntl_irq_changed(void *ctx, bool level);
 static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_state_changed(void *ctx);
@@ -13481,6 +13482,18 @@ static void intr_matrix_write_software_interrupt(esp32_periph_t *p,
     else             periph_deassert_interrupt(p, source);
 }
 
+/* ---- Target-described RTC interrupt aggregation ---- */
+
+static void target_rtc_cntl_irq_changed(void *ctx, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !(p->target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1))
+        return;
+    int source = (int)p->target->rtc_cntl.interrupt_source;
+    if (level) periph_assert_interrupt(p, source);
+    else periph_deassert_interrupt(p, source);
+}
+
 /* ---- Target-described system timer ---- */
 
 static void system_clock_gate_changed(
@@ -13997,7 +14010,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 mem, default_read, default_write, p);
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
             p->target_rtc_cntl = flexe_rtc_cntl_create(
-                mem, default_read, default_write, p);
+                mem, default_read, default_write, p,
+                target_rtc_cntl_irq_changed, p);
             if (p->target_rtc_cntl)
                 flexe_rtc_cntl_application_handoff(p->target_rtc_cntl);
         }

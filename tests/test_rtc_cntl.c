@@ -8,6 +8,11 @@ typedef struct {
     unsigned writes;
 } rtc_cntl_fallback_t;
 
+typedef struct {
+    unsigned changes;
+    bool level;
+} rtc_cntl_irq_probe_t;
+
 static uint32_t rtc_cntl_test_fallback_read(void *ctx, uint32_t addr)
 {
     rtc_cntl_fallback_t *fallback = ctx;
@@ -24,6 +29,13 @@ static void rtc_cntl_test_fallback_write(void *ctx, uint32_t addr,
     (void)value;
 }
 
+static void rtc_cntl_test_irq_changed(void *ctx, bool level)
+{
+    rtc_cntl_irq_probe_t *probe = ctx;
+    probe->changes++;
+    probe->level = level;
+}
+
 TEST(rtc_cntl_storage_resets_persists_and_delegates)
 {
     const flexe_target_desc_t *s3 =
@@ -33,7 +45,7 @@ TEST(rtc_cntl_storage_resets_persists_and_delegates)
     rtc_cntl_fallback_t fallback = {0};
     flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
         mem, rtc_cntl_test_fallback_read,
-        rtc_cntl_test_fallback_write, &fallback);
+        rtc_cntl_test_fallback_write, &fallback, NULL, NULL);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(rtc != NULL);
     if (!mem || !rtc) {
@@ -68,7 +80,7 @@ TEST(rtc_cntl_application_handoff_uses_target_clocks)
     const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
     xtensa_mem_t *mem = mem_create_for_target(s3);
     flexe_rtc_cntl_t *rtc =
-        flexe_rtc_cntl_create(mem, NULL, NULL, NULL);
+        flexe_rtc_cntl_create(mem, NULL, NULL, NULL, NULL, NULL);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(rtc != NULL);
     if (!mem || !rtc) {
@@ -233,6 +245,116 @@ TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_irq_probe_t probe = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, rtc_cntl_test_irq_changed, &probe);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t ena = desc->base + desc->interrupt_enable_offset;
+    uint32_t raw = desc->base + desc->interrupt_raw_offset;
+    uint32_t status = desc->base + desc->interrupt_status_offset;
+    uint32_t clear = desc->base + desc->interrupt_clear_offset;
+    uint32_t brownout = 1u << 9;
+    uint32_t software_raw = 1u << 20;
+    ASSERT_EQ(mem_read32(mem, ena), 0u);
+    ASSERT_EQ(mem_read32(mem, raw), 0u);
+    ASSERT_EQ(mem_read32(mem, status), 0u);
+    ASSERT_EQ(mem_read32(mem, clear), 0u);
+
+    /* A disabled event still latches RAW. Enabling it later raises the one
+     * aggregate level, and W1C removes both the condition and the level. */
+    flexe_rtc_cntl_set_interrupts(rtc, brownout, true);
+    ASSERT_EQ(mem_read32(mem, raw), brownout);
+    ASSERT_EQ(mem_read32(mem, status), 0u);
+    ASSERT_EQ(probe.changes, 0u);
+    mem_write32(mem, ena, brownout);
+    ASSERT_EQ(mem_read32(mem, status), brownout);
+    ASSERT_EQ(probe.changes, 1u);
+    ASSERT_TRUE(probe.level);
+    mem_write32(mem, ena, 0u);
+    ASSERT_EQ(mem_read32(mem, raw), brownout);
+    ASSERT_EQ(probe.changes, 2u);
+    ASSERT_FALSE(probe.level);
+    mem_write32(mem, ena, brownout);
+    ASSERT_EQ(probe.changes, 3u);
+    ASSERT_TRUE(probe.level);
+    mem_write32(mem, clear, brownout);
+    ASSERT_EQ(mem_read32(mem, raw), 0u);
+    ASSERT_EQ(probe.changes, 4u);
+    ASSERT_FALSE(probe.level);
+
+    /* S3 exposes only bit 20 as software-writable RAW. Writes to physical
+     * producer bits and injections outside the descriptor mask are ignored. */
+    mem_write32(mem, ena, brownout | software_raw);
+    mem_write32(mem, raw, brownout);
+    ASSERT_EQ(mem_read32(mem, raw), 0u);
+    mem_write32(mem, raw, software_raw);
+    ASSERT_EQ(mem_read32(mem, status), software_raw);
+    ASSERT_EQ(probe.changes, 5u);
+    ASSERT_TRUE(probe.level);
+    mem_write32(mem, raw, 0u);
+    ASSERT_EQ(probe.changes, 6u);
+    ASSERT_FALSE(probe.level);
+    flexe_rtc_cntl_set_interrupts(rtc, 1u << 31, true);
+    ASSERT_EQ(mem_read32(mem, raw), 0u);
+    ASSERT_EQ(probe.changes, 6u);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_interrupt_routes_through_target_matrix)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
+    uint32_t line = 5u;
+    uint32_t raw_bit = desc->interrupt_raw_writable_mask;
+    uint32_t map = s3->interrupt_matrix.base +
+                   s3->interrupt_matrix.map_offset[0] +
+                   desc->interrupt_source * 4u;
+    mem_write32(mem, map, line);
+    mem_write32(mem, desc->base + desc->interrupt_enable_offset, raw_bit);
+    mem_write32(mem, desc->base + desc->interrupt_raw_offset, raw_bit);
+    ASSERT_TRUE(periph_interrupt_pending(periph,
+                                         desc->interrupt_source));
+    ASSERT_TRUE(cpu.interrupt & (1u << line));
+    mem_write32(mem, desc->base + desc->interrupt_clear_offset, raw_bit);
+    ASSERT_FALSE(periph_interrupt_pending(periph,
+                                          desc->interrupt_source));
+    ASSERT_EQ(cpu.interrupt & (1u << line), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
@@ -241,4 +363,6 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);
     RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
+    RUN_TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level);
+    RUN_TEST(rtc_cntl_interrupt_routes_through_target_matrix);
 }

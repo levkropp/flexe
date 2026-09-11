@@ -310,6 +310,11 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.clock_conf_offset, 0x74u);
     ASSERT_EQ(s3->rtc_cntl.clock_conf_reset, 0x1158321Cu);
     ASSERT_EQ(s3->rtc_cntl.slow_clock_source_hz[1], 32768u);
+    ASSERT_EQ(s3->rtc_cntl.interrupt_enable_offset, 0x40u);
+    ASSERT_EQ(s3->rtc_cntl.interrupt_clear_offset, 0x4Cu);
+    ASSERT_EQ(s3->rtc_cntl.interrupt_valid_mask, 0x001FFFFFu);
+    ASSERT_EQ(s3->rtc_cntl.interrupt_raw_writable_mask, 1u << 20);
+    ASSERT_EQ(s3->rtc_cntl.interrupt_source, 39u);
     ASSERT_EQ(s3->efuse.base, 0x60007000u);
     ASSERT_EQ(s3->efuse.read_data_word_count, 84u);
     ASSERT_EQ(s3->efuse.read_data[6], 0x00000002u);

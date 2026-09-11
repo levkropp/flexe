@@ -18,6 +18,8 @@ struct flexe_rtc_cntl {
     mmio_read_fn fallback_read;
     mmio_write_fn fallback_write;
     void *fallback_ctx;
+    flexe_rtc_cntl_irq_fn irq_changed;
+    void *irq_ctx;
     xtensa_cpu_t *cpu[2];
     rtc_clock_t clock;
     uint64_t last_clock_cycles;
@@ -26,6 +28,9 @@ struct flexe_rtc_cntl {
     uint64_t counter;
     uint64_t latched_counter;
     uint32_t clock_conf;
+    uint32_t interrupt_enable;
+    uint32_t interrupt_raw;
+    bool interrupt_level;
     uint32_t store[FLEXE_TARGET_RTC_STORE_MAX];
 };
 
@@ -33,6 +38,15 @@ static bool rtc_offset_valid(uint16_t offset, uint32_t register_size)
 {
     return (offset & 3u) == 0u &&
            offset <= register_size - sizeof(uint32_t);
+}
+
+static bool rtc_interrupt_offset(const flexe_rtc_cntl_desc_t *desc,
+                                 uint16_t offset)
+{
+    return offset == desc->interrupt_enable_offset ||
+           offset == desc->interrupt_raw_offset ||
+           offset == desc->interrupt_status_offset ||
+           offset == desc->interrupt_clear_offset;
 }
 
 static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
@@ -69,7 +83,12 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         desc->time_low_offset == desc->time_high_offset ||
         desc->time_low_offset == desc->reset_state_offset ||
         desc->time_low_offset == desc->clock_conf_offset ||
-        desc->time_high_offset == desc->reset_state_offset)
+        desc->time_high_offset == desc->reset_state_offset ||
+        rtc_interrupt_offset(desc, desc->time_update_offset) ||
+        rtc_interrupt_offset(desc, desc->time_low_offset) ||
+        rtc_interrupt_offset(desc, desc->time_high_offset) ||
+        rtc_interrupt_offset(desc, desc->reset_state_offset) ||
+        rtc_interrupt_offset(desc, desc->clock_conf_offset))
         return false;
 
     if (!rtc_offset_valid(desc->clock_conf_offset, desc->register_size) ||
@@ -83,7 +102,31 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         desc->slow_clock_select_shift > 30u ||
         desc->slow_clock_select_mask !=
             (3u << desc->slow_clock_select_shift) ||
-        desc->slow_clock_source_hz[0] != desc->slow_clock_hz)
+        desc->slow_clock_source_hz[0] != desc->slow_clock_hz ||
+        !rtc_offset_valid(desc->interrupt_enable_offset,
+                          desc->register_size) ||
+        !rtc_offset_valid(desc->interrupt_raw_offset,
+                          desc->register_size) ||
+        !rtc_offset_valid(desc->interrupt_status_offset,
+                          desc->register_size) ||
+        !rtc_offset_valid(desc->interrupt_clear_offset,
+                          desc->register_size) ||
+        desc->interrupt_enable_offset == desc->interrupt_raw_offset ||
+        desc->interrupt_enable_offset == desc->interrupt_status_offset ||
+        desc->interrupt_enable_offset == desc->interrupt_clear_offset ||
+        desc->interrupt_raw_offset == desc->interrupt_status_offset ||
+        desc->interrupt_raw_offset == desc->interrupt_clear_offset ||
+        desc->interrupt_status_offset == desc->interrupt_clear_offset ||
+        desc->interrupt_valid_mask == 0u ||
+        (desc->interrupt_enable_reset &
+         ~desc->interrupt_valid_mask) != 0u ||
+        (desc->interrupt_raw_reset &
+         ~desc->interrupt_valid_mask) != 0u ||
+        (desc->interrupt_raw_writable_mask &
+         ~desc->interrupt_valid_mask) != 0u ||
+        desc->interrupt_source >= FLEXE_TARGET_INTERRUPT_SOURCE_MAX ||
+        ((target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) &&
+         desc->interrupt_source >= target->interrupt_matrix.source_count))
         return false;
 
     for (unsigned source = 0u; source < 3u; source++)
@@ -98,7 +141,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             offset == desc->time_low_offset ||
             offset == desc->time_high_offset ||
             offset == desc->reset_state_offset ||
-            offset == desc->clock_conf_offset)
+            offset == desc->clock_conf_offset ||
+            rtc_interrupt_offset(desc, offset))
             return false;
         for (unsigned j = 0u; j < i; j++)
             if (offset == desc->store_offset[j]) return false;
@@ -200,6 +244,14 @@ static void rtc_sync(flexe_rtc_cntl_t *rtc)
                     rtc_scaled_ticks(rtc, elapsed, rtc_cpu_hz(rtc))) & mask;
 }
 
+static void rtc_cntl_update_interrupt(flexe_rtc_cntl_t *rtc)
+{
+    bool level = (rtc->interrupt_raw & rtc->interrupt_enable) != 0u;
+    if (level == rtc->interrupt_level) return;
+    rtc->interrupt_level = level;
+    if (rtc->irq_changed) rtc->irq_changed(rtc->irq_ctx, level);
+}
+
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
 {
     flexe_rtc_cntl_t *rtc = ctx;
@@ -217,6 +269,14 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return desc->reset_state_reset;
     if (offset == desc->clock_conf_offset)
         return rtc->clock_conf;
+    if (offset == desc->interrupt_enable_offset)
+        return rtc->interrupt_enable;
+    if (offset == desc->interrupt_raw_offset)
+        return rtc->interrupt_raw;
+    if (offset == desc->interrupt_status_offset)
+        return rtc->interrupt_raw & rtc->interrupt_enable;
+    if (offset == desc->interrupt_clear_offset)
+        return 0u;
     return rtc->fallback_read ?
         rtc->fallback_read(rtc->fallback_ctx, addr) : 0u;
 }
@@ -267,13 +327,33 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         }
         return;
     }
+    if (offset == desc->interrupt_enable_offset) {
+        rtc->interrupt_enable = value & desc->interrupt_valid_mask;
+        rtc_cntl_update_interrupt(rtc);
+        return;
+    }
+    if (offset == desc->interrupt_raw_offset) {
+        rtc->interrupt_raw =
+            (rtc->interrupt_raw & ~desc->interrupt_raw_writable_mask) |
+            (value & desc->interrupt_raw_writable_mask);
+        rtc_cntl_update_interrupt(rtc);
+        return;
+    }
+    if (offset == desc->interrupt_status_offset)
+        return; /* Masked status is physically read-only. */
+    if (offset == desc->interrupt_clear_offset) {
+        rtc->interrupt_raw &= ~(value & desc->interrupt_valid_mask);
+        rtc_cntl_update_interrupt(rtc);
+        return;
+    }
     if (rtc->fallback_write)
         rtc->fallback_write(rtc->fallback_ctx, addr, value);
 }
 
 flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
-    mmio_write_fn fallback_write, void *fallback_ctx)
+    mmio_write_fn fallback_write, void *fallback_ctx,
+    flexe_rtc_cntl_irq_fn irq_changed, void *irq_ctx)
 {
     if (!mem) return NULL;
     const flexe_target_desc_t *target = mem_target(mem);
@@ -286,8 +366,12 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->fallback_read = fallback_read;
     rtc->fallback_write = fallback_write;
     rtc->fallback_ctx = fallback_ctx;
+    rtc->irq_changed = irq_changed;
+    rtc->irq_ctx = irq_ctx;
     const flexe_rtc_cntl_desc_t *desc = &target->rtc_cntl;
     rtc->clock_conf = desc->clock_conf_reset;
+    rtc->interrupt_enable = desc->interrupt_enable_reset;
+    rtc->interrupt_raw = desc->interrupt_raw_reset;
     for (unsigned i = 0u; i < desc->store_count; i++)
         rtc->store[i] = desc->store_reset[i];
 
@@ -296,12 +380,15 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
         free(rtc);
         return NULL;
     }
+    rtc_cntl_update_interrupt(rtc);
     return rtc;
 }
 
 void flexe_rtc_cntl_destroy(flexe_rtc_cntl_t *rtc)
 {
     if (!rtc) return;
+    if (rtc->interrupt_level && rtc->irq_changed)
+        rtc->irq_changed(rtc->irq_ctx, false);
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
     (void)mem_register_mmio_range(
         rtc->mem, desc->base, desc->register_size,
@@ -336,4 +423,16 @@ void flexe_rtc_cntl_attach_cpus(flexe_rtc_cntl_t *rtc,
         rtc->clock.valid[core] = cpu != NULL;
     }
     rtc->last_clock_cycles = rtc->clock.cycles;
+}
+
+void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
+                                   uint32_t mask, bool asserted)
+{
+    if (!rtc) return;
+    mask &= rtc->target->rtc_cntl.interrupt_valid_mask;
+    if (asserted)
+        rtc->interrupt_raw |= mask;
+    else
+        rtc->interrupt_raw &= ~mask;
+    rtc_cntl_update_interrupt(rtc);
 }

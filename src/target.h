@@ -35,7 +35,7 @@
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 3u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 23u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 24u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -220,9 +220,10 @@ typedef struct {
 } flexe_io_mux_desc_t;
 
 /* Always-on RTC controller state shared by the ROM, bootloader and
- * application. Offsets are explicit because the register layout and timer
- * width vary across the ESP32 family, while older chips also split STORE0..3
- * and STORE4..7 into separate parts of RTC_CNTL. */
+ * application. Offsets are explicit because the register layout, timer
+ * width, interrupt bank, and routed source vary across the ESP32 family,
+ * while older chips also split STORE0..3 and STORE4..7 into separate parts
+ * of RTC_CNTL. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -246,6 +247,15 @@ typedef struct {
     uint32_t clock_conf_writable_mask;
     uint32_t slow_clock_select_mask;
     uint32_t slow_clock_source_hz[4];
+    uint16_t interrupt_enable_offset;
+    uint16_t interrupt_raw_offset;
+    uint16_t interrupt_status_offset;
+    uint16_t interrupt_clear_offset;
+    uint32_t interrupt_enable_reset;
+    uint32_t interrupt_raw_reset;
+    uint32_t interrupt_valid_mask;
+    uint32_t interrupt_raw_writable_mask;
+    uint8_t  interrupt_source;
 } flexe_rtc_cntl_desc_t;
 
 /* Read views of a virtual chip's one-time-programmable fuse blocks. Burning
