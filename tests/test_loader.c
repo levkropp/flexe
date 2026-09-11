@@ -291,6 +291,13 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.cpu_per_conf_reset, 0x0Cu);
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
+    ASSERT_EQ(s3->system_clock.register_count, 7u);
+    ASSERT_EQ(s3->system_clock.gate_count, 3u);
+    ASSERT_EQ(s3->system_clock.reg[1].offset, 0x18u);
+    ASSERT_EQ(s3->system_clock.reg[1].reset, 0xF9C1E06Fu);
+    ASSERT_EQ(s3->system_clock.gate[0].device,
+              FLEXE_SYSTEM_DEVICE_SYSTIMER);
+    ASSERT_EQ(s3->system_clock.gate[2].instance, 1u);
     ASSERT_EQ(s3->io_mux.base, 0x60009000u);
     ASSERT_EQ(s3->io_mux.gpio_count, 49u);
     ASSERT_EQ(s3->io_mux.gpio_register_offset[26], 0x6Cu);

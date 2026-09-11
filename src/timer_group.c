@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ESP32-S3-style timer-group V1 register layout. */
 #define TIMER_GROUP_TIMER_STRIDE        0x024u
@@ -61,6 +62,8 @@ typedef struct {
     uint32_t int_raw;
     uint32_t date;
     uint32_t regclk;
+    bool system_clock_enabled;
+    bool system_reset_asserted;
     bool irq_level[FLEXE_TARGET_TIMER_GROUP_EVENT_MAX];
 } timer_group_state_t;
 
@@ -244,6 +247,29 @@ static void timer_group_update_irqs(flexe_timer_group_t *timer_group,
     }
 }
 
+static void timer_group_reset_registers(flexe_timer_group_t *timer_group,
+                                        unsigned group)
+{
+    timer_group_state_t *state = &timer_group->group[group];
+    bool clock_enabled = state->system_clock_enabled;
+    bool reset_asserted = state->system_reset_asserted;
+    state->int_raw = 0u;
+    timer_group_update_irqs(timer_group, group);
+    memset(state, 0, sizeof(*state));
+    state->system_clock_enabled = clock_enabled;
+    state->system_reset_asserted = reset_asserted;
+
+    const flexe_timer_group_desc_t *desc =
+        &timer_group->target->timer_group;
+    state->date = desc->date_reset;
+    state->regclk = desc->regclk_reset;
+    for (unsigned timer = 0u; timer < desc->timer_count; timer++)
+        state->timer[timer].config = desc->timer_config_reset;
+    for (unsigned index = 0u; index < 6u; index++)
+        state->wdt.config[index] = desc->wdt_config_reset[index];
+    state->wdt.protect = desc->wdt_write_protect_key;
+}
+
 static bool timer_group_advance_timer(flexe_timer_group_t *timer_group,
                                       unsigned group, unsigned index,
                                       uint64_t ticks)
@@ -362,6 +388,9 @@ static bool timer_group_sync(flexe_timer_group_t *timer_group)
     bool changed = false;
     for (unsigned group = 0u; group < desc->group_count; group++) {
         timer_group_state_t *state = &timer_group->group[group];
+        if (!state->system_clock_enabled ||
+            state->system_reset_asserted)
+            continue;
         for (unsigned index = 0u; index < desc->timer_count; index++) {
             timer_group_timer_t *timer = &state->timer[index];
             if (!(timer->config & TIMER_CONFIG_ENABLE)) continue;
@@ -674,13 +703,8 @@ flexe_timer_group_t *flexe_timer_group_create(
     const flexe_timer_group_desc_t *desc = &target->timer_group;
     for (unsigned group = 0u; group < desc->group_count; group++) {
         timer_group_state_t *state = &timer_group->group[group];
-        state->date = desc->date_reset;
-        state->regclk = desc->regclk_reset;
-        for (unsigned timer = 0u; timer < desc->timer_count; timer++)
-            state->timer[timer].config = desc->timer_config_reset;
-        for (unsigned index = 0u; index < 6u; index++)
-            state->wdt.config[index] = desc->wdt_config_reset[index];
-        state->wdt.protect = desc->wdt_write_protect_key;
+        state->system_clock_enabled = true;
+        timer_group_reset_registers(timer_group, group);
         if (mem_register_mmio_range(mem, desc->base[group],
                                     desc->register_size,
                                     timer_group_read, timer_group_write,
@@ -736,6 +760,26 @@ void flexe_timer_group_attach_cpus(flexe_timer_group_t *timer_group,
     timer_group_notify(timer_group);
 }
 
+void flexe_timer_group_set_system_state(
+    flexe_timer_group_t *timer_group, unsigned group,
+    bool clock_enabled, bool reset_asserted)
+{
+    if (!timer_group ||
+        group >= timer_group->target->timer_group.group_count)
+        return;
+    timer_group_state_t *state = &timer_group->group[group];
+    if (clock_enabled == state->system_clock_enabled &&
+        reset_asserted == state->system_reset_asserted)
+        return;
+
+    (void)timer_group_sync(timer_group);
+    if (reset_asserted && !state->system_reset_asserted)
+        timer_group_reset_registers(timer_group, group);
+    state->system_clock_enabled = clock_enabled;
+    state->system_reset_asserted = reset_asserted;
+    timer_group_notify(timer_group);
+}
+
 uint32_t flexe_timer_group_next_event(flexe_timer_group_t *timer_group,
                                       xtensa_cpu_t *cpu)
 {
@@ -749,6 +793,9 @@ uint32_t flexe_timer_group_next_event(flexe_timer_group_t *timer_group,
 
     for (unsigned group = 0u; group < desc->group_count; group++) {
         timer_group_state_t *state = &timer_group->group[group];
+        if (!state->system_clock_enabled ||
+            state->system_reset_asserted)
+            continue;
         for (unsigned index = 0u; index < desc->timer_count; index++) {
             timer_group_timer_t *timer = &state->timer[index];
             if (!(timer->config & TIMER_CONFIG_ENABLE) ||

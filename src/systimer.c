@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ESP32-S2/S3-style SYSTIMER V1 register layout. */
 #define SYSTIMER_CONF_OFF              0x000u
@@ -81,6 +82,8 @@ struct flexe_systimer {
     uint32_t int_enable;
     uint32_t int_raw;
     uint32_t date;
+    bool system_clock_enabled;
+    bool system_reset_asserted;
     systimer_counter_t counter[FLEXE_TARGET_SYSTIMER_COUNTER_MAX];
     systimer_alarm_t alarm[FLEXE_TARGET_SYSTIMER_ALARM_MAX];
 };
@@ -169,6 +172,20 @@ static void systimer_update_irqs(flexe_systimer_t *systimer)
     }
 }
 
+static void systimer_reset_registers(flexe_systimer_t *systimer)
+{
+    systimer->int_raw = 0u;
+    systimer_update_irqs(systimer);
+    systimer->config = systimer->target->systimer.config_reset;
+    systimer->int_enable = 0u;
+    systimer->int_raw = 0u;
+    systimer->date = systimer->target->systimer.date_reset;
+    systimer->tick_remainder = 0u;
+    systimer->tick_denominator = 0u;
+    memset(systimer->counter, 0, sizeof(systimer->counter));
+    memset(systimer->alarm, 0, sizeof(systimer->alarm));
+}
+
 static void systimer_evaluate_alarms(flexe_systimer_t *systimer)
 {
     uint64_t mask = systimer_mask(systimer);
@@ -235,6 +252,9 @@ static void systimer_sync(flexe_systimer_t *systimer)
     uint64_t elapsed = now >= systimer->last_clock_cycles ?
                        now - systimer->last_clock_cycles : 0u;
     systimer->last_clock_cycles = now;
+    if (!systimer->system_clock_enabled ||
+        systimer->system_reset_asserted)
+        return;
     if (elapsed == 0u) {
         systimer_evaluate_alarms(systimer);
         return;
@@ -491,8 +511,8 @@ flexe_systimer_t *flexe_systimer_create(
     systimer->state_ctx = state_ctx;
     systimer->irq_changed = irq_changed;
     systimer->irq_ctx = irq_ctx;
-    systimer->config = target->systimer.config_reset;
-    systimer->date = target->systimer.date_reset;
+    systimer->system_clock_enabled = true;
+    systimer_reset_registers(systimer);
 
     if (mem_register_mmio_range(mem, target->systimer.base,
                                 target->systimer.register_size,
@@ -537,11 +557,32 @@ void flexe_systimer_attach_cpus(flexe_systimer_t *systimer,
         systimer->state_changed(systimer->state_ctx);
 }
 
+void flexe_systimer_set_system_state(flexe_systimer_t *systimer,
+                                     bool clock_enabled,
+                                     bool reset_asserted)
+{
+    if (!systimer ||
+        (clock_enabled == systimer->system_clock_enabled &&
+         reset_asserted == systimer->system_reset_asserted))
+        return;
+
+    systimer_sync(systimer);
+    if (reset_asserted && !systimer->system_reset_asserted)
+        systimer_reset_registers(systimer);
+    systimer->system_clock_enabled = clock_enabled;
+    systimer->system_reset_asserted = reset_asserted;
+    if (systimer->state_changed)
+        systimer->state_changed(systimer->state_ctx);
+}
+
 uint32_t flexe_systimer_next_event(flexe_systimer_t *systimer,
                                    xtensa_cpu_t *cpu)
 {
     if (!systimer || !cpu) return UINT32_MAX;
     systimer_sync(systimer);
+    if (!systimer->system_clock_enabled ||
+        systimer->system_reset_asserted)
+        return UINT32_MAX;
     const flexe_systimer_desc_t *desc = &systimer->target->systimer;
     uint64_t mask = systimer_mask(systimer);
     bool have = false;

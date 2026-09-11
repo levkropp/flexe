@@ -25,6 +25,13 @@ void flexe_systimer_attach_cpus(flexe_systimer_t *systimer,
                                 xtensa_cpu_t *cpu0,
                                 xtensa_cpu_t *cpu1);
 
+/* Apply the containing SoC's bus-clock and reset signals at the current
+ * shared-time boundary. A reset assertion restores documented register
+ * state; a disabled clock pauses counters and deadlines without losing it. */
+void flexe_systimer_set_system_state(flexe_systimer_t *systimer,
+                                     bool clock_enabled,
+                                     bool reset_asserted);
+
 /* Event-scheduler integration. next_event returns a deadline in the calling
  * CPU's CCOUNT frame; eval advances counter/alarm state at that boundary. */
 uint32_t flexe_systimer_next_event(flexe_systimer_t *systimer,

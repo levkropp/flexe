@@ -29,10 +29,17 @@ and the four-stage main watchdog with prescaling, feed, write protection,
 interrupt, and reset actions. It runs Espressif's unmodified ESP-IDF 5.3.2
 `gptimer` example through its stop, autoreload, and dynamically rearmed alarm
 scenarios at the requested 1 MHz resolution and one-second alarm cadence. This
-remains functional fast-mode timing: peripheral clock/reset
-gating and silicon-calibrated interrupt latency are not modeled yet, and an
-MWDT CPU-reset action currently requests the same whole-machine reset as a
-system-reset action.
+remains functional fast-mode timing: silicon-calibrated interrupt latency is
+not modeled yet, and an MWDT CPU-reset action currently requests the same
+whole-machine reset as a system-reset action.
+
+The target-described S3 SYSTEM bank exposes documented reset state and masked
+readback for peripheral clock/reset controls, low-sleep memory power masking,
+and Bluetooth low-power-clock division. SYSTIMER and both timer groups pause at
+exact clock-gate boundaries, and their independent reset pulses restore device
+state and interrupt lines. Effects for other peripheral, memory-power, and
+Bluetooth clock fields remain explicit unsupported-access diagnostics even
+though their architectural register values are retained.
 
 The S3 RTC counter advances on the same shared dual-core virtual timeline as
 the other target-described timers. Its two-half latch, runtime CPU-frequency

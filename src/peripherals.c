@@ -1168,6 +1168,9 @@ typedef enum {
 
 static uint32_t default_read(void *ctx, uint32_t addr);
 static void default_write(void *ctx, uint32_t addr, uint32_t val);
+static void system_clock_gate_changed(
+    void *ctx, flexe_system_device_t device, unsigned instance,
+    bool clock_enabled, bool reset_asserted);
 static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_state_changed(void *ctx);
@@ -13480,6 +13483,28 @@ static void intr_matrix_write_software_interrupt(esp32_periph_t *p,
 
 /* ---- Target-described system timer ---- */
 
+static void system_clock_gate_changed(
+    void *ctx, flexe_system_device_t device, unsigned instance,
+    bool clock_enabled, bool reset_asserted)
+{
+    esp32_periph_t *p = ctx;
+    if (!p) return;
+    switch (device) {
+    case FLEXE_SYSTEM_DEVICE_SYSTIMER:
+        if (instance == 0u)
+            flexe_systimer_set_system_state(
+                p->systimer, clock_enabled, reset_asserted);
+        return;
+    case FLEXE_SYSTEM_DEVICE_TIMER_GROUP:
+        flexe_timer_group_set_system_state(
+            p->target_timer_group, instance,
+            clock_enabled, reset_asserted);
+        return;
+    case FLEXE_SYSTEM_DEVICE_NONE:
+        return;
+    }
+}
+
 static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu)
 {
     return p && p->systimer ?
@@ -13846,7 +13871,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             }
         }
         p->system_clock = flexe_system_clock_create(
-            mem, fallback_read, fallback_write, p);
+            mem, fallback_read, fallback_write, p,
+            system_clock_gate_changed, p);
         if (!p->system_clock) {
             periph_destroy(p);
             return NULL;
@@ -14003,6 +14029,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             return NULL;
         }
     }
+
+    flexe_system_clock_publish_gates(p->system_clock);
 
     if (!classic) return p;
 

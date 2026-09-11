@@ -34,6 +34,12 @@ void flexe_timer_group_attach_cpus(flexe_timer_group_t *timer_group,
                                    xtensa_cpu_t *cpu0,
                                    xtensa_cpu_t *cpu1);
 
+/* Apply one timer group's containing SoC clock/reset signals at the current
+ * shared-time boundary. Other groups remain independently clocked. */
+void flexe_timer_group_set_system_state(
+    flexe_timer_group_t *timer_group, unsigned group,
+    bool clock_enabled, bool reset_asserted);
+
 /* Event-scheduler integration. Deadlines are returned in the calling CPU's
  * CCOUNT frame so alarms and watchdog stages wake WAITI at their boundary. */
 uint32_t flexe_timer_group_next_event(flexe_timer_group_t *timer_group,

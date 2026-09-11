@@ -32,8 +32,10 @@
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
+#define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 3u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 22u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 23u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -151,10 +153,36 @@ typedef struct {
     uint32_t runstall_mask;
 } flexe_secondary_core_desc_t;
 
-/* CPU/system-clock selection registers used by S2/S3-style clock trees.
- * The first version preserves the architectural register state firmware uses
- * to derive CPU and APB frequencies. Clock propagation into target-cycle
- * timing is deliberately a separate, calibrated-mode concern. */
+typedef enum {
+    FLEXE_SYSTEM_DEVICE_NONE = 0,
+    FLEXE_SYSTEM_DEVICE_SYSTIMER,
+    FLEXE_SYSTEM_DEVICE_TIMER_GROUP,
+} flexe_system_device_t;
+
+typedef struct {
+    uint16_t offset;
+    uint32_t reset;
+    uint32_t writable_mask;
+} flexe_system_register_desc_t;
+
+/* A semantic device mapping turns clock/reset bits into actual model state.
+ * Unmapped writable fields retain their architectural readback but report a
+ * diagnostic when changed, so extending the register bank cannot silently
+ * imply that an unimplemented peripheral or power effect works. */
+typedef struct {
+    flexe_system_device_t device;
+    uint8_t  instance;
+    uint16_t clock_offset;
+    uint16_t reset_offset;
+    uint32_t clock_mask;
+    uint32_t reset_mask;
+} flexe_system_gate_desc_t;
+
+/* CPU/system-clock and peripheral clock/reset registers used by S2/S3-style
+ * clock trees. Register geometry and device mappings are target data; the
+ * reusable owner preserves register state and publishes exact gate edges.
+ * CPU-clock propagation into target-cycle timing remains a separate,
+ * calibrated-mode concern. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -164,6 +192,11 @@ typedef struct {
     uint32_t sysclk_conf_offset;
     uint32_t sysclk_conf_reset;
     uint32_t sysclk_conf_writable_mask;
+    uint8_t register_count;
+    uint8_t gate_count;
+    flexe_system_register_desc_t
+        reg[FLEXE_TARGET_SYSTEM_REGISTER_MAX];
+    flexe_system_gate_desc_t gate[FLEXE_TARGET_SYSTEM_GATE_MAX];
 } flexe_system_clock_desc_t;
 
 /* Digital pad configuration register file. GPIO-to-register routing belongs
