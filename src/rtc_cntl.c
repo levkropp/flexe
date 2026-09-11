@@ -25,6 +25,7 @@ struct flexe_rtc_cntl {
     uint64_t tick_remainder;
     uint64_t counter;
     uint64_t latched_counter;
+    uint32_t clock_conf;
     uint32_t store[FLEXE_TARGET_RTC_STORE_MAX];
 };
 
@@ -64,10 +65,31 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         desc->time_update_offset == desc->time_low_offset ||
         desc->time_update_offset == desc->time_high_offset ||
         desc->time_update_offset == desc->reset_state_offset ||
+        desc->time_update_offset == desc->clock_conf_offset ||
         desc->time_low_offset == desc->time_high_offset ||
         desc->time_low_offset == desc->reset_state_offset ||
+        desc->time_low_offset == desc->clock_conf_offset ||
         desc->time_high_offset == desc->reset_state_offset)
         return false;
+
+    if (!rtc_offset_valid(desc->clock_conf_offset, desc->register_size) ||
+        desc->time_high_offset == desc->clock_conf_offset ||
+        desc->reset_state_offset == desc->clock_conf_offset ||
+        desc->clock_conf_writable_mask == 0u ||
+        (desc->clock_conf_reset & ~desc->clock_conf_writable_mask) != 0u ||
+        desc->slow_clock_select_mask == 0u ||
+        (desc->slow_clock_select_mask &
+         ~desc->clock_conf_writable_mask) != 0u ||
+        desc->slow_clock_select_shift > 30u ||
+        desc->slow_clock_select_mask !=
+            (3u << desc->slow_clock_select_shift) ||
+        desc->slow_clock_source_hz[0] != desc->slow_clock_hz)
+        return false;
+
+    for (unsigned source = 0u; source < 3u; source++)
+        if (desc->slow_clock_source_hz[source] == 0u ||
+            desc->slow_clock_source_hz[source] > 1000000000u)
+            return false;
 
     for (unsigned i = 0u; i < desc->store_count; i++) {
         uint16_t offset = desc->store_offset[i];
@@ -75,7 +97,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             offset == desc->time_update_offset ||
             offset == desc->time_low_offset ||
             offset == desc->time_high_offset ||
-            offset == desc->reset_state_offset)
+            offset == desc->reset_state_offset ||
+            offset == desc->clock_conf_offset)
             return false;
         for (unsigned j = 0u; j < i; j++)
             if (offset == desc->store_offset[j]) return false;
@@ -128,6 +151,15 @@ static uint64_t rtc_cpu_hz(const flexe_rtc_cntl_t *rtc)
     return mhz * UINT64_C(1000000);
 }
 
+static uint64_t rtc_slow_clock_hz(const flexe_rtc_cntl_t *rtc)
+{
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    unsigned source = (rtc->clock_conf & desc->slow_clock_select_mask) >>
+                      desc->slow_clock_select_shift;
+    uint64_t hz = desc->slow_clock_source_hz[source];
+    return hz != 0u ? hz : desc->slow_clock_hz;
+}
+
 static uint64_t rtc_scaled_ticks(flexe_rtc_cntl_t *rtc,
                                  uint64_t elapsed, uint64_t cpu_hz)
 {
@@ -135,7 +167,7 @@ static uint64_t rtc_scaled_ticks(flexe_rtc_cntl_t *rtc,
         rtc->tick_denominator = cpu_hz;
         rtc->tick_remainder = 0u;
     }
-    uint64_t slow_hz = rtc->target->rtc_cntl.slow_clock_hz;
+    uint64_t slow_hz = rtc_slow_clock_hz(rtc);
     uint64_t quotient = elapsed / cpu_hz;
     uint64_t remainder = elapsed % cpu_hz;
     uint64_t ticks = quotient > UINT64_MAX / slow_hz ?
@@ -183,6 +215,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
                desc->time_high_mask;
     if (offset == desc->reset_state_offset)
         return desc->reset_state_reset;
+    if (offset == desc->clock_conf_offset)
+        return rtc->clock_conf;
     return rtc->fallback_read ?
         rtc->fallback_read(rtc->fallback_ctx, addr) : 0u;
 }
@@ -211,6 +245,28 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
     if (offset == desc->time_low_offset ||
         offset == desc->time_high_offset)
         return;
+    if (offset == desc->clock_conf_offset) {
+        rtc_sync(rtc);
+        uint32_t old = rtc->clock_conf;
+        rtc->clock_conf =
+            (old & ~desc->clock_conf_writable_mask) |
+            (value & desc->clock_conf_writable_mask);
+        unsigned source =
+            (rtc->clock_conf & desc->slow_clock_select_mask) >>
+            desc->slow_clock_select_shift;
+        bool unsupported =
+            ((old ^ rtc->clock_conf) &
+             ~desc->slow_clock_select_mask) != 0u ||
+            desc->slow_clock_source_hz[source] == 0u;
+        if (unsupported && rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        if (((old ^ rtc->clock_conf) &
+             desc->slow_clock_select_mask) != 0u) {
+            rtc->tick_denominator = 0u;
+            rtc->tick_remainder = 0u;
+        }
+        return;
+    }
     if (rtc->fallback_write)
         rtc->fallback_write(rtc->fallback_ctx, addr, value);
 }
@@ -231,6 +287,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->fallback_write = fallback_write;
     rtc->fallback_ctx = fallback_ctx;
     const flexe_rtc_cntl_desc_t *desc = &target->rtc_cntl;
+    rtc->clock_conf = desc->clock_conf_reset;
     for (unsigned i = 0u; i < desc->store_count; i++)
         rtc->store[i] = desc->store_reset[i];
 

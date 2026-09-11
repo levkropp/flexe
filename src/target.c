@@ -296,11 +296,21 @@ static const flexe_target_desc_t TARGETS[] = {
             .time_low_offset = 0x010u,
             .time_high_offset = 0x014u,
             .reset_state_offset = 0x038u,
+            .clock_conf_offset = 0x074u,
+            .slow_clock_select_shift = 30u,
             .time_update_mask = 0x80000000u,
             .time_high_mask = 0x0000FFFFu,
             /* PRO/APPCPU state-vector selection reset bits plus a power-on
              * reset cause in each six-bit core field. */
             .reset_state_reset = 0x00003041u,
+            .clock_conf_reset = 0x1158321Cu,
+            .clock_conf_writable_mask = 0xFFFFF7FEu,
+            .slow_clock_select_mask = 0xC0000000u,
+            /* RC_SLOW, XTAL32K, and RC_FAST/256 nominal frequencies. The
+             * fourth mux encoding is reserved by the S3 clock-tree HAL. */
+            .slow_clock_source_hz = {
+                136000u, 32768u, 68359u, 0u,
+            },
         },
         .efuse = {
             .base = 0x60007000u,

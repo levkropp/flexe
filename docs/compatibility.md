@@ -35,10 +35,12 @@ MWDT CPU-reset action currently requests the same whole-machine reset as a
 system-reset action.
 
 The S3 RTC counter advances on the same shared dual-core virtual timeline as
-the other target-described timers and uses the target profile's nominal
-136 kHz RC slow clock. Its two-half latch and runtime CPU-frequency scaling are
-modeled, but oscillator drift, calibration error, sleep continuity, and reset
-causes other than initial power-on are not yet modeled.
+the other target-described timers. Its two-half latch, runtime CPU-frequency
+scaling, and switching among the nominal 136 kHz RC slow, 32.768 kHz crystal,
+and RC-fast/256 sources are modeled. Oscillator drift, calibration error,
+sleep continuity, reset causes other than initial power-on, and the electrical
+effects of the other RTC clock-control fields are not yet modeled; changing
+one of those fields remains visible in unsupported-access diagnostics.
 
 The experimental USB Serial/JTAG model implements the 64-byte serial endpoint
 FIFOs, packet flush and backpressure behavior, host RX/TX, interrupt

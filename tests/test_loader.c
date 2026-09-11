@@ -300,6 +300,9 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.time_update_offset, 0x0Cu);
     ASSERT_EQ(s3->rtc_cntl.time_high_mask, 0xFFFFu);
     ASSERT_EQ(s3->rtc_cntl.reset_state_reset, 0x3041u);
+    ASSERT_EQ(s3->rtc_cntl.clock_conf_offset, 0x74u);
+    ASSERT_EQ(s3->rtc_cntl.clock_conf_reset, 0x1158321Cu);
+    ASSERT_EQ(s3->rtc_cntl.slow_clock_source_hz[1], 32768u);
     ASSERT_EQ(s3->efuse.base, 0x60007000u);
     ASSERT_EQ(s3->efuse.read_data_word_count, 84u);
     ASSERT_EQ(s3->efuse.read_data[6], 0x00000002u);

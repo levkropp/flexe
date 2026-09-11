@@ -149,6 +149,60 @@ TEST(rtc_cntl_counter_tracks_shared_time_and_frequency)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
+
+    uint32_t clock_addr = desc->base + desc->clock_conf_offset;
+    ASSERT_EQ(mem_read32(mem, clock_addr), 0x1158321Cu);
+    cpu.ccount = 160000u;
+    ASSERT_EQ64(rtc_capture(mem, desc), 136u);
+
+    uint32_t xtal32k = (mem_read32(mem, clock_addr) &
+                        ~desc->slow_clock_select_mask) |
+                       (1u << desc->slow_clock_select_shift);
+    mem_write32(mem, clock_addr, xtal32k);
+    cpu.ccount = 320000u;
+    ASSERT_EQ64(rtc_capture(mem, desc), 168u);
+    cpu.ccount = 480000u;
+    ASSERT_EQ64(rtc_capture(mem, desc), 201u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    /* Fast-clock selection is retained for correct register readback, but
+     * its unmodeled electrical effect remains an explicit diagnostic. */
+    mem_write32(mem, clock_addr, xtal32k | (1u << 29u));
+    ASSERT_TRUE(mem_read32(mem, clock_addr) & (1u << 29u));
+    ASSERT_EQ(periph_unhandled_count(periph), 1);
+
+    /* The fourth mux value is reserved. Preserve what firmware wrote, use
+     * the deterministic target fallback rate, and never claim support. */
+    uint32_t reserved =
+        (mem_read32(mem, clock_addr) & ~desc->slow_clock_select_mask) |
+        desc->slow_clock_select_mask;
+    mem_write32(mem, clock_addr, reserved);
+    ASSERT_EQ(mem_read32(mem, clock_addr), reserved);
+    ASSERT_EQ(periph_unhandled_count(periph), 2);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported)
 {
     const flexe_target_desc_t *s3 =
@@ -165,8 +219,8 @@ TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported)
     }
 
     int before = periph_unhandled_count(periph);
-    ASSERT_EQ(mem_read32(mem, desc->base + 0x74u), 0u);
-    mem_write32(mem, desc->base + 0x74u, 1u);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x7Cu), 0u);
+    mem_write32(mem, desc->base + 0x7Cu, 1u);
     ASSERT_EQ(periph_unhandled_count(periph), before + 2);
 
     /* Unsupported timestamp-control bits share TIME_UPDATE with the modeled
@@ -185,5 +239,6 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_storage_resets_persists_and_delegates);
     RUN_TEST(rtc_cntl_application_handoff_uses_target_clocks);
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);
+    RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
 }

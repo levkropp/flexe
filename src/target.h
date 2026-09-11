@@ -33,7 +33,7 @@
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 21u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 22u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -204,9 +204,15 @@ typedef struct {
     uint16_t time_low_offset;
     uint16_t time_high_offset;
     uint16_t reset_state_offset;
+    uint16_t clock_conf_offset;
+    uint8_t  slow_clock_select_shift;
     uint32_t time_update_mask;
     uint32_t time_high_mask;
     uint32_t reset_state_reset;
+    uint32_t clock_conf_reset;
+    uint32_t clock_conf_writable_mask;
+    uint32_t slow_clock_select_mask;
+    uint32_t slow_clock_source_hz[4];
 } flexe_rtc_cntl_desc_t;
 
 /* Read views of a virtual chip's one-time-programmable fuse blocks. Burning
