@@ -13,9 +13,9 @@ the selection into an assertion suitable for CI. Classic ESP32 execution is
 supported. ESP32-S3 chip ID `0x0009` has experimental interpreter support for
 the LX7 core, native memory map, flash/cache-MMU windows, mask ROM, dual-core
 startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
-CPU/system-clock selection, RTC boot-handoff storage, a read-only revision-0
-eFuse profile, digital pad configuration, UARTs, native USB Serial/JTAG, and
-interrupt matrix.
+CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
+power-on reset state, a read-only revision-0 eFuse profile, digital pad
+configuration, UARTs, native USB Serial/JTAG, and interrupt matrix.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
@@ -33,6 +33,12 @@ remains functional fast-mode timing: peripheral clock/reset
 gating and silicon-calibrated interrupt latency are not modeled yet, and an
 MWDT CPU-reset action currently requests the same whole-machine reset as a
 system-reset action.
+
+The S3 RTC counter advances on the same shared dual-core virtual timeline as
+the other target-described timers and uses the target profile's nominal
+136 kHz RC slow clock. Its two-half latch and runtime CPU-frequency scaling are
+modeled, but oscillator drift, calibration error, sleep continuity, and reset
+causes other than initial power-on are not yet modeled.
 
 The experimental USB Serial/JTAG model implements the 64-byte serial endpoint
 FIFOs, packet flush and backpressure behavior, host RX/TX, interrupt

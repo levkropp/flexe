@@ -3,7 +3,7 @@
 #include "efuse.h"
 #include "flash_mmu.h"
 #include "io_mux.h"
-#include "rtc_storage.h"
+#include "rtc_cntl.h"
 #include "regi2c.h"
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
@@ -1832,7 +1832,7 @@ struct esp32_periph {
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_efuse_t *target_efuse;
     flexe_io_mux_t *io_mux;
-    flexe_rtc_storage_t *rtc_storage;
+    flexe_rtc_cntl_t *target_rtc_cntl;
     flexe_regi2c_t *regi2c;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_system_clock_t *system_clock;
@@ -13969,11 +13969,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         if (target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)
             p->target_efuse = flexe_efuse_create(
                 mem, default_read, default_write, p);
-        if (target->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1) {
-            p->rtc_storage = flexe_rtc_storage_create(
+        if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
+            p->target_rtc_cntl = flexe_rtc_cntl_create(
                 mem, default_read, default_write, p);
-            if (p->rtc_storage)
-                flexe_rtc_storage_application_handoff(p->rtc_storage);
+            if (p->target_rtc_cntl)
+                flexe_rtc_cntl_application_handoff(p->target_rtc_cntl);
         }
         if (target->flash_mmu.shared_instruction_data)
             p->shared_flash_mmu = flexe_flash_mmu_create(mem);
@@ -13983,8 +13983,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
         if (((target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1) &&
              !p->target_efuse) ||
-            ((target->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1) &&
-             !p->rtc_storage) ||
+            ((target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) &&
+             !p->target_rtc_cntl) ||
             (target->flash_mmu.shared_instruction_data &&
              !p->shared_flash_mmu) ||
             ((target->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM) &&
@@ -14261,11 +14261,11 @@ void periph_destroy(esp32_periph_t *p) {
         (void)mem_register_mmio_range(
             p->mem, p->target->efuse.base,
             p->target->efuse.register_size, NULL, NULL, NULL);
-    flexe_rtc_storage_destroy(p->rtc_storage);
-    if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_STORAGE_V1)
+    flexe_rtc_cntl_destroy(p->target_rtc_cntl);
+    if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1)
         (void)mem_register_mmio_range(
-            p->mem, p->target->rtc_storage.base,
-            p->target->rtc_storage.register_size, NULL, NULL, NULL);
+            p->mem, p->target->rtc_cntl.base,
+            p->target->rtc_cntl.register_size, NULL, NULL, NULL);
     flexe_io_mux_destroy(p->io_mux);
     if (p->target->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1)
         (void)mem_register_mmio_range(
@@ -14748,6 +14748,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     flexe_esp32s3_extmem_attach_cpus(p->s3_extmem, cpu0, cpu1);
     flexe_systimer_attach_cpus(p->systimer, cpu0, cpu1);
     flexe_timer_group_attach_cpus(p->target_timer_group, cpu0, cpu1);
+    flexe_rtc_cntl_attach_cpus(p->target_rtc_cntl, cpu0, cpu1);
 
     bool classic = (p->target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;

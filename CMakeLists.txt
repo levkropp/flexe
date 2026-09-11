@@ -72,7 +72,7 @@ set(LIB_SOURCES
     src/esp32s3_extmem.c
     src/efuse.c
     src/io_mux.c
-    src/rtc_storage.c
+    src/rtc_cntl.c
     src/regi2c.c
     src/sensitive_memprot.c
     src/system_clock.c

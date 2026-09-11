@@ -170,7 +170,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_TIMER_GROUP_V1 |
                         FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1 |
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
-                        FLEXE_TARGET_CAP_RTC_STORAGE_V1 |
+                        FLEXE_TARGET_CAP_RTC_CNTL_V1 |
                         FLEXE_TARGET_CAP_EFUSE_READ_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -280,7 +280,7 @@ static const flexe_target_desc_t TARGETS[] = {
                 0x0BCu, 0x0C0u, 0x0C4u,
             },
         },
-        .rtc_storage = {
+        .rtc_cntl = {
             .base = 0x60008000u,
             .register_size = 0x1000u,
             .store_count = 8u,
@@ -292,6 +292,15 @@ static const flexe_target_desc_t TARGETS[] = {
                 0x050u, 0x054u, 0x058u, 0x05Cu,
                 0x0C0u, 0x0C4u, 0x0C8u, 0x0CCu,
             },
+            .time_update_offset = 0x00Cu,
+            .time_low_offset = 0x010u,
+            .time_high_offset = 0x014u,
+            .reset_state_offset = 0x038u,
+            .time_update_mask = 0x80000000u,
+            .time_high_mask = 0x0000FFFFu,
+            /* PRO/APPCPU state-vector selection reset bits plus a power-on
+             * reset cause in each six-bit core field. */
+            .reset_state_reset = 0x00003041u,
         },
         .efuse = {
             .base = 0x60007000u,

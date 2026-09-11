@@ -33,7 +33,7 @@
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 20u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 21u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -53,7 +53,7 @@ typedef enum {
     FLEXE_TARGET_CAP_TIMER_GROUP_V1              = 1ull << 11,
     FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1             = 1ull << 12,
     FLEXE_TARGET_CAP_IO_MUX_V1                   = 1ull << 13,
-    FLEXE_TARGET_CAP_RTC_STORAGE_V1               = 1ull << 14,
+    FLEXE_TARGET_CAP_RTC_CNTL_V1                  = 1ull << 14,
     FLEXE_TARGET_CAP_EFUSE_READ_V1                = 1ull << 15,
 } flexe_target_capability_t;
 
@@ -186,9 +186,10 @@ typedef struct {
     uint16_t gpio_register_offset[FLEXE_TARGET_GPIO_MAX];
 } flexe_io_mux_desc_t;
 
-/* Always-on scratch registers shared by the ROM, bootloader and application.
- * The offsets are explicit because older chips split STORE0..3 and STORE4..7
- * into separate parts of RTC_CNTL. */
+/* Always-on RTC controller state shared by the ROM, bootloader and
+ * application. Offsets are explicit because the register layout and timer
+ * width vary across the ESP32 family, while older chips also split STORE0..3
+ * and STORE4..7 into separate parts of RTC_CNTL. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -199,7 +200,14 @@ typedef struct {
     uint32_t xtal_frequency_mhz;
     uint16_t store_offset[FLEXE_TARGET_RTC_STORE_MAX];
     uint32_t store_reset[FLEXE_TARGET_RTC_STORE_MAX];
-} flexe_rtc_storage_desc_t;
+    uint16_t time_update_offset;
+    uint16_t time_low_offset;
+    uint16_t time_high_offset;
+    uint16_t reset_state_offset;
+    uint32_t time_update_mask;
+    uint32_t time_high_mask;
+    uint32_t reset_state_reset;
+} flexe_rtc_cntl_desc_t;
 
 /* Read views of a virtual chip's one-time-programmable fuse blocks. Burning
  * fuses is intentionally a separate capability: a read-only profile must not
@@ -466,8 +474,8 @@ typedef struct {
     /* Optional digital pad configuration register file. */
     flexe_io_mux_desc_t          io_mux;
 
-    /* Optional RTC-domain scratch registers used across boot stages. */
-    flexe_rtc_storage_desc_t     rtc_storage;
+    /* Optional always-on RTC controller and boot-handoff state. */
+    flexe_rtc_cntl_desc_t        rtc_cntl;
 
     /* Optional read-only virtual-silicon eFuse profile. */
     flexe_efuse_desc_t           efuse;
