@@ -11,6 +11,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_flash_mmu.c"
 #include "test_esp32s3_extmem.c"
 #include "test_systimer.c"
+#include "test_timer_group.c"
 #include "test_usb_serial_jtag.c"
 #include "test_spi_mem.c"
 #include "test_firmware_scan.c"
@@ -58,6 +59,7 @@ int main(void) {
     run_flash_mmu_tests();
     run_esp32s3_extmem_tests();
     run_systimer_tests();
+    run_timer_group_target_tests();
     run_usb_serial_jtag_tests();
     run_spi_mem_tests();
     run_firmware_scan_tests();

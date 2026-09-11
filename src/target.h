@@ -20,12 +20,15 @@
 #define FLEXE_TARGET_REGI2C_HOST_MAX 2u
 #define FLEXE_TARGET_SYSTIMER_COUNTER_MAX 2u
 #define FLEXE_TARGET_SYSTIMER_ALARM_MAX 3u
+#define FLEXE_TARGET_TIMER_GROUP_MAX 2u
+#define FLEXE_TARGET_TIMER_GROUP_TIMER_MAX 2u
+#define FLEXE_TARGET_TIMER_GROUP_EVENT_MAX 3u
 #define FLEXE_TARGET_SPI_MEM_HOST_MAX 2u
 #define FLEXE_TARGET_INTERRUPT_CORE_MAX 2u
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
 #define FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX 4u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 15u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 16u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -42,6 +45,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SPI_MEM                    = 1ull << 8,
     FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1        = 1ull << 9,
     FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1          = 1ull << 10,
+    FLEXE_TARGET_CAP_TIMER_GROUP_V1              = 1ull << 11,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -253,6 +257,32 @@ typedef struct {
     uint8_t  interrupt_source[FLEXE_TARGET_SYSTIMER_ALARM_MAX];
 } flexe_systimer_desc_t;
 
+/* Newer ESP32-family timer-group IP. V1 describes the S3-style register
+ * layout: two general-purpose timers, a four-stage main watchdog, and three
+ * independent interrupt sources per group. RTC calibration occupies the
+ * same pages but remains a separate capability so either block can be tested
+ * and reused independently. */
+typedef struct {
+    uint32_t base[FLEXE_TARGET_TIMER_GROUP_MAX];
+    uint32_t register_size;
+    uint32_t apb_clock_hz;
+    uint32_t xtal_clock_hz;
+    uint32_t timer_config_reset;
+    uint32_t timer_config_writable_mask;
+    uint32_t wdt_config_reset[6];
+    uint32_t wdt_config_writable_mask[6];
+    uint32_t wdt_write_protect_key;
+    uint32_t date_reset;
+    uint32_t date_writable_mask;
+    uint32_t regclk_reset;
+    uint32_t regclk_writable_mask;
+    uint8_t  group_count;
+    uint8_t  timer_count;
+    uint8_t  counter_width;
+    uint8_t  interrupt_source[FLEXE_TARGET_TIMER_GROUP_MAX]
+                                     [FLEXE_TARGET_TIMER_GROUP_EVENT_MAX];
+} flexe_timer_group_desc_t;
+
 /* SPI0/SPI1 memory-controller generations share command semantics but move
  * the transaction and data-buffer registers. The selected architectural
  * layout supplies those register definitions; target data identifies the
@@ -371,6 +401,9 @@ typedef struct {
 
     /* Optional V1 system-timer register block. */
     flexe_systimer_desc_t         systimer;
+
+    /* Optional V1 timer-group and main-watchdog register blocks. */
+    flexe_timer_group_desc_t      timer_group;
 
     /* Optional SPI memory controllers and their default attached devices. */
     flexe_spi_mem_desc_t          spi_mem;

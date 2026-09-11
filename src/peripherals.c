@@ -5,6 +5,7 @@
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
 #include "systimer.h"
+#include "timer_group.h"
 #include "usb_serial_jtag.h"
 #include "spi_display.h"
 #include "sandbox_events.h"
@@ -1137,6 +1138,8 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
  * that a free-running model still needs evaluation without a wake deadline. */
 #define PERIPH_EVENT_SOURCE_LIST(X) \
     X(SYSTIMER, systimer_next_fire, systimer_eval_events, false) \
+    X(TIMER_GROUP, target_timer_group_next_fire,                    \
+                   target_timer_group_eval_events, false)          \
     X(TIMG,     timg_next_fire,     timg_eval_events,     false) \
     X(LACT,     lact_next_fire,     lact_eval_events,     true)  \
     X(FRC,      frc_next_fire,      frc_eval_events,      false) \
@@ -1166,6 +1169,15 @@ static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_state_changed(void *ctx);
 static void systimer_irq_changed(void *ctx, unsigned alarm, bool level);
+static uint32_t target_timer_group_next_fire(esp32_periph_t *p,
+                                             xtensa_cpu_t *cpu);
+static void target_timer_group_eval_events(esp32_periph_t *p,
+                                           xtensa_cpu_t *cpu);
+static void target_timer_group_state_changed(void *ctx);
+static void target_timer_group_irq_changed(void *ctx, unsigned group,
+                                           unsigned event, bool level);
+static void target_timer_group_reset_requested(
+    void *ctx, unsigned group, flexe_timer_group_wdt_action_t action);
 static void usb_serial_jtag_irq_changed(void *ctx, bool level);
 static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -1805,7 +1817,7 @@ typedef struct {
 } periph_deferred_event_t;
 
 struct esp32_periph {
-    /* Set when firmware writes a software-reset bit to RTC_CNTL_OPTIONS0. */
+    /* Set when firmware or a modeled watchdog requests a system reset. */
     bool reset_requested;
     xtensa_mem_t *mem;
     const flexe_target_desc_t *target;
@@ -1818,6 +1830,7 @@ struct esp32_periph {
     flexe_regi2c_t *regi2c;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_systimer_t *systimer;
+    flexe_timer_group_t *target_timer_group;
     flexe_spi_mem_t *spi_mem;
     flexe_usb_serial_jtag_t *usb_serial_jtag;
 
@@ -13517,6 +13530,54 @@ static void systimer_irq_changed(void *ctx, unsigned alarm, bool level)
     else periph_deassert_interrupt(p, source);
 }
 
+/* ---- Target-described timer groups and main watchdogs ---- */
+
+static uint32_t target_timer_group_next_fire(esp32_periph_t *p,
+                                             xtensa_cpu_t *cpu)
+{
+    return p && p->target_timer_group ?
+        flexe_timer_group_next_event(p->target_timer_group, cpu) :
+        UINT32_MAX;
+}
+
+static void target_timer_group_eval_events(esp32_periph_t *p,
+                                           xtensa_cpu_t *cpu)
+{
+    (void)cpu;
+    if (p && p->target_timer_group)
+        flexe_timer_group_eval(p->target_timer_group);
+}
+
+static void target_timer_group_state_changed(void *ctx)
+{
+    esp32_periph_t *p = ctx;
+    if (!p) return;
+    periph_event_source_changed(p, PERIPH_EVENT_TIMER_GROUP);
+    for (unsigned core = 0u; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void target_timer_group_irq_changed(void *ctx, unsigned group,
+                                           unsigned event, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || group >= p->target->timer_group.group_count ||
+        event >= FLEXE_TARGET_TIMER_GROUP_EVENT_MAX)
+        return;
+    int source = p->target->timer_group.interrupt_source[group][event];
+    if (level) periph_assert_interrupt(p, source);
+    else periph_deassert_interrupt(p, source);
+}
+
+static void target_timer_group_reset_requested(
+    void *ctx, unsigned group, flexe_timer_group_wdt_action_t action)
+{
+    esp32_periph_t *p = ctx;
+    (void)group;
+    (void)action;
+    if (p) p->reset_requested = true;
+}
+
 static void usb_serial_jtag_irq_changed(void *ctx, bool level)
 {
     esp32_periph_t *p = ctx;
@@ -13822,6 +13883,24 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 periph_destroy(p);
                 return NULL;
             }
+        }
+    }
+
+    if (target->capabilities & FLEXE_TARGET_CAP_TIMER_GROUP_V1) {
+        mmio_read_fn fallback_read = default_read;
+        mmio_write_fn fallback_write = default_write;
+        if (target->capabilities & FLEXE_TARGET_CAP_RTC_CALIBRATION) {
+            fallback_read = rtc_calibration_read;
+            fallback_write = rtc_calibration_write;
+        }
+        p->target_timer_group = flexe_timer_group_create(
+            mem, fallback_read, fallback_write, p,
+            target_timer_group_state_changed, p,
+            target_timer_group_irq_changed, p,
+            target_timer_group_reset_requested, p);
+        if (!p->target_timer_group) {
+            periph_destroy(p);
+            return NULL;
         }
     }
 
@@ -14153,6 +14232,7 @@ void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
     flexe_usb_serial_jtag_destroy(p->usb_serial_jtag);
     flexe_spi_mem_destroy(p->spi_mem);
+    flexe_timer_group_destroy(p->target_timer_group);
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
@@ -14627,12 +14707,17 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     flexe_flash_mmu_attach_cpus(p->shared_flash_mmu, cpu0, cpu1);
     flexe_esp32s3_extmem_attach_cpus(p->s3_extmem, cpu0, cpu1);
     flexe_systimer_attach_cpus(p->systimer, cpu0, cpu1);
+    flexe_timer_group_attach_cpus(p->target_timer_group, cpu0, cpu1);
 
     bool classic = (p->target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     uint32_t candidates = classic ?
-        (PERIPH_EVENT_ALL_MASK & ~(1u << PERIPH_EVENT_SYSTIMER)) : 0u;
+        (PERIPH_EVENT_ALL_MASK &
+         ~((1u << PERIPH_EVENT_SYSTIMER) |
+           (1u << PERIPH_EVENT_TIMER_GROUP))) : 0u;
     if (p->systimer) candidates |= 1u << PERIPH_EVENT_SYSTIMER;
+    if (p->target_timer_group)
+        candidates |= 1u << PERIPH_EVENT_TIMER_GROUP;
     p->event_source_candidates[0] = candidates;
     p->event_source_candidates[1] = candidates;
 

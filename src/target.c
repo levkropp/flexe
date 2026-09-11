@@ -137,7 +137,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SYSTIMER_V1 |
                         FLEXE_TARGET_CAP_SPI_MEM |
                         FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1 |
-                        FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1,
+                        FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1 |
+                        FLEXE_TARGET_CAP_TIMER_GROUP_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -291,6 +292,42 @@ static const flexe_target_desc_t TARGETS[] = {
             .alarm_count = 3u,
             .counter_width = 52u,
             .interrupt_source = { 57u, 58u, 59u },
+        },
+        .timer_group = {
+            .base = { 0x6001F000u, 0x60020000u },
+            .register_size = 0x1000u,
+            .apb_clock_hz = 80000000u,
+            .xtal_clock_hz = 40000000u,
+            .timer_config_reset = 0x60002000u,
+            .timer_config_writable_mask = 0xFFFFE600u,
+            .wdt_config_reset = {
+                0x0004C000u,
+                0x00010000u,
+                0x018CBA80u,
+                0x07FFFFFFu,
+                0x000FFFFFu,
+                0x000FFFFFu,
+            },
+            .wdt_config_writable_mask = {
+                0xFF9FF000u,
+                0xFFFF0000u,
+                UINT32_MAX,
+                UINT32_MAX,
+                UINT32_MAX,
+                UINT32_MAX,
+            },
+            .wdt_write_protect_key = 0x50D83AA1u,
+            .date_reset = 0x02003071u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            .regclk_reset = 0u,
+            .regclk_writable_mask = 1u << 31,
+            .group_count = 2u,
+            .timer_count = 2u,
+            .counter_width = 54u,
+            .interrupt_source = {
+                { 50u, 51u, 52u },
+                { 53u, 54u, 55u },
+            },
         },
         .spi_mem = {
             .base = { 0x60003000u, 0x60002000u },

@@ -273,6 +273,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_REGI2C);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSTIMER_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_TIMER_GROUP_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1);
@@ -289,6 +290,13 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_calibration.base[0], 0x6001F000u);
     ASSERT_EQ(s3->rtc_calibration.base[1], 0x60020000u);
     ASSERT_EQ(s3->rtc_calibration.reference_clock_hz, 40000000u);
+    ASSERT_EQ(s3->timer_group.group_count, 2u);
+    ASSERT_EQ(s3->timer_group.timer_count, 2u);
+    ASSERT_EQ(s3->timer_group.counter_width, 54u);
+    ASSERT_EQ(s3->timer_group.base[0], 0x6001F000u);
+    ASSERT_EQ(s3->timer_group.base[1], 0x60020000u);
+    ASSERT_EQ(s3->timer_group.interrupt_source[0][0], 50u);
+    ASSERT_EQ(s3->timer_group.interrupt_source[1][2], 55u);
     ASSERT_EQ(s3->regi2c.base, 0x6000E000u);
     ASSERT_EQ(s3->regi2c.host_count, 2u);
     ASSERT_EQ(s3->regi2c.bbpll_done_mask, 1u << 24);
