@@ -169,7 +169,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1 |
                         FLEXE_TARGET_CAP_TIMER_GROUP_V1 |
                         FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1 |
-                        FLEXE_TARGET_CAP_IO_MUX_V1,
+                        FLEXE_TARGET_CAP_IO_MUX_V1 |
+                        FLEXE_TARGET_CAP_RTC_STORAGE_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -276,6 +277,19 @@ static const flexe_target_desc_t TARGETS[] = {
                 0x094u, 0x098u, 0x09Cu, 0x0A0u, 0x0A4u,
                 0x0A8u, 0x0ACu, 0x0B0u, 0x0B4u, 0x0B8u,
                 0x0BCu, 0x0C0u, 0x0C4u,
+            },
+        },
+        .rtc_storage = {
+            .base = 0x60008000u,
+            .register_size = 0x1000u,
+            .store_count = 8u,
+            .slow_clock_cal_store = 1u,
+            .xtal_frequency_store = 4u,
+            .slow_clock_hz = 136000u,
+            .xtal_frequency_mhz = 40u,
+            .store_offset = {
+                0x050u, 0x054u, 0x058u, 0x05Cu,
+                0x0C0u, 0x0C4u, 0x0C8u, 0x0CCu,
             },
         },
         .interrupt_matrix = {

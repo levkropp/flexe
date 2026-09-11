@@ -13,8 +13,8 @@ the selection into an assertion suitable for CI. Classic ESP32 execution is
 supported. ESP32-S3 chip ID `0x0009` has experimental interpreter support for
 the LX7 core, native memory map, flash/cache-MMU windows, mask ROM, dual-core
 startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
-CPU/system-clock selection, digital pad configuration, UARTs, native USB
-Serial/JTAG, and interrupt matrix.
+CPU/system-clock selection, RTC boot-handoff storage, digital pad
+configuration, UARTs, native USB Serial/JTAG, and interrupt matrix.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM

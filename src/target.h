@@ -30,8 +30,9 @@
 #define FLEXE_TARGET_GPIO_MAX 54u
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
+#define FLEXE_TARGET_RTC_STORE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 18u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 19u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -51,6 +52,7 @@ typedef enum {
     FLEXE_TARGET_CAP_TIMER_GROUP_V1              = 1ull << 11,
     FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1             = 1ull << 12,
     FLEXE_TARGET_CAP_IO_MUX_V1                   = 1ull << 13,
+    FLEXE_TARGET_CAP_RTC_STORAGE_V1               = 1ull << 14,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -181,6 +183,21 @@ typedef struct {
     uint32_t date_reset;
     uint16_t gpio_register_offset[FLEXE_TARGET_GPIO_MAX];
 } flexe_io_mux_desc_t;
+
+/* Always-on scratch registers shared by the ROM, bootloader and application.
+ * The offsets are explicit because older chips split STORE0..3 and STORE4..7
+ * into separate parts of RTC_CNTL. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint8_t  store_count;
+    uint8_t  slow_clock_cal_store;
+    uint8_t  xtal_frequency_store;
+    uint32_t slow_clock_hz;
+    uint32_t xtal_frequency_mhz;
+    uint16_t store_offset[FLEXE_TARGET_RTC_STORE_MAX];
+    uint32_t store_reset[FLEXE_TARGET_RTC_STORE_MAX];
+} flexe_rtc_storage_desc_t;
 
 /* Peripheral interrupt fabric used by newer ESP32-family targets. Each
  * source has one CPU-interrupt selector per core. Raw source status remains
@@ -432,6 +449,9 @@ typedef struct {
 
     /* Optional digital pad configuration register file. */
     flexe_io_mux_desc_t          io_mux;
+
+    /* Optional RTC-domain scratch registers used across boot stages. */
+    flexe_rtc_storage_desc_t     rtc_storage;
 
     /* Optional V1 peripheral interrupt matrix and software generators. */
     flexe_interrupt_matrix_desc_t interrupt_matrix;
