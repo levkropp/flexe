@@ -31,11 +31,14 @@
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
+#define FLEXE_TARGET_RTC_WDT_STAGE_MAX 4u
+#define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
+    (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 3u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 24u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 25u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -221,9 +224,9 @@ typedef struct {
 
 /* Always-on RTC controller state shared by the ROM, bootloader and
  * application. Offsets are explicit because the register layout, timer
- * width, interrupt bank, and routed source vary across the ESP32 family,
- * while older chips also split STORE0..3 and STORE4..7 into separate parts
- * of RTC_CNTL. */
+ * width, interrupt bank, watchdog, and routed source vary across the ESP32
+ * family, while older chips also split STORE0..3 and STORE4..7 into separate
+ * parts of RTC_CNTL. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -256,6 +259,19 @@ typedef struct {
     uint32_t interrupt_valid_mask;
     uint32_t interrupt_raw_writable_mask;
     uint8_t  interrupt_source;
+    uint16_t wdt_config_offset[FLEXE_TARGET_RTC_WDT_CONFIG_MAX];
+    uint16_t wdt_feed_offset;
+    uint16_t wdt_write_protect_offset;
+    uint32_t wdt_config_reset[FLEXE_TARGET_RTC_WDT_CONFIG_MAX];
+    uint32_t wdt_config_writable_mask[FLEXE_TARGET_RTC_WDT_CONFIG_MAX];
+    uint32_t wdt_enable_mask;
+    uint32_t wdt_flashboot_enable_mask;
+    uint32_t wdt_feed_mask;
+    uint32_t wdt_write_protect_key;
+    uint32_t wdt_interrupt_mask;
+    uint8_t  wdt_stage_action_shift[FLEXE_TARGET_RTC_WDT_STAGE_MAX];
+    uint8_t  wdt_stage_action_mask;
+    uint8_t  wdt_stage0_multiplier;
 } flexe_rtc_cntl_desc_t;
 
 /* Read views of a virtual chip's one-time-programmable fuse blocks. Burning

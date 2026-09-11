@@ -1140,6 +1140,8 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
  * until its own state transition marks it dirty again. The final field says
  * that a free-running model still needs evaluation without a wake deadline. */
 #define PERIPH_EVENT_SOURCE_LIST(X) \
+    X(RTC_CNTL, target_rtc_cntl_next_fire,                         \
+                target_rtc_cntl_eval_events, false)                \
     X(SYSTIMER, systimer_next_fire, systimer_eval_events, false) \
     X(TIMER_GROUP, target_timer_group_next_fire,                    \
                    target_timer_group_eval_events, false)          \
@@ -1171,7 +1173,14 @@ static void default_write(void *ctx, uint32_t addr, uint32_t val);
 static void system_clock_gate_changed(
     void *ctx, flexe_system_device_t device, unsigned instance,
     bool clock_enabled, bool reset_asserted);
+static uint32_t target_rtc_cntl_next_fire(esp32_periph_t *p,
+                                          xtensa_cpu_t *cpu);
+static void target_rtc_cntl_eval_events(esp32_periph_t *p,
+                                        xtensa_cpu_t *cpu);
+static void target_rtc_cntl_state_changed(void *ctx);
 static void target_rtc_cntl_irq_changed(void *ctx, bool level);
+static void target_rtc_cntl_reset_requested(
+    void *ctx, flexe_rtc_cntl_wdt_action_t action);
 static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_state_changed(void *ctx);
@@ -1934,7 +1943,11 @@ struct esp32_periph {
     /* CPU pointers for interrupt delivery */
     xtensa_cpu_t *cpu[2];
 
-    /* Per-core set of deadline producers which may currently be armed. */
+    /* Target-selected producers and the per-core subset which may currently
+     * be armed.  Keep registration separate from candidacy: continuously
+     * sampled models still need to run after their deadline query sleeps,
+     * but must never run for a target which did not register the device. */
+    uint32_t event_source_registered_mask;
     uint32_t event_source_candidates[2];
 
     /* Cross-core interrupt pending state */
@@ -4652,7 +4665,8 @@ static uint32_t periph_next_event_hook(xtensa_cpu_t *cpu) {
     int core = periph_event_core(p, cpu);
     if (core < 0) return UINT32_MAX;
 
-    uint32_t candidates = p->event_source_candidates[core];
+    uint32_t candidates = p->event_source_candidates[core] &
+                          p->event_source_registered_mask;
     bool have = false;
     uint32_t best = UINT32_MAX;
     uint32_t best_distance = 0;
@@ -4682,9 +4696,11 @@ static void periph_event_hook(xtensa_cpu_t *cpu) {
     int core = periph_event_core(p, cpu);
     if (core < 0) return;
 
-    uint32_t candidates = p->event_source_candidates[core];
+    uint32_t registered = p->event_source_registered_mask;
+    uint32_t candidates = p->event_source_candidates[core] & registered;
 #define PERIPH_EVAL_EVENT(name, next, eval, continuous) do {                 \
-        if ((candidates & (1u << PERIPH_EVENT_##name)) || (continuous))       \
+        const uint32_t bit = 1u << PERIPH_EVENT_##name;                      \
+        if ((candidates & bit) || ((continuous) && (registered & bit)))       \
             eval(p, cpu);                                                     \
     } while (0);
     PERIPH_EVENT_SOURCE_LIST(PERIPH_EVAL_EVENT)
@@ -13482,7 +13498,32 @@ static void intr_matrix_write_software_interrupt(esp32_periph_t *p,
     else             periph_deassert_interrupt(p, source);
 }
 
-/* ---- Target-described RTC interrupt aggregation ---- */
+/* ---- Target-described RTC controller and watchdog ---- */
+
+static uint32_t target_rtc_cntl_next_fire(esp32_periph_t *p,
+                                          xtensa_cpu_t *cpu)
+{
+    return p && p->target_rtc_cntl ?
+        flexe_rtc_cntl_next_event(p->target_rtc_cntl, cpu) :
+        UINT32_MAX;
+}
+
+static void target_rtc_cntl_eval_events(esp32_periph_t *p,
+                                        xtensa_cpu_t *cpu)
+{
+    (void)cpu;
+    if (p && p->target_rtc_cntl)
+        flexe_rtc_cntl_eval(p->target_rtc_cntl);
+}
+
+static void target_rtc_cntl_state_changed(void *ctx)
+{
+    esp32_periph_t *p = ctx;
+    if (!p) return;
+    periph_event_source_changed(p, PERIPH_EVENT_RTC_CNTL);
+    for (unsigned core = 0u; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
 
 static void target_rtc_cntl_irq_changed(void *ctx, bool level)
 {
@@ -13492,6 +13533,14 @@ static void target_rtc_cntl_irq_changed(void *ctx, bool level)
     int source = (int)p->target->rtc_cntl.interrupt_source;
     if (level) periph_assert_interrupt(p, source);
     else periph_deassert_interrupt(p, source);
+}
+
+static void target_rtc_cntl_reset_requested(
+    void *ctx, flexe_rtc_cntl_wdt_action_t action)
+{
+    esp32_periph_t *p = ctx;
+    (void)action;
+    if (p) p->reset_requested = true;
 }
 
 /* ---- Target-described system timer ---- */
@@ -14011,7 +14060,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
             p->target_rtc_cntl = flexe_rtc_cntl_create(
                 mem, default_read, default_write, p,
-                target_rtc_cntl_irq_changed, p);
+                target_rtc_cntl_state_changed, p,
+                target_rtc_cntl_irq_changed, p,
+                target_rtc_cntl_reset_requested, p);
             if (p->target_rtc_cntl)
                 flexe_rtc_cntl_application_handoff(p->target_rtc_cntl);
         }
@@ -14796,11 +14847,15 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     uint32_t candidates = classic ?
         (PERIPH_EVENT_ALL_MASK &
-         ~((1u << PERIPH_EVENT_SYSTIMER) |
+         ~((1u << PERIPH_EVENT_RTC_CNTL) |
+           (1u << PERIPH_EVENT_SYSTIMER) |
            (1u << PERIPH_EVENT_TIMER_GROUP))) : 0u;
+    if (p->target_rtc_cntl)
+        candidates |= 1u << PERIPH_EVENT_RTC_CNTL;
     if (p->systimer) candidates |= 1u << PERIPH_EVENT_SYSTIMER;
     if (p->target_timer_group)
         candidates |= 1u << PERIPH_EVENT_TIMER_GROUP;
+    p->event_source_registered_mask = candidates;
     p->event_source_candidates[0] = candidates;
     p->event_source_candidates[1] = candidates;
 

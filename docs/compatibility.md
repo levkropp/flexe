@@ -14,9 +14,9 @@ supported. ESP32-S3 chip ID `0x0009` has experimental interpreter support for
 the LX7 core, native memory map, flash/cache-MMU windows, mask ROM, dual-core
 startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
-power-on reset state, RTC interrupt aggregation, a read-only revision-0 eFuse
-profile, digital pad configuration, UARTs, native USB Serial/JTAG, and
-interrupt matrix.
+power-on reset state, RTC interrupt aggregation and watchdog, a read-only
+revision-0 eFuse profile, digital pad configuration, UARTs, native USB
+Serial/JTAG, and interrupt matrix.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
@@ -50,9 +50,15 @@ sleep continuity, reset causes other than initial power-on, and the electrical
 effects of the other RTC clock-control fields are not yet modeled. The RTC
 interrupt bank implements target-described enable/raw/masked-status/W1C state
 and level routing; physical producers such as brownout, touch, and ULP remain
-unsupported until their respective device models attach to that API. Changing
-an unmodeled RTC control field remains visible in unsupported-access
-diagnostics.
+unsupported until their respective device models attach to that API. The
+four-stage RTC watchdog runs from the selected slow clock and implements the
+revision-profile stage-0 multiplier, feed, write protection, interrupt, and
+reset actions. Watchdog CPU/system/RTC reset actions currently converge on a
+whole-machine reset; their distinct reset domains and post-reset causes are
+not yet modeled. Pause-in-sleep, reset-signal widths, per-core reset selection,
+and reserved stage actions remain explicit unsupported-access diagnostics when
+firmware changes them. Changing any other unmodeled RTC control field remains
+visible in the same diagnostics.
 
 The experimental USB Serial/JTAG model implements the 64-byte serial endpoint
 FIFOs, packet flush and backpressure behavior, host RX/TX, interrupt

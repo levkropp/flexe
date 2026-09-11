@@ -366,6 +366,28 @@ static const flexe_target_desc_t TARGETS[] = {
              * through the controller API. */
             .interrupt_raw_writable_mask = 1u << 20,
             .interrupt_source = 39u,
+            .wdt_config_offset = {
+                0x098u, 0x09Cu, 0x0A0u, 0x0A4u, 0x0A8u,
+            },
+            .wdt_feed_offset = 0x0ACu,
+            .wdt_write_protect_offset = 0x0B0u,
+            .wdt_config_reset = {
+                0x00013214u, 200000u, 80000u, 0xFFFu, 0xFFFu,
+            },
+            .wdt_config_writable_mask = {
+                UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                UINT32_MAX, UINT32_MAX,
+            },
+            .wdt_enable_mask = 1u << 31,
+            .wdt_flashboot_enable_mask = 1u << 12,
+            .wdt_feed_mask = 1u << 31,
+            .wdt_write_protect_key = 0x50D83AA1u,
+            .wdt_interrupt_mask = 1u << 3,
+            .wdt_stage_action_shift = { 28u, 25u, 22u, 19u },
+            .wdt_stage_action_mask = 0x7u,
+            /* Revision-0 WDT_DELAY_SEL is zero, making stage 0 count two
+             * slow-clock ticks for each stored hold unit. */
+            .wdt_stage0_multiplier = 2u,
         },
         .efuse = {
             .base = 0x60007000u,

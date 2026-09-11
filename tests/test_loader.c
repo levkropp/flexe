@@ -315,6 +315,13 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.interrupt_valid_mask, 0x001FFFFFu);
     ASSERT_EQ(s3->rtc_cntl.interrupt_raw_writable_mask, 1u << 20);
     ASSERT_EQ(s3->rtc_cntl.interrupt_source, 39u);
+    ASSERT_EQ(s3->rtc_cntl.wdt_config_offset[0], 0x98u);
+    ASSERT_EQ(s3->rtc_cntl.wdt_config_offset[4], 0xA8u);
+    ASSERT_EQ(s3->rtc_cntl.wdt_config_reset[0], 0x00013214u);
+    ASSERT_EQ(s3->rtc_cntl.wdt_config_reset[1], 200000u);
+    ASSERT_EQ(s3->rtc_cntl.wdt_write_protect_key, 0x50D83AA1u);
+    ASSERT_EQ(s3->rtc_cntl.wdt_interrupt_mask, 1u << 3);
+    ASSERT_EQ(s3->rtc_cntl.wdt_stage0_multiplier, 2u);
     ASSERT_EQ(s3->efuse.base, 0x60007000u);
     ASSERT_EQ(s3->efuse.read_data_word_count, 84u);
     ASSERT_EQ(s3->efuse.read_data[6], 0x00000002u);

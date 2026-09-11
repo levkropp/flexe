@@ -6,6 +6,8 @@
 typedef struct {
     unsigned reads;
     unsigned writes;
+    uint32_t last_write_addr;
+    uint32_t last_write_value;
 } rtc_cntl_fallback_t;
 
 typedef struct {
@@ -25,8 +27,8 @@ static void rtc_cntl_test_fallback_write(void *ctx, uint32_t addr,
 {
     rtc_cntl_fallback_t *fallback = ctx;
     fallback->writes++;
-    (void)addr;
-    (void)value;
+    fallback->last_write_addr = addr;
+    fallback->last_write_value = value;
 }
 
 static void rtc_cntl_test_irq_changed(void *ctx, bool level)
@@ -45,7 +47,8 @@ TEST(rtc_cntl_storage_resets_persists_and_delegates)
     rtc_cntl_fallback_t fallback = {0};
     flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
         mem, rtc_cntl_test_fallback_read,
-        rtc_cntl_test_fallback_write, &fallback, NULL, NULL);
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(rtc != NULL);
     if (!mem || !rtc) {
@@ -80,7 +83,8 @@ TEST(rtc_cntl_application_handoff_uses_target_clocks)
     const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
     xtensa_mem_t *mem = mem_create_for_target(s3);
     flexe_rtc_cntl_t *rtc =
-        flexe_rtc_cntl_create(mem, NULL, NULL, NULL, NULL, NULL);
+        flexe_rtc_cntl_create(mem, NULL, NULL, NULL,
+                              NULL, NULL, NULL, NULL, NULL, NULL);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(rtc != NULL);
     if (!mem || !rtc) {
@@ -98,6 +102,62 @@ TEST(rtc_cntl_application_handoff_uses_target_clocks)
               (uint32_t)((UINT64_C(1000000) << 19) /
                          desc->slow_clock_hz));
     ASSERT_EQ(mem_read32(mem, xtal_addr), 0x00280028u);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_watchdog_reports_unmodeled_configuration)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t config0 = desc->base + desc->wdt_config_offset[0];
+    uint32_t protect = desc->base + desc->wdt_write_protect_offset;
+    uint32_t value = desc->wdt_config_reset[0] |
+        (5u << desc->wdt_stage_action_shift[0]);
+    mem_write32(mem, config0, value);
+    ASSERT_EQ(mem_read32(mem, config0), value);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(fallback.last_write_addr, config0);
+    ASSERT_EQ(fallback.last_write_value, value);
+
+    /* Locked writes are physically inert and therefore must neither mutate
+     * the modeled register nor report a behavior that never took effect. */
+    mem_write32(mem, protect, 0u);
+    mem_write32(mem, config0, desc->wdt_config_reset[0]);
+    ASSERT_EQ(mem_read32(mem, config0), value);
+    ASSERT_EQ(fallback.writes, 1u);
+
+    /* Changing a defined but behaviorally unmodeled field is also explicit,
+     * while moving back to supported stage actions is handled normally. */
+    mem_write32(mem, protect, desc->wdt_write_protect_key);
+    mem_write32(mem, config0, desc->wdt_config_reset[0]);
+    ASSERT_EQ(fallback.writes, 1u);
+    mem_write32(mem, config0, desc->wdt_config_reset[0] ^ 1u);
+    ASSERT_EQ(fallback.writes, 2u);
+    ASSERT_EQ(fallback.last_write_addr, config0);
+
+    /* Feed is a one-bit write-only command; unexpected command bits remain
+     * visible to the common unsupported-access path. */
+    uint32_t feed = desc->base + desc->wdt_feed_offset;
+    mem_write32(mem, feed, desc->wdt_feed_mask | 1u);
+    ASSERT_EQ(fallback.writes, 3u);
+    ASSERT_EQ(fallback.last_write_addr, feed);
 
     flexe_rtc_cntl_destroy(rtc);
     mem_destroy(mem);
@@ -253,7 +313,8 @@ TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level)
     xtensa_mem_t *mem = mem_create_for_target(s3);
     rtc_cntl_irq_probe_t probe = {0};
     flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
-        mem, NULL, NULL, NULL, rtc_cntl_test_irq_changed, &probe);
+        mem, NULL, NULL, NULL, NULL, NULL,
+        rtc_cntl_test_irq_changed, &probe, NULL, NULL);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(rtc != NULL);
     if (!mem || !rtc) {
@@ -355,14 +416,114 @@ TEST(rtc_cntl_interrupt_routes_through_target_matrix)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
+
+    uint32_t config0 = desc->base + desc->wdt_config_offset[0];
+    uint32_t stage0_hold = desc->base + desc->wdt_config_offset[1];
+    uint32_t stage1_hold = desc->base + desc->wdt_config_offset[2];
+    uint32_t feed = desc->base + desc->wdt_feed_offset;
+    uint32_t protect = desc->base + desc->wdt_write_protect_offset;
+    uint32_t interrupt_enable =
+        desc->base + desc->interrupt_enable_offset;
+    uint32_t interrupt_clear =
+        desc->base + desc->interrupt_clear_offset;
+    ASSERT_EQ(mem_read32(mem, config0), desc->wdt_config_reset[0]);
+    ASSERT_EQ(mem_read32(mem, stage0_hold), 200000u);
+    ASSERT_EQ(mem_read32(mem, protect), desc->wdt_write_protect_key);
+
+    /* Disable reset-time flashboot mode, then configure four effective slow
+     * ticks for stage 0 (the revision-0 multiplier is two), followed by a
+     * three-tick system-reset stage. */
+    uint32_t base_config = desc->wdt_config_reset[0] &
+        ~(desc->wdt_enable_mask | desc->wdt_flashboot_enable_mask);
+    mem_write32(mem, config0, base_config);
+    mem_write32(mem, stage0_hold, 2u);
+    mem_write32(mem, stage1_hold, 3u);
+    mem_write32(mem, interrupt_enable, desc->wdt_interrupt_mask);
+
+    uint32_t line = 5u;
+    uint32_t map = s3->interrupt_matrix.base +
+                   s3->interrupt_matrix.map_offset[0] +
+                   desc->interrupt_source * 4u;
+    mem_write32(mem, map, line);
+    uint32_t armed_config = base_config | desc->wdt_enable_mask |
+        (1u << desc->wdt_stage_action_shift[0]) |
+        ((uint32_t)FLEXE_RTC_CNTL_WDT_RESET_SYSTEM <<
+         desc->wdt_stage_action_shift[1]);
+    mem_write32(mem, config0, armed_config);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    ASSERT_TRUE((int32_t)(cpu.next_timer_event - cpu.ccount) > 1);
+
+    /* A feed one CPU cycle before expiry must restart stage 0. */
+    cpu.ccount = cpu.next_timer_event - 1u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->interrupt_raw_offset) &
+              desc->wdt_interrupt_mask, 0u);
+    mem_write32(mem, feed, desc->wdt_feed_mask);
+    uint32_t fed_deadline = cpu.next_timer_event;
+    ASSERT_TRUE((int32_t)(fed_deadline - cpu.ccount) > 1);
+    cpu.ccount = fed_deadline - 1u;
+    cpu.periph_event(&cpu);
+    ASSERT_FALSE(periph_interrupt_pending(periph,
+                                           desc->interrupt_source));
+    cpu.ccount++;
+    cpu.periph_event(&cpu);
+    ASSERT_TRUE(periph_interrupt_pending(periph,
+                                          desc->interrupt_source));
+    ASSERT_TRUE(cpu.interrupt & (1u << line));
+    mem_write32(mem, interrupt_clear, desc->wdt_interrupt_mask);
+    ASSERT_FALSE(periph_interrupt_pending(periph,
+                                           desc->interrupt_source));
+
+    /* Locking makes both configuration writes and feed pulses inert. The
+     * already-running stage 1 therefore reaches its reset boundary. */
+    mem_write32(mem, protect, 0u);
+    mem_write32(mem, stage1_hold, 1000u);
+    ASSERT_EQ(mem_read32(mem, stage1_hold), 3u);
+    uint32_t reset_deadline = cpu.next_timer_event;
+    mem_write32(mem, feed, desc->wdt_feed_mask);
+    ASSERT_EQ(cpu.next_timer_event, reset_deadline);
+    cpu.ccount = reset_deadline - 1u;
+    cpu.periph_event(&cpu);
+    ASSERT_FALSE(periph_take_reset_request(periph));
+    cpu.ccount++;
+    cpu.periph_event(&cpu);
+    ASSERT_TRUE(periph_take_reset_request(periph));
+    ASSERT_FALSE(periph_take_reset_request(periph));
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
     RUN_TEST(rtc_cntl_storage_resets_persists_and_delegates);
     RUN_TEST(rtc_cntl_application_handoff_uses_target_clocks);
+    RUN_TEST(rtc_cntl_watchdog_reports_unmodeled_configuration);
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);
     RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
     RUN_TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level);
     RUN_TEST(rtc_cntl_interrupt_routes_through_target_matrix);
+    RUN_TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset);
 }

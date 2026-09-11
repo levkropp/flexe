@@ -2,6 +2,7 @@
 
 #include "xtensa.h"
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -18,8 +19,12 @@ struct flexe_rtc_cntl {
     mmio_read_fn fallback_read;
     mmio_write_fn fallback_write;
     void *fallback_ctx;
+    flexe_rtc_cntl_state_fn state_changed;
+    void *state_ctx;
     flexe_rtc_cntl_irq_fn irq_changed;
     void *irq_ctx;
+    flexe_rtc_cntl_reset_fn reset_requested;
+    void *reset_ctx;
     xtensa_cpu_t *cpu[2];
     rtc_clock_t clock;
     uint64_t last_clock_cycles;
@@ -31,6 +36,10 @@ struct flexe_rtc_cntl {
     uint32_t interrupt_enable;
     uint32_t interrupt_raw;
     bool interrupt_level;
+    uint32_t wdt_config[FLEXE_TARGET_RTC_WDT_CONFIG_MAX];
+    uint32_t wdt_write_protect;
+    uint64_t wdt_stage_ticks;
+    uint8_t wdt_stage;
     uint32_t store[FLEXE_TARGET_RTC_STORE_MAX];
 };
 
@@ -47,6 +56,17 @@ static bool rtc_interrupt_offset(const flexe_rtc_cntl_desc_t *desc,
            offset == desc->interrupt_raw_offset ||
            offset == desc->interrupt_status_offset ||
            offset == desc->interrupt_clear_offset;
+}
+
+static bool rtc_wdt_offset(const flexe_rtc_cntl_desc_t *desc,
+                           uint16_t offset)
+{
+    if (offset == desc->wdt_feed_offset ||
+        offset == desc->wdt_write_protect_offset)
+        return true;
+    for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++)
+        if (offset == desc->wdt_config_offset[i]) return true;
+    return false;
 }
 
 static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
@@ -88,7 +108,12 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         rtc_interrupt_offset(desc, desc->time_low_offset) ||
         rtc_interrupt_offset(desc, desc->time_high_offset) ||
         rtc_interrupt_offset(desc, desc->reset_state_offset) ||
-        rtc_interrupt_offset(desc, desc->clock_conf_offset))
+        rtc_interrupt_offset(desc, desc->clock_conf_offset) ||
+        rtc_wdt_offset(desc, desc->time_update_offset) ||
+        rtc_wdt_offset(desc, desc->time_low_offset) ||
+        rtc_wdt_offset(desc, desc->time_high_offset) ||
+        rtc_wdt_offset(desc, desc->reset_state_offset) ||
+        rtc_wdt_offset(desc, desc->clock_conf_offset))
         return false;
 
     if (!rtc_offset_valid(desc->clock_conf_offset, desc->register_size) ||
@@ -124,10 +149,70 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
          ~desc->interrupt_valid_mask) != 0u ||
         (desc->interrupt_raw_writable_mask &
          ~desc->interrupt_valid_mask) != 0u ||
+        !rtc_offset_valid(desc->wdt_feed_offset,
+                          desc->register_size) ||
+        !rtc_offset_valid(desc->wdt_write_protect_offset,
+                          desc->register_size) ||
+        desc->wdt_feed_offset == desc->wdt_write_protect_offset ||
+        rtc_interrupt_offset(desc, desc->wdt_feed_offset) ||
+        rtc_interrupt_offset(desc, desc->wdt_write_protect_offset) ||
+        desc->wdt_enable_mask == 0u ||
+        (desc->wdt_enable_mask & (desc->wdt_enable_mask - 1u)) != 0u ||
+        desc->wdt_flashboot_enable_mask == 0u ||
+        (desc->wdt_flashboot_enable_mask &
+         (desc->wdt_flashboot_enable_mask - 1u)) != 0u ||
+        (desc->wdt_enable_mask & desc->wdt_flashboot_enable_mask) != 0u ||
+        ((desc->wdt_enable_mask |
+          desc->wdt_flashboot_enable_mask) &
+         ~desc->wdt_config_writable_mask[0]) != 0u ||
+        desc->wdt_feed_mask == 0u ||
+        (desc->wdt_feed_mask & (desc->wdt_feed_mask - 1u)) != 0u ||
+        desc->wdt_write_protect_key == 0u ||
+        desc->wdt_interrupt_mask == 0u ||
+        (desc->wdt_interrupt_mask &
+         (desc->wdt_interrupt_mask - 1u)) != 0u ||
+        (desc->wdt_interrupt_mask & ~desc->interrupt_valid_mask) != 0u ||
+        desc->wdt_stage_action_mask != 0x7u ||
+        desc->wdt_stage0_multiplier == 0u ||
+        desc->wdt_stage0_multiplier > 16u ||
+        (desc->wdt_stage0_multiplier &
+         (desc->wdt_stage0_multiplier - 1u)) != 0u ||
         desc->interrupt_source >= FLEXE_TARGET_INTERRUPT_SOURCE_MAX ||
         ((target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) &&
          desc->interrupt_source >= target->interrupt_matrix.source_count))
         return false;
+
+    uint32_t action_fields = 0u;
+    for (unsigned stage = 0u; stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX;
+         stage++) {
+        unsigned shift = desc->wdt_stage_action_shift[stage];
+        if (shift > 29u) return false;
+        uint32_t field = (uint32_t)desc->wdt_stage_action_mask << shift;
+        if ((field & action_fields) != 0u ||
+            (field & (desc->wdt_enable_mask |
+                      desc->wdt_flashboot_enable_mask)) != 0u ||
+            (field & ~desc->wdt_config_writable_mask[0]) != 0u)
+            return false;
+        action_fields |= field;
+    }
+
+    for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++) {
+        uint16_t offset = desc->wdt_config_offset[i];
+        if (!rtc_offset_valid(offset, desc->register_size) ||
+            offset == desc->wdt_feed_offset ||
+            offset == desc->wdt_write_protect_offset ||
+            rtc_interrupt_offset(desc, offset) ||
+            offset == desc->time_update_offset ||
+            offset == desc->time_low_offset ||
+            offset == desc->time_high_offset ||
+            offset == desc->reset_state_offset ||
+            offset == desc->clock_conf_offset ||
+            (desc->wdt_config_reset[i] &
+             ~desc->wdt_config_writable_mask[i]) != 0u)
+            return false;
+        for (unsigned j = 0u; j < i; j++)
+            if (offset == desc->wdt_config_offset[j]) return false;
+    }
 
     for (unsigned source = 0u; source < 3u; source++)
         if (desc->slow_clock_source_hz[source] == 0u ||
@@ -142,7 +227,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             offset == desc->time_high_offset ||
             offset == desc->reset_state_offset ||
             offset == desc->clock_conf_offset ||
-            rtc_interrupt_offset(desc, offset))
+            rtc_interrupt_offset(desc, offset) ||
+            rtc_wdt_offset(desc, offset))
             return false;
         for (unsigned j = 0u; j < i; j++)
             if (offset == desc->store_offset[j]) return false;
@@ -157,6 +243,16 @@ static int rtc_store_index(const flexe_rtc_cntl_desc_t *desc,
         if (offset == desc->store_offset[i]) return (int)i;
     return -1;
 }
+
+static int rtc_wdt_config_index(const flexe_rtc_cntl_desc_t *desc,
+                                uint32_t offset)
+{
+    for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++)
+        if (offset == desc->wdt_config_offset[i]) return (int)i;
+    return -1;
+}
+
+static void rtc_cntl_update_interrupt(flexe_rtc_cntl_t *rtc);
 
 /* Both target cores observe one always-on RTC. CCOUNT is per-core, so track
  * each core's progress and publish the furthest shared virtual time without
@@ -229,19 +325,87 @@ static uint64_t rtc_scaled_ticks(flexe_rtc_cntl_t *rtc,
     return ticks;
 }
 
-static void rtc_sync(flexe_rtc_cntl_t *rtc)
+static bool rtc_wdt_active(const flexe_rtc_cntl_t *rtc)
+{
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    return rtc->wdt_stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX &&
+           (rtc->wdt_config[0] &
+            (desc->wdt_enable_mask |
+             desc->wdt_flashboot_enable_mask)) != 0u;
+}
+
+static uint64_t rtc_wdt_stage_hold(const flexe_rtc_cntl_t *rtc)
+{
+    uint64_t hold = rtc->wdt_config[1u + rtc->wdt_stage];
+    if (rtc->wdt_stage == 0u) {
+        unsigned multiplier = rtc->target->rtc_cntl.wdt_stage0_multiplier;
+        hold = hold > UINT64_MAX / multiplier ?
+               UINT64_MAX : hold * multiplier;
+    }
+    return hold != 0u ? hold : 1u;
+}
+
+static unsigned rtc_wdt_stage_action(const flexe_rtc_cntl_t *rtc)
+{
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    return (rtc->wdt_config[0] >>
+            desc->wdt_stage_action_shift[rtc->wdt_stage]) &
+           desc->wdt_stage_action_mask;
+}
+
+static bool rtc_advance_wdt(flexe_rtc_cntl_t *rtc, uint64_t ticks)
+{
+    bool changed = false;
+    while (ticks != 0u && rtc_wdt_active(rtc)) {
+        uint64_t hold = rtc_wdt_stage_hold(rtc);
+        uint64_t remaining = rtc->wdt_stage_ticks < hold ?
+                             hold - rtc->wdt_stage_ticks : 1u;
+        if (ticks < remaining) {
+            rtc->wdt_stage_ticks += ticks;
+            break;
+        }
+
+        ticks -= remaining;
+        rtc->wdt_stage_ticks = 0u;
+        unsigned action = rtc_wdt_stage_action(rtc);
+        changed = true;
+        if (action == 1u) {
+            rtc->interrupt_raw |=
+                rtc->target->rtc_cntl.wdt_interrupt_mask;
+        } else if (action >= FLEXE_RTC_CNTL_WDT_RESET_CPU &&
+                   action <= FLEXE_RTC_CNTL_WDT_RESET_RTC) {
+            rtc->wdt_stage = FLEXE_TARGET_RTC_WDT_STAGE_MAX;
+            if (rtc->reset_requested)
+                rtc->reset_requested(
+                    rtc->reset_ctx,
+                    (flexe_rtc_cntl_wdt_action_t)action);
+            break;
+        }
+
+        if (rtc->wdt_stage + 1u < FLEXE_TARGET_RTC_WDT_STAGE_MAX)
+            rtc->wdt_stage++;
+        else
+            rtc->wdt_stage = FLEXE_TARGET_RTC_WDT_STAGE_MAX;
+    }
+    return changed;
+}
+
+static bool rtc_sync(flexe_rtc_cntl_t *rtc)
 {
     uint64_t now = rtc_clock_now(rtc);
     uint64_t elapsed = now >= rtc->last_clock_cycles ?
                        now - rtc->last_clock_cycles : 0u;
     rtc->last_clock_cycles = now;
-    if (elapsed == 0u) return;
+    if (elapsed == 0u) return false;
 
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
     uint64_t mask = UINT32_MAX |
                     ((uint64_t)desc->time_high_mask << 32u);
-    rtc->counter = (rtc->counter +
-                    rtc_scaled_ticks(rtc, elapsed, rtc_cpu_hz(rtc))) & mask;
+    uint64_t ticks = rtc_scaled_ticks(rtc, elapsed, rtc_cpu_hz(rtc));
+    rtc->counter = (rtc->counter + ticks) & mask;
+    bool changed = rtc_advance_wdt(rtc, ticks);
+    if (changed) rtc_cntl_update_interrupt(rtc);
+    return changed;
 }
 
 static void rtc_cntl_update_interrupt(flexe_rtc_cntl_t *rtc)
@@ -252,13 +416,21 @@ static void rtc_cntl_update_interrupt(flexe_rtc_cntl_t *rtc)
     if (rtc->irq_changed) rtc->irq_changed(rtc->irq_ctx, level);
 }
 
+static void rtc_cntl_notify(flexe_rtc_cntl_t *rtc)
+{
+    if (rtc->state_changed) rtc->state_changed(rtc->state_ctx);
+}
+
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
 {
     flexe_rtc_cntl_t *rtc = ctx;
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
     uint32_t offset = addr - desc->base;
+    if (rtc_sync(rtc)) rtc_cntl_notify(rtc);
     int index = rtc_store_index(desc, offset);
     if (index >= 0) return rtc->store[index];
+    index = rtc_wdt_config_index(desc, offset);
+    if (index >= 0) return rtc->wdt_config[index];
     if (offset == desc->time_update_offset) return 0u;
     if (offset == desc->time_low_offset)
         return (uint32_t)rtc->latched_counter;
@@ -277,8 +449,37 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return rtc->interrupt_raw & rtc->interrupt_enable;
     if (offset == desc->interrupt_clear_offset)
         return 0u;
+    if (offset == desc->wdt_feed_offset)
+        return 0u;
+    if (offset == desc->wdt_write_protect_offset)
+        return rtc->wdt_write_protect;
     return rtc->fallback_read ?
         rtc->fallback_read(rtc->fallback_ctx, addr) : 0u;
+}
+
+static bool rtc_wdt_actions_supported(
+    const flexe_rtc_cntl_desc_t *desc, uint32_t config)
+{
+    for (unsigned stage = 0u; stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX;
+         stage++) {
+        unsigned action =
+            (config >> desc->wdt_stage_action_shift[stage]) &
+            desc->wdt_stage_action_mask;
+        if (action > FLEXE_RTC_CNTL_WDT_RESET_RTC) return false;
+    }
+    return true;
+}
+
+static uint32_t rtc_wdt_config0_modeled_mask(
+    const flexe_rtc_cntl_desc_t *desc)
+{
+    uint32_t mask = desc->wdt_enable_mask |
+                    desc->wdt_flashboot_enable_mask;
+    for (unsigned stage = 0u; stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX;
+         stage++)
+        mask |= (uint32_t)desc->wdt_stage_action_mask <<
+                desc->wdt_stage_action_shift[stage];
+    return mask;
 }
 
 static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
@@ -286,14 +487,37 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
     flexe_rtc_cntl_t *rtc = ctx;
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
     uint32_t offset = addr - desc->base;
+    if (rtc_sync(rtc)) rtc_cntl_notify(rtc);
     int index = rtc_store_index(desc, offset);
     if (index >= 0) {
         rtc->store[index] = value;
         return;
     }
+    index = rtc_wdt_config_index(desc, offset);
+    if (index >= 0) {
+        if (rtc->wdt_write_protect == desc->wdt_write_protect_key) {
+            bool was_active = rtc_wdt_active(rtc);
+            uint32_t old = rtc->wdt_config[index];
+            uint32_t next =
+                value & desc->wdt_config_writable_mask[index];
+            rtc->wdt_config[index] = next;
+            bool unsupported = index == 0 &&
+                (!rtc_wdt_actions_supported(desc, next) ||
+                 ((old ^ next) &
+                  ~rtc_wdt_config0_modeled_mask(desc)) != 0u);
+            if (unsupported && rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            if (!was_active && rtc_wdt_active(rtc)) {
+                rtc->wdt_stage = 0u;
+                rtc->wdt_stage_ticks = 0u;
+            }
+            rtc_cntl_notify(rtc);
+        }
+        return;
+    }
     if (offset == desc->time_update_offset) {
         if (value & desc->time_update_mask) {
-            rtc_sync(rtc);
+            (void)rtc_sync(rtc);
             rtc->latched_counter = rtc->counter;
         }
         if ((value & ~desc->time_update_mask) != 0u &&
@@ -306,7 +530,7 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         offset == desc->time_high_offset)
         return;
     if (offset == desc->clock_conf_offset) {
-        rtc_sync(rtc);
+        (void)rtc_sync(rtc);
         uint32_t old = rtc->clock_conf;
         rtc->clock_conf =
             (old & ~desc->clock_conf_writable_mask) |
@@ -324,6 +548,7 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
              desc->slow_clock_select_mask) != 0u) {
             rtc->tick_denominator = 0u;
             rtc->tick_remainder = 0u;
+            rtc_cntl_notify(rtc);
         }
         return;
     }
@@ -346,6 +571,21 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         rtc_cntl_update_interrupt(rtc);
         return;
     }
+    if (offset == desc->wdt_feed_offset) {
+        if ((value & ~desc->wdt_feed_mask) != 0u && rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        if (rtc->wdt_write_protect == desc->wdt_write_protect_key &&
+            (value & desc->wdt_feed_mask) != 0u) {
+            rtc->wdt_stage = 0u;
+            rtc->wdt_stage_ticks = 0u;
+            rtc_cntl_notify(rtc);
+        }
+        return;
+    }
+    if (offset == desc->wdt_write_protect_offset) {
+        rtc->wdt_write_protect = value;
+        return;
+    }
     if (rtc->fallback_write)
         rtc->fallback_write(rtc->fallback_ctx, addr, value);
 }
@@ -353,7 +593,9 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
 flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
     mmio_write_fn fallback_write, void *fallback_ctx,
-    flexe_rtc_cntl_irq_fn irq_changed, void *irq_ctx)
+    flexe_rtc_cntl_state_fn state_changed, void *state_ctx,
+    flexe_rtc_cntl_irq_fn irq_changed, void *irq_ctx,
+    flexe_rtc_cntl_reset_fn reset_requested, void *reset_ctx)
 {
     if (!mem) return NULL;
     const flexe_target_desc_t *target = mem_target(mem);
@@ -366,12 +608,19 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->fallback_read = fallback_read;
     rtc->fallback_write = fallback_write;
     rtc->fallback_ctx = fallback_ctx;
+    rtc->state_changed = state_changed;
+    rtc->state_ctx = state_ctx;
     rtc->irq_changed = irq_changed;
     rtc->irq_ctx = irq_ctx;
+    rtc->reset_requested = reset_requested;
+    rtc->reset_ctx = reset_ctx;
     const flexe_rtc_cntl_desc_t *desc = &target->rtc_cntl;
     rtc->clock_conf = desc->clock_conf_reset;
     rtc->interrupt_enable = desc->interrupt_enable_reset;
     rtc->interrupt_raw = desc->interrupt_raw_reset;
+    for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++)
+        rtc->wdt_config[i] = desc->wdt_config_reset[i];
+    rtc->wdt_write_protect = desc->wdt_write_protect_key;
     for (unsigned i = 0u; i < desc->store_count; i++)
         rtc->store[i] = desc->store_reset[i];
 
@@ -413,7 +662,7 @@ void flexe_rtc_cntl_attach_cpus(flexe_rtc_cntl_t *rtc,
                                 xtensa_cpu_t *cpu1)
 {
     if (!rtc) return;
-    rtc_sync(rtc);
+    (void)rtc_sync(rtc);
     rtc->cpu[0] = cpu0;
     rtc->cpu[1] = cpu1;
     for (unsigned core = 0u; core < 2u; core++) {
@@ -423,6 +672,51 @@ void flexe_rtc_cntl_attach_cpus(flexe_rtc_cntl_t *rtc,
         rtc->clock.valid[core] = cpu != NULL;
     }
     rtc->last_clock_cycles = rtc->clock.cycles;
+    rtc_cntl_notify(rtc);
+}
+
+static uint32_t rtc_cycles_until_ticks(uint64_t ticks,
+                                       uint64_t slow_hz,
+                                       uint64_t cpu_hz,
+                                       uint64_t remainder)
+{
+    if (ticks == 0u || slow_hz == 0u || cpu_hz == 0u) return 1u;
+    uint64_t max_numerator = (uint64_t)INT32_MAX * slow_hz;
+    if (max_numerator <= UINT64_MAX - remainder)
+        max_numerator += remainder;
+    else
+        max_numerator = UINT64_MAX;
+    if (ticks > max_numerator / cpu_hz)
+        return (uint32_t)INT32_MAX;
+
+    uint64_t needed = ticks * cpu_hz;
+    if (needed <= remainder) return 1u;
+    needed -= remainder;
+    uint64_t cycles = needed / slow_hz + (needed % slow_hz != 0u);
+    if (cycles == 0u) cycles = 1u;
+    if (cycles > (uint64_t)INT32_MAX) cycles = (uint64_t)INT32_MAX;
+    return (uint32_t)cycles;
+}
+
+uint32_t flexe_rtc_cntl_next_event(flexe_rtc_cntl_t *rtc,
+                                   xtensa_cpu_t *cpu)
+{
+    if (!rtc || !cpu) return UINT32_MAX;
+    (void)rtc_sync(rtc);
+    if (!rtc_wdt_active(rtc)) return UINT32_MAX;
+
+    uint64_t hold = rtc_wdt_stage_hold(rtc);
+    uint64_t ticks = rtc->wdt_stage_ticks < hold ?
+                     hold - rtc->wdt_stage_ticks : 1u;
+    uint32_t cycles = rtc_cycles_until_ticks(
+        ticks, rtc_slow_clock_hz(rtc), rtc_cpu_hz(rtc),
+        rtc->tick_remainder);
+    return cpu->ccount + cycles;
+}
+
+void flexe_rtc_cntl_eval(flexe_rtc_cntl_t *rtc)
+{
+    if (rtc && rtc_sync(rtc)) rtc_cntl_notify(rtc);
 }
 
 void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
