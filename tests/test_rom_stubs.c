@@ -1586,6 +1586,223 @@ TEST(test_idf_watchpoint_is_relocated_and_matches_original_routine) {
     teardown(&batch_edge);
 }
 
+static const uint8_t idf_port_exit_code[] = {
+    0x36, 0x41, 0x00, 0x90, 0x63, 0x00, 0x80, 0xEB,
+    0x03, 0x88, 0x12, 0x0B, 0x88, 0x89, 0x12, 0x56,
+    0x58, 0x00, 0x81, 0x09, 0xC8, 0x82, 0x62, 0x00,
+    0x90, 0xE6, 0x13, 0x10, 0x20, 0x00, 0xA0, 0xEB,
+    0x03, 0xA0, 0xAD, 0x04, 0xE0, 0xAA, 0x11, 0x81,
+    0x05, 0xC8, 0xAA, 0x88, 0x98, 0x08, 0xA6, 0x19,
+    0x16, 0x0B, 0x99, 0x99, 0x08, 0xCC, 0xF9, 0x21,
+    0x02, 0xC8, 0xAA, 0xA2, 0xA2, 0x2A, 0x00, 0xC0,
+    0x20, 0x00, 0x81, 0x0D, 0xC6, 0xE0, 0x08, 0x00,
+    0x1D, 0xF0,
+};
+
+static uint32_t idf_port_exit_literal_base(uint32_t addr) {
+    return (addr - 0x100u) & ~3u;
+}
+
+static void seed_idf_port_exit(xtensa_cpu_t *cpu, uint32_t addr,
+                               uint32_t nesting_addr,
+                               uint32_t old_state_addr) {
+    uint32_t literal = idf_port_exit_literal_base(addr);
+    put_test_bytes(cpu, addr, idf_port_exit_code,
+                   sizeof(idf_port_exit_code));
+    put_insn3(cpu, addr + 18u,
+              encode_test_l32r(addr + 18u, literal, 8));
+    put_insn3(cpu, addr + 39u,
+              encode_test_l32r(addr + 39u, literal + 4u, 8));
+    put_insn3(cpu, addr + 55u,
+              encode_test_l32r(addr + 55u, literal + 8u, 2));
+    put_insn3(cpu, addr + 66u,
+              encode_test_l32r(addr + 66u, literal + 12u, 8));
+    mem_write32(cpu->mem, literal, XTENSA_SPINLOCK_FREE);
+    mem_write32(cpu->mem, literal + 4u, nesting_addr);
+    mem_write32(cpu->mem, literal + 8u, old_state_addr);
+    mem_write32(cpu->mem, literal + 12u, 0x4000BFDcu);
+}
+
+static void init_idf_port_exit_call(xtensa_cpu_t *cpu, uint32_t addr,
+                                    uint32_t mux, uint32_t nesting_addr,
+                                    uint32_t old_state_addr,
+                                    uint32_t lock_count,
+                                    uint32_t nesting, uint32_t old_state,
+                                    unsigned callinc, unsigned core) {
+    for (unsigned i = 0u; i < 64u; i++)
+        cpu->ar[i] = 0xA5000000u + i;
+    cpu->pc = addr;
+    cpu->_pc_written = true;
+    cpu->windowbase = 3u;
+    cpu->windowstart = 1u << 3;
+    cpu->ps = (1u << 18) | (9u << 8) | 1u;
+    XT_PS_SET_CALLINC(cpu->ps, callinc);
+    cpu->window_callsize[(3u + callinc) & 15u] = 0xBu;
+    cpu->prid = core == 0u ? XTENSA_SPINLOCK_OWNER_CORE0
+                           : XTENSA_SPINLOCK_OWNER_CORE1;
+    cpu->core_id = (int)core;
+    cpu->ccount = 1000u;
+    cpu->cycle_count = 2000u;
+    cpu->insn_count = 0u;
+    cpu->next_timer_event = UINT32_MAX;
+    cpu->running = true;
+    cpu->halted = false;
+    cpu->exception = false;
+    cpu->seed_entry_link = false;
+    cpu->breakpoint_count = 0;
+    ar_write(cpu, 1, 0x3FFB7000u);
+    ar_write(cpu, (int)(callinc * 4u),
+             (callinc << 30) | (BASE & 0x3FFFFFFFu));
+    ar_write(cpu, (int)(callinc * 4u + 2u), mux);
+
+    uint32_t offset = core * 4u;
+    mem_write32(cpu->mem, mux, cpu->prid);
+    mem_write32(cpu->mem, mux + 4u, lock_count);
+    mem_write32(cpu->mem, nesting_addr, 0x11111111u);
+    mem_write32(cpu->mem, nesting_addr + 4u, 0x22222222u);
+    mem_write32(cpu->mem, old_state_addr, 0x33333333u);
+    mem_write32(cpu->mem, old_state_addr + 4u, 0x44444444u);
+    mem_write32(cpu->mem, nesting_addr + offset, nesting);
+    mem_write32(cpu->mem, old_state_addr + offset, old_state);
+}
+
+TEST(test_idf_port_exit_is_relocated_and_matches_original_routine) {
+    const uint32_t addr = 0x4007D500u;
+    const uint32_t mux = 0x3FFB4000u;
+    const uint32_t nesting_addr = 0x3FFB4100u;
+    const uint32_t old_state_addr = 0x3FFB4200u;
+    static const struct {
+        uint8_t lock_count;
+        uint8_t nesting;
+        uint8_t old_state;
+        uint8_t callinc;
+        uint8_t core;
+        uint8_t insns;
+    } cases[] = {
+        { 1u, 1u, 0u, 2u, 0u, 29u }, /* final release and IRQ restore */
+        { 2u, 3u, 2u, 1u, 0u, 20u }, /* recursive lock and critical */
+        { 1u, 2u, 1u, 3u, 1u, 22u }, /* core 1, outer critical remains */
+        { 1u, 0u, 3u, 2u, 1u, 19u }, /* defensive zero-nesting path */
+    };
+
+    /* Every instruction and every semantic literal participates in
+     * authorization. A familiar entry address alone never installs code. */
+    for (unsigned variant = 0u; variant < 4u; variant++) {
+        xtensa_cpu_t invalid;
+        setup(&invalid);
+        esp32_rom_stubs_t *rom = rom_stubs_create(&invalid);
+        seed_idf_port_exit(&invalid, addr, nesting_addr, old_state_addr);
+        uint32_t literal = idf_port_exit_literal_base(addr);
+        if (variant == 0u)
+            mem_write8(invalid.mem, addr + 30u, 0u);
+        else if (variant == 1u)
+            mem_write32(invalid.mem, literal, 0u);
+        else if (variant == 2u)
+            mem_write32(invalid.mem, literal + 4u, 0x3F800000u);
+        else
+            mem_write32(invalid.mem, literal + 12u, 0x40001234u);
+        ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                          rom, 0x40081234u), 0u);
+        rom_stubs_destroy(rom);
+        teardown(&invalid);
+    }
+
+    for (unsigned c = 0u; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        xtensa_cpu_t reference;
+        xtensa_cpu_t accelerated;
+        setup(&reference);
+        setup(&accelerated);
+        seed_idf_port_exit(&reference, addr, nesting_addr, old_state_addr);
+        seed_idf_port_exit(&accelerated, addr, nesting_addr, old_state_addr);
+        esp32_rom_stubs_t *reference_rom = rom_stubs_create(&reference);
+        esp32_rom_stubs_t *accelerated_rom = rom_stubs_create(&accelerated);
+        ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                          accelerated_rom, 0x40081234u), 1u);
+
+        init_idf_port_exit_call(
+                &reference, addr, mux, nesting_addr, old_state_addr,
+                cases[c].lock_count, cases[c].nesting, cases[c].old_state,
+                cases[c].callinc, cases[c].core);
+        init_idf_port_exit_call(
+                &accelerated, addr, mux, nesting_addr, old_state_addr,
+                cases[c].lock_count, cases[c].nesting, cases[c].old_state,
+                cases[c].callinc, cases[c].core);
+
+        for (unsigned step = 0u; step < 100u && reference.pc != BASE; step++)
+            ASSERT_EQ(xtensa_step(&reference), 0u);
+        ASSERT_EQ(reference.pc, BASE);
+        ASSERT_EQ64(reference.insn_count, cases[c].insns);
+        ASSERT_EQ(xtensa_step(&accelerated), 0u);
+
+        ASSERT_EQ(accelerated.pc, reference.pc);
+        ASSERT_EQ(accelerated.ccount, reference.ccount);
+        ASSERT_EQ64(accelerated.cycle_count, reference.cycle_count);
+        ASSERT_EQ64(accelerated.insn_count, reference.insn_count);
+        ASSERT_EQ(accelerated.ps, reference.ps);
+        ASSERT_EQ(accelerated.windowbase, reference.windowbase);
+        ASSERT_EQ(accelerated.windowstart, reference.windowstart);
+        ASSERT_EQ(accelerated._pc_written, reference._pc_written);
+        ASSERT_EQ(accelerated.irq_check, reference.irq_check);
+        for (unsigned i = 0u; i < 64u; i++)
+            ASSERT_EQ(accelerated.ar[i], reference.ar[i]);
+        for (unsigned i = 0u; i < 16u; i++)
+            ASSERT_EQ(accelerated.window_callsize[i],
+                      reference.window_callsize[i]);
+        ASSERT_EQ(mem_read32(accelerated.mem, mux),
+                  mem_read32(reference.mem, mux));
+        ASSERT_EQ(mem_read32(accelerated.mem, mux + 4u),
+                  mem_read32(reference.mem, mux + 4u));
+        ASSERT_EQ(mem_read32(accelerated.mem, nesting_addr),
+                  mem_read32(reference.mem, nesting_addr));
+        ASSERT_EQ(mem_read32(accelerated.mem, nesting_addr + 4u),
+                  mem_read32(reference.mem, nesting_addr + 4u));
+        ASSERT_EQ(mem_read32(accelerated.mem, old_state_addr),
+                  mem_read32(reference.mem, old_state_addr));
+        ASSERT_EQ(mem_read32(accelerated.mem, old_state_addr + 4u),
+                  mem_read32(reference.mem, old_state_addr + 4u));
+
+        rom_stubs_destroy(accelerated_rom);
+        rom_stubs_destroy(reference_rom);
+        teardown(&accelerated);
+        teardown(&reference);
+    }
+
+    /* A pending interrupt and an exact timer/scheduler boundary each expose
+     * an internal instruction PC, so all three invocations stay interpreted. */
+    xtensa_cpu_t boundary;
+    setup(&boundary);
+    seed_idf_port_exit(&boundary, addr, nesting_addr, old_state_addr);
+    esp32_rom_stubs_t *boundary_rom = rom_stubs_create(&boundary);
+    ASSERT_EQ(rom_stubs_hook_firmware_addrs(
+                      boundary_rom, 0x40081234u), 1u);
+    init_idf_port_exit_call(&boundary, addr, mux, nesting_addr,
+                            old_state_addr, 1u, 1u, 0u, 2u, 0u);
+    boundary.interrupt = 1u << 11;
+    boundary.intenable = 1u << 11;
+    boundary.irq_check = false;
+    ASSERT_EQ(xtensa_step(&boundary), 0u);
+    ASSERT_EQ(boundary.pc, addr + 3u);
+    ASSERT_EQ(mem_read32(boundary.mem, mux + 4u), 1u);
+
+    init_idf_port_exit_call(&boundary, addr, mux, nesting_addr,
+                            old_state_addr, 1u, 1u, 0u, 2u, 0u);
+    boundary.interrupt = 0u;
+    boundary.intenable = 0u;
+    boundary.next_timer_event = boundary.ccount + 29u;
+    ASSERT_EQ(xtensa_step(&boundary), 0u);
+    ASSERT_EQ(boundary.pc, addr + 3u);
+    ASSERT_EQ(mem_read32(boundary.mem, mux + 4u), 1u);
+
+    init_idf_port_exit_call(&boundary, addr, mux, nesting_addr,
+                            old_state_addr, 1u, 1u, 0u, 2u, 0u);
+    ASSERT_EQ(xtensa_run(&boundary, 28), 28u);
+    ASSERT_TRUE(boundary.pc != BASE);
+    ASSERT_EQ(xtensa_run(&boundary, 1), 1u);
+    ASSERT_EQ(boundary.pc, BASE);
+    rom_stubs_destroy(boundary_rom);
+    teardown(&boundary);
+}
+
 TEST(test_openhasp_lanbon_requires_complete_fingerprint) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -1984,6 +2201,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_newlib_memcmp_hook_matches_original_routine);
     RUN_TEST(test_wled_v1601_uses_structural_memcmp_and_scanned_phy);
     RUN_TEST(test_idf_watchpoint_is_relocated_and_matches_original_routine);
+    RUN_TEST(test_idf_port_exit_is_relocated_and_matches_original_routine);
     RUN_TEST(test_openhasp_lanbon_requires_complete_fingerprint);
     RUN_TEST(test_tasmota32_requires_complete_fingerprint);
     RUN_TEST(test_marauder_same_entry_uses_instruction_fingerprint);

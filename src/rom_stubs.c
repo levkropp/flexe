@@ -81,6 +81,18 @@ typedef struct {
     bool pending;
 } stub_irq_t;
 
+/* Decoded relocation state for a complete ESP-IDF critical-section body.
+ * Keep this beside the ROM-stub owner rather than re-reading four literal
+ * pool entries on every call: discovery is cold, while these routines are
+ * among the hottest paths in a normal FreeRTOS application. */
+typedef struct {
+    uint32_t nesting_addr;
+    uint32_t old_state_addr;
+    uint32_t free_value;
+} fw_idf_port_exit_ctx_t;
+
+#define FW_IDF_PORT_EXIT_MAX 4u
+
 #define TWDT_MAX_TASKS_DECL 16
 
 struct esp32_rom_stubs {
@@ -130,6 +142,8 @@ struct esp32_rom_stubs {
     } ht[HOOK_HT_SIZE];
     uint64_t hook_bitmap[HOOK_BITMAP_WORDS];
     stub_direct_entry_t *direct;  /* Direct dispatch table (heap-allocated, 64K entries) */
+    fw_idf_port_exit_ctx_t idf_port_exit[FW_IDF_PORT_EXIT_MAX];
+    uint8_t idf_port_exit_count;
 
     /* In-memory NVS key/value store (see stub_nvs_* functions) */
     struct nvs_kv_entry {
@@ -5473,6 +5487,246 @@ static bool fw_native_span_safe(const xtensa_cpu_t *cpu, uint32_t insns) {
            cpu->next_timer_event - cpu->ccount > insns);
 }
 
+/* ESP-IDF 4.x's optimized vPortExitCritical() implementation. This is a
+ * complete function fingerprint, not an application address: the linker may
+ * move the body and its four L32R literals independently. The decoded values
+ * below must still identify the spinlock sentinel, the two per-core DRAM
+ * arrays, and Flexe's target-appropriate _xtos_set_intlevel ROM boundary. */
+#define IDF_PORT_EXIT_SIZE                74u
+#define IDF_PORT_EXIT_FREE_L32R_OFFSET    18u
+#define IDF_PORT_EXIT_NEST_L32R_OFFSET    39u
+#define IDF_PORT_EXIT_OLD_L32R_OFFSET     55u
+#define IDF_PORT_EXIT_XTOS_L32R_OFFSET    66u
+#define IDF_PORT_EXIT_CALL_RETURN_OFFSET  72u
+
+static bool fw_named_stub_at(const esp32_rom_stubs_t *stubs, uint32_t addr,
+                             const char *name) {
+    if (!stubs || !name)
+        return false;
+    for (int i = 0; i < stubs->count; i++) {
+        const rom_stub_entry_t *entry = &stubs->entries[i];
+        if (entry->addr == addr && entry->name &&
+            strcmp(entry->name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool fw_idf_port_global_is_writable(const xtensa_cpu_t *cpu,
+                                           uint32_t addr) {
+    return cpu && cpu->target && (addr & 3u) == 0u &&
+           addr <= UINT32_MAX - 7u &&
+           flexe_target_range_uses_backing(
+                   cpu->target, addr, 8u, FLEXE_MEM_SRAM) &&
+           mem_get_ptr_w(cpu->mem, addr) != NULL &&
+           mem_get_ptr_w(cpu->mem, addr + 7u) != NULL;
+}
+
+static bool fw_idf_port_exit_matches(
+        esp32_rom_stubs_t *stubs, uint32_t addr,
+        fw_idf_port_exit_ctx_t *ctx_out) {
+    static const uint8_t signature[] = {
+        0x36, 0x41, 0x00, 0x90, 0x63, 0x00, 0x80, 0xEB,
+        0x03, 0x88, 0x12, 0x0B, 0x88, 0x89, 0x12, 0x56,
+        0x58, 0x00, 0x81, 0x09, 0xC8, 0x82, 0x62, 0x00,
+        0x90, 0xE6, 0x13, 0x10, 0x20, 0x00, 0xA0, 0xEB,
+        0x03, 0xA0, 0xAD, 0x04, 0xE0, 0xAA, 0x11, 0x81,
+        0x05, 0xC8, 0xAA, 0x88, 0x98, 0x08, 0xA6, 0x19,
+        0x16, 0x0B, 0x99, 0x99, 0x08, 0xCC, 0xF9, 0x21,
+        0x02, 0xC8, 0xAA, 0xA2, 0xA2, 0x2A, 0x00, 0xC0,
+        0x20, 0x00, 0x81, 0x0D, 0xC6, 0xE0, 0x08, 0x00,
+        0x1D, 0xF0,
+    };
+    static const size_t relocation_bytes[] = {
+        IDF_PORT_EXIT_FREE_L32R_OFFSET + 1u,
+        IDF_PORT_EXIT_FREE_L32R_OFFSET + 2u,
+        IDF_PORT_EXIT_NEST_L32R_OFFSET + 1u,
+        IDF_PORT_EXIT_NEST_L32R_OFFSET + 2u,
+        IDF_PORT_EXIT_OLD_L32R_OFFSET + 1u,
+        IDF_PORT_EXIT_OLD_L32R_OFFSET + 2u,
+        IDF_PORT_EXIT_XTOS_L32R_OFFSET + 1u,
+        IDF_PORT_EXIT_XTOS_L32R_OFFSET + 2u,
+    };
+    _Static_assert(sizeof(signature) == IDF_PORT_EXIT_SIZE,
+                   "IDF port-exit implementation size");
+    if (!stubs || !ctx_out ||
+        !firmware_signature_matches_except(
+                stubs->cpu->mem, addr, signature, sizeof(signature),
+                relocation_bytes,
+                sizeof(relocation_bytes) / sizeof(relocation_bytes[0])))
+        return false;
+
+    uint32_t free_literal;
+    uint32_t nest_literal;
+    uint32_t old_literal;
+    uint32_t xtos_literal;
+    uint32_t free_value;
+    uint32_t nesting_addr;
+    uint32_t old_state_addr;
+    uint32_t xtos_addr;
+    if (!fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_EXIT_FREE_L32R_OFFSET,
+                        &free_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_EXIT_NEST_L32R_OFFSET,
+                        &nest_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_EXIT_OLD_L32R_OFFSET,
+                        &old_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_EXIT_XTOS_L32R_OFFSET,
+                        &xtos_literal) ||
+        !fw_peek(stubs->cpu, free_literal, 4, &free_value) ||
+        !fw_peek(stubs->cpu, nest_literal, 4, &nesting_addr) ||
+        !fw_peek(stubs->cpu, old_literal, 4, &old_state_addr) ||
+        !fw_peek(stubs->cpu, xtos_literal, 4, &xtos_addr) ||
+        free_value != XTENSA_SPINLOCK_FREE ||
+        !fw_idf_port_global_is_writable(stubs->cpu, nesting_addr) ||
+        !fw_idf_port_global_is_writable(stubs->cpu, old_state_addr) ||
+        !fw_named_stub_at(stubs, xtos_addr, "_xtos_set_intlevel"))
+        return false;
+
+    ctx_out->nesting_addr = nesting_addr;
+    ctx_out->old_state_addr = old_state_addr;
+    ctx_out->free_value = free_value;
+    return true;
+}
+
+/* Execute the structurally verified port-exit body while preserving its
+ * observable architectural state and the instruction count Flexe's current
+ * fast model assigns to it. Any invocation that could fault, vector, touch a
+ * device, cross a scheduler boundary, or expose a register-window operation
+ * stays in the ordinary interpreter. */
+static int stub_idf_port_exit(xtensa_cpu_t *cpu, void *opaque) {
+    const fw_idf_port_exit_ctx_t *ctx = opaque;
+    unsigned callinc = XT_PS_CALLINC(cpu->ps);
+    if (!ctx || callinc < 1u || callinc > 3u || cpu->seed_entry_link ||
+        cpu->breakpoint_count != 0u || cpu->window_trace)
+        return 0;
+
+    unsigned wb = cpu->windowbase & 15u;
+    uint32_t live = cpu->windowstart;
+    if ((live & (1u << wb)) == 0u)
+        return 0;
+    for (unsigned i = 1u; i <= callinc + 2u; i++) {
+        if (live & (1u << ((wb + i) & 15u)))
+            return 0;
+    }
+
+    uint32_t return_link = ar_read(cpu, (int)(callinc * 4u));
+    if ((return_link >> 30) != callinc)
+        return 0;
+
+    uint32_t mux = rom_arg(cpu, 0);
+    uint32_t core_offset = ((cpu->prid >> 13) & 1u) << 2;
+    uint32_t nesting_word = ctx->nesting_addr + core_offset;
+    uint32_t old_state_word = ctx->old_state_addr + core_offset;
+    if ((mux & 3u) != 0u || mux > UINT32_MAX - 7u ||
+        mem_get_ptr_w(cpu->mem, mux) == NULL ||
+        mem_get_ptr_w(cpu->mem, mux + 7u) == NULL ||
+        mem_get_ptr_w(cpu->mem, nesting_word) == NULL ||
+        mem_get_ptr_w(cpu->mem, nesting_word + 3u) == NULL ||
+        mem_get_ptr(cpu->mem, old_state_word) == NULL ||
+        mem_get_ptr(cpu->mem, old_state_word + 3u) == NULL)
+        return 0;
+
+    uint32_t lock_count = mem_read32(cpu->mem, mux + 4u);
+    uint32_t new_lock_count = lock_count - 1u;
+    uint32_t nesting = mem_read32(cpu->mem, nesting_word);
+    bool decrement_nesting = (int32_t)nesting >= 1;
+    uint32_t new_nesting = decrement_nesting ? nesting - 1u : nesting;
+    bool restore_interrupts = decrement_nesting && new_nesting == 0u;
+
+    uint32_t insns = 7u + (new_lock_count == 0u ? 2u : 0u) + 9u;
+    if (!decrement_nesting) {
+        insns += 1u;                 /* RETW.N */
+    } else {
+        insns += 3u;                 /* decrement, store, BNEZ.N */
+        insns += restore_interrupts ? 8u : 1u;
+    }
+
+    /* RSIL and the later WSR.PS are interrupt observation points even when
+     * irq_check happened to be clear at entry. Be conservative about any
+     * enabled pending source; guest execution will deliver it at the exact
+     * internal PC. */
+    if ((cpu->interrupt & cpu->intenable) != 0u ||
+        !fw_native_span_safe(cpu, insns))
+        return 0;
+
+    uint32_t entry_ps = cpu->ps;
+    uint32_t final_ps = entry_ps;
+    XT_PS_SET_OWB(final_ps, wb);
+    uint32_t final_a2 = mux;
+    uint32_t final_a8 = nesting_word;
+    uint32_t final_a9 = new_nesting;
+    uint32_t final_a10 = core_offset;
+
+    if (restore_interrupts) {
+        uint32_t restore_level = mem_read32(cpu->mem, old_state_word);
+        uint32_t rom_entry_ps = final_ps;
+        XT_PS_SET_CALLINC(rom_entry_ps, 2u); /* CALLX8 before the ROM hook */
+        final_a2 = ctx->old_state_addr;
+        final_a8 = (2u << 30) |
+                   ((cpu->pc + IDF_PORT_EXIT_CALL_RETURN_OFFSET) &
+                    0x3FFFFFFFu);
+        final_a10 = rom_entry_ps;     /* _xtos_set_intlevel return value */
+        final_ps = rom_entry_ps;
+        XT_PS_SET_INTLEVEL(final_ps, restore_level);
+        XT_PS_SET_CALLINC(final_ps, 0u); /* ROM stub's windowed return */
+    }
+
+    mem_write32(cpu->mem, mux + 4u, new_lock_count);
+    if (new_lock_count == 0u)
+        mem_write32(cpu->mem, mux, ctx->free_value);
+    if (decrement_nesting)
+        mem_write32(cpu->mem, nesting_word, new_nesting);
+
+    /* ENTRY a1,32 and every caller-clobbered value left in the destination
+     * window after RETW.N. Address these physical registers through the
+     * still-current caller window, as the other ABI accelerators do. */
+    int callee = (int)(callinc * 4u);
+    ar_write(cpu, callee + 1, ar_read(cpu, 1) - 32u);
+    ar_write(cpu, callee + 2, final_a2);
+    ar_write(cpu, callee + 8, final_a8);
+    ar_write(cpu, callee + 9, final_a9);
+    ar_write(cpu, callee + 10, final_a10);
+    cpu->window_callsize[(wb + callinc) & 15u] = (uint8_t)callinc;
+    cpu->ps = final_ps;
+    xtensa_request_irq_check(cpu);
+    cpu->pc = 0x40000000u | (return_link & 0x3FFFFFFFu);
+    cpu->_pc_written = true;
+
+    fw_charge_stub_path(cpu, insns);
+    return (int)insns;
+}
+
+static int fw_add_idf_port_exit_hooks(esp32_rom_stubs_t *stubs) {
+    int hooked = 0;
+    uint32_t last = ESP32_IRAM_INSN_ADDR_HIGH - IDF_PORT_EXIT_SIZE;
+    for (uint32_t addr = ESP32_FIRMWARE_INSN_ADDR_LOW;
+         addr <= last &&
+         stubs->idf_port_exit_count < FW_IDF_PORT_EXIT_MAX;
+         addr++) {
+        if (mem_read8(stubs->cpu->mem, addr) != 0x36u)
+            continue;
+        fw_idf_port_exit_ctx_t decoded;
+        if (!fw_idf_port_exit_matches(stubs, addr, &decoded))
+            continue;
+
+        fw_idf_port_exit_ctx_t *ctx =
+            &stubs->idf_port_exit[stubs->idf_port_exit_count];
+        *ctx = decoded;
+        int rc = rom_stubs_register_conditional_exact_if_absent_ctx(
+                stubs, addr, stub_idf_port_exit, "vPortExitCritical", ctx);
+        if (rc == 0) {
+            stubs->idf_port_exit_count++;
+            hooked++;
+        }
+        addr += IDF_PORT_EXIT_SIZE - 1u;
+    }
+    return hooked;
+}
+
 /* cpu_hal_set_watchpoint() is called by IDF's heap-poisoning checks often
  * enough to be a material interpreter hotspot. This implementation uses a
  * seven-iteration LOOP to turn sizes 1..64 into DBREAKC mask bits. Preserve
@@ -5854,6 +6108,7 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
     int n = fw_add_canonical_window_vector_hooks(stubs);
     n += fw_add_newlib_memcmp_hooks(stubs);
     n += fw_add_idf_watchpoint_hooks(stubs);
+    n += fw_add_idf_port_exit_hooks(stubs);
     if (n != 0)
         stubs->cpu->accelerated_blocks = true;
     fw_discover_flash_poll_loops(stubs);
