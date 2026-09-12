@@ -6,6 +6,7 @@
 #include "io_mux.h"
 #include "rtc_cntl.h"
 #include "regi2c.h"
+#include "radio.h"
 #include "sens.h"
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
@@ -54,29 +55,18 @@ static inline int gpio_dbg(void) {
 #define MCPWM1_BASE     0x3FF6C000u
 #define GPIO_BASE       0x3FF44000u
 #define GPIO_SD_BASE    0x3FF44F00u
-#define FE2_BASE        0x3FF45000u
-#define FE_BASE         0x3FF46000u
 #define FRC_TIMER_BASE  0x3FF47000u
-#define PHY_BASE        0x3FF4E000u  /* undocumented WiFi PHY calibration window */
 #define RTC_CNTL_BASE   0x3FF48000u
 #define RTCIO_BASE      0x3FF48400u
 #define SENS_BASE       0x3FF48800u
 #define RTC_I2C_BASE    0x3FF48C00u
-#define BT_BASE         0x3FF51000u
 #define EFUSE_BASE      0x3FF5A000u
-#define NRX_PRIVATE_BASE 0x3FF5C000u /* includes documented NRX at +0xC00 */
-#define BB_BASE         0x3FF5D000u
 #define I2S0_BASE       0x3FF4F000u
 #define LEDC_BASE       0x3FF59000u
 #define TIMG0_BASE      0x3FF5F000u
 #define TIMG1_BASE      0x3FF60000u
 #define I2S1_BASE       0x3FF6D000u
 #define SYSCON_BASE     0x3FF66000u
-#define BT_PRIVATE_BASE 0x3FF71000u
-#define BT_MAC_BASE     0x3FF72000u
-#define WIFI_MAC_BASE   0x3FF73000u  /* WiFi MAC/BB control registers */
-#define WIFI_MAC_SIZE   0x2000u
-#define WDEV_BASE       0x3FF75000u  /* WiFi device (contains RNG register) */
 #define PAGE_SIZE       4096
 #define PAGE_WORDS      (PAGE_SIZE / sizeof(uint32_t))
 #define EMU_FLASH_SIZE  (4u * 1024u * 1024u)
@@ -1374,26 +1364,6 @@ typedef struct {
     bool ready;
 } target_rtc_cal_state_t;
 
-/* The ESP32 WiFi/BT binary blobs directly program several undocumented RF,
- * PHY, baseband, and controller windows while calibrating the radio. Most of
- * this traffic is ordinary read/modify/write configuration. Retain an
- * independent register file for each page so updates are visible to the HAL;
- * command/status registers with active behavior stay explicit in the handler
- * (currently the WiFi MAC reset/ready handshake and WDEV RNG). */
-typedef struct {
-    uint32_t fe2[PAGE_WORDS];
-    uint32_t fe[PAGE_WORDS];
-    uint32_t phy[PAGE_WORDS];
-    uint32_t bt[PAGE_WORDS];
-    uint32_t nrx[PAGE_WORDS];
-    uint32_t bb[PAGE_WORDS];
-    uint32_t bt_private[PAGE_WORDS];
-    uint32_t bt_mac[PAGE_WORDS];
-    uint32_t wifi_mac[WIFI_MAC_SIZE / sizeof(uint32_t)];
-    uint32_t wdev[PAGE_WORDS];
-    uint64_t rng_state;
-} radio_state_t;
-
 typedef struct {
     uint8_t  tx[UART_TX_BUF_SIZE];
     int      tx_len;
@@ -1840,6 +1810,7 @@ struct esp32_periph {
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
     flexe_regi2c_t *regi2c;
+    flexe_radio_t *radio_regs;
     flexe_sens_t *target_sens;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_system_clock_t *system_clock;
@@ -1988,9 +1959,6 @@ struct esp32_periph {
     uint32_t rtc_reset_cause;
     bool     sleep_requested;
     bool     sleep_deep;
-
-    /* Radio/PHY register state used by the closed-source WiFi/BT HAL. */
-    radio_state_t radio;
 
     /* Shared cycle timeline for the deadline-driven peripheral models. */
     periph_clock_t event_clock;
@@ -4915,82 +4883,6 @@ static uint32_t syscon_read(void *ctx, uint32_t addr) {
 
 static void syscon_write(void *ctx, uint32_t addr, uint32_t val) {
     (void)ctx; (void)addr; (void)val;
-}
-
-/* ---- WiFi/BT RF, PHY, baseband, and controller register files ---- */
-
-#define WIFI_MAC_INIT_CTRL 0x3FF73D24u
-#define WDEV_RND_OFF       0x144u
-#define PHY_CAL_COMMAND    0x3FF4E0C4u
-
-static uint32_t *radio_reg_ptr(esp32_periph_t *p, uint32_t addr) {
-    uint32_t page = addr & ~(PAGE_SIZE - 1u);
-    uint32_t word = (addr & (PAGE_SIZE - 1u)) / sizeof(uint32_t);
-
-    switch (page) {
-    case FE2_BASE:         return &p->radio.fe2[word];
-    case FE_BASE:          return &p->radio.fe[word];
-    case PHY_BASE:         return &p->radio.phy[word];
-    case BT_BASE:          return &p->radio.bt[word];
-    case NRX_PRIVATE_BASE: return &p->radio.nrx[word];
-    case BB_BASE:          return &p->radio.bb[word];
-    case BT_PRIVATE_BASE:  return &p->radio.bt_private[word];
-    case BT_MAC_BASE:      return &p->radio.bt_mac[word];
-    case WIFI_MAC_BASE:
-    case WIFI_MAC_BASE + PAGE_SIZE:
-        return &p->radio.wifi_mac[(addr - WIFI_MAC_BASE) /
-                                  sizeof(uint32_t)];
-    default:
-        return NULL;
-    }
-}
-
-static uint32_t radio_read(void *ctx, uint32_t addr) {
-    esp32_periph_t *p = ctx;
-    if (addr == PHY_CAL_COMMAND)
-        return 0; /* indexed calibration command completes synchronously */
-    uint32_t *reg = radio_reg_ptr(p, addr);
-    return reg ? *reg : default_read(ctx, addr);
-}
-
-static void radio_write(void *ctx, uint32_t addr, uint32_t val) {
-    esp32_periph_t *p = ctx;
-    uint32_t *reg = radio_reg_ptr(p, addr);
-    if (!reg) {
-        default_write(ctx, addr, val);
-        return;
-    }
-
-    if (addr == WIFI_MAC_INIT_CTRL) {
-        /* hal_init sets bit 1, then spins until the MAC reports ready in
-         * bit 0. Hardware completes this short reset synchronously from the
-         * guest's perspective, so expose ready immediately. */
-        *reg = val | ((val & (1u << 1)) ? 1u : 0u);
-        return;
-    }
-    *reg = val;
-}
-
-/* WDEV is distinct from the MAC register window. Its timestamp/control words
- * are ordinary RMW registers; the random source is active on every read. */
-static uint32_t wdev_read(void *ctx, uint32_t addr) {
-    esp32_periph_t *p = ctx;
-    uint32_t off = addr - WDEV_BASE;
-    if (off == WDEV_RND_OFF) {
-        /* Per-session xorshift64 stream. It is deterministic for reproducible
-         * firmware tests while still changing on every hardware read. */
-        p->radio.rng_state ^= p->radio.rng_state << 13;
-        p->radio.rng_state ^= p->radio.rng_state >> 7;
-        p->radio.rng_state ^= p->radio.rng_state << 17;
-        return (uint32_t)p->radio.rng_state;
-    }
-    return p->radio.wdev[off / sizeof(uint32_t)];
-}
-
-static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
-    esp32_periph_t *p = ctx;
-    uint32_t off = addr - WDEV_BASE;
-    p->radio.wdev[off / sizeof(uint32_t)] = val;
 }
 
 /* ---- Target-described I2C master/slave controllers ---- */
@@ -14342,6 +14234,16 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         return NULL;
     }
 
+    if (!classic &&
+        (target->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1)) {
+        p->radio_regs = flexe_radio_create(
+            mem, default_read, default_write, p);
+        if (!p->radio_regs) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     flexe_system_clock_publish_gates(p->system_clock);
 
     if (!classic) return p;
@@ -14354,7 +14256,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     p->dport_cpu_per_conf = 1u;       /* CPUPERIOD_SEL_160 */
     p->rtc_cpu_period_conf = 1u << 30u;
     p->rtc_clk_conf = (1u << 27u) | 0x00002210u; /* PLL + reset dividers */
-    p->radio.rng_state = 0x12345678ABCDEF01ULL;
     p->rtc_reset_cause = RTC_POWERON_RESET;
     /* RTC_SLOW_CLK_CAL_REG is STORE1, and the second-stage bootloader would
      * have calibrated it. Flexe loads an application image directly, so it
@@ -14514,24 +14415,17 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* SYSCON */
     mem_register_mmio(mem, (int)PAGE_OF(SYSCON_BASE), syscon_read, syscon_write, p);
 
-    /* WiFi/BT RF calibration and controller register files. The WiFi MAC
-     * spans two pages; WDEV is a separate page containing the RNG source. */
-    mem_register_mmio(mem, (int)PAGE_OF(FE2_BASE), radio_read, radio_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(FE_BASE), radio_read, radio_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(PHY_BASE), radio_read, radio_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(BT_BASE), radio_read, radio_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(NRX_PRIVATE_BASE),
-                      radio_read, radio_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(BB_BASE), radio_read, radio_write, p);
-    mem_register_mmio_range(mem, WIFI_MAC_BASE, WIFI_MAC_SIZE,
-                            radio_read, radio_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(WDEV_BASE), wdev_read, wdev_write, p);
-
-    /* Bluetooth controller private register page. */
-    mem_register_mmio(mem, (int)PAGE_OF(BT_PRIVATE_BASE),
-                      radio_read, radio_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(BT_MAC_BASE),
-                      radio_read, radio_write, p);
+    /* Install this after classic GPIO because its historical two-page MMIO
+     * registration also touches the adjacent FE2 page. The RF descriptor is
+     * the actual owner of that page. */
+    if (target->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1) {
+        p->radio_regs = flexe_radio_create(
+            mem, default_read, default_write, p);
+        if (!p->radio_regs) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
 
     return p;
 }
@@ -14603,6 +14497,7 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
+    flexe_radio_destroy(p->radio_regs);
     flexe_efuse_destroy(p->target_efuse);
     if (p->target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)
         (void)mem_register_mmio_range(

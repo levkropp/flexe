@@ -20,7 +20,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .capabilities = FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS |
                         FLEXE_TARGET_CAP_SPI_MEM |
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
-                        FLEXE_TARGET_CAP_I2C_V1,
+                        FLEXE_TARGET_CAP_I2C_V1 |
+                        FLEXE_TARGET_CAP_RADIO_REGS_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2BCFFFEu,
@@ -126,6 +127,38 @@ static const flexe_target_desc_t TARGETS[] = {
                 0x008u, 0x00Cu, 0x010u,
             },
         },
+        .radio = {
+            .window_count = 10u,
+            .completion_count = 2u,
+            .window = {
+                { 0x3FF45000u, 0x1000u }, /* FE2 */
+                { 0x3FF46000u, 0x1000u }, /* FE */
+                { 0x3FF4E000u, 0x1000u }, /* private PHY */
+                { 0x3FF51000u, 0x1000u }, /* BT */
+                { 0x3FF5C000u, 0x1000u }, /* private NRX + NRX */
+                { 0x3FF5D000u, 0x1000u }, /* BB */
+                { 0x3FF71000u, 0x1000u }, /* private BT */
+                { 0x3FF72000u, 0x1000u }, /* BT MAC */
+                { 0x3FF73000u, 0x2000u }, /* Wi-Fi MAC */
+                { 0x3FF75000u, 0x1000u }, /* WDEV */
+            },
+            .completion = {
+                /* Wi-Fi MAC reset request bit 1 reports ready in bit 0. */
+                {
+                    .control_address = 0x3FF73D24u,
+                    .active_mask = 1u << 1,
+                    .status_address = 0x3FF73D24u,
+                    .status_mask = 1u << 0,
+                },
+                /* Indexed PHY calibration command is consumed on write. */
+                {
+                    .control_address = 0x3FF4E0C4u,
+                    .self_clear_mask = UINT32_MAX,
+                },
+            },
+            .random_address = 0x3FF75144u,
+            .random_seed = UINT64_C(0x12345678ABCDEF01),
+        },
         .spi_mem = {
             .base = { 0x3FF43000u, 0x3FF42000u },
             .register_size = 0x1000u,
@@ -200,7 +233,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_EFUSE_READ_V1 |
                         FLEXE_TARGET_CAP_GPIO_V1 |
                         FLEXE_TARGET_CAP_I2C_V1 |
-                        FLEXE_TARGET_CAP_SENS_V1,
+                        FLEXE_TARGET_CAP_SENS_V1 |
+                        FLEXE_TARGET_CAP_RADIO_REGS_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -603,6 +637,44 @@ static const flexe_target_desc_t TARGETS[] = {
             .rtc_interrupt_mask = 1u << 12,
             /* Raw code 104 is approximately 25 C in range 2 (offset 0). */
             .default_output = 104u,
+        },
+        .radio = {
+            .window_count = 9u,
+            .completion_count = 2u,
+            .window = {
+                { 0x60005000u, 0x1000u }, /* FE2 */
+                { 0x60006000u, 0x1000u }, /* FE */
+                { 0x60011000u, 0x1000u }, /* BT */
+                { 0x6001C000u, 0x1000u }, /* private NRX + NRX */
+                { 0x6001D000u, 0x1000u }, /* BB */
+                { 0x60031000u, 0x1000u }, /* private BT */
+                { 0x60032000u, 0x1000u }, /* BT MAC */
+                { 0x60033000u, 0x2000u }, /* Wi-Fi MAC */
+                { 0x60035000u, 0x1000u }, /* WDEV */
+            },
+            .completion = {
+                /* ESP32-S3 rev-0 ROM rom_iq_est_enable writes enable bits
+                 * 0 then 1 at FE+0x144 and polls FE+0x174 bit 16. A quiet
+                 * virtual RF input leaves the three result accumulators at
+                 * zero while making the digital completion protocol exact. */
+                {
+                    .control_address = 0x60006144u,
+                    .active_mask = (1u << 1) | (1u << 0),
+                    .status_address = 0x60006174u,
+                    .status_mask = 1u << 16,
+                },
+                /* The S3 Wi-Fi HAL asserts MAC reset bit 1 and waits for
+                 * the controller's ready response in bit 0. */
+                {
+                    .control_address = 0x60033D14u,
+                    .active_mask = 1u << 1,
+                    .status_address = 0x60033D14u,
+                    .status_mask = 1u << 0,
+                },
+            },
+            /* WDEV_RND_REG from the public ESP32-S3 register header. */
+            .random_address = 0x6003507Cu,
+            .random_seed = UINT64_C(0x12345678ABCDEF01),
         },
         .sensitive_memprot = {
             .base = 0x600C1000u,

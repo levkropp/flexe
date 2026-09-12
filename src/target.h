@@ -39,8 +39,10 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 5u
+#define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
+#define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 29u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 30u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -65,6 +67,7 @@ typedef enum {
     FLEXE_TARGET_CAP_GPIO_V1                      = 1ull << 16,
     FLEXE_TARGET_CAP_I2C_V1                       = 1ull << 17,
     FLEXE_TARGET_CAP_SENS_V1                      = 1ull << 18,
+    FLEXE_TARGET_CAP_RADIO_REGS_V1                = 1ull << 19,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -442,6 +445,40 @@ typedef struct {
     uint16_t default_output;
 } flexe_sens_desc_t;
 
+/* Undocumented Wi-Fi/Bluetooth controller apertures contain a mixture of
+ * ordinary configuration words and short hardware operations. Retaining
+ * each target-described register window is sufficient for read/modify/write
+ * setup; completion descriptors give the few firmware-visible state
+ * machines explicit semantics instead of matching a firmware or ROM PC.
+ *
+ * A completion becomes ready while every active_mask bit is set and clears
+ * when the operation is disabled. self_clear_mask describes command bits
+ * which hardware consumes on write. status_mask is read-only even when the
+ * status and control addresses are the same register. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+} flexe_radio_window_desc_t;
+
+typedef struct {
+    uint32_t control_address;
+    uint32_t active_mask;
+    uint32_t self_clear_mask;
+    uint32_t status_address;
+    uint32_t status_mask;
+} flexe_radio_completion_desc_t;
+
+typedef struct {
+    uint8_t window_count;
+    uint8_t completion_count;
+    flexe_radio_window_desc_t
+        window[FLEXE_TARGET_RADIO_WINDOW_MAX];
+    flexe_radio_completion_desc_t
+        completion[FLEXE_TARGET_RADIO_COMPLETION_MAX];
+    uint32_t random_address;
+    uint64_t random_seed;
+} flexe_radio_desc_t;
+
 /* Internal analog-register I2C fabric used by ROM clock, bias, PHY, and ADC
  * code. This is distinct from the externally routed I2C controllers. The ROM
  * command ABI is described here so the same device model can serve targets
@@ -664,6 +701,9 @@ typedef struct {
 
     /* Optional RTC-domain ADC/touch/temperature sensor controller. */
     flexe_sens_desc_t             sens;
+
+    /* Optional RF/baseband/controller register and calibration surfaces. */
+    flexe_radio_desc_t            radio;
 
     /* Optional SENSITIVE v1 memory-protection configuration block. */
     flexe_sensitive_memprot_desc_t sensitive_memprot;

@@ -264,6 +264,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_I2C_V1);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_EQ(esp32->i2c.instance_count, 2u);
     ASSERT_EQ(esp32->i2c.instance[0].base, 0x3FF53000u);
     ASSERT_EQ(esp32->i2c.opcode_restart, 0u);
@@ -289,6 +290,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GPIO_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_I2C_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_EQ(s3->i2c.instance_count, 2u);
     ASSERT_EQ(s3->i2c.instance[0].base, 0x60013000u);
     ASSERT_EQ(s3->i2c.instance[1].base, 0x60027000u);
