@@ -745,8 +745,17 @@ static uint32_t rom_syscall_test_args[4];
 static uint32_t rom_syscall_test_alloc_next;
 static uint32_t rom_syscall_test_alloc_args[2];
 static uint32_t rom_syscall_test_lock_arg;
+static uint32_t rom_syscall_test_write_args[4];
+static uint32_t rom_syscall_test_close_args[2];
+static uint32_t rom_syscall_test_freed[4];
 static int rom_syscall_test_alloc_calls;
 static int rom_syscall_test_lock_calls;
+static int rom_syscall_test_write_calls;
+static int rom_syscall_test_close_calls;
+static int rom_syscall_test_free_calls;
+static int rom_syscall_test_close_result;
+static int rom_syscall_test_io_calls;
+static uint32_t rom_syscall_test_io_result;
 
 static void return_from_test_call8(xtensa_cpu_t *cpu, uint32_t value) {
     ar_write(cpu, 10, value);
@@ -766,6 +775,14 @@ static void test_rom_open_r_handler(xtensa_cpu_t *cpu, void *ctx) {
     return_from_test_call8(cpu, 37u);
 }
 
+static void test_rom_io_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    for (int i = 0; i < 4; i++)
+        rom_syscall_test_args[i] = ar_read(cpu, 10 + i);
+    rom_syscall_test_io_calls++;
+    return_from_test_call8(cpu, rom_syscall_test_io_result);
+}
+
 static void test_rom_malloc_r_handler(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     rom_syscall_test_alloc_args[0] = ar_read(cpu, 10);
@@ -783,6 +800,38 @@ static void test_rom_lock_init_recursive_handler(xtensa_cpu_t *cpu,
     rom_syscall_test_lock_calls++;
     mem_write32(cpu->mem, rom_syscall_test_lock_arg,
                 0xF17E0000u + (uint32_t)rom_syscall_test_lock_calls);
+    return_from_test_call8(cpu, 0);
+}
+
+static void test_rom_write_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    for (int i = 0; i < 4; i++)
+        rom_syscall_test_write_args[i] = ar_read(cpu, 10 + i);
+    rom_syscall_test_write_calls++;
+    return_from_test_call8(cpu, rom_syscall_test_write_args[3]);
+}
+
+static void test_rom_close_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_syscall_test_close_args[0] = ar_read(cpu, 10);
+    rom_syscall_test_close_args[1] = ar_read(cpu, 11);
+    rom_syscall_test_close_calls++;
+    return_from_test_call8(cpu, (uint32_t)rom_syscall_test_close_result);
+}
+
+static void test_rom_free_handler(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    if (rom_syscall_test_free_calls < 4)
+        rom_syscall_test_freed[rom_syscall_test_free_calls] = ar_read(cpu, 11);
+    rom_syscall_test_free_calls++;
+    return_from_test_call8(cpu, 0);
+}
+
+static void test_rom_lock_close_recursive_handler(xtensa_cpu_t *cpu,
+                                                  void *ctx) {
+    (void)ctx;
+    rom_syscall_test_lock_arg = ar_read(cpu, 10);
+    rom_syscall_test_lock_calls++;
     return_from_test_call8(cpu, 0);
 }
 
@@ -837,6 +886,18 @@ TEST(test_rom_newlib_scalar_helpers) {
     strchr_args[1] = 0;
     ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C53Cu, strchr_args, 2),
               first + 10u);
+
+    const uint32_t repeated = 0x3FFB2FF8u;
+    mem_load(cpu.mem, repeated, (const uint8_t *)"one/two/three", 14u);
+    uint32_t strrchr_args[] = { repeated, '/' };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001708u, strrchr_args, 2),
+              repeated + 7u);
+    strrchr_args[1] = 0;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001708u, strrchr_args, 2),
+              repeated + 13u);
+    strrchr_args[1] = 'z';
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001708u, strrchr_args, 2), 0u);
+
     uint32_t strncmp_args[] = { first, second, 6u };
     ASSERT_EQ(call_builtin_rom_args(&cpu, 0x4000C5F4u, strncmp_args, 3), 0u);
     strncmp_args[2] = 10u;
@@ -952,6 +1013,131 @@ TEST(test_rom_sfp_initializes_and_reuses_guest_files) {
     ASSERT_EQ(rom_syscall_test_lock_calls, 3);
     ASSERT_EQ(mem_read32(cpu.mem, first + 4u), 0u);
     ASSERT_EQ(mem_read32(cpu.mem, first + 88u), 0xF17E0003u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(test_rom_fclose_flushes_closes_and_releases_guest_file) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    const uint32_t table = 0x3FFB1000u;
+    const uint32_t getreent = 0x400D0100u;
+    const uint32_t free_r = 0x400D0200u;
+    const uint32_t write_fn = 0x400D0300u;
+    const uint32_t close_r = 0x400D0400u;
+    const uint32_t lock_close = 0x400D0500u;
+    const uint32_t read_r = 0x400D0600u;
+    const uint32_t lseek_r = 0x400D0700u;
+    const uint32_t reent = 0x3FFB2000u;
+    const uint32_t fp = 0x3FFB3000u;
+    const uint32_t buffer = 0x3FFB4000u;
+    const uint32_t ungetc_buffer = 0x3FFB4100u;
+    const uint32_t line_buffer = 0x3FFB4200u;
+    const uint32_t cookie = 37u;
+    uint8_t empty_file[104] = {0};
+
+    rom_syscall_test_reent = reent;
+    memset(rom_syscall_test_write_args, 0,
+           sizeof(rom_syscall_test_write_args));
+    memset(rom_syscall_test_close_args, 0,
+           sizeof(rom_syscall_test_close_args));
+    memset(rom_syscall_test_freed, 0, sizeof(rom_syscall_test_freed));
+    rom_syscall_test_write_calls = 0;
+    rom_syscall_test_close_calls = 0;
+    rom_syscall_test_free_calls = 0;
+    rom_syscall_test_lock_calls = 0;
+    rom_syscall_test_close_result = 0;
+    rom_syscall_test_io_calls = 0;
+
+    mem_write32(cpu.mem, 0x3FFAE024u, table);
+    mem_write32(cpu.mem, table + 0x00u, getreent);
+    mem_write32(cpu.mem, table + 0x08u, free_r);
+    mem_write32(cpu.mem, table + 0x4Cu, close_r);
+    mem_write32(cpu.mem, table + 0x58u, lseek_r);
+    mem_write32(cpu.mem, table + 0x5Cu, read_r);
+    mem_write32(cpu.mem, table + 0x6Cu, lock_close);
+    rom_stubs_register(rom, getreent, test_rom_getreent_handler,
+                       "test_getreent");
+    rom_stubs_register(rom, free_r, test_rom_free_handler, "test_free_r");
+    rom_stubs_register(rom, write_fn, test_rom_write_handler,
+                       "test_file_write");
+    rom_stubs_register(rom, close_r, test_rom_close_handler,
+                       "test_close_r");
+    rom_stubs_register(rom, read_r, test_rom_io_handler, "test_read_r");
+    rom_stubs_register(rom, lseek_r, test_rom_io_handler, "test_lseek_r");
+    rom_stubs_register(rom, lock_close,
+                       test_rom_lock_close_recursive_handler,
+                       "test_lock_close_recursive");
+
+    rom_syscall_test_io_result = 5u;
+    uint32_t read_args[] = { reent, cookie, buffer, 5u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001118u, read_args, 4), 5u);
+    ASSERT_EQ(rom_syscall_test_io_calls, 1);
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(rom_syscall_test_args[i], read_args[i]);
+
+    rom_syscall_test_io_result = 123u;
+    uint32_t seek_args[] = { reent, cookie, 23u, 1u };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001184u, seek_args, 4), 123u);
+    ASSERT_EQ(rom_syscall_test_io_calls, 2);
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(rom_syscall_test_args[i], seek_args[i]);
+
+    mem_load(cpu.mem, fp, empty_file, sizeof(empty_file));
+    mem_load(cpu.mem, buffer, (const uint8_t *)"flexe", 5u);
+    mem_write32(cpu.mem, fp + 0u, buffer + 5u);  /* _p */
+    mem_write32(cpu.mem, fp + 8u, 0u);           /* _w */
+    mem_write16(cpu.mem, fp + 12u, 0x0088u);     /* __SMBF | __SWR */
+    mem_write32(cpu.mem, fp + 16u, buffer);      /* _bf._base */
+    mem_write32(cpu.mem, fp + 20u, 64u);         /* _bf._size */
+    mem_write32(cpu.mem, fp + 32u, cookie);      /* _cookie */
+    mem_write32(cpu.mem, fp + 40u, write_fn);    /* _write */
+    mem_write32(cpu.mem, fp + 48u, 0x400011B8u); /* _close = __sclose */
+    mem_write32(cpu.mem, fp + 52u, ungetc_buffer);
+    mem_write32(cpu.mem, fp + 72u, line_buffer);
+    mem_write32(cpu.mem, fp + 88u, 0xF17E1234u);
+
+    uint32_t fclose_args[] = { fp };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400020ACu, fclose_args, 1), 0u);
+    ASSERT_EQ(rom_syscall_test_write_calls, 1);
+    ASSERT_EQ(rom_syscall_test_write_args[0], reent);
+    ASSERT_EQ(rom_syscall_test_write_args[1], cookie);
+    ASSERT_EQ(rom_syscall_test_write_args[2], buffer);
+    ASSERT_EQ(rom_syscall_test_write_args[3], 5u);
+    ASSERT_EQ(rom_syscall_test_close_calls, 1);
+    ASSERT_EQ(rom_syscall_test_close_args[0], reent);
+    ASSERT_EQ(rom_syscall_test_close_args[1], cookie);
+    ASSERT_EQ(rom_syscall_test_free_calls, 3);
+    ASSERT_EQ(rom_syscall_test_freed[0], buffer);
+    ASSERT_EQ(rom_syscall_test_freed[1], ungetc_buffer);
+    ASSERT_EQ(rom_syscall_test_freed[2], line_buffer);
+    ASSERT_EQ(rom_syscall_test_lock_calls, 1);
+    ASSERT_EQ(rom_syscall_test_lock_arg, fp + 88u);
+    ASSERT_EQ(mem_read32(cpu.mem, fp + 0u), buffer);
+    ASSERT_EQ(mem_read32(cpu.mem, fp + 8u), 64u);
+    ASSERT_EQ(mem_read16(cpu.mem, fp + 12u), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, fp + 52u), 0u);
+    ASSERT_EQ(mem_read32(cpu.mem, fp + 72u), 0u);
+
+    /* The reentrant entry point shares the same lifecycle. An already-free
+     * FILE is a successful no-op, while close callback failure still frees
+     * the slot and is reported as EOF. */
+    uint32_t fclose_r_args[] = { reent, fp };
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001FECu,
+                                    fclose_r_args, 2), 0u);
+    rom_syscall_test_close_result = -1;
+    mem_write16(cpu.mem, fp + 12u, 0x0004u); /* __SRD */
+    mem_write32(cpu.mem, fp + 32u, cookie + 1u);
+    mem_write32(cpu.mem, fp + 48u, 0x400011B8u);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40001FECu,
+                                    fclose_r_args, 2), (uint32_t)-1);
+    ASSERT_EQ(rom_syscall_test_close_calls, 2);
+    ASSERT_EQ(rom_syscall_test_close_args[1], cookie + 1u);
+    ASSERT_EQ(rom_syscall_test_lock_calls, 2);
+    ASSERT_EQ(mem_read16(cpu.mem, fp + 12u), 0u);
     ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
 
     rom_stubs_destroy(rom);
@@ -2742,6 +2928,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_rom_newlib_scalar_helpers);
     RUN_TEST(test_rom_strdup_uses_guest_allocator);
     RUN_TEST(test_rom_sfp_initializes_and_reuses_guest_files);
+    RUN_TEST(test_rom_fclose_flushes_closes_and_releases_guest_file);
     RUN_TEST(test_rom_open_dispatches_through_guest_syscall_table);
     RUN_TEST(test_rom_open_fails_when_syscall_table_is_uninitialized);
     RUN_TEST(test_firmware_phy_wrapper_installs_virtual_table);

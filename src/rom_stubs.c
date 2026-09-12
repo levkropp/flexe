@@ -38,10 +38,26 @@ static inline int rom_gpio_dbg(void) {
 /* newlib's ESP32 __sFILE is 104 bytes.  Keep enough returned FILE objects to
  * reuse slots after fclose clears _flags, matching the ROM's glue-list pool. */
 #define ROM_FILE_SIZE       104u
+#define ROM_FILE_P_OFS        0u
+#define ROM_FILE_W_OFS        8u
 #define ROM_FILE_FLAGS_OFS   12u
 #define ROM_FILE_FD_OFS      14u
+#define ROM_FILE_BF_BASE_OFS 16u
+#define ROM_FILE_BF_SIZE_OFS 20u
+#define ROM_FILE_COOKIE_OFS  32u
+#define ROM_FILE_WRITE_OFS   40u
+#define ROM_FILE_CLOSE_OFS   48u
+#define ROM_FILE_UB_BASE_OFS 52u
+#define ROM_FILE_UBUF_OFS    68u
+#define ROM_FILE_LB_BASE_OFS 72u
 #define ROM_FILE_LOCK_OFS    88u
 #define ROM_FILE_POOL_SIZE   64u
+
+#define ROM_FILE_FLAG_LINE_BUFFERED 0x0001u
+#define ROM_FILE_FLAG_UNBUFFERED    0x0002u
+#define ROM_FILE_FLAG_WRITE         0x0008u
+#define ROM_FILE_FLAG_MALLOC_BUFFER 0x0080u
+#define ROM_FILE_FLAG_ERROR         0x0040u
 
 #define MALLOC_CAP_DMA_BIT      (1u << 3)
 #define MALLOC_CAP_EXEC_BIT     (1u << 4)
@@ -634,6 +650,46 @@ static void stub_strchr(xtensa_cpu_t *cpu, void *ctx) {
             }
             if (current == 0) {
                 rom_return(cpu, 0);
+                return;
+            }
+            off++;
+        }
+    }
+}
+
+static void stub_strrchr(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t addr = rom_arg(cpu, 0);
+    uint8_t value = (uint8_t)rom_arg(cpu, 1);
+    uint32_t off = 0;
+    uint32_t last = 0;
+    bool matched = false;
+
+    while (1) {
+        const uint8_t *ptr = mem_get_ptr(cpu->mem, addr + off);
+        if (ptr) {
+            uint32_t chunk = 0x1000u - ((addr + off) & 0xFFFu);
+            const uint8_t *nul = memchr(ptr, 0, chunk);
+            uint32_t scan = nul ? (uint32_t)(nul - ptr) + 1u : chunk;
+            for (uint32_t i = 0; i < scan; i++) {
+                if (ptr[i] == value) {
+                    last = addr + off + i;
+                    matched = true;
+                }
+            }
+            if (nul) {
+                rom_return(cpu, matched ? last : 0u);
+                return;
+            }
+            off += chunk;
+        } else {
+            uint8_t current = mem_read8(cpu->mem, addr + off);
+            if (current == value) {
+                last = addr + off;
+                matched = true;
+            }
+            if (current == 0) {
+                rom_return(cpu, matched ? last : 0u);
                 return;
             }
             off++;
@@ -3480,8 +3536,12 @@ static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
 #define ROM_SYSCALL_GETREENT_OFF  0x00u
 #define ROM_SYSCALL_MALLOC_R_OFF   0x04u
 #define ROM_SYSCALL_FREE_R_OFF     0x08u
+#define ROM_SYSCALL_CLOSE_R_OFF    0x4Cu
 #define ROM_SYSCALL_OPEN_R_OFF    0x50u
+#define ROM_SYSCALL_LSEEK_R_OFF   0x58u
+#define ROM_SYSCALL_READ_R_OFF    0x5Cu
 #define ROM_SYSCALL_LOCK_INIT_RECURSIVE_OFF 0x64u
+#define ROM_SYSCALL_LOCK_CLOSE_RECURSIVE_OFF 0x6Cu
 #define ROM_SYSCALL_CALL_LIMIT    2000000u
 #define ROM_STRING_SCAN_LIMIT     (16u * 1024u * 1024u)
 
@@ -3520,6 +3580,217 @@ static void rom_free_guest_alloc(xtensa_cpu_t *cpu, uint32_t table,
         return;
     uint32_t args[] = { reent, ptr };
     (void)guest_call8(cpu, free_r, args, 2, ROM_SYSCALL_CALL_LIMIT, NULL);
+}
+
+static bool rom_file_callback_valid(uint32_t target) {
+    return target >= ROM_BASE && target < 0x40400000u;
+}
+
+/* Flush the writable portion of a newlib FILE through its own callback.
+ * This is the important part of __sflush_r for fclose: buffers owned by a
+ * guest VFS must reach that VFS, not a host-side UART shortcut. */
+static int rom_file_flush_write(xtensa_cpu_t *cpu, uint32_t reent,
+                                uint32_t fp) {
+    uint16_t flags = (uint16_t)mem_read16(
+        cpu->mem, fp + ROM_FILE_FLAGS_OFS);
+    if ((flags & ROM_FILE_FLAG_WRITE) == 0)
+        return 0;
+
+    uint32_t base = mem_read32(cpu->mem, fp + ROM_FILE_BF_BASE_OFS);
+    uint32_t pos = mem_read32(cpu->mem, fp + ROM_FILE_P_OFS);
+    if (base == 0 || pos == base)
+        return 0;
+    if (pos < base)
+        goto error;
+
+    uint32_t pending = pos - base;
+    uint32_t write_fn = mem_read32(cpu->mem, fp + ROM_FILE_WRITE_OFS);
+    if (!rom_file_callback_valid(write_fn))
+        goto error;
+
+    mem_write32(cpu->mem, fp + ROM_FILE_P_OFS, base);
+    int32_t size = (int32_t)mem_read32(
+        cpu->mem, fp + ROM_FILE_BF_SIZE_OFS);
+    mem_write32(cpu->mem, fp + ROM_FILE_W_OFS,
+                (flags & (ROM_FILE_FLAG_LINE_BUFFERED |
+                          ROM_FILE_FLAG_UNBUFFERED)) ? 0u : (uint32_t)size);
+
+    uint32_t cursor = base;
+    while (pending != 0) {
+        uint32_t args[] = {
+            reent,
+            mem_read32(cpu->mem, fp + ROM_FILE_COOKIE_OFS),
+            cursor,
+            pending,
+        };
+        uint32_t written = 0;
+        if (guest_call8(cpu, write_fn, args, 4, ROM_SYSCALL_CALL_LIMIT,
+                        &written) != 0 ||
+            (int32_t)written <= 0 || written > pending)
+            goto error;
+        cursor += written;
+        pending -= written;
+    }
+    return 0;
+
+error:
+    mem_write16(cpu->mem, fp + ROM_FILE_FLAGS_OFS,
+                (uint16_t)(flags | ROM_FILE_FLAG_ERROR));
+    return -1;
+}
+
+static int rom_file_close(xtensa_cpu_t *cpu, uint32_t table,
+                          uint32_t reent, uint32_t fp) {
+    if (fp == 0)
+        return 0;
+    if (!guest_range_writable(cpu, fp, ROM_FILE_SIZE))
+        return -1;
+
+    uint16_t flags = (uint16_t)mem_read16(
+        cpu->mem, fp + ROM_FILE_FLAGS_OFS);
+    if (flags == 0)
+        return 0;
+
+    int result = rom_file_flush_write(cpu, reent, fp);
+    uint32_t close_fn = mem_read32(cpu->mem, fp + ROM_FILE_CLOSE_OFS);
+    if (close_fn != 0) {
+        uint32_t args[] = {
+            reent,
+            mem_read32(cpu->mem, fp + ROM_FILE_COOKIE_OFS),
+        };
+        uint32_t close_result = 0;
+        if (!rom_file_callback_valid(close_fn) ||
+            guest_call8(cpu, close_fn, args, 2, ROM_SYSCALL_CALL_LIMIT,
+                        &close_result) != 0 ||
+            (int32_t)close_result < 0)
+            result = -1;
+    }
+
+    uint32_t base = mem_read32(cpu->mem, fp + ROM_FILE_BF_BASE_OFS);
+    if ((flags & ROM_FILE_FLAG_MALLOC_BUFFER) != 0 && base != 0 && table != 0)
+        rom_free_guest_alloc(cpu, table, reent, base);
+
+    uint32_t ungetc_base = mem_read32(cpu->mem, fp + ROM_FILE_UB_BASE_OFS);
+    if (ungetc_base != 0) {
+        if (ungetc_base != fp + ROM_FILE_UBUF_OFS && table != 0)
+            rom_free_guest_alloc(cpu, table, reent, ungetc_base);
+        mem_write32(cpu->mem, fp + ROM_FILE_UB_BASE_OFS, 0u);
+    }
+
+    uint32_t line_base = mem_read32(cpu->mem, fp + ROM_FILE_LB_BASE_OFS);
+    if (line_base != 0) {
+        if (table != 0)
+            rom_free_guest_alloc(cpu, table, reent, line_base);
+        mem_write32(cpu->mem, fp + ROM_FILE_LB_BASE_OFS, 0u);
+    }
+
+    /* The glue list retains FILE storage; zero _flags makes the slot
+     * available to the next __sfp call. */
+    mem_write16(cpu->mem, fp + ROM_FILE_FLAGS_OFS, 0u);
+
+    if (table != 0) {
+        uint32_t lock_close = mem_read32(
+            cpu->mem, table + ROM_SYSCALL_LOCK_CLOSE_RECURSIVE_OFF);
+        if (rom_syscall_target_valid(lock_close)) {
+            uint32_t lock_arg = fp + ROM_FILE_LOCK_OFS;
+            (void)guest_call8(cpu, lock_close, &lock_arg, 1,
+                              ROM_SYSCALL_CALL_LIMIT, NULL);
+        }
+    }
+    return result;
+}
+
+/* Reentrant implementation exported by the classic ESP32 mask ROM. */
+static void stub_fclose_r(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t table = 0;
+    (void)rom_syscall_table(cpu, &table);
+    rom_return(cpu, (uint32_t)rom_file_close(
+        cpu, table, rom_arg(cpu, 0), rom_arg(cpu, 1)));
+}
+
+/* Public fclose veneer: obtain this core's reent object just as the ROM does,
+ * then execute the shared FILE lifecycle above. */
+static void stub_fclose(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t table;
+    uint32_t reent;
+    if (!rom_syscall_table(cpu, &table)) {
+        rom_return(cpu, (uint32_t)-1);
+        return;
+    }
+    uint32_t getreent = mem_read32(cpu->mem,
+                                   table + ROM_SYSCALL_GETREENT_OFF);
+    if (!rom_syscall_target_valid(getreent) ||
+        guest_call8(cpu, getreent, NULL, 0, ROM_SYSCALL_CALL_LIMIT,
+                    &reent) != 0) {
+        rom_return(cpu, (uint32_t)-1);
+        return;
+    }
+    rom_return(cpu, (uint32_t)rom_file_close(
+        cpu, table, reent, rom_arg(cpu, 0)));
+}
+
+/* Default FILE close callback. Normal newlib FILEs store their descriptor in
+ * _cookie and dispatch __sclose through the per-core syscall table. */
+static void stub_sclose(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t table;
+    uint32_t result = (uint32_t)-1;
+    if (rom_syscall_table(cpu, &table)) {
+        uint32_t close_r = mem_read32(
+            cpu->mem, table + ROM_SYSCALL_CLOSE_R_OFF);
+        uint32_t args[] = { rom_arg(cpu, 0), rom_arg(cpu, 1) };
+        if (rom_syscall_target_valid(close_r) &&
+            guest_call8(cpu, close_r, args, 2, ROM_SYSCALL_CALL_LIMIT,
+                        &result) != 0)
+            result = (uint32_t)-1;
+    }
+    rom_return(cpu, result);
+}
+
+static void stub_sread(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t table;
+    uint32_t result = (uint32_t)-1;
+    if (rom_syscall_table(cpu, &table)) {
+        uint32_t read_r = mem_read32(cpu->mem,
+                                     table + ROM_SYSCALL_READ_R_OFF);
+        uint32_t args[] = {
+            rom_arg(cpu, 0), rom_arg(cpu, 1),
+            rom_arg(cpu, 2), rom_arg(cpu, 3),
+        };
+        if (rom_syscall_target_valid(read_r) &&
+            guest_call8(cpu, read_r, args, 4, ROM_SYSCALL_CALL_LIMIT,
+                        &result) != 0)
+            result = (uint32_t)-1;
+    }
+    rom_return(cpu, result);
+}
+
+static void stub_sseek(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t table;
+    uint32_t result = (uint32_t)-1;
+    if (rom_syscall_table(cpu, &table)) {
+        uint32_t lseek_r = mem_read32(cpu->mem,
+                                      table + ROM_SYSCALL_LSEEK_R_OFF);
+        uint32_t args[] = {
+            rom_arg(cpu, 0), rom_arg(cpu, 1),
+            rom_arg(cpu, 2), rom_arg(cpu, 3),
+        };
+        if (rom_syscall_target_valid(lseek_r) &&
+            guest_call8(cpu, lseek_r, args, 4, ROM_SYSCALL_CALL_LIMIT,
+                        &result) != 0)
+            result = (uint32_t)-1;
+    }
+    rom_return(cpu, result);
+}
+
+static void stub_sflush_r(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    rom_return(cpu, (uint32_t)rom_file_flush_write(
+        cpu, rom_arg(cpu, 0), rom_arg(cpu, 1)));
 }
 
 /* strdup is a ROM veneer over the firmware-provided reentrant allocator.
@@ -4730,6 +5001,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x40001274, stub_strcmp,               "strcmp");
     rom_stubs_register(s, 0x4000c5f4, stub_strncmp,             "strncmp");
     rom_stubs_register(s, 0x4000c53c, stub_strchr,              "strchr");
+    rom_stubs_register(s, 0x40001708, stub_strrchr,             "strrchr");
     rom_stubs_register(s, 0x400013ac, stub_strcpy,              "strcpy");
     rom_stubs_register(s, 0x400015d4, stub_strncpy,             "strncpy");
     rom_stubs_register(s, 0x4000c584, stub_strlcpy,             "strlcpy");
@@ -4845,7 +5117,12 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* Newlib stdio initialization */
     rom_stubs_register(s, 0x40001E38, stub_sinit,               "__sinit");
     rom_stubs_register(s, 0x40001E90, stub_sfp,                 "__sfp");
+    rom_stubs_register(s, 0x40001118, stub_sread,               "__sread");
     rom_stubs_register(s, 0x40001150, stub_swrite,              "__swrite");
+    rom_stubs_register(s, 0x40001184, stub_sseek,               "__sseek");
+    rom_stubs_register(s, 0x400011B8, stub_sclose,              "__sclose");
+    rom_stubs_register(s, 0x40001FEC, stub_fclose_r,            "_fclose_r");
+    rom_stubs_register(s, 0x400020AC, stub_fclose,              "fclose");
     rom_stubs_register(s, 0x40001E08, stub_void_unregistered,   "__sfp_lock_acquire");
     rom_stubs_register(s, 0x40001E14, stub_void_unregistered,   "__sfp_lock_release");
     rom_stubs_register(s, 0x40001E20, stub_void_unregistered,   "__sinit_lock_acquire");
@@ -4853,6 +5130,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x40001FBC, stub_getenv_r,            "_getenv_r");
 
     /* Newlib stdio flush */
+    rom_stubs_register(s, 0x400591E0, stub_sflush_r,             "__sflush_r");
     rom_stubs_register(s, 0x40059320, stub_fflush_r,             "_fflush_r");
 
     /* Soft-float double arithmetic */
