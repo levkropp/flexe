@@ -22,7 +22,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
                         FLEXE_TARGET_CAP_I2C_V1 |
                         FLEXE_TARGET_CAP_RADIO_REGS_V1 |
-                        FLEXE_TARGET_CAP_SHA_V1,
+                        FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2BCFFFEu,
@@ -177,6 +178,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .base = { 0x3FF43000u, 0x3FF42000u },
             .register_size = 0x1000u,
             .default_jedec_id = 0x001640C8u,
+            .maximum_flash_size = 0x01000000u,
             .date_reset = 0x01604270u,
             /* AP Memory's original 32-Mbit device: MFID 0x0D, KGD 0x5D,
              * EID 0x20. This matches the existing 4-MiB PSRAM backing used
@@ -186,6 +188,20 @@ static const flexe_target_desc_t TARGETS[] = {
             .flash_chip_select = 0u,
             .psram_chip_select = 1u,
             .layout = FLEXE_SPI_MEM_LAYOUT_ESP32,
+        },
+        .rom_flash = {
+            .live_data_address = 0x3FFAE270u,
+            .struct_size = 24u,
+            .device_id_offset = 0u,
+            .chip_size_offset = 4u,
+            .block_size_offset = 8u,
+            .sector_size_offset = 12u,
+            .page_size_offset = 16u,
+            .status_mask_offset = 20u,
+            .block_size = 0x00010000u,
+            .sector_size = 0x00001000u,
+            .page_size = 0x00000100u,
+            .status_mask = 0x0000FFFFu,
         },
         .backing_size = {
             [FLEXE_MEM_SRAM] = 0x000B0000u,
@@ -250,7 +266,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SENS_V1 |
                         FLEXE_TARGET_CAP_RADIO_REGS_V1 |
                         FLEXE_TARGET_CAP_GDMA_V1 |
-                        FLEXE_TARGET_CAP_SHA_V1,
+                        FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -771,11 +788,26 @@ static const flexe_target_desc_t TARGETS[] = {
             .base = { 0x60003000u, 0x60002000u },
             .register_size = 0x1000u,
             .default_jedec_id = 0x001640C8u,
+            .maximum_flash_size = 0x08000000u,
             .date_reset = 0x02101040u,
             .host_count = 2u,
             .flash_chip_select = 0u,
             .psram_chip_select = FLEXE_SPI_MEM_CS_NONE,
             .layout = FLEXE_SPI_MEM_LAYOUT_S2_S3,
+        },
+        .rom_flash = {
+            .pointer_symbol = "rom_spiflash_legacy_data",
+            .struct_size = 24u,
+            .device_id_offset = 0u,
+            .chip_size_offset = 4u,
+            .block_size_offset = 8u,
+            .sector_size_offset = 12u,
+            .page_size_offset = 16u,
+            .status_mask_offset = 20u,
+            .block_size = 0x00010000u,
+            .sector_size = 0x00001000u,
+            .page_size = 0x00000100u,
+            .status_mask = 0x0000FFFFu,
         },
         .usb_serial_jtag = {
             .base = 0x60038000u,

@@ -35,6 +35,7 @@ struct xtensa_mem {
     uint8_t *rtc_slow;
     uint8_t *psram;
     uint32_t backing_size[FLEXE_MEM_BACKING_COUNT];
+    uint32_t flash_usable_size;
     mmio_handler_t *mmio;
     uint32_t mmio_page_count;
 
@@ -51,6 +52,8 @@ typedef struct xtensa_mem xtensa_mem_t;
 /* Lifecycle */
 xtensa_mem_t *mem_create(void);
 xtensa_mem_t *mem_create_for_target(const flexe_target_desc_t *target);
+xtensa_mem_t *mem_create_for_target_with_flash(
+    const flexe_target_desc_t *target, uint32_t required_flash_size);
 void mem_destroy(xtensa_mem_t *mem);
 void mem_reset(xtensa_mem_t *mem);
 
@@ -58,6 +61,18 @@ const flexe_target_desc_t *mem_target(const xtensa_mem_t *mem);
 uint32_t mem_backing_size(const xtensa_mem_t *mem,
                           flexe_mem_backing_t backing);
 uint8_t *mem_backing_ptr(xtensa_mem_t *mem, flexe_mem_backing_t backing);
+
+/* Physical NOR capacity and application-visible capacity can differ when an
+ * image was linked for less flash than the attached virtual device. */
+uint32_t mem_flash_physical_size(const xtensa_mem_t *mem);
+uint32_t mem_flash_usable_size(const xtensa_mem_t *mem);
+uint32_t mem_flash_jedec_id(const xtensa_mem_t *mem);
+
+/* Reconstruct the target-described bootloader-to-application ROM flash
+ * handoff. `live_data_address` is resolved directly from the descriptor or
+ * from its official ROM-ELF pointer symbol. */
+int mem_prepare_rom_flash(xtensa_mem_t *mem, uint32_t live_data_address,
+                          uint32_t usable_flash_size);
 
 /* Install or remove page-table mappings without exposing page_table to SoC
  * devices. All arguments are 4 KiB aligned and size is non-zero. A mapping

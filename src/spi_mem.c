@@ -168,6 +168,12 @@ static bool spi_mem_geometry_valid(const flexe_target_desc_t *target,
         (desc->register_size & 0xFFFu) != 0u ||
         desc->default_jedec_id == 0u ||
         desc->default_jedec_id > 0x00FFFFFFu ||
+        desc->maximum_flash_size == 0u ||
+        (desc->maximum_flash_size & (desc->maximum_flash_size - 1u)) != 0u ||
+        desc->maximum_flash_size <
+            target->backing_size[FLEXE_MEM_FLASH_DATA] ||
+        desc->maximum_flash_size <
+            target->backing_size[FLEXE_MEM_FLASH_INSN] ||
         desc->flash_chip_select >= layout->chip_select_count)
         return false;
     bool has_psram = desc->default_psram_id != 0u;
@@ -224,10 +230,7 @@ static bool spi_mem_known_offset(flexe_spi_mem_layout_t generation,
 }
 
 static uint32_t spi_mem_flash_size(const flexe_spi_mem_t *spi_mem) {
-    uint32_t size = mem_backing_size(spi_mem->mem, FLEXE_MEM_FLASH_DATA);
-    uint32_t insn_size =
-        mem_backing_size(spi_mem->mem, FLEXE_MEM_FLASH_INSN);
-    return insn_size < size ? insn_size : size;
+    return mem_flash_physical_size(spi_mem->mem);
 }
 
 static uint32_t *spi_mem_buffer(flexe_spi_mem_t *spi_mem,
@@ -546,13 +549,13 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
     switch (opcode) {
     case 0x9Fu: /* RDID */
     case 0x90u: /* REMID */
-        spi_mem_set_input_word(
-            spi_mem, host, spi_mem->target->spi_mem.default_jedec_id);
+        spi_mem_set_input_word(spi_mem, host,
+                               mem_flash_jedec_id(spi_mem->mem));
         return true;
     case 0xABu: /* release power-down / electronic signature */
         flash->powered_down = false;
-        spi_mem_set_input_word(
-            spi_mem, host, spi_mem->target->spi_mem.default_jedec_id);
+        spi_mem_set_input_word(spi_mem, host,
+                               mem_flash_jedec_id(spi_mem->mem));
         return true;
     case 0xB9u: flash->powered_down = true; return true;
     case 0x05u:
@@ -714,8 +717,8 @@ static bool spi_mem_execute_dedicated(flexe_spi_mem_t *spi_mem,
     uint32_t offset = spi_mem->layout->packed_program_length ||
                       !flash->address_4byte ? addr & 0x00FFFFFFu : addr;
     if (command & SPI_CMD_FLASH_RDID) {
-        spi_mem_set_input_word(
-            spi_mem, host, spi_mem->target->spi_mem.default_jedec_id);
+        spi_mem_set_input_word(spi_mem, host,
+                               mem_flash_jedec_id(spi_mem->mem));
         handled = true;
     }
     if (command & SPI_CMD_FLASH_RDSR) {
@@ -786,7 +789,7 @@ static bool spi_mem_execute_dedicated(flexe_spi_mem_t *spi_mem,
     if (command & SPI_CMD_FLASH_RES) {
         flash->powered_down = false;
         host->reg[spi_mem->layout->status_offset / 4u] =
-            spi_mem->target->spi_mem.default_jedec_id;
+            mem_flash_jedec_id(spi_mem->mem);
         handled = true;
     }
     if (command & SPI_CMD_FLASH_DP) {

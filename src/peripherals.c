@@ -70,7 +70,6 @@ static inline int gpio_dbg(void) {
 #define SYSCON_BASE     0x3FF66000u
 #define PAGE_SIZE       4096
 #define PAGE_WORDS      (PAGE_SIZE / sizeof(uint32_t))
-#define EMU_FLASH_SIZE  (4u * 1024u * 1024u)
 #define PERIPH_DEFERRED_MAX 16u
 
 /* Classic ESP32 flash-cache MMU geometry. Each core exposes an 8 KiB register
@@ -2409,9 +2408,12 @@ static void flash_mmu_apply_entry(esp32_periph_t *p, uint32_t entry,
     if (!flash_mmu_entry_vaddr(entry, &vbase, &instruction)) return;
 
     uint32_t physical = (val & 0xFFu) * FLASH_MMU_PAGE_SIZE;
-    bool mapped = (val & FLASH_MMU_INVALID) == 0 &&
-                  physical <= EMU_FLASH_SIZE - FLASH_MMU_PAGE_SIZE;
     uint8_t *backing = instruction ? p->mem->flash_insn : p->mem->flash_data;
+    uint32_t backing_size = mem_backing_size(
+        p->mem, instruction ? FLEXE_MEM_FLASH_INSN : FLEXE_MEM_FLASH_DATA);
+    bool mapped = (val & FLASH_MMU_INVALID) == 0 && backing != NULL &&
+                  physical <= backing_size &&
+                  FLASH_MMU_PAGE_SIZE <= backing_size - physical;
     for (uint32_t off = 0; off < FLASH_MMU_PAGE_SIZE; off += PAGE_SIZE) {
         p->mem->page_table[(vbase + off) >> 12] =
             mapped ? backing + physical + off : NULL;

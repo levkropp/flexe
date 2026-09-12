@@ -21,6 +21,7 @@ typedef struct {
     uint16_t min_chip_rev_full;
     uint16_t max_chip_rev_full;
     uint32_t image_offset;
+    uint32_t flash_size;   /* Capacity declared by the standard image header */
 } loader_image_info_t;
 
 typedef struct {

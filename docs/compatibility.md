@@ -25,6 +25,20 @@ JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
 addresses belong to the classic target. Missing S3 devices remain explicit
 and S3 is not yet a production-supported target.
 
+Flexe reads the configured flash capacity from the standard ESP image header
+and grows the virtual NOR device beyond the 4 MiB board default when required
+(up to 16 MiB on classic ESP32 and 128 MiB on ESP32-S3). The SPI controller's
+JEDEC capacity byte, raw backing, cache-MMU bounds, SDK size queries, and the
+ROM's live boot-handoff structure then describe the same device. Newer ROM
+handoff pointers are resolved from the official ROM ELF, while older fixed
+ROM ABI addresses remain target data. The functional SPI-memory model supports
+raw reads, NOR page programming, sector/block/chip erase, status and power-down
+commands. The classic ROM cache APIs validate and apply both flash and
+external-RAM mappings against their target backings. Fast mode completes these
+operations immediately and does not yet model flash latency, separate
+per-core/PID cache contents, bus contention, wear, or interrupted-write power
+behavior.
+
 The S3 GPIO model implements the S2/S3-generation register layout, both data
 and enable banks, package-valid GPIO0..48 (including the GPIO22..25 holes),
 software-output selection and inversion, matrix input selection and constant

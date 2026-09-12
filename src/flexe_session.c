@@ -65,6 +65,7 @@ struct flexe_session {
     flexe_session_config_t cfg;
     char               bin_path[512];
     char               rom_elf_path[1024];
+    loader_image_info_t image;
     uint32_t           entry_point;
     uint32_t           initial_sp;
     unsigned           resets;
@@ -79,7 +80,8 @@ static bool session_sleep_us(void *ctx, xtensa_cpu_t *cpu, uint64_t us)
 }
 
 static const flexe_target_desc_t *
-session_resolve_target(const flexe_session_config_t *cfg)
+session_resolve_target(const flexe_session_config_t *cfg,
+                       loader_image_info_t *image_out)
 {
     loader_image_info_t image;
     char error[256];
@@ -126,6 +128,14 @@ session_resolve_target(const flexe_session_config_t *cfg)
                 target->display_name);
         return NULL;
     }
+    if (image.flash_size > target->spi_mem.maximum_flash_size) {
+        fprintf(stderr,
+                "flexe: %s image requests %u MiB flash, above the target "
+                "profile maximum of %u MiB\n",
+                target->display_name, image.flash_size >> 20,
+                target->spi_mem.maximum_flash_size >> 20);
+        return NULL;
+    }
     if (target->id == FLEXE_TARGET_ESP32S3 &&
         (!cfg->rom_elf_path || !*cfg->rom_elf_path)) {
         fprintf(stderr,
@@ -133,6 +143,7 @@ session_resolve_target(const flexe_session_config_t *cfg)
                 "official ROM ELF (-R or FLEXE_ROM_ELF)\n");
         return NULL;
     }
+    if (image_out) *image_out = image;
     return target;
 }
 
@@ -142,6 +153,7 @@ session_resolve_target(const flexe_session_config_t *cfg)
 static int session_build(flexe_session_t *s)
 {
     const flexe_session_config_t *cfg = &s->cfg;
+    uint32_t rom_flash_data_addr = s->target->rom_flash.live_data_address;
     if (cfg->rom_elf_path && *cfg->rom_elf_path) {
         rom_elf_load_result_t rom_res = rom_elf_load(s->mem,
                                                      cfg->rom_elf_path);
@@ -149,6 +161,7 @@ static int session_build(flexe_session_t *s)
             fprintf(stderr, "flexe: ROM ELF load error: %s\n", rom_res.error);
             return -1;
         }
+        rom_flash_data_addr = rom_res.rom_flash_data_addr;
         fprintf(stderr,
                 "Loaded %s ROM %s: %u immutable sections (%u bytes), "
                 "%u data images (%u bytes), %u interface sections "
@@ -193,6 +206,14 @@ static int session_build(flexe_session_t *s)
         fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
                 i, res.segments[i].addr, res.segments[i].size,
                 loader_region_name_for_target(target, res.segments[i].addr));
+    }
+    if ((target->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF) &&
+        mem_prepare_rom_flash(s->mem, rom_flash_data_addr,
+                              res.image.flash_size) != 0) {
+        fprintf(stderr,
+                "flexe: cannot reconstruct the %s ROM flash handoff\n",
+                target->display_name);
+        return -1;
     }
 
     /* Initialize CPU core 0 */
@@ -522,7 +543,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
         s->cfg.rom_elf_path = NULL;
     }
 
-    s->target = session_resolve_target(&s->cfg);
+    s->target = session_resolve_target(&s->cfg, &s->image);
     if (!s->target) {
         flexe_session_destroy(s);
         return NULL;
@@ -540,7 +561,8 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
     }
 
     /* Create memory */
-    s->mem = mem_create_for_target(s->target);
+    s->mem = mem_create_for_target_with_flash(s->target,
+                                               s->image.flash_size);
     if (!s->mem) {
         fprintf(stderr, "flexe: failed to allocate memory\n");
         flexe_session_destroy(s);

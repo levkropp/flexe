@@ -13,6 +13,7 @@ typedef struct {
     uint32_t data_image_bytes;
     unsigned interface_sections_loaded; /* ROM ABI tables installed in SRAM */
     uint32_t interface_bytes_loaded;
+    uint32_t rom_flash_data_addr; /* Resolved live ROM flash descriptor */
     char     error[256];
 } rom_elf_load_result_t;
 

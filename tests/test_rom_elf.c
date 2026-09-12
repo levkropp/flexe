@@ -55,9 +55,11 @@ static const char *build_rom_test_elf(bool s3)
         STR_BTDM_ROM = 1,
         STR_DATA_START = STR_BTDM_ROM + sizeof("_data_start_btdm_rom"),
         STR_DATA_END = STR_DATA_START + sizeof("_data_start"),
+        STR_ROM_FLASH = STR_DATA_END + sizeof("_data_end"),
     };
     static const char strtab[] =
-        "\0_data_start_btdm_rom\0_data_start\0_data_end\0";
+        "\0_data_start_btdm_rom\0_data_start\0_data_end\0"
+        "rom_spiflash_legacy_data\0";
     static const char shstrtab[] =
         "\0.text\0.rodata\0.data_btdm\0.data_test\0.data.interface.cache\0"
         ".symtab\0.strtab\0.shstrtab\0";
@@ -75,10 +77,10 @@ static const char *build_rom_test_elf(bool s3)
         DATA_OFF = 0x130,
         DATA_TEST_OFF = 0x140,
         DATA_INTERFACE_OFF = 0x148,
-        SYMTAB_OFF = 0x150,
-        STRTAB_OFF = 0x1A0,
-        SHSTRTAB_OFF = 0x1E0,
-        SHDR_OFF = 0x240,
+        SYMTAB_OFF = 0x160,
+        STRTAB_OFF = 0x1C0,
+        SHSTRTAB_OFF = 0x220,
+        SHDR_OFF = 0x300,
         SECTION_COUNT = 9,
         FILE_SIZE = SHDR_OFF + SECTION_COUNT * sizeof(rom_test_shdr_t),
     };
@@ -115,8 +117,8 @@ static const char *build_rom_test_elf(bool s3)
     put_le32(buf + DATA_OFF + 4, 0x55667788u);
     put_le32(buf + DATA_TEST_OFF, 0x0BADF00Du);
     put_le32(buf + DATA_TEST_OFF + 4, 0xCAFEBABEu); /* alignment padding */
-    put_le32(buf + DATA_INTERFACE_OFF, 0x3FF10000u);
-    rom_test_sym_t syms[4] = {0};
+    put_le32(buf + DATA_INTERFACE_OFF, data_test_addr);
+    rom_test_sym_t syms[5] = {0};
     syms[1].st_name = STR_BTDM_ROM;
     syms[1].st_value = 0x40001000u;
     syms[1].st_info = 0x12; /* STB_GLOBAL | STT_FUNC */
@@ -129,6 +131,11 @@ static const char *build_rom_test_elf(bool s3)
     syms[3].st_value = 0x40001020u;
     syms[3].st_info = 0x10;
     syms[3].st_shndx = 1;
+    syms[4].st_name = STR_ROM_FLASH;
+    syms[4].st_value = interface_addr;
+    syms[4].st_size = sizeof(uint32_t);
+    syms[4].st_info = 0x11; /* STB_GLOBAL | STT_OBJECT */
+    syms[4].st_shndx = 5;
     memcpy(buf + SYMTAB_OFF, syms, sizeof(syms));
     memcpy(buf + STRTAB_OFF, strtab, sizeof(strtab));
     memcpy(buf + SHSTRTAB_OFF, shstrtab, sizeof(shstrtab));
@@ -195,6 +202,7 @@ TEST(rom_elf_loads_immutable_sections_and_data_images) {
     ASSERT_EQ(res.data_images_loaded, 2u);
     ASSERT_EQ(res.data_image_bytes, 12u);
     ASSERT_EQ(res.interface_sections_loaded, 0u);
+    ASSERT_EQ(res.rom_flash_data_addr, 0x3FFAE270u);
     ASSERT_EQ(mem_read32(mem, 0x40001000u), 0x40002000u);
     ASSERT_EQ(mem_read32(mem, 0x3FF96000u), 0x11223344u);
     ASSERT_EQ(mem_read32(mem, 0x40002000u), 0xA1B2C3D4u);
@@ -209,11 +217,12 @@ TEST(rom_elf_loads_immutable_sections_and_data_images) {
 }
 
 TEST(rom_elf_uses_s3_descriptor_rom_apertures) {
+    const uint32_t data_test_addr = 0x3FCEF130u;
     const char *path = build_rom_test_elf(true);
     ASSERT_TRUE(path != NULL);
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
-    xtensa_mem_t *mem = mem_create_for_target(s3);
+    xtensa_mem_t *mem = mem_create_for_target_with_flash(s3, 0x00800000u);
     rom_elf_load_result_t res = rom_elf_load(mem, path);
 
     ASSERT_EQ(res.result, 0);
@@ -223,17 +232,26 @@ TEST(rom_elf_uses_s3_descriptor_rom_apertures) {
     ASSERT_EQ(res.data_image_bytes, 12u);
     ASSERT_EQ(res.interface_sections_loaded, 1u);
     ASSERT_EQ(res.interface_bytes_loaded, 4u);
+    ASSERT_EQ(res.rom_flash_data_addr, data_test_addr);
     ASSERT_EQ(mem_read32(mem, 0x40001000u), 0x40002000u);
     ASSERT_EQ(mem_read32(mem, 0x3FF10000u), 0x11223344u);
     ASSERT_TRUE(mem_get_ptr(mem, 0x3FF10000u) ==
                 mem_backing_ptr(mem, FLEXE_MEM_ROM) + 0x50000u);
     ASSERT_EQ(mem_read32(mem, 0x40002000u), 0xA1B2C3D4u);
     ASSERT_EQ(mem_read32(mem, 0x40003000u), 0x0BADF00Du);
-    ASSERT_EQ(mem_read32(mem, 0x3FCEFFC4u), 0x3FF10000u);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEFFC4u), data_test_addr);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF174u), 0xA1B2C3D4u);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF178u), 0x55667788u);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF130u), 0x0BADF00Du);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF134u), 0u); /* padding was not copied */
+    ASSERT_EQ(mem_prepare_rom_flash(mem, res.rom_flash_data_addr,
+                                    0x00800000u), 0);
+    ASSERT_EQ(mem_read32(mem, data_test_addr), 0x00C84017u);
+    ASSERT_EQ(mem_read32(mem, data_test_addr + 4u), 0x00800000u);
+    ASSERT_EQ(mem_read32(mem, data_test_addr + 8u), 0x00010000u);
+    ASSERT_EQ(mem_read32(mem, data_test_addr + 12u), 0x00001000u);
+    ASSERT_EQ(mem_read32(mem, data_test_addr + 16u), 0x00000100u);
+    ASSERT_EQ(mem_read32(mem, data_test_addr + 20u), 0x0000FFFFu);
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
     mem_destroy(mem);
 }

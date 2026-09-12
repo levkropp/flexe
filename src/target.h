@@ -44,7 +44,7 @@
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
 #define FLEXE_TARGET_SHA_MODE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 31u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 32u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -72,6 +72,7 @@ typedef enum {
     FLEXE_TARGET_CAP_RADIO_REGS_V1                = 1ull << 19,
     FLEXE_TARGET_CAP_GDMA_V1                      = 1ull << 20,
     FLEXE_TARGET_CAP_SHA_V1                       = 1ull << 21,
+    FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF            = 1ull << 22,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -636,6 +637,7 @@ typedef struct {
     uint32_t                base[FLEXE_TARGET_SPI_MEM_HOST_MAX];
     uint32_t                register_size;
     uint32_t                default_jedec_id;
+    uint32_t                maximum_flash_size;
     uint32_t                date_reset;
     uint64_t                default_psram_id;
     uint8_t                 host_count;
@@ -643,6 +645,27 @@ typedef struct {
     uint8_t                 psram_chip_select;
     flexe_spi_mem_layout_t  layout;
 } flexe_spi_mem_desc_t;
+
+/* Live flash geometry shared by the ROM, second-stage bootloader, and
+ * application. Older ROMs export the structure itself at a stable address;
+ * newer ROMs expose an ABI pointer whose symbol is available in the official
+ * ROM ELF. Field offsets remain target data so direct application handoff
+ * does not depend on a C SDK structure or firmware-specific address. */
+typedef struct {
+    uint32_t    live_data_address;
+    const char *pointer_symbol;
+    uint16_t    struct_size;
+    uint16_t    device_id_offset;
+    uint16_t    chip_size_offset;
+    uint16_t    block_size_offset;
+    uint16_t    sector_size_offset;
+    uint16_t    page_size_offset;
+    uint16_t    status_mask_offset;
+    uint32_t    block_size;
+    uint32_t    sector_size;
+    uint32_t    page_size;
+    uint32_t    status_mask;
+} flexe_rom_flash_desc_t;
 
 /* Native USB Serial/JTAG device shared by newer ESP32-family targets. V1
  * fixes the register layout while the descriptor supplies target placement,
@@ -773,6 +796,9 @@ typedef struct {
 
     /* Optional SPI memory controllers and their default attached devices. */
     flexe_spi_mem_desc_t          spi_mem;
+
+    /* Optional ROM/bootloader-to-application flash handoff structure. */
+    flexe_rom_flash_desc_t        rom_flash;
 
     /* Optional native USB Serial/JTAG endpoint controller. */
     flexe_usb_serial_jtag_desc_t  usb_serial_jtag;

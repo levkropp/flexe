@@ -295,9 +295,32 @@ TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_reports_allocated_flash_capacity) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target_with_flash(s3, 0x00800000u);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 23u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x9Fu);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0), 0x001740C8u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_spi_mem_tests(void) {
     TEST_SUITE("Target SPI memory controller");
     RUN_TEST(spi_mem_uses_target_layouts_and_reports_jedec_id);
     RUN_TEST(spi_mem_classic_routes_psram_by_chip_select_and_wire_phases);
     RUN_TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation);
+    RUN_TEST(spi_mem_reports_allocated_flash_capacity);
 }

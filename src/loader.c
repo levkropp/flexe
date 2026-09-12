@@ -82,6 +82,14 @@ int loader_probe_bin(const char *path, loader_image_info_t *info,
     info->min_chip_rev_full = read_le16(&hdr[15]);
     info->max_chip_rev_full = read_le16(&hdr[17]);
     info->image_offset = (uint32_t)offset;
+    uint8_t flash_size_code = hdr[3] >> 4;
+    if (flash_size_code > 7u) {
+        snprintf(error, error_size,
+                 "Unsupported ESP image flash-size code 0x%X",
+                 flash_size_code);
+        return -1;
+    }
+    info->flash_size = UINT32_C(1) << (20u + flash_size_code);
     return 0;
 }
 
@@ -125,9 +133,12 @@ static void pt_entry(uint8_t *p, uint8_t type, uint8_t subtype,
 }
 
 static int loader_synthesize_partition_table(xtensa_mem_t *mem, long app_size,
-                                             uint32_t entry_point) {
+                                             uint32_t entry_point,
+                                             uint32_t usable_flash_size) {
     const flexe_target_desc_t *target = mem_target(mem);
     uint32_t flash_size = mem_backing_size(mem, FLEXE_MEM_FLASH_DATA);
+    if (usable_flash_size != 0u && usable_flash_size < flash_size)
+        flash_size = usable_flash_size;
     uint32_t pt_offset = target ? target->partition_table_offset : 0;
     if (!target || pt_offset > flash_size || flash_size - pt_offset < 0x1000u)
         return -1;
@@ -649,6 +660,16 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
                  "%s memory has no flash backing", detected->display_name);
         return res;
     }
+    if (res.image.flash_size > flash_capacity) {
+        res.result = -1;
+        snprintf(res.error, sizeof(res.error),
+                 "%s image declares %u MiB of flash, but memory provides "
+                 "%u MiB",
+                 detected->display_name, res.image.flash_size >> 20,
+                 flash_capacity >> 20);
+        return res;
+    }
+    uint32_t usable_flash_capacity = res.image.flash_size;
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -684,12 +705,12 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
             fclose(f);
             return res;
         }
-        if ((uint64_t)file_size > flash_capacity) {
+        if ((uint64_t)file_size > usable_flash_capacity) {
             res.result = -1;
             snprintf(res.error, sizeof(res.error),
-                     "Factory image is %ld bytes, larger than %s flash "
-                     "capacity %u", file_size, detected->display_name,
-                     flash_capacity);
+                     "Factory image is %ld bytes, larger than the %s image's "
+                     "declared flash capacity %u", file_size,
+                     detected->display_name, usable_flash_capacity);
             fclose(f);
             return res;
         }
@@ -770,12 +791,14 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
     }
     long app_size = ftell(f);
     uint32_t app_flash_offset = detected->default_app_offset;
-    if (app_size <= 0 || app_flash_offset > flash_capacity ||
-        (uint64_t)app_size > flash_capacity - app_flash_offset) {
+    if (app_size <= 0 || app_flash_offset > usable_flash_capacity ||
+        (uint64_t)app_size > usable_flash_capacity - app_flash_offset) {
         res.result = -1;
         snprintf(res.error, sizeof(res.error),
-                 "App image size %ld does not fit %s flash at offset 0x%X",
-                 app_size, detected->display_name, app_flash_offset);
+                 "App image size %ld does not fit the %s image's declared "
+                 "flash capacity %u at offset 0x%X",
+                 app_size, detected->display_name, usable_flash_capacity,
+                 app_flash_offset);
         fclose(f);
         return res;
     }
@@ -807,8 +830,8 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
     }
 
     /* Bare app images carry no partition table; synthesize one at 0x8000 */
-    if (loader_synthesize_partition_table(mem, app_size,
-                                          res.entry_point) != 0) {
+    if (loader_synthesize_partition_table(mem, app_size, res.entry_point,
+                                          res.image.flash_size) != 0) {
         res.result = -1;
         snprintf(res.error, sizeof(res.error),
                  "Cannot synthesize %s partition table",

@@ -5,6 +5,7 @@
 #include "loader.h"
 #include "peripherals.h"
 #include "flash_mmu.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -69,6 +70,7 @@ TEST(loader_reports_image_revision_metadata) {
     uint8_t bin[64] = {0};
     bin[0] = 0xE9;
     bin[1] = 1;
+    bin[3] = 0x32; /* 8 MiB capacity, 40 MHz speed */
     put_le32(&bin[4], 0x40080000u);
     put_le16(&bin[12], 0x0000u);
     bin[14] = 3;
@@ -88,6 +90,42 @@ TEST(loader_reports_image_revision_metadata) {
     ASSERT_EQ(info.min_chip_rev_full, 301u);
     ASSERT_EQ(info.max_chip_rev_full, 399u);
     ASSERT_EQ(info.image_offset, 0u);
+    ASSERT_EQ(info.flash_size, 8u * 1024u * 1024u);
+}
+
+TEST(loader_rejects_reserved_flash_capacity) {
+    uint8_t bin[24] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 0;
+    bin[3] = 0x80;
+
+    const char *path = write_temp(bin, sizeof(bin));
+    ASSERT_TRUE(path != NULL);
+    loader_image_info_t info;
+    char error[256];
+    ASSERT_EQ(loader_probe_bin(path, &info, error, sizeof(error)), -1);
+    ASSERT_TRUE(strstr(error, "flash-size code 0x8") != NULL);
+}
+
+TEST(loader_rejects_app_larger_than_declared_flash) {
+    const size_t bin_size = 0xF0001u;
+    uint8_t *bin = calloc(1, bin_size);
+    ASSERT_TRUE(bin != NULL);
+    if (!bin) return;
+    bin[0] = 0xE9;
+    bin[1] = 0;
+    bin[3] = 0x00; /* 1 MiB, including the 0x10000 app offset */
+
+    const char *path = write_temp(bin, bin_size);
+    free(bin);
+    ASSERT_TRUE(path != NULL);
+    if (!path) return;
+
+    xtensa_mem_t *mem = mem_create();
+    load_result_t res = loader_load_bin(mem, path);
+    ASSERT_EQ(res.result, -1);
+    ASSERT_TRUE(strstr(res.error, "declared flash capacity 1048576") != NULL);
+    mem_destroy(mem);
 }
 
 TEST(loader_recognizes_s3_before_rejecting_classic_memory) {
@@ -266,6 +304,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_I2C_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SHA_V1);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(esp32->i2c.instance_count, 2u);
     ASSERT_EQ(esp32->i2c.instance[0].base, 0x3FF53000u);
     ASSERT_EQ(esp32->i2c.opcode_restart, 0u);
@@ -299,6 +338,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GDMA_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(s3->i2c.instance_count, 2u);
     ASSERT_EQ(s3->i2c.instance[0].base, 0x60013000u);
     ASSERT_EQ(s3->i2c.instance[1].base, 0x60027000u);
@@ -404,6 +444,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->systimer.alarm_count, 3u);
     ASSERT_EQ(esp32->spi_mem.base[0], 0x3FF43000u);
     ASSERT_EQ(esp32->spi_mem.layout, FLEXE_SPI_MEM_LAYOUT_ESP32);
+    ASSERT_EQ(esp32->spi_mem.maximum_flash_size, 0x01000000u);
     ASSERT_EQ(esp32->spi_mem.default_psram_id,
               UINT64_C(0x0000000000205D0D));
     ASSERT_EQ(esp32->spi_mem.flash_chip_select, 0u);
@@ -413,9 +454,17 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->spi_mem.host_count, 2u);
     ASSERT_EQ(s3->spi_mem.layout, FLEXE_SPI_MEM_LAYOUT_S2_S3);
     ASSERT_EQ(s3->spi_mem.default_jedec_id, 0x001640C8u);
+    ASSERT_EQ(s3->spi_mem.maximum_flash_size, 0x08000000u);
     ASSERT_EQ(s3->spi_mem.date_reset, 0x02101040u);
     ASSERT_EQ(s3->spi_mem.flash_chip_select, 0u);
     ASSERT_EQ(s3->spi_mem.psram_chip_select, FLEXE_SPI_MEM_CS_NONE);
+    ASSERT_EQ(esp32->rom_flash.live_data_address, 0x3FFAE270u);
+    ASSERT_TRUE(esp32->rom_flash.pointer_symbol == NULL);
+    ASSERT_EQ(s3->rom_flash.live_data_address, 0u);
+    ASSERT_TRUE(strcmp(s3->rom_flash.pointer_symbol,
+                       "rom_spiflash_legacy_data") == 0);
+    ASSERT_EQ(s3->rom_flash.struct_size, 24u);
+    ASSERT_EQ(s3->rom_flash.chip_size_offset, 4u);
     ASSERT_EQ(s3->usb_serial_jtag.base, 0x60038000u);
     ASSERT_EQ(s3->usb_serial_jtag.interrupt_source, 96u);
     ASSERT_EQ(s3->usb_serial_jtag.endpoint_size, 64u);
@@ -571,6 +620,8 @@ void run_loader_tests(void) {
 
     RUN_TEST(loader_single_segment);
     RUN_TEST(loader_reports_image_revision_metadata);
+    RUN_TEST(loader_rejects_reserved_flash_capacity);
+    RUN_TEST(loader_rejects_app_larger_than_declared_flash);
     RUN_TEST(loader_recognizes_s3_before_rejecting_classic_memory);
     RUN_TEST(loader_loads_s3_segments_through_shared_flash_mmu);
     RUN_TEST(loader_maps_classic_flash_without_peripheral_model);

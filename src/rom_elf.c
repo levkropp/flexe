@@ -410,6 +410,52 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
         res.data_image_bytes += image_size;
     }
 
+    const flexe_target_desc_t *target = mem_target(mem);
+    if (target->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF) {
+        const flexe_rom_flash_desc_t *flash = &target->rom_flash;
+        if (flash->live_data_address != 0u) {
+            res.rom_flash_data_addr = flash->live_data_address;
+        } else {
+            uint32_t pointer_addr = 0u;
+            int have_pointer = find_symbol(buf, file_size, &ehdr,
+                                           flash->pointer_symbol,
+                                           &pointer_addr);
+            if (have_pointer < 0) {
+                rom_error(&res, "Malformed ROM flash-interface symbol");
+                free(buf);
+                return res;
+            }
+            if (have_pointer == 0) {
+                rom_error(&res,
+                          "ROM ELF is missing required flash-interface "
+                          "symbol %s",
+                          flash->pointer_symbol);
+                free(buf);
+                return res;
+            }
+            if (!guest_range_mapped(mem, pointer_addr, sizeof(uint32_t))) {
+                rom_error(&res,
+                          "ROM flash-interface pointer %s is not mapped at "
+                          "0x%08X",
+                          flash->pointer_symbol, pointer_addr);
+                free(buf);
+                return res;
+            }
+            res.rom_flash_data_addr = mem_read32(mem, pointer_addr);
+        }
+        if (!flexe_target_range_uses_backing(
+                target, res.rom_flash_data_addr, flash->struct_size,
+                FLEXE_MEM_SRAM) ||
+            !guest_range_mapped(mem, res.rom_flash_data_addr,
+                                flash->struct_size)) {
+            rom_error(&res,
+                      "ROM flash handoff does not fit SRAM at 0x%08X",
+                      res.rom_flash_data_addr);
+            free(buf);
+            return res;
+        }
+    }
+
     res.result = 0;
     free(buf);
     return res;

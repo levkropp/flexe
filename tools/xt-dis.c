@@ -141,6 +141,7 @@ int main(int argc, char *argv[]) {
     }
 
     const flexe_target_desc_t *target = NULL;
+    uint32_t required_flash_size = 0u;
     if (!raw_mode) {
         loader_image_info_t image;
         char error[256];
@@ -149,6 +150,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         target = flexe_target_by_id(image.target);
+        required_flash_size = image.flash_size;
         if (requested_target != FLEXE_TARGET_AUTO &&
             (!target || requested_target != target->id)) {
             fprintf(stderr, "Image target does not match requested target\n");
@@ -167,7 +169,7 @@ int main(int argc, char *argv[]) {
     /* Create CPU + target-native memory. */
     xtensa_cpu_t cpu;
     xtensa_cpu_init_for_target(&cpu, target);
-    cpu.mem = mem_create_for_target(target);
+    cpu.mem = mem_create_for_target_with_flash(target, required_flash_size);
     if (!cpu.mem) {
         fprintf(stderr, "Failed to create memory\n");
         return 1;

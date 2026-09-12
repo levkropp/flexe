@@ -519,6 +519,23 @@ static uint32_t call_cache_flash_mmu_set0(xtensa_cpu_t *cpu,
     return ar_read(cpu, 2);
 }
 
+static uint32_t call_cache_sram_mmu_set0(xtensa_cpu_t *cpu,
+                                         uint32_t core, uint32_t pid,
+                                         uint32_t vaddr, uint32_t paddr,
+                                         uint32_t psize, uint32_t num) {
+    cpu->pc = 0x400097F4u;
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, BASE);
+    ar_write(cpu, 2, core);
+    ar_write(cpu, 3, pid);
+    ar_write(cpu, 4, vaddr);
+    ar_write(cpu, 5, paddr);
+    ar_write(cpu, 6, psize);
+    ar_write(cpu, 7, num);
+    xtensa_step(cpu);
+    return ar_read(cpu, 2);
+}
+
 TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -567,6 +584,36 @@ TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses) {
 
     rom_stubs_destroy(rom);
     periph_destroy(periph);
+    teardown(&cpu);
+}
+
+TEST(test_cache_sram_mmu_rom_api_maps_target_psram) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+
+    cpu.mem->psram[0x20000u] = 0xA5u;
+    cpu.mem->psram[0x27FFFu] = 0x5Au;
+    ASSERT_EQ(call_cache_sram_mmu_set0(&cpu, 0, 0, 0x3F800000u,
+                                       0x20000u, 32u, 1u), 0u);
+    ASSERT_TRUE(mem_get_ptr(cpu.mem, 0x3F800000u) ==
+                cpu.mem->psram + 0x20000u);
+    ASSERT_EQ(mem_read8(cpu.mem, 0x3F800000u), 0xA5u);
+    ASSERT_EQ(mem_read8(cpu.mem, 0x3F807FFFu), 0x5Au);
+
+    ASSERT_EQ(call_cache_sram_mmu_set0(&cpu, 0, 0, 0x3F800001u,
+                                       0x20000u, 32u, 1u), 1u);
+    ASSERT_EQ(call_cache_sram_mmu_set0(&cpu, 0, 8, 0x3F800000u,
+                                       0x20000u, 32u, 1u), 2u);
+    ASSERT_EQ(call_cache_sram_mmu_set0(&cpu, 0, 0, 0x3F800000u,
+                                       0x20000u, 2u, 1u), 3u);
+    ASSERT_EQ(call_cache_sram_mmu_set0(&cpu, 0, 0, 0x3F800000u,
+                                       0x400000u, 32u, 1u), 4u);
+    ASSERT_EQ(call_cache_sram_mmu_set0(&cpu, 0, 0, 0x3F700000u,
+                                       0x20000u, 32u, 1u), 5u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0u);
+
+    rom_stubs_destroy(rom);
     teardown(&cpu);
 }
 
@@ -2186,6 +2233,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_stub_delay_us);
     RUN_TEST(test_stub_cache_noop);
     RUN_TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses);
+    RUN_TEST(test_cache_sram_mmu_rom_api_maps_target_psram);
     RUN_TEST(test_stub_memcpy);
     RUN_TEST(test_rom_string_spans_and_bounded_concat);
     RUN_TEST(test_cpu_frequency_rom_pair);

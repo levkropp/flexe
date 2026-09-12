@@ -97,6 +97,42 @@ TEST(mem_esp32s3_native_map_and_diram_alias) {
     mem_destroy(mem);
 }
 
+TEST(mem_flash_capacity_follows_image_and_rom_handoff) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target_with_flash(s3, 0x00800000u);
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+
+    ASSERT_EQ(mem_flash_physical_size(mem), 0x00800000u);
+    ASSERT_EQ(mem_flash_usable_size(mem), 0x00800000u);
+    ASSERT_EQ(mem_flash_jedec_id(mem), 0x001740C8u);
+    ASSERT_EQ(mem_backing_size(mem, FLEXE_MEM_FLASH_DATA), 0x00800000u);
+    ASSERT_EQ(mem_backing_size(mem, FLEXE_MEM_FLASH_INSN), 0x00800000u);
+    ASSERT_EQ(mem->flash_data[0x007FFFFFu], 0xFFu);
+    ASSERT_EQ(mem->flash_insn[0x007FFFFFu], 0xFFu);
+
+    const uint32_t handoff = 0x3FCEF6A4u;
+    ASSERT_EQ(mem_prepare_rom_flash(mem, handoff, 0x00800000u), 0);
+    ASSERT_EQ(mem_read32(mem, handoff + 0u), 0x00C84017u);
+    ASSERT_EQ(mem_read32(mem, handoff + 4u), 0x00800000u);
+    ASSERT_EQ(mem_read32(mem, handoff + 8u), 0x00010000u);
+    ASSERT_EQ(mem_read32(mem, handoff + 12u), 0x00001000u);
+    ASSERT_EQ(mem_read32(mem, handoff + 16u), 0x00000100u);
+    ASSERT_EQ(mem_read32(mem, handoff + 20u), 0x0000FFFFu);
+    mem_destroy(mem);
+
+    ASSERT_TRUE(mem_create_for_target_with_flash(s3, 0x00300000u) == NULL);
+    ASSERT_TRUE(mem_create_for_target_with_flash(s3, 0x10000000u) == NULL);
+
+    mem = mem_create();
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+    ASSERT_EQ(mem_read32(mem, 0x3FFAE270u), 0x00C84016u);
+    ASSERT_EQ(mem_read32(mem, 0x3FFAE274u), 0x00400000u);
+    mem_destroy(mem);
+}
+
 TEST(mem_esp32s3_mmio_is_native_not_classic_alias) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -384,6 +420,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw32_sram_data);
     RUN_TEST(mem_sram_alias);
     RUN_TEST(mem_esp32s3_native_map_and_diram_alias);
+    RUN_TEST(mem_flash_capacity_follows_image_and_rom_handoff);
     RUN_TEST(mem_esp32s3_mmio_is_native_not_classic_alias);
     RUN_TEST(mem_full_esp32_rom_map);
     RUN_TEST(mem_builtin_rom_ctype_table);

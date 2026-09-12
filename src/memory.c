@@ -94,12 +94,121 @@ static void init_builtin_rom_data(xtensa_mem_t *mem) {
         mem_write8(mem, ROM_CTYPE_TABLE + 1u + ch, esp32_rom_ctype(ch));
 }
 
-xtensa_mem_t *mem_create_for_target(const flexe_target_desc_t *target) {
+static int is_power_of_two(uint32_t value) {
+    return value != 0u && (value & (value - 1u)) == 0u;
+}
+
+static int rom_flash_desc_valid(const flexe_target_desc_t *target) {
+    if (!(target->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF))
+        return 1;
+    const flexe_rom_flash_desc_t *desc = &target->rom_flash;
+    const uint16_t offsets[] = {
+        desc->device_id_offset, desc->chip_size_offset,
+        desc->block_size_offset, desc->sector_size_offset,
+        desc->page_size_offset, desc->status_mask_offset,
+    };
+    if ((desc->live_data_address == 0u) ==
+            (desc->pointer_symbol == NULL || !*desc->pointer_symbol) ||
+        desc->struct_size < 6u * sizeof(uint32_t) ||
+        desc->block_size == 0u || desc->sector_size == 0u ||
+        desc->page_size == 0u)
+        return 0;
+    for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++)
+        if ((offsets[i] & 3u) != 0u ||
+            offsets[i] > desc->struct_size - sizeof(uint32_t))
+            return 0;
+    return 1;
+}
+
+uint32_t mem_flash_physical_size(const xtensa_mem_t *mem) {
+    if (!mem) return 0u;
+    uint32_t data = mem->backing_size[FLEXE_MEM_FLASH_DATA];
+    uint32_t insn = mem->backing_size[FLEXE_MEM_FLASH_INSN];
+    return insn < data ? insn : data;
+}
+
+uint32_t mem_flash_usable_size(const xtensa_mem_t *mem) {
+    return mem ? mem->flash_usable_size : 0u;
+}
+
+uint32_t mem_flash_jedec_id(const xtensa_mem_t *mem) {
+    if (!mem || !mem->target) return 0u;
+    uint32_t id = mem->target->spi_mem.default_jedec_id;
+    uint32_t size = mem_flash_physical_size(mem);
+    if (!is_power_of_two(size)) return id;
+    uint32_t capacity = 0u;
+    while (size > 1u) {
+        size >>= 1;
+        capacity++;
+    }
+    return (id & 0x0000FFFFu) | ((capacity & 0xFFu) << 16);
+}
+
+static uint32_t mem_flash_rom_device_id(const xtensa_mem_t *mem) {
+    /* SPI W0 exposes RDID bytes in little-endian buffer order (capacity,
+     * type, manufacturer as a host word). The ROM ABI stores the same wire
+     * bytes as the conventional 24-bit JEDEC number (manufacturer, type,
+     * capacity). Do not conflate the two integer representations. */
+    uint32_t wire = mem_flash_jedec_id(mem);
+    return ((wire & 0x000000FFu) << 16) |
+           (wire & 0x0000FF00u) |
+           ((wire & 0x00FF0000u) >> 16);
+}
+
+int mem_prepare_rom_flash(xtensa_mem_t *mem, uint32_t live_data_address,
+                          uint32_t usable_flash_size) {
+    if (!mem || !mem->target || !rom_flash_desc_valid(mem->target) ||
+        !(mem->target->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF))
+        return -1;
+    const flexe_rom_flash_desc_t *desc = &mem->target->rom_flash;
+    uint32_t physical_size = mem_flash_physical_size(mem);
+    if (usable_flash_size == 0u) usable_flash_size = physical_size;
+    if (!is_power_of_two(usable_flash_size) ||
+        usable_flash_size > physical_size || live_data_address == 0u ||
+        (desc->live_data_address != 0u &&
+         live_data_address != desc->live_data_address) ||
+        !flexe_target_range_uses_backing(mem->target, live_data_address,
+                                         desc->struct_size,
+                                         FLEXE_MEM_SRAM) ||
+        !mem_get_ptr_w(mem, live_data_address) ||
+        !mem_get_ptr_w(mem, live_data_address + desc->struct_size - 1u))
+        return -1;
+
+    mem_write32(mem, live_data_address + desc->device_id_offset,
+                mem_flash_rom_device_id(mem));
+    mem_write32(mem, live_data_address + desc->chip_size_offset,
+                usable_flash_size);
+    mem_write32(mem, live_data_address + desc->block_size_offset,
+                desc->block_size);
+    mem_write32(mem, live_data_address + desc->sector_size_offset,
+                desc->sector_size);
+    mem_write32(mem, live_data_address + desc->page_size_offset,
+                desc->page_size);
+    mem_write32(mem, live_data_address + desc->status_mask_offset,
+                desc->status_mask);
+    mem->flash_usable_size = usable_flash_size;
+    return 0;
+}
+
+xtensa_mem_t *mem_create_for_target_with_flash(
+        const flexe_target_desc_t *target, uint32_t required_flash_size) {
     if (!target ||
         target->descriptor_version != FLEXE_TARGET_DESCRIPTOR_VERSION ||
         target->peripheral_end <= target->peripheral_start ||
         (target->peripheral_start & (PAGE_SIZE - 1u)) != 0 ||
-        (target->peripheral_end & (PAGE_SIZE - 1u)) != 0)
+        (target->peripheral_end & (PAGE_SIZE - 1u)) != 0 ||
+        !rom_flash_desc_valid(target))
+        return NULL;
+
+    uint32_t flash_size = target->backing_size[FLEXE_MEM_FLASH_DATA];
+    if (target->backing_size[FLEXE_MEM_FLASH_INSN] > flash_size)
+        flash_size = target->backing_size[FLEXE_MEM_FLASH_INSN];
+    if (required_flash_size > flash_size) flash_size = required_flash_size;
+    if (!is_power_of_two(flash_size) ||
+        (required_flash_size != 0u &&
+         !is_power_of_two(required_flash_size)) ||
+        target->spi_mem.maximum_flash_size < flash_size ||
+        !is_power_of_two(target->spi_mem.maximum_flash_size))
         return NULL;
 
     xtensa_mem_t *mem = calloc(1, sizeof(xtensa_mem_t));
@@ -108,9 +217,12 @@ xtensa_mem_t *mem_create_for_target(const flexe_target_desc_t *target) {
     mem->target = target;
     for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
         uint8_t **slot = backing_slot(mem, (flexe_mem_backing_t)i);
-        mem->backing_size[i] = target->backing_size[i];
-        if (target->backing_size[i] != 0) {
-            *slot = calloc(1, target->backing_size[i]);
+        uint32_t size = target->backing_size[i];
+        if (i == FLEXE_MEM_FLASH_DATA || i == FLEXE_MEM_FLASH_INSN)
+            size = flash_size;
+        mem->backing_size[i] = size;
+        if (size != 0) {
+            *slot = calloc(1, size);
             if (!*slot) {
                 mem_destroy(mem);
                 return NULL;
@@ -143,22 +255,20 @@ xtensa_mem_t *mem_create_for_target(const flexe_target_desc_t *target) {
     }
     if (target->id == FLEXE_TARGET_ESP32)
         init_builtin_rom_data(mem);
-
-    /* Pre-populate the ESP32 ROM spiflash chip struct (ROM BSS, fixed
-     * address 0x3FFAE270). On hardware the boot ROM fills this during its
-     * flash setup; flexe skips the boot ROM, and firmware built with
-     * CONFIG_SPI_FLASH_ROM_IMPL reads rom_spiflash_chip.chip_size from
-     * here (spi_flash_mmap validates mappings against it). */
-    if (target->id == FLEXE_TARGET_ESP32) {
-        mem_write32(mem, 0x3FFAE270, 0x00C84016u); /* device_id: GD25Q32 */
-        mem_write32(mem, 0x3FFAE274, 0x00400000u); /* chip_size: 4 MB */
-        mem_write32(mem, 0x3FFAE278, 0x00010000u); /* block_size: 64 KB */
-        mem_write32(mem, 0x3FFAE27C, 0x00001000u); /* sector_size: 4 KB */
-        mem_write32(mem, 0x3FFAE280, 0x00000100u); /* page_size: 256 B */
-        mem_write32(mem, 0x3FFAE284, 0x0000FFFFu); /* status_mask */
+    mem->flash_usable_size = mem_flash_physical_size(mem);
+    if ((target->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF) &&
+        target->rom_flash.live_data_address != 0u &&
+        mem_prepare_rom_flash(mem, target->rom_flash.live_data_address,
+                              mem->flash_usable_size) != 0) {
+        mem_destroy(mem);
+        return NULL;
     }
 
     return mem;
+}
+
+xtensa_mem_t *mem_create_for_target(const flexe_target_desc_t *target) {
+    return mem_create_for_target_with_flash(target, 0u);
 }
 
 xtensa_mem_t *mem_create(void) {
@@ -186,6 +296,11 @@ void mem_reset(xtensa_mem_t *mem) {
         memset(mem->rtc_dram, 0, mem->backing_size[FLEXE_MEM_RTC_FAST]);
     if (mem->rtc_slow)
         memset(mem->rtc_slow, 0, mem->backing_size[FLEXE_MEM_RTC_SLOW]);
+    if ((mem->target->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF) &&
+        mem->target->rom_flash.live_data_address != 0u)
+        (void)mem_prepare_rom_flash(mem,
+                                   mem->target->rom_flash.live_data_address,
+                                   mem->flash_usable_size);
 }
 
 const flexe_target_desc_t *mem_target(const xtensa_mem_t *mem) {

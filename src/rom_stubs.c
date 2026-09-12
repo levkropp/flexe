@@ -1754,14 +1754,15 @@ static void stub_esp_lcd_panel_draw_bitmap(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
-/* esp_flash_get_size(esp_flash_t *chip, uint32_t *out_size) -> ESP_OK, reports 4 MiB.
- * The underlying SPI flash chip isn't modeled, so probing via the real function
- * returns ESP_ERR_NOT_SUPPORTED. Report a conventional 4 MiB image instead. */
+/* esp_flash_get_size(esp_flash_t *chip, uint32_t *out_size) -> ESP_OK.
+ * Classic compatibility builds may call this SDK boundary instead of the
+ * modeled SPI-memory controller. Report the same image-limited capacity that
+ * the target-described ROM handoff exposes. */
 static void stub_esp_flash_get_size(xtensa_cpu_t *cpu, void *ctx) {
     (void)ctx;
     uint32_t out_ptr = rom_arg(cpu, 1);
     if (out_ptr)
-        mem_write32(cpu->mem, out_ptr, 4u * 1024u * 1024u);
+        mem_write32(cpu->mem, out_ptr, mem_flash_usable_size(cpu->mem));
     rom_return(cpu, 0);  /* ESP_OK */
 }
 
@@ -3257,6 +3258,79 @@ static void stub_cache_flash_mmu_set(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
+/* cache_sram_mmu_set(cpu_no, pid, vaddr, paddr, psize, num) — expose the
+ * target's external-RAM backing through the classic ROM cache API. ESP-IDF's
+ * supported path uses 32 KiB pages; the ROM also accepts 4/8/16 KiB pages,
+ * which align with Flexe's 4 KiB host translation granularity. The ROM's
+ * undocumented 2 KiB mode cannot be represented without sub-page mappings
+ * and is rejected explicitly as a page-size error. */
+static void stub_cache_sram_mmu_set(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint32_t core  = rom_arg(cpu, 0);
+    uint32_t pid   = rom_arg(cpu, 1);
+    uint32_t vaddr = rom_arg(cpu, 2);
+    uint32_t paddr = rom_arg(cpu, 3);
+    uint32_t psize = rom_arg(cpu, 4);
+    uint32_t num   = rom_arg(cpu, 5);
+
+    if (getenv("FLEXE_DBG_FLASH"))
+        fprintf(stderr,
+                "[SRAM MMU] core=%u pid=%u vaddr=0x%08X paddr=0x%08X "
+                "psize=%u num=%u\n",
+                core, pid, vaddr, paddr, psize, num);
+
+    if (psize != 4u && psize != 8u && psize != 16u && psize != 32u) {
+        rom_return(cpu, 3u);
+        return;
+    }
+    uint32_t page_size = psize * 1024u;
+    if (((vaddr | paddr) & (page_size - 1u)) != 0u) {
+        rom_return(cpu, 1u);
+        return;
+    }
+    if (core > 1u || pid > 7u) {
+        rom_return(cpu, 2u);
+        return;
+    }
+
+    uint64_t map_size_64 = (uint64_t)page_size * num;
+    if (num == 0u || map_size_64 > UINT32_MAX) {
+        rom_return(cpu, 4u);
+        return;
+    }
+    uint32_t map_size = (uint32_t)map_size_64;
+    uint32_t psram_size = mem_backing_size(cpu->mem, FLEXE_MEM_PSRAM);
+    if (paddr > psram_size || map_size > psram_size - paddr) {
+        rom_return(cpu, 4u);
+        return;
+    }
+
+    const flexe_target_desc_t *target = mem_target(cpu->mem);
+    bool virtual_range_valid = false;
+    uint64_t vend = (uint64_t)vaddr + map_size;
+    if (target) {
+        for (unsigned i = 0; i < target->memory_region_count; i++) {
+            const flexe_target_mem_region_t *region = &target->memory_region[i];
+            if (region->backing == FLEXE_MEM_PSRAM &&
+                vaddr >= region->start && vend <= region->end) {
+                virtual_range_valid = true;
+                break;
+            }
+        }
+    }
+    if (!virtual_range_valid) {
+        rom_return(cpu, 5u);
+        return;
+    }
+    if (mem_map_backing_range(cpu->mem, vaddr, FLEXE_MEM_PSRAM,
+                              paddr, map_size) != 0) {
+        rom_return(cpu, 4u);
+        return;
+    }
+    xtensa_invalidate_code(cpu, vaddr, map_size);
+    rom_return(cpu, 0u);
+}
+
 
 /* ===== Task watchdog =====
  *
@@ -4730,6 +4804,7 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     /* MMU/Cache */
     rom_stubs_register(s, 0x400095a4, stub_mmu_init,            "mmu_init");
     rom_stubs_register(s, 0x400095e0, stub_cache_flash_mmu_set, "cache_flash_mmu_set");
+    rom_stubs_register(s, 0x400097f4, stub_cache_sram_mmu_set,  "cache_sram_mmu_set");
 
     /* C library functions */
     rom_stubs_register(s, 0x4000143c, stub_rom_strdup,         "strdup");

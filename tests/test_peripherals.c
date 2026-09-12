@@ -2863,6 +2863,34 @@ TEST(flash_mmu_exposes_full_multicore_copy_windows) {
     mem_destroy(mem);
 }
 
+TEST(flash_mmu_uses_allocated_nor_capacity) {
+    const flexe_target_desc_t *classic =
+        flexe_target_by_id(FLEXE_TARGET_ESP32);
+    xtensa_mem_t *mem =
+        mem_create_for_target_with_flash(classic, 0x00800000u);
+    esp32_periph_t *p = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    if (!mem || !p) {
+        periph_destroy(p);
+        mem_destroy(mem);
+        return;
+    }
+
+    const uint32_t table_entry = 0x3FF10000u + 128u * 4u;
+    mem->flash_insn[0x00700000u] = 0xA5u;
+    mem_write32(mem, table_entry, 0x70u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40400000u) ==
+                mem->flash_insn + 0x00700000u);
+    ASSERT_EQ(mem_read8(mem, 0x40400000u), 0xA5u);
+
+    mem_write32(mem, table_entry, 0x80u);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x40400000u) == NULL);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(spi_flash_dual_io_mode_bits_are_not_address_bits) {
     xtensa_mem_t *mem = mem_create();
     esp32_periph_t *p = periph_create(mem);
@@ -6426,6 +6454,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(spi_flash_program_erase_require_write_enable);
     RUN_TEST(flash_mmu_maps_complete_pages_and_all_instruction_buses);
     RUN_TEST(flash_mmu_exposes_full_multicore_copy_windows);
+    RUN_TEST(flash_mmu_uses_allocated_nor_capacity);
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);
     RUN_TEST(wifi_mac_init_ready_handshake);
     RUN_TEST(radio_phy_calibration_register_files);
