@@ -292,34 +292,55 @@ static int session_build(flexe_session_t *s)
             touch_stubs_hook_symbols(s->tstubs, s->syms);
     }
 
-    /* Raw SPI display/touch capture (SPI2/SPI3 sniffing for symbol-less
-     * firmware). Pins default to CYD 2432S028R; -1 disables. */
-    if (classic_compat) {
-        bool openhasp_lanbon = rom_stubs_firmware_profile(s->rom) ==
+    /* GP-SPI controllers are constructed from the target descriptor even in
+     * headless sessions. This optional layer only attaches board-side devices.
+     * Classic compatibility keeps its historical board-profile defaults;
+     * experimental targets require explicit positive pin numbers. */
+    if (target->capabilities & FLEXE_TARGET_CAP_GP_SPI) {
+        bool openhasp_lanbon = classic_compat &&
+            rom_stubs_firmware_profile(s->rom) ==
                 ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8;
         spi_display_config_t scfg = {
-            .dc_pin = cfg->spi_dc_pin ? cfg->spi_dc_pin :
-                      (openhasp_lanbon ? 21 : 2),
-            .display_cs_pin = cfg->spi_display_cs_pin ?
-                              cfg->spi_display_cs_pin :
-                              (openhasp_lanbon ? 22 : 15),
-            .display_sck_pin = cfg->spi_display_sck_pin ?
-                               cfg->spi_display_sck_pin :
-                               (openhasp_lanbon ? 19 : 14),
-            .touch_cs_pin = cfg->spi_touch_cs_pin ? cfg->spi_touch_cs_pin :
-                            (openhasp_lanbon ? -1 : 33),
-            .touch_sck_pin = cfg->spi_touch_sck_pin ? cfg->spi_touch_sck_pin :
-                             (openhasp_lanbon ? -1 : 25),
-            .touch_mosi_pin = cfg->spi_touch_mosi_pin ?
-                              cfg->spi_touch_mosi_pin :
-                              (openhasp_lanbon ? -1 : 32),
-            .touch_miso_pin = cfg->spi_touch_miso_pin ?
-                              cfg->spi_touch_miso_pin :
-                              (openhasp_lanbon ? -1 : 39),
-            .sd_cs_pin = cfg->spi_sd_cs_pin ? cfg->spi_sd_cs_pin :
-                         (openhasp_lanbon ? -1 : 5),
-            .sd_sck_pin = cfg->spi_sd_sck_pin ? cfg->spi_sd_sck_pin :
-                          (openhasp_lanbon ? -1 : 18),
+            .dc_pin = classic_compat ?
+                (cfg->spi_dc_pin ? cfg->spi_dc_pin :
+                 (openhasp_lanbon ? 21 : 2)) :
+                (cfg->spi_dc_pin > 0 ? cfg->spi_dc_pin : -1),
+            .display_cs_pin = classic_compat ?
+                (cfg->spi_display_cs_pin ? cfg->spi_display_cs_pin :
+                 (openhasp_lanbon ? 22 : 15)) :
+                (cfg->spi_display_cs_pin > 0 ?
+                 cfg->spi_display_cs_pin : -1),
+            .display_sck_pin = classic_compat ?
+                (cfg->spi_display_sck_pin ? cfg->spi_display_sck_pin :
+                 (openhasp_lanbon ? 19 : 14)) :
+                (cfg->spi_display_sck_pin > 0 ?
+                 cfg->spi_display_sck_pin : -1),
+            .touch_cs_pin = classic_compat ?
+                (cfg->spi_touch_cs_pin ? cfg->spi_touch_cs_pin :
+                 (openhasp_lanbon ? -1 : 33)) :
+                (cfg->spi_touch_cs_pin > 0 ? cfg->spi_touch_cs_pin : -1),
+            .touch_sck_pin = classic_compat ?
+                (cfg->spi_touch_sck_pin ? cfg->spi_touch_sck_pin :
+                 (openhasp_lanbon ? -1 : 25)) :
+                (cfg->spi_touch_sck_pin > 0 ? cfg->spi_touch_sck_pin : -1),
+            .touch_mosi_pin = classic_compat ?
+                (cfg->spi_touch_mosi_pin ? cfg->spi_touch_mosi_pin :
+                 (openhasp_lanbon ? -1 : 32)) :
+                (cfg->spi_touch_mosi_pin > 0 ?
+                 cfg->spi_touch_mosi_pin : -1),
+            .touch_miso_pin = classic_compat ?
+                (cfg->spi_touch_miso_pin ? cfg->spi_touch_miso_pin :
+                 (openhasp_lanbon ? -1 : 39)) :
+                (cfg->spi_touch_miso_pin > 0 ?
+                 cfg->spi_touch_miso_pin : -1),
+            .sd_cs_pin = classic_compat ?
+                (cfg->spi_sd_cs_pin ? cfg->spi_sd_cs_pin :
+                 (openhasp_lanbon ? -1 : 5)) :
+                (cfg->spi_sd_cs_pin > 0 ? cfg->spi_sd_cs_pin : -1),
+            .sd_sck_pin = classic_compat ?
+                (cfg->spi_sd_sck_pin ? cfg->spi_sd_sck_pin :
+                 (openhasp_lanbon ? -1 : 18)) :
+                (cfg->spi_sd_sck_pin > 0 ? cfg->spi_sd_sck_pin : -1),
             .sdcard_path    = cfg->sdcard_path,
             .framebuf       = cfg->framebuf,
             .framebuf_mtx   = cfg->framebuf_mutex,
@@ -328,14 +349,6 @@ static int session_build(flexe_session_t *s)
             .touch_fn       = cfg->touch_fn,
             .touch_ctx      = cfg->touch_ctx,
         };
-        /* Always model the SPI2/SPI3 registers, even with every pin set to
-         * -1. A -1 pin means "do not try to interpret this traffic as a
-         * panel", not "there is no SPI controller" -- the chip has one either
-         * way, and leaving the window unregistered made firmware that drives
-         * VSPI look like it was touching hardware Flexe does not model.
-         * openHASP alone logged 59,957 phantom unhandled accesses to
-         * 0x3FF65000 that way. Every pin helper already treats a negative pin
-         * as absent, so sniffing stays off. */
         periph_enable_spi_display(s->periph, &scfg);
     }
 

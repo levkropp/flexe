@@ -23,6 +23,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_I2C_V1 |
                         FLEXE_TARGET_CAP_RADIO_REGS_V1 |
                         FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -174,6 +175,46 @@ static const flexe_target_desc_t TARGETS[] = {
                 FLEXE_SHA_ALGORITHM_SHA512,
             },
         },
+        .gp_spi = {
+            .register_size = 0x1000u,
+            .date_reset = 0x01604270u,
+            .host_count = 2u,
+            .layout = FLEXE_GP_SPI_LAYOUT_ESP32,
+            .instance = {
+                {
+                    .base = 0x3FF64000u,
+                    .clock_out_signal = 8u,
+                    .chip_select_out_signal = {
+                        11u, 61u, 62u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                    },
+                    .interrupt_source = 30u,
+                    .chip_select_count = 3u,
+                    .iomux_clock_pin = 14u,
+                    .iomux_chip_select0_pin = 15u,
+                    .iomux_function = 1u,
+                    .gdma_peripheral_id = FLEXE_TARGET_GDMA_PERIPHERAL_NONE,
+                },
+                {
+                    .base = 0x3FF65000u,
+                    .clock_out_signal = 63u,
+                    .chip_select_out_signal = {
+                        68u, 69u, 70u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                    },
+                    .interrupt_source = 31u,
+                    .chip_select_count = 3u,
+                    .iomux_clock_pin = 18u,
+                    .iomux_chip_select0_pin = 5u,
+                    .iomux_function = 1u,
+                    .gdma_peripheral_id = FLEXE_TARGET_GDMA_PERIPHERAL_NONE,
+                },
+            },
+        },
         .spi_mem = {
             .base = { 0x3FF43000u, 0x3FF42000u },
             .register_size = 0x1000u,
@@ -267,6 +308,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_RADIO_REGS_V1 |
                         FLEXE_TARGET_CAP_GDMA_V1 |
                         FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -377,7 +419,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 7u,
-            .gate_count = 5u,
+            .gate_count = 7u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -433,6 +475,22 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x020u,
                     .clock_mask = 1u << 18,
                     .reset_mask = 1u << 18,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_GP_SPI,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 6,
+                    .reset_mask = 1u << 6,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_GP_SPI,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 16,
+                    .reset_mask = 1u << 16,
                 },
             },
         },
@@ -782,6 +840,43 @@ static const flexe_target_desc_t TARGETS[] = {
             .interrupt_source = {
                 { 50u, 51u, 52u },
                 { 53u, 54u, 55u },
+            },
+        },
+        .gp_spi = {
+            .register_size = 0x100u,
+            .date_reset = 0x02101190u,
+            .host_count = 2u,
+            .layout = FLEXE_GP_SPI_LAYOUT_S2_S3,
+            .instance = {
+                {
+                    .base = 0x60024000u,
+                    .clock_out_signal = 101u,
+                    .chip_select_out_signal = {
+                        110u, 111u, 112u, 113u, 114u, 115u,
+                    },
+                    .interrupt_source = 21u,
+                    .chip_select_count = 6u,
+                    .iomux_clock_pin = 12u,
+                    .iomux_chip_select0_pin = 10u,
+                    .iomux_function = 4u,
+                    .gdma_peripheral_id = 0u,
+                },
+                {
+                    .base = 0x60025000u,
+                    .clock_out_signal = 66u,
+                    .chip_select_out_signal = {
+                        71u, 72u, 127u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                    },
+                    .interrupt_source = 22u,
+                    .chip_select_count = 3u,
+                    .iomux_clock_pin = FLEXE_TARGET_GPIO_NONE,
+                    .iomux_chip_select0_pin = FLEXE_TARGET_GPIO_NONE,
+                    .iomux_function = FLEXE_TARGET_GPIO_NONE,
+                    .gdma_peripheral_id = 1u,
+                },
             },
         },
         .spi_mem = {

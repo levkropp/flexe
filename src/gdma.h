@@ -18,4 +18,10 @@ void flexe_gdma_destroy(flexe_gdma_t *gdma);
 int flexe_gdma_read_tx(flexe_gdma_t *gdma, uint8_t peripheral_id,
                        uint8_t *data, size_t length);
 
+/* Write bytes into the active RX descriptor chain routed from peripheral_id.
+ * The transfer updates descriptor lengths/ownership and completion state just
+ * as a target peripheral driving the GDMA input would. */
+int flexe_gdma_write_rx(flexe_gdma_t *gdma, uint8_t peripheral_id,
+                        const uint8_t *data, size_t length);
+
 #endif /* FLEXE_GDMA_H */

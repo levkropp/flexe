@@ -64,8 +64,9 @@ typedef struct {
     int       (*touch_fn)(int *x, int *y, void *ctx);
     void       *touch_ctx;
 
-    /* Raw SPI display/touch capture pins (0 = use CYD 2432S028R defaults,
-     * -1 = disable raw SPI sniffing) */
+    /* Optional board-side SPI display/touch pins. On classic ESP32, 0 selects
+     * the active compatibility-board defaults; -1 disables a wire. Other
+     * targets have no implicit board and accept explicit positive pins only. */
     int         spi_dc_pin;
     int         spi_display_cs_pin;
     int         spi_display_sck_pin;

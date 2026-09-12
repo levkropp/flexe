@@ -1807,6 +1807,7 @@ struct esp32_periph {
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_efuse_t *target_efuse;
     flexe_gdma_t *gdma;
+    flexe_gp_spi_t *gp_spi;
     flexe_gpio_t *target_gpio;
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
@@ -13654,6 +13655,10 @@ static void system_clock_gate_changed(
         i2c_set_system_state(
             p, instance, clock_enabled, reset_asserted);
         return;
+    case FLEXE_SYSTEM_DEVICE_GP_SPI:
+        flexe_gp_spi_set_system_state(
+            p->gp_spi, instance, clock_enabled, reset_asserted);
+        return;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -14186,6 +14191,32 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_GP_SPI) {
+        p->gp_spi = flexe_gp_spi_create(
+            p, default_read, default_write, p);
+        if (!p->gp_spi) {
+            periph_destroy(p);
+            return NULL;
+        }
+        /* The GPIO matrix diagnoses selections without a modeled producer.
+         * Claim only the signals implemented by this controller; the list is
+         * target data, so newer chips do not add address or signal hacks here. */
+        if (p->target_gpio) {
+            const flexe_gp_spi_desc_t *spi = &target->gp_spi;
+            for (unsigned host = 0u; host < spi->host_count; host++) {
+                const flexe_gp_spi_instance_desc_t *instance =
+                    &spi->instance[host];
+                flexe_gpio_set_output_signal_modeled(
+                    p->target_gpio, instance->clock_out_signal);
+                for (unsigned cs = 0u; cs < instance->chip_select_count;
+                     cs++)
+                    flexe_gpio_set_output_signal_modeled(
+                        p->target_gpio,
+                        instance->chip_select_out_signal[cs]);
+            }
+        }
+    }
+
     bool classic = (target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     if (!classic) {
@@ -14505,6 +14536,8 @@ void periph_destroy(esp32_periph_t *p) {
             p->mem, p->target->gpio.base,
             p->target->gpio.register_size, NULL, NULL, NULL);
     flexe_usb_serial_jtag_destroy(p->usb_serial_jtag);
+    flexe_gp_spi_destroy(p->gp_spi);
+    p->gp_spi = NULL;
     flexe_gdma_destroy(p->gdma);
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_timer_group_destroy(p->target_timer_group);
@@ -14551,7 +14584,6 @@ void periph_destroy(esp32_periph_t *p) {
             p->target->interrupt_matrix.register_size, NULL, NULL, NULL);
     flexe_esp32s3_extmem_destroy(p->s3_extmem);
     flexe_flash_mmu_destroy(p->shared_flash_mmu);
-    periph_disable_spi_display(p);
     if (p->target->capabilities & FLEXE_TARGET_CAP_I2C_V1) {
         const flexe_i2c_desc_t *desc = &p->target->i2c;
         for (unsigned port = 0u; port < desc->instance_count; port++)
@@ -14567,6 +14599,10 @@ void periph_destroy(esp32_periph_t *p) {
 
 flexe_gdma_t *periph_gdma(esp32_periph_t *p) {
     return p ? p->gdma : NULL;
+}
+
+flexe_gp_spi_t *periph_gp_spi(esp32_periph_t *p) {
+    return p ? p->gp_spi : NULL;
 }
 
 int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,

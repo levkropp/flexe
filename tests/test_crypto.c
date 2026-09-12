@@ -4,6 +4,7 @@
 #include "aes_stubs.h"
 #include "mpi_stubs.h"
 #include "peripherals.h"
+#include "gdma.h"
 
 #define AES_BASE_ADDR 0x3FF01000u
 
@@ -297,6 +298,17 @@ TEST(sha_accelerator_matches_known_answers) {
 #define S3_SHA_TEXT             (S3_SHA_BASE + 0x80u)
 
 #define S3_GDMA_BASE            0x6003F000u
+#define S3_GDMA_IN_CONF1        (S3_GDMA_BASE + 0x004u)
+#define S3_GDMA_IN_INT_RAW      (S3_GDMA_BASE + 0x008u)
+#define S3_GDMA_IN_INT_ST       (S3_GDMA_BASE + 0x00Cu)
+#define S3_GDMA_IN_INT_ENA      (S3_GDMA_BASE + 0x010u)
+#define S3_GDMA_IN_INT_CLR      (S3_GDMA_BASE + 0x014u)
+#define S3_GDMA_IN_LINK         (S3_GDMA_BASE + 0x020u)
+#define S3_GDMA_IN_SUC_EOF_DESC (S3_GDMA_BASE + 0x028u)
+#define S3_GDMA_IN_ERR_EOF_DESC (S3_GDMA_BASE + 0x02Cu)
+#define S3_GDMA_IN_DESC         (S3_GDMA_BASE + 0x030u)
+#define S3_GDMA_IN_DESC_PREV    (S3_GDMA_BASE + 0x034u)
+#define S3_GDMA_IN_PERI_SEL     (S3_GDMA_BASE + 0x048u)
 #define S3_GDMA_OUT_CONF0       (S3_GDMA_BASE + 0x060u)
 #define S3_GDMA_OUT_CONF1       (S3_GDMA_BASE + 0x064u)
 #define S3_GDMA_OUT_INT_RAW     (S3_GDMA_BASE + 0x068u)
@@ -312,6 +324,9 @@ TEST(sha_accelerator_matches_known_answers) {
 
 #define S3_GDMA_LINK_START      (1u << 21)
 #define S3_GDMA_LINK_PARK       (1u << 23)
+#define S3_GDMA_IN_LINK_AUTO_RET (1u << 20)
+#define S3_GDMA_IN_LINK_START   (1u << 22)
+#define S3_GDMA_IN_LINK_PARK    (1u << 24)
 #define S3_GDMA_AUTO_WRITEBACK  (1u << 2)
 #define S3_GDMA_CHECK_OWNER     (1u << 12)
 #define S3_GDMA_DESC_EOF        (1u << 30)
@@ -546,6 +561,93 @@ TEST(esp32s3_gdma_honors_owner_check_and_writeback) {
     s3_sha_fixture_destroy(&fixture);
 }
 
+TEST(esp32s3_gdma_receives_chained_descriptors_and_reports_errors) {
+    const uint32_t descriptor0 = 0x3FC8F000u;
+    const uint32_t descriptor1 = 0x3FC8F010u;
+    const uint32_t buffer0 = 0x3FC90000u;
+    const uint32_t buffer1 = 0x3FC90100u;
+    static const uint8_t payload[] = {0x10u, 0x21u, 0x32u, 0x43u, 0x54u};
+    s3_sha_fixture_t fixture;
+    bool ready = s3_sha_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_sha_fixture_destroy(&fixture);
+        return;
+    }
+
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_PERI_SEL), 0x3Fu);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_LINK),
+              S3_GDMA_IN_LINK_AUTO_RET | S3_GDMA_IN_LINK_PARK);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_INT_RAW, UINT32_MAX);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_INT_RAW), 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_INT_ENA, UINT32_MAX);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_INT_ENA), 0x3FFu);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_PERI_SEL, 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_CONF1,
+                S3_GDMA_CHECK_OWNER);
+
+    /* Owner checking rejects a CPU-owned receive descriptor and raises only
+     * the architectural descriptor-error condition. */
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor0, buffer0, 3u,
+                       false, false, 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_LINK,
+                (descriptor0 & 0xFFFFFu) | S3_GDMA_IN_LINK_AUTO_RET |
+                S3_GDMA_IN_LINK_START);
+    ASSERT_EQ(flexe_gdma_write_rx(periph_gdma(fixture.periph), 0u,
+                                  payload, sizeof(payload)), -1);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_INT_RAW), 1u << 3);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_ERR_EOF_DESC), 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_INT_CLR, UINT32_MAX);
+
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor0, buffer0, 3u,
+                       false, true, descriptor1);
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor1, buffer1, 4u,
+                       true, true, 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_LINK,
+                (descriptor0 & 0xFFFFFu) | S3_GDMA_IN_LINK_AUTO_RET |
+                S3_GDMA_IN_LINK_START);
+    ASSERT_EQ(flexe_gdma_write_rx(periph_gdma(fixture.periph), 0u,
+                                  payload, sizeof(payload)), 0u);
+    ASSERT_EQ(mem_read8(fixture.cpu.mem, buffer0), payload[0]);
+    ASSERT_EQ(mem_read8(fixture.cpu.mem, buffer0 + 2u), payload[2]);
+    ASSERT_EQ(mem_read8(fixture.cpu.mem, buffer1), payload[3]);
+    ASSERT_EQ(mem_read8(fixture.cpu.mem, buffer1 + 1u), payload[4]);
+    ASSERT_EQ((mem_read32(fixture.cpu.mem, descriptor0) >> 12) & 0xFFFu,
+              3u);
+    ASSERT_EQ((mem_read32(fixture.cpu.mem, descriptor1) >> 12) & 0xFFFu,
+              2u);
+    ASSERT_FALSE(mem_read32(fixture.cpu.mem, descriptor0) &
+                 S3_GDMA_DESC_OWNER);
+    ASSERT_FALSE(mem_read32(fixture.cpu.mem, descriptor1) &
+                 S3_GDMA_DESC_OWNER);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_INT_RAW), 0x3u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_INT_ST), 0x3u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_SUC_EOF_DESC),
+              descriptor1);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_DESC), descriptor1);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_DESC_PREV),
+              descriptor0);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_LINK),
+              (descriptor0 & 0xFFFFFu) | S3_GDMA_IN_LINK_AUTO_RET |
+              S3_GDMA_IN_LINK_PARK);
+
+    /* A valid buffer which fills before the peripheral transfer completes is
+     * a descriptor-empty condition, not a malformed-descriptor condition. */
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_INT_CLR, UINT32_MAX);
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor0, buffer0, 2u,
+                       true, true, 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_IN_LINK,
+                (descriptor0 & 0xFFFFFu) | S3_GDMA_IN_LINK_START);
+    ASSERT_EQ(flexe_gdma_write_rx(periph_gdma(fixture.periph), 0u,
+                                  payload, 3u), -1);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_INT_RAW),
+              (1u << 4) | 1u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_IN_LINK),
+              (descriptor0 & 0xFFFFFu) | S3_GDMA_IN_LINK_PARK);
+
+    s3_sha_fixture_destroy(&fixture);
+}
+
 TEST(firmware_profile_does_not_authorize_mbedtls_sha256) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -579,6 +681,7 @@ static void run_crypto_tests(void) {
     RUN_TEST(esp32s3_sha_direct_modes_match_known_answers);
     RUN_TEST(esp32s3_sha_consumes_chained_gdma_descriptors);
     RUN_TEST(esp32s3_gdma_honors_owner_check_and_writeback);
+    RUN_TEST(esp32s3_gdma_receives_chained_descriptors_and_reports_errors);
     RUN_TEST(firmware_profile_does_not_authorize_mbedtls_sha256);
     RUN_TEST(raw_aes_128_encrypt_decrypt);
     RUN_TEST(raw_aes_192_encrypt_decrypt);

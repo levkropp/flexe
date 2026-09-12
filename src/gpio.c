@@ -63,6 +63,8 @@
 #define GPIO_FUNC_IN_MATRIX         (1u << 7u)
 #define GPIO_FUNC_OUT_MASK          0x00000FFFu
 #define GPIO_FUNC_OUT_SIGNAL_MASK   0x000001FFu
+#define GPIO_FUNC_OUT_SIGNAL_COUNT  512u
+#define GPIO_FUNC_OUT_SIGNAL_WORDS  (GPIO_FUNC_OUT_SIGNAL_COUNT / 64u)
 #define GPIO_FUNC_OUT_INVERT        (1u << 9u)
 #define GPIO_FUNC_OUT_OEN_SELECT    (1u << 10u)
 #define GPIO_FUNC_OUT_OEN_INVERT    (1u << 11u)
@@ -90,6 +92,7 @@ struct flexe_gpio {
     uint32_t pin[GPIO_PIN_REGISTER_COUNT];
     uint32_t func_in[GPIO_FUNC_IN_COUNT];
     uint32_t func_out[GPIO_PIN_REGISTER_COUNT];
+    uint64_t modeled_output_signal[GPIO_FUNC_OUT_SIGNAL_WORDS];
     uint32_t clock_gate;
     uint32_t date;
     bool irq_level[2];
@@ -164,6 +167,24 @@ int flexe_gpio_out_signal(const flexe_gpio_t *gpio, unsigned pin)
 {
     if (!gpio_pin_valid(gpio, pin)) return -1;
     return (int)(gpio->func_out[pin] & GPIO_FUNC_OUT_SIGNAL_MASK);
+}
+
+void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
+                                          unsigned signal)
+{
+    if (!gpio || signal >= GPIO_FUNC_OUT_SIGNAL_COUNT ||
+        signal == GPIO_FUNC_OUT_SOFTWARE)
+        return;
+    gpio->modeled_output_signal[signal / 64u] |=
+        UINT64_C(1) << (signal % 64u);
+}
+
+static bool gpio_output_signal_modeled(const flexe_gpio_t *gpio,
+                                       unsigned signal)
+{
+    return signal < GPIO_FUNC_OUT_SIGNAL_COUNT &&
+           (gpio->modeled_output_signal[signal / 64u] &
+            (UINT64_C(1) << (signal % 64u))) != 0u;
 }
 
 int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin)
@@ -495,14 +516,16 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t value)
     if (off >= GPIO_FUNC_OUT_BASE_OFF &&
         off < GPIO_FUNC_OUT_BASE_OFF + GPIO_PIN_REGISTER_COUNT * 4u) {
         unsigned pin = (off - GPIO_FUNC_OUT_BASE_OFF) / 4u;
+        unsigned signal;
         old = gpio->func_out[pin];
         next = value & GPIO_FUNC_OUT_MASK;
         gpio->func_out[pin] = next;
         if (old != next) {
             gpio_notify_pin(gpio, pin);
+            signal = next & GPIO_FUNC_OUT_SIGNAL_MASK;
             if (!gpio_pin_valid(gpio, pin) ||
-                (next & GPIO_FUNC_OUT_SIGNAL_MASK) !=
-                    GPIO_FUNC_OUT_SOFTWARE)
+                (signal != GPIO_FUNC_OUT_SOFTWARE &&
+                 !gpio_output_signal_modeled(gpio, signal)))
                 gpio_report_unsupported(gpio, addr, value);
         }
         return;

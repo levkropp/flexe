@@ -5,13 +5,12 @@
 #include <pthread.h>
 #include "peripherals.h"
 
-/* Raw GP-SPI display/touch capture for symbol-less firmware (Marauder,
- * NerdMiner). Display libraries for the CYD (TFT_eSPI, Adafruit_ILI9341,
- * XPT2046_Touchscreen) drive the panel through SPI2/SPI3 register writes
- * with CS and D/C as plain GPIOs. We emulate enough of the GP-SPI register
- * file for transactions to complete, capture the byte stream attributed by
- * CS/D/C, interpret ILI9341 commands into the emulator framebuffer, and
- * answer XPT2046 touch reads. */
+/* Target-described GP-SPI controller plus optional board devices. The shared
+ * controller handles native ESP32 and S2/S3-generation register layouts;
+ * CYD display/touch/SD interpretation is only one pluggable board-facing use
+ * of the bytes that cross it. */
+
+typedef struct flexe_gp_spi flexe_gp_spi_t;
 
 typedef struct {
     int      dc_pin;          /* ILI9341 D/C GPIO (default 2 on 2432S028R) */
@@ -35,8 +34,8 @@ typedef struct {
     void    *touch_ctx;
 } spi_display_config_t;
 
-/* Register MMIO handlers for SPI2 (0x3FF64000) and SPI3 (0x3FF65000).
- * Called from flexe_session_create after periph_create. */
+/* Replace the optional board-facing configuration without changing the SoC
+ * controller instances registered from the selected target descriptor. */
 void periph_enable_spi_display(esp32_periph_t *p, const spi_display_config_t *cfg);
 
 /* Release raw-SPI backing resources owned by a peripheral instance. */
@@ -83,5 +82,15 @@ uint64_t spi_display_bytes_fed(void);
 
 /* Completed XPT2046 commands received over GPIO software SPI. */
 uint64_t spi_touch_bitbang_commands(void);
+
+/* Machine-construction API. These are called by peripherals.c so a GP-SPI
+ * capability always creates its controllers, even for headless sessions. */
+flexe_gp_spi_t *flexe_gp_spi_create(
+    esp32_periph_t *p, mmio_read_fn fallback_read,
+    mmio_write_fn fallback_write, void *fallback_ctx);
+void flexe_gp_spi_destroy(flexe_gp_spi_t *spi);
+void flexe_gp_spi_set_system_state(flexe_gp_spi_t *spi, unsigned instance,
+                                   bool clock_enabled,
+                                   bool reset_asserted);
 
 #endif /* SPI_DISPLAY_H */

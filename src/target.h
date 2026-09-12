@@ -26,6 +26,8 @@
 #define FLEXE_TARGET_TIMER_GROUP_TIMER_MAX 2u
 #define FLEXE_TARGET_TIMER_GROUP_EVENT_MAX 3u
 #define FLEXE_TARGET_SPI_MEM_HOST_MAX 2u
+#define FLEXE_TARGET_GP_SPI_HOST_MAX 2u
+#define FLEXE_TARGET_GP_SPI_CS_MAX 6u
 #define FLEXE_TARGET_INTERRUPT_CORE_MAX 2u
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
 #define FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX 4u
@@ -38,13 +40,16 @@
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 5u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 7u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
 #define FLEXE_TARGET_SHA_MODE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 32u
+#define FLEXE_TARGET_GPIO_NONE UINT8_MAX
+#define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
+#define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 33u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -73,6 +78,7 @@ typedef enum {
     FLEXE_TARGET_CAP_GDMA_V1                      = 1ull << 20,
     FLEXE_TARGET_CAP_SHA_V1                       = 1ull << 21,
     FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF            = 1ull << 22,
+    FLEXE_TARGET_CAP_GP_SPI                       = 1ull << 23,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -206,6 +212,7 @@ typedef enum {
     FLEXE_SYSTEM_DEVICE_SYSTIMER,
     FLEXE_SYSTEM_DEVICE_TIMER_GROUP,
     FLEXE_SYSTEM_DEVICE_I2C,
+    FLEXE_SYSTEM_DEVICE_GP_SPI,
 } flexe_system_device_t;
 
 typedef struct {
@@ -622,6 +629,38 @@ typedef struct {
                                      [FLEXE_TARGET_TIMER_GROUP_EVENT_MAX];
 } flexe_timer_group_desc_t;
 
+/* General-purpose SPI2/SPI3 controller generations keep the same transaction
+ * phases while moving the FIFO, completion interrupt, and length registers.
+ * The layout selects those IP semantics; every address, interrupt source,
+ * GPIO-matrix route, native IOMUX route, and GDMA trigger remains target data.
+ * A UINT*_MAX route value means that the corresponding hardware connection
+ * does not exist on this target/host. */
+typedef enum {
+    FLEXE_GP_SPI_LAYOUT_NONE = 0,
+    FLEXE_GP_SPI_LAYOUT_ESP32,
+    FLEXE_GP_SPI_LAYOUT_S2_S3,
+} flexe_gp_spi_layout_t;
+
+typedef struct {
+    uint32_t base;
+    uint16_t clock_out_signal;
+    uint16_t chip_select_out_signal[FLEXE_TARGET_GP_SPI_CS_MAX];
+    uint8_t  interrupt_source;
+    uint8_t  chip_select_count;
+    uint8_t  iomux_clock_pin;
+    uint8_t  iomux_chip_select0_pin;
+    uint8_t  iomux_function;
+    uint8_t  gdma_peripheral_id;
+} flexe_gp_spi_instance_desc_t;
+
+typedef struct {
+    uint32_t register_size;
+    uint32_t date_reset;
+    uint8_t  host_count;
+    flexe_gp_spi_layout_t layout;
+    flexe_gp_spi_instance_desc_t instance[FLEXE_TARGET_GP_SPI_HOST_MAX];
+} flexe_gp_spi_desc_t;
+
 /* SPI0/SPI1 memory-controller generations share command semantics but move
  * the transaction and data-buffer registers. The selected architectural
  * layout supplies those register definitions; target data identifies the
@@ -793,6 +832,9 @@ typedef struct {
 
     /* Optional V1 timer-group and main-watchdog register blocks. */
     flexe_timer_group_desc_t      timer_group;
+
+    /* Optional general-purpose SPI2/SPI3 controllers and board routes. */
+    flexe_gp_spi_desc_t           gp_spi;
 
     /* Optional SPI memory controllers and their default attached devices. */
     flexe_spi_mem_desc_t          spi_mem;

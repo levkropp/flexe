@@ -3102,6 +3102,266 @@ static void test_spi_device_xfer(void *ctx, int host,
     if (miso_len > 1) miso[1] = 0x12u;
 }
 
+#define TEST_S3_SPI2_BASE 0x60024000u
+#define TEST_S3_SPI3_BASE 0x60025000u
+#define TEST_S3_GDMA_BASE 0x6003F000u
+
+typedef struct {
+    unsigned calls;
+    uint8_t tx[16];
+    size_t tx_len;
+} test_s3_spi_probe_t;
+
+static void test_s3_spi_probe(const uint8_t *mosi, size_t mosi_len,
+                              uint8_t *miso, size_t miso_len, void *ctx) {
+    test_s3_spi_probe_t *probe = ctx;
+    probe->calls++;
+    probe->tx_len = mosi_len < sizeof(probe->tx) ?
+                    mosi_len : sizeof(probe->tx);
+    if (probe->tx_len != 0u) memcpy(probe->tx, mosi, probe->tx_len);
+    for (size_t i = 0u; i < miso_len; i++)
+        miso[i] = i < mosi_len ? (uint8_t)(mosi[i] ^ 0xFFu) : 0xA5u;
+}
+
+TEST(gp_spi_s3_cpu_fifo_interrupt_clock_and_reset) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    if (!mem || !p) {
+        periph_destroy(p);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 8, 21); /* SPI2 -> CPU interrupt 8 */
+    test_s3_spi_probe_t probe = {0};
+    periph_spi_attach_probe(p, test_s3_spi_probe, &probe);
+
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x008u), 0x003C0000u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x00Cu), 0x80003043u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x010u), 0x800000C0u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x020u), 0x3Eu);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x030u), 0x3u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x0E0u), 0x02800000u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x0F0u), 0x02101190u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI3_BASE + 0x0F0u), 0x02101190u);
+
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x0E0u, 0u); /* master mode */
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x010u,
+                (1u << 27) | (1u << 28));
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x01Cu, 15u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x098u, 0x00003412u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x034u, 1u << 12);
+
+    /* The internal functional clock starts disabled. Trigger bits still
+     * self-clear, but no transfer or unsupported-MMIO diagnostic occurs. */
+    int unhandled = periph_unhandled_count(p);
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(probe.calls, 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), unhandled);
+
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x0E8u, 7u);
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 23); /* CMD.UPDATE */
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE), 0u);
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24); /* CMD.USR */
+    ASSERT_EQ(probe.calls, 1u);
+    ASSERT_EQ(probe.tx_len, 2u);
+    ASSERT_EQ(probe.tx[0], 0x12u);
+    ASSERT_EQ(probe.tx[1], 0x34u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x098u) & 0xFFFFu,
+              0x0000CBEDu);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x03Cu), 1u << 12);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x040u), 1u << 12);
+    ASSERT_TRUE(cpu0.interrupt & (1u << 8));
+
+    /* RAW is read-only; SET and CLR are the software-visible mutation paths. */
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x03Cu, 1u << 12);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x03Cu), 1u << 12);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x038u, 1u << 12);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x03Cu), 0u);
+    ASSERT_FALSE(cpu0.interrupt & (1u << 8));
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x044u, 1u << 12);
+    ASSERT_TRUE(cpu0.interrupt & (1u << 8));
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x038u, 1u << 12);
+
+    /* SPI3 has an independent register file and target interrupt/GDMA route. */
+    mem_write32(mem, TEST_S3_SPI3_BASE + 0x0E0u, 0u);
+    mem_write32(mem, TEST_S3_SPI3_BASE + 0x0E8u, 7u);
+    mem_write32(mem, TEST_S3_SPI3_BASE + 0x010u, 1u << 27);
+    mem_write32(mem, TEST_S3_SPI3_BASE + 0x01Cu, 7u);
+    mem_write32(mem, TEST_S3_SPI3_BASE + 0x098u, 0x5Au);
+    mem_write32(mem, TEST_S3_SPI3_BASE, 1u << 24);
+    ASSERT_EQ(probe.calls, 2u);
+    ASSERT_EQ(probe.tx_len, 1u);
+    ASSERT_EQ(probe.tx[0], 0x5Au);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x098u) & 0xFFFFu,
+              0x0000CBEDu);
+
+    /* SYSTEM clock gating suppresses work, while a reset edge restores the
+     * target-described register reset values independently for each host. */
+    uint32_t clocks = mem_read32(mem, TEST_S3_SYSTEM_BASE + 0x018u);
+    mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x018u, clocks & ~(1u << 6));
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(probe.calls, 2u);
+    ASSERT_EQ(periph_unhandled_count(p), unhandled);
+    mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x018u, clocks);
+    uint32_t resets = mem_read32(mem, TEST_S3_SYSTEM_BASE + 0x020u);
+    mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x020u, resets | (1u << 6));
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x010u), 0x800000C0u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x0E8u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI3_BASE + 0x010u), 1u << 27);
+    mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x020u, resets);
+    ASSERT_EQ(periph_unhandled_count(p), unhandled);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(gp_spi_s3_gdma_full_duplex) {
+    const uint32_t tx_desc = 0x3FC8F000u;
+    const uint32_t rx_desc = 0x3FC8F010u;
+    const uint32_t tx_buf = 0x3FC90000u;
+    const uint32_t rx_buf = 0x3FC90100u;
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *p = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    if (!mem || !p) {
+        periph_destroy(p);
+        mem_destroy(mem);
+        return;
+    }
+    test_s3_spi_probe_t probe = {0};
+    periph_spi_attach_probe(p, test_s3_spi_probe, &probe);
+
+    static const uint8_t request[] = {0x11u, 0x22u, 0x44u, 0x88u};
+    for (uint32_t i = 0u; i < sizeof(request); i++)
+        mem_write8(mem, tx_buf + i, request[i]);
+    test_spi_dma_desc(mem, tx_desc, tx_buf, sizeof(request),
+                      sizeof(request), 1, 0u);
+    test_spi_dma_desc(mem, rx_desc, rx_buf, sizeof(request),
+                      sizeof(request), 1, 0u);
+
+    /* One target-independent GDMA channel is connected in each direction to
+     * the SPI2 trigger ID supplied by the S3 descriptor. */
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x004u, 1u << 12);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x010u, 0x3FFu);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x048u, 0u);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x020u,
+                (rx_desc & 0xFFFFFu) | (1u << 20) | (1u << 22));
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x060u, 1u << 2);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x064u, 1u << 12);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x070u, 0xFFu);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x0A8u, 0u);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x080u,
+                (tx_desc & 0xFFFFFu) | (1u << 21));
+
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x0E0u, 0u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x0E8u, 7u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x010u,
+                (1u << 27) | (1u << 28));
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x01Cu,
+                (uint32_t)sizeof(request) * 8u - 1u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x030u,
+                (1u << 27) | (1u << 28));
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+
+    ASSERT_EQ(probe.calls, 1u);
+    ASSERT_EQ(probe.tx_len, sizeof(request));
+    ASSERT_TRUE(memcmp(probe.tx, request, sizeof(request)) == 0);
+    for (uint32_t i = 0u; i < sizeof(request); i++)
+        ASSERT_EQ(mem_read8(mem, rx_buf + i),
+                  (uint8_t)(request[i] ^ 0xFFu));
+    ASSERT_FALSE(mem_read32(mem, tx_desc) & (1u << 31));
+    ASSERT_FALSE(mem_read32(mem, rx_desc) & (1u << 31));
+    ASSERT_EQ((mem_read32(mem, rx_desc) >> 12) & 0xFFFu,
+              sizeof(request));
+    ASSERT_EQ(mem_read32(mem, TEST_S3_GDMA_BASE + 0x068u), 0x0Bu);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_GDMA_BASE + 0x008u), 0x03u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_GDMA_BASE + 0x028u), rx_desc);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x03Cu), 1u << 12);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(gp_spi_s3_uses_target_matrix_and_iomux_routes) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *p = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    if (!mem || !p) {
+        periph_destroy(p);
+        mem_destroy(mem);
+        return;
+    }
+
+    test_spi_device_t device = {0};
+    ASSERT_EQ(periph_spi_attach_device(p, 2, 10, 12,
+                                      test_spi_device_xfer, &device), 0);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x0E0u, 0u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x0E8u, 7u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x010u, 1u << 27);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x01Cu, 7u);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x098u, 0x6Cu);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x020u, 0x3Eu); /* CS0 on */
+
+    uint32_t sck_route = s3->gpio.base + 0x554u + 12u * 4u;
+    uint32_t cs_route = s3->gpio.base + 0x554u + 10u * 4u;
+    mem_write32(mem, sck_route, s3->gp_spi.instance[1].clock_out_signal);
+    mem_write32(mem, cs_route,
+                s3->gp_spi.instance[0].chip_select_out_signal[0]);
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(device.calls, 0u); /* clock belongs to SPI3 */
+
+    mem_write32(mem, sck_route,
+                s3->gp_spi.instance[0].clock_out_signal);
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(device.calls, 1u);
+    ASSERT_EQ(device.host, 2);
+    ASSERT_EQ(device.mosi_len, 1u);
+    ASSERT_EQ(device.mosi[0], 0x6Cu);
+
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x020u, 0x3Fu); /* CS0 off */
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(device.calls, 1u);
+
+    /* Return both pads to software matrix output, then select the native S3
+     * SPI2 routes described by IO_MUX function 4. */
+    mem_write32(mem, sck_route, 256u);
+    mem_write32(mem, cs_route, 256u);
+    mem_write32(mem,
+                s3->io_mux.base + s3->io_mux.gpio_register_offset[12],
+                (uint32_t)s3->gp_spi.instance[0].iomux_function <<
+                    s3->io_mux.function_shift);
+    mem_write32(mem,
+                s3->io_mux.base + s3->io_mux.gpio_register_offset[10],
+                (uint32_t)s3->gp_spi.instance[0].iomux_function <<
+                    s3->io_mux.function_shift);
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x020u, 0x3Eu);
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(device.calls, 2u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(gp_spi_routes_explicit_board_device) {
     const uint32_t spi2 = 0x3FF64000u;
     const uint32_t spi3 = 0x3FF65000u;
@@ -6458,6 +6718,9 @@ static void run_peripheral_tests(void) {
     RUN_TEST(spi_flash_dual_io_mode_bits_are_not_address_bits);
     RUN_TEST(wifi_mac_init_ready_handshake);
     RUN_TEST(radio_phy_calibration_register_files);
+    RUN_TEST(gp_spi_s3_cpu_fifo_interrupt_clock_and_reset);
+    RUN_TEST(gp_spi_s3_gdma_full_duplex);
+    RUN_TEST(gp_spi_s3_uses_target_matrix_and_iomux_routes);
     RUN_TEST(gp_spi_routes_explicit_board_device);
     RUN_TEST(gp_spi_dedicated_command_exposes_fsm_progress);
     RUN_TEST(xpt2046_pipelined_conversions);

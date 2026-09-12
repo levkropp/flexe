@@ -304,6 +304,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_I2C_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SHA_V1);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_GP_SPI);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(esp32->i2c.instance_count, 2u);
     ASSERT_EQ(esp32->i2c.instance[0].base, 0x3FF53000u);
@@ -338,6 +339,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GDMA_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GP_SPI);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(s3->i2c.instance_count, 2u);
     ASSERT_EQ(s3->i2c.instance[0].base, 0x60013000u);
@@ -367,7 +369,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 7u);
-    ASSERT_EQ(s3->system_clock.gate_count, 5u);
+    ASSERT_EQ(s3->system_clock.gate_count, 7u);
     ASSERT_EQ(s3->system_clock.reg[1].offset, 0x18u);
     ASSERT_EQ(s3->system_clock.reg[1].reset, 0xF9C1E06Fu);
     ASSERT_EQ(s3->system_clock.gate[0].device,
@@ -378,6 +380,12 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.gate[3].clock_mask, 1u << 7);
     ASSERT_EQ(s3->system_clock.gate[4].instance, 1u);
     ASSERT_EQ(s3->system_clock.gate[4].clock_mask, 1u << 18);
+    ASSERT_EQ(s3->system_clock.gate[5].device,
+              FLEXE_SYSTEM_DEVICE_GP_SPI);
+    ASSERT_EQ(s3->system_clock.gate[5].instance, 0u);
+    ASSERT_EQ(s3->system_clock.gate[5].clock_mask, 1u << 6);
+    ASSERT_EQ(s3->system_clock.gate[6].instance, 1u);
+    ASSERT_EQ(s3->system_clock.gate[6].clock_mask, 1u << 16);
     ASSERT_EQ(s3->io_mux.base, 0x60009000u);
     ASSERT_EQ(s3->io_mux.gpio_count, 49u);
     ASSERT_EQ(s3->io_mux.gpio_register_offset[26], 0x6Cu);
@@ -442,6 +450,30 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->systimer.counter_frequency_hz, 16000000u);
     ASSERT_EQ(s3->systimer.counter_count, 2u);
     ASSERT_EQ(s3->systimer.alarm_count, 3u);
+    ASSERT_EQ(esp32->gp_spi.layout, FLEXE_GP_SPI_LAYOUT_ESP32);
+    ASSERT_EQ(esp32->gp_spi.host_count, 2u);
+    ASSERT_EQ(esp32->gp_spi.instance[0].base, 0x3FF64000u);
+    ASSERT_EQ(esp32->gp_spi.instance[0].clock_out_signal, 8u);
+    ASSERT_EQ(esp32->gp_spi.instance[0].chip_select_out_signal[0], 11u);
+    ASSERT_EQ(esp32->gp_spi.instance[0].interrupt_source, 30u);
+    ASSERT_EQ(esp32->gp_spi.instance[1].base, 0x3FF65000u);
+    ASSERT_EQ(esp32->gp_spi.instance[1].clock_out_signal, 63u);
+    ASSERT_EQ(esp32->gp_spi.instance[1].interrupt_source, 31u);
+    ASSERT_EQ(s3->gp_spi.layout, FLEXE_GP_SPI_LAYOUT_S2_S3);
+    ASSERT_EQ(s3->gp_spi.register_size, 0x100u);
+    ASSERT_EQ(s3->gp_spi.host_count, 2u);
+    ASSERT_EQ(s3->gp_spi.date_reset, 0x02101190u);
+    ASSERT_EQ(s3->gp_spi.instance[0].base, 0x60024000u);
+    ASSERT_EQ(s3->gp_spi.instance[0].clock_out_signal, 101u);
+    ASSERT_EQ(s3->gp_spi.instance[0].chip_select_count, 6u);
+    ASSERT_EQ(s3->gp_spi.instance[0].chip_select_out_signal[5], 115u);
+    ASSERT_EQ(s3->gp_spi.instance[0].interrupt_source, 21u);
+    ASSERT_EQ(s3->gp_spi.instance[0].gdma_peripheral_id, 0u);
+    ASSERT_EQ(s3->gp_spi.instance[1].base, 0x60025000u);
+    ASSERT_EQ(s3->gp_spi.instance[1].clock_out_signal, 66u);
+    ASSERT_EQ(s3->gp_spi.instance[1].chip_select_out_signal[2], 127u);
+    ASSERT_EQ(s3->gp_spi.instance[1].interrupt_source, 22u);
+    ASSERT_EQ(s3->gp_spi.instance[1].gdma_peripheral_id, 1u);
     ASSERT_EQ(esp32->spi_mem.base[0], 0x3FF43000u);
     ASSERT_EQ(esp32->spi_mem.layout, FLEXE_SPI_MEM_LAYOUT_ESP32);
     ASSERT_EQ(esp32->spi_mem.maximum_flash_size, 0x01000000u);

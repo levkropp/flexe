@@ -28,6 +28,13 @@ int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_out_signal(const flexe_gpio_t *gpio, unsigned pin);
 
+/* Register a peripheral output producer implemented by the emulator. Matrix
+ * selections for unregistered producers remain visible but are diagnosed via
+ * the fallback handler, so adding a controller does not require weakening the
+ * GPIO model's unsupported-behavior accounting. */
+void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
+                                          unsigned signal);
+
 /* Drive the post-pad digital input sampled by GPIO_IN/IN1. Invalid or
  * unbonded pins are ignored. */
 void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level);

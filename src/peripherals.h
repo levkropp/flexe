@@ -11,6 +11,7 @@ typedef struct xtensa_cpu xtensa_cpu_t;
 
 typedef struct esp32_periph esp32_periph_t;
 typedef struct flexe_gdma flexe_gdma_t;
+typedef struct flexe_gp_spi flexe_gp_spi_t;
 
 /* One-shot host-device completion on the guest's peripheral clock. External
  * chips use this for operations which finish after their initiating bus
@@ -160,6 +161,8 @@ void periph_destroy(esp32_periph_t *p);
 /* Internal on-chip DMA fabric used to connect target-described peripheral
  * models. NULL means the selected target has no registered GDMA v1 block. */
 flexe_gdma_t *periph_gdma(esp32_periph_t *p);
+/* Internal controller lookup used by the board/device attachment layer. */
+flexe_gp_spi_t *periph_gp_spi(esp32_periph_t *p);
 
 void periph_set_uart_callback(esp32_periph_t *p, uart_tx_cb cb, void *ctx);
 int  periph_uart_tx_count(const esp32_periph_t *p);

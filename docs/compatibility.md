@@ -13,6 +13,7 @@ the selection into an assertion suitable for CI. Classic ESP32 execution is
 supported. ESP32-S3 chip ID `0x0009` has experimental interpreter support for
 the LX7 core, native memory map, flash/cache-MMU windows, mask ROM, dual-core
 startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
+general-purpose SPI2/SPI3 controllers and bidirectional AHB GDMA,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only
 revision-0 eFuse profile, digital pad configuration, UARTs, native USB
@@ -97,15 +98,33 @@ support: SCL/SDA edge timing, timing-register effects, arbitration, clock
 stretching, multi-master contention, electrical line resolution, and error
 injection are not modeled yet.
 
+The GP-SPI model is likewise selected by target capability and descriptor, not
+by firmware identity. Classic ESP32 and ESP32-S3 each supply their native
+SPI2/SPI3 bases, register generation, interrupt sources, GPIO-matrix and IOMUX
+routes, chip-select count, clock/reset gates, and DMA trigger IDs. In `fast`
+mode, CPU-FIFO polling transfers and S3 AHB-GDMA transmit/receive descriptor
+chains complete synchronously, including ownership and length write-back,
+EOF/error status, software interrupt set/clear, and SPI completion routing.
+Board models attach at the controller boundary; the CYD panel, touch, and SD
+card are consumers of that API rather than conditions inside the SoC map.
+Automated tests cover both hosts, matrix and native routes, clock/reset
+isolation, full-duplex DMA, malformed and exhausted receive chains, and the
+original classic display/SD paths. Slave mode, segmented/config-buffer
+transactions, GDMA interrupt delivery, bus arbitration, signal edges, and
+clock-derived transfer duration remain outside this functional envelope.
+Unsupported framing and invalid DMA setup are diagnosed instead of silently
+reported as successful transfers.
+
 The S3 SHA model uses target-described mode mappings and consumes the active
 AHB GDMA v1 transmit chain selected for SHA, including chained descriptors,
 length and EOF validation, optional owner checking and write-back, and
-completion status. It therefore works for stripped firmware without an ELF
-symbol or firmware-specific hook. Fast mode completes each block immediately;
-SHA/GDMA latency, arbitration, CPU interrupt delivery, general GDMA receive
-transfers, and SHA-512/224, SHA-512/256, and configurable SHA-512/t are not yet
-modeled. Requests for the unsupported SHA modes or malformed DMA chains are
-rejected with a diagnostic rather than returning invented digest data.
+completion status. The shared GDMA model also accepts receive streams from
+modeled peripherals such as GP-SPI. It therefore works for stripped firmware
+without an ELF symbol or firmware-specific hook. Fast mode completes each
+block immediately; SHA/GDMA latency, arbitration, GDMA CPU interrupt delivery,
+and SHA-512/224, SHA-512/256, and configurable SHA-512/t are not yet modeled.
+Requests for the unsupported SHA modes or malformed DMA chains are rejected
+with a diagnostic rather than returning invented digest data.
 
 The S3 RTC counter advances on the same shared dual-core virtual timeline as
 the other target-described timers. Its two-half latch, runtime CPU-frequency

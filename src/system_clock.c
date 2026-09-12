@@ -89,7 +89,11 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             (gate->device == FLEXE_SYSTEM_DEVICE_I2C &&
              gate->instance < FLEXE_TARGET_I2C_MAX &&
              gate->instance < target->i2c.instance_count &&
-             (target->capabilities & FLEXE_TARGET_CAP_I2C_V1));
+             (target->capabilities & FLEXE_TARGET_CAP_I2C_V1)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_GP_SPI &&
+             gate->instance < FLEXE_TARGET_GP_SPI_HOST_MAX &&
+             gate->instance < target->gp_spi.host_count &&
+             (target->capabilities & FLEXE_TARGET_CAP_GP_SPI));
         if (!device_valid || clock_reg < 0 || reset_reg < 0 ||
             !system_clock_single_bit(gate->clock_mask) ||
             !system_clock_single_bit(gate->reset_mask) ||
