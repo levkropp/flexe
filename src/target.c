@@ -199,7 +199,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_RTC_CNTL_V1 |
                         FLEXE_TARGET_CAP_EFUSE_READ_V1 |
                         FLEXE_TARGET_CAP_GPIO_V1 |
-                        FLEXE_TARGET_CAP_I2C_V1,
+                        FLEXE_TARGET_CAP_I2C_V1 |
+                        FLEXE_TARGET_CAP_SENS_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -575,6 +576,33 @@ static const flexe_target_desc_t TARGETS[] = {
                  * completes its internal analog conversion synchronously. */
                 { 0x050u, 0x07000000u, 0xF8FFFFFFu },
             },
+        },
+        .sens = {
+            .base = 0x60008800u,
+            .register_size = 0x200u,
+            .control_offset = 0x050u,
+            .control2_offset = 0x054u,
+            .clock_gate_offset = 0x104u,
+            .reset_offset = 0x108u,
+            .control_reset = 0x00019000u,
+            .control2_reset = 0x00004002u,
+            .control_writable_mask = 0x01FFF000u,
+            .control2_writable_mask = 0x00007FFFu,
+            .clock_gate_writable_mask = 0xE8000000u,
+            .reset_writable_mask = 0x6A000000u,
+            .dump_out_mask = 1u << 24,
+            .power_up_force_mask = 1u << 23,
+            .power_up_mask = 1u << 22,
+            .input_invert_mask = 1u << 13,
+            .interrupt_enable_mask = 1u << 12,
+            .ready_mask = 1u << 8,
+            .output_mask = 0xFFu,
+            .xpd_force_mask = 3u << 12,
+            .clock_enable_mask = 1u << 29,
+            .reset_mask = 1u << 29,
+            .rtc_interrupt_mask = 1u << 12,
+            /* Raw code 104 is approximately 25 C in range 2 (offset 0). */
+            .default_output = 104u,
         },
         .sensitive_memprot = {
             .base = 0x600C1000u,

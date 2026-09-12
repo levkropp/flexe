@@ -40,7 +40,7 @@
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 5u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 28u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 29u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -64,6 +64,7 @@ typedef enum {
     FLEXE_TARGET_CAP_EFUSE_READ_V1                = 1ull << 15,
     FLEXE_TARGET_CAP_GPIO_V1                      = 1ull << 16,
     FLEXE_TARGET_CAP_I2C_V1                       = 1ull << 17,
+    FLEXE_TARGET_CAP_SENS_V1                      = 1ull << 18,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -407,6 +408,40 @@ typedef struct {
     uint32_t writable_mask;
 } flexe_regi2c_aux_register_desc_t;
 
+/* RTC-domain sensor controller. The first reusable model covers the S2/S3
+ * temperature-sensor front end while leaving room for ADC and touch blocks
+ * to be added without teaching firmware addresses to the machine frontend.
+ * In fast mode a powered, clocked conversion completes synchronously; timed
+ * modes can derive latency from the retained divider and wait fields. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint16_t control_offset;
+    uint16_t control2_offset;
+    uint16_t clock_gate_offset;
+    uint16_t reset_offset;
+    uint32_t control_reset;
+    uint32_t control2_reset;
+    uint32_t clock_gate_reset;
+    uint32_t reset_reset;
+    uint32_t control_writable_mask;
+    uint32_t control2_writable_mask;
+    uint32_t clock_gate_writable_mask;
+    uint32_t reset_writable_mask;
+    uint32_t dump_out_mask;
+    uint32_t power_up_force_mask;
+    uint32_t power_up_mask;
+    uint32_t input_invert_mask;
+    uint32_t interrupt_enable_mask;
+    uint32_t ready_mask;
+    uint32_t output_mask;
+    uint32_t xpd_force_mask;
+    uint32_t clock_enable_mask;
+    uint32_t reset_mask;
+    uint32_t rtc_interrupt_mask;
+    uint16_t default_output;
+} flexe_sens_desc_t;
+
 /* Internal analog-register I2C fabric used by ROM clock, bias, PHY, and ADC
  * code. This is distinct from the externally routed I2C controllers. The ROM
  * command ABI is described here so the same device model can serve targets
@@ -626,6 +661,9 @@ typedef struct {
 
     /* Optional internal analog-register I2C fabric. */
     flexe_regi2c_desc_t           regi2c;
+
+    /* Optional RTC-domain ADC/touch/temperature sensor controller. */
+    flexe_sens_desc_t             sens;
 
     /* Optional SENSITIVE v1 memory-protection configuration block. */
     flexe_sensitive_memprot_desc_t sensitive_memprot;

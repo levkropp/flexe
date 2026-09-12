@@ -6,6 +6,7 @@
 #include "io_mux.h"
 #include "rtc_cntl.h"
 #include "regi2c.h"
+#include "sens.h"
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
 #include "system_clock.h"
@@ -1166,6 +1167,7 @@ static void target_rtc_cntl_state_changed(void *ctx);
 static void target_rtc_cntl_irq_changed(void *ctx, bool level);
 static void target_rtc_cntl_reset_requested(
     void *ctx, flexe_rtc_cntl_wdt_action_t action);
+static void target_sens_conversion_done(void *ctx);
 static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_state_changed(void *ctx);
@@ -1838,6 +1840,7 @@ struct esp32_periph {
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
     flexe_regi2c_t *regi2c;
+    flexe_sens_t *target_sens;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_system_clock_t *system_clock;
     flexe_systimer_t *systimer;
@@ -13722,6 +13725,16 @@ static void target_rtc_cntl_reset_requested(
     if (p) p->reset_requested = true;
 }
 
+static void target_sens_conversion_done(void *ctx)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !p->target_rtc_cntl ||
+        !(p->target->capabilities & FLEXE_TARGET_CAP_SENS_V1))
+        return;
+    flexe_rtc_cntl_set_interrupts(
+        p->target_rtc_cntl, p->target->sens.rtc_interrupt_mask, true);
+}
+
 /* ---- Target-described system timer ---- */
 
 static void system_clock_gate_changed(
@@ -14274,9 +14287,19 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         if (target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)
             p->target_efuse = flexe_efuse_create(
                 mem, default_read, default_write, p);
-        if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
-            p->target_rtc_cntl = flexe_rtc_cntl_create(
+        if (target->capabilities & FLEXE_TARGET_CAP_SENS_V1)
+            p->target_sens = flexe_sens_create(
                 mem, default_read, default_write, p,
+                target_sens_conversion_done, p);
+        if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
+            mmio_read_fn fallback_read = p->target_sens
+                ? flexe_sens_mmio_read : default_read;
+            mmio_write_fn fallback_write = p->target_sens
+                ? flexe_sens_mmio_write : default_write;
+            void *fallback_ctx = p->target_sens
+                ? (void *)p->target_sens : (void *)p;
+            p->target_rtc_cntl = flexe_rtc_cntl_create(
+                mem, fallback_read, fallback_write, fallback_ctx,
                 target_rtc_cntl_state_changed, p,
                 target_rtc_cntl_irq_changed, p,
                 target_rtc_cntl_reset_requested, p);
@@ -14291,6 +14314,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
         if (((target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1) &&
              !p->target_efuse) ||
+            ((target->capabilities & FLEXE_TARGET_CAP_SENS_V1) &&
+             !p->target_sens) ||
             ((target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) &&
              !p->target_rtc_cntl) ||
             (target->flash_mmu.shared_instruction_data &&
@@ -14588,6 +14613,7 @@ void periph_destroy(esp32_periph_t *p) {
         (void)mem_register_mmio_range(
             p->mem, p->target->rtc_cntl.base,
             p->target->rtc_cntl.register_size, NULL, NULL, NULL);
+    flexe_sens_destroy(p->target_sens);
     flexe_io_mux_destroy(p->io_mux);
     if (p->target->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1)
         (void)mem_register_mmio_range(
@@ -15275,6 +15301,15 @@ int periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int) {
 void periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw) {
     if (!p || channel < 0 || channel >= 40) return;
     p->adc_value[channel] = raw;
+}
+
+void periph_set_temperature_raw(esp32_periph_t *p, uint16_t raw) {
+    if (!p) return;
+    flexe_sens_set_temperature_raw(p->target_sens, raw);
+}
+
+uint16_t periph_get_temperature_raw(const esp32_periph_t *p) {
+    return p ? flexe_sens_temperature_raw(p->target_sens) : 0u;
 }
 
 uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel) {

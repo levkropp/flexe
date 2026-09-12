@@ -75,6 +75,7 @@ set(LIB_SOURCES
     src/io_mux.c
     src/rtc_cntl.c
     src/regi2c.c
+    src/sens.c
     src/sensitive_memprot.c
     src/system_clock.c
     src/systimer.c

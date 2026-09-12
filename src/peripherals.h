@@ -439,6 +439,12 @@ void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value);
 void     periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw);
 uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel);
 
+/* Physical-side raw code for a target-described on-die temperature sensor.
+ * The next conversion latches this input. Unsupported targets ignore writes
+ * and read zero; the ESP32-S3 profile defaults to an ambient-like code. */
+void     periph_set_temperature_raw(esp32_periph_t *p, uint16_t raw);
+uint16_t periph_get_temperature_raw(const esp32_periph_t *p);
+
 /* Current classic-ESP32 DAC state. Channels 0/1 correspond to GPIO25/26.
  * Invalid channels return -1 for enabled and 0 for value. */
 int     periph_dac_enabled(const esp32_periph_t *p, int channel);
