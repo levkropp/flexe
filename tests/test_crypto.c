@@ -3,6 +3,7 @@
 #include "rom_stubs.h"
 #include "aes_stubs.h"
 #include "mpi_stubs.h"
+#include "peripherals.h"
 
 #define AES_BASE_ADDR 0x3FF01000u
 
@@ -257,7 +258,7 @@ static void sha_check(xtensa_cpu_t *cpu, const char *msg, int words,
 TEST(sha_accelerator_matches_known_answers) {
     xtensa_cpu_t cpu;
     setup(&cpu);
-    sha_stubs_t *ss = sha_stubs_create(&cpu);
+    sha_stubs_t *ss = sha_stubs_create(&cpu, NULL);
     ASSERT_TRUE(ss != NULL);
 
     static const uint32_t sha1_abc[5] = {
@@ -283,11 +284,273 @@ TEST(sha_accelerator_matches_known_answers) {
     teardown(&cpu);
 }
 
+/* ESP32-S3 drives the unified SHA block through its native register layout.
+ * Production ESP-IDF uses the same path without requiring ELF symbols. */
+#define S3_SHA_BASE             0x6003B000u
+#define S3_SHA_MODE             (S3_SHA_BASE + 0x00u)
+#define S3_SHA_BLOCK_NUM        (S3_SHA_BASE + 0x0Cu)
+#define S3_SHA_START            (S3_SHA_BASE + 0x10u)
+#define S3_SHA_CONTINUE         (S3_SHA_BASE + 0x14u)
+#define S3_SHA_BUSY             (S3_SHA_BASE + 0x18u)
+#define S3_SHA_DMA_START        (S3_SHA_BASE + 0x1Cu)
+#define S3_SHA_H                (S3_SHA_BASE + 0x40u)
+#define S3_SHA_TEXT             (S3_SHA_BASE + 0x80u)
+
+#define S3_GDMA_BASE            0x6003F000u
+#define S3_GDMA_OUT_CONF0       (S3_GDMA_BASE + 0x060u)
+#define S3_GDMA_OUT_CONF1       (S3_GDMA_BASE + 0x064u)
+#define S3_GDMA_OUT_INT_RAW     (S3_GDMA_BASE + 0x068u)
+#define S3_GDMA_OUT_INT_ST      (S3_GDMA_BASE + 0x06Cu)
+#define S3_GDMA_OUT_INT_ENA     (S3_GDMA_BASE + 0x070u)
+#define S3_GDMA_OUT_INT_CLR     (S3_GDMA_BASE + 0x074u)
+#define S3_GDMA_OUT_LINK        (S3_GDMA_BASE + 0x080u)
+#define S3_GDMA_OUT_EOF_DESC    (S3_GDMA_BASE + 0x088u)
+#define S3_GDMA_OUT_EOF_PREV    (S3_GDMA_BASE + 0x08Cu)
+#define S3_GDMA_OUT_DESC        (S3_GDMA_BASE + 0x090u)
+#define S3_GDMA_OUT_DESC_PREV   (S3_GDMA_BASE + 0x094u)
+#define S3_GDMA_OUT_PERI_SEL    (S3_GDMA_BASE + 0x0A8u)
+
+#define S3_GDMA_LINK_START      (1u << 21)
+#define S3_GDMA_LINK_PARK       (1u << 23)
+#define S3_GDMA_AUTO_WRITEBACK  (1u << 2)
+#define S3_GDMA_CHECK_OWNER     (1u << 12)
+#define S3_GDMA_DESC_EOF        (1u << 30)
+#define S3_GDMA_DESC_OWNER      (1u << 31)
+
+typedef struct {
+    xtensa_cpu_t cpu;
+    esp32_periph_t *periph;
+    sha_stubs_t *sha;
+} s3_sha_fixture_t;
+
+static bool s3_sha_fixture_init(s3_sha_fixture_t *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    const flexe_target_desc_t *target =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_cpu_reset_for_target(&fixture->cpu, target);
+    fixture->cpu.mem = mem_create_for_target(target);
+    if (!fixture->cpu.mem) return false;
+    fixture->periph = periph_create(fixture->cpu.mem);
+    if (!fixture->periph || !periph_gdma(fixture->periph)) return false;
+    fixture->sha = sha_stubs_create(
+        &fixture->cpu, periph_gdma(fixture->periph));
+    return fixture->sha != NULL;
+}
+
+static void s3_sha_fixture_destroy(s3_sha_fixture_t *fixture) {
+    sha_stubs_destroy(fixture->sha);
+    periph_destroy(fixture->periph);
+    mem_destroy(fixture->cpu.mem);
+}
+
+static int sha_pad_for_block(const char *msg, uint8_t *out,
+                             size_t block_size) {
+    size_t n = strlen(msg);
+    size_t length_size = block_size == 128u ? 16u : 8u;
+    size_t total = (n + 1u + length_size + block_size - 1u) /
+                   block_size * block_size;
+    memset(out, 0, total);
+    memcpy(out, msg, n);
+    out[n] = 0x80u;
+    uint64_t bits = (uint64_t)n * 8u;
+    for (int i = 0; i < 8; i++)
+        out[total - 1u - (size_t)i] = (uint8_t)(bits >> (8 * i));
+    return (int)(total / block_size);
+}
+
+static void s3_sha_fill_block(xtensa_mem_t *mem, const uint8_t *block,
+                              size_t block_size) {
+    for (size_t i = 0u; i < block_size / sizeof(uint32_t); i++)
+        mem_write32(mem, S3_SHA_TEXT + (uint32_t)i * 4u,
+                    crypto_le32(block + i * 4u));
+}
+
+static void s3_sha_check_direct(xtensa_mem_t *mem, const char *msg,
+                                uint32_t mode, size_t block_size,
+                                const uint32_t *expected, size_t words) {
+    uint8_t padded[256];
+    int blocks = sha_pad_for_block(msg, padded, block_size);
+    mem_write32(mem, S3_SHA_MODE, mode);
+    for (int block = 0; block < blocks; block++) {
+        s3_sha_fill_block(mem, padded + (size_t)block * block_size,
+                          block_size);
+        mem_write32(mem, block == 0 ? S3_SHA_START : S3_SHA_CONTINUE, 1u);
+    }
+    ASSERT_EQ(mem_read32(mem, S3_SHA_BUSY), 0u);
+    for (size_t i = 0u; i < words; i++)
+        ASSERT_EQ(mem_read32(mem, S3_SHA_H + (uint32_t)i * 4u), expected[i]);
+}
+
+TEST(esp32s3_sha_direct_modes_match_known_answers) {
+    s3_sha_fixture_t fixture;
+    bool ready = s3_sha_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_sha_fixture_destroy(&fixture);
+        return;
+    }
+
+    static const uint32_t sha1_abc[5] = {
+        0xA9993E36u, 0x4706816Au, 0xBA3E2571u, 0x7850C26Cu,
+        0x9CD0D89Du};
+    static const uint32_t sha1_two[5] = {
+        0x84983E44u, 0x1C3BD26Eu, 0xBAAE4AA1u, 0xF95129E5u,
+        0xE54670F1u};
+    static const uint32_t sha224_abc[7] = {
+        0x23097D22u, 0x3405D822u, 0x8642A477u, 0xBDA255B3u,
+        0x2AADBCE4u, 0xBDA0B3F7u, 0xE36C9DA7u};
+    static const uint32_t sha256_abc[8] = {
+        0xBA7816BFu, 0x8F01CFEAu, 0x414140DEu, 0x5DAE2223u,
+        0xB00361A3u, 0x96177A9Cu, 0xB410FF61u, 0xF20015ADu};
+    static const uint32_t sha384_abc[12] = {
+        0xCB00753Fu, 0x45A35E8Bu, 0xB5A03D69u, 0x9AC65007u,
+        0x272C32ABu, 0x0EDED163u, 0x1A8B605Au, 0x43FF5BEDu,
+        0x8086072Bu, 0xA1E7CC23u, 0x58BAECA1u, 0x34C825A7u};
+    static const uint32_t sha512_abc[16] = {
+        0xDDAF35A1u, 0x93617ABAu, 0xCC417349u, 0xAE204131u,
+        0x12E6FA4Eu, 0x89A97EA2u, 0x0A9EEEE6u, 0x4B55D39Au,
+        0x2192992Au, 0x274FC1A8u, 0x36BA3C23u, 0xA3FEEBBDu,
+        0x454D4423u, 0x643CE80Eu, 0x2A9AC94Fu, 0xA54CA49Fu};
+
+    s3_sha_check_direct(fixture.cpu.mem, "abc", 0u, 64u,
+                        sha1_abc, 5u);
+    s3_sha_check_direct(
+        fixture.cpu.mem,
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+        0u, 64u, sha1_two, 5u);
+    s3_sha_check_direct(fixture.cpu.mem, "abc", 1u, 64u,
+                        sha224_abc, 7u);
+    s3_sha_check_direct(fixture.cpu.mem, "abc", 2u, 64u,
+                        sha256_abc, 8u);
+    s3_sha_check_direct(fixture.cpu.mem, "abc", 3u, 128u,
+                        sha384_abc, 12u);
+    s3_sha_check_direct(fixture.cpu.mem, "abc", 4u, 128u,
+                        sha512_abc, 16u);
+
+    s3_sha_fixture_destroy(&fixture);
+}
+
+static void s3_gdma_descriptor(xtensa_mem_t *mem, uint32_t descriptor,
+                               uint32_t buffer, uint32_t length,
+                               bool eof, bool owner, uint32_t next) {
+    uint32_t dw0 = length | (length << 12);
+    if (eof) dw0 |= S3_GDMA_DESC_EOF;
+    if (owner) dw0 |= S3_GDMA_DESC_OWNER;
+    mem_write32(mem, descriptor, dw0);
+    mem_write32(mem, descriptor + 4u, buffer);
+    mem_write32(mem, descriptor + 8u, next);
+}
+
+TEST(esp32s3_sha_consumes_chained_gdma_descriptors) {
+    const uint32_t descriptor0 = 0x3FC8F000u;
+    const uint32_t descriptor1 = 0x3FC8F010u;
+    const uint32_t buffer0 = 0x3FC90000u;
+    const uint32_t buffer1 = 0x3FC90100u;
+    s3_sha_fixture_t fixture;
+    bool ready = s3_sha_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_sha_fixture_destroy(&fixture);
+        return;
+    }
+
+    uint8_t padded[64];
+    ASSERT_EQ(sha_pad_for_block("abc", padded, 64u), 1u);
+    for (uint32_t i = 0u; i < 20u; i++)
+        mem_write8(fixture.cpu.mem, buffer0 + i, padded[i]);
+    for (uint32_t i = 20u; i < sizeof(padded); i++)
+        mem_write8(fixture.cpu.mem, buffer1 + i - 20u, padded[i]);
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor0, buffer0, 20u,
+                       false, true, descriptor1);
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor1, buffer1, 44u,
+                       true, true, 0u);
+
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_PERI_SEL), 0x3Fu);
+    ASSERT_TRUE(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_LINK) &
+                S3_GDMA_LINK_PARK);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_PERI_SEL, 7u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_INT_ENA, 0xFFu);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_LINK,
+                (descriptor0 & 0xFFFFFu) | S3_GDMA_LINK_START);
+    mem_write32(fixture.cpu.mem, S3_SHA_MODE, 0u);
+    mem_write32(fixture.cpu.mem, S3_SHA_BLOCK_NUM, 1u);
+    mem_write32(fixture.cpu.mem, S3_SHA_DMA_START, 1u);
+
+    static const uint32_t sha1_abc[5] = {
+        0xA9993E36u, 0x4706816Au, 0xBA3E2571u, 0x7850C26Cu,
+        0x9CD0D89Du};
+    for (size_t i = 0u; i < 5u; i++)
+        ASSERT_EQ(mem_read32(fixture.cpu.mem,
+                             S3_SHA_H + (uint32_t)i * 4u), sha1_abc[i]);
+    ASSERT_TRUE(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_LINK) &
+                S3_GDMA_LINK_PARK);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_INT_RAW), 0x0Bu);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_INT_ST), 0x0Bu);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_EOF_DESC),
+              descriptor1);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_EOF_PREV),
+              descriptor0);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_DESC), descriptor1);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_DESC_PREV),
+              descriptor0);
+    /* ESP-IDF does not request automatic descriptor write-back for its
+     * shared crypto channel, so ownership remains with DMA. */
+    ASSERT_TRUE(mem_read32(fixture.cpu.mem, descriptor0) &
+                S3_GDMA_DESC_OWNER);
+    ASSERT_TRUE(mem_read32(fixture.cpu.mem, descriptor1) &
+                S3_GDMA_DESC_OWNER);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_INT_CLR, 0x0Bu);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_INT_RAW), 0u);
+
+    s3_sha_fixture_destroy(&fixture);
+}
+
+TEST(esp32s3_gdma_honors_owner_check_and_writeback) {
+    const uint32_t descriptor = 0x3FC8F000u;
+    const uint32_t buffer = 0x3FC90000u;
+    s3_sha_fixture_t fixture;
+    bool ready = s3_sha_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_sha_fixture_destroy(&fixture);
+        return;
+    }
+
+    uint8_t payload[4] = {1u, 2u, 3u, 4u};
+    for (uint32_t i = 0u; i < sizeof(payload); i++)
+        mem_write8(fixture.cpu.mem, buffer + i, payload[i]);
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor, buffer, sizeof(payload),
+                       true, false, 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_PERI_SEL, 7u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_CONF1, S3_GDMA_CHECK_OWNER);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_LINK,
+                (descriptor & 0xFFFFFu) | S3_GDMA_LINK_START);
+    uint8_t received[4] = {0};
+    ASSERT_EQ(flexe_gdma_read_tx(periph_gdma(fixture.periph), 7u,
+                                 received, sizeof(received)), -1);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_OUT_INT_RAW), 1u << 2);
+
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_INT_CLR, UINT32_MAX);
+    s3_gdma_descriptor(fixture.cpu.mem, descriptor, buffer, sizeof(payload),
+                       true, true, 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_CONF0,
+                S3_GDMA_AUTO_WRITEBACK | 1u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_OUT_LINK,
+                (descriptor & 0xFFFFFu) | S3_GDMA_LINK_START);
+    ASSERT_EQ(flexe_gdma_read_tx(periph_gdma(fixture.periph), 7u,
+                                 received, sizeof(received)), 0u);
+    ASSERT_EQ(crypto_le32(received), crypto_le32(payload));
+    ASSERT_FALSE(mem_read32(fixture.cpu.mem, descriptor) &
+                 S3_GDMA_DESC_OWNER);
+
+    s3_sha_fixture_destroy(&fixture);
+}
+
 TEST(firmware_profile_does_not_authorize_mbedtls_sha256) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
-    sha_stubs_t *ss = sha_stubs_create(&cpu);
+    sha_stubs_t *ss = sha_stubs_create(&cpu, NULL);
     ASSERT_TRUE(ss != NULL);
     int initial_stub_count = rom_stubs_stub_count(rom);
     ASSERT_EQ(sha_stubs_hook_firmware(ss), 0);
@@ -313,6 +576,9 @@ TEST(firmware_profile_does_not_authorize_mbedtls_sha256) {
 static void run_crypto_tests(void) {
     TEST_SUITE("Crypto MMIO");
     RUN_TEST(sha_accelerator_matches_known_answers);
+    RUN_TEST(esp32s3_sha_direct_modes_match_known_answers);
+    RUN_TEST(esp32s3_sha_consumes_chained_gdma_descriptors);
+    RUN_TEST(esp32s3_gdma_honors_owner_check_and_writeback);
     RUN_TEST(firmware_profile_does_not_authorize_mbedtls_sha256);
     RUN_TEST(raw_aes_128_encrypt_decrypt);
     RUN_TEST(raw_aes_192_encrypt_decrypt);

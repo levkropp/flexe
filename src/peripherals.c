@@ -2,6 +2,7 @@
 #include "esp32s3_extmem.h"
 #include "efuse.h"
 #include "flash_mmu.h"
+#include "gdma.h"
 #include "gpio.h"
 #include "io_mux.h"
 #include "rtc_cntl.h"
@@ -1806,6 +1807,7 @@ struct esp32_periph {
     flexe_flash_mmu_t *shared_flash_mmu;
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_efuse_t *target_efuse;
+    flexe_gdma_t *gdma;
     flexe_gpio_t *target_gpio;
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
@@ -14173,6 +14175,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_GDMA_V1) {
+        p->gdma = flexe_gdma_create(
+            mem, default_read, default_write, p);
+        if (!p->gdma) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     bool classic = (target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     if (!classic) {
@@ -14492,6 +14503,7 @@ void periph_destroy(esp32_periph_t *p) {
             p->mem, p->target->gpio.base,
             p->target->gpio.register_size, NULL, NULL, NULL);
     flexe_usb_serial_jtag_destroy(p->usb_serial_jtag);
+    flexe_gdma_destroy(p->gdma);
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_timer_group_destroy(p->target_timer_group);
     flexe_systimer_destroy(p->systimer);
@@ -14549,6 +14561,10 @@ void periph_destroy(esp32_periph_t *p) {
         free(p->i2c[port].pending_write);
     free(p->sdmmc.transfer);
     free(p);
+}
+
+flexe_gdma_t *periph_gdma(esp32_periph_t *p) {
+    return p ? p->gdma : NULL;
 }
 
 int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,

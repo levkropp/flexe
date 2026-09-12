@@ -331,12 +331,17 @@ static int session_build(flexe_session_t *s)
             sdcard_stubs_hook_symbols(s->sstubs, s->syms);
     }
 
-    /* SHA hardware accelerator stubs */
-    s->shstubs = classic_compat ? sha_stubs_create(&s->cpu[0]) : NULL;
+    /* Target-described SHA hardware accelerator. Classic compatibility also
+     * enables optional, validated software/HAL hooks; newer targets execute
+     * their real MMIO and GDMA path so stripped images behave identically. */
+    s->shstubs = (target->capabilities & FLEXE_TARGET_CAP_SHA_V1)
+        ? sha_stubs_create(&s->cpu[0], periph_gdma(s->periph)) : NULL;
     if (s->shstubs) {
-        sha_stubs_hook_firmware(s->shstubs);
-        if (s->syms)
-            sha_stubs_hook_symbols(s->shstubs, s->syms);
+        if (classic_compat) {
+            sha_stubs_hook_firmware(s->shstubs);
+            if (s->syms)
+                sha_stubs_hook_symbols(s->shstubs, s->syms);
+        }
     }
 
     /* AES hardware accelerator stubs */

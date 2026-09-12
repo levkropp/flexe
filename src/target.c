@@ -21,7 +21,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SPI_MEM |
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
                         FLEXE_TARGET_CAP_I2C_V1 |
-                        FLEXE_TARGET_CAP_RADIO_REGS_V1,
+                        FLEXE_TARGET_CAP_RADIO_REGS_V1 |
+                        FLEXE_TARGET_CAP_SHA_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2BCFFFEu,
@@ -159,6 +160,19 @@ static const flexe_target_desc_t TARGETS[] = {
             .random_address = 0x3FF75144u,
             .random_seed = UINT64_C(0x12345678ABCDEF01),
         },
+        .sha = {
+            .base = 0x3FF03000u,
+            .register_size = 0x1000u,
+            .layout = FLEXE_SHA_LAYOUT_ESP32,
+            .mode_count = 4u,
+            .dma_peripheral_id = UINT8_MAX,
+            .mode = {
+                FLEXE_SHA_ALGORITHM_SHA1,
+                FLEXE_SHA_ALGORITHM_SHA256,
+                FLEXE_SHA_ALGORITHM_SHA384,
+                FLEXE_SHA_ALGORITHM_SHA512,
+            },
+        },
         .spi_mem = {
             .base = { 0x3FF43000u, 0x3FF42000u },
             .register_size = 0x1000u,
@@ -234,7 +248,9 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_GPIO_V1 |
                         FLEXE_TARGET_CAP_I2C_V1 |
                         FLEXE_TARGET_CAP_SENS_V1 |
-                        FLEXE_TARGET_CAP_RADIO_REGS_V1,
+                        FLEXE_TARGET_CAP_RADIO_REGS_V1 |
+                        FLEXE_TARGET_CAP_GDMA_V1 |
+                        FLEXE_TARGET_CAP_SHA_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -675,6 +691,30 @@ static const flexe_target_desc_t TARGETS[] = {
             /* WDEV_RND_REG from the public ESP32-S3 register header. */
             .random_address = 0x6003507Cu,
             .random_seed = UINT64_C(0x12345678ABCDEF01),
+        },
+        .gdma = {
+            .base = 0x6003F000u,
+            .register_size = 0x1000u,
+            .channel_stride = 0x0C0u,
+            .descriptor_address_prefix = 0x3FC00000u,
+            .channel_count = 5u,
+        },
+        .sha = {
+            .base = 0x6003B000u,
+            .register_size = 0x1000u,
+            .layout = FLEXE_SHA_LAYOUT_UNIFIED,
+            .mode_count = 8u,
+            .dma_peripheral_id = 7u,
+            .mode = {
+                FLEXE_SHA_ALGORITHM_SHA1,
+                FLEXE_SHA_ALGORITHM_SHA224,
+                FLEXE_SHA_ALGORITHM_SHA256,
+                FLEXE_SHA_ALGORITHM_SHA384,
+                FLEXE_SHA_ALGORITHM_SHA512,
+                FLEXE_SHA_ALGORITHM_SHA512_224,
+                FLEXE_SHA_ALGORITHM_SHA512_256,
+                FLEXE_SHA_ALGORITHM_SHA512_T,
+            },
         },
         .sensitive_memprot = {
             .base = 0x600C1000u,

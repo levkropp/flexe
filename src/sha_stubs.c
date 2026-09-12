@@ -19,18 +19,6 @@
 #define SHA_TYPE_384  2
 #define SHA_TYPE_512  3
 
-/* ESP32 SHA peripheral base: 0x3FF03000
- * SHA_TEXT registers: 0x00-0x7C (32 x uint32_t) — message block AND digest state
- * Control registers: 0x80-0xBC (START/CONTINUE/LOAD/BUSY per engine)
- * The TEXT registers serve dual purpose: the firmware writes the message block
- * before START/CONTINUE, and reads the digest state after completion.
- * For state restore, the firmware writes state to TEXT then issues LOAD.
- * Our hooks intercept sha_hal_hash_block (so START/CONTINUE never fire),
- * but the firmware's inlined sha_ll_write_digest writes state to TEXT
- * before calling sha_hal_hash_block(is_first=0). We must capture those. */
-#define SHA_PERIPH_BASE  0x3FF03000u
-#define SHA_PERIPH_PAGE  3  /* (0x3FF03000 - 0x3FF00000) / 4096 */
-
 /* ESP32 has 3 SHA hardware engines; SHA-384 and SHA-512 share one */
 #define SHA_NUM_ENGINES 3
 #define MBED_SHA256_FAMILY_MAX 4
@@ -48,17 +36,22 @@ static int sha_engine_index(uint32_t sha_type) {
 struct sha_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
+    const flexe_target_desc_t *target;
+    flexe_gdma_t      *gdma;
+    mmio_read_fn       fallback_read;
+    mmio_write_fn      fallback_write;
+    void              *fallback_ctx;
 
-    /* SHA_TEXT register backing store (32 x uint32_t).
-     * Mirrors the hardware SHA_TEXT registers at 0x3FF03000.
-     * Used for firmware MMIO reads/writes (state save/restore). */
+    /* Message and digest register files. Classic ESP32 aliases both through
+     * SHA_TEXT; unified accelerators expose SHA_TEXT and SHA_H separately. */
     uint32_t sha_text[32];
+    uint32_t sha_h[16];
+    uint32_t control[16];
+    bool sha_h_dirty;
 
-    /* Per-engine internal state (separate from SHA_TEXT, like real hardware).
-     * On ESP32, each SHA engine has independent internal state registers.
-     * The firmware relies on state persisting between consecutive blocks
-     * of the same type without explicit save/restore via SHA_TEXT. */
+    /* Internal compression state. */
     uint32_t sha1_engine[5];     /* SHA-1 engine internal state */
+    uint32_t sha224_engine[8];   /* SHA-224 engine internal state */
     uint32_t sha256_engine[8];   /* SHA-256 engine internal state */
     uint64_t sha512_engine[8];   /* SHA-384/512 engine internal state */
 
@@ -88,39 +81,79 @@ struct sha_stubs {
         uint32_t    guest_addr;
         MD5_CTX     ctx;
     } mbed_md5[MBED_CTX_SLOTS];
+
+    uint32_t warned_mode_mask;
+    bool warned_dma;
 };
 
 /* ===== SHA peripheral MMIO handler ===== */
 
-/* Recover the message block from SHA_TEXT.
- *
- * IDF's sha_ll_fill_text_block byte-swaps each word on the way in, so a
- * TEXT register holds the big-endian reading of four message bytes. OpenSSL's
- * *_Transform wants those bytes back in memory order. */
-static void sha_text_to_block(const sha_stubs_t *ss, uint8_t *raw, int words) {
-    for (int i = 0; i < words; i++) {
-        uint32_t w = ss->sha_text[i];
-        raw[i * 4 + 0] = (uint8_t)(w >> 24);
-        raw[i * 4 + 1] = (uint8_t)(w >> 16);
-        raw[i * 4 + 2] = (uint8_t)(w >> 8);
-        raw[i * 4 + 3] = (uint8_t)w;
+static bool sha_algorithm_supported(flexe_sha_algorithm_t algorithm) {
+    return algorithm >= FLEXE_SHA_ALGORITHM_SHA1 &&
+           algorithm <= FLEXE_SHA_ALGORITHM_SHA512;
+}
+
+static size_t sha_block_size(flexe_sha_algorithm_t algorithm) {
+    switch (algorithm) {
+    case FLEXE_SHA_ALGORITHM_SHA1:
+    case FLEXE_SHA_ALGORITHM_SHA224:
+    case FLEXE_SHA_ALGORITHM_SHA256:
+        return 64u;
+    case FLEXE_SHA_ALGORITHM_SHA384:
+    case FLEXE_SHA_ALGORITHM_SHA512:
+        return 128u;
+    default:
+        return 0u;
     }
 }
 
-/* Compress the block currently in SHA_TEXT into the engine's state.
- * `first` distinguishes START (begin from the algorithm's IV) from CONTINUE
- * (fold another block into the running state). */
-static void sha_engine_hash_block(sha_stubs_t *ss, uint32_t sha_type,
-                                  bool first) {
-    uint8_t raw[128];
+static flexe_sha_algorithm_t sha_mode_algorithm(const sha_stubs_t *ss,
+                                                 uint32_t mode) {
+    const flexe_sha_desc_t *desc = &ss->target->sha;
+    if (mode >= desc->mode_count || mode >= FLEXE_TARGET_SHA_MODE_MAX)
+        return FLEXE_SHA_ALGORITHM_NONE;
+    return desc->mode[mode];
+}
 
-    switch (sha_type) {
-    case SHA_TYPE_1: {
+static void sha_warn_mode(sha_stubs_t *ss, uint32_t mode) {
+    uint32_t bit = mode < 32u ? 1u << mode : 0u;
+    if (bit != 0u && (ss->warned_mode_mask & bit) != 0u) return;
+    ss->warned_mode_mask |= bit;
+    fprintf(stderr,
+            "[sha] unsupported mode %u for target %s; operation rejected\n",
+            mode, ss->target->name);
+}
+
+/* Recover a direct-mode message block from SHA_TEXT. Classic ESP32's HAL
+ * byte-swaps each word before MMIO, while the S2/S3 unified HAL copies native
+ * little-endian words and lets the accelerator perform byte ordering. */
+static void sha_text_to_block(const sha_stubs_t *ss, uint8_t *raw, int words) {
+    bool classic = ss->target->sha.layout == FLEXE_SHA_LAYOUT_ESP32;
+    for (int i = 0; i < words; i++) {
+        uint32_t w = ss->sha_text[i];
+        if (classic) {
+            raw[i * 4 + 0] = (uint8_t)(w >> 24);
+            raw[i * 4 + 1] = (uint8_t)(w >> 16);
+            raw[i * 4 + 2] = (uint8_t)(w >> 8);
+            raw[i * 4 + 3] = (uint8_t)w;
+        } else {
+            raw[i * 4 + 0] = (uint8_t)w;
+            raw[i * 4 + 1] = (uint8_t)(w >> 8);
+            raw[i * 4 + 2] = (uint8_t)(w >> 16);
+            raw[i * 4 + 3] = (uint8_t)(w >> 24);
+        }
+    }
+}
+
+static void sha_engine_hash_raw(sha_stubs_t *ss,
+                                flexe_sha_algorithm_t algorithm,
+                                const uint8_t *raw, bool first) {
+    switch (algorithm) {
+    case FLEXE_SHA_ALGORITHM_SHA1: {
         SHA_CTX c;
         uint32_t *h = ss->sha1_engine;
-        sha_text_to_block(ss, raw, 16);
+        SHA1_Init(&c);
         if (first) {
-            SHA1_Init(&c);
             h[0] = c.h0; h[1] = c.h1; h[2] = c.h2; h[3] = c.h3; h[4] = c.h4;
         }
         c.h0 = h[0]; c.h1 = h[1]; c.h2 = h[2]; c.h3 = h[3]; c.h4 = h[4];
@@ -128,25 +161,30 @@ static void sha_engine_hash_block(sha_stubs_t *ss, uint32_t sha_type,
         h[0] = c.h0; h[1] = c.h1; h[2] = c.h2; h[3] = c.h3; h[4] = c.h4;
         break;
     }
-    case SHA_TYPE_256: {
+    case FLEXE_SHA_ALGORITHM_SHA224:
+    case FLEXE_SHA_ALGORITHM_SHA256: {
         SHA256_CTX c;
-        uint32_t *h = ss->sha256_engine;
-        sha_text_to_block(ss, raw, 16);
-        if (first) { SHA256_Init(&c); memcpy(h, c.h, sizeof c.h); }
+        uint32_t *h = algorithm == FLEXE_SHA_ALGORITHM_SHA224
+            ? ss->sha224_engine : ss->sha256_engine;
+        if (algorithm == FLEXE_SHA_ALGORITHM_SHA224)
+            SHA224_Init(&c);
+        else
+            SHA256_Init(&c);
+        if (first) memcpy(h, c.h, sizeof c.h);
         memcpy(c.h, h, sizeof c.h);
         SHA256_Transform(&c, raw);
         memcpy(h, c.h, sizeof c.h);
         break;
     }
-    case SHA_TYPE_384:
-    case SHA_TYPE_512: {
+    case FLEXE_SHA_ALGORITHM_SHA384:
+    case FLEXE_SHA_ALGORITHM_SHA512: {
         SHA512_CTX c;
         uint64_t *h = ss->sha512_engine;
-        sha_text_to_block(ss, raw, 32);
-        if (first) {
-            if (sha_type == SHA_TYPE_384) SHA384_Init(&c); else SHA512_Init(&c);
-            memcpy(h, c.h, sizeof c.h);
-        }
+        if (algorithm == FLEXE_SHA_ALGORITHM_SHA384)
+            SHA384_Init(&c);
+        else
+            SHA512_Init(&c);
+        if (first) memcpy(h, c.h, sizeof c.h);
         memcpy(c.h, h, sizeof c.h);
         SHA512_Transform(&c, raw);
         memcpy(h, c.h, sizeof c.h);
@@ -155,24 +193,36 @@ static void sha_engine_hash_block(sha_stubs_t *ss, uint32_t sha_type,
     default:
         break;
     }
-    ss->current_type = (int)sha_type;
 }
 
-/* SHA_x_LOAD publishes the engine's state into SHA_TEXT, which is how
- * software reads a digest out on this part. */
-static void sha_engine_publish(sha_stubs_t *ss, uint32_t sha_type) {
-    switch (sha_type) {
-    case SHA_TYPE_1:
-        for (int i = 0; i < 5; i++) ss->sha_text[i] = ss->sha1_engine[i];
+static void sha_engine_hash_text(sha_stubs_t *ss,
+                                 flexe_sha_algorithm_t algorithm,
+                                 bool first) {
+    uint8_t raw[128];
+    size_t block_size = sha_block_size(algorithm);
+    if (block_size == 0u) return;
+    sha_text_to_block(ss, raw, (int)(block_size / 4u));
+    sha_engine_hash_raw(ss, algorithm, raw, first);
+}
+
+static void sha_engine_publish_to(sha_stubs_t *ss,
+                                  flexe_sha_algorithm_t algorithm,
+                                  uint32_t *destination) {
+    switch (algorithm) {
+    case FLEXE_SHA_ALGORITHM_SHA1:
+        for (int i = 0; i < 5; i++) destination[i] = ss->sha1_engine[i];
         break;
-    case SHA_TYPE_256:
-        for (int i = 0; i < 8; i++) ss->sha_text[i] = ss->sha256_engine[i];
+    case FLEXE_SHA_ALGORITHM_SHA224:
+        for (int i = 0; i < 8; i++) destination[i] = ss->sha224_engine[i];
         break;
-    case SHA_TYPE_384:
-    case SHA_TYPE_512:
+    case FLEXE_SHA_ALGORITHM_SHA256:
+        for (int i = 0; i < 8; i++) destination[i] = ss->sha256_engine[i];
+        break;
+    case FLEXE_SHA_ALGORITHM_SHA384:
+    case FLEXE_SHA_ALGORITHM_SHA512:
         for (int i = 0; i < 8; i++) {
-            ss->sha_text[i * 2]     = (uint32_t)(ss->sha512_engine[i] >> 32);
-            ss->sha_text[i * 2 + 1] = (uint32_t)ss->sha512_engine[i];
+            destination[i * 2] = (uint32_t)(ss->sha512_engine[i] >> 32);
+            destination[i * 2 + 1] = (uint32_t)ss->sha512_engine[i];
         }
         break;
     default:
@@ -180,56 +230,204 @@ static void sha_engine_publish(sha_stubs_t *ss, uint32_t sha_type) {
     }
 }
 
+static void sha_engine_import_h(sha_stubs_t *ss,
+                                flexe_sha_algorithm_t algorithm) {
+    switch (algorithm) {
+    case FLEXE_SHA_ALGORITHM_SHA1:
+        memcpy(ss->sha1_engine, ss->sha_h, 5u * sizeof(uint32_t));
+        break;
+    case FLEXE_SHA_ALGORITHM_SHA224:
+        memcpy(ss->sha224_engine, ss->sha_h, 8u * sizeof(uint32_t));
+        break;
+    case FLEXE_SHA_ALGORITHM_SHA256:
+        memcpy(ss->sha256_engine, ss->sha_h, 8u * sizeof(uint32_t));
+        break;
+    case FLEXE_SHA_ALGORITHM_SHA384:
+    case FLEXE_SHA_ALGORITHM_SHA512:
+        for (int i = 0; i < 8; i++)
+            ss->sha512_engine[i] = ((uint64_t)ss->sha_h[i * 2] << 32) |
+                                   ss->sha_h[i * 2 + 1];
+        break;
+    default:
+        break;
+    }
+    ss->sha_h_dirty = false;
+}
+
+static void sha_unified_finish_block(sha_stubs_t *ss,
+                                     flexe_sha_algorithm_t algorithm,
+                                     const uint8_t *raw, bool first) {
+    if (!first && ss->sha_h_dirty) sha_engine_import_h(ss, algorithm);
+    sha_engine_hash_raw(ss, algorithm, raw, first);
+    sha_engine_publish_to(ss, algorithm, ss->sha_h);
+    ss->sha_h_dirty = false;
+}
+
+static void sha_unified_direct(sha_stubs_t *ss, bool first) {
+    uint32_t mode = ss->control[0];
+    flexe_sha_algorithm_t algorithm = sha_mode_algorithm(ss, mode);
+    if (!sha_algorithm_supported(algorithm)) {
+        sha_warn_mode(ss, mode);
+        return;
+    }
+    uint8_t raw[128];
+    size_t block_size = sha_block_size(algorithm);
+    sha_text_to_block(ss, raw, (int)(block_size / 4u));
+    sha_unified_finish_block(ss, algorithm, raw, first);
+}
+
+static void sha_unified_dma(sha_stubs_t *ss, bool first) {
+    uint32_t mode = ss->control[0];
+    flexe_sha_algorithm_t algorithm = sha_mode_algorithm(ss, mode);
+    size_t block_size = sha_block_size(algorithm);
+    size_t block_count = ss->control[3] & 0x3Fu;
+    if (!sha_algorithm_supported(algorithm) || block_size == 0u) {
+        sha_warn_mode(ss, mode);
+        return;
+    }
+    if (!ss->gdma || ss->target->sha.dma_peripheral_id == UINT8_MAX ||
+        block_count == 0u || block_count > SIZE_MAX / block_size) {
+        if (!ss->warned_dma) {
+            fprintf(stderr,
+                    "[sha] target %s DMA operation has no valid GDMA stream; "
+                    "operation rejected\n", ss->target->name);
+            ss->warned_dma = true;
+        }
+        return;
+    }
+
+    size_t length = block_count * block_size;
+    uint8_t *raw = malloc(length);
+    if (!raw || flexe_gdma_read_tx(
+            ss->gdma, ss->target->sha.dma_peripheral_id,
+            raw, length) != 0) {
+        if (!ss->warned_dma) {
+            fprintf(stderr,
+                    "[sha] target %s rejected an absent or malformed GDMA "
+                    "descriptor chain\n", ss->target->name);
+            ss->warned_dma = true;
+        }
+        free(raw);
+        return;
+    }
+    for (size_t block = 0u; block < block_count; block++)
+        sha_unified_finish_block(
+            ss, algorithm, raw + block * block_size,
+            first && block == 0u);
+    free(raw);
+}
+
 static uint32_t sha_mmio_read(void *ctx, uint32_t addr) {
     sha_stubs_t *ss = ctx;
-    uint32_t off = addr - SHA_PERIPH_BASE;
+    const flexe_sha_desc_t *desc = &ss->target->sha;
+    if (addr < desc->base || addr >= desc->base + desc->register_size)
+        return ss->fallback_read
+            ? ss->fallback_read(ss->fallback_ctx, addr) : 0u;
+    uint32_t off = addr - desc->base;
 
-    if (off < 0x80) {
+    if (desc->layout == FLEXE_SHA_LAYOUT_ESP32 && off < 0x80u) {
         /* SHA_TEXT registers (32 words) */
         return ss->sha_text[off / 4];
     }
-
-    /* Control/status registers */
-    switch (off) {
-    case 0x8C: case 0x9C: case 0xAC: case 0xBC:
-        return 0; /* SHA_*_BUSY: always idle */
-    default:
-        return 0;
+    if (desc->layout == FLEXE_SHA_LAYOUT_ESP32 &&
+        off >= 0x80u && off < 0xC0u)
+        return 0u; /* Commands self-clear and BUSY is idle in fast mode. */
+    if (desc->layout == FLEXE_SHA_LAYOUT_UNIFIED) {
+        if (off < 0x40u) {
+            if (off == 0x18u) return 0u; /* BUSY */
+            return ss->control[off / 4u];
+        }
+        if (off < 0x80u) return ss->sha_h[(off - 0x40u) / 4u];
+        if (off < 0x100u) return ss->sha_text[(off - 0x80u) / 4u];
     }
+    return ss->fallback_read
+        ? ss->fallback_read(ss->fallback_ctx, addr) : 0u;
 }
 
 static void sha_mmio_write(void *ctx, uint32_t addr, uint32_t val) {
     sha_stubs_t *ss = ctx;
-    uint32_t off = addr - SHA_PERIPH_BASE;
+    const flexe_sha_desc_t *desc = &ss->target->sha;
+    if (addr < desc->base || addr >= desc->base + desc->register_size) {
+        if (ss->fallback_write)
+            ss->fallback_write(ss->fallback_ctx, addr, val);
+        return;
+    }
+    uint32_t off = addr - desc->base;
 
-    if (off < 0x80) {
+    if (desc->layout == FLEXE_SHA_LAYOUT_ESP32 && off < 0x80u) {
         /* SHA_TEXT registers — firmware writes state here via sha_ll_write_digest */
         ss->sha_text[off / 4] = val;
         return;
     }
 
-    /* Control registers. Each engine has START/CONTINUE/LOAD/BUSY four words
-     * apart: SHA-1 at 0x80, SHA-256 at 0x90, SHA-384 at 0xA0, SHA-512 at
-     * 0xB0. These used to be ignored on the grounds that the ELF-symbol hooks
-     * on sha_hal_hash_block do the work -- but a production image has no
-     * symbols, so nothing hooked, and the guest read back whatever it had
-     * just written as its digest. NerdMiner drives 16k SHA-1 operations this
-     * way. BUSY already reads idle, so completion is immediate. */
-    if (off >= 0x80 && off < 0xC0) {
-        uint32_t sha_type;
-        switch (off & ~0xFu) {
-        case 0x80: sha_type = SHA_TYPE_1;   break;
-        case 0x90: sha_type = SHA_TYPE_256; break;
-        case 0xA0: sha_type = SHA_TYPE_384; break;
-        default:   sha_type = SHA_TYPE_512; break;
-        }
+    if (desc->layout == FLEXE_SHA_LAYOUT_ESP32 &&
+        off >= 0x80u && off < 0xC0u) {
+        uint32_t mode = (off - 0x80u) / 0x10u;
+        flexe_sha_algorithm_t algorithm = sha_mode_algorithm(ss, mode);
         switch (off & 0xFu) {
-        case 0x0: sha_engine_hash_block(ss, sha_type, true);  break; /* START */
-        case 0x4: sha_engine_hash_block(ss, sha_type, false); break; /* CONT */
-        case 0x8: sha_engine_publish(ss, sha_type);           break; /* LOAD */
-        default:  break;                                             /* BUSY */
+        case 0x0: sha_engine_hash_text(ss, algorithm, true);  break;
+        case 0x4: sha_engine_hash_text(ss, algorithm, false); break;
+        case 0x8:
+            sha_engine_publish_to(ss, algorithm, ss->sha_text);
+            break;
+        default: break;
+        }
+        return;
+    }
+
+    if (desc->layout == FLEXE_SHA_LAYOUT_UNIFIED) {
+        if (off >= 0x40u && off < 0x80u) {
+            ss->sha_h[(off - 0x40u) / 4u] = val;
+            ss->sha_h_dirty = true;
+            return;
+        }
+        if (off >= 0x80u && off < 0x100u) {
+            ss->sha_text[(off - 0x80u) / 4u] = val;
+            return;
+        }
+        if (off < 0x40u) {
+            switch (off) {
+            case 0x00u: ss->control[0] = val; return; /* MODE */
+            case 0x04u: ss->control[1] = val; return; /* T string */
+            case 0x08u: ss->control[2] = val; return; /* T length */
+            case 0x0Cu: ss->control[3] = val & 0x3Fu; return;
+            case 0x10u: sha_unified_direct(ss, true); return;
+            case 0x14u: sha_unified_direct(ss, false); return;
+            case 0x18u: return; /* BUSY is read-only. */
+            case 0x1Cu: sha_unified_dma(ss, true); return;
+            case 0x20u: sha_unified_dma(ss, false); return;
+            case 0x24u: ss->control[9] = 0u; return; /* clear IRQ */
+            case 0x28u: ss->control[10] = val & 1u; return;
+            default: ss->control[off / 4u] = val; return;
+            }
         }
     }
+    if (ss->fallback_write)
+        ss->fallback_write(ss->fallback_ctx, addr, val);
+}
+
+static bool sha_geometry_valid(const flexe_target_desc_t *target) {
+    if (!target || !(target->capabilities & FLEXE_TARGET_CAP_SHA_V1))
+        return false;
+    const flexe_sha_desc_t *desc = &target->sha;
+    uint32_t minimum = desc->layout == FLEXE_SHA_LAYOUT_ESP32
+        ? 0xC0u : desc->layout == FLEXE_SHA_LAYOUT_UNIFIED ? 0x100u : 0u;
+    if (minimum == 0u || desc->base < target->peripheral_start ||
+        desc->base >= target->peripheral_end ||
+        (desc->base & 0xFFFu) != 0u ||
+        desc->register_size != 0x1000u ||
+        desc->register_size > target->peripheral_end - desc->base ||
+        desc->register_size < minimum || desc->mode_count == 0u ||
+        desc->mode_count > FLEXE_TARGET_SHA_MODE_MAX)
+        return false;
+    for (unsigned mode = 0u; mode < desc->mode_count; mode++)
+        if (desc->mode[mode] <= FLEXE_SHA_ALGORITHM_NONE ||
+            desc->mode[mode] > FLEXE_SHA_ALGORITHM_SHA512_T)
+            return false;
+    if (desc->dma_peripheral_id != UINT8_MAX &&
+        !(target->capabilities & FLEXE_TARGET_CAP_GDMA_V1))
+        return false;
+    return true;
 }
 
 /* ===== Calling convention helpers ===== */
@@ -460,10 +658,14 @@ static int sha256_self_test(void) {
 
 /* ===== Public API ===== */
 
-sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu) {
+sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu, flexe_gdma_t *gdma) {
+    if (!cpu || !cpu->mem || !sha_geometry_valid(mem_target(cpu->mem)))
+        return NULL;
     sha_stubs_t *ss = calloc(1, sizeof(*ss));
     if (!ss) return NULL;
     ss->cpu = cpu;
+    ss->target = mem_target(cpu->mem);
+    ss->gdma = gdma;
     ss->current_type = -1;
 
     /* Verify SHA-256 via OpenSSL is correct */
@@ -473,16 +675,26 @@ sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu) {
         return NULL;
     }
 
-    /* Register MMIO handler for SHA peripheral page (0x3FF03000).
-     * This overrides the DPORT handler for page 3, capturing firmware's
-     * direct register writes to SHA_TEXT (used for state save/restore). */
-    mem_register_mmio(cpu->mem, SHA_PERIPH_PAGE,
-                      sha_mmio_read, sha_mmio_write, ss);
+    uint32_t page = (ss->target->sha.base -
+                     ss->target->peripheral_start) / 0x1000u;
+    ss->fallback_read = cpu->mem->mmio[page].read;
+    ss->fallback_write = cpu->mem->mmio[page].write;
+    ss->fallback_ctx = cpu->mem->mmio[page].ctx;
+    if (mem_register_mmio_range(cpu->mem, ss->target->sha.base,
+                                ss->target->sha.register_size,
+                                sha_mmio_read, sha_mmio_write, ss) != 0) {
+        free(ss);
+        return NULL;
+    }
 
     return ss;
 }
 
 void sha_stubs_destroy(sha_stubs_t *ss) {
+    if (!ss) return;
+    (void)mem_register_mmio_range(
+        ss->cpu->mem, ss->target->sha.base, ss->target->sha.register_size,
+        ss->fallback_read, ss->fallback_write, ss->fallback_ctx);
     free(ss);
 }
 

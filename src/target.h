@@ -41,8 +41,10 @@
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 5u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
+#define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
+#define FLEXE_TARGET_SHA_MODE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 30u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 31u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -68,6 +70,8 @@ typedef enum {
     FLEXE_TARGET_CAP_I2C_V1                       = 1ull << 17,
     FLEXE_TARGET_CAP_SENS_V1                      = 1ull << 18,
     FLEXE_TARGET_CAP_RADIO_REGS_V1                = 1ull << 19,
+    FLEXE_TARGET_CAP_GDMA_V1                      = 1ull << 20,
+    FLEXE_TARGET_CAP_SHA_V1                       = 1ull << 21,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -479,6 +483,55 @@ typedef struct {
     uint64_t random_seed;
 } flexe_radio_desc_t;
 
+/* General-purpose DMA v1 is the five-channel AHB DMA shared by several
+ * ESP32-family peripherals. The register layout and 12-byte linked-list
+ * descriptor format are properties of the v1 IP; target data supplies its
+ * placement, instantiated channel count, and the address prefix omitted by
+ * the hardware's 20-bit link register. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t channel_stride;
+    uint32_t descriptor_address_prefix;
+    uint8_t  channel_count;
+} flexe_gdma_desc_t;
+
+typedef enum {
+    FLEXE_SHA_LAYOUT_NONE = 0,
+    /* Classic ESP32: one START/CONTINUE/LOAD/BUSY quartet per algorithm and
+     * a shared message/digest register file. */
+    FLEXE_SHA_LAYOUT_ESP32,
+    /* S2/S3 generation: one MODE register selects the algorithm, with
+     * separate message and digest register files and optional GDMA input. */
+    FLEXE_SHA_LAYOUT_UNIFIED,
+} flexe_sha_layout_t;
+
+typedef enum {
+    FLEXE_SHA_ALGORITHM_NONE = 0,
+    FLEXE_SHA_ALGORITHM_SHA1,
+    FLEXE_SHA_ALGORITHM_SHA224,
+    FLEXE_SHA_ALGORITHM_SHA256,
+    FLEXE_SHA_ALGORITHM_SHA384,
+    FLEXE_SHA_ALGORITHM_SHA512,
+    FLEXE_SHA_ALGORITHM_SHA512_224,
+    FLEXE_SHA_ALGORITHM_SHA512_256,
+    FLEXE_SHA_ALGORITHM_SHA512_T,
+} flexe_sha_algorithm_t;
+
+/* SHA mode values are part of the ROM/HAL ABI and differ between classic
+ * ESP32 and newer unified accelerators. Mapping them in the target keeps the
+ * crypto engine independent of firmware versions and absolute addresses.
+ * dma_peripheral_id is the GDMA v1 OUT_PERI_SEL value, or UINT8_MAX when the
+ * target has no DMA path. */
+typedef struct {
+    uint32_t             base;
+    uint32_t             register_size;
+    flexe_sha_layout_t   layout;
+    uint8_t              mode_count;
+    uint8_t              dma_peripheral_id;
+    flexe_sha_algorithm_t mode[FLEXE_TARGET_SHA_MODE_MAX];
+} flexe_sha_desc_t;
+
 /* Internal analog-register I2C fabric used by ROM clock, bias, PHY, and ADC
  * code. This is distinct from the externally routed I2C controllers. The ROM
  * command ABI is described here so the same device model can serve targets
@@ -704,6 +757,10 @@ typedef struct {
 
     /* Optional RF/baseband/controller register and calibration surfaces. */
     flexe_radio_desc_t            radio;
+
+    /* Optional general-purpose DMA fabric and SHA accelerator. */
+    flexe_gdma_desc_t             gdma;
+    flexe_sha_desc_t              sha;
 
     /* Optional SENSITIVE v1 memory-protection configuration block. */
     flexe_sensitive_memprot_desc_t sensitive_memprot;

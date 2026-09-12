@@ -3,10 +3,11 @@
 
 #include "xtensa.h"
 #include "elf_symbols.h"
+#include "gdma.h"
 
 typedef struct sha_stubs sha_stubs_t;
 
-sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu);
+sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu, flexe_gdma_t *gdma);
 void sha_stubs_destroy(sha_stubs_t *ss);
 
 /* Discover and register compatible crypto implementations in stripped

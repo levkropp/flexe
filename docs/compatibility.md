@@ -17,7 +17,8 @@ CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only
 revision-0 eFuse profile, digital pad configuration, UARTs, native USB
 Serial/JTAG, digital GPIO matrix, external I2C controllers, and interrupt
-matrix.
+matrix. Its unified SHA accelerator supports direct and GDMA-fed SHA-1,
+SHA-224, SHA-256, SHA-384, and SHA-512 blocks.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
@@ -71,6 +72,16 @@ transfer with a NACK instead of timing out. This is functional fast-mode
 support: SCL/SDA edge timing, timing-register effects, arbitration, clock
 stretching, multi-master contention, electrical line resolution, and error
 injection are not modeled yet.
+
+The S3 SHA model uses target-described mode mappings and consumes the active
+AHB GDMA v1 transmit chain selected for SHA, including chained descriptors,
+length and EOF validation, optional owner checking and write-back, and
+completion status. It therefore works for stripped firmware without an ELF
+symbol or firmware-specific hook. Fast mode completes each block immediately;
+SHA/GDMA latency, arbitration, CPU interrupt delivery, general GDMA receive
+transfers, and SHA-512/224, SHA-512/256, and configurable SHA-512/t are not yet
+modeled. Requests for the unsupported SHA modes or malformed DMA chains are
+rejected with a diagnostic rather than returning invented digest data.
 
 The S3 RTC counter advances on the same shared dual-core virtual timeline as
 the other target-described timers. Its two-half latch, runtime CPU-frequency
