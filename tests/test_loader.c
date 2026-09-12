@@ -155,6 +155,92 @@ TEST(loader_recognizes_s3_before_rejecting_classic_memory) {
     mem_destroy(mem);
 }
 
+TEST(loader_recognizes_s3_factory_with_bootloader_at_zero) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    size_t size = s3->default_app_offset + 36u;
+    uint8_t *bin = calloc(1u, size);
+    ASSERT_TRUE(bin != NULL);
+    if (!bin) return;
+    /* Both bootloader and application have valid ESP image headers. */
+    bin[0] = 0xE9;
+    bin[1] = 1u;
+    bin[3] = 0x22u; /* 4 MiB in the default unit-test memory. */
+    put_le16(&bin[12], s3->image_chip_id);
+    put_le32(&bin[4], 0x403C9800u);
+    put_le32(&bin[24], 0x3FC88000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0xDEADBEEFu);
+    uint8_t *pt = bin + s3->partition_table_offset;
+    pt[0] = 0xAAu;
+    pt[1] = 0x50u;
+    pt[2] = 1u; /* NVS data partition */
+    put_le32(&pt[4], 0x9000u);
+    put_le32(&pt[8], 0x5000u);
+    uint8_t *app = bin + s3->default_app_offset;
+    app[0] = 0xE9u;
+    app[1] = 1u;
+    app[3] = 0x22u;
+    put_le16(&app[12], s3->image_chip_id);
+    put_le32(&app[4], 0x40374000u);
+    put_le32(&app[24], 0x3FC88100u);
+    put_le32(&app[28], 4u);
+    put_le32(&app[32], 0xA5A55A5Au);
+
+    const char *path = write_temp(bin, size);
+    free(bin);
+    ASSERT_TRUE(path != NULL);
+    if (!path) return;
+    loader_image_info_t info;
+    char error[256];
+    ASSERT_EQ(loader_probe_bin(path, &info, error, sizeof(error)), 0);
+    ASSERT_EQ(info.image_offset, s3->default_app_offset);
+    ASSERT_EQ(info.target, FLEXE_TARGET_ESP32S3);
+
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    ASSERT_TRUE(mem != NULL);
+    if (mem) {
+        load_result_t res = loader_load_bin(mem, path);
+        ASSERT_EQ(res.result, 0);
+        ASSERT_EQ(res.entry_point, 0x40374000u);
+        ASSERT_EQ(mem_read32(mem, 0x3FC88100u), 0xA5A55A5Au);
+        ASSERT_EQ(mem_read32(mem, 0x3FC88000u), 0u);
+        ASSERT_EQ(mem->flash_data[s3->partition_table_offset], 0xAAu);
+        mem_destroy(mem);
+    }
+}
+
+TEST(loader_does_not_mistake_large_standalone_app_for_factory) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    size_t size = s3->default_app_offset + 36u;
+    uint8_t *bin = calloc(1u, size);
+    ASSERT_TRUE(bin != NULL);
+    if (!bin) return;
+    bin[0] = 0xE9u;
+    bin[1] = 1u;
+    put_le16(&bin[12], s3->image_chip_id);
+    put_le32(&bin[4], 0x40374000u);
+    put_le32(&bin[24], 0x3FC88100u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x11223344u);
+    bin[s3->partition_table_offset] = 0xAAu;
+    bin[s3->partition_table_offset + 1u] = 0x50u;
+    bin[s3->partition_table_offset + 2u] = 1u;
+    bin[s3->default_app_offset] = 0xE9u;
+    put_le16(&bin[s3->default_app_offset + 12u], s3->image_chip_id);
+    /* Even both signatures are insufficient without a plausible partition
+     * entry: an embedded image in a large standalone app is not a factory. */
+    const char *path = write_temp(bin, size);
+    free(bin);
+    ASSERT_TRUE(path != NULL);
+    if (!path) return;
+    loader_image_info_t info;
+    char error[256];
+    ASSERT_EQ(loader_probe_bin(path, &info, error, sizeof(error)), 0);
+    ASSERT_EQ(info.image_offset, 0u);
+}
+
 TEST(loader_loads_s3_segments_through_shared_flash_mmu) {
     uint8_t bin[96] = {0};
     bin[0] = 0xE9;
@@ -661,6 +747,8 @@ void run_loader_tests(void) {
     RUN_TEST(loader_rejects_reserved_flash_capacity);
     RUN_TEST(loader_rejects_app_larger_than_declared_flash);
     RUN_TEST(loader_recognizes_s3_before_rejecting_classic_memory);
+    RUN_TEST(loader_recognizes_s3_factory_with_bootloader_at_zero);
+    RUN_TEST(loader_does_not_mistake_large_standalone_app_for_factory);
     RUN_TEST(loader_loads_s3_segments_through_shared_flash_mmu);
     RUN_TEST(loader_maps_classic_flash_without_peripheral_model);
     RUN_TEST(loader_rejects_target_mismatch_before_loading);

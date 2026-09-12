@@ -28,7 +28,11 @@ and S3 is not yet a production-supported target.
 
 Flexe reads the configured flash capacity from the standard ESP image header
 and grows the virtual NOR device beyond the 4 MiB board default when required
-(up to 16 MiB on classic ESP32 and 128 MiB on ESP32-S3). The SPI controller's
+(up to 16 MiB on classic ESP32 and 128 MiB on ESP32-S3). It recognizes merged
+S3 factory images even when an ESP bootloader header is at flash offset zero:
+the target's partition table and matching application header distinguish them
+from standalone apps. The application runs with the merged image's real
+partition and flash contents, not a synthesized layout. The SPI controller's
 JEDEC capacity byte, raw backing, cache-MMU bounds, SDK size queries, and the
 ROM's live boot-handoff structure then describe the same device. Newer ROM
 handoff pointers are resolved from the official ROM ELF, while older fixed

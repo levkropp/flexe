@@ -10,6 +10,11 @@ static uint16_t read_le16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
+static uint32_t read_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 static int loader_read_image_header(FILE *f, long offset, uint8_t hdr[24],
                                     char *error, size_t error_size) {
     if (fseek(f, offset, SEEK_SET) != 0) {
@@ -57,6 +62,38 @@ int loader_probe_bin(const char *path, loader_image_info_t *info,
             return -1;
         }
         offset = 0x10000;
+    } else {
+        /* S3 merged images start with a valid bootloader header at offset
+         * zero. Distinguish them from standalone app images by requiring
+         * both a real partition-table entry and a second, matching ESP app
+         * header at this target's application offset. */
+        const flexe_target_desc_t *boot_target = NULL;
+        if (loader_read_image_header(f, 0, hdr, error, error_size) == 0)
+            boot_target =
+                flexe_target_by_image_chip_id(read_le16(&hdr[12]));
+        if (boot_target && fseek(f, 0, SEEK_END) == 0 &&
+            ftell(f) >= (long)boot_target->default_app_offset +
+                       ESP_IMAGE_HEADER_SIZE) {
+            uint8_t partition[32];
+            uint8_t app_hdr[ESP_IMAGE_HEADER_SIZE];
+            if (fseek(f, boot_target->partition_table_offset, SEEK_SET) == 0 &&
+                fread(partition, 1, sizeof(partition), f) ==
+                    sizeof(partition) &&
+                partition[0] == 0xAA && partition[1] == 0x50 &&
+                partition[2] <= 1u &&
+                read_le32(&partition[4]) >=
+                    boot_target->partition_table_offset + 0x1000u &&
+                (read_le32(&partition[4]) & 0xFFFu) == 0u &&
+                read_le32(&partition[8]) != 0u &&
+                (uint64_t)read_le32(&partition[4]) +
+                    read_le32(&partition[8]) <=
+                    boot_target->spi_mem.maximum_flash_size &&
+                fseek(f, boot_target->default_app_offset, SEEK_SET) == 0 &&
+                fread(app_hdr, 1, sizeof(app_hdr), f) == sizeof(app_hdr) &&
+                app_hdr[0] == 0xE9 &&
+                read_le16(&app_hdr[12]) == boot_target->image_chip_id)
+                offset = boot_target->default_app_offset;
+        }
     }
     if (loader_read_image_header(f, offset, hdr, error, error_size) != 0) {
         if (offset != 0)
@@ -678,7 +715,8 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
         return res;
     }
 
-    /* Read first byte to detect factory image vs app-only */
+    /* The probed app offset distinguishes merged images even when the
+     * bootloader itself has an ESP image header at flash offset zero. */
     uint8_t magic;
     if (fread(&magic, 1, 1, f) != 1) {
         res.result = -1;
@@ -687,9 +725,10 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
         return res;
     }
 
-    if (magic != 0xE9) {
-        /* Not a standalone app image — check if this is a factory (merged flash)
-         * image with bootloader at 0x1000 and app at 0x10000 */
+    if (res.image.image_offset != 0u) {
+        /* A merged flash image has its application at the target's app
+         * offset, regardless of whether its bootloader starts at 0x0000 or
+         * 0x1000. Its partition table is preserved with the raw flash. */
         if (fseek(f, 0, SEEK_END) != 0) {
             res.result = -1;
             snprintf(res.error, sizeof(res.error), "Cannot size factory image");
@@ -698,7 +737,8 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
         }
         long file_size = ftell(f);
 
-        if (file_size < 0x10000 + 24) {
+        if (file_size < (long)detected->default_app_offset +
+                        ESP_IMAGE_HEADER_SIZE) {
             res.result = -1;
             snprintf(res.error, sizeof(res.error),
                      "Bad magic 0x%02X and file too small for factory image", magic);
@@ -715,13 +755,14 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
             return res;
         }
 
-        /* Check for app header at 0x10000 */
-        fseek(f, 0x10000, SEEK_SET);
+        /* Check the target-described application offset. */
+        fseek(f, detected->default_app_offset, SEEK_SET);
         uint8_t app_magic;
         if (fread(&app_magic, 1, 1, f) != 1 || app_magic != 0xE9) {
             res.result = -1;
             snprintf(res.error, sizeof(res.error),
-                     "Bad magic: 0x%02X (expected 0xE9), no app at 0x10000 either", magic);
+                     "Bad magic: 0x%02X (expected 0xE9), no app at 0x%X either",
+                     magic, detected->default_app_offset);
             fclose(f);
             return res;
         }
