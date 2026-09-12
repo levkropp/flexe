@@ -93,7 +93,10 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             (gate->device == FLEXE_SYSTEM_DEVICE_GP_SPI &&
              gate->instance < FLEXE_TARGET_GP_SPI_HOST_MAX &&
              gate->instance < target->gp_spi.host_count &&
-             (target->capabilities & FLEXE_TARGET_CAP_GP_SPI));
+             (target->capabilities & FLEXE_TARGET_CAP_GP_SPI)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_SHA &&
+             gate->instance == 0u &&
+             (target->capabilities & FLEXE_TARGET_CAP_SHA_V1));
         if (!device_valid || clock_reg < 0 || reset_reg < 0 ||
             !system_clock_single_bit(gate->clock_mask) ||
             !system_clock_single_bit(gate->reset_mask) ||

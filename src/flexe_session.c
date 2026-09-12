@@ -371,6 +371,12 @@ static int session_build(flexe_session_t *s)
     s->shstubs = (target->capabilities & FLEXE_TARGET_CAP_SHA_V1)
         ? sha_stubs_create(&s->cpu[0], periph_gdma(s->periph)) : NULL;
     if (s->shstubs) {
+        if (!classic_compat &&
+            sha_stubs_attach_system_clock(s->shstubs, s->periph) != 0) {
+            fprintf(stderr,
+                    "flexe: failed to connect SHA clock/reset controls\n");
+            return -1;
+        }
         if (classic_compat) {
             sha_stubs_hook_firmware(s->shstubs);
             if (s->syms)

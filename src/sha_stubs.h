@@ -3,11 +3,14 @@
 
 #include "xtensa.h"
 #include "elf_symbols.h"
+#include "peripherals.h"
 #include "gdma.h"
 
 typedef struct sha_stubs sha_stubs_t;
 
 sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu, flexe_gdma_t *gdma);
+int sha_stubs_attach_system_clock(sha_stubs_t *ss,
+                                  esp32_periph_t *periph);
 void sha_stubs_destroy(sha_stubs_t *ss);
 
 /* Discover and register compatible crypto implementations in stripped

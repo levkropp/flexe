@@ -297,6 +297,11 @@ TEST(sha_accelerator_matches_known_answers) {
 #define S3_SHA_H                (S3_SHA_BASE + 0x40u)
 #define S3_SHA_TEXT             (S3_SHA_BASE + 0x80u)
 
+#define S3_SYSTEM_BASE          0x600C0000u
+#define S3_SYSTEM_CLK_EN1       (S3_SYSTEM_BASE + 0x01Cu)
+#define S3_SYSTEM_RST_EN1       (S3_SYSTEM_BASE + 0x024u)
+#define S3_SYSTEM_SHA           (1u << 2)
+
 #define S3_GDMA_BASE            0x6003F000u
 #define S3_GDMA_IN_CONF1        (S3_GDMA_BASE + 0x004u)
 #define S3_GDMA_IN_INT_RAW      (S3_GDMA_BASE + 0x008u)
@@ -349,7 +354,17 @@ static bool s3_sha_fixture_init(s3_sha_fixture_t *fixture) {
     if (!fixture->periph || !periph_gdma(fixture->periph)) return false;
     fixture->sha = sha_stubs_create(
         &fixture->cpu, periph_gdma(fixture->periph));
-    return fixture->sha != NULL;
+    if (!fixture->sha ||
+        sha_stubs_attach_system_clock(
+            fixture->sha, fixture->periph) != 0)
+        return false;
+    mem_write32(fixture->cpu.mem, S3_SYSTEM_CLK_EN1,
+                mem_read32(fixture->cpu.mem, S3_SYSTEM_CLK_EN1) |
+                S3_SYSTEM_SHA);
+    mem_write32(fixture->cpu.mem, S3_SYSTEM_RST_EN1,
+                mem_read32(fixture->cpu.mem, S3_SYSTEM_RST_EN1) &
+                ~S3_SYSTEM_SHA);
+    return true;
 }
 
 static void s3_sha_fixture_destroy(s3_sha_fixture_t *fixture) {
@@ -441,6 +456,52 @@ TEST(esp32s3_sha_direct_modes_match_known_answers) {
                         sha384_abc, 12u);
     s3_sha_check_direct(fixture.cpu.mem, "abc", 4u, 128u,
                         sha512_abc, 16u);
+
+    s3_sha_fixture_destroy(&fixture);
+}
+
+TEST(esp32s3_sha_honors_system_clock_and_reset) {
+    s3_sha_fixture_t fixture;
+    bool ready = s3_sha_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_sha_fixture_destroy(&fixture);
+        return;
+    }
+
+    uint8_t padded[64];
+    ASSERT_EQ(sha_pad_for_block("abc", padded, sizeof(padded)), 1u);
+    mem_write32(fixture.cpu.mem, S3_SHA_MODE, 2u);
+    s3_sha_fill_block(fixture.cpu.mem, padded, sizeof(padded));
+
+    uint32_t clocks = mem_read32(fixture.cpu.mem, S3_SYSTEM_CLK_EN1);
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_CLK_EN1,
+                clocks & ~S3_SYSTEM_SHA);
+    mem_write32(fixture.cpu.mem, S3_SHA_START, 1u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_H), 0u);
+
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_CLK_EN1,
+                clocks | S3_SYSTEM_SHA);
+    mem_write32(fixture.cpu.mem, S3_SHA_START, 1u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_H), 0xBA7816BFu);
+
+    uint32_t resets = mem_read32(fixture.cpu.mem, S3_SYSTEM_RST_EN1);
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_RST_EN1,
+                resets | S3_SYSTEM_SHA);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_MODE), 0u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_H), 0u);
+    mem_write32(fixture.cpu.mem, S3_SHA_MODE, 2u);
+    s3_sha_fill_block(fixture.cpu.mem, padded, sizeof(padded));
+    mem_write32(fixture.cpu.mem, S3_SHA_START, 1u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_MODE), 0u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_TEXT), 0u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_H), 0u);
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_RST_EN1, resets);
+    mem_write32(fixture.cpu.mem, S3_SHA_MODE, 2u);
+    s3_sha_fill_block(fixture.cpu.mem, padded, sizeof(padded));
+    mem_write32(fixture.cpu.mem, S3_SHA_START, 1u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_SHA_H), 0xBA7816BFu);
+    ASSERT_EQ(periph_unhandled_count(fixture.periph), 0);
 
     s3_sha_fixture_destroy(&fixture);
 }
@@ -679,6 +740,7 @@ static void run_crypto_tests(void) {
     TEST_SUITE("Crypto MMIO");
     RUN_TEST(sha_accelerator_matches_known_answers);
     RUN_TEST(esp32s3_sha_direct_modes_match_known_answers);
+    RUN_TEST(esp32s3_sha_honors_system_clock_and_reset);
     RUN_TEST(esp32s3_sha_consumes_chained_gdma_descriptors);
     RUN_TEST(esp32s3_gdma_honors_owner_check_and_writeback);
     RUN_TEST(esp32s3_gdma_receives_chained_descriptors_and_reports_errors);

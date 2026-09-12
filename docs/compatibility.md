@@ -79,9 +79,12 @@ The target-described S3 SYSTEM bank exposes documented reset state and masked
 readback for peripheral clock/reset controls, low-sleep memory power masking,
 and Bluetooth low-power-clock division. SYSTIMER and both timer groups pause at
 exact clock-gate boundaries, and their independent reset pulses restore device
-state and interrupt lines. Effects for other peripheral, memory-power, and
-Bluetooth clock fields remain explicit unsupported-access diagnostics even
-though their architectural register values are retained.
+state and interrupt lines. The external I2C and GP-SPI controllers and the
+session-owned SHA accelerator also consume their target-described clock/reset
+gates; SHA commands cannot complete with its clock off or reset asserted, and
+a reset pulse clears its register and digest state. Effects for other peripheral,
+memory-power, and Bluetooth clock fields remain explicit unsupported-access
+diagnostics even though their architectural register values are retained.
 
 The external I2C model is shared by classic ESP32 and ESP32-S3 through target
 descriptors rather than fixed addresses or command encodings. It implements
@@ -120,9 +123,14 @@ AHB GDMA v1 transmit chain selected for SHA, including chained descriptors,
 length and EOF validation, optional owner checking and write-back, and
 completion status. The shared GDMA model also accepts receive streams from
 modeled peripherals such as GP-SPI. It therefore works for stripped firmware
-without an ELF symbol or firmware-specific hook. Fast mode completes each
-block immediately; SHA/GDMA latency, arbitration, GDMA CPU interrupt delivery,
-and SHA-512/224, SHA-512/256, and configurable SHA-512/t are not yet modeled.
+without an ELF symbol or firmware-specific hook. The S3 SYSTEM clock and reset
+bits govern SHA execution and reset state; direct and GDMA commands do no work
+while gated or held in reset. In an unmodified S3 NerdMiner application run,
+this replaces roughly 131,000 repeated clock/reset unsupported diagnostics
+with device state transitions, though that firmware is not yet a passing S3
+production fixture. Fast mode completes each block immediately; SHA/GDMA
+latency, arbitration, GDMA CPU interrupt delivery, and SHA-512/224, SHA-512/256,
+and configurable SHA-512/t are not yet modeled.
 Requests for the unsupported SHA modes or malformed DMA chains are rejected
 with a diagnostic rather than returning invented digest data.
 

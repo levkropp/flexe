@@ -13,6 +13,13 @@ typedef struct esp32_periph esp32_periph_t;
 typedef struct flexe_gdma flexe_gdma_t;
 typedef struct flexe_gp_spi flexe_gp_spi_t;
 
+/* Some target-described devices are constructed by the session rather than
+ * by the SoC peripheral container. Registering a listener composes those
+ * devices with the same SYSTEM clock/reset controller used by built-in
+ * peripherals. Passing NULL detaches the listener. */
+typedef void (*periph_system_state_fn)(void *ctx, bool clock_enabled,
+                                       bool reset_asserted);
+
 /* One-shot host-device completion on the guest's peripheral clock. External
  * chips use this for operations which finish after their initiating bus
  * transaction has returned (radio TX, conversions, flash programming, etc.). */
@@ -359,6 +366,12 @@ void periph_cancel_deferred(esp32_periph_t *p, periph_deferred_fn fn,
 
 /* Access the backing memory object (used by spi_display) */
 xtensa_mem_t *periph_mem(esp32_periph_t *p);
+
+int periph_set_system_state_handler(esp32_periph_t *p,
+                                    flexe_system_device_t device,
+                                    unsigned instance,
+                                    periph_system_state_fn handler,
+                                    void *ctx);
 
 /* Current GPIO output level of a pin. Returns -1 for an invalid pin or a
  * peripheral-selected signal whose producer is not attached. Used by the

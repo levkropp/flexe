@@ -40,7 +40,7 @@
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 7u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 8u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
@@ -49,7 +49,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 33u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 34u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -213,6 +213,7 @@ typedef enum {
     FLEXE_SYSTEM_DEVICE_TIMER_GROUP,
     FLEXE_SYSTEM_DEVICE_I2C,
     FLEXE_SYSTEM_DEVICE_GP_SPI,
+    FLEXE_SYSTEM_DEVICE_SHA,
 } flexe_system_device_t;
 
 typedef struct {

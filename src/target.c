@@ -419,7 +419,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 7u,
-            .gate_count = 7u,
+            .gate_count = 8u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -491,6 +491,14 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x020u,
                     .clock_mask = 1u << 16,
                     .reset_mask = 1u << 16,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_SHA,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 2,
+                    .reset_mask = 1u << 2,
                 },
             },
         },

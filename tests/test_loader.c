@@ -369,7 +369,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 7u);
-    ASSERT_EQ(s3->system_clock.gate_count, 7u);
+    ASSERT_EQ(s3->system_clock.gate_count, 8u);
     ASSERT_EQ(s3->system_clock.reg[1].offset, 0x18u);
     ASSERT_EQ(s3->system_clock.reg[1].reset, 0xF9C1E06Fu);
     ASSERT_EQ(s3->system_clock.gate[0].device,
@@ -386,6 +386,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.gate[5].clock_mask, 1u << 6);
     ASSERT_EQ(s3->system_clock.gate[6].instance, 1u);
     ASSERT_EQ(s3->system_clock.gate[6].clock_mask, 1u << 16);
+    ASSERT_EQ(s3->system_clock.gate[7].device,
+              FLEXE_SYSTEM_DEVICE_SHA);
+    ASSERT_EQ(s3->system_clock.gate[7].clock_mask, 1u << 2);
+    ASSERT_EQ(s3->system_clock.gate[7].reset_mask, 1u << 2);
     ASSERT_EQ(s3->io_mux.base, 0x60009000u);
     ASSERT_EQ(s3->io_mux.gpio_count, 49u);
     ASSERT_EQ(s3->io_mux.gpio_register_offset[26], 0x6Cu);

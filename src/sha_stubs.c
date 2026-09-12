@@ -41,6 +41,9 @@ struct sha_stubs {
     mmio_read_fn       fallback_read;
     mmio_write_fn      fallback_write;
     void              *fallback_ctx;
+    esp32_periph_t     *system_periph;
+    bool                system_clock_enabled;
+    bool                system_reset_asserted;
 
     /* Message and digest register files. Classic ESP32 aliases both through
      * SHA_TEXT; unified accelerators expose SHA_TEXT and SHA_H separately. */
@@ -85,6 +88,32 @@ struct sha_stubs {
     uint32_t warned_mode_mask;
     bool warned_dma;
 };
+
+static bool sha_operational(const sha_stubs_t *ss) {
+    return ss->system_clock_enabled && !ss->system_reset_asserted;
+}
+
+static void sha_hardware_reset(sha_stubs_t *ss) {
+    memset(ss->sha_text, 0, sizeof(ss->sha_text));
+    memset(ss->sha_h, 0, sizeof(ss->sha_h));
+    memset(ss->control, 0, sizeof(ss->control));
+    memset(ss->sha1_engine, 0, sizeof(ss->sha1_engine));
+    memset(ss->sha224_engine, 0, sizeof(ss->sha224_engine));
+    memset(ss->sha256_engine, 0, sizeof(ss->sha256_engine));
+    memset(ss->sha512_engine, 0, sizeof(ss->sha512_engine));
+    ss->sha_h_dirty = false;
+    ss->current_type = -1;
+}
+
+static void sha_system_state_changed(void *ctx, bool clock_enabled,
+                                     bool reset_asserted) {
+    sha_stubs_t *ss = ctx;
+    if (!ss) return;
+    bool reset_rising = reset_asserted && !ss->system_reset_asserted;
+    ss->system_clock_enabled = clock_enabled;
+    ss->system_reset_asserted = reset_asserted;
+    if (reset_rising) sha_hardware_reset(ss);
+}
 
 /* ===== SHA peripheral MMIO handler ===== */
 
@@ -353,6 +382,7 @@ static void sha_mmio_write(void *ctx, uint32_t addr, uint32_t val) {
         return;
     }
     uint32_t off = addr - desc->base;
+    if (ss->system_reset_asserted) return;
 
     if (desc->layout == FLEXE_SHA_LAYOUT_ESP32 && off < 0x80u) {
         /* SHA_TEXT registers — firmware writes state here via sha_ll_write_digest */
@@ -362,6 +392,7 @@ static void sha_mmio_write(void *ctx, uint32_t addr, uint32_t val) {
 
     if (desc->layout == FLEXE_SHA_LAYOUT_ESP32 &&
         off >= 0x80u && off < 0xC0u) {
+        if (!sha_operational(ss)) return;
         uint32_t mode = (off - 0x80u) / 0x10u;
         flexe_sha_algorithm_t algorithm = sha_mode_algorithm(ss, mode);
         switch (off & 0xFu) {
@@ -391,11 +422,19 @@ static void sha_mmio_write(void *ctx, uint32_t addr, uint32_t val) {
             case 0x04u: ss->control[1] = val; return; /* T string */
             case 0x08u: ss->control[2] = val; return; /* T length */
             case 0x0Cu: ss->control[3] = val & 0x3Fu; return;
-            case 0x10u: sha_unified_direct(ss, true); return;
-            case 0x14u: sha_unified_direct(ss, false); return;
+            case 0x10u:
+                if (sha_operational(ss)) sha_unified_direct(ss, true);
+                return;
+            case 0x14u:
+                if (sha_operational(ss)) sha_unified_direct(ss, false);
+                return;
             case 0x18u: return; /* BUSY is read-only. */
-            case 0x1Cu: sha_unified_dma(ss, true); return;
-            case 0x20u: sha_unified_dma(ss, false); return;
+            case 0x1Cu:
+                if (sha_operational(ss)) sha_unified_dma(ss, true);
+                return;
+            case 0x20u:
+                if (sha_operational(ss)) sha_unified_dma(ss, false);
+                return;
             case 0x24u: ss->control[9] = 0u; return; /* clear IRQ */
             case 0x28u: ss->control[10] = val & 1u; return;
             default: ss->control[off / 4u] = val; return;
@@ -666,6 +705,7 @@ sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu, flexe_gdma_t *gdma) {
     ss->cpu = cpu;
     ss->target = mem_target(cpu->mem);
     ss->gdma = gdma;
+    ss->system_clock_enabled = true;
     ss->current_type = -1;
 
     /* Verify SHA-256 via OpenSSL is correct */
@@ -690,8 +730,29 @@ sha_stubs_t *sha_stubs_create(xtensa_cpu_t *cpu, flexe_gdma_t *gdma) {
     return ss;
 }
 
+int sha_stubs_attach_system_clock(sha_stubs_t *ss,
+                                  esp32_periph_t *periph) {
+    if (!ss || !periph) return -1;
+    if (ss->system_periph)
+        (void)periph_set_system_state_handler(
+            ss->system_periph, FLEXE_SYSTEM_DEVICE_SHA, 0u, NULL, NULL);
+    ss->system_periph = periph;
+    if (periph_set_system_state_handler(
+            periph, FLEXE_SYSTEM_DEVICE_SHA, 0u,
+            sha_system_state_changed, ss) != 0) {
+        ss->system_periph = NULL;
+        ss->system_clock_enabled = true;
+        ss->system_reset_asserted = false;
+        return -1;
+    }
+    return 0;
+}
+
 void sha_stubs_destroy(sha_stubs_t *ss) {
     if (!ss) return;
+    if (ss->system_periph)
+        (void)periph_set_system_state_handler(
+            ss->system_periph, FLEXE_SYSTEM_DEVICE_SHA, 0u, NULL, NULL);
     (void)mem_register_mmio_range(
         ss->cpu->mem, ss->target->sha.base, ss->target->sha.register_size,
         ss->fallback_read, ss->fallback_write, ss->fallback_ctx);

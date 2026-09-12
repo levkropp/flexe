@@ -1816,6 +1816,9 @@ struct esp32_periph {
     flexe_sens_t *target_sens;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_system_clock_t *system_clock;
+    periph_system_state_fn
+        system_state_handler[FLEXE_TARGET_SYSTEM_GATE_MAX];
+    void *system_state_ctx[FLEXE_TARGET_SYSTEM_GATE_MAX];
     flexe_systimer_t *systimer;
     flexe_timer_group_t *target_timer_group;
     flexe_spi_mem_t *spi_mem;
@@ -13645,21 +13648,35 @@ static void system_clock_gate_changed(
         if (instance == 0u)
             flexe_systimer_set_system_state(
                 p->systimer, clock_enabled, reset_asserted);
-        return;
+        break;
     case FLEXE_SYSTEM_DEVICE_TIMER_GROUP:
         flexe_timer_group_set_system_state(
             p->target_timer_group, instance,
             clock_enabled, reset_asserted);
-        return;
+        break;
     case FLEXE_SYSTEM_DEVICE_I2C:
         i2c_set_system_state(
             p, instance, clock_enabled, reset_asserted);
-        return;
+        break;
     case FLEXE_SYSTEM_DEVICE_GP_SPI:
         flexe_gp_spi_set_system_state(
             p->gp_spi, instance, clock_enabled, reset_asserted);
-        return;
+        break;
+    case FLEXE_SYSTEM_DEVICE_SHA:
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
+        return;
+    }
+
+    const flexe_system_clock_desc_t *desc = &p->target->system_clock;
+    for (unsigned index = 0u; index < desc->gate_count; index++) {
+        const flexe_system_gate_desc_t *gate = &desc->gate[index];
+        if (gate->device != device || gate->instance != instance)
+            continue;
+        if (p->system_state_handler[index])
+            p->system_state_handler[index](
+                p->system_state_ctx[index], clock_enabled,
+                reset_asserted);
         return;
     }
 }
@@ -14475,6 +14492,38 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 }
 
 xtensa_mem_t *periph_mem(esp32_periph_t *p) { return p ? p->mem : NULL; }
+
+int periph_set_system_state_handler(esp32_periph_t *p,
+                                    flexe_system_device_t device,
+                                    unsigned instance,
+                                    periph_system_state_fn handler,
+                                    void *ctx)
+{
+    if (!p || !p->system_clock) return -1;
+    const flexe_system_clock_desc_t *desc = &p->target->system_clock;
+    for (unsigned index = 0u; index < desc->gate_count; index++) {
+        const flexe_system_gate_desc_t *gate = &desc->gate[index];
+        if (gate->device != device || gate->instance != instance)
+            continue;
+
+        p->system_state_handler[index] = handler;
+        p->system_state_ctx[index] = handler ? ctx : NULL;
+        if (handler) {
+            bool clock_enabled = false;
+            bool reset_asserted = true;
+            if (!flexe_system_clock_gate_state(
+                    p->system_clock, device, instance,
+                    &clock_enabled, &reset_asserted)) {
+                p->system_state_handler[index] = NULL;
+                p->system_state_ctx[index] = NULL;
+                return -1;
+            }
+            handler(ctx, clock_enabled, reset_asserted);
+        }
+        return 0;
+    }
+    return -1;
+}
 
 int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
     if (!p || pin < 0) return -1;
