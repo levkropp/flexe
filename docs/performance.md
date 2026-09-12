@@ -44,6 +44,15 @@ kept in the corpus because it has the smallest margin. Host scheduling and
 thermal state move these numbers, so rerun the command before comparing a
 change.
 
+The stricter repeated WLED acceptance gate was rerun on 2026-09-12 after
+structural acceleration of the relocated ESP-IDF critical-section body and
+its standard heap lock wrappers. With one warm-up and three two-billion-cycle
+samples, the interpreter measured 1.482x median, 1.464x minimum, and 1.87% CV;
+the JIT measured 3.522x median, 3.519x minimum, and 2.08% CV. Both engines
+produced the pinned `F29E02EB` LED waveform. These accelerators are selected by
+complete instruction signatures and decoded call/literal targets, never by a
+WLED address; unsafe or unfamiliar calls continue in the guest.
+
 ## Reproducible compute benchmark
 
 `bench-compute.sh` builds an in-repository Arduino sketch and executes a fixed

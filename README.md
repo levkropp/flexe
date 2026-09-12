@@ -131,8 +131,8 @@ MESHTASTIC_BIN=/path/to/meshtastic.bin ./scripts/bench-stock-roms.sh
 ```
 
 In the current Apple-silicon release benchmark, every image in the five-ROM
-generic corpus clears real time in both engines. WLED is the limiting workload
-at 1.03x interpreted and 2.32x under the JIT. See
+generic corpus clears real time in both engines. The stricter repeated WLED
+acceptance benchmark sustains 1.482x interpreted and 3.522x under the JIT. See
 [Performance](docs/performance.md) for dated results and methodology.
 
 ## Architecture

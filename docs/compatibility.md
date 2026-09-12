@@ -39,6 +39,16 @@ operations immediately and does not yet model flash latency, separate
 per-core/PID cache contents, bus contention, wear, or interrupted-write power
 behavior.
 
+Fast mode also recognizes complete relocated ESP-IDF 4.x critical-section
+bodies and their standard heap lock wrappers structurally. It fuses only the
+uncontended or recursive internal-RAM path when the full instruction span is
+clear of timer, scheduler, interrupt, debugger, and register-window boundaries.
+Lock contention, finite timeouts, external RAM, unfamiliar SDK code, and every
+failed validation execute from the original firmware. Differential tests
+compare the accelerated and interpreted paths across both cores, all windowed
+call sizes, lock nesting, register state, memory effects, and boundary
+fallbacks; no application name or linked address authorizes the optimization.
+
 The S3 GPIO model implements the S2/S3-generation register layout, both data
 and enable banks, package-valid GPIO0..48 (including the GPIO22..25 holes),
 software-output selection and inversion, matrix input selection and constant

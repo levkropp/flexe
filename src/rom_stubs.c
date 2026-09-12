@@ -81,17 +81,38 @@ typedef struct {
     bool pending;
 } stub_irq_t;
 
-/* Decoded relocation state for a complete ESP-IDF critical-section body.
- * Keep this beside the ROM-stub owner rather than re-reading four literal
- * pool entries on every call: discovery is cold, while these routines are
- * among the hottest paths in a normal FreeRTOS application. */
+/* Decoded relocation state for complete ESP-IDF critical-section bodies.
+ * Keep this beside the ROM-stub owner rather than re-reading literal-pool
+ * entries on every call: discovery is cold, while these routines are among
+ * the hottest paths in a normal FreeRTOS application. */
+typedef struct {
+    uint32_t nesting_addr;
+    uint32_t old_state_addr;
+    uint32_t free_value;
+    uintptr_t sram_begin;
+    uintptr_t sram_end;
+} fw_idf_port_enter_ctx_t;
+
 typedef struct {
     uint32_t nesting_addr;
     uint32_t old_state_addr;
     uint32_t free_value;
 } fw_idf_port_exit_ctx_t;
 
+#define FW_IDF_PORT_ENTER_MAX 4u
 #define FW_IDF_PORT_EXIT_MAX 4u
+#define FW_IDF_HEAP_LOCK_MAX 8u
+
+/* Complete, relocated IDF heap-lock wrappers may be fused with a verified
+ * critical-section hook. Keep the resolved entry rather than rediscovering
+ * it on every allocation: both the wrapper and its callee were authenticated
+ * byte-for-byte during the cold firmware scan. */
+typedef struct {
+    esp32_rom_stubs_t *stubs;
+    rom_stub_entry_t *callee;
+    uint32_t call_return;
+    bool enter;
+} fw_idf_heap_lock_ctx_t;
 
 #define TWDT_MAX_TASKS_DECL 16
 
@@ -142,8 +163,12 @@ struct esp32_rom_stubs {
     } ht[HOOK_HT_SIZE];
     uint64_t hook_bitmap[HOOK_BITMAP_WORDS];
     stub_direct_entry_t *direct;  /* Direct dispatch table (heap-allocated, 64K entries) */
+    fw_idf_port_enter_ctx_t idf_port_enter[FW_IDF_PORT_ENTER_MAX];
+    uint8_t idf_port_enter_count;
     fw_idf_port_exit_ctx_t idf_port_exit[FW_IDF_PORT_EXIT_MAX];
     uint8_t idf_port_exit_count;
+    fw_idf_heap_lock_ctx_t idf_heap_lock[FW_IDF_HEAP_LOCK_MAX];
+    uint8_t idf_heap_lock_count;
 
     /* In-memory NVS key/value store (see stub_nvs_* functions) */
     struct nvs_kv_entry {
@@ -5562,6 +5587,295 @@ static bool fw_native_span_safe(const xtensa_cpu_t *cpu, uint32_t insns) {
            cpu->next_timer_event - cpu->ccount > insns);
 }
 
+static void fw_window_hazard_refresh(xtensa_cpu_t *cpu) {
+    if (!cpu->real_window_vectors) {
+        cpu->window_hazard = 0u;
+        return;
+    }
+    uint32_t windows = cpu->windowstart & 0xFFFFu;
+    unsigned shift = (cpu->windowbase + 1u) & 15u;
+    cpu->window_hazard =
+        (uint8_t)(((windows | (windows << 16)) >> shift) & 7u);
+}
+
+static bool fw_named_stub_at(const esp32_rom_stubs_t *stubs, uint32_t addr,
+                             const char *name);
+static bool fw_idf_port_global_is_writable(const xtensa_cpu_t *cpu,
+                                           uint32_t addr);
+
+/* ESP-IDF 4.x's vPortEnterCriticalTimeout() implementation. The complete
+ * body is fingerprinted and every link-relocated literal is decoded before
+ * the hook is installed. The fast path below deliberately handles only an
+ * uncontended or recursive internal-RAM acquisition with an infinite
+ * timeout. Contention must return to the guest so S32C1I can hand the core
+ * back to the deterministic scheduler; finite timeout and external-RAM paths
+ * likewise retain their real instruction-by-instruction behavior. */
+#define IDF_PORT_ENTER_SIZE                 229u
+#define IDF_PORT_ENTER_OWNER_XOR_L32R       20u
+#define IDF_PORT_ENTER_ADDR_BIAS_L32R       26u
+#define IDF_PORT_ENTER_ADDR_LIMIT_L32R      31u
+#define IDF_PORT_ENTER_FREE_L32R            34u
+#define IDF_PORT_ENTER_ATOMIC_L32R_1        96u
+#define IDF_PORT_ENTER_ATOMIC_L32R_2       130u
+#define IDF_PORT_ENTER_XTOS_L32R           166u
+#define IDF_PORT_ENTER_NEST_L32R           198u
+#define IDF_PORT_ENTER_OLD_L32R            212u
+
+static bool fw_idf_port_enter_matches(
+        esp32_rom_stubs_t *stubs, uint32_t addr,
+        fw_idf_port_enter_ctx_t *ctx_out) {
+    static const uint8_t signature[] = {
+        0x36, 0x81, 0x00, 0x9D, 0x03, 0x70, 0x63, 0x00,
+        0x60, 0x63, 0x00, 0x26, 0x03, 0x02, 0xD0, 0xEA,
+        0x03, 0x50, 0xEB, 0x03, 0x41, 0x41, 0xC8, 0x40,
+        0x45, 0x30, 0x81, 0x40, 0xC8, 0x8A, 0x82, 0xE1,
+        0x04, 0xC7, 0x31, 0x3F, 0xC8, 0x87, 0xBE, 0x28,
+        0x66, 0x09, 0x12, 0x8D, 0x05, 0x30, 0x0C, 0x13,
+        0x82, 0xE2, 0x00, 0x89, 0x71, 0x87, 0x14, 0xF2,
+        0xC0, 0x20, 0x00, 0x86, 0x1C, 0x00, 0xAD, 0x05,
+        0x30, 0x0C, 0x13, 0xA2, 0xE2, 0x00, 0xA9, 0x71,
+        0xA7, 0x14, 0x49, 0xC0, 0x20, 0x00, 0xC6, 0x17,
+        0x00, 0x66, 0x09, 0x19, 0xC2, 0xC1, 0x1C, 0xBD,
+        0x03, 0xAD, 0x02, 0x59, 0x71, 0xC0, 0x20, 0x00,
+        0x81, 0x33, 0xC8, 0xE0, 0x08, 0x00, 0x88, 0x71,
+        0x87, 0x14, 0xE8, 0x86, 0x10, 0x00, 0xAD, 0x02,
+        0xC2, 0xC1, 0x1C, 0xBD, 0x03, 0x89, 0x21, 0x99,
+        0x11, 0xD9, 0x31, 0xE9, 0x01, 0x59, 0x71, 0xC0,
+        0x20, 0x00, 0x81, 0x2A, 0xC8, 0xE0, 0x08, 0x00,
+        0xA8, 0x71, 0x88, 0x21, 0x98, 0x11, 0xD8, 0x31,
+        0xE8, 0x01, 0xA7, 0x94, 0x1B, 0xA0, 0xEA, 0x03,
+        0xD0, 0xAA, 0xC0, 0xA7, 0xB9, 0x86, 0x60, 0xE6,
+        0x13, 0x10, 0x20, 0x00, 0xAD, 0x07, 0x81, 0x2E,
+        0xC6, 0xE0, 0x08, 0x00, 0x0C, 0x02, 0x46, 0x0C,
+        0x00, 0x38, 0x12, 0x1B, 0x33, 0x39, 0x12, 0x60,
+        0xE6, 0x13, 0x10, 0x20, 0x00, 0x40, 0xEB, 0x03,
+        0x40, 0x4D, 0x04, 0xE0, 0x44, 0x11, 0x31, 0x17,
+        0xC8, 0x4A, 0x33, 0x28, 0x03, 0x1B, 0x22, 0x29,
+        0x03, 0x66, 0x12, 0x0C, 0x31, 0x15, 0xC8, 0x4A,
+        0x43, 0x79, 0x04, 0xC0, 0x20, 0x00, 0x46, 0x00,
+        0x00, 0x0C, 0x12, 0x1D, 0xF0,
+    };
+    static const size_t relocation_bytes[] = {
+        IDF_PORT_ENTER_OWNER_XOR_L32R + 1u,
+        IDF_PORT_ENTER_OWNER_XOR_L32R + 2u,
+        IDF_PORT_ENTER_ADDR_BIAS_L32R + 1u,
+        IDF_PORT_ENTER_ADDR_BIAS_L32R + 2u,
+        IDF_PORT_ENTER_ADDR_LIMIT_L32R + 1u,
+        IDF_PORT_ENTER_ADDR_LIMIT_L32R + 2u,
+        IDF_PORT_ENTER_FREE_L32R + 1u,
+        IDF_PORT_ENTER_FREE_L32R + 2u,
+        IDF_PORT_ENTER_ATOMIC_L32R_1 + 1u,
+        IDF_PORT_ENTER_ATOMIC_L32R_1 + 2u,
+        IDF_PORT_ENTER_ATOMIC_L32R_2 + 1u,
+        IDF_PORT_ENTER_ATOMIC_L32R_2 + 2u,
+        IDF_PORT_ENTER_XTOS_L32R + 1u,
+        IDF_PORT_ENTER_XTOS_L32R + 2u,
+        IDF_PORT_ENTER_NEST_L32R + 1u,
+        IDF_PORT_ENTER_NEST_L32R + 2u,
+        IDF_PORT_ENTER_OLD_L32R + 1u,
+        IDF_PORT_ENTER_OLD_L32R + 2u,
+    };
+    _Static_assert(sizeof(signature) == IDF_PORT_ENTER_SIZE,
+                   "IDF port-enter implementation size");
+    if (!stubs || !ctx_out ||
+        !firmware_signature_matches_except(
+                stubs->cpu->mem, addr, signature, sizeof(signature),
+                relocation_bytes,
+                sizeof(relocation_bytes) / sizeof(relocation_bytes[0])))
+        return false;
+
+    uint32_t owner_xor_literal, bias_literal, limit_literal, free_literal;
+    uint32_t atomic_literal_1, atomic_literal_2, xtos_literal;
+    uint32_t nest_literal, old_literal;
+    uint32_t owner_xor, bias, limit, free_value, atomic_addr_1;
+    uint32_t atomic_addr_2, xtos_addr, nesting_addr, old_state_addr;
+    if (!fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_OWNER_XOR_L32R,
+                        &owner_xor_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_ADDR_BIAS_L32R,
+                        &bias_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_ADDR_LIMIT_L32R,
+                        &limit_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_FREE_L32R,
+                        &free_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_ATOMIC_L32R_1,
+                        &atomic_literal_1) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_ATOMIC_L32R_2,
+                        &atomic_literal_2) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_XTOS_L32R,
+                        &xtos_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_NEST_L32R,
+                        &nest_literal) ||
+        !fw_l32r_target(stubs->cpu,
+                        addr + IDF_PORT_ENTER_OLD_L32R,
+                        &old_literal) ||
+        !fw_peek(stubs->cpu, owner_xor_literal, 4, &owner_xor) ||
+        !fw_peek(stubs->cpu, bias_literal, 4, &bias) ||
+        !fw_peek(stubs->cpu, limit_literal, 4, &limit) ||
+        !fw_peek(stubs->cpu, free_literal, 4, &free_value) ||
+        !fw_peek(stubs->cpu, atomic_literal_1, 4, &atomic_addr_1) ||
+        !fw_peek(stubs->cpu, atomic_literal_2, 4, &atomic_addr_2) ||
+        !fw_peek(stubs->cpu, xtos_literal, 4, &xtos_addr) ||
+        !fw_peek(stubs->cpu, nest_literal, 4, &nesting_addr) ||
+        !fw_peek(stubs->cpu, old_literal, 4, &old_state_addr) ||
+        owner_xor != (XTENSA_SPINLOCK_OWNER_CORE0 ^
+                      XTENSA_SPINLOCK_OWNER_CORE1) ||
+        bias != 0xC0800000u || limit != 0x003FFFFFu ||
+        free_value != XTENSA_SPINLOCK_FREE ||
+        atomic_addr_1 != atomic_addr_2 ||
+        mem_get_ptr(stubs->cpu->mem, atomic_addr_1) == NULL ||
+        !fw_named_stub_at(stubs, xtos_addr, "_xtos_set_intlevel") ||
+        !fw_idf_port_global_is_writable(stubs->cpu, nesting_addr) ||
+        !fw_idf_port_global_is_writable(stubs->cpu, old_state_addr))
+        return false;
+
+    ctx_out->nesting_addr = nesting_addr;
+    ctx_out->old_state_addr = old_state_addr;
+    ctx_out->free_value = free_value;
+    ctx_out->sram_begin = (uintptr_t)mem_backing_ptr(
+            stubs->cpu->mem, FLEXE_MEM_SRAM);
+    ctx_out->sram_end = ctx_out->sram_begin +
+        mem_backing_size(stubs->cpu->mem, FLEXE_MEM_SRAM);
+    if (ctx_out->sram_begin == 0u ||
+        ctx_out->sram_end <= ctx_out->sram_begin)
+        return false;
+    return true;
+}
+
+static int stub_idf_port_enter(xtensa_cpu_t *cpu, void *opaque) {
+    const fw_idf_port_enter_ctx_t *ctx = opaque;
+    unsigned callinc = XT_PS_CALLINC(cpu->ps);
+    if (!ctx || callinc < 1u || callinc > 3u || cpu->seed_entry_link ||
+        cpu->breakpoint_count != 0u || cpu->window_trace ||
+        rom_arg(cpu, 1) != UINT32_MAX || cpu->core_id < 0 ||
+        cpu->core_id > 1)
+        return 0;
+
+    uint32_t owner = cpu->core_id == 0 ? XTENSA_SPINLOCK_OWNER_CORE0
+                                       : XTENSA_SPINLOCK_OWNER_CORE1;
+    if (cpu->prid != owner)
+        return 0;
+
+    unsigned wb = cpu->windowbase & 15u;
+    uint32_t live = cpu->windowstart;
+    if ((live & (1u << wb)) == 0u)
+        return 0;
+    for (unsigned i = 1u; i <= callinc + 3u; i++) {
+        if (live & (1u << ((wb + i) & 15u)))
+            return 0;
+    }
+
+    uint32_t return_link = ar_read(cpu, (int)(callinc * 4u));
+    if ((return_link >> 30) != callinc)
+        return 0;
+
+    uint32_t mux = rom_arg(cpu, 0);
+    uint8_t *mux_begin = mem_get_ptr_w(cpu->mem, mux);
+    uint8_t *mux_end = mux <= UINT32_MAX - 7u
+                     ? mem_get_ptr_w(cpu->mem, mux + 7u) : NULL;
+    if ((mux & 3u) != 0u || mux_begin == NULL || mux_end == NULL ||
+        (uintptr_t)mux_begin < ctx->sram_begin ||
+        (uintptr_t)mux_end >= ctx->sram_end)
+        return 0;
+
+    uint32_t old_owner = mem_read32(cpu->mem, mux);
+    if (old_owner != ctx->free_value && old_owner != owner)
+        return 0;
+
+    uint32_t core_offset = (uint32_t)cpu->core_id << 2;
+    uint32_t nesting_word = ctx->nesting_addr + core_offset;
+    uint32_t old_state_word = ctx->old_state_addr + core_offset;
+    uint32_t caller_sp = ar_read(cpu, 1);
+    if (caller_sp < 64u ||
+        mem_get_ptr_w(cpu->mem, caller_sp - 36u) == NULL ||
+        mem_get_ptr_w(cpu->mem, caller_sp - 33u) == NULL ||
+        mem_get_ptr_w(cpu->mem, nesting_word) == NULL ||
+        mem_get_ptr_w(cpu->mem, nesting_word + 3u) == NULL ||
+        mem_get_ptr_w(cpu->mem, old_state_word) == NULL ||
+        mem_get_ptr_w(cpu->mem, old_state_word + 3u) == NULL)
+        return 0;
+
+    uint32_t nesting = mem_read32(cpu->mem, nesting_word);
+    uint32_t new_nesting = nesting + 1u;
+    bool first_nesting = new_nesting == 1u;
+    uint32_t insns = first_nesting ? 41u : 37u;
+    if ((cpu->interrupt & cpu->intenable) != 0u ||
+        !fw_native_span_safe(cpu, insns))
+        return 0;
+
+    uint32_t post_entry_ps = cpu->ps;
+    XT_PS_SET_OWB(post_entry_ps, wb);
+    uint32_t critical_ps = post_entry_ps;
+    XT_PS_SET_INTLEVEL(critical_ps, 3u);
+
+    if (old_owner == ctx->free_value)
+        mem_write32(cpu->mem, mux, owner);
+    mem_write32(cpu->mem, mux + 4u,
+                mem_read32(cpu->mem, mux + 4u) + 1u);
+    mem_write32(cpu->mem, caller_sp - 36u, old_owner);
+    mem_write32(cpu->mem, nesting_word, new_nesting);
+    if (first_nesting)
+        mem_write32(cpu->mem, old_state_word, post_entry_ps);
+
+    int callee = (int)(callinc * 4u);
+    ar_write(cpu, callee + 1, caller_sp - 64u);
+    ar_write(cpu, callee + 2, 1u);
+    ar_write(cpu, callee + 3,
+             first_nesting ? ctx->old_state_addr : nesting_word);
+    ar_write(cpu, callee + 4,
+             first_nesting ? old_state_word : core_offset);
+    ar_write(cpu, callee + 5, owner);
+    ar_write(cpu, callee + 6, critical_ps);
+    ar_write(cpu, callee + 7, post_entry_ps);
+    ar_write(cpu, callee + 8, old_owner);
+    ar_write(cpu, callee + 9, UINT32_MAX);
+    ar_write(cpu, callee + 14, 0x003FFFFFu);
+    cpu->scompare1 = ctx->free_value;
+    cpu->window_callsize[(wb + callinc) & 15u] = (uint8_t)callinc;
+    cpu->ps = critical_ps;
+    xtensa_request_irq_check(cpu);
+    cpu->pc = 0x40000000u | (return_link & 0x3FFFFFFFu);
+    cpu->_pc_written = true;
+
+    fw_charge_stub_path(cpu, insns);
+    return (int)insns;
+}
+
+static int fw_add_idf_port_enter_hooks(esp32_rom_stubs_t *stubs) {
+    int hooked = 0;
+    uint32_t last = ESP32_IRAM_INSN_ADDR_HIGH - IDF_PORT_ENTER_SIZE;
+    for (uint32_t addr = ESP32_FIRMWARE_INSN_ADDR_LOW;
+         addr <= last &&
+         stubs->idf_port_enter_count < FW_IDF_PORT_ENTER_MAX;
+         addr++) {
+        if (mem_read8(stubs->cpu->mem, addr) != 0x36u)
+            continue;
+        fw_idf_port_enter_ctx_t decoded;
+        if (!fw_idf_port_enter_matches(stubs, addr, &decoded))
+            continue;
+
+        fw_idf_port_enter_ctx_t *ctx =
+            &stubs->idf_port_enter[stubs->idf_port_enter_count];
+        *ctx = decoded;
+        int rc = rom_stubs_register_conditional_exact_if_absent_ctx(
+                stubs, addr, stub_idf_port_enter,
+                "vPortEnterCriticalTimeout", ctx);
+        if (rc == 0) {
+            stubs->idf_port_enter_count++;
+            hooked++;
+        }
+        addr += IDF_PORT_ENTER_SIZE - 1u;
+    }
+    return hooked;
+}
+
 /* ESP-IDF 4.x's optimized vPortExitCritical() implementation. This is a
  * complete function fingerprint, not an application address: the linker may
  * move the body and its four L32R literals independently. The decoded values
@@ -5798,6 +6112,243 @@ static int fw_add_idf_port_exit_hooks(esp32_rom_stubs_t *stubs) {
             hooked++;
         }
         addr += IDF_PORT_EXIT_SIZE - 1u;
+    }
+    return hooked;
+}
+
+/* IDF 4.x multi_heap_internal_lock()/unlock() are tiny ABI wrappers around
+ * the critical-section primitives above. Their call displacement changes at
+ * every link, so discovery authenticates the complete fixed instruction
+ * stream and resolves the CALL8 target semantically. The wrapper is fused
+ * only when that target is itself one of the fully verified conditional
+ * hooks; this composes two proven units without trusting a firmware address.
+ *
+ * The callback models ENTRY, the wrapper loads/branches, the nested CALL8,
+ * and the final RETW.N. If the nested hook declines (contention, finite
+ * scheduler room, an observable interrupt, or any unsafe mapping), the few
+ * speculative register-window writes are restored and the original wrapper
+ * executes unchanged. */
+#define IDF_HEAP_LOCK_SIZE          14u
+#define IDF_HEAP_LOCK_CALL_OFFSET    9u
+#define IDF_HEAP_UNLOCK_SIZE        12u
+#define IDF_HEAP_UNLOCK_CALL_OFFSET  7u
+
+static rom_stub_entry_t *fw_conditional_entry(
+        esp32_rom_stubs_t *stubs, uint32_t addr,
+        rom_conditional_stub_fn expected) {
+    if (!stubs || !expected)
+        return NULL;
+    for (int i = 0; i < stubs->count; i++) {
+        rom_stub_entry_t *entry = &stubs->entries[i];
+        if (entry->addr == addr && entry->conditional_fn == expected)
+            return entry;
+    }
+    return NULL;
+}
+
+static int stub_idf_heap_lock_wrapper(xtensa_cpu_t *cpu, void *opaque) {
+    fw_idf_heap_lock_ctx_t *ctx = opaque;
+    unsigned callinc = XT_PS_CALLINC(cpu->ps);
+    if (!ctx || !ctx->stubs || !ctx->callee || callinc < 1u || callinc > 3u ||
+        cpu->seed_entry_link || cpu->breakpoint_count != 0u ||
+        cpu->window_trace || ctx->stubs->log_fn)
+        return 0;
+
+    unsigned caller_wb = cpu->windowbase & 15u;
+    unsigned wrapper_wb = (caller_wb + callinc) & 15u;
+    uint32_t live = cpu->windowstart;
+    if ((live & (1u << caller_wb)) == 0u)
+        return 0;
+    for (unsigned i = 1u; i <= callinc; i++) {
+        if (live & (1u << ((caller_wb + i) & 15u)))
+            return 0;
+    }
+
+    uint32_t return_link = ar_read(cpu, (int)(callinc * 4u));
+    if ((return_link >> 30) != callinc)
+        return 0;
+    uint32_t caller_sp = ar_read(cpu, 1);
+    uint32_t heap = rom_arg(cpu, 0);
+    if ((heap & 3u) != 0u || heap > UINT32_MAX - 3u ||
+        mem_get_ptr(cpu->mem, heap) == NULL ||
+        mem_get_ptr(cpu->mem, heap + 3u) == NULL)
+        return 0;
+
+    uint32_t mux = mem_read32(cpu->mem, heap);
+    if (mux == 0u) {
+        if (!fw_native_span_safe(cpu, 4u))
+            return 0;
+
+        /* ENTRY a1,32; L32I.N; taken BEQZ.N; RETW.N. The wrapper's physical
+         * a1/a10 residue remains visible after the return, just as it does
+         * when the four instructions execute individually. */
+        unsigned sp_index = (wrapper_wb * 4u + 1u) & 63u;
+        unsigned a10_index = (wrapper_wb * 4u + 10u) & 63u;
+        cpu->ar[sp_index] = caller_sp - 32u;
+        cpu->ar[a10_index] = 0u;
+        cpu->window_callsize[wrapper_wb] = (uint8_t)callinc;
+        XT_PS_SET_OWB(cpu->ps, caller_wb);
+        cpu->windowbase = caller_wb;
+        cpu->windowstart = live;
+        fw_window_hazard_refresh(cpu);
+        cpu->pc = 0x40000000u | (return_link & 0x3FFFFFFFu);
+        cpu->_pc_written = true;
+        fw_charge_stub_path(cpu, 4u);
+        return 4;
+    }
+
+    /* The longest verified enter/exit path plus the wrapper. Requiring the
+     * maximum keeps a timer or scheduler boundary from becoming visible only
+     * after the nested callback has committed memory side effects. */
+    uint32_t maximum_span = ctx->enter ? 47u : 34u;
+    if (!fw_native_span_safe(cpu, maximum_span))
+        return 0;
+
+    unsigned sp_index = (wrapper_wb * 4u + 1u) & 63u;
+    unsigned a8_index = (wrapper_wb * 4u + 8u) & 63u;
+    unsigned a10_index = (wrapper_wb * 4u + 10u) & 63u;
+    unsigned a11_index = (wrapper_wb * 4u + 11u) & 63u;
+    uint32_t saved_sp = cpu->ar[sp_index];
+    uint32_t saved_a8 = cpu->ar[a8_index];
+    uint32_t saved_a10 = cpu->ar[a10_index];
+    uint32_t saved_a11 = cpu->ar[a11_index];
+    uint32_t saved_ps = cpu->ps;
+    uint32_t saved_pc = cpu->pc;
+    uint32_t saved_pc_written = cpu->_pc_written;
+    uint32_t saved_windowstart = cpu->windowstart;
+    uint8_t saved_hazard = cpu->window_hazard;
+    uint8_t saved_callsize = cpu->window_callsize[wrapper_wb];
+
+    /* Execute the wrapper prefix in its real physical registers. */
+    cpu->ar[sp_index] = caller_sp - 32u;
+    cpu->windowbase = wrapper_wb;
+    cpu->windowstart = live | (1u << wrapper_wb);
+    cpu->window_callsize[wrapper_wb] = (uint8_t)callinc;
+    XT_PS_SET_OWB(cpu->ps, caller_wb);
+    fw_window_hazard_refresh(cpu);
+    ar_write(cpu, 10, mux);
+    if (ctx->enter)
+        ar_write(cpu, 11, UINT32_MAX);
+    XT_PS_SET_CALLINC(cpu->ps, 2u);
+    ar_write(cpu, 8, (2u << 30) | (ctx->call_return & 0x3FFFFFFFu));
+    cpu->pc = ctx->callee->addr;
+    cpu->_pc_written = true;
+
+    void *callee_ctx = ctx->callee->user_ctx ? ctx->callee->user_ctx
+                                               : ctx->stubs;
+    int nested = ctx->callee->conditional_fn(cpu, callee_ctx);
+    if (nested == 0) {
+        /* Conditional hooks promise not to mutate on a declined path. Undo
+         * only the wrapper prefix and leave the firmware at its exact entry. */
+        cpu->ar[sp_index] = saved_sp;
+        cpu->ar[a8_index] = saved_a8;
+        cpu->ar[a10_index] = saved_a10;
+        cpu->ar[a11_index] = saved_a11;
+        cpu->ps = saved_ps;
+        cpu->pc = saved_pc;
+        cpu->_pc_written = saved_pc_written;
+        cpu->windowbase = caller_wb;
+        cpu->windowstart = saved_windowstart;
+        cpu->window_hazard = saved_hazard;
+        cpu->window_callsize[wrapper_wb] = saved_callsize;
+        return 0;
+    }
+
+    /* Preserve diagnostics that an unfused guest CALL8 would have produced. */
+    ctx->stubs->total_calls++;
+    ctx->callee->call_count++;
+
+    /* The verified nested callback has returned to the wrapper's RETW.N.
+     * Its caller window was proven live above, so this is the normal return
+     * path and cannot raise WindowUnderflow. */
+    cpu->windowstart &= ~(1u << wrapper_wb);
+    cpu->windowbase = caller_wb;
+    fw_window_hazard_refresh(cpu);
+    cpu->pc = 0x40000000u | (return_link & 0x3FFFFFFFu);
+    cpu->_pc_written = true;
+
+    /* The callee already charged nested-1 and the dispatcher will charge the
+     * remaining one. Add every wrapper instruction verbatim. */
+    uint32_t wrapper_insns = ctx->enter ? 6u : 5u;
+    cpu->ccount += wrapper_insns;
+    cpu->cycle_count += wrapper_insns;
+    return nested + (int)wrapper_insns;
+}
+
+static bool fw_idf_heap_wrapper_matches(
+        esp32_rom_stubs_t *stubs, uint32_t addr, bool enter,
+        rom_stub_entry_t **callee_out, uint32_t *call_return_out) {
+    static const uint8_t lock_signature[IDF_HEAP_LOCK_SIZE] = {
+        0x36, 0x41, 0x00, 0xA8, 0x02, 0x8C, 0x3A,
+        0x7C, 0xFB, 0x00, 0x00, 0x00, 0x1D, 0xF0,
+    };
+    static const uint8_t unlock_signature[IDF_HEAP_UNLOCK_SIZE] = {
+        0x36, 0x41, 0x00, 0xA8, 0x02, 0x8C, 0x1A,
+        0x00, 0x00, 0x00, 0x1D, 0xF0,
+    };
+    static const size_t lock_relocations[] = { 9u, 10u, 11u };
+    static const size_t unlock_relocations[] = { 7u, 8u, 9u };
+    const uint8_t *signature = enter ? lock_signature : unlock_signature;
+    size_t size = enter ? sizeof(lock_signature) : sizeof(unlock_signature);
+    const size_t *relocations = enter ? lock_relocations
+                                      : unlock_relocations;
+    size_t relocation_count = 3u;
+    uint32_t call_offset = enter ? IDF_HEAP_LOCK_CALL_OFFSET
+                                 : IDF_HEAP_UNLOCK_CALL_OFFSET;
+    if (!firmware_signature_matches_except(
+                stubs->cpu->mem, addr, signature, size,
+                relocations, relocation_count))
+        return false;
+
+    unsigned callinc;
+    uint32_t target;
+    if (!firmware_xtensa_call_target(stubs->cpu->mem, addr + call_offset,
+                                     &callinc, &target) || callinc != 2u)
+        return false;
+    rom_conditional_stub_fn expected = enter ? stub_idf_port_enter
+                                              : stub_idf_port_exit;
+    rom_stub_entry_t *callee = fw_conditional_entry(stubs, target, expected);
+    if (!callee)
+        return false;
+
+    *callee_out = callee;
+    *call_return_out = addr + call_offset + 3u;
+    return true;
+}
+
+static int fw_add_idf_heap_lock_hooks(esp32_rom_stubs_t *stubs) {
+    int hooked = 0;
+    uint32_t last = ESP32_IRAM_INSN_ADDR_HIGH - IDF_HEAP_LOCK_SIZE;
+    for (uint32_t addr = ESP32_FIRMWARE_INSN_ADDR_LOW;
+         addr <= last && stubs->idf_heap_lock_count < FW_IDF_HEAP_LOCK_MAX;
+         addr++) {
+        if (mem_read8(stubs->cpu->mem, addr) != 0x36u)
+            continue;
+        for (unsigned kind = 0u; kind < 2u; kind++) {
+            bool enter = kind == 0u;
+            rom_stub_entry_t *callee;
+            uint32_t call_return;
+            if (!fw_idf_heap_wrapper_matches(
+                        stubs, addr, enter, &callee, &call_return))
+                continue;
+
+            fw_idf_heap_lock_ctx_t *ctx =
+                &stubs->idf_heap_lock[stubs->idf_heap_lock_count];
+            ctx->stubs = stubs;
+            ctx->callee = callee;
+            ctx->call_return = call_return;
+            ctx->enter = enter;
+            int rc = rom_stubs_register_conditional_exact_if_absent_ctx(
+                    stubs, addr, stub_idf_heap_lock_wrapper,
+                    enter ? "multi_heap_internal_lock"
+                          : "multi_heap_internal_unlock",
+                    ctx);
+            if (rc == 0) {
+                stubs->idf_heap_lock_count++;
+                hooked++;
+            }
+            break;
+        }
     }
     return hooked;
 }
@@ -6183,7 +6734,9 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
     int n = fw_add_canonical_window_vector_hooks(stubs);
     n += fw_add_newlib_memcmp_hooks(stubs);
     n += fw_add_idf_watchpoint_hooks(stubs);
+    n += fw_add_idf_port_enter_hooks(stubs);
     n += fw_add_idf_port_exit_hooks(stubs);
+    n += fw_add_idf_heap_lock_hooks(stubs);
     if (n != 0)
         stubs->cpu->accelerated_blocks = true;
     fw_discover_flash_poll_loops(stubs);
@@ -6226,9 +6779,10 @@ int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point
             n++;
         }
     }
-    /* WLED has no fixed-address PHY hook. FreeRTOS synchronization and
-     * allocator code always execute in the guest: their cross-core ordering
-     * cannot be replaced safely at a function boundary. */
+    /* WLED has no fixed-address PHY hook. The generic structural scanners
+     * above handle only verified, uncontended FreeRTOS synchronization paths;
+     * all allocator logic and every observable contention path remain guest
+     * code. */
     if (profile == ROM_FIRMWARE_WLED_V1601) {
         n += fw_hook_scanned_phy(stubs);
     }
