@@ -564,6 +564,17 @@ static const flexe_target_desc_t TARGETS[] = {
             .bbpll_stop_high_mask = 1u << 2,
             .bbpll_stop_low_mask = 1u << 3,
             .bbpll_done_mask = 1u << 24,
+            .aux_register_count = 2u,
+            .aux_register = {
+                /* PHY TX-DC calibration command/result. Bit 24 reports
+                 * completion; fast mode resolves the conversion immediately
+                 * while retaining the 24-bit software command payload. */
+                { 0x04Cu, 0x01000000u, 0x00FFFFFFu },
+                /* S3 ROM SAR2 power/peak-detector controller. The three-bit
+                 * FSM status is idle/ready at reset; functional fast mode
+                 * completes its internal analog conversion synchronously. */
+                { 0x050u, 0x07000000u, 0xF8FFFFFFu },
+            },
         },
         .sensitive_memprot = {
             .base = 0x600C1000u,

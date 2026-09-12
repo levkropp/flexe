@@ -19,6 +19,7 @@
 #define FLEXE_TARGET_RTC_CAL_GROUP_MAX 2u
 #define FLEXE_TARGET_RTC_CAL_CLOCK_MAX 4u
 #define FLEXE_TARGET_REGI2C_HOST_MAX 2u
+#define FLEXE_TARGET_REGI2C_AUX_REGISTER_MAX 8u
 #define FLEXE_TARGET_SYSTIMER_COUNTER_MAX 2u
 #define FLEXE_TARGET_SYSTIMER_ALARM_MAX 3u
 #define FLEXE_TARGET_TIMER_GROUP_MAX 2u
@@ -39,7 +40,7 @@
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 5u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 27u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 28u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -400,10 +401,19 @@ typedef struct {
     uint32_t source_clock_hz[FLEXE_TARGET_RTC_CAL_CLOCK_MAX];
 } flexe_rtc_calibration_desc_t;
 
+typedef struct {
+    uint32_t offset;
+    uint32_t reset;
+    uint32_t writable_mask;
+} flexe_regi2c_aux_register_desc_t;
+
 /* Internal analog-register I2C fabric used by ROM clock, bias, PHY, and ADC
  * code. This is distinct from the externally routed I2C controllers. The ROM
  * command ABI is described here so the same device model can serve targets
- * whose host count, register locations, or bit fields differ. */
+ * whose host count, register locations, or bit fields differ. Some revisions
+ * expose adjacent analog-controller state in the same aperture; auxiliary
+ * register descriptors give those surfaces explicit reset and access masks
+ * without baking target addresses into the device implementation. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -431,6 +441,9 @@ typedef struct {
     uint32_t bbpll_stop_high_mask;
     uint32_t bbpll_stop_low_mask;
     uint32_t bbpll_done_mask;
+    uint8_t  aux_register_count;
+    flexe_regi2c_aux_register_desc_t
+        aux_register[FLEXE_TARGET_REGI2C_AUX_REGISTER_MAX];
 } flexe_regi2c_desc_t;
 
 /* Security/memory-protection register IP shared by compatible targets. The

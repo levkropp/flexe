@@ -13,6 +13,7 @@ struct flexe_regi2c {
     uint32_t analog_control;
     uint32_t config;
     uint32_t config2;
+    uint32_t aux_register[FLEXE_TARGET_REGI2C_AUX_REGISTER_MAX];
     uint8_t *registers;
     size_t address_count;
     unsigned bbpll_reads;
@@ -45,6 +46,8 @@ static bool regi2c_geometry_valid(const flexe_target_desc_t *target)
         desc->register_size > target->peripheral_end - desc->base ||
         desc->host_count == 0u ||
         desc->host_count > FLEXE_TARGET_REGI2C_HOST_MAX ||
+        desc->aux_register_count >
+            FLEXE_TARGET_REGI2C_AUX_REGISTER_MAX ||
         (desc->command_offset & 3u) != 0u ||
         (desc->command_stride & 3u) != 0u ||
         desc->command_stride == 0u ||
@@ -55,6 +58,23 @@ static bool regi2c_geometry_valid(const flexe_target_desc_t *target)
         desc->config_offset > desc->register_size - 4u ||
         desc->config2_offset > desc->register_size - 4u)
         return false;
+
+    for (unsigned index = 0u; index < desc->aux_register_count; index++) {
+        uint32_t offset = desc->aux_register[index].offset;
+        if ((offset & 3u) != 0u ||
+            offset > desc->register_size - sizeof(uint32_t) ||
+            offset == desc->analog_control_offset ||
+            offset == desc->config_offset ||
+            offset == desc->config2_offset)
+            return false;
+        for (unsigned host = 0u; host < desc->host_count; host++)
+            if (offset == desc->command_offset +
+                          host * desc->command_stride)
+                return false;
+        for (unsigned other = 0u; other < index; other++)
+            if (offset == desc->aux_register[other].offset)
+                return false;
+    }
 
     uint64_t last_command = (uint64_t)desc->command_offset +
         (uint64_t)(desc->host_count - 1u) * desc->command_stride;
@@ -96,6 +116,14 @@ static int regi2c_host(const flexe_regi2c_t *regi2c, uint32_t off)
     return host < desc->host_count ? (int)host : -1;
 }
 
+static int regi2c_aux_register(const flexe_regi2c_t *regi2c, uint32_t off)
+{
+    const flexe_regi2c_desc_t *desc = &regi2c->target->regi2c;
+    for (unsigned index = 0u; index < desc->aux_register_count; index++)
+        if (desc->aux_register[index].offset == off) return (int)index;
+    return -1;
+}
+
 static size_t regi2c_index(const flexe_regi2c_t *regi2c,
                            uint32_t command)
 {
@@ -123,6 +151,8 @@ static uint32_t regi2c_read(void *ctx, uint32_t addr)
     }
     if (off == desc->config_offset) return regi2c->config;
     if (off == desc->config2_offset) return regi2c->config2;
+    int aux = regi2c_aux_register(regi2c, off);
+    if (aux >= 0) return regi2c->aux_register[aux];
     return regi2c->fallback_read
         ? regi2c->fallback_read(regi2c->fallback_ctx, addr) : 0u;
 }
@@ -189,6 +219,14 @@ static void regi2c_write(void *ctx, uint32_t addr, uint32_t value)
         regi2c->config2 = value & desc->config2_writable_mask;
         return;
     }
+    int aux = regi2c_aux_register(regi2c, off);
+    if (aux >= 0) {
+        uint32_t writable = desc->aux_register[aux].writable_mask;
+        regi2c->aux_register[aux] =
+            (regi2c->aux_register[aux] & ~writable) |
+            (value & writable);
+        return;
+    }
     if (regi2c->fallback_write)
         regi2c->fallback_write(regi2c->fallback_ctx, addr, value);
 }
@@ -222,6 +260,8 @@ flexe_regi2c_t *flexe_regi2c_create(xtensa_mem_t *mem,
     regi2c->analog_control = desc->analog_control_reset;
     regi2c->config = desc->config_reset;
     regi2c->config2 = desc->config2_reset;
+    for (unsigned index = 0u; index < desc->aux_register_count; index++)
+        regi2c->aux_register[index] = desc->aux_register[index].reset;
 
     if (mem_register_mmio_range(mem, desc->base, desc->register_size,
                                 regi2c_read, regi2c_write, regi2c) != 0) {

@@ -372,6 +372,11 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->regi2c.base, 0x6000E000u);
     ASSERT_EQ(s3->regi2c.host_count, 2u);
     ASSERT_EQ(s3->regi2c.bbpll_done_mask, 1u << 24);
+    ASSERT_EQ(s3->regi2c.aux_register_count, 2u);
+    ASSERT_EQ(s3->regi2c.aux_register[0].offset, 0x04Cu);
+    ASSERT_EQ(s3->regi2c.aux_register[0].reset, 0x01000000u);
+    ASSERT_EQ(s3->regi2c.aux_register[1].offset, 0x050u);
+    ASSERT_EQ(s3->regi2c.aux_register[1].reset, 0x07000000u);
     ASSERT_EQ(s3->sensitive_memprot.base, 0x600C1000u);
     ASSERT_EQ(s3->sensitive_memprot.register_size, 0x1000u);
     ASSERT_EQ(s3->systimer.base, 0x60023000u);

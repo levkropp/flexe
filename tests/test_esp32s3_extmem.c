@@ -445,9 +445,24 @@ TEST(peripherals_model_target_described_internal_regi2c) {
     ASSERT_EQ(mem_read32(mem, config), 0xFFFFBFFFu);
     ASSERT_EQ(mem_read32(mem, config2), 0x0001FF40u);
 
+    /* The adjacent ROM-facing SAR2 controller is target-described rather
+     * than recognized by firmware PC. Its FSM is ready synchronously in fast
+     * mode while software-owned control and configuration bits retain state. */
+    ASSERT_EQ(desc->aux_register_count, 2u);
+    uint32_t txdc_status = desc->base + desc->aux_register[0].offset;
+    ASSERT_EQ(mem_read32(mem, txdc_status), 0x01000000u);
+    mem_write32(mem, txdc_status, 0x00113CF3u);
+    ASSERT_EQ(mem_read32(mem, txdc_status), 0x01113CF3u);
+
+    uint32_t sar_status = desc->base + desc->aux_register[1].offset;
+    ASSERT_EQ(mem_read32(mem, sar_status), 0x07000000u);
+    mem_write32(mem, sar_status, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, sar_status), UINT32_MAX);
+    mem_write32(mem, sar_status, 0u);
+    ASSERT_EQ(mem_read32(mem, sar_status), 0x07000000u);
     int before = periph_unhandled_count(periph);
-    ASSERT_EQ(mem_read32(mem, desc->base + 0x04Cu), 0u);
-    mem_write32(mem, desc->base + 0x04Cu, 1u);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x05Cu), 0u);
+    mem_write32(mem, desc->base + 0x05Cu, 1u);
     ASSERT_EQ(periph_unhandled_count(periph), before + 2);
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
 
