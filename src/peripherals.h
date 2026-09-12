@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "memory.h"
+#include "gpio.h"
 
 /* Forward declaration */
 typedef struct xtensa_cpu xtensa_cpu_t;
@@ -419,13 +420,14 @@ void periph_deassert_interrupt(esp32_periph_t *p, int source);
 void periph_assert_interrupt_status(esp32_periph_t *p, int source,
                                     uint32_t status);
 
-/* Pad hold across a deep-sleep reset.
+/* Pad hold across a machine rebuild.
  *
  * Deep sleep powers the digital domain down and the session rebuilds the
  * peripheral model, which would drop every pin level. A pad whose RTC hold bit
  * is set must not lose its level -- parking an output at a known state across
  * sleep is the only reason the bit exists. Snapshot before periph_destroy(),
- * restore after periph_create(); only held channels are carried over. */
+ * restore after periph_create(); only held channels are carried over. Classic
+ * RTC GPIO and S3 digital GPIO use distinct, target-specific hold registers. */
 typedef struct {
     uint32_t hold_mask;     /* RTC channels with their hold bit set */
     uint32_t rtcio_out;     /* RTC_GPIO_OUT/ENABLE, channel-indexed */
@@ -433,6 +435,8 @@ typedef struct {
     uint32_t regs[8];       /* the pad words carrying the hold bits */
     uint16_t reg_off[8];
     unsigned reg_count;
+    uint32_t target_rtc_hold;
+    flexe_gpio_pad_hold_t target_gpio;
 } periph_pad_hold_t;
 
 void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out);

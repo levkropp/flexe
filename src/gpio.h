@@ -6,6 +6,14 @@
 
 #include "memory.h"
 
+typedef struct {
+    uint64_t mask;
+    uint64_t levels;
+    uint64_t level_known;
+    uint64_t enables;
+    uint64_t enable_known;
+} flexe_gpio_pad_hold_t;
+
 typedef struct flexe_gpio flexe_gpio_t;
 
 /* `level` or `enabled` is -1 when a peripheral-selected signal has no
@@ -27,6 +35,15 @@ void flexe_gpio_destroy(flexe_gpio_t *gpio);
 int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_out_signal(const flexe_gpio_t *gpio, unsigned pin);
+
+/* A held digital pad retains its physical level and output-enable while the
+ * GPIO output latches continue to accept writes. Releasing hold immediately
+ * exposes the current latch. RTC owns the hold register and calls this API. */
+void flexe_gpio_set_pad_hold(flexe_gpio_t *gpio, uint64_t held_pins);
+void flexe_gpio_pad_hold_snapshot(const flexe_gpio_t *gpio,
+                                  flexe_gpio_pad_hold_t *out);
+void flexe_gpio_pad_hold_restore(flexe_gpio_t *gpio,
+                                 const flexe_gpio_pad_hold_t *in);
 
 /* Register a peripheral output producer implemented by the emulator. Matrix
  * selections for unregistered producers remain visible but are diagnosed via

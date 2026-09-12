@@ -41,7 +41,36 @@ struct flexe_rtc_cntl {
     uint64_t wdt_stage_ticks;
     uint8_t wdt_stage;
     uint32_t store[FLEXE_TARGET_RTC_STORE_MAX];
+    uint32_t digital_pad_hold;
+    flexe_rtc_cntl_pad_hold_fn pad_hold_changed;
+    void *pad_hold_ctx;
 };
+
+static uint32_t rtc_digital_pad_hold_mask(const flexe_rtc_cntl_desc_t *desc)
+{
+    if (desc->digital_pad_hold_count == 0u) return 0u;
+    return (UINT32_MAX >> (32u - desc->digital_pad_hold_count))
+           << desc->digital_pad_hold_first_bit;
+}
+
+static uint32_t rtc_digital_pad_hold_valid_mask(
+    const flexe_target_desc_t *target)
+{
+    const flexe_rtc_cntl_desc_t *desc = &target->rtc_cntl;
+    return ((uint32_t)(target->gpio.valid_gpio_mask >>
+                       desc->digital_pad_hold_first_gpio)
+            << desc->digital_pad_hold_first_bit) &
+           rtc_digital_pad_hold_mask(desc);
+}
+
+static uint64_t rtc_digital_pad_hold_pins(const flexe_rtc_cntl_t *rtc)
+{
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    if (desc->digital_pad_hold_count == 0u) return 0u;
+    return (uint64_t)(rtc->digital_pad_hold >>
+                      desc->digital_pad_hold_first_bit)
+           << desc->digital_pad_hold_first_gpio;
+}
 
 static bool rtc_offset_valid(uint16_t offset, uint32_t register_size)
 {
@@ -114,6 +143,27 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         rtc_wdt_offset(desc, desc->time_high_offset) ||
         rtc_wdt_offset(desc, desc->reset_state_offset) ||
         rtc_wdt_offset(desc, desc->clock_conf_offset))
+        return false;
+
+    if (desc->digital_pad_hold_count != 0u &&
+        (!rtc_offset_valid(desc->digital_pad_hold_offset,
+                           desc->register_size) ||
+         desc->digital_pad_hold_first_bit >= 32u ||
+         desc->digital_pad_hold_count >
+             32u - desc->digital_pad_hold_first_bit ||
+         desc->digital_pad_hold_first_gpio >= 64u ||
+         desc->digital_pad_hold_count >
+             64u - desc->digital_pad_hold_first_gpio ||
+         !(target->capabilities & FLEXE_TARGET_CAP_GPIO_V1) ||
+         desc->digital_pad_hold_first_gpio +
+             desc->digital_pad_hold_count > target->gpio.gpio_count ||
+         desc->digital_pad_hold_offset == desc->clock_conf_offset ||
+         desc->digital_pad_hold_offset == desc->reset_state_offset ||
+         desc->digital_pad_hold_offset == desc->time_update_offset ||
+         desc->digital_pad_hold_offset == desc->time_low_offset ||
+         desc->digital_pad_hold_offset == desc->time_high_offset ||
+         rtc_interrupt_offset(desc, desc->digital_pad_hold_offset) ||
+         rtc_wdt_offset(desc, desc->digital_pad_hold_offset)))
         return false;
 
     if (!rtc_offset_valid(desc->clock_conf_offset, desc->register_size) ||
@@ -206,6 +256,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             offset == desc->time_low_offset ||
             offset == desc->time_high_offset ||
             offset == desc->reset_state_offset ||
+            (desc->digital_pad_hold_count != 0u &&
+             offset == desc->digital_pad_hold_offset) ||
             offset == desc->clock_conf_offset ||
             (desc->wdt_config_reset[i] &
              ~desc->wdt_config_writable_mask[i]) != 0u)
@@ -226,6 +278,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             offset == desc->time_low_offset ||
             offset == desc->time_high_offset ||
             offset == desc->reset_state_offset ||
+            (desc->digital_pad_hold_count != 0u &&
+             offset == desc->digital_pad_hold_offset) ||
             offset == desc->clock_conf_offset ||
             rtc_interrupt_offset(desc, offset) ||
             rtc_wdt_offset(desc, offset))
@@ -453,6 +507,9 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return 0u;
     if (offset == desc->wdt_write_protect_offset)
         return rtc->wdt_write_protect;
+    if (desc->digital_pad_hold_count != 0u &&
+        offset == desc->digital_pad_hold_offset)
+        return rtc->digital_pad_hold;
     return rtc->fallback_read ?
         rtc->fallback_read(rtc->fallback_ctx, addr) : 0u;
 }
@@ -586,6 +643,20 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         rtc->wdt_write_protect = value;
         return;
     }
+    if (desc->digital_pad_hold_count != 0u &&
+        offset == desc->digital_pad_hold_offset) {
+        uint32_t mask = rtc_digital_pad_hold_valid_mask(rtc->target);
+        uint32_t next = value & mask;
+        if (next != rtc->digital_pad_hold) {
+            rtc->digital_pad_hold = next;
+            if (rtc->pad_hold_changed)
+                rtc->pad_hold_changed(rtc->pad_hold_ctx,
+                                      rtc_digital_pad_hold_pins(rtc));
+        }
+        if ((value & ~mask) != 0u && rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        return;
+    }
     if (rtc->fallback_write)
         rtc->fallback_write(rtc->fallback_ctx, addr, value);
 }
@@ -643,6 +714,16 @@ void flexe_rtc_cntl_destroy(flexe_rtc_cntl_t *rtc)
         rtc->mem, desc->base, desc->register_size,
         rtc->fallback_read, rtc->fallback_write, rtc->fallback_ctx);
     free(rtc);
+}
+
+void flexe_rtc_cntl_set_pad_hold_listener(flexe_rtc_cntl_t *rtc,
+                                          flexe_rtc_cntl_pad_hold_fn fn,
+                                          void *ctx)
+{
+    if (!rtc) return;
+    rtc->pad_hold_changed = fn;
+    rtc->pad_hold_ctx = ctx;
+    if (fn) fn(ctx, rtc_digital_pad_hold_pins(rtc));
 }
 
 void flexe_rtc_cntl_application_handoff(flexe_rtc_cntl_t *rtc)

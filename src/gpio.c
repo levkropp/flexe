@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* S2/S3 GPIO register layout. Addresses never appear in firmware hooks: the
  * target descriptor selects this IP generation and supplies its base. */
@@ -96,6 +97,9 @@ struct flexe_gpio {
     uint32_t clock_gate;
     uint32_t date;
     bool irq_level[2];
+    uint64_t held_pins;
+    int8_t held_level[GPIO_PIN_REGISTER_COUNT];
+    int8_t held_enable[GPIO_PIN_REGISTER_COUNT];
 };
 
 static uint64_t gpio_count_mask(unsigned count)
@@ -190,6 +194,8 @@ static bool gpio_output_signal_modeled(const flexe_gpio_t *gpio,
 int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin)
 {
     if (!gpio_pin_valid(gpio, pin)) return -1;
+    if (gpio->held_pins & (UINT64_C(1) << pin))
+        return gpio->held_level[pin];
     uint32_t route = gpio->func_out[pin];
     if ((route & GPIO_FUNC_OUT_SIGNAL_MASK) != GPIO_FUNC_OUT_SOFTWARE)
         return -1;
@@ -204,6 +210,8 @@ int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin)
 int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin)
 {
     if (!gpio_pin_valid(gpio, pin)) return -1;
+    if (gpio->held_pins & (UINT64_C(1) << pin))
+        return gpio->held_enable[pin];
     uint32_t route = gpio->func_out[pin];
     if ((route & GPIO_FUNC_OUT_SIGNAL_MASK) != GPIO_FUNC_OUT_SOFTWARE &&
         (route & GPIO_FUNC_OUT_OEN_SELECT) == 0u)
@@ -219,9 +227,85 @@ int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin)
 static void gpio_notify_pin(flexe_gpio_t *gpio, unsigned pin)
 {
     if (!gpio->output_changed || !gpio_pin_valid(gpio, pin)) return;
+    if (gpio->held_pins & (UINT64_C(1) << pin)) return;
     gpio->output_changed(gpio->output_ctx, pin,
                          flexe_gpio_pin_level(gpio, pin),
                          flexe_gpio_output_enabled(gpio, pin));
+}
+
+void flexe_gpio_set_pad_hold(flexe_gpio_t *gpio, uint64_t held_pins)
+{
+    if (!gpio) return;
+    uint64_t changed = gpio->held_pins ^ held_pins;
+    while (changed) {
+        unsigned pin = (unsigned)__builtin_ctzll(changed);
+        uint64_t bit = UINT64_C(1) << pin;
+        changed &= changed - 1u;
+        if (!gpio_pin_valid(gpio, pin)) continue;
+        if (held_pins & bit) {
+            /* Capture the resolved pad before enabling hold, including an
+             * unknown peripheral-produced signal (-1). */
+            gpio->held_level[pin] = (int8_t)flexe_gpio_pin_level(gpio, pin);
+            gpio->held_enable[pin] =
+                (int8_t)flexe_gpio_output_enabled(gpio, pin);
+        } else {
+            int old_level = gpio->held_level[pin];
+            int old_enable = gpio->held_enable[pin];
+            gpio->held_pins &= ~bit;
+            if (old_level != flexe_gpio_pin_level(gpio, pin) ||
+                old_enable != flexe_gpio_output_enabled(gpio, pin))
+                gpio_notify_pin(gpio, pin);
+        }
+    }
+    gpio->held_pins = held_pins & gpio->target->gpio.valid_gpio_mask;
+}
+
+void flexe_gpio_pad_hold_snapshot(const flexe_gpio_t *gpio,
+                                  flexe_gpio_pad_hold_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!gpio) return;
+    out->mask = gpio->held_pins;
+    uint64_t pins = out->mask;
+    while (pins) {
+        unsigned pin = (unsigned)__builtin_ctzll(pins);
+        uint64_t bit = UINT64_C(1) << pin;
+        pins &= pins - 1u;
+        if (gpio->held_level[pin] >= 0) {
+            out->level_known |= bit;
+            if (gpio->held_level[pin]) out->levels |= bit;
+        }
+        if (gpio->held_enable[pin] >= 0) {
+            out->enable_known |= bit;
+            if (gpio->held_enable[pin]) out->enables |= bit;
+        }
+    }
+}
+
+void flexe_gpio_pad_hold_restore(flexe_gpio_t *gpio,
+                                 const flexe_gpio_pad_hold_t *in)
+{
+    if (!gpio || !in) return;
+    flexe_gpio_set_pad_hold(gpio, in->mask);
+    uint64_t pins = in->mask & gpio->target->gpio.valid_gpio_mask;
+    while (pins) {
+        unsigned pin = (unsigned)__builtin_ctzll(pins);
+        uint64_t bit = UINT64_C(1) << pin;
+        pins &= pins - 1u;
+        int level = (in->level_known & bit) ?
+                    (in->levels & bit) != 0u : -1;
+        int enabled = (in->enable_known & bit) ?
+                      (in->enables & bit) != 0u : -1;
+        if (gpio->held_level[pin] != level ||
+            gpio->held_enable[pin] != enabled) {
+            gpio->held_level[pin] = (int8_t)level;
+            gpio->held_enable[pin] = (int8_t)enabled;
+            if (gpio->output_changed)
+                gpio->output_changed(gpio->output_ctx, pin,
+                                     level, enabled);
+        }
+    }
 }
 
 static void gpio_notify_mask(flexe_gpio_t *gpio, unsigned bank,

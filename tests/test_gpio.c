@@ -3,6 +3,23 @@
 #include "gpio.h"
 #include "peripherals.h"
 
+typedef struct {
+    unsigned calls;
+    unsigned pin;
+    int level;
+    int enabled;
+} gpio_pad_probe_t;
+
+static void gpio_pad_probe_changed(void *ctx, unsigned pin, int level,
+                                   int enabled)
+{
+    gpio_pad_probe_t *probe = ctx;
+    probe->calls++;
+    probe->pin = pin;
+    probe->level = level;
+    probe->enabled = enabled;
+}
+
 TEST(target_gpio_models_s3_banks_masks_and_software_output)
 {
     const flexe_target_desc_t *s3 =
@@ -163,6 +180,57 @@ TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads)
     mem_destroy(mem);
 }
 
+TEST(target_gpio_pad_hold_defers_output_notifications_until_release)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    gpio_pad_probe_t probe = {0};
+    flexe_gpio_t *gpio = mem ? flexe_gpio_create(
+        mem, NULL, NULL, NULL, gpio_pad_probe_changed, &probe,
+        NULL, NULL) : NULL;
+    ASSERT_TRUE(gpio != NULL);
+    if (!gpio) {
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t base = s3->gpio.base;
+    mem_write32(mem, base + 0x008u, 1u << 21u);
+    mem_write32(mem, base + 0x024u, 1u << 21u);
+    unsigned before = probe.calls;
+    flexe_gpio_set_pad_hold(gpio, UINT64_C(1) << 21u);
+    ASSERT_EQ(probe.calls, before);
+    mem_write32(mem, base + 0x00Cu, 1u << 21u);
+    mem_write32(mem, base + 0x028u, 1u << 21u);
+    ASSERT_EQ(probe.calls, before);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 21u), 1);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 21u), 1);
+    flexe_gpio_set_pad_hold(gpio, 0u);
+    ASSERT_EQ(probe.calls, before + 1u);
+    ASSERT_EQ(probe.pin, 21u);
+    ASSERT_EQ(probe.level, 0);
+    ASSERT_EQ(probe.enabled, 0);
+
+    /* No change on release means no duplicate physical edge. */
+    flexe_gpio_set_pad_hold(gpio, UINT64_C(1) << 21u);
+    flexe_gpio_set_pad_hold(gpio, 0u);
+    ASSERT_EQ(probe.calls, before + 1u);
+
+    /* A held unknown peripheral output stays unknown instead of becoming a
+     * fabricated low level when firmware changes its GPIO latch. */
+    mem_write32(mem, base + 0x554u + 21u * 4u, 43u);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 21u), -1);
+    flexe_gpio_set_pad_hold(gpio, UINT64_C(1) << 21u);
+    mem_write32(mem, base + 0x008u, 1u << 21u);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 21u), -1);
+    flexe_gpio_set_pad_hold(gpio, 0u);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 21u), -1);
+
+    flexe_gpio_destroy(gpio);
+    mem_destroy(mem);
+}
+
 TEST(target_gpio_diagnoses_behavior_outside_functional_envelope)
 {
     const flexe_target_desc_t *s3 =
@@ -204,5 +272,6 @@ void run_target_gpio_tests(void)
     RUN_TEST(target_gpio_models_s3_banks_masks_and_software_output);
     RUN_TEST(target_gpio_routes_s3_edge_and_level_interrupts_to_both_cores);
     RUN_TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads);
+    RUN_TEST(target_gpio_pad_hold_defers_output_notifications_until_release);
     RUN_TEST(target_gpio_diagnoses_behavior_outside_functional_envelope);
 }

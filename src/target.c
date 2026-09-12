@@ -611,6 +611,12 @@ static const flexe_target_desc_t TARGETS[] = {
             /* Revision-0 WDT_DELAY_SEL is zero, making stage 0 count two
              * slow-clock ticks for each stored hold unit. */
             .wdt_stage0_multiplier = 2u,
+            /* ESP32-S3 gpio_periph.c maps GPIO21..47 to bits 1..27 of
+             * RTC_CNTL_DIG_PAD_HOLD_REG; GPIO22..25 are unbonded. */
+            .digital_pad_hold_offset = 0x0DCu,
+            .digital_pad_hold_first_gpio = 21u,
+            .digital_pad_hold_first_bit = 1u,
+            .digital_pad_hold_count = 27u,
         },
         .efuse = {
             .base = 0x60007000u,

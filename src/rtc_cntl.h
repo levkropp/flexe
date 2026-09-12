@@ -15,6 +15,7 @@ typedef void (*flexe_rtc_cntl_state_fn)(void *ctx);
 typedef void (*flexe_rtc_cntl_irq_fn)(void *ctx, bool level);
 typedef void (*flexe_rtc_cntl_reset_fn)(
     void *ctx, flexe_rtc_cntl_wdt_action_t action);
+typedef void (*flexe_rtc_cntl_pad_hold_fn)(void *ctx, uint64_t gpio_mask);
 
 flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
@@ -23,6 +24,13 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     flexe_rtc_cntl_irq_fn irq_changed, void *irq_ctx,
     flexe_rtc_cntl_reset_fn reset_requested, void *reset_ctx);
 void flexe_rtc_cntl_destroy(flexe_rtc_cntl_t *rtc);
+
+/* The RTC register owns the hold bits; GPIO owns the physical output state.
+ * The listener composes the two without letting either device claim the
+ * other's MMIO range. */
+void flexe_rtc_cntl_set_pad_hold_listener(flexe_rtc_cntl_t *rtc,
+                                          flexe_rtc_cntl_pad_hold_fn fn,
+                                          void *ctx);
 
 /* Populate state that a second-stage bootloader normally hands to an
  * application loaded directly by Flexe. */

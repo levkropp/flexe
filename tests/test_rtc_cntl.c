@@ -305,6 +305,110 @@ TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
+    const flexe_gpio_desc_t *gpio = &s3->gpio;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t hold = rtc->base + rtc->digital_pad_hold_offset;
+    ASSERT_EQ(mem_read32(mem, hold), 0u);
+    ASSERT_EQ(rtc->digital_pad_hold_first_gpio, 21u);
+    ASSERT_EQ(rtc->digital_pad_hold_first_bit, 1u);
+    /* GPIO21 is the first held pad, GPIO31 the last in the low bank. */
+    mem_write32(mem, gpio->base + 0x008u, (1u << 21u) | (1u << 31u));
+    mem_write32(mem, gpio->base + 0x024u, (1u << 21u) | (1u << 31u));
+    mem_write32(mem, hold, (1u << 1u) | (1u << 11u));
+    ASSERT_EQ(mem_read32(mem, hold), (1u << 1u) | (1u << 11u));
+
+    mem_write32(mem, gpio->base + 0x00Cu, (1u << 21u) | (1u << 31u));
+    mem_write32(mem, gpio->base + 0x028u, (1u << 21u) | (1u << 31u));
+    ASSERT_EQ(mem_read32(mem, gpio->base + 0x004u), 0u);
+    ASSERT_EQ(mem_read32(mem, gpio->base + 0x020u), 0u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 21), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 31), 1);
+
+    mem_write32(mem, hold, 1u << 11u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 21), 0);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 21), 0);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 31), 1);
+    mem_write32(mem, hold, 0u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 31), 0);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 31), 0);
+
+    /* GPIO47 uses the upper bank; GPIO48 has no RTC digital hold bit. */
+    mem_write32(mem, gpio->base + 0x014u, 1u << 15u);
+    mem_write32(mem, gpio->base + 0x030u, 1u << 15u);
+    mem_write32(mem, hold, 1u << 27u);
+    mem_write32(mem, gpio->base + 0x018u, 1u << 15u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 47), 1);
+    mem_write32(mem, hold, 0u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 47), 0);
+
+    int before = periph_unhandled_count(periph);
+    /* Bit 2 maps to unbonded GPIO22; bit 28 is not an S3 hold bit. */
+    mem_write32(mem, hold, (1u << 2u) | (1u << 28u));
+    ASSERT_EQ(mem_read32(mem, hold), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), before + 1);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_digital_pad_hold_survives_rebuild_without_unheld_gpio)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
+    const flexe_gpio_desc_t *gpio = &s3->gpio;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t hold = rtc->base + rtc->digital_pad_hold_offset;
+    mem_write32(mem, gpio->base + 0x008u,
+                (1u << 21u) | (1u << 26u));
+    mem_write32(mem, gpio->base + 0x024u,
+                (1u << 21u) | (1u << 26u));
+    mem_write32(mem, hold, 1u << 1u);
+    periph_pad_hold_t snapshot;
+    periph_pad_hold_snapshot(periph, &snapshot);
+    ASSERT_EQ64(snapshot.target_gpio.mask, UINT64_C(1) << 21u);
+    ASSERT_EQ(snapshot.target_rtc_hold, 1u << 1u);
+
+    periph_destroy(periph);
+    periph = periph_create(mem);
+    ASSERT_TRUE(periph != NULL);
+    if (periph) {
+        ASSERT_EQ(mem_read32(mem, hold), 0u);
+        periph_pad_hold_restore(periph, &snapshot);
+        ASSERT_EQ(mem_read32(mem, hold), 1u << 1u);
+        ASSERT_EQ(mem_read32(mem, gpio->base + 0x004u), 0u);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 21), 1);
+        ASSERT_EQ(periph_gpio_output_enabled(periph, 21), 1);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 26), 0);
+        ASSERT_EQ(periph_gpio_output_enabled(periph, 26), 0);
+        mem_write32(mem, hold, 0u);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 21), 0);
+        ASSERT_EQ(periph_gpio_output_enabled(periph, 21), 0);
+        ASSERT_EQ(periph_unhandled_count(periph), 0);
+    }
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level)
 {
     const flexe_target_desc_t *s3 =
@@ -523,6 +627,8 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);
     RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
+    RUN_TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches);
+    RUN_TEST(rtc_cntl_digital_pad_hold_survives_rebuild_without_unheld_gpio);
     RUN_TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level);
     RUN_TEST(rtc_cntl_interrupt_routes_through_target_matrix);
     RUN_TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset);

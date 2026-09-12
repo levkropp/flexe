@@ -49,7 +49,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 34u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 35u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -344,6 +344,12 @@ typedef struct {
     uint8_t  wdt_stage_action_shift[FLEXE_TARGET_RTC_WDT_STAGE_MAX];
     uint8_t  wdt_stage_action_mask;
     uint8_t  wdt_stage0_multiplier;
+    /* RTC-domain digital pad hold register. GPIO pins map consecutively to
+     * bits, but the first pin and bit differ across SoC generations. */
+    uint16_t digital_pad_hold_offset;
+    uint8_t  digital_pad_hold_first_gpio;
+    uint8_t  digital_pad_hold_first_bit;
+    uint8_t  digital_pad_hold_count;
 } flexe_rtc_cntl_desc_t;
 
 /* Read views of a virtual chip's one-time-programmable fuse blocks. Burning

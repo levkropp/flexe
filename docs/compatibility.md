@@ -63,6 +63,14 @@ an unsupported-access diagnostic instead of an invented result. Pulls, drive
 strength, and other pad electrical behavior remain part of the separate IO_MUX
 and future board/net model. This is useful functional GPIO support for the
 experimental S3 target, not hardware-calibrated timing or electrical evidence.
+S3 RTC digital-pad hold is now connected to the GPIO output model: held
+GPIO21..47 retain their physical output level and enable while the GPIO
+latches keep accepting writes, and release reveals the current latches.
+Held outputs also survive a session reset's machine rebuild without retaining
+unheld GPIO state. Unbonded and undocumented hold bits remain diagnostic.
+Global pad-force and auto-hold controls, the deep-sleep wake sequence, and
+electrical drive effects are not yet modeled; a register readback alone is
+not a claim that those behaviors work.
 
 The descriptor-driven S3 timer-group model implements both 54-bit general-
 purpose timers per group, APB/XTAL clock selection and division, software

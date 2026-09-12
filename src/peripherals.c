@@ -13793,6 +13793,13 @@ static void target_gpio_irq_changed(void *ctx, bool nmi, bool level)
     else       periph_deassert_interrupt(p, source);
 }
 
+static void target_rtc_pad_hold_changed(void *ctx, uint64_t held_pins)
+{
+    esp32_periph_t *p = ctx;
+    if (p && p->target_gpio)
+        flexe_gpio_set_pad_hold(p->target_gpio, held_pins);
+}
+
 /* ---- Target-described secondary-core control ---- */
 
 static bool secondary_core_geometry_valid(const flexe_target_desc_t *target)
@@ -14258,6 +14265,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 target_rtc_cntl_reset_requested, p);
             if (p->target_rtc_cntl)
                 flexe_rtc_cntl_application_handoff(p->target_rtc_cntl);
+            if (p->target_rtc_cntl && p->target_gpio)
+                flexe_rtc_cntl_set_pad_hold_listener(
+                    p->target_rtc_cntl, target_rtc_pad_hold_changed, p);
         }
         if (target->flash_mmu.shared_instruction_data)
             p->shared_flash_mmu = flexe_flash_mmu_create(mem);
@@ -15221,6 +15231,15 @@ void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out)
     memset(out, 0, sizeof(*out));
     if (!p) return;
 
+    if (p->target_gpio && p->target_rtc_cntl &&
+        p->target->rtc_cntl.digital_pad_hold_count != 0u) {
+        const flexe_rtc_cntl_desc_t *rtc = &p->target->rtc_cntl;
+        out->target_rtc_hold = mem_read32(
+            p->mem, rtc->base + rtc->digital_pad_hold_offset);
+        flexe_gpio_pad_hold_snapshot(p->target_gpio, &out->target_gpio);
+        return;
+    }
+
     for (int ch = 0; ch < RTC_GPIO_CHANNELS; ch++) {
         if (!rtcio_channel_held(p, ch)) continue;
         out->hold_mask |= 1u << ch;
@@ -15243,7 +15262,19 @@ void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out)
 
 void periph_pad_hold_restore(esp32_periph_t *p, const periph_pad_hold_t *in)
 {
-    if (!p || !in || !in->hold_mask) return;
+    if (!p || !in) return;
+    if (p->target_gpio && p->target_rtc_cntl &&
+        p->target->rtc_cntl.digital_pad_hold_count != 0u) {
+        if (in->target_gpio.mask) {
+            const flexe_rtc_cntl_desc_t *rtc = &p->target->rtc_cntl;
+            mem_write32(p->mem,
+                        rtc->base + rtc->digital_pad_hold_offset,
+                        in->target_rtc_hold);
+            flexe_gpio_pad_hold_restore(p->target_gpio, &in->target_gpio);
+        }
+        return;
+    }
+    if (!in->hold_mask) return;
 
     /* Put the hold bits back first: rtcio_publish_pads() consults them, and
      * restoring the levels while the pads read as unheld would let a later
