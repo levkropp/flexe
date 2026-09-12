@@ -2006,10 +2006,14 @@ TEST(uart2_rx_fifo_and_interrupt) {
     mem_destroy(mem);
 }
 
-/* Classic ESP32 I2C master command encoding: byte count [7:0], ACK check
- * enable [8], expected ACK [9], master ACK value [10], opcode [13:11]. */
+/* Shared ESP32-family I2C command fields: byte count [7:0], ACK check
+ * enable [8], expected ACK [9], master ACK value [10], opcode [13:11].
+ * Opcode values themselves are target-specific. */
 #define TEST_I2C0_BASE 0x3FF53000u
 #define TEST_I2C1_BASE 0x3FF67000u
+#define TEST_S3_I2C0_BASE 0x60013000u
+#define TEST_S3_I2C1_BASE 0x60027000u
+#define TEST_S3_SYSTEM_BASE 0x600C0000u
 #define TEST_RTC_I2C_BASE 0x3FF48C00u
 #define TEST_SENS_BASE 0x3FF48800u
 
@@ -2201,6 +2205,122 @@ TEST(i2c_dual_port_ahb_alias_and_address_nack) {
     ASSERT_EQ(mem_read32(mem, TEST_I2C0_BASE + 0x2Cu), 1u << 10);
     ASSERT_TRUE(mem_read32(mem, TEST_I2C0_BASE + 0x08u) & 1u);
     ASSERT_EQ(cpu0.interrupt & (1u << 9), 1u << 9);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(i2c_s3_native_instances_opcodes_interrupts_and_reset) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    if (!mem || !p) {
+        periph_destroy(p);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(p, &cpu0, NULL);
+    periph_intr_matrix_set(p, 0, 8, 42); /* Native I2C0 source. */
+    periph_intr_matrix_set(p, 0, 9, 43); /* Native I2C1 source. */
+
+    test_i2c_device_t device0 = {0};
+    device0.regs[0x10] = 0xA5u;
+    device0.regs[0x11] = 0x5Au;
+    ASSERT_EQ(periph_i2c_attach_device(p, 0, 0x34,
+                                       test_i2c_device, &device0), 0);
+
+    /* S3 resets both module clocks off. A start written before SYSTEM enables
+     * the instance cannot originate bus traffic. */
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x1Cu, 0x34u << 1);
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x58u,
+                test_i2c_cmd(6, 0, 0));
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x5Cu,
+                test_i2c_cmd(1, 1, 1));
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x60u,
+                test_i2c_cmd(2, 0, 0));
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x04u,
+                (1u << 4) | (1u << 5));
+    ASSERT_EQ(device0.calls, 0);
+    ASSERT_FALSE(periph_interrupt_pending(p, 42));
+
+    uint32_t clocks = mem_read32(mem, TEST_S3_SYSTEM_BASE + 0x18u);
+    mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x18u,
+                clocks | (1u << 7) | (1u << 18));
+    /* A real driver pulses module reset after enabling the clock. It clears
+     * the stale disabled-clock command state without detaching the board. */
+    mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x20u, 1u << 7);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0xF8u), 0x20070201u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0x04u), 0u);
+    mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x20u, 0u);
+
+    /* ESP32-S3 HAL opcodes are RESTART=6, WRITE=1, READ=3, STOP=2. */
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x1Cu, 0x34u << 1);
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x1Cu, 0x10u);
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x1Cu,
+                (0x34u << 1) | 1u);
+    const uint32_t commands[] = {
+        test_i2c_cmd(6, 0, 0),
+        test_i2c_cmd(1, 2, 1),
+        test_i2c_cmd(6, 0, 0),
+        test_i2c_cmd(1, 1, 1),
+        test_i2c_cmd(3, 2, 0),
+        test_i2c_cmd(2, 0, 0),
+    };
+    for (size_t index = 0; index < sizeof(commands) / sizeof(commands[0]);
+         index++)
+        mem_write32(mem, TEST_S3_I2C0_BASE + 0x58u +
+                    (uint32_t)index * 4u, commands[index]);
+    /* 0x78 is timing state on S3, not a ninth command slot. */
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x78u, 0x1234u);
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x28u, 1u << 7);
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x04u,
+                (1u << 4) | (1u << 5));
+
+    ASSERT_EQ(device0.calls, 1);
+    ASSERT_EQ(device0.last_port, 0);
+    ASSERT_EQ(device0.last_address, 0x34u);
+    ASSERT_EQ(device0.last_write_len, 1u);
+    ASSERT_EQ(device0.last_write[0], 0x10u);
+    ASSERT_EQ(device0.last_read_len, 2u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0x1Cu), 0xA5u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0x1Cu), 0x5Au);
+    ASSERT_TRUE(mem_read32(mem, TEST_S3_I2C0_BASE + 0x20u) & (1u << 4));
+    ASSERT_TRUE(mem_read32(mem, TEST_S3_I2C0_BASE + 0x20u) & (1u << 7));
+    ASSERT_FALSE(mem_read32(mem, TEST_S3_I2C0_BASE + 0x20u) & (1u << 6));
+    ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0x78u), 0x1234u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0xF8u), 0x20070201u);
+    ASSERT_TRUE(cpu0.interrupt & (1u << 8));
+    mem_write32(mem, TEST_S3_I2C0_BASE + 0x24u, 1u << 7);
+    ASSERT_FALSE(cpu0.interrupt & (1u << 8));
+
+    /* The second native instance has independent FIFO/device state and uses
+     * source 43 rather than inheriting classic ESP32's source 50. */
+    test_i2c_device_t device1 = {0};
+    ASSERT_EQ(periph_i2c_attach_device(p, 1, 0x50,
+                                       test_i2c_device, &device1), 0);
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x1Cu, 0x50u << 1);
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x1Cu, 0x22u);
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x1Cu, 0xCCu);
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x58u,
+                test_i2c_cmd(6, 0, 0));
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x5Cu,
+                test_i2c_cmd(1, 3, 1));
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x60u,
+                test_i2c_cmd(2, 0, 0));
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x28u, 1u << 7);
+    mem_write32(mem, TEST_S3_I2C1_BASE + 0x04u,
+                (1u << 4) | (1u << 5));
+    ASSERT_EQ(device1.calls, 1);
+    ASSERT_EQ(device1.last_port, 1);
+    ASSERT_EQ(device1.regs[0x22], 0xCCu);
+    ASSERT_TRUE(cpu0.interrupt & (1u << 9));
     ASSERT_EQ(periph_unhandled_count(p), 0);
 
     periph_destroy(p);
@@ -6297,6 +6417,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(i2c_master_repeated_start_read_and_interrupt);
     RUN_TEST(i2c_end_command_streams_fifo_chunks_until_stop);
     RUN_TEST(i2c_dual_port_ahb_alias_and_address_nack);
+    RUN_TEST(i2c_s3_native_instances_opcodes_interrupts_and_reset);
     RUN_TEST(rtc_i2c_register_masks_and_command_file);
     RUN_TEST(rtc_i2c_sens_master_read_write_nack_and_timeout);
     RUN_TEST(irq_dispatch_observes_only_rising_edges);

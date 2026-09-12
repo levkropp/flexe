@@ -263,6 +263,11 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
                 FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SPI_MEM);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_I2C_V1);
+    ASSERT_EQ(esp32->i2c.instance_count, 2u);
+    ASSERT_EQ(esp32->i2c.instance[0].base, 0x3FF53000u);
+    ASSERT_EQ(esp32->i2c.opcode_restart, 0u);
+    ASSERT_EQ(esp32->i2c.command_count, 16u);
     ASSERT_EQ(s3->image_chip_id, 9u);
     ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
     ASSERT_EQ(s3->support_level, FLEXE_TARGET_EXPERIMENTAL);
@@ -283,6 +288,16 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GPIO_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_I2C_V1);
+    ASSERT_EQ(s3->i2c.instance_count, 2u);
+    ASSERT_EQ(s3->i2c.instance[0].base, 0x60013000u);
+    ASSERT_EQ(s3->i2c.instance[1].base, 0x60027000u);
+    ASSERT_EQ(s3->i2c.instance[0].interrupt_source, 42u);
+    ASSERT_EQ(s3->i2c.instance[1].interrupt_source, 43u);
+    ASSERT_EQ(s3->i2c.opcode_restart, 6u);
+    ASSERT_EQ(s3->i2c.opcode_read, 3u);
+    ASSERT_EQ(s3->i2c.opcode_stop, 2u);
+    ASSERT_EQ(s3->i2c.command_count, 8u);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
@@ -293,12 +308,17 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 7u);
-    ASSERT_EQ(s3->system_clock.gate_count, 3u);
+    ASSERT_EQ(s3->system_clock.gate_count, 5u);
     ASSERT_EQ(s3->system_clock.reg[1].offset, 0x18u);
     ASSERT_EQ(s3->system_clock.reg[1].reset, 0xF9C1E06Fu);
     ASSERT_EQ(s3->system_clock.gate[0].device,
               FLEXE_SYSTEM_DEVICE_SYSTIMER);
     ASSERT_EQ(s3->system_clock.gate[2].instance, 1u);
+    ASSERT_EQ(s3->system_clock.gate[3].device,
+              FLEXE_SYSTEM_DEVICE_I2C);
+    ASSERT_EQ(s3->system_clock.gate[3].clock_mask, 1u << 7);
+    ASSERT_EQ(s3->system_clock.gate[4].instance, 1u);
+    ASSERT_EQ(s3->system_clock.gate[4].clock_mask, 1u << 18);
     ASSERT_EQ(s3->io_mux.base, 0x60009000u);
     ASSERT_EQ(s3->io_mux.gpio_count, 49u);
     ASSERT_EQ(s3->io_mux.gpio_register_offset[26], 0x6Cu);

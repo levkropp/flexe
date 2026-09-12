@@ -19,7 +19,8 @@ static const flexe_target_desc_t TARGETS[] = {
         .support_level = FLEXE_TARGET_STABLE,
         .capabilities = FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS |
                         FLEXE_TARGET_CAP_SPI_MEM |
-                        FLEXE_TARGET_CAP_IO_MUX_V1,
+                        FLEXE_TARGET_CAP_IO_MUX_V1 |
+                        FLEXE_TARGET_CAP_I2C_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2BCFFFEu,
@@ -71,6 +72,31 @@ static const flexe_target_desc_t TARGETS[] = {
             { .base = 0x3FF40000u, .interrupt_source = 34u },
             { .base = 0x3FF50000u, .interrupt_source = 35u },
             { .base = 0x3FF6E000u, .interrupt_source = 36u },
+        },
+        .i2c = {
+            .register_size = 0x104u,
+            .date_reset = 0x16042000u,
+            .interrupt_valid_mask = 0x00001FFFu,
+            .interrupt_rxfifo_full_mask = 1u << 0,
+            .interrupt_txfifo_empty_mask = 1u << 1,
+            .interrupt_rxfifo_overflow_mask = 1u << 2,
+            .interrupt_end_detect_mask = 1u << 3,
+            .interrupt_slave_complete_mask = 1u << 4,
+            .interrupt_command_done_mask = 1u << 6,
+            .interrupt_transaction_complete_mask = 1u << 7,
+            .interrupt_transaction_start_mask = 1u << 9,
+            .interrupt_nack_mask = 1u << 10,
+            .instance_count = 2u,
+            .command_count = 16u,
+            .opcode_restart = 0u,
+            .opcode_write = 1u,
+            .opcode_read = 2u,
+            .opcode_stop = 3u,
+            .opcode_end = 4u,
+            .instance = {
+                { .base = 0x3FF53000u, .interrupt_source = 49u },
+                { .base = 0x3FF67000u, .interrupt_source = 50u },
+            },
         },
         .io_mux = {
             .base = 0x3FF49000u,
@@ -172,7 +198,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
                         FLEXE_TARGET_CAP_RTC_CNTL_V1 |
                         FLEXE_TARGET_CAP_EFUSE_READ_V1 |
-                        FLEXE_TARGET_CAP_GPIO_V1,
+                        FLEXE_TARGET_CAP_GPIO_V1 |
+                        FLEXE_TARGET_CAP_I2C_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -230,6 +257,32 @@ static const flexe_target_desc_t TARGETS[] = {
             { .base = 0x60010000u, .interrupt_source = 28u },
             { .base = 0x6002E000u, .interrupt_source = 29u },
         },
+        .i2c = {
+            .register_size = 0x184u,
+            .date_reset = 0x20070201u,
+            .interrupt_valid_mask = 0x0003FFFFu,
+            .interrupt_rxfifo_full_mask = 1u << 0,
+            .interrupt_txfifo_empty_mask = 1u << 1,
+            .interrupt_rxfifo_overflow_mask = 1u << 2,
+            .interrupt_end_detect_mask = 1u << 3,
+            .interrupt_command_done_mask = 1u << 4,
+            .interrupt_transaction_complete_mask = 1u << 7,
+            .interrupt_transaction_start_mask = 1u << 9,
+            .interrupt_nack_mask = 1u << 10,
+            .instance_count = 2u,
+            .command_count = 8u,
+            /* ESP32-S3's HAL command encoding is 6/1/3/2/4, unlike the
+             * classic ESP32's otherwise similar FIFO command front end. */
+            .opcode_restart = 6u,
+            .opcode_write = 1u,
+            .opcode_read = 3u,
+            .opcode_stop = 2u,
+            .opcode_end = 4u,
+            .instance = {
+                { .base = 0x60013000u, .interrupt_source = 42u },
+                { .base = 0x60027000u, .interrupt_source = 43u },
+            },
+        },
         .secondary_core = {
             .base = 0x600C0000u,
             .register_size = 0x1000u,
@@ -250,7 +303,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 7u,
-            .gate_count = 3u,
+            .gate_count = 5u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -290,6 +343,22 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x020u,
                     .clock_mask = 1u << 15,
                     .reset_mask = 1u << 15,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2C,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 7,
+                    .reset_mask = 1u << 7,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2C,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 18,
+                    .reset_mask = 1u << 18,
                 },
             },
         },

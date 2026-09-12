@@ -16,7 +16,8 @@ startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only
 revision-0 eFuse profile, digital pad configuration, UARTs, native USB
-Serial/JTAG, digital GPIO matrix, and interrupt matrix.
+Serial/JTAG, digital GPIO matrix, external I2C controllers, and interrupt
+matrix.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
@@ -55,6 +56,21 @@ exact clock-gate boundaries, and their independent reset pulses restore device
 state and interrupt lines. Effects for other peripheral, memory-power, and
 Bluetooth clock fields remain explicit unsupported-access diagnostics even
 though their architectural register values are retained.
+
+The external I2C model is shared by classic ESP32 and ESP32-S3 through target
+descriptors rather than fixed addresses or command encodings. It implements
+both native instances, their FIFO command lists, master writes and repeated-
+start reads, address NACKs, raw/enable/status/clear interrupt state, native
+interrupt routing, host-attachable bus devices, and guest-slave transfers. The
+S3 descriptor supplies its eight-command depth, different HAL opcodes, native
+interrupt sources, peripheral identity, and independent SYSTEM clock/reset
+gates. Tests cover both target layouts, and an S3 application built with the
+official ESP-IDF 5.3.2 toolchain and legacy production `driver/i2c.h` path
+reaches `app_main`, installs the driver, and completes an absent-device
+transfer with a NACK instead of timing out. This is functional fast-mode
+support: SCL/SDA edge timing, timing-register effects, arbitration, clock
+stretching, multi-master contention, electrical line resolution, and error
+injection are not modeled yet.
 
 The S3 RTC counter advances on the same shared dual-core virtual timeline as
 the other target-described timers. Its two-half latch, runtime CPU-frequency

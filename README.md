@@ -15,8 +15,9 @@ production corpus passes the generic interpreter/JIT gate described in
 - Xtensa LX6 integer, loop, MAC16, floating-point, exception, interrupt, and
   windowed-register execution
 - ESP32 SRAM, ROM, flash, RTC memory, PSRAM, flash MMU, and dual-core model
-- Timed GPIO, UART, SPI, I2C, I2S, RMT, LEDC, PCNT, MCPWM, TWAI, Ethernet,
-  SDMMC/SDIO, ADC/DAC, RTC, timers, watchdogs, and crypto accelerators
+- Functional and event-timed GPIO, UART, SPI, I2C, I2S, RMT, LEDC, PCNT,
+  MCPWM, TWAI, Ethernet, SDMMC/SDIO, ADC/DAC, RTC, timer, watchdog, and crypto
+  models, with each model's timing limits documented separately
 - CYD ILI9341 display, XPT2046 touch, SD/FAT, and SPIFFS integration
 - FreeRTOS, ESP timer, NVS, GPIO, Wi-Fi, Bluetooth, VFS, and ROM boundaries
   needed by production firmware

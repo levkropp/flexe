@@ -85,7 +85,11 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             (gate->device == FLEXE_SYSTEM_DEVICE_TIMER_GROUP &&
              gate->instance < FLEXE_TARGET_TIMER_GROUP_MAX &&
              gate->instance < target->timer_group.group_count &&
-             (target->capabilities & FLEXE_TARGET_CAP_TIMER_GROUP_V1));
+             (target->capabilities & FLEXE_TARGET_CAP_TIMER_GROUP_V1)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_I2C &&
+             gate->instance < FLEXE_TARGET_I2C_MAX &&
+             gate->instance < target->i2c.instance_count &&
+             (target->capabilities & FLEXE_TARGET_CAP_I2C_V1));
         if (!device_valid || clock_reg < 0 || reset_reg < 0 ||
             !system_clock_single_bit(gate->clock_mask) ||
             !system_clock_single_bit(gate->reset_mask) ||

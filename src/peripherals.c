@@ -42,8 +42,6 @@ static inline int gpio_dbg(void) {
 #define HINF_BASE       0x3FF4B000u
 #define SLCHOST_BASE    0x3FF55000u
 #define SLC_BASE        0x3FF58000u
-#define I2C0_BASE       0x3FF53000u
-#define I2C1_BASE       0x3FF67000u
 #define SDMMC_BASE      0x3FF68000u
 #define EMAC_DMA_BASE   0x3FF69000u
 #define EMAC_EXT_BASE   0x3FF69800u
@@ -860,12 +858,14 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define EMAC_MII_REG_SHIFT             6u
 #define EMAC_MII_PHY_SHIFT             11u
 
-/* Classic ESP32 I2C controller register/FIFO geometry. */
-#define I2C_PORT_COUNT       2
+/* Shared ESP32-family I2C controller register/FIFO geometry. Instance
+ * placement, command depth/opcodes, interrupt meanings, and identity are
+ * target-described below. */
+#define I2C_PORT_COUNT       FLEXE_TARGET_I2C_MAX
 #define I2C_DEVICE_COUNT     128
 #define I2C_FIFO_SIZE        32
-#define I2C_COMMAND_COUNT    16
-#define I2C_REG_FILE_SIZE    0x104u
+#define I2C_COMMAND_MAX      16u
+#define I2C_REG_FILE_MAX_SIZE 0x184u
 #define I2C_MAX_PENDING_WRITE (1024u * 1024u)
 
 #define I2C_CTR_OFF          0x004u
@@ -889,22 +889,6 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define I2C_FIFO_RX_RST      (1u << 12)
 #define I2C_FIFO_TX_RST      (1u << 13)
 
-#define I2C_INT_RXFIFO_FULL  (1u << 0)
-#define I2C_INT_TXFIFO_EMPTY (1u << 1)
-#define I2C_INT_RXFIFO_OVF   (1u << 2)
-#define I2C_INT_END_DETECT   (1u << 3)
-#define I2C_INT_SLAVE_TRAN_COMP (1u << 4)
-#define I2C_INT_MASTER_DONE  (1u << 6)
-#define I2C_INT_TRANS_DONE   (1u << 7)
-#define I2C_INT_TRANS_START  (1u << 9)
-#define I2C_INT_ACK_ERR      (1u << 10)
-#define I2C_INT_VALID_MASK   0x1FFFu
-
-#define I2C_CMD_RESTART      0u
-#define I2C_CMD_WRITE        1u
-#define I2C_CMD_READ         2u
-#define I2C_CMD_STOP         3u
-#define I2C_CMD_END          4u
 #define I2C_CMD_DONE         (1u << 31)
 
 /* Classic ESP32 dual I2S controller and circular lldesc DMA geometry. */
@@ -1195,6 +1179,9 @@ static void target_timer_group_irq_changed(void *ctx, unsigned group,
                                            unsigned event, bool level);
 static void target_timer_group_reset_requested(
     void *ctx, unsigned group, flexe_timer_group_wdt_action_t action);
+static void i2c_set_system_state(esp32_periph_t *p, unsigned port,
+                                 bool clock_enabled,
+                                 bool reset_asserted);
 static void usb_serial_jtag_irq_changed(void *ctx, bool level);
 static uint32_t uhci_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void uhci_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -1604,7 +1591,7 @@ typedef struct {
 } i2c_device_t;
 
 typedef struct {
-    uint32_t regs[I2C_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t regs[I2C_REG_FILE_MAX_SIZE / sizeof(uint32_t)];
     uint8_t tx_fifo[I2C_FIFO_SIZE];
     uint8_t rx_fifo[I2C_FIFO_SIZE];
     uint8_t tx_head;
@@ -1625,6 +1612,8 @@ typedef struct {
     bool have_address;
     bool read_direction;
     bool target_present;
+    bool clock_enabled;
+    bool reset_asserted;
     uint8_t address;
     uint8_t *pending_write;
     size_t pending_write_len;
@@ -5001,21 +4990,120 @@ static void wdev_write(void *ctx, uint32_t addr, uint32_t val) {
     p->radio.wdev[off / sizeof(uint32_t)] = val;
 }
 
-/* ---- I2C0/I2C1 master controllers ---- */
+/* ---- Target-described I2C master/slave controllers ---- */
 
-static const uint32_t i2c_bases[I2C_PORT_COUNT] = {
-    I2C0_BASE, I2C1_BASE
-};
+static const flexe_i2c_desc_t *i2c_desc(const esp32_periph_t *p) {
+    if (!p || !p->target ||
+        !(p->target->capabilities & FLEXE_TARGET_CAP_I2C_V1))
+        return NULL;
+    return &p->target->i2c;
+}
 
-static const int i2c_intr_sources[I2C_PORT_COUNT] = {49, 50};
+static bool i2c_port_valid(const esp32_periph_t *p, int port) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    return desc && port >= 0 && (unsigned)port < desc->instance_count;
+}
 
-static int i2c_port_from_addr(uint32_t addr) {
-    for (int port = 0; port < I2C_PORT_COUNT; port++) {
-        if (addr >= i2c_bases[port] &&
-            addr < i2c_bases[port] + PAGE_SIZE)
+static const flexe_i2c_instance_desc_t *i2c_instance(
+    const esp32_periph_t *p, int port)
+{
+    return i2c_port_valid(p, port) ? &p->target->i2c.instance[port] : NULL;
+}
+
+static int i2c_port_from_addr(const esp32_periph_t *p, uint32_t addr) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    if (!desc) return -1;
+    for (unsigned port = 0; port < desc->instance_count; port++) {
+        uint32_t base = desc->instance[port].base;
+        if (addr >= base && addr - base < desc->register_size)
             return port;
     }
     return -1;
+}
+
+static bool i2c_single_bit(uint32_t mask) {
+    return mask != 0u && (mask & (mask - 1u)) == 0u;
+}
+
+static bool i2c_geometry_valid(const esp32_periph_t *p) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    if (!desc || desc->instance_count == 0u ||
+        desc->instance_count > I2C_PORT_COUNT ||
+        desc->command_count == 0u ||
+        desc->command_count > I2C_COMMAND_MAX ||
+        desc->register_size < I2C_DATE_OFF + sizeof(uint32_t) ||
+        desc->register_size > I2C_REG_FILE_MAX_SIZE ||
+        I2C_COMMAND0_OFF + (uint32_t)desc->command_count * 4u >
+            desc->register_size ||
+        desc->interrupt_valid_mask == 0u)
+        return false;
+
+    const uint32_t required_interrupts[] = {
+        desc->interrupt_rxfifo_full_mask,
+        desc->interrupt_txfifo_empty_mask,
+        desc->interrupt_rxfifo_overflow_mask,
+        desc->interrupt_end_detect_mask,
+        desc->interrupt_transaction_complete_mask,
+        desc->interrupt_transaction_start_mask,
+        desc->interrupt_nack_mask,
+    };
+    uint32_t seen = 0u;
+    for (size_t index = 0u;
+         index < sizeof(required_interrupts) / sizeof(required_interrupts[0]);
+         index++) {
+        uint32_t mask = required_interrupts[index];
+        if (!i2c_single_bit(mask) ||
+            (mask & desc->interrupt_valid_mask) == 0u ||
+            (mask & seen) != 0u)
+            return false;
+        seen |= mask;
+    }
+    const uint32_t optional_interrupts[] = {
+        desc->interrupt_slave_complete_mask,
+        desc->interrupt_command_done_mask,
+    };
+    for (size_t index = 0u;
+         index < sizeof(optional_interrupts) / sizeof(optional_interrupts[0]);
+         index++) {
+        uint32_t mask = optional_interrupts[index];
+        if (mask != 0u && (!i2c_single_bit(mask) ||
+                           (mask & desc->interrupt_valid_mask) == 0u ||
+                           (mask & seen) != 0u))
+            return false;
+        seen |= mask;
+    }
+
+    const uint8_t opcodes[] = {
+        desc->opcode_restart, desc->opcode_write, desc->opcode_read,
+        desc->opcode_stop, desc->opcode_end,
+    };
+    uint8_t opcode_seen = 0u;
+    for (size_t index = 0u;
+         index < sizeof(opcodes) / sizeof(opcodes[0]); index++) {
+        if (opcodes[index] > 7u ||
+            (opcode_seen & (uint8_t)(1u << opcodes[index])) != 0u)
+            return false;
+        opcode_seen |= (uint8_t)(1u << opcodes[index]);
+    }
+
+    for (unsigned port = 0u; port < desc->instance_count; port++) {
+        const flexe_i2c_instance_desc_t *instance = &desc->instance[port];
+        if ((instance->base & (PAGE_SIZE - 1u)) != 0u ||
+            instance->base < p->target->peripheral_start ||
+            instance->base >= p->target->peripheral_end ||
+            desc->register_size >
+                p->target->peripheral_end - instance->base ||
+            instance->interrupt_source >= intr_matrix_source_count(p))
+            return false;
+        for (unsigned old = 0u; old < port; old++) {
+            uint32_t old_base = desc->instance[old].base;
+            if (instance->base <= old_base ?
+                desc->register_size > old_base - instance->base :
+                desc->register_size > instance->base - old_base)
+                return false;
+        }
+    }
+    return true;
 }
 
 /* Deliver the ISR again when a *new* enabled condition appears, even though
@@ -5034,8 +5122,15 @@ static int i2c_port_from_addr(uint32_t addr) {
  * does and is also how an interrupt storm starts; the general gap is worth
  * fixing separately and with its own measurements. */
 static void i2c_intr_update(esp32_periph_t *p, int port) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    const flexe_i2c_instance_desc_t *instance = i2c_instance(p, port);
+    if (!desc || !instance) return;
     i2c_state_t *i2c = &p->i2c[port];
-    int source = i2c_intr_sources[port];
+    int source = (int)instance->interrupt_source;
+    if (i2c->reset_asserted) {
+        periph_deassert_interrupt(p, source);
+        return;
+    }
 
     /* The two FIFO interrupts are *level* conditions, not events: the hardware
      * asserts TXFIFO_EMPTY for as long as the TX FIFO is below its threshold
@@ -5048,20 +5143,65 @@ static void i2c_intr_update(esp32_periph_t *p, int port) {
     uint32_t conf = i2c->regs[I2C_FIFO_CONF_OFF / 4u];
     uint32_t rx_threshold = conf & 0x1Fu;
     uint32_t tx_threshold = (conf >> 5) & 0x1Fu;
-    if (i2c->tx_count <= tx_threshold) i2c->int_raw |= I2C_INT_TXFIFO_EMPTY;
-    else                               i2c->int_raw &= ~I2C_INT_TXFIFO_EMPTY;
-    if (i2c->rx_count > rx_threshold)  i2c->int_raw |= I2C_INT_RXFIFO_FULL;
-    else                               i2c->int_raw &= ~I2C_INT_RXFIFO_FULL;
+    if (i2c->tx_count <= tx_threshold)
+        i2c->int_raw |= desc->interrupt_txfifo_empty_mask;
+    else
+        i2c->int_raw &= ~desc->interrupt_txfifo_empty_mask;
+    if (i2c->rx_count > rx_threshold)
+        i2c->int_raw |= desc->interrupt_rxfifo_full_mask;
+    else
+        i2c->int_raw &= ~desc->interrupt_rxfifo_full_mask;
 
     /* Level conditions need the status-aware form: a fresh condition arriving
      * while the line is already high produces no edge, and the plain assert
      * would never call the handler again. This used to be a bespoke
      * i2c_dispatch_new_conditions() helper; it is the general mechanism now,
      * so every peripheral with a raw/ena pair gets the same behaviour. */
-    if (i2c->int_raw & i2c->int_ena)
+    if (i2c->clock_enabled && !i2c->reset_asserted &&
+        (i2c->int_raw & i2c->int_ena))
         periph_assert_interrupt_status(p, source, i2c->int_raw & i2c->int_ena);
     else
         periph_deassert_interrupt(p, source);
+}
+
+static void i2c_reset_state(esp32_periph_t *p, unsigned port) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    if (!desc || port >= desc->instance_count) return;
+    i2c_state_t *i2c = &p->i2c[port];
+    memset(i2c->regs, 0, sizeof(i2c->regs));
+    i2c->tx_head = 0u;
+    i2c->tx_tail = 0u;
+    i2c->tx_count = 0u;
+    i2c->rx_head = 0u;
+    i2c->rx_tail = 0u;
+    i2c->rx_count = 0u;
+    i2c->int_raw = 0u;
+    i2c->int_ena = 0u;
+    i2c->ack_nack = false;
+    i2c->slave_addressed = false;
+    i2c->active = false;
+    i2c->expect_address = false;
+    i2c->have_address = false;
+    i2c->read_direction = false;
+    i2c->target_present = false;
+    i2c->address = 0u;
+    i2c->pending_write_len = 0u;
+    i2c->regs[I2C_DATE_OFF / 4u] = desc->date_reset;
+    periph_deassert_interrupt(
+        p, (int)desc->instance[port].interrupt_source);
+}
+
+static void i2c_set_system_state(esp32_periph_t *p, unsigned port,
+                                 bool clock_enabled,
+                                 bool reset_asserted)
+{
+    if (!i2c_port_valid(p, (int)port)) return;
+    i2c_state_t *i2c = &p->i2c[port];
+    bool reset_rising = reset_asserted && !i2c->reset_asserted;
+    i2c->clock_enabled = clock_enabled;
+    i2c->reset_asserted = reset_asserted;
+    if (reset_rising) i2c_reset_state(p, port);
+    i2c_intr_update(p, (int)port);
 }
 
 static void i2c_tx_reset(i2c_state_t *i2c) {
@@ -5320,6 +5460,7 @@ static int i2c_commit_write(esp32_periph_t *p, int port) {
 }
 
 static int i2c_fill_read(esp32_periph_t *p, int port, size_t wanted) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
     i2c_state_t *i2c = &p->i2c[port];
     size_t available = I2C_FIFO_SIZE - i2c->rx_count;
     size_t count = wanted < available ? wanted : available;
@@ -5343,13 +5484,14 @@ static int i2c_fill_read(esp32_periph_t *p, int port, size_t wanted) {
     for (size_t index = 0; index < count; index++)
         (void)i2c_rx_push(i2c, data[index]);
     if (wanted > count)
-        i2c->int_raw |= I2C_INT_RXFIFO_OVF;
+        i2c->int_raw |= desc->interrupt_rxfifo_overflow_mask;
     i2c_emit_transfer(port, i2c->address, true, data, count);
     return result;
 }
 
 static bool i2c_select_address(esp32_periph_t *p, int port,
                                uint8_t address_byte) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
     i2c_state_t *i2c = &p->i2c[port];
     uint8_t address = address_byte >> 1;
     bool read = (address_byte & 1u) != 0;
@@ -5358,7 +5500,7 @@ static bool i2c_select_address(esp32_periph_t *p, int port,
 
     if (i2c->have_address && !i2c->read_direction && !combined_read) {
         if (i2c_commit_write(p, port) != 0)
-            i2c->int_raw |= I2C_INT_ACK_ERR;
+            i2c->int_raw |= desc->interrupt_nack_mask;
     }
     if (!combined_read)
         i2c->pending_write_len = 0;
@@ -5373,6 +5515,7 @@ static bool i2c_select_address(esp32_periph_t *p, int port,
 }
 
 static bool i2c_execute_write(esp32_periph_t *p, int port, uint32_t cmd) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
     i2c_state_t *i2c = &p->i2c[port];
     unsigned count = cmd & 0xFFu;
     bool nack = false;
@@ -5396,54 +5539,49 @@ static bool i2c_execute_write(esp32_periph_t *p, int port, uint32_t cmd) {
     if ((cmd & (1u << 8)) != 0) {
         bool expected_nack = (cmd & (1u << 9)) != 0;
         if (nack != expected_nack)
-            i2c->int_raw |= I2C_INT_ACK_ERR;
+            i2c->int_raw |= desc->interrupt_nack_mask;
     }
     return !nack;
 }
 
 static void i2c_execute(esp32_periph_t *p, int port) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    if (!desc) return;
     i2c_state_t *i2c = &p->i2c[port];
-    i2c->int_raw |= I2C_INT_TRANS_START;
+    i2c->int_raw |= desc->interrupt_transaction_start_mask;
 
-    for (unsigned index = 0; index < I2C_COMMAND_COUNT; index++) {
+    for (unsigned index = 0; index < desc->command_count; index++) {
         uint32_t *reg = &i2c->regs[(I2C_COMMAND0_OFF / 4u) + index];
         uint32_t cmd = *reg & 0x3FFFu;
         unsigned opcode = (cmd >> 11) & 7u;
         bool stop = false;
 
-        switch (opcode) {
-        case I2C_CMD_RESTART:
+        if (opcode == desc->opcode_restart) {
             i2c->active = true;
             i2c->expect_address = true;
-            break;
-        case I2C_CMD_WRITE:
+        } else if (opcode == desc->opcode_write) {
             (void)i2c_execute_write(p, port, cmd);
-            break;
-        case I2C_CMD_READ:
+        } else if (opcode == desc->opcode_read) {
             if (i2c_fill_read(p, port, cmd & 0xFFu) != 0)
-                i2c->int_raw |= I2C_INT_ACK_ERR;
-            break;
-        case I2C_CMD_STOP:
+                i2c->int_raw |= desc->interrupt_nack_mask;
+        } else if (opcode == desc->opcode_stop) {
             if (i2c_commit_write(p, port) != 0)
-                i2c->int_raw |= I2C_INT_ACK_ERR;
+                i2c->int_raw |= desc->interrupt_nack_mask;
             i2c_end_transaction(i2c);
-            i2c->int_raw |= I2C_INT_TRANS_DONE;
+            i2c->int_raw |= desc->interrupt_transaction_complete_mask;
             stop = true;
-            break;
-        case I2C_CMD_END:
-            i2c->int_raw |= I2C_INT_END_DETECT;
+        } else if (opcode == desc->opcode_end) {
+            i2c->int_raw |= desc->interrupt_end_detect_mask;
             stop = true;
-            break;
-        default:
-            i2c->int_raw |= I2C_INT_ACK_ERR;
+        } else {
+            i2c->int_raw |= desc->interrupt_nack_mask;
             stop = true;
-            break;
         }
 
         *reg = cmd | I2C_CMD_DONE;
-        i2c->int_raw |= I2C_INT_MASTER_DONE;
-        if ((i2c->int_raw & I2C_INT_ACK_ERR) != 0 &&
-            opcode == I2C_CMD_WRITE) {
+        i2c->int_raw |= desc->interrupt_command_done_mask;
+        if ((i2c->int_raw & desc->interrupt_nack_mask) != 0 &&
+            opcode == desc->opcode_write) {
             i2c_end_transaction(i2c);
             stop = true;
         }
@@ -5452,10 +5590,10 @@ static void i2c_execute(esp32_periph_t *p, int port) {
     }
 
     if (i2c->tx_count == 0)
-        i2c->int_raw |= I2C_INT_TXFIFO_EMPTY;
+        i2c->int_raw |= desc->interrupt_txfifo_empty_mask;
     uint32_t rx_threshold = i2c->regs[I2C_FIFO_CONF_OFF / 4u] & 0x1Fu;
     if (i2c->rx_count > rx_threshold)
-        i2c->int_raw |= I2C_INT_RXFIFO_FULL;
+        i2c->int_raw |= desc->interrupt_rxfifo_full_mask;
     i2c->regs[I2C_CTR_OFF / 4u] &= ~I2C_CTR_TRANS_START;
     i2c_intr_update(p, port);
 }
@@ -5471,10 +5609,15 @@ int periph_i2c_master_xfer(esp32_periph_t *p, int port, uint8_t address,
                            const uint8_t *wr, size_t wrlen,
                            uint8_t *rd, size_t rdlen)
 {
-    if (!p || port < 0 || port >= I2C_PORT_COUNT) return -1;
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    if (!desc || !i2c_port_valid(p, port) ||
+        (!wr && wrlen != 0u) || (!rd && rdlen != 0u))
+        return -1;
     i2c_state_t *i2c = &p->i2c[port];
 
-    if (i2c->regs[I2C_CTR_OFF / 4u] & I2C_CTR_MS_MODE) return -1;
+    if (!i2c->clock_enabled || i2c->reset_asserted ||
+        (i2c->regs[I2C_CTR_OFF / 4u] & I2C_CTR_MS_MODE))
+        return -1;
     uint32_t own = i2c->regs[I2C_SLAVE_ADDR_OFF / 4u] & I2C_SLAVE_ADDR_MASK;
     if ((own & 0x7Fu) != (uint32_t)(address & 0x7Fu)) return -1;
 
@@ -5487,7 +5630,7 @@ int periph_i2c_master_xfer(esp32_periph_t *p, int port, uint8_t address,
      * real condition firmware handles. */
     for (size_t i = 0; i < wrlen; i++) {
         if (!i2c_rx_push(i2c, wr[i])) {
-            i2c->int_raw |= I2C_INT_RXFIFO_OVF;
+            i2c->int_raw |= desc->interrupt_rxfifo_overflow_mask;
             break;
         }
         accepted++;
@@ -5495,7 +5638,7 @@ int periph_i2c_master_xfer(esp32_periph_t *p, int port, uint8_t address,
     if (wrlen) {
         uint32_t threshold = i2c->regs[I2C_FIFO_CONF_OFF / 4u] & 0x1Fu;
         if (i2c->rx_count > threshold)
-            i2c->int_raw |= I2C_INT_RXFIFO_FULL;
+            i2c->int_raw |= desc->interrupt_rxfifo_full_mask;
     }
 
     /* A read is answered from whatever the guest left in the TX FIFO. Real
@@ -5503,21 +5646,24 @@ int periph_i2c_master_xfer(esp32_periph_t *p, int port, uint8_t address,
     for (size_t i = 0; i < rdlen; i++)
         rd[i] = i2c->tx_count ? i2c_tx_pop(i2c) : 0xFFu;
     if (rdlen && i2c->tx_count == 0)
-        i2c->int_raw |= I2C_INT_TXFIFO_EMPTY;
+        i2c->int_raw |= desc->interrupt_txfifo_empty_mask;
 
-    i2c->int_raw |= I2C_INT_SLAVE_TRAN_COMP | I2C_INT_TRANS_DONE;
+    i2c->int_raw |= desc->interrupt_slave_complete_mask |
+                    desc->interrupt_transaction_complete_mask;
     i2c_intr_update(p, port);
     return accepted;
 }
 
 static uint32_t i2c_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    int port = i2c_port_from_addr(addr);
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    int port = i2c_port_from_addr(p, addr);
     if (port < 0)
         return default_read(ctx, addr);
+    const flexe_i2c_instance_desc_t *instance = i2c_instance(p, port);
     i2c_state_t *i2c = &p->i2c[port];
-    uint32_t off = addr - i2c_bases[port];
-    if ((off & 3u) != 0 || off >= I2C_REG_FILE_SIZE)
+    uint32_t off = addr - instance->base;
+    if ((off & 3u) != 0 || off >= desc->register_size)
         return default_read(ctx, addr);
 
     switch (off) {
@@ -5534,7 +5680,7 @@ static uint32_t i2c_read(void *ctx, uint32_t addr) {
                (uint32_t)(i2c->rx_tail & 0x1Fu);
     case I2C_DATA_OFF: {
         uint8_t byte = i2c_rx_pop(i2c);
-        i2c_intr_update(p, i2c_port_from_addr(addr));
+        i2c_intr_update(p, port);
         return byte;
     }
     case I2C_INT_RAW_OFF:
@@ -5552,17 +5698,21 @@ static uint32_t i2c_read(void *ctx, uint32_t addr) {
 
 static void i2c_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
-    int port = i2c_port_from_addr(addr);
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    int port = i2c_port_from_addr(p, addr);
     if (port < 0) {
         default_write(ctx, addr, val);
         return;
     }
+    const flexe_i2c_instance_desc_t *instance = i2c_instance(p, port);
     i2c_state_t *i2c = &p->i2c[port];
-    uint32_t off = addr - i2c_bases[port];
-    if ((off & 3u) != 0 || off >= I2C_REG_FILE_SIZE) {
+    uint32_t off = addr - instance->base;
+    if ((off & 3u) != 0 || off >= desc->register_size) {
         default_write(ctx, addr, val);
         return;
     }
+
+    if (i2c->reset_asserted) return;
 
     switch (off) {
     case I2C_CTR_OFF:
@@ -5570,7 +5720,8 @@ static void i2c_write(void *ctx, uint32_t addr, uint32_t val) {
         /* The command list belongs to master mode. A slave has no say in when
          * a transfer happens -- it answers one -- so running the list here
          * would have the port originate traffic it should be receiving. */
-        if ((val & I2C_CTR_TRANS_START) && (val & I2C_CTR_MS_MODE))
+        if (i2c->clock_enabled && (val & I2C_CTR_TRANS_START) &&
+            (val & I2C_CTR_MS_MODE))
             i2c_execute(p, port);
         break;
     case I2C_FIFO_CONF_OFF:
@@ -5589,17 +5740,39 @@ static void i2c_write(void *ctx, uint32_t addr, uint32_t val) {
     case I2C_INT_ST_OFF:
         break; /* read-only */
     case I2C_INT_CLR_OFF:
-        i2c->int_raw &= ~(val & I2C_INT_VALID_MASK);
+        i2c->int_raw &= ~(val & desc->interrupt_valid_mask);
         i2c_intr_update(p, port);
         break;
     case I2C_INT_ENA_OFF:
-        i2c->int_ena = val & I2C_INT_VALID_MASK;
+        i2c->int_ena = val & desc->interrupt_valid_mask;
         i2c_intr_update(p, port);
         break;
     default:
         i2c->regs[off / 4u] = val;
         break;
     }
+}
+
+static int i2c_register_target(esp32_periph_t *p) {
+    const flexe_i2c_desc_t *desc = i2c_desc(p);
+    if (!desc) return 0;
+    if (!i2c_geometry_valid(p)) return -1;
+
+    for (unsigned port = 0u; port < desc->instance_count; port++) {
+        bool clock_enabled = true;
+        bool reset_asserted = false;
+        (void)flexe_system_clock_gate_state(
+            p->system_clock, FLEXE_SYSTEM_DEVICE_I2C, port,
+            &clock_enabled, &reset_asserted);
+        p->i2c[port].clock_enabled = clock_enabled;
+        p->i2c[port].reset_asserted = reset_asserted;
+        i2c_reset_state(p, port);
+        if (mem_register_mmio_range(
+                p->mem, desc->instance[port].base, desc->register_size,
+                i2c_read, i2c_write, p) != 0)
+            return -1;
+    }
+    return 0;
 }
 
 /* ---- RMT remote-control / pulse engine ---- */
@@ -13568,6 +13741,10 @@ static void system_clock_gate_changed(
             p->target_timer_group, instance,
             clock_enabled, reset_asserted);
         return;
+    case FLEXE_SYSTEM_DEVICE_I2C:
+        i2c_set_system_state(
+            p, instance, clock_enabled, reset_asserted);
+        return;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -14135,6 +14312,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (i2c_register_target(p) != 0) {
+        periph_destroy(p);
+        return NULL;
+    }
+
     flexe_system_clock_publish_gates(p->system_clock);
 
     if (!classic) return p;
@@ -14161,9 +14343,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
      * ROM that merely happens to call touch_pad_init(). */
     for (int pad = 0; pad < SENS_TOUCH_PAD_COUNT; pad++)
         p->touch_value[pad] = 0xFFFFu;
-    for (int port = 0; port < I2C_PORT_COUNT; port++)
-        p->i2c[port].regs[I2C_DATE_OFF / 4u] = 0x16042000u;
-
     /* Both SAR units reset to 12-bit conversion width. RTC DAC pads reset
      * disabled at code zero with their documented drive-strength value. */
     p->sens_regs[SENS_SAR_START_FORCE_OFF / 4u] = 0xFu;
@@ -14249,10 +14428,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     mem_register_mmio(mem, (int)PAGE_OF(SLCHOST_BASE),
                       slchost_read, slchost_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(SLC_BASE), slc_read, slc_write, p);
-
-    /* Two classic ESP32 I2C controllers (interrupt sources 49/50). */
-    mem_register_mmio(mem, (int)PAGE_OF(I2C0_BASE), i2c_read, i2c_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(I2C1_BASE), i2c_read, i2c_write, p);
 
     /* Dual-slot native SD/MMC host (interrupt source 37). */
     mem_register_mmio(mem, (int)PAGE_OF(SDMMC_BASE),
@@ -14442,7 +14617,14 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_esp32s3_extmem_destroy(p->s3_extmem);
     flexe_flash_mmu_destroy(p->shared_flash_mmu);
     periph_disable_spi_display(p);
-    for (int port = 0; port < I2C_PORT_COUNT; port++)
+    if (p->target->capabilities & FLEXE_TARGET_CAP_I2C_V1) {
+        const flexe_i2c_desc_t *desc = &p->target->i2c;
+        for (unsigned port = 0u; port < desc->instance_count; port++)
+            (void)mem_register_mmio_range(
+                p->mem, desc->instance[port].base, desc->register_size,
+                NULL, NULL, NULL);
+    }
+    for (unsigned port = 0u; port < I2C_PORT_COUNT; port++)
         free(p->i2c[port].pending_write);
     free(p->sdmmc.transfer);
     free(p);
@@ -14659,10 +14841,13 @@ size_t periph_uart_rx_pending(const esp32_periph_t *p) {
 
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
                              periph_i2c_device_fn fn, void *ctx) {
-    if (!p || port < 0 || port > PERIPH_I2C_PORT_RTC ||
-        address >= I2C_DEVICE_COUNT)
+    bool external = i2c_port_valid(p, port);
+    bool rtc = p && port == PERIPH_I2C_PORT_RTC &&
+               (p->target->capabilities &
+                FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS);
+    if ((!external && !rtc) || address >= I2C_DEVICE_COUNT)
         return -1;
-    i2c_device_t *device = port == PERIPH_I2C_PORT_RTC ?
+    i2c_device_t *device = rtc ?
                            &p->rtc_i2c.device[address] :
                            &p->i2c[port].device[address];
     device->fn = fn;

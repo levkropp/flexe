@@ -15,6 +15,7 @@
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
 #define FLEXE_TARGET_UART_MAX 3
+#define FLEXE_TARGET_I2C_MAX 2u
 #define FLEXE_TARGET_RTC_CAL_GROUP_MAX 2u
 #define FLEXE_TARGET_RTC_CAL_CLOCK_MAX 4u
 #define FLEXE_TARGET_REGI2C_HOST_MAX 2u
@@ -36,9 +37,9 @@
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 3u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 5u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 26u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 27u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -61,6 +62,7 @@ typedef enum {
     FLEXE_TARGET_CAP_RTC_CNTL_V1                  = 1ull << 14,
     FLEXE_TARGET_CAP_EFUSE_READ_V1                = 1ull << 15,
     FLEXE_TARGET_CAP_GPIO_V1                      = 1ull << 16,
+    FLEXE_TARGET_CAP_I2C_V1                       = 1ull << 17,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -142,6 +144,38 @@ typedef struct {
     uint32_t interrupt_source;
 } flexe_uart_instance_desc_t;
 
+/* External I2C controller front end. ESP32 and ESP32-S3 retain the same
+ * FIFO/register positions, but the S3 moves each instance, shortens the
+ * command list, changes command opcodes, and replaces several interrupt
+ * meanings. Keep those architectural differences out of the bus model. */
+typedef struct {
+    uint32_t base;
+    uint8_t  interrupt_source;
+} flexe_i2c_instance_desc_t;
+
+typedef struct {
+    uint32_t register_size;
+    uint32_t date_reset;
+    uint32_t interrupt_valid_mask;
+    uint32_t interrupt_rxfifo_full_mask;
+    uint32_t interrupt_txfifo_empty_mask;
+    uint32_t interrupt_rxfifo_overflow_mask;
+    uint32_t interrupt_end_detect_mask;
+    uint32_t interrupt_slave_complete_mask;
+    uint32_t interrupt_command_done_mask;
+    uint32_t interrupt_transaction_complete_mask;
+    uint32_t interrupt_transaction_start_mask;
+    uint32_t interrupt_nack_mask;
+    uint8_t  instance_count;
+    uint8_t  command_count;
+    uint8_t  opcode_restart;
+    uint8_t  opcode_write;
+    uint8_t  opcode_read;
+    uint8_t  opcode_stop;
+    uint8_t  opcode_end;
+    flexe_i2c_instance_desc_t instance[FLEXE_TARGET_I2C_MAX];
+} flexe_i2c_desc_t;
+
 /* Register interface used to start a target's secondary CPU. Bit positions
  * and register locations vary by SoC even when the Xtensa boot contract does
  * not, so machine construction consumes this descriptor rather than addresses
@@ -161,6 +195,7 @@ typedef enum {
     FLEXE_SYSTEM_DEVICE_NONE = 0,
     FLEXE_SYSTEM_DEVICE_SYSTIMER,
     FLEXE_SYSTEM_DEVICE_TIMER_GROUP,
+    FLEXE_SYSTEM_DEVICE_I2C,
 } flexe_system_device_t;
 
 typedef struct {
@@ -548,6 +583,9 @@ typedef struct {
     uint8_t                     uart_count;
     flexe_uart_ip_desc_t        uart_ip;
     flexe_uart_instance_desc_t  uart[FLEXE_TARGET_UART_MAX];
+
+    /* Optional external I2C controllers and pluggable bus endpoints. */
+    flexe_i2c_desc_t            i2c;
 
     /* Optional SoC register block controlling the secondary CPU. */
     flexe_secondary_core_desc_t secondary_core;
