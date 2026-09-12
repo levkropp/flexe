@@ -206,7 +206,13 @@ static const flexe_target_desc_t TARGETS[] = {
         .configid1 = 0x23090F1Fu,
         .default_cpu_frequency_mhz = 160u,
         .cpu_frequency_word = 0x3FCEF758u,
-        .bootstrap_stack_top = { 0x3FCE0000u, 0x3FCF0000u },
+        /* ESP32-S3 rev-0 ROM linker symbols __stack and __stack_app.
+         * Application handoff still runs the PRO/APP startup paths before
+         * FreeRTOS installs task stacks, so both cores need the ROM-owned
+         * 8-KiB startup ranges. 0x3FCED710 and above is ROM static state;
+         * placing APP_CPU at the old 0x3FCF0000 boundary let its first LX7
+         * window spill overwrite the ROM ABI interface immediately below. */
+        .bootstrap_stack_top = { 0x3FCEB710u, 0x3FCED710u },
         .interrupt_level = {
             1, 1, 1, 1, 1, 1, 1, 1,
             1, 1, 1, 3, 1, 1, 7, 3,
