@@ -72,10 +72,13 @@ WLED_BIN=/path/to/wled.bin \
 ./scripts/bench-stock-roms.sh
 ```
 
-The default gate runs three two-billion-cycle samples and rejects runs that
-stop early, trap, miss the real-time threshold, or spend most wall time blocked
-in the host. Configure it with `CYCLES`, `REPS`, `ENGINE`, `MIN_REALTIME`, and
-`ESP_HZ`.
+The default gate runs one unmeasured warm-up followed by three two-billion-
+cycle samples. It rejects runs that stop early, trap, spend most wall time
+blocked in the host, or let even the slowest accepted sample miss the real-time
+threshold. The report includes median wall time, median and minimum realtime,
+and realtime coefficient of variation (population standard deviation divided
+by the mean). Configure it with `CYCLES`, `WARMUPS`, `REPS`, `ENGINE`,
+`MIN_REALTIME`, and `ESP_HZ`.
 
 For any other image:
 

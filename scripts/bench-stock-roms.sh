@@ -8,7 +8,7 @@
 #   TASMOTA_BIN=/path/to/tasmota32.bin ./scripts/bench-stock-roms.sh
 #
 # Useful overrides:
-#   EMU=./build/xtensa-emu  CYCLES=2000000000  REPS=3
+#   EMU=./build/xtensa-emu  CYCLES=2000000000  WARMUPS=1  REPS=3
 #   ENGINE=jit|interp      MIN_REALTIME=1.0     ESP_HZ=240000000
 
 set -euo pipefail
@@ -16,6 +16,7 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 emu=${EMU:-"$script_dir/build/xtensa-emu"}
 cycles=${CYCLES:-2000000000}
+warmups=${WARMUPS:-1}
 reps=${REPS:-3}
 engine=${ENGINE:-jit}
 min_realtime=${MIN_REALTIME:-1.0}
@@ -33,6 +34,10 @@ for integer in "$cycles" "$reps" "$esp_hz"; do
         exit 2
     fi
 done
+if [[ ! "$warmups" =~ ^[0-9]+$ ]]; then
+    echo "error: WARMUPS must be a non-negative integer" >&2
+    exit 2
+fi
 if ! python3 -c 'import sys; assert float(sys.argv[1]) >= 0' "$min_realtime" 2>/dev/null; then
     echo "error: MIN_REALTIME must be a non-negative number" >&2
     exit 2
@@ -106,19 +111,18 @@ child_cpu_seconds() {
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/flexe-stock-bench.XXXXXX")
 trap 'rm -rf -- "$work_dir"' EXIT
 
-printf 'engine=%s cycles=%s reps=%s threshold=%sx\n' \
-       "$engine" "$cycles" "$reps" "$min_realtime"
-printf '%-18s %10s %12s %11s %11s %s\n' \
-       workload wall_s virtual_Mcycles agg_MIPS real_time result
+printf 'engine=%s cycles=%s warmups=%s reps=%s threshold=%sx\n' \
+       "$engine" "$cycles" "$warmups" "$reps" "$min_realtime"
+printf '%-18s %10s %12s %11s %10s %10s %9s %s\n' \
+       workload wall_med_s virtual_Mcycles agg_MIPS rt_median rt_min rt_cv result
 
 failed=0
 for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
     name=${names[$rom_index]}
     rom=${roms[$rom_index]}
-    wall_total=0
-    virtual_total=0
-    aggregate_total=0
+    sample_values=()
     workload_ok=1
+    warmed=0
     accepted=0
     attempt=0
     discarded=0
@@ -127,7 +131,8 @@ for ((rom_index = 0; rom_index < ${#roms[@]}; rom_index++)); do
     # dyld, filesystem, or scheduler activity. Discard one such sample, but
     # fail on a second: persistent off-CPU time is an emulator regression,
     # not benchmark noise (for example, blocking in poll()/accept()).
-    while (( accepted < reps && attempt < reps + 1 )); do
+    max_attempts=$((warmups + reps + 1))
+    while (( accepted < reps && attempt < max_attempts )); do
         ((attempt += 1))
         log="$work_dir/${rom_index}-${attempt}.stderr"
         uart="$work_dir/${rom_index}-${attempt}.uart"
@@ -196,11 +201,12 @@ sys.exit(0 if cpu >= 0.5 * wall else 1)' "$wall" "$cpu_before" "$cpu_after"; the
                  "off-CPU; discarding the contaminated sample" >&2
             continue
         fi
+        if (( warmed < warmups )); then
+            ((warmed += 1))
+            continue
+        fi
         ((accepted += 1))
-        wall_total=$(python3 -c 'import sys; print(float(sys.argv[1])+float(sys.argv[2]))' \
-            "$wall_total" "$wall")
-        virtual_total=$((virtual_total + virtual))
-        aggregate_total=$((aggregate_total + aggregate))
+        sample_values+=("$wall" "$virtual" "$aggregate")
     done
 
     if (( workload_ok && accepted < reps )); then
@@ -209,30 +215,47 @@ sys.exit(0 if cpu >= 0.5 * wall else 1)' "$wall" "$cpu_before" "$cpu_after"; the
     fi
 
     if (( ! workload_ok )); then
-        printf '%-18s %10s %12s %11s %11s %s\n' "$name" - - - - FAIL
+        printf '%-18s %10s %12s %11s %10s %10s %9s %s\n' \
+               "$name" - - - - - - FAIL
         failed=1
         continue
     fi
 
-    read -r avg_wall virtual_mcycles aggregate_mips realtime < <(
+    read -r median_wall virtual_mcycles aggregate_mips median_realtime \
+        minimum_realtime realtime_cv minimum_realtime_raw < <(
         python3 -c '
+import statistics
 import sys
-wall = float(sys.argv[1]) / int(sys.argv[4])
-virtual = int(sys.argv[2]) / int(sys.argv[4])
-aggregate = int(sys.argv[3]) / int(sys.argv[4])
-hz = int(sys.argv[5])
-print(f"{wall:.3f} {virtual/1e6:.1f} {aggregate/wall/1e6:.1f} {virtual/hz/wall:.2f}")
-' "$wall_total" "$virtual_total" "$aggregate_total" "$reps" "$esp_hz"
+
+hz = int(sys.argv[1])
+values = [float(value) for value in sys.argv[2:]]
+if not values or len(values) % 3:
+    raise SystemExit("invalid benchmark sample set")
+walls = values[0::3]
+virtual = values[1::3]
+aggregate = values[2::3]
+realtime = [cycles / hz / wall for cycles, wall in zip(virtual, walls)]
+mean_realtime = statistics.fmean(realtime)
+cv = (statistics.pstdev(realtime) / mean_realtime * 100.0
+      if mean_realtime else 0.0)
+minimum = min(realtime)
+print(f"{statistics.median(walls):.3f} "
+      f"{statistics.fmean(virtual)/1e6:.1f} "
+      f"{sum(aggregate)/sum(walls)/1e6:.1f} "
+      f"{statistics.median(realtime):.3f} {minimum:.3f} {cv:.2f} "
+      f"{minimum:.12g}")
+' "$esp_hz" "${sample_values[@]}"
     )
 
     result=PASS
     if ! python3 -c 'import sys; raise SystemExit(float(sys.argv[1]) < float(sys.argv[2]))' \
-            "$realtime" "$min_realtime"; then
+            "$minimum_realtime_raw" "$min_realtime"; then
         result=FAIL
         failed=1
     fi
-    printf '%-18s %10s %12s %11s %10sx %s\n' \
-           "$name" "$avg_wall" "$virtual_mcycles" "$aggregate_mips" "$realtime" "$result"
+    printf '%-18s %10s %12s %11s %9sx %9sx %8s%% %s\n' \
+           "$name" "$median_wall" "$virtual_mcycles" "$aggregate_mips" \
+           "$median_realtime" "$minimum_realtime" "$realtime_cv" "$result"
 done
 
 exit "$failed"
