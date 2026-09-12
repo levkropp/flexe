@@ -351,7 +351,8 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.wdt_stage0_multiplier, 2u);
     ASSERT_EQ(s3->efuse.base, 0x60007000u);
     ASSERT_EQ(s3->efuse.read_data_word_count, 84u);
-    ASSERT_EQ(s3->efuse.read_data[6], 0x00000002u);
+    ASSERT_EQ(s3->efuse.read_data[6], 0x00000001u);
+    ASSERT_EQ(s3->efuse.read_data[7], 0x00000200u);
     ASSERT_EQ(s3->interrupt_matrix.base, 0x600C2000u);
     ASSERT_EQ(s3->interrupt_matrix.source_count, 99u);
     ASSERT_EQ(s3->interrupt_matrix.map_offset[1], 0x800u);

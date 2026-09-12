@@ -489,8 +489,8 @@ static const flexe_target_desc_t TARGETS[] = {
             /* ESP32-S3 revision 0.0, no embedded flash/PSRAM, and the
              * locally administered unicast MAC 02:00:00:00:00:01. */
             .read_data = {
-                [6] = 0x00000002u, /* RD_MAC_SPI_SYS_0 */
-                [7] = 0x00000100u, /* RD_MAC_SPI_SYS_1 */
+                [6] = 0x00000001u, /* RD_MAC_SPI_SYS_0: MAC bits 31:0 */
+                [7] = 0x00000200u, /* RD_MAC_SPI_SYS_1: MAC bits 47:32 */
             },
         },
         .interrupt_matrix = {

@@ -44,11 +44,30 @@ TEST(efuse_exposes_read_only_virtual_silicon_profile)
     uint32_t mac0 = desc->base + 0x044u;
     uint32_t mac1 = desc->base + 0x048u;
     uint32_t revision = desc->base + 0x058u;
-    ASSERT_EQ(mem_read32(mem, mac0), 0x00000002u);
-    ASSERT_EQ(mem_read32(mem, mac1), 0x00000100u);
+    ASSERT_EQ(mem_read32(mem, mac0), 0x00000001u);
+    ASSERT_EQ(mem_read32(mem, mac1), 0x00000200u);
     ASSERT_EQ(mem_read32(mem, revision), 0u);
     mem_write32(mem, mac0, UINT32_MAX);
-    ASSERT_EQ(mem_read32(mem, mac0), 0x00000002u);
+    ASSERT_EQ(mem_read32(mem, mac0), 0x00000001u);
+
+    /* ESP_EFUSE_MAC_FACTORY lists bytes from BLK1 bit 40 down to bit 0.
+     * Reconstruct that public API view so a word-order regression cannot
+     * silently turn the virtual station identity into a multicast address. */
+    uint32_t mac_low = mem_read32(mem, mac0);
+    uint32_t mac_high = mem_read32(mem, mac1);
+    uint8_t mac[6] = {
+        (uint8_t)(mac_high >> 8), (uint8_t)mac_high,
+        (uint8_t)(mac_low >> 24), (uint8_t)(mac_low >> 16),
+        (uint8_t)(mac_low >> 8), (uint8_t)mac_low,
+    };
+    ASSERT_EQ(mac[0], 0x02u);
+    ASSERT_EQ(mac[1], 0x00u);
+    ASSERT_EQ(mac[2], 0x00u);
+    ASSERT_EQ(mac[3], 0x00u);
+    ASSERT_EQ(mac[4], 0x00u);
+    ASSERT_EQ(mac[5], 0x01u);
+    ASSERT_EQ(mac[0] & 1u, 0u);
+    ASSERT_TRUE(mac[0] & 2u);
 
     uint32_t date = desc->base + desc->date_offset;
     ASSERT_EQ(mem_read32(mem, date), 0x02101290u);
