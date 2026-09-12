@@ -2,6 +2,7 @@
 #include "esp32s3_extmem.h"
 #include "efuse.h"
 #include "flash_mmu.h"
+#include "gpio.h"
 #include "io_mux.h"
 #include "rtc_cntl.h"
 #include "regi2c.h"
@@ -1844,6 +1845,7 @@ struct esp32_periph {
     flexe_flash_mmu_t *shared_flash_mmu;
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_efuse_t *target_efuse;
+    flexe_gpio_t *target_gpio;
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
     flexe_regi2c_t *regi2c;
@@ -3243,19 +3245,23 @@ static uint32_t gpio_read(void *ctx, uint32_t addr) {
     return 0;
 }
 
+static void gpio_emit_pin_changed(esp32_periph_t *p, int pin, int level) {
+    if (gpio_dbg())
+        fprintf(stderr, "[GPIO] pin%d -> %d\n", pin, level);
+    spi_display_gpio_changed(p, pin, level);
+    sbx_event_t ev = { .kind = SBX_EV_GPIO_OUT, .cycle = 0 };
+    ev.gpio_out.pin = (uint8_t)pin;
+    ev.gpio_out.level = level;
+    sbx_events_emit(&ev);
+}
+
 static void gpio_emit_changed(esp32_periph_t *p, uint32_t prev, uint32_t now,
                               int pin_base) {
     uint32_t diff = prev ^ now;
     while (diff) {
         int bit = __builtin_ctz(diff);
         diff &= ~(1u << bit);
-        if (gpio_dbg())
-            fprintf(stderr, "[GPIO] pin%d -> %d\n", pin_base + bit, (now >> bit) & 1u);
-        spi_display_gpio_changed(p, pin_base + bit, (now >> bit) & 1u);
-        sbx_event_t ev = { .kind = SBX_EV_GPIO_OUT, .cycle = 0 };
-        ev.gpio_out.pin = (uint8_t)(pin_base + bit);
-        ev.gpio_out.level = (now >> bit) & 1u;
-        sbx_events_emit(&ev);
+        gpio_emit_pin_changed(p, pin_base + bit, (now >> bit) & 1u);
     }
 }
 
@@ -13656,6 +13662,29 @@ static void usb_serial_jtag_irq_changed(void *ctx, bool level)
     else periph_deassert_interrupt(p, source);
 }
 
+static void target_gpio_output_changed(void *ctx, unsigned gpio,
+                                       int level, int enabled)
+{
+    esp32_periph_t *p = ctx;
+    (void)enabled;
+    /* Existing sandbox events describe a digital value rather than a
+     * tri-state net. Unknown peripheral-produced values therefore remain
+     * absent instead of being flattened to a plausible-looking zero. */
+    if (p && level >= 0)
+        gpio_emit_pin_changed(p, (int)gpio, level);
+}
+
+static void target_gpio_irq_changed(void *ctx, bool nmi, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !(p->target->capabilities & FLEXE_TARGET_CAP_GPIO_V1))
+        return;
+    int source = nmi ? p->target->gpio.nmi_interrupt_source :
+                       p->target->gpio.interrupt_source;
+    if (level) periph_assert_interrupt(p, source);
+    else       periph_deassert_interrupt(p, source);
+}
+
 /* ---- Target-described secondary-core control ---- */
 
 static bool secondary_core_geometry_valid(const flexe_target_desc_t *target)
@@ -13945,6 +13974,17 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         p->io_mux = flexe_io_mux_create(
             mem, default_read, default_write, p);
         if (!p->io_mux) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
+    if (target->capabilities & FLEXE_TARGET_CAP_GPIO_V1) {
+        p->target_gpio = flexe_gpio_create(
+            mem, default_read, default_write, p,
+            target_gpio_output_changed, p,
+            target_gpio_irq_changed, p);
+        if (!p->target_gpio) {
             periph_destroy(p);
             return NULL;
         }
@@ -14299,7 +14339,10 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 xtensa_mem_t *periph_mem(esp32_periph_t *p) { return p ? p->mem : NULL; }
 
 int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
-    if (!p || pin < 0 || pin > 39) return -1;
+    if (!p || pin < 0) return -1;
+    if (p->target_gpio)
+        return flexe_gpio_pin_level(p->target_gpio, (unsigned)pin);
+    if (pin > 39) return -1;
 
     uint32_t route = p->gpio.func_out_sel[pin];
     uint32_t signal = route & 0x1FFu;
@@ -14326,13 +14369,19 @@ int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
 }
 
 int periph_gpio_output_enabled(const esp32_periph_t *p, int pin) {
-    if (!p || pin < 0 || pin > 39) return 0;
+    if (!p || pin < 0) return 0;
+    if (p->target_gpio)
+        return flexe_gpio_output_enabled(p->target_gpio, (unsigned)pin);
+    if (pin > 39) return 0;
     if (pin < 32) return (int)((p->gpio.enable >> pin) & 1u);
     return (int)((p->gpio.enable1 >> (pin - 32)) & 1u);
 }
 
 int periph_gpio_out_signal(const esp32_periph_t *p, int pin) {
-    if (!p || pin < 0 || pin > 39) return -1;
+    if (!p || pin < 0) return -1;
+    if (p->target_gpio)
+        return flexe_gpio_out_signal(p->target_gpio, (unsigned)pin);
+    if (pin > 39) return -1;
     return (int)(p->gpio.func_out_sel[pin] & 0x1FFu);
 }
 
@@ -14343,6 +14392,11 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    flexe_gpio_destroy(p->target_gpio);
+    if (p->target->capabilities & FLEXE_TARGET_CAP_GPIO_V1)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->gpio.base,
+            p->target->gpio.register_size, NULL, NULL, NULL);
     flexe_usb_serial_jtag_destroy(p->usb_serial_jtag);
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_timer_group_destroy(p->target_timer_group);
@@ -15067,7 +15121,12 @@ void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value) {
 }
 
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
-    if (!p || pin < 0 || pin > 39) return;
+    if (!p || pin < 0) return;
+    if (p->target_gpio) {
+        flexe_gpio_set_input(p->target_gpio, (unsigned)pin, level != 0);
+        return;
+    }
+    if (pin > 39) return;
     uint32_t mask = (pin < 32) ? (1u << pin) : (1u << (pin - 32));
     uint32_t *in = (pin < 32) ? &p->gpio.in : &p->gpio.in1;
     int old = (*in & mask) ? 1 : 0;

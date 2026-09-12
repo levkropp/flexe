@@ -282,6 +282,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GPIO_V1);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
@@ -301,6 +302,12 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->io_mux.base, 0x60009000u);
     ASSERT_EQ(s3->io_mux.gpio_count, 49u);
     ASSERT_EQ(s3->io_mux.gpio_register_offset[26], 0x6Cu);
+    ASSERT_EQ(s3->gpio.base, 0x60004000u);
+    ASSERT_EQ(s3->gpio.gpio_count, 49u);
+    ASSERT_EQ64(s3->gpio.valid_gpio_mask,
+                UINT64_C(0x0001FFFFFC3FFFFF));
+    ASSERT_EQ(s3->gpio.interrupt_source, 16u);
+    ASSERT_EQ(s3->gpio.nmi_interrupt_source, 17u);
     ASSERT_EQ(s3->rtc_cntl.base, 0x60008000u);
     ASSERT_EQ(s3->rtc_cntl.store_offset[4], 0xC0u);
     ASSERT_EQ(s3->rtc_cntl.xtal_frequency_mhz, 40u);

@@ -16,12 +16,26 @@ startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only
 revision-0 eFuse profile, digital pad configuration, UARTs, native USB
-Serial/JTAG, and interrupt matrix.
+Serial/JTAG, digital GPIO matrix, and interrupt matrix.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
 JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
 addresses belong to the classic target. Missing S3 devices remain explicit
 and S3 is not yet a production-supported target.
+
+The S3 GPIO model implements the S2/S3-generation register layout, both data
+and enable banks, package-valid GPIO0..48 (including the GPIO22..25 holes),
+software-output selection and inversion, matrix input selection and constant
+inputs, host-driven digital inputs, edge/level status latching, W1TS/W1TC
+aliases, and the shared normal/NMI sources routed through both cores' target
+interrupt matrices. The virtual target currently supplies zero-valued strap
+inputs. Peripheral-produced matrix output levels, BT/SDIO pad ownership,
+open-drain electrical resolution, input synchronizer/filter timing, GPIO wake,
+and clock-gate effects are not modeled yet; selecting those behaviors produces
+an unsupported-access diagnostic instead of an invented result. Pulls, drive
+strength, and other pad electrical behavior remain part of the separate IO_MUX
+and future board/net model. This is useful functional GPIO support for the
+experimental S3 target, not hardware-calibrated timing or electrical evidence.
 
 The descriptor-driven S3 timer-group model implements both 54-bit general-
 purpose timers per group, APB/XTAL clock selection and division, software

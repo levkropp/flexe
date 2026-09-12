@@ -10,6 +10,7 @@ int test_count = 0, test_passes = 0, test_failures = 0;
 #include "test_memory.c"
 #include "test_flash_mmu.c"
 #include "test_efuse.c"
+#include "test_gpio.c"
 #include "test_io_mux.c"
 #include "test_rtc_cntl.c"
 #include "test_esp32s3_extmem.c"
@@ -62,6 +63,7 @@ int main(void) {
     run_memory_tests();
     run_flash_mmu_tests();
     run_efuse_tests();
+    run_target_gpio_tests();
     run_io_mux_tests();
     run_rtc_cntl_tests();
     run_esp32s3_extmem_tests();

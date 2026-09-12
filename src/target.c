@@ -171,7 +171,8 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1 |
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
                         FLEXE_TARGET_CAP_RTC_CNTL_V1 |
-                        FLEXE_TARGET_CAP_EFUSE_READ_V1,
+                        FLEXE_TARGET_CAP_EFUSE_READ_V1 |
+                        FLEXE_TARGET_CAP_GPIO_V1,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
         .configid0 = 0xC2F0FFFEu,
@@ -322,6 +323,19 @@ static const flexe_target_desc_t TARGETS[] = {
                 0x0A8u, 0x0ACu, 0x0B0u, 0x0B4u, 0x0B8u,
                 0x0BCu, 0x0C0u, 0x0C4u,
             },
+        },
+        .gpio = {
+            .base = 0x60004000u,
+            .register_size = 0x1000u,
+            /* ESP32-S3 has GPIO0..48 with package holes at GPIO22..25. */
+            .valid_gpio_mask = UINT64_C(0x0001FFFFFC3FFFFF),
+            .strap_reset = 0u,
+            .date_reset = 0x01907040u,
+            .gpio_count = 49u,
+            .matrix_const_one_input = 0x38u,
+            .matrix_const_zero_input = 0x3Cu,
+            .interrupt_source = 16u,
+            .nmi_interrupt_source = 17u,
         },
         .rtc_cntl = {
             .base = 0x60008000u,

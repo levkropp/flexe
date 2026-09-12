@@ -38,7 +38,7 @@
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 3u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 25u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 26u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -60,6 +60,7 @@ typedef enum {
     FLEXE_TARGET_CAP_IO_MUX_V1                   = 1ull << 13,
     FLEXE_TARGET_CAP_RTC_CNTL_V1                  = 1ull << 14,
     FLEXE_TARGET_CAP_EFUSE_READ_V1                = 1ull << 15,
+    FLEXE_TARGET_CAP_GPIO_V1                      = 1ull << 16,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -221,6 +222,24 @@ typedef struct {
     uint32_t date_reset;
     uint16_t gpio_register_offset[FLEXE_TARGET_GPIO_MAX];
 } flexe_io_mux_desc_t;
+
+/* S2/S3-generation digital GPIO matrix. The capability selects the reusable
+ * register layout while target data supplies package-valid pads, virtual
+ * strap state, constant matrix inputs, and interrupt-source wiring. GPIO
+ * registers exist for more indices than every package bonds out, hence the
+ * separate valid mask and exclusive gpio_count upper bound. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint64_t valid_gpio_mask;
+    uint32_t strap_reset;
+    uint32_t date_reset;
+    uint8_t  gpio_count;
+    uint8_t  matrix_const_one_input;
+    uint8_t  matrix_const_zero_input;
+    uint8_t  interrupt_source;
+    uint8_t  nmi_interrupt_source;
+} flexe_gpio_desc_t;
 
 /* Always-on RTC controller state shared by the ROM, bootloader and
  * application. Offsets are explicit because the register layout, timer
@@ -538,6 +557,9 @@ typedef struct {
 
     /* Optional digital pad configuration register file. */
     flexe_io_mux_desc_t          io_mux;
+
+    /* Optional S2/S3-generation digital GPIO matrix. */
+    flexe_gpio_desc_t             gpio;
 
     /* Optional always-on RTC controller and boot-handoff state. */
     flexe_rtc_cntl_desc_t        rtc_cntl;

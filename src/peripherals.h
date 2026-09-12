@@ -353,12 +353,14 @@ void periph_cancel_deferred(esp32_periph_t *p, periph_deferred_fn fn,
 /* Access the backing memory object (used by spi_display) */
 xtensa_mem_t *periph_mem(esp32_periph_t *p);
 
-/* Current GPIO output level of a pin (0/1, -1 if invalid). Used by the
+/* Current GPIO output level of a pin. Returns -1 for an invalid pin or a
+ * peripheral-selected signal whose producer is not attached. Used by the
  * GP-SPI display/touch sniffer to sample CS and D/C lines. */
 int periph_gpio_pin_level(const esp32_periph_t *p, int pin);
 
 /* Whether the GPIO output driver is enabled for a pin. This distinguishes an
- * intentionally driven-low software chip select from an untouched reset pin. */
+ * intentionally driven-low software chip select from an untouched reset pin.
+ * A target-described GPIO may return -1 for peripheral-controlled enable. */
 int periph_gpio_output_enabled(const esp32_periph_t *p, int pin);
 
 /* GPIO-matrix output signal selected for a pin (bits OUT_SEL[8:0] of
