@@ -1738,7 +1738,7 @@ static void exec_fp1(xtensa_cpu_t *cpu, uint32_t insn) {
 
 /* Execute op0=0 (QRST) - the main RRR instruction group */
 static inline __attribute__((always_inline))
-void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
+bool exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
     int op1 = XT_OP1(insn);
     int op2 = XT_OP2(insn);
     int r = XT_R(insn);
@@ -1754,22 +1754,22 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 if (s == 0 && t == 0) {
                     /* ILL */
                     xtensa_raise_exception(cpu, EXCCAUSE_ILLEGAL, cpu->pc - 3, 0);
-                    return;
+                    return false;
                 } else {
                     int m = XT_M(insn);
                     int nn = XT_N(insn);
                     if (m == 2 && nn == 0) {
                         /* RET: pc = a0 */
                         BRANCH_TO(cpu, ar_read(cpu, 0));
-                        return; /* skip default pc advance */
+                        return false; /* skip default pc advance */
                     } else if (m == 2 && nn == 1) {
                         /* RETW: windowed return */
                         exec_retw(cpu, 3);
-                        return;
+                        return false;
                     } else if (m == 2 && nn == 2) {
                         /* JX: pc = ar[s] */
                         BRANCH_TO(cpu, ar_read(cpu, s));
-                        return;
+                        return false;
                     } else if (m == 3) {
                         /* CALLX0/4/8/12 */
                         uint32_t target = ar_read(cpu, s);
@@ -1780,7 +1780,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                             ar_write(cpu, 0, cpu->pc);
                         }
                         BRANCH_TO(cpu, target);
-                        return;
+                        return false;
                     }
                     /* BREAK, etc. */
                     if (m == 0 && nn != 0) {
@@ -1811,7 +1811,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         if ((cpu->windowstart & callers) == 0u) {
                             xtensa_raise_exception(cpu, EXCCAUSE_ALLOCA,
                                                    cpu->pc - 3u, 0);
-                            return;
+                            return false;
                         }
                     }
                     ar_write(cpu, t, ar_read(cpu, s));
@@ -1854,7 +1854,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 if (!xtensa_sync_encoding_valid(insn)) {
                     xtensa_raise_exception(cpu, EXCCAUSE_ILLEGAL,
                                            cpu->pc - 3u, 0);
-                    return;
+                    return false;
                 }
                 /* Fast mode has a single strongly ordered host timeline, so
                  * ISYNC/RSYNC/ESYNC/DSYNC/EXTW/MEMW/EXCW need no additional
@@ -1871,7 +1871,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         XT_PS_SET_EXCM(cpu->ps, 0);
                         xtensa_request_irq_check(cpu); /* may unmask; see WSR PS */
                         BRANCH_TO(cpu, cpu->epc[0]);
-                        return;
+                        return false;
                     case 4: /* RFWO */
                         WINLOG(cpu, "RFWO epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
@@ -1880,7 +1880,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
                         window_hazard_refresh(cpu);
                         BRANCH_TO(cpu, cpu->epc[0]);
-                        return;
+                        return false;
                     case 5: /* RFWU */
                         WINLOG(cpu, "RFWU epc=%08X ps=%08X\n", cpu->epc[0], cpu->ps);
                         XT_PS_SET_EXCM(cpu->ps, 0);
@@ -1889,7 +1889,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                         cpu->windowbase = XT_PS_OWB(cpu->ps);
                         window_hazard_refresh(cpu);
                         BRANCH_TO(cpu, cpu->epc[0]);
-                        return;
+                        return false;
                     default: break;
                     }
                     break;
@@ -1907,13 +1907,14 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                          * assert, timer tick or PS write picks it up. */
                         BRANCH_TO(cpu, cpu->epc[s - 1]);
                     }
-                    return;
+                    return false;
                 default: break;
                 }
                 break;
             case 4: /* BREAK */
+                cpu->debugcause = XT_DEBUGCAUSE_BREAK;
                 cpu->debug_break = true;
-                break;
+                return true;
             case 5: /* SYSCALL */
                 if (!cpu->real_window_vectors && XT_PS_WOE(cpu->ps)) {
                     /* Legacy fallback for guests whose window vectors are
@@ -1929,7 +1930,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 } else {
                     xtensa_raise_exception(cpu, EXCCAUSE_SYSCALL,
                                            cpu->pc - 3, 0);
-                    return;
+                    return false;
                 }
                 break;
             case 6: /* RSIL - read/set interrupt level */
@@ -2168,12 +2169,12 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             } break;
         case 12: /* QUOU */
             { uint32_t divisor = ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
               ar_write(cpu, r, ar_read(cpu, s) / divisor);
             } break;
         case 13: /* QUOS */
             { int32_t divisor = (int32_t)ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
               int32_t dividend = (int32_t)ar_read(cpu, s);
               /* Handle INT_MIN / -1 overflow */
               if (dividend == (int32_t)0x80000000 && divisor == -1)
@@ -2183,12 +2184,12 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
             } break;
         case 14: /* REMU */
             { uint32_t divisor = ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
               ar_write(cpu, r, ar_read(cpu, s) % divisor);
             } break;
         case 15: /* REMS */
             { int32_t divisor = (int32_t)ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
               int32_t dividend = (int32_t)ar_read(cpu, s);
               if (dividend == (int32_t)0x80000000 && divisor == -1)
                   ar_write(cpu, r, 0);
@@ -2358,6 +2359,7 @@ void exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
         /* Unimplemented op1 groups */
         break;
     }
+    return false;
 }
 
 /* Execute op0=2 (LSAI) - loads, stores, and ALU immediates */
@@ -2446,10 +2448,9 @@ void exec_lsai(xtensa_cpu_t *cpu, uint32_t insn) {
 
 /* Execute narrow (16-bit) instructions */
 static inline __attribute__((always_inline))
-/* exec_narrow has external linkage (used by tests). The compiler will
- * still inline it into xtensa_step_impl thanks to LTO + the call site
- * being in the same TU. */
-void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
+/* Keep the debug-stop result in the inlined control flow so ordinary
+ * instructions do not need to reload cpu->debug_break after dispatch. */
+bool exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
     int op0 = XT_OP0(insn);
     int t = XT_T(insn);
     int s = XT_S(insn);
@@ -2501,18 +2502,19 @@ void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
             switch (t) {
             case 0: /* RET.N */
                 BRANCH_TO(cpu, ar_read(cpu, 0));
-                return; /* skip default pc advance */
+                return false; /* skip default pc advance */
             case 1: /* RETW.N */
                 exec_retw(cpu, 2);
-                return;
+                return false;
             case 2: /* BREAK.N */
+                cpu->debugcause = XT_DEBUGCAUSE_BREAKN;
                 cpu->debug_break = true;
-                break;
+                return true;
             case 3: /* NOP.N */
                 break;
             case 6: /* ILL.N */
                 xtensa_raise_exception(cpu, EXCCAUSE_ILLEGAL, cpu->pc - 2, 0);
-                return;
+                return false;
             default: break;
             }
             break;
@@ -2522,6 +2524,7 @@ void exec_narrow(xtensa_cpu_t *cpu, uint32_t insn) {
 
     default: break;
     }
+    return false;
 }
 
 /* B4const / B4constu lookup tables for immediate branches */
@@ -3299,10 +3302,14 @@ have_insn:
     cpu->pc += (uint32_t)ilen;
 
     if (ilen == 2) {
-        exec_narrow(cpu, insn);
+        if (__builtin_expect(exec_narrow(cpu, insn), 0))
+            goto retired_debug_break;
     } else {
         switch (XT_OP0(insn)) {
-        case 0: exec_qrst(cpu, insn); break;
+        case 0:
+            if (__builtin_expect(exec_qrst(cpu, insn), 0))
+                goto retired_debug_break;
+            break;
         case 1: /* L32R */
             { int lt = XT_T(insn);
               uint16_t imm16 = (uint16_t)XT_IMM16(insn);
@@ -3390,11 +3397,22 @@ have_insn:
     }
 
     return cpu->exception ? -1 : 0;
+
+retired_debug_break:
+    /* BREAK is an architectural debug stop. Retire it at the exact boundary,
+     * without running loop or interrupt machinery before the frontend can
+     * observe the stop. panic_abort() deliberately places unrelated code
+     * immediately after BREAK. */
+    cpu->ccount++;
+    ++*local_cc;
+    return -1;
 }
 
 /* External entry point (for single-step / trace callers).
  * Always checks timers + interrupts unconditionally (no batching). */
 int xtensa_step(xtensa_cpu_t *cpu) {
+    if (cpu->debug_break)
+        return -1;
     window_hazard_refresh(cpu);
     uint64_t cc = cpu->cycle_count;
     uint32_t prev_pc = cpu->dbg_prev_pc;
@@ -3504,6 +3522,8 @@ static inline int xtensa_run_poll_spin(xtensa_cpu_t *cpu,
  * (avoids per-instruction 64-bit memory increment). */
 
 int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
+    if (cpu->debug_break)
+        return 0;
     window_hazard_refresh(cpu);
     uint64_t cc = cpu->cycle_count;
     uint32_t prev_pc = cpu->dbg_prev_pc;
@@ -3595,7 +3615,8 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
         cpu->native_span_room = 0u;
         exec_total += executed;
         /* No progress, or the CPU stopped: either way do not spin. */
-        if (executed == 0 || !cpu->running || cpu->core_handoff) break;
+        if (executed == 0 || !cpu->running || cpu->core_handoff ||
+            cpu->debug_break) break;
     }
 
     cpu->cycle_count = cc;

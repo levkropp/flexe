@@ -4640,6 +4640,7 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
 
     while (__builtin_expect(cpu->running, 1) &&
            __builtin_expect(!cpu->breakpoint_hit, 1) &&
+           __builtin_expect(!cpu->debug_break, 1) &&
            executed < max_cycles) {
         int remaining = max_cycles - executed;
 
@@ -4715,7 +4716,8 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
              * that lock; immediately entering xtensa_run() again would clear
              * the hint and spend the rest of this batch spinning. */
             if (cpu->core_handoff) break;
-            if (!cpu->running || cpu->halted || cpu->breakpoint_hit) break;
+            if (!cpu->running || cpu->halted || cpu->breakpoint_hit ||
+                cpu->debug_break) break;
             if (ran <= 0) break;
         }
     }

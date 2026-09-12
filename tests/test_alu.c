@@ -432,12 +432,31 @@ TEST(exec_ill) {
 
 TEST(exec_break) {
     xtensa_cpu_t cpu; setup(&cpu);
-    /* BREAK s, t: op2=0, op1=0, r=4, s and t encode params
-       Actually BREAK is r=4 in the SYNC group? No.
-       Let me use the correct encoding: op2=0, r=4(BREAK), s=0, t=0 */
+    /* BREAK s, t: op2=0, op1=0, r=4; s and t encode parameters. */
     put_insn3(&cpu, BASE, rrr(0, 0, 4, 0, 0));
-    xtensa_step(&cpu);
+    ASSERT_EQ(xtensa_step(&cpu), -1);
     ASSERT_TRUE(cpu.debug_break);
+    ASSERT_EQ(cpu.debugcause, XT_DEBUGCAUSE_BREAK);
+    ASSERT_EQ(cpu.dbg_prev_pc, BASE);
+    ASSERT_EQ(cpu.pc, BASE + 3u);
+    ASSERT_EQ(xtensa_step(&cpu), -1);
+    ASSERT_EQ(cpu.pc, BASE + 3u);
+    teardown(&cpu);
+}
+
+TEST(exec_break_n_stops_batch_at_the_debug_boundary) {
+    xtensa_cpu_t cpu; setup(&cpu);
+    cpu.running = true;
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 2));
+    put_insn3(&cpu, BASE + 2u, rri8(0xA, 0, 3, 42));
+
+    ASSERT_EQ(xtensa_run(&cpu, 10), 1);
+    ASSERT_TRUE(cpu.debug_break);
+    ASSERT_EQ(cpu.debugcause, XT_DEBUGCAUSE_BREAKN);
+    ASSERT_EQ(cpu.dbg_prev_pc, BASE);
+    ASSERT_EQ(cpu.pc, BASE + 2u);
+    ASSERT_EQ(ar_read(&cpu, 3), 0u);
+    ASSERT_EQ(xtensa_run(&cpu, 10), 0);
     teardown(&cpu);
 }
 
@@ -733,6 +752,7 @@ void run_alu_tests(void) {
     RUN_TEST(exec_nop_n);
     RUN_TEST(exec_ill);
     RUN_TEST(exec_break);
+    RUN_TEST(exec_break_n_stops_batch_at_the_debug_boundary);
     RUN_TEST(exec_salt_less);
     RUN_TEST(exec_salt_equal);
     RUN_TEST(exec_saltu_unsigned);

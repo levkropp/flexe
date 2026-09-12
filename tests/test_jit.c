@@ -726,6 +726,33 @@ TEST(test_branch_target_ring_is_disabled_without_a_jit_consumer) {
     teardown(&cpu);
 }
 
+TEST(test_jit_fallback_stops_at_debug_break_boundary) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn3(&cpu, BASE + 2u, rrr(0, 0, 4, 0, 0)); /* BREAK 0, 0 */
+    put_insn3(&cpu, BASE + 5u, rri8(0xA, 0, 3, 42)); /* MOVI a3, 42 */
+    cpu.running = true;
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    ASSERT_EQ(jit_run(jit, &cpu, 10), 2);
+    ASSERT_TRUE(cpu.debug_break);
+    ASSERT_EQ(cpu.debugcause, XT_DEBUGCAUSE_BREAK);
+    ASSERT_EQ(cpu.dbg_prev_pc, BASE + 2u);
+    ASSERT_EQ(cpu.pc, BASE + 5u);
+    ASSERT_EQ(ar_read(&cpu, 3), 0u);
+    ASSERT_EQ(jit_run(jit, &cpu, 10), 0);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
 TEST(test_jit_verify_toggle_recompiles_blocks) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -3633,6 +3660,7 @@ static void run_jit_tests(void) {
     TEST_SUITE("jit");
     RUN_TEST(test_jit_init_destroy);
     RUN_TEST(test_branch_target_ring_is_disabled_without_a_jit_consumer);
+    RUN_TEST(test_jit_fallback_stops_at_debug_break_boundary);
     RUN_TEST(test_jit_verify_toggle_recompiles_blocks);
     RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
     RUN_TEST(test_jit_hot_threshold);

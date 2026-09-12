@@ -166,6 +166,7 @@ typedef enum {
     STOP_RUNNING,           /* Still running (not stopped) */
     STOP_MAX_CYCLES,        /* Hit cycle limit */
     STOP_BREAKPOINT,        /* Hit a breakpoint address */
+    STOP_DEBUG_BREAK,       /* Guest BREAK/BREAK.N instruction */
     STOP_HALT,              /* WAITI instruction, no wake */
     STOP_EXCEPTION_LOOP,    /* Same exception repeated at same PC */
     STOP_SOFTWARE_RESET,    /* software_reset ROM stub called */
@@ -184,6 +185,10 @@ typedef enum {
 #define EXCCAUSE_DIVIDE_BY_ZERO     6
 #define EXCCAUSE_PRIVILEGED         8
 #define EXCCAUSE_LOAD_STORE_ALIGN   9
+
+/* DEBUGCAUSE bits implemented by BREAK and BREAK.N on LX6 and LX7. */
+#define XT_DEBUGCAUSE_BREAK         (1u << 3)
+#define XT_DEBUGCAUSE_BREAKN        (1u << 4)
 
 /*
  * ESP32 vector offsets from VECBASE
@@ -300,6 +305,7 @@ struct xtensa_cpu {
     bool     running;
     bool     halted;                    /* WAITI halt state */
     bool     exception;                 /* Exception pending flag */
+    bool     debug_break;               /* BREAK/BREAK.N debugger stop */
     /* Set when an instruction modifies PC. 32-bit, not bool: the JIT stores
      * it with a 32-bit immediate store, which at a bool offset would also
      * overwrite the neighbouring irq_check and silently drop a pending
@@ -429,7 +435,6 @@ struct xtensa_cpu {
     float    fr[16];            /* Floating-point registers */
 
     /* Execution control */
-    bool     debug_break;       /* Debug break requested */
     bool     window_trace;      /* Emit window spill/fill/ENTRY/RETW trace to stderr */
     bool     window_trace_active; /* Set by main loop to gate window trace */
     /* Raise WindowOverflow/WindowUnderflow into the guest's own vectors
