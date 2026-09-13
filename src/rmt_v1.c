@@ -126,6 +126,12 @@ struct flexe_rmt_v1 {
     uint32_t date;
 };
 
+static unsigned rmt_rx_channel_count(const flexe_rmt_v1_desc_t *desc)
+{
+    return (unsigned)desc->channel_count -
+           (unsigned)desc->tx_channel_count;
+}
+
 static uint64_t rmt_gcd(uint64_t a, uint64_t b)
 {
     while (b) {
@@ -395,7 +401,7 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
         }
     }
     for (unsigned channel = 0u;
-         channel < rmt->desc->channel_count - rmt->desc->tx_channel_count;
+         channel < rmt_rx_channel_count(rmt->desc);
          channel++) {
         rmt_rx_channel_t *rx = &rmt->rx[channel];
         if (rx->pending_end && rx->deadline <= now) {
@@ -420,7 +426,7 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
         if (d < distance) distance = d;
     }
     for (unsigned channel = 0u;
-         channel < rmt->desc->channel_count - rmt->desc->tx_channel_count;
+         channel < rmt_rx_channel_count(rmt->desc);
          channel++) {
         const rmt_rx_channel_t *rx = &rmt->rx[channel];
         if (!rx->pending_end) continue;
@@ -466,7 +472,7 @@ static uint32_t rmt_read(void *ctx, uint32_t address)
                                             rmt->desc->tx_channel_count * 4u)
         return rmt->tx[(off - RMT_TX_CONF_OFF) / 4u].conf;
     if (off >= RMT_RX_CONF_OFF && off < RMT_RX_CONF_OFF +
-            (rmt->desc->channel_count - rmt->desc->tx_channel_count) * 8u) {
+            rmt_rx_channel_count(rmt->desc) * 8u) {
         unsigned channel = (off - RMT_RX_CONF_OFF) / 8u;
         return (off & 4u) ? rmt->rx[channel].conf1 :
                             rmt->rx[channel].conf0;
@@ -475,7 +481,7 @@ static uint32_t rmt_read(void *ctx, uint32_t address)
                                         rmt->desc->tx_channel_count * 4u)
         return rmt_status(rmt, (off - RMT_STATUS_OFF) / 4u);
     if (off >= RMT_RX_STATUS_OFF && off < RMT_RX_STATUS_OFF +
-            (rmt->desc->channel_count - rmt->desc->tx_channel_count) * 4u)
+            rmt_rx_channel_count(rmt->desc) * 4u)
         return rmt_rx_status(rmt, (off - RMT_RX_STATUS_OFF) / 4u);
     if (off == RMT_INT_RAW_OFF) return rmt->int_raw;
     if (off == RMT_INT_ST_OFF) return rmt->int_raw & rmt->int_ena;
@@ -485,13 +491,13 @@ static uint32_t rmt_read(void *ctx, uint32_t address)
                                          rmt->desc->tx_channel_count * 4u)
         return rmt->tx[(off - RMT_CARRIER_OFF) / 4u].carrier;
     if (off >= RMT_RX_CARRIER_OFF && off < RMT_RX_CARRIER_OFF +
-            (rmt->desc->channel_count - rmt->desc->tx_channel_count) * 4u)
+            rmt_rx_channel_count(rmt->desc) * 4u)
         return rmt->rx[(off - RMT_RX_CARRIER_OFF) / 4u].carrier;
     if (off >= RMT_TX_LIMIT_OFF && off < RMT_TX_LIMIT_OFF +
                                           rmt->desc->tx_channel_count * 4u)
         return rmt->tx[(off - RMT_TX_LIMIT_OFF) / 4u].tx_limit;
     if (off >= RMT_RX_LIMIT_OFF && off < RMT_RX_LIMIT_OFF +
-            (rmt->desc->channel_count - rmt->desc->tx_channel_count) * 4u)
+            rmt_rx_channel_count(rmt->desc) * 4u)
         return rmt->rx[(off - RMT_RX_LIMIT_OFF) / 4u].limit;
     if (off == RMT_SYS_CONF_OFF) return rmt->sys_conf;
     if (off == RMT_TX_SIM_OFF) return rmt->tx_sim;
@@ -540,7 +546,7 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         return;
     }
     if (off >= RMT_RX_CONF_OFF && off < RMT_RX_CONF_OFF +
-            (rmt->desc->channel_count - rmt->desc->tx_channel_count) * 8u) {
+            rmt_rx_channel_count(rmt->desc) * 8u) {
         unsigned channel = (off - RMT_RX_CONF_OFF) / 8u;
         rmt_rx_channel_t *rx = &rmt->rx[channel];
         if ((off & 4u) == 0u) {
@@ -581,7 +587,7 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         return;
     }
     if (off >= RMT_RX_CARRIER_OFF && off < RMT_RX_CARRIER_OFF +
-            (rmt->desc->channel_count - rmt->desc->tx_channel_count) * 4u) {
+            rmt_rx_channel_count(rmt->desc) * 4u) {
         rmt->rx[(off - RMT_RX_CARRIER_OFF) / 4u].carrier = value;
         return;
     }
@@ -594,7 +600,7 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         return;
     }
     if (off >= RMT_RX_LIMIT_OFF && off < RMT_RX_LIMIT_OFF +
-            (rmt->desc->channel_count - rmt->desc->tx_channel_count) * 4u) {
+            rmt_rx_channel_count(rmt->desc) * 4u) {
         if (value & ~0x1FFu)
             rmt->fallback_write(rmt->fallback_ctx, address, value);
         rmt->rx[(off - RMT_RX_LIMIT_OFF) / 4u].limit = value & 0x1FFu;
@@ -645,7 +651,7 @@ flexe_rmt_v1_t *flexe_rmt_v1_create(xtensa_mem_t *mem,
         desc->tx_channel_count == 0u ||
         desc->tx_channel_count > RMT_MAX_TX_CHANNELS ||
         desc->channel_count < desc->tx_channel_count ||
-        desc->channel_count - desc->tx_channel_count >
+        rmt_rx_channel_count(desc) >
             RMT_MAX_CHANNELS - RMT_MAX_TX_CHANNELS ||
         desc->channel_count > RMT_MAX_CHANNELS ||
         desc->words_per_channel != 48u ||
@@ -676,7 +682,7 @@ flexe_rmt_v1_t *flexe_rmt_v1_create(xtensa_mem_t *mem,
     for (unsigned channel = 0u; channel < desc->tx_channel_count; channel++)
         rmt->tx[channel].tx_limit = 128u;
     for (unsigned channel = 0u;
-         channel < desc->channel_count - desc->tx_channel_count; channel++) {
+         channel < rmt_rx_channel_count(desc); channel++) {
         rmt->rx[channel].conf0 = 0x317FFF02u;
         rmt->rx[channel].conf1 = 0x000001E8u;
         rmt->rx[channel].limit = 128u;
