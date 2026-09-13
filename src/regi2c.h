@@ -6,6 +6,7 @@
 #include "memory.h"
 
 typedef struct flexe_regi2c flexe_regi2c_t;
+typedef struct flexe_rtc_cntl flexe_rtc_cntl_t;
 
 /* Unknown addresses are delegated to the supplied fallback handlers so a
  * partially modeled register page remains visible to diagnostic counters. */
@@ -14,6 +15,10 @@ flexe_regi2c_t *flexe_regi2c_create(xtensa_mem_t *mem,
                                     mmio_write_fn fallback_write,
                                     void *fallback_ctx);
 void flexe_regi2c_destroy(flexe_regi2c_t *regi2c);
+
+/* The S3 SAR analog-register slave lives in an RTC-controlled power domain. */
+void flexe_regi2c_attach_rtc_cntl(flexe_regi2c_t *regi2c,
+                                  const flexe_rtc_cntl_t *rtc_cntl);
 
 /* Read an internal analog slave register for another modeled device that
  * shares this fabric (for example, the SAR ADC's calibration-ground mux). */

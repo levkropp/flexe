@@ -579,6 +579,15 @@ static const flexe_target_desc_t TARGETS[] = {
             .slow_clock_source_hz = {
                 136000u, 32768u, 68359u, 0u,
             },
+            .analog_conf_offset = 0x034u,
+            /* RTC_CNTL_ANA_CONF reset: SAR_I2C_PU and
+             * I2C_RESET_POR_FORCE_PD are set on S3 revision 0. */
+            .analog_conf_reset = (1u << 22) | (1u << 18),
+            .analog_conf_writable_mask =
+                (1u << 31) | (1u << 30) | (1u << 28) | (1u << 27) |
+                (1u << 26) | (1u << 25) | (1u << 24) | (1u << 23) |
+                (1u << 22) | (1u << 20) | (1u << 19) | (1u << 18),
+            .sar_i2c_power_mask = 1u << 22,
             .interrupt_enable_offset = 0x040u,
             .interrupt_raw_offset = 0x044u,
             .interrupt_status_offset = 0x048u,

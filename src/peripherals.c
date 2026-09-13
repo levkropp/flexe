@@ -14374,6 +14374,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 target_rtc_cntl_reset_requested, p);
             if (p->target_rtc_cntl)
                 flexe_rtc_cntl_application_handoff(p->target_rtc_cntl);
+            flexe_regi2c_attach_rtc_cntl(p->regi2c, p->target_rtc_cntl);
             if (p->target_rtc_cntl && p->target_gpio)
                 flexe_rtc_cntl_set_pad_hold_listener(
                     p->target_rtc_cntl, target_rtc_pad_hold_changed, p);

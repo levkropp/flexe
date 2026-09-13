@@ -33,6 +33,7 @@ struct flexe_rtc_cntl {
     uint64_t counter;
     uint64_t latched_counter;
     uint32_t clock_conf;
+    uint32_t analog_conf;
     uint32_t interrupt_enable;
     uint32_t interrupt_raw;
     bool interrupt_level;
@@ -232,6 +233,25 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
          desc->interrupt_source >= target->interrupt_matrix.source_count))
         return false;
 
+    if (!rtc_offset_valid(desc->analog_conf_offset, desc->register_size) ||
+        desc->analog_conf_writable_mask == 0u ||
+        desc->sar_i2c_power_mask == 0u ||
+        (desc->analog_conf_reset & ~desc->analog_conf_writable_mask) != 0u ||
+        (desc->sar_i2c_power_mask & desc->analog_conf_writable_mask) !=
+            desc->sar_i2c_power_mask ||
+        (desc->sar_i2c_power_mask &
+         (desc->sar_i2c_power_mask - 1u)) != 0u ||
+        desc->analog_conf_offset == desc->time_update_offset ||
+        desc->analog_conf_offset == desc->time_low_offset ||
+        desc->analog_conf_offset == desc->time_high_offset ||
+        desc->analog_conf_offset == desc->reset_state_offset ||
+        desc->analog_conf_offset == desc->clock_conf_offset ||
+        rtc_interrupt_offset(desc, desc->analog_conf_offset) ||
+        rtc_wdt_offset(desc, desc->analog_conf_offset) ||
+        (desc->digital_pad_hold_count != 0u &&
+         desc->analog_conf_offset == desc->digital_pad_hold_offset))
+        return false;
+
     uint32_t action_fields = 0u;
     for (unsigned stage = 0u; stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX;
          stage++) {
@@ -259,6 +279,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             (desc->digital_pad_hold_count != 0u &&
              offset == desc->digital_pad_hold_offset) ||
             offset == desc->clock_conf_offset ||
+            offset == desc->analog_conf_offset ||
             (desc->wdt_config_reset[i] &
              ~desc->wdt_config_writable_mask[i]) != 0u)
             return false;
@@ -281,6 +302,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             (desc->digital_pad_hold_count != 0u &&
              offset == desc->digital_pad_hold_offset) ||
             offset == desc->clock_conf_offset ||
+            offset == desc->analog_conf_offset ||
             rtc_interrupt_offset(desc, offset) ||
             rtc_wdt_offset(desc, offset))
             return false;
@@ -495,6 +517,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return desc->reset_state_reset;
     if (offset == desc->clock_conf_offset)
         return rtc->clock_conf;
+    if (offset == desc->analog_conf_offset)
+        return rtc->analog_conf;
     if (offset == desc->interrupt_enable_offset)
         return rtc->interrupt_enable;
     if (offset == desc->interrupt_raw_offset)
@@ -609,6 +633,16 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         }
         return;
     }
+    if (offset == desc->analog_conf_offset) {
+        uint32_t old = rtc->analog_conf;
+        rtc->analog_conf = value & desc->analog_conf_writable_mask;
+        if ((((old ^ rtc->analog_conf) &
+              ~desc->sar_i2c_power_mask) != 0u ||
+             (value & ~desc->analog_conf_writable_mask) != 0u) &&
+            rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        return;
+    }
     if (offset == desc->interrupt_enable_offset) {
         rtc->interrupt_enable = value & desc->interrupt_valid_mask;
         rtc_cntl_update_interrupt(rtc);
@@ -687,6 +721,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->reset_ctx = reset_ctx;
     const flexe_rtc_cntl_desc_t *desc = &target->rtc_cntl;
     rtc->clock_conf = desc->clock_conf_reset;
+    rtc->analog_conf = desc->analog_conf_reset;
     rtc->interrupt_enable = desc->interrupt_enable_reset;
     rtc->interrupt_raw = desc->interrupt_raw_reset;
     for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++)
@@ -816,4 +851,10 @@ void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
     else
         rtc->interrupt_raw &= ~mask;
     rtc_cntl_update_interrupt(rtc);
+}
+
+bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc)
+{
+    return rtc && (rtc->analog_conf &
+                   rtc->target->rtc_cntl.sar_i2c_power_mask) != 0u;
 }

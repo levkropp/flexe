@@ -52,5 +52,10 @@ if grep -Eq '0x600088(0C|30|40)|0x60040038' "$tmpdir/guest.err"; then
     echo "FAIL: RTC ADC measure/status or APB arbiter MMIO fell back" >&2
     exit 1
 fi
+if grep -E '0x60008034' "$tmpdir/guest.err" |
+        grep -q 'adc_hal_self_calibration'; then
+    echo "FAIL: RTC SAR-I2C power control fell back during ADC calibration" >&2
+    exit 1
+fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/guest.err")
 echo "PASS: stock Arduino S3 read ADC1/ADC2 $samples times with injected samples; $unhandled unsupported accesses remain visible"

@@ -50,7 +50,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 39u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 40u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -325,6 +325,13 @@ typedef struct {
     uint32_t clock_conf_writable_mask;
     uint32_t slow_clock_select_mask;
     uint32_t slow_clock_source_hz[4];
+    /* RTC analog power controls. The SAR-I2C bit gates access to the
+     * internal SAR analog-register slave; other writable bits retain their
+     * register value but remain diagnostic until their consumers exist. */
+    uint16_t analog_conf_offset;
+    uint32_t analog_conf_reset;
+    uint32_t analog_conf_writable_mask;
+    uint32_t sar_i2c_power_mask;
     uint16_t interrupt_enable_offset;
     uint16_t interrupt_raw_offset;
     uint16_t interrupt_status_offset;

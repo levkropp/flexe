@@ -1,4 +1,5 @@
 #include "regi2c.h"
+#include "rtc_cntl.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@ struct flexe_regi2c {
     mmio_read_fn fallback_read;
     mmio_write_fn fallback_write;
     void *fallback_ctx;
+    const flexe_rtc_cntl_t *rtc_cntl;
     uint32_t command[FLEXE_TARGET_REGI2C_HOST_MAX];
     uint32_t analog_control;
     uint32_t config;
@@ -133,6 +135,15 @@ static size_t regi2c_index(const flexe_regi2c_t *regi2c,
     return slave * regi2c->address_count + address;
 }
 
+static bool regi2c_sar_unpowered(const flexe_regi2c_t *regi2c,
+                                 unsigned slave)
+{
+    return regi2c->rtc_cntl &&
+           (regi2c->target->capabilities & FLEXE_TARGET_CAP_SENS_V1) != 0u &&
+           slave == regi2c->target->sens.adc_calibration_slave &&
+           !flexe_rtc_cntl_sar_i2c_powered(regi2c->rtc_cntl);
+}
+
 static uint32_t regi2c_read(void *ctx, uint32_t addr)
 {
     flexe_regi2c_t *regi2c = ctx;
@@ -165,6 +176,19 @@ static void regi2c_write_command(flexe_regi2c_t *regi2c, unsigned host,
                      desc->slave_mask | desc->address_mask | desc->data_mask;
     uint32_t command = value & known;
     if (command & desc->command_start_mask) {
+        unsigned slave = (command & desc->slave_mask) >> desc->slave_shift;
+        if (regi2c_sar_unpowered(regi2c, slave)) {
+            /* A powered-off analog slave cannot acknowledge or mutate its
+             * register file. Keep the host busy and report the unsupported
+             * transaction instead of fabricating a completed command. */
+            regi2c->command[host] = command | desc->command_busy_mask;
+            if (regi2c->fallback_write)
+                regi2c->fallback_write(
+                    regi2c->fallback_ctx,
+                    desc->base + desc->command_offset +
+                        host * desc->command_stride, value);
+            return;
+        }
         size_t index = regi2c_index(regi2c, command);
         if (command & desc->command_write_mask) {
             regi2c->registers[index] =
@@ -282,6 +306,12 @@ void flexe_regi2c_destroy(flexe_regi2c_t *regi2c)
     free(regi2c);
 }
 
+void flexe_regi2c_attach_rtc_cntl(flexe_regi2c_t *regi2c,
+                                  const flexe_rtc_cntl_t *rtc_cntl)
+{
+    if (regi2c) regi2c->rtc_cntl = rtc_cntl;
+}
+
 bool flexe_regi2c_register_read(const flexe_regi2c_t *regi2c,
                                 unsigned slave, unsigned address,
                                 uint8_t *value)
@@ -291,6 +321,7 @@ bool flexe_regi2c_register_read(const flexe_regi2c_t *regi2c,
     if (slave > (desc->slave_mask >> desc->slave_shift) ||
         address >= regi2c->address_count)
         return false;
+    if (regi2c_sar_unpowered(regi2c, slave)) return false;
     *value = regi2c->registers[slave * regi2c->address_count + address];
     return true;
 }

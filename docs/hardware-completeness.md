@@ -40,7 +40,7 @@ The milestone is complete only when:
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
 | S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
-| S3 RTC SAR ADC (partial) | `tests/test_sens.c` covers both units' pad selection, START/DONE/DATA latching, internal-ground calibration selection, reader inversion, clock/reset gating, and host ADC stimulus through `adc_in` (channels 0–9 = ADC1, 10–19 = ADC2). `tests/test_apb_saradc.c` covers ADC2 forced-grant and RTC bypass. `scripts/check-s3-adc.sh` checks five sustained stock Arduino `analogRead()` pairs. | Digital/DMA conversion, ULP, ADC interrupts, competing-requester arbitration, and calibrated analog voltage/electrical behavior are unsupported. |
+| S3 RTC SAR ADC (partial) | `tests/test_sens.c` covers both units' pad selection, START/DONE/DATA latching, internal-ground calibration selection, reader inversion, clock/reset gating, and host ADC stimulus through `adc_in` (channels 0–9 = ADC1, 10–19 = ADC2). `tests/test_apb_saradc.c` covers ADC2 forced-grant and RTC bypass; `tests/test_rtc_cntl.c` covers SAR-I2C power gating. `scripts/check-s3-adc.sh` checks five sustained stock Arduino `analogRead()` pairs. | Digital/DMA conversion, ULP, ADC interrupts, competing-requester arbitration, and calibrated analog voltage/electrical behavior are unsupported. |
 | S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
@@ -110,7 +110,11 @@ The S3 RTC SAR ADC model follows Espressif's S3 `sens_reg.h` and `adc_ll.h`
 register contract: software pad selection and START, hardware-owned DONE/DATA,
 and an idle measurement status after a synchronous fast-mode conversion. An
 internal analog-register I2C bit selects ground for the SDK's hardware
-calibration path; a ground conversion yields zero rather than claiming an
+calibration path; RTC_CNTL_ANA_CONF's SAR-I2C power bit now gates that analog
+slave, so a powered-off command cannot alter calibration state or report
+completion. The other analog power/reset bits retain documented register
+state but remain diagnostic because their PLL/RF effects are not modeled.
+A ground conversion yields zero rather than claiming an
 ordinary external-pad sample. `tests/fixtures/s3_adc/s3_adc.ino`, compiled with
 Arduino-ESP32 3.3.11 for `esp32:esp32:esp32s3`, reads GPIO4 (ADC1 channel 3)
 and GPIO11 (ADC2 channel 0) repeatedly. With injected raw codes 2645 and

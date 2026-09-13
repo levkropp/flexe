@@ -1,6 +1,7 @@
 /* Target-described always-on RTC controller tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "regi2c.h"
 #include "rtc_cntl.h"
 
 typedef struct {
@@ -72,6 +73,102 @@ TEST(rtc_cntl_storage_resets_persists_and_delegates)
     ASSERT_EQ(fallback.reads, 1u);
     ASSERT_EQ(fallback.writes, 1u);
 
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_sar_i2c_power_gates_analog_slave)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc_desc = &s3->rtc_cntl;
+    const flexe_regi2c_desc_t *bus = &s3->regi2c;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    flexe_regi2c_t *regi2c = flexe_regi2c_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    ASSERT_TRUE(regi2c != NULL);
+    if (!mem || !rtc || !regi2c) {
+        flexe_regi2c_destroy(regi2c);
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+    flexe_regi2c_attach_rtc_cntl(regi2c, rtc);
+
+    uint32_t analog = rtc_desc->base + rtc_desc->analog_conf_offset;
+    uint32_t host = bus->base + bus->command_offset + bus->command_stride;
+    uint32_t write = bus->command_start_mask | bus->command_write_mask |
+        s3->sens.adc_calibration_slave |
+        ((uint32_t)s3->sens.adc_calibration_address <<
+         bus->address_shift) |
+        (0x35u << bus->data_shift);
+    uint8_t data = 0u;
+
+    ASSERT_EQ(mem_read32(mem, analog), rtc_desc->analog_conf_reset);
+    ASSERT_TRUE(flexe_rtc_cntl_sar_i2c_powered(rtc));
+    mem_write32(mem, host, write);
+    ASSERT_TRUE(flexe_regi2c_register_read(
+        regi2c, s3->sens.adc_calibration_slave,
+        s3->sens.adc_calibration_address, &data));
+    ASSERT_EQ(data, 0x35u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* An RTC power-down makes the analog register inaccessible and prevents
+     * new SAR commands from completing, without erasing other slaves. */
+    uint32_t off = rtc_desc->analog_conf_reset &
+                   ~rtc_desc->sar_i2c_power_mask;
+    mem_write32(mem, analog, off);
+    ASSERT_TRUE(!flexe_rtc_cntl_sar_i2c_powered(rtc));
+    ASSERT_EQ(mem_read32(mem, analog), off);
+    ASSERT_TRUE(!flexe_regi2c_register_read(
+        regi2c, s3->sens.adc_calibration_slave,
+        s3->sens.adc_calibration_address, &data));
+    mem_write32(mem, host,
+                (write & ~bus->data_mask) | (0xA6u << bus->data_shift));
+    ASSERT_EQ(mem_read32(mem, host) & bus->command_busy_mask,
+              bus->command_busy_mask);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(fallback.last_write_addr, host);
+    uint32_t other = bus->command_start_mask | bus->command_write_mask |
+                     0x66u | (0x5Au << bus->data_shift);
+    mem_write32(mem, host, other);
+    ASSERT_EQ(mem_read32(mem, host) & bus->command_busy_mask, 0u);
+    ASSERT_EQ(fallback.writes, 1u);
+
+    mem_write32(mem, analog,
+                off | rtc_desc->sar_i2c_power_mask);
+    ASSERT_TRUE(flexe_rtc_cntl_sar_i2c_powered(rtc));
+    ASSERT_TRUE(flexe_regi2c_register_read(
+        regi2c, s3->sens.adc_calibration_slave,
+        s3->sens.adc_calibration_address, &data));
+    ASSERT_EQ(data, 0x35u);
+    mem_write32(mem, host,
+                (write & ~bus->data_mask) | (0xA6u << bus->data_shift));
+    ASSERT_TRUE(flexe_regi2c_register_read(
+        regi2c, s3->sens.adc_calibration_slave,
+        s3->sens.adc_calibration_address, &data));
+    ASSERT_EQ(data, 0xA6u);
+
+    /* Register retention is not a claim that RF/PLL controls are modeled. */
+    mem_write32(mem, analog, rtc_desc->analog_conf_reset | (1u << 31));
+    ASSERT_EQ(mem_read32(mem, analog),
+              rtc_desc->analog_conf_reset | (1u << 31));
+    ASSERT_EQ(fallback.writes, 2u);
+    ASSERT_EQ(fallback.last_write_addr, analog);
+    mem_write32(mem, analog, rtc_desc->analog_conf_reset | (1u << 31) | 1u);
+    ASSERT_EQ(mem_read32(mem, analog),
+              rtc_desc->analog_conf_reset | (1u << 31));
+    ASSERT_EQ(fallback.writes, 3u);
+
+    flexe_regi2c_destroy(regi2c);
     flexe_rtc_cntl_destroy(rtc);
     mem_destroy(mem);
 }
@@ -630,6 +727,7 @@ void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
     RUN_TEST(rtc_cntl_storage_resets_persists_and_delegates);
+    RUN_TEST(rtc_cntl_sar_i2c_power_gates_analog_slave);
     RUN_TEST(rtc_cntl_application_handoff_uses_target_clocks);
     RUN_TEST(rtc_cntl_watchdog_reports_unmodeled_configuration);
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);

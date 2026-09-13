@@ -53,4 +53,8 @@ void flexe_rtc_cntl_eval(flexe_rtc_cntl_t *rtc);
 void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
                                    uint32_t mask, bool asserted);
 
+/* RTC_CNTL_ANA_CONF powers the internal SAR analog-register I2C slave.
+ * A detached/missing RTC cannot claim that power domain is available. */
+bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc);
+
 #endif /* FLEXE_RTC_CNTL_H */
