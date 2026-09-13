@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 /* rtc.h: timer wake trigger, and the RESET_REASON for a deep-sleep wake. */
 #define RTC_TIMER_WAKE_CAUSE        (1u << 3)
@@ -148,9 +149,8 @@ session_resolve_target(const flexe_session_config_t *cfg,
 }
 
 /* Build every emulated subsystem on top of an already-created memory.
- * Shared by session creation and by the software-reset path, which has to
- * produce a machine indistinguishable from a cold boot. */
-static int session_build(flexe_session_t *s)
+ * A software reset rebuilds machine state but retains guest-written flash. */
+static int session_build(flexe_session_t *s, bool preserve_flash)
 {
     const flexe_session_config_t *cfg = &s->cfg;
     uint32_t rom_flash_data_addr = s->target->rom_flash.live_data_address;
@@ -189,8 +189,9 @@ static int session_build(flexe_session_t *s)
         periph_gpio_set_input(s->periph, s->touch_irq_pin, 1);
 
     /* Load firmware */
-    load_result_t res = loader_load_bin_for_target(s->mem, cfg->bin_path,
-                                                    cfg->target);
+    load_result_t res = preserve_flash ?
+        loader_rebuild_bin_for_target(s->mem, cfg->bin_path, cfg->target) :
+        loader_load_bin_for_target(s->mem, cfg->bin_path, cfg->target);
     if (res.result != 0) {
         fprintf(stderr, "flexe: load error: %s\n", res.error);
         return -1;
@@ -588,7 +589,7 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
         return NULL;
     }
 
-    if (session_build(s) != 0) {
+    if (session_build(s, false) != 0) {
         flexe_session_destroy(s);
         return NULL;
     }
@@ -705,7 +706,7 @@ void flexe_session_reset(flexe_session_t *s)
     bool was_verifying = jit_verify_enabled(s->jit);
     jit_destroy(s->jit);
     s->jit = NULL;
-    if (session_build(s) != 0) {
+    if (session_build(s, true) != 0) {
         fprintf(stderr, "[reset] rebuild failed; halting\n");
         s->cpu[0].running = false;
         s->cpu[1].running = false;
@@ -729,6 +730,7 @@ void flexe_session_reset(flexe_session_t *s)
      * all measured against it, and a reboot does not rewind wall time here. */
     s->cpu[0].cycle_count = cycles;
     s->cpu[1].cycle_count = cycles;
+    s->resets++;
 }
 
 /* ===== Accessors ===== */
@@ -961,7 +963,6 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
             fprintf(stderr, "[sleep] %s sleep, woke after %llu us, cause=0x%X\n",
                     deep ? "deep" : "light", (unsigned long long)slept, cause);
             if (deep) {
-                s->resets++;
                 s->preserve_rtc_mem = 1;
                 flexe_session_reset(s);
                 periph_set_wake_state(s->periph, cause, RTC_DEEPSLEEP_RESET_CAUSE);
@@ -972,9 +973,8 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     }
 
     if (periph_take_reset_request(s->periph)) {
-        s->resets++;
         fprintf(stderr, "[reset] firmware requested a software reset (#%u)\n",
-                s->resets);
+                s->resets + 1u);
         flexe_session_reset(s);
         return;
     }

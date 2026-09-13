@@ -53,6 +53,16 @@ operations immediately and does not yet model flash latency, separate
 per-core/PID cache contents, bus contention, wear, or interrupted-write power
 behavior.
 
+Software resets retain the live NOR backing, including guest-written NVS and
+filesystem partitions. Flexe reloads internal-memory application segments
+and rebuilds peripherals without copying the original factory/app file over
+flash. Factory and standalone app-image paths have regression tests for this
+distinction. Changes to the originally loaded application bytes are rejected
+with an OTA diagnostic. Selecting and booting a different OTA slot is not
+modeled yet and must not be treated as a verified OTA workflow. Flash state
+remains in the emulator session; it is not automatically written back to the
+input `.bin` or retained across a new process.
+
 Fast mode also recognizes complete relocated ESP-IDF 4.x critical-section
 bodies and their standard heap lock wrappers structurally. It fuses only the
 uncontended or recursive internal-RAM path when the full instruction span is

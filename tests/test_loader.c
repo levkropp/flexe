@@ -3,6 +3,7 @@
  */
 #include "test_helpers.h"
 #include "loader.h"
+#include "flexe_session.h"
 #include "peripherals.h"
 #include "flash_mmu.h"
 #include <stdlib.h>
@@ -63,7 +64,60 @@ TEST(loader_single_segment) {
     ASSERT_EQ(res.image.target, FLEXE_TARGET_ESP32);
     ASSERT_EQ(res.image.chip_id, 0);
     ASSERT_EQ(mem_read32(mem, 0x3FFB0000), 0xDEADBEEF);
+
+    /* Warm reconstruction reloads internal segments but must not overwrite
+     * guest-written data partitions with the original app image. */
+    mem->flash_data[0x20000u] = 0x3Cu;
+    mem->flash_insn[0x20000u] = 0x3Cu;
+    mem_write32(mem, 0x3FFB0000u, 0u);
+    res = loader_rebuild_bin_for_target(mem, path, FLEXE_TARGET_ESP32);
+    ASSERT_EQ(res.result, 0);
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0xDEADBEEFu);
+    ASSERT_EQ(mem->flash_data[0x20000u], 0x3Cu);
+    ASSERT_EQ(mem->flash_insn[0x20000u], 0x3Cu);
+
+    /* An OTA-modified boot application cannot safely be reconstructed from
+     * the original file; reject it instead of executing stale code. */
+    mem->flash_data[0x10000u + 32u] ^= 1u;
+    res = loader_rebuild_bin_for_target(mem, path, FLEXE_TARGET_ESP32);
+    ASSERT_EQ(res.result, -1);
+    ASSERT_TRUE(strstr(res.error, "OTA boot selection") != NULL);
     mem_destroy(mem);
+}
+
+TEST(session_software_reset_preserves_guest_flash) {
+    uint8_t bin[36] = {0};
+    bin[0] = 0xE9u;
+    bin[1] = 1u;
+    put_le32(&bin[4], 0x40080000u);
+    put_le32(&bin[24], 0x3FFB0000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x12345678u);
+    const char *path = write_temp(bin, sizeof(bin));
+    ASSERT_TRUE(path != NULL);
+    if (!path) return;
+
+    flexe_session_config_t cfg = {
+        .bin_path = path,
+        .single_core = 1,
+        .disable_jit = 1,
+    };
+    flexe_session_t *session = flexe_session_create(&cfg);
+    ASSERT_TRUE(session != NULL);
+    if (!session) return;
+    xtensa_mem_t *mem = flexe_session_mem(session);
+    ASSERT_EQ(mem->flash_data[0x20000u], 0xFFu);
+    mem->flash_data[0x20000u] = 0x6Cu;
+    mem->flash_insn[0x20000u] = 0x6Cu;
+    mem_write32(mem, 0x3FFB0000u, 0u);
+
+    flexe_session_reset(session);
+    ASSERT_EQ(flexe_session_reset_count(session), 1u);
+    ASSERT_TRUE(flexe_session_mem(session) == mem);
+    ASSERT_EQ(mem->flash_data[0x20000u], 0x6Cu);
+    ASSERT_EQ(mem->flash_insn[0x20000u], 0x6Cu);
+    ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0x12345678u);
+    flexe_session_destroy(session);
 }
 
 TEST(loader_reports_image_revision_metadata) {
@@ -171,6 +225,7 @@ TEST(loader_recognizes_s3_factory_with_bootloader_at_zero) {
     put_le32(&bin[24], 0x3FC88000u);
     put_le32(&bin[28], 4u);
     put_le32(&bin[32], 0xDEADBEEFu);
+    memset(bin + 0x9000u, 0xFF, 0x5000u);
     uint8_t *pt = bin + s3->partition_table_offset;
     pt[0] = 0xAAu;
     pt[1] = 0x50u;
@@ -205,6 +260,16 @@ TEST(loader_recognizes_s3_factory_with_bootloader_at_zero) {
         ASSERT_EQ(res.entry_point, 0x40374000u);
         ASSERT_EQ(mem_read32(mem, 0x3FC88100u), 0xA5A55A5Au);
         ASSERT_EQ(mem_read32(mem, 0x3FC88000u), 0u);
+        ASSERT_EQ(mem->flash_data[s3->partition_table_offset], 0xAAu);
+        mem->flash_data[0x9000u] = 0xA5u;
+        mem->flash_insn[0x9000u] = 0xA5u;
+        mem_write32(mem, 0x3FC88100u, 0u);
+        res = loader_rebuild_bin_for_target(mem, path,
+                                            FLEXE_TARGET_ESP32S3);
+        ASSERT_EQ(res.result, 0);
+        ASSERT_EQ(mem_read32(mem, 0x3FC88100u), 0xA5A55A5Au);
+        ASSERT_EQ(mem->flash_data[0x9000u], 0xA5u);
+        ASSERT_EQ(mem->flash_insn[0x9000u], 0xA5u);
         ASSERT_EQ(mem->flash_data[s3->partition_table_offset], 0xAAu);
         mem_destroy(mem);
     }
@@ -743,6 +808,7 @@ void run_loader_tests(void) {
     TEST_SUITE("ESP32 .bin Loader");
 
     RUN_TEST(loader_single_segment);
+    RUN_TEST(session_software_reset_preserves_guest_flash);
     RUN_TEST(loader_reports_image_revision_metadata);
     RUN_TEST(loader_rejects_reserved_flash_capacity);
     RUN_TEST(loader_rejects_app_larger_than_declared_flash);

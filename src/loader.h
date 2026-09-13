@@ -44,6 +44,15 @@ load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path);
 load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
                                          flexe_target_id_t expected_target);
 
+/* Rebuild an application after a software reset without reflashing the
+ * original image over guest-written NVS/filesystem partitions. Internal
+ * segments are restored from the image, while the live NOR backing and its
+ * partition table survive. Changes to the originally loaded application
+ * bytes are rejected; OTA slot selection is not modeled. Call only after a
+ * successful cold load. */
+load_result_t loader_rebuild_bin_for_target(xtensa_mem_t *mem, const char *path,
+                                            flexe_target_id_t expected_target);
+
 /* Describe what memory region an address falls in (for diagnostics) */
 const char *loader_region_name(uint32_t addr);
 const char *loader_region_name_for_target(const flexe_target_desc_t *target,

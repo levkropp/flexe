@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <openssl/md5.h>
 
 #define ESP_IMAGE_HEADER_SIZE 24u
@@ -316,13 +317,34 @@ static int range_fits(uint32_t addr, uint32_t size,
     return addr >= start && (uint64_t)addr + size <= end;
 }
 
+/* Refuse a warm reboot if the boot image bytes no longer match the image
+ * used to build internal RAM. Otherwise we would silently boot stale code. */
+static int loader_flash_image_matches(xtensa_mem_t *mem,
+                                      uint64_t flash_offset,
+                                      const uint8_t *source, size_t len,
+                                      load_result_t *res) {
+    uint32_t capacity = mem_backing_size(mem, FLEXE_MEM_FLASH_DATA);
+    if (flash_offset > capacity || len > capacity - flash_offset ||
+        memcmp(mem->flash_data + flash_offset, source, len) != 0) {
+        snprintf(res->error, sizeof(res->error),
+                 "Boot application flash changed at 0x%llX; OTA boot "
+                 "selection is not supported yet",
+                 (unsigned long long)flash_offset);
+        return -1;
+    }
+    return 0;
+}
+
 /* Parse an ESP image header at the given file offset, loading internal-memory
  * segments. Flash segments remain in the raw flash image and are exposed by
- * the target's MMU mappings after parsing.
+ * the target's MMU mappings after parsing. On warm reset, verify those bytes
+ * still describe the active boot app without rewriting the NOR backing.
  * The image header (24 bytes) is also written to flash_hdr_out if non-NULL. */
 static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
                               const flexe_target_desc_t *target,
-                              load_result_t *res, uint8_t *flash_hdr_out) {
+                              load_result_t *res, uint8_t *flash_hdr_out,
+                              uint32_t app_flash_offset,
+                              bool preserve_flash) {
     if (fseek(f, offset, SEEK_SET) != 0) {
         snprintf(res->error, sizeof(res->error), "Seek to 0x%lX failed", offset);
         return -1;
@@ -339,6 +361,11 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
                  "Bad magic: 0x%02X at offset 0x%lX (expected 0xE9)", hdr[0], offset);
         return -1;
     }
+
+    if (preserve_flash &&
+        loader_flash_image_matches(mem, app_flash_offset, hdr,
+                                   sizeof(hdr), res) != 0)
+        return -1;
 
     if (flash_hdr_out)
         memcpy(flash_hdr_out, hdr, 24);
@@ -363,6 +390,13 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
         }
         data_off += 8;
 
+        if (preserve_flash &&
+            loader_flash_image_matches(
+                mem, (uint64_t)app_flash_offset +
+                     (uint64_t)(data_off - offset - 8),
+                seg_hdr, sizeof(seg_hdr), res) != 0)
+            return -1;
+
         uint32_t load_addr = (uint32_t)seg_hdr[0]
                            | ((uint32_t)seg_hdr[1] << 8)
                            | ((uint32_t)seg_hdr[2] << 16)
@@ -385,6 +419,15 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
 
         if (fread(buf, 1, data_len, f) != data_len) {
             snprintf(res->error, sizeof(res->error), "Segment %d data truncated", i);
+            free(buf);
+            return -1;
+        }
+
+        if (preserve_flash &&
+            loader_flash_image_matches(
+                mem, (uint64_t)app_flash_offset +
+                     (uint64_t)(data_off - offset),
+                buf, data_len, res) != 0) {
             free(buf);
             return -1;
         }
@@ -638,8 +681,9 @@ static int loader_seed_flash_mmu(xtensa_mem_t *mem,
     return loader_seed_esp32_flash_mmu(mem, res, app_flash_offset);
 }
 
-load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
-                                         flexe_target_id_t expected_target) {
+static load_result_t loader_load_bin_impl(xtensa_mem_t *mem, const char *path,
+                                         flexe_target_id_t expected_target,
+                                         bool preserve_flash) {
     load_result_t res = {0};
 
     if (!path) {
@@ -767,39 +811,45 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
             return res;
         }
 
-        /* Factory image detected — load entire flash image into flash memory */
-        size_t flash_len = (size_t)file_size;
-        uint8_t *flash_buf = malloc(flash_len);
-        if (!flash_buf) {
-            res.result = -1;
-            snprintf(res.error, sizeof(res.error), "Flash image malloc failed (%zu bytes)", flash_len);
-            fclose(f);
-            return res;
-        }
-
-        fseek(f, 0, SEEK_SET);
-        if (fread(flash_buf, 1, flash_len, f) != flash_len) {
-            res.result = -1;
-            snprintf(res.error, sizeof(res.error), "Flash image read truncated");
+        /* A cold boot installs the factory image. A software reset must
+         * leave the live NOR contents intact: NVS and filesystem writes
+         * are not part of the original file anymore. */
+        if (!preserve_flash) {
+            size_t flash_len = (size_t)file_size;
+            uint8_t *flash_buf = malloc(flash_len);
+            if (!flash_buf) {
+                res.result = -1;
+                snprintf(res.error, sizeof(res.error),
+                         "Flash image malloc failed (%zu bytes)", flash_len);
+                fclose(f);
+                return res;
+            }
+            fseek(f, 0, SEEK_SET);
+            if (fread(flash_buf, 1, flash_len, f) != flash_len) {
+                res.result = -1;
+                snprintf(res.error, sizeof(res.error),
+                         "Flash image read truncated");
+                free(flash_buf);
+                fclose(f);
+                return res;
+            }
+            if (mem_load_flash(mem, flash_buf, flash_len) != 0) {
+                res.result = -1;
+                snprintf(res.error, sizeof(res.error),
+                         "Flash image load failed");
+                free(flash_buf);
+                fclose(f);
+                return res;
+            }
             free(flash_buf);
-            fclose(f);
-            return res;
         }
-
-        if (mem_load_flash(mem, flash_buf, flash_len) != 0) {
-            res.result = -1;
-            snprintf(res.error, sizeof(res.error), "Flash image load failed");
-            free(flash_buf);
-            fclose(f);
-            return res;
-        }
-        free(flash_buf);
 
         /* Flash segments already live in the raw image. Parse only copies
          * internal-memory segments, then the MMU exposes flash segments. */
         uint32_t app_flash_offset = res.image.image_offset;
         if (loader_parse_image(mem, f, (long)app_flash_offset, detected,
-                               &res, NULL) != 0) {
+                               &res, NULL, app_flash_offset,
+                               preserve_flash) != 0) {
             res.result = -1;
             fclose(f);
             return res;
@@ -843,35 +893,40 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
         fclose(f);
         return res;
     }
-    uint8_t *img = malloc((size_t)app_size);
-    if (!img) {
-        res.result = -1;
-        snprintf(res.error, sizeof(res.error),
-                 "App image malloc failed (%ld bytes)", app_size);
-        fclose(f);
-        return res;
-    }
-    if (fseek(f, 0, SEEK_SET) != 0 ||
-        fread(img, 1, (size_t)app_size, f) != (size_t)app_size) {
-        res.result = -1;
-        snprintf(res.error, sizeof(res.error), "App image read truncated");
+    if (!preserve_flash) {
+        uint8_t *img = malloc((size_t)app_size);
+        if (!img) {
+            res.result = -1;
+            snprintf(res.error, sizeof(res.error),
+                     "App image malloc failed (%ld bytes)", app_size);
+            fclose(f);
+            return res;
+        }
+        if (fseek(f, 0, SEEK_SET) != 0 ||
+            fread(img, 1, (size_t)app_size, f) != (size_t)app_size) {
+            res.result = -1;
+            snprintf(res.error, sizeof(res.error),
+                     "App image read truncated");
+            free(img);
+            fclose(f);
+            return res;
+        }
+        memcpy(mem->flash_data + app_flash_offset, img, (size_t)app_size);
+        memcpy(mem->flash_insn + app_flash_offset, img, (size_t)app_size);
         free(img);
-        fclose(f);
-        return res;
     }
-    memcpy(mem->flash_data + app_flash_offset, img, (size_t)app_size);
-    memcpy(mem->flash_insn + app_flash_offset, img, (size_t)app_size);
-    free(img);
 
     /* Standalone app image — parse from offset 0 */
-    if (loader_parse_image(mem, f, 0, detected, &res, NULL) != 0) {
+    if (loader_parse_image(mem, f, 0, detected, &res, NULL,
+                           app_flash_offset, preserve_flash) != 0) {
         res.result = -1;
         fclose(f);
         return res;
     }
 
     /* Bare app images carry no partition table; synthesize one at 0x8000 */
-    if (loader_synthesize_partition_table(mem, app_size, res.entry_point,
+    if (!preserve_flash &&
+        loader_synthesize_partition_table(mem, app_size, res.entry_point,
                                           res.image.flash_size) != 0) {
         res.result = -1;
         snprintf(res.error, sizeof(res.error),
@@ -893,6 +948,16 @@ load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
     res.result = 0;
     fclose(f);
     return res;
+}
+
+load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
+                                         flexe_target_id_t expected_target) {
+    return loader_load_bin_impl(mem, path, expected_target, false);
+}
+
+load_result_t loader_rebuild_bin_for_target(xtensa_mem_t *mem, const char *path,
+                                            flexe_target_id_t expected_target) {
+    return loader_load_bin_impl(mem, path, expected_target, true);
 }
 
 load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path) {

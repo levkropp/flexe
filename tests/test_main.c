@@ -1,6 +1,8 @@
 #include "test_helpers.h"
 
 int test_count = 0, test_passes = 0, test_failures = 0;
+/* Session-based tests link the same touch-stub lifecycle as the CLI. */
+volatile int emu_app_running = 1;
 
 #include "test_decode.c"
 #include "test_alu.c"

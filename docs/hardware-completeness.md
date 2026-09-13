@@ -36,7 +36,7 @@ The milestone is complete only when:
 | Area | Current evidence | Next gate |
 |---|---|---|
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
-| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`; NerdMiner 1.8.3 factory image reaches a mounted SPIFFS volume and configuration portal | Make a reproducible interactive S3 production gate and test filesystem reads/writes across reset. |
+| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`; NerdMiner 1.8.3 factory image reaches a mounted SPIFFS volume and configuration portal; loader tests preserve NOR across reset | Make a reproducible interactive S3 production gate and test guest filesystem reads/writes across reset. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
