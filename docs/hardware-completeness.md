@@ -38,7 +38,7 @@ The milestone is complete only when:
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
 | S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
-| S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with matching interpreter/JIT output | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
+| S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
 S3 remains experimental. The NerdMiner filesystem result is a meaningful
@@ -65,9 +65,10 @@ TX, DMA, and exact waveform-to-GPIO routing are not yet supported. Unsupported
 paths retain MMIO diagnostics. For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and
-321,448 pulse words on channel 0. Interpreter and JIT agreed on 13,605
+321,448 pulse words on channel 0. Repeated interpreter runs yielded 13,605
 chunks and the `30EAB266` pulse-stream digest; 7,197 unsupported peripheral
-accesses remain. This establishes sustained hardware-output progress, not
+accesses remain. S3 JIT is not enabled, so no JIT parity is claimed. This
+establishes sustained hardware-output progress, not
 correct colors on a physical LED strip or a functioning WLED web UI. Recheck
 with the external image and ROM ELF:
 

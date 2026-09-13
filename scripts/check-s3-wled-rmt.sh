@@ -16,36 +16,24 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
 fi
 
 tmpdir=$(mktemp -d)
-trap 'rm -f "$tmpdir/jit.err" "$tmpdir/interp.err"; rmdir "$tmpdir"' EXIT
+trap 'rm -f "$tmpdir/interp.err"; rmdir "$tmpdir"' EXIT
 
-for engine in jit interp; do
-    options=(-J)
-    [[ "$engine" == interp ]] && options=(--no-jit)
-    "$runner" -N -q --target esp32s3 -R "$S3_ROM_ELF" \
-        --rmt-stats -c 4000000000 "${options[@]}" "$S3_WLED_BIN" \
-        > /dev/null 2> "$tmpdir/$engine.err"
-    grep -q '^Stop reason: halt (WAITI)' "$tmpdir/$engine.err" || {
-        echo "FAIL: $engine did not sustain WLED execution" >&2
-        tail -30 "$tmpdir/$engine.err" >&2
-        exit 1
-    }
-    if [[ "$engine" == jit ]] &&
-       grep -q 'Native JIT unavailable' "$tmpdir/$engine.err"; then
-        echo "FAIL: JIT unavailable; engine parity was not checked" >&2
-        exit 1
-    fi
-done
-
-jit_result=$(awk '/^RMT TX0:/{print; exit}' "$tmpdir/jit.err")
-interp_result=$(awk '/^RMT TX0:/{print; exit}' "$tmpdir/interp.err")
-completions=$(printf '%s\n' "$jit_result" |
-    sed -E 's/.* ([0-9]+) completions,.*/\1/')
-if [[ "$jit_result" != "$interp_result" ||
-      ! "$completions" =~ ^[0-9]+$ || "$completions" -lt 100 ]]; then
-    echo "FAIL: RMT output differs or fewer than 100 frames completed" >&2
-    echo "JIT: $jit_result" >&2
-    echo "Interpreter: $interp_result" >&2
+"$runner" -N -q --no-jit --target esp32s3 -R "$S3_ROM_ELF" \
+    --rmt-stats -c 4000000000 "$S3_WLED_BIN" \
+    > /dev/null 2> "$tmpdir/interp.err"
+if ! grep -q '^Stop reason: halt (WAITI)' "$tmpdir/interp.err"; then
+    echo "FAIL: WLED S3 did not sustain execution" >&2
+    tail -30 "$tmpdir/interp.err" >&2
     exit 1
 fi
 
-echo "PASS: WLED S3 emitted $completions RMT frames with matching JIT/interpreter pulse streams"
+expected='RMT TX0:    13605 chunks, 321448 items, 317 completions, fnv32=30EAB266'
+actual=$(awk '/^RMT TX0:/{print; exit}' "$tmpdir/interp.err")
+if [[ "$actual" != "$expected" ]]; then
+    echo "FAIL: WLED S3 pulse stream changed" >&2
+    echo "expected: $expected" >&2
+    echo "actual:   $actual" >&2
+    exit 1
+fi
+
+echo "PASS: WLED S3 emitted 317 RMT frames with the pinned interpreter pulse stream"
