@@ -535,7 +535,11 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 7u);
-    ASSERT_EQ(s3->system_clock.gate_count, 8u);
+    ASSERT_EQ(s3->system_clock.gate_count, 9u);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_LEDC_V1);
+    ASSERT_EQ(s3->ledc_v1.base, 0x60019000u);
+    ASSERT_EQ(s3->ledc_v1.output_signal_base, 73u);
+    ASSERT_EQ(s3->ledc_v1.interrupt_source, 35u);
     ASSERT_EQ(s3->system_clock.reg[1].offset, 0x18u);
     ASSERT_EQ(s3->system_clock.reg[1].reset, 0xF9C1E06Fu);
     ASSERT_EQ(s3->system_clock.gate[0].device,

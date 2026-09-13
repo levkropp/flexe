@@ -31,19 +31,34 @@ The milestone is complete only when:
 4. The repository stays lean and CI stays green. Improvements are generic
    SoC/core/device mechanisms, not firmware-name or fixed-PC workarounds.
 
-## Current evidence and next gates
+## Current capability matrix
 
-| Area | Current evidence | Next gate |
-|---|---|---|
-| Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
-| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, saves submitted settings, restarts, and reloads the same JSON from guest-written flash. `scripts/check-s3-idf-nvs.sh` runs native ESP-IDF NVS write/commit/restart/readback. | Extend storage/peripheral coverage beyond these workflows. |
-| S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection), `scripts/check-s3-idf-hello.sh` (official ESP-IDF countdown/restart), `scripts/check-s3-idf-crosscore.sh` (32 CPU1/CPU0 queue-notification handoffs, RTC software stall/resume, and sustained output), and target-specific unit/Arduino fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Extend cross-core and Arduino peripheral workflows and work down the measured unhandled-access inventory. |
-| S3 RTC GPIO/RTCIO (partial) | `tests/test_rtc_io.c` covers GPIO0..21 RTC pad ownership, output/enable W1TS/W1TC, host input, unknown alternate functions, and return to digital GPIO. `tests/test_rtc_cntl.c` covers both pad-hold sources, frozen output/mux/input state, GPIO21 overlap, and reset rebuild. The stock Arduino ADC gate checks that `rtc_gpio_deinit()` for GPIO4/11 no longer falls back. | RTC wakeup/interrupt routing, digital IO_MUX function hold, pad pulls, drive strength, analog/electrical resolution, and deep-sleep wake sequencing are unsupported. |
-| S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
-| S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
-| S3 RTC SAR ADC (partial) | `tests/test_sens.c` covers both units' pad selection, START/DONE/DATA latching, internal-ground calibration selection, reader inversion, clock/reset gating, and host ADC stimulus through `adc_in` (channels 0–9 = ADC1, 10–19 = ADC2). `tests/test_apb_saradc.c` covers ADC2 forced-grant and RTC bypass; `tests/test_rtc_cntl.c` covers SAR-I2C power gating. `scripts/check-s3-adc.sh` checks five sustained stock Arduino `analogRead()` pairs. | Digital/DMA conversion, ULP, ADC interrupts, competing-requester arbitration, and calibrated analog voltage/electrical behavior are unsupported. |
-| S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
-| Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
+“Modeled” means functional behavior under the cited gates, not complete silicon
+or timing equivalence. “Partial” retains explicit unsupported paths and must
+not be advertised as general hardware support. A service shim is named as such
+even when a firmware workflow succeeds.
+
+| Area | Status | Evidence | Remaining boundary |
+|---|---|---|---|
+| Classic LX6 and production corpus | Modeled (functional) | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios), `scripts/check-stock-roms.sh`, CPU/JIT differential tests | No cache/cycle timing or simultaneous cores; expand interactive coverage without losing WLED throughput. |
+| Classic flash, partitions, NVS/filesystems | Partial (MMIO and service shims) | `tests/test_flash_mmu.c`, `tests/test_spi_mem.c`, [CYD scenarios](compatibility.md#curated-cyd-scenarios) | Not every flash mode, filesystem, or persistence path has a hardware-format replay gate. |
+| Classic GPIO, UART, SPI/I2C, DMA | Partial (MMIO plus host devices) | `tests/test_peripherals.c`, compiled Arduino hardware gates, `scripts/check-stock-roms.sh` | Electrical and all controller/driver combinations remain outside the validated set. |
+| Classic timers, PWM/RMT, watchdogs | Partial (MMIO) | `tools/ledc_pwm_test.c`, `tools/rmt_tx_test.c`, timer/watchdog unit and firmware gates | Aggregate output and event timing do not imply cycle-accurate waveforms or all reset causes. |
+| Classic network/Bluetooth | Partial (service shims and device models) | Meshtastic, Marauder, NerdMiner and WLED compatibility scenarios | RF/PHY propagation and general controller equivalence are unsupported. |
+| S3 LX7, interrupts, dual-core startup | Partial | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, target and interrupt-matrix unit tests | Sustained queue handoffs and CPU1 stall/resume pass; broader FreeRTOS and interrupt workloads remain to validate. |
+| S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh` | Other flash modes, cache behavior, and bootloader paths remain unverified. |
+| S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate | Additional partition and filesystem variants need end-to-end gates. |
+| S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate | RTC wake routing, full pad hold/pulls/drive, and electrical levels are not complete. |
+| S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c` | More guest driver/device combinations and DMA modes need gates. |
+| S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
+| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core and restart gates | Calibrated timing, all wake modes, and all reset causes remain unsupported. |
+| S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
+| S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | RX, counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
+| S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
+| S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal and WLED native lwIP/Ethernet UI and JSON state gates | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported. |
+| S3 Bluetooth baseband clock | Partial (MMIO) | `tests/test_radio.c` checks half-slot/subslot phase against guest time | Controller scheduler, packets, and RF are unsupported; Marauder still asserts before its CLI. |
+| Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
 
 S3 remains experimental. The NerdMiner filesystem result is a meaningful
 end-to-end flash-format/mount check. With the matching application ELF, the
@@ -216,6 +231,33 @@ S3_ADC_BIN=/tmp/flexe-s3-adc-fixture-build/s3_adc.ino.merged.bin \
 S3_ADC_ELF=/tmp/flexe-s3-adc-fixture-build/s3_adc.ino.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-adc.sh
+```
+
+The S3 LEDC model follows Espressif's `esp32s3` `ledc_reg.h`,
+`system_reg.h`, `gpio_sig_map.h`, and `interrupts.h`: eight low-speed-only
+channels at `0x60019000`, four timers, shadowed divider/resolution updates,
+immediate timer reset/pause, duty-change and timer-overflow interrupts, and
+SYSTEM clock/reset gating. It resolves the live GPIO output-matrix route and
+emits aggregate PWM state (frequency, duty, enable and inversion) to a host
+sink; it does not emit electrical edges or model the S3 overflow-count
+feature. The stock Arduino-ESP32 3.3.11
+`tests/fixtures/s3_ledc/s3_ledc.ino` sets GPIO4 to 5 kHz at 8-bit
+resolution, cycles through duties 64/192/96/0, and reads each back after a
+PWM period. The pinned merged image SHA-256 is
+`72e3198ed282afaf1cffb6c478b715ec8d7c6d40965e7a90df4fd5c0f838e60e`,
+with ELF SHA-256
+`47b844193180ca6e8323157d33eeff5dc72f6ec38896589c1bef938006d23e83`.
+`scripts/check-s3-ledc.sh` requires byte-identical event replay and no LEDC
+MMIO fallback, while 171 unrelated unsupported accesses stay visible:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+  --build-path /tmp/flexe-s3-ledc-fixture-build \
+  --build-property compiler.optimization_flags=-Os tests/fixtures/s3_ledc
+S3_LEDC_BIN=/tmp/flexe-s3-ledc-fixture-build/s3_ledc.ino.merged.bin \
+S3_LEDC_ELF=/tmp/flexe-s3-ledc-fixture-build/s3_ledc.ino.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-ledc.sh
 ```
 
 The native S3 `esp_wifi_internal_tx`/`tx_by_ref` and

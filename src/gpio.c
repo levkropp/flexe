@@ -177,6 +177,12 @@ int flexe_gpio_out_signal(const flexe_gpio_t *gpio, unsigned pin)
     return (int)(gpio->func_out[pin] & GPIO_FUNC_OUT_SIGNAL_MASK);
 }
 
+int flexe_gpio_out_route(const flexe_gpio_t *gpio, unsigned pin)
+{
+    if (!gpio_pin_valid(gpio, pin)) return -1;
+    return (int)gpio->func_out[pin];
+}
+
 void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
                                           unsigned signal)
 {

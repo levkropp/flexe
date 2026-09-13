@@ -42,7 +42,7 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 8u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 9u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
@@ -51,7 +51,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 42u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 43u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -84,6 +84,7 @@ typedef enum {
     FLEXE_TARGET_CAP_RMT_V1                        = 1ull << 24,
     FLEXE_TARGET_CAP_APB_SARADC_V1                = 1ull << 25,
     FLEXE_TARGET_CAP_RTC_IO_V1                    = 1ull << 26,
+    FLEXE_TARGET_CAP_LEDC_V1                      = 1ull << 27,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -219,6 +220,7 @@ typedef enum {
     FLEXE_SYSTEM_DEVICE_I2C,
     FLEXE_SYSTEM_DEVICE_GP_SPI,
     FLEXE_SYSTEM_DEVICE_SHA,
+    FLEXE_SYSTEM_DEVICE_LEDC,
 } flexe_system_device_t;
 
 typedef struct {
@@ -745,6 +747,18 @@ typedef struct {
     uint32_t xtal_clock_hz;
 } flexe_rmt_v1_desc_t;
 
+/* Low-speed-only LEDC generation used by ESP32-S3. The register layout is
+ * intrinsic to this IP version; clocks, GPIO-matrix routes and IRQ are SoC
+ * wiring and therefore remain target data. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t source_clock_hz[4]; /* CONF.APB_CLK_SEL: 0 unused, 1/2/3 */
+    uint32_t date_reset;
+    uint16_t output_signal_base;
+    uint8_t interrupt_source;
+} flexe_ledc_v1_desc_t;
+
 /* General-purpose SPI2/SPI3 controller generations keep the same transaction
  * phases while moving the FIFO, completion interrupt, and length registers.
  * The layout selects those IP semantics; every address, interrupt source,
@@ -953,6 +967,7 @@ typedef struct {
 
     /* Optional V1 remote-control pulse engine. */
     flexe_rmt_v1_desc_t           rmt_v1;
+    flexe_ledc_v1_desc_t          ledc_v1;
 
     /* Optional general-purpose SPI2/SPI3 controllers and board routes. */
     flexe_gp_spi_desc_t           gp_spi;

@@ -311,6 +311,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SHA_V1 |
                         FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_RMT_V1 |
+                        FLEXE_TARGET_CAP_LEDC_V1 |
                         FLEXE_TARGET_CAP_APB_SARADC_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
@@ -422,7 +423,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 7u,
-            .gate_count = 8u,
+            .gate_count = 9u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -502,6 +503,13 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x024u,
                     .clock_mask = 1u << 2,
                     .reset_mask = 1u << 2,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_LEDC,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 11,
+                    .reset_mask = 1u << 11,
                 },
             },
         },
@@ -978,6 +986,15 @@ static const flexe_target_desc_t TARGETS[] = {
             .apb_clock_hz = 80000000u,
             .ref_clock_hz = 8000000u,
             .xtal_clock_hz = 40000000u,
+        },
+        .ledc_v1 = {
+            .base = 0x60019000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = { 0u, 80000000u, 8000000u,
+                                 40000000u },
+            .date_reset = 0x19040200u,
+            .output_signal_base = 73u,
+            .interrupt_source = 35u,
         },
         .gp_spi = {
             .register_size = 0x100u,

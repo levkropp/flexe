@@ -35,6 +35,7 @@ void flexe_gpio_destroy(flexe_gpio_t *gpio);
 int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_out_signal(const flexe_gpio_t *gpio, unsigned pin);
+int flexe_gpio_out_route(const flexe_gpio_t *gpio, unsigned pin);
 
 /* A held digital pad retains its physical level and output-enable while the
  * GPIO output latches continue to accept writes. Releasing hold immediately

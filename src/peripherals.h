@@ -113,7 +113,7 @@ typedef void (*periph_rmt_tx_fn)(void *ctx, int channel,
                                  uint32_t tick_hz, uint32_t carrier_hz,
                                  bool finished);
 
-/* Aggregate output state for one classic ESP32 LEDC PWM channel. The GPIO is
+/* Aggregate output state for one classic or S3 LEDC PWM channel. The GPIO is
  * resolved through the live GPIO matrix (-1 while unrouted); duty and
  * duty_max describe the hardware timer resolution, while frequency_hz is
  * the configured PWM carrier. `inverted` reflects GPIO matrix output
@@ -330,10 +330,10 @@ int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
 size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel,
                             const uint32_t *items, size_t count);
 
-/* Attach a PWM sink to one of the 16 classic LEDC outputs. speed_mode 0 is
- * the high-speed group and 1 is the low-speed group. The current aggregate
- * state is delivered immediately, and subsequent timer/channel/GPIO-matrix
- * changes produce another callback. */
+/* Attach a PWM sink: classic has 16 outputs (high-speed group 0, low-speed
+ * group 1); S3 has only the eight low-speed outputs (group 1). The current
+ * aggregate state is delivered immediately, then on timer/channel/matrix
+ * changes. */
 int periph_set_ledc_output_callback(esp32_periph_t *p, int speed_mode,
                                     int channel, periph_ledc_output_fn fn,
                                     void *ctx);
