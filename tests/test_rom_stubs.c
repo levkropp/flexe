@@ -106,9 +106,58 @@ TEST(test_classic_rom_abi_is_not_installed_on_s3) {
 
     ASSERT_TRUE(rom != NULL);
     ASSERT_EQ(rom_stubs_stub_count(rom), 0);
-    ASSERT_TRUE(cpu.pc_hook == NULL);
-    ASSERT_TRUE(cpu.pc_hook_bitmap == NULL);
+    /* The generic dispatcher is available for symbol-resolved services,
+     * but no classic fixed-address ROM hooks or RAM writes are installed. */
+    ASSERT_TRUE(cpu.pc_hook != NULL);
+    ASSERT_TRUE(cpu.pc_hook_bitmap != NULL);
     ASSERT_EQ(mem_unmapped_count(mem), unmapped);
+
+    rom_stubs_destroy(rom);
+    mem_destroy(mem);
+}
+
+static int s3_dispatch_called;
+
+static void test_s3_dispatch_stub(xtensa_cpu_t *cpu, void *ctx)
+{
+    (void)ctx;
+    s3_dispatch_called++;
+    cpu->pc = 0x40374140u;
+}
+
+TEST(test_s3_symbol_service_dispatch_preserves_unregistered_code) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    xtensa_cpu_t cpu;
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+    xtensa_cpu_reset_for_target(&cpu, s3);
+    cpu.mem = mem;
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    ASSERT_TRUE(rom != NULL);
+    if (!rom) { mem_destroy(mem); return; }
+
+    const uint32_t service = 0x40374100u;
+    const uint32_t native = 0x40374130u;
+    put_insn3(&cpu, native, rom_nop_insn());
+    ASSERT_EQ(rom_stubs_register_exact_ctx(
+                  rom, service, test_s3_dispatch_stub,
+                  "s3_symbol_service", NULL), 0u);
+    s3_dispatch_called = 0;
+    cpu.pc = service;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_step(&cpu), 0u);
+    ASSERT_EQ(s3_dispatch_called, 1u);
+    ASSERT_EQ(cpu.pc, 0x40374140u);
+
+    /* Neighboring S3 code must execute normally, including the real ROM
+     * ELF when one is loaded. */
+    cpu.pc = native;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_step(&cpu), 0u);
+    ASSERT_EQ(cpu.pc, native + 3u);
+    ASSERT_EQ(s3_dispatch_called, 1u);
 
     rom_stubs_destroy(rom);
     mem_destroy(mem);
@@ -2908,6 +2957,7 @@ static void run_rom_stub_tests(void) {
     RUN_TEST(test_pc_hook_skips_non_match);
     RUN_TEST(test_loaded_rom_executes_unregistered_entry);
     RUN_TEST(test_classic_rom_abi_is_not_installed_on_s3);
+    RUN_TEST(test_s3_symbol_service_dispatch_preserves_unregistered_code);
     RUN_TEST(test_rom_stub_dispatch);
     RUN_TEST(test_rom_conditional_stub);
     RUN_TEST(test_rom_conditional_fallback_preserves_existing_hook);

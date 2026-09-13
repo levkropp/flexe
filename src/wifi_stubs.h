@@ -58,6 +58,15 @@ void wifi_stubs_destroy(wifi_stubs_t *ws);
 /* Look up ELF symbols and register PC hooks for lwip socket functions */
 int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms);
 
+/* Hook only symbol-resolved lwIP socket entry points. This is a host-backed
+ * network service boundary, not a Wi-Fi MAC/PHY model. Unlike the classic
+ * compatibility set above, it installs no fixed ROM hooks or Wi-Fi API/event
+ * replacements and can be composed with native S3 FreeRTOS execution. The
+ * descriptor base is firmware SDK configuration, not a silicon property. */
+int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
+                                   const elf_symbols_t *syms,
+                                   int socket_fd_base);
+
 /* Discover stripped library boundaries where possible, then add any remaining
  * compatibility hooks for an exactly verified legacy firmware profile. */
 int wifi_stubs_hook_firmware(wifi_stubs_t *ws, uint32_t entry_point);

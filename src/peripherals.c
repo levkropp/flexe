@@ -3777,8 +3777,13 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t val) {
          * the guest span in that loop for ever. SW_APPCPU_RST (bit 4) is
          * routine -- the PRO CPU uses it to start the APP CPU -- so it is not
          * a reboot on its own. */
-        if (val & ((1u << 31) | (1u << 5)))
+        if (val & ((1u << 31) | (1u << 5))) {
+            if (getenv("FLEXE_RESETDBG"))
+                fprintf(stderr,
+                        "[reset] firmware wrote RTC_CNTL_OPTIONS0=0x%08X\n",
+                        val);
             p->reset_requested = true;
+        }
         return;
     }
     switch (off) {
@@ -13667,7 +13672,9 @@ static void target_rtc_cntl_reset_requested(
     void *ctx, flexe_rtc_cntl_wdt_action_t action)
 {
     esp32_periph_t *p = ctx;
-    (void)action;
+    if (getenv("FLEXE_RESETDBG"))
+        fprintf(stderr, "[reset] RTC watchdog action %d requested reset\n",
+                (int)action);
     if (p) p->reset_requested = true;
 }
 
@@ -13800,8 +13807,10 @@ static void target_timer_group_reset_requested(
     void *ctx, unsigned group, flexe_timer_group_wdt_action_t action)
 {
     esp32_periph_t *p = ctx;
-    (void)group;
-    (void)action;
+    if (getenv("FLEXE_RESETDBG"))
+        fprintf(stderr,
+                "[reset] timer-group %u watchdog action %d requested reset\n",
+                group, (int)action);
     if (p) p->reset_requested = true;
 }
 

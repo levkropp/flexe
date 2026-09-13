@@ -2,7 +2,9 @@
 #include "test_helpers.h"
 #include "rom_stubs.h"
 #include "wifi_stubs.h"
+#include "elf_symbols.h"
 
+#include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -365,6 +367,165 @@ static void invoke_wifi_call0_6(xtensa_cpu_t *cpu, uint32_t addr,
     ar_write(cpu, 6, arg4);
     ar_write(cpu, 7, arg5);
     xtensa_step(cpu);
+}
+
+/* A tiny symbol-bearing ELF verifies the S3 service boundary without
+ * checking in a firmware binary or relying on a particular SDK link. */
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t ident[16];
+    uint16_t type, machine;
+    uint32_t version, entry, phoff, shoff, flags;
+    uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+} wifi_test_elf_header_t;
+
+typedef struct {
+    uint32_t name, type, flags, addr, offset, size, link, info;
+    uint32_t align, entsize;
+} wifi_test_elf_section_t;
+
+typedef struct {
+    uint32_t name, value, size;
+    uint8_t info, other;
+    uint16_t shndx;
+} wifi_test_elf_symbol_t;
+#pragma pack(pop)
+
+static elf_symbols_t *wifi_test_s3_symbols(void)
+{
+    static const char *path = "/tmp/flexe_test_s3_socket_symbols.elf";
+    static const char *names[] = {
+        "lwip_socket", "lwip_select", "lwip_send", "lwip_close",
+        "esp_wifi_init",
+    };
+    static const uint32_t addrs[] = {
+        0x40374100u, 0x40374140u, 0x40374180u, 0x403741C0u,
+        0x40374200u,
+    };
+    static const char section_names[] = "\0.symtab\0.strtab\0.shstrtab\0";
+    char strings[128] = {0};
+    wifi_test_elf_symbol_t symbols[6] = {{0}};
+    size_t strings_len = 1u;
+    for (size_t i = 0; i < 5u; i++) {
+        size_t len = strlen(names[i]) + 1u;
+        if (strings_len + len > sizeof(strings)) return NULL;
+        symbols[i + 1u].name = (uint32_t)strings_len;
+        symbols[i + 1u].value = addrs[i];
+        symbols[i + 1u].size = 0x20u;
+        symbols[i + 1u].info = 0x12u; /* global function */
+        symbols[i + 1u].shndx = 1u;
+        memcpy(strings + strings_len, names[i], len);
+        strings_len += len;
+    }
+
+    uint32_t strings_off = sizeof(wifi_test_elf_header_t);
+    uint32_t symbols_off = strings_off + (uint32_t)strings_len;
+    uint32_t sections_str_off = symbols_off + sizeof(symbols);
+    uint32_t sections_off = (sections_str_off + sizeof(section_names) + 3u)
+                          & ~3u;
+    size_t image_size = sections_off + 4u * sizeof(wifi_test_elf_section_t);
+    uint8_t *image = calloc(1u, image_size);
+    if (!image) return NULL;
+
+    wifi_test_elf_header_t header = {0};
+    header.ident[0] = 0x7Fu;
+    header.ident[1] = 'E';
+    header.ident[2] = 'L';
+    header.ident[3] = 'F';
+    header.ident[4] = 1u; /* ELF32 */
+    header.ident[5] = 1u; /* little-endian */
+    header.ident[6] = 1u;
+    header.type = 2u;
+    header.machine = 94u; /* Xtensa */
+    header.version = 1u;
+    header.entry = addrs[0];
+    header.shoff = sections_off;
+    header.ehsize = sizeof(header);
+    header.shentsize = sizeof(wifi_test_elf_section_t);
+    header.shnum = 4u;
+    header.shstrndx = 3u;
+    memcpy(image, &header, sizeof(header));
+    memcpy(image + strings_off, strings, strings_len);
+    memcpy(image + symbols_off, symbols, sizeof(symbols));
+    memcpy(image + sections_str_off, section_names,
+           sizeof(section_names));
+
+    wifi_test_elf_section_t sections[4] = {{0}};
+    sections[1].name = 1u;
+    sections[1].type = 2u; /* SYMTAB */
+    sections[1].offset = symbols_off;
+    sections[1].size = sizeof(symbols);
+    sections[1].link = 2u;
+    sections[1].entsize = sizeof(wifi_test_elf_symbol_t);
+    sections[2].name = 9u;
+    sections[2].type = 3u; /* STRTAB */
+    sections[2].offset = strings_off;
+    sections[2].size = (uint32_t)strings_len;
+    sections[3].name = 17u;
+    sections[3].type = 3u;
+    sections[3].offset = sections_str_off;
+    sections[3].size = sizeof(section_names);
+    memcpy(image + sections_off, sections, sizeof(sections));
+
+    FILE *out = fopen(path, "wb");
+    if (!out) { free(image); return NULL; }
+    size_t written = fwrite(image, 1u, image_size, out);
+    fclose(out);
+    free(image);
+    if (written != image_size) { remove(path); return NULL; }
+    elf_symbols_t *loaded = elf_symbols_load(path);
+    remove(path);
+    return loaded;
+}
+
+TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks) {
+#ifndef _WIN32
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+    xtensa_cpu_t cpu;
+    xtensa_cpu_reset_for_target(&cpu, s3);
+    cpu.mem = mem;
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    elf_symbols_t *syms = wifi_test_s3_symbols();
+    ASSERT_TRUE(rom != NULL);
+    ASSERT_TRUE(wifi != NULL);
+    ASSERT_TRUE(syms != NULL);
+    if (!rom || !wifi || !syms) goto done;
+
+    ASSERT_EQ(wifi_stubs_hook_socket_symbols(wifi, syms, 48), 4u);
+    /* An unconnected UDP socket is writable without arranging a host peer,
+     * so readiness tests the guest fd_set translation deterministically. */
+    invoke_wifi_call0_4(&cpu, 0x40374100u, 2u, 2u, 0u, 0u);
+    uint32_t fd = ar_read(&cpu, 2);
+    ASSERT_EQ(fd, 48u);
+
+    /* Arduino's WiFiClient::write gates send() through select(). */
+    const uint32_t set_addr = 0x3FCA1000u;
+    mem_write32(mem, set_addr, 0u);
+    mem_write32(mem, set_addr + 4u, 1u << (fd - 32u));
+    invoke_wifi_call0_4(&cpu, 0x40374140u, fd + 1u, 0u, set_addr, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read32(mem, set_addr + 4u), 1u << (fd - 32u));
+    invoke_wifi_call0(&cpu, 0x403741C0u, fd);
+
+    /* An identically named Wi-Fi API symbol is deliberately not hooked on
+     * S3: its real guest implementation is responsible for the PHY path. */
+    put_insn3(&cpu, 0x40374200u, 0x0020F0u); /* NOP */
+    cpu.pc = 0x40374200u;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_step(&cpu), 0u);
+    ASSERT_EQ(cpu.pc, 0x40374203u);
+
+done:
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    mem_destroy(mem);
+#endif
 }
 
 TEST(promiscuous_frame_requires_enabled_callback) {
@@ -1016,6 +1177,7 @@ TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time) {
 
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
+    RUN_TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks);
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);
     RUN_TEST(raw_tx_crosses_host_radio_boundary);

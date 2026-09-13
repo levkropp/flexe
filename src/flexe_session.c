@@ -400,12 +400,22 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
             mpi_stubs_hook_symbols(s->mstubs, s->syms);
     }
 
-    /* WiFi / lwip socket bridge */
-    s->wstubs = classic_compat ? wifi_stubs_create(&s->cpu[0]) : NULL;
+    /* Host socket service is symbol-resolved on S3. The classic target also
+     * installs its separate Wi-Fi API/ROM compatibility hooks; S3 keeps its
+     * native Wi-Fi stack and explicit unsupported PHY diagnostics. */
+    s->wstubs = wifi_stubs_create(&s->cpu[0]);
     if (s->wstubs) {
-        wifi_stubs_hook_firmware(s->wstubs, res.entry_point);
-        if (s->syms)
-            wifi_stubs_hook_symbols(s->wstubs, s->syms);
+        if (classic_compat) {
+            wifi_stubs_hook_firmware(s->wstubs, res.entry_point);
+            if (s->syms)
+                wifi_stubs_hook_symbols(s->wstubs, s->syms);
+        } else if (s->syms) {
+            /* ESP-IDF/Arduino's default 64-descriptor, 16-socket build
+             * places sockets at 48..63. This is an SDK profile, not an S3
+             * silicon register; other builds need offset discovery before
+             * they can claim this host service. */
+            wifi_stubs_hook_socket_symbols(s->wstubs, s->syms, 48);
+        }
     }
 
     /* VFS / SPIFFS / FATFS stubs (host-backed file I/O).
@@ -975,7 +985,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     }
 
     if (periph_take_reset_request(s->periph)) {
-        fprintf(stderr, "[reset] firmware requested a software reset (#%u)\n",
+        fprintf(stderr, "[reset] system reset requested (#%u)\n",
                 s->resets + 1u);
         flexe_session_reset(s);
         return;

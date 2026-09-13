@@ -77,9 +77,10 @@ static inline int fcntl(int fd, int cmd, ...)
  * the ROM close()/read()/write() hooks from accidentally operating on
  * sockets when the firmware closes VFS files (and vice versa).
  *
- * Mapping: firmware fd = array_index + SOCKET_FD_BASE
- *          array_index = firmware fd - SOCKET_FD_BASE */
-#define SOCKET_FD_BASE 46
+ * Mapping: firmware fd = array_index + socket_fd_base
+ *          array_index = firmware fd - socket_fd_base. The base depends on
+ * the linked lwIP/SDK configuration rather than the chip itself. */
+#define CLASSIC_SOCKET_FD_BASE 46
 
 /* Firmware's reent address (set by rom_stubs esp_newlib_init).
  * newlib struct _reent has _errno at offset 0. */
@@ -203,6 +204,7 @@ static const fake_ap_t fake_aps[] = {
 struct wifi_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
+    int                socket_fd_base;
     /* The firmware's own __errno routine. Calling it preserves newlib's
      * per-task reentrancy instead of redirecting every subsystem to a global
      * emulator scratch word. */
@@ -319,9 +321,9 @@ static void wifi_log(wifi_stubs_t *ws, const char *fmt, ...) {
 /* ===== Socket slot management ===== */
 
 /* Convert firmware fd to array index. Returns -1 if out of range. */
-static int fd_to_idx(int fd)
+static int fd_to_idx(const wifi_stubs_t *ws, int fd)
 {
-    int idx = fd - SOCKET_FD_BASE;
+    int idx = fd - ws->socket_fd_base;
     if (idx < 0 || idx >= MAX_EMU_SOCKETS) return -1;
     return idx;
 }
@@ -340,7 +342,7 @@ static int slot_alloc(wifi_stubs_t *ws, int host_fd)
             ws->sockets[i].recvfrom_poll_after_us = 0;
             ws->sockets[i].ssl = NULL;
             ws->sockets[i].ssl_ctx = NULL;
-            return i + SOCKET_FD_BASE;  /* return firmware fd */
+            return i + ws->socket_fd_base;  /* return firmware fd */
         }
     }
     return -1;
@@ -348,7 +350,7 @@ static int slot_alloc(wifi_stubs_t *ws, int host_fd)
 
 static emu_socket_t *slot_get(wifi_stubs_t *ws, int fd)
 {
-    int idx = fd_to_idx(fd);
+    int idx = fd_to_idx(ws, fd);
     if (idx < 0) return NULL;
     if (ws->sockets[idx].host_fd == -1) return NULL;
     return &ws->sockets[idx];
@@ -356,7 +358,7 @@ static emu_socket_t *slot_get(wifi_stubs_t *ws, int fd)
 
 static void slot_free(wifi_stubs_t *ws, int fd)
 {
-    int idx = fd_to_idx(fd);
+    int idx = fd_to_idx(ws, fd);
     if (idx >= 0) {
         if (ws->sockets[idx].ssl) {
             SSL_shutdown(ws->sockets[idx].ssl);
@@ -636,7 +638,8 @@ static void stub_lwip_close(xtensa_cpu_t *cpu, void *ctx)
         wifi_log(ws, "close(slot %u, host fd %d)\n", fd, s->host_fd);
         close(s->host_fd);
         slot_free(ws, (int)fd);
-    } else if (fd >= SOCKET_FD_BASE && fd < SOCKET_FD_BASE + MAX_EMU_SOCKETS) {
+    } else if (fd >= (uint32_t)ws->socket_fd_base &&
+               fd < (uint32_t)(ws->socket_fd_base + MAX_EMU_SOCKETS)) {
         wifi_log(ws, "close(fd %u): no slot (passthrough)\n", fd);
     }
     ws_return(cpu, 0);
@@ -972,8 +975,7 @@ static void stub_lwip_select(xtensa_cpu_t *cpu, void *ctx)
 
     /* Build host fd_sets from emulator fd_sets.
      * ESP-IDF lwip fd_set: array of uint32_t bitmasks, FD_SETSIZE=64.
-     * With SOCKET_FD_BASE=46, socket bits are in the second uint32_t
-     * (bits 32-63 of the fd_set). */
+     * The classic compatibility ABI stores bits by guest fd number. */
     fd_set hread, hwrite, hexc;
     FD_ZERO(&hread); FD_ZERO(&hwrite); FD_ZERO(&hexc);
     int maxfd = -1;
@@ -993,7 +995,7 @@ static void stub_lwip_select(xtensa_cpu_t *cpu, void *ctx)
 
     /* Check each possible socket fd */
     for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
-        int fd = i + SOCKET_FD_BASE;
+        int fd = i + ws->socket_fd_base;
         if ((uint32_t)fd >= nfds) break;
         emu_socket_t *s = slot_get(ws, fd);
         if (!s) continue;
@@ -1020,7 +1022,7 @@ static void stub_lwip_select(xtensa_cpu_t *cpu, void *ctx)
     if (ret > 0) {
         uint32_t out_r[2] = {0, 0}, out_w[2] = {0, 0}, out_e[2] = {0, 0};
         for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
-            int fd = i + SOCKET_FD_BASE;
+            int fd = i + ws->socket_fd_base;
             emu_socket_t *s = slot_get(ws, fd);
             if (!s) continue;
             int word = fd / 32;
@@ -2646,6 +2648,7 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
     wifi_stubs_t *ws = calloc(1, sizeof(*ws));
     if (!ws) return NULL;
     ws->cpu = cpu;
+    ws->socket_fd_base = CLASSIC_SOCKET_FD_BASE;
     ws->hostent_buf = HOSTENT_SCRATCH_ADDR;
     ws->channel = 1;
     ws->wifi_mode = WIFI_MODE_NULL;
@@ -2665,6 +2668,7 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
      * changed between IDF 4 and 5. Detect the producer instead of guessing
      * from a handler address or requiring symbols in stripped images. */
     if (cpu && cpu->mem &&
+        mem_target(cpu->mem)->id == FLEXE_TARGET_ESP32 &&
         mem_read32(cpu->mem, ESP_APP_DESC_ADDR) == ESP_APP_DESC_MAGIC) {
         uint32_t version = ESP_APP_DESC_ADDR +
                            ESP_APP_DESC_IDF_VERSION_OFFSET;
@@ -2694,46 +2698,53 @@ void wifi_stubs_destroy(wifi_stubs_t *ws)
     free(ws);
 }
 
-int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
+typedef struct {
+    const char *name;
+    rom_stub_fn fn;
+} wifi_symbol_hook_t;
+
+static int wifi_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms,
+                             const wifi_symbol_hook_t *hooks)
 {
-    if (!ws || !syms) return 0;
+    int hooked = 0;
+    for (size_t i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(ws->rom, addr, hooks[i].fn,
+                                   hooks[i].name, ws);
+            hooked++;
+        }
+    }
+    return hooked;
+}
 
-    esp32_rom_stubs_t *rom = ws->cpu->pc_hook_ctx;
-    if (!rom) return 0;
-    ws->rom = rom;
+int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
+                                   const elf_symbols_t *syms,
+                                   int socket_fd_base)
+{
+    if (!ws || !syms || socket_fd_base < 0 ||
+        socket_fd_base + MAX_EMU_SOCKETS > 64)
+        return 0;
+    ws->rom = ws->cpu ? ws->cpu->pc_hook_ctx : NULL;
+    if (!ws->rom) return 0;
+    ws->socket_fd_base = socket_fd_base;
 
-    /* Native socket calls must update the calling task's own newlib errno.
-     * Remember the real accessor and invoke it only when a socket operation
-     * needs it; replacing __errno globally also changes filesystem and every
-     * other newlib consumer. */
+    /* The guest's own accessor, not a classic ESP32 fixed RAM address,
+     * determines task-local errno on this symbol-resolved path. */
     uint32_t errno_fn = 0u;
     if (elf_symbols_find(syms, "__errno", &errno_fn) == 0)
         ws->guest_errno_fn = errno_fn;
 
-    int hooked = 0;
-
-    struct {
-        const char *name;
-        rom_stub_fn fn;
-    } hooks[] = {
-        /* Tier 1: Connection */
+    static const wifi_symbol_hook_t hooks[] = {
         { "lwip_socket",        stub_lwip_socket },
         { "lwip_connect",       stub_lwip_connect },
         { "lwip_close",         stub_lwip_close },
-
-        /* Tier 2: Data transfer */
         { "lwip_write",         stub_lwip_write },
         { "lwip_send",          stub_lwip_send },
         { "lwip_read",          stub_lwip_read },
         { "lwip_recv",          stub_lwip_recv },
         { "lwip_sendto",        stub_lwip_sendto },
         { "lwip_recvfrom",      stub_lwip_recvfrom },
-
-        /* Tier 3: DNS */
-        { "lwip_gethostbyname", stub_lwip_gethostbyname },
-        { "dns_gethostbyname",  stub_dns_gethostbyname },
-
-        /* Tier 4: Multiplexing & config */
         { "lwip_select",        stub_lwip_select },
         { "lwip_ioctl",         stub_lwip_ioctl },
         { "lwip_setsockopt",    stub_lwip_setsockopt },
@@ -2741,16 +2752,29 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { "lwip_fcntl",         stub_lwip_fcntl },
         { "lwip_getpeername",   stub_lwip_getpeername },
         { "lwip_getsockname",   stub_lwip_getsockname },
-
-        /* VFS wrappers (WiFiClient uses these instead of lwip_*) */
-        { "fcntl",              stub_vfs_fcntl },
-        { "select",             stub_vfs_select },
-        { "esp_vfs_select",     stub_vfs_select },
-
-        /* Tier 5: Server stubs */
         { "lwip_bind",          stub_lwip_bind },
         { "lwip_listen",        stub_lwip_listen },
         { "lwip_accept",        stub_lwip_accept },
+        { NULL, NULL }
+    };
+    return wifi_hook_symbols(ws, syms, hooks);
+}
+
+int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
+{
+    if (!ws || !syms) return 0;
+    int hooked = wifi_stubs_hook_socket_symbols(
+        ws, syms, CLASSIC_SOCKET_FD_BASE);
+    if (!ws->rom) return 0;
+
+    static const wifi_symbol_hook_t hooks[] = {
+        /* Classic DNS callbacks need guest scratch memory. */
+        { "lwip_gethostbyname", stub_lwip_gethostbyname },
+        { "dns_gethostbyname",  stub_dns_gethostbyname },
+        /* Classic VFS wrappers (WiFiClient may bypass lwip_*). */
+        { "fcntl",              stub_vfs_fcntl },
+        { "select",             stub_vfs_select },
+        { "esp_vfs_select",     stub_vfs_select },
 
         /* Tier 6: Host-side TLS (replaces firmware mbedtls) */
         { "_Z16start_ssl_clientP17sslclient_contextRK9IPAddressjPKciS5_bS5_S5_S5_S5_bPS5_",
@@ -2824,21 +2848,14 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
         { NULL, NULL }
     };
 
-    for (int i = 0; hooks[i].name; i++) {
-        uint32_t addr;
-        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
-            rom_stubs_register_ctx(rom, addr, hooks[i].fn,
-                                   hooks[i].name, ws);
-            hooked++;
-        }
-    }
+    hooked += wifi_hook_symbols(ws, syms, hooks);
 
     /* Override POSIX syscall ROM stubs with socket-aware versions.
      * These are fallback paths — most socket I/O goes through lwip_*
      * hooks above. But some code may call read()/write()/close() directly. */
-    rom_stubs_register_ctx(rom, 0x4000181C, stub_lwip_write, "write", ws);
-    rom_stubs_register_ctx(rom, 0x400017DC, stub_lwip_read,  "read",  ws);
-    rom_stubs_register_ctx(rom, 0x40001778, stub_lwip_close, "close", ws);
+    rom_stubs_register_ctx(ws->rom, 0x4000181C, stub_lwip_write, "write", ws);
+    rom_stubs_register_ctx(ws->rom, 0x400017DC, stub_lwip_read,  "read",  ws);
+    rom_stubs_register_ctx(ws->rom, 0x40001778, stub_lwip_close, "close", ws);
     hooked += 3;
 
     if (hooked > 0)

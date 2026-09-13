@@ -4926,17 +4926,27 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     s->cpu = cpu;
     s->cpu_freq_mhz = 160;
 
-    /* This module describes the classic ESP32 ROM ABI and its compatibility
-     * services. Newer family members reuse portions of the 0x40000000 address
-     * space for different ROM routines, so installing the classic address
-     * table on them silently replaces unrelated target code. Keep a valid,
-     * empty statistics object for common session plumbing, but leave the CPU
-     * entirely unhooked until that target has its own ROM service provider.
-     * An official ROM ELF can then execute without accidental LX6 aliases. */
-    if (!cpu || !cpu->target ||
-        !(cpu->target->capabilities &
-          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
+    if (!cpu || !cpu->target)
         return s;
+
+    /* Allocate direct dispatch table (64K entries × 24 bytes ≈ 1.5MB) */
+    s->direct = calloc(STUB_DIRECT_SIZE, sizeof(stub_direct_entry_t));
+
+    /* Install PC hook */
+    cpu->pc_hook = rom_pc_hook;
+    cpu->pc_hook_ctx = s;
+    cpu->pc_hook_contains = rom_pc_hook_contains;
+    cpu->pc_hook_contains_ctx = s;
+
+    /* Newer targets may register symbol-resolved, ABI-checked service
+     * boundaries into this dispatcher. Never install classic ROM addresses
+     * or classic RAM heap state on them: those aliases replace unrelated S3
+     * routines. Their unregistered ROM code executes from the official ELF. */
+    if (!(cpu->target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)) {
+        cpu->pc_hook_bitmap = s->hook_bitmap;
+        return s;
+    }
 
     s->heap = (stub_heap_region_t){
         .base = HEAP_BASE,
@@ -4948,15 +4958,6 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
         .end = INTERNAL_HEAP_END,
         .ptr = INTERNAL_HEAP_BASE,
     };
-
-    /* Allocate direct dispatch table (64K entries × 24 bytes ≈ 1.5MB) */
-    s->direct = calloc(STUB_DIRECT_SIZE, sizeof(stub_direct_entry_t));
-
-    /* Install PC hook */
-    cpu->pc_hook = rom_pc_hook;
-    cpu->pc_hook_ctx = s;
-    cpu->pc_hook_contains = rom_pc_hook_contains;
-    cpu->pc_hook_contains_ctx = s;
 
     /* Pre-populate bitmap for entire ROM range (unregistered calls also intercepted) */
     for (uint32_t a = ROM_BASE; a < ROM_END; a += 4)
