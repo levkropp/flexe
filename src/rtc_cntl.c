@@ -730,6 +730,12 @@ void flexe_rtc_cntl_application_handoff(flexe_rtc_cntl_t *rtc)
 {
     if (!rtc) return;
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    /* The session enters the application directly, after the second-stage
+     * bootloader's handoff. The power-on FLASHBOOT_MOD_EN bit is not supposed
+     * to remain armed throughout user code in the default ESP-IDF boot flow.
+     * Keep WDT_EN independent: firmware that enables the runtime RTC WDT
+     * still gets its programmed stages and reset actions. */
+    rtc->wdt_config[0] &= ~desc->wdt_flashboot_enable_mask;
     uint64_t calibration = (UINT64_C(1000000) << 19) /
                            desc->slow_clock_hz;
     rtc->store[desc->slow_clock_cal_store] = (uint32_t)calibration;

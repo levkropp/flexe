@@ -102,6 +102,12 @@ TEST(rtc_cntl_application_handoff_uses_target_clocks)
               (uint32_t)((UINT64_C(1000000) << 19) /
                          desc->slow_clock_hz));
     ASSERT_EQ(mem_read32(mem, xtal_addr), 0x00280028u);
+    uint32_t wdt_config0 = desc->base + desc->wdt_config_offset[0];
+    ASSERT_EQ(mem_read32(mem, wdt_config0) &
+              desc->wdt_flashboot_enable_mask, 0u);
+    ASSERT_EQ(mem_read32(mem, wdt_config0) &
+              desc->wdt_enable_mask,
+              desc->wdt_config_reset[0] & desc->wdt_enable_mask);
 
     flexe_rtc_cntl_destroy(rtc);
     mem_destroy(mem);
@@ -549,13 +555,15 @@ TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset)
         desc->base + desc->interrupt_enable_offset;
     uint32_t interrupt_clear =
         desc->base + desc->interrupt_clear_offset;
-    ASSERT_EQ(mem_read32(mem, config0), desc->wdt_config_reset[0]);
+    ASSERT_EQ(mem_read32(mem, config0),
+              desc->wdt_config_reset[0] &
+              ~desc->wdt_flashboot_enable_mask);
     ASSERT_EQ(mem_read32(mem, stage0_hold), 200000u);
     ASSERT_EQ(mem_read32(mem, protect), desc->wdt_write_protect_key);
 
-    /* Disable reset-time flashboot mode, then configure four effective slow
-     * ticks for stage 0 (the revision-0 multiplier is two), followed by a
-     * three-tick system-reset stage. */
+    /* The application handoff already cleared flashboot mode. Configure four
+     * effective slow ticks for stage 0 (the revision-0 multiplier is two),
+     * followed by a three-tick system-reset stage. */
     uint32_t base_config = desc->wdt_config_reset[0] &
         ~(desc->wdt_enable_mask | desc->wdt_flashboot_enable_mask);
     mem_write32(mem, config0, base_config);
