@@ -472,6 +472,46 @@ static void format_addr(const elf_symbols_t *syms, uint32_t addr, char *buf, int
     }
 }
 
+static int compare_unhandled_sites(const void *left, const void *right) {
+    const periph_unhandled_site_t *a = left;
+    const periph_unhandled_site_t *b = right;
+    if (a->count != b->count) return a->count > b->count ? -1 : 1;
+    if (a->address != b->address) return a->address < b->address ? -1 : 1;
+    if (a->pc != b->pc) return a->pc < b->pc ? -1 : 1;
+    if (a->core != b->core) return a->core < b->core ? -1 : 1;
+    return (int)a->write - (int)b->write;
+}
+
+static void print_unhandled_report(const esp32_periph_t *periph,
+                                    const elf_symbols_t *syms) {
+    size_t count = periph_unhandled_audit_count(periph);
+    uint64_t omitted = periph_unhandled_audit_omitted(periph);
+    fprintf(stderr, "\n--- Unsupported MMIO sites (%zu, %llu ungrouped) ---\n",
+            count, (unsigned long long)omitted);
+    if (!count) return;
+    periph_unhandled_site_t *sites = malloc(count * sizeof(*sites));
+    if (!sites) {
+        fprintf(stderr, "Cannot allocate unsupported MMIO report\n");
+        return;
+    }
+    for (size_t i = 0; i < count; i++)
+        (void)periph_unhandled_audit_get(periph, i, &sites[i]);
+    qsort(sites, count, sizeof(*sites), compare_unhandled_sites);
+    for (size_t i = 0; i < count; i++) {
+        char symbol[160];
+        format_addr(syms, sites[i].pc, symbol, sizeof(symbol));
+        fprintf(stderr,
+                "%8llu  %c  0x%08X  core%u pc=0x%08X (%s)",
+                (unsigned long long)sites[i].count,
+                sites[i].write ? 'W' : 'R', sites[i].address,
+                sites[i].core, sites[i].pc, symbol);
+        if (sites[i].write)
+            fprintf(stderr, " first=0x%08X", sites[i].first_value);
+        fputc('\n', stderr);
+    }
+    free(sites);
+}
+
 /* ===== ROM stub log callback for verbose trace ===== */
 
 static void rom_log_cb(void *ctx, uint32_t addr, const char *name,
@@ -549,6 +589,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -T              Verbose trace (reg changes, ROM calls, exceptions)\n");
     fprintf(stderr, "  -v              Verbose register dump on exit\n");
     fprintf(stderr, "  -q              Quiet: suppress per-access unhandled peripheral warnings\n");
+    fprintf(stderr, "  --unhandled-report  Rank unsupported MMIO sites by count (interpreter diagnostic)\n");
     fprintf(stderr, "  -e <addr>       Override entry point (hex)\n");
     fprintf(stderr, "  -s <file.elf>   Load ELF symbols for trace/breakpoints\n");
     fprintf(stderr, "  -R <rom.elf>    Load official ESP32 ROM code and data images\n");
@@ -890,6 +931,7 @@ int main(int argc, char *argv[]) {
     int window_trace = 0;
     int verbose = 0;
     int quiet_unhandled = 0;
+    int unhandled_report = 0;
     int call_trace = 0;
     int ring_size = 0;
     uint32_t entry_override = 0;
@@ -976,6 +1018,12 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--usb-console") == 0) {
             usb_console = 1;
+            memmove(&argv[i], &argv[i + 1],
+                    (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--unhandled-report") == 0) {
+            unhandled_report = 1;
             memmove(&argv[i], &argv[i + 1],
                     (size_t)(argc - i) * sizeof(char *));
             argc -= 1;
@@ -1111,6 +1159,15 @@ int main(int argc, char *argv[]) {
     }
     const char *firmware = argv[optind];
 
+    if (unhandled_report) {
+        if (jit_enabled)
+            fprintf(stderr,
+                    "flexe: --unhandled-report uses the interpreter to "
+                    "attribute MMIO to guest PCs\n");
+        jit_enabled = 0;
+        xtensa_enable_diagnostic_pc();
+    }
+
     /* Set up ring buffer: always used when -T is active.
      * -B N overrides default size.  Without -B, default to 50K lines. */
     if (verbose_trace && ring_size == 0)
@@ -1137,6 +1194,7 @@ int main(int argc, char *argv[]) {
         .single_core = single_core,
         .native_freertos = native_freertos,
         .disable_jit = !jit_enabled,
+        .unhandled_audit = unhandled_report,
         .target = target_id,
         .window_trace = window_trace,
         .spill_verify = spill_verify,
@@ -1366,6 +1424,7 @@ int main(int argc, char *argv[]) {
      * delta is clamped: firmware can xwsr/reset ccount, which would wrap
      * the subtraction. */
     uint32_t prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
+    unsigned observed_resets = flexe_session_reset_count(session);
     while (cycles < max_cycles_u64 &&
            (cpu->running || (cpu1_any && cpu1_any->running)) &&
            !cpu->breakpoint_hit && !cpu->debug_break &&
@@ -1585,6 +1644,19 @@ int main(int argc, char *argv[]) {
 
         /* Preemptive timeslice + core 1 management */
         flexe_session_post_batch(session, batch);
+
+        /* A session reset replaces peripheral and compatibility providers
+         * while retaining the CPU and memory objects. Do not keep pointers
+         * to the destroyed providers for the next input batch or summary. */
+        unsigned current_resets = flexe_session_reset_count(session);
+        if (current_resets != observed_resets) {
+            observed_resets = current_resets;
+            periph = flexe_session_periph(session);
+            rom = flexe_session_rom(session);
+            frt = flexe_session_frt(session);
+            hb_stub_count = 0;
+            prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
+        }
 
         /* Charge core 1's executed instructions against the budget */
         if (cpu1_any) {
@@ -1813,6 +1885,8 @@ int main(int argc, char *argv[]) {
 
     if (!quiet_unhandled || periph_unhandled_count(periph) > 0)
         fprintf(stderr, "Unhandled:  %d peripheral accesses\n", periph_unhandled_count(periph));
+    if (unhandled_report)
+        print_unhandled_report(periph, syms);
 
     /* -U: Audit unhooked firmware functions.
      * Uses the ROM call stats from the completed run + symbol lookup

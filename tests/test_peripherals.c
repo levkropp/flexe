@@ -93,6 +93,62 @@ TEST(mmio_complete_ahb_alias_window) {
 
 /* ===== ESP32 peripheral stubs ===== */
 
+TEST(unhandled_mmio_audit_groups_sites_without_changing_fallback) {
+    xtensa_mem_t *mem = mem_create_for_target(
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3));
+    esp32_periph_t *p = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    if (!mem || !p) {
+        periph_destroy(p);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t old_pc = g_dbg_pc;
+    int old_core = g_dbg_core;
+    const uint32_t addr = 0x6000E0C4u;
+    g_dbg_pc = 0x40374000u;
+    g_dbg_core = 0;
+    ASSERT_EQ(mem_read32(mem, addr), 0u);
+    ASSERT_EQ(periph_unhandled_count(p), 1);
+    ASSERT_EQ(periph_unhandled_audit_count(p), 0u);
+
+    periph_unhandled_audit_enable(p);
+    ASSERT_EQ(mem_read32(mem, addr), 0u);
+    ASSERT_EQ(mem_read32(mem, addr), 0u);
+    mem_write32(mem, addr, 0x1234u);
+    mem_write32(mem, addr, 0x5678u);
+    g_dbg_pc = 0x40374003u;
+    g_dbg_core = 1;
+    ASSERT_EQ(mem_read32(mem, addr), 0u);
+
+    ASSERT_EQ(periph_unhandled_count(p), 6);
+    ASSERT_EQ(periph_unhandled_audit_count(p), 3u);
+    ASSERT_EQ64(periph_unhandled_audit_omitted(p), 0u);
+    periph_unhandled_site_t site;
+    ASSERT_TRUE(periph_unhandled_audit_get(p, 0u, &site));
+    ASSERT_EQ(site.address, addr);
+    ASSERT_EQ(site.pc, 0x40374000u);
+    ASSERT_EQ(site.core, 0u);
+    ASSERT_TRUE(!site.write);
+    ASSERT_EQ64(site.count, 2u);
+    ASSERT_TRUE(periph_unhandled_audit_get(p, 1u, &site));
+    ASSERT_TRUE(site.write);
+    ASSERT_EQ(site.first_value, 0x1234u);
+    ASSERT_EQ64(site.count, 2u);
+    ASSERT_TRUE(periph_unhandled_audit_get(p, 2u, &site));
+    ASSERT_EQ(site.pc, 0x40374003u);
+    ASSERT_EQ(site.core, 1u);
+    ASSERT_EQ64(site.count, 1u);
+    ASSERT_TRUE(!periph_unhandled_audit_get(p, 3u, &site));
+
+    g_dbg_pc = old_pc;
+    g_dbg_core = old_core;
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 static void test_deferred_event_fire(void *ctx) {
     unsigned *fires = ctx;
     (*fires)++;
@@ -6674,6 +6730,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(mmio_range_registration);
     RUN_TEST(mmio_no_handler_returns_zero);
     RUN_TEST(mmio_complete_ahb_alias_window);
+    RUN_TEST(unhandled_mmio_audit_groups_sites_without_changing_fallback);
     RUN_TEST(peripheral_event_source_reactivates_after_idle);
     RUN_TEST(uart_tx_capture);
     RUN_TEST(uhci_reset_register_file_dual_instance_and_dport);

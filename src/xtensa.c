@@ -2976,6 +2976,10 @@ int g_dbg_step_trace;
 static int g_dbg_step_slow;
 int g_flexe_shadow_fill;   /* FLEXE_SHADOWFILL */
 
+void xtensa_enable_diagnostic_pc(void) {
+    g_dbg_step_slow = 1;
+}
+
 __attribute__((constructor))
 static void g_dbg_watch_init(void) {
     const char *e = getenv("FLEXE_WATCH");
@@ -3104,6 +3108,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
     *prev_pc = cpu->pc;
     if (__builtin_expect(g_dbg_step_slow, 0)) {
         g_dbg_pc = cpu->pc;
+        g_dbg_core = cpu->core_id;
         if (g_dbg_step_trace)
             xtensa_dbg_step_trace(cpu);
     }

@@ -86,6 +86,7 @@ Common options:
 | `-s ELF` | Load symbols and firmware hooks from an ELF image |
 | `-R ROM_ELF` | Load official ESP32 ROM code and data images |
 | `--usb-console` | Use native USB Serial/JTAG instead of UART0 for console output |
+| `--unhandled-report` | Rank unsupported MMIO by register, guest PC, core, and direction; uses the interpreter for accurate attribution |
 | `-c N` | Stop after `N` aggregate emulated cycles |
 | `-q` | Suppress emulator diagnostics |
 | `-T` | Emit an instruction trace to stderr |

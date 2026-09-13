@@ -179,6 +179,8 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
         fprintf(stderr, "flexe: failed to create peripherals\n");
         return -1;
     }
+    if (cfg->unhandled_audit)
+        periph_unhandled_audit_enable(s->periph);
     if (cfg->uart_cb)
         periph_set_uart_callback(s->periph, cfg->uart_cb, cfg->uart_ctx);
     if (cfg->usb_serial_jtag_cb)

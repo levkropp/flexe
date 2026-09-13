@@ -1928,8 +1928,13 @@ struct esp32_periph {
      * these and reads them back to verify, so they must persist. */
     uint32_t bt_lpck[2];
 
-    /* Unhandled access counter */
+    /* Unhandled access counter and optional bounded call-site inventory. */
     int unhandled_count;
+    bool unhandled_audit_enabled;
+    periph_unhandled_site_t *unhandled_audit;
+    size_t unhandled_audit_count;
+    size_t unhandled_audit_capacity;
+    uint64_t unhandled_audit_omitted;
 
     /* ADC input shadow values driven from sandbox stdin. Reads by
      * adc_oneshot_read / adc1_get_raw ROM-stubs pull from here. */
@@ -13376,9 +13381,49 @@ static void i2s_write(void *ctx, uint32_t addr, uint32_t val) {
 
 /* ---- Default handler (unhandled peripherals) ---- */
 
+#define PERIPH_UNHANDLED_AUDIT_MAX 4096u
+
+static void unhandled_audit_record(esp32_periph_t *p, uint32_t addr,
+                                   bool write, uint32_t value)
+{
+    if (!p->unhandled_audit_enabled) return;
+    for (size_t i = 0; i < p->unhandled_audit_count; i++) {
+        periph_unhandled_site_t *site = &p->unhandled_audit[i];
+        if (site->address == addr && site->pc == g_dbg_pc &&
+            site->core == (uint8_t)g_dbg_core && site->write == write) {
+            site->count++;
+            return;
+        }
+    }
+    if (p->unhandled_audit_count == p->unhandled_audit_capacity) {
+        if (p->unhandled_audit_capacity == PERIPH_UNHANDLED_AUDIT_MAX) {
+            p->unhandled_audit_omitted++;
+            return;
+        }
+        size_t capacity = p->unhandled_audit_capacity ?
+            p->unhandled_audit_capacity * 2u : 64u;
+        if (capacity > PERIPH_UNHANDLED_AUDIT_MAX)
+            capacity = PERIPH_UNHANDLED_AUDIT_MAX;
+        periph_unhandled_site_t *grown = realloc(
+            p->unhandled_audit, capacity * sizeof(*grown));
+        if (!grown) {
+            p->unhandled_audit_omitted++;
+            return;
+        }
+        p->unhandled_audit = grown;
+        p->unhandled_audit_capacity = capacity;
+    }
+    p->unhandled_audit[p->unhandled_audit_count++] =
+        (periph_unhandled_site_t){
+            .address = addr, .pc = g_dbg_pc, .first_value = value,
+            .count = 1u, .core = (uint8_t)g_dbg_core, .write = write,
+        };
+}
+
 static uint32_t default_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     p->unhandled_count++;
+    unhandled_audit_record(p, addr, false, 0u);
     if (getenv("FLEXE_PERIPHDBG"))
         fprintf(stderr, "[PERIPH] unhandled read  0x%08X pc=0x%08X\n", addr, g_dbg_pc);
     return 0;
@@ -13387,6 +13432,7 @@ static uint32_t default_read(void *ctx, uint32_t addr) {
 static void default_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
     p->unhandled_count++;
+    unhandled_audit_record(p, addr, true, val);
     if (getenv("FLEXE_PERIPHDBG"))
         fprintf(stderr, "[PERIPH] unhandled write 0x%08X <- 0x%08X pc=0x%08X\n", addr, val, g_dbg_pc);
 }
@@ -14589,6 +14635,7 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
+    free(p->unhandled_audit);
     flexe_gpio_destroy(p->target_gpio);
     if (p->target->capabilities & FLEXE_TARGET_CAP_GPIO_V1)
         (void)mem_register_mmio_range(
@@ -15096,6 +15143,25 @@ bool periph_take_reset_request(esp32_periph_t *p)
 
 int periph_unhandled_count(const esp32_periph_t *p) {
     return p ? p->unhandled_count : 0;
+}
+
+void periph_unhandled_audit_enable(esp32_periph_t *p) {
+    if (p) p->unhandled_audit_enabled = true;
+}
+
+size_t periph_unhandled_audit_count(const esp32_periph_t *p) {
+    return p ? p->unhandled_audit_count : 0u;
+}
+
+uint64_t periph_unhandled_audit_omitted(const esp32_periph_t *p) {
+    return p ? p->unhandled_audit_omitted : 0u;
+}
+
+bool periph_unhandled_audit_get(const esp32_periph_t *p, size_t index,
+                                periph_unhandled_site_t *out) {
+    if (!p || !out || index >= p->unhandled_audit_count) return false;
+    *out = p->unhandled_audit[index];
+    return true;
 }
 
 uint32_t periph_app_cpu_boot_addr(const esp32_periph_t *p) {

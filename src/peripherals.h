@@ -213,6 +213,24 @@ size_t periph_uart_rx_pending_num(const esp32_periph_t *p, int uart_num);
 bool periph_uart_rx_break_num(esp32_periph_t *p, int uart_num);
 int  periph_unhandled_count(const esp32_periph_t *p);
 
+/* Opt-in, bounded inventory of unsupported MMIO sites. The collector does
+ * not change the fallback read/write behavior; frontends can rank these
+ * records without retaining a multi-megabyte per-access trace. PC/core are
+ * meaningful when the execution engine publishes diagnostic PCs. */
+typedef struct {
+    uint32_t address;
+    uint32_t pc;
+    uint32_t first_value;  /* first write value; zero for reads */
+    uint64_t count;
+    uint8_t core;
+    bool write;
+} periph_unhandled_site_t;
+void periph_unhandled_audit_enable(esp32_periph_t *p);
+size_t periph_unhandled_audit_count(const esp32_periph_t *p);
+uint64_t periph_unhandled_audit_omitted(const esp32_periph_t *p);
+bool periph_unhandled_audit_get(const esp32_periph_t *p, size_t index,
+                                periph_unhandled_site_t *out);
+
 /* Attach/detach a 7-bit target address on either APB I2C master or the
  * RTC-domain I2C master. Passing NULL as fn detaches the address. */
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,

@@ -42,6 +42,7 @@ typedef struct {
     int         spill_verify;       /* Enable spill/fill verification */
     int         native_freertos;    /* -N: let firmware run real FreeRTOS */
     int         disable_jit;        /* 1 = interpreter only; default is native JIT */
+    int         unhandled_audit;    /* Collect unsupported MMIO sites */
     flexe_target_id_t target;       /* AUTO (zero) = detect from image header */
 
     /* UART output callback (NULL = no UART output) */

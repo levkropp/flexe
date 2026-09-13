@@ -10,6 +10,10 @@
 typedef struct xtensa_mem xtensa_mem_t;
 typedef struct xtensa_cpu xtensa_cpu_t;
 
+/* Enable per-instruction PC/core publication for opt-in peripheral audits.
+ * This is deliberately disabled in normal runs to avoid a hot-path store. */
+void xtensa_enable_diagnostic_pc(void);
+
 /* Classic ESP32 instruction-space geometry. The external cache has three
  * instruction buses after internal IRAM: IRAM0, IRAM1, and IROM0. */
 #define ESP32_INSN_ADDR_LOW          0x40000000u

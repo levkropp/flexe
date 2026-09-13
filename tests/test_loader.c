@@ -101,6 +101,7 @@ TEST(session_software_reset_preserves_guest_flash) {
         .bin_path = path,
         .single_core = 1,
         .disable_jit = 1,
+        .unhandled_audit = 1,
     };
     flexe_session_t *session = flexe_session_create(&cfg);
     ASSERT_TRUE(session != NULL);
@@ -110,6 +111,9 @@ TEST(session_software_reset_preserves_guest_flash) {
     mem->flash_data[0x20000u] = 0x6Cu;
     mem->flash_insn[0x20000u] = 0x6Cu;
     mem_write32(mem, 0x3FFB0000u, 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF22000u), 0u);
+    ASSERT_EQ(periph_unhandled_audit_count(
+                  flexe_session_periph(session)), 1u);
 
     flexe_session_reset(session);
     ASSERT_EQ(flexe_session_reset_count(session), 1u);
@@ -117,6 +121,11 @@ TEST(session_software_reset_preserves_guest_flash) {
     ASSERT_EQ(mem->flash_data[0x20000u], 0x6Cu);
     ASSERT_EQ(mem->flash_insn[0x20000u], 0x6Cu);
     ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0x12345678u);
+    ASSERT_EQ(periph_unhandled_audit_count(
+                  flexe_session_periph(session)), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FF22000u), 0u);
+    ASSERT_EQ(periph_unhandled_audit_count(
+                  flexe_session_periph(session)), 1u);
     flexe_session_destroy(session);
 }
 
