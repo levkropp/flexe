@@ -12,7 +12,15 @@ static void fail(uint32_t stage, uint32_t detail) {
 
 void setup() {
   flexe_i2c_stage = 1;
-  if (!Wire.begin(21, 22, 400000)) {
+#if CONFIG_IDF_TARGET_ESP32S3
+  // GPIO22 is not bonded out on S3; use ordinary, bidirectional GPIOs.
+  constexpr int kSda = 8;
+  constexpr int kScl = 9;
+#else
+  constexpr int kSda = 21;
+  constexpr int kScl = 22;
+#endif
+  if (!Wire.begin(kSda, kScl, 400000)) {
     fail(1, 0);
     return;
   }

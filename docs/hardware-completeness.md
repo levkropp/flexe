@@ -50,7 +50,7 @@ even when a firmware workflow succeeds.
 | S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate | Additional partition and filesystem variants need end-to-end gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate | RTC wake routing, full pad hold/pulls/drive, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c` | More guest driver/device combinations and DMA modes need gates. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; `scripts/check-s3-i2c-wire.sh` runs stock Arduino Wire against a virtual slave | I2C slave mode, more guest driver/device combinations, and GP-SPI DMA firmware gates remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core and restart gates | Calibrated timing, all wake modes, and all reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
@@ -147,6 +147,28 @@ S3_IDF_NVS_BIN=/path/to/s3_idf_nvs.bin \
 S3_IDF_NVS_ELF=/path/to/s3_idf_nvs.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-idf-nvs.sh
+```
+
+The shared Arduino Wire fixture also runs unmodified on S3 with valid S3
+GPIOs. Its 40-byte write exceeds the 32-byte controller FIFO, then a
+repeated-START read returns the same bytes through the driver's interrupt
+path; an unattached address returns a NACK. The virtual slave callback is a
+host-side I2C device, not a substitute for guest Wire or the MMIO controller.
+The stock Arduino-ESP32 3.3.11 image/ELF hashes are
+`91440bdbb4f0a057bf95fab104bc27602555f254d904d7a97b3c032fcb3cb49e` /
+`271630096105d3afef3946cf0d91f5413f50ac8ce99be39b05cd39e235f45121`.
+Two replay runs match byte-for-byte, with no unsupported I2C MMIO sites;
+175 unrelated startup accesses remain unsupported. This gate does not test
+S3 slave mode, electrical timing, bus contention, or other devices:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+  --build-path /tmp/flexe-s3-i2c-wire-build \
+  --build-property compiler.optimization_flags=-Os tests/fixtures/i2c_wire
+S3_I2C_BIN=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.merged.bin \
+S3_I2C_ELF=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+RUNNER=./build/flexe-i2c-wire-test ./scripts/check-s3-i2c-wire.sh
 ```
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,

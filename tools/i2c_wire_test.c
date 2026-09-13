@@ -5,6 +5,7 @@
 #include "flexe_session.h"
 #include "memory.h"
 #include "peripherals.h"
+#include "target.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,7 +13,8 @@
 #include <string.h>
 
 #define SUCCESS_MARKER 0x1C2C0040u
-#define MAX_CYCLES     30000000ull
+#define MAX_CYCLES_CLASSIC 30000000ull
+#define MAX_CYCLES_S3      3000000000ull
 
 volatile int emu_app_running = 1;
 
@@ -45,13 +47,20 @@ static int register_device(void *opaque, int port, uint8_t address,
 
 int main(int argc, char **argv) {
     bool disable_jit = false;
+    bool s3 = false;
     int arg = 1;
-    if (argc > 1 && strcmp(argv[1], "--no-jit") == 0) {
-        disable_jit = true;
+    while (arg < argc) {
+        if (strcmp(argv[arg], "--no-jit") == 0)
+            disable_jit = true;
+        else if (strcmp(argv[arg], "--s3") == 0)
+            s3 = true;
+        else
+            break;
         arg++;
     }
-    if (argc - arg != 2) {
-        fprintf(stderr, "usage: %s [--no-jit] FIRMWARE.bin FIRMWARE.elf\n",
+    if (argc - arg != (s3 ? 3 : 2)) {
+        fprintf(stderr, "usage: %s [--no-jit] [--s3] FIRMWARE.bin "
+                "FIRMWARE.elf [ROM.elf]\n",
                 argv[0]);
         return 2;
     }
@@ -70,7 +79,11 @@ int main(int argc, char **argv) {
     flexe_session_config_t config = {
         .bin_path = argv[arg],
         .elf_path = argv[arg + 1],
+        .rom_elf_path = s3 ? argv[arg + 2] : NULL,
         .disable_jit = disable_jit,
+        .native_freertos = s3,
+        .target = s3 ? FLEXE_TARGET_ESP32S3 : FLEXE_TARGET_AUTO,
+        .unhandled_audit = s3,
     };
     flexe_session_t *session = flexe_session_create(&config);
     if (!session) {
@@ -91,7 +104,7 @@ int main(int argc, char **argv) {
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
     xtensa_mem_t *mem = flexe_session_mem(session);
     uint32_t stage = 0;
-    while (cpu->cycle_count < MAX_CYCLES) {
+    while (cpu->cycle_count < (s3 ? MAX_CYCLES_S3 : MAX_CYCLES_CLASSIC)) {
         stage = mem_read32(mem, stage_addr);
         if (stage == SUCCESS_MARKER ||
             (stage & 0xFFF00000u) == 0xBAD00000u)
@@ -114,19 +127,42 @@ int main(int argc, char **argv) {
             memory_ok = 0;
     }
     int unhandled = periph_unhandled_count(periph);
+    unsigned i2c_unhandled_sites = 0;
+    if (s3) {
+        const flexe_target_desc_t *target = flexe_target_by_id(config.target);
+        for (size_t i = 0; i < periph_unhandled_audit_count(periph); ++i) {
+            periph_unhandled_site_t site;
+            if (!periph_unhandled_audit_get(periph, i, &site))
+                continue;
+            for (unsigned port = 0; port < target->i2c.instance_count; ++port) {
+                uint32_t base = target->i2c.instance[port].base;
+                if (site.address >= base &&
+                    site.address - base < target->i2c.register_size) {
+                    i2c_unhandled_sites++;
+                    fprintf(stderr, "[s3-i2c] unsupported port=%u %c "
+                            "0x%08X pc=0x%08X count=%llu\n",
+                            port, site.write ? 'W' : 'R', site.address,
+                            site.pc, (unsigned long long)site.count);
+                    break;
+                }
+            }
+        }
+    }
     printf("engine=%s stage=0x%08X result=%u/%u/%u/0x%08X calls=%u "
            "write_bytes=%zu read_bytes=%zu memory_ok=%d unhandled=%d "
+           "i2c_unhandled_sites=%u "
            "cycles=%llu\n",
            disable_jit ? "interp" : "jit", stage,
            results[0], results[1], results[2], results[3],
            device.calls, device.write_bytes, device.read_bytes, memory_ok,
-           unhandled, (unsigned long long)cpu->cycle_count);
+           unhandled, i2c_unhandled_sites,
+           (unsigned long long)cpu->cycle_count);
 
     int ok = stage == SUCCESS_MARKER && results[0] == 0 &&
              results[1] == 0 && results[2] == 40 &&
              results[3] == expected_checksum && memory_ok &&
              device.write_bytes >= 42 && device.read_bytes == 40 &&
-             unhandled == 0;
+             (s3 ? i2c_unhandled_sites == 0 : unhandled == 0);
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);
     return ok ? 0 : 1;
