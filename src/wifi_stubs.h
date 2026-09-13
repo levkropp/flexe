@@ -12,6 +12,12 @@ typedef void (*wifi_raw_tx_cb)(void *ctx, uint32_t iface,
                                const uint8_t *frame, size_t len,
                                bool en_sys_seq);
 
+/* ESP-IDF's Wi-Fi netif passes Ethernet frames at its driver boundary. The
+ * callback must consume/copy the frame before returning; zero means the host
+ * network backend accepted it. This is distinct from raw 802.11 injection. */
+typedef int (*wifi_ethernet_tx_cb)(void *ctx, uint32_t iface,
+                                    const uint8_t *frame, size_t len);
+
 typedef struct {
     uint64_t socket_calls;
     uint64_t socket_successes;
@@ -50,6 +56,11 @@ typedef struct {
     uint64_t raw_tx_failures;
     uint64_t raw_rx_frames;
     uint64_t raw_rx_callback_failures;
+    uint64_t ethernet_tx_frames;
+    uint64_t ethernet_tx_bytes;
+    uint64_t ethernet_rx_frames;
+    uint64_t ethernet_rx_callback_failures;
+    uint64_t ethernet_rx_dropped;
 } wifi_stubs_stats_t;
 
 wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu);
@@ -66,6 +77,19 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms);
 int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
                                    const elf_symbols_t *syms,
                                    int socket_fd_base);
+
+/* Observe the guest's native Wi-Fi netif registration and virtualize its
+ * Ethernet frame boundary only when a host backend is attached. Without one,
+ * the guest's original transmit/free functions execute unchanged. */
+int wifi_stubs_hook_ethernet_symbols(wifi_stubs_t *ws,
+                                     const elf_symbols_t *syms);
+void wifi_stubs_set_ethernet_tx_callback(wifi_stubs_t *ws,
+                                         wifi_ethernet_tx_cb cb, void *ctx);
+/* Queue one host Ethernet frame for the guest's registered STA (0) or AP (1)
+ * receive callback. Returns 0 on queueing, a negative value if unavailable,
+ * invalid, or full. Delivery runs at a safe inter-batch boundary. */
+int wifi_stubs_queue_ethernet_frame(wifi_stubs_t *ws, uint32_t iface,
+                                    const uint8_t *frame, size_t len);
 
 /* Discover stripped library boundaries where possible, then add any remaining
  * compatibility hooks for an exactly verified legacy firmware profile. */
@@ -122,6 +146,8 @@ typedef struct {
     char     sta_ssid[33];
     char     sta_password[65];
     uint32_t dns_override;
+    wifi_ethernet_tx_cb ethernet_tx_cb;
+    void    *ethernet_tx_ctx;
 } wifi_host_config_t;
 
 void wifi_stubs_snapshot_host_config(const wifi_stubs_t *ws,

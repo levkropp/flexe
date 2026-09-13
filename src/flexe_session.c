@@ -415,6 +415,7 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
              * silicon register; other builds need offset discovery before
              * they can claim this host service. */
             wifi_stubs_hook_socket_symbols(s->wstubs, s->syms, 48);
+            wifi_stubs_hook_ethernet_symbols(s->wstubs, s->syms);
         }
     }
 

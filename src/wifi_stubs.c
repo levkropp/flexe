@@ -148,6 +148,10 @@ typedef struct {
 /* Event handler table */
 #define MAX_EVENT_HANDLERS 16
 #define WIFI_RAW_FRAME_MAX 4095u
+#define WIFI_ETHERNET_FRAME_MAX 1600u
+#define WIFI_ETHERNET_RX_SLOTS 8u
+#define WIFI_ETHERNET_RX_BASE 0x7FFE0000u
+#define WIFI_ETHERNET_RX_PAGE_SIZE 4096u
 #define ESP_APP_DESC_ADDR  0x3F400020u
 #define ESP_APP_DESC_MAGIC 0xABCD5432u
 #define ESP_APP_DESC_IDF_VERSION_OFFSET 112u
@@ -179,6 +183,17 @@ typedef struct {
     int32_t         event_id;
     evt_data_kind_t data_kind;
 } pending_event_t;
+
+typedef struct {
+    uint32_t iface;
+    uint16_t len;
+    uint8_t bytes[WIFI_ETHERNET_FRAME_MAX];
+} ethernet_pending_frame_t;
+
+typedef struct {
+    uint8_t *page;
+    bool busy;
+} ethernet_rx_slot_t;
 
 /* Synthetic AP for scan results */
 typedef struct {
@@ -227,6 +242,12 @@ struct wifi_stubs {
     wifi_stubs_stats_t  stats;
     wifi_raw_tx_cb      raw_tx_cb;
     void               *raw_tx_ctx;
+    wifi_ethernet_tx_cb ethernet_tx_cb;
+    void               *ethernet_tx_ctx;
+    uint32_t            ethernet_rx_cb[2];
+    ethernet_pending_frame_t ethernet_pending[WIFI_ETHERNET_RX_SLOTS];
+    unsigned            ethernet_pending_count;
+    ethernet_rx_slot_t  ethernet_rx_slot[WIFI_ETHERNET_RX_SLOTS];
 
     /* WiFi subsystem state */
     uint32_t           wifi_mode;       /* WIFI_MODE_NULL/STA/AP/APSTA */
@@ -316,6 +337,69 @@ static void wifi_log(wifi_stubs_t *ws, const char *fmt, ...) {
         fprintf(stderr, "[wifi] ");
     vfprintf(stderr, fmt, ap);
     va_end(ap);
+}
+
+/* The ESP-IDF Wi-Fi netif boundary carries Ethernet frames, not raw 802.11
+ * packets. Keep its host service separate from promiscuous/radio callbacks. */
+static void spy_wifi_ethernet_rx_register(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t iface = ws_arg(cpu, 0);
+    uint32_t callback = ws_arg(cpu, 1);
+    if (iface >= 2u || (callback && !mem_get_ptr(cpu->mem, callback)))
+        return;
+    ws->ethernet_rx_cb[iface] = callback;
+    wifi_log(ws, "netif RX callback iface=%u fn=0x%08X\n",
+             iface, callback);
+}
+
+static int stub_wifi_ethernet_tx(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    if (!ws->ethernet_tx_cb) return 0; /* run the guest driver unchanged */
+    uint32_t iface = ws_arg(cpu, 0);
+    uint32_t buffer = ws_arg(cpu, 1);
+    uint32_t len = ws_arg(cpu, 2);
+    if (iface >= 2u || len < 14u || len > WIFI_ETHERNET_FRAME_MAX) {
+        ws_return(cpu, ESP_ERR_INVALID_ARG_VALUE);
+        return 1;
+    }
+    uint8_t frame[WIFI_ETHERNET_FRAME_MAX];
+    for (uint32_t i = 0u; i < len; i++) {
+        const uint8_t *byte = mem_get_ptr(cpu->mem, buffer + i);
+        if (!byte) {
+            ws_return(cpu, ESP_ERR_INVALID_ARG_VALUE);
+            return 1;
+        }
+        frame[i] = *byte;
+    }
+    if (ws->ethernet_tx_cb(ws->ethernet_tx_ctx, iface, frame, len) != 0) {
+        ws_return(cpu, 0x101u); /* ESP_ERR_NO_MEM: host queue rejected it */
+        return 1;
+    }
+    ws->stats.ethernet_tx_frames++;
+    ws->stats.ethernet_tx_bytes += len;
+    ws_return(cpu, 0u);
+    return 1;
+}
+
+static int stub_wifi_ethernet_rx_free(xtensa_cpu_t *cpu, void *ctx)
+{
+    wifi_stubs_t *ws = ctx;
+    uint32_t buffer = ws_arg(cpu, 0);
+    if (buffer < WIFI_ETHERNET_RX_BASE ||
+        buffer - WIFI_ETHERNET_RX_BASE >=
+            WIFI_ETHERNET_RX_SLOTS * WIFI_ETHERNET_RX_PAGE_SIZE ||
+        ((buffer - WIFI_ETHERNET_RX_BASE) &
+         (WIFI_ETHERNET_RX_PAGE_SIZE - 1u)) != 0u)
+        return 0; /* let the guest driver free its own buffers */
+    unsigned slot = (buffer - WIFI_ETHERNET_RX_BASE) /
+                    WIFI_ETHERNET_RX_PAGE_SIZE;
+    if (!ws->ethernet_rx_slot[slot].busy)
+        ws->stats.ethernet_rx_callback_failures++;
+    ws->ethernet_rx_slot[slot].busy = false;
+    ws_return(cpu, 0u);
+    return 1;
 }
 
 /* ===== Socket slot management ===== */
@@ -2000,9 +2084,70 @@ static void wifi_pop_pending_event(wifi_stubs_t *ws) {
     ws->pending_event_count--;
 }
 
+static void wifi_pop_pending_ethernet(wifi_stubs_t *ws)
+{
+    for (unsigned i = 1u; i < ws->ethernet_pending_count; i++)
+        ws->ethernet_pending[i - 1u] = ws->ethernet_pending[i];
+    ws->ethernet_pending_count--;
+}
+
+static bool wifi_tick_ethernet_rx(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
+                                  xtensa_cpu_t *peer)
+{
+    if (ws->ethernet_pending_count == 0u) return false;
+    ethernet_pending_frame_t *frame = &ws->ethernet_pending[0];
+    uint32_t callback = ws->ethernet_rx_cb[frame->iface];
+    if (!callback || !guest_call_injection_is_quiescent(cpu, peer))
+        return false;
+
+    unsigned slot = 0u;
+    while (slot < WIFI_ETHERNET_RX_SLOTS &&
+           ws->ethernet_rx_slot[slot].busy)
+        slot++;
+    if (slot == WIFI_ETHERNET_RX_SLOTS) return false;
+
+    ethernet_rx_slot_t *rx = &ws->ethernet_rx_slot[slot];
+    uint32_t address = WIFI_ETHERNET_RX_BASE +
+                       slot * WIFI_ETHERNET_RX_PAGE_SIZE;
+    uint32_t page_index = address >> 12;
+    if (!rx->page) {
+        if (cpu->mem->page_table[page_index]) {
+            wifi_log(ws, "netif RX scratch page 0x%08X is occupied\n",
+                     address);
+            ws->stats.ethernet_rx_dropped++;
+            wifi_pop_pending_ethernet(ws);
+            return true;
+        }
+        rx->page = calloc(1u, WIFI_ETHERNET_RX_PAGE_SIZE);
+        if (!rx->page) {
+            ws->stats.ethernet_rx_dropped++;
+            wifi_pop_pending_ethernet(ws);
+            return true;
+        }
+        cpu->mem->page_table[page_index] = rx->page;
+    }
+
+    memcpy(rx->page, frame->bytes, frame->len);
+    rx->busy = true;
+    uint32_t args[3] = {address, frame->len, address};
+    uint32_t result = UINT32_MAX;
+    int call = guest_call8(cpu, callback, args, 3, 1000000u, &result);
+    if (call != 0 || result != 0u) {
+        rx->busy = false;
+        ws->stats.ethernet_rx_callback_failures++;
+        wifi_log(ws, "netif RX callback failed: call=%d result=0x%X\n",
+                 call, result);
+    } else {
+        ws->stats.ethernet_rx_frames++;
+    }
+    wifi_pop_pending_ethernet(ws);
+    return true;
+}
+
 void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
                      xtensa_cpu_t *peer) {
     if (!ws || !cpu) return;
+    if (wifi_tick_ethernet_rx(ws, cpu, peer)) return;
 
     if (ws->native_event_post_addr != 0u) {
         if (ws->pending_event_count == 0) return;
@@ -2695,6 +2840,15 @@ void wifi_stubs_destroy(wifi_stubs_t *ws)
         if (ws->sockets[i].host_fd >= 0)
             close(ws->sockets[i].host_fd);
     }
+    if (ws->cpu && ws->cpu->mem) {
+        for (unsigned i = 0u; i < WIFI_ETHERNET_RX_SLOTS; i++) {
+            uint32_t page = (WIFI_ETHERNET_RX_BASE >> 12) + i;
+            if (ws->cpu->mem->page_table[page] ==
+                ws->ethernet_rx_slot[i].page)
+                ws->cpu->mem->page_table[page] = NULL;
+            free(ws->ethernet_rx_slot[i].page);
+        }
+    }
     free(ws);
 }
 
@@ -2758,6 +2912,42 @@ int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
         { NULL, NULL }
     };
     return wifi_hook_symbols(ws, syms, hooks);
+}
+
+int wifi_stubs_hook_ethernet_symbols(wifi_stubs_t *ws,
+                                     const elf_symbols_t *syms)
+{
+    if (!ws || !syms || !ws->cpu || !ws->cpu->mem ||
+        mem_target(ws->cpu->mem)->id != FLEXE_TARGET_ESP32S3)
+        return 0;
+    ws->rom = ws->cpu->pc_hook_ctx;
+    if (!ws->rom) return 0;
+
+    uint32_t reg = 0u, tx = 0u, tx_ref = 0u, free_rx = 0u;
+    if (elf_symbols_find(syms, "esp_wifi_internal_reg_rxcb", &reg) != 0 ||
+        elf_symbols_find(syms, "esp_wifi_internal_tx", &tx) != 0 ||
+        elf_symbols_find(syms, "esp_wifi_internal_free_rx_buffer",
+                         &free_rx) != 0)
+        return 0; /* no incomplete packet service from a partial symbol set */
+    (void)elf_symbols_find(syms, "esp_wifi_internal_tx_by_ref", &tx_ref);
+
+    if (rom_stubs_register_spy(ws->rom, reg,
+                               spy_wifi_ethernet_rx_register,
+                               "esp_wifi_internal_reg_rxcb", ws) != 0 ||
+        rom_stubs_register_conditional_ctx(ws->rom, tx,
+                                           stub_wifi_ethernet_tx,
+                                           "esp_wifi_internal_tx", ws) != 0 ||
+        rom_stubs_register_conditional_ctx(ws->rom, free_rx,
+                                           stub_wifi_ethernet_rx_free,
+                                           "esp_wifi_internal_free_rx_buffer",
+                                           ws) != 0)
+        return -1;
+    int hooked = 3;
+    if (tx_ref && rom_stubs_register_conditional_ctx(
+            ws->rom, tx_ref, stub_wifi_ethernet_tx,
+            "esp_wifi_internal_tx_by_ref", ws) == 0)
+        hooked++;
+    return hooked;
 }
 
 int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
@@ -3587,6 +3777,8 @@ void wifi_stubs_snapshot_host_config(const wifi_stubs_t *ws,
     snprintf(out->sta_password, sizeof(out->sta_password), "%s",
              ws->sta_password);
     out->dns_override = ws->dns_override;
+    out->ethernet_tx_cb = ws->ethernet_tx_cb;
+    out->ethernet_tx_ctx = ws->ethernet_tx_ctx;
 }
 
 void wifi_stubs_apply_host_config(wifi_stubs_t *ws,
@@ -3594,6 +3786,8 @@ void wifi_stubs_apply_host_config(wifi_stubs_t *ws,
     if (!ws || !cfg) return;
     wifi_stubs_set_sta_credentials(ws, cfg->sta_ssid, cfg->sta_password);
     ws->dns_override = cfg->dns_override;
+    wifi_stubs_set_ethernet_tx_callback(ws, cfg->ethernet_tx_cb,
+                                        cfg->ethernet_tx_ctx);
 }
 
 void wifi_stubs_set_dns_override(wifi_stubs_t *ws, uint32_t addr_net_order) {
@@ -3633,6 +3827,32 @@ void wifi_stubs_set_raw_tx_callback(wifi_stubs_t *ws, wifi_raw_tx_cb cb,
     if (!ws) return;
     ws->raw_tx_cb = cb;
     ws->raw_tx_ctx = ctx;
+}
+
+void wifi_stubs_set_ethernet_tx_callback(wifi_stubs_t *ws,
+                                         wifi_ethernet_tx_cb cb, void *ctx)
+{
+    if (!ws) return;
+    ws->ethernet_tx_cb = cb;
+    ws->ethernet_tx_ctx = ctx;
+}
+
+int wifi_stubs_queue_ethernet_frame(wifi_stubs_t *ws, uint32_t iface,
+                                    const uint8_t *frame, size_t len)
+{
+    if (!ws || !frame || iface >= 2u || len < 14u ||
+        len > WIFI_ETHERNET_FRAME_MAX)
+        return -1;
+    if (ws->ethernet_pending_count >= WIFI_ETHERNET_RX_SLOTS) {
+        ws->stats.ethernet_rx_dropped++;
+        return -2;
+    }
+    ethernet_pending_frame_t *pending =
+        &ws->ethernet_pending[ws->ethernet_pending_count++];
+    pending->iface = iface;
+    pending->len = (uint16_t)len;
+    memcpy(pending->bytes, frame, len);
+    return 0;
 }
 
 int wifi_stubs_inject_promiscuous_frame(wifi_stubs_t *ws,

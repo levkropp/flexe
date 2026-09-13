@@ -38,7 +38,7 @@ The milestone is complete only when:
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
 | S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
-| S3 network service (partial) | NerdMiner's BSD-socket web portal completes a host-backed request/response session; a WLED source build reaches raw lwIP TCP listen but has no host HTTP listener | Add general raw-lwIP TCP or virtual-network support, then exercise WLED's HTTP UI; RF/PHY remains unsupported. |
+| S3 network service (partial) | NerdMiner's BSD-socket web portal completes a host-backed request/response session; WLED reaches raw lwIP TCP listen; a symbol-resolved Ethernet netif boundary now exposes guest TX and registered RX without replacing its TCP stack | Attach a host virtual-network backend and exercise WLED's HTTP UI; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
 | S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
@@ -90,6 +90,16 @@ BSD-socket bridge does not expose. A general raw-TCP or virtual-network path
 and an HTTP request/response gate are still needed. This source-built image
 is not byte-identical to the pinned release image; its ELF must not be used
 to symbolize that release binary.
+
+The native S3 `esp_wifi_internal_tx`/`tx_by_ref` and
+`esp_wifi_internal_reg_rxcb` symbols now form an optional Ethernet-frame
+service boundary. A host backend can accept guest frames and queue frames
+through the netif's registered RX callback; the RX buffer remains mapped
+until the guest calls `esp_wifi_internal_free_rx_buffer`. Without an attached
+backend, guest transmit and free functions execute unchanged. A synthetic
+S3 ELF unit gate checks callback registration, transmit fallback, frame
+delivery, buffer reuse, and statistics. This is transport plumbing, not a
+working WLED HTTP server yet.
 
 The S3 Bluetooth register window now includes a captured baseband clock:
 requesting a latch publishes a half-slot count and a down-counting subslot

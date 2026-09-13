@@ -286,6 +286,15 @@ typedef struct {
 
 typedef struct {
     uint64_t calls;
+    uint32_t iface;
+    uint32_t buffer;
+    uint32_t eb;
+    uint8_t frame[32];
+    size_t len;
+} test_ethernet_capture_t;
+
+typedef struct {
+    uint64_t calls;
     uint32_t base;
     int32_t event_id;
     uint32_t data;
@@ -328,10 +337,41 @@ static void capture_raw_tx(void *ctx, uint32_t iface, const uint8_t *frame,
     memcpy(capture->frame, frame, copy_len);
 }
 
+static int capture_ethernet_tx(void *ctx, uint32_t iface,
+                               const uint8_t *frame, size_t len)
+{
+    test_ethernet_capture_t *capture = ctx;
+    capture->calls++;
+    capture->iface = iface;
+    capture->len = len;
+    size_t copy = len < sizeof(capture->frame) ? len :
+                  sizeof(capture->frame);
+    memcpy(capture->frame, frame, copy);
+    return 0;
+}
+
+static void capture_ethernet_rx(xtensa_cpu_t *cpu, void *ctx)
+{
+    test_ethernet_capture_t *capture = ctx;
+    capture->calls++;
+    capture->buffer = ar_read(cpu, 10);
+    capture->len = ar_read(cpu, 11);
+    capture->eb = ar_read(cpu, 12);
+    size_t copy = capture->len < sizeof(capture->frame) ? capture->len :
+                  sizeof(capture->frame);
+    for (size_t i = 0u; i < copy; i++)
+        capture->frame[i] = mem_read8(cpu->mem,
+                                      capture->buffer + (uint32_t)i);
+    ar_write(cpu, 10, 0u);
+    cpu->pc = 0x40000000u | (ar_read(cpu, 8) & 0x3FFFFFFFu);
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+}
+
 static void invoke_wifi_call0(xtensa_cpu_t *cpu, uint32_t addr,
                               uint32_t arg0)
 {
     cpu->pc = addr;
+    cpu->_pc_written = true;
     XT_PS_SET_CALLINC(cpu->ps, 0);
     ar_write(cpu, 0, BASE + 0x100u);
     ar_write(cpu, 2, arg0);
@@ -343,6 +383,7 @@ static void invoke_wifi_call0_4(xtensa_cpu_t *cpu, uint32_t addr,
                                 uint32_t arg2, uint32_t arg3)
 {
     cpu->pc = addr;
+    cpu->_pc_written = true;
     XT_PS_SET_CALLINC(cpu->ps, 0);
     ar_write(cpu, 0, BASE + 0x100u);
     ar_write(cpu, 2, arg0);
@@ -358,6 +399,7 @@ static void invoke_wifi_call0_6(xtensa_cpu_t *cpu, uint32_t addr,
                                 uint32_t arg4, uint32_t arg5)
 {
     cpu->pc = addr;
+    cpu->_pc_written = true;
     XT_PS_SET_CALLINC(cpu->ps, 0);
     ar_write(cpu, 0, BASE + 0x100u);
     ar_write(cpu, 2, arg0);
@@ -397,16 +439,20 @@ static elf_symbols_t *wifi_test_s3_symbols(void)
     static const char *names[] = {
         "lwip_socket", "lwip_select", "lwip_send", "lwip_close",
         "esp_wifi_init",
+        "esp_wifi_internal_reg_rxcb", "esp_wifi_internal_tx",
+        "esp_wifi_internal_tx_by_ref",
+        "esp_wifi_internal_free_rx_buffer",
     };
     static const uint32_t addrs[] = {
         0x40374100u, 0x40374140u, 0x40374180u, 0x403741C0u,
         0x40374200u,
+        0x40374240u, 0x40374280u, 0x403742C0u, 0x40374300u,
     };
     static const char section_names[] = "\0.symtab\0.strtab\0.shstrtab\0";
-    char strings[128] = {0};
-    wifi_test_elf_symbol_t symbols[6] = {{0}};
+    char strings[256] = {0};
+    wifi_test_elf_symbol_t symbols[10] = {{0}};
     size_t strings_len = 1u;
-    for (size_t i = 0; i < 5u; i++) {
+    for (size_t i = 0; i < 9u; i++) {
         size_t len = strlen(names[i]) + 1u;
         if (strings_len + len > sizeof(strings)) return NULL;
         symbols[i + 1u].name = (uint32_t)strings_len;
@@ -526,6 +572,92 @@ done:
     rom_stubs_destroy(rom);
     mem_destroy(mem);
 #endif
+}
+
+TEST(s3_ethernet_netif_boundary_preserves_guest_fallback_and_buffer_lifetime)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+    xtensa_cpu_t cpu;
+    xtensa_cpu_reset_for_target(&cpu, s3);
+    cpu.mem = mem;
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    elf_symbols_t *syms = wifi_test_s3_symbols();
+    ASSERT_TRUE(rom != NULL);
+    ASSERT_TRUE(wifi != NULL);
+    ASSERT_TRUE(syms != NULL);
+    if (!rom || !wifi || !syms) goto done;
+
+    const uint32_t reg = 0x40374240u;
+    const uint32_t tx = 0x40374280u;
+    const uint32_t free_rx = 0x40374300u;
+    const uint32_t callback = 0x40374340u;
+    const uint32_t frame_addr = 0x3FCA2000u;
+    const uint32_t rx_addr = 0x7FFE0000u;
+    uint8_t frame[14] = {
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x08, 0x06,
+    };
+    for (size_t i = 0u; i < sizeof(frame); i++)
+        mem_write8(mem, frame_addr + (uint32_t)i, frame[i]);
+    put_insn3(&cpu, reg, 0x0020F0u); /* NOP: spy observes native call */
+    put_insn3(&cpu, tx, 0x0020F0u);  /* native fallback without backend */
+    put_insn3(&cpu, callback, 0x0020F0u);
+    ASSERT_EQ(wifi_stubs_hook_ethernet_symbols(wifi, syms), 4u);
+
+    invoke_wifi_call0_4(&cpu, tx, 1u, frame_addr, sizeof(frame), 0u);
+    ASSERT_EQ(cpu.pc, tx + 3u);
+    test_ethernet_capture_t sent = {0}, received = {0};
+    wifi_stubs_set_ethernet_tx_callback(wifi, capture_ethernet_tx, &sent);
+    invoke_wifi_call0_4(&cpu, tx, 1u, frame_addr, sizeof(frame), 0u);
+    ASSERT_EQ64(sent.calls, 1u);
+    ASSERT_EQ(sent.iface, 1u);
+    ASSERT_EQ(sent.len, sizeof(frame));
+    ASSERT_EQ(memcmp(sent.frame, frame, sizeof(frame)), 0);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u); /* ESP_OK, not a fake native send */
+
+    ASSERT_EQ(rom_stubs_register_ctx(rom, callback, capture_ethernet_rx,
+                                      "test_ethernet_rx", &received), 0);
+    invoke_wifi_call0_4(&cpu, reg, 1u, callback, 0u, 0u);
+    ASSERT_EQ(cpu.pc, reg + 3u); /* original registration still executes */
+    ASSERT_EQ(wifi_stubs_queue_ethernet_frame(
+                  wifi, 1u, frame, sizeof(frame)), 0);
+    cpu.running = true;
+    cpu.halted = true;
+    cpu.ps = 1u << 18; /* WOE, INTLEVEL=0, not exception mode */
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ64(received.calls, 1u);
+    ASSERT_EQ(received.buffer, rx_addr);
+    ASSERT_EQ(received.eb, rx_addr);
+    ASSERT_EQ(received.len, sizeof(frame));
+    ASSERT_EQ(memcmp(received.frame, frame, sizeof(frame)), 0);
+    ASSERT_TRUE(mem_get_ptr(mem, rx_addr) != NULL);
+
+    invoke_wifi_call0(&cpu, free_rx, rx_addr);
+    ASSERT_EQ(wifi_stubs_queue_ethernet_frame(
+                  wifi, 1u, frame, sizeof(frame)), 0);
+    cpu.halted = true;
+    cpu.ps = 1u << 18;
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ64(received.calls, 2u); /* free made the page reusable */
+    invoke_wifi_call0(&cpu, free_rx, rx_addr);
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.ethernet_tx_frames, 1u);
+    ASSERT_EQ64(stats.ethernet_rx_frames, 2u);
+    ASSERT_EQ64(stats.ethernet_rx_callback_failures, 0u);
+
+done:
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    ASSERT_TRUE(mem_get_ptr(mem, 0x7FFE0000u) == NULL);
+    rom_stubs_destroy(rom);
+    mem_destroy(mem);
 }
 
 TEST(promiscuous_frame_requires_enabled_callback) {
@@ -1178,6 +1310,7 @@ TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time) {
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks);
+    RUN_TEST(s3_ethernet_netif_boundary_preserves_guest_fallback_and_buffer_lifetime);
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);
     RUN_TEST(raw_tx_crosses_host_radio_boundary);
