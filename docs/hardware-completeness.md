@@ -38,6 +38,7 @@ The milestone is complete only when:
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
 | S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
+| S3 network service (partial) | NerdMiner's BSD-socket web portal completes a host-backed request/response session; a WLED source build reaches raw lwIP TCP listen but has no host HTTP listener | Add general raw-lwIP TCP or virtual-network support, then exercise WLED's HTTP UI; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
 | S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
@@ -78,6 +79,17 @@ S3_WLED_BIN=/path/to/WLED_16.0.1_ESP32-S3_4M_qspi.bin \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-wled-rmt.sh
 ```
+
+A separate build of WLED v16.0.1 from its tagged source (`29b389d`, image
+SHA-256 `8e165290df301b0bcea5763637db1f0ec9d4ad5b1d07b8588a1baa5ebd50bad5`)
+with its matching ELF reaches `AsyncServer::begin()` and then
+`tcp_listen_with_backlog()` at about 1.16 billion guest cycles. Its UDP
+sockets reach the host bridge, but no host HTTP listener appears. WLED's
+AsyncTCP web server uses lwIP's raw TCP PCB API, which the current S3
+BSD-socket bridge does not expose. A general raw-TCP or virtual-network path
+and an HTTP request/response gate are still needed. This source-built image
+is not byte-identical to the pinned release image; its ELF must not be used
+to symbolize that release binary.
 
 The S3 Bluetooth register window now includes a captured baseband clock:
 requesting a latch publishes a half-slot count and a down-counting subslot
