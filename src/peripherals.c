@@ -21,6 +21,7 @@
 #include "spi_display.h"
 #include "sandbox_events.h"
 #include "xtensa.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -13614,21 +13615,31 @@ static void i2s_write(void *ctx, uint32_t addr, uint32_t val) {
 
 #define PERIPH_UNHANDLED_AUDIT_MAX 4096u
 
-static void unhandled_audit_record(esp32_periph_t *p, uint32_t addr,
-                                   bool write, uint32_t value)
+static uint64_t audit_add_saturating(uint64_t a, uint64_t b)
 {
-    if (!p->unhandled_audit_enabled) return;
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+static void unhandled_audit_merge_site(esp32_periph_t *p,
+                                       const periph_unhandled_site_t *incoming,
+                                       bool incoming_is_older)
+{
     for (size_t i = 0; i < p->unhandled_audit_count; i++) {
         periph_unhandled_site_t *site = &p->unhandled_audit[i];
-        if (site->address == addr && site->pc == g_dbg_pc &&
-            site->core == (uint8_t)g_dbg_core && site->write == write) {
-            site->count++;
+        if (site->address == incoming->address &&
+            site->pc == incoming->pc && site->core == incoming->core &&
+            site->write == incoming->write) {
+            site->count = audit_add_saturating(site->count,
+                                               incoming->count);
+            if (incoming_is_older)
+                site->first_value = incoming->first_value;
             return;
         }
     }
     if (p->unhandled_audit_count == p->unhandled_audit_capacity) {
         if (p->unhandled_audit_capacity == PERIPH_UNHANDLED_AUDIT_MAX) {
-            p->unhandled_audit_omitted++;
+            p->unhandled_audit_omitted = audit_add_saturating(
+                p->unhandled_audit_omitted, incoming->count);
             return;
         }
         size_t capacity = p->unhandled_audit_capacity ?
@@ -13638,22 +13649,30 @@ static void unhandled_audit_record(esp32_periph_t *p, uint32_t addr,
         periph_unhandled_site_t *grown = realloc(
             p->unhandled_audit, capacity * sizeof(*grown));
         if (!grown) {
-            p->unhandled_audit_omitted++;
+            p->unhandled_audit_omitted = audit_add_saturating(
+                p->unhandled_audit_omitted, incoming->count);
             return;
         }
         p->unhandled_audit = grown;
         p->unhandled_audit_capacity = capacity;
     }
-    p->unhandled_audit[p->unhandled_audit_count++] =
-        (periph_unhandled_site_t){
-            .address = addr, .pc = g_dbg_pc, .first_value = value,
-            .count = 1u, .core = (uint8_t)g_dbg_core, .write = write,
-        };
+    p->unhandled_audit[p->unhandled_audit_count++] = *incoming;
+}
+
+static void unhandled_audit_record(esp32_periph_t *p, uint32_t addr,
+                                   bool write, uint32_t value)
+{
+    if (!p->unhandled_audit_enabled) return;
+    const periph_unhandled_site_t site = {
+        .address = addr, .pc = g_dbg_pc, .first_value = value,
+        .count = 1u, .core = (uint8_t)g_dbg_core, .write = write,
+    };
+    unhandled_audit_merge_site(p, &site, false);
 }
 
 static uint32_t default_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    p->unhandled_count++;
+    if (p->unhandled_count < INT_MAX) p->unhandled_count++;
     unhandled_audit_record(p, addr, false, 0u);
     if (getenv("FLEXE_PERIPHDBG"))
         fprintf(stderr, "[PERIPH] unhandled read  0x%08X pc=0x%08X\n", addr, g_dbg_pc);
@@ -13662,7 +13681,7 @@ static uint32_t default_read(void *ctx, uint32_t addr) {
 
 static void default_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
-    p->unhandled_count++;
+    if (p->unhandled_count < INT_MAX) p->unhandled_count++;
     unhandled_audit_record(p, addr, true, val);
     if (getenv("FLEXE_PERIPHDBG"))
         fprintf(stderr, "[PERIPH] unhandled write 0x%08X <- 0x%08X pc=0x%08X\n", addr, val, g_dbg_pc);
@@ -15527,6 +15546,56 @@ bool periph_unhandled_audit_get(const esp32_periph_t *p, size_t index,
     if (!p || !out || index >= p->unhandled_audit_count) return false;
     *out = p->unhandled_audit[index];
     return true;
+}
+
+void periph_unhandled_audit_take(esp32_periph_t *p,
+                                periph_unhandled_audit_snapshot_t *snapshot)
+{
+    if (!p || !snapshot || !p->unhandled_audit_enabled) return;
+    snapshot->sites = p->unhandled_audit;
+    snapshot->count = p->unhandled_audit_count;
+    snapshot->capacity = p->unhandled_audit_capacity;
+    snapshot->omitted = p->unhandled_audit_omitted;
+    snapshot->total_accesses = p->unhandled_count;
+    p->unhandled_audit = NULL;
+    p->unhandled_audit_count = 0u;
+    p->unhandled_audit_capacity = 0u;
+    p->unhandled_audit_omitted = 0u;
+    p->unhandled_count = 0;
+}
+
+void periph_unhandled_audit_dispose(periph_unhandled_audit_snapshot_t *snapshot)
+{
+    if (!snapshot) return;
+    free(snapshot->sites);
+    *snapshot = (periph_unhandled_audit_snapshot_t){0};
+}
+
+void periph_unhandled_audit_resume(esp32_periph_t *p,
+                                  periph_unhandled_audit_snapshot_t *snapshot)
+{
+    if (!snapshot) return;
+    if (!p || !p->unhandled_audit_enabled) {
+        periph_unhandled_audit_dispose(snapshot);
+        return;
+    }
+    if (snapshot->total_accesses > INT_MAX - p->unhandled_count)
+        p->unhandled_count = INT_MAX;
+    else
+        p->unhandled_count += snapshot->total_accesses;
+    p->unhandled_audit_omitted = audit_add_saturating(
+        p->unhandled_audit_omitted, snapshot->omitted);
+    if (p->unhandled_audit_count == 0u) {
+        free(p->unhandled_audit);
+        p->unhandled_audit = snapshot->sites;
+        p->unhandled_audit_count = snapshot->count;
+        p->unhandled_audit_capacity = snapshot->capacity;
+        snapshot->sites = NULL;
+    } else {
+        for (size_t i = 0u; i < snapshot->count; i++)
+            unhandled_audit_merge_site(p, &snapshot->sites[i], true);
+    }
+    periph_unhandled_audit_dispose(snapshot);
 }
 
 uint32_t periph_app_cpu_boot_addr(const esp32_periph_t *p) {

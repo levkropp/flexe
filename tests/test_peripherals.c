@@ -149,6 +149,82 @@ TEST(unhandled_mmio_audit_groups_sites_without_changing_fallback) {
     mem_destroy(mem);
 }
 
+TEST(unhandled_mmio_audit_survives_rebuilt_peripherals) {
+    const flexe_target_desc_t *target =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const uint32_t addr = 0x6000E0C4u;
+    uint32_t old_pc = g_dbg_pc;
+    int old_core = g_dbg_core;
+    periph_unhandled_audit_snapshot_t snapshot = {0};
+    xtensa_mem_t *mem1 = mem_create_for_target(target);
+    esp32_periph_t *p1 = mem1 ? periph_create(mem1) : NULL;
+    ASSERT_TRUE(p1 != NULL);
+    if (!p1) {
+        mem_destroy(mem1);
+        return;
+    }
+    periph_unhandled_audit_enable(p1);
+    g_dbg_pc = 0x40374000u;
+    g_dbg_core = 0;
+    mem_write32(mem1, addr, 0x1111u);
+    ASSERT_EQ(mem_read32(mem1, addr), 0u);
+    ASSERT_EQ(mem_read32(mem1, addr), 0u);
+    periph_unhandled_audit_take(p1, &snapshot);
+    ASSERT_EQ(periph_unhandled_audit_count(p1), 0u);
+    ASSERT_EQ(snapshot.count, 2u);
+    ASSERT_EQ(snapshot.total_accesses, 3);
+    periph_destroy(p1);
+    mem_destroy(mem1);
+
+    xtensa_mem_t *mem2 = mem_create_for_target(target);
+    esp32_periph_t *p2 = mem2 ? periph_create(mem2) : NULL;
+    ASSERT_TRUE(p2 != NULL);
+    if (!p2) {
+        periph_unhandled_audit_dispose(&snapshot);
+        mem_destroy(mem2);
+        g_dbg_pc = old_pc;
+        g_dbg_core = old_core;
+        return;
+    }
+    periph_unhandled_audit_enable(p2);
+    mem_write32(mem2, addr, 0x2222u);
+    g_dbg_pc = 0x40374004u;
+    g_dbg_core = 1;
+    ASSERT_EQ(mem_read32(mem2, addr + 4u), 0u);
+    periph_unhandled_audit_resume(p2, &snapshot);
+    ASSERT_TRUE(snapshot.sites == NULL);
+    ASSERT_EQ(periph_unhandled_count(p2), 5);
+    ASSERT_EQ(periph_unhandled_audit_count(p2), 3u);
+    periph_unhandled_site_t site;
+    ASSERT_TRUE(periph_unhandled_audit_get(p2, 0u, &site));
+    ASSERT_TRUE(site.write);
+    ASSERT_EQ(site.first_value, 0x1111u);
+    ASSERT_EQ64(site.count, 2u);
+    ASSERT_TRUE(periph_unhandled_audit_get(p2, 2u, &site));
+    ASSERT_TRUE(!site.write);
+    ASSERT_EQ(site.pc, 0x40374000u);
+    ASSERT_EQ64(site.count, 2u);
+
+    periph_unhandled_audit_take(p2, &snapshot);
+    periph_destroy(p2);
+    mem_destroy(mem2);
+    xtensa_mem_t *mem3 = mem_create_for_target(target);
+    esp32_periph_t *p3 = mem3 ? periph_create(mem3) : NULL;
+    ASSERT_TRUE(p3 != NULL);
+    if (p3) {
+        periph_unhandled_audit_enable(p3);
+        periph_unhandled_audit_resume(p3, &snapshot);
+        ASSERT_EQ(periph_unhandled_count(p3), 5);
+        ASSERT_EQ(periph_unhandled_audit_count(p3), 3u);
+    } else {
+        periph_unhandled_audit_dispose(&snapshot);
+    }
+    periph_destroy(p3);
+    mem_destroy(mem3);
+    g_dbg_pc = old_pc;
+    g_dbg_core = old_core;
+}
+
 static void test_deferred_event_fire(void *ctx) {
     unsigned *fires = ctx;
     (*fires)++;
@@ -6731,6 +6807,7 @@ static void run_peripheral_tests(void) {
     RUN_TEST(mmio_no_handler_returns_zero);
     RUN_TEST(mmio_complete_ahb_alias_window);
     RUN_TEST(unhandled_mmio_audit_groups_sites_without_changing_fallback);
+    RUN_TEST(unhandled_mmio_audit_survives_rebuilt_peripherals);
     RUN_TEST(peripheral_event_source_reactivates_after_idle);
     RUN_TEST(uart_tx_capture);
     RUN_TEST(uhci_reset_register_file_dual_instance_and_dport);

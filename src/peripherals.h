@@ -226,11 +226,26 @@ typedef struct {
     uint8_t core;
     bool write;
 } periph_unhandled_site_t;
+/* Diagnostic-only state that survives a software reset without carrying any
+ * peripheral register contents into the rebuilt machine. Zero-initialize
+ * before take; resume consumes it, and dispose covers failed rebuilds. */
+typedef struct {
+    periph_unhandled_site_t *sites;
+    size_t count;
+    size_t capacity;
+    uint64_t omitted;
+    int total_accesses;
+} periph_unhandled_audit_snapshot_t;
 void periph_unhandled_audit_enable(esp32_periph_t *p);
 size_t periph_unhandled_audit_count(const esp32_periph_t *p);
 uint64_t periph_unhandled_audit_omitted(const esp32_periph_t *p);
 bool periph_unhandled_audit_get(const esp32_periph_t *p, size_t index,
                                 periph_unhandled_site_t *out);
+void periph_unhandled_audit_take(esp32_periph_t *p,
+                                periph_unhandled_audit_snapshot_t *snapshot);
+void periph_unhandled_audit_resume(esp32_periph_t *p,
+                                  periph_unhandled_audit_snapshot_t *snapshot);
+void periph_unhandled_audit_dispose(periph_unhandled_audit_snapshot_t *snapshot);
 
 /* Attach/detach a 7-bit target address on either APB I2C master or the
  * RTC-domain I2C master. Passing NULL as fn detaches the address. */

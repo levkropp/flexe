@@ -308,19 +308,34 @@ but does not make its Bluetooth controller functional. The unmodified Marauder
 v1.12.1 multiboard S3 image (SHA-256
 `62292a502635f02eab9e515bc3f18fbf43330f81abe2c006c1afe43bd21b57ea`)
 then reports `assert lld.c 292` and reboots on an interrupt watchdog before
-its CLI. It is not an accepted second interactive S3 scenario; the controller
-scheduler and RF/packet behavior remain unsupported.
+its CLI. The [official v1.16.0 MultiBoard S3 release](https://github.com/justcallmekoko/ESP32Marauder/releases/tag/v1.16.0)
+(SHA-256 `b6b61e6c6c41bc78422d405d14117ab5aa6ec0cdee751327ea568232e52dd0be`)
+still reaches the same assertion. A 2-billion-cycle interpreter run of that
+image reports 20,957 unsupported accesses across 334 address/PC/core/
+direction sites because the audit survives each of its three software resets;
+the hottest sites are RF/PHY reads in `0x6000E000`. Neither image is an
+accepted interactive S3 scenario. The controller scheduler and RF/packet
+behavior remain unsupported, and the assertion is not suppressed.
+
+```sh
+./build/xtensa-emu -N -q --no-jit --target esp32s3 \
+  -R "$FLEXE_S3_ROM_ELF" --unhandled-report -c 2000000000 \
+  "$FLEXE_S3_MARAUDER_BIN"
+```
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
-the following interpreter audit at 4 billion aggregate cycles reports 7,065
-unsupported accesses at 361 distinct address/PC/core/direction sites. Of
+the following interpreter audit at 4 billion aggregate cycles reports 6,955
+unsupported accesses at 310 distinct address/PC/core/direction sites. Of
 these, 6,728 are in the `0x6000E000` RF/PHY window; the hottest named callers
 include `wr_rf_freq_mem`, `set_chan_freq_sw_start`, and `bt_txpwr_freq`.
 That concentration identifies a network-controller boundary, not evidence
 that the reads and writes are harmless or that a zero-returning PHY model is
 correct. The remaining inventory includes documented SYSCON, RTC, and sensor
-registers. Repeat the measurement with the matching application and ROM ELFs:
+registers. The `--unhandled-report` inventory and total now accumulate across
+firmware-requested resets; neither this output nor the working network
+scenario proves real RF behavior. Repeat the measurement with the matching
+application and ROM ELFs:
 
 ```sh
 ./build/xtensa-emu -N --target esp32s3 -R "$FLEXE_S3_ROM_ELF" \

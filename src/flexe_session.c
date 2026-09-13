@@ -691,6 +691,13 @@ void flexe_session_reset(flexe_session_t *s)
     wifi_host_config_t netcfg;
     wifi_stubs_snapshot_host_config(s->wstubs, &netcfg);
 
+    /* MMIO audit records describe the run, not the silicon state. Carry the
+     * bounded diagnostic inventory across rebuilt peripherals so a firmware
+     * reset loop does not erase the sites that caused its first failure. */
+    periph_unhandled_audit_snapshot_t audit = {0};
+    if (s->cfg.unhandled_audit)
+        periph_unhandled_audit_take(s->periph, &audit);
+
     bt_stubs_destroy(s->bstubs);      s->bstubs = NULL;
     vfs_stubs_destroy(s->vstubs);     s->vstubs = NULL;
     wifi_stubs_destroy(s->wstubs);    s->wstubs = NULL;
@@ -725,11 +732,13 @@ void flexe_session_reset(flexe_session_t *s)
      * rom_elf_load() during the direct boot handoff; the guest startup clears
      * its own BSS while preserving application .noinit. */
     if (session_build(s, true) != 0) {
+        periph_unhandled_audit_dispose(&audit);
         fprintf(stderr, "[reset] rebuild failed; halting\n");
         s->cpu[0].running = false;
         s->cpu[1].running = false;
         return;
     }
+    periph_unhandled_audit_resume(s->periph, &audit);
     wifi_stubs_apply_host_config(s->wstubs, &netcfg);
     periph_pad_hold_restore(s->periph, &pad_hold);
     if (was_verifying) jit_set_verify(s->jit, true);

@@ -128,10 +128,15 @@ TEST(session_software_reset_preserves_guest_flash) {
     ASSERT_EQ(mem_read32(mem, 0x3FFB1000u), 0xA5A5A5A5u);
     ASSERT_EQ(mem_read8(mem, 0x50000000u), 0x5Au);
     ASSERT_EQ(periph_unhandled_audit_count(
-                  flexe_session_periph(session)), 0u);
+                  flexe_session_periph(session)), 1u);
     ASSERT_EQ(mem_read32(mem, 0x3FF22000u), 0u);
     ASSERT_EQ(periph_unhandled_audit_count(
                   flexe_session_periph(session)), 1u);
+    periph_unhandled_site_t site;
+    ASSERT_TRUE(periph_unhandled_audit_get(flexe_session_periph(session),
+                                           0u, &site));
+    ASSERT_EQ64(site.count, 2u);
+    ASSERT_EQ(periph_unhandled_count(flexe_session_periph(session)), 2);
     flexe_session_destroy(session);
 }
 
