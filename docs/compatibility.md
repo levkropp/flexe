@@ -93,11 +93,13 @@ RTC GPIO interrupts remain unsupported. This follows Espressif's
 [S3 RTC GPIO mapping](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
 This is useful functional GPIO support for the
 experimental S3 target, not hardware-calibrated timing or electrical evidence.
-S3 RTC digital-pad hold is now connected to the GPIO output model: held
-GPIO21..47 retain their physical output level and enable while the GPIO
-latches keep accepting writes, and release reveals the current latches.
-Held outputs also survive a session reset's machine rebuild without retaining
-unheld GPIO state. Unbonded and undocumented hold bits remain diagnostic.
+S3 RTC and digital pad-hold registers are connected to the shared pad model:
+RTC GPIO0..21 and digital GPIO21..47 retain physical output level and enable,
+RTC owner mux and input-enable selection while the register latches keep
+accepting writes. GPIO21 remains held until both hold sources are cleared.
+Held pad state also survives a session reset's machine rebuild without
+retaining unheld GPIO state. Unbonded and undocumented hold bits remain
+diagnostic.
 Global pad-force and auto-hold controls, the deep-sleep wake sequence, and
 electrical drive effects are not yet modeled; a register readback alone is
 not a claim that those behaviors work.

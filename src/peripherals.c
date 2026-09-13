@@ -13892,6 +13892,8 @@ static void target_gpio_irq_changed(void *ctx, bool nmi, bool level)
 static void target_rtc_pad_hold_changed(void *ctx, uint64_t held_pins)
 {
     esp32_periph_t *p = ctx;
+    if (p && p->target_rtc_io)
+        flexe_rtc_io_set_pad_hold(p->target_rtc_io, held_pins);
     if (p && p->target_gpio)
         flexe_gpio_set_pad_hold(p->target_gpio, held_pins);
 }
@@ -15389,10 +15391,17 @@ void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out)
     if (!p) return;
 
     if (p->target_gpio && p->target_rtc_cntl &&
-        p->target->rtc_cntl.digital_pad_hold_count != 0u) {
+        (p->target->rtc_cntl.rtc_pad_hold_count != 0u ||
+         p->target->rtc_cntl.digital_pad_hold_count != 0u)) {
         const flexe_rtc_cntl_desc_t *rtc = &p->target->rtc_cntl;
-        out->target_rtc_hold = mem_read32(
-            p->mem, rtc->base + rtc->digital_pad_hold_offset);
+        if (rtc->rtc_pad_hold_count != 0u)
+            out->target_rtc_io_hold = mem_read32(
+                p->mem, rtc->base + rtc->rtc_pad_hold_offset);
+        if (rtc->digital_pad_hold_count != 0u)
+            out->target_rtc_hold = mem_read32(
+                p->mem, rtc->base + rtc->digital_pad_hold_offset);
+        flexe_rtc_io_pad_hold_snapshot(p->target_rtc_io,
+                                       &out->target_rtc_io);
         flexe_gpio_pad_hold_snapshot(p->target_gpio, &out->target_gpio);
         return;
     }
@@ -15421,12 +15430,20 @@ void periph_pad_hold_restore(esp32_periph_t *p, const periph_pad_hold_t *in)
 {
     if (!p || !in) return;
     if (p->target_gpio && p->target_rtc_cntl &&
-        p->target->rtc_cntl.digital_pad_hold_count != 0u) {
+        (p->target->rtc_cntl.rtc_pad_hold_count != 0u ||
+         p->target->rtc_cntl.digital_pad_hold_count != 0u)) {
         if (in->target_gpio.mask) {
             const flexe_rtc_cntl_desc_t *rtc = &p->target->rtc_cntl;
-            mem_write32(p->mem,
-                        rtc->base + rtc->digital_pad_hold_offset,
-                        in->target_rtc_hold);
+            if (rtc->rtc_pad_hold_count != 0u)
+                mem_write32(p->mem,
+                            rtc->base + rtc->rtc_pad_hold_offset,
+                            in->target_rtc_io_hold);
+            if (rtc->digital_pad_hold_count != 0u)
+                mem_write32(p->mem,
+                            rtc->base + rtc->digital_pad_hold_offset,
+                            in->target_rtc_hold);
+            flexe_rtc_io_pad_hold_restore(p->target_rtc_io,
+                                           &in->target_rtc_io);
             flexe_gpio_pad_hold_restore(p->target_gpio, &in->target_gpio);
         }
         return;

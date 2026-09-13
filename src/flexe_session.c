@@ -664,8 +664,8 @@ void flexe_session_reset(flexe_session_t *s)
     if (!s) return;
     uint64_t cycles = s->cpu[0].cycle_count;
 
-    /* RTC-held pads keep their level across the reset, including S3 digital
-     * pads held with gpio_hold_en(); see periph_pad_hold_snapshot(). */
+    /* RTC-held pads keep their state across the reset, including S3 RTC and
+     * digital pads; see periph_pad_hold_snapshot(). */
     periph_pad_hold_t pad_hold;
     periph_pad_hold_snapshot(s->periph, &pad_hold);
 

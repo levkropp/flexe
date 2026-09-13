@@ -2,10 +2,12 @@
 
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
-/* ESP32-S3 rtc_io_reg.h. Only output, output-enable, sampled input and the
- * pad-owner mux have functional effects here. The other documented pad
- * fields retain their register value but remain diagnostic when changed. */
+/* ESP32-S3 rtc_io_reg.h. Output, output-enable, sampled input and the
+ * pad-owner mux have functional effects, including RTC_CNTL pad hold. Other
+ * documented pad fields retain their register value but remain diagnostic
+ * when changed. */
 #define RTC_GPIO_OUT_OFF         0x000u
 #define RTC_GPIO_OUT_SET_OFF     0x004u
 #define RTC_GPIO_OUT_CLEAR_OFF   0x008u
@@ -31,6 +33,8 @@ struct flexe_rtc_io {
     uint32_t output;
     uint32_t enabled;
     uint32_t pad[FLEXE_TARGET_RTC_IO_PIN_MAX];
+    uint32_t held_mask;
+    uint32_t held_pad[FLEXE_TARGET_RTC_IO_PIN_MAX];
 };
 
 static bool one_bit(uint32_t value)
@@ -49,6 +53,13 @@ static uint32_t pad_writable_mask(unsigned pin)
     if (pin < 15u) mask |= RTC_PAD_TOUCH_MASK;
     if (pin == 17u || pin == 18u) mask |= RTC_PAD_DAC_MASK;
     return mask;
+}
+
+static uint32_t rtc_io_effective_pad(const flexe_rtc_io_t *rtc_io,
+                                     unsigned pin)
+{
+    return (rtc_io->held_mask & (1u << pin)) != 0u ?
+           rtc_io->held_pad[pin] : rtc_io->pad[pin];
 }
 
 static bool rtc_io_geometry_valid(const flexe_target_desc_t *target)
@@ -88,7 +99,7 @@ static void rtc_io_publish(flexe_rtc_io_t *rtc_io)
     uint64_t owned = 0u;
     uint64_t unknown = 0u;
     for (unsigned pin = 0u; pin < desc->gpio_count; pin++) {
-        uint32_t pad = rtc_io->pad[pin];
+        uint32_t pad = rtc_io_effective_pad(rtc_io, pin);
         uint64_t bit = UINT64_C(1) << pin;
         if ((pad & desc->pad_mux_mask) == 0u) continue;
         owned |= bit;
@@ -136,7 +147,7 @@ uint32_t flexe_rtc_io_mmio_read(void *ctx, uint32_t addr)
     case RTC_GPIO_IN_OFF: {
         uint32_t inputs = 0u;
         for (unsigned pin = 0u; pin < desc->gpio_count; pin++)
-            if ((rtc_io->pad[pin] &
+            if ((rtc_io_effective_pad(rtc_io, pin) &
                  (desc->pad_mux_mask | RTC_PAD_INPUT_ENABLE |
                   RTC_PAD_FUNCTION_MASK)) ==
                     (desc->pad_mux_mask | RTC_PAD_INPUT_ENABLE) &&
@@ -248,4 +259,44 @@ void flexe_rtc_io_destroy(flexe_rtc_io_t *rtc_io)
         rtc_io->fallback_read, rtc_io->fallback_write,
         rtc_io->fallback_ctx);
     free(rtc_io);
+}
+
+void flexe_rtc_io_set_pad_hold(flexe_rtc_io_t *rtc_io,
+                                uint64_t held_pins)
+{
+    if (!rtc_io) return;
+    uint32_t next = (uint32_t)held_pins & pin_mask(&rtc_io->target->rtc_io);
+    uint32_t newly_held = next & ~rtc_io->held_mask;
+    while (newly_held) {
+        unsigned pin = (unsigned)__builtin_ctz(newly_held);
+        newly_held &= newly_held - 1u;
+        rtc_io->held_pad[pin] = rtc_io->pad[pin];
+    }
+    if (next != rtc_io->held_mask) {
+        rtc_io->held_mask = next;
+        rtc_io_publish(rtc_io);
+    }
+}
+
+void flexe_rtc_io_pad_hold_snapshot(const flexe_rtc_io_t *rtc_io,
+                                    flexe_rtc_io_pad_hold_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!rtc_io) return;
+    out->mask = rtc_io->held_mask;
+    for (unsigned pin = 0u; pin < rtc_io->target->rtc_io.gpio_count; pin++)
+        if ((out->mask & (1u << pin)) != 0u)
+            out->pad[pin] = rtc_io->held_pad[pin];
+}
+
+void flexe_rtc_io_pad_hold_restore(flexe_rtc_io_t *rtc_io,
+                                   const flexe_rtc_io_pad_hold_t *in)
+{
+    if (!rtc_io || !in) return;
+    flexe_rtc_io_set_pad_hold(rtc_io, in->mask);
+    for (unsigned pin = 0u; pin < rtc_io->target->rtc_io.gpio_count; pin++)
+        if ((rtc_io->held_mask & (1u << pin)) != 0u)
+            rtc_io->held_pad[pin] = in->pad[pin];
+    rtc_io_publish(rtc_io);
 }
