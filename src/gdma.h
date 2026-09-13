@@ -3,6 +3,7 @@
 #define FLEXE_GDMA_H
 
 #include "memory.h"
+#include <stdbool.h>
 
 typedef struct flexe_gdma flexe_gdma_t;
 
@@ -10,6 +11,11 @@ flexe_gdma_t *flexe_gdma_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
     mmio_write_fn fallback_write, void *fallback_ctx);
 void flexe_gdma_destroy(flexe_gdma_t *gdma);
+
+/* Whether a started TX descriptor stream is routed to this peripheral.
+ * A peripheral enable bit may remain set after the driver intentionally
+ * omits a TX stream for a receive-only transaction. */
+bool flexe_gdma_tx_active(const flexe_gdma_t *gdma, uint8_t peripheral_id);
 
 /* Consume bytes from the active TX descriptor chain routed to peripheral_id.
  * Returns zero only when exactly `length` bytes were copied. The descriptor

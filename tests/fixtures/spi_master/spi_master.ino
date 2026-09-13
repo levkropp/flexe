@@ -13,10 +13,22 @@
 #include <driver/spi_master.h>
 #include <driver/gpio.h>
 
+#if CONFIG_IDF_TARGET_ESP32S3
+#define PIN_MISO  13
+#define PIN_MOSI  11
+#define PIN_SCLK  12
+#define PIN_CS    10
+#define TEST_SPI_HOST SPI3_HOST
+#define TEST_SPI_DMA SPI_DMA_CH_AUTO
+#else
 #define PIN_MISO  19
 #define PIN_MOSI  23
 #define PIN_SCLK  18
-#define PIN_CS    27      /* modelled as nothing: the harness answers here */
+#define PIN_CS    27
+#define TEST_SPI_HOST VSPI_HOST
+#define TEST_SPI_DMA 1
+#endif
+/* CS is modeled as nothing: the host harness answers here. */
 
 #define SUCCESS_MARKER 0x5D100D1Eu
 #define FAIL_BASE      0xBAD00000u
@@ -65,7 +77,8 @@ void setup() {
   bus.quadwp_io_num = -1;
   bus.quadhd_io_num = -1;
   bus.max_transfer_sz = 4096;
-  if (spi_bus_initialize(VSPI_HOST, &bus, 1) != ESP_OK) { fail(1); return; }
+  esp_err_t err = spi_bus_initialize(TEST_SPI_HOST, &bus, TEST_SPI_DMA);
+  if (err != ESP_OK) { flexe_spi_result[10] = err; fail(1); return; }
 
   spi_device_interface_config_t devcfg = {};
   devcfg.clock_speed_hz = 1000000;
@@ -74,7 +87,8 @@ void setup() {
   devcfg.queue_size = 4;
   devcfg.command_bits = 8;
   devcfg.address_bits = 8;
-  if (spi_bus_add_device(VSPI_HOST, &devcfg, &dev) != ESP_OK) { fail(2); return; }
+  err = spi_bus_add_device(TEST_SPI_HOST, &devcfg, &dev);
+  if (err != ESP_OK) { flexe_spi_result[10] = err; fail(2); return; }
 
   flexe_spi_stage = 1;
 

@@ -50,7 +50,7 @@ even when a firmware workflow succeeds.
 | S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate | Additional partition and filesystem variants need end-to-end gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate | RTC wake routing, full pad hold/pulls/drive, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; `scripts/check-s3-i2c-wire.sh` runs stock Arduino Wire against a virtual slave | I2C slave mode, more guest driver/device combinations, and GP-SPI DMA firmware gates remain. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and ESP-IDF SPI-master replay gates run against virtual slaves | I2C slave mode, more guest driver/device combinations, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core and restart gates | Calibrated timing, all wake modes, and all reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
@@ -169,6 +169,31 @@ S3_I2C_BIN=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.merged.bin \
 S3_I2C_ELF=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 RUNNER=./build/flexe-i2c-wire-test ./scripts/check-s3-i2c-wire.sh
+```
+
+The S3 GP-SPI gate compiles the same ESP-IDF `spi_master` fixture used for
+classic ESP32 against Arduino-ESP32 3.3.11, selecting SPI3 and S3-valid pins.
+The driver completes five full-duplex lengths (1, 4, 5, 17, and 33 bytes),
+a command/address read, and one queued transaction through the MMIO/GDMA
+engine and a host-attached slave. In the command/address read, ESP-IDF retains
+SPI `DMA_TX_ENA` from the prior transfer but starts no TX GDMA link. Flexe
+uses the live GDMA route to distinguish this valid receive-only case from a
+broken TX descriptor; the unit test keeps the latter diagnostic. The gate's
+merged image/ELF SHA-256 values are
+`f4a50104a5cd08c91d563eb30cc38ad86bb9df72f36a5420a43cb5e62ca01940` /
+`ea7494ab15e49a75da094b40b5cad7b4cf25e186832e89de4800f562e2b9dba4`.
+Two interpreter runs match byte-for-byte with no unsupported GP-SPI sites;
+175 unrelated startup accesses remain. This does not validate SPI slave mode,
+segmented transfer, exact bus timing, or physical pin levels:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+  --build-path /tmp/flexe-s3-spi-master-build \
+  --build-property compiler.optimization_flags=-Os tests/fixtures/spi_master
+S3_SPI_BIN=/tmp/flexe-s3-spi-master-build/spi_master.ino.merged.bin \
+S3_SPI_ELF=/tmp/flexe-s3-spi-master-build/spi_master.ino.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+RUNNER=./build/flexe-spi-master-test ./scripts/check-s3-spi-master.sh
 ```
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,

@@ -3425,6 +3425,28 @@ TEST(gp_spi_s3_gdma_full_duplex) {
     ASSERT_EQ(periph_unhandled_count(p), 0);
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
 
+    /* A receive-only transaction may retain SPI DMA_TX_ENA from the prior
+     * duplex transfer while its TX GDMA link is parked. The active RX link
+     * must still receive data without a spurious missing-TX diagnostic. */
+    test_spi_dma_desc(mem, rx_desc, rx_buf, sizeof(request),
+                      sizeof(request), 1, 0u);
+    mem_write32(mem, TEST_S3_GDMA_BASE + 0x020u,
+                (rx_desc & 0xFFFFFu) | (1u << 22));
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(probe.calls, 2u);
+    ASSERT_EQ(probe.tx_len, 0u);
+    for (uint32_t i = 0u; i < sizeof(request); i++)
+        ASSERT_EQ(mem_read8(mem, rx_buf + i), 0xA5u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SPI2_BASE + 0x03Cu) & 3u, 0u);
+
+    /* A transmit-only request without a started TX descriptor is still a
+     * real transport error, not a successful empty transfer. */
+    mem_write32(mem, TEST_S3_SPI2_BASE + 0x010u, 1u << 27);
+    mem_write32(mem, TEST_S3_SPI2_BASE, 1u << 24);
+    ASSERT_EQ(periph_unhandled_count(p), 1);
+    ASSERT_TRUE(mem_read32(mem, TEST_S3_SPI2_BASE + 0x03Cu) & (1u << 1));
+
     periph_destroy(p);
     mem_destroy(mem);
 }

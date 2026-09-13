@@ -516,22 +516,35 @@ int flexe_gdma_write_rx(flexe_gdma_t *gdma, uint8_t peripheral_id,
     return success ? 0 : -1;
 }
 
+static int gdma_active_tx_channel(const flexe_gdma_t *gdma,
+                                  uint8_t peripheral_id)
+{
+    if (!gdma) return -1;
+    const flexe_gdma_desc_t *geometry = &gdma->target->gdma;
+    for (unsigned i = 0u; i < geometry->channel_count; i++) {
+        uint32_t addr = gdma_channel_addr(
+            gdma, i, GDMA_V1_OUT_PERI_SEL_OFF);
+        uint32_t peri = gdma->regs[(addr - geometry->base) / sizeof(uint32_t)];
+        if (gdma->tx[i].active &&
+            (peri & GDMA_V1_PERI_SEL_MASK) == peripheral_id)
+            return (int)i;
+    }
+    return -1;
+}
+
+bool flexe_gdma_tx_active(const flexe_gdma_t *gdma, uint8_t peripheral_id)
+{
+    return gdma_active_tx_channel(gdma, peripheral_id) >= 0;
+}
+
 int flexe_gdma_read_tx(flexe_gdma_t *gdma, uint8_t peripheral_id,
                        uint8_t *data, size_t length)
 {
     if (!gdma || (!data && length != 0u)) return -1;
+    int active_channel = gdma_active_tx_channel(gdma, peripheral_id);
+    if (active_channel < 0) return -1;
+    unsigned channel = (unsigned)active_channel;
     const flexe_gdma_desc_t *geometry = &gdma->target->gdma;
-    unsigned channel = geometry->channel_count;
-    for (unsigned i = 0u; i < geometry->channel_count; i++) {
-        uint32_t *peri = gdma_reg(gdma, gdma_channel_addr(
-            gdma, i, GDMA_V1_OUT_PERI_SEL_OFF));
-        if (gdma->tx[i].active && peri &&
-            (*peri & GDMA_V1_PERI_SEL_MASK) == peripheral_id) {
-            channel = i;
-            break;
-        }
-    }
-    if (channel == geometry->channel_count) return -1;
 
     gdma_tx_channel_t *tx = &gdma->tx[channel];
     uint32_t desc = geometry->descriptor_address_prefix |

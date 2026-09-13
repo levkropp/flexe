@@ -1000,6 +1000,15 @@ static void gp_spi_transact(spi_display_t *s) {
                           phase_bytes(s, s->mosi_dlen) : 0;
     size_t rx_requested = (s->user & SPI_USER_USR_MISO) ?
                           phase_bytes(s, s->miso_dlen) : 0;
+    if (gp_spi_is_s3(s) && rx_requested != 0u &&
+        (s->dma_conf & S3_SPI_DMA_TX_ENABLE) != 0u &&
+        !flexe_gdma_tx_active(periph_gdma(s->periph),
+                             s->instance->gdma_peripheral_id)) {
+        /* ESP-IDF leaves DMA_TX_ENA set across transactions, but starts a TX
+         * GDMA link only when it supplies a send buffer. With only RX GDMA
+         * active, there is no outgoing byte stream to consume or diagnose. */
+        tx_requested = 0u;
+    }
     bool tx_dma = tx_requested != 0u &&
         (gp_spi_is_s3(s) ? (s->dma_conf & S3_SPI_DMA_TX_ENABLE) != 0u
                          : (s->dma_out_link & SPI_DMA_LINK_START) != 0u);
