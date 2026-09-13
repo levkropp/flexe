@@ -32,6 +32,14 @@ struct flexe_rtc_cntl {
     uint64_t tick_remainder;
     uint64_t counter;
     uint64_t latched_counter;
+    uint64_t sleep_alarm;
+    uint32_t sleep_state;
+    uint32_t wakeup_enable;
+    uint32_t wakeup_cause;
+    uint32_t digital_power;
+    uint32_t reset_state;
+    bool sleep_alarm_armed;
+    bool sleep_requested;
     uint32_t clock_conf;
     uint32_t analog_conf;
     uint32_t interrupt_enable;
@@ -408,6 +416,65 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
                 if (offset == desc->store_offset[j]) return false;
         }
     }
+    if (desc->sleep_timer_low_offset != 0u) {
+        const uint16_t offsets[] = {
+            desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
+            desc->sleep_state_offset, desc->wakeup_state_offset,
+            desc->digital_power_offset, desc->wakeup_cause_offset,
+        };
+        if (desc->sleep_enable_mask == 0u ||
+            (desc->sleep_enable_mask & (desc->sleep_enable_mask - 1u)) != 0u ||
+            desc->sleep_wakeup_mask == 0u ||
+            (desc->sleep_wakeup_mask & (desc->sleep_wakeup_mask - 1u)) != 0u ||
+            (desc->sleep_enable_mask & desc->sleep_wakeup_mask) != 0u ||
+            desc->sleep_alarm_enable_mask == 0u ||
+            (desc->sleep_alarm_enable_mask &
+             (desc->sleep_alarm_enable_mask - 1u)) != 0u ||
+            (desc->sleep_alarm_enable_mask & desc->time_high_mask) != 0u ||
+            (desc->sleep_alarm_interrupt_mask &
+             desc->interrupt_valid_mask) !=
+                desc->sleep_alarm_interrupt_mask ||
+            desc->sleep_alarm_interrupt_mask == 0u ||
+            desc->digital_wrap_power_down_mask == 0u ||
+            (desc->digital_wrap_power_down_mask &
+             (desc->digital_wrap_power_down_mask - 1u)) != 0u ||
+            desc->timer_wakeup_mask == 0u ||
+            (desc->timer_wakeup_mask &
+             (desc->timer_wakeup_mask - 1u)) != 0u ||
+            (desc->timer_wakeup_mask & desc->wakeup_valid_mask) == 0u ||
+            (desc->sleep_wakeup_interrupt_mask &
+             desc->interrupt_valid_mask) !=
+                desc->sleep_wakeup_interrupt_mask ||
+            desc->sleep_wakeup_interrupt_mask == 0u ||
+            desc->wakeup_enable_shift >= 32u ||
+            desc->wakeup_valid_mask == 0u ||
+            (desc->wakeup_enable_reset & ~desc->wakeup_valid_mask) != 0u ||
+            desc->wakeup_valid_mask >
+                (UINT32_MAX >> desc->wakeup_enable_shift))
+            return false;
+        for (unsigned i = 0u; i < sizeof(offsets) / sizeof(offsets[0]);
+             i++) {
+            uint16_t offset = offsets[i];
+            if (!rtc_offset_valid(offset, desc->register_size) ||
+                offset == desc->time_update_offset ||
+                offset == desc->time_low_offset ||
+                offset == desc->time_high_offset ||
+                offset == desc->reset_state_offset ||
+                offset == desc->clock_conf_offset ||
+                offset == desc->analog_conf_offset ||
+                rtc_interrupt_offset(desc, offset) ||
+                rtc_wdt_offset(desc, offset) ||
+                rtc_pad_hold_offset(desc, offset) ||
+                (desc->cpu_stall_high_offset != 0u &&
+                 (offset == desc->cpu_stall_options_offset ||
+                  offset == desc->cpu_stall_high_offset)))
+                return false;
+            for (unsigned j = 0u; j < i; j++)
+                if (offset == offsets[j]) return false;
+            for (unsigned j = 0u; j < desc->store_count; j++)
+                if (offset == desc->store_offset[j]) return false;
+        }
+    }
     return true;
 }
 
@@ -577,8 +644,16 @@ static bool rtc_sync(flexe_rtc_cntl_t *rtc)
     uint64_t mask = UINT32_MAX |
                     ((uint64_t)desc->time_high_mask << 32u);
     uint64_t ticks = rtc_scaled_ticks(rtc, elapsed, rtc_cpu_hz(rtc));
-    rtc->counter = (rtc->counter + ticks) & mask;
+    uint64_t before = rtc->counter;
+    rtc->counter = (before + ticks) & mask;
     bool changed = rtc_advance_wdt(rtc, ticks);
+    if (rtc->sleep_alarm_armed &&
+        ((rtc->sleep_alarm - before) & mask) <= ticks) {
+        rtc->sleep_alarm_armed = false;
+        rtc->interrupt_raw |=
+            desc->sleep_alarm_interrupt_mask;
+        changed = true;
+    }
     if (changed) rtc_cntl_update_interrupt(rtc);
     return changed;
 }
@@ -613,7 +688,22 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return (uint32_t)(rtc->latched_counter >> 32u) &
                desc->time_high_mask;
     if (offset == desc->reset_state_offset)
-        return desc->reset_state_reset;
+        return rtc->reset_state;
+    if (desc->sleep_timer_low_offset != 0u) {
+        if (offset == desc->sleep_timer_low_offset)
+            return (uint32_t)rtc->sleep_alarm;
+        if (offset == desc->sleep_timer_high_offset)
+            return (uint32_t)(rtc->sleep_alarm >> 32u) &
+                   desc->time_high_mask;
+        if (offset == desc->sleep_state_offset)
+            return rtc->sleep_state;
+        if (offset == desc->wakeup_state_offset)
+            return rtc->wakeup_enable << desc->wakeup_enable_shift;
+        if (offset == desc->digital_power_offset)
+            return rtc->digital_power;
+        if (offset == desc->wakeup_cause_offset)
+            return rtc->wakeup_cause;
+    }
     if (desc->cpu_stall_high_offset != 0u) {
         if (offset == desc->cpu_stall_options_offset)
             return rtc->cpu_stall_options;
@@ -718,6 +808,79 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
     if (offset == desc->time_low_offset ||
         offset == desc->time_high_offset)
         return;
+    if (desc->sleep_timer_low_offset != 0u) {
+        uint64_t high_mask = desc->time_high_mask;
+        if (offset == desc->sleep_timer_low_offset) {
+            rtc->sleep_alarm = (rtc->sleep_alarm &
+                                (high_mask << 32u)) | value;
+            rtc_cntl_notify(rtc);
+            return;
+        }
+        if (offset == desc->sleep_timer_high_offset) {
+            rtc->sleep_alarm = (rtc->sleep_alarm & UINT32_MAX) |
+                ((uint64_t)(value & desc->time_high_mask) << 32u);
+            if ((value & desc->sleep_alarm_enable_mask) != 0u)
+                rtc->sleep_alarm_armed = true;
+            if ((value & ~(desc->time_high_mask |
+                           desc->sleep_alarm_enable_mask)) != 0u &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            rtc_cntl_notify(rtc);
+            return;
+        }
+        if (offset == desc->sleep_state_offset) {
+            uint32_t old = rtc->sleep_state;
+            rtc->sleep_state =
+                (value & ~desc->sleep_wakeup_mask) |
+                (old & desc->sleep_wakeup_mask);
+            bool unsupported =
+                ((old ^ rtc->sleep_state) &
+                 ~(desc->sleep_enable_mask |
+                   desc->sleep_wakeup_mask)) != 0u;
+            if ((value & desc->sleep_enable_mask) != 0u) {
+                rtc->sleep_state &= ~desc->sleep_wakeup_mask;
+                if (rtc->wakeup_enable == desc->timer_wakeup_mask &&
+                    (rtc->sleep_alarm_armed ||
+                     (rtc->interrupt_raw &
+                      desc->sleep_alarm_interrupt_mask) != 0u)) {
+                    rtc->sleep_requested = true;
+                } else {
+                    /* An unknown source or unarmed timer cannot be reported
+                     * as a successful wake by the session. */
+                    rtc->sleep_requested = false;
+                    unsupported = true;
+                }
+            } else {
+                rtc->sleep_requested = false;
+            }
+            if (unsupported && rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
+        if (offset == desc->wakeup_state_offset) {
+            rtc->wakeup_enable =
+                (value >> desc->wakeup_enable_shift) &
+                desc->wakeup_valid_mask;
+            if (((value & ~(desc->wakeup_valid_mask <<
+                            desc->wakeup_enable_shift)) != 0u ||
+                 (rtc->wakeup_enable &
+                  ~desc->timer_wakeup_mask) != 0u) &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
+        if (offset == desc->digital_power_offset) {
+            uint32_t old = rtc->digital_power;
+            rtc->digital_power = value;
+            if (((old ^ value) &
+                 ~desc->digital_wrap_power_down_mask) != 0u &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
+        if (offset == desc->wakeup_cause_offset)
+            return; /* Physically read-only. */
+    }
     if (desc->cpu_stall_high_offset != 0u &&
         offset == desc->cpu_stall_options_offset) {
         uint32_t reset_mask = desc->software_reset_cpu0_mask |
@@ -874,6 +1037,9 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->reset_ctx = reset_ctx;
     const flexe_rtc_cntl_desc_t *desc = &target->rtc_cntl;
     rtc->clock_conf = desc->clock_conf_reset;
+    rtc->reset_state = desc->reset_state_reset;
+    rtc->wakeup_enable = desc->wakeup_enable_reset;
+    rtc->digital_power = desc->digital_power_reset;
     rtc->cpu_stall_options = desc->cpu_stall_options_reset;
     rtc->analog_conf = desc->analog_conf_reset;
     rtc->interrupt_enable = desc->interrupt_enable_reset;
@@ -992,15 +1158,26 @@ uint32_t flexe_rtc_cntl_next_event(flexe_rtc_cntl_t *rtc,
 {
     if (!rtc || !cpu) return UINT32_MAX;
     (void)rtc_sync(rtc);
-    if (!rtc_wdt_active(rtc)) return UINT32_MAX;
-
-    uint64_t hold = rtc_wdt_stage_hold(rtc);
-    uint64_t ticks = rtc->wdt_stage_ticks < hold ?
-                     hold - rtc->wdt_stage_ticks : 1u;
-    uint32_t cycles = rtc_cycles_until_ticks(
-        ticks, rtc_slow_clock_hz(rtc), rtc_cpu_hz(rtc),
-        rtc->tick_remainder);
-    return cpu->ccount + cycles;
+    uint32_t nearest = UINT32_MAX;
+    if (rtc_wdt_active(rtc)) {
+        uint64_t hold = rtc_wdt_stage_hold(rtc);
+        uint64_t ticks = rtc->wdt_stage_ticks < hold ?
+                         hold - rtc->wdt_stage_ticks : 1u;
+        nearest = rtc_cycles_until_ticks(
+            ticks, rtc_slow_clock_hz(rtc), rtc_cpu_hz(rtc),
+            rtc->tick_remainder);
+    }
+    if (rtc->sleep_alarm_armed) {
+        const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+        uint64_t mask = UINT32_MAX |
+                        ((uint64_t)desc->time_high_mask << 32u);
+        uint64_t ticks = (rtc->sleep_alarm - rtc->counter) & mask;
+        uint32_t cycles = rtc_cycles_until_ticks(
+            ticks, rtc_slow_clock_hz(rtc), rtc_cpu_hz(rtc),
+            rtc->tick_remainder);
+        if (cycles < nearest) nearest = cycles;
+    }
+    return nearest == UINT32_MAX ? UINT32_MAX : cpu->ccount + nearest;
 }
 
 void flexe_rtc_cntl_eval(flexe_rtc_cntl_t *rtc)
@@ -1024,4 +1201,90 @@ bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc)
 {
     return rtc && (rtc->analog_conf &
                    rtc->target->rtc_cntl.sar_i2c_power_mask) != 0u;
+}
+
+void flexe_rtc_cntl_retained_snapshot(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_retained_t *out)
+{
+    if (!out) return;
+    *out = (flexe_rtc_cntl_retained_t){0};
+    if (!rtc) return;
+    (void)rtc_sync(rtc);
+    out->counter = rtc->counter;
+    out->tick_denominator = rtc->tick_denominator;
+    out->tick_remainder = rtc->tick_remainder;
+    for (unsigned i = 0u; i < rtc->target->rtc_cntl.store_count; i++)
+        out->store[i] = rtc->store[i];
+}
+
+void flexe_rtc_cntl_retained_restore(
+    flexe_rtc_cntl_t *rtc, const flexe_rtc_cntl_retained_t *snapshot)
+{
+    if (!rtc || !snapshot) return;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    uint64_t mask = UINT32_MAX |
+                    ((uint64_t)desc->time_high_mask << 32u);
+    rtc->counter = snapshot->counter & mask;
+    rtc->tick_denominator = snapshot->tick_denominator;
+    rtc->tick_remainder = snapshot->tick_remainder;
+    for (unsigned i = 0u; i < desc->store_count; i++)
+        rtc->store[i] = snapshot->store[i];
+}
+
+bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
+                                       bool *deep, uint64_t *timeout_us)
+{
+    if (!rtc || !rtc->sleep_requested) return false;
+    rtc->sleep_requested = false;
+    (void)rtc_sync(rtc);
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    if (rtc->wakeup_enable != desc->timer_wakeup_mask ||
+        (!rtc->sleep_alarm_armed &&
+         (rtc->interrupt_raw & desc->sleep_alarm_interrupt_mask) == 0u))
+        return false;
+    if (deep)
+        *deep = (rtc->digital_power &
+                 desc->digital_wrap_power_down_mask) != 0u;
+    if (timeout_us) {
+        uint64_t ticks = 0u;
+        if (rtc->sleep_alarm_armed) {
+            uint64_t mask = UINT32_MAX |
+                            ((uint64_t)desc->time_high_mask << 32u);
+            ticks = (rtc->sleep_alarm - rtc->counter) & mask;
+        }
+        uint64_t hz = rtc_slow_clock_hz(rtc);
+        uint64_t seconds = ticks / hz;
+        uint64_t fraction = ticks % hz;
+        *timeout_us = seconds > UINT64_MAX / UINT64_C(1000000) ?
+            UINT64_MAX : seconds * UINT64_C(1000000) +
+            (fraction * UINT64_C(1000000) + hz - 1u) / hz;
+    }
+    return true;
+}
+
+void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause)
+{
+    if (!rtc || rtc->target->rtc_cntl.sleep_timer_low_offset == 0u) return;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    rtc->wakeup_cause = cause & desc->wakeup_valid_mask;
+    rtc->sleep_state &= ~desc->sleep_enable_mask;
+    rtc->sleep_state |= desc->sleep_wakeup_mask;
+    rtc->sleep_alarm_armed = false;
+    rtc->sleep_requested = false;
+    rtc->interrupt_raw |= desc->sleep_wakeup_interrupt_mask;
+    rtc_cntl_update_interrupt(rtc);
+    rtc_cntl_notify(rtc);
+}
+
+void flexe_rtc_cntl_set_wake_state(flexe_rtc_cntl_t *rtc,
+                                   uint32_t cause, uint32_t reset_cause)
+{
+    if (!rtc || rtc->target->rtc_cntl.sleep_timer_low_offset == 0u) return;
+    rtc->wakeup_cause = cause & rtc->target->rtc_cntl.wakeup_valid_mask;
+    /* ESP32-S3 RESET_STATE has six-bit reset causes for PRO and APP CPU at
+     * bits 0 and 6; retain the target's other reset-state fields. */
+    rtc->reset_state =
+        (rtc->reset_state & ~0xFFFu) |
+        (reset_cause & 0x3Fu) |
+        ((reset_cause & 0x3Fu) << 6u);
 }

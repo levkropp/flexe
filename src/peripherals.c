@@ -14735,6 +14735,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     flexe_system_clock_publish_gates(p->system_clock);
 
+    p->rtc_reset_cause = RTC_POWERON_RESET;
     if (!classic) return p;
 
     p->dport_wifi_clk_en = 0xFFFCE030u;
@@ -15502,6 +15503,12 @@ bool periph_interrupt_pending(const esp32_periph_t *p, int source) {
 bool periph_take_sleep_request(esp32_periph_t *p, bool *deep,
                                uint64_t *timeout_us, uint32_t *cause)
 {
+    if (p && p->target_rtc_cntl) {
+        bool accepted = flexe_rtc_cntl_take_sleep_request(
+            p->target_rtc_cntl, deep, timeout_us);
+        if (accepted && cause) *cause = 0u;
+        return accepted;
+    }
     if (!p || !p->sleep_requested) return false;
     p->sleep_requested = false;
     if (deep) *deep = p->sleep_deep;
@@ -15535,6 +15542,7 @@ bool periph_take_sleep_request(esp32_periph_t *p, bool *deep,
 /* Poll the level-triggered wake sources while time is being stepped forward. */
 uint32_t periph_sleep_poll_wake(esp32_periph_t *p)
 {
+    if (p && p->target_rtc_cntl) return 0u; /* Timer via session deadline. */
     return p ? rtc_wake_condition(p) : 0;
 }
 
@@ -15544,6 +15552,10 @@ uint32_t periph_sleep_poll_wake(esp32_periph_t *p)
 void periph_finish_wake(esp32_periph_t *p, uint32_t cause)
 {
     if (!p) return;
+    if (p->target_rtc_cntl) {
+        flexe_rtc_cntl_finish_wake(p->target_rtc_cntl, cause);
+        return;
+    }
     p->rtc_wakeup_cause = cause & RTC_CNTL_WAKEUP_ENA_MASK;
     p->rtc_state0 &= ~RTC_CNTL_SLEEP_EN_BIT;
     p->rtc_state0 |= RTC_CNTL_SLP_WAKEUP_BIT;
@@ -15557,6 +15569,22 @@ void periph_set_wake_state(esp32_periph_t *p, uint32_t wake_cause,
     if (!p) return;
     p->rtc_wakeup_cause = wake_cause & RTC_CNTL_WAKEUP_ENA_MASK;
     p->rtc_reset_cause = reset_cause & 0x3Fu;
+    if (p->target_rtc_cntl)
+        flexe_rtc_cntl_set_wake_state(
+            p->target_rtc_cntl, wake_cause, reset_cause);
+}
+
+void periph_rtc_retained_snapshot(
+    esp32_periph_t *p, flexe_rtc_cntl_retained_t *out)
+{
+    if (!out) return;
+    flexe_rtc_cntl_retained_snapshot(p ? p->target_rtc_cntl : NULL, out);
+}
+
+void periph_rtc_retained_restore(
+    esp32_periph_t *p, const flexe_rtc_cntl_retained_t *snapshot)
+{
+    if (p) flexe_rtc_cntl_retained_restore(p->target_rtc_cntl, snapshot);
 }
 
 uint32_t periph_reset_cause(const esp32_periph_t *p)

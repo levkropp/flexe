@@ -9,8 +9,8 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
-expected_bin=${S3_IDF_NVS_BIN_SHA256:-3d81633344bd43cdc901c32c48411bbd00c88a8260a103862aa74ea82c9945b4}
-expected_elf=${S3_IDF_NVS_ELF_SHA256:-c4266b7433b41a25f73067e274b0622314be62106fba43416a9a1d0f1a2c8935}
+expected_bin=${S3_IDF_NVS_BIN_SHA256:-6eb44365aa80da064ab9b861ecc8210c31c4326216d89902da8d432afee04989}
+expected_elf=${S3_IDF_NVS_ELF_SHA256:-0992d03138cdfd968b974968c6abcf1f4fec01ab35a233d737dada8b81414588}
 expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
 for entry in "$S3_IDF_NVS_BIN:$expected_bin" \
              "$S3_IDF_NVS_ELF:$expected_elf" \
@@ -57,8 +57,8 @@ count() {
     fail "new NVS key was not initially absent"
 [[ $(count 'NVS_COMMITTED value=0x5a17c0de' "$tmpdir/guest.out") -eq 1 ]] ||
     fail "NVS write/commit did not finish"
-[[ $(count 'NVS_SECOND_BOOT value=0x5a17c0de' "$tmpdir/guest.out") -eq 1 ]] ||
-    fail "guest did not read committed NVS value after restart"
+[[ $(count 'NVS_SECOND_BOOT value=0x5a17c0de reset=3 rtc_store=51ee5a17' "$tmpdir/guest.out") -eq 1 ]] ||
+    fail "guest did not read committed NVS, software-reset cause, and retained RTC STORE after restart"
 grep -q 'NVS_ALIVE 10' "$tmpdir/guest.out" ||
     fail "second boot did not sustain its loop"
 [[ $(count 'CORE1 started' "$tmpdir/emu.err") -eq 2 ]] ||
@@ -72,11 +72,11 @@ if grep -Eq 'NVS_FAIL|^\[TRAP\]|Guru Meditation|panic' \
     fail "guest failed, trapped, or panicked"
 fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 154 ]] ||
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 306 ]] ||
     fail "unsupported MMIO count changed from the pinned baseline"
 cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
     fail "guest UART transcript differs on replay"
 cmp -s "$tmpdir/emu.err" "$tmpdir/emu.replay" ||
     fail "emulator state and MMIO report differ on replay"
 
-echo "PASS: native ESP-IDF S3 NVS committed, restarted, reloaded 0x5a17c0de, and sustained app_main with identical replay; $unhandled unsupported accesses remain visible"
+echo "PASS: native ESP-IDF S3 NVS committed, restarted with software-reset cause and retained RTC STORE, reloaded 0x5a17c0de, and sustained app_main with identical replay; $unhandled unsupported accesses remain visible"

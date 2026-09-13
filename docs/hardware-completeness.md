@@ -47,12 +47,12 @@ even when a firmware workflow succeeds.
 | Classic network/Bluetooth | Partial (service shims and device models) | Meshtastic, Marauder, NerdMiner and WLED compatibility scenarios | RF/PHY propagation and general controller equivalence are unsupported. |
 | S3 LX7, interrupts, dual-core startup | Partial | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, target and interrupt-matrix unit tests | Sustained queue handoffs and CPU1 stall/resume pass; broader FreeRTOS and interrupt workloads remain to validate. |
 | S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh` | Other flash modes, cache behavior, and bootloader paths remain unverified. |
-| S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate | Additional partition and filesystem variants need end-to-end gates. |
+| S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | RTC slow counter/STORE and RTC_DATA survive machine rebuild; additional partition and filesystem variants need end-to-end gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate | RTC wake routing, full pad hold/pulls/drive, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and ESP-IDF SPI-master replay gates run twice across session resets against persistent virtual slaves | I2C slave mode, more guest driver/device combinations, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
-| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core and restart gates | Calibrated timing, all wake modes, and all reset causes remain unsupported. |
+| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core, restart, and native timer light/deep-sleep gates | Timer wake works; external/touch/ULP wake, power-transition fidelity, calibrated timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | Counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
 | S3 RMT RX | Partial (MMIO plus host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 receives 2- and 96-symbol frames through the ESP-IDF ISR without RMT fallback | Host supplies decoded symbols; GPIO edge capture, filter/carrier physics, DMA, and overrun/error behavior under delayed ISR service remain unsupported. |
@@ -94,8 +94,8 @@ heartbeats. Its image SHA-256 is
 and ELF SHA-256 is
 `84e74cdcdfac1bbc67caef66b9fa49366d8f6940c81f794c8253d47301a4f230`.
 Both external-image gates compare a complete second replay byte-for-byte,
-including the unsupported-MMIO report; each still reports 154 unsupported
-accesses after boot. This proves these FreeRTOS interactions, not simultaneous
+including the unsupported-MMIO report; hello-world reports 306 unsupported
+accesses across its two boots and cross-core reports 145 in one boot. This proves these FreeRTOS interactions, not simultaneous
 core execution or timing fidelity. Run with matching external artifacts:
 
 ```sh
@@ -126,18 +126,53 @@ idf.py -C tests/fixtures/s3_idf_crosscore \
 Independently rebuilt images can supply matching `*_SHA256` overrides, since
 ESP-IDF embeds build metadata in the application.
 
+The S3 RTC controller now owns its documented 48-bit sleep alarm, wake enable,
+sleep state, timer interrupt, digital-wrap power-down selection, and separate
+wake-cause register. The session advances the shared virtual clock through
+timer-only light sleep or resets after timer-only deep sleep; the always-on
+counter, fractional tick phase, and STORE0-7 survive that rebuild. The
+unmodified ESP-IDF 5.3.2 `tests/fixtures/s3_idf_sleep` application enters a
+50 ms light sleep, observes `ESP_SLEEP_WAKEUP_TIMER`, then enters a 20 ms deep
+sleep and checks the timer wake cause, deep-sleep reset reason, RTC_DATA marker,
+and STORE0 marker on its second `app_main()`. The guest also measures RTC
+ticks through each sleep, including the second boot's startup, and sustains a
+FreeRTOS heartbeat afterward. Its image SHA-256 is
+`cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2`
+and matching ELF SHA-256 is
+`a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294`.
+The two complete replays are byte-identical; 388 other unsupported accesses
+across both boots remain visible, mainly RTC power/isolation configuration.
+No unsupported sites remain for S3 sleep timer, state, wake-enable, or cause
+registers. The nominal slow-clock model yielded about 48.9/19.3 ms for the
+guest's requested 50/20 ms, so this is functional wake ordering, not calibrated
+sleep duration. EXT0/EXT1/touch/ULP wake and voltage/power-domain transitions
+are not modeled; an unarmed timer or those sources do not synthesize a wake.
+Rebuild and run with the matching external artifacts:
+
+```sh
+idf.py -C tests/fixtures/s3_idf_sleep \
+  -B /tmp/flexe-s3-sleep-build -D SDKCONFIG=/tmp/flexe-s3-sleep-build/sdkconfig \
+  -D IDF_TARGET=esp32s3 build
+S3_IDF_SLEEP_BIN=/tmp/flexe-s3-sleep-build/s3_idf_sleep.bin \
+S3_IDF_SLEEP_ELF=/tmp/flexe-s3-sleep-build/s3_idf_sleep.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-idf-sleep.sh
+```
+
 The separate `tests/fixtures/s3_idf_nvs` project uses ESP-IDF v5.3.2's real
 `nvs_flash` implementation to open a namespace, write and commit a 32-bit
-value, request a software reset, and read the value after the second boot.
+value, request a software reset, and read the value after the second boot. It
+also verifies the software CPU reset reason and an RTC STORE0 marker retained
+across that reset.
 Neither its API nor its SPI-flash transactions are replaced by host NVS shims.
 Its direct application image uses Flexe's documented synthesized NVS
 partition; NerdMiner's factory-image gate separately exercises a real
 partition table and SPIFFS volume. The pinned NVS image SHA-256 is
-`3d81633344bd43cdc901c32c48411bbd00c88a8260a103862aa74ea82c9945b4`
+`6eb44365aa80da064ab9b861ecc8210c31c4326216d89902da8d432afee04989`
 and ELF SHA-256 is
-`c4266b7433b41a25f73067e274b0622314be62106fba43416a9a1d0f1a2c8935`.
-The gate checks two byte-identical runs and still reports 154 unsupported
-startup accesses:
+`0992d03138cdfd968b974968c6abcf1f4fec01ab35a233d737dada8b81414588`.
+The gate checks two byte-identical runs and still reports 306 unsupported
+accesses across its two boots:
 
 ```sh
 idf.py -C tests/fixtures/s3_idf_nvs \

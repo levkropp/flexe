@@ -379,6 +379,25 @@ typedef struct {
     uint8_t  digital_pad_hold_first_gpio;
     uint8_t  digital_pad_hold_first_bit;
     uint8_t  digital_pad_hold_count;
+    /* Optional RTC sleep/wake register block. A zero timer-low offset means
+     * that this target has no sleep model in the target RTC controller. */
+    uint16_t sleep_timer_low_offset;
+    uint16_t sleep_timer_high_offset;
+    uint16_t sleep_state_offset;
+    uint16_t wakeup_state_offset;
+    uint16_t digital_power_offset;
+    uint16_t wakeup_cause_offset;
+    uint32_t digital_power_reset;
+    uint32_t sleep_enable_mask;
+    uint32_t sleep_wakeup_mask;
+    uint32_t sleep_alarm_enable_mask;
+    uint32_t sleep_alarm_interrupt_mask;
+    uint32_t digital_wrap_power_down_mask;
+    uint32_t timer_wakeup_mask;
+    uint32_t sleep_wakeup_interrupt_mask;
+    uint32_t wakeup_valid_mask;
+    uint32_t wakeup_enable_reset;
+    uint8_t wakeup_enable_shift;
 } flexe_rtc_cntl_desc_t;
 
 /* S3-generation RTC GPIO output bank and contiguous per-pad RTC mux. GPIO

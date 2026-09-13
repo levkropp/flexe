@@ -34,6 +34,8 @@
 /* rtc.h: timer wake trigger, and the RESET_REASON for a deep-sleep wake. */
 #define RTC_TIMER_WAKE_CAUSE        (1u << 3)
 #define RTC_DEEPSLEEP_RESET_CAUSE   5u
+/* esp32s3/rom/rtc.h: esp_restart() yields RTC_SW_CPU_RESET on reboot. */
+#define RTC_SOFTWARE_CPU_RESET_CAUSE 12u
 
 struct flexe_session {
     xtensa_cpu_t       cpu[2];
@@ -674,6 +676,8 @@ void flexe_session_reset(flexe_session_t *s)
     periph_i2c_attachments_snapshot(s->periph, &i2c_attachments);
     periph_spi_attachment_snapshot_t spi_attachments;
     periph_spi_attachments_snapshot(s->periph, &spi_attachments);
+    flexe_rtc_cntl_retained_t rtc_retained;
+    periph_rtc_retained_snapshot(s->periph, &rtc_retained);
 
     /* A deep-sleep wake keeps RTC memory -- RTC_DATA_ATTR variables and the
      * wake stub live there, and firmware counts on them surviving. The reload
@@ -745,6 +749,10 @@ void flexe_session_reset(flexe_session_t *s)
     periph_unhandled_audit_resume(s->periph, &audit);
     periph_i2c_attachments_restore(s->periph, &i2c_attachments);
     periph_spi_attachments_restore(s->periph, &spi_attachments);
+    periph_rtc_retained_restore(s->periph, &rtc_retained);
+    if (s->target->id == FLEXE_TARGET_ESP32S3)
+        periph_set_wake_state(s->periph, 0u,
+                              RTC_SOFTWARE_CPU_RESET_CAUSE);
     wifi_stubs_apply_host_config(s->wstubs, &netcfg);
     periph_pad_hold_restore(s->periph, &pad_hold);
     if (was_verifying) jit_set_verify(s->jit, true);

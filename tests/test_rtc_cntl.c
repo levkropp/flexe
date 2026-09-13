@@ -946,6 +946,200 @@ TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_s3_timer_sleep_wakes_and_reports_cause)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
+
+    uint32_t low = desc->base + desc->sleep_timer_low_offset;
+    uint32_t high = desc->base + desc->sleep_timer_high_offset;
+    uint32_t state = desc->base + desc->sleep_state_offset;
+    uint32_t wakeup = desc->base + desc->wakeup_state_offset;
+    uint32_t cause_reg = desc->base + desc->wakeup_cause_offset;
+    uint32_t digital = desc->base + desc->digital_power_offset;
+    uint32_t raw = desc->base + desc->interrupt_raw_offset;
+    uint32_t clear = desc->base + desc->interrupt_clear_offset;
+    ASSERT_EQ(mem_read32(mem, digital), desc->digital_power_reset);
+    ASSERT_EQ(mem_read32(mem, cause_reg), 0u);
+    ASSERT_EQ(mem_read32(mem, wakeup),
+              desc->wakeup_enable_reset << desc->wakeup_enable_shift);
+
+    /* The official S3 HAL writes an absolute 48-bit target, then a
+     * write-only alarm-enable command in the high word. */
+    mem_write32(mem, low, 13600u); /* 100 ms at 136 kHz */
+    mem_write32(mem, high, 0u);
+    mem_write32(mem, high, desc->sleep_alarm_enable_mask);
+    ASSERT_EQ(mem_read32(mem, low), 13600u);
+    ASSERT_EQ(mem_read32(mem, high), 0u);
+    mem_write32(mem, wakeup,
+                desc->timer_wakeup_mask << desc->wakeup_enable_shift);
+    mem_write32(mem, state, desc->sleep_enable_mask);
+
+    bool deep = true;
+    uint64_t timeout_us = 0u;
+    uint32_t cause = UINT32_MAX;
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                           &cause));
+    ASSERT_FALSE(deep);
+    ASSERT_EQ64(timeout_us, 100000u);
+    ASSERT_EQ(cause, 0u);
+    ASSERT_FALSE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                            &cause));
+
+    cpu.ccount = 16000000u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, raw) & desc->sleep_alarm_interrupt_mask,
+              desc->sleep_alarm_interrupt_mask);
+    periph_finish_wake(periph, desc->timer_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, state) & desc->sleep_enable_mask, 0u);
+    ASSERT_EQ(mem_read32(mem, state) & desc->sleep_wakeup_mask,
+              desc->sleep_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, raw) & desc->sleep_wakeup_interrupt_mask,
+              desc->sleep_wakeup_interrupt_mask);
+    ASSERT_EQ(mem_read32(mem, cause_reg), desc->timer_wakeup_mask);
+    mem_write32(mem, clear, desc->sleep_alarm_interrupt_mask |
+                            desc->sleep_wakeup_interrupt_mask);
+
+    /* A second alarm can enter deep sleep; the reset cause and wake source
+     * use separate S3 registers, unlike the classic ESP32 layout. */
+    uint64_t now = rtc_capture(mem, desc);
+    mem_write32(mem, low, (uint32_t)(now + 68u));
+    mem_write32(mem, high,
+                (uint32_t)((now + 68u) >> 32u) |
+                desc->sleep_alarm_enable_mask);
+    mem_write32(mem, digital, desc->digital_power_reset |
+                               desc->digital_wrap_power_down_mask);
+    mem_write32(mem, state, desc->sleep_enable_mask);
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                           &cause));
+    ASSERT_TRUE(deep);
+    ASSERT_EQ64(timeout_us, 500u);
+    periph_set_wake_state(periph, desc->timer_wakeup_mask, 5u);
+    ASSERT_EQ(mem_read32(mem, cause_reg), desc->timer_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->reset_state_offset) &
+              0xFFFu, 5u | (5u << 6u));
+    periph_set_wake_state(periph, 0u, 12u);
+    ASSERT_EQ(mem_read32(mem, cause_reg), 0u);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->reset_state_offset) &
+              0xFFFu, 12u | (12u << 6u));
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    uint32_t wakeup = desc->base + desc->wakeup_state_offset;
+    uint32_t state = desc->base + desc->sleep_state_offset;
+    uint32_t raw = desc->base + desc->interrupt_raw_offset;
+
+    mem_write32(mem, wakeup,
+                desc->timer_wakeup_mask << desc->wakeup_enable_shift);
+    mem_write32(mem, state, desc->sleep_enable_mask);
+    bool deep = false;
+    uint64_t timeout_us = 0u;
+    uint32_t cause = 0u;
+    ASSERT_FALSE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                            &cause));
+    ASSERT_EQ(periph_unhandled_count(periph), 1);
+
+    mem_write32(mem, wakeup, 1u << desc->wakeup_enable_shift);
+    mem_write32(mem, state, desc->sleep_enable_mask);
+    ASSERT_FALSE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                            &cause));
+    ASSERT_EQ(mem_read32(mem, raw) &
+              desc->sleep_wakeup_interrupt_mask, 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 3);
+    /* One transaction touching both an unmodeled wake source and another
+     * unmodeled STATE0 field contributes one audit event, not two. */
+    mem_write32(mem, state, desc->sleep_enable_mask | (1u << 22u));
+    ASSERT_EQ(mem_read32(mem, state) & (1u << 22u), 1u << 22u);
+    ASSERT_EQ(periph_unhandled_count(periph), 4);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_counter_and_store_survive_controller_rebuild)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
+    cpu.ccount = 160001u;
+    ASSERT_EQ64(rtc_capture(mem, desc), 136u);
+    mem_write32(mem, desc->base + desc->store_offset[0], 0xA5A55A5Au);
+    mem_write32(mem, desc->base + desc->store_offset[1], 0x12345678u);
+    mem_write32(mem, desc->base + desc->sleep_timer_low_offset, 99u);
+
+    flexe_rtc_cntl_retained_t retained;
+    periph_rtc_retained_snapshot(periph, &retained);
+    periph_destroy(periph);
+    periph = periph_create(mem);
+    ASSERT_TRUE(periph != NULL);
+    if (periph) {
+        xtensa_cpu_t restarted;
+        xtensa_cpu_init_for_target(&restarted, s3);
+        restarted.mem = mem;
+        periph_attach_cpus(periph, &restarted, NULL);
+        periph_rtc_retained_restore(periph, &retained);
+        ASSERT_EQ64(rtc_capture(mem, desc), 136u);
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->store_offset[0]),
+                  0xA5A55A5Au);
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->store_offset[1]),
+                  0x12345678u);
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->sleep_timer_low_offset),
+                  0u);
+        /* One extra pre-reset CPU cycle contributes a fractional RTC tick.
+         * The first 1,176 cycles after reboot cross the tick boundary only
+         * if that phase was retained with the integer counter. */
+        restarted.ccount = 1176u;
+        ASSERT_EQ64(rtc_capture(mem, desc), 137u);
+        restarted.ccount = 161176u;
+        ASSERT_EQ64(rtc_capture(mem, desc), 273u);
+    }
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
@@ -964,4 +1158,7 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level);
     RUN_TEST(rtc_cntl_interrupt_routes_through_target_matrix);
     RUN_TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset);
+    RUN_TEST(rtc_cntl_s3_timer_sleep_wakes_and_reports_cause);
+    RUN_TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources);
+    RUN_TEST(rtc_cntl_s3_counter_and_store_survive_controller_rebuild);
 }

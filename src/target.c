@@ -651,6 +651,26 @@ static const flexe_target_desc_t TARGETS[] = {
             .digital_pad_hold_first_gpio = 21u,
             .digital_pad_hold_first_bit = 1u,
             .digital_pad_hold_count = 27u,
+            /* ESP32-S3 rtc_cntl_reg.h and rtc_cntl_ll.h. Only the timer
+             * wake source is currently executed; other wake sources stay
+             * explicitly unsupported. */
+            .sleep_timer_low_offset = 0x004u,
+            .sleep_timer_high_offset = 0x008u,
+            .sleep_state_offset = 0x018u,
+            .wakeup_state_offset = 0x03Cu,
+            .digital_power_offset = 0x090u,
+            .wakeup_cause_offset = 0x130u,
+            .digital_power_reset = 0x00545010u,
+            .sleep_enable_mask = 1u << 31,
+            .sleep_wakeup_mask = 1u << 29,
+            .sleep_alarm_enable_mask = 1u << 16,
+            .sleep_alarm_interrupt_mask = 1u << 10,
+            .digital_wrap_power_down_mask = 1u << 31,
+            .timer_wakeup_mask = 1u << 3,
+            .sleep_wakeup_interrupt_mask = 1u,
+            .wakeup_valid_mask = 0x1FFFFu,
+            .wakeup_enable_reset = 0xCu,
+            .wakeup_enable_shift = 15u,
         },
         .rtc_io = {
             .base = 0x60008400u,

@@ -19,6 +19,16 @@ typedef void (*flexe_rtc_cntl_reset_fn)(
     void *ctx, flexe_rtc_cntl_reset_action_t action);
 typedef void (*flexe_rtc_cntl_pad_hold_fn)(void *ctx, uint64_t gpio_mask);
 
+/* The RTC slow counter and STORE registers remain powered through an S3
+ * software reset/deep-sleep wake. Volatile WDT, alarm, and interrupt state
+ * are deliberately not part of this snapshot. */
+typedef struct {
+    uint64_t counter;
+    uint64_t tick_denominator;
+    uint64_t tick_remainder;
+    uint32_t store[FLEXE_TARGET_RTC_STORE_MAX];
+} flexe_rtc_cntl_retained_t;
+
 flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
     mmio_write_fn fallback_write, void *fallback_ctx,
@@ -61,5 +71,18 @@ bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc);
 
 /* Software stall pauses instruction retirement without erasing CPU state. */
 bool flexe_rtc_cntl_cpu_stalled(const flexe_rtc_cntl_t *rtc, unsigned core);
+
+void flexe_rtc_cntl_retained_snapshot(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_retained_t *out);
+void flexe_rtc_cntl_retained_restore(
+    flexe_rtc_cntl_t *rtc, const flexe_rtc_cntl_retained_t *snapshot);
+
+/* Timer-only sleep is consumed by the session's virtual-clock/reset path.
+ * Unsupported wake sources never produce a synthetic wake. */
+bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
+                                       bool *deep, uint64_t *timeout_us);
+void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause);
+void flexe_rtc_cntl_set_wake_state(flexe_rtc_cntl_t *rtc,
+                                   uint32_t cause, uint32_t reset_cause);
 
 #endif /* FLEXE_RTC_CNTL_H */

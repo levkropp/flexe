@@ -7,6 +7,7 @@
 #include "memory.h"
 #include "gpio.h"
 #include "rtc_io.h"
+#include "rtc_cntl.h"
 
 /* Forward declaration */
 typedef struct xtensa_cpu xtensa_cpu_t;
@@ -168,6 +169,13 @@ typedef void (*periph_irq_dispatch_fn)(void *ctx, int source);
 
 esp32_periph_t *periph_create(xtensa_mem_t *mem);
 void periph_destroy(esp32_periph_t *p);
+
+/* RTC slow counter/STORE survive a session software reset. Other controller
+ * registers and the watchdog are reconstructed from reset defaults. */
+void periph_rtc_retained_snapshot(
+    esp32_periph_t *p, flexe_rtc_cntl_retained_t *out);
+void periph_rtc_retained_restore(
+    esp32_periph_t *p, const flexe_rtc_cntl_retained_t *snapshot);
 /* Internal on-chip DMA fabric used to connect target-described peripheral
  * models. NULL means the selected target has no registered GDMA v1 block. */
 flexe_gdma_t *periph_gdma(esp32_periph_t *p);

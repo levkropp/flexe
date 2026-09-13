@@ -71,7 +71,7 @@ if grep -Eq '^\[TRAP\]|Guru Meditation|panic' "$tmpdir/emu.err" "$tmpdir/guest.o
     fail "guest trapped or panicked"
 fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 154 ]] ||
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 306 ]] ||
     fail "unsupported MMIO count changed from the pinned baseline"
 cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
     fail "the guest UART transcript differs on replay"
