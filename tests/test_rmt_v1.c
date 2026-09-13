@@ -327,6 +327,67 @@ TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_rx_wrap_refills_both_halves_before_end)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 24) | (5u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_LIMIT4, 24u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_ENA,
+                (1u << 16) | (1u << 24));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 13) | (1u << 3) | 1u);
+
+    uint32_t symbols[96];
+    for (unsigned i = 0u; i < 96u; i++)
+        symbols[i] = (1u + i % 16u) | ((1u + i % 7u) << 16) |
+                     ((i & 1u) << 15);
+    ASSERT_EQ(periph_rmt_rx_inject(periph, 4, symbols, 96u), 96u);
+
+    uint64_t ticks = 0u;
+    for (unsigned half = 0u; half < 4u; half++) {
+        for (unsigned i = half * 24u; i < (half + 1u) * 24u; i++)
+            ticks += (symbols[i] & 0x7FFFu) +
+                     ((symbols[i] >> 16) & 0x7FFFu);
+        cpu0.ccount = (uint32_t)(ticks * 8u - 1u);
+        ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+        cpu0.ccount++;
+        ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST),
+                  1u << 24);
+        unsigned memory_half = half & 1u;
+        for (unsigned i = 0u; i < 24u; i++)
+            ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4 +
+                                 (memory_half * 24u + i) * 4u),
+                      symbols[half * 24u + i]);
+        ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
+                  0x3FFu, 192u + ((half + 1u) * 24u) % 48u);
+        mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 24);
+    }
+    cpu0.ccount = (uint32_t)((ticks + 5u) * 8u - 1u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    cpu0.ccount++;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 16);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
+              (1u << 26), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic)
 {
     const flexe_target_desc_t *s3 =
@@ -359,5 +420,6 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline);
     RUN_TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq);
     RUN_TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible);
+    RUN_TEST(s3_rmt_v1_rx_wrap_refills_both_halves_before_end);
     RUN_TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic);
 }

@@ -1,5 +1,5 @@
-/* Exercise the stock Arduino-ESP32 3.x RX API and ESP-IDF RMT ISR with an
- * externally injected, already-decoded pulse frame. */
+/* Exercise the stock Arduino-ESP32 3.x RX API and ESP-IDF RMT ISR with short
+ * and wrap/ping-pong pulse frames injected through the hardware boundary. */
 #include "elf_symbols.h"
 #include "flexe_session.h"
 #include "memory.h"
@@ -56,24 +56,39 @@ int main(int argc, char **argv)
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
     xtensa_mem_t *mem = flexe_session_mem(session);
     esp32_periph_t *periph = flexe_session_periph(session);
-    const uint32_t expected[] = {
+    const uint32_t expected_short[] = {
         10u | (1u << 15) | (12u << 16),
         8u | (1u << 31) | (9u << 16),
     };
+    uint32_t expected_long[96];
+    for (unsigned i = 0u; i < 96u; i++)
+        expected_long[i] = (1u + i % 16u) | ((1u + i % 7u) << 16) |
+                           ((i & 1u) << 15);
     uint32_t stage = 0u;
-    int injected = 0;
+    int injected_short = 0;
+    int injected_long = 0;
     while (cpu->cycle_count < MAX_CYCLES) {
         stage = mem_read32(mem, stage_addr);
-        if (stage == 1u && !injected &&
+        if (stage == 1u && !injected_short &&
             (mem_read32(mem, RMT_RX_CONF4) & 1u)) {
             size_t accepted = periph_rmt_rx_inject(periph, 4,
-                                                   expected, 2u);
+                                                   expected_short, 2u);
             if (accepted != 2u) {
-                fprintf(stderr, "RX injection accepted %zu/2 symbols\n",
+                fprintf(stderr, "short RX accepted %zu/2 symbols\n",
                         accepted);
                 break;
             }
-            injected = 1;
+            injected_short = 1;
+        } else if (stage == 2u && !injected_long &&
+                   (mem_read32(mem, RMT_RX_CONF4) & 1u)) {
+            size_t accepted = periph_rmt_rx_inject(periph, 4,
+                                                   expected_long, 96u);
+            if (accepted != 96u) {
+                fprintf(stderr, "long RX accepted %zu/96 symbols\n",
+                        accepted);
+                break;
+            }
+            injected_long = 1;
         }
         if (stage == SUCCESS_MARKER || (stage & 0xFFF00000u) == 0xBAD00000u)
             break;
@@ -84,6 +99,18 @@ int main(int argc, char **argv)
     uint32_t count = mem_read32(mem, result_addr);
     uint32_t first = mem_read32(mem, result_addr + 4u);
     uint32_t second = mem_read32(mem, result_addr + 8u);
+    uint32_t long_count = mem_read32(mem, result_addr + 12u);
+    int long_match = long_count == 96u;
+    for (unsigned i = 0u; i < 96u; i++) {
+        uint32_t actual = mem_read32(mem, result_addr + (4u + i) * 4u);
+        if (actual != expected_long[i]) {
+            if (long_match)
+                fprintf(stderr,
+                        "[s3-rmt-rx] long symbol %u: got %08X expected %08X\n",
+                        i, actual, expected_long[i]);
+            long_match = 0;
+        }
+    }
     uint64_t cycles = cpu->cycle_count;
     unsigned unhandled = periph_unhandled_count(periph);
     unsigned rmt_unhandled = 0u;
@@ -98,14 +125,16 @@ int main(int argc, char **argv)
                     site.first_value, (unsigned long long)site.count);
         }
     }
-    int ok = injected && stage == SUCCESS_MARKER && count == 2u &&
-             first == expected[0] && second == expected[1] &&
+    int ok = injected_short && injected_long && stage == SUCCESS_MARKER &&
+             count == 2u && first == expected_short[0] &&
+             second == expected_short[1] && long_match &&
              rmt_unhandled == 0u;
     fprintf(stderr,
-            "[s3-rmt-rx] stage=0x%08X injected=%d count=%u "
-            "symbols=%08X,%08X cycles=%llu unhandled=%u "
+            "[s3-rmt-rx] stage=0x%08X injected=%d,%d counts=%u,%u "
+            "short=%08X,%08X long_match=%d cycles=%llu unhandled=%u "
             "rmt_unhandled_sites=%u\n",
-            stage, injected, count, first, second,
+            stage, injected_short, injected_long, count, long_count,
+            first, second, long_match,
             (unsigned long long)cycles, unhandled, rmt_unhandled);
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);

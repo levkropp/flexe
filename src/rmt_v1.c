@@ -63,7 +63,6 @@
 #define RMT_MAX_CHANNELS      8u
 #define RMT_MAX_TX_CHANNELS   4u
 #define RMT_MAX_WORDS         (RMT_MAX_CHANNELS * 48u)
-#define RMT_MAX_RX_WORDS      ((RMT_MAX_CHANNELS - RMT_MAX_TX_CHANNELS) * 48u)
 #define RMT_MAX_SEGMENT_WORDS (RMT_MAX_CHANNELS * 48u)
 
 typedef enum {
@@ -91,12 +90,12 @@ typedef struct {
     uint32_t conf1;
     uint32_t carrier;
     uint32_t limit;
-    uint32_t write_index;
+    size_t write_index;
     uint32_t apb_index;
     uint32_t status_flags;
-    uint32_t frame[RMT_MAX_RX_WORDS];
-    uint32_t frame_count;
-    uint32_t next_word;
+    uint32_t *frame;
+    size_t frame_count;
+    size_t next_word;
     uint64_t frame_start;
     uint64_t elapsed_ticks;
     uint64_t deadline;
@@ -279,15 +278,25 @@ static uint32_t rmt_rx_capacity(const flexe_rmt_v1_t *rmt,
     return blocks * rmt->desc->words_per_channel;
 }
 
+static void rmt_abort_rx_frame(rmt_rx_channel_t *rx)
+{
+    free(rx->frame);
+    rx->frame = NULL;
+    rx->frame_count = 0u;
+    rx->next_word = 0u;
+    rx->pending_end = false;
+    rx->pending_error = false;
+}
+
 static void rmt_finish_rx(flexe_rmt_v1_t *rmt, unsigned channel)
 {
     rmt_rx_channel_t *rx = &rmt->rx[channel];
-    rx->pending_end = false;
+    bool error = rx->pending_error;
+    rmt_abort_rx_frame(rx);
     rx->active = false;
-    if (rx->pending_error) rx->status_flags |= 1u << 26;
-    rmt->int_raw |= rx->pending_error ?
+    if (error) rx->status_flags |= 1u << 26;
+    rmt->int_raw |= error ?
         RMT_RX_ERROR_INT(channel) : RMT_RX_END_INT(channel);
-    rx->pending_error = false;
     rmt_notify_irq(rmt);
 }
 
@@ -417,12 +426,19 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
             } else {
                 unsigned physical = rmt->desc->tx_channel_count + channel;
                 unsigned base = physical * rmt->desc->words_per_channel;
-                rmt->memory[base + rx->write_index] =
+                uint32_t capacity = rmt_rx_capacity(rmt, channel);
+                size_t slot = rx->write_index;
+                if ((rx->conf1 & RMT_RX_WRAP) && capacity)
+                    slot %= capacity;
+                rmt->memory[base + slot] =
                     rx->frame[rx->next_word++];
                 rx->write_index++;
                 if (rx->next_word == rx->frame_count && rx->pending_error)
                     rx->status_flags |= 1u << 26;
-                if (rx->limit != 0u && rx->write_index == rx->limit) {
+                if (rx->limit != 0u &&
+                    ((rx->conf1 & RMT_RX_WRAP) ?
+                     rx->write_index % rx->limit == 0u :
+                     rx->write_index == rx->limit)) {
                     rmt->int_raw |= RMT_RX_THRESHOLD_INT(channel);
                     rmt_notify_irq(rmt);
                 }
@@ -484,7 +500,10 @@ static uint32_t rmt_rx_status(const flexe_rmt_v1_t *rmt, unsigned channel)
     unsigned physical = rmt->desc->tx_channel_count + channel;
     const rmt_rx_channel_t *rx = &rmt->rx[channel];
     uint32_t base = physical * rmt->desc->words_per_channel;
-    return ((base + rx->write_index) & 0x3FFu) |
+    size_t writer = rx->write_index;
+    uint32_t capacity = rmt_rx_capacity(rmt, channel);
+    if ((rx->conf1 & RMT_RX_WRAP) && capacity) writer %= capacity;
+    return (((uint32_t)(base + writer)) & 0x3FFu) |
            (((base + rx->apb_index) & 0x3FFu) << 11) |
            (rx->active ? 1u << 22 : 0u) | rx->status_flags;
 }
@@ -592,12 +611,12 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             if (value & RMT_RX_MEM_WR_RST) {
                 rx->write_index = 0u;
                 rx->status_flags = 0u;
-                rx->pending_end = false;
+                rmt_abort_rx_frame(rx);
             }
             if (value & RMT_RX_APB_MEM_RST) rx->apb_index = 0u;
             if (value & RMT_RX_CONF_UPDATE) {
                 rx->active = (rx->conf1 & RMT_RX_EN) != 0u;
-                if (!rx->active) rx->pending_end = false;
+                if (!rx->active) rmt_abort_rx_frame(rx);
                 rmt_notify_state(rmt);
             }
         }
@@ -730,6 +749,9 @@ flexe_rmt_v1_t *flexe_rmt_v1_create(xtensa_mem_t *mem,
 void flexe_rmt_v1_destroy(flexe_rmt_v1_t *rmt)
 {
     if (!rmt) return;
+    for (unsigned channel = 0u;
+         channel < rmt_rx_channel_count(rmt->desc); channel++)
+        rmt_abort_rx_frame(&rmt->rx[channel]);
     (void)mem_register_mmio_range(rmt->mem, rmt->desc->base,
                                   rmt->desc->register_size,
                                   NULL, NULL, NULL);
@@ -776,11 +798,16 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
     }
 
     uint32_t capacity = rmt_rx_capacity(rmt, index);
-    size_t available = rx->write_index < capacity ?
-        capacity - rx->write_index : 0u;
+    size_t available = (rx->conf1 & RMT_RX_WRAP) ? count :
+        (rx->write_index < capacity ? capacity - rx->write_index : 0u);
     size_t accepted = count < available ? count : available;
-    if (accepted) memcpy(rx->frame, items, accepted * sizeof(uint32_t));
-    rx->frame_count = (uint32_t)accepted;
+    if (capacity == 0u) accepted = 0u;
+    if (accepted > SIZE_MAX / sizeof(uint32_t)) return 0u;
+    uint32_t *frame = accepted ? malloc(accepted * sizeof(uint32_t)) : NULL;
+    if (accepted && !frame) return 0u;
+    if (accepted) memcpy(frame, items, accepted * sizeof(uint32_t));
+    rx->frame = frame;
+    rx->frame_count = accepted;
     rx->next_word = 0u;
     rx->pending_error = accepted < count || capacity == 0u;
     /* One call supplies one input frame at its first edge. The host provides
