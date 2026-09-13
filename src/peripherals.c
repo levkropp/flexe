@@ -1,4 +1,5 @@
 #include "peripherals.h"
+#include "apb_saradc.h"
 #include "esp32s3_extmem.h"
 #include "efuse.h"
 #include "flash_mmu.h"
@@ -1821,6 +1822,7 @@ struct esp32_periph {
     flexe_regi2c_t *regi2c;
     flexe_radio_t *radio_regs;
     flexe_sens_t *target_sens;
+    flexe_apb_saradc_t *target_apb_saradc;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_system_clock_t *system_clock;
     periph_system_state_fn
@@ -14349,11 +14351,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         if (target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)
             p->target_efuse = flexe_efuse_create(
                 mem, default_read, default_write, p);
+        if (target->capabilities & FLEXE_TARGET_CAP_APB_SARADC_V1)
+            p->target_apb_saradc = flexe_apb_saradc_create(
+                mem, default_read, default_write, p);
         if (target->capabilities & FLEXE_TARGET_CAP_SENS_V1)
             p->target_sens = flexe_sens_create(
                 mem, default_read, default_write, p,
                 target_sens_conversion_done, p);
         flexe_sens_attach_regi2c(p->target_sens, p->regi2c);
+        flexe_sens_attach_apb_saradc(p->target_sens, p->target_apb_saradc);
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
             mmio_read_fn fallback_read = p->target_sens
                 ? flexe_sens_mmio_read : default_read;
@@ -14382,6 +14388,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
              !p->target_efuse) ||
             ((target->capabilities & FLEXE_TARGET_CAP_SENS_V1) &&
              !p->target_sens) ||
+            ((target->capabilities & FLEXE_TARGET_CAP_APB_SARADC_V1) &&
+             !p->target_apb_saradc) ||
             ((target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) &&
              !p->target_rtc_cntl) ||
             (target->flash_mmu.shared_instruction_data &&
@@ -14721,6 +14729,7 @@ void periph_destroy(esp32_periph_t *p) {
             p->mem, p->target->rtc_cntl.base,
             p->target->rtc_cntl.register_size, NULL, NULL, NULL);
     flexe_sens_destroy(p->target_sens);
+    flexe_apb_saradc_destroy(p->target_apb_saradc);
     flexe_io_mux_destroy(p->io_mux);
     if (p->target->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1)
         (void)mem_register_mmio_range(

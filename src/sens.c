@@ -1,5 +1,6 @@
 #include "sens.h"
 
+#include "apb_saradc.h"
 #include "regi2c.h"
 
 #include <stdbool.h>
@@ -41,6 +42,7 @@ struct flexe_sens {
     uint16_t output;
     bool ready;
     const flexe_regi2c_t *regi2c;
+    const flexe_apb_saradc_t *apb_saradc;
     uint32_t adc_power;
     uint32_t adc_status_addr;
     sens_adc_unit_t adc[FLEXE_TARGET_SENS_ADC_UNIT_MAX];
@@ -182,7 +184,10 @@ static bool sens_geometry_valid(const flexe_target_desc_t *target)
             (adc->reader_invert_mask & ~adc->reader_writable_mask) != 0u ||
             (adc->reader_reset & ~adc->reader_writable_mask) != 0u ||
             (adc->mux_rtc_block_mask & ~adc->mux_writable_mask) != 0u ||
+            (adc->mux_rtc_bypass_mask & ~adc->mux_writable_mask) != 0u ||
             (adc->mux_unsupported_mask & ~adc->mux_writable_mask) != 0u ||
+            (adc->arbiter_controlled &&
+             !(target->capabilities & FLEXE_TARGET_CAP_APB_SARADC_V1)) ||
             (adc->calibration_ground_mask != 0u &&
              (!one_bit(adc->calibration_ground_mask) ||
               !(target->capabilities & FLEXE_TARGET_CAP_REGI2C) ||
@@ -318,11 +323,15 @@ static void sens_adc_measure_write(flexe_sens_t *sens, unsigned index,
     bool one_pad = one_bit(pads);
     bool internal_ground = sens_adc_internal_ground(sens, index);
     bool rtc_control = (unit->mux & model->mux_rtc_block_mask) == 0u;
+    bool rtc_granted = !model->arbiter_controlled ||
+        (unit->mux & model->mux_rtc_bypass_mask) != 0u ||
+        (sens->apb_saradc &&
+         flexe_apb_saradc_rtc_granted(sens->apb_saradc));
     if ((!internal_ground &&
          (!one_pad || pads >= (1u << desc->adc_channels_per_unit))) ||
         (unit->measure & (SENS_ADC_PAD_FORCE | SENS_ADC_START_FORCE)) !=
             (SENS_ADC_PAD_FORCE | SENS_ADC_START_FORCE) ||
-        !rtc_control || !sens_adc_powered(sens)) {
+        !rtc_control || !rtc_granted || !sens_adc_powered(sens)) {
         /* Do not claim a conversion that the modeled RTC path cannot do. */
         sens_fallback_write(sens, addr, value);
         return;
@@ -539,6 +548,12 @@ void flexe_sens_attach_regi2c(flexe_sens_t *sens,
                               const flexe_regi2c_t *regi2c)
 {
     if (sens) sens->regi2c = regi2c;
+}
+
+void flexe_sens_attach_apb_saradc(flexe_sens_t *sens,
+                                  const flexe_apb_saradc_t *apb_saradc)
+{
+    if (sens) sens->apb_saradc = apb_saradc;
 }
 
 void flexe_sens_set_temperature_raw(flexe_sens_t *sens, uint16_t raw)

@@ -40,7 +40,7 @@ The milestone is complete only when:
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
 | S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
-| S3 RTC SAR ADC (partial) | `tests/test_sens.c` covers both units' pad selection, START/DONE/DATA latching, internal-ground calibration selection, reader inversion, clock/reset gating, and host ADC stimulus through `adc_in` (channels 0–9 = ADC1, 10–19 = ADC2). `scripts/check-s3-adc.sh` replays a stock Arduino S3 sketch and checks five sustained `analogRead()` pairs. | Digital/DMA conversion, ULP, ADC interrupts, calibrated analog voltage/electrical behavior, and ADC2 arbitration are unsupported or incomplete. |
+| S3 RTC SAR ADC (partial) | `tests/test_sens.c` covers both units' pad selection, START/DONE/DATA latching, internal-ground calibration selection, reader inversion, clock/reset gating, and host ADC stimulus through `adc_in` (channels 0–9 = ADC1, 10–19 = ADC2). `tests/test_apb_saradc.c` covers ADC2 forced-grant and RTC bypass. `scripts/check-s3-adc.sh` checks five sustained stock Arduino `analogRead()` pairs. | Digital/DMA conversion, ULP, ADC interrupts, competing-requester arbitration, and calibrated analog voltage/electrical behavior are unsupported. |
 | S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
@@ -119,9 +119,14 @@ aggregate cycles. Its merged image SHA-256 is
 `5178a6d97110c3682664ecbe602e0bbce40367c639ebc46ab3f714d879c4ec34`
 and matching ELF SHA-256 is
 `7c156185527896c78a8cf8de1155b10f417350ac1dad27a7ef255298fdad99d0`.
-The gate keeps 446 other unsupported accesses visible, including APB SAR ADC
-arbiter configuration and RF power-detector trim. This is raw-code functional
-behavior, not physical analog, attenuation, calibration accuracy, or
+The APB ADC2 arbiter retains its reset priorities and software configuration.
+When grant is forced, only a forced RTC grant completes an RTC ADC2 conversion;
+the SENS RTC_FORCE bit bypasses that arbiter. With no modeled competing
+requester, unforced RTC conversion proceeds. Digital and Wi-Fi/PWDET
+requesters and simultaneous contention are still unsupported, and forcing
+those owners remains diagnostic. The gate keeps 222 other unsupported accesses
+visible, including RF power-detector trim and RTC setup. This is raw-code
+functional behavior, not physical analog, attenuation, calibration accuracy, or
 continuous/DMA ADC fidelity. Recheck with the external compiled fixture:
 
 ```sh

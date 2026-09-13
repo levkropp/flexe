@@ -50,7 +50,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 38u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 39u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -81,6 +81,7 @@ typedef enum {
     FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF            = 1ull << 22,
     FLEXE_TARGET_CAP_GP_SPI                       = 1ull << 23,
     FLEXE_TARGET_CAP_RMT_V1                        = 1ull << 24,
+    FLEXE_TARGET_CAP_APB_SARADC_V1                = 1ull << 25,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -446,9 +447,24 @@ typedef struct {
     uint32_t reader_invert_mask;
     uint32_t mux_writable_mask;
     uint32_t mux_rtc_block_mask;
+    uint32_t mux_rtc_bypass_mask;
     uint32_t mux_unsupported_mask;
     uint8_t calibration_ground_mask;
+    bool arbiter_controlled;
 } flexe_sens_adc_unit_desc_t;
+
+/* APB SAR ADC2 arbitration. Only the RTC requester is currently modeled;
+ * digital DMA and Wi-Fi/PWDET requests remain explicit unsupported paths. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint16_t arbiter_offset;
+    uint32_t arbiter_reset;
+    uint32_t arbiter_writable_mask;
+    uint32_t grant_force_mask;
+    uint32_t rtc_force_mask;
+    uint32_t force_selection_mask;
+} flexe_apb_saradc_desc_t;
 
 typedef struct {
     uint32_t base;
@@ -879,6 +895,7 @@ typedef struct {
 
     /* Optional RTC-domain ADC/touch/temperature sensor controller. */
     flexe_sens_desc_t             sens;
+    flexe_apb_saradc_desc_t       apb_saradc;
 
     /* Optional RF/baseband/controller register and calibration surfaces. */
     flexe_radio_desc_t            radio;

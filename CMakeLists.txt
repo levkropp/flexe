@@ -71,6 +71,7 @@ set(LIB_SOURCES
     src/flash_mmu.c
     src/esp32s3_extmem.c
     src/efuse.c
+    src/apb_saradc.c
     src/gpio.c
     src/gdma.c
     src/rmt_v1.c

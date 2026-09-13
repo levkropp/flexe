@@ -310,6 +310,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SHA_V1 |
                         FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_RMT_V1 |
+                        FLEXE_TARGET_CAP_APB_SARADC_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -784,8 +785,21 @@ static const flexe_target_desc_t TARGETS[] = {
                     .mux_writable_mask = 0xF0000000u,
                     .mux_unsupported_mask = 7u << 28,
                     .calibration_ground_mask = 1u << 7,
+                    .mux_rtc_bypass_mask = 1u << 31,
+                    .arbiter_controlled = true,
                 },
             },
+        },
+        .apb_saradc = {
+            .base = 0x60040000u,
+            .register_size = 0x1000u,
+            .arbiter_offset = 0x038u,
+            /* Reset priorities: Wi-Fi 2 > RTC 1 > APB 0. */
+            .arbiter_reset = (2u << 10) | (1u << 8),
+            .arbiter_writable_mask = 0x00001FFCu,
+            .grant_force_mask = 1u << 5,
+            .rtc_force_mask = 1u << 3,
+            .force_selection_mask = 7u << 2,
         },
         .radio = {
             .window_count = 9u,

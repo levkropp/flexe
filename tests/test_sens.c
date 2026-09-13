@@ -1,5 +1,6 @@
 /* Target-described RTC-domain sensor controller tests. */
 #include "test_helpers.h"
+#include "apb_saradc.h"
 #include "peripherals.h"
 #include "regi2c.h"
 #include "sens.h"
@@ -201,13 +202,18 @@ TEST(sens_s3_rtc_adc_latches_channel_and_obeys_clock_reset)
     flexe_sens_t *sens = flexe_sens_create(
         mem, sens_test_fallback_read, sens_test_fallback_write,
         &fallback, NULL, NULL);
+    flexe_apb_saradc_t *apb = flexe_apb_saradc_create(
+        mem, sens_test_fallback_read, sens_test_fallback_write, &fallback);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(sens != NULL);
-    if (!mem || !sens) {
+    ASSERT_TRUE(apb != NULL);
+    if (!mem || !sens || !apb) {
         flexe_sens_destroy(sens);
+        flexe_apb_saradc_destroy(apb);
         mem_destroy(mem);
         return;
     }
+    flexe_sens_attach_apb_saradc(sens, apb);
 
     const flexe_sens_adc_unit_desc_t *adc1 = &desc->adc_unit[0];
     const flexe_sens_adc_unit_desc_t *adc2 = &desc->adc_unit[1];
@@ -284,6 +290,7 @@ TEST(sens_s3_rtc_adc_latches_channel_and_obeys_clock_reset)
     ASSERT_EQ(fallback.writes, 2u);
 
     flexe_sens_destroy(sens);
+    flexe_apb_saradc_destroy(apb);
     mem_destroy(mem);
 }
 

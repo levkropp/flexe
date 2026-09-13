@@ -5,6 +5,7 @@
 #include "memory.h"
 
 typedef struct flexe_regi2c flexe_regi2c_t;
+typedef struct flexe_apb_saradc flexe_apb_saradc_t;
 
 typedef struct flexe_sens flexe_sens_t;
 
@@ -19,6 +20,8 @@ flexe_sens_t *flexe_sens_create(
 void flexe_sens_destroy(flexe_sens_t *sens);
 void flexe_sens_attach_regi2c(flexe_sens_t *sens,
                               const flexe_regi2c_t *regi2c);
+void flexe_sens_attach_apb_saradc(flexe_sens_t *sens,
+                                  const flexe_apb_saradc_t *apb_saradc);
 
 /* These are public so another device sharing the same 4-KiB MMIO page can
  * retain SENS as its fallback handler. */
