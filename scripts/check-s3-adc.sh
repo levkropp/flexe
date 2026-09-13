@@ -48,8 +48,8 @@ if (( samples < 3 )); then
     cat "$tmpdir/uart" >&2
     exit 1
 fi
-if grep -Eq '0x600088(0C|30|40)|0x60040038' "$tmpdir/guest.err"; then
-    echo "FAIL: RTC ADC measure/status or APB arbiter MMIO fell back" >&2
+if grep -Eq '0x600088(0C|30|40)|0x60040038|0x600084(94|B0)' "$tmpdir/guest.err"; then
+    echo "FAIL: RTC ADC, APB arbiter, or RTCIO pad MMIO fell back" >&2
     exit 1
 fi
 if grep -E '0x60008034' "$tmpdir/guest.err" |

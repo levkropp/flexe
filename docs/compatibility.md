@@ -83,8 +83,15 @@ inputs. Peripheral-produced matrix output levels, BT/SDIO pad ownership,
 open-drain electrical resolution, input synchronizer/filter timing, GPIO wake,
 and clock-gate effects are not modeled yet; selecting those behaviors produces
 an unsupported-access diagnostic instead of an invented result. Pulls, drive
-strength, and other pad electrical behavior remain part of the separate IO_MUX
-and future board/net model. This is useful functional GPIO support for the
+strength, and other pad electrical behavior remain outside the current
+IO_MUX/RTCIO and board/net models. The S3 RTCIO bank now models GPIO0..21
+pad-owner selection, RTC output and enable latches, W1TS/W1TC aliases, and
+sampled host-driven input. When an RTC pad owns the pin, digital output latches
+remain writable but no longer drive the reported physical pin. Unmodeled RTC
+pad functions report unknown output and retain diagnostics; RTC wakeup and
+RTC GPIO interrupts remain unsupported. This follows Espressif's
+[S3 RTC GPIO mapping](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
+This is useful functional GPIO support for the
 experimental S3 target, not hardware-calibrated timing or electrical evidence.
 S3 RTC digital-pad hold is now connected to the GPIO output model: held
 GPIO21..47 retain their physical output level and enable while the GPIO

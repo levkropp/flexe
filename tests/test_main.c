@@ -15,6 +15,7 @@ volatile int emu_app_running = 1;
 #include "test_gpio.c"
 #include "test_io_mux.c"
 #include "test_rtc_cntl.c"
+#include "test_rtc_io.c"
 #include "test_sens.c"
 #include "test_apb_saradc.c"
 #include "test_radio.c"
@@ -72,6 +73,7 @@ int main(void) {
     run_target_gpio_tests();
     run_io_mux_tests();
     run_rtc_cntl_tests();
+    run_rtc_io_tests();
     run_sens_tests();
     run_apb_saradc_tests();
     run_radio_tests();

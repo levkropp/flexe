@@ -77,6 +77,7 @@ set(LIB_SOURCES
     src/rmt_v1.c
     src/io_mux.c
     src/rtc_cntl.c
+    src/rtc_io.c
     src/regi2c.c
     src/radio.c
     src/sens.c

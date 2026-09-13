@@ -38,6 +38,7 @@ The milestone is complete only when:
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
 | S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
+| S3 RTC GPIO/RTCIO (partial) | `tests/test_rtc_io.c` covers GPIO0..21 RTC pad ownership, output/enable W1TS/W1TC, host input, unknown alternate functions, and return to digital GPIO. The stock Arduino ADC gate checks that `rtc_gpio_deinit()` for GPIO4/11 no longer falls back. | RTC wakeup/interrupt routing, pad pulls, drive strength, analog/electrical resolution, and sleep behavior are unsupported. |
 | S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
 | S3 RTC SAR ADC (partial) | `tests/test_sens.c` covers both units' pad selection, START/DONE/DATA latching, internal-ground calibration selection, reader inversion, clock/reset gating, and host ADC stimulus through `adc_in` (channels 0–9 = ADC1, 10–19 = ADC2). `tests/test_apb_saradc.c` covers ADC2 forced-grant and RTC bypass; `tests/test_rtc_cntl.c` covers SAR-I2C power gating. `scripts/check-s3-adc.sh` checks five sustained stock Arduino `analogRead()` pairs. | Digital/DMA conversion, ULP, ADC interrupts, competing-requester arbitration, and calibrated analog voltage/electrical behavior are unsupported. |
@@ -92,7 +93,10 @@ PCB API, which the S3 BSD-socket bridge alone does not expose. The optional
 to WLED's own AP netif through Ethernet frames (libslirp is required). The
 source-built image served its gzip HTML UI, returned JSON state, accepted a
 brightness/red-color JSON POST, and read that state back. The pinned external
-gate repeats the complete interaction:
+gate repeats the complete interaction; it accepts either a parked `WAITI`
+stop or a clean 12-billion-cycle budget stop with at least one billion
+retired instructions, since concurrently active network/DMX tasks need not
+park at the exact limit:
 
 ```sh
 S3_WLED_BIN=/path/to/matching/firmware.bin \

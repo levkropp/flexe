@@ -98,6 +98,10 @@ struct flexe_gpio {
     uint32_t date;
     bool irq_level[2];
     uint64_t held_pins;
+    uint64_t rtc_owned;
+    uint64_t rtc_unknown;
+    uint64_t rtc_output;
+    uint64_t rtc_enabled;
     int8_t held_level[GPIO_PIN_REGISTER_COUNT];
     int8_t held_enable[GPIO_PIN_REGISTER_COUNT];
 };
@@ -196,6 +200,10 @@ int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin)
     if (!gpio_pin_valid(gpio, pin)) return -1;
     if (gpio->held_pins & (UINT64_C(1) << pin))
         return gpio->held_level[pin];
+    if (gpio->rtc_owned & (UINT64_C(1) << pin)) {
+        if (gpio->rtc_unknown & (UINT64_C(1) << pin)) return -1;
+        return (gpio->rtc_output & (UINT64_C(1) << pin)) != 0u;
+    }
     uint32_t route = gpio->func_out[pin];
     if ((route & GPIO_FUNC_OUT_SIGNAL_MASK) != GPIO_FUNC_OUT_SOFTWARE)
         return -1;
@@ -212,6 +220,10 @@ int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin)
     if (!gpio_pin_valid(gpio, pin)) return -1;
     if (gpio->held_pins & (UINT64_C(1) << pin))
         return gpio->held_enable[pin];
+    if (gpio->rtc_owned & (UINT64_C(1) << pin)) {
+        if (gpio->rtc_unknown & (UINT64_C(1) << pin)) return -1;
+        return (gpio->rtc_enabled & (UINT64_C(1) << pin)) != 0u;
+    }
     uint32_t route = gpio->func_out[pin];
     if ((route & GPIO_FUNC_OUT_SIGNAL_MASK) != GPIO_FUNC_OUT_SOFTWARE &&
         (route & GPIO_FUNC_OUT_OEN_SELECT) == 0u)
@@ -231,6 +243,31 @@ static void gpio_notify_pin(flexe_gpio_t *gpio, unsigned pin)
     gpio->output_changed(gpio->output_ctx, pin,
                          flexe_gpio_pin_level(gpio, pin),
                          flexe_gpio_output_enabled(gpio, pin));
+}
+
+void flexe_gpio_set_rtc_state(flexe_gpio_t *gpio, uint64_t owned,
+                              uint64_t unknown, uint64_t output,
+                              uint64_t enabled)
+{
+    if (!gpio) return;
+    uint64_t valid = gpio->target->gpio.valid_gpio_mask;
+    owned &= valid;
+    unknown &= owned;
+    output &= valid;
+    enabled &= valid;
+    uint64_t changed = (gpio->rtc_owned ^ owned) |
+        (gpio->rtc_unknown ^ unknown) |
+        ((gpio->rtc_output ^ output) & (gpio->rtc_owned | owned)) |
+        ((gpio->rtc_enabled ^ enabled) & (gpio->rtc_owned | owned));
+    gpio->rtc_owned = owned;
+    gpio->rtc_unknown = unknown;
+    gpio->rtc_output = output;
+    gpio->rtc_enabled = enabled;
+    while (changed) {
+        unsigned pin = (unsigned)__builtin_ctzll(changed);
+        changed &= changed - 1u;
+        gpio_notify_pin(gpio, pin);
+    }
 }
 
 void flexe_gpio_set_pad_hold(flexe_gpio_t *gpio, uint64_t held_pins)
@@ -398,8 +435,10 @@ static uint32_t gpio_read(void *ctx, uint32_t addr)
     case GPIO_ENABLE_OFF: return gpio->enable[0];
     case GPIO_ENABLE1_OFF: return gpio->enable[1];
     case GPIO_STRAP_OFF: return desc->strap_reset & GPIO_STRAP_MASK;
-    case GPIO_IN_OFF: return gpio->input[0];
-    case GPIO_IN1_OFF: return gpio->input[1];
+    case GPIO_IN_OFF:
+        return gpio->input[0] & ~(uint32_t)gpio->rtc_owned;
+    case GPIO_IN1_OFF:
+        return gpio->input[1] & ~(uint32_t)(gpio->rtc_owned >> 32u);
     case GPIO_STATUS_OFF: return gpio->status[0];
     case GPIO_STATUS1_OFF: return gpio->status[1];
     case GPIO_CPU_INT_OFF:
@@ -680,7 +719,8 @@ void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level)
     if (level) gpio->input[bank] |= mask;
     else       gpio->input[bank] &= ~mask;
 
-    if (old != level) {
+    if (old != level &&
+        (gpio->rtc_owned & (UINT64_C(1) << pin)) == 0u) {
         uint32_t config = gpio->pin[pin];
         if (config & GPIO_PIN_INT_ENABLE_MASK) {
             unsigned type = (config & GPIO_PIN_INT_TYPE_MASK) >>
@@ -693,6 +733,15 @@ void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level)
         }
     }
     gpio_update_irq(gpio);
+}
+
+int flexe_gpio_input_level(const flexe_gpio_t *gpio, unsigned pin)
+{
+    if (!gpio_pin_valid(gpio, pin)) return -1;
+    unsigned bank;
+    uint32_t mask;
+    (void)gpio_pin_bit(pin, &bank, &mask);
+    return (gpio->input[bank] & mask) != 0u;
 }
 
 int flexe_gpio_input_signal_level(const flexe_gpio_t *gpio, unsigned signal)
@@ -708,6 +757,8 @@ int flexe_gpio_input_signal_level(const flexe_gpio_t *gpio, unsigned signal)
         level = 0;
     } else {
         if (!gpio_pin_valid(gpio, input)) return -1;
+        if ((gpio->rtc_owned & (UINT64_C(1) << input)) != 0u)
+            return -1;
         unsigned bank;
         uint32_t mask;
         (void)gpio_pin_bit(input, &bank, &mask);

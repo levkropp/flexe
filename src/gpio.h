@@ -45,6 +45,13 @@ void flexe_gpio_pad_hold_snapshot(const flexe_gpio_t *gpio,
 void flexe_gpio_pad_hold_restore(flexe_gpio_t *gpio,
                                  const flexe_gpio_pad_hold_t *in);
 
+/* RTCIO selects the physical pad owner. Digital GPIO latches continue to
+ * change while RTC owns a pad; unmodeled RTC pad functions resolve as unknown
+ * instead of leaking the digital output onto the pin. */
+void flexe_gpio_set_rtc_state(flexe_gpio_t *gpio, uint64_t owned,
+                              uint64_t unknown, uint64_t output,
+                              uint64_t enabled);
+
 /* Register a peripheral output producer implemented by the emulator. Matrix
  * selections for unregistered producers remain visible but are diagnosed via
  * the fallback handler, so adding a controller does not require weakening the
@@ -55,6 +62,7 @@ void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
 /* Drive the post-pad digital input sampled by GPIO_IN/IN1. Invalid or
  * unbonded pins are ignored. */
 void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level);
+int flexe_gpio_input_level(const flexe_gpio_t *gpio, unsigned pin);
 
 /* Resolve a peripheral input routed through the GPIO matrix. Returns -1 for
  * an invalid signal, IO_MUX bypass, or an unbonded selected pin. */

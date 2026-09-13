@@ -7,6 +7,7 @@
 #include "gpio.h"
 #include "io_mux.h"
 #include "rtc_cntl.h"
+#include "rtc_io.h"
 #include "regi2c.h"
 #include "radio.h"
 #include "rmt_v1.h"
@@ -1819,6 +1820,7 @@ struct esp32_periph {
     flexe_gpio_t *target_gpio;
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
+    flexe_rtc_io_t *target_rtc_io;
     flexe_regi2c_t *regi2c;
     flexe_radio_t *radio_regs;
     flexe_sens_t *target_sens;
@@ -14354,19 +14356,28 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         if (target->capabilities & FLEXE_TARGET_CAP_APB_SARADC_V1)
             p->target_apb_saradc = flexe_apb_saradc_create(
                 mem, default_read, default_write, p);
+        if (target->capabilities & FLEXE_TARGET_CAP_RTC_IO_V1)
+            p->target_rtc_io = flexe_rtc_io_create(
+                mem, p->target_gpio, default_read, default_write, p);
         if (target->capabilities & FLEXE_TARGET_CAP_SENS_V1)
             p->target_sens = flexe_sens_create(
-                mem, default_read, default_write, p,
+                mem,
+                p->target_rtc_io ? flexe_rtc_io_mmio_read : default_read,
+                p->target_rtc_io ? flexe_rtc_io_mmio_write : default_write,
+                p->target_rtc_io ? (void *)p->target_rtc_io : (void *)p,
                 target_sens_conversion_done, p);
         flexe_sens_attach_regi2c(p->target_sens, p->regi2c);
         flexe_sens_attach_apb_saradc(p->target_sens, p->target_apb_saradc);
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
             mmio_read_fn fallback_read = p->target_sens
-                ? flexe_sens_mmio_read : default_read;
+                ? flexe_sens_mmio_read :
+                (p->target_rtc_io ? flexe_rtc_io_mmio_read : default_read);
             mmio_write_fn fallback_write = p->target_sens
-                ? flexe_sens_mmio_write : default_write;
+                ? flexe_sens_mmio_write :
+                (p->target_rtc_io ? flexe_rtc_io_mmio_write : default_write);
             void *fallback_ctx = p->target_sens
-                ? (void *)p->target_sens : (void *)p;
+                ? (void *)p->target_sens :
+                (p->target_rtc_io ? (void *)p->target_rtc_io : (void *)p);
             p->target_rtc_cntl = flexe_rtc_cntl_create(
                 mem, fallback_read, fallback_write, fallback_ctx,
                 target_rtc_cntl_state_changed, p,
@@ -14391,6 +14402,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
              !p->target_sens) ||
             ((target->capabilities & FLEXE_TARGET_CAP_APB_SARADC_V1) &&
              !p->target_apb_saradc) ||
+            ((target->capabilities & FLEXE_TARGET_CAP_RTC_IO_V1) &&
+             !p->target_rtc_io) ||
             ((target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) &&
              !p->target_rtc_cntl) ||
             (target->flash_mmu.shared_instruction_data &&
@@ -14702,11 +14715,6 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
     free(p->unhandled_audit);
-    flexe_gpio_destroy(p->target_gpio);
-    if (p->target->capabilities & FLEXE_TARGET_CAP_GPIO_V1)
-        (void)mem_register_mmio_range(
-            p->mem, p->target->gpio.base,
-            p->target->gpio.register_size, NULL, NULL, NULL);
     flexe_usb_serial_jtag_destroy(p->usb_serial_jtag);
     flexe_gp_spi_destroy(p->gp_spi);
     p->gp_spi = NULL;
@@ -14725,12 +14733,18 @@ void periph_destroy(esp32_periph_t *p) {
             p->mem, p->target->efuse.base,
             p->target->efuse.register_size, NULL, NULL, NULL);
     flexe_rtc_cntl_destroy(p->target_rtc_cntl);
+    flexe_sens_destroy(p->target_sens);
+    flexe_rtc_io_destroy(p->target_rtc_io);
     if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1)
         (void)mem_register_mmio_range(
             p->mem, p->target->rtc_cntl.base,
             p->target->rtc_cntl.register_size, NULL, NULL, NULL);
-    flexe_sens_destroy(p->target_sens);
     flexe_apb_saradc_destroy(p->target_apb_saradc);
+    flexe_gpio_destroy(p->target_gpio);
+    if (p->target->capabilities & FLEXE_TARGET_CAP_GPIO_V1)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->gpio.base,
+            p->target->gpio.register_size, NULL, NULL, NULL);
     flexe_io_mux_destroy(p->io_mux);
     if (p->target->capabilities & FLEXE_TARGET_CAP_IO_MUX_V1)
         (void)mem_register_mmio_range(

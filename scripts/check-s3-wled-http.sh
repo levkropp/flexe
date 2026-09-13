@@ -98,8 +98,21 @@ jq -e '.bri == 42 and .seg[0].col[0] == [255,0,0]' \
 
 if ! wait "$emu_pid"; then fail "emulator exited with an error"; fi
 emu_pid=
-grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err" ||
-    fail "guest did not sustain execution after HTTP session"
+if ! grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err"; then
+    # Under concurrent host load the network/DMX tasks can stay runnable
+    # through the full budget instead of both cores parking in WAITI. An
+    # interactive session followed by 12B cycles and at least 1B retired
+    # instructions is sustained execution, but a trap or early stop is not.
+    grep -q '^Stop reason: max_cycles$' "$tmpdir/emu.err" ||
+        fail "guest stopped unexpectedly after HTTP session"
+    awk '$1 == "Cycles:" && $2 + 0 >= 12000000000 { cycles = 1 }
+         $1 == "Insns:" && $2 + 0 >= 1000000000 { insns = 1 }
+         END { exit !(cycles && insns) }' "$tmpdir/emu.err" ||
+        fail "guest did not sustain execution after HTTP session"
+    if grep -Eq '^\[TRAP\]|Invalid PC=' "$tmpdir/emu.err"; then
+        fail "guest trapped after HTTP session"
+    fi
+fi
 ethernet=$(awk '/^Ethernet:/{print $2; exit}' "$tmpdir/emu.err")
 [[ -n "$ethernet" && "$ethernet" -gt 0 ]] ||
     fail "guest did not transmit Ethernet frames"

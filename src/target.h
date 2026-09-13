@@ -35,6 +35,7 @@
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
+#define FLEXE_TARGET_RTC_IO_PIN_MAX 22u
 #define FLEXE_TARGET_RTC_WDT_STAGE_MAX 4u
 #define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
@@ -50,7 +51,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 40u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 41u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -82,6 +83,7 @@ typedef enum {
     FLEXE_TARGET_CAP_GP_SPI                       = 1ull << 23,
     FLEXE_TARGET_CAP_RMT_V1                        = 1ull << 24,
     FLEXE_TARGET_CAP_APB_SARADC_V1                = 1ull << 25,
+    FLEXE_TARGET_CAP_RTC_IO_V1                    = 1ull << 26,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -361,6 +363,19 @@ typedef struct {
     uint8_t  digital_pad_hold_first_bit;
     uint8_t  digital_pad_hold_count;
 } flexe_rtc_cntl_desc_t;
+
+/* S3-generation RTC GPIO output bank and contiguous per-pad RTC mux. GPIO
+ * numbering matches RTC GPIO numbering on S3, but the register values and
+ * page address remain target data. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint8_t gpio_count;
+    uint8_t data_shift;
+    uint16_t pad_base_offset;
+    uint32_t pad_mux_mask;
+    uint32_t pad_reset[FLEXE_TARGET_RTC_IO_PIN_MAX];
+} flexe_rtc_io_desc_t;
 
 /* Read views of a virtual chip's one-time-programmable fuse blocks. Burning
  * fuses is intentionally a separate capability: a read-only profile must not
@@ -887,6 +902,7 @@ typedef struct {
 
     /* Optional always-on RTC controller and boot-handoff state. */
     flexe_rtc_cntl_desc_t        rtc_cntl;
+    flexe_rtc_io_desc_t          rtc_io;
 
     /* Optional read-only virtual-silicon eFuse profile. */
     flexe_efuse_desc_t           efuse;

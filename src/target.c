@@ -301,6 +301,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1 |
                         FLEXE_TARGET_CAP_IO_MUX_V1 |
                         FLEXE_TARGET_CAP_RTC_CNTL_V1 |
+                        FLEXE_TARGET_CAP_RTC_IO_V1 |
                         FLEXE_TARGET_CAP_EFUSE_READ_V1 |
                         FLEXE_TARGET_CAP_GPIO_V1 |
                         FLEXE_TARGET_CAP_I2C_V1 |
@@ -628,6 +629,27 @@ static const flexe_target_desc_t TARGETS[] = {
             .digital_pad_hold_first_gpio = 21u,
             .digital_pad_hold_first_bit = 1u,
             .digital_pad_hold_count = 27u,
+        },
+        .rtc_io = {
+            .base = 0x60008400u,
+            .register_size = 0x200u,
+            .gpio_count = 22u,
+            .data_shift = 10u,
+            .pad_base_offset = 0x084u,
+            .pad_mux_mask = 1u << 19,
+            /* esp32s3 rtc_io_reg.h: all pads reset to drive strength 2.
+             * Package pull defaults differ: GPIO0/2/4/5/19..21 down,
+             * GPIO1/3/6 up, and the other RTC pads float. */
+            .pad_reset = {
+                0x50000000u, 0x48000000u, 0x50000000u,
+                0x48000000u, 0x50000000u, 0x50000000u,
+                0x48000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x50000000u, 0x50000000u,
+                0x50000000u,
+            },
         },
         .efuse = {
             .base = 0x60007000u,
