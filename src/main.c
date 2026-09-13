@@ -1284,7 +1284,12 @@ int main(int argc, char *argv[]) {
     if (cond.active)
         cond_trace_resolve(&cond, syms);
 
-    /* Resolve and install breakpoints */
+    xtensa_cpu_t *cpu1_any = single_core ? NULL :
+        flexe_session_cpu(session, 1);
+
+    /* Resolve and install breakpoints on both cores. A shared firmware
+     * function may execute on either core, especially under native
+     * FreeRTOS, and missing a core silently defeats debugging. */
     for (int i = 0; i < bp_count; i++) {
         const char *arg = bp_args[i];
         uint32_t bp_addr;
@@ -1299,10 +1304,14 @@ int main(int argc, char *argv[]) {
                 continue;
             }
         }
-        if (xtensa_set_breakpoint(cpu, bp_addr) == 0) {
+        int bp0 = xtensa_set_breakpoint(cpu, bp_addr);
+        int bp1 = cpu1_any ? xtensa_set_breakpoint(cpu1_any, bp_addr) : 0;
+        if (bp0 == 0 && bp1 == 0) {
             char sym_buf[128];
             format_addr(syms, bp_addr, sym_buf, sizeof(sym_buf));
             fprintf(stderr, "Breakpoint set at 0x%08X (%s)\n", bp_addr, sym_buf);
+        } else {
+            fprintf(stderr, "Warning: breakpoint table full for '%s'\n", arg);
         }
     }
 
@@ -1350,7 +1359,6 @@ int main(int argc, char *argv[]) {
      * core 0 task exit (e.g. main_task returning after vTaskDelete) would
      * terminate the whole session, starving core 1 of the periodic esp_timer
      * ticks that drive LVGL tick subsystems. */
-    xtensa_cpu_t *cpu1_any = single_core ? NULL : flexe_session_cpu(session, 1);
     int batch = 10000;
     /* Core 1 executes inside flexe_session_post_batch() and its instructions
      * would otherwise go uncounted against the -c budget (and understated
@@ -1361,6 +1369,7 @@ int main(int argc, char *argv[]) {
     while (cycles < max_cycles_u64 &&
            (cpu->running || (cpu1_any && cpu1_any->running)) &&
            !cpu->breakpoint_hit && !cpu->debug_break &&
+           !(cpu1_any && cpu1_any->breakpoint_hit) &&
            !(cpu1_any && cpu1_any->debug_break)) {
         if (sandbox_events) sandbox_drain_stdin(periph);
         /* Are we in a trace window?
@@ -1557,6 +1566,7 @@ int main(int argc, char *argv[]) {
                  * keep the outer loop alive so core 1 can continue executing
                  * via flexe_session_post_batch(). */
                 if (cpu->breakpoint_hit || cpu->debug_break ||
+                    (cpu1_any && cpu1_any->breakpoint_hit) ||
                     (cpu1_any && cpu1_any->debug_break) || cpu->halted ||
                     (!cpu->running && !(cpu1_any && cpu1_any->running))) break;
             }
@@ -1672,7 +1682,8 @@ int main(int argc, char *argv[]) {
 
     /* Determine stop reason */
     if (stop_reason == STOP_RUNNING) {
-        if (cpu->breakpoint_hit)
+        if (cpu->breakpoint_hit ||
+            (cpu1_any && cpu1_any->breakpoint_hit))
             stop_reason = STOP_BREAKPOINT;
         else if (cpu->debug_break ||
                  (cpu1_any && cpu1_any->debug_break))
@@ -1684,6 +1695,9 @@ int main(int argc, char *argv[]) {
         else
             stop_reason = STOP_MAX_CYCLES;
     }
+    xtensa_cpu_t *breakpoint_cpu = NULL;
+    if (stop_reason == STOP_BREAKPOINT)
+        breakpoint_cpu = cpu->breakpoint_hit ? cpu : cpu1_any;
     xtensa_cpu_t *debug_break_cpu = NULL;
     if (stop_reason == STOP_DEBUG_BREAK)
         debug_break_cpu = cpu->debug_break ? cpu : cpu1_any;
@@ -1720,9 +1734,11 @@ int main(int argc, char *argv[]) {
                 exc_cause_name(last_exc_cause), last_exc_pc, exc_repeat);
     } else if (stop_reason == STOP_BREAKPOINT) {
         char sym_buf[128];
-        format_addr(syms, cpu->breakpoint_hit_addr, sym_buf, sizeof(sym_buf));
-        fprintf(stderr, "Stop reason: %s at 0x%08X (%s)\n",
-                stop_reason_str(stop_reason), cpu->breakpoint_hit_addr, sym_buf);
+        uint32_t addr = breakpoint_cpu->breakpoint_hit_addr;
+        format_addr(syms, addr, sym_buf, sizeof(sym_buf));
+        fprintf(stderr, "Stop reason: %s at 0x%08X (%s), core %d\n",
+                stop_reason_str(stop_reason), addr, sym_buf,
+                breakpoint_cpu->core_id);
     } else if (stop_reason == STOP_DEBUG_BREAK) {
         uint32_t break_pc = debug_break_cpu
                           ? debug_break_cpu->dbg_prev_pc : cpu->pc;
@@ -1833,8 +1849,8 @@ int main(int argc, char *argv[]) {
     /* Register dump */
     if (verbose || stop_reason == STOP_BREAKPOINT ||
         stop_reason == STOP_DEBUG_BREAK) {
-        xtensa_cpu_t *register_cpu = debug_break_cpu
-                                   ? debug_break_cpu : cpu;
+        xtensa_cpu_t *register_cpu = breakpoint_cpu ? breakpoint_cpu :
+                                     (debug_break_cpu ? debug_break_cpu : cpu);
         fprintf(stderr, "\n--- Registers ---\n");
         fprintf(stderr, "PS=0x%08X  SAR=%u  LBEG=0x%08X  LEND=0x%08X  LCOUNT=%u\n",
                 register_cpu->ps, register_cpu->sar, register_cpu->lbeg,

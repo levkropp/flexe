@@ -128,7 +128,7 @@ TEST(spi_mem_uses_target_layouts_and_reports_jedec_id) {
     mem->flash_data[offset] = 0xC9u;
     mem->flash_data[offset + 1u] = 0x04u;
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
-    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offset << 8);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offset);
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 15u);
     s3_spi_user_command(mem, S3_SPI1_BASE,
                         SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MISO,
@@ -259,7 +259,7 @@ TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation) {
     mem->flash_data[offset] = 0xF0u;
     mem->flash_insn[offset] = 0xF0u;
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
-    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offset << 8);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offset);
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0xAAu);
 
@@ -317,10 +317,62 @@ TEST(spi_mem_reports_allocated_flash_capacity) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_s3_user_address_matches_flash_partition_offset) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* The S3 SPI_MEM_ADDR register uses bits 23:0 for a 24-bit address.
+     * ESP-IDF writes 0x003100FE, not 0x3100FE00, for an operation in a
+     * 0x310000 filesystem partition. A shifted decode corrupts flash at
+     * 0x003100 while reporting successful erase/program operations. */
+    const uint32_t offset = 0x3100FEu;
+    mem->flash_data[offset] = 0x34u;
+    mem->flash_data[offset + 1u] = 0x12u;
+    mem->flash_data[0x3100u] = 0x5Au;
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offset);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 15u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MISO,
+                        0xEBu);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFFFu,
+              0x1234u);
+
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR, 0x20u);
+    ASSERT_EQ(mem->flash_data[offset], 0xFFu);
+    ASSERT_EQ(mem->flash_data[0x3100u], 0x5Au);
+
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 15u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x0000BBAAu);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI,
+                        0x02u);
+    ASSERT_EQ(mem->flash_data[offset], 0xAAu);
+    ASSERT_EQ(mem->flash_data[offset + 1u], 0xBBu);
+    ASSERT_EQ(mem->flash_data[0x3100u], 0x5Au);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_spi_mem_tests(void) {
     TEST_SUITE("Target SPI memory controller");
     RUN_TEST(spi_mem_uses_target_layouts_and_reports_jedec_id);
     RUN_TEST(spi_mem_classic_routes_psram_by_chip_select_and_wire_phases);
     RUN_TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation);
     RUN_TEST(spi_mem_reports_allocated_flash_capacity);
+    RUN_TEST(spi_mem_s3_user_address_matches_flash_partition_offset);
 }

@@ -269,6 +269,23 @@ static uint32_t spi_mem_address_tail(uint32_t value, unsigned phase_bits,
     return phase & ((UINT32_C(1) << keep_bits) - 1u);
 }
 
+static uint32_t spi_mem_command_address(const flexe_spi_mem_t *spi_mem,
+                                         uint32_t value,
+                                         unsigned phase_bits) {
+    if (phase_bits > 32u) return 0u;
+    if (spi_mem->target->spi_mem.layout == FLEXE_SPI_MEM_LAYOUT_S2_S3) {
+        /* SPI_MEM_ADDR on S2/S3 stores a 24-bit flash address in bits
+         * 23:0 (or the whole word in 4-byte address mode). Unlike the
+         * original ESP32 controller, firmware does not left-align a
+         * 24-bit phase before writing the register. */
+        unsigned keep_bits = phase_bits & ~7u;
+        if (keep_bits == 0u) return 0u;
+        if (keep_bits == 32u) return value;
+        return value & ((UINT32_C(1) << keep_bits) - 1u);
+    }
+    return spi_mem_address_tail(value, phase_bits, 0u);
+}
+
 static int spi_mem_program_bytes(const flexe_spi_mem_t *spi_mem,
                                  const spi_mem_host_t *host) {
     uint32_t addr = host->reg[1];
@@ -312,8 +329,8 @@ static spi_mem_transaction_t spi_mem_decode_user(
         if (command_bits == 8u) {
             transaction.opcode = (uint8_t)user2;
             transaction.opcode_valid = true;
-            transaction.address = spi_mem_address_tail(
-                address, address_bits, 0u);
+            transaction.address = spi_mem_command_address(
+                spi_mem, address, address_bits);
             return transaction;
         }
 

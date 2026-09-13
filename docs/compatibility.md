@@ -38,7 +38,16 @@ ROM's live boot-handoff structure then describe the same device. Newer ROM
 handoff pointers are resolved from the official ROM ELF, while older fixed
 ROM ABI addresses remain target data. The functional SPI-memory model supports
 raw reads, NOR page programming, sector/block/chip erase, status and power-down
-commands. The classic ROM cache APIs validate and apply both flash and
+commands. The S3-generation `SPI_MEM_ADDR` register keeps a 24-bit user-mode
+flash address in bits 23:0; interpreting it as the classic controller's
+left-aligned address would silently erase or program the wrong flash sector.
+Read/program/erase tests now use the register sequence seen in an unmodified
+ESP32-S3 NerdMiner 1.8.3 factory image. That image formats its actual `spiffs`
+partition, reports `SPIFS: Mounted`, and reaches its configuration portal in
+the interpreter. This is a focused firmware milestone, not an S3 production
+pass: roughly 7,000 peripheral accesses in that run remain unhandled, and
+portal interaction has not been validated. The classic ROM cache APIs
+validate and apply both flash and
 external-RAM mappings against their target backings. Fast mode completes these
 operations immediately and does not yet model flash latency, separate
 per-core/PID cache contents, bus contention, wear, or interrupted-write power
@@ -139,8 +148,9 @@ without an ELF symbol or firmware-specific hook. The S3 SYSTEM clock and reset
 bits govern SHA execution and reset state; direct and GDMA commands do no work
 while gated or held in reset. In an unmodified S3 NerdMiner application run,
 this replaces roughly 131,000 repeated clock/reset unsupported diagnostics
-with device state transitions, though that firmware is not yet a passing S3
-production fixture. Fast mode completes each block immediately; SHA/GDMA
+with device state transitions. The firmware now reaches its configuration
+portal, but has not passed an interactive end-to-end S3 scenario. Fast mode
+completes each block immediately; SHA/GDMA
 latency, arbitration, GDMA CPU interrupt delivery, and SHA-512/224, SHA-512/256,
 and configurable SHA-512/t are not yet modeled.
 Requests for the unsupported SHA modes or malformed DMA chains are rejected

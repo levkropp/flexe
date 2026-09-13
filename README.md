@@ -1,14 +1,17 @@
 # Flexe
 
 **F**ree **l**ittle **x**tensa **e**mulator: a lightweight ESP32/Xtensa LX6
-emulator written in C. Flexe boots unmodified ESP-IDF and Arduino firmware,
+emulator with experimental ESP32-S3/LX7 support, written in C. Flexe boots
+unmodified ESP-IDF and Arduino firmware,
 models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
 backends.
 
 Flexe is under active development. Bruce, Marauder, Meshtastic, NerdMiner,
 openHASP, Tasmota, and WLED pass scripted end-to-end scenarios, and the broader
 production corpus passes the generic interpreter/JIT gate described in
-[Firmware compatibility](docs/compatibility.md).
+[Firmware compatibility](docs/compatibility.md). The current
+[functional hardware milestone](docs/hardware-completeness.md) states what
+must be demonstrated before broader support claims.
 
 ## Highlights
 
@@ -86,7 +89,7 @@ Common options:
 | `-c N` | Stop after `N` aggregate emulated cycles |
 | `-q` | Suppress emulator diagnostics |
 | `-T` | Emit an instruction trace to stderr |
-| `-b ADDR` | Set a breakpoint |
+| `-b ADDR` | Set a breakpoint on both cores |
 | `-m ADDR[:LEN]` | Dump guest memory on exit |
 
 ## Production status
