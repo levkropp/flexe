@@ -220,6 +220,20 @@ TEST(peripherals_model_target_described_secondary_core_control) {
     ASSERT_FALSE(periph_app_cpu_released(periph));
     mem_write32(mem, control, 1u << 1);
     ASSERT_TRUE(periph_app_cpu_released(periph));
+    uint32_t rtc_options = s3->rtc_cntl.base +
+                           s3->rtc_cntl.cpu_stall_options_offset;
+    uint32_t rtc_high = s3->rtc_cntl.base +
+                        s3->rtc_cntl.cpu_stall_high_offset;
+    mem_write32(mem, rtc_options,
+                s3->rtc_cntl.cpu_stall_options_reset | 2u);
+    ASSERT_TRUE(periph_app_cpu_released(periph));
+    mem_write32(mem, rtc_high, 0x21u << 20);
+    ASSERT_TRUE(periph_cpu_stalled(periph, 1u));
+    ASSERT_FALSE(periph_app_cpu_released(periph));
+    mem_write32(mem, rtc_options,
+                s3->rtc_cntl.cpu_stall_options_reset);
+    ASSERT_FALSE(periph_cpu_stalled(periph, 1u));
+    ASSERT_TRUE(periph_app_cpu_released(periph));
     mem_write32(mem, control, (1u << 1) | (1u << 0));
     ASSERT_FALSE(periph_app_cpu_released(periph));
 

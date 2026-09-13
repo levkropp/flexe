@@ -44,6 +44,8 @@ struct flexe_rtc_cntl {
     uint32_t store[FLEXE_TARGET_RTC_STORE_MAX];
     uint32_t rtc_pad_hold;
     uint32_t digital_pad_hold;
+    uint32_t cpu_stall_options;
+    uint32_t cpu_stall_high;
     flexe_rtc_cntl_pad_hold_fn pad_hold_changed;
     void *pad_hold_ctx;
 };
@@ -53,6 +55,18 @@ static bool rtc_interrupt_offset(const flexe_rtc_cntl_desc_t *desc,
                                  uint16_t offset);
 static bool rtc_wdt_offset(const flexe_rtc_cntl_desc_t *desc,
                            uint16_t offset);
+
+static uint32_t rtc_stall_low_mask(const flexe_rtc_cntl_desc_t *desc)
+{
+    return (3u << desc->cpu_stall_low_shift[0]) |
+           (3u << desc->cpu_stall_low_shift[1]);
+}
+
+static uint32_t rtc_stall_high_mask(const flexe_rtc_cntl_desc_t *desc)
+{
+    return (0x3Fu << desc->cpu_stall_high_shift[0]) |
+           (0x3Fu << desc->cpu_stall_high_shift[1]);
+}
 
 static uint32_t rtc_hold_field_mask(unsigned first_bit, unsigned count)
 {
@@ -348,6 +362,52 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         for (unsigned j = 0u; j < i; j++)
             if (offset == desc->store_offset[j]) return false;
     }
+    if (desc->cpu_stall_high_offset != 0u) {
+        uint16_t low = desc->cpu_stall_options_offset;
+        uint16_t high = desc->cpu_stall_high_offset;
+        if (!rtc_offset_valid(low, desc->register_size) ||
+            !rtc_offset_valid(high, desc->register_size) ||
+            low == high ||
+            desc->cpu_stall_low_shift[0] > 30u ||
+            desc->cpu_stall_low_shift[1] > 30u ||
+            desc->cpu_stall_high_shift[0] > 26u ||
+            desc->cpu_stall_high_shift[1] > 26u ||
+            ((3u << desc->cpu_stall_low_shift[0]) &
+             (3u << desc->cpu_stall_low_shift[1])) != 0u ||
+            ((0x3Fu << desc->cpu_stall_high_shift[0]) &
+             (0x3Fu << desc->cpu_stall_high_shift[1])) != 0u ||
+            (desc->cpu_stall_options_reset &
+             rtc_stall_low_mask(desc)) != 0u ||
+            (desc->software_reset_cpu0_mask &
+             (desc->software_reset_cpu1_mask |
+              desc->software_reset_system_mask |
+              rtc_stall_low_mask(desc))) != 0u ||
+            (desc->software_reset_cpu1_mask &
+             (desc->software_reset_system_mask |
+              rtc_stall_low_mask(desc))) != 0u ||
+            (desc->software_reset_system_mask &
+             rtc_stall_low_mask(desc)) != 0u ||
+            (desc->cpu_stall_options_reset &
+             (desc->software_reset_cpu0_mask |
+              desc->software_reset_cpu1_mask |
+              desc->software_reset_system_mask)) != 0u)
+            return false;
+        for (unsigned i = 0u; i < 2u; i++) {
+            uint16_t offset = i == 0u ? low : high;
+            if (offset == desc->time_update_offset ||
+                offset == desc->time_low_offset ||
+                offset == desc->time_high_offset ||
+                offset == desc->reset_state_offset ||
+                offset == desc->clock_conf_offset ||
+                offset == desc->analog_conf_offset ||
+                rtc_interrupt_offset(desc, offset) ||
+                rtc_wdt_offset(desc, offset) ||
+                rtc_pad_hold_offset(desc, offset))
+                return false;
+            for (unsigned j = 0u; j < desc->store_count; j++)
+                if (offset == desc->store_offset[j]) return false;
+        }
+    }
     return true;
 }
 
@@ -493,7 +553,7 @@ static bool rtc_advance_wdt(flexe_rtc_cntl_t *rtc, uint64_t ticks)
             if (rtc->reset_requested)
                 rtc->reset_requested(
                     rtc->reset_ctx,
-                    (flexe_rtc_cntl_wdt_action_t)action);
+                    (flexe_rtc_cntl_reset_action_t)action);
             break;
         }
 
@@ -554,6 +614,12 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
                desc->time_high_mask;
     if (offset == desc->reset_state_offset)
         return desc->reset_state_reset;
+    if (desc->cpu_stall_high_offset != 0u) {
+        if (offset == desc->cpu_stall_options_offset)
+            return rtc->cpu_stall_options;
+        if (offset == desc->cpu_stall_high_offset)
+            return rtc->cpu_stall_high;
+    }
     if (offset == desc->clock_conf_offset)
         return rtc->clock_conf;
     if (offset == desc->analog_conf_offset)
@@ -652,6 +718,41 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
     if (offset == desc->time_low_offset ||
         offset == desc->time_high_offset)
         return;
+    if (desc->cpu_stall_high_offset != 0u &&
+        offset == desc->cpu_stall_options_offset) {
+        uint32_t reset_mask = desc->software_reset_cpu0_mask |
+                              desc->software_reset_cpu1_mask |
+                              desc->software_reset_system_mask;
+        uint32_t next = value & ~reset_mask;
+        uint32_t changed = rtc->cpu_stall_options ^ next;
+        rtc->cpu_stall_options = next;
+        if (changed & ~rtc_stall_low_mask(desc)) {
+            if (rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        } else if (value & desc->software_reset_cpu1_mask) {
+            /* APP CPU-only reset is not yet modeled. */
+            if (rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        }
+        if (rtc->reset_requested) {
+            if (value & desc->software_reset_system_mask)
+                rtc->reset_requested(rtc->reset_ctx,
+                                     FLEXE_RTC_CNTL_SW_RESET_SYSTEM);
+            else if (value & desc->software_reset_cpu0_mask)
+                rtc->reset_requested(rtc->reset_ctx,
+                                     FLEXE_RTC_CNTL_SW_RESET_CPU);
+        }
+        return;
+    }
+    if (desc->cpu_stall_high_offset != 0u &&
+        offset == desc->cpu_stall_high_offset) {
+        uint32_t changed = rtc->cpu_stall_high ^ value;
+        rtc->cpu_stall_high = value;
+        if ((changed & ~rtc_stall_high_mask(desc)) != 0u &&
+            rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        return;
+    }
     if (offset == desc->clock_conf_offset) {
         (void)rtc_sync(rtc);
         uint32_t old = rtc->clock_conf;
@@ -773,6 +874,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->reset_ctx = reset_ctx;
     const flexe_rtc_cntl_desc_t *desc = &target->rtc_cntl;
     rtc->clock_conf = desc->clock_conf_reset;
+    rtc->cpu_stall_options = desc->cpu_stall_options_reset;
     rtc->analog_conf = desc->analog_conf_reset;
     rtc->interrupt_enable = desc->interrupt_enable_reset;
     rtc->interrupt_raw = desc->interrupt_raw_reset;
@@ -801,6 +903,19 @@ void flexe_rtc_cntl_destroy(flexe_rtc_cntl_t *rtc)
         rtc->mem, desc->base, desc->register_size,
         rtc->fallback_read, rtc->fallback_write, rtc->fallback_ctx);
     free(rtc);
+}
+
+bool flexe_rtc_cntl_cpu_stalled(const flexe_rtc_cntl_t *rtc, unsigned core)
+{
+    if (!rtc || core > 1u ||
+        rtc->target->rtc_cntl.cpu_stall_high_offset == 0u)
+        return false;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    unsigned low = (rtc->cpu_stall_options >>
+                    desc->cpu_stall_low_shift[core]) & 3u;
+    unsigned high = (rtc->cpu_stall_high >>
+                     desc->cpu_stall_high_shift[core]) & 0x3Fu;
+    return ((high << 2u) | low) == 0x86u;
 }
 
 void flexe_rtc_cntl_set_pad_hold_listener(flexe_rtc_cntl_t *rtc,

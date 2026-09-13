@@ -363,6 +363,7 @@ bool periph_interrupt_pending(const esp32_periph_t *p, int source);
 /* Target-visible secondary-core control state. A zero boot address means
  * firmware has not programmed one yet. */
 bool periph_app_cpu_released(const esp32_periph_t *p);
+bool periph_cpu_stalled(const esp32_periph_t *p, unsigned core);
 uint32_t periph_app_cpu_boot_addr(const esp32_periph_t *p);
 
 /* Attach CPU pointers for interrupt delivery (call after cpu init) */

@@ -318,6 +318,17 @@ typedef struct {
     uint16_t time_low_offset;
     uint16_t time_high_offset;
     uint16_t reset_state_offset;
+    /* CPU software stall uses a two-bit low field in OPTIONS0 and a
+     * six-bit high field in another register. The combined value 0x86
+     * stalls the corresponding core. Zero high offset disables this block. */
+    uint16_t cpu_stall_options_offset;
+    uint16_t cpu_stall_high_offset;
+    uint32_t cpu_stall_options_reset;
+    uint8_t cpu_stall_low_shift[2];
+    uint8_t cpu_stall_high_shift[2];
+    uint32_t software_reset_cpu0_mask;
+    uint32_t software_reset_cpu1_mask;
+    uint32_t software_reset_system_mask;
     uint16_t clock_conf_offset;
     uint8_t  slow_clock_select_shift;
     uint32_t time_update_mask;

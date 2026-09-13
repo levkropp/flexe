@@ -10,11 +10,13 @@ typedef enum {
     FLEXE_RTC_CNTL_WDT_RESET_CPU = 2,
     FLEXE_RTC_CNTL_WDT_RESET_SYSTEM = 3,
     FLEXE_RTC_CNTL_WDT_RESET_RTC = 4,
-} flexe_rtc_cntl_wdt_action_t;
+    FLEXE_RTC_CNTL_SW_RESET_CPU = 5,
+    FLEXE_RTC_CNTL_SW_RESET_SYSTEM = 6,
+} flexe_rtc_cntl_reset_action_t;
 typedef void (*flexe_rtc_cntl_state_fn)(void *ctx);
 typedef void (*flexe_rtc_cntl_irq_fn)(void *ctx, bool level);
 typedef void (*flexe_rtc_cntl_reset_fn)(
-    void *ctx, flexe_rtc_cntl_wdt_action_t action);
+    void *ctx, flexe_rtc_cntl_reset_action_t action);
 typedef void (*flexe_rtc_cntl_pad_hold_fn)(void *ctx, uint64_t gpio_mask);
 
 flexe_rtc_cntl_t *flexe_rtc_cntl_create(
@@ -56,5 +58,8 @@ void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
 /* RTC_CNTL_ANA_CONF powers the internal SAR analog-register I2C slave.
  * A detached/missing RTC cannot claim that power domain is available. */
 bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc);
+
+/* Software stall pauses instruction retirement without erasing CPU state. */
+bool flexe_rtc_cntl_cpu_stalled(const flexe_rtc_cntl_t *rtc, unsigned core);
 
 #endif /* FLEXE_RTC_CNTL_H */

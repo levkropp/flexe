@@ -56,6 +56,7 @@ struct flexe_session {
     jit_state_t       *jit;
     int                single_core;
     int                native_freertos;
+    bool               app_cpu_started;
     int              (*touch_fn)(int *x, int *y, void *ctx);
     void              *touch_ctx;
     int                touch_irq_pin;
@@ -489,6 +490,7 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
     s->cpu[1].prid = 0xABAB;
     XT_PS_SET_EXCM(s->cpu[1].ps, 0);   /* see core 0, above */
     s->cpu[1].running = false;
+    s->app_cpu_started = false;
     s->cpu[1].window_trace = cfg->window_trace;
     s->cpu[1].window_trace_active = false;
     s->cpu[1].spill_verify = cfg->spill_verify;
@@ -816,6 +818,8 @@ int flexe_session_run_core(flexe_session_t *s, int core, int max_cycles)
 {
     if (!s || core < 0 || core > 1 || max_cycles <= 0) return 0;
     if (core == 1 && s->single_core) return 0;
+    if (periph_cpu_stalled(s->periph, (unsigned)core)) return 0;
+    if (core == 1 && !periph_app_cpu_released(s->periph)) return 0;
     if (s->jit)
         return jit_run(s->jit, &s->cpu[core], max_cycles);
     return xtensa_run(&s->cpu[core], max_cycles);
@@ -860,22 +864,24 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     uint32_t app_cpu_boot_addr = periph_app_cpu_boot_addr(s->periph);
     if (app_cpu_boot_addr == 0u)
         app_cpu_boot_addr = rom_stubs_app_cpu_boot_addr(s->rom);
-    if (!s->single_core && !s->cpu[1].running &&
-        periph_app_cpu_released(s->periph) &&
+    bool app_cpu_released = periph_app_cpu_released(s->periph);
+    if (!s->single_core && !s->app_cpu_started &&
+        app_cpu_released &&
         app_cpu_boot_addr != 0u) {
         s->cpu[1].pc = app_cpu_boot_addr;
         s->cpu[1].running = true;
+        s->app_cpu_started = true;
         fprintf(stderr, "[%10llu] CORE1 started at 0x%08X\n",
                 (unsigned long long)s->cpu[0].cycle_count, s->cpu[1].pc);
     }
 
     /* Dual-core: run core 1 batch (or poll scheduler if parked) */
     if (!s->single_core && s->cpu[1].pc != 0) {
-        if (s->cpu[1].running) {
+        if (app_cpu_released && s->cpu[1].running) {
             flexe_session_run_core(s, 1, batch_size);
             if (s->frt && !s->native_freertos)
                 freertos_stubs_check_preempt_core(s->frt, 1);
-        } else if (s->frt && !s->native_freertos) {
+        } else if (app_cpu_released && s->frt && !s->native_freertos) {
             /* Core 1 is parked at stub_esp_startup_start_app_other_cores
              * waiting for an eligible task.  Poll the scheduler so it gets
              * resumed once a core-1 task becomes ready. */

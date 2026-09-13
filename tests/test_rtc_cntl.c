@@ -39,6 +39,83 @@ static void rtc_cntl_test_irq_changed(void *ctx, bool level)
     probe->level = level;
 }
 
+static void rtc_cntl_test_reset_requested(
+    void *ctx, flexe_rtc_cntl_reset_action_t action)
+{
+    *(flexe_rtc_cntl_reset_action_t *)ctx = action;
+}
+
+TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_reset_action_t reset = 0;
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, rtc_cntl_test_reset_requested, &reset);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t options = desc->base + desc->cpu_stall_options_offset;
+    uint32_t high = desc->base + desc->cpu_stall_high_offset;
+    ASSERT_EQ(mem_read32(mem, options), 0x1C00A000u);
+    ASSERT_EQ(mem_read32(mem, high), 0u);
+    ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 0u));
+    ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+
+    /* Neither half alone is the 0x86 stall key. */
+    mem_write32(mem, options, desc->cpu_stall_options_reset | 2u);
+    ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+    mem_write32(mem, high, 0x21u << 20);
+    ASSERT_TRUE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+    ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 0u));
+    ASSERT_EQ(fallback.writes, 0u);
+
+    mem_write32(mem, options, desc->cpu_stall_options_reset | 0xAu);
+    mem_write32(mem, high, (0x21u << 26) | (0x21u << 20));
+    ASSERT_TRUE(flexe_rtc_cntl_cpu_stalled(rtc, 0u));
+    ASSERT_TRUE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+    mem_write32(mem, options, desc->cpu_stall_options_reset | 0x8u);
+    ASSERT_TRUE(flexe_rtc_cntl_cpu_stalled(rtc, 0u));
+    ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+    mem_write32(mem, high, 0u);
+    ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 0u));
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* Other OPTIONS0 power controls keep readback but remain diagnostic. */
+    uint32_t other = desc->cpu_stall_options_reset ^ (1u << 13);
+    mem_write32(mem, options, other);
+    ASSERT_EQ(mem_read32(mem, options), other);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(fallback.last_write_addr, options);
+    mem_write32(mem, high, 1u);
+    ASSERT_EQ(mem_read32(mem, high), 1u);
+    ASSERT_EQ(fallback.writes, 2u);
+
+    /* Write-only reset commands are not sticky register bits. */
+    mem_write32(mem, options, other | desc->software_reset_cpu1_mask);
+    ASSERT_EQ(mem_read32(mem, options), other);
+    ASSERT_EQ(fallback.writes, 3u);
+    mem_write32(mem, options, other | desc->software_reset_cpu0_mask);
+    ASSERT_EQ(reset, FLEXE_RTC_CNTL_SW_RESET_CPU);
+    ASSERT_EQ(mem_read32(mem, options), other);
+    mem_write32(mem, options, other | desc->software_reset_system_mask);
+    ASSERT_EQ(reset, FLEXE_RTC_CNTL_SW_RESET_SYSTEM);
+    ASSERT_EQ(mem_read32(mem, options), other);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_storage_resets_persists_and_delegates)
 {
     const flexe_target_desc_t *s3 =
@@ -872,6 +949,7 @@ TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset)
 void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
+    RUN_TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands);
     RUN_TEST(rtc_cntl_storage_resets_persists_and_delegates);
     RUN_TEST(rtc_cntl_sar_i2c_power_gates_analog_slave);
     RUN_TEST(rtc_cntl_application_handoff_uses_target_clocks);

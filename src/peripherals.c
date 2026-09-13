@@ -1160,7 +1160,7 @@ static void target_rtc_cntl_eval_events(esp32_periph_t *p,
 static void target_rtc_cntl_state_changed(void *ctx);
 static void target_rtc_cntl_irq_changed(void *ctx, bool level);
 static void target_rtc_cntl_reset_requested(
-    void *ctx, flexe_rtc_cntl_wdt_action_t action);
+    void *ctx, flexe_rtc_cntl_reset_action_t action);
 static void target_sens_conversion_done(void *ctx);
 static uint32_t systimer_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void systimer_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -13680,11 +13680,12 @@ static void target_rtc_cntl_irq_changed(void *ctx, bool level)
 }
 
 static void target_rtc_cntl_reset_requested(
-    void *ctx, flexe_rtc_cntl_wdt_action_t action)
+    void *ctx, flexe_rtc_cntl_reset_action_t action)
 {
     esp32_periph_t *p = ctx;
     if (getenv("FLEXE_RESETDBG"))
-        fprintf(stderr, "[reset] RTC watchdog action %d requested reset\n",
+        fprintf(stderr, "[reset] RTC %s action %d requested reset\n",
+                action >= FLEXE_RTC_CNTL_SW_RESET_CPU ? "software" : "watchdog",
                 (int)action);
     if (p) p->reset_requested = true;
 }
@@ -15258,7 +15259,12 @@ uint32_t periph_app_cpu_boot_addr(const esp32_periph_t *p) {
 }
 
 bool periph_app_cpu_released(const esp32_periph_t *p) {
-    return p ? !p->app_cpu_in_reset : false;
+    return p && !p->app_cpu_in_reset &&
+           !flexe_rtc_cntl_cpu_stalled(p->target_rtc_cntl, 1u);
+}
+
+bool periph_cpu_stalled(const esp32_periph_t *p, unsigned core) {
+    return p && flexe_rtc_cntl_cpu_stalled(p->target_rtc_cntl, core);
 }
 
 void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1) {

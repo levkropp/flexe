@@ -70,12 +70,15 @@ now reaches `app_main()`, counts down through ten guest seconds, requests its
 own software reset, and does so again after both cores restart. The separate
 `tests/fixtures/s3_idf_crosscore` project, built with the same IDF, pins a
 producer to CPU1 and checks 32 queue-message/notification round trips with
-`app_main()` on CPU0 before sustained 100 ms heartbeats. Its image SHA-256 is
-`c38d4cf3a51d05885c263fa2c1fe88deaa13dbde2beb357562622433254772a1`
+`app_main()` on CPU0. It then uses the official `esp_cpu_stall(1)` and
+`esp_cpu_unstall(1)` calls to verify that an active CPU1 task stops making
+progress and resumes without losing its state, before sustained 100 ms
+heartbeats. Its image SHA-256 is
+`f1b90e7ae15c5eba69d75aef6372fa0cbf387acadb75265a26d0d4cdb6943631`
 and ELF SHA-256 is
-`9b2a6d8d0451e833f2050bd75534a10872d3046bc2eaeb369b3ec43dad5fcfc6`.
+`84e74cdcdfac1bbc67caef66b9fa49366d8f6940c81f794c8253d47301a4f230`.
 Both external-image gates compare a complete second replay byte-for-byte,
-including the unsupported-MMIO report; each still reports 167 unsupported
+including the unsupported-MMIO report; each still reports 154 unsupported
 accesses after boot. This proves these FreeRTOS interactions, not simultaneous
 core execution or timing fidelity. Run with matching external artifacts:
 
