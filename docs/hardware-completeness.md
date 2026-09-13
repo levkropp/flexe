@@ -36,8 +36,8 @@ The milestone is complete only when:
 | Area | Current evidence | Next gate |
 |---|---|---|
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
-| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
-| S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection), `scripts/check-s3-idf-hello.sh` (official ESP-IDF countdown/restart), `scripts/check-s3-idf-crosscore.sh` (32 CPU1/CPU0 queue-notification handoffs and sustained output), and target-specific unit/Arduino fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Extend cross-core and Arduino peripheral workflows and work down the measured unhandled-access inventory. |
+| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, saves submitted settings, restarts, and reloads the same JSON from guest-written flash. `scripts/check-s3-idf-nvs.sh` runs native ESP-IDF NVS write/commit/restart/readback. | Extend storage/peripheral coverage beyond these workflows. |
+| S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection), `scripts/check-s3-idf-hello.sh` (official ESP-IDF countdown/restart), `scripts/check-s3-idf-crosscore.sh` (32 CPU1/CPU0 queue-notification handoffs, RTC software stall/resume, and sustained output), and target-specific unit/Arduino fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Extend cross-core and Arduino peripheral workflows and work down the measured unhandled-access inventory. |
 | S3 RTC GPIO/RTCIO (partial) | `tests/test_rtc_io.c` covers GPIO0..21 RTC pad ownership, output/enable W1TS/W1TC, host input, unknown alternate functions, and return to digital GPIO. `tests/test_rtc_cntl.c` covers both pad-hold sources, frozen output/mux/input state, GPIO21 overlap, and reset rebuild. The stock Arduino ADC gate checks that `rtc_gpio_deinit()` for GPIO4/11 no longer falls back. | RTC wakeup/interrupt routing, digital IO_MUX function hold, pad pulls, drive strength, analog/electrical resolution, and deep-sleep wake sequencing are unsupported. |
 | S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
@@ -109,6 +109,29 @@ idf.py -C tests/fixtures/s3_idf_crosscore \
 
 Independently rebuilt images can supply matching `*_SHA256` overrides, since
 ESP-IDF embeds build metadata in the application.
+
+The separate `tests/fixtures/s3_idf_nvs` project uses ESP-IDF v5.3.2's real
+`nvs_flash` implementation to open a namespace, write and commit a 32-bit
+value, request a software reset, and read the value after the second boot.
+Neither its API nor its SPI-flash transactions are replaced by host NVS shims.
+Its direct application image uses Flexe's documented synthesized NVS
+partition; NerdMiner's factory-image gate separately exercises a real
+partition table and SPIFFS volume. The pinned NVS image SHA-256 is
+`3d81633344bd43cdc901c32c48411bbd00c88a8260a103862aa74ea82c9945b4`
+and ELF SHA-256 is
+`c4266b7433b41a25f73067e274b0622314be62106fba43416a9a1d0f1a2c8935`.
+The gate checks two byte-identical runs and still reports 154 unsupported
+startup accesses:
+
+```sh
+idf.py -C tests/fixtures/s3_idf_nvs \
+  -B /tmp/flexe-s3-nvs-build -D SDKCONFIG=/tmp/flexe-s3-nvs-sdkconfig \
+  -D IDF_TARGET=esp32s3 build
+S3_IDF_NVS_BIN=/path/to/s3_idf_nvs.bin \
+S3_IDF_NVS_ELF=/path/to/s3_idf_nvs.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-idf-nvs.sh
+```
 
 The S3 RMT V1 TX model handles direct pulse RAM, per-channel dividers,
 threshold refill interrupts, end/error interrupts, and pulse-timed
