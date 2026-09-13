@@ -229,14 +229,26 @@ TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq)
     };
     ASSERT_EQ(periph_rmt_rx_inject(periph, 0, symbols, 2u), 0u);
     ASSERT_EQ(periph_rmt_rx_inject(periph, 4, symbols, 2u), 2u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              192u);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) >> 22) & 7u,
+              1u);
+    /* 30 + 10 + 5 symbol/idle ticks at 8 CPU cycles per RMT tick. */
+    cpu0.ccount = 239u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              192u);
+    cpu0.ccount = 240u;
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), symbols[0]);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              193u);
+    cpu0.ccount = 319u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4 + 4u), 0u);
+    cpu0.ccount = 320u;
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4 + 4u),
               symbols[1]);
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
               194u);
-    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) >> 22) & 7u,
-              1u);
-    /* 45 symbol/idle ticks, 20 MHz RMT clock, 160 MHz CPU: 360 cycles. */
     cpu0.ccount = 359u;
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
     cpu0.ccount = 360u;
@@ -281,12 +293,26 @@ TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible)
     uint32_t symbols[49];
     for (unsigned i = 0u; i < 49u; i++) symbols[i] = 1u | (1u << 16);
     ASSERT_EQ(periph_rmt_rx_inject(periph, 4, symbols, 49u), 48u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
+              (1u << 26), 0u);
+    cpu0.ccount = 31u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    cpu0.ccount = 32u;
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 24);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 24);
+    cpu0.ccount = 767u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
+              (1u << 26), 0u);
+    cpu0.ccount = 768u;
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
               (1u << 26), 1u << 26);
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 24);
-    cpu0.ccount = 10000u;
+    cpu0.ccount = 807u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    cpu0.ccount = 808u;
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 20);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
+              (1u << 26), 1u << 26);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 20);
 
     /* Ownership is a hardware gate: software-owned RX RAM rejects input. */

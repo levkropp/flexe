@@ -151,9 +151,10 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,
 threshold refill interrupts, end/error interrupts, pulse-timed TX and
-short-frame RX through a host symbol-injection API. RX writes the channel's
-RAM, advances its hardware writer offset, and signals completion after the
-configured signal and idle duration. The stock Arduino-ESP32 3.3.11 RX driver
+short-frame RX through a host symbol-injection API. RX writes each symbol to
+RAM at its guest-time pulse deadline, advances the hardware writer offset and
+threshold interrupt at that point, then signals completion after the
+configured idle duration. The stock Arduino-ESP32 3.3.11 RX driver
 copies the injected symbols through its unmodified ESP-IDF interrupt handler;
 the pinned gate finds no unsupported RMT MMIO sites (173 unrelated accesses
 remain). Input is already decoded, so this does not model GPIO edge capture,

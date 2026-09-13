@@ -63,6 +63,7 @@
 #define RMT_MAX_CHANNELS      8u
 #define RMT_MAX_TX_CHANNELS   4u
 #define RMT_MAX_WORDS         (RMT_MAX_CHANNELS * 48u)
+#define RMT_MAX_RX_WORDS      ((RMT_MAX_CHANNELS - RMT_MAX_TX_CHANNELS) * 48u)
 #define RMT_MAX_SEGMENT_WORDS (RMT_MAX_CHANNELS * 48u)
 
 typedef enum {
@@ -93,6 +94,11 @@ typedef struct {
     uint32_t write_index;
     uint32_t apb_index;
     uint32_t status_flags;
+    uint32_t frame[RMT_MAX_RX_WORDS];
+    uint32_t frame_count;
+    uint32_t next_word;
+    uint64_t frame_start;
+    uint64_t elapsed_ticks;
     uint64_t deadline;
     bool active;
     bool pending_end;
@@ -278,6 +284,7 @@ static void rmt_finish_rx(flexe_rmt_v1_t *rmt, unsigned channel)
     rmt_rx_channel_t *rx = &rmt->rx[channel];
     rx->pending_end = false;
     rx->active = false;
+    if (rx->pending_error) rx->status_flags |= 1u << 26;
     rmt->int_raw |= rx->pending_error ?
         RMT_RX_ERROR_INT(channel) : RMT_RX_END_INT(channel);
     rx->pending_error = false;
@@ -404,8 +411,33 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
          channel < rmt_rx_channel_count(rmt->desc);
          channel++) {
         rmt_rx_channel_t *rx = &rmt->rx[channel];
-        if (rx->pending_end && rx->deadline <= now) {
-            rmt_finish_rx(rmt, channel);
+        while (rx->pending_end && rx->deadline <= now) {
+            if (rx->next_word == rx->frame_count) {
+                rmt_finish_rx(rmt, channel);
+            } else {
+                unsigned physical = rmt->desc->tx_channel_count + channel;
+                unsigned base = physical * rmt->desc->words_per_channel;
+                rmt->memory[base + rx->write_index] =
+                    rx->frame[rx->next_word++];
+                rx->write_index++;
+                if (rx->next_word == rx->frame_count && rx->pending_error)
+                    rx->status_flags |= 1u << 26;
+                if (rx->limit != 0u && rx->write_index == rx->limit) {
+                    rmt->int_raw |= RMT_RX_THRESHOLD_INT(channel);
+                    rmt_notify_irq(rmt);
+                }
+                if (rx->next_word < rx->frame_count) {
+                    uint32_t item = rx->frame[rx->next_word];
+                    rx->elapsed_ticks += (item & 0x7FFFu) +
+                                         ((item >> 16) & 0x7FFFu);
+                } else {
+                    rx->elapsed_ticks += (rx->conf0 >> 8) & 0x7FFFu;
+                }
+                uint64_t duration = rmt_ticks_to_cycles_div(
+                    rmt, rx->conf0 & 0xFFu, rx->elapsed_ticks);
+                rx->deadline = rx->frame_start > UINT64_MAX - duration ?
+                               UINT64_MAX : rx->frame_start + duration;
+            }
             changed = true;
         }
     }
@@ -747,31 +779,22 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
     size_t available = rx->write_index < capacity ?
         capacity - rx->write_index : 0u;
     size_t accepted = count < available ? count : available;
-    unsigned base = channel * rmt->desc->words_per_channel;
-    uint64_t ticks = 0u;
-    for (size_t i = 0u; i < accepted; i++) {
-        uint32_t item = items[i];
-        rmt->memory[base + rx->write_index + i] = item;
-        ticks += (item & 0x7FFFu) + ((item >> 16) & 0x7FFFu);
-    }
-    rx->write_index += (uint32_t)accepted;
-    if (rx->limit != 0u && rx->write_index >= rx->limit) {
-        rmt->int_raw |= RMT_RX_THRESHOLD_INT(index);
-        rmt_notify_irq(rmt);
-    }
-    if (accepted < count || capacity == 0u) {
-        rx->status_flags |= 1u << 26;
-        rx->pending_error = true;
-    }
+    if (accepted) memcpy(rx->frame, items, accepted * sizeof(uint32_t));
+    rx->frame_count = (uint32_t)accepted;
+    rx->next_word = 0u;
+    rx->pending_error = accepted < count || capacity == 0u;
     /* One call supplies one input frame at its first edge. The host provides
      * symbols after filtering/demodulation; the RX_DONE edge follows the
      * pulse train and configured idle threshold in guest time. */
-    ticks += (rx->conf0 >> 8) & 0x7FFFu;
+    uint64_t ticks = accepted ?
+        (rx->frame[0] & 0x7FFFu) + ((rx->frame[0] >> 16) & 0x7FFFu) :
+        (rx->conf0 >> 8) & 0x7FFFu;
+    rx->elapsed_ticks = ticks;
     uint64_t duration = rmt_ticks_to_cycles_div(
         rmt, rx->conf0 & 0xFFu, ticks);
-    uint64_t now = rmt_clock_now(rmt);
-    rx->deadline = now > UINT64_MAX - duration ?
-                   UINT64_MAX : now + duration;
+    rx->frame_start = rmt_clock_now(rmt);
+    rx->deadline = rx->frame_start > UINT64_MAX - duration ?
+                   UINT64_MAX : rx->frame_start + duration;
     rx->pending_end = true;
     rmt_notify_state(rmt);
     return accepted;
