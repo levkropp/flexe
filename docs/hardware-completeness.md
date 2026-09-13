@@ -37,7 +37,7 @@ The milestone is complete only when:
 |---|---|---|
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
 | S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
-| S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
+| S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection), `scripts/check-s3-idf-hello.sh` (official ESP-IDF countdown/restart), `scripts/check-s3-idf-crosscore.sh` (32 CPU1/CPU0 queue-notification handoffs and sustained output), and target-specific unit/Arduino fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Extend cross-core and Arduino peripheral workflows and work down the measured unhandled-access inventory. |
 | S3 RTC GPIO/RTCIO (partial) | `tests/test_rtc_io.c` covers GPIO0..21 RTC pad ownership, output/enable W1TS/W1TC, host input, unknown alternate functions, and return to digital GPIO. `tests/test_rtc_cntl.c` covers both pad-hold sources, frozen output/mux/input state, GPIO21 overlap, and reset rebuild. The stock Arduino ADC gate checks that `rtc_gpio_deinit()` for GPIO4/11 no longer falls back. | RTC wakeup/interrupt routing, digital IO_MUX function hold, pad pulls, drive strength, analog/electrical resolution, and deep-sleep wake sequencing are unsupported. |
 | S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
@@ -61,6 +61,51 @@ provides a second, independently sourced production interactive network and
 output scenario. The remaining RF/PHY gaps prohibit a
 production-support claim. ROM images and third-party firmware binaries are
 not copied into this repository.
+
+The official ESP-IDF v5.3.2 `examples/get-started/hello_world` image built
+from commit `9d7f2d69f50d1288526d4f1027108e314e8c879f` (application image
+SHA-256 `e9ce7296ec826e19216ef9ee3940857f561184fefef06a4d4dfa20a5494dfc54`,
+ELF `643073d572d06dce114bb9a70f41ef975ff2ce76dd87696316baf31af20216d8`)
+now reaches `app_main()`, counts down through ten guest seconds, requests its
+own software reset, and does so again after both cores restart. The separate
+`tests/fixtures/s3_idf_crosscore` project, built with the same IDF, pins a
+producer to CPU1 and checks 32 queue-message/notification round trips with
+`app_main()` on CPU0 before sustained 100 ms heartbeats. Its image SHA-256 is
+`c38d4cf3a51d05885c263fa2c1fe88deaa13dbde2beb357562622433254772a1`
+and ELF SHA-256 is
+`9b2a6d8d0451e833f2050bd75534a10872d3046bc2eaeb369b3ec43dad5fcfc6`.
+Both external-image gates compare a complete second replay byte-for-byte,
+including the unsupported-MMIO report; each still reports 167 unsupported
+accesses after boot. This proves these FreeRTOS interactions, not simultaneous
+core execution or timing fidelity. Run with matching external artifacts:
+
+```sh
+S3_IDF_HELLO_BIN=/path/to/hello_world.bin \
+S3_IDF_HELLO_ELF=/path/to/hello_world.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-idf-hello.sh
+S3_IDF_CROSSCORE_BIN=/path/to/s3_idf_crosscore.bin \
+S3_IDF_CROSSCORE_ELF=/path/to/s3_idf_crosscore.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-idf-crosscore.sh
+```
+
+The gates default to these pinned image/ELF hashes and the official revision-0
+ROM ELF SHA-256 `c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd`.
+With ESP-IDF v5.3.2 installed, build from its unmodified example and the
+in-tree cross-core fixture (keep generated configuration outside the repo):
+
+```sh
+idf.py -C "$IDF_PATH/examples/get-started/hello_world" \
+  -B /tmp/flexe-s3-hello-build -D SDKCONFIG=/tmp/flexe-s3-hello-sdkconfig \
+  -D IDF_TARGET=esp32s3 build
+idf.py -C tests/fixtures/s3_idf_crosscore \
+  -B /tmp/flexe-s3-crosscore-build -D SDKCONFIG=/tmp/flexe-s3-crosscore-sdkconfig \
+  -D IDF_TARGET=esp32s3 build
+```
+
+Independently rebuilt images can supply matching `*_SHA256` overrides, since
+ESP-IDF embeds build metadata in the application.
 
 The S3 RMT V1 TX model handles direct pulse RAM, per-channel dividers,
 threshold refill interrupts, end/error interrupts, and pulse-timed
