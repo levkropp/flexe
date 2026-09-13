@@ -158,8 +158,10 @@ without an ELF symbol or firmware-specific hook. The S3 SYSTEM clock and reset
 bits govern SHA execution and reset state; direct and GDMA commands do no work
 while gated or held in reset. In an unmodified S3 NerdMiner application run,
 this replaces roughly 131,000 repeated clock/reset unsupported diagnostics
-with device state transitions. The firmware now reaches its configuration
-portal, but has not passed an interactive end-to-end S3 scenario. Fast mode
+with device state transitions. NerdMiner now passes an interactive portal,
+SPIFFS save, software restart, and configuration-reload scenario; a separately
+built WLED S3 image passes an AP web UI and JSON state-change scenario through
+its own raw-lwIP stack. Fast mode
 completes each block immediately; SHA/GDMA
 latency, arbitration, GDMA CPU interrupt delivery, and SHA-512/224, SHA-512/256,
 and configurable SHA-512/t are not yet modeled.

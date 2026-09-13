@@ -38,7 +38,7 @@ The milestone is complete only when:
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
 | S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
-| S3 network service (partial) | NerdMiner's BSD-socket web portal completes a host-backed request/response session; WLED reaches raw lwIP TCP listen; a symbol-resolved Ethernet netif boundary now exposes guest TX and registered RX without replacing its TCP stack | Attach a host virtual-network backend and exercise WLED's HTTP UI; RF/PHY remains unsupported. |
+| S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
 | S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
@@ -55,8 +55,8 @@ from the official ROM ELF during a software restart lets NerdMiner initialize
 again and reload its saved settings instead of panicking during PSRAM setup,
 while physical SRAM outside those sections remains intact for app `.noinit`.
 The scripted POST/restart/reload gate exercises that full path. WLED now
-provides a second, independently sourced production output scenario, but not
-a second interactive network workflow. The remaining RF/PHY gaps prohibit a
+provides a second, independently sourced production interactive network and
+output scenario. The remaining RF/PHY gaps prohibit a
 production-support claim. ROM images and third-party firmware binaries are
 not copied into this repository.
 
@@ -71,7 +71,7 @@ paths retain MMIO diagnostics. For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 chunks and the `30EAB266` pulse-stream digest; 7,197 unsupported peripheral
 accesses remain. S3 JIT is not enabled, so no JIT parity is claimed. This
 establishes sustained hardware-output progress, not
-correct colors on a physical LED strip or a functioning WLED web UI. Recheck
+correct colors on a physical LED strip. Recheck
 with the external image and ROM ELF:
 
 ```sh
@@ -81,13 +81,27 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 ```
 
 A separate build of WLED v16.0.1 from its tagged source (`29b389d`, image
-SHA-256 `8e165290df301b0bcea5763637db1f0ec9d4ad5b1d07b8588a1baa5ebd50bad5`)
+SHA-256 `8e165290df301b0bcea5763637db1f0ec9d4ad5b1d07b8588a1baa5ebd50bad5`,
+ELF SHA-256 `a6ca2cb74ce281fd4f3846b6347e3f2abc434d1ced2d553630ba3a8478fe1965`)
 with its matching ELF reaches `AsyncServer::begin()` and then
 `tcp_listen_with_backlog()` at about 1.16 billion guest cycles. Its UDP
-sockets reach the host bridge, but no host HTTP listener appears. WLED's
-AsyncTCP web server uses lwIP's raw TCP PCB API, which the current S3
-BSD-socket bridge does not expose. A general raw-TCP or virtual-network path
-and an HTTP request/response gate are still needed. This source-built image
+sockets reach the host bridge. WLED's AsyncTCP web server uses lwIP's raw TCP
+PCB API, which the S3 BSD-socket bridge alone does not expose. The optional
+`--net-hostfwd ap:HOST_PORT:4.3.2.1:80` path connects a loopback host listener
+to WLED's own AP netif through Ethernet frames (libslirp is required). The
+source-built image served its gzip HTML UI, returned JSON state, accepted a
+brightness/red-color JSON POST, and read that state back. The pinned external
+gate repeats the complete interaction:
+
+```sh
+S3_WLED_BIN=/path/to/matching/firmware.bin \
+S3_WLED_APP_ELF=/path/to/matching/firmware.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-wled-http.sh
+```
+
+The guest AP address `4.3.2.1` was observed in WLED's gratuitous ARP frames;
+it is a gate input, not a hardcoded emulator address. This source-built image
 is not byte-identical to the pinned release image; its ELF must not be used
 to symbolize that release binary.
 
@@ -98,8 +112,10 @@ through the netif's registered RX callback; the RX buffer remains mapped
 until the guest calls `esp_wifi_internal_free_rx_buffer`. Without an attached
 backend, guest transmit and free functions execute unchanged. A synthetic
 S3 ELF unit gate checks callback registration, transmit fallback, frame
-delivery, buffer reuse, and statistics. This is transport plumbing, not a
-working WLED HTTP server yet.
+delivery, buffer reuse, and statistics. This is a network transport boundary,
+not modeled RF/PHY, wireless client association, cache timing, or
+cycle-accurate network delivery. The S3 network workflow is still partial
+outside the validated AP scenario.
 
 The S3 Bluetooth register window now includes a captured baseband clock:
 requesting a latch publishes a half-slot count and a down-counting subslot

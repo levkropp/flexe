@@ -35,6 +35,7 @@ of both cores.
 ## Build
 
 Requirements: a C17 compiler, CMake, OpenSSL, zlib, and pthreads.
+S3 Ethernet host forwarding is optional and additionally needs libslirp 4.9+.
 
 ```sh
 cmake -S . -B build

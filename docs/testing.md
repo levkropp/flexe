@@ -87,6 +87,17 @@ FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 See [Firmware compatibility](compatibility.md) for the assertions and current
 known failures.
 
+The S3 production gates also use external pinned images and the official ROM
+ELF. `check-s3-nerdminer-portal.sh` exercises provisioning and reset,
+`check-s3-wled-rmt.sh` checks the release image's LED pulse stream, and
+`check-s3-wled-http.sh` checks a matching WLED source-build image/ELF pair
+through its own raw-lwIP web server. The HTTP gate needs a build with
+libslirp 4.9 or newer and `jq`; it binds a randomly selected host loopback
+port and checks page delivery, a JSON state change, readback, and Ethernet
+delivery.
+See [Hardware completeness](hardware-completeness.md) for exact inputs and
+scope.
+
 ## JIT verification
 
 `--jit-verify` runs each eligible compiled block natively, rolls back its memory

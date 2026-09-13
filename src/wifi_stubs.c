@@ -245,6 +245,7 @@ struct wifi_stubs {
     wifi_ethernet_tx_cb ethernet_tx_cb;
     void               *ethernet_tx_ctx;
     uint32_t            ethernet_rx_cb[2];
+    bool                ethernet_hooked;
     ethernet_pending_frame_t ethernet_pending[WIFI_ETHERNET_RX_SLOTS];
     unsigned            ethernet_pending_count;
     ethernet_rx_slot_t  ethernet_rx_slot[WIFI_ETHERNET_RX_SLOTS];
@@ -373,7 +374,9 @@ static int stub_wifi_ethernet_tx(xtensa_cpu_t *cpu, void *ctx)
         }
         frame[i] = *byte;
     }
-    if (ws->ethernet_tx_cb(ws->ethernet_tx_ctx, iface, frame, len) != 0) {
+    int delivery = ws->ethernet_tx_cb(ws->ethernet_tx_ctx, iface, frame, len);
+    if (delivery > 0) return 0; /* another interface uses the guest driver */
+    if (delivery < 0) {
         ws_return(cpu, 0x101u); /* ESP_ERR_NO_MEM: host queue rejected it */
         return 1;
     }
@@ -2947,7 +2950,13 @@ int wifi_stubs_hook_ethernet_symbols(wifi_stubs_t *ws,
             ws->rom, tx_ref, stub_wifi_ethernet_tx,
             "esp_wifi_internal_tx_by_ref", ws) == 0)
         hooked++;
+    ws->ethernet_hooked = true;
     return hooked;
+}
+
+bool wifi_stubs_has_ethernet_boundary(const wifi_stubs_t *ws)
+{
+    return ws && ws->ethernet_hooked;
 }
 
 int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)

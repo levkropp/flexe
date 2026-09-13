@@ -340,6 +340,7 @@ static void capture_raw_tx(void *ctx, uint32_t iface, const uint8_t *frame,
 static int capture_ethernet_tx(void *ctx, uint32_t iface,
                                const uint8_t *frame, size_t len)
 {
+    if (iface == 0u) return 1; /* test unrelated STA native fallback */
     test_ethernet_capture_t *capture = ctx;
     capture->calls++;
     capture->iface = iface;
@@ -608,18 +609,29 @@ TEST(s3_ethernet_netif_boundary_preserves_guest_fallback_and_buffer_lifetime)
     put_insn3(&cpu, reg, 0x0020F0u); /* NOP: spy observes native call */
     put_insn3(&cpu, tx, 0x0020F0u);  /* native fallback without backend */
     put_insn3(&cpu, callback, 0x0020F0u);
+    ASSERT_TRUE(!wifi_stubs_has_ethernet_boundary(wifi));
     ASSERT_EQ(wifi_stubs_hook_ethernet_symbols(wifi, syms), 4u);
+    ASSERT_TRUE(wifi_stubs_has_ethernet_boundary(wifi));
 
     invoke_wifi_call0_4(&cpu, tx, 1u, frame_addr, sizeof(frame), 0u);
     ASSERT_EQ(cpu.pc, tx + 3u);
     test_ethernet_capture_t sent = {0}, received = {0};
     wifi_stubs_set_ethernet_tx_callback(wifi, capture_ethernet_tx, &sent);
+    wifi_host_config_t host_config = {0};
+    wifi_stubs_snapshot_host_config(wifi, &host_config);
+    ASSERT_TRUE(host_config.ethernet_tx_cb == capture_ethernet_tx);
+    ASSERT_TRUE(host_config.ethernet_tx_ctx == &sent);
+    wifi_stubs_set_ethernet_tx_callback(wifi, NULL, NULL);
+    wifi_stubs_apply_host_config(wifi, &host_config);
     invoke_wifi_call0_4(&cpu, tx, 1u, frame_addr, sizeof(frame), 0u);
     ASSERT_EQ64(sent.calls, 1u);
     ASSERT_EQ(sent.iface, 1u);
     ASSERT_EQ(sent.len, sizeof(frame));
     ASSERT_EQ(memcmp(sent.frame, frame, sizeof(frame)), 0);
     ASSERT_EQ(ar_read(&cpu, 2), 0u); /* ESP_OK, not a fake native send */
+    invoke_wifi_call0_4(&cpu, tx, 0u, frame_addr, sizeof(frame), 0u);
+    ASSERT_EQ(cpu.pc, tx + 3u);
+    ASSERT_EQ64(sent.calls, 1u);
 
     ASSERT_EQ(rom_stubs_register_ctx(rom, callback, capture_ethernet_rx,
                                       "test_ethernet_rx", &received), 0);

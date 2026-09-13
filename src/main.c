@@ -8,6 +8,7 @@
 #include "peripherals.h"
 #include "rom_stubs.h"
 #include "wifi_stubs.h"
+#include "host_net_slirp.h"
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
 #include "savestate.h"
@@ -665,6 +666,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --jit-stats     Print JIT block/coverage statistics on exit\n");
     fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
     fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
+    fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -1014,6 +1016,7 @@ int main(int argc, char *argv[]) {
     int usb_console = 0;
     /* AOT statically-recompiled firmware dylib */
     const char *aot_dylib_path = NULL;
+    const char *net_hostfwd_spec = NULL;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
 
     /* Manual parsing for long options (--checkpoint-*, --restore) */
@@ -1087,6 +1090,12 @@ int main(int argc, char *argv[]) {
                         argv[i + 1]);
                 return 1;
             }
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--net-hostfwd") == 0 && i + 1 < argc) {
+            net_hostfwd_spec = argv[i + 1];
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1263,6 +1272,22 @@ int main(int argc, char *argv[]) {
 
     /* Pull out pointers for use in the execution loop */
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
+    flexe_host_net_t *host_net = NULL;
+    if (net_hostfwd_spec) {
+        if (cpu->target->id != FLEXE_TARGET_ESP32S3) {
+            fprintf(stderr, "[net] --net-hostfwd currently requires ESP32-S3\n");
+            flexe_session_destroy(session);
+            ring_destroy(g_ring);
+            return 1;
+        }
+        host_net = flexe_host_net_create(net_hostfwd_spec,
+                                         flexe_session_wifi(session));
+        if (!host_net) {
+            flexe_session_destroy(session);
+            ring_destroy(g_ring);
+            return 1;
+        }
+    }
     xtensa_mem_t *mem = flexe_session_mem(session);
     const elf_symbols_t *syms = flexe_session_syms(session);
     esp32_periph_t *periph = flexe_session_periph(session);
@@ -1310,6 +1335,7 @@ int main(int argc, char *argv[]) {
         g_htrace = htrace_create();
         if (!g_htrace) {
             fprintf(stderr, "Failed to allocate hierarchical trace (~24 MB)\n");
+            flexe_host_net_destroy(host_net);
             flexe_session_destroy(session);
             ring_destroy(g_ring);
             return 1;
@@ -1337,6 +1363,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Restoring from checkpoint: %s\n", restore_file);
         if (savestate_restore(cpu, frt, restore_file) != 0) {
             fprintf(stderr, "Failed to restore checkpoint\n");
+            flexe_host_net_destroy(host_net);
             flexe_session_destroy(session);
             ring_destroy(g_ring);
             return 1;
@@ -1699,6 +1726,7 @@ int main(int argc, char *argv[]) {
         unsigned current_resets = flexe_session_reset_count(session);
         if (current_resets != observed_resets) {
             observed_resets = current_resets;
+            flexe_host_net_attach(host_net, flexe_session_wifi(session));
             periph = flexe_session_periph(session);
             if (rmt_stats_enabled) rmt_stats_attach(periph, rmt_stats);
             rom = flexe_session_rom(session);
@@ -1706,6 +1734,7 @@ int main(int argc, char *argv[]) {
             hb_stub_count = 0;
             prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
         }
+        flexe_host_net_pump(host_net);
 
         /* Charge core 1's executed instructions against the budget */
         if (cpu1_any) {
@@ -1953,6 +1982,16 @@ int main(int argc, char *argv[]) {
                 (unsigned long long)wifi_stats.recvfrom_host_polls,
                 (unsigned long long)wifi_stats.recvfrom_polls_coalesced);
     }
+    if (wifi_stats.ethernet_tx_frames || wifi_stats.ethernet_rx_frames ||
+        wifi_stats.ethernet_rx_dropped ||
+        wifi_stats.ethernet_rx_callback_failures) {
+        fprintf(stderr,
+                "Ethernet:   %llu guest TX, %llu guest RX, %llu dropped, %llu RX callback failures\n",
+                (unsigned long long)wifi_stats.ethernet_tx_frames,
+                (unsigned long long)wifi_stats.ethernet_rx_frames,
+                (unsigned long long)wifi_stats.ethernet_rx_dropped,
+                (unsigned long long)wifi_stats.ethernet_rx_callback_failures);
+    }
     if (rom_stubs_unregistered_count(rom) > 0)
         fprintf(stderr, "Unregistered ROM calls: %d\n", rom_stubs_unregistered_count(rom));
 
@@ -2043,6 +2082,7 @@ int main(int argc, char *argv[]) {
         htrace_destroy(g_htrace);
         g_htrace = NULL;
     }
+    flexe_host_net_destroy(host_net);
     flexe_session_destroy(session);
     return 0;
 }

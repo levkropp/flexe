@@ -13,8 +13,10 @@ typedef void (*wifi_raw_tx_cb)(void *ctx, uint32_t iface,
                                bool en_sys_seq);
 
 /* ESP-IDF's Wi-Fi netif passes Ethernet frames at its driver boundary. The
- * callback must consume/copy the frame before returning; zero means the host
- * network backend accepted it. This is distinct from raw 802.11 injection. */
+ * callback must consume/copy the frame before returning. Zero means accepted,
+ * a positive value leaves the native guest driver in charge (for an unrelated
+ * interface), and a negative value reports a host failure. This is distinct
+ * from raw 802.11 injection. */
 typedef int (*wifi_ethernet_tx_cb)(void *ctx, uint32_t iface,
                                     const uint8_t *frame, size_t len);
 
@@ -83,6 +85,7 @@ int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
  * the guest's original transmit/free functions execute unchanged. */
 int wifi_stubs_hook_ethernet_symbols(wifi_stubs_t *ws,
                                      const elf_symbols_t *syms);
+bool wifi_stubs_has_ethernet_boundary(const wifi_stubs_t *ws);
 void wifi_stubs_set_ethernet_tx_callback(wifi_stubs_t *ws,
                                          wifi_ethernet_tx_cb cb, void *ctx);
 /* Queue one host Ethernet frame for the guest's registered STA (0) or AP (1)
