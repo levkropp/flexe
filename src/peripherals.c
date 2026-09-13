@@ -15243,6 +15243,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     flexe_systimer_attach_cpus(p->systimer, cpu0, cpu1);
     flexe_timer_group_attach_cpus(p->target_timer_group, cpu0, cpu1);
     flexe_rmt_v1_attach_cpus(p->rmt_v1, cpu0, cpu1);
+    flexe_radio_attach_cpus(p->radio_regs, cpu0, cpu1);
     flexe_rtc_cntl_attach_cpus(p->target_rtc_cntl, cpu0, cpu1);
 
     bool classic = (p->target->capabilities &

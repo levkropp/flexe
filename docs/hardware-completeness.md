@@ -39,6 +39,7 @@ The milestone is complete only when:
 | S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
+| S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
 S3 remains experimental. The NerdMiner filesystem result is a meaningful
@@ -77,6 +78,19 @@ S3_WLED_BIN=/path/to/WLED_16.0.1_ESP32-S3_4M_qspi.bin \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-wled-rmt.sh
 ```
+
+The S3 Bluetooth register window now includes a captured baseband clock:
+requesting a latch publishes a half-slot count and a down-counting subslot
+phase from shared guest time. Its register protocol and 312.5 µs half-slot
+interpretation are inferred from `r_rwip_time_get` in the official
+`esp32s3_rev0_rom.elf`, not from a public Bluetooth-controller register
+specification. This removes Marauder's unbounded poll of the latch command,
+but does not make its Bluetooth controller functional. The unmodified Marauder
+v1.12.1 multiboard S3 image (SHA-256
+`62292a502635f02eab9e515bc3f18fbf43330f81abe2c006c1afe43bd21b57ea`)
+then reports `assert lld.c 292` and reboots on an interrupt watchdog before
+its CLI. It is not an accepted second interactive S3 scenario; the controller
+scheduler and RF/packet behavior remain unsupported.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),

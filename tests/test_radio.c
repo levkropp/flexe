@@ -148,6 +148,62 @@ TEST(esp32s3_wdev_random_source_is_deterministic_and_live)
     mem_destroy(mem_b);
 }
 
+TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0, cpu1;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    xtensa_cpu_init_for_target(&cpu1, s3);
+    cpu0.mem = mem;
+    cpu1.mem = mem;
+    periph_attach_cpus(periph, &cpu0, &cpu1);
+
+    const uint32_t count = s3->radio.time_latch.count_address;
+    const uint32_t phase = s3->radio.time_latch.phase_address;
+    const uint32_t capture = s3->radio.time_latch.capture_mask;
+    mem_write32(mem, count, capture);
+    ASSERT_EQ(mem_read32(mem, count), 0u);
+    ASSERT_EQ(mem_read32(mem, phase), 624u);
+    /* One BLE half-slot is 625 half-microsecond ticks: 50,000 CPU
+     * cycles at 160 MHz. The second core may advance shared time. */
+    cpu0.cycle_count = 50000u;
+    mem_write32(mem, count, capture);
+    ASSERT_EQ(mem_read32(mem, count), 1u);
+    ASSERT_EQ(mem_read32(mem, phase), 624u);
+    /* CCOUNT advances inside an execution batch before cycle_count is
+     * published. The half-microsecond subslot must still move. */
+    cpu0.ccount += 80u;
+    ASSERT_EQ(mem_read32(mem, phase), 624u); /* frozen snapshot */
+    mem_write32(mem, count, capture);
+    ASSERT_EQ(mem_read32(mem, count), 1u);
+    ASSERT_EQ(mem_read32(mem, phase), 623u);
+    cpu1.cycle_count = 100000u;
+    mem_write32(mem, count, capture);
+    ASSERT_EQ(mem_read32(mem, count), 2u);
+    ASSERT_EQ(mem_read32(mem, phase), 624u);
+    cpu1.virtual_time_us = 313u;
+    mem_write32(mem, count, capture);
+    ASSERT_EQ(mem_read32(mem, count), 3u);
+    ASSERT_EQ(mem_read32(mem, phase), 623u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    mem_write32(mem, count, 0x12345u);
+    ASSERT_EQ(mem_read32(mem, count), 3u);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(radio_rejects_absent_capability_and_overlapping_windows)
 {
     const flexe_target_desc_t *s3 =
@@ -167,6 +223,14 @@ TEST(radio_rejects_absent_capability_and_overlapping_windows)
     radio = flexe_radio_create(mem, NULL, NULL, NULL);
     ASSERT_TRUE(radio == NULL);
     mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.radio.time_latch.phase_address = 0u;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    radio = flexe_radio_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(radio == NULL);
+    mem_destroy(mem);
 }
 
 static void run_radio_tests(void)
@@ -176,5 +240,6 @@ static void run_radio_tests(void)
     RUN_TEST(esp32s3_rom_iq_estimation_completes_from_control_protocol);
     RUN_TEST(esp32s3_wifi_mac_reset_reports_ready);
     RUN_TEST(esp32s3_wdev_random_source_is_deterministic_and_live);
+    RUN_TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock);
     RUN_TEST(radio_rejects_absent_capability_and_overlapping_windows);
 }

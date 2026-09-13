@@ -3,6 +3,7 @@
 #define FLEXE_RADIO_H
 
 #include "memory.h"
+#include "xtensa.h"
 
 typedef struct flexe_radio flexe_radio_t;
 
@@ -12,6 +13,8 @@ typedef struct flexe_radio flexe_radio_t;
 flexe_radio_t *flexe_radio_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
     mmio_write_fn fallback_write, void *fallback_ctx);
+void flexe_radio_attach_cpus(flexe_radio_t *radio,
+                              xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1);
 void flexe_radio_destroy(flexe_radio_t *radio);
 
 #endif /* FLEXE_RADIO_H */

@@ -781,6 +781,14 @@ static const flexe_target_desc_t TARGETS[] = {
             /* WDEV_RND_REG from the public ESP32-S3 register header. */
             .random_address = 0x6003507Cu,
             .random_seed = UINT64_C(0x12345678ABCDEF01),
+            .time_latch = {
+                .count_address = 0x6003101Cu,
+                .phase_address = 0x60031020u,
+                .capture_mask = 1u << 31,
+                .count_mask = 0x0FFFFFFFu,
+                .tick_hz = 2000000u,
+                .ticks_per_half_slot = 625u,
+            },
         },
         .gdma = {
             .base = 0x6003F000u,

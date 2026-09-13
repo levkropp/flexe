@@ -1,11 +1,18 @@
 #include "radio.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 typedef struct {
     uint32_t *words;
 } flexe_radio_window_t;
+
+typedef struct {
+    uint64_t cycles;
+    uint32_t last_ccount;
+    bool valid;
+} flexe_radio_clock_t;
 
 struct flexe_radio {
     xtensa_mem_t *mem;
@@ -15,7 +22,79 @@ struct flexe_radio {
     void *fallback_ctx;
     flexe_radio_window_t window[FLEXE_TARGET_RADIO_WINDOW_MAX];
     uint64_t random_state;
+    xtensa_cpu_t *cpu[2];
+    flexe_radio_clock_t clock[2];
 };
+
+static uint32_t *radio_word(flexe_radio_t *radio, uint32_t address);
+
+static uint64_t radio_add_saturating(uint64_t a, uint64_t b)
+{
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+static uint64_t radio_clock_cycles(flexe_radio_t *radio, unsigned core)
+{
+    const xtensa_cpu_t *cpu = radio->cpu[core];
+    flexe_radio_clock_t *clock = &radio->clock[core];
+    if (!cpu) return 0u;
+    if (!clock->valid) {
+        clock->cycles = cpu->cycle_count;
+        clock->last_ccount = cpu->ccount;
+        clock->valid = true;
+    } else {
+        /* cycle_count is published at a batch boundary. CCOUNT also moves
+         * inside a batch, so a ROM MMIO read must sample its live progress. */
+        uint32_t elapsed = cpu->ccount - clock->last_ccount;
+        if (elapsed < (uint32_t)INT32_MAX)
+            clock->cycles = radio_add_saturating(clock->cycles, elapsed);
+        clock->last_ccount = cpu->ccount;
+        if (cpu->cycle_count > clock->cycles)
+            clock->cycles = cpu->cycle_count;
+    }
+    return clock->cycles;
+}
+
+static uint64_t radio_cpu_ticks(flexe_radio_t *radio, unsigned core)
+{
+    const xtensa_cpu_t *cpu = radio->cpu[core];
+    if (!cpu) return 0u;
+    const flexe_radio_time_latch_desc_t *latch =
+        &radio->target->radio.time_latch;
+    uint32_t mhz = xtensa_cpu_freq_mhz(cpu);
+    if (!mhz) return 0u;
+    uint64_t cycles = radio_clock_cycles(radio, core);
+    uint64_t skipped = cpu->virtual_time_us > UINT64_MAX / mhz ?
+                       UINT64_MAX : cpu->virtual_time_us * mhz;
+    cycles = radio_add_saturating(cycles, skipped);
+    uint64_t cpu_hz = (uint64_t)mhz * 1000000u;
+    uint64_t whole = cycles / cpu_hz;
+    uint64_t ticks = whole > UINT64_MAX / latch->tick_hz ?
+                     UINT64_MAX : whole * latch->tick_hz;
+    uint64_t fraction =
+        ((cycles % cpu_hz) * latch->tick_hz) / cpu_hz;
+    return radio_add_saturating(ticks, fraction);
+}
+
+static uint64_t radio_latch_ticks(flexe_radio_t *radio)
+{
+    uint64_t ticks0 = radio_cpu_ticks(radio, 0u);
+    uint64_t ticks1 = radio_cpu_ticks(radio, 1u);
+    return ticks0 > ticks1 ? ticks0 : ticks1;
+}
+
+static void radio_capture_time(flexe_radio_t *radio)
+{
+    const flexe_radio_time_latch_desc_t *latch =
+        &radio->target->radio.time_latch;
+    uint64_t ticks = radio_latch_ticks(radio);
+    uint32_t *count = radio_word(radio, latch->count_address);
+    uint32_t *phase = radio_word(radio, latch->phase_address);
+    *count = (uint32_t)(ticks / latch->ticks_per_half_slot) &
+             latch->count_mask;
+    *phase = latch->ticks_per_half_slot - 1u -
+             (uint32_t)(ticks % latch->ticks_per_half_slot);
+}
 
 static bool radio_address_in_window(const flexe_radio_desc_t *desc,
                                     uint32_t address)
@@ -61,6 +140,21 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
         (desc->random_address != 0u &&
          !radio_address_in_window(desc, desc->random_address)))
         return false;
+
+    const flexe_radio_time_latch_desc_t *latch = &desc->time_latch;
+    if (latch->count_address != 0u || latch->phase_address != 0u ||
+        latch->capture_mask != 0u || latch->count_mask != 0u ||
+        latch->tick_hz != 0u || latch->ticks_per_half_slot != 0u) {
+        if (!radio_address_in_window(desc, latch->count_address) ||
+            !radio_address_in_window(desc, latch->phase_address) ||
+            latch->count_address == latch->phase_address ||
+            latch->capture_mask == 0u ||
+            (latch->capture_mask & (latch->capture_mask - 1u)) != 0u ||
+            latch->count_mask == 0u ||
+            (latch->count_mask & latch->capture_mask) != 0u ||
+            latch->tick_hz == 0u || latch->ticks_per_half_slot == 0u)
+            return false;
+    }
 
     for (unsigned i = 0u; i < desc->completion_count; i++) {
         const flexe_radio_completion_desc_t *completion =
@@ -138,6 +232,18 @@ static void radio_write(void *ctx, uint32_t address, uint32_t value)
 {
     flexe_radio_t *radio = ctx;
     const flexe_radio_desc_t *desc = &radio->target->radio;
+    const flexe_radio_time_latch_desc_t *latch = &desc->time_latch;
+    if (latch->count_address && address == latch->count_address) {
+        if (value & latch->capture_mask) radio_capture_time(radio);
+        if (value != latch->capture_mask && radio->fallback_write)
+            radio->fallback_write(radio->fallback_ctx, address, value);
+        return;
+    }
+    if (latch->phase_address && address == latch->phase_address) {
+        if (radio->fallback_write)
+            radio->fallback_write(radio->fallback_ctx, address, value);
+        return;
+    }
     uint32_t *word = radio_word(radio, address);
     if (!word) {
         if (radio->fallback_write)
@@ -218,6 +324,20 @@ fail:
         free(radio->window[i].words);
     free(radio);
     return NULL;
+}
+
+void flexe_radio_attach_cpus(flexe_radio_t *radio,
+                              xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1)
+{
+    if (!radio) return;
+    radio->cpu[0] = cpu0;
+    radio->cpu[1] = cpu1;
+    for (unsigned core = 0u; core < 2u; core++) {
+        xtensa_cpu_t *cpu = radio->cpu[core];
+        radio->clock[core].cycles = cpu ? cpu->cycle_count : 0u;
+        radio->clock[core].last_ccount = cpu ? cpu->ccount : 0u;
+        radio->clock[core].valid = cpu != NULL;
+    }
 }
 
 void flexe_radio_destroy(flexe_radio_t *radio)

@@ -49,7 +49,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 36u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 37u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -488,6 +488,18 @@ typedef struct {
     uint32_t status_mask;
 } flexe_radio_completion_desc_t;
 
+/* The private BT controller can snapshot its baseband half-slot clock into
+ * two registers. The ROM's time_get path requests a latch then reads the
+ * half-slot count and its down-counting subslot phase. */
+typedef struct {
+    uint32_t count_address;
+    uint32_t phase_address;
+    uint32_t capture_mask;
+    uint32_t count_mask;
+    uint32_t tick_hz;
+    uint16_t ticks_per_half_slot;
+} flexe_radio_time_latch_desc_t;
+
 typedef struct {
     uint8_t window_count;
     uint8_t completion_count;
@@ -497,6 +509,7 @@ typedef struct {
         completion[FLEXE_TARGET_RADIO_COMPLETION_MAX];
     uint32_t random_address;
     uint64_t random_seed;
+    flexe_radio_time_latch_desc_t time_latch;
 } flexe_radio_desc_t;
 
 /* General-purpose DMA v1 is the five-channel AHB DMA shared by several
