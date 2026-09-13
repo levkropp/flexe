@@ -40,6 +40,7 @@ The milestone is complete only when:
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
 | S3 network service (partial) | NerdMiner's BSD-socket portal completes a host-backed request/response session; a separately built WLED 16.0.1 serves its UI and accepts/readbacks a JSON LED-state change through native raw lwIP and the optional Ethernet user-mode backend | Exercise more network modes and production images; RF/PHY remains unsupported. |
 | S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with a pinned interpreter output digest | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
+| S3 RTC SAR ADC (partial) | `tests/test_sens.c` covers both units' pad selection, START/DONE/DATA latching, internal-ground calibration selection, reader inversion, clock/reset gating, and host ADC stimulus through `adc_in` (channels 0–9 = ADC1, 10–19 = ADC2). `scripts/check-s3-adc.sh` replays a stock Arduino S3 sketch and checks five sustained `analogRead()` pairs. | Digital/DMA conversion, ULP, ADC interrupts, calibrated analog voltage/electrical behavior, and ADC2 arbitration are unsupported or incomplete. |
 | S3 Bluetooth baseband clock (partial) | `tests/test_radio.c` checks the captured half-slot count and subslot phase against both cores' guest time | The controller scheduler, packet exchange, and RF path are unsupported; Marauder still asserts before its CLI. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
@@ -104,6 +105,34 @@ The guest AP address `4.3.2.1` was observed in WLED's gratuitous ARP frames;
 it is a gate input, not a hardcoded emulator address. This source-built image
 is not byte-identical to the pinned release image; its ELF must not be used
 to symbolize that release binary.
+
+The S3 RTC SAR ADC model follows Espressif's S3 `sens_reg.h` and `adc_ll.h`
+register contract: software pad selection and START, hardware-owned DONE/DATA,
+and an idle measurement status after a synchronous fast-mode conversion. An
+internal analog-register I2C bit selects ground for the SDK's hardware
+calibration path; a ground conversion yields zero rather than claiming an
+ordinary external-pad sample. `tests/fixtures/s3_adc/s3_adc.ino`, compiled with
+Arduino-ESP32 3.3.11 for `esp32:esp32:esp32s3`, reads GPIO4 (ADC1 channel 3)
+and GPIO11 (ADC2 channel 0) repeatedly. With injected raw codes 2645 and
+1450, the interpreter emitted five matching pairs within two billion
+aggregate cycles. Its merged image SHA-256 is
+`5178a6d97110c3682664ecbe602e0bbce40367c639ebc46ab3f714d879c4ec34`
+and matching ELF SHA-256 is
+`7c156185527896c78a8cf8de1155b10f417350ac1dad27a7ef255298fdad99d0`.
+The gate keeps 446 other unsupported accesses visible, including APB SAR ADC
+arbiter configuration and RF power-detector trim. This is raw-code functional
+behavior, not physical analog, attenuation, calibration accuracy, or
+continuous/DMA ADC fidelity. Recheck with the external compiled fixture:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+  --build-path /tmp/flexe-s3-adc-fixture-build \
+  --build-property compiler.optimization_flags=-Os tests/fixtures/s3_adc
+S3_ADC_BIN=/tmp/flexe-s3-adc-fixture-build/s3_adc.ino.merged.bin \
+S3_ADC_ELF=/tmp/flexe-s3-adc-fixture-build/s3_adc.ino.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-adc.sh
+```
 
 The native S3 `esp_wifi_internal_tx`/`tx_by_ref` and
 `esp_wifi_internal_reg_rxcb` symbols now form an optional Ethernet-frame

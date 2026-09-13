@@ -14353,6 +14353,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             p->target_sens = flexe_sens_create(
                 mem, default_read, default_write, p,
                 target_sens_conversion_done, p);
+        flexe_sens_attach_regi2c(p->target_sens, p->regi2c);
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
             mmio_read_fn fallback_read = p->target_sens
                 ? flexe_sens_mmio_read : default_read;
@@ -15462,6 +15463,13 @@ int periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int) {
 void periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw) {
     if (!p || channel < 0 || channel >= 40) return;
     p->adc_value[channel] = raw;
+    if (p->target_sens) {
+        unsigned channels = p->target->sens.adc_channels_per_unit;
+        if (channels != 0u)
+            flexe_sens_set_adc_raw(p->target_sens,
+                                   (unsigned)channel / channels,
+                                   (unsigned)channel % channels, raw);
+    }
 }
 
 void periph_set_temperature_raw(esp32_periph_t *p, uint16_t raw) {

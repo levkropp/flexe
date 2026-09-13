@@ -39,6 +39,7 @@
 #define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
+#define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 8u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
@@ -49,7 +50,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 37u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 38u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -431,11 +432,24 @@ typedef struct {
     uint32_t writable_mask;
 } flexe_regi2c_aux_register_desc_t;
 
-/* RTC-domain sensor controller. The first reusable model covers the S2/S3
- * temperature-sensor front end while leaving room for ADC and touch blocks
- * to be added without teaching firmware addresses to the machine frontend.
+/* RTC-domain sensor controller. Temperature and polled SAR ADC register
+ * geometry live here rather than in the machine frontend.
  * In fast mode a powered, clocked conversion completes synchronously; timed
  * modes can derive latency from the retained divider and wait fields. */
+typedef struct {
+    uint16_t reader_offset;
+    uint16_t measure_offset;
+    uint16_t mux_offset;
+    uint16_t atten_offset;
+    uint32_t reader_reset;
+    uint32_t reader_writable_mask;
+    uint32_t reader_invert_mask;
+    uint32_t mux_writable_mask;
+    uint32_t mux_rtc_block_mask;
+    uint32_t mux_unsupported_mask;
+    uint8_t calibration_ground_mask;
+} flexe_sens_adc_unit_desc_t;
+
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -463,6 +477,18 @@ typedef struct {
     uint32_t reset_mask;
     uint32_t rtc_interrupt_mask;
     uint16_t default_output;
+    uint8_t adc_unit_count;
+    uint8_t adc_channels_per_unit;
+    uint16_t adc_power_offset;
+    uint16_t adc_status_offset;
+    uint32_t adc_power_writable_mask;
+    uint32_t adc_status_writable_mask;
+    uint32_t adc_clock_enable_mask;
+    uint32_t adc_reset_mask;
+    uint16_t adc_output_mask;
+    uint8_t adc_calibration_slave;
+    uint8_t adc_calibration_address;
+    flexe_sens_adc_unit_desc_t adc_unit[FLEXE_TARGET_SENS_ADC_UNIT_MAX];
 } flexe_sens_desc_t;
 
 /* Undocumented Wi-Fi/Bluetooth controller apertures contain a mixture of

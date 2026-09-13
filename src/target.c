@@ -743,6 +743,49 @@ static const flexe_target_desc_t TARGETS[] = {
             .rtc_interrupt_mask = 1u << 12,
             /* Raw code 104 is approximately 25 C in range 2 (offset 0). */
             .default_output = 104u,
+            .adc_unit_count = 2u,
+            .adc_channels_per_unit = 10u,
+            .adc_power_offset = 0x03Cu,
+            .adc_status_offset = 0x040u,
+            .adc_power_writable_mask = 0xE0000000u,
+            .adc_status_writable_mask = 0x003FFFFFu,
+            .adc_clock_enable_mask = 1u << 30,
+            .adc_reset_mask = 1u << 30,
+            .adc_output_mask = 0x1FFFu, /* S3 RTC ADC is 13-bit. */
+            .adc_calibration_slave = 0x69u,
+            .adc_calibration_address = 0x07u,
+            .adc_unit = {
+                {
+                    .reader_offset = 0x000u,
+                    .measure_offset = 0x00Cu,
+                    .mux_offset = 0x010u,
+                    .atten_offset = 0x014u,
+                    .reader_reset = (1u << 29) | (1u << 18) | 2u,
+                    .reader_writable_mask =
+                        (1u << 29) | (1u << 28) |
+                        (0xFFu << 19) | (1u << 18) | 0xFFu,
+                    .reader_invert_mask = 1u << 28,
+                    .mux_writable_mask = 1u << 31,
+                    .mux_rtc_block_mask = 1u << 31,
+                    .calibration_ground_mask = 1u << 5,
+                },
+                {
+                    .reader_offset = 0x024u,
+                    .measure_offset = 0x030u,
+                    .mux_offset = 0x034u,
+                    .atten_offset = 0x038u,
+                    .reader_reset = (1u << 30) | (1u << 18) |
+                                    (1u << 16) | 2u,
+                    .reader_writable_mask =
+                        (1u << 30) | (1u << 29) |
+                        (0xFFu << 19) | (1u << 18) |
+                        (3u << 16) | 0xFFu,
+                    .reader_invert_mask = 1u << 29,
+                    .mux_writable_mask = 0xF0000000u,
+                    .mux_unsupported_mask = 7u << 28,
+                    .calibration_ground_mask = 1u << 7,
+                },
+            },
         },
         .radio = {
             .window_count = 9u,

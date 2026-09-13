@@ -281,3 +281,16 @@ void flexe_regi2c_destroy(flexe_regi2c_t *regi2c)
     free(regi2c->registers);
     free(regi2c);
 }
+
+bool flexe_regi2c_register_read(const flexe_regi2c_t *regi2c,
+                                unsigned slave, unsigned address,
+                                uint8_t *value)
+{
+    if (!regi2c || !value) return false;
+    const flexe_regi2c_desc_t *desc = &regi2c->target->regi2c;
+    if (slave > (desc->slave_mask >> desc->slave_shift) ||
+        address >= regi2c->address_count)
+        return false;
+    *value = regi2c->registers[slave * regi2c->address_count + address];
+    return true;
+}
