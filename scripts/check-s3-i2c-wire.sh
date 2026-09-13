@@ -29,6 +29,6 @@ for run in 1 2; do
 done
 cmp "$tmpdir/run1" "$tmpdir/run2"
 grep -q 'stage=0x1C2C0040 result=0/0/40/0x95AED6CC' "$tmpdir/run1"
-grep -q 'write_bytes=42 read_bytes=40 memory_ok=1' "$tmpdir/run1"
-grep -q 'i2c_unhandled_sites=0' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 Wire transferred 40 bytes through real driver/FIFO/ISR, repeated START, and NACK; byte-identical replay"
+grep -q 'calls=8 write_bytes=84 read_bytes=80 memory_ok=1' "$tmpdir/run1"
+grep -q 'i2c_unhandled_sites=0 resets=1' "$tmpdir/run1"
+echo "PASS: stock Arduino S3 Wire transferred 40 bytes through real driver/FIFO/ISR, repeated START, and NACK across a controller reset; byte-identical replay"

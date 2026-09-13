@@ -50,7 +50,7 @@ even when a firmware workflow succeeds.
 | S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate | Additional partition and filesystem variants need end-to-end gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate | RTC wake routing, full pad hold/pulls/drive, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and ESP-IDF SPI-master replay gates run against virtual slaves | I2C slave mode, more guest driver/device combinations, and GP-SPI segmented/slave modes remain. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and ESP-IDF SPI-master replay gates run against virtual slaves, with Wire repeated after a session reset | I2C slave mode, more guest driver/device combinations, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core and restart gates | Calibrated timing, all wake modes, and all reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
@@ -157,9 +157,14 @@ host-side I2C device, not a substitute for guest Wire or the MMIO controller.
 The stock Arduino-ESP32 3.3.11 image/ELF hashes are
 `91440bdbb4f0a057bf95fab104bc27602555f254d904d7a97b3c032fcb3cb49e` /
 `271630096105d3afef3946cf0d91f5413f50ac8ce99be39b05cd39e235f45121`.
-Two replay runs match byte-for-byte, with no unsupported I2C MMIO sites;
-175 unrelated startup accesses remain unsupported. This gate does not test
-S3 slave mode, electrical timing, bus contention, or other devices:
+The harness then requests a software reset and lets the same guest image run
+the transfer again. The external slave registration and its host-held register
+contents persist, while the SoC I2C controller is rebuilt. A separate unit
+test covers all three classic I2C bus attachments across reset. Two complete
+S3 replay runs match byte-for-byte, with no unsupported I2C MMIO sites;
+350 unrelated startup accesses across the two boots remain unsupported. This
+gate does not test a guest-initiated restart, S3 slave mode, electrical timing,
+bus contention, or other devices:
 
 ```sh
 arduino-cli compile --fqbn esp32:esp32:esp32s3 \

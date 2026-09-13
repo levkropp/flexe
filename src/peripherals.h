@@ -48,6 +48,7 @@ typedef enum {
     PERIPH_I2C_PORT_1 = 1,
     PERIPH_I2C_PORT_RTC = 2,
 } periph_i2c_port_t;
+#define PERIPH_I2C_ADDRESS_COUNT 128u
 
 /* Native SDMMC cards expose 512-byte logical sectors to the two-slot host.
  * Callbacks return zero on success and nonzero for a card-side I/O failure. */
@@ -251,6 +252,22 @@ void periph_unhandled_audit_dispose(periph_unhandled_audit_snapshot_t *snapshot)
  * RTC-domain I2C master. Passing NULL as fn detaches the address. */
 int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
                              periph_i2c_device_fn fn, void *ctx);
+
+/* Host-side I2C targets survive an SoC software reset; controller registers,
+ * FIFOs, and in-flight transactions do not. The caller retains ownership of
+ * each callback context across the reset. */
+typedef struct {
+    periph_i2c_device_fn fn;
+    void *ctx;
+} periph_i2c_attachment_t;
+typedef struct {
+    periph_i2c_attachment_t
+        port[PERIPH_I2C_PORT_RTC + 1][PERIPH_I2C_ADDRESS_COUNT];
+} periph_i2c_attachment_snapshot_t;
+void periph_i2c_attachments_snapshot(
+    const esp32_periph_t *p, periph_i2c_attachment_snapshot_t *out);
+void periph_i2c_attachments_restore(
+    esp32_periph_t *p, const periph_i2c_attachment_snapshot_t *snapshot);
 
 /* The mirror of the above, for slave mode: the host drives a transfer *at* the
  * guest, which is answering rather than originating. Writes land in the port's

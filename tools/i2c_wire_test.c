@@ -45,6 +45,27 @@ static int register_device(void *opaque, int port, uint8_t address,
     return 0;
 }
 
+static uint32_t run_until_stage(flexe_session_t *session,
+                                uint32_t stage_addr, uint64_t cycle_limit,
+                                bool wait_for_reset_clear)
+{
+    xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
+    xtensa_mem_t *mem = flexe_session_mem(session);
+    uint32_t stage;
+    bool armed = !wait_for_reset_clear;
+    while (cpu->cycle_count < cycle_limit) {
+        stage = mem_read32(mem, stage_addr);
+        if (!armed && stage != SUCCESS_MARKER)
+            armed = true;
+        if (armed && (stage == SUCCESS_MARKER ||
+                      (stage & 0xFFF00000u) == 0xBAD00000u))
+            return stage;
+        (void)flexe_session_run_core(session, 0, 10000);
+        flexe_session_post_batch(session, 10000);
+    }
+    return mem_read32(mem, stage_addr);
+}
+
 int main(int argc, char **argv) {
     bool disable_jit = false;
     bool s3 = false;
@@ -103,14 +124,17 @@ int main(int argc, char **argv) {
 
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
     xtensa_mem_t *mem = flexe_session_mem(session);
-    uint32_t stage = 0;
-    while (cpu->cycle_count < (s3 ? MAX_CYCLES_S3 : MAX_CYCLES_CLASSIC)) {
-        stage = mem_read32(mem, stage_addr);
-        if (stage == SUCCESS_MARKER ||
-            (stage & 0xFFF00000u) == 0xBAD00000u)
-            break;
-        (void)flexe_session_run_core(session, 0, 10000);
-        flexe_session_post_batch(session, 10000);
+    uint64_t cycle_limit = s3 ? MAX_CYCLES_S3 : MAX_CYCLES_CLASSIC;
+    uint32_t stage = run_until_stage(session, stage_addr, cycle_limit, false);
+    bool second_boot = !s3;
+    if (s3 && stage == SUCCESS_MARKER && device.calls == 4u) {
+        /* Rebuild the guest machine but keep the external I2C target and its
+         * register contents. A missing attachment makes boot two NACK. */
+        flexe_session_reset(session);
+        periph = flexe_session_periph(session);
+        second_boot = flexe_session_reset_count(session) == 1u;
+        if (second_boot)
+            stage = run_until_stage(session, stage_addr, cycle_limit, true);
     }
 
     stage = mem_read32(mem, stage_addr);
@@ -150,18 +174,22 @@ int main(int argc, char **argv) {
     }
     printf("engine=%s stage=0x%08X result=%u/%u/%u/0x%08X calls=%u "
            "write_bytes=%zu read_bytes=%zu memory_ok=%d unhandled=%d "
-           "i2c_unhandled_sites=%u "
+           "i2c_unhandled_sites=%u resets=%u "
            "cycles=%llu\n",
            disable_jit ? "interp" : "jit", stage,
            results[0], results[1], results[2], results[3],
            device.calls, device.write_bytes, device.read_bytes, memory_ok,
            unhandled, i2c_unhandled_sites,
+           flexe_session_reset_count(session),
            (unsigned long long)cpu->cycle_count);
 
     int ok = stage == SUCCESS_MARKER && results[0] == 0 &&
              results[1] == 0 && results[2] == 40 &&
              results[3] == expected_checksum && memory_ok &&
-             device.write_bytes >= 42 && device.read_bytes == 40 &&
+             second_boot &&
+             device.write_bytes >= (s3 ? 84u : 42u) &&
+             device.read_bytes == (s3 ? 80u : 40u) &&
+             device.calls == (s3 ? 8u : 4u) &&
              (s3 ? i2c_unhandled_sites == 0 : unhandled == 0);
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);

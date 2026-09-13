@@ -857,7 +857,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
  * placement, command depth/opcodes, interrupt meanings, and identity are
  * target-described below. */
 #define I2C_PORT_COUNT       FLEXE_TARGET_I2C_MAX
-#define I2C_DEVICE_COUNT     128
+#define I2C_DEVICE_COUNT     PERIPH_I2C_ADDRESS_COUNT
 #define I2C_FIFO_SIZE        32
 #define I2C_COMMAND_MAX      16u
 #define I2C_REG_FILE_MAX_SIZE 0x184u
@@ -15310,6 +15310,52 @@ int periph_i2c_attach_device(esp32_periph_t *p, int port, uint8_t address,
     device->fn = fn;
     device->ctx = fn ? ctx : NULL;
     return 0;
+}
+
+void periph_i2c_attachments_snapshot(
+    const esp32_periph_t *p, periph_i2c_attachment_snapshot_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!p) return;
+    for (unsigned port = 0; port < p->target->i2c.instance_count; ++port) {
+        for (unsigned address = 0; address < I2C_DEVICE_COUNT; ++address) {
+            out->port[port][address].fn = p->i2c[port].device[address].fn;
+            out->port[port][address].ctx = p->i2c[port].device[address].ctx;
+        }
+    }
+    if (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) {
+        for (unsigned address = 0; address < I2C_DEVICE_COUNT; ++address) {
+            out->port[PERIPH_I2C_PORT_RTC][address].fn =
+                p->rtc_i2c.device[address].fn;
+            out->port[PERIPH_I2C_PORT_RTC][address].ctx =
+                p->rtc_i2c.device[address].ctx;
+        }
+    }
+}
+
+void periph_i2c_attachments_restore(
+    esp32_periph_t *p, const periph_i2c_attachment_snapshot_t *snapshot)
+{
+    if (!p || !snapshot) return;
+    for (unsigned port = 0; port < p->target->i2c.instance_count; ++port) {
+        for (unsigned address = 0; address < I2C_DEVICE_COUNT; ++address) {
+            const periph_i2c_attachment_t *device =
+                &snapshot->port[port][address];
+            p->i2c[port].device[address].fn = device->fn;
+            p->i2c[port].device[address].ctx =
+                device->fn ? device->ctx : NULL;
+        }
+    }
+    if (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) {
+        for (unsigned address = 0; address < I2C_DEVICE_COUNT; ++address) {
+            const periph_i2c_attachment_t *device =
+                &snapshot->port[PERIPH_I2C_PORT_RTC][address];
+            p->rtc_i2c.device[address].fn = device->fn;
+            p->rtc_i2c.device[address].ctx =
+                device->fn ? device->ctx : NULL;
+        }
+    }
 }
 
 int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,

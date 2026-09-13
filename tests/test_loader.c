@@ -41,6 +41,27 @@ static const char *write_temp(const uint8_t *data, size_t len) {
     return path;
 }
 
+typedef struct {
+    unsigned calls;
+    size_t write_len;
+    uint8_t first_write;
+} reset_i2c_target_state_t;
+
+static int reset_i2c_target(void *ctx, int port, uint8_t address,
+                            const uint8_t *write_data, size_t write_len,
+                            uint8_t *read_data, size_t read_len)
+{
+    reset_i2c_target_state_t *device = ctx;
+    (void)port;
+    (void)address;
+    (void)read_data;
+    (void)read_len;
+    device->calls++;
+    device->write_len = write_len;
+    device->first_write = write_len ? write_data[0] : 0u;
+    return 0;
+}
+
 TEST(loader_single_segment) {
     /* Build a minimal .bin: 24-byte header + 1 segment */
     uint8_t bin[64];
@@ -113,6 +134,25 @@ TEST(session_software_reset_preserves_guest_flash) {
     mem_write32(mem, 0x3FFB0000u, 0u);
     mem_write32(mem, 0x3FFB1000u, 0xA5A5A5A5u);
     mem_write8(mem, 0x50000000u, 0x5Au);
+    reset_i2c_target_state_t i2c_device = {0};
+    ASSERT_EQ(periph_i2c_attach_device(flexe_session_periph(session),
+                                        0, 0x34u,
+                                        reset_i2c_target, &i2c_device), 0);
+    ASSERT_EQ(periph_i2c_attach_device(flexe_session_periph(session),
+                                        1, 0x35u,
+                                        reset_i2c_target, &i2c_device), 0);
+    ASSERT_EQ(periph_i2c_attach_device(flexe_session_periph(session),
+                                        PERIPH_I2C_PORT_RTC, 0x36u,
+                                        reset_i2c_target, &i2c_device), 0);
+    /* Leave a partial bus transaction pending across the SoC reset. Its
+     * bytes belong to the old controller, not to the external sensor. */
+    mem_write32(mem, 0x3FF5301Cu, 0x34u << 1);
+    mem_write32(mem, 0x3FF5301Cu, 0x20u);
+    mem_write32(mem, 0x3FF53058u, 0u);                 /* RESTART */
+    mem_write32(mem, 0x3FF5305Cu, (1u << 11) | 2u);    /* WRITE 2 */
+    mem_write32(mem, 0x3FF53060u, 4u << 11);           /* END, no STOP */
+    mem_write32(mem, 0x3FF53004u, (1u << 4) | (1u << 5));
+    ASSERT_EQ(i2c_device.calls, 0u);
     ASSERT_EQ(mem_read32(mem, 0x3FF22000u), 0u);
     ASSERT_EQ(periph_unhandled_audit_count(
                   flexe_session_periph(session)), 1u);
@@ -137,6 +177,27 @@ TEST(session_software_reset_preserves_guest_flash) {
                                            0u, &site));
     ASSERT_EQ64(site.count, 2u);
     ASSERT_EQ(periph_unhandled_count(flexe_session_periph(session)), 2);
+
+    periph_i2c_attachment_snapshot_t attachments;
+    periph_i2c_attachments_snapshot(flexe_session_periph(session),
+                                     &attachments);
+    ASSERT_TRUE(attachments.port[0][0x34u].fn == reset_i2c_target);
+    ASSERT_TRUE(attachments.port[1][0x35u].fn == reset_i2c_target);
+    ASSERT_TRUE(attachments.port[PERIPH_I2C_PORT_RTC][0x36u].fn ==
+                reset_i2c_target);
+    ASSERT_TRUE(attachments.port[0][0x34u].ctx == &i2c_device);
+    ASSERT_TRUE(attachments.port[0][0x35u].fn == NULL);
+    /* The attached sensor is still on the bus, while the controller's
+     * in-flight FIFO/command state has restarted from reset. */
+    mem_write32(mem, 0x3FF5301Cu, 0x34u << 1);
+    mem_write32(mem, 0x3FF5301Cu, 0x10u);
+    mem_write32(mem, 0x3FF53058u, 0u);                 /* RESTART */
+    mem_write32(mem, 0x3FF5305Cu, (1u << 11) | 2u);    /* WRITE 2 */
+    mem_write32(mem, 0x3FF53060u, 3u << 11);           /* STOP */
+    mem_write32(mem, 0x3FF53004u, (1u << 4) | (1u << 5));
+    ASSERT_EQ(i2c_device.calls, 1u);
+    ASSERT_EQ(i2c_device.write_len, 1u);
+    ASSERT_EQ(i2c_device.first_write, 0x10u);
     flexe_session_destroy(session);
 }
 
