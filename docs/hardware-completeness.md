@@ -36,7 +36,7 @@ The milestone is complete only when:
 | Area | Current evidence | Next gate |
 |---|---|---|
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
-| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS and serves its own configuration page over a symbol-resolved host socket bridge; loader tests preserve NOR across reset | Test guest filesystem writes and an explicit software-reset cycle. |
+| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Add a second independent S3 production image and extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
@@ -47,11 +47,14 @@ host-backed socket/select boundary now lets the unmodified firmware serve
 service shim, not a modeled Wi-Fi radio: the page reports no networks, the
 roughly 7,000 unsupported accesses (mostly RF/PHY) remain visible. The S3
 application handoff now clears the power-on flash-boot watchdog mode skipped
-with the second-stage bootloader; NerdMiner runs beyond eight billion
-aggregate cycles without the previous spurious RTC-WDT reset. A deliberate
-software-reset/PSRAM reinitialization path has not yet been validated. These
-limits prohibit a production-support claim. ROM images and third-party
-firmware binaries are not copied into this repository.
+with the second-stage bootloader. Restoring ROM-owned BSS and interface state
+from the official ROM ELF during a software restart lets NerdMiner initialize
+again and reload its saved settings instead of panicking during PSRAM setup,
+while physical SRAM outside those sections remains intact for app `.noinit`.
+The scripted POST/restart/reload gate exercises that full path. The remaining
+RF/PHY gaps and absence of a second S3 production scenario prohibit a
+production-support claim. ROM images and third-party firmware binaries are
+not copied into this repository.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
@@ -71,9 +74,10 @@ registers. Repeat the measurement with the matching application and ROM ELFs:
 ```
 
 The app/ROM binaries are external inputs. The interactive gate drives a real
-`GET /wifi` request against the guest's WebServer and WiFiManager, checks the
-provisioning form, rejects a guest reset, and requires unsupported-access
-diagnostics to remain visible:
+`GET /wifi` request against the guest's WebServer and WiFiManager, submits the
+provisioning form, waits for the firmware's requested reset, and checks that
+the new boot loads the saved pool and wallet from SPIFFS. Unsupported-access
+diagnostics must remain visible:
 
 ```sh
 S3_FACTORY_BIN=/path/to/NerdminerV2_factory.bin \

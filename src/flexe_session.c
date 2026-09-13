@@ -718,6 +718,9 @@ void flexe_session_reset(flexe_session_t *s)
     bool was_verifying = jit_verify_enabled(s->jit);
     jit_destroy(s->jit);
     s->jit = NULL;
+    /* Physical SRAM survives a software reset. ROM-owned BSS is reset by
+     * rom_elf_load() during the direct boot handoff; the guest startup clears
+     * its own BSS while preserving application .noinit. */
     if (session_build(s, true) != 0) {
         fprintf(stderr, "[reset] rebuild failed; halting\n");
         s->cpu[0].running = false;

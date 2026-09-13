@@ -12,6 +12,7 @@
 #define SHT_PROGBITS 1u
 #define SHT_SYMTAB   2u
 #define SHT_STRTAB   3u
+#define SHT_NOBITS   8u
 #define SHF_WRITE    0x1u
 #define SHF_ALLOC    0x2u
 
@@ -281,6 +282,26 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
             free(buf);
             return res;
         }
+        /* Direct application handoff skips the ROM startup that clears its
+         * own NOBITS. Rebuild only ROM-owned BSS from the ELF: physical SRAM
+         * outside those sections must survive software reset for .noinit. */
+        if ((mem_target(mem)->capabilities &
+             FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT) != 0u &&
+            sh.sh_type == SHT_NOBITS && sh.sh_size != 0 &&
+            (sh.sh_flags & (SHF_ALLOC | SHF_WRITE)) ==
+                (SHF_ALLOC | SHF_WRITE) &&
+            flexe_target_range_uses_backing(mem_target(mem), sh.sh_addr,
+                                            sh.sh_size, FLEXE_MEM_SRAM)) {
+            uint8_t *dst = mem_get_ptr_w(mem, sh.sh_addr);
+            if (!dst || !guest_range_mapped(mem, sh.sh_addr,
+                                            sh.sh_size)) {
+                rom_error(&res, "ROM BSS section %s does not fit SRAM at "
+                          "0x%08X", name, sh.sh_addr);
+                free(buf);
+                return res;
+            }
+            memset(dst, 0, sh.sh_size);
+        }
         if (sh.sh_type != SHT_PROGBITS || sh.sh_size == 0) continue;
         if (!file_range_valid(sh.sh_offset, sh.sh_size, file_size)) {
             rom_error(&res, "Section %s extends past end of file", name);
@@ -311,11 +332,14 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
             return res;
         }
 
-        /* Espressif ROM ELFs expose stable ROM/application ABI pointers as
-         * .data.interface.* snapshots at their live SRAM VMAs. They are not
-         * part of the ROM startup-copy table: a direct application handoff
-         * must install them explicitly, while BSS remains calloc-zeroed. */
-        if (strncmp(name, ".data.interface.", 16) == 0) {
+        /* Espressif ROM ELFs expose ROM/application ABI state as SRAM
+         * .data.interface.* and .bss.interface.* snapshots. Neither goes
+         * through the ROM startup-copy table, so direct handoff must restore
+         * both on every boot, including a software restart. */
+        if ((mem_target(mem)->capabilities &
+             FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT) != 0u &&
+            (strncmp(name, ".data.interface.", 16) == 0 ||
+             strncmp(name, ".bss.interface.", 15) == 0)) {
             if (!flexe_target_range_uses_backing(mem_target(mem), sh.sh_addr,
                                                  sh.sh_size, FLEXE_MEM_SRAM) ||
                 !guest_range_mapped(mem, sh.sh_addr, sh.sh_size) ||

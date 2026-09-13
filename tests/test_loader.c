@@ -111,6 +111,8 @@ TEST(session_software_reset_preserves_guest_flash) {
     mem->flash_data[0x20000u] = 0x6Cu;
     mem->flash_insn[0x20000u] = 0x6Cu;
     mem_write32(mem, 0x3FFB0000u, 0u);
+    mem_write32(mem, 0x3FFB1000u, 0xA5A5A5A5u);
+    mem_write8(mem, 0x50000000u, 0x5Au);
     ASSERT_EQ(mem_read32(mem, 0x3FF22000u), 0u);
     ASSERT_EQ(periph_unhandled_audit_count(
                   flexe_session_periph(session)), 1u);
@@ -121,6 +123,10 @@ TEST(session_software_reset_preserves_guest_flash) {
     ASSERT_EQ(mem->flash_data[0x20000u], 0x6Cu);
     ASSERT_EQ(mem->flash_insn[0x20000u], 0x6Cu);
     ASSERT_EQ(mem_read32(mem, 0x3FFB0000u), 0x12345678u);
+    /* Software reset retains physical SRAM outside image sections; an app's
+     * own startup clears BSS while deliberately preserving .noinit. */
+    ASSERT_EQ(mem_read32(mem, 0x3FFB1000u), 0xA5A5A5A5u);
+    ASSERT_EQ(mem_read8(mem, 0x50000000u), 0x5Au);
     ASSERT_EQ(periph_unhandled_audit_count(
                   flexe_session_periph(session)), 0u);
     ASSERT_EQ(mem_read32(mem, 0x3FF22000u), 0u);

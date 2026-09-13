@@ -62,7 +62,8 @@ static const char *build_rom_test_elf(bool s3)
         "rom_spiflash_legacy_data\0";
     static const char shstrtab[] =
         "\0.text\0.rodata\0.data_btdm\0.data_test\0.data.interface.cache\0"
-        ".symtab\0.strtab\0.shstrtab\0";
+        ".symtab\0.strtab\0.shstrtab\0.bss_shared_bufs\0"
+        ".bss.interface.cache\0";
     enum {
         SHN_TEXT = 1,
         SHN_RODATA = SHN_TEXT + sizeof(".text"),
@@ -72,6 +73,8 @@ static const char *build_rom_test_elf(bool s3)
         SHN_SYMTAB = SHN_DATA_INTERFACE + sizeof(".data.interface.cache"),
         SHN_STRTAB = SHN_SYMTAB + sizeof(".symtab"),
         SHN_SHSTRTAB = SHN_STRTAB + sizeof(".strtab"),
+        SHN_BSS_SHARED = SHN_SHSTRTAB + sizeof(".shstrtab"),
+        SHN_BSS_INTERFACE = SHN_BSS_SHARED + sizeof(".bss_shared_bufs"),
         TEXT_OFF = 0x100,
         RODATA_OFF = 0x120,
         DATA_OFF = 0x130,
@@ -81,7 +84,7 @@ static const char *build_rom_test_elf(bool s3)
         STRTAB_OFF = 0x1C0,
         SHSTRTAB_OFF = 0x220,
         SHDR_OFF = 0x300,
-        SECTION_COUNT = 9,
+        SECTION_COUNT = 11,
         FILE_SIZE = SHDR_OFF + SECTION_COUNT * sizeof(rom_test_shdr_t),
     };
 
@@ -178,6 +181,17 @@ static const char *build_rom_test_elf(bool s3)
         .sh_name = SHN_SHSTRTAB, .sh_type = 3, .sh_offset = SHSTRTAB_OFF,
         .sh_size = sizeof(shstrtab),
     };
+    sh[9] = (rom_test_shdr_t){
+        .sh_name = SHN_BSS_SHARED, .sh_type = 8, .sh_flags = s3 ? 0x3 : 0,
+        .sh_addr = s3 ? 0x3FCD8000u : 0u, .sh_size = s3 ? 16u : 0u,
+    };
+    sh[10] = (rom_test_shdr_t){
+        .sh_name = SHN_BSS_INTERFACE, .sh_type = 1,
+        .sh_flags = s3 ? 0x1 : 0,
+        .sh_addr = s3 ? 0x3FCEFFC8u : 0u,
+        .sh_offset = DATA_INTERFACE_OFF + 4u,
+        .sh_size = s3 ? 4u : 0u,
+    };
 
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -223,6 +237,9 @@ TEST(rom_elf_uses_s3_descriptor_rom_apertures) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
     xtensa_mem_t *mem = mem_create_for_target_with_flash(s3, 0x00800000u);
+    mem_write32(mem, 0x3FCD8000u, 0xA5A5A5A5u);
+    mem_write32(mem, 0x3FCEFFC8u, 0xB6B6B6B6u);
+    mem_write32(mem, 0x3FC90000u, 0x5A5A5A5Au);
     rom_elf_load_result_t res = rom_elf_load(mem, path);
 
     ASSERT_EQ(res.result, 0);
@@ -230,8 +247,8 @@ TEST(rom_elf_uses_s3_descriptor_rom_apertures) {
     ASSERT_EQ(res.bytes_loaded, 36u);
     ASSERT_EQ(res.data_images_loaded, 2u);
     ASSERT_EQ(res.data_image_bytes, 12u);
-    ASSERT_EQ(res.interface_sections_loaded, 1u);
-    ASSERT_EQ(res.interface_bytes_loaded, 4u);
+    ASSERT_EQ(res.interface_sections_loaded, 2u);
+    ASSERT_EQ(res.interface_bytes_loaded, 8u);
     ASSERT_EQ(res.rom_flash_data_addr, data_test_addr);
     ASSERT_EQ(mem_read32(mem, 0x40001000u), 0x40002000u);
     ASSERT_EQ(mem_read32(mem, 0x3FF10000u), 0x11223344u);
@@ -240,10 +257,22 @@ TEST(rom_elf_uses_s3_descriptor_rom_apertures) {
     ASSERT_EQ(mem_read32(mem, 0x40002000u), 0xA1B2C3D4u);
     ASSERT_EQ(mem_read32(mem, 0x40003000u), 0x0BADF00Du);
     ASSERT_EQ(mem_read32(mem, 0x3FCEFFC4u), data_test_addr);
+    ASSERT_EQ(mem_read32(mem, 0x3FCD8000u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEFFC8u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FC90000u), 0x5A5A5A5Au);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF174u), 0xA1B2C3D4u);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF178u), 0x55667788u);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF130u), 0x0BADF00Du);
     ASSERT_EQ(mem_read32(mem, 0x3FCEF134u), 0u); /* padding was not copied */
+    /* Replaying the ROM handoff after a software reset resets ROM-owned
+     * BSS/interface state but does not erase application-owned .noinit RAM. */
+    mem_write32(mem, 0x3FCD8000u, 0xCCCCCCCCu);
+    mem_write32(mem, 0x3FCEFFC8u, 0xDDDDDDDDu);
+    res = rom_elf_load(mem, path);
+    ASSERT_EQ(res.result, 0);
+    ASSERT_EQ(mem_read32(mem, 0x3FCD8000u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FCEFFC8u), 0u);
+    ASSERT_EQ(mem_read32(mem, 0x3FC90000u), 0x5A5A5A5Au);
     ASSERT_EQ(mem_prepare_rom_flash(mem, res.rom_flash_data_addr,
                                     0x00800000u), 0);
     ASSERT_EQ(mem_read32(mem, data_test_addr), 0x00C84017u);

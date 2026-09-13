@@ -11,7 +11,7 @@ typedef struct {
     uint32_t bytes_loaded;
     unsigned data_images_loaded;  /* Writable ROM startup images installed */
     uint32_t data_image_bytes;
-    unsigned interface_sections_loaded; /* ROM ABI tables installed in SRAM */
+    unsigned interface_sections_loaded; /* ROM ABI data/BSS installed in SRAM */
     uint32_t interface_bytes_loaded;
     uint32_t rom_flash_data_addr; /* Resolved live ROM flash descriptor */
     char     error[256];
@@ -27,7 +27,8 @@ typedef struct {
  * after the real ROM startup copy would have run. Targets whose established
  * bootstrap model initializes ROM state elsewhere retain their existing live
  * SRAM contents. Accepted addresses come from mem's versioned target
- * descriptor, not from hard-coded ESP32 ranges. */
+ * descriptor, not from hard-coded ESP32 ranges. ROM-owned BSS and interface
+ * images are also restored on direct handoff, without clearing app .noinit. */
 rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path);
 
 #endif /* ROM_ELF_H */
