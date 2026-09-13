@@ -28,7 +28,7 @@ for run in 1 2; do
         >"$tmpdir/run$run" 2>&1
 done
 cmp "$tmpdir/run1" "$tmpdir/run2"
-grep -q 'stage=0x5D100D1E transfers=7 mosi_bytes=64' "$tmpdir/run1"
+grep -q 'stage=0x5D100D1E transfers=14 mosi_bytes=128' "$tmpdir/run1"
 grep -q 'lens=1/4/5/17/33 cmdaddr=0x1E314093 queued=1 err=0x00000000' "$tmpdir/run1"
-grep -q 'spi_unhandled_sites=0 unregistered=0' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 spi_master completed seven synchronous/queued GDMA transfers including RX-only without GP-SPI fallback; byte-identical replay"
+grep -q 'spi_unhandled_sites=0 unregistered=0 resets=1' "$tmpdir/run1"
+echo "PASS: stock Arduino S3 spi_master repeated seven synchronous/queued GDMA transfers across an SoC reset without GP-SPI fallback; byte-identical replay"

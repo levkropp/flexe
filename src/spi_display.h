@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include "peripherals.h"
+#include "target.h"
 
 /* Target-described GP-SPI controller plus optional board devices. The shared
  * controller handles native ESP32 and S2/S3-generation register layouts;
@@ -68,6 +69,28 @@ typedef void (*periph_spi_device_fn)(void *ctx, int host,
                                      const uint8_t *mosi, size_t mosi_len,
                                      uint8_t *miso, size_t miso_len);
 typedef void (*periph_spi_select_fn)(void *ctx, int selected);
+#define FLEXE_GP_SPI_DEVICE_MAX 8u
+typedef struct {
+    int cs_pin;
+    int sck_pin;
+    periph_spi_device_fn fn;
+    periph_spi_select_fn select_fn;
+    void *ctx;
+} periph_spi_attachment_t;
+typedef struct {
+    spi_probe_fn probe_fn;
+    void *probe_ctx;
+    periph_spi_attachment_t device[FLEXE_GP_SPI_DEVICE_MAX];
+} periph_spi_host_attachment_t;
+typedef struct {
+    periph_spi_host_attachment_t host[FLEXE_TARGET_GP_SPI_HOST_MAX];
+} periph_spi_attachment_snapshot_t;
+/* Preserve external host wiring across a session software reset. No GP-SPI
+ * register, DMA, CS, or device-protocol state is copied into the new SoC. */
+void periph_spi_attachments_snapshot(
+    esp32_periph_t *p, periph_spi_attachment_snapshot_t *out);
+void periph_spi_attachments_restore(
+    esp32_periph_t *p, const periph_spi_attachment_snapshot_t *snapshot);
 int periph_spi_attach_device(esp32_periph_t *p, int host, int cs_pin,
                              int sck_pin, periph_spi_device_fn fn, void *ctx);
 int periph_spi_attach_device_ex(esp32_periph_t *p, int host, int cs_pin,

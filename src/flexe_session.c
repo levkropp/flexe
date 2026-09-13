@@ -672,6 +672,8 @@ void flexe_session_reset(flexe_session_t *s)
     periph_pad_hold_snapshot(s->periph, &pad_hold);
     periph_i2c_attachment_snapshot_t i2c_attachments;
     periph_i2c_attachments_snapshot(s->periph, &i2c_attachments);
+    periph_spi_attachment_snapshot_t spi_attachments;
+    periph_spi_attachments_snapshot(s->periph, &spi_attachments);
 
     /* A deep-sleep wake keeps RTC memory -- RTC_DATA_ATTR variables and the
      * wake stub live there, and firmware counts on them surviving. The reload
@@ -742,6 +744,7 @@ void flexe_session_reset(flexe_session_t *s)
     }
     periph_unhandled_audit_resume(s->periph, &audit);
     periph_i2c_attachments_restore(s->periph, &i2c_attachments);
+    periph_spi_attachments_restore(s->periph, &spi_attachments);
     wifi_stubs_apply_host_config(s->wstubs, &netcfg);
     periph_pad_hold_restore(s->periph, &pad_hold);
     if (was_verifying) jit_set_verify(s->jit, true);

@@ -61,6 +61,32 @@ static void spi_probe(const uint8_t *mosi, size_t mosi_len,
         miso[i] = expect_miso(len, i);
 }
 
+static uint32_t run_until_stage(flexe_session_t *session,
+                                uint32_t stage_addr, uint64_t cycle_limit,
+                                bool wait_for_reset_clear)
+{
+    xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
+    xtensa_mem_t *mem = flexe_session_mem(session);
+    uint32_t last_stage = UINT32_MAX;
+    bool armed = !wait_for_reset_clear;
+    while (cpu->cycle_count < cycle_limit) {
+        uint32_t stage = mem_read32(mem, stage_addr);
+        if (stage != last_stage) {
+            fprintf(stderr, "[spi-fixture] stage=0x%08X cycles=%llu\n",
+                    stage, (unsigned long long)cpu->cycle_count);
+            last_stage = stage;
+        }
+        if (!armed && stage != SUCCESS_MARKER)
+            armed = true;
+        if (armed && (stage == SUCCESS_MARKER ||
+                      (stage & 0xFFF00000u) == 0xBAD00000u))
+            return stage;
+        (void)flexe_session_run_core(session, 0, 10000);
+        flexe_session_post_batch(session, 10000);
+    }
+    return mem_read32(mem, stage_addr);
+}
+
 int main(int argc, char **argv) {
     int argi = 1;
     int disable_jit = 0;
@@ -111,18 +137,16 @@ int main(int argc, char **argv) {
 
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
     xtensa_mem_t *mem = flexe_session_mem(session);
-    uint32_t stage = 0, last_stage = UINT32_MAX;
-    while (cpu->cycle_count < (s3 ? MAX_CYCLES_S3 : MAX_CYCLES_CLASSIC)) {
-        stage = mem_read32(mem, stage_addr);
-        if (stage != last_stage) {
-            fprintf(stderr, "[spi-fixture] stage=0x%08X cycles=%llu\n",
-                    stage, (unsigned long long)cpu->cycle_count);
-            last_stage = stage;
-        }
-        if (stage == SUCCESS_MARKER || (stage & 0xFFF00000u) == 0xBAD00000u)
-            break;
-        (void)flexe_session_run_core(session, 0, 10000);
-        flexe_session_post_batch(session, 10000);
+    uint64_t cycle_limit = s3 ? MAX_CYCLES_S3 : MAX_CYCLES_CLASSIC;
+    uint32_t stage = run_until_stage(session, stage_addr, cycle_limit, false);
+    bool second_boot = !s3;
+    if (s3 && stage == SUCCESS_MARKER && probe.transfers == 7u) {
+        /* The external slave/probe is a host attachment, not GP-SPI state.
+         * It remains connected when the SoC machine is rebuilt. */
+        flexe_session_reset(session);
+        second_boot = flexe_session_reset_count(session) == 1u;
+        if (second_boot)
+            stage = run_until_stage(session, stage_addr, cycle_limit, true);
     }
 
     stage = mem_read32(mem, stage_addr);
@@ -164,7 +188,7 @@ int main(int argc, char **argv) {
     printf("engine=%s stage=0x%08X transfers=%u mosi_bytes=%zu "
            "first=%02X%02X payload=%d lens=%u/%u/%u/%u/%u cmdaddr=0x%08X "
            "queued=%u err=0x%08X unhandled=%d spi_unhandled_sites=%u "
-           "unregistered=%d\n",
+           "unregistered=%d resets=%u\n",
            flexe_session_jit(session) ? "jit" : "interp", stage,
            probe.transfers, probe.total_mosi,
            probe.first_len > 0 ? probe.first_mosi[0] : 0,
@@ -172,7 +196,7 @@ int main(int argc, char **argv) {
            (int)probe.saw_expected_payload,
            results[0], results[1], results[2], results[3], results[4],
            results[8], results[9], results[10], unhandled, spi_unhandled_sites,
-           unregistered);
+           unregistered, flexe_session_reset_count(session));
 
     /* The guest checked every received byte itself; results[0..4] carry the
      * transfer lengths it accepted, so a silently truncated transfer fails
@@ -184,7 +208,9 @@ int main(int argc, char **argv) {
     for (size_t i = 0u; i < 4u; i++)
         expected_cmdaddr = (expected_cmdaddr << 8) | expect_miso(4u, i);
     int ok = stage == SUCCESS_MARKER && lengths_ok &&
-             probe.transfers >= 7u && probe.saw_expected_payload &&
+             second_boot && probe.transfers == (s3 ? 14u : 7u) &&
+             probe.saw_expected_payload &&
+             (!s3 || probe.total_mosi == 128u) &&
              results[8] == expected_cmdaddr && results[9] == 1u &&
              results[10] == 0u &&
              (s3 ? spi_unhandled_sites == 0 : unhandled == 0) &&

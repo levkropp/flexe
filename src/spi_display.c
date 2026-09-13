@@ -163,7 +163,7 @@ static inline int spi_dbg(const int *flag) {
 #define SPI_DMA_DESC_SIZE_MASK  0x00000FFFu
 #define SPI_DMA_MAX_DESCRIPTORS 1024
 #define SPI_DMA_MAX_TRANSFER    (4u * 1024u * 1024u)
-#define SPI_DEVICE_MAX          8
+#define SPI_DEVICE_MAX          FLEXE_GP_SPI_DEVICE_MAX
 
 /* ILI9341 commands */
 #define ILI_CASET 0x2A
@@ -1671,6 +1671,49 @@ int periph_spi_attach_device_ex(esp32_periph_t *p, int host, int cs_pin,
         return 0;
     }
     return -1;
+}
+
+void periph_spi_attachments_snapshot(
+    esp32_periph_t *p, periph_spi_attachment_snapshot_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    flexe_gp_spi_t *spi = periph_gp_spi(p);
+    if (!spi) return;
+    for (unsigned host = 0u; host < spi->target->gp_spi.host_count; host++) {
+        const spi_display_t *s = &spi->host[host];
+        periph_spi_host_attachment_t *dest = &out->host[host];
+        dest->probe_fn = s->probe_fn;
+        dest->probe_ctx = s->probe_ctx;
+        for (unsigned i = 0u; i < SPI_DEVICE_MAX; i++) {
+            dest->device[i].cs_pin = s->device[i].cs_pin;
+            dest->device[i].sck_pin = s->device[i].sck_pin;
+            dest->device[i].fn = s->device[i].fn;
+            dest->device[i].select_fn = s->device[i].select_fn;
+            dest->device[i].ctx = s->device[i].ctx;
+        }
+    }
+}
+
+void periph_spi_attachments_restore(
+    esp32_periph_t *p, const periph_spi_attachment_snapshot_t *snapshot)
+{
+    flexe_gp_spi_t *spi = periph_gp_spi(p);
+    if (!spi || !snapshot) return;
+    for (unsigned host = 0u; host < spi->target->gp_spi.host_count; host++) {
+        spi_display_t *s = &spi->host[host];
+        const periph_spi_host_attachment_t *source = &snapshot->host[host];
+        s->probe_fn = source->probe_fn;
+        s->probe_ctx = source->probe_fn ? source->probe_ctx : NULL;
+        for (unsigned i = 0u; i < SPI_DEVICE_MAX; i++) {
+            const periph_spi_attachment_t *device = &source->device[i];
+            s->device[i].cs_pin = device->cs_pin;
+            s->device[i].sck_pin = device->sck_pin;
+            s->device[i].fn = device->fn;
+            s->device[i].select_fn = device->fn ? device->select_fn : NULL;
+            s->device[i].ctx = device->fn ? device->ctx : NULL;
+        }
+    }
 }
 
 void spi_display_gpio_changed(esp32_periph_t *p, int pin, int level) {

@@ -5,6 +5,7 @@
 #include "loader.h"
 #include "flexe_session.h"
 #include "peripherals.h"
+#include "spi_display.h"
 #include "flash_mmu.h"
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,34 @@ static int reset_i2c_target(void *ctx, int port, uint8_t address,
     device->write_len = write_len;
     device->first_write = write_len ? write_data[0] : 0u;
     return 0;
+}
+
+static void reset_spi_probe(const uint8_t *mosi, size_t mosi_len,
+                            uint8_t *miso, size_t miso_len, void *ctx)
+{
+    (void)mosi;
+    (void)mosi_len;
+    (void)miso;
+    (void)miso_len;
+    (void)ctx;
+}
+
+static void reset_spi_target(void *ctx, int host,
+                             const uint8_t *mosi, size_t mosi_len,
+                             uint8_t *miso, size_t miso_len)
+{
+    (void)ctx;
+    (void)host;
+    (void)mosi;
+    (void)mosi_len;
+    (void)miso;
+    (void)miso_len;
+}
+
+static void reset_spi_select(void *ctx, int selected)
+{
+    (void)ctx;
+    (void)selected;
 }
 
 TEST(loader_single_segment) {
@@ -144,6 +173,15 @@ TEST(session_software_reset_preserves_guest_flash) {
     ASSERT_EQ(periph_i2c_attach_device(flexe_session_periph(session),
                                         PERIPH_I2C_PORT_RTC, 0x36u,
                                         reset_i2c_target, &i2c_device), 0);
+    unsigned spi_context = 0u;
+    periph_spi_attach_probe(flexe_session_periph(session),
+                            reset_spi_probe, &spi_context);
+    ASSERT_EQ(periph_spi_attach_device_ex(flexe_session_periph(session),
+                                          2, 4, 14, reset_spi_target,
+                                          reset_spi_select, &spi_context), 0);
+    ASSERT_EQ(periph_spi_attach_device_ex(flexe_session_periph(session),
+                                          3, 5, 18, reset_spi_target,
+                                          reset_spi_select, &spi_context), 0);
     /* Leave a partial bus transaction pending across the SoC reset. Its
      * bytes belong to the old controller, not to the external sensor. */
     mem_write32(mem, 0x3FF5301Cu, 0x34u << 1);
@@ -198,6 +236,22 @@ TEST(session_software_reset_preserves_guest_flash) {
     ASSERT_EQ(i2c_device.calls, 1u);
     ASSERT_EQ(i2c_device.write_len, 1u);
     ASSERT_EQ(i2c_device.first_write, 0x10u);
+    periph_spi_attachment_snapshot_t spi_attachments;
+    periph_spi_attachments_snapshot(flexe_session_periph(session),
+                                    &spi_attachments);
+    for (unsigned host = 0u; host < FLEXE_TARGET_GP_SPI_HOST_MAX; host++) {
+        ASSERT_TRUE(spi_attachments.host[host].probe_fn == reset_spi_probe);
+        ASSERT_TRUE(spi_attachments.host[host].probe_ctx == &spi_context);
+        ASSERT_TRUE(spi_attachments.host[host].device[0].fn ==
+                    reset_spi_target);
+        ASSERT_TRUE(spi_attachments.host[host].device[0].select_fn ==
+                    reset_spi_select);
+        ASSERT_TRUE(spi_attachments.host[host].device[0].ctx == &spi_context);
+        ASSERT_EQ(spi_attachments.host[host].device[0].cs_pin,
+                  host == 0u ? 4 : 5);
+        ASSERT_EQ(spi_attachments.host[host].device[0].sck_pin,
+                  host == 0u ? 14 : 18);
+    }
     flexe_session_destroy(session);
 }
 
