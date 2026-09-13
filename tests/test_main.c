@@ -21,6 +21,7 @@ volatile int emu_app_running = 1;
 #include "test_system_clock.c"
 #include "test_systimer.c"
 #include "test_timer_group.c"
+#include "test_rmt_v1.c"
 #include "test_usb_serial_jtag.c"
 #include "test_spi_mem.c"
 #include "test_firmware_scan.c"
@@ -76,6 +77,7 @@ int main(void) {
     run_system_clock_tests();
     run_systimer_tests();
     run_timer_group_target_tests();
+    run_rmt_v1_tests();
     run_usb_serial_jtag_tests();
     run_spi_mem_tests();
     run_firmware_scan_tests();

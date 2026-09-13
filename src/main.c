@@ -39,6 +39,44 @@ volatile int emu_app_running = 1;
 #define MAX_COND_FUNCS  8
 #define MAX_COND_RANGES 8
 #define MAX_ASSERTIONS  16
+#define RMT_STATS_CHANNELS 8
+
+typedef struct {
+    uint64_t chunks;
+    uint64_t items;
+    uint64_t completions;
+    uint32_t digest;
+} rmt_channel_stats_t;
+
+static void rmt_stats_observe(void *ctx, int channel,
+                              const uint32_t *items, size_t count,
+                              uint32_t tick_hz, uint32_t carrier_hz,
+                              bool finished)
+{
+    (void)tick_hz;
+    (void)carrier_hz;
+    rmt_channel_stats_t *stats = ctx;
+    if (channel < 0 || channel >= RMT_STATS_CHANNELS) return;
+    rmt_channel_stats_t *s = &stats[channel];
+    if (!s->chunks) s->digest = 2166136261u;
+    s->chunks++;
+    s->items += count;
+    if (finished) s->completions++;
+    for (size_t i = 0; i < count; i++) {
+        for (unsigned byte = 0; byte < 4u; byte++) {
+            s->digest ^= (items[i] >> (byte * 8u)) & 0xFFu;
+            s->digest *= 16777619u;
+        }
+    }
+}
+
+static void rmt_stats_attach(esp32_periph_t *periph,
+                              rmt_channel_stats_t *stats)
+{
+    for (int channel = 0; channel < RMT_STATS_CHANNELS; channel++)
+        (void)periph_set_rmt_tx_callback(periph, channel,
+                                         rmt_stats_observe, stats);
+}
 
 typedef struct {
     uint32_t addr;
@@ -590,6 +628,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -v              Verbose register dump on exit\n");
     fprintf(stderr, "  -q              Quiet: suppress per-access unhandled peripheral warnings\n");
     fprintf(stderr, "  --unhandled-report  Rank unsupported MMIO sites by count (interpreter diagnostic)\n");
+    fprintf(stderr, "  --rmt-stats     Summarize transmitted RMT pulse chunks and completions\n");
     fprintf(stderr, "  -e <addr>       Override entry point (hex)\n");
     fprintf(stderr, "  -s <file.elf>   Load ELF symbols for trace/breakpoints\n");
     fprintf(stderr, "  -R <rom.elf>    Load official ESP32 ROM code and data images\n");
@@ -932,6 +971,8 @@ int main(int argc, char *argv[]) {
     int verbose = 0;
     int quiet_unhandled = 0;
     int unhandled_report = 0;
+    int rmt_stats_enabled = 0;
+    rmt_channel_stats_t rmt_stats[RMT_STATS_CHANNELS] = {0};
     int call_trace = 0;
     int ring_size = 0;
     uint32_t entry_override = 0;
@@ -1024,6 +1065,12 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--unhandled-report") == 0) {
             unhandled_report = 1;
+            memmove(&argv[i], &argv[i + 1],
+                    (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--rmt-stats") == 0) {
+            rmt_stats_enabled = 1;
             memmove(&argv[i], &argv[i + 1],
                     (size_t)(argc - i) * sizeof(char *));
             argc -= 1;
@@ -1219,6 +1266,7 @@ int main(int argc, char *argv[]) {
     xtensa_mem_t *mem = flexe_session_mem(session);
     const elf_symbols_t *syms = flexe_session_syms(session);
     esp32_periph_t *periph = flexe_session_periph(session);
+    if (rmt_stats_enabled) rmt_stats_attach(periph, rmt_stats);
     esp32_rom_stubs_t *rom = flexe_session_rom(session);
     freertos_stubs_t *frt = flexe_session_frt(session);
 
@@ -1652,6 +1700,7 @@ int main(int argc, char *argv[]) {
         if (current_resets != observed_resets) {
             observed_resets = current_resets;
             periph = flexe_session_periph(session);
+            if (rmt_stats_enabled) rmt_stats_attach(periph, rmt_stats);
             rom = flexe_session_rom(session);
             frt = flexe_session_frt(session);
             hb_stub_count = 0;
@@ -1853,6 +1902,30 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "UART TX:    %d bytes\n", periph_uart_tx_count(periph));
     fprintf(stderr, "USB TX:     %zu bytes\n",
             periph_usb_serial_jtag_tx_count(periph));
+    if (rmt_stats_enabled) {
+        for (int channel = 0; channel < RMT_STATS_CHANNELS; channel++) {
+            const rmt_channel_stats_t *s = &rmt_stats[channel];
+            if (!s->chunks) continue;
+            fprintf(stderr,
+                    "RMT TX%d:    %llu chunks, %llu items, %llu completions, fnv32=%08X\n",
+                    channel, (unsigned long long)s->chunks,
+                    (unsigned long long)s->items,
+                    (unsigned long long)s->completions, s->digest);
+        }
+        const flexe_target_desc_t *rmt_target = mem_target(mem);
+        if (rmt_target &&
+            (rmt_target->capabilities & FLEXE_TARGET_CAP_RMT_V1)) {
+            uint32_t base = rmt_target->rmt_v1.base;
+            fprintf(stderr,
+                    "RMT regs:   conf0=%08X limit0=%08X sys=%08X status0=%08X raw=%08X ena=%08X\n",
+                    mem_read32(mem, base + 0x20u),
+                    mem_read32(mem, base + 0xA0u),
+                    mem_read32(mem, base + 0xC0u),
+                    mem_read32(mem, base + 0x50u),
+                    mem_read32(mem, base + 0x70u),
+                    mem_read32(mem, base + 0x78u));
+        }
+    }
 
     /* ROM stub call stats */
     int nstubs = rom_stubs_stub_count(rom);

@@ -36,8 +36,9 @@ The milestone is complete only when:
 | Area | Current evidence | Next gate |
 |---|---|---|
 | Classic ESP32 production corpus | [Compatibility scenarios](compatibility.md#curated-cyd-scenarios) and `scripts/check-stock-roms.sh` | Expand uncovered interactive device/network paths without losing WLED fast-mode throughput. |
-| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Add a second independent S3 production image and extend storage/peripheral coverage beyond this workflow. |
+| S3 image, ROM, and flash | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh`; NerdMiner 1.8.3 mounts SPIFFS, serves its configuration page, saves submitted settings, restarts, and reloads the same JSON from guest-written flash | Extend storage/peripheral coverage beyond this workflow. |
 | S3 CPU, dual-core, and basic devices | [Target notes](compatibility.md#target-selection) and target-specific unit/ESP-IDF fixtures; `--unhandled-report` ranks unsupported MMIO by call site | Finish sustained FreeRTOS/Arduino fixtures and work down the measured unhandled-access inventory. |
+| S3 RMT TX | `tests/test_rmt_v1.c` and `scripts/check-s3-wled-rmt.sh`; unmodified WLED 16.0.1 transmits sustained LED pulse chunks with matching interpreter/JIT output | Model RX, counted loops, synchronized TX and finer channel status; verify actual LED protocol and GPIO routing. |
 | Timed/cycle/electrical/RF fidelity | Not accepted by this functional milestone | Track separately with calibrated hardware traces and declared tolerances. |
 
 S3 remains experimental. The NerdMiner filesystem result is a meaningful
@@ -51,10 +52,30 @@ with the second-stage bootloader. Restoring ROM-owned BSS and interface state
 from the official ROM ELF during a software restart lets NerdMiner initialize
 again and reload its saved settings instead of panicking during PSRAM setup,
 while physical SRAM outside those sections remains intact for app `.noinit`.
-The scripted POST/restart/reload gate exercises that full path. The remaining
-RF/PHY gaps and absence of a second S3 production scenario prohibit a
+The scripted POST/restart/reload gate exercises that full path. WLED now
+provides a second, independently sourced production output scenario, but not
+a second interactive network workflow. The remaining RF/PHY gaps prohibit a
 production-support claim. ROM images and third-party firmware binaries are
 not copied into this repository.
+
+The S3 RMT V1 TX model handles direct pulse RAM, per-channel dividers,
+threshold refill interrupts, end/error interrupts, and pulse-timed
+transmission. It is a partial device model: RX, counted loops, synchronized
+TX, DMA, and exact waveform-to-GPIO routing are not yet supported. Unsupported
+paths retain MMIO diagnostics. For the WLED 16.0.1 S3 4M QSPI image (SHA-256
+`eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
+4 billion aggregate cycles produced 317 completed RMT transmissions and
+321,448 pulse words on channel 0. Interpreter and JIT agreed on 13,605
+chunks and the `30EAB266` pulse-stream digest; 7,197 unsupported peripheral
+accesses remain. This establishes sustained hardware-output progress, not
+correct colors on a physical LED strip or a functioning WLED web UI. Recheck
+with the external image and ROM ELF:
+
+```sh
+S3_WLED_BIN=/path/to/WLED_16.0.1_ESP32-S3_4M_qspi.bin \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-wled-rmt.sh
+```
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),

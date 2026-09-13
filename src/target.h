@@ -49,7 +49,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 35u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 36u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -79,6 +79,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SHA_V1                       = 1ull << 21,
     FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF            = 1ull << 22,
     FLEXE_TARGET_CAP_GP_SPI                       = 1ull << 23,
+    FLEXE_TARGET_CAP_RMT_V1                        = 1ull << 24,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -636,6 +637,22 @@ typedef struct {
                                      [FLEXE_TARGET_TIMER_GROUP_EVENT_MAX];
 } flexe_timer_group_desc_t;
 
+/* ESP32-S3-generation RMT pulse engine. Register offsets and command bits
+ * belong to the V1 IP block; geometry, clocks and IRQ routing belong to the
+ * target instance. TX and RX channels share the same pulse RAM. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint16_t memory_offset;
+    uint8_t  tx_channel_count;
+    uint8_t  channel_count;
+    uint8_t  words_per_channel;
+    uint8_t  interrupt_source;
+    uint32_t apb_clock_hz;
+    uint32_t ref_clock_hz;
+    uint32_t xtal_clock_hz;
+} flexe_rmt_v1_desc_t;
+
 /* General-purpose SPI2/SPI3 controller generations keep the same transaction
  * phases while moving the FIFO, completion interrupt, and length registers.
  * The layout selects those IP semantics; every address, interrupt source,
@@ -839,6 +856,9 @@ typedef struct {
 
     /* Optional V1 timer-group and main-watchdog register blocks. */
     flexe_timer_group_desc_t      timer_group;
+
+    /* Optional V1 remote-control pulse engine. */
+    flexe_rmt_v1_desc_t           rmt_v1;
 
     /* Optional general-purpose SPI2/SPI3 controllers and board routes. */
     flexe_gp_spi_desc_t           gp_spi;

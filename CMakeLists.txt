@@ -73,6 +73,7 @@ set(LIB_SOURCES
     src/efuse.c
     src/gpio.c
     src/gdma.c
+    src/rmt_v1.c
     src/io_mux.c
     src/rtc_cntl.c
     src/regi2c.c

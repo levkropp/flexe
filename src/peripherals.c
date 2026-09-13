@@ -8,6 +8,7 @@
 #include "rtc_cntl.h"
 #include "regi2c.h"
 #include "radio.h"
+#include "rmt_v1.h"
 #include "sens.h"
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
@@ -1129,6 +1130,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
     X(TWAI,     twai_next_fire,     twai_eval_events,     false) \
     X(I2S,      i2s_next_fire,      i2s_eval_events,      false) \
     X(RMT,      rmt_next_fire,      rmt_eval_events,      false) \
+    X(RMT_V1,   rmt_v1_next_fire,   rmt_v1_eval_events,   false) \
     X(LEDC,     ledc_next_fire,     ledc_eval_events,     true)  \
     X(PCNT,     pcnt_next_fire,     pcnt_eval_events,     false) \
     X(MCPWM,    mcpwm_next_fire,    mcpwm_eval_events,    true)  \
@@ -1200,6 +1202,10 @@ static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void rmt_reset_state(esp32_periph_t *p);
+static uint32_t rmt_v1_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void rmt_v1_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void rmt_v1_state_changed(void *ctx);
+static void rmt_v1_irq_changed(void *ctx, uint32_t status);
 static uint32_t ledc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void ledc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void ledc_reset_state(esp32_periph_t *p);
@@ -1808,6 +1814,7 @@ struct esp32_periph {
     flexe_efuse_t *target_efuse;
     flexe_gdma_t *gdma;
     flexe_gp_spi_t *gp_spi;
+    flexe_rmt_v1_t *rmt_v1;
     flexe_gpio_t *target_gpio;
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
@@ -13814,6 +13821,36 @@ static void target_timer_group_reset_requested(
     if (p) p->reset_requested = true;
 }
 
+static uint32_t rmt_v1_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu)
+{
+    return p && p->rmt_v1 ?
+        flexe_rmt_v1_next_event(p->rmt_v1, cpu) : UINT32_MAX;
+}
+
+static void rmt_v1_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu)
+{
+    (void)cpu;
+    if (p && p->rmt_v1) flexe_rmt_v1_eval(p->rmt_v1);
+}
+
+static void rmt_v1_state_changed(void *ctx)
+{
+    esp32_periph_t *p = ctx;
+    if (!p) return;
+    periph_event_source_changed(p, PERIPH_EVENT_RMT_V1);
+    for (unsigned core = 0u; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void rmt_v1_irq_changed(void *ctx, uint32_t status)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !p->rmt_v1) return;
+    int source = p->target->rmt_v1.interrupt_source;
+    if (status) periph_assert_interrupt_status(p, source, status);
+    else periph_deassert_interrupt(p, source);
+}
+
 static void usb_serial_jtag_irq_changed(void *ctx, bool level)
 {
     esp32_periph_t *p = ctx;
@@ -14296,6 +14333,16 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_RMT_V1) {
+        p->rmt_v1 = flexe_rmt_v1_create(
+            mem, default_read, default_write, p,
+            rmt_v1_state_changed, p, rmt_v1_irq_changed, p);
+        if (!p->rmt_v1) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     bool classic = (target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
     if (!classic) {
@@ -14653,6 +14700,8 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_usb_serial_jtag_destroy(p->usb_serial_jtag);
     flexe_gp_spi_destroy(p->gp_spi);
     p->gp_spi = NULL;
+    flexe_rmt_v1_destroy(p->rmt_v1);
+    p->rmt_v1 = NULL;
     flexe_gdma_destroy(p->gdma);
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_timer_group_destroy(p->target_timer_group);
@@ -14967,6 +15016,10 @@ size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port) {
 
 int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
                                periph_rmt_tx_fn fn, void *ctx) {
+    if (p && p->rmt_v1)
+        return channel >= 0 ?
+            flexe_rmt_v1_set_tx_callback(p->rmt_v1, (unsigned)channel,
+                                          fn, ctx) : -1;
     if (!p || channel < 0 || channel >= (int)RMT_CHANNEL_COUNT) return -1;
     p->rmt.channel[channel].tx_cb = fn;
     p->rmt.channel[channel].tx_cb_ctx = fn ? ctx : NULL;
@@ -15189,6 +15242,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     flexe_esp32s3_extmem_attach_cpus(p->s3_extmem, cpu0, cpu1);
     flexe_systimer_attach_cpus(p->systimer, cpu0, cpu1);
     flexe_timer_group_attach_cpus(p->target_timer_group, cpu0, cpu1);
+    flexe_rmt_v1_attach_cpus(p->rmt_v1, cpu0, cpu1);
     flexe_rtc_cntl_attach_cpus(p->target_rtc_cntl, cpu0, cpu1);
 
     bool classic = (p->target->capabilities &
@@ -15197,12 +15251,14 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         (PERIPH_EVENT_ALL_MASK &
          ~((1u << PERIPH_EVENT_RTC_CNTL) |
            (1u << PERIPH_EVENT_SYSTIMER) |
-           (1u << PERIPH_EVENT_TIMER_GROUP))) : 0u;
+           (1u << PERIPH_EVENT_TIMER_GROUP) |
+           (1u << PERIPH_EVENT_RMT_V1))) : 0u;
     if (p->target_rtc_cntl)
         candidates |= 1u << PERIPH_EVENT_RTC_CNTL;
     if (p->systimer) candidates |= 1u << PERIPH_EVENT_SYSTIMER;
     if (p->target_timer_group)
         candidates |= 1u << PERIPH_EVENT_TIMER_GROUP;
+    if (p->rmt_v1) candidates |= 1u << PERIPH_EVENT_RMT_V1;
     p->event_source_registered_mask = candidates;
     p->event_source_candidates[0] = candidates;
     p->event_source_candidates[1] = candidates;

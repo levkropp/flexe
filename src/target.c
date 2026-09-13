@@ -309,6 +309,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_GDMA_V1 |
                         FLEXE_TARGET_CAP_SHA_V1 |
                         FLEXE_TARGET_CAP_GP_SPI |
+                        FLEXE_TARGET_CAP_RMT_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -855,6 +856,18 @@ static const flexe_target_desc_t TARGETS[] = {
                 { 50u, 51u, 52u },
                 { 53u, 54u, 55u },
             },
+        },
+        .rmt_v1 = {
+            .base = 0x60016000u,
+            .register_size = 0x1000u,
+            .memory_offset = 0x800u,
+            .tx_channel_count = 4u,
+            .channel_count = 8u,
+            .words_per_channel = 48u,
+            .interrupt_source = 40u,
+            .apb_clock_hz = 80000000u,
+            .ref_clock_hz = 8000000u,
+            .xtal_clock_hz = 40000000u,
         },
         .gp_spi = {
             .register_size = 0x100u,
