@@ -1,4 +1,4 @@
-/* ESP32-S3 RMT V1 TX register, pulse-timing and interrupt tests. */
+/* ESP32-S3 RMT V1 TX/RX register, pulse-timing and interrupt tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
 
@@ -6,16 +6,21 @@
 #define S3_RMT_CONF0      0x020u
 #define S3_RMT_CONF3      0x02Cu
 #define S3_RMT_RX_CONF4   0x030u
+#define S3_RMT_RX_CTRL4   0x034u
 #define S3_RMT_STATUS0    0x050u
+#define S3_RMT_RX_STATUS4 0x060u
 #define S3_RMT_INT_RAW    0x070u
 #define S3_RMT_INT_ST     0x074u
 #define S3_RMT_INT_ENA    0x078u
 #define S3_RMT_INT_CLR    0x07Cu
 #define S3_RMT_TX_LIMIT0  0x0A0u
+#define S3_RMT_RX_LIMIT4  0x0B0u
 #define S3_RMT_SYS_CONF   0x0C0u
 #define S3_RMT_TX_SIM     0x0C4u
+#define S3_RMT_REF_RST    0x0C8u
 #define S3_RMT_DATE       0x0CCu
 #define S3_RMT_MEM0       0x800u
+#define S3_RMT_RX_MEM4    0xB00u
 
 typedef struct {
     unsigned calls;
@@ -186,6 +191,116 @@ TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4),
+              0x317FFF02u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4),
+              0x000001E8u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_LIMIT4), 128u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_REF_RST, 1u << 4);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_REF_RST), 0u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              192u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 24) | (5u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | 1u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_ENA, 1u << 16);
+    const uint32_t symbols[] = {
+        10u | (1u << 15) | (20u << 16),
+        5u | (5u << 16),
+    };
+    ASSERT_EQ(periph_rmt_rx_inject(periph, 0, symbols, 2u), 0u);
+    ASSERT_EQ(periph_rmt_rx_inject(periph, 4, symbols, 2u), 2u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), symbols[0]);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4 + 4u),
+              symbols[1]);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              194u);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) >> 22) & 7u,
+              1u);
+    /* 45 symbol/idle ticks, 20 MHz RMT clock, 160 MHz CPU: 360 cycles. */
+    cpu0.ccount = 359u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
+    cpu0.ccount = 360u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 1u << 16);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 16);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) >> 22) & 7u,
+              0u);
+    ASSERT_TRUE(periph_interrupt_pending(periph,
+                                          s3->rmt_v1.interrupt_source));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 16);
+    ASSERT_FALSE(periph_interrupt_pending(periph,
+                                           s3->rmt_v1.interrupt_source));
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 24) | (5u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_LIMIT4, 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_ENA,
+                (1u << 20) | (1u << 24));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | 1u);
+    uint32_t symbols[49];
+    for (unsigned i = 0u; i < 49u; i++) symbols[i] = 1u | (1u << 16);
+    ASSERT_EQ(periph_rmt_rx_inject(periph, 4, symbols, 49u), 48u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 24);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
+              (1u << 26), 1u << 26);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 24);
+    cpu0.ccount = 10000u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 20);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 20);
+
+    /* Ownership is a hardware gate: software-owned RX RAM rejects input. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 1) | 1u);
+    ASSERT_EQ(periph_rmt_rx_inject(periph, 4, symbols, 1u), 0u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) &
+              (1u << 25), 1u << 25);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 20);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic)
 {
     const flexe_target_desc_t *s3 =
@@ -202,7 +317,7 @@ TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic)
     mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0, 1u << 3);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF3, 1u << 25);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_SIM, 1u << 4);
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4, 1u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4, 1u << 23);
     ASSERT_EQ(periph_unhandled_count(periph), 4u);
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF3) & (1u << 25),
               0u);
@@ -216,5 +331,7 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_tx_completes_on_pulse_deadline_and_asserts_irq);
     RUN_TEST(s3_rmt_v1_threshold_and_empty_terminator_are_distinct_events);
     RUN_TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline);
+    RUN_TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq);
+    RUN_TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible);
     RUN_TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic);
 }

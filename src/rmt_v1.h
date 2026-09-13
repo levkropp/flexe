@@ -31,5 +31,9 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
 void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt);
 int flexe_rmt_v1_set_tx_callback(flexe_rmt_v1_t *rmt, unsigned channel,
                                   flexe_rmt_v1_tx_fn fn, void *ctx);
+/* Inject a complete, already-decoded pulse frame into physical RX channel
+ * 4..7. Returns the symbols accepted by the configured RX RAM capacity. */
+size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
+                              const uint32_t *items, size_t count);
 
 #endif

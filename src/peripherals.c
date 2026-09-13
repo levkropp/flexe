@@ -15379,6 +15379,9 @@ int periph_set_mcpwm_output_callback(esp32_periph_t *p, int unit,
 
 size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel_index,
                             const uint32_t *items, size_t count) {
+    if (p && p->rmt_v1)
+        return channel_index >= 0 ? flexe_rmt_v1_rx_inject(
+            p->rmt_v1, (unsigned)channel_index, items, count) : 0u;
     if (!p || channel_index < 0 ||
         channel_index >= (int)RMT_CHANNEL_COUNT || (!items && count != 0))
         return 0;

@@ -321,10 +321,10 @@ size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
                             const uint8_t *data, size_t len);
 size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port);
 
-/* Attach a host pulse sink to one of the eight classic ESP32 RMT channels.
- * RX injection accepts already-decoded RMT items after firmware has enabled
- * the channel, writes them through the hardware RAM/interrupt path, and
- * returns the number accepted by the configured memory blocks. */
+/* Attach a host pulse sink to a classic channel 0..7 or S3 TX channel 0..3.
+ * RX injection accepts already-decoded RMT symbols after firmware enables
+ * the channel (classic 0..7, S3 physical RX channel 4..7), writes them through
+ * hardware RAM and interrupt state, and returns the accepted symbol count. */
 int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
                                periph_rmt_tx_fn fn, void *ctx);
 size_t periph_rmt_rx_inject(esp32_periph_t *p, int channel,

@@ -54,7 +54,8 @@ even when a firmware workflow succeeds.
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core and restart gates | Calibrated timing, all wake modes, and all reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
-| S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | RX, counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
+| S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | Counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
+| S3 RMT RX | Partial (MMIO plus host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 receives an injected frame through the ESP-IDF ISR without RMT fallback | Host supplies decoded short frames; GPIO edge capture, filter/carrier physics, long-frame ping-pong, and DMA remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal and WLED native lwIP/Ethernet UI and JSON state gates | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported. |
 | S3 Bluetooth baseband clock | Partial (MMIO) | `tests/test_radio.c` checks half-slot/subslot phase against guest time | Controller scheduler, packets, and RF are unsupported; Marauder still asserts before its CLI. |
@@ -148,11 +149,33 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-idf-nvs.sh
 ```
 
-The S3 RMT V1 TX model handles direct pulse RAM, per-channel dividers,
-threshold refill interrupts, end/error interrupts, and pulse-timed
-transmission. It is a partial device model: RX, counted loops, synchronized
-TX, DMA, and exact waveform-to-GPIO routing are not yet supported. Unsupported
-paths retain MMIO diagnostics. For the WLED 16.0.1 S3 4M QSPI image (SHA-256
+The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,
+threshold refill interrupts, end/error interrupts, pulse-timed TX and
+short-frame RX through a host symbol-injection API. RX writes the channel's
+RAM, advances its hardware writer offset, and signals completion after the
+configured signal and idle duration. The stock Arduino-ESP32 3.3.11 RX driver
+copies the injected symbols through its unmodified ESP-IDF interrupt handler;
+the pinned gate finds no unsupported RMT MMIO sites (173 unrelated accesses
+remain). Input is already decoded, so this does not model GPIO edge capture,
+glitch filtering, carrier demodulation, long-frame ping-pong, or DMA. Counted
+TX loops, synchronized TX, and exact waveform-to-GPIO routing also remain
+unsupported; those paths retain diagnostics. Recheck the RX path with the
+compiled fixture and official ROM ELF:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+  --build-path /tmp/flexe-s3-rmt-rx-build tests/fixtures/s3_rmt_rx
+S3_RMT_RX_BIN=/tmp/flexe-s3-rmt-rx-build/s3_rmt_rx.ino.merged.bin \
+S3_RMT_RX_ELF=/tmp/flexe-s3-rmt-rx-build/s3_rmt_rx.ino.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+RUNNER=./build/flexe-s3-rmt-rx-test ./scripts/check-s3-rmt-rx.sh
+```
+
+The RX fixture's pinned merged image SHA-256 is
+`e003347401033354a6893a6e9b98e2eb5265615b39df188b12671efaaf33d250`
+and its matching ELF SHA-256 is
+`ea0afe5f45f23215d9a452e17d5624554859bdba9b70e63898bd3e7de73039c2`.
+For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and
 321,448 pulse words on channel 0. Repeated interpreter runs yielded 13,605
