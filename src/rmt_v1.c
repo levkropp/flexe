@@ -28,6 +28,8 @@
 #define RMT_DATE_RESET        34607489u
 #define RMT_TX_LIMIT_REG_MASK 0x003FFFFFu
 #define RMT_LOOP_COUNT_RESET  (1u << 20)
+#define RMT_TX_LOOP_COUNT_EN  (1u << 19)
+#define RMT_TX_LOOP_STOP_EN   (1u << 21)
 
 #define RMT_TX_START          (1u << 0)
 #define RMT_MEM_RD_RST        (1u << 1)
@@ -51,6 +53,7 @@
 #define RMT_TX_END_INT(ch)    (1u << (ch))
 #define RMT_ERROR_INT(ch)     (1u << (4u + (ch)))
 #define RMT_THRESHOLD_INT(ch) (1u << (8u + (ch)))
+#define RMT_TX_LOOP_INT(ch)   (1u << (12u + (ch)))
 #define RMT_RX_END_INT(ch)    (1u << (16u + (ch)))
 #define RMT_RX_ERROR_INT(ch)  (1u << (20u + (ch)))
 #define RMT_RX_THRESHOLD_INT(ch) (1u << (24u + (ch)))
@@ -79,6 +82,7 @@
 typedef enum {
     RMT_EVENT_NONE,
     RMT_EVENT_THRESHOLD,
+    RMT_EVENT_LOOP,
     RMT_EVENT_END,
     RMT_EVENT_ERROR,
 } rmt_event_kind_t;
@@ -89,6 +93,7 @@ typedef struct {
     uint32_t tx_limit;
     uint32_t read_index;
     uint32_t apb_index;
+    uint32_t loop_count;
     uint32_t segment_items[RMT_MAX_SEGMENT_WORDS];
     uint32_t segment_count;
     uint64_t segment_start;
@@ -99,6 +104,7 @@ typedef struct {
     uint32_t edge_item;
     bool edge_second;
     bool edge_active;
+    bool loop_has_marker;
     uint64_t deadline;
     rmt_event_kind_t event;
     bool active;
@@ -382,6 +388,14 @@ static uint32_t rmt_rx_capacity(const flexe_rmt_v1_t *rmt,
     return blocks * rmt->desc->words_per_channel;
 }
 
+static bool rmt_tx_has_counted_autostop(const rmt_tx_channel_t *tx)
+{
+    return (tx->conf & RMT_TX_CONTINUOUS) &&
+           (tx->tx_limit & (RMT_TX_LOOP_COUNT_EN | RMT_TX_LOOP_STOP_EN)) ==
+           (RMT_TX_LOOP_COUNT_EN | RMT_TX_LOOP_STOP_EN) &&
+           ((tx->tx_limit >> 9u) & 0x3FFu) != 0u;
+}
+
 static void rmt_abort_rx_frame(rmt_rx_channel_t *rx)
 {
     free(rx->frame);
@@ -531,12 +545,22 @@ static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     tx->segment_start = start_cycle;
     tx->segment_count = 0u;
     tx->edge_active = false;
+    tx->loop_has_marker = false;
     tx->event = RMT_EVENT_NONE;
     if (capacity == 0u || !rmt_source_hz(rmt)) {
         tx->event = RMT_EVENT_ERROR;
         tx->deadline = start_cycle + 1u;
         return;
     }
+    if ((tx->conf & RMT_TX_CONTINUOUS) &&
+        !rmt_tx_has_counted_autostop(tx)) {
+        /* Unbounded and manually stopped loops need a different event
+         * policy. Do not turn them into finite, fake-success streams. */
+        tx->event = RMT_EVENT_ERROR;
+        tx->deadline = start_cycle + 1u;
+        return;
+    }
+    if (tx->conf & RMT_TX_CONTINUOUS) limit = capacity;
     if (limit == 0u || limit > capacity) limit = capacity;
 
     while (tx->segment_count < limit) {
@@ -558,22 +582,33 @@ static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
         uint32_t low = item & 0x7FFFu;
         uint32_t high = (item >> 16) & 0x7FFFu;
         if (low == 0u) {
-            tx->event = RMT_EVENT_END;
+            tx->loop_has_marker = true;
+            tx->event = (tx->conf & RMT_TX_CONTINUOUS) ?
+                        RMT_EVENT_LOOP : RMT_EVENT_END;
             break;
         }
         tx->segment_items[tx->segment_count++] = item;
         tx->read_index++;
         ticks += low;
         if (high == 0u) {
-            tx->event = RMT_EVENT_END;
+            tx->loop_has_marker = true;
+            tx->event = (tx->conf & RMT_TX_CONTINUOUS) ?
+                        RMT_EVENT_LOOP : RMT_EVENT_END;
             break;
         }
         ticks += high;
     }
     if (tx->event == RMT_EVENT_NONE) {
-        if (tx->segment_count == limit && limit < capacity)
+        if (tx->conf & RMT_TX_CONTINUOUS) {
+            /* A counted S3 loop increments only at an end marker. Without
+             * one, auto-stop and the loop interrupt can never occur. */
+            tx->event = RMT_EVENT_ERROR;
+            rmt->fallback_write(rmt->fallback_ctx,
+                                rmt->desc->base + RMT_TX_CONF_OFF +
+                                channel * 4u, tx->conf);
+        } else if (tx->segment_count == limit && limit < capacity)
             tx->event = RMT_EVENT_THRESHOLD;
-        else if (tx->conf & (RMT_MEM_TX_WRAP | RMT_TX_CONTINUOUS))
+        else if (tx->conf & RMT_MEM_TX_WRAP)
             tx->event = RMT_EVENT_THRESHOLD;
         else
             tx->event = RMT_EVENT_ERROR;
@@ -629,7 +664,11 @@ static void rmt_tx_start_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     rmt_plan_segment(rmt, channel, start_cycle);
     rmt_tx_channel_t *tx = &rmt->tx[channel];
     if (tx->segment_count == 0u) {
-        rmt_tx_emit_idle(rmt, channel, start_cycle);
+        if (tx->event == RMT_EVENT_ERROR &&
+            (tx->conf & RMT_TX_CONTINUOUS))
+            rmt_tx_emit_level(rmt, channel, -1, -1, start_cycle);
+        else
+            rmt_tx_emit_idle(rmt, channel, start_cycle);
         return;
     }
     bool observed = rmt->tx_edge_changed && rmt->tx_edge_needed &&
@@ -682,6 +721,17 @@ static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     rmt_tx_channel_t *tx = &rmt->tx[channel];
     rmt_event_kind_t event = tx->event;
     tx->event = RMT_EVENT_NONE;
+    bool loop_done = false;
+    if (event == RMT_EVENT_LOOP && tx->loop_has_marker &&
+        (tx->tx_limit & RMT_TX_LOOP_COUNT_EN)) {
+        uint32_t target = (tx->tx_limit >> 9u) & 0x3FFu;
+        tx->loop_count++;
+        if (target && tx->loop_count >= target) {
+            tx->loop_count = 0u;
+            loop_done = true;
+        }
+    }
+    bool loop_stop = loop_done && (tx->tx_limit & RMT_TX_LOOP_STOP_EN);
     if (rmt->tx_cb[channel] &&
         (tx->segment_count || event == RMT_EVENT_END ||
          event == RMT_EVENT_ERROR)) {
@@ -690,9 +740,21 @@ static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
         rmt->tx_cb[channel](rmt->tx_ctx[channel], (int)channel,
                             tx->segment_items, tx->segment_count,
                             tick_hz, carrier_hz,
-                            event == RMT_EVENT_END || event == RMT_EVENT_ERROR);
+                            event == RMT_EVENT_END ||
+                            event == RMT_EVENT_ERROR || loop_stop);
     }
     switch (event) {
+    case RMT_EVENT_LOOP:
+        if (loop_done) rmt->int_raw |= RMT_TX_LOOP_INT(channel);
+        if (loop_stop) {
+            tx->active = false;
+            tx->edge_active = false;
+            tx->carrier_deadline = UINT64_MAX;
+            rmt_tx_emit_idle(rmt, channel, event_cycle);
+        } else {
+            tx->read_index = 0u;
+        }
+        break;
     case RMT_EVENT_END:
         tx->active = false;
         tx->edge_active = false;
@@ -714,7 +776,8 @@ static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
         break;
     }
     rmt_notify_irq(rmt);
-    if (tx->active && event == RMT_EVENT_THRESHOLD)
+    if (tx->active && (event == RMT_EVENT_THRESHOLD ||
+                       event == RMT_EVENT_LOOP))
         rmt_tx_start_segment(rmt, channel, event_cycle);
 }
 
@@ -842,8 +905,10 @@ bool flexe_rmt_v1_tx_sample(flexe_rmt_v1_t *rmt, unsigned channel,
         *enabled = (tx->conf & RMT_IDLE_OUT_ENABLE) != 0u;
         return true;
     }
-    if ((tx->conf & RMT_TX_CONTINUOUS) != 0u ||
-        tx->segment_count == 0u)
+    if ((tx->conf & RMT_TX_CONTINUOUS) &&
+        !rmt_tx_has_counted_autostop(tx))
+        return false;
+    if (tx->segment_count == 0u)
         return false;
 
     uint64_t now = rmt_clock_now(rmt);
@@ -1019,10 +1084,9 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
                                             rmt->desc->tx_channel_count * 4u) {
         unsigned channel = (off - RMT_TX_CONF_OFF) / 4u;
         rmt_tx_channel_t *tx = &rmt->tx[channel];
-        /* The finite-stream path supports wrap and threshold refills. The
-         * channel loop-count engine is not modeled yet, so make that mode
-         * visible in unsupported-MMIO diagnostics instead of accepting it. */
-        if ((value & (RMT_TX_CONTINUOUS | RMT_DMA_ACCESS)) ||
+        /* DMA and always-on carrier retain diagnostics. Counted auto-stop
+         * loops are checked at TX_START, after their limit register is set. */
+        if ((value & RMT_DMA_ACCESS) ||
             (value & (RMT_CARRIER_ENABLE | RMT_CARRIER_DATA_ONLY)) ==
             RMT_CARRIER_ENABLE)
             rmt->fallback_write(rmt->fallback_ctx, address, value);
@@ -1040,6 +1104,9 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             tx->active = true;
             tx->read_index = 0u;
             tx->carrier_start = rmt_clock_now(rmt);
+            if ((tx->conf & RMT_TX_CONTINUOUS) &&
+                !rmt_tx_has_counted_autostop(tx))
+                rmt->fallback_write(rmt->fallback_ctx, address, value);
             rmt_tx_start_segment(rmt, channel, tx->carrier_start);
         }
         if (!tx->active)
@@ -1103,7 +1170,10 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
                                           rmt->desc->tx_channel_count * 4u) {
         if (value & ~RMT_TX_LIMIT_REG_MASK)
             rmt->fallback_write(rmt->fallback_ctx, address, value);
-        rmt->tx[(off - RMT_TX_LIMIT_OFF) / 4u].tx_limit =
+        rmt_tx_channel_t *tx =
+            &rmt->tx[(off - RMT_TX_LIMIT_OFF) / 4u];
+        if (value & RMT_LOOP_COUNT_RESET) tx->loop_count = 0u;
+        tx->tx_limit =
             value & RMT_TX_LIMIT_REG_MASK & ~RMT_LOOP_COUNT_RESET;
         return;
     }

@@ -1054,6 +1054,130 @@ TEST(s3_rmt_v1_rx_wrap_refills_both_halves_before_end)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_counted_tx_loop_repeats_pad_and_autostops_on_loop_irq)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    rmt_v1_probe_t probe = {0};
+    ASSERT_EQ(periph_set_rmt_tx_callback(periph, 0,
+                                         rmt_v1_tx_observed, &probe), 0);
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_FUNC_OUT4,
+                s3->rmt_v1.output_signal_base);
+    mem_write32(mem, S3_GPIO_BASE + 0x074u + 4u * 4u,
+                (1u << 13) | (1u << 7)); /* positive-edge GPIO IRQ */
+    const uint32_t pulse = 10u | (1u << 15u) | (20u << 16u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0, pulse);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0 + 4u, 0u);
+    uint32_t loop_limit = 128u | (3u << 9u) |
+                          (1u << 19u) | (1u << 21u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_LIMIT0,
+                loop_limit | (1u << 20u));
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_TX_LIMIT0), loop_limit);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_ENA,
+                (1u << 12u) | 1u);
+    uint32_t conf = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF0);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                (conf & ~(1u << 21u)) | (1u << 3u) |
+                (1u << 6u) | 1u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x044u) & (1u << 4u),
+              1u << 4u);
+    mem_write32(mem, S3_GPIO_BASE + 0x04Cu, 1u << 4u);
+
+    cpu0.ccount = 239u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    cpu0.ccount = 240u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x044u) & (1u << 4u),
+              1u << 4u);
+    mem_write32(mem, S3_GPIO_BASE + 0x04Cu, 1u << 4u);
+    cpu0.ccount = 320u;
+    (void)mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 0);
+    cpu0.ccount = 480u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    cpu0.ccount = 719u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 0u);
+    cpu0.ccount = 720u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 12u);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0) >> 22u) & 7u,
+              0u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 0);
+    ASSERT_EQ(probe.calls, 3u);
+    ASSERT_EQ(probe.items, 3u);
+    ASSERT_EQ(probe.completions, 1u);
+    ASSERT_EQ(probe.last_item, pulse);
+    ASSERT_TRUE(periph_interrupt_pending(periph,
+                                         s3->rmt_v1.interrupt_source));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 12u);
+    ASSERT_FALSE(periph_interrupt_pending(periph,
+                                           s3->rmt_v1.interrupt_source));
+
+    /* The write-trigger reset does not latch in TX_LIM. The same register
+     * program can drive another complete three-iteration transaction. */
+    cpu0.ccount = 800u;
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_LIMIT0,
+                loop_limit | (1u << 20u));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                (conf & ~(1u << 21u)) | (1u << 3u) |
+                (1u << 6u) | 1u);
+    cpu0.ccount = 1520u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 12u);
+    ASSERT_EQ(probe.calls, 6u);
+    ASSERT_EQ(probe.completions, 2u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(s3_rmt_v1_markerless_counted_loop_stays_diagnostic)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    for (unsigned i = 0u; i < 48u; i++)
+        mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0 + i * 4u,
+                    10u | (20u << 16u));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_LIMIT0,
+                128u | (2u << 9u) | (1u << 19u) | (1u << 21u));
+    uint32_t conf = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF0);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                (conf & ~(1u << 21u)) | (1u << 3u) | 1u);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    cpu0.ccount = 11520u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 1u << 4u);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0) >> 22u) & 7u,
+              0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic)
 {
     const flexe_target_desc_t *s3 =
@@ -1067,7 +1191,8 @@ TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic)
         mem_destroy(mem);
         return;
     }
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0, 1u << 3);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                (1u << 3) | 1u); /* unbounded loop is diagnostic at start */
     mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF3, 1u << 25);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_SIM, 1u << 4);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4, 1u << 23);
@@ -1097,5 +1222,7 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_rx_demodulates_both_carrier_polarities);
     RUN_TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible);
     RUN_TEST(s3_rmt_v1_rx_wrap_refills_both_halves_before_end);
+    RUN_TEST(s3_rmt_v1_counted_tx_loop_repeats_pad_and_autostops_on_loop_irq);
+    RUN_TEST(s3_rmt_v1_markerless_counted_loop_stays_diagnostic);
     RUN_TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic);
 }

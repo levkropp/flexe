@@ -172,8 +172,58 @@ void app_main(void)
         fail("carrier-pulse-data", ESP_ERR_INVALID_RESPONSE);
     printf("RMT_CARRIER_LOOPBACK_OK count=%u\n", (unsigned)received_count);
     fflush(stdout);
-    check("disable-tx", rmt_disable(tx));
+
+    check("tx-carrier-off", rmt_apply_carrier(tx, NULL));
+    check("rx-demod-off", rmt_apply_carrier(rx, NULL));
+    received_count = 0;
+    check("loop-receive", rmt_receive(rx, received, sizeof(received),
+                                       &receive_config));
+    const rmt_symbol_word_t loop_frame[] = {
+        {.level0 = 1, .duration0 = 10, .level1 = 0, .duration1 = 12},
+        {.level0 = 1, .duration0 = 8,  .level1 = 0, .duration1 = 9},
+    };
+    rmt_transmit_config_t loop_config = {.loop_count = 3};
+    check("loop-transmit", rmt_transmit(tx, encoder, loop_frame,
+                                        sizeof(loop_frame), &loop_config));
+    check("loop-tx-complete", rmt_tx_wait_all_done(tx, 1000));
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0)
+        fail("loop-rx-timeout", ESP_ERR_TIMEOUT);
+    printf("RMT_LOOP_COUNT_OBSERVED count=%u first=%u,%u third=%u,%u fifth=%u,%u\n",
+           (unsigned)received_count,
+           (unsigned)received[0].duration0,
+           (unsigned)received[0].duration1,
+           (unsigned)received[2].duration0,
+           (unsigned)received[2].duration1,
+           (unsigned)received[4].duration0,
+           (unsigned)received[4].duration1);
+    fflush(stdout);
+    if (received_count != 6u ||
+        !near(received[0].duration0, 10u) ||
+        !near(received[0].duration1, 12u) ||
+        !near(received[1].duration0, 8u) ||
+        !near(received[1].duration1, 9u) ||
+        !near(received[2].duration0, 10u) ||
+        !near(received[2].duration1, 12u) ||
+        !near(received[3].duration0, 8u) ||
+        !near(received[3].duration1, 9u) ||
+        !near(received[4].duration0, 10u) ||
+        !near(received[4].duration1, 12u) ||
+        /* The final low joins idle, so RX has no edge to measure its
+         * programmed duration, just as in the plain-pulse frame. */
+        !near(received[5].duration0, 8u))
+        fail("loop-pulse-data", ESP_ERR_INVALID_RESPONSE);
+    printf("RMT_LOOP_COUNT_OK count=%u\n", (unsigned)received_count);
+    fflush(stdout);
     check("disable-rx", rmt_disable(rx));
+    /* The driver splits counts above the 10-bit hardware limit into
+     * multiple loop-interrupt batches. The second batch must finish too. */
+    rmt_transmit_config_t batch_config = {.loop_count = 1024};
+    check("batch-transmit", rmt_transmit(tx, encoder, loop_frame,
+                                         sizeof(loop_frame), &batch_config));
+    check("batch-tx-complete", rmt_tx_wait_all_done(tx, 1000));
+    printf("RMT_LOOP_BATCH_OK count=1024\n");
+    fflush(stdout);
+    check("disable-tx", rmt_disable(tx));
     check("delete-tx", rmt_del_channel(tx));
     check("delete-rx", rmt_del_channel(rx));
     check("delete-encoder", rmt_del_encoder(encoder));
