@@ -118,8 +118,17 @@ jobs:
           "$HOME/bin/arduino-cli" version
           "$HOME/bin/arduino-cli" core update-index \
             --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          "$HOME/bin/arduino-cli" core install esp32:esp32@2.0.11 \
-            --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          for attempt in 1 2 3 4; do
+            if "$HOME/bin/arduino-cli" core install esp32:esp32@2.0.11 \
+                --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json; then
+              break
+            fi
+            if [[ "$attempt" -eq 4 ]]; then
+              echo "ESP32 core installation failed after four attempts" >&2
+              exit 1
+            fi
+            sleep "$((attempt * 10))"
+          done
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF
