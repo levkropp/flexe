@@ -55,7 +55,7 @@ even when a firmware workflow succeeds.
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
-| S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF TX/RX drivers loop three measurable pulse words through GPIO4 | Unmodulated half-symbol pad edges are scheduled for a watched matrix input or GPIO interrupt; otherwise active pad level is unknown and the aggregate pulse sink remains fast. GPIO_IN-only polling, carrier modulation, counted loops, synchronized TX, and fine status remain unsupported. |
+| S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, stock ESP-IDF TX/RX drivers loop three measurable pulse words through GPIO4, and unobserved TX is sampled by `GPIO_IN` at half-symbol boundaries | Unmodulated half-symbol pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polling samples on demand without missed-edge history. Carrier modulation, counted loops, synchronized TX, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and unmodulated RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
@@ -495,12 +495,15 @@ and its matching ELF SHA-256 is
 `eab784508a17f30998a7a314bfc661f6078390bdde092d49287c56fb6274d72f`.
 Individual TX pad edges are scheduled only when a watched matrix input or
 GPIO interrupt can observe them; the latter has its own rising-edge unit gate.
-With no such consumer, the active pad level is deliberately unknown while the
-existing aggregate pulse sink records the full stream; the pinned WLED pulse
-digest is unchanged. A `GPIO_IN` read during that unknown interval emits a
-diagnostic once per interval instead of silently claiming a valid low level.
-Carrier modulation, GPIO_IN-only polling, mid-segment route changes, and
-electrical line behavior are not modeled.
+With no such consumer, the aggregate pulse sink records the full stream
+without scheduling every edge; the pinned WLED pulse digest is unchanged.
+A `GPIO_IN` read samples unmodulated TX directly from the planned pulse words
+at that guest cycle, including matrix inversion, software output-enable
+selection, and IO_MUX input-buffer gating. A sampled read does not invent
+past GPIO interrupts or RX transitions. If the pad is still unknown, such as
+for unmodeled carrier phase, the read emits a diagnostic once per unknown
+interval instead of silently claiming a valid low level. Mid-segment route
+changes and electrical line behavior are not modeled.
 The carrier remover joins short opposite-polarity gaps according to the
 channel-clock thresholds in the
 [S3 technical reference manual](https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf).

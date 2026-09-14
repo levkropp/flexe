@@ -88,6 +88,8 @@ struct flexe_gpio {
     void *irq_ctx;
     flexe_gpio_input_signal_fn input_signal_changed;
     void *input_signal_ctx;
+    flexe_gpio_output_sample_fn output_sample;
+    void *output_sample_ctx;
 
     uint32_t bt_select;
     uint32_t sdio_select;
@@ -235,6 +237,48 @@ void flexe_gpio_drive_output_signal(flexe_gpio_t *gpio, unsigned signal,
             gpio_notify_pin(gpio, pin);
 }
 
+void flexe_gpio_set_output_sample_handler(flexe_gpio_t *gpio,
+                                          flexe_gpio_output_sample_fn sample,
+                                          void *ctx)
+{
+    if (!gpio) return;
+    gpio->output_sample = sample;
+    gpio->output_sample_ctx = sample ? ctx : NULL;
+}
+
+static bool gpio_output_signal_modeled(const flexe_gpio_t *gpio,
+                                       unsigned signal)
+{
+    return signal < GPIO_FUNC_OUT_SIGNAL_COUNT &&
+           (gpio->modeled_output_signal[signal / 64u] &
+            (UINT64_C(1) << (signal % 64u))) != 0u;
+}
+
+static int gpio_sample_output_pad(flexe_gpio_t *gpio, unsigned pin)
+{
+    if (!gpio->output_sample) return -1;
+    uint32_t route = gpio->func_out[pin];
+    unsigned signal = route & GPIO_FUNC_OUT_SIGNAL_MASK;
+    if (!gpio_output_signal_modeled(gpio, signal)) return -1;
+    int level = -1;
+    int enabled = -1;
+    if (!gpio->output_sample(gpio->output_sample_ctx, signal,
+                             &level, &enabled) || level < 0 ||
+        (enabled < 0 && (route & GPIO_FUNC_OUT_OEN_SELECT) == 0u))
+        return -1;
+    if (route & GPIO_FUNC_OUT_INVERT) level = !level;
+    if (route & GPIO_FUNC_OUT_OEN_SELECT) {
+        unsigned bank;
+        uint32_t mask;
+        (void)gpio_pin_bit(pin, &bank, &mask);
+        enabled = (gpio->enable[bank] & mask) != 0u;
+    }
+    if (route & GPIO_FUNC_OUT_OEN_INVERT) enabled = !enabled;
+    if (enabled && (gpio->pin[pin] & GPIO_PIN_OPEN_DRAIN) && level)
+        enabled = 0;
+    return enabled && level;
+}
+
 bool flexe_gpio_output_signal_has_input_consumer(const flexe_gpio_t *gpio,
                                                   unsigned signal)
 {
@@ -283,14 +327,6 @@ void flexe_gpio_watch_input_signal(flexe_gpio_t *gpio, unsigned signal)
     if (!gpio || signal >= GPIO_FUNC_IN_COUNT) return;
     gpio->watched_input_signal[signal / 64u] |=
         UINT64_C(1) << (signal % 64u);
-}
-
-static bool gpio_output_signal_modeled(const flexe_gpio_t *gpio,
-                                       unsigned signal)
-{
-    return signal < GPIO_FUNC_OUT_SIGNAL_COUNT &&
-           (gpio->modeled_output_signal[signal / 64u] &
-            (UINT64_C(1) << (signal % 64u))) != 0u;
 }
 
 int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin)
@@ -650,12 +686,26 @@ static uint32_t gpio_read(void *ctx, uint32_t addr)
             (uint32_t)(gpio->rtc_owned >> 32u);
         uint32_t unknown = gpio->peripheral_unknown[bank] &
                            gpio->input_enable[bank] & ~rtc_owned;
+        uint32_t value = gpio->input[bank] &
+                         gpio->input_enable[bank] & ~rtc_owned;
+        uint32_t candidates = unknown;
+        while (candidates != 0u) {
+            unsigned bit = (unsigned)__builtin_ctz(candidates);
+            uint32_t mask = 1u << bit;
+            candidates &= candidates - 1u;
+            int level = gpio_sample_output_pad(gpio, bank * 32u + bit);
+            if (level < 0) continue;
+            unknown &= ~mask;
+            if (level) value |= mask;
+            else       value &= ~mask;
+        }
+        if (!unknown) gpio->unknown_input_read_reported[bank] = false;
         if (unknown && !gpio->unknown_input_read_reported[bank]) {
             gpio->unknown_input_read_reported[bank] = true;
             if (gpio->fallback_read)
                 (void)gpio->fallback_read(gpio->fallback_ctx, addr);
         }
-        return gpio->input[bank] & gpio->input_enable[bank] & ~rtc_owned;
+        return value;
     }
     case GPIO_STATUS_OFF: return gpio->status[0];
     case GPIO_STATUS1_OFF: return gpio->status[1];

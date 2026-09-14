@@ -751,6 +751,51 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
     if (changed) rmt_notify_state(rmt);
 }
 
+bool flexe_rmt_v1_tx_sample(flexe_rmt_v1_t *rmt, unsigned channel,
+                            int *level, int *enabled)
+{
+    if (!rmt || !level || !enabled ||
+        channel >= rmt->desc->tx_channel_count)
+        return false;
+    flexe_rmt_v1_eval(rmt);
+    const rmt_tx_channel_t *tx = &rmt->tx[channel];
+    if (!tx->active) {
+        *level = (tx->conf & RMT_IDLE_OUT_LEVEL) != 0u;
+        *enabled = (tx->conf & RMT_IDLE_OUT_ENABLE) != 0u;
+        return true;
+    }
+    if ((tx->conf & ((1u << 21u) | RMT_TX_CONTINUOUS)) != 0u ||
+        tx->segment_count == 0u)
+        return false;
+
+    uint64_t now = rmt_clock_now(rmt);
+    uint64_t ticks = 0u;
+    for (uint32_t i = 0u; i < tx->segment_count; i++) {
+        uint32_t item = tx->segment_items[i];
+        uint32_t first = item & 0x7FFFu;
+        uint32_t second = (item >> 16u) & 0x7FFFu;
+        ticks += first;
+        uint64_t duration = rmt_ticks_to_cycles(rmt, tx, ticks);
+        uint64_t boundary = tx->segment_start > UINT64_MAX - duration ?
+                            UINT64_MAX : tx->segment_start + duration;
+        if (now < boundary) {
+            *level = (item & (1u << 15u)) != 0u;
+            *enabled = 1;
+            return true;
+        }
+        ticks += second;
+        duration = rmt_ticks_to_cycles(rmt, tx, ticks);
+        boundary = tx->segment_start > UINT64_MAX - duration ?
+                   UINT64_MAX : tx->segment_start + duration;
+        if (second != 0u && now < boundary) {
+            *level = (item & (1u << 31u)) != 0u;
+            *enabled = 1;
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
                                   xtensa_cpu_t *cpu)
 {

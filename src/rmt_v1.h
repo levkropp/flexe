@@ -41,6 +41,11 @@ void flexe_rmt_v1_set_tx_edge_handler(flexe_rmt_v1_t *rmt,
                                       flexe_rmt_v1_tx_edge_fn changed,
                                       flexe_rmt_v1_tx_edge_needed_fn needed,
                                       void *ctx);
+/* Sample the unmodulated TX pad at the current guest time for GPIO_IN polling
+ * without scheduling every half-symbol edge. Unsupported carrier/loop modes
+ * return false, preserving the GPIO unknown-input diagnostic. */
+bool flexe_rmt_v1_tx_sample(flexe_rmt_v1_t *rmt, unsigned channel,
+                            int *level, int *enabled);
 /* Inject a complete, already-decoded pulse frame into physical RX channel
  * 4..7. Returns symbols accepted (one RAM capacity without wrap, or the
  * whole frame with wrap/ping-pong enabled). */

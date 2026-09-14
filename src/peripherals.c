@@ -14187,6 +14187,19 @@ static bool rmt_v1_tx_edge_needed(void *ctx, unsigned channel)
             p->target->rmt_v1.output_signal_base + channel);
 }
 
+static bool target_gpio_output_sample(void *ctx, unsigned signal,
+                                      int *level, int *enabled)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !p->rmt_v1) return false;
+    const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
+    if (signal < desc->output_signal_base ||
+        signal >= desc->output_signal_base + desc->tx_channel_count)
+        return false;
+    return flexe_rmt_v1_tx_sample(
+        p->rmt_v1, signal - desc->output_signal_base, level, enabled);
+}
+
 static void usb_serial_jtag_irq_changed(void *ctx, bool level)
 {
     esp32_periph_t *p = ctx;
@@ -14740,6 +14753,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             flexe_rmt_v1_set_tx_edge_handler(
                 p->rmt_v1, rmt_v1_tx_edge_changed,
                 rmt_v1_tx_edge_needed, p);
+            flexe_gpio_set_output_sample_handler(
+                p->target_gpio, target_gpio_output_sample, p);
         }
     }
 

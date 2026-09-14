@@ -23,6 +23,11 @@ typedef void (*flexe_gpio_output_fn)(void *ctx, unsigned gpio,
 typedef void (*flexe_gpio_irq_fn)(void *ctx, bool nmi, bool level);
 typedef void (*flexe_gpio_input_signal_fn)(void *ctx, unsigned signal,
                                            bool old_level, bool level);
+/* Resolve a peripheral output at the instant GPIO_IN is read. Returns false
+ * for signals that cannot be sampled (for example, unmodeled carrier phase).
+ * This does not synthesize missed edges or alter interrupt history. */
+typedef bool (*flexe_gpio_output_sample_fn)(void *ctx, unsigned signal,
+                                             int *level, int *enabled);
 
 flexe_gpio_t *flexe_gpio_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
@@ -67,10 +72,12 @@ void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
  * software-controlled output-enable routes. */
 void flexe_gpio_drive_output_signal(flexe_gpio_t *gpio, unsigned signal,
                                     int level, int enabled);
+void flexe_gpio_set_output_sample_handler(flexe_gpio_t *gpio,
+                                          flexe_gpio_output_sample_fn sample,
+                                          void *ctx);
 /* Trace individual output edges only when a registered matrix-input watcher
- * or GPIO interrupt can observe them. GPIO_IN-only polling without either
- * consumer is outside this fast path; aggregate peripheral pulse output
- * remains available separately. */
+ * or GPIO interrupt can observe them. GPIO_IN-only polling uses an on-demand
+ * producer sample and does not make the event queue process every edge. */
 bool flexe_gpio_output_signal_has_input_consumer(const flexe_gpio_t *gpio,
                                                   unsigned signal);
 
