@@ -718,6 +718,9 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.wakeup_state_offset, 0x3Cu);
     ASSERT_EQ(s3->rtc_cntl.digital_power_offset, 0x90u);
     ASSERT_EQ(s3->rtc_cntl.wakeup_cause_offset, 0x130u);
+    ASSERT_EQ(s3->rtc_cntl.rtc_power_offset, 0x88u);
+    ASSERT_EQ(s3->rtc_cntl.rtc_power_reset, 0x925u);
+    ASSERT_EQ(s3->rtc_cntl.rtc_pad_force_hold_mask, 1u << 21u);
     ASSERT_EQ(s3->rtc_cntl.sleep_alarm_interrupt_mask, 1u << 10u);
     ASSERT_EQ(s3->rtc_cntl.ext0_wakeup_mask, 1u);
     ASSERT_EQ(s3->rtc_cntl.ext1_wakeup_mask, 1u << 1u);

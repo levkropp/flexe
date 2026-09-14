@@ -15848,6 +15848,10 @@ void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out)
         if (rtc->digital_pad_hold_count != 0u)
             out->target_rtc_hold = mem_read32(
                 p->mem, rtc->base + rtc->digital_pad_hold_offset);
+        if (rtc->rtc_power_offset != 0u)
+            out->target_rtc_force_hold = mem_read32(
+                p->mem, rtc->base + rtc->rtc_power_offset) &
+                rtc->rtc_pad_force_hold_mask;
         flexe_rtc_io_pad_hold_snapshot(p->target_rtc_io,
                                        &out->target_rtc_io);
         flexe_gpio_pad_hold_snapshot(p->target_gpio, &out->target_gpio);
@@ -15882,6 +15886,13 @@ void periph_pad_hold_restore(esp32_periph_t *p, const periph_pad_hold_t *in)
          p->target->rtc_cntl.digital_pad_hold_count != 0u)) {
         if (in->target_gpio.mask) {
             const flexe_rtc_cntl_desc_t *rtc = &p->target->rtc_cntl;
+            if (rtc->rtc_power_offset != 0u) {
+                uint32_t addr = rtc->base + rtc->rtc_power_offset;
+                uint32_t value = mem_read32(p->mem, addr);
+                mem_write32(p->mem, addr,
+                            (value & ~rtc->rtc_pad_force_hold_mask) |
+                            in->target_rtc_force_hold);
+            }
             if (rtc->rtc_pad_hold_count != 0u)
                 mem_write32(p->mem,
                             rtc->base + rtc->rtc_pad_hold_offset,

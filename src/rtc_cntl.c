@@ -36,6 +36,7 @@ struct flexe_rtc_cntl {
     uint32_t sleep_state;
     uint32_t wakeup_enable;
     uint32_t wakeup_cause;
+    uint32_t rtc_power_control;
     uint32_t digital_power;
     uint32_t reset_state;
     uint32_t ext_wakeup_config;
@@ -106,7 +107,11 @@ static uint64_t rtc_hold_pins(uint32_t value, unsigned first_gpio,
 static uint64_t rtc_all_pad_hold_pins(const flexe_rtc_cntl_t *rtc)
 {
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
-    return rtc_hold_pins(rtc->rtc_pad_hold,
+    uint64_t global =
+        (rtc->rtc_power_control & desc->rtc_pad_force_hold_mask) != 0u ?
+        ((UINT64_C(1) << rtc->target->rtc_io.gpio_count) - 1u) : 0u;
+    return global |
+           rtc_hold_pins(rtc->rtc_pad_hold,
                          desc->rtc_pad_hold_first_gpio,
                          desc->rtc_pad_hold_first_bit,
                          desc->rtc_pad_hold_count) |
@@ -425,12 +430,18 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
             desc->sleep_state_offset, desc->wakeup_state_offset,
             desc->digital_power_offset, desc->wakeup_cause_offset,
+            desc->rtc_power_offset,
             desc->ext_wakeup_config_offset, desc->ext1_select_offset,
             desc->ext1_status_offset, desc->brownout_offset,
         };
         if (!(target->capabilities & FLEXE_TARGET_CAP_RTC_IO_V1) ||
             target->rtc_io.gpio_count == 0u ||
             target->rtc_io.gpio_count >= 32u ||
+            desc->rtc_pad_hold_count != target->rtc_io.gpio_count ||
+            desc->rtc_pad_force_hold_mask == 0u ||
+            (desc->rtc_pad_force_hold_mask &
+             (desc->rtc_pad_force_hold_mask - 1u)) != 0u ||
+            (desc->rtc_power_reset & desc->rtc_pad_force_hold_mask) != 0u ||
             desc->sleep_enable_mask == 0u ||
             (desc->sleep_enable_mask & (desc->sleep_enable_mask - 1u)) != 0u ||
             desc->sleep_wakeup_mask == 0u ||
@@ -750,6 +761,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
             return rtc->digital_power;
         if (offset == desc->wakeup_cause_offset)
             return rtc->wakeup_cause;
+        if (offset == desc->rtc_power_offset)
+            return rtc->rtc_power_control;
         if (offset == desc->ext_wakeup_config_offset)
             return rtc->ext_wakeup_config;
         if (offset == desc->ext1_select_offset)
@@ -945,6 +958,18 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         }
         if (offset == desc->wakeup_cause_offset)
             return; /* Physically read-only. */
+        if (offset == desc->rtc_power_offset) {
+            uint32_t changed = rtc->rtc_power_control ^ value;
+            rtc->rtc_power_control = value;
+            if ((changed & desc->rtc_pad_force_hold_mask) != 0u &&
+                rtc->pad_hold_changed)
+                rtc->pad_hold_changed(rtc->pad_hold_ctx,
+                                      rtc_all_pad_hold_pins(rtc));
+            if ((changed & ~desc->rtc_pad_force_hold_mask) != 0u &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
         if (offset == desc->ext_wakeup_config_offset) {
             uint32_t old = rtc->ext_wakeup_config;
             rtc->ext_wakeup_config = value;
@@ -1137,6 +1162,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->clock_conf = desc->clock_conf_reset;
     rtc->reset_state = desc->reset_state_reset;
     rtc->wakeup_enable = desc->wakeup_enable_reset;
+    rtc->rtc_power_control = desc->rtc_power_reset;
     rtc->digital_power = desc->digital_power_reset;
     rtc->brownout_config = desc->brownout_reset;
     rtc->cpu_stall_options = desc->cpu_stall_options_reset;

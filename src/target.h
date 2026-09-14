@@ -387,6 +387,9 @@ typedef struct {
     uint16_t wakeup_state_offset;
     uint16_t digital_power_offset;
     uint16_t wakeup_cause_offset;
+    uint16_t rtc_power_offset;
+    uint32_t rtc_power_reset;
+    uint32_t rtc_pad_force_hold_mask;
     uint32_t digital_power_reset;
     uint32_t sleep_enable_mask;
     uint32_t sleep_wakeup_mask;

@@ -71,7 +71,7 @@ if grep -Eq '^\[TRAP\]|Guru Meditation|panic' "$tmpdir/emu.err" "$tmpdir/guest.o
     fail "guest trapped or panicked"
 fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 266 ]] ||
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 246 ]] ||
     fail "unsupported MMIO count changed from the pinned baseline"
 if grep -Eq '  [RW]  0x600080E8 ' "$tmpdir/emu.err"; then
     fail "S3 brownout configuration MMIO remains unsupported"

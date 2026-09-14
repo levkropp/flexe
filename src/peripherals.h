@@ -487,7 +487,8 @@ void periph_assert_interrupt_status(esp32_periph_t *p, int source,
  * is set must not lose its level -- parking an output at a known state across
  * sleep is the only reason the bit exists. Snapshot before periph_destroy(),
  * restore after periph_create(); only held channels are carried over. Classic
- * RTC GPIO and S3 RTC/digital GPIO use distinct target-specific registers. */
+ * RTC GPIO and S3 RTC/digital GPIO use distinct target-specific registers;
+ * the S3 global RTC hold source is retained separately from per-pad bits. */
 typedef struct {
     uint32_t hold_mask;     /* RTC channels with their hold bit set */
     uint32_t rtcio_out;     /* RTC_GPIO_OUT/ENABLE, channel-indexed */
@@ -497,6 +498,7 @@ typedef struct {
     unsigned reg_count;
     uint32_t target_rtc_io_hold;
     uint32_t target_rtc_hold;
+    uint32_t target_rtc_force_hold;
     flexe_rtc_io_pad_hold_t target_rtc_io;
     flexe_gpio_pad_hold_t target_gpio;
 } periph_pad_hold_t;

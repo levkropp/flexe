@@ -104,7 +104,7 @@ for replay in 1 2; do
         fail "EXT wake selection, state, or status MMIO remains unsupported"
     fi
     unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$emu")
-    [[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 344 ]] ||
+    [[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 314 ]] ||
         fail "unrelated unsupported MMIO count exceeded the pinned baseline"
 done
 
