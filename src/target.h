@@ -357,6 +357,13 @@ typedef struct {
     uint32_t analog_conf_reset;
     uint32_t analog_conf_writable_mask;
     uint32_t sar_i2c_power_mask;
+    /* Optional RTC USB PHY mux. Only the software override and selection
+     * bits are functional; analog USB controls remain diagnostic. */
+    uint16_t usb_conf_offset;
+    uint32_t usb_conf_reset;
+    uint32_t usb_conf_writable_mask;
+    uint32_t usb_phy_override_mask;
+    uint32_t usb_phy_select_mask;
     uint16_t interrupt_enable_offset;
     uint16_t interrupt_raw_offset;
     uint16_t interrupt_status_offset;

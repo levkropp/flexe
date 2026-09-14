@@ -70,6 +70,11 @@ void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
  * A detached/missing RTC cannot claim that power domain is available. */
 bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc);
 
+/* S3 RTC USB mux selection. The default virtual board has its internal PHY
+ * attached to USB Serial/JTAG unless software routes it to USB OTG. */
+bool flexe_rtc_cntl_usb_serial_jtag_internal_phy(
+    const flexe_rtc_cntl_t *rtc);
+
 /* Software stall pauses instruction retirement without erasing CPU state. */
 bool flexe_rtc_cntl_cpu_stalled(const flexe_rtc_cntl_t *rtc, unsigned core);
 

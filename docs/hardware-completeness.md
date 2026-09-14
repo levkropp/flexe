@@ -50,7 +50,7 @@ even when a firmware workflow succeeds.
 | S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC/digital hold work; physical pulls, drive strength, and electrical levels are not complete. |
-| S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
+| S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire, I2C-slave, and ESP-IDF SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
@@ -73,7 +73,40 @@ uses SYSTEM's `USB_DEVICE` clock/reset bits for that controller. Flexe now
 blocks host RX, packet completion, synthetic SOF, and interrupt output while
 its clock is off; a reset edge drops unsent/unread packets and restores
 configuration while preserving cable connection and already-captured output.
-USB enumeration and line signaling remain outside this functional model.
+The [S3 RTC USB PHY mux](https://github.com/espressif/esp-idf/blob/v5.3.2/components/hal/esp32s3/include/hal/usb_serial_jtag_ll.h)
+retains its software override/selection bits and gates the virtual host when
+the internal PHY is routed to USB OTG or `CONF0.PHY_SEL` chooses the external
+PHY. The default virtual board assumes the internal-PHY eFuse route;
+external PHY hardware, enumeration, and line signaling remain outside this
+functional model.
+The ESP-IDF v5.3.2 `tests/fixtures/s3_idf_usb_serial_jtag` application
+installs the [stock interrupt-driven USB Serial/JTAG driver](https://github.com/espressif/esp-idf/blob/v5.3.2/components/esp_driver_usb_serial_jtag/include/driver/usb_serial_jtag.h), writes a greeting,
+then receives two host-injected `ping` packets and replies `USJ_PONG_1/2`
+through the driver's TX ring buffer. The gate runs the complete interaction
+twice with byte-identical UART, USB, and unsupported-MMIO digests. Neither
+the USB controller aperture nor the RTC USB PHY mux has unsupported
+accesses; 70 other accesses remain diagnostic. The pinned
+application image SHA-256 is
+`b8cc669dbd8fb46f5dc93c5dad948cba266fb773ea6a62656455e9e60de82b37`
+and matching ELF SHA-256 is
+`42e6c6e2e38372272955ad2df6e09340178c619fb7bd82957c000b0c28608678`.
+This checks driver-level packet and interrupt progress, not USB enumeration,
+electrical timing, or large/bursty packet stress. Rebuild with ESP-IDF commit
+`9d7f2d69f50d1288526d4f1027108e314e8c879f` and run with external artifacts:
+
+```sh
+idf.py -C tests/fixtures/s3_idf_usb_serial_jtag \
+  -B /tmp/flexe-s3-usj-build -D SDKCONFIG=/tmp/flexe-s3-usj-sdkconfig \
+  -D IDF_TARGET=esp32s3 build
+cmake --build build --target flexe-s3-idf-usb-serial-jtag-test
+S3_IDF_USJ_BIN=/tmp/flexe-s3-usj-build/s3_idf_usb_serial_jtag.bin \
+S3_IDF_USJ_ELF=/tmp/flexe-s3-usj-build/s3_idf_usb_serial_jtag.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  scripts/check-s3-idf-usb-serial-jtag.sh
+```
+
+Independently rebuilt images may provide matching `*_SHA256` overrides,
+because ESP-IDF embeds build metadata.
 
 S3 remains experimental. The NerdMiner filesystem result is a meaningful
 end-to-end flash-format/mount check. With the matching application ELF, the

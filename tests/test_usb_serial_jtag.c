@@ -35,6 +35,9 @@
 #define SYSTEM_CLK_EN1       0x01Cu
 #define SYSTEM_RST_EN1       0x024u
 #define SYSTEM_USB_GATE      (1u << 10)
+#define RTC_USB_CONF         0x120u
+#define RTC_USB_PHY_OVERRIDE (1u << 20)
+#define RTC_USB_PHY_SELECT   (1u << 19)
 
 static uint32_t usb_read_reg(xtensa_mem_t *mem, uint32_t off)
 {
@@ -243,6 +246,74 @@ TEST(usb_serial_jtag_host_rx_sof_and_w1c_status) {
     mem_destroy(mem);
 }
 
+TEST(usb_serial_jtag_rtc_phy_mux_routes_only_internal_host) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    static const uint8_t packet[] = { 0x51u };
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t mux = s3->rtc_cntl.base + RTC_USB_CONF;
+    ASSERT_EQ(mux, s3->rtc_cntl.base + s3->rtc_cntl.usb_conf_offset);
+    ASSERT_EQ(mem_read32(mem, mux), 0u);
+
+    /* RTC software control sends the internal PHY to USB OTG. The USB
+     * Serial/JTAG controller remains clocked, but no host transfer occurs. */
+    mem_write32(mem, mux, RTC_USB_PHY_OVERRIDE | RTC_USB_PHY_SELECT);
+    ASSERT_EQ(mem_read32(mem, mux),
+              RTC_USB_PHY_OVERRIDE | RTC_USB_PHY_SELECT);
+    ASSERT_TRUE(periph_usb_serial_jtag_connected(periph));
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 0u);
+    uint32_t frame = usb_read_reg(mem, USB_FRAME_NUM);
+    periph_usb_serial_jtag_host_sof(periph);
+    ASSERT_EQ(usb_read_reg(mem, USB_FRAME_NUM), frame);
+    usb_write_reg(mem, USB_EP1, 'M');
+    usb_write_reg(mem, USB_EP1_CONF, USB_WR_DONE);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 0u);
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1_CONF) & USB_IN_FREE, 0u);
+
+    /* Return the internal PHY to Serial/JTAG: the queued packet drains. */
+    mem_write32(mem, mux, RTC_USB_PHY_OVERRIDE);
+    ASSERT_EQ(mem_read32(mem, mux), RTC_USB_PHY_OVERRIDE);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 1u);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_buf(periph)[0], 'M');
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 1u);
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1), packet[0]);
+
+    /* CONF0 selects the external PHY independently of the RTC mux. */
+    usb_write_reg(mem, USB_CONF0, s3->usb_serial_jtag.conf0_reset | 1u);
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 0u);
+    usb_write_reg(mem, USB_CONF0, s3->usb_serial_jtag.conf0_reset);
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 1u);
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1), packet[0]);
+
+    /* The default hardware/eFuse route remains internal when software
+     * override is disabled, even if the selection bit is set. */
+    mem_write32(mem, mux, RTC_USB_PHY_SELECT);
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 1u);
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1), packet[0]);
+
+    int before = periph_unhandled_count(periph);
+    mem_write32(mem, mux, RTC_USB_PHY_OVERRIDE | (1u << 18));
+    ASSERT_EQ(mem_read32(mem, mux), RTC_USB_PHY_OVERRIDE);
+    ASSERT_EQ(periph_unhandled_count(periph), before + 1);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(usb_serial_jtag_system_clock_and_reset_gate_host_activity) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -354,6 +425,7 @@ void run_usb_serial_jtag_tests(void) {
     RUN_TEST(usb_serial_jtag_reset_masks_and_reserved_fallback);
     RUN_TEST(usb_serial_jtag_tx_packets_backpressure_and_interrupts);
     RUN_TEST(usb_serial_jtag_host_rx_sof_and_w1c_status);
+    RUN_TEST(usb_serial_jtag_rtc_phy_mux_routes_only_internal_host);
     RUN_TEST(usb_serial_jtag_system_clock_and_reset_gate_host_activity);
     RUN_TEST(usb_serial_jtag_clock_resumes_pending_in_packet);
 }

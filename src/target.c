@@ -638,6 +638,13 @@ static const flexe_target_desc_t TARGETS[] = {
                 (1u << 26) | (1u << 25) | (1u << 24) | (1u << 23) |
                 (1u << 22) | (1u << 20) | (1u << 19) | (1u << 18),
             .sar_i2c_power_mask = 1u << 22,
+            /* RTC_CNTL_USB_CONF_REG: the default eFuse route attaches the
+             * internal FSLS PHY to USB Serial/JTAG. */
+            .usb_conf_offset = 0x120u,
+            .usb_conf_reset = 0u,
+            .usb_conf_writable_mask = (1u << 20) | (1u << 19),
+            .usb_phy_override_mask = 1u << 20,
+            .usb_phy_select_mask = 1u << 19,
             .interrupt_enable_offset = 0x040u,
             .interrupt_raw_offset = 0x044u,
             .interrupt_status_offset = 0x048u,

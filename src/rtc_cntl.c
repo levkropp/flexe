@@ -48,6 +48,7 @@ struct flexe_rtc_cntl {
     bool sleep_requested;
     uint32_t clock_conf;
     uint32_t analog_conf;
+    uint32_t usb_conf;
     uint32_t interrupt_enable;
     uint32_t interrupt_raw;
     bool interrupt_level;
@@ -624,6 +625,51 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
              desc->sequence_register[index].reset) == 0u)
             return false;
     }
+    if (desc->usb_conf_offset != 0u) {
+        uint16_t offset = desc->usb_conf_offset;
+        if (!(target->capabilities & FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1) ||
+            !rtc_offset_valid(offset, desc->register_size) ||
+            desc->usb_phy_override_mask == 0u ||
+            (desc->usb_phy_override_mask &
+             (desc->usb_phy_override_mask - 1u)) != 0u ||
+            desc->usb_phy_select_mask == 0u ||
+            (desc->usb_phy_select_mask &
+             (desc->usb_phy_select_mask - 1u)) != 0u ||
+            (desc->usb_phy_override_mask & desc->usb_phy_select_mask) != 0u ||
+            desc->usb_conf_writable_mask !=
+                (desc->usb_phy_override_mask | desc->usb_phy_select_mask) ||
+            (desc->usb_conf_reset & ~desc->usb_conf_writable_mask) != 0u ||
+            offset == desc->time_update_offset ||
+            offset == desc->time_low_offset ||
+            offset == desc->time_high_offset ||
+            offset == desc->reset_state_offset ||
+            offset == desc->clock_conf_offset ||
+            offset == desc->analog_conf_offset ||
+            rtc_interrupt_offset(desc, offset) ||
+            rtc_wdt_offset(desc, offset) ||
+            rtc_pad_hold_offset(desc, offset) ||
+            (desc->cpu_stall_high_offset != 0u &&
+             (offset == desc->cpu_stall_options_offset ||
+              offset == desc->cpu_stall_high_offset)))
+            return false;
+        for (unsigned i = 0u; i < desc->store_count; i++)
+            if (offset == desc->store_offset[i]) return false;
+        for (unsigned i = 0u; i < desc->sequence_register_count; i++)
+            if (offset == desc->sequence_register[i].offset) return false;
+        if (desc->sleep_timer_low_offset != 0u) {
+            const uint16_t sleep_offsets[] = {
+                desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
+                desc->sleep_state_offset, desc->wakeup_state_offset,
+                desc->digital_power_offset, desc->wakeup_cause_offset,
+                desc->rtc_power_offset, desc->digital_iso_offset,
+                desc->ext_wakeup_config_offset, desc->ext1_select_offset,
+                desc->ext1_status_offset, desc->brownout_offset,
+            };
+            for (unsigned i = 0u;
+                 i < sizeof(sleep_offsets) / sizeof(sleep_offsets[0]); i++)
+                if (offset == sleep_offsets[i]) return false;
+        }
+    }
     return true;
 }
 
@@ -877,6 +923,9 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return rtc->clock_conf;
     if (offset == desc->analog_conf_offset)
         return rtc->analog_conf;
+    if (desc->usb_conf_offset != 0u &&
+        offset == desc->usb_conf_offset)
+        return rtc->usb_conf;
     if (offset == desc->interrupt_enable_offset)
         return rtc->interrupt_enable;
     if (offset == desc->interrupt_raw_offset)
@@ -1202,6 +1251,16 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
         return;
     }
+    if (desc->usb_conf_offset != 0u &&
+        offset == desc->usb_conf_offset) {
+        uint32_t old = rtc->usb_conf;
+        rtc->usb_conf = value & desc->usb_conf_writable_mask;
+        if ((value & ~desc->usb_conf_writable_mask) != 0u &&
+            rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        if (old != rtc->usb_conf) rtc_cntl_notify(rtc);
+        return;
+    }
     if (offset == desc->interrupt_enable_offset) {
         rtc->interrupt_enable = value & desc->interrupt_valid_mask;
         rtc_cntl_update_interrupt(rtc);
@@ -1298,6 +1357,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->brownout_config = desc->brownout_reset;
     rtc->cpu_stall_options = desc->cpu_stall_options_reset;
     rtc->analog_conf = desc->analog_conf_reset;
+    rtc->usb_conf = desc->usb_conf_reset;
     rtc->interrupt_enable = desc->interrupt_enable_reset;
     rtc->interrupt_raw = desc->interrupt_raw_reset;
     for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++)
@@ -1466,6 +1526,16 @@ bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc)
 {
     return rtc && (rtc->analog_conf &
                    rtc->target->rtc_cntl.sar_i2c_power_mask) != 0u;
+}
+
+bool flexe_rtc_cntl_usb_serial_jtag_internal_phy(
+    const flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc || rtc->target->rtc_cntl.usb_conf_offset == 0u)
+        return true;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    return (rtc->usb_conf & desc->usb_phy_override_mask) == 0u ||
+           (rtc->usb_conf & desc->usb_phy_select_mask) == 0u;
 }
 
 void flexe_rtc_cntl_retained_snapshot(

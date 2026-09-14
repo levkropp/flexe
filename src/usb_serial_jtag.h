@@ -25,6 +25,11 @@ void flexe_usb_serial_jtag_destroy(flexe_usb_serial_jtag_t *usb);
 void flexe_usb_serial_jtag_set_system_state(
     flexe_usb_serial_jtag_t *usb, bool clock_enabled, bool reset_asserted);
 
+/* Only the internal PHY is connected to Flexe's virtual USB host. The RTC
+ * USB mux and CONF0 PHY_SEL jointly decide whether that path is active. */
+void flexe_usb_serial_jtag_set_internal_phy_routed(
+    flexe_usb_serial_jtag_t *usb, bool routed);
+
 /* The virtual host consumes complete IN packets and can inject one OUT packet
  * at a time. The byte callback is optional; transmitted bytes are retained in
  * a bounded capture buffer independently of it. */

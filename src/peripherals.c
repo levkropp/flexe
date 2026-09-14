@@ -13931,6 +13931,11 @@ static void target_rtc_cntl_state_changed(void *ctx)
 {
     esp32_periph_t *p = ctx;
     if (!p) return;
+    if (p->usb_serial_jtag && p->target_rtc_cntl)
+        flexe_usb_serial_jtag_set_internal_phy_routed(
+            p->usb_serial_jtag,
+            flexe_rtc_cntl_usb_serial_jtag_internal_phy(
+                p->target_rtc_cntl));
     periph_event_source_changed(p, PERIPH_EVENT_RTC_CNTL);
     for (unsigned core = 0u; core < 2u; core++)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
@@ -14731,6 +14736,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 target_rtc_cntl_reset_requested, p);
             if (p->target_rtc_cntl)
                 flexe_rtc_cntl_application_handoff(p->target_rtc_cntl);
+            if (p->target_rtc_cntl && p->usb_serial_jtag)
+                flexe_usb_serial_jtag_set_internal_phy_routed(
+                    p->usb_serial_jtag,
+                    flexe_rtc_cntl_usb_serial_jtag_internal_phy(
+                        p->target_rtc_cntl));
             flexe_regi2c_attach_rtc_cntl(p->regi2c, p->target_rtc_cntl);
             if (p->target_rtc_cntl && p->target_gpio)
                 flexe_rtc_cntl_set_pad_hold_listener(

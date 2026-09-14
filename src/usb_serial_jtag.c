@@ -37,6 +37,7 @@
 #define USB_INT_OUT_EP1_ZERO        (1u << 10)
 
 #define USB_CONF0_PAD_ENABLE        (1u << 14)
+#define USB_CONF0_PHY_SEL           (1u << 0)
 #define USB_MEM_POWER_DOWN          (1u << 0)
 
 #define USB_JFIFO_IDLE              ((1u << 6) | (1u << 2))
@@ -72,6 +73,7 @@ struct flexe_usb_serial_jtag {
     uint16_t frame_number;
     bool tx_waiting_for_host;
     bool connected;
+    bool internal_phy_routed;
     bool irq_level;
     bool clock_enabled;
     bool reset_asserted;
@@ -109,6 +111,8 @@ static bool usb_link_active(const flexe_usb_serial_jtag_t *usb)
 {
     return usb->clock_enabled && !usb->reset_asserted &&
            usb->connected && (usb->conf0 & USB_CONF0_PAD_ENABLE) != 0u &&
+           (usb->conf0 & USB_CONF0_PHY_SEL) == 0u &&
+           usb->internal_phy_routed &&
            (usb->mem_conf & USB_MEM_POWER_DOWN) == 0u;
 }
 
@@ -373,6 +377,7 @@ flexe_usb_serial_jtag_t *flexe_usb_serial_jtag_create(
     /* A capture sink is a deterministic virtual USB host. Frontends may
      * explicitly disconnect it when testing cable/power behavior. */
     usb->connected = true;
+    usb->internal_phy_routed = true;
 
     if (mem_register_mmio_range(mem, desc->base, desc->register_size,
                                 usb_read, usb_write, usb) != 0) {
@@ -408,6 +413,17 @@ void flexe_usb_serial_jtag_set_system_state(
     usb_update_irq(usb);
     if (clock_enabled && !reset_asserted)
         usb_consume_tx_packet(usb);
+}
+
+void flexe_usb_serial_jtag_set_internal_phy_routed(
+    flexe_usb_serial_jtag_t *usb, bool routed)
+{
+    if (!usb || usb->internal_phy_routed == routed) return;
+    usb->internal_phy_routed = routed;
+    if (routed) {
+        usb_observe_connected_host(usb);
+        usb_consume_tx_packet(usb);
+    }
 }
 
 void flexe_usb_serial_jtag_destroy(flexe_usb_serial_jtag_t *usb)
