@@ -254,6 +254,52 @@ static bool spi_mem_is_gd25q32c(const flexe_spi_mem_t *spi_mem) {
            spi_mem_flash_size(spi_mem) == 0x00400000u;
 }
 
+typedef enum {
+    SPI_MEM_WRITE_ALLOWED,
+    SPI_MEM_WRITE_PROTECTED,
+    SPI_MEM_WRITE_UNSUPPORTED,
+} spi_mem_write_result_t;
+
+/* GD25Q32C DS-00088 rev 4.1, Tables 1.0/1.1. BP2..0 select a
+ * top/bottom fraction, BP3 chooses bottom, BP4 switches to 4 KiB units,
+ * and CMP complements the selected region. All boundaries are sector
+ * aligned, so an overlapping erase or page program is rejected whole. */
+static spi_mem_write_result_t spi_mem_write_gate(
+        const flexe_spi_mem_t *spi_mem, uint32_t offset, uint32_t bytes) {
+    const spi_nor_state_t *flash = &spi_mem->flash;
+    if (!spi_mem_is_gd25q32c(spi_mem)) {
+        /* Another JEDEC capacity is not necessarily the same silicon with
+         * the same protection layout. Keep that path diagnostic. */
+        return ((flash->status[0] & 0x7Cu) != 0u ||
+                (flash->status[1] & 0x40u) != 0u) ?
+            SPI_MEM_WRITE_UNSUPPORTED : SPI_MEM_WRITE_ALLOWED;
+    }
+
+    uint32_t bp = (flash->status[0] >> 2) & 0x1Fu;
+    uint32_t group = bp & 7u;
+    bool cmp = (flash->status[1] & 0x40u) != 0u;
+    uint32_t flash_size = spi_mem_flash_size(spi_mem);
+    uint32_t start = 0u, end = 0u;
+    if (group == 0u || group == 7u) {
+        if ((group == 0u && cmp) || (group == 7u && !cmp))
+            end = flash_size;
+    } else {
+        uint32_t length = (bp & 0x10u) ?
+            0x1000u << (group > 4u ? 3u : group - 1u) :
+            0x10000u << (group - 1u);
+        bool bottom = (bp & 0x08u) != 0u;
+        if (cmp) {
+            start = bottom ? length : 0u;
+            end = bottom ? flash_size : flash_size - length;
+        } else {
+            start = bottom ? 0u : flash_size - length;
+            end = bottom ? length : flash_size;
+        }
+    }
+    return bytes > 0u && offset < end && start < offset + bytes ?
+        SPI_MEM_WRITE_PROTECTED : SPI_MEM_WRITE_ALLOWED;
+}
+
 static void spi_mem_nor_clear_volatile(flexe_spi_mem_t *spi_mem) {
     spi_nor_state_t *flash = &spi_mem->flash;
     flash->status[0] &= (uint8_t)~(FLASH_SR_WIP | FLASH_SR_WEL);
@@ -563,14 +609,16 @@ static void spi_mem_note_flash_change(flexe_spi_mem_t *spi_mem,
         spi_mem->flash_changed(spi_mem->flash_changed_ctx, offset, size);
 }
 
-static void spi_mem_program(flexe_spi_mem_t *spi_mem,
-                            uint32_t offset, const uint8_t *src, int bytes) {
+static spi_mem_write_result_t spi_mem_program(flexe_spi_mem_t *spi_mem,
+                                               uint32_t offset,
+                                               const uint8_t *src, int bytes) {
     uint32_t size = spi_mem_flash_size(spi_mem);
     if (offset >= size || !spi_mem->mem->flash_data ||
-        !spi_mem->mem->flash_insn || !src)
-        return;
-    uint32_t available = size - offset;
-    if ((uint32_t)bytes > available) bytes = (int)available;
+        !spi_mem->mem->flash_insn || !src || bytes <= 0)
+        return SPI_MEM_WRITE_ALLOWED;
+    uint32_t page = offset & ~0xFFu;
+    spi_mem_write_result_t gate = spi_mem_write_gate(spi_mem, page, 0x100u);
+    if (gate != SPI_MEM_WRITE_ALLOWED) return gate;
     if (spi_debug_offset(offset)) {
         fprintf(stderr,
                 "[SPIWR] off=0x%X bytes=%d w0=%02X %02X %02X %02X "
@@ -579,24 +627,33 @@ static void spi_mem_program(flexe_spi_mem_t *spi_mem,
                 src[4], src[5], src[6], src[7]);
     }
     for (int i = 0; i < bytes; i++) {
-        spi_mem->mem->flash_data[offset + (uint32_t)i] &= src[i];
-        spi_mem->mem->flash_insn[offset + (uint32_t)i] &= src[i];
+        uint32_t address = page | ((offset + (uint32_t)i) & 0xFFu);
+        spi_mem->mem->flash_data[address] &= src[i];
+        spi_mem->mem->flash_insn[address] &= src[i];
     }
-    spi_mem_note_flash_change(spi_mem, offset, (uint32_t)bytes);
+    uint32_t first = 0x100u - (offset & 0xFFu);
+    if (first > (uint32_t)bytes) first = (uint32_t)bytes;
+    spi_mem_note_flash_change(spi_mem, offset, first);
+    if ((uint32_t)bytes > first)
+        spi_mem_note_flash_change(spi_mem, page, (uint32_t)bytes - first);
+    return SPI_MEM_WRITE_ALLOWED;
 }
 
-static void spi_mem_erase(flexe_spi_mem_t *spi_mem,
-                          uint32_t offset, uint32_t size) {
+static spi_mem_write_result_t spi_mem_erase(flexe_spi_mem_t *spi_mem,
+                                             uint32_t offset, uint32_t size) {
     uint32_t flash_size = spi_mem_flash_size(spi_mem);
     if (offset >= flash_size || !spi_mem->mem->flash_data ||
         !spi_mem->mem->flash_insn)
-        return;
+        return SPI_MEM_WRITE_ALLOWED;
     if (size > flash_size - offset) size = flash_size - offset;
+    spi_mem_write_result_t gate = spi_mem_write_gate(spi_mem, offset, size);
+    if (gate != SPI_MEM_WRITE_ALLOWED) return gate;
     if (spi_debug_offset(offset))
         fprintf(stderr, "[SPIERASE] off=0x%X bytes=%u\n", offset, size);
     memset(spi_mem->mem->flash_data + offset, 0xFF, size);
     memset(spi_mem->mem->flash_insn + offset, 0xFF, size);
     spi_mem_note_flash_change(spi_mem, offset, size);
+    return SPI_MEM_WRITE_ALLOWED;
 }
 
 static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
@@ -664,31 +721,36 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
         return true;
     case 0x02u: case 0x32u:
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_program(spi_mem, offset, transaction->mosi, mosi);
+            if (spi_mem_program(spi_mem, offset, transaction->mosi, mosi) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         return true;
     case 0x20u:
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_erase(spi_mem, offset & ~0xFFFu, 0x1000u);
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFu, 0x1000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         return true;
     case 0x52u:
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_erase(spi_mem, offset & ~0x7FFFu, 0x8000u);
+            if (spi_mem_erase(spi_mem, offset & ~0x7FFFu, 0x8000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         return true;
     case 0xD8u:
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_erase(spi_mem, offset & ~0xFFFFu, 0x10000u);
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFFu, 0x10000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         return true;
     case 0x60u: case 0xC7u:
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_erase(spi_mem, 0u, spi_mem_flash_size(spi_mem));
+            if (spi_mem_erase(spi_mem, 0u, spi_mem_flash_size(spi_mem)) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         return true;
@@ -825,31 +887,35 @@ static bool spi_mem_execute_dedicated(flexe_spi_mem_t *spi_mem,
     }
     if (command & SPI_CMD_FLASH_PP) {
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_program(
+            if (spi_mem_program(
                 spi_mem, offset,
                 (const uint8_t *)spi_mem_buffer(spi_mem, host, false),
-                spi_mem_program_bytes(spi_mem, host));
+                spi_mem_program_bytes(spi_mem, host)) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         handled = true;
     }
     if (command & SPI_CMD_FLASH_SE) {
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_erase(spi_mem, offset & ~0xFFFu, 0x1000u);
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFu, 0x1000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         handled = true;
     }
     if (command & SPI_CMD_FLASH_BE) {
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_erase(spi_mem, offset & ~0xFFFFu, 0x10000u);
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFFu, 0x10000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         handled = true;
     }
     if (command & SPI_CMD_FLASH_CE) {
         if (flash->status[0] & FLASH_SR_WEL) {
-            spi_mem_erase(spi_mem, 0u, spi_mem_flash_size(spi_mem));
+            if (spi_mem_erase(spi_mem, 0u, spi_mem_flash_size(spi_mem)) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
             flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
         }
         handled = true;

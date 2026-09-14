@@ -38,12 +38,20 @@ ROM's live boot-handoff structure then describe the same device. Newer ROM
 handoff pointers are resolved from the official ROM ELF, while older fixed
 ROM ABI addresses remain target data. The functional SPI-memory model supports
 raw reads, NOR page programming, sector/block/chip erase, status and power-down
-commands. For its default 4 MiB GigaDevice `C8 40 16` profile, it also serves
+commands. Page programs wrap inside their 256-byte physical page. For its
+default 4 MiB GigaDevice `C8 40 16` profile, the model follows the
+[GD25Q32C datasheet's protection tables](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf):
+BP4..0 and CMP block page programs and whole sector/block erases that touch
+the selected range; chip erase is refused if any region is protected.
+Unprotected regions remain writable. A different JEDEC
+capacity with protection bits set cannot reuse that map; attempted writes
+remain diagnostic and leave flash unchanged. The 4 MiB profile also serves
 the chip's documented SFDP header and parameter tables through opcode `0x5A`;
 other capacities retain an unsupported-command diagnostic rather than
 advertising a contradictory 4 MiB density. The NOR's `0x66`/`0x99` reset
 sequence clears WEL and volatile modes while retaining nonvolatile status
-bits. The S3-generation `SPI_MEM_ADDR` register keeps a 24-bit user-mode flash
+bits. WP# pin-level locking and security-register protection are not modeled.
+The S3-generation `SPI_MEM_ADDR` register keeps a 24-bit user-mode flash
 address in bits 23:0; interpreting it as the classic controller's
 left-aligned address would silently erase or program the wrong flash sector.
 Read/program/erase tests now use the register sequence seen in an unmodified

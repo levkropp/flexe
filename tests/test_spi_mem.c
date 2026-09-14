@@ -3,6 +3,10 @@
 #include "peripherals.h"
 
 #define SPI_CMD_USR             (1u << 18)
+#define SPI_CMD_FLASH_CE        (1u << 22)
+#define SPI_CMD_FLASH_SE        (1u << 24)
+#define SPI_CMD_FLASH_PP        (1u << 25)
+#define SPI_CMD_FLASH_WREN      (1u << 30)
 #define SPI_USER_MOSI           (1u << 27)
 #define SPI_USER_MISO           (1u << 28)
 #define SPI_USER_ADDR           (1u << 30)
@@ -429,6 +433,262 @@ TEST(spi_mem_gd25q32c_status_survives_flash_reset) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_gd25q32c_protection_blocks_whole_operations) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* BP4/BP0 protect the top 4 KiB. WRSR on SPI1 takes WREN from SPI0. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x44u);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MOSI, 0x01u);
+    s3_spi_user_command(mem, S3_SPI0_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x05u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI0_BASE + S3_SPI_W0) & 0xFFu, 0x44u);
+
+    const uint32_t top = 0x3FF010u;
+    const uint32_t below = 0x3FE010u;
+    mem->flash_data[top] = mem->flash_insn[top] = 0xAAu;
+    mem->flash_data[below] = mem->flash_insn[below] = 0xAAu;
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, top);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI,
+                        0x02u);
+    ASSERT_EQ(mem->flash_data[top], 0xAAu);
+    ASSERT_EQ(mem->flash_insn[top], 0xAAu);
+    s3_spi_user_command(mem, S3_SPI0_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x05u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI0_BASE + S3_SPI_W0) & 0x02u, 0u);
+
+    /* A 32 KiB erase containing a protected 4 KiB sector is rejected in
+     * full, including its unprotected portion. Chip erase is rejected too. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, below);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR, 0x52u);
+    ASSERT_EQ(mem->flash_data[below], 0xAAu);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR, 0x20u);
+    ASSERT_EQ(mem->flash_data[below], 0xFFu);
+    ASSERT_EQ(mem->flash_data[top], 0xAAu);
+    mem->flash_data[below] = mem->flash_insn[below] = 0xAAu;
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0xC7u);
+    ASSERT_EQ(mem->flash_data[top], 0xAAu);
+    ASSERT_EQ(mem->flash_data[below], 0xAAu);
+
+    /* Dedicated controller commands must use the same NOR protection gate. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, top);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_WREN);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_PP);
+    ASSERT_EQ(mem->flash_data[top], 0xAAu);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_WREN);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_SE);
+    ASSERT_EQ(mem->flash_data[top], 0xAAu);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_WREN);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_CE);
+    ASSERT_EQ(mem->flash_data[below], 0xAAu);
+
+    /* CMP complements the range: only the top 4 KiB can now change. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 15u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x4044u);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MOSI, 0x01u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x35u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0x40u, 0x40u);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0x66u);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0x99u);
+    flexe_spi_mem_nor_state_t chip;
+    periph_flash_chip_snapshot(periph, &chip);
+    periph_flash_chip_restore(periph, &chip, true);
+    periph_flash_chip_snapshot(periph, &chip);
+    ASSERT_EQ(chip.status[0] & 0x7Cu, 0x44u);
+    ASSERT_EQ(chip.status[1] & 0x40u, 0x40u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, below);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI,
+                        0x02u);
+    ASSERT_EQ(mem->flash_data[below], 0xAAu);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, top);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI,
+                        0x02u);
+    ASSERT_EQ(mem->flash_data[top], 0u);
+    ASSERT_EQ(mem->flash_insn[top], 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(spi_mem_gd25q32c_protection_table_boundaries) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* Address pairs straddle the GigaDevice Tables 1.0/1.1 boundaries. */
+    static const struct {
+        uint8_t bp;
+        bool cmp;
+        uint32_t blocked;
+        uint32_t writable;
+    } cases[] = {
+        {0x00u, false, UINT32_MAX, 0x000000u},
+        {0x00u, true, 0x000000u, UINT32_MAX},
+        {0x07u, false, 0x3FFFFFu, UINT32_MAX},
+        {0x07u, true, UINT32_MAX, 0x3FFFFFu},
+        {0x01u, false, 0x3F0000u, 0x3EFFFFu},
+        {0x09u, false, 0x00FFFFu, 0x010000u},
+        {0x11u, false, 0x3FF000u, 0x3FEFFFu},
+        {0x19u, false, 0x000FFFu, 0x001000u},
+        {0x16u, false, 0x3F8000u, 0x3F7FFFu},
+        {0x1Eu, false, 0x007FFFu, 0x008000u},
+        {0x06u, false, 0x200000u, 0x1FFFFFu},
+        {0x0Eu, false, 0x1FFFFFu, 0x200000u},
+        {0x01u, true, 0x3EFFFFu, 0x3F0000u},
+        {0x09u, true, 0x010000u, 0x00FFFFu},
+        {0x11u, true, 0x3FEFFFu, 0x3FF000u},
+        {0x19u, true, 0x001000u, 0x000FFFu},
+    };
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        flexe_spi_mem_nor_state_t chip = {0};
+        chip.status[0] = cases[i].bp << 2;
+        chip.status[1] = cases[i].cmp ? 0x40u : 0u;
+        chip.status[2] = 0x20u;
+        periph_flash_chip_restore(periph, &chip, false);
+        const uint32_t addresses[] = {cases[i].blocked, cases[i].writable};
+        for (unsigned kind = 0; kind < 2u; kind++) {
+            uint32_t address = addresses[kind];
+            if (address == UINT32_MAX) continue;
+            mem->flash_data[address] = mem->flash_insn[address] = 0xFFu;
+            mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, address);
+            mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0u);
+            s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+            s3_spi_user_command(mem, S3_SPI1_BASE,
+                                SPI_USER_COMMAND | SPI_USER_ADDR |
+                                    SPI_USER_MOSI, 0x02u);
+            uint8_t expected = kind == 0u ? 0xFFu : 0u;
+            ASSERT_EQ(mem->flash_data[address], expected);
+            ASSERT_EQ(mem->flash_insn[address], expected);
+        }
+    }
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(spi_mem_page_program_wraps_within_physical_page) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    const uint32_t offset = 0x12FFu;
+    mem->flash_data[0x1200u] = mem->flash_insn[0x1200u] = 0xFFu;
+    mem->flash_data[0x1300u] = mem->flash_insn[0x1300u] = 0x5Au;
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offset);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 15u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x0000AABBu);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI,
+                        0x02u);
+    ASSERT_EQ(mem->flash_data[offset], 0xBBu);
+    ASSERT_EQ(mem->flash_data[0x1200u], 0xAAu);
+    ASSERT_EQ(mem->flash_data[0x1300u], 0x5Au);
+    ASSERT_EQ(mem->flash_insn[0x1200u], 0xAAu);
+    ASSERT_EQ(mem->flash_insn[0x1300u], 0x5Au);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(spi_mem_other_flash_profiles_reject_unknown_protection_layout) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target_with_flash(s3, 0x00800000u);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* C8 40 17 is not the profiled GD25Q32C. A nonzero BP bit must not
+     * silently write through its unknown protection region. */
+    flexe_spi_mem_nor_state_t chip = {0};
+    chip.status[0] = 0x04u;
+    periph_flash_chip_restore(periph, &chip, false);
+    const uint32_t offset = 0x1234u;
+    mem->flash_data[offset] = mem->flash_insn[offset] = 0xAAu;
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offset);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0u);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI,
+                        0x02u);
+    ASSERT_EQ(mem->flash_data[offset], 0xAAu);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_WREN);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_FLASH_SE);
+    ASSERT_EQ(mem->flash_data[offset], 0xAAu);
+    ASSERT_EQ(periph_unhandled_count(periph), 2u);
+
+    /* The same larger backing still supports unprotected NOR writes. */
+    chip.status[0] = 0u;
+    periph_flash_chip_restore(periph, &chip, false);
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI,
+                        0x02u);
+    ASSERT_EQ(mem->flash_data[offset], 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 2u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(spi_mem_s3_external_nor_state_survives_controller_rebuild) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -576,6 +836,10 @@ void run_spi_mem_tests(void) {
     RUN_TEST(spi_mem_reports_allocated_flash_capacity);
     RUN_TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile);
     RUN_TEST(spi_mem_gd25q32c_status_survives_flash_reset);
+    RUN_TEST(spi_mem_gd25q32c_protection_blocks_whole_operations);
+    RUN_TEST(spi_mem_gd25q32c_protection_table_boundaries);
+    RUN_TEST(spi_mem_page_program_wraps_within_physical_page);
+    RUN_TEST(spi_mem_other_flash_profiles_reject_unknown_protection_layout);
     RUN_TEST(spi_mem_s3_external_nor_state_survives_controller_rebuild);
     RUN_TEST(spi_mem_s3_user_address_matches_flash_partition_offset);
 }
