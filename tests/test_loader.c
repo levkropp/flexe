@@ -725,6 +725,8 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.ext1_select_offset, 0xE0u);
     ASSERT_EQ(s3->rtc_cntl.ext1_status_offset, 0xE4u);
     ASSERT_EQ(s3->rtc_cntl.ext1_select_mask, 0x003FFFFFu);
+    ASSERT_EQ(s3->rtc_cntl.brownout_offset, 0xE8u);
+    ASSERT_EQ(s3->rtc_cntl.brownout_reset, 0x43FF0010u);
     ASSERT_EQ(s3->rtc_cntl.wakeup_enable_shift, 15u);
     ASSERT_EQ(s3->rtc_io.ext0_select_offset, 0xDCu);
     ASSERT_EQ(s3->rtc_io.ext0_select_shift, 27u);

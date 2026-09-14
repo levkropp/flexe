@@ -64,7 +64,7 @@ grep -q 'CORE1 started' "$tmpdir/emu.err" ||
 grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err" ||
     fail "guest did not sustain native FreeRTOS execution"
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 145 ]] ||
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 125 ]] ||
     fail "unsupported MMIO count changed from the pinned baseline"
 cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
     fail "the guest UART transcript differs on replay"

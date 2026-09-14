@@ -399,6 +399,11 @@ typedef struct {
     uint16_t ext_wakeup_config_offset;
     uint16_t ext1_select_offset;
     uint16_t ext1_status_offset;
+    uint16_t brownout_offset;
+    uint32_t brownout_reset;
+    uint32_t brownout_writable_mask;
+    uint32_t brownout_detect_mask;
+    uint32_t brownout_count_clear_mask;
     uint32_t ext0_wakeup_level_mask;
     uint32_t ext1_wakeup_level_mask;
     uint32_t ext1_select_mask;

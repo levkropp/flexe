@@ -1279,6 +1279,41 @@ TEST(rtc_cntl_s3_gpio_wake_preempts_armed_timer)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_s3_brownout_config_reads_back_without_analog_detection)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    uint32_t addr = desc->base + desc->brownout_offset;
+    ASSERT_EQ(mem_read32(mem, addr), desc->brownout_reset);
+    ASSERT_EQ(mem_read32(mem, addr) & desc->brownout_detect_mask, 0u);
+
+    uint32_t config = (1u << 28u) | (1u << 27u) |
+                      (17u << 16u) | (1u << 14u) | (3u << 4u);
+    mem_write32(mem, addr, config | desc->brownout_count_clear_mask);
+    ASSERT_EQ(mem_read32(mem, addr), config);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+    mem_write32(mem, addr, config | desc->brownout_detect_mask);
+    ASSERT_EQ(mem_read32(mem, addr), config);
+    ASSERT_EQ(periph_unhandled_count(periph), 1);
+
+    periph_destroy(periph);
+    periph = periph_create(mem);
+    ASSERT_TRUE(periph != NULL);
+    if (periph) {
+        ASSERT_EQ(mem_read32(mem, addr), desc->brownout_reset);
+        periph_destroy(periph);
+    }
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_s3_counter_and_store_survive_controller_rebuild)
 {
     const flexe_target_desc_t *s3 =
@@ -1367,5 +1402,6 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_s3_ext0_ext1_wake_samples_gpio_and_latches_status);
     RUN_TEST(rtc_cntl_s3_gpio_wake_rejects_invalid_selection_and_retains_status);
     RUN_TEST(rtc_cntl_s3_gpio_wake_preempts_armed_timer);
+    RUN_TEST(rtc_cntl_s3_brownout_config_reads_back_without_analog_detection);
     RUN_TEST(rtc_cntl_s3_counter_and_store_survive_controller_rebuild);
 }

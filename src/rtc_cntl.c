@@ -41,6 +41,7 @@ struct flexe_rtc_cntl {
     uint32_t ext_wakeup_config;
     uint32_t ext1_select;
     uint32_t ext1_status;
+    uint32_t brownout_config;
     bool sleep_alarm_armed;
     bool sleep_requested;
     uint32_t clock_conf;
@@ -425,7 +426,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             desc->sleep_state_offset, desc->wakeup_state_offset,
             desc->digital_power_offset, desc->wakeup_cause_offset,
             desc->ext_wakeup_config_offset, desc->ext1_select_offset,
-            desc->ext1_status_offset,
+            desc->ext1_status_offset, desc->brownout_offset,
         };
         if (!(target->capabilities & FLEXE_TARGET_CAP_RTC_IO_V1) ||
             target->rtc_io.gpio_count == 0u ||
@@ -475,6 +476,19 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             desc->ext1_status_clear_mask == 0u ||
             (desc->ext1_status_clear_mask &
              (desc->ext1_status_clear_mask - 1u)) != 0u ||
+            desc->brownout_writable_mask == 0u ||
+            (desc->brownout_reset & ~desc->brownout_writable_mask) != 0u ||
+            desc->brownout_detect_mask == 0u ||
+            (desc->brownout_detect_mask &
+             (desc->brownout_detect_mask - 1u)) != 0u ||
+            desc->brownout_count_clear_mask == 0u ||
+            (desc->brownout_count_clear_mask &
+             (desc->brownout_count_clear_mask - 1u)) != 0u ||
+            ((desc->brownout_detect_mask |
+              desc->brownout_count_clear_mask) &
+             desc->brownout_writable_mask) != 0u ||
+            (desc->brownout_detect_mask &
+             desc->brownout_count_clear_mask) != 0u ||
             (desc->sleep_wakeup_interrupt_mask &
              desc->interrupt_valid_mask) !=
                 desc->sleep_wakeup_interrupt_mask ||
@@ -742,6 +756,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
             return rtc->ext1_select;
         if (offset == desc->ext1_status_offset)
             return rtc->ext1_status;
+        if (offset == desc->brownout_offset)
+            return rtc->brownout_config;
     }
     if (desc->cpu_stall_high_offset != 0u) {
         if (offset == desc->cpu_stall_options_offset)
@@ -951,6 +967,17 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         }
         if (offset == desc->ext1_status_offset)
             return; /* Physically read-only. */
+        if (offset == desc->brownout_offset) {
+            /* With a fixed nominal supply, the detection bit stays low.
+             * CNT_CLR is a write-only strobe; the remaining documented
+             * configuration fields read back until the next RTC reset. */
+            rtc->brownout_config = value & desc->brownout_writable_mask;
+            if ((value & ~(desc->brownout_writable_mask |
+                           desc->brownout_count_clear_mask)) != 0u &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
     }
     if (desc->cpu_stall_high_offset != 0u &&
         offset == desc->cpu_stall_options_offset) {
@@ -1111,6 +1138,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->reset_state = desc->reset_state_reset;
     rtc->wakeup_enable = desc->wakeup_enable_reset;
     rtc->digital_power = desc->digital_power_reset;
+    rtc->brownout_config = desc->brownout_reset;
     rtc->cpu_stall_options = desc->cpu_stall_options_reset;
     rtc->analog_conf = desc->analog_conf_reset;
     rtc->interrupt_enable = desc->interrupt_enable_reset;

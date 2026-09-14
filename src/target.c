@@ -672,6 +672,13 @@ static const flexe_target_desc_t TARGETS[] = {
             .ext_wakeup_config_offset = 0x064u,
             .ext1_select_offset = 0x0E0u,
             .ext1_status_offset = 0x0E4u,
+            /* rtc_cntl_reg.h: the S3 brownout comparator observes a
+             * nominal host supply unless voltage injection is modeled. */
+            .brownout_offset = 0x0E8u,
+            .brownout_reset = 0x43FF0010u,
+            .brownout_writable_mask = 0x5FFFFFF0u,
+            .brownout_detect_mask = 1u << 31,
+            .brownout_count_clear_mask = 1u << 29,
             .ext0_wakeup_level_mask = 1u << 30,
             .ext1_wakeup_level_mask = 1u << 31,
             .ext1_select_mask = 0x003FFFFFu,
