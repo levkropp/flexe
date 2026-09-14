@@ -15006,6 +15006,17 @@ int periph_iomux_function(const esp32_periph_t *p, int pin) {
     return flexe_io_mux_function(p->io_mux, (unsigned)pin);
 }
 
+void periph_flash_chip_snapshot(const esp32_periph_t *p,
+                                flexe_spi_mem_nor_state_t *out) {
+    flexe_spi_mem_nor_snapshot(p ? p->spi_mem : NULL, out);
+}
+
+void periph_flash_chip_restore(esp32_periph_t *p,
+                               const flexe_spi_mem_nor_state_t *state,
+                               bool power_cycle) {
+    flexe_spi_mem_nor_restore(p ? p->spi_mem : NULL, state, power_cycle);
+}
+
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
     free(p->unhandled_audit);

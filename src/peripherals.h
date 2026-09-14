@@ -8,6 +8,7 @@
 #include "gpio.h"
 #include "rtc_io.h"
 #include "rtc_cntl.h"
+#include "spi_mem.h"
 
 /* Forward declaration */
 typedef struct xtensa_cpu xtensa_cpu_t;
@@ -169,6 +170,14 @@ typedef void (*periph_irq_dispatch_fn)(void *ctx, int source);
 
 esp32_periph_t *periph_create(xtensa_mem_t *mem);
 void periph_destroy(esp32_periph_t *p);
+
+/* SoC software reset drops SPI controller registers, not the external NOR's
+ * command-visible state. Snapshot the chip before the peripheral rebuild. */
+void periph_flash_chip_snapshot(const esp32_periph_t *p,
+                                flexe_spi_mem_nor_state_t *out);
+void periph_flash_chip_restore(esp32_periph_t *p,
+                               const flexe_spi_mem_nor_state_t *state,
+                               bool power_cycle);
 
 /* RTC slow counter/STORE survive a session software reset. Other controller
  * registers and the watchdog are reconstructed from reset defaults. */

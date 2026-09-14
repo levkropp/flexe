@@ -59,10 +59,16 @@ per-core/PID cache contents, bus contention, wear, or interrupted-write power
 behavior.
 
 Software resets retain the live NOR backing, including guest-written NVS and
-filesystem partitions. Flexe reloads internal-memory application segments
-and rebuilds peripherals without copying the original factory/app file over
-flash. Factory and standalone app-image paths have regression tests for this
-distinction. Changes to the originally loaded application bytes are rejected
+filesystem partitions. They also keep the external NOR's command-visible
+status and mode state while resetting the SoC's SPI controller registers.
+On S3 [deep-sleep flash power-down](https://docs.espressif.com/projects/esp-idf/en/v5.2/esp32s3/api-reference/system/sleep_modes.html#power-down-of-flash),
+the modeled GD25Q32C retains only its documented nonvolatile status bits;
+other capacity profiles do not claim a nonvolatile register layout and emit a
+diagnostic if potentially nonvolatile status would be lost. Flexe
+reloads internal-memory application segments and rebuilds peripherals without
+copying the original factory/app file over flash. Factory and standalone
+app-image paths have regression tests for this distinction. Changes to the
+originally loaded application bytes are rejected
 with an OTA diagnostic. Selecting and booting a different OTA slot is not
 modeled yet and must not be treated as a verified OTA workflow. Flash state
 remains in the emulator session; it is not automatically written back to the

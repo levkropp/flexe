@@ -42,6 +42,14 @@ static const char *write_temp(const uint8_t *data, size_t len) {
     return path;
 }
 
+static void loader_flash_user_command(xtensa_mem_t *mem, uint32_t user,
+                                      uint8_t opcode) {
+    const uint32_t base = 0x3FF42000u; /* Classic SPI1 */
+    mem_write32(mem, base + 0x01Cu, user);
+    mem_write32(mem, base + 0x024u, (7u << 28) | opcode);
+    mem_write32(mem, base, 1u << 18);
+}
+
 typedef struct {
     unsigned calls;
     size_t write_len;
@@ -252,6 +260,56 @@ TEST(session_software_reset_preserves_guest_flash) {
         ASSERT_EQ(spi_attachments.host[host].device[0].sck_pin,
                   host == 0u ? 14 : 18);
     }
+    flexe_session_destroy(session);
+}
+
+TEST(session_software_reset_preserves_external_nor_state) {
+    uint8_t bin[36] = {0};
+    bin[0] = 0xE9u;
+    bin[1] = 1u;
+    put_le32(&bin[4], 0x40080000u);
+    put_le32(&bin[24], 0x3FFB0000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x12345678u);
+    const char *path = write_temp(bin, sizeof(bin));
+    ASSERT_TRUE(path != NULL);
+    if (!path) return;
+
+    flexe_session_config_t cfg = {
+        .bin_path = path, .single_core = 1, .disable_jit = 1,
+    };
+    flexe_session_t *session = flexe_session_create(&cfg);
+    ASSERT_TRUE(session != NULL);
+    if (!session) return;
+    xtensa_mem_t *mem = flexe_session_mem(session);
+    const uint32_t base = 0x3FF42000u;
+    const uint32_t command = 1u << 31;
+    const uint32_t mosi = 1u << 27;
+    const uint32_t miso = 1u << 28;
+
+    /* WREN and WRSR-2 set the external chip's nonvolatile QE bit. WREN
+     * again leaves its volatile latch set at the SoC reset boundary. */
+    loader_flash_user_command(mem, command, 0x06u);
+    mem_write32(mem, base + 0x028u, 7u);
+    mem_write32(mem, base + 0x080u, 0x02u);
+    loader_flash_user_command(mem, command | mosi, 0x31u);
+    loader_flash_user_command(mem, command, 0x06u);
+    mem_write32(mem, base + 0x02Cu, 7u);
+    loader_flash_user_command(mem, command | miso, 0x35u);
+    ASSERT_EQ(mem_read32(mem, base + 0x080u) & 0xFFu, 0x02u);
+    loader_flash_user_command(mem, command | miso, 0x05u);
+    ASSERT_EQ(mem_read32(mem, base + 0x080u) & 0x02u, 0x02u);
+    mem_write32(mem, base + 0x020u, 0u); /* on-chip USER1, not NOR state */
+
+    flexe_session_reset(session);
+    ASSERT_EQ(flexe_session_reset_count(session), 1u);
+    ASSERT_TRUE(flexe_session_mem(session) == mem);
+    ASSERT_EQ(mem_read32(mem, base + 0x020u), 0x5C000007u);
+    loader_flash_user_command(mem, command | miso, 0x35u);
+    ASSERT_EQ(mem_read32(mem, base + 0x080u) & 0xFFu, 0x02u);
+    loader_flash_user_command(mem, command | miso, 0x05u);
+    ASSERT_EQ(mem_read32(mem, base + 0x080u) & 0x02u, 0x02u);
+    ASSERT_EQ(periph_unhandled_count(flexe_session_periph(session)), 0u);
     flexe_session_destroy(session);
 }
 
@@ -974,6 +1032,7 @@ void run_loader_tests(void) {
 
     RUN_TEST(loader_single_segment);
     RUN_TEST(session_software_reset_preserves_guest_flash);
+    RUN_TEST(session_software_reset_preserves_external_nor_state);
     RUN_TEST(loader_reports_image_revision_metadata);
     RUN_TEST(loader_rejects_reserved_flash_capacity);
     RUN_TEST(loader_rejects_app_larger_than_declared_flash);

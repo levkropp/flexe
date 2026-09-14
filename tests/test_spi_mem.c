@@ -315,6 +315,7 @@ TEST(spi_mem_reports_allocated_flash_capacity) {
     ASSERT_EQ(periph_unhandled_count(periph), 0u);
     periph_destroy(periph);
     mem_destroy(mem);
+
 }
 
 TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile) {
@@ -428,6 +429,94 @@ TEST(spi_mem_gd25q32c_status_survives_flash_reset) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_s3_external_nor_state_survives_controller_rebuild) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* Program QE through SPI1 after WREN on SPI0, then put the external
+     * flash to sleep. A new SoC controller must not power-cycle the chip. */
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x02u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MOSI, 0x31u);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0xB9u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 0u);
+    flexe_spi_mem_nor_state_t chip;
+    periph_flash_chip_snapshot(periph, &chip);
+    ASSERT_EQ(chip.status[1], 0x02u);
+    ASSERT_TRUE(chip.powered_down);
+    periph_destroy(periph);
+
+    periph = periph_create(mem);
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_USER1), 0x5C000007u);
+    flexe_spi_mem_nor_state_t cold_chip;
+    periph_flash_chip_snapshot(periph, &cold_chip);
+    ASSERT_EQ(cold_chip.status[1], 0u);
+    ASSERT_TRUE(!cold_chip.powered_down);
+
+    periph_flash_chip_restore(periph, &chip, false);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x35u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFu, 0xFFu);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0xABu);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x35u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFu, 0x02u);
+
+    /* Deep sleep removes flash power. GD25Q32C's QE and drive-strength
+     * settings survive, while WEL, suspend/HPF and transient modes do not. */
+    flexe_spi_mem_nor_state_t deep = chip;
+    deep.status[0] |= 0x02u;
+    deep.status[1] |= 0x84u;
+    deep.status[2] |= 0x10u;
+    deep.address_4byte = true;
+    deep.reset_armed = true;
+    periph_flash_chip_restore(periph, &deep, true);
+    flexe_spi_mem_nor_state_t wake;
+    periph_flash_chip_snapshot(periph, &wake);
+    ASSERT_EQ(wake.status[0] & 0x03u, 0u);
+    ASSERT_EQ(wake.status[1], 0x02u);
+    ASSERT_EQ(wake.status[2], 0x20u);
+    ASSERT_TRUE(!wake.powered_down);
+    ASSERT_TRUE(!wake.address_4byte);
+    ASSERT_TRUE(!wake.reset_armed);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+
+    /* A different capacity has no claimed nonvolatile status layout. Its
+     * deep-sleep path stays cold and emits an explicit diagnostic. */
+    mem = mem_create_for_target_with_flash(s3, 0x00800000u);
+    periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    periph_flash_chip_restore(periph, &deep, true);
+    periph_flash_chip_snapshot(periph, &wake);
+    ASSERT_EQ(wake.status[1], 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(spi_mem_s3_user_address_matches_flash_partition_offset) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -487,5 +576,6 @@ void run_spi_mem_tests(void) {
     RUN_TEST(spi_mem_reports_allocated_flash_capacity);
     RUN_TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile);
     RUN_TEST(spi_mem_gd25q32c_status_survives_flash_reset);
+    RUN_TEST(spi_mem_s3_external_nor_state_survives_controller_rebuild);
     RUN_TEST(spi_mem_s3_user_address_matches_flash_partition_offset);
 }

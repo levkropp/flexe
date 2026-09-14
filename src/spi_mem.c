@@ -90,12 +90,7 @@ typedef struct {
  * PSRAM buses. Device state therefore lives here, not in either controller's
  * register file. A write-enable issued through one host is visible to the
  * other host just as it is on the SoC. */
-typedef struct {
-    uint8_t status[3];
-    bool reset_armed;
-    bool powered_down;
-    bool address_4byte;
-} spi_nor_state_t;
+typedef flexe_spi_mem_nor_state_t spi_nor_state_t;
 
 typedef struct {
     bool reset_armed;
@@ -257,6 +252,20 @@ static uint32_t spi_mem_flash_size(const flexe_spi_mem_t *spi_mem) {
 static bool spi_mem_is_gd25q32c(const flexe_spi_mem_t *spi_mem) {
     return mem_flash_jedec_id(spi_mem->mem) == 0x001640C8u &&
            spi_mem_flash_size(spi_mem) == 0x00400000u;
+}
+
+static void spi_mem_nor_clear_volatile(flexe_spi_mem_t *spi_mem) {
+    spi_nor_state_t *flash = &spi_mem->flash;
+    flash->status[0] &= (uint8_t)~(FLASH_SR_WIP | FLASH_SR_WEL);
+    if (spi_mem_is_gd25q32c(spi_mem)) {
+        /* GD25Q32C: SR2.SUS1/SUS2 and SR3.HPF are volatile. The retained
+         * bits are SRP0/BP4..0, CMP/LB3..1/QE/SRP1 and DRV1/DRV0. */
+        flash->status[1] &= 0x7Bu;
+        flash->status[2] &= 0x60u;
+    }
+    flash->powered_down = false;
+    flash->address_4byte = false;
+    flash->reset_armed = false;
 }
 
 static uint32_t *spi_mem_buffer(flexe_spi_mem_t *spi_mem,
@@ -688,10 +697,7 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
         if (flash->reset_armed) {
             /* RESET clears WIP/WEL and volatile modes, not the NOR's
              * nonvolatile protection, quad-enable or drive-strength bits. */
-            flash->status[0] &= (uint8_t)~(FLASH_SR_WIP | FLASH_SR_WEL);
-            flash->powered_down = false;
-            flash->address_4byte = false;
-            flash->reset_armed = false;
+            spi_mem_nor_clear_volatile(spi_mem);
         }
         return true;
     case 0xB7u: flash->address_4byte = true; return true;
@@ -1015,4 +1021,28 @@ void flexe_spi_mem_destroy(flexe_spi_mem_t *spi_mem) {
             spi_mem->mem, spi_mem->target->spi_mem.base[host],
             spi_mem->target->spi_mem.register_size, NULL, NULL, NULL);
     free(spi_mem);
+}
+
+void flexe_spi_mem_nor_snapshot(const flexe_spi_mem_t *spi_mem,
+                                flexe_spi_mem_nor_state_t *out) {
+    if (!out) return;
+    *out = spi_mem ? spi_mem->flash : (flexe_spi_mem_nor_state_t){0};
+}
+
+void flexe_spi_mem_nor_restore(flexe_spi_mem_t *spi_mem,
+                               const flexe_spi_mem_nor_state_t *state,
+                               bool power_cycle) {
+    if (!spi_mem || !state) return;
+    if (power_cycle && !spi_mem_is_gd25q32c(spi_mem)) {
+        /* No assumed status-bit map for another capacity/device profile. */
+        if ((state->status[0] & 0xFCu) != 0u ||
+            state->status[1] != 0u || state->status[2] != 0u)
+            fprintf(stderr,
+                    "[spi-mem] unsupported nonvolatile status retention "
+                    "after flash power cycle (JEDEC %06X)\n",
+                    mem_flash_jedec_id(spi_mem->mem));
+        return;
+    }
+    spi_mem->flash = *state;
+    if (power_cycle) spi_mem_nor_clear_volatile(spi_mem);
 }

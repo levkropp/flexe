@@ -658,9 +658,9 @@ void flexe_session_destroy(flexe_session_t *s)
  * Every subsystem is torn down and rebuilt, because a fresh boot must see a
  * cold machine: half-reset state (peripheral registers mid-transaction, open
  * sockets, a scheduler mid-switch) makes the firmware crash on the way back
- * up. One thing survives, deliberately: the memory object -- so flash, and
- * with it NVS and SPIFFS, persists exactly as across a real reboot, which is
- * the entire reason firmware reboots itself.
+ * up. The memory object survives so guest-written flash, NVS and SPIFFS do.
+ * The external NOR chip's command state also survives an SoC-only restart;
+ * deep sleep powers flash down and retains only its nonvolatile state.
  */
 /* RTC domains, which a deep-sleep wake must preserve. Everything else is
  * rebuilt: that is the point of the reset. */
@@ -672,6 +672,7 @@ void flexe_session_destroy(flexe_session_t *s)
 void flexe_session_reset(flexe_session_t *s)
 {
     if (!s) return;
+    bool flash_power_cycle = s->preserve_rtc_mem != 0;
     s->gpio_sleeping = false;
     uint64_t cycles = s->cpu[0].cycle_count;
 
@@ -683,6 +684,8 @@ void flexe_session_reset(flexe_session_t *s)
     periph_i2c_attachments_snapshot(s->periph, &i2c_attachments);
     periph_spi_attachment_snapshot_t spi_attachments;
     periph_spi_attachments_snapshot(s->periph, &spi_attachments);
+    flexe_spi_mem_nor_state_t flash_chip;
+    periph_flash_chip_snapshot(s->periph, &flash_chip);
     flexe_rtc_cntl_retained_t rtc_retained;
     periph_rtc_retained_snapshot(s->periph, &rtc_retained);
 
@@ -756,6 +759,7 @@ void flexe_session_reset(flexe_session_t *s)
     periph_unhandled_audit_resume(s->periph, &audit);
     periph_i2c_attachments_restore(s->periph, &i2c_attachments);
     periph_spi_attachments_restore(s->periph, &spi_attachments);
+    periph_flash_chip_restore(s->periph, &flash_chip, flash_power_cycle);
     periph_rtc_retained_restore(s->periph, &rtc_retained);
     if (s->target->id == FLEXE_TARGET_ESP32S3)
         periph_set_wake_state(s->periph, 0u,
