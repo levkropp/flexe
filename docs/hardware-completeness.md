@@ -66,13 +66,14 @@ end-to-end flash-format/mount check. With the matching application ELF, the
 host-backed socket/select boundary now lets the unmodified firmware serve
 `GET /wifi` as `200 OK` with its 4,985-byte configuration HTML. This is a
 service shim, not a modeled Wi-Fi radio: the page reports no networks, and
-the full POST/restart/reload replay still reports 35,055 unsupported accesses.
-The separate 4-billion-cycle audit below counts 6,926 (mostly RF/PHY). The S3
-application handoff now clears the power-on flash-boot watchdog mode skipped
-with the second-stage bootloader. Restoring ROM-owned BSS and interface state
-from the official ROM ELF during a software restart lets NerdMiner initialize
-again and reload its saved settings instead of panicking during PSRAM setup,
-while physical SRAM outside those sections remains intact for app `.noinit`.
+the full POST/restart/reload replay still reports about 35,000 unsupported
+accesses. The separate 4-billion-cycle audit below counts 6,920 (mostly
+RF/PHY). The S3 application handoff now clears the power-on flash-boot
+watchdog mode skipped with the second-stage bootloader. Restoring ROM-owned
+BSS and interface state from the official ROM ELF during a software restart
+lets NerdMiner initialize again and reload its saved settings instead of
+panicking during PSRAM setup, while physical SRAM outside those sections
+remains intact for app `.noinit`.
 The scripted POST/restart/reload gate exercises that full path. WLED now
 provides a second, independently sourced production interactive network and
 output scenario. The remaining RF/PHY gaps prohibit a
@@ -519,16 +520,20 @@ behavior remain unsupported, and the assertion is not suppressed.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
-the following interpreter audit at 4 billion aggregate cycles reports 6,926
+the following interpreter audit at 4 billion aggregate cycles reports 6,920
 unsupported accesses. The default 4 MiB GigaDevice flash's `0x5A` SFDP reads
 now use the [GD25Q32C parameter table](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf);
 other capacity profiles retain an explicit unsupported command instead of
-borrowing its 4 MiB density. Of
-these, 6,728 are in the `0x6000E000` RF/PHY window; the hottest named callers
-include `wr_rf_freq_mem`, `set_chan_freq_sw_start`, and `bt_txpwr_freq`.
-That concentration identifies a network-controller boundary, not evidence
-that the reads and writes are harmless or that a zero-returning PHY model is
-correct. The remaining inventory includes documented SYSCON, RTC, and sensor
+borrowing its 4 MiB density. This image advertises 8 MiB, so one bootloader
+SFDP read is still reported. Six previously reported SPI1 commands are
+16-bit octal-PSRAM register probes on CS1: with no PSRAM attached in Flexe's
+current S3 profile, they now clock through and return undriven high bits,
+without pretending to supply PSRAM. Of these, 6,728 are in the `0x6000E000`
+RF/PHY window; the hottest named callers include `wr_rf_freq_mem`,
+`set_chan_freq_sw_start`, and `bt_txpwr_freq`. That concentration identifies
+a network-controller boundary, not evidence that the reads and writes are
+harmless or that a zero-returning PHY model is correct. The remaining
+inventory includes documented SYSCON, RTC, and sensor
 registers. The `--unhandled-report` inventory and total now accumulate across
 firmware-requested resets; neither this output nor the working network
 scenario proves real RF behavior. Repeat the measurement with the matching

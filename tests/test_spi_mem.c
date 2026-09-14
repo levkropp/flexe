@@ -235,6 +235,74 @@ TEST(spi_mem_classic_routes_psram_by_chip_select_and_wire_phases) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_unpopulated_chip_select_clocks_any_command_width) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* Octal PSRAM mode-register traffic is 16-bit command + 32-bit address.
+     * With no PSRAM attached to S3 CS1, the wires clock but nobody drives
+     * MISO. The same command on CS0 must still be rejected by NOR flash. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISC, 0x1u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER,
+                SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MISO);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 31u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER2,
+                (15u << 28) | 0x4040u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 15u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_USR);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0), 0xFFFFFFFFu);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER,
+                SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MOSI);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER2,
+                (15u << 28) | 0xC0C0u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 15u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x28u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_USR);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0), 0x28u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISC, 0x2u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_CMD, SPI_CMD_USR);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+
+    /* The classic controller has an unpopulated CS2 as well. */
+    mem = mem_create();
+    periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    mem_write32(mem, CLASSIC_SPI1_BASE + CLASSIC_SPI_PIN, 0x3u);
+    mem_write32(mem, CLASSIC_SPI1_BASE + CLASSIC_SPI_USER,
+                SPI_USER_COMMAND | SPI_USER_MISO);
+    mem_write32(mem, CLASSIC_SPI1_BASE + CLASSIC_SPI_USER2,
+                (15u << 28) | 0x4040u);
+    mem_write32(mem, CLASSIC_SPI1_BASE + CLASSIC_SPI_MISO_DLEN, 15u);
+    mem_write32(mem, CLASSIC_SPI1_BASE, SPI_CMD_USR);
+    ASSERT_EQ(mem_read32(mem, CLASSIC_SPI1_BASE + CLASSIC_SPI_W0),
+              0xFFFFFFFFu);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -832,6 +900,7 @@ void run_spi_mem_tests(void) {
     TEST_SUITE("Target SPI memory controller");
     RUN_TEST(spi_mem_uses_target_layouts_and_reports_jedec_id);
     RUN_TEST(spi_mem_classic_routes_psram_by_chip_select_and_wire_phases);
+    RUN_TEST(spi_mem_unpopulated_chip_select_clocks_any_command_width);
     RUN_TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation);
     RUN_TEST(spi_mem_reports_allocated_flash_capacity);
     RUN_TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile);

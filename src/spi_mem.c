@@ -522,10 +522,13 @@ static void spi_debug_command(unsigned host, const spi_mem_host_t *state,
     if (!spi_debug_offset(offset)) return;
     fprintf(stderr,
             "[SPI%u] op=%02X off=0x%06X mosi=%d miso=%d pc=%08X core=%d "
-            "user=%08X user1=%08X addr=%08X\n",
+            "user=%08X user1=%08X user2=%08X addr=%08X cs=%08X w0=%08X\n",
             host, opcode, offset, mosi, miso, g_dbg_pc, g_dbg_core,
             state->reg[layout->user_offset / 4u],
-            state->reg[layout->user1_offset / 4u], state->reg[1]);
+            state->reg[layout->user1_offset / 4u],
+            state->reg[layout->user2_offset / 4u], state->reg[1],
+            state->reg[layout->chip_select_offset / 4u],
+            state->reg[layout->buffer_offset / 4u]);
 }
 
 static uint8_t *spi_mem_prepare_input(flexe_spi_mem_t *spi_mem,
@@ -819,20 +822,24 @@ static bool spi_mem_execute_user(flexe_spi_mem_t *spi_mem, unsigned index,
     spi_debug_command(index, host, spi_mem->layout, transaction.opcode,
                       transaction.address, transaction.mosi_bytes,
                       transaction.miso_bytes);
+    spi_mem_device_t device = spi_mem_selected_device(spi_mem, host);
+    /* SPI clocks still complete when no connected slave is selected. The
+     * command width/encoding only matters to a device that sees the wires;
+     * in particular, an absent S3 CS1 must not reject octal-PSRAM probes. */
+    if (device == SPI_MEM_DEVICE_NONE) {
+        if (transaction.miso_bytes > 0)
+            spi_mem_prepare_input(spi_mem, host);
+        return true;
+    }
     if (!transaction.opcode_valid) return false;
 
-    switch (spi_mem_selected_device(spi_mem, host)) {
+    switch (device) {
     case SPI_MEM_DEVICE_FLASH:
         return spi_mem_execute_flash(spi_mem, host, &transaction);
     case SPI_MEM_DEVICE_PSRAM:
         return spi_mem_execute_psram(spi_mem, host, &transaction);
-    case SPI_MEM_DEVICE_NONE:
-        /* A valid transaction to an unpopulated chip select completes; no
-         * slave drives MISO, so pull-ups return all ones. */
-        if (transaction.miso_bytes > 0)
-            spi_mem_prepare_input(spi_mem, host);
-        return true;
     case SPI_MEM_DEVICE_CONTENTION:
+    case SPI_MEM_DEVICE_NONE: /* Already handled above. */
     default:
         return false;
     }
