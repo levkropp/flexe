@@ -14694,10 +14694,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
         if (p->target_gpio) {
             const flexe_rmt_v1_desc_t *desc = &target->rmt_v1;
+            unsigned rx_count = (unsigned)desc->channel_count -
+                                (unsigned)desc->tx_channel_count;
             flexe_gpio_set_input_signal_handler(
                 p->target_gpio, target_gpio_input_signal_changed, p);
-            for (unsigned ch = 0u;
-                 ch < desc->channel_count - desc->tx_channel_count; ch++)
+            for (unsigned ch = 0u; ch < rx_count; ch++)
                 flexe_gpio_watch_input_signal(
                     p->target_gpio, desc->input_signal_base + ch);
         }
