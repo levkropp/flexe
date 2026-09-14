@@ -102,6 +102,8 @@ int                flexe_session_is_native_freertos(const flexe_session_t *s);
 /* How many times the machine has been rebuilt: software resets and
  * deep-sleep wakes. */
 unsigned           flexe_session_reset_count(const flexe_session_t *s);
+/* True while an S3 EXT0/EXT1 wake is waiting for host-driven GPIO input. */
+bool               flexe_session_gpio_sleeping(const flexe_session_t *s);
 jit_state_t       *flexe_session_jit(flexe_session_t *s);
 
 /* Execute up to max_cycles on one core using the session's configured

@@ -15506,7 +15506,7 @@ bool periph_take_sleep_request(esp32_periph_t *p, bool *deep,
     if (p && p->target_rtc_cntl) {
         bool accepted = flexe_rtc_cntl_take_sleep_request(
             p->target_rtc_cntl, deep, timeout_us);
-        if (accepted && cause) *cause = 0u;
+        if (accepted && cause) *cause = periph_sleep_poll_wake(p);
         return accepted;
     }
     if (!p || !p->sleep_requested) return false;
@@ -15542,8 +15542,23 @@ bool periph_take_sleep_request(esp32_periph_t *p, bool *deep,
 /* Poll the level-triggered wake sources while time is being stepped forward. */
 uint32_t periph_sleep_poll_wake(esp32_periph_t *p)
 {
-    if (p && p->target_rtc_cntl) return 0u; /* Timer via session deadline. */
+    if (p && p->target_rtc_cntl) {
+        uint32_t high = 0u;
+        int ext0 = flexe_rtc_io_ext0_selector(p->target_rtc_io);
+        int ext0_level = ext0 >= 0 ?
+            flexe_rtc_io_input_level(p->target_rtc_io, (unsigned)ext0) : -1;
+        for (unsigned pin = 0u; pin < p->target->rtc_io.gpio_count; pin++)
+            if (flexe_gpio_input_level(p->target_gpio, pin) == 1)
+                high |= 1u << pin;
+        return flexe_rtc_cntl_poll_gpio_wake(p->target_rtc_cntl,
+                                             ext0_level, high);
+    }
     return p ? rtc_wake_condition(p) : 0;
+}
+
+bool periph_sleep_has_gpio_wake(const esp32_periph_t *p)
+{
+    return p && flexe_rtc_cntl_has_gpio_wake(p->target_rtc_cntl);
 }
 
 /* Record why the chip woke and release the guest's wait. Light sleep resumes

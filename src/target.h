@@ -394,6 +394,15 @@ typedef struct {
     uint32_t sleep_alarm_interrupt_mask;
     uint32_t digital_wrap_power_down_mask;
     uint32_t timer_wakeup_mask;
+    uint32_t ext0_wakeup_mask;
+    uint32_t ext1_wakeup_mask;
+    uint16_t ext_wakeup_config_offset;
+    uint16_t ext1_select_offset;
+    uint16_t ext1_status_offset;
+    uint32_t ext0_wakeup_level_mask;
+    uint32_t ext1_wakeup_level_mask;
+    uint32_t ext1_select_mask;
+    uint32_t ext1_status_clear_mask;
     uint32_t sleep_wakeup_interrupt_mask;
     uint32_t wakeup_valid_mask;
     uint32_t wakeup_enable_reset;
@@ -410,6 +419,9 @@ typedef struct {
     uint8_t data_shift;
     uint16_t pad_base_offset;
     uint32_t pad_mux_mask;
+    uint16_t ext0_select_offset;
+    uint8_t ext0_select_shift;
+    uint8_t ext0_select_width;
     uint32_t pad_reset[FLEXE_TARGET_RTC_IO_PIN_MAX];
 } flexe_rtc_io_desc_t;
 

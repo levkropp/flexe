@@ -1501,7 +1501,8 @@ int main(int argc, char *argv[]) {
     uint32_t prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
     unsigned observed_resets = flexe_session_reset_count(session);
     while (cycles < max_cycles_u64 &&
-           (cpu->running || (cpu1_any && cpu1_any->running)) &&
+           (cpu->running || (cpu1_any && cpu1_any->running) ||
+            flexe_session_gpio_sleeping(session)) &&
            !cpu->breakpoint_hit && !cpu->debug_break &&
            !(cpu1_any && cpu1_any->breakpoint_hit) &&
            !(cpu1_any && cpu1_any->debug_break)) {
@@ -1514,7 +1515,8 @@ int main(int argc, char *argv[]) {
         if (window_trace)
             cpu->window_trace_active = (trace_start == 0 || ccnt >= trace_start) &&
                                       (ccnt < trace_end);
-        int in_trace_window = need_step &&
+        bool was_gpio_sleeping = flexe_session_gpio_sleeping(session);
+        int in_trace_window = need_step && !was_gpio_sleeping &&
             (trace_start == 0 || ccnt >= trace_start) &&
             (ccnt < trace_end);
 
@@ -1667,10 +1669,14 @@ int main(int argc, char *argv[]) {
             /* --- Batch execution --- */
             uint32_t pc_before = cpu->pc;
             uint64_t remaining = max_cycles_u64 - cycles;
-            int n = remaining < (uint64_t)batch ? (int)remaining : batch;
+            uint64_t wanted = was_gpio_sleeping ?
+                (uint64_t)xtensa_cpu_freq_mhz(cpu) * 1000u :
+                (uint64_t)batch;
+            int n = remaining < wanted ? (int)remaining : (int)wanted;
             /* Cap batch at trace window boundary if approaching.
              * Use cpu->cycle_count to match event log timestamps. */
-            if (need_step && cpu->cycle_count < trace_start) {
+            if (!was_gpio_sleeping && need_step &&
+                cpu->cycle_count < trace_start) {
                 uint64_t to_window = trace_start - cpu->cycle_count;
                 if (to_window < (uint64_t)n) n = (int)to_window;
             }
@@ -1701,8 +1707,10 @@ int main(int argc, char *argv[]) {
                  * via flexe_session_post_batch(). */
                 if (cpu->breakpoint_hit || cpu->debug_break ||
                     (cpu1_any && cpu1_any->breakpoint_hit) ||
-                    (cpu1_any && cpu1_any->debug_break) || cpu->halted ||
-                    (!cpu->running && !(cpu1_any && cpu1_any->running))) break;
+                    (cpu1_any && cpu1_any->debug_break) ||
+                    (!was_gpio_sleeping && cpu->halted) ||
+                    (!was_gpio_sleeping && !cpu->running &&
+                     !(cpu1_any && cpu1_any->running))) break;
             }
             if (cpu->pc == pc_before && frt && !native_freertos) {
                 uint32_t param;
@@ -1740,7 +1748,8 @@ int main(int argc, char *argv[]) {
         if (cpu1_any) {
             uint32_t d1 = cpu1_any->ccount - prev_cc1;
             prev_cc1 = cpu1_any->ccount;
-            if (d1 <= (uint32_t)batch * 4)   /* clamps ccount resets/xwsr */
+            if (!was_gpio_sleeping &&
+                d1 <= (uint32_t)batch * 4)   /* clamps ccount resets/xwsr */
                 cycles += d1;
         }
 

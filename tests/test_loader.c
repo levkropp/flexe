@@ -719,7 +719,15 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.digital_power_offset, 0x90u);
     ASSERT_EQ(s3->rtc_cntl.wakeup_cause_offset, 0x130u);
     ASSERT_EQ(s3->rtc_cntl.sleep_alarm_interrupt_mask, 1u << 10u);
+    ASSERT_EQ(s3->rtc_cntl.ext0_wakeup_mask, 1u);
+    ASSERT_EQ(s3->rtc_cntl.ext1_wakeup_mask, 1u << 1u);
+    ASSERT_EQ(s3->rtc_cntl.ext_wakeup_config_offset, 0x64u);
+    ASSERT_EQ(s3->rtc_cntl.ext1_select_offset, 0xE0u);
+    ASSERT_EQ(s3->rtc_cntl.ext1_status_offset, 0xE4u);
+    ASSERT_EQ(s3->rtc_cntl.ext1_select_mask, 0x003FFFFFu);
     ASSERT_EQ(s3->rtc_cntl.wakeup_enable_shift, 15u);
+    ASSERT_EQ(s3->rtc_io.ext0_select_offset, 0xDCu);
+    ASSERT_EQ(s3->rtc_io.ext0_select_shift, 27u);
     ASSERT_EQ(s3->efuse.base, 0x60007000u);
     ASSERT_EQ(s3->efuse.read_data_word_count, 84u);
     ASSERT_EQ(s3->efuse.read_data[6], 0x00000001u);

@@ -1070,7 +1070,7 @@ TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources)
                                             &cause));
     ASSERT_EQ(periph_unhandled_count(periph), 1);
 
-    mem_write32(mem, wakeup, 1u << desc->wakeup_enable_shift);
+    mem_write32(mem, wakeup, (1u << 5u) << desc->wakeup_enable_shift);
     mem_write32(mem, state, desc->sleep_enable_mask);
     ASSERT_FALSE(periph_take_sleep_request(periph, &deep, &timeout_us,
                                             &cause));
@@ -1082,6 +1082,199 @@ TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources)
     mem_write32(mem, state, desc->sleep_enable_mask | (1u << 22u));
     ASSERT_EQ(mem_read32(mem, state) & (1u << 22u), 1u << 22u);
     ASSERT_EQ(periph_unhandled_count(periph), 4);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_ext0_ext1_wake_samples_gpio_and_latches_status)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
+    const flexe_rtc_io_desc_t *io = &s3->rtc_io;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t state = rtc->base + rtc->sleep_state_offset;
+    uint32_t wakeup = rtc->base + rtc->wakeup_state_offset;
+    uint32_t cause_reg = rtc->base + rtc->wakeup_cause_offset;
+    uint32_t extconf = rtc->base + rtc->ext_wakeup_config_offset;
+    uint32_t ext1sel = rtc->base + rtc->ext1_select_offset;
+    uint32_t ext1status = rtc->base + rtc->ext1_status_offset;
+    uint32_t ext0sel = io->base + io->ext0_select_offset;
+    uint32_t pad4 = io->base + io->pad_base_offset + 4u * 4u;
+    bool deep = true;
+    uint64_t timeout_us = 0u;
+    uint32_t cause = UINT32_MAX;
+
+    /* EXT0 requires an RTC-owned input. A raw host level on a digitally
+     * owned pad cannot wake it, even if that level matches the trigger. */
+    mem_write32(mem, ext0sel, 4u << io->ext0_select_shift);
+    mem_write32(mem, extconf, rtc->ext0_wakeup_level_mask);
+    mem_write32(mem, wakeup,
+                rtc->ext0_wakeup_mask << rtc->wakeup_enable_shift);
+    periph_gpio_set_input(periph, 4, 1);
+    mem_write32(mem, state, rtc->sleep_enable_mask);
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                          &cause));
+    ASSERT_FALSE(deep);
+    ASSERT_EQ64(timeout_us, PERIPH_SLEEP_FOREVER);
+    ASSERT_EQ(cause, 0u);
+    ASSERT_TRUE(periph_sleep_has_gpio_wake(periph));
+    ASSERT_EQ(periph_sleep_poll_wake(periph), 0u);
+    mem_write32(mem, pad4, io->pad_reset[4] | io->pad_mux_mask |
+                            (1u << 13u));
+    ASSERT_EQ(periph_sleep_poll_wake(periph), rtc->ext0_wakeup_mask);
+    periph_finish_wake(periph, rtc->ext0_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, cause_reg), rtc->ext0_wakeup_mask);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), 0u);
+
+    /* EXT1 ANY_HIGH reports the triggering RTC pad(s), not every selected
+     * pad. The status-clear command is write-only and selection remains. */
+    periph_gpio_set_input(periph, 4, 0);
+    periph_gpio_set_input(periph, 11, 0);
+    mem_write32(mem, ext1sel, (1u << 4u) | (1u << 11u) |
+                              rtc->ext1_status_clear_mask);
+    mem_write32(mem, extconf, rtc->ext1_wakeup_level_mask);
+    mem_write32(mem, wakeup,
+                rtc->ext1_wakeup_mask << rtc->wakeup_enable_shift);
+    mem_write32(mem, state, rtc->sleep_enable_mask);
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                          &cause));
+    ASSERT_EQ(cause, 0u);
+    periph_gpio_set_input(periph, 11, 1);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), rtc->ext1_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, ext1status), 1u << 11u);
+    periph_finish_wake(periph, rtc->ext1_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, cause_reg), rtc->ext1_wakeup_mask);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), 0u);
+    mem_write32(mem, ext1sel, (1u << 4u) | (1u << 11u) |
+                              rtc->ext1_status_clear_mask);
+    ASSERT_EQ(mem_read32(mem, ext1status), 0u);
+    ASSERT_EQ(mem_read32(mem, ext1sel), (1u << 4u) | (1u << 11u));
+
+    /* EXT1 ALL_LOW requires every selected pad low and reports both. */
+    mem_write32(mem, extconf, 0u);
+    mem_write32(mem, state, rtc->sleep_enable_mask);
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                          &cause));
+    ASSERT_EQ(cause, 0u);
+    periph_gpio_set_input(periph, 11, 0);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), rtc->ext1_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, ext1status), (1u << 4u) | (1u << 11u));
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_gpio_wake_rejects_invalid_selection_and_retains_status)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
+    const flexe_rtc_io_desc_t *io = &s3->rtc_io;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    uint32_t ext0sel = io->base + io->ext0_select_offset;
+    uint32_t ext1sel = rtc->base + rtc->ext1_select_offset;
+    uint32_t ext1status = rtc->base + rtc->ext1_status_offset;
+    uint32_t wakeup = rtc->base + rtc->wakeup_state_offset;
+    uint32_t state = rtc->base + rtc->sleep_state_offset;
+    bool deep = false;
+    uint64_t timeout_us = 0u;
+    uint32_t cause = 0u;
+
+    mem_write32(mem, ext0sel, 22u << io->ext0_select_shift);
+    ASSERT_EQ(mem_read32(mem, ext0sel), 22u << io->ext0_select_shift);
+    ASSERT_EQ(periph_unhandled_count(periph), 1);
+    mem_write32(mem, wakeup,
+                rtc->ext0_wakeup_mask << rtc->wakeup_enable_shift);
+    mem_write32(mem, state, rtc->sleep_enable_mask);
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                          &cause));
+    periph_gpio_set_input(periph, 21, 1);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), 0u);
+    periph_finish_wake(periph, 0u);
+
+    mem_write32(mem, ext1sel, 0u);
+    mem_write32(mem, wakeup,
+                rtc->ext1_wakeup_mask << rtc->wakeup_enable_shift);
+    mem_write32(mem, state, rtc->sleep_enable_mask);
+    ASSERT_FALSE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                           &cause));
+    ASSERT_EQ(periph_unhandled_count(periph), 2);
+
+    mem_write32(mem, ext1sel, 1u << 4u);
+    mem_write32(mem, wakeup,
+                (rtc->ext1_wakeup_mask | rtc->timer_wakeup_mask) <<
+                rtc->wakeup_enable_shift);
+    mem_write32(mem, state, rtc->sleep_enable_mask);
+    ASSERT_FALSE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                           &cause));
+    ASSERT_EQ(periph_unhandled_count(periph), 3); /* timer unarmed */
+    mem_write32(mem, ext1status, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, ext1status), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 3);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_gpio_wake_preempts_armed_timer)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
+    mem_write32(mem, rtc->base + rtc->ext1_select_offset, 1u << 4u);
+    mem_write32(mem, rtc->base + rtc->ext_wakeup_config_offset,
+                rtc->ext1_wakeup_level_mask);
+    mem_write32(mem, rtc->base + rtc->sleep_timer_low_offset, 13600u);
+    mem_write32(mem, rtc->base + rtc->sleep_timer_high_offset,
+                rtc->sleep_alarm_enable_mask);
+    mem_write32(mem, rtc->base + rtc->wakeup_state_offset,
+                (rtc->ext1_wakeup_mask | rtc->timer_wakeup_mask) <<
+                rtc->wakeup_enable_shift);
+    mem_write32(mem, rtc->base + rtc->sleep_state_offset,
+                rtc->sleep_enable_mask);
+    bool deep = false;
+    uint64_t timeout_us = 0u;
+    uint32_t cause = 0u;
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                          &cause));
+    ASSERT_EQ64(timeout_us, 100000u);
+    ASSERT_EQ(cause, 0u);
+    periph_gpio_set_input(periph, 4, 1);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), rtc->ext1_wakeup_mask);
+    periph_finish_wake(periph, rtc->ext1_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, rtc->base + rtc->wakeup_cause_offset),
+              rtc->ext1_wakeup_mask);
+    cpu.ccount = 16000000u;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(mem_read32(mem, rtc->base + rtc->interrupt_raw_offset) &
+              rtc->sleep_alarm_interrupt_mask, 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
     periph_destroy(periph);
     mem_destroy(mem);
 }
@@ -1109,6 +1302,15 @@ TEST(rtc_cntl_s3_counter_and_store_survive_controller_rebuild)
     mem_write32(mem, desc->base + desc->store_offset[0], 0xA5A55A5Au);
     mem_write32(mem, desc->base + desc->store_offset[1], 0x12345678u);
     mem_write32(mem, desc->base + desc->sleep_timer_low_offset, 99u);
+    mem_write32(mem, desc->base + desc->ext1_select_offset, 1u << 4u);
+    mem_write32(mem, desc->base + desc->ext_wakeup_config_offset,
+                desc->ext1_wakeup_level_mask);
+    mem_write32(mem, desc->base + desc->wakeup_state_offset,
+                desc->ext1_wakeup_mask << desc->wakeup_enable_shift);
+    mem_write32(mem, desc->base + desc->sleep_state_offset,
+                desc->sleep_enable_mask);
+    periph_gpio_set_input(periph, 4, 1);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), desc->ext1_wakeup_mask);
 
     flexe_rtc_cntl_retained_t retained;
     periph_rtc_retained_snapshot(periph, &retained);
@@ -1128,6 +1330,8 @@ TEST(rtc_cntl_s3_counter_and_store_survive_controller_rebuild)
                   0x12345678u);
         ASSERT_EQ(mem_read32(mem, desc->base + desc->sleep_timer_low_offset),
                   0u);
+        ASSERT_EQ(mem_read32(mem, desc->base + desc->ext1_status_offset),
+                  1u << 4u);
         /* One extra pre-reset CPU cycle contributes a fractional RTC tick.
          * The first 1,176 cycles after reboot cross the tick boundary only
          * if that phase was retained with the integer counter. */
@@ -1160,5 +1364,8 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset);
     RUN_TEST(rtc_cntl_s3_timer_sleep_wakes_and_reports_cause);
     RUN_TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources);
+    RUN_TEST(rtc_cntl_s3_ext0_ext1_wake_samples_gpio_and_latches_status);
+    RUN_TEST(rtc_cntl_s3_gpio_wake_rejects_invalid_selection_and_retains_status);
+    RUN_TEST(rtc_cntl_s3_gpio_wake_preempts_armed_timer);
     RUN_TEST(rtc_cntl_s3_counter_and_store_survive_controller_rebuild);
 }

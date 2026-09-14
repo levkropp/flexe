@@ -4,10 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ESP32-S3 rtc_io_reg.h. Output, output-enable, sampled input and the
- * pad-owner mux have functional effects, including RTC_CNTL pad hold. Other
- * documented pad fields retain their register value but remain diagnostic
- * when changed. */
+/* ESP32-S3 rtc_io_reg.h. Output, output-enable, sampled input, EXT0 pin
+ * selection and the pad-owner mux have functional effects, including
+ * RTC_CNTL pad hold. Other documented pad fields retain their register
+ * value but remain diagnostic when changed. */
 #define RTC_GPIO_OUT_OFF         0x000u
 #define RTC_GPIO_OUT_SET_OFF     0x004u
 #define RTC_GPIO_OUT_CLEAR_OFF   0x008u
@@ -32,6 +32,7 @@ struct flexe_rtc_io {
     void *fallback_ctx;
     uint32_t output;
     uint32_t enabled;
+    uint32_t ext0_select;
     uint32_t pad[FLEXE_TARGET_RTC_IO_PIN_MAX];
     uint32_t held_mask;
     uint32_t held_pad[FLEXE_TARGET_RTC_IO_PIN_MAX];
@@ -80,6 +81,14 @@ static bool rtc_io_geometry_valid(const flexe_target_desc_t *target)
         (desc->pad_base_offset & 3u) != 0u ||
         desc->pad_base_offset + 4u * desc->gpio_count >
             desc->register_size ||
+        desc->ext0_select_offset <
+            desc->pad_base_offset + 4u * desc->gpio_count ||
+        (desc->ext0_select_offset & 3u) != 0u ||
+        desc->ext0_select_offset > desc->register_size - 4u ||
+        desc->ext0_select_width == 0u ||
+        desc->ext0_select_width > 5u ||
+        desc->ext0_select_shift + desc->ext0_select_width > 32u ||
+        (1u << desc->ext0_select_width) < desc->gpio_count ||
         !one_bit(desc->pad_mux_mask) ||
         desc->pad_mux_mask != (1u << 19) ||
         (target->gpio.valid_gpio_mask & pin_mask(desc)) !=
@@ -158,6 +167,8 @@ uint32_t flexe_rtc_io_mmio_read(void *ctx, uint32_t addr)
     default:
         break;
     }
+    if (off == desc->ext0_select_offset)
+        return rtc_io->ext0_select << desc->ext0_select_shift;
     if (off >= desc->pad_base_offset &&
         off < desc->pad_base_offset + 4u * desc->gpio_count &&
         (off & 3u) == 0u)
@@ -204,6 +215,16 @@ void flexe_rtc_io_mmio_write(void *ctx, uint32_t addr, uint32_t value)
     return;
 
 pad_or_fallback:
+    if (off == desc->ext0_select_offset) {
+        uint32_t mask = ((1u << desc->ext0_select_width) - 1u) <<
+                        desc->ext0_select_shift;
+        rtc_io->ext0_select = (value & mask) >> desc->ext0_select_shift;
+        if (((value & ~mask) != 0u ||
+             rtc_io->ext0_select >= desc->gpio_count) &&
+            rtc_io->fallback_write)
+            rtc_io->fallback_write(rtc_io->fallback_ctx, addr, value);
+        return;
+    }
     if (off >= desc->pad_base_offset &&
         off < desc->pad_base_offset + 4u * desc->gpio_count &&
         (off & 3u) == 0u) {
@@ -299,4 +320,22 @@ void flexe_rtc_io_pad_hold_restore(flexe_rtc_io_t *rtc_io,
         if ((rtc_io->held_mask & (1u << pin)) != 0u)
             rtc_io->held_pad[pin] = in->pad[pin];
     rtc_io_publish(rtc_io);
+}
+
+int flexe_rtc_io_ext0_selector(const flexe_rtc_io_t *rtc_io)
+{
+    return rtc_io && rtc_io->ext0_select < rtc_io->target->rtc_io.gpio_count ?
+           (int)rtc_io->ext0_select : -1;
+}
+
+int flexe_rtc_io_input_level(const flexe_rtc_io_t *rtc_io, unsigned pin)
+{
+    if (!rtc_io || pin >= rtc_io->target->rtc_io.gpio_count) return -1;
+    const flexe_rtc_io_desc_t *desc = &rtc_io->target->rtc_io;
+    uint32_t pad = rtc_io_effective_pad(rtc_io, pin);
+    if ((pad & (desc->pad_mux_mask | RTC_PAD_INPUT_ENABLE |
+                RTC_PAD_FUNCTION_MASK)) !=
+        (desc->pad_mux_mask | RTC_PAD_INPUT_ENABLE))
+        return -1;
+    return flexe_gpio_input_level(rtc_io->gpio, pin);
 }

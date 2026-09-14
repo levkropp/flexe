@@ -26,6 +26,10 @@ void flexe_rtc_io_pad_hold_snapshot(const flexe_rtc_io_t *rtc_io,
                                     flexe_rtc_io_pad_hold_t *out);
 void flexe_rtc_io_pad_hold_restore(flexe_rtc_io_t *rtc_io,
                                    const flexe_rtc_io_pad_hold_t *in);
+/* EXT0 is selected by RTCIO; only an RTC-owned, input-enabled pad can
+ * supply its level. Invalid selection or mux returns -1. */
+int flexe_rtc_io_ext0_selector(const flexe_rtc_io_t *rtc_io);
+int flexe_rtc_io_input_level(const flexe_rtc_io_t *rtc_io, unsigned pin);
 uint32_t flexe_rtc_io_mmio_read(void *ctx, uint32_t addr);
 void flexe_rtc_io_mmio_write(void *ctx, uint32_t addr, uint32_t value);
 

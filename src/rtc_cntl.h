@@ -27,6 +27,7 @@ typedef struct {
     uint64_t tick_denominator;
     uint64_t tick_remainder;
     uint32_t store[FLEXE_TARGET_RTC_STORE_MAX];
+    uint32_t ext1_status;
 } flexe_rtc_cntl_retained_t;
 
 flexe_rtc_cntl_t *flexe_rtc_cntl_create(
@@ -77,10 +78,14 @@ void flexe_rtc_cntl_retained_snapshot(
 void flexe_rtc_cntl_retained_restore(
     flexe_rtc_cntl_t *rtc, const flexe_rtc_cntl_retained_t *snapshot);
 
-/* Timer-only sleep is consumed by the session's virtual-clock/reset path.
- * Unsupported wake sources never produce a synthetic wake. */
+/* Supported timer/EXT0/EXT1 sleep is consumed by the session's virtual
+ * clock/reset path. Unsupported wake sources never produce a synthetic wake. */
 bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
                                        bool *deep, uint64_t *timeout_us);
+bool flexe_rtc_cntl_has_gpio_wake(const flexe_rtc_cntl_t *rtc);
+uint32_t flexe_rtc_cntl_poll_gpio_wake(flexe_rtc_cntl_t *rtc,
+                                       int ext0_level,
+                                       uint32_t ext1_high_mask);
 void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause);
 void flexe_rtc_cntl_set_wake_state(flexe_rtc_cntl_t *rtc,
                                    uint32_t cause, uint32_t reset_cause);

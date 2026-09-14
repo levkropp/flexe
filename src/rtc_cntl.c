@@ -38,6 +38,9 @@ struct flexe_rtc_cntl {
     uint32_t wakeup_cause;
     uint32_t digital_power;
     uint32_t reset_state;
+    uint32_t ext_wakeup_config;
+    uint32_t ext1_select;
+    uint32_t ext1_status;
     bool sleep_alarm_armed;
     bool sleep_requested;
     uint32_t clock_conf;
@@ -421,8 +424,13 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
             desc->sleep_state_offset, desc->wakeup_state_offset,
             desc->digital_power_offset, desc->wakeup_cause_offset,
+            desc->ext_wakeup_config_offset, desc->ext1_select_offset,
+            desc->ext1_status_offset,
         };
-        if (desc->sleep_enable_mask == 0u ||
+        if (!(target->capabilities & FLEXE_TARGET_CAP_RTC_IO_V1) ||
+            target->rtc_io.gpio_count == 0u ||
+            target->rtc_io.gpio_count >= 32u ||
+            desc->sleep_enable_mask == 0u ||
             (desc->sleep_enable_mask & (desc->sleep_enable_mask - 1u)) != 0u ||
             desc->sleep_wakeup_mask == 0u ||
             (desc->sleep_wakeup_mask & (desc->sleep_wakeup_mask - 1u)) != 0u ||
@@ -442,6 +450,31 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             (desc->timer_wakeup_mask &
              (desc->timer_wakeup_mask - 1u)) != 0u ||
             (desc->timer_wakeup_mask & desc->wakeup_valid_mask) == 0u ||
+            desc->ext0_wakeup_mask == 0u ||
+            desc->ext1_wakeup_mask == 0u ||
+            (desc->ext0_wakeup_mask &
+             (desc->ext0_wakeup_mask - 1u)) != 0u ||
+            (desc->ext1_wakeup_mask &
+             (desc->ext1_wakeup_mask - 1u)) != 0u ||
+            ((desc->timer_wakeup_mask | desc->ext0_wakeup_mask |
+              desc->ext1_wakeup_mask) & ~desc->wakeup_valid_mask) != 0u ||
+            (desc->ext0_wakeup_mask &
+             (desc->timer_wakeup_mask | desc->ext1_wakeup_mask)) != 0u ||
+            (desc->ext1_wakeup_mask & desc->timer_wakeup_mask) != 0u ||
+            desc->ext0_wakeup_level_mask == 0u ||
+            desc->ext1_wakeup_level_mask == 0u ||
+            (desc->ext0_wakeup_level_mask &
+             (desc->ext0_wakeup_level_mask - 1u)) != 0u ||
+            (desc->ext1_wakeup_level_mask &
+             (desc->ext1_wakeup_level_mask - 1u)) != 0u ||
+            (desc->ext0_wakeup_level_mask &
+             desc->ext1_wakeup_level_mask) != 0u ||
+            desc->ext1_select_mask !=
+                ((1u << target->rtc_io.gpio_count) - 1u) ||
+            (desc->ext1_select_mask & desc->ext1_status_clear_mask) != 0u ||
+            desc->ext1_status_clear_mask == 0u ||
+            (desc->ext1_status_clear_mask &
+             (desc->ext1_status_clear_mask - 1u)) != 0u ||
             (desc->sleep_wakeup_interrupt_mask &
              desc->interrupt_valid_mask) !=
                 desc->sleep_wakeup_interrupt_mask ||
@@ -703,6 +736,12 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
             return rtc->digital_power;
         if (offset == desc->wakeup_cause_offset)
             return rtc->wakeup_cause;
+        if (offset == desc->ext_wakeup_config_offset)
+            return rtc->ext_wakeup_config;
+        if (offset == desc->ext1_select_offset)
+            return rtc->ext1_select;
+        if (offset == desc->ext1_status_offset)
+            return rtc->ext1_status;
     }
     if (desc->cpu_stall_high_offset != 0u) {
         if (offset == desc->cpu_stall_options_offset)
@@ -839,10 +878,18 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
                    desc->sleep_wakeup_mask)) != 0u;
             if ((value & desc->sleep_enable_mask) != 0u) {
                 rtc->sleep_state &= ~desc->sleep_wakeup_mask;
-                if (rtc->wakeup_enable == desc->timer_wakeup_mask &&
-                    (rtc->sleep_alarm_armed ||
-                     (rtc->interrupt_raw &
-                      desc->sleep_alarm_interrupt_mask) != 0u)) {
+                uint32_t supported = desc->timer_wakeup_mask |
+                    desc->ext0_wakeup_mask | desc->ext1_wakeup_mask;
+                bool timer_ready =
+                    (rtc->wakeup_enable & desc->timer_wakeup_mask) == 0u ||
+                    rtc->sleep_alarm_armed ||
+                    (rtc->interrupt_raw &
+                     desc->sleep_alarm_interrupt_mask) != 0u;
+                if (rtc->wakeup_enable != 0u &&
+                    (rtc->wakeup_enable & ~supported) == 0u &&
+                    timer_ready &&
+                    ((rtc->wakeup_enable & desc->ext1_wakeup_mask) == 0u ||
+                     rtc->ext1_select != 0u)) {
                     rtc->sleep_requested = true;
                 } else {
                     /* An unknown source or unarmed timer cannot be reported
@@ -864,7 +911,9 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
             if (((value & ~(desc->wakeup_valid_mask <<
                             desc->wakeup_enable_shift)) != 0u ||
                  (rtc->wakeup_enable &
-                  ~desc->timer_wakeup_mask) != 0u) &&
+                  ~(desc->timer_wakeup_mask |
+                    desc->ext0_wakeup_mask |
+                    desc->ext1_wakeup_mask)) != 0u) &&
                 rtc->fallback_write)
                 rtc->fallback_write(rtc->fallback_ctx, addr, value);
             return;
@@ -879,6 +928,28 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
             return;
         }
         if (offset == desc->wakeup_cause_offset)
+            return; /* Physically read-only. */
+        if (offset == desc->ext_wakeup_config_offset) {
+            uint32_t old = rtc->ext_wakeup_config;
+            rtc->ext_wakeup_config = value;
+            if (((old ^ value) &
+                 ~(desc->ext0_wakeup_level_mask |
+                   desc->ext1_wakeup_level_mask)) != 0u &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
+        if (offset == desc->ext1_select_offset) {
+            rtc->ext1_select = value & desc->ext1_select_mask;
+            if ((value & desc->ext1_status_clear_mask) != 0u)
+                rtc->ext1_status = 0u;
+            if ((value & ~(desc->ext1_select_mask |
+                           desc->ext1_status_clear_mask)) != 0u &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
+        if (offset == desc->ext1_status_offset)
             return; /* Physically read-only. */
     }
     if (desc->cpu_stall_high_offset != 0u &&
@@ -1215,6 +1286,7 @@ void flexe_rtc_cntl_retained_snapshot(
     out->tick_remainder = rtc->tick_remainder;
     for (unsigned i = 0u; i < rtc->target->rtc_cntl.store_count; i++)
         out->store[i] = rtc->store[i];
+    out->ext1_status = rtc->ext1_status;
 }
 
 void flexe_rtc_cntl_retained_restore(
@@ -1229,6 +1301,7 @@ void flexe_rtc_cntl_retained_restore(
     rtc->tick_remainder = snapshot->tick_remainder;
     for (unsigned i = 0u; i < desc->store_count; i++)
         rtc->store[i] = snapshot->store[i];
+    rtc->ext1_status = snapshot->ext1_status & desc->ext1_select_mask;
 }
 
 bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
@@ -1238,8 +1311,14 @@ bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
     rtc->sleep_requested = false;
     (void)rtc_sync(rtc);
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
-    if (rtc->wakeup_enable != desc->timer_wakeup_mask ||
-        (!rtc->sleep_alarm_armed &&
+    uint32_t supported = desc->timer_wakeup_mask |
+        desc->ext0_wakeup_mask | desc->ext1_wakeup_mask;
+    if (rtc->wakeup_enable == 0u ||
+        (rtc->wakeup_enable & ~supported) != 0u ||
+        ((rtc->wakeup_enable & desc->ext1_wakeup_mask) != 0u &&
+         rtc->ext1_select == 0u) ||
+        ((rtc->wakeup_enable & desc->timer_wakeup_mask) != 0u &&
+         !rtc->sleep_alarm_armed &&
          (rtc->interrupt_raw & desc->sleep_alarm_interrupt_mask) == 0u))
         return false;
     if (deep)
@@ -1247,6 +1326,10 @@ bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
                  desc->digital_wrap_power_down_mask) != 0u;
     if (timeout_us) {
         uint64_t ticks = 0u;
+        if ((rtc->wakeup_enable & desc->timer_wakeup_mask) == 0u) {
+            *timeout_us = UINT64_MAX;
+            return true;
+        }
         if (rtc->sleep_alarm_armed) {
             uint64_t mask = UINT32_MAX |
                             ((uint64_t)desc->time_high_mask << 32u);
@@ -1260,6 +1343,42 @@ bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
             (fraction * UINT64_C(1000000) + hz - 1u) / hz;
     }
     return true;
+}
+
+bool flexe_rtc_cntl_has_gpio_wake(const flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc) return false;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    return (rtc->wakeup_enable &
+            (desc->ext0_wakeup_mask | desc->ext1_wakeup_mask)) != 0u;
+}
+
+uint32_t flexe_rtc_cntl_poll_gpio_wake(flexe_rtc_cntl_t *rtc,
+                                       int ext0_level,
+                                       uint32_t ext1_high_mask)
+{
+    if (!rtc) return 0u;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    if ((rtc->sleep_state & desc->sleep_enable_mask) == 0u)
+        return 0u;
+    uint32_t cause = 0u;
+    if ((rtc->wakeup_enable & desc->ext0_wakeup_mask) != 0u &&
+        ext0_level >= 0 &&
+        ext0_level == ((rtc->ext_wakeup_config &
+                        desc->ext0_wakeup_level_mask) != 0u))
+        cause |= desc->ext0_wakeup_mask;
+    if ((rtc->wakeup_enable & desc->ext1_wakeup_mask) != 0u &&
+        rtc->ext1_select != 0u) {
+        uint32_t high = ext1_high_mask & rtc->ext1_select;
+        bool any_high = (rtc->ext_wakeup_config &
+                         desc->ext1_wakeup_level_mask) != 0u;
+        if ((any_high && high != 0u) ||
+            (!any_high && high == 0u)) {
+            rtc->ext1_status = any_high ? high : rtc->ext1_select;
+            cause |= desc->ext1_wakeup_mask;
+        }
+    }
+    return cause;
 }
 
 void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause)
