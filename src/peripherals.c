@@ -14199,6 +14199,14 @@ static void target_gpio_irq_changed(void *ctx, bool nmi, bool level)
     else       periph_deassert_interrupt(p, source);
 }
 
+static void target_io_mux_input_changed(void *ctx, unsigned gpio,
+                                        bool enabled)
+{
+    esp32_periph_t *p = ctx;
+    if (p && p->target_gpio)
+        flexe_gpio_set_input_enable(p->target_gpio, gpio, enabled);
+}
+
 static void target_rtc_pad_hold_changed(void *ctx, uint64_t held_pins)
 {
     esp32_periph_t *p = ctx;
@@ -14510,6 +14518,17 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         if (!p->target_gpio) {
             periph_destroy(p);
             return NULL;
+        }
+        if (p->io_mux) {
+            for (unsigned gpio = 0u; gpio < target->gpio.gpio_count;
+                 gpio++) {
+                int enabled = flexe_io_mux_input_enabled(p->io_mux, gpio);
+                if (enabled >= 0)
+                    flexe_gpio_set_input_enable(p->target_gpio, gpio,
+                                                 enabled != 0);
+            }
+            flexe_io_mux_set_input_changed_handler(
+                p->io_mux, target_io_mux_input_changed, p);
         }
     }
 

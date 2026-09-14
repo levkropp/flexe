@@ -91,6 +91,9 @@ struct flexe_gpio {
     uint32_t out[2];
     uint32_t enable[2];
     uint32_t input[2];
+    uint32_t input_enable[2];
+    uint32_t host_input[2];
+    uint32_t host_valid[2];
     uint32_t status[2];
     uint32_t pin[GPIO_PIN_REGISTER_COUNT];
     uint32_t func_in[GPIO_FUNC_IN_COUNT];
@@ -249,13 +252,52 @@ int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin)
     return enabled;
 }
 
+static void gpio_update_irq(flexe_gpio_t *gpio);
+
+static void gpio_refresh_input_pin(flexe_gpio_t *gpio, unsigned pin)
+{
+    unsigned bank;
+    uint32_t mask;
+    (void)gpio_pin_bit(pin, &bank, &mask);
+    bool old = (gpio->input[bank] & mask) != 0u;
+    bool level;
+    if (gpio->host_valid[bank] & mask) {
+        level = (gpio->host_input[bank] & mask) != 0u;
+    } else {
+        /* Without an external sample, only a known actively driven digital
+         * output feeds back. A floating pad has no modeled pull voltage. */
+        level = flexe_gpio_output_enabled(gpio, pin) == 1 &&
+                flexe_gpio_pin_level(gpio, pin) == 1;
+    }
+    if (old == level) return;
+    if (level) gpio->input[bank] |= mask;
+    else       gpio->input[bank] &= ~mask;
+
+    if ((gpio->rtc_owned & (UINT64_C(1) << pin)) == 0u &&
+        (gpio->input_enable[bank] & mask) != 0u) {
+        uint32_t config = gpio->pin[pin];
+        if (config & GPIO_PIN_INT_ENABLE_MASK) {
+            unsigned type = (config & GPIO_PIN_INT_TYPE_MASK) >>
+                            GPIO_PIN_INT_TYPE_SHIFT;
+            bool fire = type == 3u || (type == 1u && level) ||
+                        (type == 2u && !level) ||
+                        (type == 4u && !level) ||
+                        (type == 5u && level);
+            if (fire) gpio->status[bank] |= mask;
+        }
+    }
+    gpio_update_irq(gpio);
+}
+
 static void gpio_notify_pin(flexe_gpio_t *gpio, unsigned pin)
 {
-    if (!gpio->output_changed || !gpio_pin_valid(gpio, pin)) return;
+    if (!gpio_pin_valid(gpio, pin)) return;
     if (gpio->held_pins & (UINT64_C(1) << pin)) return;
-    gpio->output_changed(gpio->output_ctx, pin,
-                         flexe_gpio_pin_level(gpio, pin),
-                         flexe_gpio_output_enabled(gpio, pin));
+    gpio_refresh_input_pin(gpio, pin);
+    if (gpio->output_changed)
+        gpio->output_changed(gpio->output_ctx, pin,
+                             flexe_gpio_pin_level(gpio, pin),
+                             flexe_gpio_output_enabled(gpio, pin));
 }
 
 void flexe_gpio_set_rtc_state(flexe_gpio_t *gpio, uint64_t owned,
@@ -351,6 +393,7 @@ void flexe_gpio_pad_hold_restore(flexe_gpio_t *gpio,
             gpio->held_enable[pin] != enabled) {
             gpio->held_level[pin] = (int8_t)level;
             gpio->held_enable[pin] = (int8_t)enabled;
+            gpio_refresh_input_pin(gpio, pin);
             if (gpio->output_changed)
                 gpio->output_changed(gpio->output_ctx, pin,
                                      level, enabled);
@@ -397,6 +440,9 @@ static void gpio_latch_active_levels(flexe_gpio_t *gpio)
         unsigned bank;
         uint32_t mask;
         (void)gpio_pin_bit(pin, &bank, &mask);
+        if ((gpio->rtc_owned & (UINT64_C(1) << pin)) != 0u ||
+            (gpio->input_enable[bank] & mask) == 0u)
+            continue;
         bool high = (gpio->input[bank] & mask) != 0u;
         if ((type == 4u && !high) || (type == 5u && high))
             gpio->status[bank] |= mask;
@@ -449,9 +495,11 @@ static uint32_t gpio_read(void *ctx, uint32_t addr)
     case GPIO_ENABLE1_OFF: return gpio->enable[1];
     case GPIO_STRAP_OFF: return desc->strap_reset & GPIO_STRAP_MASK;
     case GPIO_IN_OFF:
-        return gpio->input[0] & ~(uint32_t)gpio->rtc_owned;
+        return gpio->input[0] & gpio->input_enable[0] &
+               ~(uint32_t)gpio->rtc_owned;
     case GPIO_IN1_OFF:
-        return gpio->input[1] & ~(uint32_t)(gpio->rtc_owned >> 32u);
+        return gpio->input[1] & gpio->input_enable[1] &
+               ~(uint32_t)(gpio->rtc_owned >> 32u);
     case GPIO_STATUS_OFF: return gpio->status[0];
     case GPIO_STATUS1_OFF: return gpio->status[1];
     case GPIO_CPU_INT_OFF:
@@ -696,6 +744,9 @@ flexe_gpio_t *flexe_gpio_create(
     gpio->irq_ctx = irq_ctx;
     gpio->clock_gate = GPIO_CLOCK_GATE_ENABLE;
     gpio->date = target->gpio.date_reset & GPIO_DATE_MASK;
+    gpio->input_enable[0] = (uint32_t)target->gpio.valid_gpio_mask;
+    gpio->input_enable[1] =
+        (uint32_t)(target->gpio.valid_gpio_mask >> 32u);
     for (unsigned pin = 0u; pin < GPIO_PIN_REGISTER_COUNT; pin++)
         gpio->func_out[pin] = GPIO_FUNC_OUT_SOFTWARE;
 
@@ -724,29 +775,28 @@ void flexe_gpio_destroy(flexe_gpio_t *gpio)
     free(gpio);
 }
 
+void flexe_gpio_set_input_enable(flexe_gpio_t *gpio, unsigned pin,
+                                 bool enabled)
+{
+    if (!gpio_pin_valid(gpio, pin)) return;
+    unsigned bank;
+    uint32_t mask;
+    (void)gpio_pin_bit(pin, &bank, &mask);
+    if (enabled) gpio->input_enable[bank] |= mask;
+    else         gpio->input_enable[bank] &= ~mask;
+    gpio_update_irq(gpio);
+}
+
 void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level)
 {
     if (!gpio_pin_valid(gpio, pin)) return;
     unsigned bank;
     uint32_t mask;
     (void)gpio_pin_bit(pin, &bank, &mask);
-    bool old = (gpio->input[bank] & mask) != 0u;
-    if (level) gpio->input[bank] |= mask;
-    else       gpio->input[bank] &= ~mask;
-
-    if (old != level &&
-        (gpio->rtc_owned & (UINT64_C(1) << pin)) == 0u) {
-        uint32_t config = gpio->pin[pin];
-        if (config & GPIO_PIN_INT_ENABLE_MASK) {
-            unsigned type = (config & GPIO_PIN_INT_TYPE_MASK) >>
-                            GPIO_PIN_INT_TYPE_SHIFT;
-            bool fire = type == 3u || (type == 1u && level) ||
-                        (type == 2u && !level) ||
-                        (type == 4u && !level) ||
-                        (type == 5u && level);
-            if (fire) gpio->status[bank] |= mask;
-        }
-    }
+    gpio->host_valid[bank] |= mask;
+    if (level) gpio->host_input[bank] |= mask;
+    else       gpio->host_input[bank] &= ~mask;
+    gpio_refresh_input_pin(gpio, pin);
     gpio_update_irq(gpio);
 }
 
@@ -777,7 +827,8 @@ int flexe_gpio_input_signal_level(const flexe_gpio_t *gpio, unsigned signal)
         unsigned bank;
         uint32_t mask;
         (void)gpio_pin_bit(input, &bank, &mask);
-        level = (gpio->input[bank] & mask) != 0u;
+        level = (gpio->input_enable[bank] & mask) != 0u &&
+                (gpio->input[bank] & mask) != 0u;
     }
     if (route & GPIO_FUNC_IN_INVERT) level = !level;
     return level;

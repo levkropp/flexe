@@ -57,6 +57,12 @@ TEST(target_gpio_models_s3_banks_masks_and_software_output)
     ASSERT_EQ(periph_gpio_pin_level(periph, 48), 1);
     ASSERT_EQ(periph_gpio_output_enabled(periph, 48), 1);
     ASSERT_EQ(periph_gpio_out_signal(periph, 48), 256);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x040u) & (1u << 16u), 0u);
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[48],
+                s3->io_mux.input_enable_mask);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x040u) & (1u << 16u),
+              1u << 16u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 22), -1);
     ASSERT_EQ(periph_gpio_pin_level(periph, 49), -1);
 
@@ -103,6 +109,9 @@ TEST(target_gpio_routes_s3_edge_and_level_interrupts_to_both_cores)
     periph_intr_matrix_set(periph, 1, 14, desc->nmi_interrupt_source);
 
     uint32_t pin4 = desc->base + 0x074u + 4u * 4u;
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
     mem_write32(mem, pin4, (1u << 13u) | (1u << 7u));
     periph_gpio_set_input(periph, 4, 1);
     ASSERT_EQ(mem_read32(mem, desc->base + 0x044u), 1u << 4u);
@@ -116,6 +125,9 @@ TEST(target_gpio_routes_s3_edge_and_level_interrupts_to_both_cores)
     ASSERT_FALSE(cpu1.interrupt & (1u << 4u));
 
     uint32_t pin48 = desc->base + 0x074u + 48u * 4u;
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[48],
+                s3->io_mux.input_enable_mask);
     mem_write32(mem, pin48, (1u << 14u) | (5u << 7u));
     periph_gpio_set_input(periph, 48, 1);
     ASSERT_EQ(mem_read32(mem, desc->base + 0x050u), 1u << 16u);
@@ -143,6 +155,92 @@ TEST(target_gpio_routes_s3_edge_and_level_interrupts_to_both_cores)
     mem_destroy(mem);
 }
 
+TEST(target_gpio_input_buffer_gates_host_samples_and_interrupts)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t base = s3->gpio.base;
+    uint32_t mux4 = s3->io_mux.base +
+                    s3->io_mux.gpio_register_offset[4];
+    uint32_t matrix42 = base + 0x154u + 42u * 4u;
+    uint32_t pin4 = base + 0x074u + 4u * 4u;
+    mem_write32(mem, matrix42, (1u << 7u) | 4u);
+    mem_write32(mem, pin4, (1u << 13u) | (1u << 7u));
+    periph_gpio_set_input(periph, 4, 1);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & (1u << 4u), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x044u) & (1u << 4u), 0u);
+
+    /* Enabling an already-high pad exposes its level, but is not an edge. */
+    mem_write32(mem, mux4, s3->io_mux.input_enable_mask);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & (1u << 4u), 1u << 4u);
+    ASSERT_EQ(mem_read32(mem, base + 0x044u) & (1u << 4u), 0u);
+    periph_gpio_set_input(periph, 4, 0);
+    periph_gpio_set_input(periph, 4, 1);
+    ASSERT_EQ(mem_read32(mem, base + 0x044u) & (1u << 4u), 1u << 4u);
+    mem_write32(mem, base + 0x04Cu, 1u << 4u);
+    mem_write32(mem, mux4, 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & (1u << 4u), 0u);
+    ASSERT_EQ(mem_read32(mem, base + 0x044u) & (1u << 4u), 0u);
+    periph_gpio_set_input(periph, 4, 0);
+    periph_gpio_set_input(periph, 4, 1);
+    ASSERT_EQ(mem_read32(mem, base + 0x044u) & (1u << 4u), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(target_gpio_driven_output_feeds_enabled_input_without_host_sample)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t base = s3->gpio.base;
+    uint32_t mux6 = s3->io_mux.base +
+                    s3->io_mux.gpio_register_offset[6];
+    uint32_t pin6 = base + 0x074u + 6u * 4u;
+    uint32_t mask = 1u << 6u;
+    mem_write32(mem, base + 0x008u, mask);
+    mem_write32(mem, base + 0x024u, mask);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & mask, 0u);
+    mem_write32(mem, mux6, s3->io_mux.input_enable_mask);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & mask, mask);
+    mem_write32(mem, base + 0x028u, mask);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & mask, 0u);
+    mem_write32(mem, base + 0x024u, mask);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & mask, mask);
+
+    /* Open-drain high releases the pad. Without a host pad sample or modeled
+     * pull, the virtual floating pad defaults low; a host sample wins. */
+    mem_write32(mem, pin6, 1u << 2u);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 6), 0);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & mask, 0u);
+    periph_gpio_set_input(periph, 6, 1);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & mask, mask);
+    mem_write32(mem, base + 0x00Cu, mask);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 6), 1);
+    ASSERT_EQ(mem_read32(mem, base + 0x03Cu) & mask, mask);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads)
 {
     const flexe_target_desc_t *s3 =
@@ -163,7 +261,11 @@ TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads)
     flexe_gpio_set_input(gpio, 48u, true);
     mem_write32(mem, signal42, (1u << 7u) | 48u);
     ASSERT_EQ(flexe_gpio_input_signal_level(gpio, 42u), 1);
+    flexe_gpio_set_input_enable(gpio, 48u, false);
+    ASSERT_EQ(flexe_gpio_input_signal_level(gpio, 42u), 0);
     mem_write32(mem, signal42, (1u << 7u) | (1u << 6u) | 48u);
+    ASSERT_EQ(flexe_gpio_input_signal_level(gpio, 42u), 1);
+    flexe_gpio_set_input_enable(gpio, 48u, true);
     ASSERT_EQ(flexe_gpio_input_signal_level(gpio, 42u), 0);
     mem_write32(mem, signal42,
                 (1u << 7u) | desc->matrix_const_one_input);
@@ -343,6 +445,8 @@ void run_target_gpio_tests(void)
     TEST_SUITE("Target GPIO");
     RUN_TEST(target_gpio_models_s3_banks_masks_and_software_output);
     RUN_TEST(target_gpio_routes_s3_edge_and_level_interrupts_to_both_cores);
+    RUN_TEST(target_gpio_input_buffer_gates_host_samples_and_interrupts);
+    RUN_TEST(target_gpio_driven_output_feeds_enabled_input_without_host_sample);
     RUN_TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads);
     RUN_TEST(target_gpio_pad_hold_defers_output_notifications_until_release);
     RUN_TEST(target_gpio_open_drain_releases_high_and_notifies_pad);

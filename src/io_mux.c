@@ -12,6 +12,8 @@ struct flexe_io_mux {
     uint32_t reg[FLEXE_TARGET_IO_MUX_REGISTER_MAX];
     uint64_t valid;
     uint64_t written;
+    flexe_io_mux_input_changed_fn input_changed;
+    void *input_changed_ctx;
 };
 
 static bool io_mux_geometry_valid(const flexe_target_desc_t *target)
@@ -37,7 +39,9 @@ static bool io_mux_geometry_valid(const flexe_target_desc_t *target)
         desc->register_writable_mask == 0u ||
         desc->function_shift >= 32u ||
         (desc->function_mask >> desc->function_shift) == 0u ||
-        (desc->function_mask & ~desc->register_writable_mask) != 0u)
+        (desc->function_mask & ~desc->register_writable_mask) != 0u ||
+        (desc->input_enable_mask & ~desc->register_writable_mask) != 0u ||
+        (desc->input_enable_mask & (desc->input_enable_mask - 1u)) != 0u)
         return false;
 
     if (desc->date_offset != UINT32_MAX &&
@@ -89,9 +93,19 @@ static void io_mux_write(void *ctx, uint32_t addr, uint32_t value)
             uint32_t writable = offset == desc->control_offset ?
                 desc->control_writable_mask :
                 desc->register_writable_mask;
+            uint32_t old = io_mux->reg[index];
             io_mux->reg[index] =
                 (io_mux->reg[index] & ~writable) | (value & writable);
             io_mux->written |= UINT64_C(1) << index;
+            if (io_mux->input_changed && desc->input_enable_mask != 0u &&
+                ((old ^ io_mux->reg[index]) & desc->input_enable_mask) != 0u) {
+                for (unsigned gpio = 0u; gpio < desc->gpio_count; gpio++) {
+                    if (desc->gpio_register_offset[gpio] != offset) continue;
+                    io_mux->input_changed(io_mux->input_changed_ctx, gpio,
+                        (io_mux->reg[index] & desc->input_enable_mask) != 0u);
+                    break;
+                }
+            }
             return;
         }
     }
@@ -155,4 +169,24 @@ int flexe_io_mux_function(const flexe_io_mux_t *io_mux, unsigned gpio)
     if ((io_mux->written & (UINT64_C(1) << index)) == 0u) return -1;
     return (int)((io_mux->reg[index] & desc->function_mask) >>
                  desc->function_shift);
+}
+
+int flexe_io_mux_input_enabled(const flexe_io_mux_t *io_mux, unsigned gpio)
+{
+    if (!io_mux || gpio >= io_mux->target->io_mux.gpio_count) return -1;
+    const flexe_io_mux_desc_t *desc = &io_mux->target->io_mux;
+    uint32_t offset = desc->gpio_register_offset[gpio];
+    if (offset == FLEXE_TARGET_IO_MUX_OFFSET_NONE ||
+        desc->input_enable_mask == 0u)
+        return -1;
+    return (io_mux->reg[offset / sizeof(uint32_t)] &
+            desc->input_enable_mask) != 0u;
+}
+
+void flexe_io_mux_set_input_changed_handler(
+    flexe_io_mux_t *io_mux, flexe_io_mux_input_changed_fn changed, void *ctx)
+{
+    if (!io_mux) return;
+    io_mux->input_changed = changed;
+    io_mux->input_changed_ctx = ctx;
 }

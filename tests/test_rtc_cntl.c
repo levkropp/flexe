@@ -700,6 +700,13 @@ TEST(rtc_cntl_rtc_pad_hold_freezes_mux_input_and_output)
     ASSERT_EQ(rtc->rtc_pad_hold_count, 22u);
     ASSERT_EQ(mem_read32(mem, hold), 0u);
 
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[11],
+                s3->io_mux.input_enable_mask);
+
     /* A digitally owned held pad ignores subsequent changes to both GPIO
      * output latches and the RTC owner mux, but those writes still read back. */
     mem_write32(mem, gpio + 0x008u, 1u << 4u);
@@ -804,6 +811,9 @@ TEST(rtc_cntl_rtc_pad_hold_survives_rebuild_with_frozen_mux)
     ASSERT_TRUE(periph != NULL);
     if (periph) {
         ASSERT_EQ(mem_read32(mem, hold), 0u);
+        mem_write32(mem, s3->io_mux.base +
+                         s3->io_mux.gpio_register_offset[4],
+                    s3->io_mux.input_enable_mask);
         periph_gpio_set_input(periph, 4, 1);
         periph_pad_hold_restore(periph, &snapshot);
         ASSERT_EQ(mem_read32(mem, hold), 1u << 4u);

@@ -49,7 +49,7 @@ even when a firmware workflow succeeds.
 | S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c` (4/8 MiB GigaDevice SFDP; 4 MiB BP/CMP protection), `scripts/check-s3-nerdminer-portal.sh` | Other flash protection profiles, cache behavior, and bootloader paths remain unverified. |
 | S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
-| S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, `scripts/check-s3-idf-gpio-isr.sh`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Stock ESP-IDF's per-pin ISR, FreeRTOS task notification, and digital open-drain output work; RTC GPIO wake and pad hold work; physical pulls, drive strength, and electrical levels are not complete. |
+| S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, `scripts/check-s3-idf-gpio-isr.sh`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Stock ESP-IDF's per-pin ISR, FreeRTOS task notification, digital open-drain release, IO_MUX input-buffer gating, driven-output input feedback, RTC GPIO wake, and pad hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
@@ -282,6 +282,13 @@ diagnostic. The pinned image SHA-256 is
 `af96acd3c647184f2b92e6d07df25a20ed28e9a28bcb4084a59479d7c02c9186`
 and matching ELF SHA-256 is
 `d3bea1061d45252a05cc973720e4f0ab77ca4ea5945ac854bb6961de59ef66f1`.
+Digital `GPIO_IN` reads, GPIO-matrix inputs, and edge/level interrupt sampling
+now honor each pad's IO_MUX `FUN_IE` bit. An enabled input with no host sample
+reads back a known driven output; a released open-drain pad has no modeled
+pull voltage and defaults low. Host samples override output feedback. RTCIO
+uses its separate input path. This follows Espressif's
+[GPIO input-mode contract](https://docs.espressif.com/projects/esp-idf/en/v5.3.2/esp32s3/api-reference/peripherals/gpio.html)
+and [S3 IO_MUX register definition](https://github.com/espressif/esp-idf/blob/v5.3.2/components/soc/esp32s3/include/soc/io_mux_reg.h).
 The image and ELF hashes matched across two clean build directories with the
 same pinned ESP-IDF toolchain.
 This checks digital edge/interrupt and high-impedance output behavior, not

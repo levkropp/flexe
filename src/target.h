@@ -281,6 +281,7 @@ typedef struct {
     uint32_t register_reset;
     uint32_t register_writable_mask;
     uint32_t function_mask;
+    uint32_t input_enable_mask;
     uint32_t date_offset;
     uint32_t date_reset;
     uint16_t gpio_register_offset[FLEXE_TARGET_GPIO_MAX];

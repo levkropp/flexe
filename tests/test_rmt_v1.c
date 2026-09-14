@@ -287,6 +287,9 @@ TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time)
     periph_attach_cpus(periph, &cpu0, NULL);
 
     /* RX0 is physical channel 4. GPIO4 routes to S3 matrix input 81. */
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
     mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
                 (1u << 24) | (20u << 8) | 2u);
@@ -360,6 +363,9 @@ TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock)
 
     /* Default SCLK is 80 MHz / 2 and the channel divides by 2 again.
      * A threshold of three GROUP ticks is 12 CPU cycles, not 24. */
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
     mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
                 (1u << 24) | (20u << 8) | 2u);
@@ -441,6 +447,9 @@ TEST(s3_rmt_v1_rx_demodulates_both_carrier_polarities)
     xtensa_cpu_init_for_target(&cpu0, s3);
     cpu0.mem = mem;
     periph_attach_cpus(periph, &cpu0, NULL);
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
     mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
 
     /* Four short high carrier pulses separated by two-tick low gaps form

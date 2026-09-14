@@ -114,6 +114,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .register_reset = 0x00001800u,
             .register_writable_mask = 0x0000FFFFu,
             .function_mask = 0x00007000u,
+            .input_enable_mask = 1u << 9u,
             .date_offset = UINT32_MAX,
             .gpio_register_offset = {
                 0x044u, 0x088u, 0x040u, 0x084u, 0x048u,
@@ -558,6 +559,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .register_reset = 0u,
             .register_writable_mask = 0x0000FFFFu,
             .function_mask = 0x00007000u,
+            .input_enable_mask = 1u << 9u,
             .date_offset = 0x0FCu,
             .date_reset = 0x01907160u,
             .gpio_register_offset = {

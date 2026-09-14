@@ -22,6 +22,9 @@ TEST(rtc_io_s3_mux_selects_rtc_or_digital_output)
     uint32_t bit11 = 1u << (rtc->data_shift + 11u);
     uint32_t bit21 = 1u << (rtc->data_shift + 21u);
     uint32_t gpio = s3->gpio.base;
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[11],
+                s3->io_mux.input_enable_mask);
 
     ASSERT_EQ(rtc->gpio_count, 22u);
     ASSERT_EQ(mem_read32(mem, pad4), 0x50000000u);

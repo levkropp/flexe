@@ -61,9 +61,16 @@ void flexe_gpio_set_rtc_state(flexe_gpio_t *gpio, uint64_t owned,
 void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
                                           unsigned signal);
 
-/* Drive the post-pad digital input sampled by GPIO_IN/IN1. Invalid or
- * unbonded pins are ignored. */
+/* IO_MUX controls the digital input buffer. Standalone GPIO models default
+ * to enabled inputs; a target with IO_MUX supplies the reset/programmed state
+ * through this API. */
+void flexe_gpio_set_input_enable(flexe_gpio_t *gpio, unsigned pin,
+                                 bool enabled);
+
+/* Supply an observed host-pad sample. This overrides digital output feedback
+ * on that pin; invalid or unbonded pins are ignored. */
 void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level);
+/* Raw pad sample for RTCIO and wake logic, independent of digital FUN_IE. */
 int flexe_gpio_input_level(const flexe_gpio_t *gpio, unsigned pin);
 
 /* Resolve a peripheral input routed through the GPIO matrix. Returns -1 for

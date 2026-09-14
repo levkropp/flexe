@@ -108,20 +108,23 @@ fallbacks; no application name or linked address authorizes the optimization.
 The S3 GPIO model implements the S2/S3-generation register layout, both data
 and enable banks, package-valid GPIO0..48 (including the GPIO22..25 holes),
 software-output selection and inversion, matrix input selection and constant
-inputs, host-driven digital inputs, edge/level status latching, W1TS/W1TC
-aliases, and the shared normal/NMI sources routed through both cores' target
-interrupt matrices. The virtual target currently supplies zero-valued strap
-inputs. Peripheral-produced matrix output levels, BT/SDIO pad ownership,
-open-drain electrical resolution, input synchronizer/filter timing, GPIO wake,
-and clock-gate effects are not modeled yet; selecting those behaviors produces
-an unsupported-access diagnostic instead of an invented result. Pulls, drive
-strength, and other pad electrical behavior remain outside the current
-IO_MUX/RTCIO and board/net models. The S3 RTCIO bank now models GPIO0..21
+inputs, host-driven digital inputs, IO_MUX `FUN_IE` gating of digital reads,
+matrix inputs and interrupts, driven-output input feedback, edge/level status
+latching, W1TS/W1TC aliases, and the shared normal/NMI sources routed through
+both cores' target interrupt matrices. The virtual target currently supplies
+zero-valued strap inputs. Unattached peripheral matrix outputs and BT/SDIO
+pad ownership are not modeled. Open-drain net voltage, input synchronizer/filter
+timing, and clock-gate effects are also absent. Digital open-drain release is
+modeled, but a floating pad without a host sample defaults low; host-injected
+samples override output feedback. Pulls, drive strength, contention, and other
+pad electrical behavior remain outside the current IO_MUX/RTCIO and board/net
+models. The S3 RTCIO bank now models GPIO0..21
 pad-owner selection, RTC output and enable latches, W1TS/W1TC aliases, and
 sampled host-driven input. When an RTC pad owns the pin, digital output latches
 remain writable but no longer drive the reported physical pin. Unmodeled RTC
-pad functions report unknown output and retain diagnostics; RTC wakeup and
-RTC GPIO interrupts remain unsupported. This follows Espressif's
+pad functions report unknown output and retain diagnostics; RTC GPIO
+interrupts remain unsupported. EXT0/EXT1 wake has a native ESP-IDF
+replay gate. This follows Espressif's
 [S3 RTC GPIO mapping](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
 This is useful functional GPIO support for the
 experimental S3 target, not hardware-calibrated timing or electrical evidence.
