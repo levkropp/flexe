@@ -1,0 +1,136 @@
+/* Stock ESP-IDF RMT TX/RX drivers on a shared ESP32-S3 GPIO pad. */
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+
+#include "driver/rmt_encoder.h"
+#include "driver/rmt_rx.h"
+#include "driver/rmt_tx.h"
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#define LOOPBACK_GPIO 4
+#define LOOPBACK_SYMBOLS 4u
+
+static TaskHandle_t receiver_task;
+static volatile size_t received_count;
+static rmt_symbol_word_t received[16];
+
+static bool receive_done(rmt_channel_handle_t channel,
+                         const rmt_rx_done_event_data_t *event,
+                         void *ctx)
+{
+    (void)channel;
+    (void)ctx;
+    BaseType_t woken = pdFALSE;
+    received_count = event->num_symbols;
+    vTaskNotifyGiveFromISR(receiver_task, &woken);
+    return woken == pdTRUE;
+}
+
+static void fail(const char *stage, esp_err_t error)
+{
+    printf("RMT_LOOPBACK_FAIL stage=%s error=%d\n", stage, (int)error);
+    fflush(stdout);
+    for (;;) vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static void check(const char *stage, esp_err_t error)
+{
+    if (error != ESP_OK) fail(stage, error);
+}
+
+static bool near(unsigned observed, unsigned expected)
+{
+    return observed + 1u >= expected && observed <= expected + 1u;
+}
+
+void app_main(void)
+{
+    receiver_task = xTaskGetCurrentTaskHandle();
+    rmt_channel_handle_t rx = NULL;
+    rmt_channel_handle_t tx = NULL;
+    rmt_encoder_handle_t encoder = NULL;
+
+    rmt_rx_channel_config_t rx_config = {
+        .gpio_num = LOOPBACK_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 1000000,
+        .mem_block_symbols = 48,
+        .flags.io_loop_back = true,
+    };
+    check("new-rx", rmt_new_rx_channel(&rx_config, &rx));
+    rmt_rx_event_callbacks_t callbacks = {
+        .on_recv_done = receive_done,
+    };
+    check("rx-callback", rmt_rx_register_event_callbacks(
+        rx, &callbacks, NULL));
+
+    rmt_tx_channel_config_t tx_config = {
+        .gpio_num = LOOPBACK_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 1000000,
+        .mem_block_symbols = 48,
+        .trans_queue_depth = 1,
+        .flags.io_loop_back = true,
+    };
+    check("new-tx", rmt_new_tx_channel(&tx_config, &tx));
+    rmt_copy_encoder_config_t encoder_config = {};
+    check("copy-encoder", rmt_new_copy_encoder(&encoder_config, &encoder));
+    check("enable-tx", rmt_enable(tx));
+    check("enable-rx", rmt_enable(rx));
+
+    rmt_receive_config_t receive_config = {
+        .signal_range_min_ns = 1000,
+        .signal_range_max_ns = 100000,
+    };
+    check("receive", rmt_receive(rx, received, sizeof(received),
+                                  &receive_config));
+    const rmt_symbol_word_t frame[LOOPBACK_SYMBOLS] = {
+        {.level0 = 1, .duration0 = 10, .level1 = 0, .duration1 = 12},
+        {.level0 = 1, .duration0 = 8,  .level1 = 0, .duration1 = 9},
+        {.level0 = 1, .duration0 = 6,  .level1 = 0, .duration1 = 7},
+        /* The final low joins the low idle level; only prior words have
+         * a following edge that makes both half-durations measurable. */
+        {.level0 = 1, .duration0 = 5,  .level1 = 0, .duration1 = 6},
+    };
+    rmt_transmit_config_t transmit_config = {.loop_count = 0};
+    check("transmit", rmt_transmit(tx, encoder, frame, sizeof(frame),
+                                    &transmit_config));
+    check("tx-complete", rmt_tx_wait_all_done(tx, 1000));
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0)
+        fail("rx-timeout", ESP_ERR_TIMEOUT);
+    if (received_count != LOOPBACK_SYMBOLS ||
+        received[0].level0 != 1u || received[0].level1 != 0u ||
+        received[1].level0 != 1u || received[1].level1 != 0u ||
+        received[2].level0 != 1u || received[2].level1 != 0u ||
+        !near(received[0].duration0, 10u) ||
+        !near(received[0].duration1, 12u) ||
+        !near(received[1].duration0, 8u) ||
+        !near(received[1].duration1, 9u) ||
+        !near(received[2].duration0, 6u) ||
+        !near(received[2].duration1, 7u))
+        fail("pulse-data", ESP_ERR_INVALID_RESPONSE);
+
+    printf("RMT_LOOPBACK_OK count=%u first=%u,%u second=%u,%u third=%u,%u\n",
+           (unsigned)received_count,
+           (unsigned)received[0].duration0,
+           (unsigned)received[0].duration1,
+           (unsigned)received[1].duration0,
+           (unsigned)received[1].duration1,
+           (unsigned)received[2].duration0,
+           (unsigned)received[2].duration1);
+    fflush(stdout);
+    check("disable-tx", rmt_disable(tx));
+    check("disable-rx", rmt_disable(rx));
+    check("delete-tx", rmt_del_channel(tx));
+    check("delete-rx", rmt_del_channel(rx));
+    check("delete-encoder", rmt_del_encoder(encoder));
+    for (unsigned beat = 1u; beat <= 10u; beat++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        printf("RMT_LOOPBACK_ALIVE %u\n", beat);
+        fflush(stdout);
+    }
+    for (;;) vTaskDelay(pdMS_TO_TICKS(100));
+}
