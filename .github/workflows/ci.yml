@@ -108,8 +108,14 @@ jobs:
       - name: Install arduino-cli and ESP32 core 2.0.11
         run: |
           mkdir -p "$HOME/bin"
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
-            | BINDIR="$HOME/bin" sh
+          curl -fsSL --retry 3 --retry-delay 2 \
+            https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_Linux_64bit.tar.gz \
+            -o "$RUNNER_TEMP/arduino-cli.tar.gz"
+          printf '%s  %s\n' \
+            28a8e119c498a25607821c36cb2dc49e8463941b261a0d99091baa7bc692dd2b \
+            "$RUNNER_TEMP/arduino-cli.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/arduino-cli.tar.gz" -C "$HOME/bin" arduino-cli
+          "$HOME/bin/arduino-cli" version
           "$HOME/bin/arduino-cli" core update-index \
             --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           "$HOME/bin/arduino-cli" core install esp32:esp32@2.0.11 \
