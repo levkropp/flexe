@@ -51,7 +51,7 @@ even when a firmware workflow succeeds.
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, `scripts/check-s3-idf-gpio-isr.sh`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Stock ESP-IDF's per-pin ISR, FreeRTOS task notification, and digital open-drain output work; RTC GPIO wake and pad hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire, I2C-slave, and ESP-IDF SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, and GP-SPI segmented/slave modes remain. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
@@ -355,6 +355,37 @@ S3_I2C_ELF=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 RUNNER=./build/flexe-i2c-wire-test ./scripts/check-s3-i2c-wire.sh
 ```
+
+The separate `tests/fixtures/s3_idf_i2c_master` project calls ESP-IDF
+v5.3.2's [new I2C master driver](https://docs.espressif.com/projects/esp-idf/en/v5.3.2/esp32s3/api-reference/peripherals/i2c.html)
+directly, without Arduino or guest-driver hooks. I2C0 sends a 41-byte
+register write to a host-attached device, then performs a repeated-START
+40-byte read through the controller's interrupt/FIFO path. It verifies every
+returned byte and an unattached-address NACK (`ESP_ERR_NOT_FOUND`). Two
+interpreter replays have identical UART and unsupported-MMIO digests, with
+no unsupported I2C controller accesses. The other 72 accesses remain
+diagnostic: 70 startup accesses plus the SDA/SCL GPIO-matrix output routes
+for signals 90/89. The MMIO transaction works, but Flexe does not claim
+to emit their electrical pin waveforms. The pinned image SHA-256 is
+`10934e17ec7ca440c4d81689225373b7fc1809b898700a5a8b813ab9a02c1ccc`
+and the matching ELF SHA-256 is
+`5ef3ea1fb67a20e5748d98124c791197a9404cac0b6dd953a28b441e3d3fd734`;
+both matched across two clean build directories using ESP-IDF commit
+`9d7f2d69f50d1288526d4f1027108e314e8c879f`:
+
+```sh
+idf.py -C tests/fixtures/s3_idf_i2c_master \
+  -B /tmp/flexe-s3-idf-i2c-master-build \
+  -D SDKCONFIG=/tmp/flexe-s3-idf-i2c-master-sdkconfig \
+  -D IDF_TARGET=esp32s3 build
+cmake --build build --target flexe-s3-idf-i2c-master-test
+S3_IDF_I2C_MASTER_BIN=/tmp/flexe-s3-idf-i2c-master-build/s3_idf_i2c_master.bin \
+S3_IDF_I2C_MASTER_ELF=/tmp/flexe-s3-idf-i2c-master-build/s3_idf_i2c_master.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  scripts/check-s3-idf-i2c-master.sh
+```
+
+Matching independently built artifacts can supply `*_SHA256` overrides.
 
 A separate stock Arduino-ESP32 3.3.11 S3 image configures ESP-IDF's I2C0
 slave driver at address `0x42`. A host master writes `DE AD BE EF`; the guest

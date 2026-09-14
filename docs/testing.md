@@ -98,6 +98,12 @@ delivery.
 See [Hardware completeness](hardware-completeness.md) for exact inputs and
 scope.
 
+The direct ESP-IDF S3 driver gates are separate from `test-fixtures.sh`.
+For example, `check-s3-idf-i2c-master.sh` replays a pinned ESP-IDF 5.3
+I2C-master image against a host register device, including repeated-START,
+FIFO refill, and NACK handling. Its build commands and artifact hashes are
+in [Hardware completeness](hardware-completeness.md).
+
 ## JIT verification
 
 `--jit-verify` runs each eligible compiled block natively, rolls back its memory
