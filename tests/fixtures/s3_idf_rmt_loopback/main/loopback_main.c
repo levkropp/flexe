@@ -46,6 +46,13 @@ static bool near(unsigned observed, unsigned expected)
     return observed + 1u >= expected && observed <= expected + 1u;
 }
 
+static bool near_carrier(unsigned observed, unsigned expected)
+{
+    /* RX can measure the envelope boundary only when a carrier edge
+     * arrives. Permit one roughly 26-us carrier cycle at 38 kHz. */
+    return observed + 30u >= expected && observed <= expected + 30u;
+}
+
 void app_main(void)
 {
     receiver_task = xTaskGetCurrentTaskHandle();
@@ -121,6 +128,49 @@ void app_main(void)
            (unsigned)received[1].duration1,
            (unsigned)received[2].duration0,
            (unsigned)received[2].duration1);
+    fflush(stdout);
+
+    rmt_carrier_config_t tx_carrier = {
+        .frequency_hz = 38000,
+        .duty_cycle = 0.5,
+    };
+    rmt_carrier_config_t rx_carrier = {
+        .frequency_hz = 25000,
+        .duty_cycle = 0.5,
+    };
+    check("tx-carrier", rmt_apply_carrier(tx, &tx_carrier));
+    check("rx-demod", rmt_apply_carrier(rx, &rx_carrier));
+    received_count = 0;
+    receive_config.signal_range_max_ns = 500000;
+    check("carrier-receive", rmt_receive(rx, received, sizeof(received),
+                                          &receive_config));
+    const rmt_symbol_word_t carrier_frame[] = {
+        {.level0 = 1, .duration0 = 200, .level1 = 0, .duration1 = 250},
+        {.level0 = 1, .duration0 = 180, .level1 = 0, .duration1 = 220},
+        {.level0 = 1, .duration0 = 160, .level1 = 0, .duration1 = 200},
+    };
+    check("carrier-transmit", rmt_transmit(tx, encoder, carrier_frame,
+                                           sizeof(carrier_frame),
+                                           &transmit_config));
+    check("carrier-tx-complete", rmt_tx_wait_all_done(tx, 1000));
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0)
+        fail("carrier-rx-timeout", ESP_ERR_TIMEOUT);
+    printf("RMT_CARRIER_OBSERVED count=%u first=%u,%u second=%u,%u\n",
+           (unsigned)received_count,
+           (unsigned)received[0].duration0,
+           (unsigned)received[0].duration1,
+           (unsigned)received[1].duration0,
+           (unsigned)received[1].duration1);
+    fflush(stdout);
+    if (received_count < 2u ||
+        received[0].level0 != 1u || received[0].level1 != 0u ||
+        received[1].level0 != 1u || received[1].level1 != 0u ||
+        !near_carrier(received[0].duration0, 200u) ||
+        !near_carrier(received[0].duration1, 250u) ||
+        !near_carrier(received[1].duration0, 180u) ||
+        !near_carrier(received[1].duration1, 220u))
+        fail("carrier-pulse-data", ESP_ERR_INVALID_RESPONSE);
+    printf("RMT_CARRIER_LOOPBACK_OK count=%u\n", (unsigned)received_count);
     fflush(stdout);
     check("disable-tx", rmt_disable(tx));
     check("disable-rx", rmt_disable(rx));

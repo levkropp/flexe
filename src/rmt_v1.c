@@ -35,6 +35,9 @@
 #define RMT_TX_CONTINUOUS     (1u << 3)
 #define RMT_MEM_TX_WRAP       (1u << 4)
 #define RMT_TX_STOP           (1u << 7)
+#define RMT_CARRIER_DATA_ONLY (1u << 20)
+#define RMT_CARRIER_ENABLE    (1u << 21)
+#define RMT_CARRIER_LEVEL     (1u << 22)
 #define RMT_IDLE_OUT_LEVEL     (1u << 5)
 #define RMT_IDLE_OUT_ENABLE    (1u << 6)
 #define RMT_AFIFO_RST         (1u << 23)
@@ -91,10 +94,11 @@ typedef struct {
     uint64_t segment_start;
     uint64_t edge_ticks;
     uint64_t edge_deadline;
+    uint64_t carrier_start;
+    uint64_t carrier_deadline;
     uint32_t edge_item;
     bool edge_second;
     bool edge_active;
-    bool carrier_unsupported_reported;
     uint64_t deadline;
     rmt_event_kind_t event;
     bool active;
@@ -262,6 +266,19 @@ static uint32_t rmt_tick_hz(const flexe_rmt_v1_t *rmt,
     return (uint32_t)((source * div_den) / div_num);
 }
 
+static uint32_t rmt_carrier_hz(const flexe_rmt_v1_t *rmt,
+                               const rmt_tx_channel_t *tx)
+{
+    if (!(tx->conf & RMT_CARRIER_ENABLE)) return 0u;
+    uint64_t source, div_num, div_den;
+    if (!rmt_tick_ratio(rmt, 1u, &source, &div_num, &div_den)) return 0u;
+    /* The duty register is clocked by group SCLK, not the channel divider.
+     * Both half-period fields encode ticks minus one (S3 TRM 37.3.4.3). */
+    uint32_t period = (tx->carrier & 0xFFFFu) + 1u +
+                      ((tx->carrier >> 16u) & 0xFFFFu) + 1u;
+    return (uint32_t)((source * div_den) / (div_num * period));
+}
+
 static uint64_t rmt_ticks_to_cycles_div(const flexe_rmt_v1_t *rmt,
                                         uint32_t channel_div,
                                         uint64_t ticks)
@@ -307,6 +324,44 @@ static uint64_t rmt_cycles_to_ticks_div(const flexe_rmt_v1_t *rmt,
         rmt_mul_saturating(cycles, source / common), div_den);
     uint64_t denominator = (cpu_hz / common) * div_num;
     return numerator / denominator;
+}
+
+static bool rmt_carrier_wave_high(const flexe_rmt_v1_t *rmt,
+                                  const rmt_tx_channel_t *tx,
+                                  uint64_t now, uint64_t *next)
+{
+    /* Start high with TX_START and keep phase across threshold refills.
+     * The register periods are architectural; the silicon start phase is
+     * not yet calibrated against a physical S3. */
+    uint32_t high = ((tx->carrier >> 16u) & 0xFFFFu) + 1u;
+    uint32_t low = (tx->carrier & 0xFFFFu) + 1u;
+    uint32_t period = high + low;
+    uint64_t elapsed = now >= tx->carrier_start ?
+                       now - tx->carrier_start : 0u;
+    uint64_t tick = rmt_cycles_to_ticks_div(rmt, 1u, elapsed);
+    uint32_t phase = (uint32_t)(tick % period);
+    if (next) {
+        uint64_t next_tick = tick +
+            (phase < high ? high - phase : period - phase);
+        uint64_t duration = rmt_ticks_to_cycles_div(rmt, 1u, next_tick);
+        *next = tx->carrier_start > UINT64_MAX - duration ?
+                UINT64_MAX : tx->carrier_start + duration;
+        if (*next <= now && now != UINT64_MAX) *next = now + 1u;
+    }
+    return phase < high;
+}
+
+static bool rmt_tx_pad_level(const flexe_rmt_v1_t *rmt,
+                              const rmt_tx_channel_t *tx,
+                              bool symbol_level, uint64_t now,
+                              uint64_t *carrier_deadline)
+{
+    if (carrier_deadline) *carrier_deadline = UINT64_MAX;
+    bool carrier_level = (tx->conf & RMT_CARRIER_LEVEL) != 0u;
+    if (!(tx->conf & RMT_CARRIER_ENABLE) || symbol_level != carrier_level)
+        return symbol_level;
+    bool high = rmt_carrier_wave_high(rmt, tx, now, carrier_deadline);
+    return high ? carrier_level : !carrier_level;
 }
 
 static uint32_t rmt_capacity(const flexe_rmt_v1_t *rmt, unsigned channel)
@@ -540,8 +595,32 @@ static void rmt_tx_emit_idle(flexe_rmt_v1_t *rmt, unsigned channel,
                              uint64_t cycle)
 {
     uint32_t conf = rmt->tx[channel].conf;
+    if ((conf & (RMT_CARRIER_ENABLE | RMT_CARRIER_DATA_ONLY)) ==
+        RMT_CARRIER_ENABLE) {
+        /* Always-on modulation also runs while the channel is idle. Its
+         * idle oscillator is not scheduled yet; do not expose a fake level. */
+        rmt_tx_emit_level(rmt, channel, -1, -1, cycle);
+        return;
+    }
     rmt_tx_emit_level(rmt, channel, (conf & RMT_IDLE_OUT_LEVEL) != 0u,
                       (conf & RMT_IDLE_OUT_ENABLE) != 0u, cycle);
+}
+
+static bool rmt_tx_edge_symbol_level(const rmt_tx_channel_t *tx)
+{
+    uint32_t item = tx->segment_items[tx->edge_item];
+    return tx->edge_second ? (item & (1u << 31u)) != 0u :
+                             (item & (1u << 15u)) != 0u;
+}
+
+static void rmt_tx_emit_edge_level(flexe_rmt_v1_t *rmt,
+                                    unsigned channel, uint64_t cycle)
+{
+    rmt_tx_channel_t *tx = &rmt->tx[channel];
+    bool level = rmt_tx_pad_level(rmt, tx,
+                                  rmt_tx_edge_symbol_level(tx), cycle,
+                                  &tx->carrier_deadline);
+    rmt_tx_emit_level(rmt, channel, level, true, cycle);
 }
 
 static void rmt_tx_start_segment(flexe_rmt_v1_t *rmt, unsigned channel,
@@ -555,17 +634,11 @@ static void rmt_tx_start_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     }
     bool observed = rmt->tx_edge_changed && rmt->tx_edge_needed &&
                     rmt->tx_edge_needed(rmt->tx_edge_ctx, channel);
-    if (!observed || (tx->conf & (1u << 21u)) != 0u) {
+    if (!observed ||
+        (tx->conf & (RMT_CARRIER_ENABLE | RMT_CARRIER_DATA_ONLY)) ==
+        RMT_CARRIER_ENABLE) {
         /* Without a pad observer, keep the aggregate pulse callback fast.
-         * A modulated carrier needs further phase modeling; do not feed
-         * the bare symbol envelope into a receiver as a fake waveform. */
-        if (observed && !tx->carrier_unsupported_reported) {
-            rmt->fallback_write(
-                rmt->fallback_ctx,
-                rmt->desc->base + RMT_TX_CONF_OFF + channel * 4u,
-                tx->conf);
-            tx->carrier_unsupported_reported = true;
-        }
+         * Always-on carrier is explicitly unsupported, including idle. */
         rmt_tx_emit_level(rmt, channel, -1, -1, start_cycle);
         return;
     }
@@ -576,9 +649,7 @@ static void rmt_tx_start_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     uint64_t duration = rmt_ticks_to_cycles(rmt, tx, tx->edge_ticks);
     tx->edge_deadline = start_cycle > UINT64_MAX - duration ?
                         UINT64_MAX : start_cycle + duration;
-    rmt_tx_emit_level(rmt, channel,
-                      (tx->segment_items[0] & (1u << 15u)) != 0u,
-                      true, start_cycle);
+    rmt_tx_emit_edge_level(rmt, channel, start_cycle);
 }
 
 static void rmt_tx_advance_edge(flexe_rmt_v1_t *rmt, unsigned channel,
@@ -602,10 +673,7 @@ static void rmt_tx_advance_edge(flexe_rmt_v1_t *rmt, unsigned channel,
     uint64_t duration = rmt_ticks_to_cycles(rmt, tx, tx->edge_ticks);
     tx->edge_deadline = tx->segment_start > UINT64_MAX - duration ?
                         UINT64_MAX : tx->segment_start + duration;
-    bool level = tx->edge_second ?
-        (item & (1u << 31u)) != 0u :
-        (item & (1u << 15u)) != 0u;
-    rmt_tx_emit_level(rmt, channel, level, true, cycle);
+    rmt_tx_emit_edge_level(rmt, channel, cycle);
 }
 
 static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
@@ -618,11 +686,7 @@ static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
         (tx->segment_count || event == RMT_EVENT_END ||
          event == RMT_EVENT_ERROR)) {
         uint32_t tick_hz = rmt_tick_hz(rmt, tx);
-        uint32_t carrier_hz = 0u;
-        uint32_t carrier_period = (tx->carrier & 0xFFFFu) +
-                                  (tx->carrier >> 16);
-        if ((tx->conf & (1u << 21)) && carrier_period)
-            carrier_hz = tick_hz / carrier_period;
+        uint32_t carrier_hz = rmt_carrier_hz(rmt, tx);
         rmt->tx_cb[channel](rmt->tx_ctx[channel], (int)channel,
                             tx->segment_items, tx->segment_count,
                             tick_hz, carrier_hz,
@@ -632,12 +696,14 @@ static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     case RMT_EVENT_END:
         tx->active = false;
         tx->edge_active = false;
+        tx->carrier_deadline = UINT64_MAX;
         rmt_tx_emit_idle(rmt, channel, event_cycle);
         rmt->int_raw |= RMT_TX_END_INT(channel);
         break;
     case RMT_EVENT_ERROR:
         tx->active = false;
         tx->edge_active = false;
+        tx->carrier_deadline = UINT64_MAX;
         rmt_tx_emit_idle(rmt, channel, event_cycle);
         rmt->int_raw |= RMT_ERROR_INT(channel);
         break;
@@ -730,17 +796,26 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
     for (unsigned channel = 0u; channel < rmt->desc->tx_channel_count;
          channel++) {
         rmt_tx_channel_t *tx = &rmt->tx[channel];
-        unsigned safety = 0u;
+        unsigned segment_safety = 0u;
         while (tx->active && tx->event != RMT_EVENT_NONE &&
-               safety++ < 1024u) {
+               segment_safety < 1024u) {
             if (tx->edge_active && tx->edge_deadline < tx->deadline &&
+                tx->edge_deadline <= tx->carrier_deadline &&
                 tx->edge_deadline <= now) {
                 rmt_tx_advance_edge(rmt, channel, tx->edge_deadline);
                 changed = true;
                 continue;
             }
+            if (tx->edge_active && tx->carrier_deadline < tx->deadline &&
+                tx->carrier_deadline <= now) {
+                rmt_tx_emit_edge_level(rmt, channel,
+                                        tx->carrier_deadline);
+                changed = true;
+                continue;
+            }
             if (tx->deadline > now) break;
             rmt_finish_segment(rmt, channel, tx->deadline);
+            segment_safety++;
             changed = true;
         }
     }
@@ -759,12 +834,15 @@ bool flexe_rmt_v1_tx_sample(flexe_rmt_v1_t *rmt, unsigned channel,
         return false;
     flexe_rmt_v1_eval(rmt);
     const rmt_tx_channel_t *tx = &rmt->tx[channel];
+    if ((tx->conf & (RMT_CARRIER_ENABLE | RMT_CARRIER_DATA_ONLY)) ==
+        RMT_CARRIER_ENABLE)
+        return false;
     if (!tx->active) {
         *level = (tx->conf & RMT_IDLE_OUT_LEVEL) != 0u;
         *enabled = (tx->conf & RMT_IDLE_OUT_ENABLE) != 0u;
         return true;
     }
-    if ((tx->conf & ((1u << 21u) | RMT_TX_CONTINUOUS)) != 0u ||
+    if ((tx->conf & RMT_TX_CONTINUOUS) != 0u ||
         tx->segment_count == 0u)
         return false;
 
@@ -779,7 +857,9 @@ bool flexe_rmt_v1_tx_sample(flexe_rmt_v1_t *rmt, unsigned channel,
         uint64_t boundary = tx->segment_start > UINT64_MAX - duration ?
                             UINT64_MAX : tx->segment_start + duration;
         if (now < boundary) {
-            *level = (item & (1u << 15u)) != 0u;
+            *level = rmt_tx_pad_level(rmt, tx,
+                                      (item & (1u << 15u)) != 0u,
+                                      now, NULL);
             *enabled = 1;
             return true;
         }
@@ -788,7 +868,9 @@ bool flexe_rmt_v1_tx_sample(flexe_rmt_v1_t *rmt, unsigned channel,
         boundary = tx->segment_start > UINT64_MAX - duration ?
                    UINT64_MAX : tx->segment_start + duration;
         if (second != 0u && now < boundary) {
-            *level = (item & (1u << 31u)) != 0u;
+            *level = rmt_tx_pad_level(rmt, tx,
+                                      (item & (1u << 31u)) != 0u,
+                                      now, NULL);
             *enabled = 1;
             return true;
         }
@@ -810,6 +892,11 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
         if (d < distance) distance = d;
         if (tx->edge_active && tx->edge_deadline < tx->deadline) {
             d = tx->edge_deadline > now ? tx->edge_deadline - now : 0u;
+            if (d < distance) distance = d;
+        }
+        if (tx->edge_active && tx->carrier_deadline < tx->deadline) {
+            d = tx->carrier_deadline > now ?
+                tx->carrier_deadline - now : 0u;
             if (d < distance) distance = d;
         }
     }
@@ -935,7 +1022,9 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         /* The finite-stream path supports wrap and threshold refills. The
          * channel loop-count engine is not modeled yet, so make that mode
          * visible in unsupported-MMIO diagnostics instead of accepting it. */
-        if (value & (RMT_TX_CONTINUOUS | RMT_DMA_ACCESS))
+        if ((value & (RMT_TX_CONTINUOUS | RMT_DMA_ACCESS)) ||
+            (value & (RMT_CARRIER_ENABLE | RMT_CARRIER_DATA_ONLY)) ==
+            RMT_CARRIER_ENABLE)
             rmt->fallback_write(rmt->fallback_ctx, address, value);
         tx->conf = value & ~RMT_COMMAND_MASK;
         if (value & RMT_MEM_RD_RST) tx->read_index = 0u;
@@ -944,13 +1033,14 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             tx->active = false;
             tx->event = RMT_EVENT_NONE;
             tx->edge_active = false;
+            tx->carrier_deadline = UINT64_MAX;
             rmt_tx_emit_idle(rmt, channel, rmt_clock_now(rmt));
         }
         if (value & RMT_TX_START) {
             tx->active = true;
             tx->read_index = 0u;
-            tx->carrier_unsupported_reported = false;
-            rmt_tx_start_segment(rmt, channel, rmt_clock_now(rmt));
+            tx->carrier_start = rmt_clock_now(rmt);
+            rmt_tx_start_segment(rmt, channel, tx->carrier_start);
         }
         if (!tx->active)
             rmt_tx_emit_idle(rmt, channel, rmt_clock_now(rmt));

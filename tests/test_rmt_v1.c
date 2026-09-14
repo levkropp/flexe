@@ -13,6 +13,8 @@
 #define S3_RMT_INT_ST     0x074u
 #define S3_RMT_INT_ENA    0x078u
 #define S3_RMT_INT_CLR    0x07Cu
+#define S3_RMT_CARRIER0   0x080u
+#define S3_RMT_RX_CARRIER4 0x090u
 #define S3_RMT_TX_LIMIT0  0x0A0u
 #define S3_RMT_RX_LIMIT4  0x0B0u
 #define S3_RMT_SYS_CONF   0x0C0u
@@ -540,19 +542,104 @@ TEST(s3_rmt_v1_gpio_in_polls_unobserved_tx_without_edge_events)
     ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, 0u);
     ASSERT_EQ(periph_unhandled_count(periph), 0u);
 
-    /* A carrier-modulated TX is not an envelope waveform. Sampling it
-     * remains unknown and causes a visible diagnostic. */
+    /* A data-only carrier is sampled from the group-clock oscillator even
+     * when no consumer has asked the device to schedule pad edges. */
     cpu0.ccount = 800u;
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_FUNC_OUT4,
+                s3->rmt_v1.output_signal_base);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CARRIER0,
+                (1u << 16u)); /* high two SCLK ticks, low one */
     mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
                 conf | (1u << 21u) | 1u);
-    (void)mem_read32(mem, S3_GPIO_BASE + 0x03Cu);
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, mask);
+    cpu0.ccount = 807u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, mask);
+    cpu0.ccount = 808u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, 0u);
+    cpu0.ccount = 812u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, mask);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    /* Always-on carrier includes the idle oscillator, which is still
+     * unsupported and must not be mistaken for a valid sampled level. */
+    cpu0.ccount = 1200u;
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                (conf & ~(1u << 20u)) | (1u << 21u));
     ASSERT_EQ(periph_unhandled_count(periph), 1u);
 
     periph_destroy(periph);
     mem_destroy(mem);
 }
 
-TEST(s3_rmt_v1_carrier_loopback_stays_unknown_and_diagnostic)
+TEST(s3_rmt_v1_data_only_carrier_reaches_gpio_and_rx_demodulator)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    rmt_v1_probe_t probe = {0};
+    ASSERT_EQ(periph_set_rmt_tx_callback(periph, 0,
+                                         rmt_v1_tx_observed, &probe), 0);
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_FUNC_OUT4,
+                s3->rmt_v1.output_signal_base);
+    uint32_t conf = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF0) |
+                    (1u << 6);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0, conf);
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & (1u << 4),
+              0u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 29) | (1u << 28) | (1u << 24) |
+                (40u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CARRIER4, 1u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | 1u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0,
+                10u | (1u << 15) | (20u << 16));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CARRIER0,
+                1u << 16u); /* 8 high + 4 low CPU cycles */
+    /* Reset TX configuration already selects data-only/high carrier. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                conf | (1u << 5) | 1u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & (1u << 4),
+              1u << 4);
+    cpu0.ccount = 7u;
+    (void)mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    cpu0.ccount = 8u;
+    (void)mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 0);
+    cpu0.ccount = 12u;
+    (void)mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    cpu0.ccount = 239u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+    cpu0.ccount = 240u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              10u | (1u << 15) | (20u << 16));
+    ASSERT_EQ(probe.carrier_hz, 13333333u);
+    ASSERT_EQ(probe.completions, 1u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(s3_rmt_v1_carrier_delayed_eval_replays_full_pad_waveform)
 {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -570,33 +657,71 @@ TEST(s3_rmt_v1_carrier_loopback_stays_unknown_and_diagnostic)
     mem_write32(mem, s3->io_mux.base +
                      s3->io_mux.gpio_register_offset[4],
                 s3->io_mux.input_enable_mask);
-    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
     mem_write32(mem, S3_GPIO_BASE + S3_GPIO_FUNC_OUT4,
                 s3->rmt_v1.output_signal_base);
-    uint32_t conf = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF0) |
-                    (1u << 5) | (1u << 6);
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0, conf);
-    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & (1u << 4),
-              1u << 4);
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
-                (1u << 24) | (20u << 8) | 2u);
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
-                (1u << 15) | (1u << 3) | 1u);
+    mem_write32(mem, S3_GPIO_BASE + 0x074u + 4u * 4u,
+                (1u << 13) | (1u << 7)); /* watched positive-edge IRQ */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CARRIER0,
+                1u << 16u); /* 8 high + 4 low CPU cycles */
     mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0,
-                10u | (1u << 15) | (20u << 16));
-    /* The reset TX configuration enables a carrier. Its phase/duty is not
-     * modeled at the pad, even though aggregate pulse output still works. */
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0, conf | 1u);
-    ASSERT_EQ(periph_gpio_pin_level(periph, 4), -1);
-    ASSERT_EQ(periph_unhandled_count(periph), 1u);
-    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & (1u << 4), 0u);
-    ASSERT_EQ(periph_unhandled_count(periph), 2u);
-    (void)mem_read32(mem, S3_GPIO_BASE + 0x03Cu);
-    ASSERT_EQ(periph_unhandled_count(periph), 2u);
-    cpu0.ccount = 400u;
-    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+                2000u | (1u << 15) | (10u << 16));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0 + 4u, 0u);
+    uint32_t conf = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF0);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                conf | (1u << 6) | 1u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
-    ASSERT_EQ(periph_unhandled_count(periph), 2u);
+
+    /* One delayed read must not drop the 2,666 carrier transitions before
+     * the 2,000-tick envelope boundary. The safety bound counts segments,
+     * not observable pad edges. */
+    cpu0.ccount = 16000u;
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0) >> 22) & 7u,
+              1u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 0);
+    cpu0.ccount = 16080u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 1u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(s3_rmt_v1_data_only_carrier_can_modulate_low_symbols)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    mem_write32(mem, s3->io_mux.base +
+                     s3->io_mux.gpio_register_offset[4],
+                s3->io_mux.input_enable_mask);
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_FUNC_OUT4,
+                s3->rmt_v1.output_signal_base);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CARRIER0, 1u << 16u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0,
+                10u | (10u << 16u) | (1u << 31u));
+    uint32_t conf = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF0);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                (conf & ~(1u << 22u)) | (1u << 6u) | 1u);
+    uint32_t mask = 1u << 4u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, 0u);
+    cpu0.ccount = 8u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, mask);
+    cpu0.ccount = 12u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, 0u);
+    cpu0.ccount = 80u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, mask);
+    cpu0.ccount = 159u;
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, mask);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
     periph_destroy(periph);
     mem_destroy(mem);
 }
@@ -964,7 +1089,9 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_rx_captures_gpio_output_loopback_edges);
     RUN_TEST(s3_rmt_v1_rx_captures_rmt_tx_pad_waveform);
     RUN_TEST(s3_rmt_v1_gpio_in_polls_unobserved_tx_without_edge_events);
-    RUN_TEST(s3_rmt_v1_carrier_loopback_stays_unknown_and_diagnostic);
+    RUN_TEST(s3_rmt_v1_data_only_carrier_reaches_gpio_and_rx_demodulator);
+    RUN_TEST(s3_rmt_v1_carrier_delayed_eval_replays_full_pad_waveform);
+    RUN_TEST(s3_rmt_v1_data_only_carrier_can_modulate_low_symbols);
     RUN_TEST(s3_rmt_v1_tx_pad_edges_raise_gpio_interrupt);
     RUN_TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock);
     RUN_TEST(s3_rmt_v1_rx_demodulates_both_carrier_polarities);
