@@ -153,9 +153,10 @@ resets to the specified defaults, and treats counter-clear as a write-only
 strobe. Its detector remains clear under Flexe's fixed nominal supply; analog
 thresholds, voltage injection, brownout interrupts, and resets are not modeled.
 `RTC_CNTL_PWC_REG`'s global RTC pad-force-hold bit freezes all 22 RTC-capable
-pads through the same physical hold model as individual bits. It retains its
-own source across a deep-sleep rebuild; releasing it does not release a pad
-held individually. Other RTC power/isolation fields read back but their power
+pads through the same physical hold model as individual bits. ROM boot clears
+the global source, while individually held pads retain their state across a
+deep-sleep rebuild. Releasing global hold does not release an individual pad.
+Other RTC power/isolation fields read back but their power
 effects remain diagnostic and are not treated as implemented.
 Rebuild and run with the matching external artifacts:
 

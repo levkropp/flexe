@@ -15832,6 +15832,14 @@ void periph_deassert_interrupt(esp32_periph_t *p, int source) {
     intr_matrix_update_source(p, source, false);
 }
 
+static uint64_t pad_hold_source_pins(uint32_t value, unsigned first_gpio,
+                                     unsigned first_bit, unsigned count)
+{
+    if (count == 0u) return 0u;
+    return ((uint64_t)(value >> first_bit) &
+            ((UINT64_C(1) << count) - 1u)) << first_gpio;
+}
+
 void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out)
 {
     if (!out) return;
@@ -15848,13 +15856,23 @@ void periph_pad_hold_snapshot(const esp32_periph_t *p, periph_pad_hold_t *out)
         if (rtc->digital_pad_hold_count != 0u)
             out->target_rtc_hold = mem_read32(
                 p->mem, rtc->base + rtc->digital_pad_hold_offset);
-        if (rtc->rtc_power_offset != 0u)
-            out->target_rtc_force_hold = mem_read32(
-                p->mem, rtc->base + rtc->rtc_power_offset) &
-                rtc->rtc_pad_force_hold_mask;
         flexe_rtc_io_pad_hold_snapshot(p->target_rtc_io,
                                        &out->target_rtc_io);
         flexe_gpio_pad_hold_snapshot(p->target_gpio, &out->target_gpio);
+        /* The effective hold mask includes global force-hold, but that source
+         * disappears during ROM boot. Preserve only independently held pads;
+         * otherwise their frozen levels would be resurrected after reset. */
+        uint64_t held =
+            pad_hold_source_pins(out->target_rtc_io_hold,
+                                 rtc->rtc_pad_hold_first_gpio,
+                                 rtc->rtc_pad_hold_first_bit,
+                                 rtc->rtc_pad_hold_count) |
+            pad_hold_source_pins(out->target_rtc_hold,
+                                 rtc->digital_pad_hold_first_gpio,
+                                 rtc->digital_pad_hold_first_bit,
+                                 rtc->digital_pad_hold_count);
+        out->target_rtc_io.mask &= (uint32_t)held;
+        out->target_gpio.mask &= held;
         return;
     }
 
@@ -15886,13 +15904,6 @@ void periph_pad_hold_restore(esp32_periph_t *p, const periph_pad_hold_t *in)
          p->target->rtc_cntl.digital_pad_hold_count != 0u)) {
         if (in->target_gpio.mask) {
             const flexe_rtc_cntl_desc_t *rtc = &p->target->rtc_cntl;
-            if (rtc->rtc_power_offset != 0u) {
-                uint32_t addr = rtc->base + rtc->rtc_power_offset;
-                uint32_t value = mem_read32(p->mem, addr);
-                mem_write32(p->mem, addr,
-                            (value & ~rtc->rtc_pad_force_hold_mask) |
-                            in->target_rtc_force_hold);
-            }
             if (rtc->rtc_pad_hold_count != 0u)
                 mem_write32(p->mem,
                             rtc->base + rtc->rtc_pad_hold_offset,

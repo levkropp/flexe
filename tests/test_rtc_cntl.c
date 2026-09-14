@@ -768,10 +768,10 @@ TEST(rtc_cntl_s3_force_hold_freezes_all_rtc_pads_and_preserves_sources)
                 rtc->rtc_power_reset | rtc->rtc_pad_force_hold_mask);
     periph_pad_hold_t snapshot;
     periph_pad_hold_snapshot(periph, &snapshot);
-    ASSERT_EQ64(snapshot.target_gpio.mask,
-                (UINT64_C(1) << io->gpio_count) - 1u);
-    ASSERT_EQ(snapshot.target_rtc_force_hold,
-              rtc->rtc_pad_force_hold_mask);
+    /* The active global source holds every RTC pad, but a rebuild snapshot
+     * contains only independently held pads that survive ROM boot. */
+    ASSERT_EQ64(snapshot.target_gpio.mask, 0u);
+    ASSERT_EQ(snapshot.target_rtc_io.mask, 0u);
     mem_write32(mem, gpio + 0x00Cu, 1u << 4u);
     mem_write32(mem, io->base + 0x008u, rtc11);
     ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
@@ -796,7 +796,7 @@ TEST(rtc_cntl_s3_force_hold_freezes_all_rtc_pads_and_preserves_sources)
     mem_destroy(mem);
 }
 
-TEST(rtc_cntl_s3_force_hold_survives_rebuild_without_per_pad_latches)
+TEST(rtc_cntl_s3_force_hold_clears_at_boot_without_inventing_pad_holds)
 {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -819,8 +819,8 @@ TEST(rtc_cntl_s3_force_hold_survives_rebuild_without_per_pad_latches)
     periph_pad_hold_t snapshot;
     periph_pad_hold_snapshot(periph, &snapshot);
     ASSERT_EQ(snapshot.target_rtc_io_hold, 0u);
-    ASSERT_EQ(snapshot.target_rtc_force_hold,
-              rtc->rtc_pad_force_hold_mask);
+    ASSERT_EQ64(snapshot.target_gpio.mask, 0u);
+    ASSERT_EQ(snapshot.target_rtc_io.mask, 0u);
     periph_destroy(periph);
 
     periph = periph_create(mem);
@@ -828,13 +828,59 @@ TEST(rtc_cntl_s3_force_hold_survives_rebuild_without_per_pad_latches)
     if (periph) {
         ASSERT_EQ(mem_read32(mem, power), rtc->rtc_power_reset);
         periph_pad_hold_restore(periph, &snapshot);
-        ASSERT_EQ(mem_read32(mem, power),
-                  rtc->rtc_power_reset | rtc->rtc_pad_force_hold_mask);
+        ASSERT_EQ(mem_read32(mem, power), rtc->rtc_power_reset);
         ASSERT_EQ(mem_read32(mem, hold), 0u);
-        ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
-        mem_write32(mem, power, rtc->rtc_power_reset);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 4), 0);
         periph_pad_hold_snapshot(periph, &snapshot);
         ASSERT_EQ64(snapshot.target_gpio.mask, 0u);
+        ASSERT_EQ(periph_unhandled_count(periph), 0);
+        periph_destroy(periph);
+    }
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_force_hold_rebuild_retains_only_individual_source)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    uint32_t power = rtc->base + rtc->rtc_power_offset;
+    uint32_t hold = rtc->base + rtc->rtc_pad_hold_offset;
+    uint32_t gpio = s3->gpio.base;
+    uint32_t pin4 = 1u << 4u;
+    mem_write32(mem, gpio + 0x008u, pin4);
+    mem_write32(mem, gpio + 0x024u, pin4);
+    mem_write32(mem, power,
+                rtc->rtc_power_reset | rtc->rtc_pad_force_hold_mask);
+    mem_write32(mem, hold, pin4);
+    mem_write32(mem, gpio + 0x00Cu, pin4);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+
+    periph_pad_hold_t snapshot;
+    periph_pad_hold_snapshot(periph, &snapshot);
+    ASSERT_EQ(snapshot.target_rtc_io_hold, pin4);
+    ASSERT_EQ64(snapshot.target_gpio.mask, pin4);
+    ASSERT_EQ(snapshot.target_rtc_io.mask, pin4);
+    periph_destroy(periph);
+
+    periph = periph_create(mem);
+    ASSERT_TRUE(periph != NULL);
+    if (periph) {
+        periph_pad_hold_restore(periph, &snapshot);
+        ASSERT_EQ(mem_read32(mem, power), rtc->rtc_power_reset);
+        ASSERT_EQ(mem_read32(mem, hold), pin4);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+        periph_pad_hold_snapshot(periph, &snapshot);
+        ASSERT_EQ64(snapshot.target_gpio.mask, pin4);
+        mem_write32(mem, hold, 0u);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 4), 0);
         ASSERT_EQ(periph_unhandled_count(periph), 0);
         periph_destroy(periph);
     }
@@ -1501,7 +1547,8 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_rtc_pad_hold_freezes_mux_input_and_output);
     RUN_TEST(rtc_cntl_rtc_pad_hold_survives_rebuild_with_frozen_mux);
     RUN_TEST(rtc_cntl_s3_force_hold_freezes_all_rtc_pads_and_preserves_sources);
-    RUN_TEST(rtc_cntl_s3_force_hold_survives_rebuild_without_per_pad_latches);
+    RUN_TEST(rtc_cntl_s3_force_hold_clears_at_boot_without_inventing_pad_holds);
+    RUN_TEST(rtc_cntl_s3_force_hold_rebuild_retains_only_individual_source);
     RUN_TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level);
     RUN_TEST(rtc_cntl_interrupt_routes_through_target_matrix);
     RUN_TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset);
