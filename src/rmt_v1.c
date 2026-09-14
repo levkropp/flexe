@@ -8,7 +8,7 @@
 /* ESP32-S3 RMT V1 register layout from Espressif's rmt_reg.h. Four TX and
  * four RX channels share a 384-word pulse RAM. Host RX injection supplies
  * already-decoded symbols; GPIO-matrix edges pass through the timed RX
- * glitch filter before pulse decoding. */
+ * glitch filter and carrier remover before pulse decoding. */
 #define RMT_TX_CONF_OFF       0x020u
 #define RMT_RX_CONF_OFF       0x030u
 #define RMT_STATUS_OFF        0x050u
@@ -62,6 +62,7 @@
 #define RMT_RX_CONF_UPDATE   (1u << 15)
 #define RMT_RX_DMA_ACCESS    (1u << 23)
 #define RMT_RX_DEMOD_EN      (1u << 28)
+#define RMT_RX_CARRIER_LEVEL (1u << 29)
 #define RMT_RX_COMMAND_MASK  (RMT_RX_MEM_WR_RST | RMT_RX_APB_MEM_RST | \
                               RMT_RX_AFIFO_RST | RMT_RX_CONF_UPDATE)
 
@@ -117,6 +118,9 @@ typedef struct {
     bool filter_level;
     bool filter_target;
     uint64_t filter_deadline;
+    bool demod_pending;
+    uint64_t demod_start;
+    uint64_t demod_deadline;
 } rmt_rx_channel_t;
 
 struct flexe_rmt_v1 {
@@ -324,6 +328,8 @@ static void rmt_abort_rx_frame(rmt_rx_channel_t *rx)
     rx->edge_deadline = UINT64_MAX;
     rx->filter_pending = false;
     rx->filter_deadline = UINT64_MAX;
+    rx->demod_pending = false;
+    rx->demod_deadline = UINT64_MAX;
 }
 
 static void rmt_finish_rx(flexe_rmt_v1_t *rmt, unsigned channel)
@@ -404,6 +410,47 @@ static void rmt_rx_commit_edge(flexe_rmt_v1_t *rmt, unsigned index,
         rmt, rx->conf0 & 0xFFu, idle_ticks) : UINT64_MAX;
     rx->edge_deadline = now > UINT64_MAX - idle_cycles ?
                         UINT64_MAX : now + idle_cycles;
+    rmt_notify_state(rmt);
+}
+
+static void rmt_rx_accept_level(flexe_rmt_v1_t *rmt, unsigned index,
+                                bool level, uint64_t now)
+{
+    rmt_rx_channel_t *rx = &rmt->rx[index];
+    if (!(rx->conf0 & RMT_RX_DEMOD_EN)) {
+        rmt_rx_commit_edge(rmt, index, level, now);
+        return;
+    }
+
+    bool carrier_level = (rx->conf0 & RMT_RX_CARRIER_LEVEL) != 0u;
+    if (level == carrier_level) {
+        /* A short gap between carrier cycles never reaches the symbol
+         * counter. A gap that qualified has already committed its edge. */
+        if (rx->demod_pending) {
+            rx->demod_pending = false;
+            rx->demod_deadline = UINT64_MAX;
+            rmt_notify_state(rmt);
+        }
+        if (!rx->edge_started || rx->edge_level != level)
+            rmt_rx_commit_edge(rmt, index, level, now);
+        return;
+    }
+    if (!rx->edge_started || rx->edge_level != carrier_level) return;
+
+    /* The opposite-level gap must remain for its programmed number of
+     * channel ticks before the carrier envelope ends. The register encodes
+     * a period minus one (S3 RMT_CHm_RX_CARRIER_RM_REG). Preserve the
+     * original edge timestamp when the gap qualifies. Same-polarity duty
+     * discrimination is outside this functional envelope model. */
+    uint32_t threshold = carrier_level ?
+        (rx->carrier & 0xFFFFu) + 1u :
+        ((rx->carrier >> 16u) & 0xFFFFu) + 1u;
+    uint64_t cycles = rmt_ticks_to_cycles_div(
+        rmt, rx->conf0 & 0xFFu, threshold);
+    rx->demod_pending = true;
+    rx->demod_start = now;
+    rx->demod_deadline = now > UINT64_MAX - cycles ?
+                         UINT64_MAX : now + cycles;
     rmt_notify_state(rmt);
 }
 
@@ -530,11 +577,15 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
         while (rx->active) {
             bool filter_due = rx->filter_pending &&
                               rx->filter_deadline <= now;
+            bool demod_due = rx->demod_pending &&
+                             rx->demod_deadline <= now;
             bool idle_due = rx->edge_started &&
                             rx->edge_deadline <= now;
-            if (!filter_due && !idle_due) break;
+            if (!filter_due && !demod_due && !idle_due) break;
             if (idle_due && (!filter_due ||
-                             rx->edge_deadline <= rx->filter_deadline)) {
+                             rx->edge_deadline <= rx->filter_deadline) &&
+                            (!demod_due ||
+                             rx->edge_deadline <= rx->demod_deadline)) {
                 /* Idle completion precedes a later qualifying edge. A
                  * completed first half with no second edge is terminal. */
                 if (rx->edge_first_valid)
@@ -543,11 +594,21 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
                 changed = true;
                 break;
             }
+            if (demod_due && (!filter_due ||
+                              rx->demod_deadline <= rx->filter_deadline)) {
+                uint64_t edge_cycle = rx->demod_start;
+                bool inactive = (rx->conf0 & RMT_RX_CARRIER_LEVEL) == 0u;
+                rx->demod_pending = false;
+                rx->demod_deadline = UINT64_MAX;
+                rmt_rx_commit_edge(rmt, channel, inactive, edge_cycle);
+                changed = true;
+                continue;
+            }
             uint64_t deadline = rx->filter_deadline;
             bool level = rx->filter_target;
             rx->filter_pending = false;
             rx->filter_level = level;
-            rmt_rx_commit_edge(rmt, channel, level, deadline);
+            rmt_rx_accept_level(rmt, channel, level, deadline);
             changed = true;
         }
         while (rx->pending_end && rx->deadline <= now) {
@@ -608,6 +669,11 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
         if (rx->filter_pending) {
             uint64_t d = rx->filter_deadline > now ?
                 rx->filter_deadline - now : 0u;
+            if (d < distance) distance = d;
+        }
+        if (rx->demod_pending) {
+            uint64_t d = rx->demod_deadline > now ?
+                rx->demod_deadline - now : 0u;
             if (d < distance) distance = d;
         }
     }
@@ -747,6 +813,9 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             if (value & RMT_RX_CONF_UPDATE) {
                 bool was_active = rx->active;
                 rx->active = (rx->conf1 & RMT_RX_EN) != 0u;
+                /* The envelope path models opposite-level gaps, but not
+                 * same-level carrier duty recognition or silicon phase.
+                 * Keep that partial mode visible in the MMIO audit. */
                 if (rx->active && (rx->conf0 & RMT_RX_DEMOD_EN))
                     rmt->fallback_write(rmt->fallback_ctx, address, value);
                 if (!was_active || !rx->active) rmt_abort_rx_frame(rx);
@@ -925,7 +994,7 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
     unsigned index = channel - rmt->desc->tx_channel_count;
     rmt_rx_channel_t *rx = &rmt->rx[index];
     if (!rx->active || rx->pending_end || rx->edge_started ||
-        rx->filter_pending ||
+        rx->filter_pending || rx->demod_pending ||
         !rmt_source_hz(rmt)) return 0u;
     if (!(rx->conf1 & RMT_RX_MEM_OWNER)) {
         rx->status_flags |= 1u << 25;
@@ -972,8 +1041,7 @@ void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
     unsigned index = channel - rmt->desc->tx_channel_count;
     flexe_rmt_v1_eval(rmt);
     rmt_rx_channel_t *rx = &rmt->rx[index];
-    if (!rx->active || rx->pending_end ||
-        (rx->conf0 & RMT_RX_DEMOD_EN) || !rmt_source_hz(rmt)) return;
+    if (!rx->active || rx->pending_end || !rmt_source_hz(rmt)) return;
     if (!(rx->conf1 & RMT_RX_MEM_OWNER)) {
         rx->status_flags |= 1u << 25;
         rmt->int_raw |= RMT_RX_ERROR_INT(index);
@@ -984,7 +1052,7 @@ void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
     if (!(rx->conf1 & RMT_RX_FILTER_EN) ||
         !((rx->conf1 >> RMT_RX_FILTER_THRES_SHIFT) &
           RMT_RX_FILTER_THRES_MASK)) {
-        rmt_rx_commit_edge(rmt, index, level, now);
+        rmt_rx_accept_level(rmt, index, level, now);
         return;
     }
     if (!rx->edge_started && !rx->filter_pending)

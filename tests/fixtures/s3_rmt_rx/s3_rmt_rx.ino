@@ -4,7 +4,7 @@
 // These markers let the host test inject a frame only after the production
 // Arduino/ESP-IDF RX driver has armed its channel.
 extern "C" volatile uint32_t flexe_rmt_rx_stage = 0;
-extern "C" volatile uint32_t flexe_rmt_rx_result[100] = {};
+extern "C" volatile uint32_t flexe_rmt_rx_result[104] = {};
 
 static constexpr int kRxPin = 4;
 static rmt_data_t received[128] = {};
@@ -33,7 +33,8 @@ void setup() {
 
 void loop() {
   const uint32_t stage = flexe_rmt_rx_stage;
-  if ((stage != 1 && stage != 2) || !rmtReceiveCompleted(kRxPin)) {
+  if ((stage != 1 && stage != 2 && stage != 3) ||
+      !rmtReceiveCompleted(kRxPin)) {
     delay(1);
     return;
   }
@@ -50,9 +51,27 @@ void loop() {
     flexe_rmt_rx_stage = 2;
     return;
   }
-  flexe_rmt_rx_result[3] = received_count;
-  for (size_t i = 0; i < received_count && i < 96; i++)
-    flexe_rmt_rx_result[4 + i] = received[i].val;
+  if (stage == 2) {
+    flexe_rmt_rx_result[3] = received_count;
+    for (size_t i = 0; i < received_count && i < 96; i++)
+      flexe_rmt_rx_result[4 + i] = received[i].val;
+    Serial.printf("S3_RMT_RX_LONG count=%u\n", (unsigned)received_count);
+    if (!rmtSetRxMaxThreshold(kRxPin, 200) ||
+        !rmtSetCarrier(kRxPin, true, false, 25000, 0.33f)) {
+      flexe_rmt_rx_stage = 0xBAD00006;
+      return;
+    }
+    received_count = RMT_SYMBOLS_OF(received);
+    if (!rmtReadAsync(kRxPin, received, &received_count)) {
+      flexe_rmt_rx_stage = 0xBAD00007;
+      return;
+    }
+    flexe_rmt_rx_stage = 3;
+    return;
+  }
+  flexe_rmt_rx_result[100] = received_count;
+  flexe_rmt_rx_result[101] = received[0].val;
+  flexe_rmt_rx_result[102] = received[1].val;
   flexe_rmt_rx_stage = 0x1A7C0DE;
-  Serial.printf("S3_RMT_RX_LONG count=%u\n", (unsigned)received_count);
+  Serial.printf("S3_RMT_RX_CARRIER count=%u\n", (unsigned)received_count);
 }

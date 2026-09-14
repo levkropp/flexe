@@ -10,8 +10,8 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-rmt-rx-test"}
-expected_bin=eb707b1e97ffbc51a0e6849fe1cd31c87fd04c61ba1b30a817ca6ae1b280a018
-expected_elf=13f230b233c5e8f18dd46cebe5116663b1c1d08fbdbd9322192dcd32d8e95051
+expected_bin=27c4a14c42ac478cd6bfbaf509f1068ffb15d7371c6626c148a088772eee41cd
+expected_elf=0eedeb00430d938805517f0ff008147f890111dfcbc3b67e6b2b18af8193f81f
 expected_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
 for entry in "$S3_RMT_RX_BIN:$expected_bin" "$S3_RMT_RX_ELF:$expected_elf" \
              "$S3_ROM_ELF:$expected_rom"; do
@@ -39,7 +39,7 @@ cmp -s "$tmpdir/run1" "$tmpdir/run2" || {
     diff -u "$tmpdir/run1" "$tmpdir/run2" >&2 || true
     exit 1
 }
-grep -Fq 'gpio=1 injected_long=1 counts=2,96' "$tmpdir/run1"
-grep -Fq 'short_match=1 long_match=1' "$tmpdir/run1"
-grep -Fq 'rmt_unhandled_sites=0' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 filtered a GPIO4 glitch, decoded pulse edges and a 96-symbol host frame through its RX ISR, with no unsupported RMT MMIO and byte-identical replay"
+grep -Fq 'gpio=1 injected_long=1 gpio_carrier=1 counts=2,96,2' "$tmpdir/run1"
+grep -Fq 'short_match=1 long_match=1 carrier_match=1' "$tmpdir/run1"
+grep -Fq 'rmt_partial_sites=1 rmt_unhandled_sites=0' "$tmpdir/run1"
+echo "PASS: stock Arduino S3 filtered GPIO4 glitches, demodulated a carrier frame, and received 96 host symbols through its RX ISR, with one explicit partial demod diagnostic and byte-identical replay"

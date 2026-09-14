@@ -55,7 +55,7 @@ even when a firmware workflow succeeds.
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, power-transition fidelity, calibrated timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | Counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
-| S3 RMT RX | Partial (MMIO, filtered GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, decodes the remaining waveform and a 96-symbol host frame through the ESP-IDF ISR without RMT fallback | GPIO edges and filter deadlines use guest time; carrier demodulation, DMA, odd pulse tails, and overrun behavior under delayed ISR service remain unverified or unsupported. |
+| S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame through the ESP-IDF ISR | GPIO, filter, and carrier-envelope deadlines use guest time; one explicit demod MMIO diagnostic remains for unmodeled same-polarity duty/phase behavior; DMA, odd pulse tails, and delayed-ISR overrun remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal and WLED native lwIP/Ethernet UI and JSON state gates | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported. |
 | S3 Bluetooth baseband clock | Partial (MMIO) | `tests/test_radio.c` checks half-slot/subslot phase against guest time | Controller scheduler, packets, and RF are unsupported; Marauder still asserts before its CLI. |
@@ -328,15 +328,25 @@ the model measures edge intervals on the guest clock. The input glitch
 filter qualifies edges after the configured number of RMT group-clock ticks,
 before the per-channel divider, matching ESP-IDF 5.5's S3 filter clock choice
 ([Espressif RX driver](https://github.com/espressif/esp-idf/blob/v5.5.1/components/esp_driver_rmt/src/rmt_rx.c)).
-The stock RX fixture arms a three-channel-tick minimum and verifies that a
-one-tick GPIO4 glitch does not change its first decoded symbol. Two pinned interpreter
-replays match byte-for-byte with no unsupported RMT MMIO sites. Host-decoded
-injection still bypasses GPIO and the filter; carrier demodulation, DMA,
-and overrun/error behavior when the guest fails to service a threshold
-in time remain unsupported. Counted TX loops, synchronized TX, and exact
-waveform-to-GPIO output routing also remain unsupported; those paths retain
-diagnostics. Odd final half-symbol encoding and GPIO route changes mid-frame
-also lack hardware validation. Recheck the RX path with the compiled fixture
+The carrier remover joins short opposite-polarity gaps according to the
+channel-clock thresholds in the
+[S3 technical reference manual](https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf).
+The stock RX fixture arms a three-channel-tick filter minimum, rejects a
+one-tick GPIO4 glitch, and then uses Arduino's `rmtSetCarrier()` to demodulate
+a 38 kHz-style carrier with 25 kHz tolerance into a two-symbol frame. Unit
+tests cover both carrier polarities. Two pinned interpreter replays match
+byte-for-byte with one expected demodulation MMIO diagnostic and no other
+unsupported RMT sites. This is a functional
+envelope model that uses the opposite-polarity gap threshold; same-polarity
+carrier duty discrimination and exact demodulation phase/frequency tolerance
+are not calibrated against physical S3 silicon. Host-decoded injection still
+bypasses GPIO, filtering,
+and demodulation. DMA and overrun/error behavior when the guest fails to
+service a threshold in time remain unsupported. Counted TX loops,
+synchronized TX, and exact waveform-to-GPIO output routing also remain
+unsupported; those paths retain diagnostics. Odd final half-symbol encoding
+and GPIO route changes mid-frame also lack hardware validation. Recheck the RX
+path with the compiled fixture
 and official ROM ELF:
 
 ```sh
@@ -349,9 +359,9 @@ RUNNER=./build/flexe-s3-rmt-rx-test ./scripts/check-s3-rmt-rx.sh
 ```
 
 The RX fixture's pinned merged image SHA-256 is
-`eb707b1e97ffbc51a0e6849fe1cd31c87fd04c61ba1b30a817ca6ae1b280a018`
+`27c4a14c42ac478cd6bfbaf509f1068ffb15d7371c6626c148a088772eee41cd`
 and its matching ELF SHA-256 is
-`13f230b233c5e8f18dd46cebe5116663b1c1d08fbdbd9322192dcd32d8e95051`.
+`0eedeb00430d938805517f0ff008147f890111dfcbc3b67e6b2b18af8193f81f`.
 For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and

@@ -424,6 +424,76 @@ TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_rx_demodulates_both_carrier_polarities)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
+
+    /* Four short high carrier pulses separated by two-tick low gaps form
+     * one 14-tick mark. A ten-tick low gap ends it; the low threshold is
+     * register value + 1 = five channel ticks. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 29) | (1u << 28) | (1u << 24) |
+                (40u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + 0x90u, (4u << 16) | 4u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | 1u);
+    periph_gpio_set_input(periph, 4, 1);
+    for (unsigned i = 0u; i < 3u; i++) {
+        cpu0.ccount = 16u + i * 32u;
+        periph_gpio_set_input(periph, 4, 0);
+        cpu0.ccount = 32u + i * 32u;
+        periph_gpio_set_input(periph, 4, 1);
+    }
+    cpu0.ccount = 112u;
+    periph_gpio_set_input(periph, 4, 0);
+    cpu0.ccount = 151u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+    cpu0.ccount = 192u;
+    periph_gpio_set_input(periph, 4, 1);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              14u | (1u << 15) | (10u << 16));
+
+    /* The opposite polarity uses the high-gap threshold instead. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 1));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 28) | (1u << 24) | (40u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | 1u);
+    cpu0.ccount = 300u;
+    periph_gpio_set_input(periph, 4, 0);
+    for (unsigned i = 0u; i < 3u; i++) {
+        cpu0.ccount = 316u + i * 32u;
+        periph_gpio_set_input(periph, 4, 1);
+        cpu0.ccount = 332u + i * 32u;
+        periph_gpio_set_input(periph, 4, 0);
+    }
+    cpu0.ccount = 412u;
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 492u;
+    periph_gpio_set_input(periph, 4, 0);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              14u | ((10u | (1u << 15)) << 16));
+    ASSERT_EQ(periph_unhandled_count(periph), 2u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible)
 {
     const flexe_target_desc_t *s3 =
@@ -579,6 +649,7 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq);
     RUN_TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time);
     RUN_TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock);
+    RUN_TEST(s3_rmt_v1_rx_demodulates_both_carrier_polarities);
     RUN_TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible);
     RUN_TEST(s3_rmt_v1_rx_wrap_refills_both_halves_before_end);
     RUN_TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic);
