@@ -394,6 +394,20 @@ static void invoke_wifi_call0_4(xtensa_cpu_t *cpu, uint32_t addr,
     xtensa_step(cpu);
 }
 
+static void invoke_s3_vfs_fd_range(xtensa_cpu_t *cpu, uint32_t return_pc,
+                                   uint32_t min_fd, uint32_t max_fd)
+{
+    cpu->pc = 0x40374340u;
+    cpu->_pc_written = true;
+    XT_PS_SET_CALLINC(cpu->ps, 0);
+    ar_write(cpu, 0, return_pc);
+    ar_write(cpu, 2, 0x3FCA2000u); /* guest esp_vfs_t pointer */
+    ar_write(cpu, 3, 0u);          /* context */
+    ar_write(cpu, 4, min_fd);
+    ar_write(cpu, 5, max_fd);
+    xtensa_step(cpu);
+}
+
 static void invoke_wifi_call0_6(xtensa_cpu_t *cpu, uint32_t addr,
                                 uint32_t arg0, uint32_t arg1,
                                 uint32_t arg2, uint32_t arg3,
@@ -443,17 +457,20 @@ static elf_symbols_t *wifi_test_s3_symbols(void)
         "esp_wifi_internal_reg_rxcb", "esp_wifi_internal_tx",
         "esp_wifi_internal_tx_by_ref",
         "esp_wifi_internal_free_rx_buffer",
+        "esp_vfs_register_fd_range",
+        "esp_vfs_lwip_sockets_register",
     };
     static const uint32_t addrs[] = {
         0x40374100u, 0x40374140u, 0x40374180u, 0x403741C0u,
         0x40374200u,
         0x40374240u, 0x40374280u, 0x403742C0u, 0x40374300u,
+        0x40374340u, 0x40374380u,
     };
     static const char section_names[] = "\0.symtab\0.strtab\0.shstrtab\0";
-    char strings[256] = {0};
-    wifi_test_elf_symbol_t symbols[10] = {{0}};
+    char strings[512] = {0};
+    wifi_test_elf_symbol_t symbols[12] = {{0}};
     size_t strings_len = 1u;
-    for (size_t i = 0; i < 9u; i++) {
+    for (size_t i = 0; i < 11u; i++) {
         size_t len = strlen(names[i]) + 1u;
         if (strings_len + len > sizeof(strings)) return NULL;
         symbols[i + 1u].name = (uint32_t)strings_len;
@@ -566,6 +583,111 @@ TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks) {
     cpu._pc_written = true;
     ASSERT_EQ(xtensa_step(&cpu), 0u);
     ASSERT_EQ(cpu.pc, 0x40374203u);
+
+done:
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    mem_destroy(mem);
+#endif
+}
+
+TEST(s3_socket_range_uses_only_lwip_vfs_registration) {
+#ifndef _WIN32
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+    xtensa_cpu_t cpu;
+    xtensa_cpu_reset_for_target(&cpu, s3);
+    cpu.mem = mem;
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    elf_symbols_t *syms = wifi_test_s3_symbols();
+    ASSERT_TRUE(rom != NULL);
+    ASSERT_TRUE(wifi != NULL);
+    ASSERT_TRUE(syms != NULL);
+    if (!rom || !wifi || !syms) goto done;
+
+    const uint32_t register_range = 0x40374340u;
+    const uint32_t lwip_register = 0x40374380u;
+    put_insn3(&cpu, register_range, 0x0020F0u); /* spy lets VFS execute */
+    ASSERT_EQ(wifi_stubs_hook_socket_symbols_from_vfs(wifi, syms), 5u);
+
+    /* Before the guest registers its range, the bridge must not invent 48. */
+    invoke_wifi_call0_4(&cpu, 0x40374100u, 2u, 2u, 0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+    wifi_stubs_stats_t stats = {0};
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.socket_successes, 0u);
+
+    /* An identical range from another VFS owner is not evidence for lwIP. */
+    invoke_s3_vfs_fd_range(&cpu, BASE + 0x100u, 54u, 64u);
+    ASSERT_EQ(cpu.pc, register_range + 3u);
+    invoke_wifi_call0_4(&cpu, 0x40374100u, 2u, 2u, 0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+
+    /* The two-word fd_set boundary is explicit, not silently truncated. */
+    invoke_s3_vfs_fd_range(&cpu, lwip_register + 4u, 54u, 65u);
+    ASSERT_EQ(cpu.pc, register_range + 3u);
+    invoke_wifi_call0_4(&cpu, 0x40374100u, 2u, 2u, 0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+
+    invoke_s3_vfs_fd_range(&cpu, lwip_register + 4u, 54u, 64u);
+    ASSERT_EQ(cpu.pc, register_range + 3u);
+    invoke_wifi_call0_4(&cpu, 0x40374100u, 2u, 2u, 0u, 0u);
+    uint32_t fd = ar_read(&cpu, 2);
+    ASSERT_EQ(fd, 54u);
+    const uint32_t set_addr = 0x3FCA1000u;
+    mem_write32(mem, set_addr, 0u);
+    mem_write32(mem, set_addr + 4u, 1u << (fd - 32u));
+    invoke_wifi_call0_4(&cpu, 0x40374140u, fd + 1u, 0u, set_addr, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 1u);
+    ASSERT_EQ(mem_read32(mem, set_addr + 4u), 1u << (fd - 32u));
+    invoke_wifi_call0(&cpu, 0x403741C0u, fd);
+    invoke_wifi_call0(&cpu, 0x403741C0u, fd);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX); /* closed FD is EBADF */
+    wifi_stubs_get_stats(wifi, &stats);
+    ASSERT_EQ64(stats.socket_successes, 1u);
+
+done:
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    mem_destroy(mem);
+#endif
+}
+
+TEST(s3_socket_range_expands_past_default_sixteen_slots) {
+#ifndef _WIN32
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+    xtensa_cpu_t cpu;
+    xtensa_cpu_reset_for_target(&cpu, s3);
+    cpu.mem = mem;
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    elf_symbols_t *syms = wifi_test_s3_symbols();
+    ASSERT_TRUE(rom != NULL);
+    ASSERT_TRUE(wifi != NULL);
+    ASSERT_TRUE(syms != NULL);
+    if (!rom || !wifi || !syms) goto done;
+
+    put_insn3(&cpu, 0x40374340u, 0x0020F0u);
+    ASSERT_EQ(wifi_stubs_hook_socket_symbols_from_vfs(wifi, syms), 5u);
+    invoke_s3_vfs_fd_range(&cpu, 0x40374384u, 40u, 64u);
+    for (uint32_t i = 0; i < 24u; i++) {
+        invoke_wifi_call0_4(&cpu, 0x40374100u, 2u, 2u, 0u, 0u);
+        ASSERT_EQ(ar_read(&cpu, 2), 40u + i);
+    }
+    invoke_wifi_call0_4(&cpu, 0x40374100u, 2u, 2u, 0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+    for (uint32_t i = 0; i < 24u; i++)
+        invoke_wifi_call0(&cpu, 0x403741C0u, 40u + i);
 
 done:
     elf_symbols_destroy(syms);
@@ -1322,6 +1444,8 @@ TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time) {
 static void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks);
+    RUN_TEST(s3_socket_range_uses_only_lwip_vfs_registration);
+    RUN_TEST(s3_socket_range_expands_past_default_sixteen_slots);
     RUN_TEST(s3_ethernet_netif_boundary_preserves_guest_fallback_and_buffer_lifetime);
     RUN_TEST(promiscuous_frame_requires_enabled_callback);
     RUN_TEST(promiscuous_frame_runs_callback_and_restores_cpu);

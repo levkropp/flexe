@@ -421,11 +421,9 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
             if (s->syms)
                 wifi_stubs_hook_symbols(s->wstubs, s->syms);
         } else if (s->syms) {
-            /* ESP-IDF/Arduino's default 64-descriptor, 16-socket build
-             * places sockets at 48..63. This is an SDK profile, not an S3
-             * silicon register; other builds need offset discovery before
-             * they can claim this host service. */
-            wifi_stubs_hook_socket_symbols(s->wstubs, s->syms, 48);
+            /* Use the linked SDK's own VFS socket registration rather than
+             * assuming a descriptor offset for every S3 firmware image. */
+            wifi_stubs_hook_socket_symbols_from_vfs(s->wstubs, s->syms);
             wifi_stubs_hook_ethernet_symbols(s->wstubs, s->syms);
         }
     }

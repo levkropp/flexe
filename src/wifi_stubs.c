@@ -61,7 +61,8 @@ static inline int fcntl(int fd, int cmd, ...)
 
 /* ===== Constants ===== */
 
-#define MAX_EMU_SOCKETS 16
+#define MAX_EMU_SOCKETS 64
+#define CLASSIC_SOCKET_COUNT 16
 #define GUEST_ERRNO_CACHE_SLOTS 16
 
 /* A guest can poll a nonblocking UDP socket much faster than either a real
@@ -220,6 +221,10 @@ struct wifi_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
     int                socket_fd_base;
+    int                socket_fd_count;
+    uint32_t           socket_vfs_caller_start;
+    uint32_t           socket_vfs_caller_end;
+    bool               socket_range_missing_reported;
     /* The firmware's own __errno routine. Calling it preserves newlib's
      * per-task reentrancy instead of redirecting every subsystem to a global
      * emulator scratch word. */
@@ -327,6 +332,8 @@ static void ws_return(xtensa_cpu_t *cpu, uint32_t retval)
     }
 }
 
+static void ws_fail(wifi_stubs_t *ws, xtensa_cpu_t *cpu, int err);
+
 /* ===== WiFi log helper ===== */
 
 static void wifi_log(wifi_stubs_t *ws, const char *fmt, ...) {
@@ -411,13 +418,13 @@ static int stub_wifi_ethernet_rx_free(xtensa_cpu_t *cpu, void *ctx)
 static int fd_to_idx(const wifi_stubs_t *ws, int fd)
 {
     int idx = fd - ws->socket_fd_base;
-    if (idx < 0 || idx >= MAX_EMU_SOCKETS) return -1;
+    if (idx < 0 || idx >= ws->socket_fd_count) return -1;
     return idx;
 }
 
 static int slot_alloc(wifi_stubs_t *ws, int host_fd)
 {
-    for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
+    for (int i = 0; i < ws->socket_fd_count; i++) {
         if (ws->sockets[i].host_fd == -1) {
             ws->sockets[i].host_fd = host_fd;
             ws->sockets[i].socket_type = 0;
@@ -513,6 +520,15 @@ static void stub_lwip_socket(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     ws->stats.socket_calls++;
+    if (ws->socket_fd_count == 0) {
+        if (!ws->socket_range_missing_reported) {
+            fprintf(stderr, "[wifi] unsupported lwIP socket FD range: "
+                    "guest VFS registration was not observed\n");
+            ws->socket_range_missing_reported = true;
+        }
+        ws_fail(ws, cpu, NEWLIB_EBADF);
+        return;
+    }
     uint32_t domain   = ws_arg(cpu, 0);
     uint32_t type     = ws_arg(cpu, 1);
     uint32_t protocol = ws_arg(cpu, 2);
@@ -721,14 +737,13 @@ static void stub_lwip_close(xtensa_cpu_t *cpu, void *ctx)
     uint32_t fd = ws_arg(cpu, 0);
 
     emu_socket_t *s = slot_get(ws, (int)fd);
-    if (s) {
-        wifi_log(ws, "close(slot %u, host fd %d)\n", fd, s->host_fd);
-        close(s->host_fd);
-        slot_free(ws, (int)fd);
-    } else if (fd >= (uint32_t)ws->socket_fd_base &&
-               fd < (uint32_t)(ws->socket_fd_base + MAX_EMU_SOCKETS)) {
-        wifi_log(ws, "close(fd %u): no slot (passthrough)\n", fd);
+    if (!s) {
+        ws_fail(ws, cpu, NEWLIB_EBADF);
+        return;
     }
+    wifi_log(ws, "close(slot %u, host fd %d)\n", fd, s->host_fd);
+    close(s->host_fd);
+    slot_free(ws, (int)fd);
     ws_return(cpu, 0);
 }
 
@@ -1081,7 +1096,7 @@ static void stub_lwip_select(xtensa_cpu_t *cpu, void *ctx)
                      emu_ebits[1] = mem_read32(cpu->mem, exc_ptr + 4); }
 
     /* Check each possible socket fd */
-    for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
+    for (int i = 0; i < ws->socket_fd_count; i++) {
         int fd = i + ws->socket_fd_base;
         if ((uint32_t)fd >= nfds) break;
         emu_socket_t *s = slot_get(ws, fd);
@@ -1108,7 +1123,7 @@ static void stub_lwip_select(xtensa_cpu_t *cpu, void *ctx)
 
     if (ret > 0) {
         uint32_t out_r[2] = {0, 0}, out_w[2] = {0, 0}, out_e[2] = {0, 0};
-        for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
+        for (int i = 0; i < ws->socket_fd_count; i++) {
             int fd = i + ws->socket_fd_base;
             emu_socket_t *s = slot_get(ws, fd);
             if (!s) continue;
@@ -2797,6 +2812,7 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
     if (!ws) return NULL;
     ws->cpu = cpu;
     ws->socket_fd_base = CLASSIC_SOCKET_FD_BASE;
+    ws->socket_fd_count = CLASSIC_SOCKET_COUNT;
     ws->hostent_buf = HOSTENT_SCRATCH_ADDR;
     ws->channel = 1;
     ws->wifi_mode = WIFI_MODE_NULL;
@@ -2875,17 +2891,58 @@ static int wifi_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms,
     return hooked;
 }
 
-int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
-                                   const elf_symbols_t *syms,
-                                   int socket_fd_base)
+/* ESP-IDF registers the linked lwIP descriptor interval with VFS during
+ * startup. Observe the real call, but only when its return address is inside
+ * esp_vfs_lwip_sockets_register; unrelated VFS ranges are not socket ranges.
+ * The spy leaves the guest's own registration implementation untouched. */
+static void spy_lwip_vfs_fd_range(xtensa_cpu_t *cpu, void *ctx)
 {
-    if (!ws || !syms || socket_fd_base < 0 ||
-        socket_fd_base + MAX_EMU_SOCKETS > 64)
-        return 0;
-    ws->rom = ws->cpu ? ws->cpu->pc_hook_ctx : NULL;
-    if (!ws->rom) return 0;
-    ws->socket_fd_base = socket_fd_base;
+    wifi_stubs_t *ws = ctx;
+    int callinc = XT_PS_CALLINC(cpu->ps);
+    uint32_t return_pc = (cpu->pc & 0xC0000000u) |
+                         (ar_read(cpu, callinc * 4) & 0x3FFFFFFFu);
+    if (return_pc < ws->socket_vfs_caller_start ||
+        return_pc >= ws->socket_vfs_caller_end)
+        return;
 
+    uint32_t min_fd = ws_arg(cpu, 2);
+    uint32_t max_fd = ws_arg(cpu, 3);
+    if (min_fd >= max_fd || max_fd > MAX_EMU_SOCKETS) {
+        fprintf(stderr, "[wifi] unsupported lwIP socket FD range [%u, %u)\n",
+                min_fd, max_fd);
+        return;
+    }
+    if (ws->socket_fd_count != 0 &&
+        (ws->socket_fd_base != (int)min_fd ||
+         ws->socket_fd_count != (int)(max_fd - min_fd))) {
+        fprintf(stderr, "[wifi] unsupported conflicting lwIP socket FD range "
+                "[%u, %u)\n",
+                min_fd, max_fd);
+        return;
+    }
+    ws->socket_fd_base = (int)min_fd;
+    ws->socket_fd_count = (int)(max_fd - min_fd);
+}
+
+typedef struct {
+    const char *name;
+    uint32_t start;
+    uint32_t size;
+} wifi_symbol_range_t;
+
+static int wifi_find_symbol_range(const char *name, uint32_t addr,
+                                  uint32_t size, void *ctx)
+{
+    wifi_symbol_range_t *range = ctx;
+    if (strcmp(name, range->name) != 0) return 0;
+    range->start = addr;
+    range->size = size;
+    return 1;
+}
+
+static int wifi_hook_socket_symbols(wifi_stubs_t *ws,
+                                    const elf_symbols_t *syms)
+{
     /* The guest's own accessor, not a classic ESP32 fixed RAM address,
      * determines task-local errno on this symbol-resolved path. */
     uint32_t errno_fn = 0u;
@@ -2915,6 +2972,57 @@ int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
         { NULL, NULL }
     };
     return wifi_hook_symbols(ws, syms, hooks);
+}
+
+int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
+                                   const elf_symbols_t *syms,
+                                   int socket_fd_base)
+{
+    if (!ws || !syms || socket_fd_base < 0 || socket_fd_base >= 64)
+        return 0;
+    ws->rom = ws->cpu ? ws->cpu->pc_hook_ctx : NULL;
+    if (!ws->rom) return 0;
+    ws->socket_fd_base = socket_fd_base;
+    ws->socket_fd_count = 64 - socket_fd_base;
+    if (ws->socket_fd_count > CLASSIC_SOCKET_COUNT)
+        ws->socket_fd_count = CLASSIC_SOCKET_COUNT;
+    return wifi_hook_socket_symbols(ws, syms);
+}
+
+int wifi_stubs_hook_socket_symbols_from_vfs(wifi_stubs_t *ws,
+                                            const elf_symbols_t *syms)
+{
+    if (!ws || !syms || !ws->cpu || !ws->cpu->mem ||
+        mem_target(ws->cpu->mem)->id != FLEXE_TARGET_ESP32S3)
+        return 0;
+    ws->rom = ws->cpu->pc_hook_ctx;
+    if (!ws->rom) return 0;
+    if (elf_symbols_find(syms, "lwip_socket", NULL) != 0)
+        return 0; /* a non-networking image needs no socket bridge */
+
+    wifi_symbol_range_t caller = {
+        .name = "esp_vfs_lwip_sockets_register"
+    };
+    uint32_t register_range = 0;
+    elf_symbols_iterate(syms, wifi_find_symbol_range, &caller);
+    if (!caller.start || !caller.size ||
+        caller.start > UINT32_MAX - caller.size ||
+        elf_symbols_find(syms, "esp_vfs_register_fd_range",
+                         &register_range) != 0) {
+        fprintf(stderr, "[wifi] unsupported lwIP socket FD range: "
+                "guest VFS registration symbols are unavailable\n");
+        return 0;
+    }
+
+    ws->socket_fd_base = 0;
+    ws->socket_fd_count = 0;
+    ws->socket_vfs_caller_start = caller.start;
+    ws->socket_vfs_caller_end = caller.start + caller.size;
+    if (rom_stubs_register_spy(ws->rom, register_range,
+                               spy_lwip_vfs_fd_range,
+                               "esp_vfs_register_fd_range", ws) != 0)
+        return 0;
+    return 1 + wifi_hook_socket_symbols(ws, syms);
 }
 
 int wifi_stubs_hook_ethernet_symbols(wifi_stubs_t *ws,
@@ -3820,7 +3928,7 @@ int wifi_stubs_get_bound_host_port(const wifi_stubs_t *ws,
                                    uint16_t *host_port_out) {
     if (!ws || !host_port_out) return -1;
     int wanted_type = datagram ? SOCK_DGRAM : SOCK_STREAM;
-    for (int i = 0; i < MAX_EMU_SOCKETS; i++) {
+    for (int i = 0; i < ws->socket_fd_count; i++) {
         const emu_socket_t *s = &ws->sockets[i];
         if (s->host_fd >= 0 && s->socket_type == wanted_type &&
             s->firmware_port == firmware_port && s->host_port != 0) {

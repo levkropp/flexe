@@ -57,7 +57,7 @@ even when a firmware workflow succeeds.
 | S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | Counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame through the ESP-IDF ISR | GPIO, filter, and carrier-envelope deadlines use guest time; one explicit demod MMIO diagnostic remains for unmodeled same-polarity duty/phase behavior; DMA, odd pulse tails, and delayed-ISR overrun remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
-| S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal and WLED native lwIP/Ethernet UI and JSON state gates | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported. |
+| S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth baseband clock | Partial (MMIO) | `tests/test_radio.c` checks half-slot/subslot phase against guest time | Controller scheduler, packets, and RF are unsupported; Marauder still asserts before its CLI. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
 
@@ -549,9 +549,30 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-nerdminer-portal.sh
 ```
 
-The socket descriptor base `48` is this Arduino build's ESP-IDF
-configuration, not a universal S3 constant; other SDK configurations need
-discovery before this bridge can claim support. The
+The S3 BSD-socket service no longer assumes this Arduino build's descriptor
+base `48`. ESP-IDF's
+[`esp_vfs_lwip_sockets_register`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/lwip/port/esp32xx/vfs_lwip.c)
+registers the linked `[LWIP_SOCKET_OFFSET, MAX_FDS)` interval with VFS;
+Flexe observes that native guest call and uses its arguments, leaving the
+guest implementation intact. The stock ESP-IDF v5.3.2 fixture in
+`tests/fixtures/s3_idf_socket_range` builds with `CONFIG_LWIP_MAX_SOCKETS=10`
+and demonstrates guest FDs `54..63`, `select()`, exhaustion, and byte-identical
+interpreter replays (image SHA-256
+`9b28227195225f9ecf9b59edc5d9e6d962eb561a069a6b8d5501c41627dec353`,
+ELF SHA-256
+`2dbbafa1ac2915298c40918e76bb3ff0afb0dc63f58c23eb332bbf5ffbfef881`).
+Without the VFS registration symbols or for a range beyond Flexe's current
+64-FD `select()` layout, the bridge does not guess a base and reports the
+unsupported condition. Run the external-image gate with:
+
+```sh
+S3_IDF_SOCKET_BIN=/path/to/s3_idf_socket_range.bin \
+S3_IDF_SOCKET_ELF=/path/to/s3_idf_socket_range.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-idf-socket-range.sh
+```
+
+The
 [default ESP-IDF RTC-WDT handoff](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/system/wdts.html)
 is represented, but images built to retain that watchdog into user code need
 a separate boot-configuration path. Unsupported PHY diagnostics remain a

@@ -80,6 +80,12 @@ int wifi_stubs_hook_socket_symbols(wifi_stubs_t *ws,
                                    const elf_symbols_t *syms,
                                    int socket_fd_base);
 
+/* S3: observe esp_vfs_lwip_sockets_register's actual fd-range registration
+ * and use its linked SDK descriptor interval. Socket calls fail visibly until
+ * that native guest registration runs; no S3-specific FD constant is used. */
+int wifi_stubs_hook_socket_symbols_from_vfs(wifi_stubs_t *ws,
+                                            const elf_symbols_t *syms);
+
 /* Observe the guest's native Wi-Fi netif registration and virtualize its
  * Ethernet frame boundary only when a host backend is attached. Without one,
  * the guest's original transmit/free functions execute unchanged. */
