@@ -9,9 +9,10 @@
 #define SPI_MEM_REGISTER_WORDS 64u
 #define SPI_MEM_BUFFER_WORDS   16u
 
-/* GD25Q32C SFDP, GigaDevice DS-00088 rev 4.1, tables 3-5. This is the
- * physical 4 MiB profile advertised by the default C8 40 16 JEDEC ID; it
- * must not be reused when the virtual NOR is enlarged to another capacity.
+/* GD25Q32C SFDP, GigaDevice DS-00088 rev 4.1, tables 3-5. The GD25Q64C
+ * (DS-00111 rev 3.2, tables 3-5) has the same bytes in this range except
+ * for the density at 0x37. Select profiles by both JEDEC ID and physical
+ * capacity; other virtual NOR sizes must not inherit either table.
  * Unlisted addresses in the serial parameter space read as pulled-up 0xFF. */
 static const uint8_t GD25Q32C_SFDP[] = {
     0x53, 0x46, 0x44, 0x50, 0x00, 0x01, 0x01, 0xFF,
@@ -252,6 +253,11 @@ static uint32_t spi_mem_flash_size(const flexe_spi_mem_t *spi_mem) {
 static bool spi_mem_is_gd25q32c(const flexe_spi_mem_t *spi_mem) {
     return mem_flash_jedec_id(spi_mem->mem) == 0x001640C8u &&
            spi_mem_flash_size(spi_mem) == 0x00400000u;
+}
+
+static bool spi_mem_is_gd25q64c(const flexe_spi_mem_t *spi_mem) {
+    return mem_flash_jedec_id(spi_mem->mem) == 0x001740C8u &&
+           spi_mem_flash_size(spi_mem) == 0x00800000u;
 }
 
 typedef enum {
@@ -574,13 +580,15 @@ static void spi_mem_read_data(flexe_spi_mem_t *spi_mem,
 static bool spi_mem_read_sfdp(flexe_spi_mem_t *spi_mem,
                                spi_mem_host_t *host,
                                uint32_t offset, int bytes) {
-    if (!spi_mem_is_gd25q32c(spi_mem)) return false;
+    bool gd25q64c = spi_mem_is_gd25q64c(spi_mem);
+    if (!spi_mem_is_gd25q32c(spi_mem) && !gd25q64c) return false;
 
     uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
     for (int i = 0; i < bytes; i++) {
         uint32_t address = offset + (uint32_t)i;
         if (address < sizeof(GD25Q32C_SFDP))
-            dst[i] = GD25Q32C_SFDP[address];
+            dst[i] = gd25q64c && address == 0x37u ? 0x03u :
+                     GD25Q32C_SFDP[address];
     }
     return true;
 }

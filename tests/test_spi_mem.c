@@ -390,7 +390,7 @@ TEST(spi_mem_reports_allocated_flash_capacity) {
 
 }
 
-TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile) {
+TEST(spi_mem_sfdp_matches_advertised_gd25q_c_profiles) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
     xtensa_mem_t *mem = mem_create_for_target(s3);
@@ -426,8 +426,9 @@ TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile) {
     periph_destroy(periph);
     mem_destroy(mem);
 
-    /* A larger virtual NOR advertises a different JEDEC capacity and must
-     * not silently inherit the 4 MiB part's contradictory SFDP density. */
+    /* The documented GD25Q64C has the same parameter bytes except for its
+     * 64-Mbit density DWORD. Check the same reads through SPI0 as well as
+     * the chip ID that selects this profile. */
     mem = mem_create_for_target_with_flash(s3, 0x00800000u);
     periph = periph_create(mem);
     ASSERT_TRUE(mem != NULL);
@@ -437,6 +438,33 @@ TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile) {
         mem_destroy(mem);
         return;
     }
+    ASSERT_EQ(mem_flash_jedec_id(mem), 0x001740C8u);
+    mem_write32(mem, S3_SPI0_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI0_BASE + S3_SPI_MISO_DLEN, 31u);
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        mem_write32(mem, S3_SPI0_BASE + S3_SPI_ADDR, offsets[i]);
+        s3_spi_user_command(mem, S3_SPI0_BASE,
+                            SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MISO,
+                            0x5Au);
+        ASSERT_EQ(mem_read32(mem, S3_SPI0_BASE + S3_SPI_W0),
+                  offsets[i] == 0x34u ? 0x03FFFFFFu : expected[i]);
+    }
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+
+    /* An unprofiled 16 MiB device must not inherit either density, even
+     * though its generated JEDEC manufacturer/family bytes still match. */
+    mem = mem_create_for_target_with_flash(s3, 0x01000000u);
+    periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    ASSERT_EQ(mem_flash_jedec_id(mem), 0x001840C8u);
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 31u);
     mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, 0u);
@@ -903,7 +931,7 @@ void run_spi_mem_tests(void) {
     RUN_TEST(spi_mem_unpopulated_chip_select_clocks_any_command_width);
     RUN_TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation);
     RUN_TEST(spi_mem_reports_allocated_flash_capacity);
-    RUN_TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile);
+    RUN_TEST(spi_mem_sfdp_matches_advertised_gd25q_c_profiles);
     RUN_TEST(spi_mem_gd25q32c_status_survives_flash_reset);
     RUN_TEST(spi_mem_gd25q32c_protection_blocks_whole_operations);
     RUN_TEST(spi_mem_gd25q32c_protection_table_boundaries);

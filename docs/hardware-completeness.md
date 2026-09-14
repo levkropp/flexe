@@ -46,7 +46,7 @@ even when a firmware workflow succeeds.
 | Classic timers, PWM/RMT, watchdogs | Partial (MMIO) | `tools/ledc_pwm_test.c`, `tools/rmt_tx_test.c`, timer/watchdog unit and firmware gates | Aggregate output and event timing do not imply cycle-accurate waveforms or all reset causes. |
 | Classic network/Bluetooth | Partial (service shims and device models) | Meshtastic, Marauder, NerdMiner and WLED compatibility scenarios | RF/PHY propagation and general controller equivalence are unsupported. |
 | S3 LX7, interrupts, dual-core startup | Partial | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, target and interrupt-matrix unit tests | Sustained queue handoffs and CPU1 stall/resume pass; broader FreeRTOS and interrupt workloads remain to validate. |
-| S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c` (including 4 MiB GigaDevice SFDP and BP/CMP protection), `scripts/check-s3-nerdminer-portal.sh` | Other flash protection profiles, cache behavior, and bootloader paths remain unverified. |
+| S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c` (4/8 MiB GigaDevice SFDP; 4 MiB BP/CMP protection), `scripts/check-s3-nerdminer-portal.sh` | Other flash protection profiles, cache behavior, and bootloader paths remain unverified. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC/digital hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
@@ -67,7 +67,7 @@ host-backed socket/select boundary now lets the unmodified firmware serve
 `GET /wifi` as `200 OK` with its 4,985-byte configuration HTML. This is a
 service shim, not a modeled Wi-Fi radio: the page reports no networks, and
 the full POST/restart/reload replay still reports about 35,000 unsupported
-accesses. The separate 4-billion-cycle audit below counts 6,920 (mostly
+accesses. The separate 4-billion-cycle audit below counts 6,919 (mostly
 RF/PHY). The S3 application handoff now clears the power-on flash-boot
 watchdog mode skipped with the second-stage bootloader. Restoring ROM-owned
 BSS and interface state from the official ROM ELF during a software restart
@@ -520,12 +520,13 @@ behavior remain unsupported, and the assertion is not suppressed.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
-the following interpreter audit at 4 billion aggregate cycles reports 6,920
-unsupported accesses. The default 4 MiB GigaDevice flash's `0x5A` SFDP reads
-now use the [GD25Q32C parameter table](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf);
-other capacity profiles retain an explicit unsupported command instead of
-borrowing its 4 MiB density. This image advertises 8 MiB, so one bootloader
-SFDP read is still reported. Six previously reported SPI1 commands are
+the following interpreter audit at 4 billion aggregate cycles reports 6,919
+unsupported accesses. GigaDevice `0x5A` SFDP reads now use the documented
+[GD25Q32C 4 MiB](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf)
+or [GD25Q64C 8 MiB](https://download.gigadevice.com/Datasheet/DS-00111-GD25Q64C-Rev3.2.pdf)
+parameter table only when both JEDEC ID and physical capacity match; other
+profiles remain explicitly unsupported. The latter clears this image's one
+bootloader SFDP diagnostic. Six previously reported SPI1 commands are
 16-bit octal-PSRAM register probes on CS1: with no PSRAM attached in Flexe's
 current S3 profile, they now clock through and return undriven high bits,
 without pretending to supply PSRAM. Of these, 6,728 are in the `0x6000E000`
