@@ -44,6 +44,17 @@ void app_main(void)
     if (err != ESP_OK) fail("install", err);
     err = gpio_isr_handler_add(GPIO_NUM_4, gpio4_rising, NULL);
     if (err != ESP_OK) fail("handler", err);
+    gpio_config_t open_drain = {
+        .pin_bit_mask = UINT64_C(1) << GPIO_NUM_5,
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    err = gpio_config(&open_drain);
+    if (err != ESP_OK) fail("open-drain config", err);
+    err = gpio_set_level(GPIO_NUM_5, 1);
+    if (err != ESP_OK) fail("open-drain release", err);
 
     printf("GPIO_ISR_READY\n");
     fflush(stdout);
@@ -56,6 +67,10 @@ void app_main(void)
             fail("edge", (int)count);
         printf("GPIO_ISR_EDGE round=%u count=%u level=%d\n",
                round, (unsigned)count, level);
+        fflush(stdout);
+        err = gpio_set_level(GPIO_NUM_5, round == 1u ? 0 : 1);
+        if (err != ESP_OK) fail("open-drain level", err);
+        printf("GPIO_OD_%s\n", round == 1u ? "LOW" : "RELEASED");
         fflush(stdout);
     }
     printf("GPIO_ISR_DONE\n");

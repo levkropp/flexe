@@ -231,6 +231,76 @@ TEST(target_gpio_pad_hold_defers_output_notifications_until_release)
     mem_destroy(mem);
 }
 
+TEST(target_gpio_open_drain_releases_high_and_notifies_pad)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    gpio_pad_probe_t probe = {0};
+    flexe_gpio_t *gpio = mem ? flexe_gpio_create(
+        mem, NULL, NULL, NULL, gpio_pad_probe_changed, &probe,
+        NULL, NULL) : NULL;
+    ASSERT_TRUE(gpio != NULL);
+    if (!gpio) {
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t base = s3->gpio.base;
+    uint32_t pin4 = base + 0x074u + 4u * 4u;
+    mem_write32(mem, base + 0x008u, 1u << 4u);
+    mem_write32(mem, base + 0x024u, 1u << 4u);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), 1);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 1);
+    unsigned before = probe.calls;
+
+    mem_write32(mem, pin4, 1u << 2u);
+    ASSERT_EQ(mem_read32(mem, pin4), 1u << 2u);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), 1);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 0);
+    ASSERT_EQ(probe.calls, before + 1u);
+    ASSERT_EQ(probe.pin, 4u);
+    ASSERT_EQ(probe.level, 1);
+    ASSERT_EQ(probe.enabled, 0);
+
+    mem_write32(mem, base + 0x00Cu, 1u << 4u);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), 0);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 1);
+    ASSERT_EQ(probe.calls, before + 2u);
+    ASSERT_EQ(probe.level, 0);
+    ASSERT_EQ(probe.enabled, 1);
+
+    mem_write32(mem, base + 0x008u, 1u << 4u);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 0);
+    ASSERT_EQ(probe.calls, before + 3u);
+    ASSERT_EQ(probe.enabled, 0);
+    mem_write32(mem, pin4, 0u);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 1);
+    ASSERT_EQ(probe.calls, before + 4u);
+    ASSERT_EQ(probe.enabled, 1);
+
+    /* The second S3 GPIO bank uses the same per-pin open-drain control. */
+    uint32_t pin48 = base + 0x074u + 48u * 4u;
+    mem_write32(mem, base + 0x014u, 1u << 16u);
+    mem_write32(mem, base + 0x030u, 1u << 16u);
+    mem_write32(mem, pin48, 1u << 2u);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 48u), 0);
+    mem_write32(mem, base + 0x018u, 1u << 16u);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 48u), 1);
+
+    /* Open-drain follows the routed pad value, after output inversion. */
+    mem_write32(mem, pin4, 1u << 2u);
+    mem_write32(mem, base + 0x554u + 4u * 4u, 256u | (1u << 9u));
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), 0);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 1);
+    mem_write32(mem, base + 0x554u + 4u * 4u, 256u | (1u << 9u) |
+                (1u << 11u));
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 0);
+
+    flexe_gpio_destroy(gpio);
+    mem_destroy(mem);
+}
+
 TEST(target_gpio_diagnoses_behavior_outside_functional_envelope)
 {
     const flexe_target_desc_t *s3 =
@@ -248,8 +318,10 @@ TEST(target_gpio_diagnoses_behavior_outside_functional_envelope)
 
     int before = periph_unhandled_count(periph);
     mem_write32(mem, desc->base + 0x074u, 1u << 2u); /* open drain */
-    ASSERT_EQ(periph_unhandled_count(periph), before + 1);
+    ASSERT_EQ(periph_unhandled_count(periph), before);
     ASSERT_EQ(mem_read32(mem, desc->base + 0x074u), 1u << 2u);
+    mem_write32(mem, desc->base + 0x074u, 1u); /* unmodeled pin control */
+    ASSERT_EQ(periph_unhandled_count(periph), before + 1);
     mem_write32(mem, desc->base + 0x554u, 43u); /* unattached producer */
     ASSERT_EQ(periph_unhandled_count(periph), before + 2);
     ASSERT_EQ(periph_gpio_out_signal(periph, 0), 43);
@@ -273,5 +345,6 @@ void run_target_gpio_tests(void)
     RUN_TEST(target_gpio_routes_s3_edge_and_level_interrupts_to_both_cores);
     RUN_TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads);
     RUN_TEST(target_gpio_pad_hold_defers_output_notifications_until_release);
+    RUN_TEST(target_gpio_open_drain_releases_high_and_notifies_pad);
     RUN_TEST(target_gpio_diagnoses_behavior_outside_functional_envelope);
 }

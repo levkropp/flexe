@@ -8,8 +8,8 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-idf-gpio-isr-test"}
-pinned_bin=dd3a8f53a788a7ac0d74d8c8ee56c591007335448568ce853015adcc8b88399c
-pinned_elf=2949fab9ba1bc4706285e5a4fd2202fb90048d31b05095e4a23b476a1d7a5cbd
+pinned_bin=af96acd3c647184f2b92e6d07df25a20ed28e9a28bcb4084a59479d7c02c9186
+pinned_elf=d3bea1061d45252a05cc973720e4f0ab77ca4ea5945ac854bb6961de59ef66f1
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
 expected_bin=${S3_IDF_GPIO_ISR_BIN_SHA256:-$pinned_bin}
 expected_elf=${S3_IDF_GPIO_ISR_ELF_SHA256:-$pinned_elf}
@@ -51,7 +51,7 @@ fi
 if [[ "$expected_bin" == "$pinned_bin" &&
       "$expected_elf" == "$pinned_elf" &&
       "$expected_rom" == "$pinned_rom" ]]; then
-    for marker in 'UART: 109 bytes fnv32=5BB033A0' \
+    for marker in 'UART: 140 bytes fnv32=18E90165' \
                   'MMIO: 30 sites fnv32=8564F5A6'; do
         grep -Fxq "$marker" "$tmpdir/first.out" || {
             echo "FAIL: pinned UART or MMIO digest changed: $marker" >&2
@@ -68,4 +68,4 @@ cmp -s "$tmpdir/first.err" "$tmpdir/second.err" || {
     exit 1
 }
 
-echo "PASS: ESP-IDF S3 GPIO4 ISR handled two rising edges and task notifications with byte-identical replay; $unsupported other unsupported accesses remain visible"
+echo "PASS: ESP-IDF S3 GPIO4 ISR and GPIO5 open-drain output completed with byte-identical replay; $unsupported other unsupported accesses remain visible"

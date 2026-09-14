@@ -54,11 +54,13 @@
 #define GPIO_PIN_INT_TYPE_MASK      (7u << 7u)
 #define GPIO_PIN_INT_TYPE_SHIFT     7u
 #define GPIO_PIN_INT_ENABLE_MASK    (0x1Fu << 13u)
+#define GPIO_PIN_OPEN_DRAIN         (1u << 2u)
 #define GPIO_PIN_NORMAL_ENABLE      (1u << 13u)
 #define GPIO_PIN_NMI_ENABLE         (1u << 14u)
 #define GPIO_PIN_SDIO_ENABLE        (1u << 17u)
 #define GPIO_PIN_MODELED_MASK       \
-    (GPIO_PIN_INT_TYPE_MASK | GPIO_PIN_NORMAL_ENABLE | GPIO_PIN_NMI_ENABLE)
+    (GPIO_PIN_INT_TYPE_MASK | GPIO_PIN_NORMAL_ENABLE | GPIO_PIN_NMI_ENABLE | \
+     GPIO_PIN_OPEN_DRAIN)
 #define GPIO_FUNC_IN_MASK           0x000000FFu
 #define GPIO_FUNC_IN_INVERT         (1u << 6u)
 #define GPIO_FUNC_IN_MATRIX         (1u << 7u)
@@ -239,6 +241,11 @@ int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin)
     if (!gpio_pin_bit(pin, &bank, &mask)) return -1;
     int enabled = (gpio->enable[bank] & mask) != 0u;
     if (route & GPIO_FUNC_OUT_OEN_INVERT) enabled = !enabled;
+    if (enabled && (gpio->pin[pin] & GPIO_PIN_OPEN_DRAIN) != 0u) {
+        int level = flexe_gpio_pin_level(gpio, pin);
+        if (level < 0) return -1;
+        if (level != 0) enabled = 0;
+    }
     return enabled;
 }
 
@@ -631,6 +638,8 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t value)
         if ((changed & ~GPIO_PIN_MODELED_MASK) != 0u || type > 5u ||
             !gpio_pin_valid(gpio, pin))
             gpio_report_unsupported(gpio, addr, value);
+        if ((changed & GPIO_PIN_OPEN_DRAIN) != 0u)
+            gpio_notify_pin(gpio, pin);
         gpio_update_irq(gpio);
         return;
     }

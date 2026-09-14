@@ -110,10 +110,21 @@ int main(int argc, char **argv)
     periph_gpio_set_input(periph, 4, 0);
 
     bool ok = run_until(session, &uart, "GPIO_ISR_READY");
+    if (ok && (periph_gpio_pin_level(periph, 5) != 1 ||
+               periph_gpio_output_enabled(periph, 5) != 0)) {
+        fprintf(stderr, "GPIO5 open-drain did not release high\n");
+        ok = false;
+    }
     if (ok) {
         periph_gpio_set_input(periph, 4, 1);
         ok = run_until(session, &uart,
-                       "GPIO_ISR_EDGE round=1 count=1 level=1");
+                       "GPIO_OD_LOW") &&
+             has(&uart, "GPIO_ISR_EDGE round=1 count=1 level=1");
+        if (ok && (periph_gpio_pin_level(periph, 5) != 0 ||
+                   periph_gpio_output_enabled(periph, 5) != 1)) {
+            fprintf(stderr, "GPIO5 open-drain did not drive low\n");
+            ok = false;
+        }
     }
     if (ok) {
         periph_gpio_set_input(periph, 4, 1); /* No new edge. */
@@ -126,7 +137,13 @@ int main(int argc, char **argv)
     if (ok) {
         periph_gpio_set_input(periph, 4, 1);
         ok = run_until(session, &uart, "GPIO_ISR_DONE") &&
-             has(&uart, "GPIO_ISR_EDGE round=2 count=2 level=1");
+             has(&uart, "GPIO_ISR_EDGE round=2 count=2 level=1") &&
+             has(&uart, "GPIO_OD_RELEASED");
+        if (ok && (periph_gpio_pin_level(periph, 5) != 1 ||
+                   periph_gpio_output_enabled(periph, 5) != 0)) {
+            fprintf(stderr, "GPIO5 open-drain did not release again\n");
+            ok = false;
+        }
     }
 
     uint32_t mmio_digest = UINT32_C(2166136261);
@@ -155,8 +172,9 @@ int main(int argc, char **argv)
     int unsupported = periph_unhandled_count(periph);
     if (ok) {
         printf("PASS: ESP-IDF S3 GPIO ISR service handled two host rising "
-               "edges, ignored stable/falling input, and notified its "
-               "task; %d other unsupported accesses remain visible\n",
+               "edges, ignored stable/falling input, notified its task, "
+               "and released/drove GPIO5 open-drain; %d other unsupported "
+               "accesses remain visible\n",
                unsupported);
         printf("UART: %zu bytes fnv32=%08X\n", uart.len,
                digest_bytes(UINT32_C(2166136261), uart.data, uart.len));

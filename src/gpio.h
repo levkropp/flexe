@@ -29,9 +29,10 @@ flexe_gpio_t *flexe_gpio_create(
     flexe_gpio_irq_fn irq_changed, void *irq_ctx);
 void flexe_gpio_destroy(flexe_gpio_t *gpio);
 
-/* Software-visible output state. A valid pin may still return -1 when its
- * output or output-enable comes from a peripheral signal whose producer is
- * not attached to this matrix model. */
+/* Software-visible output latch and effective pad drive-enable. In
+ * open-drain mode a high output level releases the pad (enabled == 0), not
+ * a driven-high voltage. A valid pin may still return -1 when its output or
+ * output-enable comes from an unattached peripheral signal. */
 int flexe_gpio_pin_level(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin);
 int flexe_gpio_out_signal(const flexe_gpio_t *gpio, unsigned pin);
