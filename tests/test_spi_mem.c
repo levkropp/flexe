@@ -317,6 +317,117 @@ TEST(spi_mem_reports_allocated_flash_capacity) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    /* Use the stock S3 bootloader's 8-bit command and 24-bit address phases;
+     * four-byte reads also cover parameter-word and arbitrary byte offsets.
+     * Both SPI hosts share one NOR but keep independent data buffers. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 31u);
+    const uint32_t offsets[] = { 0u, 4u, 0x10u, 0x2Eu,
+                                 0x34u, 0x4Cu, 0x60u, 0x6Cu };
+    const uint32_t expected[] = { 0x50444653u, 0xFF010100u,
+                                  0x030100C8u, 0x20E5FFFFu,
+                                  0x01FFFFFFu, 0x520F200Cu,
+                                  0x27003600u, 0xFFFFFFFFu };
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, offsets[i]);
+        s3_spi_user_command(mem, S3_SPI1_BASE,
+                            SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MISO,
+                            0x5Au);
+        ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0), expected[i]);
+    }
+    ASSERT_EQ(mem_read32(mem, S3_SPI0_BASE + S3_SPI_W0), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+
+    /* A larger virtual NOR advertises a different JEDEC capacity and must
+     * not silently inherit the 4 MiB part's contradictory SFDP density. */
+    mem = mem_create_for_target_with_flash(s3, 0x00800000u);
+    periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_USER1, 23u << 26);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 31u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_ADDR, 0u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0xDEADBEEFu);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_ADDR | SPI_USER_MISO,
+                        0x5Au);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0), 0xDEADBEEFu);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(spi_mem_gd25q32c_status_survives_flash_reset) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 7u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x15u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFu, 0x20u);
+
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 7u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x02u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MOSI, 0x31u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x35u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFu, 0u);
+
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x02u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MOSI, 0x31u);
+    s3_spi_user_command(mem, S3_SPI0_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x35u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI0_BASE + S3_SPI_W0) & 0xFFu, 0x02u);
+
+    s3_spi_user_command(mem, S3_SPI0_BASE, SPI_USER_COMMAND, 0x06u);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0x66u);
+    s3_spi_user_command(mem, S3_SPI1_BASE, SPI_USER_COMMAND, 0x99u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x05u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & (1u << 1), 0u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x35u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFu, 0x02u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x15u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFu, 0x20u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(spi_mem_s3_user_address_matches_flash_partition_offset) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -374,5 +485,7 @@ void run_spi_mem_tests(void) {
     RUN_TEST(spi_mem_classic_routes_psram_by_chip_select_and_wire_phases);
     RUN_TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation);
     RUN_TEST(spi_mem_reports_allocated_flash_capacity);
+    RUN_TEST(spi_mem_sfdp_matches_advertised_gd25q32c_profile);
+    RUN_TEST(spi_mem_gd25q32c_status_survives_flash_reset);
     RUN_TEST(spi_mem_s3_user_address_matches_flash_partition_offset);
 }

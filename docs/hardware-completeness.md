@@ -46,7 +46,7 @@ even when a firmware workflow succeeds.
 | Classic timers, PWM/RMT, watchdogs | Partial (MMIO) | `tools/ledc_pwm_test.c`, `tools/rmt_tx_test.c`, timer/watchdog unit and firmware gates | Aggregate output and event timing do not imply cycle-accurate waveforms or all reset causes. |
 | Classic network/Bluetooth | Partial (service shims and device models) | Meshtastic, Marauder, NerdMiner and WLED compatibility scenarios | RF/PHY propagation and general controller equivalence are unsupported. |
 | S3 LX7, interrupts, dual-core startup | Partial | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, target and interrupt-matrix unit tests | Sustained queue handoffs and CPU1 stall/resume pass; broader FreeRTOS and interrupt workloads remain to validate. |
-| S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh` | Other flash modes, cache behavior, and bootloader paths remain unverified. |
+| S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c` (including 4 MiB GigaDevice SFDP), `scripts/check-s3-nerdminer-portal.sh` | Other flash profiles, cache behavior, and bootloader paths remain unverified. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | RTC slow counter/STORE and RTC_DATA survive machine rebuild; additional partition and filesystem variants need end-to-end gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC/digital hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
@@ -518,8 +518,11 @@ behavior remain unsupported, and the assertion is not suppressed.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
-the following interpreter audit at 4 billion aggregate cycles reports 6,936
-unsupported accesses at 291 distinct address/PC/core/direction sites. Of
+the following interpreter audit at 4 billion aggregate cycles reports 6,926
+unsupported accesses. The default 4 MiB GigaDevice flash's `0x5A` SFDP reads
+now use the [GD25Q32C parameter table](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf);
+other capacity profiles retain an explicit unsupported command instead of
+borrowing its 4 MiB density. Of
 these, 6,728 are in the `0x6000E000` RF/PHY window; the hottest named callers
 include `wr_rf_freq_mem`, `set_chan_freq_sw_start`, and `bt_txpwr_freq`.
 That concentration identifies a network-controller boundary, not evidence

@@ -38,15 +38,20 @@ ROM's live boot-handoff structure then describe the same device. Newer ROM
 handoff pointers are resolved from the official ROM ELF, while older fixed
 ROM ABI addresses remain target data. The functional SPI-memory model supports
 raw reads, NOR page programming, sector/block/chip erase, status and power-down
-commands. The S3-generation `SPI_MEM_ADDR` register keeps a 24-bit user-mode
-flash address in bits 23:0; interpreting it as the classic controller's
+commands. For its default 4 MiB GigaDevice `C8 40 16` profile, it also serves
+the chip's documented SFDP header and parameter tables through opcode `0x5A`;
+other capacities retain an unsupported-command diagnostic rather than
+advertising a contradictory 4 MiB density. The NOR's `0x66`/`0x99` reset
+sequence clears WEL and volatile modes while retaining nonvolatile status
+bits. The S3-generation `SPI_MEM_ADDR` register keeps a 24-bit user-mode flash
+address in bits 23:0; interpreting it as the classic controller's
 left-aligned address would silently erase or program the wrong flash sector.
 Read/program/erase tests now use the register sequence seen in an unmodified
 ESP32-S3 NerdMiner 1.8.3 factory image. That image formats its actual `spiffs`
-partition, reports `SPIFS: Mounted`, and reaches its configuration portal in
-the interpreter. This is a focused firmware milestone, not an S3 production
-pass: roughly 7,000 peripheral accesses in that run remain unhandled, and
-portal interaction has not been validated. The classic ROM cache APIs
+partition, reports `SPIFS: Mounted`, and completes a scripted portal
+configuration/save/restart/reload session in the interpreter. This is a
+focused firmware milestone, not an S3 production pass: thousands of
+peripheral accesses in that run remain unhandled. The classic ROM cache APIs
 validate and apply both flash and
 external-RAM mappings against their target backings. Fast mode completes these
 operations immediately and does not yet model flash latency, separate

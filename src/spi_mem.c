@@ -9,6 +9,27 @@
 #define SPI_MEM_REGISTER_WORDS 64u
 #define SPI_MEM_BUFFER_WORDS   16u
 
+/* GD25Q32C SFDP, GigaDevice DS-00088 rev 4.1, tables 3-5. This is the
+ * physical 4 MiB profile advertised by the default C8 40 16 JEDEC ID; it
+ * must not be reused when the virtual NOR is enlarged to another capacity.
+ * Unlisted addresses in the serial parameter space read as pulled-up 0xFF. */
+static const uint8_t GD25Q32C_SFDP[] = {
+    0x53, 0x46, 0x44, 0x50, 0x00, 0x01, 0x01, 0xFF,
+    0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0xFF,
+    0xC8, 0x00, 0x01, 0x03, 0x60, 0x00, 0x00, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xE5, 0x20, 0xF1, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+    0x44, 0xEB, 0x08, 0x6B, 0x08, 0x3B, 0x42, 0xBB,
+    0xEE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF,
+    0xFF, 0xFF, 0x00, 0xFF, 0x0C, 0x20, 0x0F, 0x52,
+    0x10, 0xD8, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x00, 0x36, 0x00, 0x27, 0x9E, 0xF9, 0x77, 0x64,
+    0xFC, 0xEB, 0xFF, 0xFF,
+};
+
 /* CMD bits shared by the ESP32 and S2/S3 SPI-memory generations. */
 #define SPI_CMD_FLASH_PE       (1u << 17)
 #define SPI_CMD_USR            (1u << 18)
@@ -231,6 +252,11 @@ static bool spi_mem_known_offset(flexe_spi_mem_layout_t generation,
 
 static uint32_t spi_mem_flash_size(const flexe_spi_mem_t *spi_mem) {
     return mem_flash_physical_size(spi_mem->mem);
+}
+
+static bool spi_mem_is_gd25q32c(const flexe_spi_mem_t *spi_mem) {
+    return mem_flash_jedec_id(spi_mem->mem) == 0x001640C8u &&
+           spi_mem_flash_size(spi_mem) == 0x00400000u;
 }
 
 static uint32_t *spi_mem_buffer(flexe_spi_mem_t *spi_mem,
@@ -487,6 +513,20 @@ static void spi_mem_read_data(flexe_spi_mem_t *spi_mem,
     }
 }
 
+static bool spi_mem_read_sfdp(flexe_spi_mem_t *spi_mem,
+                               spi_mem_host_t *host,
+                               uint32_t offset, int bytes) {
+    if (!spi_mem_is_gd25q32c(spi_mem)) return false;
+
+    uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+    for (int i = 0; i < bytes; i++) {
+        uint32_t address = offset + (uint32_t)i;
+        if (address < sizeof(GD25Q32C_SFDP))
+            dst[i] = GD25Q32C_SFDP[address];
+    }
+    return true;
+}
+
 static void spi_mem_read_psram(flexe_spi_mem_t *spi_mem,
                                spi_mem_host_t *host,
                                uint32_t offset, int bytes) {
@@ -606,6 +646,9 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
         return true;
     case 0x06u: flash->status[0] |= FLASH_SR_WEL; return true;
     case 0x04u: flash->status[0] &= (uint8_t)~FLASH_SR_WEL; return true;
+    case 0x5Au: /* Read serial flash discoverable parameters. */
+        return spi_mem_read_sfdp(spi_mem, host, offset,
+                                 transaction->miso_bytes);
     case 0x03u: case 0x0Bu: case 0x3Bu:
     case 0x6Bu: case 0xBBu: case 0xEBu:
         spi_mem_read_data(spi_mem, host, offset, transaction->miso_bytes);
@@ -643,7 +686,9 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
     case 0x66u: flash->reset_armed = true; return true;
     case 0x99u:
         if (flash->reset_armed) {
-            memset(flash->status, 0, sizeof(flash->status));
+            /* RESET clears WIP/WEL and volatile modes, not the NOR's
+             * nonvolatile protection, quad-enable or drive-strength bits. */
+            flash->status[0] &= (uint8_t)~(FLASH_SR_WIP | FLASH_SR_WEL);
             flash->powered_down = false;
             flash->address_4byte = false;
             flash->reset_armed = false;
@@ -936,6 +981,8 @@ flexe_spi_mem_t *flexe_spi_mem_create(
     spi_mem->fallback_ctx = fallback_ctx;
     spi_mem->flash_changed = flash_changed;
     spi_mem->flash_changed_ctx = flash_changed_ctx;
+    if (spi_mem_is_gd25q32c(spi_mem))
+        spi_mem->flash.status[2] = 0x20u; /* GD25Q32C DRV0 reset bit. */
 
     for (unsigned host = 0; host < target->spi_mem.host_count; host++) {
         spi_mem_host_t *state = &spi_mem->host[host];
