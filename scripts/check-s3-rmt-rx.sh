@@ -24,5 +24,22 @@ for entry in "$S3_RMT_RX_BIN:$expected_bin" "$S3_RMT_RX_ELF:$expected_elf" \
     fi
 done
 
-"$runner" --no-jit "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" "$S3_ROM_ELF"
-echo "PASS: stock Arduino S3 received 2- and 96-symbol frames through the ESP-IDF RX ISR without RMT MMIO fallback"
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/flexe-s3-rmt-rx.XXXXXX")
+cleanup() {
+    rm -f -- "$tmpdir/run1" "$tmpdir/run2"
+    rmdir -- "$tmpdir"
+}
+trap cleanup EXIT
+for run in 1 2; do
+    "$runner" --no-jit "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" "$S3_ROM_ELF" \
+        >"$tmpdir/run$run" 2>&1
+done
+cmp -s "$tmpdir/run1" "$tmpdir/run2" || {
+    echo "FAIL: S3 RMT RX replay changed guest/host output" >&2
+    diff -u "$tmpdir/run1" "$tmpdir/run2" >&2 || true
+    exit 1
+}
+grep -Fq 'gpio=1 injected_long=1 counts=2,96' "$tmpdir/run1"
+grep -Fq 'short_match=1 long_match=1' "$tmpdir/run1"
+grep -Fq 'rmt_unhandled_sites=0' "$tmpdir/run1"
+echo "PASS: stock Arduino S3 decoded GPIO4 pulse edges and a 96-symbol host frame through its RX ISR, with no unsupported RMT MMIO and byte-identical replay"

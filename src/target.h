@@ -787,6 +787,7 @@ typedef struct {
     uint8_t  channel_count;
     uint8_t  words_per_channel;
     uint8_t  interrupt_source;
+    uint16_t input_signal_base; /* RX0 GPIO-matrix signal */
     uint32_t apb_clock_hz;
     uint32_t ref_clock_hz;
     uint32_t xtal_clock_hz;

@@ -7,7 +7,8 @@
 
 /* ESP32-S3 RMT V1 register layout from Espressif's rmt_reg.h. Four TX and
  * four RX channels share a 384-word pulse RAM. Host RX injection supplies
- * already-decoded symbols after the GPIO/filter/carrier-demodulation stage. */
+ * already-decoded symbols; GPIO-matrix edges can also feed the unfiltered
+ * pulse decoder. */
 #define RMT_TX_CONF_OFF       0x020u
 #define RMT_RX_CONF_OFF       0x030u
 #define RMT_STATUS_OFF        0x050u
@@ -53,10 +54,12 @@
 #define RMT_RX_MEM_WR_RST     (1u << 1)
 #define RMT_RX_APB_MEM_RST    (1u << 2)
 #define RMT_RX_MEM_OWNER     (1u << 3)
+#define RMT_RX_FILTER_EN     (1u << 4)
 #define RMT_RX_WRAP          (1u << 13)
 #define RMT_RX_AFIFO_RST     (1u << 14)
 #define RMT_RX_CONF_UPDATE   (1u << 15)
 #define RMT_RX_DMA_ACCESS    (1u << 23)
+#define RMT_RX_DEMOD_EN      (1u << 28)
 #define RMT_RX_COMMAND_MASK  (RMT_RX_MEM_WR_RST | RMT_RX_APB_MEM_RST | \
                               RMT_RX_AFIFO_RST | RMT_RX_CONF_UPDATE)
 
@@ -102,6 +105,12 @@ typedef struct {
     bool active;
     bool pending_end;
     bool pending_error;
+    bool edge_started;
+    bool edge_level;
+    bool edge_first_valid;
+    uint32_t edge_first;
+    uint64_t edge_start;
+    uint64_t edge_deadline;
 } rmt_rx_channel_t;
 
 struct flexe_rmt_v1 {
@@ -260,6 +269,24 @@ static uint64_t rmt_ticks_to_cycles(const flexe_rmt_v1_t *rmt,
     return rmt_ticks_to_cycles_div(rmt, (tx->conf >> 8) & 0xFFu, ticks);
 }
 
+static uint64_t rmt_cycles_to_ticks_div(const flexe_rmt_v1_t *rmt,
+                                        uint32_t channel_div,
+                                        uint64_t cycles)
+{
+    uint64_t source, div_num, div_den;
+    uint32_t cpu_mhz = rmt->cpu[0] ?
+        xtensa_cpu_freq_mhz(rmt->cpu[0]) :
+        rmt->desc->apb_clock_hz / 1000000u;
+    if (!rmt_tick_ratio(rmt, channel_div, &source, &div_num, &div_den) ||
+        !cpu_mhz) return 0u;
+    uint64_t cpu_hz = (uint64_t)cpu_mhz * 1000000u;
+    uint64_t common = rmt_gcd(cpu_hz, source);
+    uint64_t numerator = rmt_mul_saturating(
+        rmt_mul_saturating(cycles, source / common), div_den);
+    uint64_t denominator = (cpu_hz / common) * div_num;
+    return numerator / denominator;
+}
+
 static uint32_t rmt_capacity(const flexe_rmt_v1_t *rmt, unsigned channel)
 {
     uint32_t blocks = (rmt->tx[channel].conf >> 16) & 0xFu;
@@ -286,6 +313,9 @@ static void rmt_abort_rx_frame(rmt_rx_channel_t *rx)
     rx->next_word = 0u;
     rx->pending_end = false;
     rx->pending_error = false;
+    rx->edge_started = false;
+    rx->edge_first_valid = false;
+    rx->edge_deadline = UINT64_MAX;
 }
 
 static void rmt_finish_rx(flexe_rmt_v1_t *rmt, unsigned channel)
@@ -298,6 +328,33 @@ static void rmt_finish_rx(flexe_rmt_v1_t *rmt, unsigned channel)
     rmt->int_raw |= error ?
         RMT_RX_ERROR_INT(channel) : RMT_RX_END_INT(channel);
     rmt_notify_irq(rmt);
+}
+
+static bool rmt_rx_store_word(flexe_rmt_v1_t *rmt, unsigned channel,
+                              uint32_t word)
+{
+    rmt_rx_channel_t *rx = &rmt->rx[channel];
+    uint32_t capacity = rmt_rx_capacity(rmt, channel);
+    if (!capacity || (!(rx->conf1 & RMT_RX_WRAP) &&
+                      rx->write_index >= capacity)) {
+        rx->pending_error = true;
+        rmt_finish_rx(rmt, channel);
+        return false;
+    }
+    unsigned physical = rmt->desc->tx_channel_count + channel;
+    unsigned base = physical * rmt->desc->words_per_channel;
+    size_t slot = (rx->conf1 & RMT_RX_WRAP) ?
+        rx->write_index % capacity : rx->write_index;
+    rmt->memory[base + slot] = word;
+    rx->write_index++;
+    if (rx->limit != 0u &&
+        ((rx->conf1 & RMT_RX_WRAP) ?
+         rx->write_index % rx->limit == 0u :
+         rx->write_index == rx->limit)) {
+        rmt->int_raw |= RMT_RX_THRESHOLD_INT(channel);
+        rmt_notify_irq(rmt);
+    }
+    return true;
 }
 
 static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
@@ -420,28 +477,25 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
          channel < rmt_rx_channel_count(rmt->desc);
          channel++) {
         rmt_rx_channel_t *rx = &rmt->rx[channel];
+        if (rx->edge_started && rx->edge_deadline <= now) {
+            /* Idle-threshold completion ends the pulse train. A completed
+             * first half with no second edge is a terminal half-symbol. */
+            if (rx->edge_first_valid)
+                (void)rmt_rx_store_word(rmt, channel, rx->edge_first);
+            if (rx->active) rmt_finish_rx(rmt, channel);
+            changed = true;
+        }
         while (rx->pending_end && rx->deadline <= now) {
             if (rx->next_word == rx->frame_count) {
                 rmt_finish_rx(rmt, channel);
             } else {
-                unsigned physical = rmt->desc->tx_channel_count + channel;
-                unsigned base = physical * rmt->desc->words_per_channel;
-                uint32_t capacity = rmt_rx_capacity(rmt, channel);
-                size_t slot = rx->write_index;
-                if ((rx->conf1 & RMT_RX_WRAP) && capacity)
-                    slot %= capacity;
-                rmt->memory[base + slot] =
-                    rx->frame[rx->next_word++];
-                rx->write_index++;
+                uint32_t word = rx->frame[rx->next_word++];
+                if (!rmt_rx_store_word(rmt, channel, word)) {
+                    changed = true;
+                    continue;
+                }
                 if (rx->next_word == rx->frame_count && rx->pending_error)
                     rx->status_flags |= 1u << 26;
-                if (rx->limit != 0u &&
-                    ((rx->conf1 & RMT_RX_WRAP) ?
-                     rx->write_index % rx->limit == 0u :
-                     rx->write_index == rx->limit)) {
-                    rmt->int_raw |= RMT_RX_THRESHOLD_INT(channel);
-                    rmt_notify_irq(rmt);
-                }
                 if (rx->next_word < rx->frame_count) {
                     uint32_t item = rx->frame[rx->next_word];
                     rx->elapsed_ticks += (item & 0x7FFFu) +
@@ -477,9 +531,15 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
          channel < rmt_rx_channel_count(rmt->desc);
          channel++) {
         const rmt_rx_channel_t *rx = &rmt->rx[channel];
-        if (!rx->pending_end) continue;
-        uint64_t d = rx->deadline > now ? rx->deadline - now : 0u;
-        if (d < distance) distance = d;
+        if (rx->pending_end) {
+            uint64_t d = rx->deadline > now ? rx->deadline - now : 0u;
+            if (d < distance) distance = d;
+        }
+        if (rx->edge_started && rx->edge_deadline != UINT64_MAX) {
+            uint64_t d = rx->edge_deadline > now ?
+                rx->edge_deadline - now : 0u;
+            if (d < distance) distance = d;
+        }
     }
     if (distance == UINT64_MAX) return UINT32_MAX;
     if (distance > (uint32_t)INT32_MAX) distance = INT32_MAX;
@@ -615,8 +675,13 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             }
             if (value & RMT_RX_APB_MEM_RST) rx->apb_index = 0u;
             if (value & RMT_RX_CONF_UPDATE) {
+                bool was_active = rx->active;
                 rx->active = (rx->conf1 & RMT_RX_EN) != 0u;
-                if (!rx->active) rmt_abort_rx_frame(rx);
+                if (rx->active &&
+                    ((rx->conf1 & RMT_RX_FILTER_EN) ||
+                     (rx->conf0 & RMT_RX_DEMOD_EN)))
+                    rmt->fallback_write(rmt->fallback_ctx, address, value);
+                if (!was_active || !rx->active) rmt_abort_rx_frame(rx);
                 rmt_notify_state(rmt);
             }
         }
@@ -707,6 +772,8 @@ flexe_rmt_v1_t *flexe_rmt_v1_create(xtensa_mem_t *mem,
         desc->channel_count > RMT_MAX_CHANNELS ||
         desc->words_per_channel != 48u ||
         desc->memory_offset != 0x800u ||
+        !(target->capabilities & FLEXE_TARGET_CAP_GPIO_V1) ||
+        desc->input_signal_base + rmt_rx_channel_count(desc) > 256u ||
         desc->memory_offset +
             desc->channel_count * desc->words_per_channel * 4u >
             desc->register_size ||
@@ -789,7 +856,8 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
         return 0u;
     unsigned index = channel - rmt->desc->tx_channel_count;
     rmt_rx_channel_t *rx = &rmt->rx[index];
-    if (!rx->active || rx->pending_end || !rmt_source_hz(rmt)) return 0u;
+    if (!rx->active || rx->pending_end || rx->edge_started ||
+        !rmt_source_hz(rmt)) return 0u;
     if (!(rx->conf1 & RMT_RX_MEM_OWNER)) {
         rx->status_flags |= 1u << 25;
         rmt->int_raw |= RMT_RX_ERROR_INT(index);
@@ -825,4 +893,59 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
     rx->pending_end = true;
     rmt_notify_state(rmt);
     return accepted;
+}
+
+void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
+                                 bool level)
+{
+    if (!rmt || channel < rmt->desc->tx_channel_count ||
+        channel >= rmt->desc->channel_count) return;
+    unsigned index = channel - rmt->desc->tx_channel_count;
+    flexe_rmt_v1_eval(rmt);
+    rmt_rx_channel_t *rx = &rmt->rx[index];
+    if (!rx->active || rx->pending_end ||
+        (rx->conf1 & RMT_RX_FILTER_EN) ||
+        (rx->conf0 & RMT_RX_DEMOD_EN) || !rmt_source_hz(rmt)) return;
+    if (!(rx->conf1 & RMT_RX_MEM_OWNER)) {
+        rx->status_flags |= 1u << 25;
+        rmt->int_raw |= RMT_RX_ERROR_INT(index);
+        rmt_notify_irq(rmt);
+        return;
+    }
+    uint64_t now = rmt_clock_now(rmt);
+    if (rx->edge_started) {
+        if (rx->edge_level == level) return;
+        uint64_t elapsed = now - rx->edge_start;
+        uint64_t ticks = rmt_cycles_to_ticks_div(
+            rmt, rx->conf0 & 0xFFu, elapsed);
+        if (ticks == 0u) ticks = 1u;
+        if (ticks > 0x7FFFu) {
+            rx->pending_error = true;
+            rmt_finish_rx(rmt, index);
+            rmt_notify_state(rmt);
+            return;
+        }
+        uint32_t half = (uint32_t)ticks |
+                        ((uint32_t)rx->edge_level << 15u);
+        if (!rx->edge_first_valid) {
+            rx->edge_first = half;
+            rx->edge_first_valid = true;
+        } else {
+            rx->edge_first_valid = false;
+            if (!rmt_rx_store_word(rmt, index,
+                                   rx->edge_first | (half << 16u))) {
+                rmt_notify_state(rmt);
+                return;
+            }
+        }
+    }
+    rx->edge_started = true;
+    rx->edge_level = level;
+    rx->edge_start = now;
+    uint32_t idle_ticks = (rx->conf0 >> 8u) & 0x7FFFu;
+    uint64_t idle_cycles = idle_ticks ? rmt_ticks_to_cycles_div(
+        rmt, rx->conf0 & 0xFFu, idle_ticks) : UINT64_MAX;
+    rx->edge_deadline = now > UINT64_MAX - idle_cycles ?
+                        UINT64_MAX : now + idle_cycles;
+    rmt_notify_state(rmt);
 }

@@ -1030,6 +1030,8 @@ static const flexe_target_desc_t TARGETS[] = {
             .channel_count = 8u,
             .words_per_channel = 48u,
             .interrupt_source = 40u,
+            /* Espressif esp32s3 gpio_sig_map.h: RMT_SIG_IN0_IDX. */
+            .input_signal_base = 81u,
             .apb_clock_hz = 80000000u,
             .ref_clock_hz = 8000000u,
             .xtal_clock_hz = 40000000u,

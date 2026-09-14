@@ -55,7 +55,7 @@ even when a firmware workflow succeeds.
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, power-transition fidelity, calibrated timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | Counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
-| S3 RMT RX | Partial (MMIO plus host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 receives 2- and 96-symbol frames through the ESP-IDF ISR without RMT fallback | Host supplies decoded symbols; GPIO edge capture, filter/carrier physics, DMA, and overrun/error behavior under delayed ISR service remain unsupported. |
+| S3 RMT RX | Partial (MMIO, GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 decodes a GPIO4 waveform and a 96-symbol host frame through the ESP-IDF ISR without RMT fallback | GPIO edges are measured in guest time, but glitch filtering, carrier demodulation, DMA, odd pulse tails, and overrun behavior under delayed ISR service remain unverified or unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal and WLED native lwIP/Ethernet UI and JSON state gates | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported. |
 | S3 Bluetooth baseband clock | Partial (MMIO) | `tests/test_radio.c` checks half-slot/subslot phase against guest time | Controller scheduler, packets, and RF are unsupported; Marauder still asserts before its CLI. |
@@ -316,19 +316,24 @@ RUNNER=./build/flexe-spi-master-test ./scripts/check-s3-spi-master.sh
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,
 threshold refill interrupts, end/error interrupts, pulse-timed TX and
-non-DMA RX through a host symbol-injection API. RX writes each symbol to
-RAM at its guest-time pulse deadline, advances the hardware writer offset and
-threshold interrupt at that point, wraps the physical RAM in ping-pong mode,
-then signals completion after the configured idle duration. The stock
-Arduino-ESP32 3.3.11 RX driver copies both a 2-symbol frame and a 96-symbol
-frame (four half-RAM transfers) through its unmodified ESP-IDF interrupt
-handler; the pinned gate finds no unsupported RMT MMIO sites (173 unrelated
-accesses remain). Input is already decoded, so this does not model GPIO edge
-capture, glitch filtering, carrier demodulation, DMA, or overrun/error
-behavior when the guest fails to service a threshold in time. Counted
-TX loops, synchronized TX, and exact waveform-to-GPIO routing also remain
-unsupported; those paths retain diagnostics. Recheck the RX path with the
-compiled fixture and official ROM ELF:
+non-DMA RX from GPIO-matrix edges or a host symbol-injection API. RX advances
+the hardware writer offset, signals threshold interrupts, wraps the physical
+RAM in ping-pong mode, and completes after the configured idle duration. The
+stock Arduino-ESP32 3.3.11 RX driver copies a 2-symbol frame measured from
+host-driven GPIO4 transitions and a 96-symbol host-decoded frame (four half-RAM
+transfers) through its unmodified ESP-IDF interrupt handler. The S3 GPIO
+matrix routes RMT RX0 through signal 81
+([Espressif signal map](https://github.com/espressif/esp-idf/blob/master/components/soc/esp32s3/include/soc/gpio_sig_map.h));
+the model measures edge intervals on the guest clock. Two pinned interpreter
+replays match byte-for-byte with no unsupported RMT MMIO sites. Host-decoded
+injection still bypasses GPIO, and glitch filtering, carrier demodulation,
+DMA, and overrun/error behavior when the guest fails to service a threshold
+in time remain unsupported. Filter-enabled RX is diagnosed rather than
+decoded as unfiltered edges. Counted TX loops, synchronized TX, and exact
+waveform-to-GPIO output routing also remain unsupported; those paths retain
+diagnostics. Odd final half-symbol encoding and GPIO route changes mid-frame
+also lack hardware validation. Recheck the RX path with the compiled fixture
+and official ROM ELF:
 
 ```sh
 arduino-cli compile --fqbn esp32:esp32:esp32s3 \

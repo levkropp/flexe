@@ -11,9 +11,78 @@
 
 #define SUCCESS_MARKER 0x01A7C0DEu
 #define MAX_CYCLES     3000000000ull
+#define RMT_RX_CONF0   0x60016030u
 #define RMT_RX_CONF4   0x60016034u
+#define RMT_SYS_CONF   0x600160C0u
+#define RX_GPIO        4
 
 volatile int emu_app_running = 1;
+
+static uint32_t guest_cycles_for_rmt_ticks(xtensa_cpu_t *cpu,
+                                            xtensa_mem_t *mem,
+                                            uint32_t ticks)
+{
+    uint32_t sys = mem_read32(mem, RMT_SYS_CONF);
+    uint32_t conf = mem_read32(mem, RMT_RX_CONF0);
+    uint32_t source = 0u;
+    switch ((sys >> 24u) & 3u) {
+    case 1u: source = 80000000u; break;
+    case 2u: source = 8000000u; break;
+    case 3u: source = 40000000u; break;
+    default: return 0u;
+    }
+    uint32_t group_div = ((sys >> 4u) & 0xFFu) + 1u;
+    uint32_t ch_div = conf & 0xFFu;
+    if (!ch_div) ch_div = 256u;
+    uint32_t frac_num = (sys >> 12u) & 0x3Fu;
+    uint32_t frac_den = (sys >> 18u) & 0x3Fu;
+    uint32_t den = frac_den ? frac_den : 1u;
+    uint64_t numerator = (uint64_t)ticks *
+        xtensa_cpu_freq_mhz(cpu) * 1000000u * ch_div *
+        ((uint64_t)group_div * den + (frac_den ? frac_num : 0u));
+    uint64_t denominator = (uint64_t)source * den;
+    return (uint32_t)((numerator + denominator - 1u) / denominator);
+}
+
+static int run_guest_cycles(flexe_session_t *session, xtensa_cpu_t *cpu,
+                            uint32_t requested)
+{
+    uint32_t start = cpu->ccount;
+    while ((uint32_t)(cpu->ccount - start) < requested) {
+        uint32_t remaining = requested - (uint32_t)(cpu->ccount - start);
+        int ran = flexe_session_run_core(session, 0, (int)remaining);
+        if (ran <= 0) return 0;
+        flexe_session_post_batch(session, ran);
+    }
+    return 1;
+}
+
+static int feed_short_gpio_frame(flexe_session_t *session,
+                                  xtensa_cpu_t *cpu, xtensa_mem_t *mem,
+                                  esp32_periph_t *periph)
+{
+    static const uint32_t duration[] = {10u, 12u, 8u, 9u};
+    fprintf(stderr, "[s3-rmt-rx] rx_conf0=%08X rx_conf1=%08X sys=%08X\n",
+            mem_read32(mem, RMT_RX_CONF0), mem_read32(mem, RMT_RX_CONF4),
+            mem_read32(mem, RMT_SYS_CONF));
+    periph_gpio_set_input(periph, RX_GPIO, 0);
+    periph_gpio_set_input(periph, RX_GPIO, 1);
+    for (unsigned i = 0u; i < 4u; i++) {
+        uint32_t cycles = guest_cycles_for_rmt_ticks(cpu, mem, duration[i]);
+        if (!cycles || !run_guest_cycles(session, cpu, cycles)) return 0;
+        periph_gpio_set_input(periph, RX_GPIO, (i & 1u) != 0u);
+    }
+    return 1;
+}
+
+static int pulse_close_to(uint32_t word, unsigned shift, unsigned level,
+                          unsigned nominal)
+{
+    unsigned half = (word >> shift) & 0xFFFFu;
+    unsigned ticks = half & 0x7FFFu;
+    return (half >> 15u) == level && ticks + 1u >= nominal &&
+           ticks <= nominal + 1u;
+}
 
 int main(int argc, char **argv)
 {
@@ -56,29 +125,22 @@ int main(int argc, char **argv)
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
     xtensa_mem_t *mem = flexe_session_mem(session);
     esp32_periph_t *periph = flexe_session_periph(session);
-    const uint32_t expected_short[] = {
-        10u | (1u << 15) | (12u << 16),
-        8u | (1u << 31) | (9u << 16),
-    };
     uint32_t expected_long[96];
     for (unsigned i = 0u; i < 96u; i++)
         expected_long[i] = (1u + i % 16u) | ((1u + i % 7u) << 16) |
                            ((i & 1u) << 15);
     uint32_t stage = 0u;
-    int injected_short = 0;
+    int gpio_short = 0;
     int injected_long = 0;
     while (cpu->cycle_count < MAX_CYCLES) {
         stage = mem_read32(mem, stage_addr);
-        if (stage == 1u && !injected_short &&
+        if (stage == 1u && !gpio_short &&
             (mem_read32(mem, RMT_RX_CONF4) & 1u)) {
-            size_t accepted = periph_rmt_rx_inject(periph, 4,
-                                                   expected_short, 2u);
-            if (accepted != 2u) {
-                fprintf(stderr, "short RX accepted %zu/2 symbols\n",
-                        accepted);
+            if (!feed_short_gpio_frame(session, cpu, mem, periph)) {
+                fprintf(stderr, "short GPIO waveform stalled\n");
                 break;
             }
-            injected_short = 1;
+            gpio_short = 1;
         } else if (stage == 2u && !injected_long &&
                    (mem_read32(mem, RMT_RX_CONF4) & 1u)) {
             size_t accepted = periph_rmt_rx_inject(periph, 4,
@@ -125,16 +187,21 @@ int main(int argc, char **argv)
                     site.first_value, (unsigned long long)site.count);
         }
     }
-    int ok = injected_short && injected_long && stage == SUCCESS_MARKER &&
-             count == 2u && first == expected_short[0] &&
-             second == expected_short[1] && long_match &&
+    int short_match = count == 2u &&
+        pulse_close_to(first, 0u, 1u, 10u) &&
+        pulse_close_to(first, 16u, 0u, 12u) &&
+        pulse_close_to(second, 0u, 1u, 8u) &&
+        pulse_close_to(second, 16u, 0u, 9u);
+    int ok = gpio_short && injected_long && stage == SUCCESS_MARKER &&
+             short_match && long_match &&
              rmt_unhandled == 0u;
     fprintf(stderr,
-            "[s3-rmt-rx] stage=0x%08X injected=%d,%d counts=%u,%u "
-            "short=%08X,%08X long_match=%d cycles=%llu unhandled=%u "
+            "[s3-rmt-rx] stage=0x%08X gpio=%d injected_long=%d "
+            "counts=%u,%u short=%08X,%08X short_match=%d long_match=%d "
+            "cycles=%llu unhandled=%u "
             "rmt_unhandled_sites=%u\n",
-            stage, injected_short, injected_long, count, long_count,
-            first, second, long_match,
+            stage, gpio_short, injected_long, count, long_count,
+            first, second, short_match, long_match,
             (unsigned long long)cycles, unhandled, rmt_unhandled);
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);

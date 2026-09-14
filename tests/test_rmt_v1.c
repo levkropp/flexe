@@ -21,6 +21,8 @@
 #define S3_RMT_DATE       0x0CCu
 #define S3_RMT_MEM0       0x800u
 #define S3_RMT_RX_MEM4    0xB00u
+#define S3_GPIO_BASE      0x60004000u
+#define S3_GPIO_RMT_RX0   (0x154u + 81u * 4u)
 
 typedef struct {
     unsigned calls;
@@ -266,6 +268,90 @@ TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+
+    /* RX0 is physical channel 4. GPIO4 routes to S3 matrix input 81. */
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 24) | (20u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | 1u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_ENA, 1u << 16);
+    periph_gpio_set_input(periph, 5, 1); /* unrelated pad */
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+
+    periph_gpio_set_input(periph, 4, 1); /* first rising edge */
+    cpu0.ccount = 80u;
+    periph_gpio_set_input(periph, 4, 0); /* 10 high ticks */
+    cpu0.ccount = 176u;
+    periph_gpio_set_input(periph, 4, 1); /* 12 low ticks */
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              10u | (1u << 15) | (12u << 16));
+    cpu0.ccount = 240u;
+    periph_gpio_set_input(periph, 4, 0); /* 8 high ticks */
+    cpu0.ccount = 312u;
+    periph_gpio_set_input(periph, 4, 1); /* 9 low ticks */
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4 + 4u),
+              8u | (1u << 15) | (9u << 16));
+    cpu0.ccount = 471u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
+    cpu0.ccount = 472u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 16);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              194u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    /* Re-arm with an inverted matrix input. Physical low is now logical
+     * high, so the receiver must still encode the same high/low pair. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 16);
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0xC0u | 4u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | (1u << 1) | 1u);
+    periph_gpio_set_input(periph, 4, 0);
+    cpu0.ccount = 552u;
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 648u;
+    periph_gpio_set_input(periph, 4, 0);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              10u | (1u << 15) | (12u << 16));
+    cpu0.ccount = 808u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 16);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              193u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    /* Filtered electrical input is deliberately not decoded as raw edges;
+     * the unsupported configuration remains in the MMIO audit. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 16);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 4) | (1u << 3) | (1u << 1) | 1u);
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 888u;
+    periph_gpio_set_input(periph, 4, 0);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
+              192u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
+    ASSERT_TRUE(periph_unhandled_count(periph) > 0);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible)
 {
     const flexe_target_desc_t *s3 =
@@ -419,6 +505,7 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_threshold_and_empty_terminator_are_distinct_events);
     RUN_TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline);
     RUN_TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq);
+    RUN_TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time);
     RUN_TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible);
     RUN_TEST(s3_rmt_v1_rx_wrap_refills_both_halves_before_end);
     RUN_TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic);

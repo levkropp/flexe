@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 typedef struct flexe_rmt_v1 flexe_rmt_v1_t;
+#define FLEXE_RMT_V1_RX_CHANNELS_MAX 4u
 typedef void (*flexe_rmt_v1_state_fn)(void *ctx);
 typedef void (*flexe_rmt_v1_irq_fn)(void *ctx, uint32_t status);
 typedef void (*flexe_rmt_v1_tx_fn)(void *ctx, int channel,
@@ -36,5 +37,11 @@ int flexe_rmt_v1_set_tx_callback(flexe_rmt_v1_t *rmt, unsigned channel,
  * whole frame with wrap/ping-pong enabled). */
 size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
                               const uint32_t *items, size_t count);
+
+/* Feed a GPIO-matrix input transition into a physical RX channel (4..7).
+ * Pulse widths are measured on the guest CPU/RMT clock timeline. The first
+ * edge starts a frame; subsequent edges commit paired duration/level words. */
+void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
+                                 bool level);
 
 #endif

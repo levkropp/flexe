@@ -16023,7 +16023,26 @@ void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value) {
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
     if (!p || pin < 0) return;
     if (p->target_gpio) {
+        int before[FLEXE_RMT_V1_RX_CHANNELS_MAX] = {0};
+        unsigned rx_count = 0u;
+        if (p->rmt_v1) {
+            const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
+            rx_count = desc->channel_count - desc->tx_channel_count;
+            if (rx_count > FLEXE_RMT_V1_RX_CHANNELS_MAX)
+                rx_count = FLEXE_RMT_V1_RX_CHANNELS_MAX;
+            for (unsigned ch = 0u; ch < rx_count; ch++)
+                before[ch] = flexe_gpio_input_signal_level(
+                    p->target_gpio, desc->input_signal_base + ch);
+        }
         flexe_gpio_set_input(p->target_gpio, (unsigned)pin, level != 0);
+        for (unsigned ch = 0u; ch < rx_count; ch++) {
+            const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
+            int after = flexe_gpio_input_signal_level(
+                p->target_gpio, desc->input_signal_base + ch);
+            if (before[ch] >= 0 && after >= 0 && before[ch] != after)
+                flexe_rmt_v1_rx_input_edge(p->rmt_v1,
+                    desc->tx_channel_count + ch, after != 0);
+        }
         return;
     }
     if (pin > 39) return;
