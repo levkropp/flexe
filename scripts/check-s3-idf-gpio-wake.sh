@@ -99,12 +99,12 @@ for replay in 1 2; do
     fi
     grep -Eq '^Stop reason: (halt \(WAITI\)|max_cycles)' "$emu" ||
         fail "second boot did not sustain execution"
-    if grep -Eq '  [RW]  0x600080(18|3C|64|E0|E4) |  [RW]  0x60008130 |  [RW]  0x600084DC ' \
+    if grep -Eq '  [RW]  0x600080(18|1C|20|24|28|2C|30|3C|64|E0|E4) |  [RW]  0x60008130 |  [RW]  0x600084DC ' \
         "$emu"; then
         fail "EXT wake selection, state, or status MMIO remains unsupported"
     fi
     unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$emu")
-    [[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 288 ]] ||
+    [[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 208 ]] ||
         fail "unrelated unsupported MMIO count exceeded the pinned baseline"
 done
 

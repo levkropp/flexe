@@ -35,6 +35,7 @@
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
+#define FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX 6u
 #define FLEXE_TARGET_RTC_IO_PIN_MAX 22u
 #define FLEXE_TARGET_RTC_WDT_STAGE_MAX 4u
 #define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
@@ -301,6 +302,13 @@ typedef struct {
     uint8_t  nmi_interrupt_source;
 } flexe_gpio_desc_t;
 
+/* RTC power-sequencer register, with explicit reset and writable fields. */
+typedef struct {
+    uint16_t offset;
+    uint32_t reset;
+    uint32_t writable_mask;
+} flexe_rtc_sequence_register_desc_t;
+
 /* Always-on RTC controller state shared by the ROM, bootloader and
  * application. Offsets are explicit because the register layout, timer
  * width, interrupt bank, watchdog, and routed source vary across the ESP32
@@ -384,6 +392,13 @@ typedef struct {
     uint16_t sleep_timer_low_offset;
     uint16_t sleep_timer_high_offset;
     uint16_t sleep_state_offset;
+    /* Power-domain sequencing timers are software-visible RTC state. Fast
+     * execution does not assign their analog settle delays to guest time. */
+    uint8_t sequence_register_count;
+    flexe_rtc_sequence_register_desc_t
+        sequence_register[FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX];
+    uint16_t cpu_stall_enable_offset;
+    uint32_t cpu_stall_enable_mask;
     uint16_t wakeup_state_offset;
     uint16_t digital_power_offset;
     uint16_t wakeup_cause_offset;

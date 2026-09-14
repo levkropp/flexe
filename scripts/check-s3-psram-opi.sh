@@ -36,6 +36,8 @@ for replay in 1 2; do
        (( $(grep -c '^S3_PSRAM_PASS ' "$tmpdir/out.$replay" || true) < 10 )) ||
        grep -q 'S3_PSRAM_.*FAIL' "$tmpdir/out.$replay" ||
        grep -Eq '0x6000(20|30)' "$tmpdir/err.$replay" ||
+       grep -Eq '0x600080(1C|20|24|28|2C|30)' \
+           "$tmpdir/err.$replay" ||
        ! grep -q '^Stop reason: halt (WAITI)' "$tmpdir/err.$replay"; then
         echo "FAIL: selected OPI PSRAM did not sustain Arduino array traffic" >&2
         tail -30 "$tmpdir/out.$replay" >&2

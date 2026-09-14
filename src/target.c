@@ -656,6 +656,20 @@ static const flexe_target_desc_t TARGETS[] = {
             .sleep_timer_low_offset = 0x004u,
             .sleep_timer_high_offset = 0x008u,
             .sleep_state_offset = 0x018u,
+            /* ESP-IDF v5.5.1 esp32s3 rtc_cntl_reg.h TIMER1..TIMER6:
+             * all fields use their documented power-on values. TIMER5 has
+             * only the eight writable MIN_SLP_VAL bits. */
+            .sequence_register_count = 6u,
+            .sequence_register = {
+                { 0x01Cu, 0x28140403u, UINT32_MAX },
+                { 0x020u, 0x01080000u, 0xFFFF8000u },
+                { 0x024u, 0x14160A08u, UINT32_MAX },
+                { 0x028u, 0x10200A08u, UINT32_MAX },
+                { 0x02Cu, 0x00008000u, 0x0000FF00u },
+                { 0x030u, 0x10200A08u, UINT32_MAX },
+            },
+            .cpu_stall_enable_offset = 0x01Cu,
+            .cpu_stall_enable_mask = 1u,
             .wakeup_state_offset = 0x03Cu,
             .digital_power_offset = 0x090u,
             .wakeup_cause_offset = 0x130u,

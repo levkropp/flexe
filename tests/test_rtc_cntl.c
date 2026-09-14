@@ -116,6 +116,91 @@ TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_s3_sequence_timers_read_back_and_enable_cpu_stall)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(desc->sequence_register_count, 6u);
+    const uint16_t expected_offset[] = {
+        0x01Cu, 0x020u, 0x024u, 0x028u, 0x02Cu, 0x030u,
+    };
+    const uint32_t expected_reset[] = {
+        0x28140403u, 0x01080000u, 0x14160A08u,
+        0x10200A08u, 0x00008000u, 0x10200A08u,
+    };
+    const uint32_t expected_mask[] = {
+        UINT32_MAX, 0xFFFF8000u, UINT32_MAX,
+        UINT32_MAX, 0x0000FF00u, UINT32_MAX,
+    };
+    for (unsigned i = 0u; i < desc->sequence_register_count; i++) {
+        const flexe_rtc_sequence_register_desc_t *reg =
+            &desc->sequence_register[i];
+        ASSERT_EQ(reg->offset, expected_offset[i]);
+        ASSERT_EQ(reg->reset, expected_reset[i]);
+        ASSERT_EQ(reg->writable_mask, expected_mask[i]);
+        uint32_t addr = desc->base + reg->offset;
+        ASSERT_EQ(mem_read32(mem, addr), reg->reset);
+        uint32_t expected = reg->reset ^
+                            (reg->writable_mask & 0x00AA55AAu);
+        mem_write32(mem, addr, expected);
+        ASSERT_EQ(mem_read32(mem, addr), expected);
+    }
+    ASSERT_EQ(fallback.reads, 0u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* TIMER2/TIMER5 have reserved bits: an unsupported write remains
+     * diagnostic and cannot contaminate their documented fields. */
+    const flexe_rtc_sequence_register_desc_t *timer2 =
+        &desc->sequence_register[1];
+    uint32_t timer2_addr = desc->base + timer2->offset;
+    uint32_t timer2_value = mem_read32(mem, timer2_addr);
+    mem_write32(mem, timer2_addr, timer2_value | 1u);
+    ASSERT_EQ(mem_read32(mem, timer2_addr), timer2_value);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(fallback.last_write_addr, timer2_addr);
+    const flexe_rtc_sequence_register_desc_t *timer5 =
+        &desc->sequence_register[4];
+    uint32_t timer5_addr = desc->base + timer5->offset;
+    uint32_t timer5_value = mem_read32(mem, timer5_addr);
+    mem_write32(mem, timer5_addr, timer5_value | 1u);
+    ASSERT_EQ(mem_read32(mem, timer5_addr), timer5_value);
+    ASSERT_EQ(fallback.writes, 2u);
+
+    uint32_t options = desc->base + desc->cpu_stall_options_offset;
+    uint32_t high = desc->base + desc->cpu_stall_high_offset;
+    mem_write32(mem, options, desc->cpu_stall_options_reset | 2u);
+    mem_write32(mem, high, 0x21u << 20);
+    ASSERT_TRUE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+    uint32_t timer1_addr = desc->base +
+                           desc->cpu_stall_enable_offset;
+    uint32_t timer1 = mem_read32(mem, timer1_addr);
+    ASSERT_TRUE((timer1 & desc->cpu_stall_enable_mask) != 0u);
+    mem_write32(mem, timer1_addr,
+                timer1 & ~desc->cpu_stall_enable_mask);
+    ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+    mem_write32(mem, timer1_addr, timer1);
+    ASSERT_TRUE(flexe_rtc_cntl_cpu_stalled(rtc, 1u));
+    ASSERT_EQ(fallback.writes, 2u);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_storage_resets_persists_and_delegates)
 {
     const flexe_target_desc_t *s3 =
@@ -1640,6 +1725,7 @@ void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
     RUN_TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands);
+    RUN_TEST(rtc_cntl_s3_sequence_timers_read_back_and_enable_cpu_stall);
     RUN_TEST(rtc_cntl_storage_resets_persists_and_delegates);
     RUN_TEST(rtc_cntl_sar_i2c_power_gates_analog_slave);
     RUN_TEST(rtc_cntl_application_handoff_uses_target_clocks);

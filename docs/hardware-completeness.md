@@ -53,7 +53,7 @@ even when a firmware workflow succeeds.
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire, I2C-slave, and ESP-IDF SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
-| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, power-transition fidelity, calibrated timing, and other reset causes remain unsupported. |
+| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | Counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame through the ESP-IDF ISR | GPIO, filter, and carrier-envelope deadlines use guest time; one explicit demod MMIO diagnostic remains for unmodeled same-polarity duty/phase behavior; DMA, odd pulse tails, and delayed-ISR overrun remain unsupported. |
@@ -97,8 +97,8 @@ heartbeats. Its image SHA-256 is
 and ELF SHA-256 is
 `84e74cdcdfac1bbc67caef66b9fa49366d8f6940c81f794c8253d47301a4f230`.
 Both external-image gates compare a complete second replay byte-for-byte,
-including the unsupported-MMIO report; hello-world reports 224 unsupported
-accesses across its two boots and cross-core reports 104 in one boot. This
+including the unsupported-MMIO report; hello-world reports 156 unsupported
+accesses across its two boots and cross-core reports 70 in one boot. This
 proves these FreeRTOS interactions, not simultaneous core execution or timing
 fidelity. Run with matching external artifacts:
 
@@ -135,6 +135,12 @@ sleep state, timer interrupt, digital-wrap power-down selection, and separate
 wake-cause register. The session advances the shared virtual clock through
 timer-only light sleep or resets after timer-only deep sleep; the always-on
 counter, fractional tick phase, and STORE0-7 survive that rebuild. The
+[S3 RTC TIMER1..TIMER6 registers](https://github.com/espressif/esp-idf/blob/v5.5.1/components/soc/esp32s3/register/soc/rtc_cntl_reg.h)
+now retain their specified power-on and writable fields. TIMER1's CPU_STALL_EN
+bit gates the real two-register CPU stall key; reserved writes remain
+diagnostic. Fast mode still does not delay execution by programmed analog
+power-settle intervals. In the pinned stock Arduino PSRAM boot, these registers
+accounted for 34 of 123 formerly unsupported accesses; 89 remain. The
 unmodified ESP-IDF 5.3.2 `tests/fixtures/s3_idf_sleep` application enters a
 50 ms light sleep, observes `ESP_SLEEP_WAKEUP_TIMER`, then enters a 20 ms deep
 sleep and checks the timer wake cause, deep-sleep reset reason, RTC_DATA marker,
@@ -144,7 +150,7 @@ FreeRTOS heartbeat afterward. Its image SHA-256 is
 `cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2`
 and matching ELF SHA-256 is
 `a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294`.
-The two complete replays are byte-identical; 288 other unsupported accesses
+The two complete replays are byte-identical; 208 other unsupported accesses
 across both boots remain visible, mainly RTC power/isolation configuration.
 No unsupported sites remain for S3 sleep timer, state, wake-enable, or cause
 registers. The nominal slow-clock model yielded about 48.9/19.3 ms for the
@@ -197,7 +203,7 @@ Its image SHA-256 is
 `d4897a5ea5b5805bfda3ac3f624788f2600c9f17653e07f8dee7bea67df91314`
 and ELF SHA-256 is
 `27a2d3710e867e0310494a29a6c3612878ec10796a5ea32beeb30a4eca627d4d`.
-The gate reports 288 unrelated unsupported accesses across both boots, mainly
+The gate reports 208 unrelated unsupported accesses across both boots, mainly
 RTC power/isolation setup; the EXT selection/state/status sites are modeled.
 Physical pull resistors, voltage thresholds, glitches/filtering, and pad
 electrical behavior are not inferred from the host's digital level:
@@ -225,7 +231,7 @@ partition table and SPIFFS volume. The pinned NVS image SHA-256 is
 `6eb44365aa80da064ab9b861ecc8210c31c4326216d89902da8d432afee04989`
 and ELF SHA-256 is
 `0992d03138cdfd968b974968c6abcf1f4fec01ab35a233d737dada8b81414588`.
-The gate checks two byte-identical runs and still reports 224 unsupported
+The gate checks two byte-identical runs and still reports 156 unsupported
 accesses across its two boots:
 
 ```sh
@@ -539,8 +545,9 @@ behavior remain unsupported, and the assertion is not suppressed.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
-the following interpreter audit at 4 billion aggregate cycles reports 6,919
-unsupported accesses. GigaDevice `0x5A` SFDP reads now use the documented
+an earlier interpreter audit, before RTC power-sequencer support, reported
+6,919 unsupported accesses at 4 billion aggregate cycles. GigaDevice `0x5A`
+SFDP reads now use the documented
 [GD25Q32C 4 MiB](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf)
 or [GD25Q64C 8 MiB](https://download.gigadevice.com/Datasheet/DS-00111-GD25Q64C-Rev3.2.pdf)
 parameter table only when both JEDEC ID and physical capacity match; other

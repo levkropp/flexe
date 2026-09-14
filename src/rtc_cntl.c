@@ -52,6 +52,7 @@ struct flexe_rtc_cntl {
     uint32_t interrupt_raw;
     bool interrupt_level;
     uint32_t wdt_config[FLEXE_TARGET_RTC_WDT_CONFIG_MAX];
+    uint32_t sequence_reg[FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX];
     uint32_t wdt_write_protect;
     uint64_t wdt_stage_ticks;
     uint8_t wdt_stage;
@@ -183,6 +184,14 @@ static bool rtc_wdt_offset(const flexe_rtc_cntl_desc_t *desc,
     for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++)
         if (offset == desc->wdt_config_offset[i]) return true;
     return false;
+}
+
+static int rtc_sequence_index(const flexe_rtc_cntl_desc_t *desc,
+                              uint32_t offset)
+{
+    for (unsigned i = 0u; i < desc->sequence_register_count; i++)
+        if (offset == desc->sequence_register[i].offset) return (int)i;
+    return -1;
 }
 
 static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
@@ -556,6 +565,65 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
                 if (offset == desc->store_offset[j]) return false;
         }
     }
+    if (desc->sequence_register_count >
+        FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX)
+        return false;
+    for (unsigned i = 0u; i < desc->sequence_register_count; i++) {
+        const flexe_rtc_sequence_register_desc_t *reg =
+            &desc->sequence_register[i];
+        uint16_t offset = reg->offset;
+        if (!rtc_offset_valid(offset, desc->register_size) ||
+            reg->writable_mask == 0u ||
+            (reg->reset & ~reg->writable_mask) != 0u ||
+            offset == desc->time_update_offset ||
+            offset == desc->time_low_offset ||
+            offset == desc->time_high_offset ||
+            offset == desc->reset_state_offset ||
+            offset == desc->clock_conf_offset ||
+            offset == desc->analog_conf_offset ||
+            rtc_interrupt_offset(desc, offset) ||
+            rtc_wdt_offset(desc, offset) ||
+            rtc_pad_hold_offset(desc, offset) ||
+            (desc->cpu_stall_high_offset != 0u &&
+             (offset == desc->cpu_stall_options_offset ||
+              offset == desc->cpu_stall_high_offset)))
+            return false;
+        if (desc->sleep_timer_low_offset != 0u) {
+            const uint16_t sleep_offsets[] = {
+                desc->sleep_timer_low_offset,
+                desc->sleep_timer_high_offset,
+                desc->sleep_state_offset,
+                desc->wakeup_state_offset,
+                desc->digital_power_offset,
+                desc->wakeup_cause_offset,
+                desc->rtc_power_offset,
+                desc->digital_iso_offset,
+                desc->ext_wakeup_config_offset,
+                desc->ext1_select_offset,
+                desc->ext1_status_offset,
+                desc->brownout_offset,
+            };
+            for (unsigned j = 0u;
+                 j < sizeof(sleep_offsets) / sizeof(sleep_offsets[0]); j++)
+                if (offset == sleep_offsets[j]) return false;
+        }
+        for (unsigned j = 0u; j < desc->store_count; j++)
+            if (offset == desc->store_offset[j]) return false;
+        for (unsigned j = 0u; j < i; j++)
+            if (offset == desc->sequence_register[j].offset) return false;
+    }
+    if (desc->cpu_stall_enable_mask != 0u) {
+        int index = rtc_sequence_index(desc,
+                                       desc->cpu_stall_enable_offset);
+        if (desc->cpu_stall_high_offset == 0u || index < 0 ||
+            (desc->cpu_stall_enable_mask &
+             (desc->cpu_stall_enable_mask - 1u)) != 0u ||
+            (desc->cpu_stall_enable_mask &
+             desc->sequence_register[index].writable_mask) == 0u ||
+            (desc->cpu_stall_enable_mask &
+             desc->sequence_register[index].reset) == 0u)
+            return false;
+    }
     return true;
 }
 
@@ -760,6 +828,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
     if (rtc_sync(rtc)) rtc_cntl_notify(rtc);
     int index = rtc_store_index(desc, offset);
     if (index >= 0) return rtc->store[index];
+    index = rtc_sequence_index(desc, offset);
+    if (index >= 0) return rtc->sequence_reg[index];
     index = rtc_wdt_config_index(desc, offset);
     if (index >= 0) return rtc->wdt_config[index];
     if (offset == desc->time_update_offset) return 0u;
@@ -863,6 +933,22 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
     int index = rtc_store_index(desc, offset);
     if (index >= 0) {
         rtc->store[index] = value;
+        return;
+    }
+    index = rtc_sequence_index(desc, offset);
+    if (index >= 0) {
+        const flexe_rtc_sequence_register_desc_t *reg =
+            &desc->sequence_register[index];
+        uint32_t old = rtc->sequence_reg[index];
+        uint32_t next = (old & ~reg->writable_mask) |
+                        (value & reg->writable_mask);
+        rtc->sequence_reg[index] = next;
+        if ((value & ~reg->writable_mask) != 0u &&
+            rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        if (offset == desc->cpu_stall_enable_offset &&
+            ((old ^ next) & desc->cpu_stall_enable_mask) != 0u)
+            rtc_cntl_notify(rtc);
         return;
     }
     index = rtc_wdt_config_index(desc, offset);
@@ -1219,6 +1305,8 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->wdt_write_protect = desc->wdt_write_protect_key;
     for (unsigned i = 0u; i < desc->store_count; i++)
         rtc->store[i] = desc->store_reset[i];
+    for (unsigned i = 0u; i < desc->sequence_register_count; i++)
+        rtc->sequence_reg[i] = desc->sequence_register[i].reset;
 
     if (mem_register_mmio_range(mem, desc->base, desc->register_size,
                                 rtc_cntl_read, rtc_cntl_write, rtc) != 0) {
@@ -1247,6 +1335,13 @@ bool flexe_rtc_cntl_cpu_stalled(const flexe_rtc_cntl_t *rtc, unsigned core)
         rtc->target->rtc_cntl.cpu_stall_high_offset == 0u)
         return false;
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    if (desc->cpu_stall_enable_mask != 0u) {
+        int index = rtc_sequence_index(desc,
+                                       desc->cpu_stall_enable_offset);
+        if (index < 0 || (rtc->sequence_reg[index] &
+                          desc->cpu_stall_enable_mask) == 0u)
+            return false;
+    }
     unsigned low = (rtc->cpu_stall_options >>
                     desc->cpu_stall_low_shift[core]) & 3u;
     unsigned high = (rtc->cpu_stall_high >>
