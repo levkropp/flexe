@@ -709,6 +709,121 @@ TEST(esp32s3_gdma_receives_chained_descriptors_and_reports_errors) {
     s3_sha_fixture_destroy(&fixture);
 }
 
+TEST(esp32s3_gdma_channel_irqs_reach_both_cpu_interrupt_matrices) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0, cpu1;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    xtensa_cpu_init_for_target(&cpu1, s3);
+    cpu0.mem = cpu1.mem = mem;
+    periph_attach_cpus(periph, &cpu0, &cpu1);
+    ASSERT_EQ(s3->gdma.rx_interrupt_source[0], 66u);
+    ASSERT_EQ(s3->gdma.rx_interrupt_source[4], 70u);
+    ASSERT_EQ(s3->gdma.tx_interrupt_source[0], 71u);
+    ASSERT_EQ(s3->gdma.tx_interrupt_source[4], 75u);
+    periph_intr_matrix_set(periph, 0, 8, 71);
+    periph_intr_matrix_set(periph, 1, 9, 71);
+    periph_intr_matrix_set(periph, 0, 10, 66);
+    periph_intr_matrix_set(periph, 1, 12, 66);
+    periph_intr_matrix_set(periph, 0, 13, 67);
+
+    const uint32_t descriptor = 0x3FC8F000u;
+    const uint32_t buffer = 0x3FC90000u;
+    mem_write8(mem, buffer, 0xA5u);
+    s3_gdma_descriptor(mem, descriptor, buffer, 1u, true, true, 0u);
+    mem_write32(mem, S3_GDMA_OUT_PERI_SEL, 7u);
+    mem_write32(mem, S3_GDMA_OUT_LINK,
+                (descriptor & 0xFFFFFu) | S3_GDMA_LINK_START);
+    uint8_t byte = 0u;
+    ASSERT_EQ(flexe_gdma_read_tx(periph_gdma(periph), 7u, &byte, 1u), 0);
+    ASSERT_EQ(byte, 0xA5u);
+    ASSERT_EQ(mem_read32(mem, S3_GDMA_OUT_INT_RAW), 0x0Bu);
+    ASSERT_EQ(mem_read32(mem, S3_GDMA_OUT_INT_ST), 0u);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 71));
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0u);
+
+    /* Enabling a latched condition raises the level on both cores; masking
+     * it again drops the line without clearing the raw event. */
+    mem_write32(mem, S3_GDMA_OUT_INT_ENA, 1u);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 71));
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
+    ASSERT_EQ(cpu1.interrupt & (1u << 9), 1u << 9);
+    mem_write32(mem, S3_GDMA_OUT_INT_ENA, 0u);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 71));
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0u);
+    ASSERT_EQ(cpu1.interrupt & (1u << 9), 0u);
+    ASSERT_EQ(mem_read32(mem, S3_GDMA_OUT_INT_RAW), 0x0Bu);
+    mem_write32(mem, S3_GDMA_OUT_INT_ENA, 1u << 1);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 71));
+    mem_write32(mem, S3_GDMA_OUT_INT_CLR, 1u << 1);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 71));
+    mem_write32(mem, S3_GDMA_OUT_INT_ENA, 1u << 3);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 71));
+    mem_write32(mem, S3_GDMA_OUT_INT_CLR, 1u << 3);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 71));
+
+    /* RX has an independent source. Completion and descriptor errors
+     * both assert only when their respective enable bit is set. */
+    s3_gdma_descriptor(mem, descriptor, buffer, 1u, true, true, 0u);
+    mem_write32(mem, S3_GDMA_IN_PERI_SEL, 3u);
+    mem_write32(mem, S3_GDMA_IN_LINK,
+                (descriptor & 0xFFFFFu) | S3_GDMA_IN_LINK_START);
+    const uint8_t input = 0x5Au;
+    ASSERT_EQ(flexe_gdma_write_rx(periph_gdma(periph), 3u, &input, 1u), 0);
+    ASSERT_EQ(mem_read8(mem, buffer), input);
+    ASSERT_EQ(mem_read32(mem, S3_GDMA_IN_INT_RAW), 0x3u);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 66));
+    mem_write32(mem, S3_GDMA_IN_INT_ENA, 1u << 1);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 66));
+    ASSERT_EQ(cpu0.interrupt & (1u << 10), 1u << 10);
+    ASSERT_EQ(cpu1.interrupt & (1u << 12), 1u << 12);
+    ASSERT_EQ(cpu0.interrupt & (1u << 8), 0u);
+    mem_write32(mem, S3_GDMA_IN_INT_CLR, 1u << 1);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 66));
+    ASSERT_EQ(cpu0.interrupt & (1u << 10), 0u);
+    ASSERT_EQ(cpu1.interrupt & (1u << 12), 0u);
+
+    s3_gdma_descriptor(mem, descriptor, buffer, 1u, true, false, 0u);
+    mem_write32(mem, S3_GDMA_IN_CONF1, S3_GDMA_CHECK_OWNER);
+    mem_write32(mem, S3_GDMA_IN_LINK,
+                (descriptor & 0xFFFFFu) | S3_GDMA_IN_LINK_START);
+    mem_write32(mem, S3_GDMA_IN_INT_ENA, 1u << 3);
+    ASSERT_EQ(flexe_gdma_write_rx(periph_gdma(periph), 3u, &input, 1u), -1);
+    ASSERT_EQ(mem_read32(mem, S3_GDMA_IN_INT_ST), 1u << 3);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 66));
+    mem_write32(mem, S3_GDMA_IN_INT_CLR, 1u << 3);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 66));
+
+    /* Channel 1 routes to its own source, not channel 0's latched status. */
+    const uint32_t channel1 = S3_GDMA_BASE + 0x0C0u;
+    s3_gdma_descriptor(mem, descriptor, buffer, 1u, true, true, 0u);
+    mem_write32(mem, channel1 + 0x048u, 4u);
+    mem_write32(mem, channel1 + 0x010u, 1u);
+    mem_write32(mem, channel1 + 0x020u,
+                (descriptor & 0xFFFFFu) | S3_GDMA_IN_LINK_START);
+    ASSERT_EQ(flexe_gdma_write_rx(periph_gdma(periph), 4u, &input, 1u), 0);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 67));
+    ASSERT_FALSE(periph_interrupt_pending(periph, 66));
+    ASSERT_EQ(cpu0.interrupt & (1u << 13), 1u << 13);
+    ASSERT_EQ(cpu1.interrupt & (1u << 13), 0u);
+    mem_write32(mem, channel1 + 0x014u, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 67));
+    ASSERT_EQ(cpu0.interrupt & (1u << 13), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(firmware_profile_does_not_authorize_mbedtls_sha256) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -744,6 +859,7 @@ static void run_crypto_tests(void) {
     RUN_TEST(esp32s3_sha_consumes_chained_gdma_descriptors);
     RUN_TEST(esp32s3_gdma_honors_owner_check_and_writeback);
     RUN_TEST(esp32s3_gdma_receives_chained_descriptors_and_reports_errors);
+    RUN_TEST(esp32s3_gdma_channel_irqs_reach_both_cpu_interrupt_matrices);
     RUN_TEST(firmware_profile_does_not_authorize_mbedtls_sha256);
     RUN_TEST(raw_aes_128_encrypt_decrypt);
     RUN_TEST(raw_aes_192_encrypt_decrypt);

@@ -7,9 +7,15 @@
 
 typedef struct flexe_gdma flexe_gdma_t;
 
+/* The controller presents one level-sensitive interrupt per RX/TX channel.
+ * `receive` selects the RX half; `level` is INT_RAW & INT_ENA != 0. */
+typedef void (*flexe_gdma_irq_changed_fn)(void *ctx, unsigned channel,
+                                          bool receive, bool level);
+
 flexe_gdma_t *flexe_gdma_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
-    mmio_write_fn fallback_write, void *fallback_ctx);
+    mmio_write_fn fallback_write, void *fallback_ctx,
+    flexe_gdma_irq_changed_fn irq_changed, void *irq_ctx);
 void flexe_gdma_destroy(flexe_gdma_t *gdma);
 
 /* Whether a started TX descriptor stream is routed to this peripheral.

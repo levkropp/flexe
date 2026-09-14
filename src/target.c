@@ -953,6 +953,10 @@ static const flexe_target_desc_t TARGETS[] = {
             .channel_stride = 0x0C0u,
             .descriptor_address_prefix = 0x3FC00000u,
             .channel_count = 5u,
+            /* ESP-IDF v5.3.2 soc/esp32s3/include/soc/interrupts.h:
+             * ETS_DMA_IN_CH0..4 and ETS_DMA_OUT_CH0..4 are level sources. */
+            .rx_interrupt_source = { 66u, 67u, 68u, 69u, 70u },
+            .tx_interrupt_source = { 71u, 72u, 73u, 74u, 75u },
         },
         .sha = {
             .base = 0x6003B000u,

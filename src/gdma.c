@@ -95,6 +95,10 @@ struct flexe_gdma {
     mmio_read_fn fallback_read;
     mmio_write_fn fallback_write;
     void *fallback_ctx;
+    flexe_gdma_irq_changed_fn irq_changed;
+    void *irq_ctx;
+    bool rx_irq_level[FLEXE_TARGET_GDMA_CHANNEL_MAX];
+    bool tx_irq_level[FLEXE_TARGET_GDMA_CHANNEL_MAX];
     uint32_t *regs;
     gdma_rx_channel_t rx[FLEXE_TARGET_GDMA_CHANNEL_MAX];
     gdma_tx_channel_t tx[FLEXE_TARGET_GDMA_CHANNEL_MAX];
@@ -118,8 +122,23 @@ static bool gdma_geometry_valid(const flexe_target_desc_t *target)
         (uint64_t)(desc->channel_count - 1u) * desc->channel_stride +
             GDMA_V1_OUT_PERI_SEL_OFF + sizeof(uint32_t) >
             desc->register_size ||
-        (desc->descriptor_address_prefix & GDMA_V1_LINK_ADDR_MASK) != 0u)
+        (desc->descriptor_address_prefix & GDMA_V1_LINK_ADDR_MASK) != 0u ||
+        !(target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1))
         return false;
+    for (unsigned channel = 0u; channel < desc->channel_count; channel++) {
+        uint8_t rx = desc->rx_interrupt_source[channel];
+        uint8_t tx = desc->tx_interrupt_source[channel];
+        if (rx >= target->interrupt_matrix.source_count ||
+            tx >= target->interrupt_matrix.source_count || rx == tx)
+            return false;
+        for (unsigned prior = 0u; prior < channel; prior++) {
+            if (rx == desc->rx_interrupt_source[prior] ||
+                rx == desc->tx_interrupt_source[prior] ||
+                tx == desc->rx_interrupt_source[prior] ||
+                tx == desc->tx_interrupt_source[prior])
+                return false;
+        }
+    }
     return true;
 }
 
@@ -153,6 +172,26 @@ static uint32_t gdma_channel_addr(const flexe_gdma_t *gdma,
 {
     const flexe_gdma_desc_t *desc = &gdma->target->gdma;
     return desc->base + channel * desc->channel_stride + offset;
+}
+
+static void gdma_update_irq(flexe_gdma_t *gdma, unsigned channel,
+                            bool receive)
+{
+    uint32_t raw_offset = receive ? GDMA_V1_IN_INT_RAW_OFF :
+                                    GDMA_V1_OUT_INT_RAW_OFF;
+    uint32_t ena_offset = receive ? GDMA_V1_IN_INT_ENA_OFF :
+                                    GDMA_V1_OUT_INT_ENA_OFF;
+    uint32_t *raw = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, raw_offset));
+    uint32_t *ena = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, ena_offset));
+    bool level = raw && ena && ((*raw & *ena) != 0u);
+    bool *old = receive ? &gdma->rx_irq_level[channel] :
+                          &gdma->tx_irq_level[channel];
+    if (*old == level) return;
+    *old = level;
+    if (gdma->irq_changed)
+        gdma->irq_changed(gdma->irq_ctx, channel, receive, level);
 }
 
 static void gdma_rx_reset_fsm(flexe_gdma_t *gdma, unsigned channel)
@@ -301,12 +340,14 @@ static void gdma_write(void *ctx, uint32_t addr, uint32_t value)
         return; /* Read-only raw interrupt status. */
     if (off == GDMA_V1_IN_INT_ENA_OFF) {
         *reg = value & GDMA_V1_IN_INT_MASK;
+        gdma_update_irq(gdma, channel, true);
         return;
     }
     if (off == GDMA_V1_IN_INT_CLR_OFF) {
         uint32_t *raw = gdma_reg(gdma, gdma_channel_addr(
             gdma, channel, GDMA_V1_IN_INT_RAW_OFF));
         if (raw) *raw &= ~(value & GDMA_V1_IN_INT_MASK);
+        gdma_update_irq(gdma, channel, true);
         return;
     }
     if (off == GDMA_V1_IN_LINK_OFF) {
@@ -338,12 +379,14 @@ static void gdma_write(void *ctx, uint32_t addr, uint32_t value)
         return; /* Read-only raw interrupt status. */
     if (off == GDMA_V1_OUT_INT_ENA_OFF) {
         *reg = value & GDMA_V1_OUT_INT_MASK;
+        gdma_update_irq(gdma, channel, false);
         return;
     }
     if (off == GDMA_V1_OUT_INT_CLR_OFF) {
         uint32_t *raw = gdma_reg(gdma, gdma_channel_addr(
             gdma, channel, GDMA_V1_OUT_INT_RAW_OFF));
         if (raw) *raw &= ~(value & GDMA_V1_OUT_INT_MASK);
+        gdma_update_irq(gdma, channel, false);
         return;
     }
     if (off == GDMA_V1_OUT_LINK_OFF) {
@@ -401,6 +444,7 @@ static void gdma_tx_finish(flexe_gdma_t *gdma, unsigned channel,
     }
     if (success && eof_desc) *eof_desc = tx->current_desc;
     if (success && eof_prev) *eof_prev = tx->previous_desc;
+    gdma_update_irq(gdma, channel, false);
 }
 
 static void gdma_rx_finish(flexe_gdma_t *gdma, unsigned channel,
@@ -425,6 +469,7 @@ static void gdma_rx_finish(flexe_gdma_t *gdma, unsigned channel,
         *success_desc = rx->current_desc;
     if ((interrupt_status & GDMA_V1_IN_ERR_EOF_INT) && error_desc)
         *error_desc = rx->current_desc;
+    gdma_update_irq(gdma, channel, true);
 }
 
 int flexe_gdma_write_rx(flexe_gdma_t *gdma, uint8_t peripheral_id,
@@ -618,7 +663,8 @@ int flexe_gdma_read_tx(flexe_gdma_t *gdma, uint8_t peripheral_id,
 
 flexe_gdma_t *flexe_gdma_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
-    mmio_write_fn fallback_write, void *fallback_ctx)
+    mmio_write_fn fallback_write, void *fallback_ctx,
+    flexe_gdma_irq_changed_fn irq_changed, void *irq_ctx)
 {
     const flexe_target_desc_t *target = mem_target(mem);
     if (!mem || !gdma_geometry_valid(target)) return NULL;
@@ -636,6 +682,8 @@ flexe_gdma_t *flexe_gdma_create(
     gdma->fallback_read = fallback_read;
     gdma->fallback_write = fallback_write;
     gdma->fallback_ctx = fallback_ctx;
+    gdma->irq_changed = irq_changed;
+    gdma->irq_ctx = irq_ctx;
     for (unsigned channel = 0u; channel < target->gdma.channel_count;
          channel++) {
         gdma_rx_power_on_reset(gdma, channel);
@@ -655,6 +703,15 @@ flexe_gdma_t *flexe_gdma_create(
 void flexe_gdma_destroy(flexe_gdma_t *gdma)
 {
     if (!gdma) return;
+    if (gdma->irq_changed) {
+        for (unsigned channel = 0u;
+             channel < gdma->target->gdma.channel_count; channel++) {
+            if (gdma->rx_irq_level[channel])
+                gdma->irq_changed(gdma->irq_ctx, channel, true, false);
+            if (gdma->tx_irq_level[channel])
+                gdma->irq_changed(gdma->irq_ctx, channel, false, false);
+        }
+    }
     (void)mem_register_mmio_range(
         gdma->mem, gdma->target->gdma.base,
         gdma->target->gdma.register_size,

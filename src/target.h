@@ -649,6 +649,8 @@ typedef struct {
     uint32_t channel_stride;
     uint32_t descriptor_address_prefix;
     uint8_t  channel_count;
+    uint8_t  rx_interrupt_source[FLEXE_TARGET_GDMA_CHANNEL_MAX];
+    uint8_t  tx_interrupt_source[FLEXE_TARGET_GDMA_CHANNEL_MAX];
 } flexe_gdma_desc_t;
 
 typedef enum {

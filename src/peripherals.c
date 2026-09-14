@@ -14104,6 +14104,18 @@ static void usb_serial_jtag_irq_changed(void *ctx, bool level)
     else periph_deassert_interrupt(p, source);
 }
 
+static void gdma_irq_changed(void *ctx, unsigned channel,
+                             bool receive, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || channel >= p->target->gdma.channel_count) return;
+    int source = receive ?
+        p->target->gdma.rx_interrupt_source[channel] :
+        p->target->gdma.tx_interrupt_source[channel];
+    if (level) periph_assert_interrupt(p, source);
+    else periph_deassert_interrupt(p, source);
+}
+
 static void target_gpio_output_changed(void *ctx, unsigned gpio,
                                        int level, int enabled)
 {
@@ -14558,7 +14570,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     if (target->capabilities & FLEXE_TARGET_CAP_GDMA_V1) {
         p->gdma = flexe_gdma_create(
-            mem, default_read, default_write, p);
+            mem, default_read, default_write, p, gdma_irq_changed, p);
         if (!p->gdma) {
             periph_destroy(p);
             return NULL;

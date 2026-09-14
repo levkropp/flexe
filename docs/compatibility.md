@@ -171,9 +171,11 @@ Board models attach at the controller boundary; the CYD panel, touch, and SD
 card are consumers of that API rather than conditions inside the SoC map.
 Automated tests cover both hosts, matrix and native routes, clock/reset
 isolation, full-duplex DMA, malformed and exhausted receive chains, and the
-original classic display/SD paths. Slave mode, segmented/config-buffer
-transactions, GDMA interrupt delivery, bus arbitration, signal edges, and
-clock-derived transfer duration remain outside this functional envelope.
+original classic display/SD paths. GDMA completion/error status now drives
+the [S3's separate level interrupt source for each RX and TX channel](https://github.com/espressif/esp-idf/blob/v5.3.2/components/soc/esp32s3/include/soc/interrupts.h),
+including both CPU interrupt matrices and late enable/clear transitions.
+Slave mode, segmented/config-buffer transactions, bus arbitration, signal
+edges, and clock-derived transfer duration remain outside this functional envelope.
 Unsupported framing and invalid DMA setup are diagnosed instead of silently
 reported as successful transfers.
 
