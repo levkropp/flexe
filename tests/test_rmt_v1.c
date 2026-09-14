@@ -343,6 +343,55 @@ TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_rx_captures_gpio_output_loopback_edges)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+
+    uint32_t mask = 1u << 4u;
+    uint32_t mux4 = s3->io_mux.base +
+                    s3->io_mux.gpio_register_offset[4];
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
+    mem_write32(mem, S3_GPIO_BASE + 0x024u, mask);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 24) | (20u << 8) | 2u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (1u << 3) | 1u);
+
+    /* A driven output is visible to GPIO_IN only after FUN_IE. Neither the
+     * disabled input nor its RMT matrix route should see these toggles. */
+    mem_write32(mem, S3_GPIO_BASE + 0x008u, mask);
+    cpu0.ccount = 80u;
+    mem_write32(mem, S3_GPIO_BASE + 0x00Cu, mask);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+    mem_write32(mem, mux4, s3->io_mux.input_enable_mask);
+
+    cpu0.ccount = 100u;
+    mem_write32(mem, S3_GPIO_BASE + 0x008u, mask);
+    ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & mask, mask);
+    cpu0.ccount = 180u;
+    mem_write32(mem, S3_GPIO_BASE + 0x00Cu, mask);
+    cpu0.ccount = 276u;
+    mem_write32(mem, S3_GPIO_BASE + 0x008u, mask);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              10u | (1u << 15) | (12u << 16));
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock)
 {
     const flexe_target_desc_t *s3 =
@@ -657,6 +706,7 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline);
     RUN_TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq);
     RUN_TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time);
+    RUN_TEST(s3_rmt_v1_rx_captures_gpio_output_loopback_edges);
     RUN_TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock);
     RUN_TEST(s3_rmt_v1_rx_demodulates_both_carrier_polarities);
     RUN_TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible);

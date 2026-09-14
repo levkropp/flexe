@@ -21,6 +21,8 @@ typedef struct flexe_gpio flexe_gpio_t;
 typedef void (*flexe_gpio_output_fn)(void *ctx, unsigned gpio,
                                      int level, int enabled);
 typedef void (*flexe_gpio_irq_fn)(void *ctx, bool nmi, bool level);
+typedef void (*flexe_gpio_input_signal_fn)(void *ctx, unsigned signal,
+                                           bool old_level, bool level);
 
 flexe_gpio_t *flexe_gpio_create(
     xtensa_mem_t *mem, mmio_read_fn fallback_read,
@@ -60,6 +62,14 @@ void flexe_gpio_set_rtc_state(flexe_gpio_t *gpio, uint64_t owned,
  * GPIO model's unsupported-behavior accounting. */
 void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
                                           unsigned signal);
+
+/* Watch selected GPIO-matrix input signals for digital transitions. Both
+ * host samples and output-to-input feedback use the same notification path;
+ * unwatched signals have no per-edge callback cost. */
+void flexe_gpio_set_input_signal_handler(flexe_gpio_t *gpio,
+                                         flexe_gpio_input_signal_fn changed,
+                                         void *ctx);
+void flexe_gpio_watch_input_signal(flexe_gpio_t *gpio, unsigned signal);
 
 /* IO_MUX controls the digital input buffer. Standalone GPIO models default
  * to enabled inputs; a target with IO_MUX supplies the reset/programmed state

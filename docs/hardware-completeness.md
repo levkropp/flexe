@@ -56,7 +56,7 @@ even when a firmware workflow succeeds.
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`; WLED 16.0.1 emits sustained pulse chunks | Counted loops, synchronized TX, fine status, and output-pad waveform validation remain. |
-| S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame through the ESP-IDF ISR | GPIO, filter, and carrier-envelope deadlines use guest time; one explicit demod MMIO diagnostic remains for unmodeled same-polarity duty/phase behavior; DMA, odd pulse tails, and delayed-ISR overrun remain unsupported. |
+| S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame through the ESP-IDF ISR | Host pad samples and software GPIO output loopback share the GPIO-matrix edge path; one explicit demod MMIO diagnostic remains for unmodeled same-polarity duty/phase behavior; RMT TX-to-pad loopback, DMA, odd pulse tails, and delayed-ISR overrun remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth baseband clock | Partial (MMIO) | `tests/test_radio.c` checks half-slot/subslot phase against guest time | Controller scheduler, packets, and RF are unsupported; Marauder still asserts before its CLI. |
@@ -460,6 +460,12 @@ the model measures edge intervals on the guest clock. The input glitch
 filter qualifies edges after the configured number of RMT group-clock ticks,
 before the per-channel divider, matching ESP-IDF 5.5's S3 filter clock choice
 ([Espressif RX driver](https://github.com/espressif/esp-idf/blob/v5.5.1/components/esp_driver_rmt/src/rmt_rx.c)).
+GPIO now dispatches watched matrix-signal edges from either a host pad sample
+or a driven software GPIO output. A unit gate drives the latter into RMT RX0
+on the same GPIO, with `FUN_IE` disabled/enabled, and verifies pulse widths in
+guest time. This is software-GPIO-to-RMT-RX loopback, not yet RMT TX waveform
+routing back through the pad; Espressif documents the latter as an RMT
+[TX/RX GPIO loopback mode](https://docs.espressif.com/projects/esp-idf/en/v5.3.2/esp32s3/api-reference/peripherals/rmt.html).
 The carrier remover joins short opposite-polarity gaps according to the
 channel-clock thresholds in the
 [S3 technical reference manual](https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf).

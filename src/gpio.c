@@ -42,6 +42,7 @@
 #define GPIO_STATUS_NEXT1_OFF       0x150u
 #define GPIO_FUNC_IN_BASE_OFF       0x154u
 #define GPIO_FUNC_IN_COUNT          256u
+#define GPIO_FUNC_IN_WORDS          (GPIO_FUNC_IN_COUNT / 64u)
 #define GPIO_FUNC_OUT_BASE_OFF      0x554u
 #define GPIO_CLOCK_GATE_OFF         0x62Cu
 #define GPIO_DATE_OFF               0x6FCu
@@ -85,6 +86,8 @@ struct flexe_gpio {
     void *output_ctx;
     flexe_gpio_irq_fn irq_changed;
     void *irq_ctx;
+    flexe_gpio_input_signal_fn input_signal_changed;
+    void *input_signal_ctx;
 
     uint32_t bt_select;
     uint32_t sdio_select;
@@ -97,6 +100,7 @@ struct flexe_gpio {
     uint32_t status[2];
     uint32_t pin[GPIO_PIN_REGISTER_COUNT];
     uint32_t func_in[GPIO_FUNC_IN_COUNT];
+    uint64_t watched_input_signal[GPIO_FUNC_IN_WORDS];
     uint32_t func_out[GPIO_PIN_REGISTER_COUNT];
     uint64_t modeled_output_signal[GPIO_FUNC_OUT_SIGNAL_WORDS];
     uint32_t clock_gate;
@@ -198,6 +202,22 @@ void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
         UINT64_C(1) << (signal % 64u);
 }
 
+void flexe_gpio_set_input_signal_handler(flexe_gpio_t *gpio,
+                                         flexe_gpio_input_signal_fn changed,
+                                         void *ctx)
+{
+    if (!gpio) return;
+    gpio->input_signal_changed = changed;
+    gpio->input_signal_ctx = changed ? ctx : NULL;
+}
+
+void flexe_gpio_watch_input_signal(flexe_gpio_t *gpio, unsigned signal)
+{
+    if (!gpio || signal >= GPIO_FUNC_IN_COUNT) return;
+    gpio->watched_input_signal[signal / 64u] |=
+        UINT64_C(1) << (signal % 64u);
+}
+
 static bool gpio_output_signal_modeled(const flexe_gpio_t *gpio,
                                        unsigned signal)
 {
@@ -254,6 +274,31 @@ int flexe_gpio_output_enabled(const flexe_gpio_t *gpio, unsigned pin)
 
 static void gpio_update_irq(flexe_gpio_t *gpio);
 
+static void gpio_notify_input_signals(flexe_gpio_t *gpio, unsigned pin,
+                                      bool old_pad, bool new_pad,
+                                      bool old_enabled, bool new_enabled)
+{
+    bool before_pad = old_enabled && old_pad;
+    bool after_pad = new_enabled && new_pad;
+    if (!gpio->input_signal_changed || before_pad == after_pad) return;
+    for (unsigned word = 0u; word < GPIO_FUNC_IN_WORDS; word++) {
+        uint64_t watched = gpio->watched_input_signal[word];
+        while (watched != 0u) {
+            unsigned signal = word * 64u +
+                              (unsigned)__builtin_ctzll(watched);
+            watched &= watched - 1u;
+            uint32_t route = gpio->func_in[signal];
+            if ((route & GPIO_FUNC_IN_MATRIX) == 0u ||
+                (route & 0x3Fu) != pin)
+                continue;
+            bool invert = (route & GPIO_FUNC_IN_INVERT) != 0u;
+            gpio->input_signal_changed(gpio->input_signal_ctx, signal,
+                                       before_pad ^ invert,
+                                       after_pad ^ invert);
+        }
+    }
+}
+
 static void gpio_refresh_input_pin(flexe_gpio_t *gpio, unsigned pin)
 {
     unsigned bank;
@@ -287,6 +332,10 @@ static void gpio_refresh_input_pin(flexe_gpio_t *gpio, unsigned pin)
         }
     }
     gpio_update_irq(gpio);
+    if ((gpio->rtc_owned & (UINT64_C(1) << pin)) == 0u)
+        gpio_notify_input_signals(gpio, pin, old, level,
+                                  (gpio->input_enable[bank] & mask) != 0u,
+                                  (gpio->input_enable[bank] & mask) != 0u);
 }
 
 static void gpio_notify_pin(flexe_gpio_t *gpio, unsigned pin)
@@ -782,9 +831,15 @@ void flexe_gpio_set_input_enable(flexe_gpio_t *gpio, unsigned pin,
     unsigned bank;
     uint32_t mask;
     (void)gpio_pin_bit(pin, &bank, &mask);
+    bool old_enabled = (gpio->input_enable[bank] & mask) != 0u;
+    if (old_enabled == enabled) return;
     if (enabled) gpio->input_enable[bank] |= mask;
     else         gpio->input_enable[bank] &= ~mask;
     gpio_update_irq(gpio);
+    if ((gpio->rtc_owned & (UINT64_C(1) << pin)) == 0u) {
+        bool pad = (gpio->input[bank] & mask) != 0u;
+        gpio_notify_input_signals(gpio, pin, pad, pad, old_enabled, enabled);
+    }
 }
 
 void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level)

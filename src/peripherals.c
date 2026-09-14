@@ -14139,6 +14139,22 @@ static void rmt_v1_irq_changed(void *ctx, uint32_t status)
     else periph_deassert_interrupt(p, source);
 }
 
+static void target_gpio_input_signal_changed(void *ctx, unsigned signal,
+                                             bool old_level, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !p->rmt_v1) return;
+    const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
+    unsigned rx_count = desc->channel_count - desc->tx_channel_count;
+    if (signal < desc->input_signal_base ||
+        signal >= desc->input_signal_base + rx_count)
+        return;
+    flexe_rmt_v1_rx_input_edge(
+        p->rmt_v1,
+        desc->tx_channel_count + signal - desc->input_signal_base,
+        old_level, level);
+}
+
 static void usb_serial_jtag_irq_changed(void *ctx, bool level)
 {
     esp32_periph_t *p = ctx;
@@ -14675,6 +14691,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         if (!p->rmt_v1) {
             periph_destroy(p);
             return NULL;
+        }
+        if (p->target_gpio) {
+            const flexe_rmt_v1_desc_t *desc = &target->rmt_v1;
+            flexe_gpio_set_input_signal_handler(
+                p->target_gpio, target_gpio_input_signal_changed, p);
+            for (unsigned ch = 0u;
+                 ch < desc->channel_count - desc->tx_channel_count; ch++)
+                flexe_gpio_watch_input_signal(
+                    p->target_gpio, desc->input_signal_base + ch);
         }
     }
 
@@ -16128,27 +16153,7 @@ void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value) {
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
     if (!p || pin < 0) return;
     if (p->target_gpio) {
-        int before[FLEXE_RMT_V1_RX_CHANNELS_MAX] = {0};
-        unsigned rx_count = 0u;
-        if (p->rmt_v1) {
-            const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
-            rx_count = desc->channel_count - desc->tx_channel_count;
-            if (rx_count > FLEXE_RMT_V1_RX_CHANNELS_MAX)
-                rx_count = FLEXE_RMT_V1_RX_CHANNELS_MAX;
-            for (unsigned ch = 0u; ch < rx_count; ch++)
-                before[ch] = flexe_gpio_input_signal_level(
-                    p->target_gpio, desc->input_signal_base + ch);
-        }
         flexe_gpio_set_input(p->target_gpio, (unsigned)pin, level != 0);
-        for (unsigned ch = 0u; ch < rx_count; ch++) {
-            const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
-            int after = flexe_gpio_input_signal_level(
-                p->target_gpio, desc->input_signal_base + ch);
-            if (before[ch] >= 0 && after >= 0 && before[ch] != after)
-                flexe_rmt_v1_rx_input_edge(p->rmt_v1,
-                    desc->tx_channel_count + ch,
-                    before[ch] != 0, after != 0);
-        }
         return;
     }
     if (pin > 39) return;
