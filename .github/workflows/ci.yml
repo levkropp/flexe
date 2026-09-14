@@ -55,7 +55,7 @@ jobs:
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
       - name: Build
-        run: cmake --build build-asan -j"$(nproc)"
+        run: cmake --build build-asan --target xtensa-tests -j"$(nproc)"
       - name: Unit tests
         env:
           # Leak detection is on: the suite is leak-clean, and a test that

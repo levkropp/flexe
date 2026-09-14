@@ -72,7 +72,7 @@ if grep -Eq 'NVS_FAIL|^\[TRAP\]|Guru Meditation|panic' \
     fail "guest failed, trapped, or panicked"
 fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 246 ]] ||
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 224 ]] ||
     fail "unsupported MMIO count changed from the pinned baseline"
 cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
     fail "guest UART transcript differs on replay"

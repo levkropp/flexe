@@ -37,6 +37,7 @@ struct flexe_rtc_cntl {
     uint32_t wakeup_enable;
     uint32_t wakeup_cause;
     uint32_t rtc_power_control;
+    uint32_t digital_iso_control;
     uint32_t digital_power;
     uint32_t reset_state;
     uint32_t ext_wakeup_config;
@@ -107,10 +108,18 @@ static uint64_t rtc_hold_pins(uint32_t value, unsigned first_gpio,
 static uint64_t rtc_all_pad_hold_pins(const flexe_rtc_cntl_t *rtc)
 {
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
-    uint64_t global =
+    uint64_t rtc_global =
         (rtc->rtc_power_control & desc->rtc_pad_force_hold_mask) != 0u ?
         ((UINT64_C(1) << rtc->target->rtc_io.gpio_count) - 1u) : 0u;
-    return global |
+    uint64_t digital_global =
+        (rtc->digital_iso_control & desc->digital_pad_force_hold_mask) != 0u &&
+        (rtc->digital_iso_control & desc->digital_pad_force_unhold_mask) == 0u ?
+        rtc_hold_pins(UINT32_MAX,
+                      desc->digital_pad_hold_first_gpio,
+                      desc->digital_pad_hold_first_bit,
+                      desc->digital_pad_hold_count) &
+        rtc->target->gpio.valid_gpio_mask : 0u;
+    return rtc_global | digital_global |
            rtc_hold_pins(rtc->rtc_pad_hold,
                          desc->rtc_pad_hold_first_gpio,
                          desc->rtc_pad_hold_first_bit,
@@ -430,7 +439,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
             desc->sleep_state_offset, desc->wakeup_state_offset,
             desc->digital_power_offset, desc->wakeup_cause_offset,
-            desc->rtc_power_offset,
+            desc->rtc_power_offset, desc->digital_iso_offset,
             desc->ext_wakeup_config_offset, desc->ext1_select_offset,
             desc->ext1_status_offset, desc->brownout_offset,
         };
@@ -442,6 +451,20 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             (desc->rtc_pad_force_hold_mask &
              (desc->rtc_pad_force_hold_mask - 1u)) != 0u ||
             (desc->rtc_power_reset & desc->rtc_pad_force_hold_mask) != 0u ||
+            desc->digital_iso_offset == 0u ||
+            desc->digital_pad_hold_count == 0u ||
+            desc->digital_pad_force_hold_mask == 0u ||
+            (desc->digital_pad_force_hold_mask &
+             (desc->digital_pad_force_hold_mask - 1u)) != 0u ||
+            desc->digital_pad_force_unhold_mask == 0u ||
+            (desc->digital_pad_force_unhold_mask &
+             (desc->digital_pad_force_unhold_mask - 1u)) != 0u ||
+            (desc->digital_pad_force_hold_mask &
+             desc->digital_pad_force_unhold_mask) != 0u ||
+            (desc->digital_iso_reset &
+             desc->digital_pad_force_hold_mask) != 0u ||
+            (desc->digital_iso_reset &
+             desc->digital_pad_force_unhold_mask) == 0u ||
             desc->sleep_enable_mask == 0u ||
             (desc->sleep_enable_mask & (desc->sleep_enable_mask - 1u)) != 0u ||
             desc->sleep_wakeup_mask == 0u ||
@@ -763,6 +786,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
             return rtc->wakeup_cause;
         if (offset == desc->rtc_power_offset)
             return rtc->rtc_power_control;
+        if (offset == desc->digital_iso_offset)
+            return rtc->digital_iso_control;
         if (offset == desc->ext_wakeup_config_offset)
             return rtc->ext_wakeup_config;
         if (offset == desc->ext1_select_offset)
@@ -970,6 +995,25 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
                 rtc->fallback_write(rtc->fallback_ctx, addr, value);
             return;
         }
+        if (offset == desc->digital_iso_offset) {
+            uint32_t old = rtc->digital_iso_control;
+            /* CLR_DG_PAD_AUTOHOLD is a write-only strobe; AUTOHOLD status
+             * is read-only and remains clear until sleep autohold is modeled. */
+            uint32_t next = value & ~((1u << 10u) | (1u << 9u));
+            rtc->digital_iso_control = next;
+            uint32_t hold_bits = desc->digital_pad_force_hold_mask |
+                                 desc->digital_pad_force_unhold_mask;
+            if (((old ^ next) & hold_bits) != 0u &&
+                rtc->pad_hold_changed)
+                rtc->pad_hold_changed(rtc->pad_hold_ctx,
+                                      rtc_all_pad_hold_pins(rtc));
+            if ((((old ^ next) & ~hold_bits) != 0u ||
+                 (value & ((1u << 10u) | (1u << 9u))) != 0u ||
+                 (next & hold_bits) == hold_bits) &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            return;
+        }
         if (offset == desc->ext_wakeup_config_offset) {
             uint32_t old = rtc->ext_wakeup_config;
             rtc->ext_wakeup_config = value;
@@ -1163,6 +1207,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->reset_state = desc->reset_state_reset;
     rtc->wakeup_enable = desc->wakeup_enable_reset;
     rtc->rtc_power_control = desc->rtc_power_reset;
+    rtc->digital_iso_control = desc->digital_iso_reset;
     rtc->digital_power = desc->digital_power_reset;
     rtc->brownout_config = desc->brownout_reset;
     rtc->cpu_stall_options = desc->cpu_stall_options_reset;

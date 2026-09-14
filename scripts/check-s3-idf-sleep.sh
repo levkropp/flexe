@@ -68,7 +68,7 @@ if grep -Eq '  [RW]  0x600080(04|08|18|3C) |  [RW]  0x60008130 ' "$tmpdir/emu.1"
     fail "RTC timer, sleep state, or wake-cause MMIO remains unsupported"
 fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.1")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 314 ]] ||
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 288 ]] ||
     fail "unrelated unsupported MMIO count changed from pinned baseline"
 cmp -s "$tmpdir/guest.1" "$tmpdir/guest.2" ||
     fail "guest UART/USB transcript differs on replay"

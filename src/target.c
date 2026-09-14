@@ -662,6 +662,12 @@ static const flexe_target_desc_t TARGETS[] = {
             .rtc_power_offset = 0x088u,
             .rtc_power_reset = 0x00000925u,
             .rtc_pad_force_hold_mask = 1u << 21,
+            /* RTC_CNTL_DIG_ISO_REG: digital pads use a separate global
+             * force-hold source and force-unhold override. */
+            .digital_iso_offset = 0x094u,
+            .digital_iso_reset = 0xAA805080u,
+            .digital_pad_force_hold_mask = 1u << 15,
+            .digital_pad_force_unhold_mask = 1u << 14,
             .digital_power_reset = 0x00545010u,
             .sleep_enable_mask = 1u << 31,
             .sleep_wakeup_mask = 1u << 29,

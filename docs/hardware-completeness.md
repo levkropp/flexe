@@ -48,7 +48,7 @@ even when a firmware workflow succeeds.
 | S3 LX7, interrupts, dual-core startup | Partial | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, target and interrupt-matrix unit tests | Sustained queue handoffs and CPU1 stall/resume pass; broader FreeRTOS and interrupt workloads remain to validate. |
 | S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-nerdminer-portal.sh` | Other flash modes, cache behavior, and bootloader paths remain unverified. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | RTC slow counter/STORE and RTC_DATA survive machine rebuild; additional partition and filesystem variants need end-to-end gates. |
-| S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC hold work; physical pulls, drive strength, and electrical levels are not complete. |
+| S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC/digital hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and ESP-IDF SPI-master replay gates run twice across session resets against persistent virtual slaves | I2C slave mode, more guest driver/device combinations, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
@@ -94,8 +94,8 @@ heartbeats. Its image SHA-256 is
 and ELF SHA-256 is
 `84e74cdcdfac1bbc67caef66b9fa49366d8f6940c81f794c8253d47301a4f230`.
 Both external-image gates compare a complete second replay byte-for-byte,
-including the unsupported-MMIO report; hello-world reports 246 unsupported
-accesses across its two boots and cross-core reports 115 in one boot. This
+including the unsupported-MMIO report; hello-world reports 224 unsupported
+accesses across its two boots and cross-core reports 104 in one boot. This
 proves these FreeRTOS interactions, not simultaneous core execution or timing
 fidelity. Run with matching external artifacts:
 
@@ -141,7 +141,7 @@ FreeRTOS heartbeat afterward. Its image SHA-256 is
 `cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2`
 and matching ELF SHA-256 is
 `a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294`.
-The two complete replays are byte-identical; 314 other unsupported accesses
+The two complete replays are byte-identical; 288 other unsupported accesses
 across both boots remain visible, mainly RTC power/isolation configuration.
 No unsupported sites remain for S3 sleep timer, state, wake-enable, or cause
 registers. The nominal slow-clock model yielded about 48.9/19.3 ms for the
@@ -158,6 +158,10 @@ the global source, while individually held pads retain their state across a
 deep-sleep rebuild. Releasing global hold does not release an individual pad.
 The digital hold register maps bits 1–27 to GPIO22–48; GPIO22–25 are unbonded,
 so GPIO26 is its first usable pad, while GPIO21 uses the RTC hold register.
+`RTC_CNTL_DIG_ISO_REG`'s global digital force-hold freezes bonded GPIO26–48;
+its force-unhold bit releases that source without clearing individual holds.
+ROM boot clears global digital hold, but individually held pads keep their
+latched state. Digital autohold and non-pad isolation effects remain diagnostic.
 Other RTC power/isolation fields read back but their power
 effects remain diagnostic and are not treated as implemented.
 Rebuild and run with the matching external artifacts:
@@ -190,7 +194,7 @@ Its image SHA-256 is
 `d4897a5ea5b5805bfda3ac3f624788f2600c9f17653e07f8dee7bea67df91314`
 and ELF SHA-256 is
 `27a2d3710e867e0310494a29a6c3612878ec10796a5ea32beeb30a4eca627d4d`.
-The gate reports 314 unrelated unsupported accesses across both boots, mainly
+The gate reports 288 unrelated unsupported accesses across both boots, mainly
 RTC power/isolation setup; the EXT selection/state/status sites are modeled.
 Physical pull resistors, voltage thresholds, glitches/filtering, and pad
 electrical behavior are not inferred from the host's digital level:
@@ -218,7 +222,7 @@ partition table and SPIFFS volume. The pinned NVS image SHA-256 is
 `6eb44365aa80da064ab9b861ecc8210c31c4326216d89902da8d432afee04989`
 and ELF SHA-256 is
 `0992d03138cdfd968b974968c6abcf1f4fec01ab35a233d737dada8b81414588`.
-The gate checks two byte-identical runs and still reports 246 unsupported
+The gate checks two byte-identical runs and still reports 224 unsupported
 accesses across its two boots:
 
 ```sh

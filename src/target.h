@@ -390,6 +390,12 @@ typedef struct {
     uint16_t rtc_power_offset;
     uint32_t rtc_power_reset;
     uint32_t rtc_pad_force_hold_mask;
+    /* Digital-pad isolation/force-hold register. Other isolation controls
+     * remain visible but are not electrically modeled. */
+    uint16_t digital_iso_offset;
+    uint32_t digital_iso_reset;
+    uint32_t digital_pad_force_hold_mask;
+    uint32_t digital_pad_force_unhold_mask;
     uint32_t digital_power_reset;
     uint32_t sleep_enable_mask;
     uint32_t sleep_wakeup_mask;
