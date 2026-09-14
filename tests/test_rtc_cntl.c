@@ -501,41 +501,41 @@ TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches)
 
     uint32_t hold = rtc->base + rtc->digital_pad_hold_offset;
     ASSERT_EQ(mem_read32(mem, hold), 0u);
-    ASSERT_EQ(rtc->digital_pad_hold_first_gpio, 21u);
+    ASSERT_EQ(rtc->digital_pad_hold_first_gpio, 22u);
     ASSERT_EQ(rtc->digital_pad_hold_first_bit, 1u);
-    /* GPIO21 is the first held pad, GPIO31 the last in the low bank. */
-    mem_write32(mem, gpio->base + 0x008u, (1u << 21u) | (1u << 31u));
-    mem_write32(mem, gpio->base + 0x024u, (1u << 21u) | (1u << 31u));
-    mem_write32(mem, hold, (1u << 1u) | (1u << 11u));
-    ASSERT_EQ(mem_read32(mem, hold), (1u << 1u) | (1u << 11u));
+    /* GPIO26 is the first bonded digital pad, GPIO31 the last in bank 0. */
+    mem_write32(mem, gpio->base + 0x008u, (1u << 26u) | (1u << 31u));
+    mem_write32(mem, gpio->base + 0x024u, (1u << 26u) | (1u << 31u));
+    mem_write32(mem, hold, (1u << 5u) | (1u << 10u));
+    ASSERT_EQ(mem_read32(mem, hold), (1u << 5u) | (1u << 10u));
 
-    mem_write32(mem, gpio->base + 0x00Cu, (1u << 21u) | (1u << 31u));
-    mem_write32(mem, gpio->base + 0x028u, (1u << 21u) | (1u << 31u));
+    mem_write32(mem, gpio->base + 0x00Cu, (1u << 26u) | (1u << 31u));
+    mem_write32(mem, gpio->base + 0x028u, (1u << 26u) | (1u << 31u));
     ASSERT_EQ(mem_read32(mem, gpio->base + 0x004u), 0u);
     ASSERT_EQ(mem_read32(mem, gpio->base + 0x020u), 0u);
-    ASSERT_EQ(periph_gpio_pin_level(periph, 21), 1);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 26), 1);
     ASSERT_EQ(periph_gpio_output_enabled(periph, 31), 1);
 
-    mem_write32(mem, hold, 1u << 11u);
-    ASSERT_EQ(periph_gpio_pin_level(periph, 21), 0);
-    ASSERT_EQ(periph_gpio_output_enabled(periph, 21), 0);
+    mem_write32(mem, hold, 1u << 10u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 26), 0);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 26), 0);
     ASSERT_EQ(periph_gpio_pin_level(periph, 31), 1);
     mem_write32(mem, hold, 0u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 31), 0);
     ASSERT_EQ(periph_gpio_output_enabled(periph, 31), 0);
 
-    /* GPIO47 uses the upper bank; GPIO48 has no RTC digital hold bit. */
-    mem_write32(mem, gpio->base + 0x014u, 1u << 15u);
-    mem_write32(mem, gpio->base + 0x030u, 1u << 15u);
+    /* GPIO48 uses the final bit and the upper GPIO bank. */
+    mem_write32(mem, gpio->base + 0x014u, 1u << 16u);
+    mem_write32(mem, gpio->base + 0x030u, 1u << 16u);
     mem_write32(mem, hold, 1u << 27u);
-    mem_write32(mem, gpio->base + 0x018u, 1u << 15u);
-    ASSERT_EQ(periph_gpio_pin_level(periph, 47), 1);
+    mem_write32(mem, gpio->base + 0x018u, 1u << 16u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 48), 1);
     mem_write32(mem, hold, 0u);
-    ASSERT_EQ(periph_gpio_pin_level(periph, 47), 0);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 48), 0);
 
     int before = periph_unhandled_count(periph);
-    /* Bit 2 maps to unbonded GPIO22; bit 28 is not an S3 hold bit. */
-    mem_write32(mem, hold, (1u << 2u) | (1u << 28u));
+    /* Bit 1 maps to unbonded GPIO22; bit 28 is not an S3 hold bit. */
+    mem_write32(mem, hold, (1u << 1u) | (1u << 28u));
     ASSERT_EQ(mem_read32(mem, hold), 0u);
     ASSERT_EQ(periph_unhandled_count(periph), before + 1);
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
@@ -559,14 +559,14 @@ TEST(rtc_cntl_digital_pad_hold_survives_rebuild_without_unheld_gpio)
 
     uint32_t hold = rtc->base + rtc->digital_pad_hold_offset;
     mem_write32(mem, gpio->base + 0x008u,
-                (1u << 21u) | (1u << 26u));
+                (1u << 26u) | (1u << 27u));
     mem_write32(mem, gpio->base + 0x024u,
-                (1u << 21u) | (1u << 26u));
-    mem_write32(mem, hold, 1u << 1u);
+                (1u << 26u) | (1u << 27u));
+    mem_write32(mem, hold, 1u << 5u);
     periph_pad_hold_t snapshot;
     periph_pad_hold_snapshot(periph, &snapshot);
-    ASSERT_EQ64(snapshot.target_gpio.mask, UINT64_C(1) << 21u);
-    ASSERT_EQ(snapshot.target_rtc_hold, 1u << 1u);
+    ASSERT_EQ64(snapshot.target_gpio.mask, UINT64_C(1) << 26u);
+    ASSERT_EQ(snapshot.target_rtc_hold, 1u << 5u);
 
     periph_destroy(periph);
     periph = periph_create(mem);
@@ -574,15 +574,15 @@ TEST(rtc_cntl_digital_pad_hold_survives_rebuild_without_unheld_gpio)
     if (periph) {
         ASSERT_EQ(mem_read32(mem, hold), 0u);
         periph_pad_hold_restore(periph, &snapshot);
-        ASSERT_EQ(mem_read32(mem, hold), 1u << 1u);
+        ASSERT_EQ(mem_read32(mem, hold), 1u << 5u);
         ASSERT_EQ(mem_read32(mem, gpio->base + 0x004u), 0u);
-        ASSERT_EQ(periph_gpio_pin_level(periph, 21), 1);
-        ASSERT_EQ(periph_gpio_output_enabled(periph, 21), 1);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 26), 1);
+        ASSERT_EQ(periph_gpio_output_enabled(periph, 26), 1);
+        ASSERT_EQ(periph_gpio_pin_level(periph, 27), 0);
+        ASSERT_EQ(periph_gpio_output_enabled(periph, 27), 0);
+        mem_write32(mem, hold, 0u);
         ASSERT_EQ(periph_gpio_pin_level(periph, 26), 0);
         ASSERT_EQ(periph_gpio_output_enabled(periph, 26), 0);
-        mem_write32(mem, hold, 0u);
-        ASSERT_EQ(periph_gpio_pin_level(periph, 21), 0);
-        ASSERT_EQ(periph_gpio_output_enabled(periph, 21), 0);
         ASSERT_EQ(periph_unhandled_count(periph), 0);
     }
     periph_destroy(periph);
@@ -658,16 +658,17 @@ TEST(rtc_cntl_rtc_pad_hold_freezes_mux_input_and_output)
     ASSERT_EQ(mem_read32(mem, gpio + 0x03Cu) & (1u << 11u), 1u << 11u);
     ASSERT_EQ(mem_read32(mem, io->base + 0x024u) & rtc11, 0u);
 
-    /* GPIO21 has two independent hold sources: clearing only one does not
-     * release the physical pad. */
+    /* GPIO21 has an RTC hold bit but no digital hold bit. */
     mem_write32(mem, gpio + 0x008u, 1u << 21u);
     mem_write32(mem, gpio + 0x024u, 1u << 21u);
     mem_write32(mem, hold, 1u << 21u);
+    int before_digital = periph_unhandled_count(periph);
     mem_write32(mem, digital_hold, 1u << 1u);
+    ASSERT_EQ(mem_read32(mem, digital_hold), 0u);
+    ASSERT_EQ(periph_unhandled_count(periph), before_digital + 1);
     mem_write32(mem, gpio + 0x00Cu, 1u << 21u);
-    mem_write32(mem, hold, 0u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 21), 1);
-    mem_write32(mem, digital_hold, 0u);
+    mem_write32(mem, hold, 0u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 21), 0);
 
     int before = periph_unhandled_count(periph);

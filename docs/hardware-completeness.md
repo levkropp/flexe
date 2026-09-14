@@ -156,6 +156,8 @@ thresholds, voltage injection, brownout interrupts, and resets are not modeled.
 pads through the same physical hold model as individual bits. ROM boot clears
 the global source, while individually held pads retain their state across a
 deep-sleep rebuild. Releasing global hold does not release an individual pad.
+The digital hold register maps bits 1–27 to GPIO22–48; GPIO22–25 are unbonded,
+so GPIO26 is its first usable pad, while GPIO21 uses the RTC hold register.
 Other RTC power/isolation fields read back but their power
 effects remain diagnostic and are not treated as implemented.
 Rebuild and run with the matching external artifacts:

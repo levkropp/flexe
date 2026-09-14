@@ -711,6 +711,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.wdt_interrupt_mask, 1u << 3);
     ASSERT_EQ(s3->rtc_cntl.wdt_stage0_multiplier, 2u);
     ASSERT_EQ(s3->rtc_cntl.digital_pad_hold_offset, 0xDCu);
+    ASSERT_EQ(s3->rtc_cntl.digital_pad_hold_first_gpio, 22u);
     ASSERT_EQ(s3->rtc_cntl.digital_pad_hold_count, 27u);
     ASSERT_EQ(s3->rtc_cntl.sleep_timer_low_offset, 0x04u);
     ASSERT_EQ(s3->rtc_cntl.sleep_timer_high_offset, 0x08u);
