@@ -11,6 +11,7 @@
 #include "memory.h"
 #include "peripherals.h"
 #include "rom_stubs.h"
+#include "target.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,7 +19,8 @@
 #include <string.h>
 
 #define SUCCESS_MARKER 0x12C51AEEu
-#define MAX_CYCLES     4000000000ull
+#define MAX_CYCLES_CLASSIC 4000000000ull
+#define MAX_CYCLES_S3      8000000000ull
 #define RESULT_COUNT   8u
 
 #define PORT       0
@@ -29,13 +31,19 @@ volatile int emu_app_running = 1;
 int main(int argc, char **argv) {
     int argi = 1;
     int disable_jit = 0;
-    if (argi < argc && strcmp(argv[argi], "--no-jit") == 0) {
-        disable_jit = 1;
+    bool s3 = false;
+    while (argi < argc) {
+        if (strcmp(argv[argi], "--no-jit") == 0)
+            disable_jit = 1;
+        else if (strcmp(argv[argi], "--s3") == 0)
+            s3 = true;
+        else
+            break;
         argi++;
     }
-    if (argc - argi != 2) {
-        fprintf(stderr, "usage: %s [--no-jit] FIRMWARE.bin FIRMWARE.elf\n",
-                argv[0]);
+    if (argc - argi != (s3 ? 3 : 2)) {
+        fprintf(stderr, "usage: %s [--no-jit] [--s3] FIRMWARE.bin "
+                "FIRMWARE.elf [ROM.elf]\n", argv[0]);
         return 2;
     }
 
@@ -52,7 +60,11 @@ int main(int argc, char **argv) {
     flexe_session_config_t config = {
         .bin_path = argv[argi],
         .elf_path = argv[argi + 1],
+        .rom_elf_path = s3 ? argv[argi + 2] : NULL,
         .disable_jit = disable_jit,
+        .native_freertos = s3,
+        .target = s3 ? FLEXE_TARGET_ESP32S3 : FLEXE_TARGET_AUTO,
+        .unhandled_audit = s3,
     };
     flexe_session_t *session = flexe_session_create(&config);
     if (!session) {
@@ -72,7 +84,8 @@ int main(int argc, char **argv) {
     uint32_t stage = 0, last_stage = UINT32_MAX;
     bool budget_stop = true;
 
-    while (cpu->cycle_count < MAX_CYCLES) {
+    uint64_t max_cycles = s3 ? MAX_CYCLES_S3 : MAX_CYCLES_CLASSIC;
+    while (cpu->cycle_count < max_cycles) {
         stage = mem_read32(mem, stage_addr);
         if (stage != last_stage) {
             fprintf(stderr, "[i2c-slave-fixture] stage=0x%08X cycles=%llu\n",
@@ -100,19 +113,42 @@ int main(int argc, char **argv) {
 
     if (budget_stop)
         fprintf(stderr, "[i2c-slave-fixture] exited on cycle budget (%llu) at "
-                        "pc=0x%08X\n", MAX_CYCLES, cpu->pc);
+                        "pc=0x%08X\n", (unsigned long long)max_cycles,
+                        cpu->pc);
 
     int unhandled = periph_unhandled_count(flexe_session_periph(session));
+    unsigned i2c_unhandled_sites = 0u;
+    if (s3) {
+        const flexe_target_desc_t *target = flexe_target_by_id(config.target);
+        for (size_t i = 0; i < periph_unhandled_audit_count(periph); i++) {
+            periph_unhandled_site_t site;
+            if (!periph_unhandled_audit_get(periph, i, &site)) continue;
+            for (unsigned port = 0; port < target->i2c.instance_count; port++) {
+                uint32_t base = target->i2c.instance[port].base;
+                if (site.address >= base &&
+                    site.address - base < target->i2c.register_size) {
+                    i2c_unhandled_sites++;
+                    fprintf(stderr, "[s3-i2c-slave] unsupported port=%u %c "
+                            "0x%08X pc=0x%08X count=%llu\n",
+                            port, site.write ? 'W' : 'R', site.address,
+                            site.pc, (unsigned long long)site.count);
+                    break;
+                }
+            }
+        }
+    }
     int unregistered = rom_stubs_unregistered_count(flexe_session_rom(session));
 
     uint32_t packed = (uint32_t)SEND[0] | ((uint32_t)SEND[1] << 8) |
                       ((uint32_t)SEND[2] << 16) | ((uint32_t)SEND[3] << 24);
 
     printf("engine=%s stage=0x%08X staged=%u guest_got=%u guest_bytes=%08X "
-           "accepted=%d read_back=%02X%02X%02X unhandled=%d unregistered=%d\n",
+           "accepted=%d read_back=%02X%02X%02X unhandled=%d "
+           "i2c_unhandled_sites=%u unregistered=%d\n",
            flexe_session_jit(session) ? "jit" : "interp", stage,
            r[0], r[1], r[2], accepted,
-           got_back[0], got_back[1], got_back[2], unhandled, unregistered);
+           got_back[0], got_back[1], got_back[2], unhandled,
+           i2c_unhandled_sites, unregistered);
 
     /* The slave took every byte the master sent, and reported the same ones. */
     bool rx_ok = accepted == (int)sizeof SEND && r[1] == sizeof SEND &&
@@ -122,7 +158,8 @@ int main(int argc, char **argv) {
     bool tx_ok = memcmp(got_back, WANT_BACK, sizeof WANT_BACK) == 0;
 
     int ok = stage == SUCCESS_MARKER && rx_ok && tx_ok &&
-             unhandled == 0 && unregistered == 0;
+             (s3 ? i2c_unhandled_sites == 0u : unhandled == 0) &&
+             unregistered == 0;
     if (!ok)
         fprintf(stderr, "[i2c-slave-fixture] stage_ok=%d rx_ok=%d tx_ok=%d\n",
                 stage == SUCCESS_MARKER, rx_ok, tx_ok);

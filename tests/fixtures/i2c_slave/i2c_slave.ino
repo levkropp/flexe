@@ -21,7 +21,12 @@
 #define PORT        I2C_NUM_0
 #define SLAVE_ADDR  0x42
 #define SDA_PIN     21
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+/* GPIO22 is unbonded on S3; avoid flash/PSRAM pads GPIO26-32 too. */
+#define SCL_PIN     4
+#else
 #define SCL_PIN     22
+#endif
 #define SPIN_LIMIT  200000
 
 /* What the host sends, and what it should read back. */

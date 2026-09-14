@@ -50,7 +50,7 @@ even when a firmware workflow succeeds.
 | S3 NVS, SPIFFS, reset persistence | Partial | `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | RTC slow counter/STORE and RTC_DATA survive machine rebuild; additional partition and filesystem variants need end-to-end gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC/digital hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and ESP-IDF SPI-master replay gates run twice across session resets against persistent virtual slaves | I2C slave mode, more guest driver/device combinations, and GP-SPI segmented/slave modes remain. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire, I2C-slave, and ESP-IDF SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback and errors; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c`, ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, power-transition fidelity, calibrated timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
@@ -249,8 +249,8 @@ contents persist, while the SoC I2C controller is rebuilt. A separate unit
 test covers all three classic I2C bus attachments across reset. Two complete
 S3 replay runs match byte-for-byte, with no unsupported I2C MMIO sites;
 350 unrelated startup accesses across the two boots remain unsupported. This
-gate does not test a guest-initiated restart, S3 slave mode, electrical timing,
-bus contention, or other devices:
+gate does not test a guest-initiated restart, electrical timing, bus
+contention, or other devices:
 
 ```sh
 arduino-cli compile --fqbn esp32:esp32:esp32s3 \
@@ -260,6 +260,28 @@ S3_I2C_BIN=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.merged.bin \
 S3_I2C_ELF=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 RUNNER=./build/flexe-i2c-wire-test ./scripts/check-s3-i2c-wire.sh
+```
+
+A separate stock Arduino-ESP32 3.3.11 S3 image configures ESP-IDF's I2C0
+slave driver at address `0x42`. A host master writes `DE AD BE EF`; the guest
+reads those bytes and returns its staged `11 22 33`. The fixture uses GPIO4
+for SCL because S3 has no GPIO22, while GPIO26-32 are normally
+reserved for flash/PSRAM ([Espressif GPIO guide](https://docs.espressif.com/projects/esp-idf/en/release-v5.2/esp32s3/api-reference/peripherals/gpio.html)).
+The merged image and ELF hashes are
+`bdfd7cdf30381de4f3c9e26a588c114ddd8721638c397bdd84cd6f9a018ed290`
+and `5477d38fc97a858da0ea0e11cd1bd7a75c0f1a30bd28595dd37f80496c29fcfa`.
+Two complete interpreter runs replay byte-for-byte with no unsupported I2C
+MMIO sites. Clock stretching, overflow, electrical bus timing, and other
+slave-driver implementations remain unverified:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+  --build-path /tmp/flexe-s3-i2c-slave-build \
+  --build-property compiler.optimization_flags=-Os tests/fixtures/i2c_slave
+S3_I2C_SLAVE_BIN=/tmp/flexe-s3-i2c-slave-build/i2c_slave.ino.merged.bin \
+S3_I2C_SLAVE_ELF=/tmp/flexe-s3-i2c-slave-build/i2c_slave.ino.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+RUNNER=./build/flexe-i2c-slave-test ./scripts/check-s3-i2c-slave.sh
 ```
 
 The S3 GP-SPI gate compiles the same ESP-IDF `spi_master` fixture used for
