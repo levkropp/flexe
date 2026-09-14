@@ -44,6 +44,7 @@ typedef struct {
     int         disable_jit;        /* 1 = interpreter only; default is native JIT */
     int         unhandled_audit;    /* Collect unsupported MMIO sites */
     flexe_target_id_t target;       /* AUTO (zero) = detect from image header */
+    flexe_board_psram_t board_psram; /* Optional physically populated PSRAM */
 
     /* UART output callback (NULL = no UART output) */
     void      (*uart_cb)(void *ctx, uint8_t byte);

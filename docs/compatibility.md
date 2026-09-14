@@ -26,6 +26,17 @@ JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
 addresses belong to the classic target. Missing S3 devices remain explicit
 and S3 is not yet a production-supported target.
 
+Boards populated with the [AP Memory APS6408L-3OBMx 64-Mbit octal
+PSRAM](https://www.apmemory.com/en/downloadFiles/0324112221b2583847) can opt
+in with `--psram ap-8m-opi`. This attaches 8 MiB on S3 CS1, supports its
+16-bit doubled DDR mode-register and array commands, and exposes the backing
+through the S3 cache MMU. The stock Arduino-ESP32 3.3.11
+`FlashSize=8M,PSRAM=opi` fixture detects 8 MiB, allocates external RAM, and
+repeats 8 KiB read/write checks under `scripts/check-s3-psram-opi.sh`.
+Without the flag, S3 CS1 remains unpopulated and the same firmware reports
+no PSRAM. This is functional byte-array support, not calibrated DQS timing,
+refresh behavior, or a claim about other PSRAM devices.
+
 Flexe reads the configured flash capacity from the standard ESP image header
 and grows the virtual NOR device beyond the 4 MiB board default when required
 (up to 16 MiB on classic ESP32 and 128 MiB on ESP32-S3). It recognizes merged
@@ -69,6 +80,8 @@ behavior.
 Software resets retain the live NOR backing, including guest-written NVS and
 filesystem partitions. They also keep the external NOR's command-visible
 status and mode state while resetting the SoC's SPI controller registers.
+The optional S3 PSRAM array and mode registers likewise survive an SoC-only
+reset; a chip power cycle resets its mode registers.
 On S3 [deep-sleep flash power-down](https://docs.espressif.com/projects/esp-idf/en/v5.2/esp32s3/api-reference/system/sleep_modes.html#power-down-of-flash),
 the modeled GD25Q32C retains only its documented nonvolatile status bits;
 other capacity profiles do not claim a nonvolatile register layout and emit a

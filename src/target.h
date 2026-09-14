@@ -850,6 +850,19 @@ typedef enum {
     FLEXE_SPI_MEM_LAYOUT_S2_S3,
 } flexe_spi_mem_layout_t;
 
+typedef enum {
+    FLEXE_SPI_MEM_PSRAM_NONE = 0,
+    FLEXE_SPI_MEM_PSRAM_QUAD,
+    FLEXE_SPI_MEM_PSRAM_AP_8M_OPI,
+} flexe_spi_mem_psram_kind_t;
+
+/* Optional board population; zero retains the target's standard board.
+ * The AP profile represents a physical 64-Mbit APS6408L-3OBMx on S3 CS1. */
+typedef enum {
+    FLEXE_BOARD_PSRAM_DEFAULT = 0,
+    FLEXE_BOARD_PSRAM_AP_8M_OPI,
+} flexe_board_psram_t;
+
 typedef struct {
     uint32_t                base[FLEXE_TARGET_SPI_MEM_HOST_MAX];
     uint32_t                register_size;
@@ -861,6 +874,7 @@ typedef struct {
     uint8_t                 flash_chip_select;
     uint8_t                 psram_chip_select;
     flexe_spi_mem_layout_t  layout;
+    flexe_spi_mem_psram_kind_t psram_kind;
 } flexe_spi_mem_desc_t;
 
 /* Live flash geometry shared by the ROM, second-stage bootloader, and
@@ -1051,6 +1065,11 @@ typedef struct {
 const flexe_target_desc_t *flexe_target_by_id(flexe_target_id_t id);
 const flexe_target_desc_t *flexe_target_by_image_chip_id(uint16_t chip_id);
 const flexe_target_desc_t *flexe_target_by_name(const char *name);
+/* Copy a canonical target and populate an optional board-side PSRAM device.
+ * The caller owns `out` for as long as memory, CPUs and peripherals use it. */
+bool flexe_target_with_board_psram(const flexe_target_desc_t *base,
+                                   flexe_board_psram_t board_psram,
+                                   flexe_target_desc_t *out);
 
 /* Parse "auto" or a recognized descriptor name/alias. */
 int flexe_target_parse(const char *name, flexe_target_id_t *id_out);

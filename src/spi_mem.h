@@ -17,6 +17,16 @@ typedef struct {
     bool address_4byte;
 } flexe_spi_mem_nor_state_t;
 
+/* External PSRAM mode registers survive an SoC-only software reset. */
+typedef struct {
+    bool reset_armed;
+    bool qpi;
+    bool burst_32;
+    uint8_t mr0;
+    uint8_t mr4;
+    uint8_t mr8;
+} flexe_spi_mem_psram_state_t;
+
 typedef void (*flexe_spi_mem_flash_changed_fn)(void *ctx,
                                                 uint32_t offset,
                                                 uint32_t size);
@@ -34,5 +44,10 @@ void flexe_spi_mem_nor_snapshot(const flexe_spi_mem_t *spi_mem,
 void flexe_spi_mem_nor_restore(flexe_spi_mem_t *spi_mem,
                                const flexe_spi_mem_nor_state_t *state,
                                bool power_cycle);
+void flexe_spi_mem_psram_snapshot(const flexe_spi_mem_t *spi_mem,
+                                  flexe_spi_mem_psram_state_t *out);
+void flexe_spi_mem_psram_restore(flexe_spi_mem_t *spi_mem,
+                                 const flexe_spi_mem_psram_state_t *state,
+                                 bool power_cycle);
 
 #endif /* FLEXE_SPI_MEM_H */

@@ -47,6 +47,7 @@ even when a firmware workflow succeeds.
 | Classic network/Bluetooth | Partial (service shims and device models) | Meshtastic, Marauder, NerdMiner and WLED compatibility scenarios | RF/PHY propagation and general controller equivalence are unsupported. |
 | S3 LX7, interrupts, dual-core startup | Partial | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, target and interrupt-matrix unit tests | Sustained queue handoffs and CPU1 stall/resume pass; broader FreeRTOS and interrupt workloads remain to validate. |
 | S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c` (4/8 MiB GigaDevice SFDP; 4 MiB BP/CMP protection), `scripts/check-s3-nerdminer-portal.sh` | Other flash protection profiles, cache behavior, and bootloader paths remain unverified. |
+| S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC/digital hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
@@ -481,6 +482,24 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-ledc.sh
 ```
 
+The optional AP Memory 8 MiB OPI profile is selected by the board, not
+inferred from firmware: `--psram ap-8m-opi` attaches it on CS1. The pinned
+stock Arduino-ESP32 3.3.11 fixture checks 8 KiB of allocated external RAM
+repeatedly; its second replay must be byte-identical, and the same image
+without the flag must report no PSRAM. Build and run it with:
+
+```sh
+arduino-cli compile \
+  --fqbn 'esp32:esp32:esp32s3:FlashSize=8M,PSRAM=opi' \
+  --build-path /tmp/flexe-s3-psram-opi-build \
+  --build-property compiler.optimization_flags=-Os \
+  tests/fixtures/s3_psram_opi
+S3_PSRAM_BIN=/tmp/flexe-s3-psram-opi-build/s3_psram_opi.ino.merged.bin \
+S3_PSRAM_ELF=/tmp/flexe-s3-psram-opi-build/s3_psram_opi.ino.elf \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-psram-opi.sh
+```
+
 The native S3 `esp_wifi_internal_tx`/`tx_by_ref` and
 `esp_wifi_internal_reg_rxcb` symbols now form an optional Ethernet-frame
 service boundary. A host backend can accept guest frames and queue frames
@@ -528,7 +547,7 @@ parameter table only when both JEDEC ID and physical capacity match; other
 profiles remain explicitly unsupported. The latter clears this image's one
 bootloader SFDP diagnostic. Six previously reported SPI1 commands are
 16-bit octal-PSRAM register probes on CS1: with no PSRAM attached in Flexe's
-current S3 profile, they now clock through and return undriven high bits,
+default S3 profile, they now clock through and return undriven high bits,
 without pretending to supply PSRAM. Of these, 6,728 are in the `0x6000E000`
 RF/PHY window; the hottest named callers include `wr_rf_freq_mem`,
 `set_chan_freq_sw_start`, and `bt_txpwr_freq`. That concentration identifies

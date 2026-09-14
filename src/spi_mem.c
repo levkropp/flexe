@@ -93,14 +93,11 @@ typedef struct {
  * other host just as it is on the SoC. */
 typedef flexe_spi_mem_nor_state_t spi_nor_state_t;
 
-typedef struct {
-    bool reset_armed;
-    bool qpi;
-    bool burst_32;
-} spi_psram_state_t;
+typedef flexe_spi_mem_psram_state_t spi_psram_state_t;
 
 typedef struct {
-    uint8_t opcode;
+    uint16_t opcode;
+    uint8_t opcode_bits;
     uint32_t address;
     const uint8_t *mosi;
     int mosi_bytes;
@@ -193,12 +190,22 @@ static bool spi_mem_geometry_valid(const flexe_target_desc_t *target,
             target->backing_size[FLEXE_MEM_FLASH_INSN] ||
         desc->flash_chip_select >= layout->chip_select_count)
         return false;
-    bool has_psram = desc->default_psram_id != 0u;
+    bool has_psram = desc->psram_kind != FLEXE_SPI_MEM_PSRAM_NONE;
     if ((has_psram &&
          (desc->psram_chip_select >= layout->chip_select_count ||
           desc->psram_chip_select == desc->flash_chip_select ||
           target->backing_size[FLEXE_MEM_PSRAM] == 0u)) ||
-        (!has_psram && desc->psram_chip_select != FLEXE_SPI_MEM_CS_NONE))
+        (!has_psram && (desc->psram_chip_select != FLEXE_SPI_MEM_CS_NONE ||
+                        desc->default_psram_id != 0u ||
+                        target->backing_size[FLEXE_MEM_PSRAM] != 0u)))
+        return false;
+    if ((desc->psram_kind == FLEXE_SPI_MEM_PSRAM_QUAD &&
+         desc->default_psram_id == 0u) ||
+        (desc->psram_kind == FLEXE_SPI_MEM_PSRAM_AP_8M_OPI &&
+         (desc->layout != FLEXE_SPI_MEM_LAYOUT_S2_S3 ||
+          desc->default_psram_id != 0u ||
+          target->backing_size[FLEXE_MEM_PSRAM] != 0x800000u)) ||
+        desc->psram_kind > FLEXE_SPI_MEM_PSRAM_AP_8M_OPI)
         return false;
     for (unsigned host = 0; host < desc->host_count; host++) {
         uint32_t base = desc->base[host];
@@ -415,6 +422,15 @@ static spi_mem_transaction_t spi_mem_decode_user(
         unsigned command_bits = ((user2 >> 28) & 0xFu) + 1u;
         if (command_bits == 8u) {
             transaction.opcode = (uint8_t)user2;
+            transaction.opcode_bits = 8u;
+            transaction.opcode_valid = true;
+            transaction.address = spi_mem_command_address(
+                spi_mem, address, address_bits);
+            return transaction;
+        }
+        if (command_bits == 16u) {
+            transaction.opcode = (uint16_t)user2;
+            transaction.opcode_bits = 16u;
             transaction.opcode_valid = true;
             transaction.address = spi_mem_command_address(
                 spi_mem, address, address_bits);
@@ -433,6 +449,7 @@ static spi_mem_transaction_t spi_mem_decode_user(
 
     if ((user & SPI_USER_ADDR) && address_bits >= 8u) {
         transaction.opcode = (uint8_t)(address >> 24);
+        transaction.opcode_bits = 8u;
         transaction.opcode_valid = true;
         transaction.address = spi_mem_address_tail(
             address, address_bits, 8u);
@@ -449,6 +466,7 @@ static spi_mem_transaction_t spi_mem_decode_user(
             byte++;
         if (byte < transaction.mosi_bytes) {
             transaction.opcode = transaction.mosi[byte++];
+            transaction.opcode_bits = 8u;
             transaction.opcode_valid = true;
             transaction.mosi += byte;
             transaction.mosi_bytes -= byte;
@@ -471,7 +489,7 @@ static spi_mem_device_t spi_mem_selected_device(
         spi_mem->layout->chip_select_offset / 4u];
     bool flash = (disabled & (UINT32_C(1) <<
                               desc->flash_chip_select)) == 0u;
-    bool psram = desc->default_psram_id != 0u &&
+    bool psram = desc->psram_kind != FLEXE_SPI_MEM_PSRAM_NONE &&
                  (disabled & (UINT32_C(1) <<
                               desc->psram_chip_select)) == 0u;
     if (flash && psram) return SPI_MEM_DEVICE_CONTENTION;
@@ -523,11 +541,11 @@ static bool spi_debug_offset(uint32_t offset) {
 
 static void spi_debug_command(unsigned host, const spi_mem_host_t *state,
                               const spi_mem_layout_desc_t *layout,
-                              uint8_t opcode, uint32_t offset,
+                              uint16_t opcode, uint32_t offset,
                               int mosi, int miso) {
     if (!spi_debug_offset(offset)) return;
     fprintf(stderr,
-            "[SPI%u] op=%02X off=0x%06X mosi=%d miso=%d pc=%08X core=%d "
+            "[SPI%u] op=%04X off=0x%06X mosi=%d miso=%d pc=%08X core=%d "
             "user=%08X user1=%08X user2=%08X addr=%08X cs=%08X w0=%08X\n",
             host, opcode, offset, mosi, miso, g_dbg_pc, g_dbg_core,
             state->reg[layout->user_offset / 4u],
@@ -670,6 +688,7 @@ static spi_mem_write_result_t spi_mem_erase(flexe_spi_mem_t *spi_mem,
 static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
                                   spi_mem_host_t *host,
                                   const spi_mem_transaction_t *transaction) {
+    if (transaction->opcode_bits != 8u) return false;
     spi_nor_state_t *flash = &spi_mem->flash;
     uint8_t opcode = transaction->opcode;
     uint32_t offset = transaction->address;
@@ -779,9 +798,114 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
     }
 }
 
-static bool spi_mem_execute_psram(flexe_spi_mem_t *spi_mem,
-                                  spi_mem_host_t *host,
-                                  const spi_mem_transaction_t *transaction) {
+/* APS6408L-3OBMx mode-register defaults (AP Memory rev 4.0, tables 9-18).
+ * MR1/MR2/MR3 identify the physical device; only MR0/MR4/MR8 are writable.
+ * Command bytes are repeated on both DDR edges of the S3 octal bus. */
+static void spi_mem_ap_psram_reset(spi_psram_state_t *psram) {
+    psram->mr0 = 0x09u; /* read latency 6, 1/4 drive strength */
+    psram->mr4 = 0x40u; /* write latency 5, fast refresh */
+    psram->mr8 = 0x05u; /* 32-byte burst, hybrid wrap */
+}
+
+static uint8_t spi_mem_ap_mode_read(const spi_psram_state_t *psram,
+                                     uint32_t address) {
+    switch (address) {
+    case 0u: return psram->mr0;
+    case 1u: return 0x0Du; /* AP Memory vendor ID */
+    case 2u: return 0x93u; /* good die, gen 3, 64 Mbit */
+    case 3u: return 0xE0u; /* row crossing, 3 V, fast refresh */
+    case 4u: return psram->mr4;
+    case 8u: return psram->mr8;
+    default: return 0xFFu;
+    }
+}
+
+static uint32_t spi_mem_ap_array_address(
+        const spi_psram_state_t *psram, uint32_t start, uint32_t byte,
+        bool linear, bool read) {
+    uint32_t row = start & ~0x3FFu;
+    uint32_t column = start & 0x3FFu;
+    if (linear) {
+        /* Linear bursts otherwise wrap at the 1 KiB row boundary. Only
+         * reads may cross into the next row when MR8[3] enables RBX. */
+        if (read && (psram->mr8 & 0x08u)) return start + byte;
+        return row | ((column + byte) & 0x3FFu);
+    }
+
+    uint32_t burst = (psram->mr8 & 0x03u) == 3u ?
+                     1024u : 16u << (psram->mr8 & 0x03u);
+    uint32_t base = column & ~(burst - 1u);
+    uint32_t offset = column & (burst - 1u);
+    if ((psram->mr8 & 0x04u) == 0u || byte < burst)
+        return row | (base + ((offset + byte) & (burst - 1u)));
+    /* Hybrid wrap visits the initial burst once, then proceeds to the end
+     * of the 1 KiB column and wraps within that row. */
+    return row | ((base + byte) & 0x3FFu);
+}
+
+static bool spi_mem_ap_array_transfer(
+        flexe_spi_mem_t *spi_mem, spi_mem_host_t *host,
+        const spi_mem_transaction_t *transaction, bool linear, bool read) {
+    uint8_t *array = mem_backing_ptr(spi_mem->mem, FLEXE_MEM_PSRAM);
+    uint32_t size = mem_backing_size(spi_mem->mem, FLEXE_MEM_PSRAM);
+    if (!array || size == 0u) return false;
+    uint8_t *input = read ? spi_mem_prepare_input(spi_mem, host) : NULL;
+    int count = read ? transaction->miso_bytes : transaction->mosi_bytes;
+    for (int i = 0; i < count; i++) {
+        uint32_t address = spi_mem_ap_array_address(
+            &spi_mem->psram, transaction->address, (uint32_t)i,
+            linear, read) % size;
+        if (read) input[i] = array[address];
+        else array[address] = transaction->mosi[i];
+    }
+    return true;
+}
+
+static bool spi_mem_execute_ap_psram(
+        flexe_spi_mem_t *spi_mem, spi_mem_host_t *host,
+        const spi_mem_transaction_t *transaction) {
+    if (transaction->opcode_bits != 16u) return false;
+    spi_psram_state_t *psram = &spi_mem->psram;
+    uint32_t address = transaction->address;
+    switch (transaction->opcode) {
+    case 0x4040u: { /* mode register read */
+        if (address > 4u && address != 8u) return false;
+        uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+        for (int i = 0; i < transaction->miso_bytes; i++)
+            dst[i] = spi_mem_ap_mode_read(psram, address + (uint32_t)i);
+        return true;
+    }
+    case 0xC0C0u: /* mode register write */
+        if (transaction->mosi_bytes == 0) return false;
+        switch (address) {
+        case 0u: psram->mr0 = transaction->mosi[0] & 0x3Fu; return true;
+        case 4u: psram->mr4 = transaction->mosi[0] & 0xEFu; return true;
+        case 8u: psram->mr8 = transaction->mosi[0] & 0x0Fu; return true;
+        default: return false;
+        }
+    case 0x0000u: /* synchronous read */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          false, true);
+    case 0x2020u: /* linear read */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          true, true);
+    case 0x8080u: /* synchronous write */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          false, false);
+    case 0xA0A0u: /* linear write */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          true, false);
+    case 0xFFFFu: /* global reset, memory contents retained */
+        spi_mem_ap_psram_reset(psram);
+        return true;
+    default: return false;
+    }
+}
+
+static bool spi_mem_execute_quad_psram(flexe_spi_mem_t *spi_mem,
+                                       spi_mem_host_t *host,
+                                       const spi_mem_transaction_t *transaction) {
+    if (transaction->opcode_bits != 8u) return false;
     spi_psram_state_t *psram = &spi_mem->psram;
     switch (transaction->opcode) {
     case 0x9Fu: /* device ID */
@@ -845,7 +969,10 @@ static bool spi_mem_execute_user(flexe_spi_mem_t *spi_mem, unsigned index,
     case SPI_MEM_DEVICE_FLASH:
         return spi_mem_execute_flash(spi_mem, host, &transaction);
     case SPI_MEM_DEVICE_PSRAM:
-        return spi_mem_execute_psram(spi_mem, host, &transaction);
+        return spi_mem->target->spi_mem.psram_kind ==
+               FLEXE_SPI_MEM_PSRAM_AP_8M_OPI ?
+               spi_mem_execute_ap_psram(spi_mem, host, &transaction) :
+               spi_mem_execute_quad_psram(spi_mem, host, &transaction);
     case SPI_MEM_DEVICE_CONTENTION:
     case SPI_MEM_DEVICE_NONE: /* Already handled above. */
     default:
@@ -1068,6 +1195,8 @@ flexe_spi_mem_t *flexe_spi_mem_create(
     spi_mem->fallback_ctx = fallback_ctx;
     spi_mem->flash_changed = flash_changed;
     spi_mem->flash_changed_ctx = flash_changed_ctx;
+    if (target->spi_mem.psram_kind == FLEXE_SPI_MEM_PSRAM_AP_8M_OPI)
+        spi_mem_ap_psram_reset(&spi_mem->psram);
     if (spi_mem_is_gd25q32c(spi_mem))
         spi_mem->flash.status[2] = 0x20u; /* GD25Q32C DRV0 reset bit. */
 
@@ -1126,4 +1255,17 @@ void flexe_spi_mem_nor_restore(flexe_spi_mem_t *spi_mem,
     }
     spi_mem->flash = *state;
     if (power_cycle) spi_mem_nor_clear_volatile(spi_mem);
+}
+
+void flexe_spi_mem_psram_snapshot(const flexe_spi_mem_t *spi_mem,
+                                  flexe_spi_mem_psram_state_t *out) {
+    if (!out) return;
+    *out = spi_mem ? spi_mem->psram : (flexe_spi_mem_psram_state_t){0};
+}
+
+void flexe_spi_mem_psram_restore(flexe_spi_mem_t *spi_mem,
+                                 const flexe_spi_mem_psram_state_t *state,
+                                 bool power_cycle) {
+    if (!spi_mem || !state || power_cycle) return;
+    spi_mem->psram = *state;
 }

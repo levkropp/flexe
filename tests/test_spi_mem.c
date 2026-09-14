@@ -61,6 +61,17 @@ static void s3_spi_user_command(xtensa_mem_t *mem, uint32_t base,
     spi_user_command(mem, base, S3_SPI_USER, S3_SPI_USER2, user, opcode);
 }
 
+static void s3_opi_command(xtensa_mem_t *mem, uint32_t base,
+                           uint32_t user, uint16_t opcode,
+                           uint32_t address) {
+    mem_write32(mem, base + S3_SPI_USER, user | SPI_USER_COMMAND |
+                                         SPI_USER_ADDR);
+    mem_write32(mem, base + S3_SPI_USER1, 31u << 26);
+    mem_write32(mem, base + S3_SPI_USER2, (15u << 28) | opcode);
+    mem_write32(mem, base + S3_SPI_ADDR, address);
+    mem_write32(mem, base + S3_SPI_CMD, SPI_CMD_USR);
+}
+
 TEST(spi_mem_uses_target_layouts_and_reports_jedec_id) {
     xtensa_mem_t *classic_mem = mem_create();
     esp32_periph_t *classic = periph_create(classic_mem);
@@ -924,6 +935,141 @@ TEST(spi_mem_s3_user_address_matches_flash_partition_offset) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_s3_optional_ap_opi_psram_registers_array_and_cache) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    flexe_target_desc_t board;
+    ASSERT_TRUE(!flexe_target_with_board_psram(
+        flexe_target_by_id(FLEXE_TARGET_ESP32),
+        FLEXE_BOARD_PSRAM_AP_8M_OPI, &board));
+    ASSERT_TRUE(flexe_target_with_board_psram(
+        s3, FLEXE_BOARD_PSRAM_AP_8M_OPI, &board));
+    ASSERT_EQ(board.backing_size[FLEXE_MEM_PSRAM], 0x800000u);
+
+    xtensa_mem_t *mem = mem_create_for_target(&board);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    ASSERT_EQ(mem_backing_size(mem, FLEXE_MEM_PSRAM), 0x800000u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISC, 1u);
+    mem_write32(mem, S3_SPI0_BASE + S3_SPI_MISC, 1u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 15u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x4040u, 0u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFFFu,
+              0x0D09u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x4040u, 2u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFFFu,
+              0xE093u);
+
+    /* Controller hosts share the same external chip's mode registers. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 15u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x0028u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MOSI, 0xC0C0u, 0u);
+    mem_write32(mem, S3_SPI0_BASE + S3_SPI_MISO_DLEN, 15u);
+    s3_opi_command(mem, S3_SPI0_BASE, SPI_USER_MISO, 0x4040u, 0u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI0_BASE + S3_SPI_W0) & 0xFFFFu,
+              0x0D28u);
+
+    /* OPI array writes are visible through both CPU cache buses after the
+     * S3 MMU selects a PSRAM physical page, and vice versa. */
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MOSI_DLEN, 31u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x44332211u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MOSI, 0x8080u, 0x20122u);
+    ASSERT_EQ(mem->psram[0x20122u], 0x11u);
+    mem_write32(mem, board.flash_mmu.table_base[0] + 13u * 4u,
+                0x8002u);
+    ASSERT_EQ(mem_read32(mem, 0x3C0D0120u) >> 16, 0x2211u);
+    ASSERT_EQ(mem_read8(mem, 0x420D0122u), 0x11u);
+    mem_write8(mem, 0x3C0D0123u, 0xABu);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 31u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x2020u, 0x20122u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0),
+              0x4433AB11u);
+
+    /* Default MR8 selects 32-byte hybrid wrap: finish the current burst,
+     * wrap to its start, then continue with the next burst. */
+    mem->psram[30u] = 0x1Eu;
+    mem->psram[31u] = 0x1Fu;
+    mem->psram[0u] = 0xA0u;
+    mem->psram[1u] = 0xA1u;
+    mem->psram[29u] = 0xADu;
+    mem->psram[32u] = 0xB0u;
+    mem->psram[33u] = 0xB1u;
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 34u * 8u - 1u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x0000u, 30u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0),
+              0xA1A01F1Eu);
+    ASSERT_EQ(mem_read8(mem, S3_SPI1_BASE + S3_SPI_W0 + 31u), 0xADu);
+    ASSERT_EQ(mem_read8(mem, S3_SPI1_BASE + S3_SPI_W0 + 32u), 0xB0u);
+    ASSERT_EQ(mem_read8(mem, S3_SPI1_BASE + S3_SPI_W0 + 33u), 0xB1u);
+
+    /* Linear reads stay inside a 1 KiB row until MR8[3] enables RBX. */
+    mem->psram[1022u] = 0xE2u;
+    mem->psram[1023u] = 0xE3u;
+    mem->psram[1024u] = 0xC0u;
+    mem->psram[1025u] = 0xC1u;
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 31u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x2020u, 1022u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0),
+              0xA1A0E3E2u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x0Du);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MOSI, 0xC0C0u, 8u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x2020u, 1022u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0),
+              0xC1C0E3E2u);
+
+    /* Reset the external chip without erasing the PSRAM array. Unsupported
+     * 8-bit commands do not alias this 16-bit octal device. */
+    s3_opi_command(mem, S3_SPI1_BASE, 0u, 0xFFFFu, 0u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x4040u, 0u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFFFu,
+              0x0D09u);
+    ASSERT_EQ(mem->psram[0x20123u], 0xABu);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_W0, 0x28u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MOSI, 0xC0C0u, 0u);
+    flexe_spi_mem_psram_state_t chip;
+    periph_psram_chip_snapshot(periph, &chip);
+    periph_destroy(periph);
+    periph = periph_create(mem);
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) { mem_destroy(mem); return; }
+    periph_psram_chip_restore(periph, &chip, false);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISC, 1u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 15u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x4040u, 0u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFFFu,
+              0x0D28u);
+    ASSERT_EQ(mem->psram[0x20123u], 0xABu);
+
+    /* A chip power cycle returns the mode registers to their documented
+     * defaults; byte-sized NOR commands cannot be reinterpreted as OPI. */
+    periph_destroy(periph);
+    periph = periph_create(mem);
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) { mem_destroy(mem); return; }
+    periph_psram_chip_restore(periph, &chip, true);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISC, 1u);
+    mem_write32(mem, S3_SPI1_BASE + S3_SPI_MISO_DLEN, 15u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x4040u, 0u);
+    ASSERT_EQ(mem_read32(mem, S3_SPI1_BASE + S3_SPI_W0) & 0xFFFFu,
+              0x0D09u);
+    s3_spi_user_command(mem, S3_SPI1_BASE,
+                        SPI_USER_COMMAND | SPI_USER_MISO, 0x9Fu);
+    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    s3_opi_command(mem, S3_SPI1_BASE, SPI_USER_MISO, 0x4040u, 9u);
+    ASSERT_EQ(periph_unhandled_count(periph), 2u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_spi_mem_tests(void) {
     TEST_SUITE("Target SPI memory controller");
     RUN_TEST(spi_mem_uses_target_layouts_and_reports_jedec_id);
@@ -939,4 +1085,5 @@ void run_spi_mem_tests(void) {
     RUN_TEST(spi_mem_other_flash_profiles_reject_unknown_protection_layout);
     RUN_TEST(spi_mem_s3_external_nor_state_survives_controller_rebuild);
     RUN_TEST(spi_mem_s3_user_address_matches_flash_partition_offset);
+    RUN_TEST(spi_mem_s3_optional_ap_opi_psram_registers_array_and_cache);
 }

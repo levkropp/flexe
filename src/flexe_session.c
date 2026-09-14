@@ -43,6 +43,7 @@ struct flexe_session {
     xtensa_cpu_t       cpu[2];
     xtensa_mem_t      *mem;
     const flexe_target_desc_t *target;
+    flexe_target_desc_t board_target;
     esp32_periph_t    *periph;
     elf_symbols_t     *syms;
     esp32_rom_stubs_t *rom;
@@ -591,6 +592,17 @@ flexe_session_t *flexe_session_create(const flexe_session_config_t *cfg)
         flexe_session_destroy(s);
         return NULL;
     }
+    if (s->cfg.board_psram != FLEXE_BOARD_PSRAM_DEFAULT) {
+        if (!flexe_target_with_board_psram(s->target, s->cfg.board_psram,
+                                           &s->board_target)) {
+            fprintf(stderr,
+                    "flexe: requested PSRAM board profile is not available "
+                    "for %s\n", s->target->display_name);
+            flexe_session_destroy(s);
+            return NULL;
+        }
+        s->target = &s->board_target;
+    }
 
     /* Load ELF symbols */
     if (cfg->elf_path) {
@@ -686,6 +698,8 @@ void flexe_session_reset(flexe_session_t *s)
     periph_spi_attachments_snapshot(s->periph, &spi_attachments);
     flexe_spi_mem_nor_state_t flash_chip;
     periph_flash_chip_snapshot(s->periph, &flash_chip);
+    flexe_spi_mem_psram_state_t psram_chip;
+    periph_psram_chip_snapshot(s->periph, &psram_chip);
     flexe_rtc_cntl_retained_t rtc_retained;
     periph_rtc_retained_snapshot(s->periph, &rtc_retained);
 
@@ -760,6 +774,7 @@ void flexe_session_reset(flexe_session_t *s)
     periph_i2c_attachments_restore(s->periph, &i2c_attachments);
     periph_spi_attachments_restore(s->periph, &spi_attachments);
     periph_flash_chip_restore(s->periph, &flash_chip, flash_power_cycle);
+    periph_psram_chip_restore(s->periph, &psram_chip, flash_power_cycle);
     periph_rtc_retained_restore(s->periph, &rtc_retained);
     if (s->target->id == FLEXE_TARGET_ESP32S3)
         periph_set_wake_state(s->periph, 0u,

@@ -178,6 +178,11 @@ void periph_flash_chip_snapshot(const esp32_periph_t *p,
 void periph_flash_chip_restore(esp32_periph_t *p,
                                const flexe_spi_mem_nor_state_t *state,
                                bool power_cycle);
+void periph_psram_chip_snapshot(const esp32_periph_t *p,
+                                flexe_spi_mem_psram_state_t *out);
+void periph_psram_chip_restore(esp32_periph_t *p,
+                               const flexe_spi_mem_psram_state_t *state,
+                               bool power_cycle);
 
 /* RTC slow counter/STORE survive a session software reset. Other controller
  * registers and the watchdog are reconstructed from reset defaults. */

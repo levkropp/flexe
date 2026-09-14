@@ -229,6 +229,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .flash_chip_select = 0u,
             .psram_chip_select = 1u,
             .layout = FLEXE_SPI_MEM_LAYOUT_ESP32,
+            .psram_kind = FLEXE_SPI_MEM_PSRAM_QUAD,
         },
         .rom_flash = {
             .live_data_address = 0x3FFAE270u,
@@ -1096,6 +1097,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .flash_chip_select = 0u,
             .psram_chip_select = FLEXE_SPI_MEM_CS_NONE,
             .layout = FLEXE_SPI_MEM_LAYOUT_S2_S3,
+            .psram_kind = FLEXE_SPI_MEM_PSRAM_NONE,
         },
         .rom_flash = {
             .pointer_symbol = "rom_spiflash_legacy_data",
@@ -1187,6 +1189,28 @@ const flexe_target_desc_t *flexe_target_by_name(const char *name)
     if (strcmp(name, "esp32-s3") == 0)
         return flexe_target_by_id(FLEXE_TARGET_ESP32S3);
     return NULL;
+}
+
+bool flexe_target_with_board_psram(const flexe_target_desc_t *base,
+                                   flexe_board_psram_t board_psram,
+                                   flexe_target_desc_t *out)
+{
+    if (!base || !out) return false;
+    if (board_psram == FLEXE_BOARD_PSRAM_DEFAULT) {
+        *out = *base;
+        return true;
+    }
+    if (board_psram != FLEXE_BOARD_PSRAM_AP_8M_OPI ||
+        base->id != FLEXE_TARGET_ESP32S3 ||
+        base->spi_mem.psram_kind != FLEXE_SPI_MEM_PSRAM_NONE ||
+        base->spi_mem.psram_chip_select != FLEXE_SPI_MEM_CS_NONE ||
+        base->backing_size[FLEXE_MEM_PSRAM] != 0u)
+        return false;
+    *out = *base;
+    out->backing_size[FLEXE_MEM_PSRAM] = 0x00800000u;
+    out->spi_mem.psram_chip_select = 1u;
+    out->spi_mem.psram_kind = FLEXE_SPI_MEM_PSRAM_AP_8M_OPI;
+    return true;
 }
 
 int flexe_target_parse(const char *name, flexe_target_id_t *id_out)

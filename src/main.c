@@ -665,6 +665,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --no-jit        Disable JIT, run fully interpreted\n");
     fprintf(stderr, "  --jit-stats     Print JIT block/coverage statistics on exit\n");
     fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
+    fprintf(stderr, "  --psram <chip>  Attach optional S3 PSRAM: ap-8m-opi (default: none)\n");
     fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
     fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
     fprintf(stderr, "\nCheckpoint options:\n");
@@ -1018,6 +1019,7 @@ int main(int argc, char *argv[]) {
     const char *aot_dylib_path = NULL;
     const char *net_hostfwd_spec = NULL;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
+    flexe_board_psram_t board_psram = FLEXE_BOARD_PSRAM_DEFAULT;
 
     /* Manual parsing for long options (--checkpoint-*, --restore) */
     int i = 1;
@@ -1090,6 +1092,18 @@ int main(int argc, char *argv[]) {
                         argv[i + 1]);
                 return 1;
             }
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--psram") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "ap-8m-opi") != 0) {
+                fprintf(stderr,
+                        "Invalid PSRAM chip '%s' (expected ap-8m-opi)\n",
+                        argv[i + 1]);
+                return 1;
+            }
+            board_psram = FLEXE_BOARD_PSRAM_AP_8M_OPI;
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1252,6 +1266,7 @@ int main(int argc, char *argv[]) {
         .disable_jit = !jit_enabled,
         .unhandled_audit = unhandled_report,
         .target = target_id,
+        .board_psram = board_psram,
         .window_trace = window_trace,
         .spill_verify = spill_verify,
         .uart_cb = usb_console ? NULL : uart_stdout_cb,
