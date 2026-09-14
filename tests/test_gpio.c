@@ -241,6 +241,58 @@ TEST(target_gpio_driven_output_feeds_enabled_input_without_host_sample)
     mem_destroy(mem);
 }
 
+TEST(target_gpio_peripheral_output_resolves_matrix_inversion_and_enable)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    gpio_pad_probe_t probe = {0};
+    flexe_gpio_t *gpio = mem ? flexe_gpio_create(
+        mem, NULL, NULL, NULL, gpio_pad_probe_changed, &probe,
+        NULL, NULL) : NULL;
+    ASSERT_TRUE(gpio != NULL);
+    if (!gpio) {
+        mem_destroy(mem);
+        return;
+    }
+
+    unsigned signal = s3->rmt_v1.output_signal_base;
+    uint32_t route4 = s3->gpio.base + 0x554u + 4u * 4u;
+    uint32_t mask = 1u << 4u;
+    flexe_gpio_set_output_signal_modeled(gpio, signal);
+    mem_write32(mem, route4, signal);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), -1);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), -1);
+
+    flexe_gpio_drive_output_signal(gpio, signal, 1, 1);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), 1);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 1);
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, mask);
+    mem_write32(mem, route4, signal | (1u << 9u));
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), 0);
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, 0u);
+
+    mem_write32(mem, route4, signal | (1u << 9u) | (1u << 10u));
+    flexe_gpio_drive_output_signal(gpio, signal, 0, 1);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), 1);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 0);
+    mem_write32(mem, s3->gpio.base + 0x024u, mask);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 1);
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, mask);
+    mem_write32(mem, s3->gpio.base + 0x074u + 4u * 4u, 1u << 2u);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), 0);
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, 0u);
+
+    flexe_gpio_drive_output_signal(gpio, signal, -1, -1);
+    ASSERT_EQ(flexe_gpio_pin_level(gpio, 4u), -1);
+    ASSERT_EQ(flexe_gpio_output_enabled(gpio, 4u), -1);
+    ASSERT_EQ(probe.pin, 4u);
+    ASSERT_EQ(probe.level, -1);
+
+    flexe_gpio_destroy(gpio);
+    mem_destroy(mem);
+}
+
 TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads)
 {
     const flexe_target_desc_t *s3 =
@@ -447,6 +499,7 @@ void run_target_gpio_tests(void)
     RUN_TEST(target_gpio_routes_s3_edge_and_level_interrupts_to_both_cores);
     RUN_TEST(target_gpio_input_buffer_gates_host_samples_and_interrupts);
     RUN_TEST(target_gpio_driven_output_feeds_enabled_input_without_host_sample);
+    RUN_TEST(target_gpio_peripheral_output_resolves_matrix_inversion_and_enable);
     RUN_TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads);
     RUN_TEST(target_gpio_pad_hold_defers_output_notifications_until_release);
     RUN_TEST(target_gpio_open_drain_releases_high_and_notifies_pad);

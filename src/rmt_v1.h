@@ -15,6 +15,11 @@ typedef void (*flexe_rmt_v1_tx_fn)(void *ctx, int channel,
                                    const uint32_t *items, size_t count,
                                    uint32_t tick_hz, uint32_t carrier_hz,
                                    bool complete);
+typedef void (*flexe_rmt_v1_tx_edge_fn)(void *ctx, unsigned channel,
+                                        int level, int enabled,
+                                        uint64_t cycle);
+typedef bool (*flexe_rmt_v1_tx_edge_needed_fn)(void *ctx,
+                                               unsigned channel);
 
 flexe_rmt_v1_t *flexe_rmt_v1_create(xtensa_mem_t *mem,
                                     mmio_read_fn fallback_read,
@@ -32,6 +37,10 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
 void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt);
 int flexe_rmt_v1_set_tx_callback(flexe_rmt_v1_t *rmt, unsigned channel,
                                   flexe_rmt_v1_tx_fn fn, void *ctx);
+void flexe_rmt_v1_set_tx_edge_handler(flexe_rmt_v1_t *rmt,
+                                      flexe_rmt_v1_tx_edge_fn changed,
+                                      flexe_rmt_v1_tx_edge_needed_fn needed,
+                                      void *ctx);
 /* Inject a complete, already-decoded pulse frame into physical RX channel
  * 4..7. Returns symbols accepted (one RAM capacity without wrap, or the
  * whole frame with wrap/ping-pong enabled). */
@@ -43,5 +52,10 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
  * Pulse widths are measured on the guest CPU/RMT clock timeline. */
 void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
                                  bool old_level, bool level);
+/* For a TX edge emitted during RMT evaluation, use its exact event cycle
+ * without recursively evaluating TX or substituting the later CPU time. */
+void flexe_rmt_v1_rx_input_edge_at(flexe_rmt_v1_t *rmt, unsigned channel,
+                                    bool old_level, bool level,
+                                    uint64_t cycle);
 
 #endif

@@ -1837,6 +1837,8 @@ struct esp32_periph {
     flexe_gdma_t *gdma;
     flexe_gp_spi_t *gp_spi;
     flexe_rmt_v1_t *rmt_v1;
+    uint64_t rmt_tx_edge_cycle;
+    bool rmt_tx_edge_dispatch;
     flexe_gpio_t *target_gpio;
     flexe_io_mux_t *io_mux;
     flexe_rtc_cntl_t *target_rtc_cntl;
@@ -14149,10 +14151,40 @@ static void target_gpio_input_signal_changed(void *ctx, unsigned signal,
     if (signal < desc->input_signal_base ||
         signal >= desc->input_signal_base + rx_count)
         return;
-    flexe_rmt_v1_rx_input_edge(
-        p->rmt_v1,
-        desc->tx_channel_count + signal - desc->input_signal_base,
-        old_level, level);
+    unsigned channel = (unsigned)desc->tx_channel_count +
+                       signal - desc->input_signal_base;
+    if (p->rmt_tx_edge_dispatch)
+        flexe_rmt_v1_rx_input_edge_at(
+            p->rmt_v1, channel, old_level, level, p->rmt_tx_edge_cycle);
+    else
+        flexe_rmt_v1_rx_input_edge(p->rmt_v1, channel,
+                                    old_level, level);
+}
+
+static void rmt_v1_tx_edge_changed(void *ctx, unsigned channel,
+                                    int level, int enabled,
+                                    uint64_t cycle)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !p->target_gpio) return;
+    bool nested = p->rmt_tx_edge_dispatch;
+    uint64_t previous_cycle = p->rmt_tx_edge_cycle;
+    p->rmt_tx_edge_dispatch = true;
+    p->rmt_tx_edge_cycle = cycle;
+    flexe_gpio_drive_output_signal(
+        p->target_gpio, p->target->rmt_v1.output_signal_base + channel,
+        level, enabled);
+    p->rmt_tx_edge_cycle = previous_cycle;
+    p->rmt_tx_edge_dispatch = nested;
+}
+
+static bool rmt_v1_tx_edge_needed(void *ctx, unsigned channel)
+{
+    esp32_periph_t *p = ctx;
+    return p && p->target_gpio &&
+        flexe_gpio_output_signal_has_input_consumer(
+            p->target_gpio,
+            p->target->rmt_v1.output_signal_base + channel);
 }
 
 static void usb_serial_jtag_irq_changed(void *ctx, bool level)
@@ -14696,11 +14728,18 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             const flexe_rmt_v1_desc_t *desc = &target->rmt_v1;
             unsigned rx_count = (unsigned)desc->channel_count -
                                 (unsigned)desc->tx_channel_count;
+            for (unsigned ch = 0u;
+                 ch < (unsigned)desc->tx_channel_count; ch++)
+                flexe_gpio_set_output_signal_modeled(
+                    p->target_gpio, desc->output_signal_base + ch);
             flexe_gpio_set_input_signal_handler(
                 p->target_gpio, target_gpio_input_signal_changed, p);
             for (unsigned ch = 0u; ch < rx_count; ch++)
                 flexe_gpio_watch_input_signal(
                     p->target_gpio, desc->input_signal_base + ch);
+            flexe_rmt_v1_set_tx_edge_handler(
+                p->rmt_v1, rmt_v1_tx_edge_changed,
+                rmt_v1_tx_edge_needed, p);
         }
     }
 

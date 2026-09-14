@@ -62,6 +62,17 @@ void flexe_gpio_set_rtc_state(flexe_gpio_t *gpio, uint64_t owned,
  * GPIO model's unsupported-behavior accounting. */
 void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
                                           unsigned signal);
+/* Drive a modeled peripheral output through every selected GPIO matrix pad.
+ * The signal level and output-enable remain distinct for open-drain and
+ * software-controlled output-enable routes. */
+void flexe_gpio_drive_output_signal(flexe_gpio_t *gpio, unsigned signal,
+                                    int level, int enabled);
+/* Trace individual output edges only when a registered matrix-input watcher
+ * or GPIO interrupt can observe them. GPIO_IN-only polling without either
+ * consumer is outside this fast path; aggregate peripheral pulse output
+ * remains available separately. */
+bool flexe_gpio_output_signal_has_input_consumer(const flexe_gpio_t *gpio,
+                                                  unsigned signal);
 
 /* Watch selected GPIO-matrix input signals for digital transitions. Both
  * host samples and output-to-input feedback use the same notification path;

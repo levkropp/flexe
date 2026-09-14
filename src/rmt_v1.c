@@ -35,6 +35,8 @@
 #define RMT_TX_CONTINUOUS     (1u << 3)
 #define RMT_MEM_TX_WRAP       (1u << 4)
 #define RMT_TX_STOP           (1u << 7)
+#define RMT_IDLE_OUT_LEVEL     (1u << 5)
+#define RMT_IDLE_OUT_ENABLE    (1u << 6)
 #define RMT_AFIFO_RST         (1u << 23)
 #define RMT_CONF_UPDATE       (1u << 24)
 #define RMT_DMA_ACCESS        (1u << 25)
@@ -86,6 +88,13 @@ typedef struct {
     uint32_t apb_index;
     uint32_t segment_items[RMT_MAX_SEGMENT_WORDS];
     uint32_t segment_count;
+    uint64_t segment_start;
+    uint64_t edge_ticks;
+    uint64_t edge_deadline;
+    uint32_t edge_item;
+    bool edge_second;
+    bool edge_active;
+    bool carrier_unsupported_reported;
     uint64_t deadline;
     rmt_event_kind_t event;
     bool active;
@@ -135,6 +144,9 @@ struct flexe_rmt_v1 {
     void *irq_ctx;
     flexe_rmt_v1_tx_fn tx_cb[RMT_MAX_TX_CHANNELS];
     void *tx_ctx[RMT_MAX_TX_CHANNELS];
+    flexe_rmt_v1_tx_edge_fn tx_edge_changed;
+    flexe_rmt_v1_tx_edge_needed_fn tx_edge_needed;
+    void *tx_edge_ctx;
     xtensa_cpu_t *cpu[2];
     uint64_t core_cycles[2];
     uint32_t last_ccount[2];
@@ -461,7 +473,9 @@ static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     uint32_t capacity = rmt_capacity(rmt, channel);
     uint32_t limit = tx->tx_limit & 0x1FFu;
     uint64_t ticks = 0u;
+    tx->segment_start = start_cycle;
     tx->segment_count = 0u;
+    tx->edge_active = false;
     tx->event = RMT_EVENT_NONE;
     if (capacity == 0u || !rmt_source_hz(rmt)) {
         tx->event = RMT_EVENT_ERROR;
@@ -514,6 +528,86 @@ static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
                    UINT64_MAX : start_cycle + duration;
 }
 
+static void rmt_tx_emit_level(flexe_rmt_v1_t *rmt, unsigned channel,
+                              int level, int enabled, uint64_t cycle)
+{
+    if (rmt->tx_edge_changed)
+        rmt->tx_edge_changed(rmt->tx_edge_ctx, channel, level, enabled,
+                             cycle);
+}
+
+static void rmt_tx_emit_idle(flexe_rmt_v1_t *rmt, unsigned channel,
+                             uint64_t cycle)
+{
+    uint32_t conf = rmt->tx[channel].conf;
+    rmt_tx_emit_level(rmt, channel, (conf & RMT_IDLE_OUT_LEVEL) != 0u,
+                      (conf & RMT_IDLE_OUT_ENABLE) != 0u, cycle);
+}
+
+static void rmt_tx_start_segment(flexe_rmt_v1_t *rmt, unsigned channel,
+                                  uint64_t start_cycle)
+{
+    rmt_plan_segment(rmt, channel, start_cycle);
+    rmt_tx_channel_t *tx = &rmt->tx[channel];
+    if (tx->segment_count == 0u) {
+        rmt_tx_emit_idle(rmt, channel, start_cycle);
+        return;
+    }
+    bool observed = rmt->tx_edge_changed && rmt->tx_edge_needed &&
+                    rmt->tx_edge_needed(rmt->tx_edge_ctx, channel);
+    if (!observed || (tx->conf & (1u << 21u)) != 0u) {
+        /* Without a pad observer, keep the aggregate pulse callback fast.
+         * A modulated carrier needs further phase modeling; do not feed
+         * the bare symbol envelope into a receiver as a fake waveform. */
+        if (observed && !tx->carrier_unsupported_reported) {
+            rmt->fallback_write(
+                rmt->fallback_ctx,
+                rmt->desc->base + RMT_TX_CONF_OFF + channel * 4u,
+                tx->conf);
+            tx->carrier_unsupported_reported = true;
+        }
+        rmt_tx_emit_level(rmt, channel, -1, -1, start_cycle);
+        return;
+    }
+    tx->edge_active = true;
+    tx->edge_item = 0u;
+    tx->edge_second = false;
+    tx->edge_ticks = tx->segment_items[0] & 0x7FFFu;
+    uint64_t duration = rmt_ticks_to_cycles(rmt, tx, tx->edge_ticks);
+    tx->edge_deadline = start_cycle > UINT64_MAX - duration ?
+                        UINT64_MAX : start_cycle + duration;
+    rmt_tx_emit_level(rmt, channel,
+                      (tx->segment_items[0] & (1u << 15u)) != 0u,
+                      true, start_cycle);
+}
+
+static void rmt_tx_advance_edge(flexe_rmt_v1_t *rmt, unsigned channel,
+                                 uint64_t cycle)
+{
+    rmt_tx_channel_t *tx = &rmt->tx[channel];
+    if (tx->edge_second) {
+        tx->edge_item++;
+        tx->edge_second = false;
+    } else {
+        tx->edge_second = true;
+    }
+    if (tx->edge_item >= tx->segment_count) {
+        tx->edge_active = false;
+        return;
+    }
+    uint32_t item = tx->segment_items[tx->edge_item];
+    uint32_t duration_ticks = tx->edge_second ?
+        (item >> 16u) & 0x7FFFu : item & 0x7FFFu;
+    tx->edge_ticks += duration_ticks;
+    uint64_t duration = rmt_ticks_to_cycles(rmt, tx, tx->edge_ticks);
+    tx->edge_deadline = tx->segment_start > UINT64_MAX - duration ?
+                        UINT64_MAX : tx->segment_start + duration;
+    bool level = tx->edge_second ?
+        (item & (1u << 31u)) != 0u :
+        (item & (1u << 15u)) != 0u;
+    rmt_tx_emit_level(rmt, channel, level, true, cycle);
+}
+
 static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
                                 uint64_t event_cycle)
 {
@@ -537,10 +631,14 @@ static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     switch (event) {
     case RMT_EVENT_END:
         tx->active = false;
+        tx->edge_active = false;
+        rmt_tx_emit_idle(rmt, channel, event_cycle);
         rmt->int_raw |= RMT_TX_END_INT(channel);
         break;
     case RMT_EVENT_ERROR:
         tx->active = false;
+        tx->edge_active = false;
+        rmt_tx_emit_idle(rmt, channel, event_cycle);
         rmt->int_raw |= RMT_ERROR_INT(channel);
         break;
     case RMT_EVENT_THRESHOLD:
@@ -551,7 +649,77 @@ static void rmt_finish_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     }
     rmt_notify_irq(rmt);
     if (tx->active && event == RMT_EVENT_THRESHOLD)
-        rmt_plan_segment(rmt, channel, event_cycle);
+        rmt_tx_start_segment(rmt, channel, event_cycle);
+}
+
+static bool rmt_eval_rx_channel_to(flexe_rmt_v1_t *rmt,
+                                    unsigned channel, uint64_t now)
+{
+    rmt_rx_channel_t *rx = &rmt->rx[channel];
+    bool changed = false;
+    while (rx->active) {
+        bool filter_due = rx->filter_pending &&
+                          rx->filter_deadline <= now;
+        bool demod_due = rx->demod_pending &&
+                         rx->demod_deadline <= now;
+        bool idle_due = rx->edge_started &&
+                        rx->edge_deadline <= now;
+        if (!filter_due && !demod_due && !idle_due) break;
+        if (idle_due && (!filter_due ||
+                         rx->edge_deadline <= rx->filter_deadline) &&
+                        (!demod_due ||
+                         rx->edge_deadline <= rx->demod_deadline)) {
+            /* Idle completion precedes a later qualifying edge. A
+             * completed first half with no second edge is terminal. */
+            if (rx->edge_first_valid)
+                (void)rmt_rx_store_word(rmt, channel, rx->edge_first);
+            if (rx->active) rmt_finish_rx(rmt, channel);
+            changed = true;
+            break;
+        }
+        if (demod_due && (!filter_due ||
+                          rx->demod_deadline <= rx->filter_deadline)) {
+            uint64_t edge_cycle = rx->demod_start;
+            bool inactive = (rx->conf0 & RMT_RX_CARRIER_LEVEL) == 0u;
+            rx->demod_pending = false;
+            rx->demod_deadline = UINT64_MAX;
+            rmt_rx_commit_edge(rmt, channel, inactive, edge_cycle);
+            changed = true;
+            continue;
+        }
+        uint64_t deadline = rx->filter_deadline;
+        bool level = rx->filter_target;
+        rx->filter_pending = false;
+        rx->filter_level = level;
+        rmt_rx_accept_level(rmt, channel, level, deadline);
+        changed = true;
+    }
+    while (rx->pending_end && rx->deadline <= now) {
+        if (rx->next_word == rx->frame_count) {
+            rmt_finish_rx(rmt, channel);
+        } else {
+            uint32_t word = rx->frame[rx->next_word++];
+            if (!rmt_rx_store_word(rmt, channel, word)) {
+                changed = true;
+                continue;
+            }
+            if (rx->next_word == rx->frame_count && rx->pending_error)
+                rx->status_flags |= 1u << 26;
+            if (rx->next_word < rx->frame_count) {
+                uint32_t item = rx->frame[rx->next_word];
+                rx->elapsed_ticks += (item & 0x7FFFu) +
+                                     ((item >> 16) & 0x7FFFu);
+            } else {
+                rx->elapsed_ticks += (rx->conf0 >> 8) & 0x7FFFu;
+            }
+            uint64_t duration = rmt_ticks_to_cycles_div(
+                rmt, rx->conf0 & 0xFFu, rx->elapsed_ticks);
+            rx->deadline = rx->frame_start > UINT64_MAX - duration ?
+                           UINT64_MAX : rx->frame_start + duration;
+        }
+        changed = true;
+    }
+    return changed;
 }
 
 void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
@@ -564,79 +732,22 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
         rmt_tx_channel_t *tx = &rmt->tx[channel];
         unsigned safety = 0u;
         while (tx->active && tx->event != RMT_EVENT_NONE &&
-               tx->deadline <= now && safety++ < 1024u) {
-            uint64_t event_cycle = tx->deadline;
-            rmt_finish_segment(rmt, channel, event_cycle);
+               safety++ < 1024u) {
+            if (tx->edge_active && tx->edge_deadline < tx->deadline &&
+                tx->edge_deadline <= now) {
+                rmt_tx_advance_edge(rmt, channel, tx->edge_deadline);
+                changed = true;
+                continue;
+            }
+            if (tx->deadline > now) break;
+            rmt_finish_segment(rmt, channel, tx->deadline);
             changed = true;
         }
     }
     for (unsigned channel = 0u;
          channel < rmt_rx_channel_count(rmt->desc);
-         channel++) {
-        rmt_rx_channel_t *rx = &rmt->rx[channel];
-        while (rx->active) {
-            bool filter_due = rx->filter_pending &&
-                              rx->filter_deadline <= now;
-            bool demod_due = rx->demod_pending &&
-                             rx->demod_deadline <= now;
-            bool idle_due = rx->edge_started &&
-                            rx->edge_deadline <= now;
-            if (!filter_due && !demod_due && !idle_due) break;
-            if (idle_due && (!filter_due ||
-                             rx->edge_deadline <= rx->filter_deadline) &&
-                            (!demod_due ||
-                             rx->edge_deadline <= rx->demod_deadline)) {
-                /* Idle completion precedes a later qualifying edge. A
-                 * completed first half with no second edge is terminal. */
-                if (rx->edge_first_valid)
-                    (void)rmt_rx_store_word(rmt, channel, rx->edge_first);
-                if (rx->active) rmt_finish_rx(rmt, channel);
-                changed = true;
-                break;
-            }
-            if (demod_due && (!filter_due ||
-                              rx->demod_deadline <= rx->filter_deadline)) {
-                uint64_t edge_cycle = rx->demod_start;
-                bool inactive = (rx->conf0 & RMT_RX_CARRIER_LEVEL) == 0u;
-                rx->demod_pending = false;
-                rx->demod_deadline = UINT64_MAX;
-                rmt_rx_commit_edge(rmt, channel, inactive, edge_cycle);
-                changed = true;
-                continue;
-            }
-            uint64_t deadline = rx->filter_deadline;
-            bool level = rx->filter_target;
-            rx->filter_pending = false;
-            rx->filter_level = level;
-            rmt_rx_accept_level(rmt, channel, level, deadline);
-            changed = true;
-        }
-        while (rx->pending_end && rx->deadline <= now) {
-            if (rx->next_word == rx->frame_count) {
-                rmt_finish_rx(rmt, channel);
-            } else {
-                uint32_t word = rx->frame[rx->next_word++];
-                if (!rmt_rx_store_word(rmt, channel, word)) {
-                    changed = true;
-                    continue;
-                }
-                if (rx->next_word == rx->frame_count && rx->pending_error)
-                    rx->status_flags |= 1u << 26;
-                if (rx->next_word < rx->frame_count) {
-                    uint32_t item = rx->frame[rx->next_word];
-                    rx->elapsed_ticks += (item & 0x7FFFu) +
-                                         ((item >> 16) & 0x7FFFu);
-                } else {
-                    rx->elapsed_ticks += (rx->conf0 >> 8) & 0x7FFFu;
-                }
-                uint64_t duration = rmt_ticks_to_cycles_div(
-                    rmt, rx->conf0 & 0xFFu, rx->elapsed_ticks);
-                rx->deadline = rx->frame_start > UINT64_MAX - duration ?
-                               UINT64_MAX : rx->frame_start + duration;
-            }
-            changed = true;
-        }
-    }
+         channel++)
+        if (rmt_eval_rx_channel_to(rmt, channel, now)) changed = true;
     if (changed) rmt_notify_state(rmt);
 }
 
@@ -652,6 +763,10 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
         if (!tx->active || tx->event == RMT_EVENT_NONE) continue;
         uint64_t d = tx->deadline > now ? tx->deadline - now : 0u;
         if (d < distance) distance = d;
+        if (tx->edge_active && tx->edge_deadline < tx->deadline) {
+            d = tx->edge_deadline > now ? tx->edge_deadline - now : 0u;
+            if (d < distance) distance = d;
+        }
     }
     for (unsigned channel = 0u;
          channel < rmt_rx_channel_count(rmt->desc);
@@ -783,12 +898,17 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         if (value & RMT_TX_STOP) {
             tx->active = false;
             tx->event = RMT_EVENT_NONE;
+            tx->edge_active = false;
+            rmt_tx_emit_idle(rmt, channel, rmt_clock_now(rmt));
         }
         if (value & RMT_TX_START) {
             tx->active = true;
             tx->read_index = 0u;
-            rmt_plan_segment(rmt, channel, rmt_clock_now(rmt));
+            tx->carrier_unsupported_reported = false;
+            rmt_tx_start_segment(rmt, channel, rmt_clock_now(rmt));
         }
+        if (!tx->active)
+            rmt_tx_emit_idle(rmt, channel, rmt_clock_now(rmt));
         rmt_notify_state(rmt);
         return;
     }
@@ -911,6 +1031,7 @@ flexe_rmt_v1_t *flexe_rmt_v1_create(xtensa_mem_t *mem,
         desc->memory_offset != 0x800u ||
         !(target->capabilities & FLEXE_TARGET_CAP_GPIO_V1) ||
         desc->input_signal_base + rmt_rx_channel_count(desc) > 256u ||
+        desc->output_signal_base + desc->tx_channel_count > 256u ||
         desc->memory_offset +
             desc->channel_count * desc->words_per_channel * 4u >
             desc->register_size ||
@@ -985,6 +1106,22 @@ int flexe_rmt_v1_set_tx_callback(flexe_rmt_v1_t *rmt, unsigned channel,
     return 0;
 }
 
+void flexe_rmt_v1_set_tx_edge_handler(flexe_rmt_v1_t *rmt,
+                                      flexe_rmt_v1_tx_edge_fn changed,
+                                      flexe_rmt_v1_tx_edge_needed_fn needed,
+                                      void *ctx)
+{
+    if (!rmt) return;
+    rmt->tx_edge_changed = changed;
+    rmt->tx_edge_needed = changed ? needed : NULL;
+    rmt->tx_edge_ctx = changed ? ctx : NULL;
+    if (!changed) return;
+    uint64_t now = rmt_clock_now(rmt);
+    for (unsigned channel = 0u; channel < rmt->desc->tx_channel_count;
+         channel++)
+        rmt_tx_emit_idle(rmt, channel, now);
+}
+
 size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
                               const uint32_t *items, size_t count)
 {
@@ -1038,8 +1175,20 @@ void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
 {
     if (!rmt || channel < rmt->desc->tx_channel_count ||
         channel >= rmt->desc->channel_count) return;
-    unsigned index = channel - rmt->desc->tx_channel_count;
     flexe_rmt_v1_eval(rmt);
+    flexe_rmt_v1_rx_input_edge_at(rmt, channel, old_level, level,
+                                  rmt_clock_now(rmt));
+}
+
+void flexe_rmt_v1_rx_input_edge_at(flexe_rmt_v1_t *rmt, unsigned channel,
+                                    bool old_level, bool level,
+                                    uint64_t cycle)
+{
+    if (!rmt || channel < rmt->desc->tx_channel_count ||
+        channel >= rmt->desc->channel_count) return;
+    unsigned index = channel - rmt->desc->tx_channel_count;
+    if (rmt_eval_rx_channel_to(rmt, index, cycle))
+        rmt_notify_state(rmt);
     rmt_rx_channel_t *rx = &rmt->rx[index];
     if (!rx->active || rx->pending_end || !rmt_source_hz(rmt)) return;
     if (!(rx->conf1 & RMT_RX_MEM_OWNER)) {
@@ -1048,7 +1197,7 @@ void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
         rmt_notify_irq(rmt);
         return;
     }
-    uint64_t now = rmt_clock_now(rmt);
+    uint64_t now = cycle;
     if (!(rx->conf1 & RMT_RX_FILTER_EN) ||
         !((rx->conf1 >> RMT_RX_FILTER_THRES_SHIFT) &
           RMT_RX_FILTER_THRES_MASK)) {
