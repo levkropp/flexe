@@ -99,7 +99,9 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
              (target->capabilities & FLEXE_TARGET_CAP_SHA_V1)) ||
             (gate->device == FLEXE_SYSTEM_DEVICE_LEDC &&
              gate->instance == 0u &&
-             (target->capabilities & FLEXE_TARGET_CAP_LEDC_V1));
+             (target->capabilities & FLEXE_TARGET_CAP_LEDC_V1)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_UART &&
+             gate->instance < target->uart_count);
         if (!device_valid || clock_reg < 0 || reset_reg < 0 ||
             !system_clock_single_bit(gate->clock_mask) ||
             !system_clock_single_bit(gate->reset_mask) ||

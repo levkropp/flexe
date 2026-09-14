@@ -42,6 +42,16 @@
 #define SC_TIMG_ENABLE          (1u << 31)
 #define SC_TIMG_INCREASE        (1u << 30)
 
+#define SC_UART0_BASE           0x60000000u
+#define SC_UART1_BASE           0x60010000u
+#define SC_UART2_BASE           0x6002E000u
+#define SC_UART0_GATE           (1u << 2)
+#define SC_UART1_GATE           (1u << 5)
+#define SC_UART2_GATE           (1u << 9)
+#define SC_UART_INT_ENA         0x00Cu
+#define SC_UART_CONF1           0x024u
+#define SC_UART_DATE            0x07Cu
+
 static uint32_t sc_systimer_value(xtensa_mem_t *mem)
 {
     mem_write32(mem, SC_SYSTIMER_BASE + SC_SYSTIMER_UNIT0_OP,
@@ -246,9 +256,89 @@ TEST(system_clock_gates_and_resets_target_devices_at_exact_boundaries)
     mem_destroy(mem);
 }
 
+TEST(system_clock_uart_gates_and_resets_are_per_port)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t clocks0 = mem_read32(mem, SC_SYSTEM_BASE +
+                                       SC_PERIP_CLK_EN0_OFF);
+    uint32_t clocks1 = mem_read32(mem, SC_SYSTEM_BASE +
+                                       SC_PERIP_CLK_EN1_OFF);
+    ASSERT_TRUE(clocks0 & SC_UART0_GATE);
+    ASSERT_TRUE(clocks0 & SC_UART1_GATE);
+    ASSERT_TRUE(clocks1 & SC_UART2_GATE);
+
+    mem_write32(mem, SC_UART0_BASE, 'A');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 1);
+    mem_write32(mem, SC_UART0_BASE + SC_UART_INT_ENA, 1u << 1);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 27));
+
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN0_OFF,
+                clocks0 & ~SC_UART0_GATE);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 27));
+    mem_write32(mem, SC_UART0_BASE, 'B');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 1);
+    const uint8_t input[] = { 'x', 'y' };
+    ASSERT_EQ(periph_uart_rx_inject_num(periph, 0, input, sizeof(input)), 0u);
+    mem_write32(mem, SC_UART1_BASE, '1');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 1), 1);
+
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN0_OFF, clocks0);
+    ASSERT_TRUE(periph_interrupt_pending(periph, 27));
+    ASSERT_EQ(periph_uart_rx_inject_num(periph, 0, input, sizeof(input)),
+              sizeof(input));
+    ASSERT_EQ(mem_read32(mem, SC_UART0_BASE), 'x');
+    ASSERT_EQ(periph_uart_rx_pending_num(periph, 0), 1u);
+    mem_write32(mem, SC_UART0_BASE + SC_UART_CONF1, 0x1234u);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN0_OFF,
+                SC_UART0_GATE);
+    ASSERT_FALSE(periph_interrupt_pending(periph, 27));
+    ASSERT_EQ(periph_uart_rx_pending_num(periph, 0), 0u);
+    ASSERT_EQ(mem_read32(mem, SC_UART0_BASE + SC_UART_INT_ENA), 0u);
+    ASSERT_EQ(mem_read32(mem, SC_UART0_BASE + SC_UART_CONF1), 0u);
+    ASSERT_EQ(mem_read32(mem, SC_UART0_BASE + SC_UART_DATE),
+              s3->uart_ip.date_reset);
+    mem_write32(mem, SC_UART0_BASE, 'C');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 1);
+    ASSERT_EQ(periph_uart_rx_inject_num(periph, 0, input, sizeof(input)), 0u);
+    mem_write32(mem, SC_UART1_BASE, '2');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 1), 2);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN0_OFF, 0u);
+    mem_write32(mem, SC_UART0_BASE, 'D');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 2);
+
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN1_OFF,
+                clocks1 & ~SC_UART2_GATE);
+    mem_write32(mem, SC_UART2_BASE, 'E');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 2), 0);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN1_OFF, clocks1);
+    mem_write32(mem, SC_UART2_BASE, 'F');
+    ASSERT_EQ(periph_uart_tx_count_num(periph, 2), 1);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN1_OFF,
+                mem_read32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN1_OFF) |
+                SC_UART2_GATE);
+    ASSERT_EQ(mem_read32(mem, SC_UART2_BASE + SC_UART_DATE),
+              s3->uart_ip.date_reset);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_system_clock_tests(void)
 {
     TEST_SUITE("Target system clock");
     RUN_TEST(system_clock_reset_masks_and_shared_page_composition);
     RUN_TEST(system_clock_gates_and_resets_target_devices_at_exact_boundaries);
+    RUN_TEST(system_clock_uart_gates_and_resets_are_per_port);
 }

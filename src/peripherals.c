@@ -1402,6 +1402,8 @@ typedef struct {
     uint32_t shadow[64];
     uint32_t int_raw;
     uint32_t int_ena;
+    bool clock_enabled;
+    bool reset_asserted;
 } uart_state_t;
 
 typedef struct {
@@ -2737,7 +2739,8 @@ static void uart_intr_update(esp32_periph_t *p, int uart_num) {
         return;
 
     uint32_t mask = 1u << (source % 32);
-    bool active = (uart->int_raw & uart->int_ena) != 0;
+    bool active = uart->clock_enabled && !uart->reset_asserted &&
+                  (uart->int_raw & uart->int_ena) != 0;
     if (active) {
         periph_assert_interrupt_status(p, source,
                                        uart->int_raw & uart->int_ena);
@@ -2765,6 +2768,7 @@ static void uart_emit_tx_byte(esp32_periph_t *p, int uart_num, uint8_t byte,
                               bool apb_fifo_write) {
     if (!uart_num_valid(p, uart_num)) return;
     uart_state_t *uart = &p->uart[uart_num];
+    if (!uart->clock_enabled || uart->reset_asserted) return;
     if (uart->tx_len < UART_TX_BUF_SIZE)
         uart->tx[uart->tx_len++] = byte;
     if (uart->cb)
@@ -2783,8 +2787,36 @@ static void uart_emit_tx_byte(esp32_periph_t *p, int uart_num, uint8_t byte,
 
 static void uart_dma_tx_done(esp32_periph_t *p, int uart_num) {
     if (!uart_num_valid(p, uart_num)) return;
+    if (!p->uart[uart_num].clock_enabled ||
+        p->uart[uart_num].reset_asserted) return;
     p->uart[uart_num].int_raw |= UART_TXFIFO_EMPTY_INT | UART_TX_DONE_INT;
     uart_intr_update(p, uart_num);
+}
+
+static void uart_reset_state(esp32_periph_t *p, unsigned uart_num) {
+    if (!uart_num_valid(p, (int)uart_num)) return;
+    const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
+    uart_state_t *uart = &p->uart[uart_num];
+    uart->rx_head = 0u;
+    uart->rx_tail = 0u;
+    uart->rx_count = 0u;
+    memset(uart->shadow, 0, sizeof(uart->shadow));
+    uart->shadow[ip->date_offset / 4u] = ip->date_reset;
+    uart->int_raw = ip->interrupt_raw_reset;
+    uart->int_ena = 0u;
+    uart_intr_update(p, (int)uart_num);
+}
+
+static void uart_set_system_state(esp32_periph_t *p, unsigned uart_num,
+                                  bool clock_enabled,
+                                  bool reset_asserted) {
+    if (!uart_num_valid(p, (int)uart_num)) return;
+    uart_state_t *uart = &p->uart[uart_num];
+    bool reset_rising = reset_asserted && !uart->reset_asserted;
+    uart->clock_enabled = clock_enabled;
+    uart->reset_asserted = reset_asserted;
+    if (reset_rising) uart_reset_state(p, uart_num);
+    uart_intr_update(p, (int)uart_num);
 }
 
 static uint32_t uart_read(void *ctx, uint32_t addr) {
@@ -2828,6 +2860,7 @@ static void uart_write(void *ctx, uint32_t addr, uint32_t val) {
     const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
     uart_state_t *uart = &p->uart[uart_num];
     uint32_t off = addr - desc->base;
+    if (uart->reset_asserted) return;
     if (off == 0x00) {
         /* FIFO write: TX byte */
         uint8_t byte = (uint8_t)(val & 0xFF);
@@ -2866,8 +2899,8 @@ static int uart_register_target(esp32_periph_t *p) {
                                     ip->register_size,
                                     uart_read, uart_write, p) != 0)
             return -1;
-        p->uart[uart_num].int_raw = ip->interrupt_raw_reset;
-        p->uart[uart_num].shadow[ip->date_offset / 4u] = ip->date_reset;
+        p->uart[uart_num].clock_enabled = true;
+        uart_reset_state(p, (unsigned)uart_num);
     }
     return 0;
 }
@@ -13966,6 +13999,9 @@ static void system_clock_gate_changed(
     case FLEXE_SYSTEM_DEVICE_LEDC:
         ledc_set_system_state(p, clock_enabled, reset_asserted);
         break;
+    case FLEXE_SYSTEM_DEVICE_UART:
+        uart_set_system_state(p, instance, clock_enabled, reset_asserted);
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -15290,6 +15326,7 @@ size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
         (!data && len != 0)) return 0;
     const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
     uart_state_t *uart = &p->uart[uart_num];
+    if (!uart->clock_enabled || uart->reset_asserted) return 0u;
     size_t dma_accepted = uhci_uart_rx_feed(p, uart_num, data, len, true);
     size_t accepted = dma_accepted;
     while (accepted < len && uart->rx_count < UART_RX_FIFO_SIZE) {
