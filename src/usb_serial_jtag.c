@@ -73,6 +73,8 @@ struct flexe_usb_serial_jtag {
     bool tx_waiting_for_host;
     bool connected;
     bool irq_level;
+    bool clock_enabled;
+    bool reset_asserted;
 };
 
 static bool usb_geometry_valid(const flexe_target_desc_t *target)
@@ -105,7 +107,8 @@ static bool usb_geometry_valid(const flexe_target_desc_t *target)
 
 static bool usb_link_active(const flexe_usb_serial_jtag_t *usb)
 {
-    return usb->connected && (usb->conf0 & USB_CONF0_PAD_ENABLE) != 0u &&
+    return usb->clock_enabled && !usb->reset_asserted &&
+           usb->connected && (usb->conf0 & USB_CONF0_PAD_ENABLE) != 0u &&
            (usb->mem_conf & USB_MEM_POWER_DOWN) == 0u;
 }
 
@@ -113,7 +116,8 @@ static void usb_update_irq(flexe_usb_serial_jtag_t *usb)
 {
     const flexe_usb_serial_jtag_desc_t *desc =
         &usb->target->usb_serial_jtag;
-    bool level = (usb->int_raw & usb->int_enable &
+    bool level = usb->clock_enabled && !usb->reset_asserted &&
+                 (usb->int_raw & usb->int_enable &
                   desc->interrupt_valid_mask) != 0u;
     if (level == usb->irq_level) return;
     usb->irq_level = level;
@@ -171,10 +175,13 @@ static uint32_t usb_ep1_conf(const flexe_usb_serial_jtag_t *usb)
 {
     uint32_t value = 0u;
     size_t endpoint_size = usb->target->usb_serial_jtag.endpoint_size;
-    if (!usb->tx_waiting_for_host && usb->tx_len < endpoint_size &&
+    if (usb->clock_enabled && !usb->reset_asserted &&
+        !usb->tx_waiting_for_host && usb->tx_len < endpoint_size &&
         (usb->mem_conf & USB_MEM_POWER_DOWN) == 0u)
         value |= USB_EP_CONF_IN_FREE;
-    if (usb->rx_pos < usb->rx_len) value |= USB_EP_CONF_OUT_AVAIL;
+    if (usb->clock_enabled && !usb->reset_asserted &&
+        usb->rx_pos < usb->rx_len)
+        value |= USB_EP_CONF_OUT_AVAIL;
     return value;
 }
 
@@ -203,6 +210,7 @@ static uint32_t usb_read(void *ctx, uint32_t addr)
 
     switch (off) {
     case USB_EP1_OFF: {
+        if (!usb->clock_enabled || usb->reset_asserted) return 0u;
         if (usb->rx_pos >= usb->rx_len) return 0u;
         uint8_t byte = usb->rx_fifo[usb->rx_pos++];
         if (usb->rx_pos == usb->rx_len) {
@@ -265,6 +273,12 @@ static void usb_write(void *ctx, uint32_t addr, uint32_t value)
         &usb->target->usb_serial_jtag;
     uint32_t off = addr - desc->base;
     if ((off & 3u) != 0u) goto fallback;
+
+    /* The register bus is inert while SYSTEM holds this block in reset or
+     * gates its clock. Unknown offsets still go to the diagnostic fallback. */
+    if ((!usb->clock_enabled || usb->reset_asserted) &&
+        (off <= USB_MEM_CONF_OFF || off == USB_DATE_OFF))
+        return;
 
     switch (off) {
     case USB_EP1_OFF:
@@ -349,6 +363,7 @@ flexe_usb_serial_jtag_t *flexe_usb_serial_jtag_create(
     usb->fallback_ctx = fallback_ctx;
     usb->irq_changed = irq_changed;
     usb->irq_ctx = irq_ctx;
+    usb->clock_enabled = true;
     usb->int_raw = desc->interrupt_raw_reset;
     usb->conf0 = desc->conf0_reset;
     usb->test = desc->test_reset;
@@ -365,6 +380,34 @@ flexe_usb_serial_jtag_t *flexe_usb_serial_jtag_create(
         return NULL;
     }
     return usb;
+}
+
+void flexe_usb_serial_jtag_set_system_state(
+    flexe_usb_serial_jtag_t *usb, bool clock_enabled, bool reset_asserted)
+{
+    if (!usb) return;
+    bool reset_rising = reset_asserted && !usb->reset_asserted;
+    usb->clock_enabled = clock_enabled;
+    usb->reset_asserted = reset_asserted;
+    if (reset_rising) {
+        const flexe_usb_serial_jtag_desc_t *desc =
+            &usb->target->usb_serial_jtag;
+        usb->tx_len = 0u;
+        usb->rx_len = 0u;
+        usb->rx_pos = 0u;
+        usb->tx_waiting_for_host = false;
+        usb->int_raw = desc->interrupt_raw_reset;
+        usb->int_enable = 0u;
+        usb->conf0 = desc->conf0_reset;
+        usb->test = desc->test_reset;
+        usb->misc_conf = desc->misc_conf_reset;
+        usb->mem_conf = desc->mem_conf_reset;
+        usb->date = desc->date_reset;
+        usb->frame_number = 0u;
+    }
+    usb_update_irq(usb);
+    if (clock_enabled && !reset_asserted)
+        usb_consume_tx_packet(usb);
 }
 
 void flexe_usb_serial_jtag_destroy(flexe_usb_serial_jtag_t *usb)

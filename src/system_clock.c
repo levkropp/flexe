@@ -101,7 +101,11 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
              gate->instance == 0u &&
              (target->capabilities & FLEXE_TARGET_CAP_LEDC_V1)) ||
             (gate->device == FLEXE_SYSTEM_DEVICE_UART &&
-             gate->instance < target->uart_count);
+             gate->instance < target->uart_count) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_USB_SERIAL_JTAG &&
+             gate->instance == 0u &&
+             (target->capabilities &
+              FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1));
         if (!device_valid || clock_reg < 0 || reset_reg < 0 ||
             !system_clock_single_bit(gate->clock_mask) ||
             !system_clock_single_bit(gate->reset_mask) ||

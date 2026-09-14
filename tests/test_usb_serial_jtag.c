@@ -31,6 +31,10 @@
 #define USB_INT_IN_TOKEN     (1u << 8)
 #define USB_INT_ZERO_PACKET  (1u << 10)
 #define USB_INTR_SOURCE      96
+#define S3_SYSTEM_BASE       0x600C0000u
+#define SYSTEM_CLK_EN1       0x01Cu
+#define SYSTEM_RST_EN1       0x024u
+#define SYSTEM_USB_GATE      (1u << 10)
 
 static uint32_t usb_read_reg(xtensa_mem_t *mem, uint32_t off)
 {
@@ -239,9 +243,117 @@ TEST(usb_serial_jtag_host_rx_sof_and_w1c_status) {
     mem_destroy(mem);
 }
 
+TEST(usb_serial_jtag_system_clock_and_reset_gate_host_activity) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    static const uint8_t packet[] = { 0xA5u };
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t clocks = mem_read32(mem, S3_SYSTEM_BASE + SYSTEM_CLK_EN1);
+    uint32_t resets = mem_read32(mem, S3_SYSTEM_BASE + SYSTEM_RST_EN1);
+    ASSERT_TRUE(clocks & SYSTEM_USB_GATE);
+    ASSERT_EQ(resets & SYSTEM_USB_GATE, 0u);
+    usb_write_reg(mem, USB_INT_ENA, USB_INT_TX_EMPTY);
+    ASSERT_TRUE(periph_interrupt_pending(periph, USB_INTR_SOURCE));
+
+    mem_write32(mem, S3_SYSTEM_BASE + SYSTEM_CLK_EN1,
+                clocks & ~SYSTEM_USB_GATE);
+    ASSERT_FALSE(periph_interrupt_pending(periph, USB_INTR_SOURCE));
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1_CONF) & USB_IN_FREE, 0u);
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 0u);
+    uint32_t frame = usb_read_reg(mem, USB_FRAME_NUM);
+    periph_usb_serial_jtag_host_sof(periph);
+    ASSERT_EQ(usb_read_reg(mem, USB_FRAME_NUM), frame);
+    usb_write_reg(mem, USB_EP1, 'X');
+    usb_write_reg(mem, USB_EP1_CONF, USB_WR_DONE);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 0u);
+
+    mem_write32(mem, S3_SYSTEM_BASE + SYSTEM_CLK_EN1, clocks);
+    ASSERT_TRUE(periph_interrupt_pending(periph, USB_INTR_SOURCE));
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1_CONF) & USB_IN_FREE, USB_IN_FREE);
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 1u);
+    usb_write_reg(mem, USB_EP1, 'A');
+    usb_write_reg(mem, USB_EP1_CONF, USB_WR_DONE);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 1u);
+    usb_write_reg(mem, USB_EP1, 'B'); /* Unsent packet is lost on reset. */
+    usb_write_reg(mem, USB_TEST, 0xFu);
+
+    mem_write32(mem, S3_SYSTEM_BASE + SYSTEM_RST_EN1,
+                resets | SYSTEM_USB_GATE);
+    ASSERT_FALSE(periph_interrupt_pending(periph, USB_INTR_SOURCE));
+    ASSERT_EQ(periph_usb_serial_jtag_rx_pending(periph), 0u);
+    ASSERT_EQ(usb_read_reg(mem, USB_INT_ENA), 0u);
+    ASSERT_EQ(usb_read_reg(mem, USB_TEST), 0u);
+    ASSERT_EQ(usb_read_reg(mem, USB_CONF0), s3->usb_serial_jtag.conf0_reset);
+    ASSERT_EQ(usb_read_reg(mem, USB_DATE), s3->usb_serial_jtag.date_reset);
+    ASSERT_TRUE(periph_usb_serial_jtag_connected(periph));
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 1u);
+    usb_write_reg(mem, USB_EP1, 'Y');
+    usb_write_reg(mem, USB_EP1_CONF, USB_WR_DONE);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 1u);
+    ASSERT_EQ(periph_usb_serial_jtag_rx_inject(
+                  periph, packet, sizeof(packet)), 0u);
+
+    mem_write32(mem, S3_SYSTEM_BASE + SYSTEM_RST_EN1, resets);
+    usb_write_reg(mem, USB_EP1, 'C');
+    usb_write_reg(mem, USB_EP1_CONF, USB_WR_DONE);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 2u);
+    ASSERT_TRUE(memcmp(periph_usb_serial_jtag_tx_buf(periph), "AC", 2u) == 0);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(usb_serial_jtag_clock_resumes_pending_in_packet) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t clocks = mem_read32(mem, S3_SYSTEM_BASE + SYSTEM_CLK_EN1);
+    periph_usb_serial_jtag_set_connected(periph, false);
+    usb_write_reg(mem, USB_EP1, 'Q');
+    usb_write_reg(mem, USB_EP1_CONF, USB_WR_DONE);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 0u);
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1_CONF) & USB_IN_FREE, 0u);
+
+    mem_write32(mem, S3_SYSTEM_BASE + SYSTEM_CLK_EN1,
+                clocks & ~SYSTEM_USB_GATE);
+    periph_usb_serial_jtag_set_connected(periph, true);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 0u);
+    mem_write32(mem, S3_SYSTEM_BASE + SYSTEM_CLK_EN1, clocks);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_count(periph), 1u);
+    ASSERT_EQ(periph_usb_serial_jtag_tx_buf(periph)[0], 'Q');
+    ASSERT_EQ(usb_read_reg(mem, USB_EP1_CONF) & USB_IN_FREE, USB_IN_FREE);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_usb_serial_jtag_tests(void) {
     TEST_SUITE("USB Serial/JTAG");
     RUN_TEST(usb_serial_jtag_reset_masks_and_reserved_fallback);
     RUN_TEST(usb_serial_jtag_tx_packets_backpressure_and_interrupts);
     RUN_TEST(usb_serial_jtag_host_rx_sof_and_w1c_status);
+    RUN_TEST(usb_serial_jtag_system_clock_and_reset_gate_host_activity);
+    RUN_TEST(usb_serial_jtag_clock_resumes_pending_in_packet);
 }

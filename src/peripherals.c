@@ -14002,6 +14002,11 @@ static void system_clock_gate_changed(
     case FLEXE_SYSTEM_DEVICE_UART:
         uart_set_system_state(p, instance, clock_enabled, reset_asserted);
         break;
+    case FLEXE_SYSTEM_DEVICE_USB_SERIAL_JTAG:
+        if (instance == 0u)
+            flexe_usb_serial_jtag_set_system_state(
+                p->usb_serial_jtag, clock_enabled, reset_asserted);
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }

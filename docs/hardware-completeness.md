@@ -50,7 +50,7 @@ even when a firmware workflow succeeds.
 | S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Host-driven RTC GPIO wake and per-pad/global RTC/digital hold work; physical pulls, drive strength, and electrical levels are not complete. |
-| S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; `tests/test_usb_serial_jtag.c` | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
+| S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire, I2C-slave, and ESP-IDF SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
@@ -68,6 +68,12 @@ an unclocked port cannot emit TX bytes, accept host RX, or assert its
 interrupt; a reset edge clears its FIFO, configuration, and interrupt state
 without erasing already-observed host output. This is a functional gate, not a
 model of APB bus stalls, serial line timing, or the separate USB controller.
+Espressif's [S3 USB Serial/JTAG low-level driver](https://github.com/espressif/esp-idf/blob/v5.5.1/components/hal/esp32s3/include/hal/usb_serial_jtag_ll.h)
+uses SYSTEM's `USB_DEVICE` clock/reset bits for that controller. Flexe now
+blocks host RX, packet completion, synthetic SOF, and interrupt output while
+its clock is off; a reset edge drops unsent/unread packets and restores
+configuration while preserving cable connection and already-captured output.
+USB enumeration and line signaling remain outside this functional model.
 
 S3 remains experimental. The NerdMiner filesystem result is a meaningful
 end-to-end flash-format/mount check. With the matching application ELF, the
@@ -158,7 +164,7 @@ FreeRTOS heartbeat afterward. Its image SHA-256 is
 `cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2`
 and matching ELF SHA-256 is
 `a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294`.
-The two complete replays are byte-identical; 208 other unsupported accesses
+The two complete replays are byte-identical; 206 other unsupported accesses
 across both boots remain visible, mainly RTC power/isolation configuration.
 No unsupported sites remain for S3 sleep timer, state, wake-enable, or cause
 registers. The nominal slow-clock model yielded about 48.9/19.3 ms for the
@@ -211,7 +217,7 @@ Its image SHA-256 is
 `d4897a5ea5b5805bfda3ac3f624788f2600c9f17653e07f8dee7bea67df91314`
 and ELF SHA-256 is
 `27a2d3710e867e0310494a29a6c3612878ec10796a5ea32beeb30a4eca627d4d`.
-The gate reports 208 unrelated unsupported accesses across both boots, mainly
+The gate reports 206 unrelated unsupported accesses across both boots, mainly
 RTC power/isolation setup; the EXT selection/state/status sites are modeled.
 Physical pull resistors, voltage thresholds, glitches/filtering, and pad
 electrical behavior are not inferred from the host's digital level:

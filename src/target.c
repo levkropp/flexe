@@ -424,7 +424,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 7u,
-            .gate_count = 12u,
+            .gate_count = 13u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -535,6 +535,14 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x024u,
                     .clock_mask = 1u << 9,
                     .reset_mask = 1u << 9,
+                },
+                {
+                    /* S3 usb_serial_jtag_ll uses SYSTEM_USB_DEVICE for USJ. */
+                    .device = FLEXE_SYSTEM_DEVICE_USB_SERIAL_JTAG,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 10,
+                    .reset_mask = 1u << 10,
                 },
             },
         },

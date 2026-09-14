@@ -20,6 +20,11 @@ flexe_usb_serial_jtag_t *flexe_usb_serial_jtag_create(
     flexe_usb_serial_jtag_irq_fn irq_changed, void *irq_ctx);
 void flexe_usb_serial_jtag_destroy(flexe_usb_serial_jtag_t *usb);
 
+/* SYSTEM clock/reset inputs. A reset edge clears controller/FIFO state but
+ * keeps the physical host connection and already-captured output. */
+void flexe_usb_serial_jtag_set_system_state(
+    flexe_usb_serial_jtag_t *usb, bool clock_enabled, bool reset_asserted);
+
 /* The virtual host consumes complete IN packets and can inject one OUT packet
  * at a time. The byte callback is optional; transmitted bytes are retained in
  * a bounded capture buffer independently of it. */
