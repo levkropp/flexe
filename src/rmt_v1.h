@@ -39,9 +39,9 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
                               const uint32_t *items, size_t count);
 
 /* Feed a GPIO-matrix input transition into a physical RX channel (4..7).
- * Pulse widths are measured on the guest CPU/RMT clock timeline. The first
- * edge starts a frame; subsequent edges commit paired duration/level words. */
+ * Both levels are needed to seed the RX filter when the first edge arrives.
+ * Pulse widths are measured on the guest CPU/RMT clock timeline. */
 void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
-                                 bool level);
+                                 bool old_level, bool level);
 
 #endif

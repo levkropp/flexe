@@ -65,7 +65,19 @@ static int feed_short_gpio_frame(flexe_session_t *session,
     fprintf(stderr, "[s3-rmt-rx] rx_conf0=%08X rx_conf1=%08X sys=%08X\n",
             mem_read32(mem, RMT_RX_CONF0), mem_read32(mem, RMT_RX_CONF4),
             mem_read32(mem, RMT_SYS_CONF));
+    if (!(mem_read32(mem, RMT_RX_CONF4) & (1u << 4))) {
+        fprintf(stderr, "[s3-rmt-rx] stock RX filter was not armed\n");
+        return 0;
+    }
     periph_gpio_set_input(periph, RX_GPIO, 0);
+    /* One channel tick is shorter than the driver's three-tick minimum.
+     * This high glitch must not start a frame or change the first symbol. */
+    periph_gpio_set_input(periph, RX_GPIO, 1);
+    uint32_t glitch_cycles = guest_cycles_for_rmt_ticks(cpu, mem, 1u);
+    if (!glitch_cycles ||
+        !run_guest_cycles(session, cpu, glitch_cycles)) return 0;
+    periph_gpio_set_input(periph, RX_GPIO, 0);
+    if (!run_guest_cycles(session, cpu, glitch_cycles)) return 0;
     periph_gpio_set_input(periph, RX_GPIO, 1);
     for (unsigned i = 0u; i < 4u; i++) {
         uint32_t cycles = guest_cycles_for_rmt_ticks(cpu, mem, duration[i]);

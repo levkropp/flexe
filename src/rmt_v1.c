@@ -7,8 +7,8 @@
 
 /* ESP32-S3 RMT V1 register layout from Espressif's rmt_reg.h. Four TX and
  * four RX channels share a 384-word pulse RAM. Host RX injection supplies
- * already-decoded symbols; GPIO-matrix edges can also feed the unfiltered
- * pulse decoder. */
+ * already-decoded symbols; GPIO-matrix edges pass through the timed RX
+ * glitch filter before pulse decoding. */
 #define RMT_TX_CONF_OFF       0x020u
 #define RMT_RX_CONF_OFF       0x030u
 #define RMT_STATUS_OFF        0x050u
@@ -55,6 +55,8 @@
 #define RMT_RX_APB_MEM_RST    (1u << 2)
 #define RMT_RX_MEM_OWNER     (1u << 3)
 #define RMT_RX_FILTER_EN     (1u << 4)
+#define RMT_RX_FILTER_THRES_SHIFT 5u
+#define RMT_RX_FILTER_THRES_MASK  0xFFu
 #define RMT_RX_WRAP          (1u << 13)
 #define RMT_RX_AFIFO_RST     (1u << 14)
 #define RMT_RX_CONF_UPDATE   (1u << 15)
@@ -111,6 +113,10 @@ typedef struct {
     uint32_t edge_first;
     uint64_t edge_start;
     uint64_t edge_deadline;
+    bool filter_pending;
+    bool filter_level;
+    bool filter_target;
+    uint64_t filter_deadline;
 } rmt_rx_channel_t;
 
 struct flexe_rmt_v1 {
@@ -316,6 +322,8 @@ static void rmt_abort_rx_frame(rmt_rx_channel_t *rx)
     rx->edge_started = false;
     rx->edge_first_valid = false;
     rx->edge_deadline = UINT64_MAX;
+    rx->filter_pending = false;
+    rx->filter_deadline = UINT64_MAX;
 }
 
 static void rmt_finish_rx(flexe_rmt_v1_t *rmt, unsigned channel)
@@ -355,6 +363,48 @@ static bool rmt_rx_store_word(flexe_rmt_v1_t *rmt, unsigned channel,
         rmt_notify_irq(rmt);
     }
     return true;
+}
+
+static void rmt_rx_commit_edge(flexe_rmt_v1_t *rmt, unsigned index,
+                               bool level, uint64_t now)
+{
+    rmt_rx_channel_t *rx = &rmt->rx[index];
+    if (!rx->active) return;
+    if (rx->edge_started) {
+        if (rx->edge_level == level) return;
+        uint64_t elapsed = now - rx->edge_start;
+        uint64_t ticks = rmt_cycles_to_ticks_div(
+            rmt, rx->conf0 & 0xFFu, elapsed);
+        if (ticks == 0u) ticks = 1u;
+        if (ticks > 0x7FFFu) {
+            rx->pending_error = true;
+            rmt_finish_rx(rmt, index);
+            rmt_notify_state(rmt);
+            return;
+        }
+        uint32_t half = (uint32_t)ticks |
+                        ((uint32_t)rx->edge_level << 15u);
+        if (!rx->edge_first_valid) {
+            rx->edge_first = half;
+            rx->edge_first_valid = true;
+        } else {
+            rx->edge_first_valid = false;
+            if (!rmt_rx_store_word(rmt, index,
+                                   rx->edge_first | (half << 16u))) {
+                rmt_notify_state(rmt);
+                return;
+            }
+        }
+    }
+    rx->edge_started = true;
+    rx->edge_level = level;
+    rx->edge_start = now;
+    uint32_t idle_ticks = (rx->conf0 >> 8u) & 0x7FFFu;
+    uint64_t idle_cycles = idle_ticks ? rmt_ticks_to_cycles_div(
+        rmt, rx->conf0 & 0xFFu, idle_ticks) : UINT64_MAX;
+    rx->edge_deadline = now > UINT64_MAX - idle_cycles ?
+                        UINT64_MAX : now + idle_cycles;
+    rmt_notify_state(rmt);
 }
 
 static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
@@ -477,12 +527,27 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
          channel < rmt_rx_channel_count(rmt->desc);
          channel++) {
         rmt_rx_channel_t *rx = &rmt->rx[channel];
-        if (rx->edge_started && rx->edge_deadline <= now) {
-            /* Idle-threshold completion ends the pulse train. A completed
-             * first half with no second edge is a terminal half-symbol. */
-            if (rx->edge_first_valid)
-                (void)rmt_rx_store_word(rmt, channel, rx->edge_first);
-            if (rx->active) rmt_finish_rx(rmt, channel);
+        while (rx->active) {
+            bool filter_due = rx->filter_pending &&
+                              rx->filter_deadline <= now;
+            bool idle_due = rx->edge_started &&
+                            rx->edge_deadline <= now;
+            if (!filter_due && !idle_due) break;
+            if (idle_due && (!filter_due ||
+                             rx->edge_deadline <= rx->filter_deadline)) {
+                /* Idle completion precedes a later qualifying edge. A
+                 * completed first half with no second edge is terminal. */
+                if (rx->edge_first_valid)
+                    (void)rmt_rx_store_word(rmt, channel, rx->edge_first);
+                if (rx->active) rmt_finish_rx(rmt, channel);
+                changed = true;
+                break;
+            }
+            uint64_t deadline = rx->filter_deadline;
+            bool level = rx->filter_target;
+            rx->filter_pending = false;
+            rx->filter_level = level;
+            rmt_rx_commit_edge(rmt, channel, level, deadline);
             changed = true;
         }
         while (rx->pending_end && rx->deadline <= now) {
@@ -538,6 +603,11 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
         if (rx->edge_started && rx->edge_deadline != UINT64_MAX) {
             uint64_t d = rx->edge_deadline > now ?
                 rx->edge_deadline - now : 0u;
+            if (d < distance) distance = d;
+        }
+        if (rx->filter_pending) {
+            uint64_t d = rx->filter_deadline > now ?
+                rx->filter_deadline - now : 0u;
             if (d < distance) distance = d;
         }
     }
@@ -677,9 +747,7 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             if (value & RMT_RX_CONF_UPDATE) {
                 bool was_active = rx->active;
                 rx->active = (rx->conf1 & RMT_RX_EN) != 0u;
-                if (rx->active &&
-                    ((rx->conf1 & RMT_RX_FILTER_EN) ||
-                     (rx->conf0 & RMT_RX_DEMOD_EN)))
+                if (rx->active && (rx->conf0 & RMT_RX_DEMOD_EN))
                     rmt->fallback_write(rmt->fallback_ctx, address, value);
                 if (!was_active || !rx->active) rmt_abort_rx_frame(rx);
                 rmt_notify_state(rmt);
@@ -857,6 +925,7 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
     unsigned index = channel - rmt->desc->tx_channel_count;
     rmt_rx_channel_t *rx = &rmt->rx[index];
     if (!rx->active || rx->pending_end || rx->edge_started ||
+        rx->filter_pending ||
         !rmt_source_hz(rmt)) return 0u;
     if (!(rx->conf1 & RMT_RX_MEM_OWNER)) {
         rx->status_flags |= 1u << 25;
@@ -896,7 +965,7 @@ size_t flexe_rmt_v1_rx_inject(flexe_rmt_v1_t *rmt, unsigned channel,
 }
 
 void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
-                                 bool level)
+                                 bool old_level, bool level)
 {
     if (!rmt || channel < rmt->desc->tx_channel_count ||
         channel >= rmt->desc->channel_count) return;
@@ -904,7 +973,6 @@ void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
     flexe_rmt_v1_eval(rmt);
     rmt_rx_channel_t *rx = &rmt->rx[index];
     if (!rx->active || rx->pending_end ||
-        (rx->conf1 & RMT_RX_FILTER_EN) ||
         (rx->conf0 & RMT_RX_DEMOD_EN) || !rmt_source_hz(rmt)) return;
     if (!(rx->conf1 & RMT_RX_MEM_OWNER)) {
         rx->status_flags |= 1u << 25;
@@ -913,39 +981,29 @@ void flexe_rmt_v1_rx_input_edge(flexe_rmt_v1_t *rmt, unsigned channel,
         return;
     }
     uint64_t now = rmt_clock_now(rmt);
-    if (rx->edge_started) {
-        if (rx->edge_level == level) return;
-        uint64_t elapsed = now - rx->edge_start;
-        uint64_t ticks = rmt_cycles_to_ticks_div(
-            rmt, rx->conf0 & 0xFFu, elapsed);
-        if (ticks == 0u) ticks = 1u;
-        if (ticks > 0x7FFFu) {
-            rx->pending_error = true;
-            rmt_finish_rx(rmt, index);
-            rmt_notify_state(rmt);
-            return;
-        }
-        uint32_t half = (uint32_t)ticks |
-                        ((uint32_t)rx->edge_level << 15u);
-        if (!rx->edge_first_valid) {
-            rx->edge_first = half;
-            rx->edge_first_valid = true;
-        } else {
-            rx->edge_first_valid = false;
-            if (!rmt_rx_store_word(rmt, index,
-                                   rx->edge_first | (half << 16u))) {
-                rmt_notify_state(rmt);
-                return;
-            }
-        }
+    if (!(rx->conf1 & RMT_RX_FILTER_EN) ||
+        !((rx->conf1 >> RMT_RX_FILTER_THRES_SHIFT) &
+          RMT_RX_FILTER_THRES_MASK)) {
+        rmt_rx_commit_edge(rmt, index, level, now);
+        return;
     }
-    rx->edge_started = true;
-    rx->edge_level = level;
-    rx->edge_start = now;
-    uint32_t idle_ticks = (rx->conf0 >> 8u) & 0x7FFFu;
-    uint64_t idle_cycles = idle_ticks ? rmt_ticks_to_cycles_div(
-        rmt, rx->conf0 & 0xFFu, idle_ticks) : UINT64_MAX;
-    rx->edge_deadline = now > UINT64_MAX - idle_cycles ?
-                        UINT64_MAX : now + idle_cycles;
+    if (!rx->edge_started && !rx->filter_pending)
+        rx->filter_level = old_level;
+    if (level == rx->filter_level) {
+        /* The raw line returned before it qualified: discard the glitch. */
+        rx->filter_pending = false;
+        rx->filter_deadline = UINT64_MAX;
+        rmt_notify_state(rmt);
+        return;
+    }
+    uint32_t threshold = (rx->conf1 >> RMT_RX_FILTER_THRES_SHIFT) &
+                         RMT_RX_FILTER_THRES_MASK;
+    /* On S3 the RX filter counts group-clock ticks, before the per-channel
+     * divider. ESP-IDF uses group->resolution_hz to program this register. */
+    uint64_t filter_cycles = rmt_ticks_to_cycles_div(rmt, 1u, threshold);
+    rx->filter_pending = true;
+    rx->filter_target = level;
+    rx->filter_deadline = now > UINT64_MAX - filter_cycles ?
+                          UINT64_MAX : now + filter_cycles;
     rmt_notify_state(rmt);
 }

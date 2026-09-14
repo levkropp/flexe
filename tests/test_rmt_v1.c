@@ -336,18 +336,90 @@ TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time)
               193u);
     ASSERT_EQ(periph_unhandled_count(periph), 0u);
 
-    /* Filtered electrical input is deliberately not decoded as raw edges;
-     * the unsupported configuration remains in the MMIO audit. */
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 16);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+
+    /* Default SCLK is 80 MHz / 2 and the channel divides by 2 again.
+     * A threshold of three GROUP ticks is 12 CPU cycles, not 24. */
+    mem_write32(mem, S3_GPIO_BASE + S3_GPIO_RMT_RX0, 0x80u | 4u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4,
+                (1u << 24) | (20u << 8) | 2u);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
-                (1u << 15) | (1u << 4) | (1u << 3) | (1u << 1) | 1u);
+                (1u << 15) | (3u << 5) | (1u << 4) | (1u << 3) | 1u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_ENA, 1u << 16);
+
     periph_gpio_set_input(periph, 4, 1);
-    cpu0.ccount = 888u;
+    cpu0.ccount = 11u;
     periph_gpio_set_input(periph, 4, 0);
-    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_STATUS4) & 0x3FFu,
-              192u);
+    cpu0.ccount = 19u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
-    ASSERT_TRUE(periph_unhandled_count(periph) > 0);
+
+    cpu0.ccount = 20u;
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 31u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+    cpu0.ccount = 100u;
+    periph_gpio_set_input(periph, 4, 0);
+    cpu0.ccount = 140u;
+    periph_gpio_set_input(periph, 4, 1); /* glitch inside the low half */
+    cpu0.ccount = 151u;
+    periph_gpio_set_input(periph, 4, 0);
+    cpu0.ccount = 196u;
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 207u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+    cpu0.ccount = 208u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              10u | (1u << 15) | (12u << 16));
+    cpu0.ccount = 260u;
+    periph_gpio_set_input(periph, 4, 0);
+    cpu0.ccount = 332u;
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 344u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4 + 4u),
+              8u | (1u << 15) | (9u << 16));
+    cpu0.ccount = 503u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
+    cpu0.ccount = 504u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 1u << 16);
+
+    /* Equal-to-threshold pulses survive: eval qualifies the high edge
+     * before the raw input falls on cycle 532. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_CLR, 1u << 16);
+    periph_gpio_set_input(periph, 4, 0);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CTRL4,
+                (1u << 15) | (3u << 5) | (1u << 4) |
+                (1u << 3) | (1u << 1) | 1u);
+    cpu0.ccount = 520u;
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 532u;
+    periph_gpio_set_input(periph, 4, 0);
+    cpu0.ccount = 620u;
+    periph_gpio_set_input(periph, 4, 1);
+    cpu0.ccount = 632u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
+              1u | (1u << 15) | (11u << 16));
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
     periph_destroy(periph);
     mem_destroy(mem);
 }
@@ -506,6 +578,7 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline);
     RUN_TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq);
     RUN_TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time);
+    RUN_TEST(s3_rmt_v1_rx_filter_rejects_glitch_and_qualifies_at_group_clock);
     RUN_TEST(s3_rmt_v1_rx_threshold_capacity_and_ownership_are_visible);
     RUN_TEST(s3_rmt_v1_rx_wrap_refills_both_halves_before_end);
     RUN_TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic);

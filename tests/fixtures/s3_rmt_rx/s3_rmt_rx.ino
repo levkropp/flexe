@@ -20,6 +20,10 @@ void setup() {
     flexe_rmt_rx_stage = 0xBAD00002;
     return;
   }
+  if (!rmtSetRxMinThreshold(kRxPin, 3)) {
+    flexe_rmt_rx_stage = 0xBAD00005;
+    return;
+  }
   if (!rmtReadAsync(kRxPin, received, &received_count)) {
     flexe_rmt_rx_stage = 0xBAD00003;
     return;

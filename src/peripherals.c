@@ -16041,7 +16041,8 @@ void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
                 p->target_gpio, desc->input_signal_base + ch);
             if (before[ch] >= 0 && after >= 0 && before[ch] != after)
                 flexe_rmt_v1_rx_input_edge(p->rmt_v1,
-                    desc->tx_channel_count + ch, after != 0);
+                    desc->tx_channel_count + ch,
+                    before[ch] != 0, after != 0);
         }
         return;
     }
