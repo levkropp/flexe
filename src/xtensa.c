@@ -3155,6 +3155,12 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
             __builtin_expect(cpu->pc == GUEST_CALL_ASYNC_SENTINEL, 0))
             guest_call_async_return(cpu);
     }
+    /* Consume a private accelerator boundary even when its PC is absent from
+     * the sparse hook bitmap.  Value 2 remains visible to jit_pc_hook when
+     * the bitmap does hit; a native block reached there may re-arm value 1
+     * for its own fallthrough, which the cleanup below must preserve. */
+    if (accelerator_fallthrough)
+        cpu->jit_fallthrough_dispatch = 2u;
     if (dispatch_boundary && cpu->pc_hook && (!cpu->pc_hook_bitmap ||
         rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, cpu->pc))) {
         cpu->cycle_count = *local_cc;  /* flush for stub visibility */
@@ -3165,7 +3171,8 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
         int hook_insns = cpu->pc_hook(cpu, cpu->pc, cpu->pc_hook_ctx);
         cpu->native_span_room = 0u;
         if (hook_insns) {
-            if (accelerator_fallthrough)
+            if (accelerator_fallthrough &&
+                cpu->jit_fallthrough_dispatch == 2u)
                 cpu->jit_fallthrough_dispatch = false;
             /* Native hooks may account a whole block, while time-oriented
              * stubs may fast-forward cycle_count.  Pull that advancement
@@ -3192,7 +3199,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
         }
     }
     /* This transition marker is normally already clear. */
-    if (accelerator_fallthrough)
+    if (accelerator_fallthrough && cpu->jit_fallthrough_dispatch == 2u)
         cpu->jit_fallthrough_dispatch = false;
 
     /* Breakpoint check */

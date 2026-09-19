@@ -92,9 +92,11 @@ ELF. `check-s3-nerdminer-portal.sh` exercises provisioning and reset,
 `check-s3-marauder.sh` runs the official v1.16.0 MultiBoard S3 image through
 native Bluetooth/Wi-Fi initialization and its absent-GPS probe, then injects
 `help` through UART0 and verifies the command response and following prompt,
-`check-s3-wled-rmt.sh` checks the release image's LED pulse stream, and
-`check-s3-wled-http.sh` checks a matching WLED source-build image/ELF pair
-through its own raw-lwIP web server. The HTTP gate needs a build with
+and requires nonzero JIT retirement. `check-s3-wled-rmt.sh` runs both engines,
+compares every completed LED frame plus the final CPU/time summary, and also
+requires nonzero JIT retirement. `check-s3-wled-http.sh` checks a matching
+WLED source-build image/ELF pair through its own raw-lwIP web server. The HTTP
+gate needs a build with
 libslirp 4.9 or newer and `jq`; it binds a randomly selected host loopback
 port and checks page delivery, a JSON state change, readback, and Ethernet
 delivery.

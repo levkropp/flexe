@@ -16,24 +16,54 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
 fi
 
 tmpdir=$(mktemp -d)
-trap 'rm -f "$tmpdir/interp.err"; rmdir "$tmpdir"' EXIT
+trap 'rm -f "$tmpdir"/*; rmdir "$tmpdir"' EXIT
 
-"$runner" -N -q --no-jit --target esp32s3 -R "$S3_ROM_ELF" \
-    --rmt-stats -c 4000000000 "$S3_WLED_BIN" \
-    > /dev/null 2> "$tmpdir/interp.err"
-if ! grep -q '^Stop reason: halt (WAITI)' "$tmpdir/interp.err"; then
-    echo "FAIL: WLED S3 did not sustain execution" >&2
-    tail -30 "$tmpdir/interp.err" >&2
-    exit 1
-fi
+run_engine() {
+    local name=$1
+    shift
+    FLEXE_RMT_FRAME_STATS=1 "$runner" -N -q "$@" \
+        --target esp32s3 -R "$S3_ROM_ELF" --rmt-stats \
+        -c 4000000000 "$S3_WLED_BIN" \
+        > /dev/null 2> "$tmpdir/$name.err"
+    if ! grep -q '^Stop reason: halt (WAITI)' "$tmpdir/$name.err"; then
+        echo "FAIL: WLED S3 did not sustain $name execution" >&2
+        tail -30 "$tmpdir/$name.err" >&2
+        exit 1
+    fi
+    grep '^\[rmt-frame\]' "$tmpdir/$name.err" > "$tmpdir/$name.frames"
+    grep -E '^(Cycles:|Insns:|Final PC:|Core 1 PC:|UART TX:|USB TX:|RMT TX0:|RMT done0:)' \
+        "$tmpdir/$name.err" > "$tmpdir/$name.state"
+}
+
+run_engine interp --no-jit
+run_engine jit --jit-stats
 
 expected='RMT TX0:    13605 chunks, 321448 items, 317 completions, fnv32=30EAB266'
-actual=$(awk '/^RMT TX0:/{print; exit}' "$tmpdir/interp.err")
-if [[ "$actual" != "$expected" ]]; then
-    echo "FAIL: WLED S3 pulse stream changed" >&2
-    echo "expected: $expected" >&2
-    echo "actual:   $actual" >&2
+for name in interp jit; do
+    actual=$(awk '/^RMT TX0:/{print; exit}' "$tmpdir/$name.err")
+    if [[ "$actual" != "$expected" ]]; then
+        echo "FAIL: WLED S3 $name pulse stream changed" >&2
+        echo "expected: $expected" >&2
+        echo "actual:   $actual" >&2
+        exit 1
+    fi
+done
+
+if ! cmp -s "$tmpdir/interp.frames" "$tmpdir/jit.frames"; then
+    echo "FAIL: WLED S3 JIT differs from the interpreter at a completed-frame boundary" >&2
+    diff -u "$tmpdir/interp.frames" "$tmpdir/jit.frames" >&2 || true
+    exit 1
+fi
+if ! cmp -s "$tmpdir/interp.state" "$tmpdir/jit.state"; then
+    echo "FAIL: WLED S3 JIT final CPU/time/output state differs from the interpreter" >&2
+    diff -u "$tmpdir/interp.state" "$tmpdir/jit.state" >&2 || true
     exit 1
 fi
 
-echo "PASS: WLED S3 emitted 317 RMT frames with the pinned interpreter pulse stream"
+jit_insns=$(awk '/^  Insns JIT:/{print $3; exit}' "$tmpdir/jit.err")
+if [[ -z "$jit_insns" || "$jit_insns" -eq 0 ]]; then
+    echo "FAIL: WLED S3 JIT gate did not execute native guest instructions" >&2
+    exit 1
+fi
+
+echo "PASS: WLED S3 interpreter and JIT emitted the same 317-frame pinned RMT stream ($jit_insns native instructions)"

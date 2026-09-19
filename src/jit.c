@@ -64,6 +64,8 @@ static inline void jit_wx_write_end(void *start, size_t len) {
 #define CPU_OFF_LOOP_EXIT   offsetof(xtensa_cpu_t, jit_loop_exit)
 #define CPU_OFF_IRQ_CHECK   offsetof(xtensa_cpu_t, irq_check)
 #define CPU_OFF_JIT_CHAIN_LIMIT offsetof(xtensa_cpu_t, jit_chain_limit)
+#define CPU_OFF_JIT_TIME_PREFIX offsetof(xtensa_cpu_t, jit_time_prefix)
+#define CPU_OFF_JIT_TIME_ACCOUNTED offsetof(xtensa_cpu_t, jit_time_accounted)
 #define CPU_OFF_CYCLE_COUNT offsetof(xtensa_cpu_t, cycle_count)
 #define CPU_OFF_MEM         offsetof(xtensa_cpu_t, mem)
 #define CPU_OFF_PC_HOOK     offsetof(xtensa_cpu_t, pc_hook)
@@ -270,16 +272,44 @@ static inline uint32_t jit_pend_key(uint32_t pc, uint32_t wb) {
     return jit_mix(pc, wb, 0u) & JIT_HASH_MASK;
 }
 
-/* Combined tag for collision detection: pack wb into unused high bits of PC.
- * ESP32 PCs are 0x4000xxxx-0x404xxxxx, so bits 31:27 = 01000. We can pack
- * wb (0-15) into bits 31:28 safely by XORing.
- *
- * The loop variant has to be in the tag as well now. It used to be carried by
- * the index alone, which was sound only while a slot held exactly one entry:
- * with several ways per set, two variants of the same (pc, wb) can share a set
- * and would otherwise be indistinguishable. */
-static inline uint32_t jit_make_tag(uint32_t pc, uint32_t wb, uint32_t lv) {
-    return pc ^ (wb << 28) ^ (lv ? JIT_LOOP_VARIANT_SALT : 0u);
+static inline bool jit_target_supported(const flexe_target_desc_t *target) {
+    return target &&
+           target->translation_profile ==
+               FLEXE_XTENSA_TRANSLATE_WINDOWED_COMMON;
+}
+
+/* Translate every target-described executable range. Exact ROM/service hooks
+ * remain dispatch boundaries because jit_scan_block() consults the target's
+ * authoritative hook query before decoding each instruction; ordinary mask-
+ * ROM code does not need to pay the interpreter cost merely because other ROM
+ * addresses are virtualized. A mapped-page miss is still rejected by the
+ * scanner, so a broad MMU aperture in the descriptor is safe here. */
+static inline bool jit_pc_is_candidate(const xtensa_cpu_t *cpu, uint32_t pc) {
+    const flexe_target_desc_t *target = cpu ? cpu->target : NULL;
+    return jit_target_supported(target) &&
+           flexe_target_pc_is_executable(target, pc);
+}
+
+/* Preserve the complete cache key. The old representation XORed WINDOWBASE
+ * into the high PC nibble, which assumed every translated PC lived in the
+ * classic ESP32 0x40...... aperture. ESP32-S3 flash executes at 0x42......;
+ * more importantly, that packing was not one-to-one for arbitrary executable
+ * ranges. Seven otherwise-unused flag bits hold WB and the loop variant while
+ * the PC remains exact, keeping jit_block_t at 32 bytes. */
+#define JIT_BLK_KEY_WB_SHIFT 2u
+#define JIT_BLK_KEY_WB_MASK  (0xFu << JIT_BLK_KEY_WB_SHIFT)
+#define JIT_BLK_KEY_LV       (1u << 6)
+#define JIT_BLK_KEY_MASK     (JIT_BLK_KEY_WB_MASK | JIT_BLK_KEY_LV)
+
+static inline uint16_t jit_block_key(uint32_t wb, uint32_t lv) {
+    return (uint16_t)(((wb & 0xFu) << JIT_BLK_KEY_WB_SHIFT) |
+                      (lv ? JIT_BLK_KEY_LV : 0u));
+}
+
+static inline bool jit_block_matches(const jit_block_t *block, uint32_t pc,
+                                     uint32_t wb, uint32_t lv) {
+    return (block->flags & JIT_BLK_VALID) != 0u && block->pc == pc &&
+           (block->flags & JIT_BLK_KEY_MASK) == jit_block_key(wb, lv);
 }
 
 static inline jit_block_t *jit_set_of(jit_state_t *jit, uint32_t pc,
@@ -290,9 +320,8 @@ static inline jit_block_t *jit_set_of(jit_state_t *jit, uint32_t pc,
 static jit_block_t *jit_lookup(jit_state_t *jit, uint32_t pc, uint32_t wb,
                                uint32_t lv) {
     jit_block_t *set = jit_set_of(jit, pc, wb, lv);
-    uint32_t tag = jit_make_tag(pc, wb, lv);
     for (unsigned w = 0; w < JIT_WAYS; w++)
-        if (set[w].code && set[w].pc == tag)
+        if (set[w].code && jit_block_matches(&set[w], pc, wb, lv))
             return &set[w];
     return NULL;
 }
@@ -309,7 +338,7 @@ static void *jit_dynamic_chain_lookup(jit_state_t *jit, xtensa_cpu_t *cpu,
     if (jit->no_chain || jit->invalidate_pending)
         return NULL;
 
-    if (pc < ESP32_FIRMWARE_INSN_ADDR_LOW || pc >= ESP32_INSN_ADDR_HIGH)
+    if (!jit_pc_is_candidate(cpu, pc))
         return NULL;
 
     uint32_t lv = jit_loop_variant(cpu, pc);
@@ -331,12 +360,11 @@ static void *jit_dynamic_chain_lookup(jit_state_t *jit, xtensa_cpu_t *cpu,
 static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc,
                                       uint32_t wb, uint32_t lv) {
     jit_block_t *set = jit_set_of(jit, pc, wb, lv);
-    uint32_t tag = jit_make_tag(pc, wb, lv);
     jit_block_t *victim = NULL;
 
     for (unsigned w = 0; w < JIT_WAYS; w++) {
         jit_block_t *b = &set[w];
-        if ((b->flags & JIT_BLK_VALID) && b->pc == tag)
+        if (jit_block_matches(b, pc, wb, lv))
             return b;
         if (!(b->flags & JIT_BLK_VALID)) {
             /* A free way always wins. This must replace an earlier occupied
@@ -356,13 +384,13 @@ static jit_block_t *jit_get_or_create(jit_state_t *jit, uint32_t pc,
             victim = b;
     }
 
-    victim->pc = tag;
+    victim->pc = pc;
     victim->code = NULL;
     victim->chain_entry = NULL;
     victim->end_pc = 0;
     victim->exec_count = 0;
     victim->guest_insns = 0;
-    victim->flags = JIT_BLK_VALID;
+    victim->flags = (uint16_t)(JIT_BLK_VALID | jit_block_key(wb, lv));
     return victim;
 }
 
@@ -715,11 +743,14 @@ static inline void emit_acc_zero(emit_t *e) { emit_mov_reg_imm32(e, REG_ACC, 0);
 static inline void emit_acc_add(emit_t *e, int n) {
     if (n) emit_add_reg32_imm32(e, REG_ACC, n);
 }
-/* Limit check: returns the jcc site that continues while the chain remains
- * below its dispatcher-computed timer/scheduler horizon. */
-static inline int emit_acc_cap_jcc(emit_t *e) {
-    emit_cmp_reg32(e, REG_ACC, REG_CHAIN_LIMIT);
-    return emit_jcc_rel32(e, CC_B);
+/* Limit check: continue only if this complete block fits before the
+ * dispatcher-computed timer/scheduler horizon. Testing the accumulator alone
+ * let a 64-instruction block cross a timer deadline by 63 instructions. */
+static inline int emit_acc_cap_jcc(emit_t *e, unsigned block_insns) {
+    emit_mov_reg32_reg32(e, RAX, REG_ACC);
+    emit_add_reg32_imm32(e, RAX, (int32_t)block_insns);
+    emit_cmp_reg32(e, RAX, REG_CHAIN_LIMIT);
+    return emit_jcc_rel32(e, CC_BE);
 }
 #else
 #define CPU_OFF_JIT_ACC  offsetof(xtensa_cpu_t, jit_acc)
@@ -729,10 +760,11 @@ static inline void emit_acc_zero(emit_t *e) {
 static inline void emit_acc_add(emit_t *e, int n) {
     if (n) emit_add32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_JIT_ACC, (uint32_t)n);
 }
-static inline int emit_acc_cap_jcc(emit_t *e) {
+static inline int emit_acc_cap_jcc(emit_t *e, unsigned block_insns) {
     emit_load32_disp(e, RAX, REG_CPU, (int32_t)CPU_OFF_JIT_ACC);
+    emit_add_reg32_imm32(e, RAX, (int32_t)block_insns);
     emit_cmp32_mem(e, RAX, REG_CPU, (int32_t)CPU_OFF_JIT_CHAIN_LIMIT);
-    return emit_jcc_rel32(e, CC_B);
+    return emit_jcc_rel32(e, CC_BE);
 }
 #endif
 
@@ -957,13 +989,18 @@ static void ra_invalidate(regalloc_t *ra, int n) {
  * Dirty bits persist for the full block compilation (reset via regalloc_t ra = {0,0}
  * at each new block). Both branch exits emit the same stores — the second is
  * redundant but correct. Cost: ≤2 extra mov instructions at one exit per block. */
-static void ra_flush(emit_t *e, regalloc_t *ra, int wb4) {
+static void ra_flush_mask(emit_t *e, const regalloc_t *ra, int wb4,
+                          uint8_t dirty) {
     for (int i = 0; i < RA_COUNT; i++) {
-        if (ra->greg[i] >= 0 && (ra->dirty & (1u << i))) {
+        if (ra->greg[i] >= 0 && (dirty & (1u << i))) {
             emit_store32_disp(e, RA_HOST[i], REG_CPU,
                               ar_offset(wb4, ra->greg[i]));
         }
     }
+}
+
+static void ra_flush(emit_t *e, regalloc_t *ra, int wb4) {
+    ra_flush_mask(e, ra, wb4, ra->dirty);
     /* NOTE: do NOT clear ra->dirty here. Multiple block exits (both sides of a
      * branch) need to emit stores independently. Dirty bits reset at block start. */
 }
@@ -1018,24 +1055,6 @@ static int emit_pt_null_jz(emit_t *e) {
     emit_test_reg64(e, RAX, RAX);
     return emit_jcc_rel32(e, CC_E);
 }
-static void emit_call_slow2(emit_t *e, void *fn, int addr_reg) {
-    if (addr_reg != RCX) emit_mov_reg32_reg32(e, RCX, addr_reg); /* W1 = addr */
-    emit_mov_reg_reg(e, RAX, REG_MEM);                          /* X0 = mem  */
-    emit_mov_reg_imm64(e, ARM64_SCRATCH, (uint64_t)(uintptr_t)fn);
-    emit_call_reg(e, ARM64_SCRATCH);
-    emit_load32_disp(e, REG_CHAIN_LIMIT, REG_CPU,
-                     (int32_t)CPU_OFF_JIT_CHAIN_LIMIT);
-}
-static void emit_call_slow3(emit_t *e, void *fn, int addr_reg, int val_reg) {
-    emit_mov_reg32_reg32(e, ARM64_SCRATCH, val_reg);            /* W9 = val  */
-    if (addr_reg != RCX) emit_mov_reg32_reg32(e, RCX, addr_reg); /* W1 = addr */
-    emit_mov_reg32_reg32(e, RDX, ARM64_SCRATCH);                /* W2 = val  */
-    emit_mov_reg_reg(e, RAX, REG_MEM);                          /* X0 = mem  */
-    emit_mov_reg_imm64(e, ARM64_SCRATCH, (uint64_t)(uintptr_t)fn);
-    emit_call_reg(e, ARM64_SCRATCH);
-    emit_load32_disp(e, REG_CHAIN_LIMIT, REG_CPU,
-                     (int32_t)CPU_OFF_JIT_CHAIN_LIMIT);
-}
 /* Same shape, but arg0 is the CPU rather than the memory: helpers that need
  * other architectural state (S32C1I wants SCOMPARE1) take it from there
  * instead of being handed a fourth argument, which would need a second
@@ -1065,24 +1084,6 @@ static int emit_pt_null_jz(emit_t *e) {
     emit8(e, 0x85);
     emit8(e, modrm(3, RAX, RAX));
     return emit_jcc_rel32(e, CC_E);
-}
-static void emit_call_slow2(emit_t *e, void *fn, int addr_reg) {
-    /* Save caller-saved allocated regs around C call */
-    emit_push(e, R8); emit_push(e, R9); emit_push(e, R10); emit_push(e, R11);
-    emit_mov_reg_reg(e, RDI, REG_MEM);
-    emit_mov_reg32_reg32(e, RSI, addr_reg);
-    emit_mov_reg_imm64(e, RAX, (uint64_t)(uintptr_t)fn);
-    emit_call_reg(e, RAX);
-    emit_pop(e, R11); emit_pop(e, R10); emit_pop(e, R9); emit_pop(e, R8);
-}
-static void emit_call_slow3(emit_t *e, void *fn, int addr_reg, int val_reg) {
-    emit_push(e, R8); emit_push(e, R9); emit_push(e, R10); emit_push(e, R11);
-    emit_mov_reg_reg(e, RDI, REG_MEM);
-    emit_mov_reg32_reg32(e, RSI, addr_reg);
-    emit_mov_reg32_reg32(e, RDX, val_reg);
-    emit_mov_reg_imm64(e, RAX, (uint64_t)(uintptr_t)fn);
-    emit_call_reg(e, RAX);
-    emit_pop(e, R11); emit_pop(e, R10); emit_pop(e, R9); emit_pop(e, R8);
 }
 /* Same shape, but arg0 is the CPU rather than the memory: helpers that need
  * other architectural state (S32C1I wants SCOMPARE1) take it from there
@@ -1123,9 +1124,12 @@ typedef struct {
 #define JIT_HELPER_RESULT1 RDX
 #endif
 
+static void jit_publish_guest_time(xtensa_cpu_t *cpu);
+
 static jit_s32c1i_result_t jit_s32c1i_helper(xtensa_cpu_t *cpu,
                                               uint32_t addr,
                                               uint32_t val) {
+    jit_publish_guest_time(cpu);
     uint32_t old = mem_read32(cpu->mem, addr);
     bool handoff = false;
     if (old == cpu->scompare1)
@@ -1204,7 +1208,73 @@ static uint32_t jit_nsau_helper(xtensa_cpu_t *cpu, uint32_t value,
     return value ? (uint32_t)__builtin_clz(value) : 32u;
 }
 
-static void emit_mem_read32(emit_t *e, int addr_reg, int dst_reg) {
+/* Publish the portion of a native chain which precedes a slow memory access.
+ * RAM hits stay entirely native, but an MMIO callback can observe the shared
+ * guest clock and schedule device work from it.  Leaving cycle_count at the
+ * chain-entry value made the same device access occur hundreds of guest
+ * instructions early whenever blocks were linked together. */
+static void jit_publish_guest_time(xtensa_cpu_t *cpu) {
+    uint32_t prefix = cpu->jit_time_prefix;
+    uint32_t accounted = cpu->jit_time_accounted;
+    if (prefix <= accounted) return;
+    uint32_t delta = prefix - accounted;
+    cpu->ccount += delta;
+    cpu->cycle_count += delta;
+    cpu->jit_time_accounted = prefix;
+}
+
+static uint32_t jit_mem_read32_slow(xtensa_cpu_t *cpu, uint32_t addr,
+                                    uint32_t unused) {
+    (void)unused;
+    jit_publish_guest_time(cpu);
+    return mem_read32_slow(cpu->mem, addr);
+}
+
+static uint32_t jit_mem_read16_slow(xtensa_cpu_t *cpu, uint32_t addr,
+                                    uint32_t unused) {
+    (void)unused;
+    jit_publish_guest_time(cpu);
+    return mem_read16_slow(cpu->mem, addr);
+}
+
+static uint32_t jit_mem_read8_slow(xtensa_cpu_t *cpu, uint32_t addr,
+                                   uint32_t unused) {
+    (void)unused;
+    jit_publish_guest_time(cpu);
+    return mem_read8_slow(cpu->mem, addr);
+}
+
+#define JIT_WRITE_WRAPPER(name, target)                                      \
+    static uint32_t name(xtensa_cpu_t *cpu, uint32_t addr, uint32_t value) { \
+        jit_publish_guest_time(cpu);                                         \
+        target(cpu->mem, addr, value);                                       \
+        return 0u;                                                           \
+    }
+
+JIT_WRITE_WRAPPER(jit_mem_write32_slow, mem_write32_slow)
+JIT_WRITE_WRAPPER(jit_mem_write16_slow, mem_write16_slow)
+JIT_WRITE_WRAPPER(jit_mem_write8_slow, mem_write8_slow)
+JIT_WRITE_WRAPPER(jit_mem_write32_journaled, mem_write32_journaled)
+JIT_WRITE_WRAPPER(jit_mem_write16_journaled, mem_write16_journaled)
+JIT_WRITE_WRAPPER(jit_mem_write8_journaled, mem_write8_journaled)
+
+#undef JIT_WRITE_WRAPPER
+
+/* Store the absolute number of guest instructions preceding the current
+ * instruction.  REG_ACC spans chained blocks and native loop iterations;
+ * insn_idx covers the prefix inside this block. */
+static void emit_jit_time_prefix(emit_t *e, int insn_idx) {
+#ifdef JIT_ARCH_ARM64
+    emit_mov_reg32_reg32(e, RAX, REG_ACC);
+#else
+    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_JIT_ACC);
+#endif
+    emit_add_reg32_imm32(e, RAX, insn_idx);
+    emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_JIT_TIME_PREFIX);
+}
+
+static void emit_mem_read32(emit_t *e, int addr_reg, int dst_reg,
+                            int insn_idx) {
     /* ecx = addr >> 12 */
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
@@ -1232,7 +1302,9 @@ static void emit_mem_read32(emit_t *e, int addr_reg, int dst_reg) {
 
     /* Slow path: call mem_read32_slow(mem, addr) */
     emit_patch_rel32(e, slow_patch);
-    emit_call_slow2(e, (void *)(uintptr_t)mem_read32_slow, addr_reg);
+    emit_jit_time_prefix(e, insn_idx);
+    emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_read32_slow,
+                   addr_reg, RBX);
     /* Result is in W0/eax, move to dst if needed */
     if (dst_reg != RAX) {
         emit_mov_reg32_reg32(e, dst_reg, RAX);
@@ -1247,12 +1319,14 @@ static void emit_mem_read32(emit_t *e, int addr_reg, int dst_reg) {
  * Uses RAX, RCX, RDX as scratch. addr_reg and val_reg must not be RAX/RCX/RDX.
  */
 static void emit_mem_write32(emit_t *e, int addr_reg, int val_reg,
-                             jit_state_t *jit) {
+                             jit_state_t *jit, int insn_idx) {
     /* Verification needs the journal to see this store, and the inline
      * page-table path bypasses it. Give up the fast path for the
      * duration -- a verification run has already given up speed. */
     if (jit && jit->verify) {
-        emit_call_slow3(e, (void *)(uintptr_t)mem_write32_journaled, addr_reg, val_reg);
+        emit_jit_time_prefix(e, insn_idx);
+        emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_write32_journaled,
+                       addr_reg, val_reg);
         return;
     }
     /* ecx = addr >> 12 */
@@ -1282,13 +1356,16 @@ static void emit_mem_write32(emit_t *e, int addr_reg, int val_reg,
 
     /* Slow path: call mem_write32_slow(mem, addr, val) */
     emit_patch_rel32(e, slow_patch);
-    emit_call_slow3(e, (void *)(uintptr_t)mem_write32_slow, addr_reg, val_reg);
+    emit_jit_time_prefix(e, insn_idx);
+    emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_write32_slow,
+                   addr_reg, val_reg);
 
     emit_patch_rel32(e, done_patch);
 }
 
 /* Emit memory read8u inlined fast path */
-static void emit_mem_read8u(emit_t *e, int addr_reg, int dst_reg) {
+static void emit_mem_read8u(emit_t *e, int addr_reg, int dst_reg,
+                            int insn_idx) {
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
     emit_pt_load(e, RCX);
@@ -1306,13 +1383,16 @@ static void emit_mem_read8u(emit_t *e, int addr_reg, int dst_reg) {
 #endif
     int done_patch = emit_jmp_rel32(e);
     emit_patch_rel32(e, slow_patch);
-    emit_call_slow2(e, (void *)(uintptr_t)mem_read8_slow, addr_reg);
+    emit_jit_time_prefix(e, insn_idx);
+    emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_read8_slow,
+                   addr_reg, RBX);
     if (dst_reg != RAX) emit_mov_reg32_reg32(e, dst_reg, RAX);
     emit_patch_rel32(e, done_patch);
 }
 
 /* Emit memory read16u inlined fast path */
-static void emit_mem_read16u(emit_t *e, int addr_reg, int dst_reg) {
+static void emit_mem_read16u(emit_t *e, int addr_reg, int dst_reg,
+                             int insn_idx) {
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
     emit_pt_load(e, RCX);
@@ -1330,13 +1410,16 @@ static void emit_mem_read16u(emit_t *e, int addr_reg, int dst_reg) {
 #endif
     int done_patch = emit_jmp_rel32(e);
     emit_patch_rel32(e, slow_patch);
-    emit_call_slow2(e, (void *)(uintptr_t)mem_read16_slow, addr_reg);
+    emit_jit_time_prefix(e, insn_idx);
+    emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_read16_slow,
+                   addr_reg, RBX);
     if (dst_reg != RAX) emit_mov_reg32_reg32(e, dst_reg, RAX);
     emit_patch_rel32(e, done_patch);
 }
 
 /* Emit memory read16s (signed) */
-static void emit_mem_read16s(emit_t *e, int addr_reg, int dst_reg) {
+static void emit_mem_read16s(emit_t *e, int addr_reg, int dst_reg,
+                             int insn_idx) {
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
     emit_pt_load(e, RCX);
@@ -1354,7 +1437,9 @@ static void emit_mem_read16s(emit_t *e, int addr_reg, int dst_reg) {
 #endif
     int done_patch = emit_jmp_rel32(e);
     emit_patch_rel32(e, slow_patch);
-    emit_call_slow2(e, (void *)(uintptr_t)mem_read16_slow, addr_reg);
+    emit_jit_time_prefix(e, insn_idx);
+    emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_read16_slow,
+                   addr_reg, RBX);
     /* Sign extend from 16 bits */
     emit_movsx_reg32_reg16(e, dst_reg != RAX ? dst_reg : RAX, RAX);
     emit_patch_rel32(e, done_patch);
@@ -1362,12 +1447,14 @@ static void emit_mem_read16s(emit_t *e, int addr_reg, int dst_reg) {
 
 /* Emit memory write8 */
 static void emit_mem_write8(emit_t *e, int addr_reg, int val_reg,
-                             jit_state_t *jit) {
+                            jit_state_t *jit, int insn_idx) {
     /* Verification needs the journal to see this store, and the inline
      * page-table path bypasses it. Give up the fast path for the
      * duration -- a verification run has already given up speed. */
     if (jit && jit->verify) {
-        emit_call_slow3(e, (void *)(uintptr_t)mem_write8_journaled, addr_reg, val_reg);
+        emit_jit_time_prefix(e, insn_idx);
+        emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_write8_journaled,
+                       addr_reg, val_reg);
         return;
     }
     emit_mov_reg32_reg32(e, RCX, addr_reg);
@@ -1390,18 +1477,22 @@ static void emit_mem_write8(emit_t *e, int addr_reg, int val_reg,
 #endif
     int done_patch = emit_jmp_rel32(e);
     emit_patch_rel32(e, slow_patch);
-    emit_call_slow3(e, (void *)(uintptr_t)mem_write8_slow, addr_reg, val_reg);
+    emit_jit_time_prefix(e, insn_idx);
+    emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_write8_slow,
+                   addr_reg, val_reg);
     emit_patch_rel32(e, done_patch);
 }
 
 /* Emit memory write16 */
 static void emit_mem_write16(emit_t *e, int addr_reg, int val_reg,
-                             jit_state_t *jit) {
+                             jit_state_t *jit, int insn_idx) {
     /* Verification needs the journal to see this store, and the inline
      * page-table path bypasses it. Give up the fast path for the
      * duration -- a verification run has already given up speed. */
     if (jit && jit->verify) {
-        emit_call_slow3(e, (void *)(uintptr_t)mem_write16_journaled, addr_reg, val_reg);
+        emit_jit_time_prefix(e, insn_idx);
+        emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_write16_journaled,
+                       addr_reg, val_reg);
         return;
     }
     emit_mov_reg32_reg32(e, RCX, addr_reg);
@@ -1422,7 +1513,9 @@ static void emit_mem_write16(emit_t *e, int addr_reg, int val_reg,
 #endif
     int done_patch = emit_jmp_rel32(e);
     emit_patch_rel32(e, slow_patch);
-    emit_call_slow3(e, (void *)(uintptr_t)mem_write16_slow, addr_reg, val_reg);
+    emit_jit_time_prefix(e, insn_idx);
+    emit_call_cpu3(e, (void *)(uintptr_t)jit_mem_write16_slow,
+                   addr_reg, val_reg);
     emit_patch_rel32(e, done_patch);
 }
 
@@ -1432,7 +1525,8 @@ static void emit_mem_write16(emit_t *e, int addr_reg, int val_reg,
 /* Forward declarations for helpers used in instruction compilation */
 static void emit_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
                                uint32_t exit_pc, int insn_count,
-                               jit_state_t *jit, bool loop_end_exit);
+                               jit_state_t *jit, bool loop_end_exit,
+                               bool accelerator_fallthrough);
 static void emit_jmp_to_epilogue(emit_t *e, jit_state_t *jit);
 static void emit_dynamic_chain_or_epilogue(emit_t *e, jit_state_t *jit);
 static void emit_dynamic_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
@@ -1488,6 +1582,32 @@ typedef struct {
     uint32_t target_wb;   /* windowbase for the chain slot */
 } side_exit_t;
 
+/* A memory helper or special-register write can request interrupt polling in
+ * the middle of an otherwise straight-line native block.  The interpreter
+ * polls immediately after the instruction that caused the request, so the
+ * JIT records the architectural prefix here and returns to the dispatcher at
+ * that same boundary.  The dirty mask is the prefix mask, not the final block
+ * mask: registers first written by a later instruction must not be published
+ * on an earlier exit. */
+typedef struct {
+    int      patch_site;
+    uint32_t next_pc;
+    int      insn_count;
+    uint8_t  dirty;
+} irq_exit_t;
+
+static void jit_add_irq_checkpoint(emit_t *e, const regalloc_t *ra,
+                                   uint32_t next_pc, int insn_count,
+                                   irq_exit_t *ix, int *ix_count) {
+    emit_load8u_disp(e, RAX, REG_CPU, (int32_t)CPU_OFF_IRQ_CHECK);
+    emit_test_reg32(e, RAX, RAX);
+    ix[*ix_count].patch_site = emit_jcc_rel32(e, CC_NE);
+    ix[*ix_count].next_pc = next_pc;
+    ix[*ix_count].insn_count = insn_count;
+    ix[*ix_count].dirty = ra->dirty;
+    (*ix_count)++;
+}
+
 /* Record a conditional branch's taken path as a deferred side exit.
  * Emits: flush dirty regs (ar[] correct at branch point), then the
  * conditional jump to the not-yet-emitted stub. Fall-through continues. */
@@ -1521,14 +1641,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         switch (op0) {
         case 0x8: { /* L32I.N: at = mem32[as + r*4] */
             int areg = ra_addr_reg(e, ra, wb4, s, r << 2);
-            emit_mem_read32(e, areg, RBX);
+            emit_mem_read32(e, areg, RBX, insn_idx);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x9: { /* S32I.N: mem32[as + r*4] = at */
             int areg = ra_addr_reg(e, ra, wb4, s, r << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, areg, RBP, jit);
+            emit_mem_write32(e, areg, RBP, jit, insn_idx);
             return 1;
         }
         case 0xA: { /* ADD.N: ar = as + at */
@@ -1590,7 +1710,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
                     /* Set _pc_written = true */
                     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
-                    emit_block_exit_ra(e, ra, wb4, 0 /* will use cpu->pc */, insn_idx + 1, jit, false);
+                    emit_block_exit_ra(e, ra, wb4, 0 /* will use cpu->pc */,
+                                       insn_idx + 1, jit, false, false);
                     return 1;
                 }
                 if (t == 1) {
@@ -1744,7 +1865,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     ra_load_ar(e, ra,RAX, wb4, 0);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
                     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
-                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit, false);
+                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit,
+                                       false, false);
                     return 1;
                 }
                 /* RETW: window return (r==0, m==2, nn==1) */
@@ -1756,7 +1878,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     ra_load_ar(e, ra, RAX, wb4, s);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PC);
                     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
-                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit, false);
+                    emit_block_exit_ra(e, ra, wb4, 0, insn_idx + 1, jit,
+                                       false, false);
                     return 1;
                 }
                 /* CALLX0/4/8/12: pc = as, plus the return-address and window
@@ -2279,6 +2402,9 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_JIT_ACC);
                     emit_add_reg32(e, RAX, RBX);
 #endif
+                    emit_load_cpu32(e, RBX,
+                                    (int32_t)CPU_OFF_JIT_TIME_ACCOUNTED);
+                    emit_sub_reg32(e, RAX, RBX);
                     emit_add_reg32_imm32(e, RAX, insn_idx);
                 }
                 ra_store_ar(e, ra,RAX, wb4, t);
@@ -2320,7 +2446,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_store_cpu32(e, RAX,
                                      (int32_t)CPU_OFF_WINDOWSTART);
                     emit_block_exit_ra(e, ra, wb4, next_pc, insn_idx + 1,
-                                       jit, false);
+                                       jit, false, true);
                     return 1;
                 }
                 if (sr_num == XT_SR_PS) {
@@ -2548,13 +2674,13 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         case 9: { /* LSC4: L32E/S32E window spill/fill stack transfers */
             int areg = ra_addr_reg(e, ra, wb4, s, (r << 2) - 64);
             if (op2 == 0) {
-                emit_mem_read32(e, areg, RBX);
+                emit_mem_read32(e, areg, RBX, insn_idx);
                 ra_store_ar(e, ra, RBX, wb4, t);
                 return 1;
             }
             if (op2 == 4) {
                 ra_load_ar(e, ra, RBP, wb4, t);
-                emit_mem_write32(e, areg, RBP, jit);
+                emit_mem_write32(e, areg, RBP, jit, insn_idx);
                 return 1;
             }
             return 0;
@@ -2567,12 +2693,14 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
     case 1: { /* L32R: at = mem32[pc_aligned + sext(imm16 << 2)] */
         uint16_t imm16 = (uint16_t)XT_IMM16(insn);
         uint32_t target = (next_pc & ~3u) + (0xFFFC0000u | ((uint32_t)imm16 << 2));
-        /* Constant-fold literal pools in ROM or the instruction-flash buses.
-         * Flash-MMU and SPI writes flush translated code before these bytes
-         * can change. Internal IRAM and DROM stay as runtime loads. */
-        if ((target >= ESP32_INSN_ADDR_LOW && target < 0x40070000u) ||
-            (target >= ESP32_FLASH_INSN_ADDR_LOW &&
-             target < ESP32_INSN_ADDR_HIGH)) {
+        /* Constant-fold literal pools backed by immutable ROM or executable
+         * flash according to the active target. Flash-MMU and SPI writes
+         * flush translated code before these bytes can change. Internal RAM
+         * and data buses stay as runtime loads. */
+        if (flexe_target_range_uses_backing(cpu->target, target, 4u,
+                                            FLEXE_MEM_ROM) ||
+            flexe_target_range_uses_backing(cpu->target, target, 4u,
+                                            FLEXE_MEM_FLASH_INSN)) {
             uint32_t val = mem_read32(cpu->mem, target);
             emit_mov_reg_imm32(e, RBX, val);
             ra_store_ar(e, ra,RBX, wb4, t);
@@ -2580,7 +2708,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         }
         /* Load the literal value from guest memory */
         emit_mov_reg_imm32(e, RSI, target);
-        emit_mem_read32(e, RSI, RBX);
+        emit_mem_read32(e, RSI, RBX, insn_idx);
         ra_store_ar(e, ra,RBX, wb4, t);
         return 1;
     }
@@ -2589,45 +2717,45 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         switch (r) {
         case 0x0: { /* L8UI */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8);
-            emit_mem_read8u(e, areg, RBX);
+            emit_mem_read8u(e, areg, RBX, insn_idx);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x1: { /* L16UI */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 1);
-            emit_mem_read16u(e, areg, RBX);
+            emit_mem_read16u(e, areg, RBX, insn_idx);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x2: { /* L32I */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
-            emit_mem_read32(e, areg, RBX);
+            emit_mem_read32(e, areg, RBX, insn_idx);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
         case 0x4: { /* S8I */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write8(e, areg, RBP, jit);
+            emit_mem_write8(e, areg, RBP, jit, insn_idx);
             return 1;
         }
         case 0x5: { /* S16I */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 1);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write16(e, areg, RBP, jit);
+            emit_mem_write16(e, areg, RBP, jit, insn_idx);
             return 1;
         }
         case 0x6: { /* S32I */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, areg, RBP, jit);
+            emit_mem_write32(e, areg, RBP, jit, insn_idx);
             return 1;
         }
         case 0x7: /* Cache ops — no-op */
             return 1;
         case 0x9: { /* L16SI */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 1);
-            emit_mem_read16s(e, areg, RBX);
+            emit_mem_read16s(e, areg, RBX, insn_idx);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
@@ -2639,7 +2767,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         }
         case 0xB: { /* L32AI (acquire = no-op, same as L32I) */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
-            emit_mem_read32(e, areg, RBX);
+            emit_mem_read32(e, areg, RBX, insn_idx);
             ra_store_ar(e, ra,RBX, wb4, t);
             return 1;
         }
@@ -2665,6 +2793,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     * the store happened. */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
             ra_load_ar(e, ra, RBX, wb4, t);
+            emit_jit_time_prefix(e, insn_idx);
             emit_call_cpu3(e, (void *)(uintptr_t)jit_s32c1i_helper, areg, RBX);
             ra_store_ar(e, ra, RAX, wb4, t);
 
@@ -2687,7 +2816,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         case 0xF: { /* S32RI (release = no-op, same as S32I) */
             int areg = ra_addr_reg(e, ra, wb4, s, imm8 << 2);
             ra_load_ar(e, ra,RBP, wb4, t);
-            emit_mem_write32(e, areg, RBP, jit);
+            emit_mem_write32(e, areg, RBP, jit, insn_idx);
             return 1;
         }
         default: return 0;
@@ -2726,7 +2855,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
         emit_store32_disp_imm(e, REG_CPU, ret_ar_off, ret_addr);
 
         /* Block exit to callee. */
-        emit_block_exit_ra(e, ra, wb4, call_target, insn_idx + 1, jit, false);
+        emit_block_exit_ra(e, ra, wb4, call_target, insn_idx + 1, jit,
+                           false, false);
         return 1;
     }
 
@@ -2738,7 +2868,8 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
             /* J: unconditional jump */
             int32_t offset = sign_extend(XT_OFFSET18(insn), 18);
             uint32_t target = next_pc + (uint32_t)offset + 1; /* +1 per ISA */
-            emit_block_exit_ra(e, ra, wb4, target, insn_idx + 1, jit, false);
+            emit_block_exit_ra(e, ra, wb4, target, insn_idx + 1, jit,
+                               false, false);
             return 1;
         }
 
@@ -2925,9 +3056,11 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_NE);
 
                 emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_VECBASE);
-                emit_cmp_reg32_imm32(e, RAX, 0x40070000u);
+                emit_cmp_reg32_imm32(e, RAX,
+                                     (int32_t)cpu->target->iram_start);
                 overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_B);
-                emit_cmp_reg32_imm32(e, RAX, 0x40400000u);
+                emit_cmp_reg32_imm32(e, RAX,
+                                     (int32_t)cpu->target->iram_end);
                 overflow_fb[overflow_fb_count++] = emit_jcc_rel32(e, CC_AE);
                 emit_mov_reg32_reg32(e, RCX, RAX);
                 emit_shr_reg32_imm(e, RCX, 12);
@@ -2995,43 +3128,21 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                 emit_or_reg32(e, RAX, RCX);
                 emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
 
-                /* Exit to pc+3 (ENTRY is always 3 bytes) — no dirty flush needed (done above). */
+                /* ENTRY changes the register-window context on an ordinary
+                 * fallthrough. End the native run at that architectural
+                 * boundary so xtensa_step_impl() can refresh its derived
+                 * window state, then use the private fallthrough marker to
+                 * select a block under the new WINDOWBASE without notifying
+                 * firmware observers. Directly chaining across ENTRY made
+                 * the JIT's result depend on whether its callee body happened
+                 * to be compiled already. */
                 emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, pc + 3);
-                emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+                emit_store32_disp_imm(e, REG_CPU,
+                                      (int32_t)CPU_OFF_PC_WRITTEN, 0);
+                emit_store32_disp_imm(e, REG_CPU,
+                                      (int32_t)CPU_OFF_JIT_FALLTHROUGH, 1);
                 emit_acc_add(e, insn_idx + 1);
-
-                /* ENTRY's target PC is static even though its destination
-                 * window is not.  Returning to the C dispatcher here made
-                 * every windowed function pay a second lookup immediately
-                 * after its CALL: once for the ENTRY block and once for the
-                 * callee body.  There are only four possible CALLINC values,
-                 * so select one of four ordinary chain sites using the
-                 * new window we already computed in RDX.  An unavailable
-                 * target still jumps to the epilogue exactly as before and
-                 * is patched when that (PC, WB) block later compiles.
-                 *
-                 * Keep the selection after publishing PC, WINDOWBASE and
-                 * WINDOWSTART.  A chained target enters past its prologue
-                 * but still runs its window-collision and chain-cap guards,
-                 * all of which consume that architectural state. */
-                int entry_wb_path[3];
-                uint32_t old_wb = (uint32_t)wb4 >> 2;
-                for (uint32_t ci = 0; ci < 3; ci++) {
-                    emit_cmp_reg32_imm32(e, RDX,
-                                         (int32_t)((old_wb + ci) & 15u));
-                    entry_wb_path[ci] = emit_jcc_rel32(e, CC_E);
-                }
-                uint8_t *entry_chain_site = e->ptr;
                 emit_jmp_to_epilogue(e, jit);
-                jit_chain_record(jit, pc + 3, (old_wb + 3u) & 15u,
-                                 entry_chain_site);
-                for (uint32_t ci = 0; ci < 3; ci++) {
-                    emit_patch_rel32(e, entry_wb_path[ci]);
-                    entry_chain_site = e->ptr;
-                    emit_jmp_to_epilogue(e, jit);
-                    jit_chain_record(jit, pc + 3, (old_wb + ci) & 15u,
-                                     entry_chain_site);
-                }
 
                 /* A real ENTRY collision is an architectural control-flow
                  * transition, so enter the guest's vector without decoding
@@ -3300,6 +3411,8 @@ static void emit_dynamic_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
     ra_flush(e, ra, wb4);
     emit_store_cpu32(e, pc_reg, (int32_t)CPU_OFF_PC);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+    emit_store32_disp_imm(e, REG_CPU,
+                          (int32_t)CPU_OFF_JIT_FALLTHROUGH, 0);
     emit_acc_add(e, insn_count);
 
     if (allow_chain && jit->cur_lv == 0u && !jit->no_chain) {
@@ -3320,6 +3433,8 @@ static void emit_side_exit_body(emit_t *e, regalloc_t *ra, int wb4,
     if (ra->defer_flush) ra_flush(e, ra, wb4);
     emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, sx->target_pc);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+    emit_store32_disp_imm(e, REG_CPU,
+                          (int32_t)CPU_OFF_JIT_FALLTHROUGH, 0);
     emit_acc_add(e, sx->insn_count);
 
     uint8_t *chain_site = e->ptr;
@@ -3436,6 +3551,8 @@ static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
     ra_flush(e, ra, wb4);
     emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, lend);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+    emit_store32_disp_imm(e, REG_CPU,
+                          (int32_t)CPU_OFF_JIT_FALLTHROUGH, 0);
     emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_LOOP_EXIT, 1);
     emit_acc_add(e, insn_count);
     emit_jmp_to_epilogue(e, jit);
@@ -3443,13 +3560,18 @@ static void emit_loop_backedge_exit(emit_t *e, regalloc_t *ra, int wb4,
 
 static void emit_block_exit_ra(emit_t *e, regalloc_t *ra, int wb4,
                                uint32_t exit_pc, int insn_count,
-                               jit_state_t *jit, bool loop_end_exit) {
+                               jit_state_t *jit, bool loop_end_exit,
+                               bool accelerator_fallthrough) {
     /* Flush dirty regs to memory */
     ra_flush(e, ra, wb4);
 
     if (exit_pc != 0) {
         emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, exit_pc);
-        emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN, 1);
+        emit_store32_disp_imm(e, REG_CPU, (int32_t)CPU_OFF_PC_WRITTEN,
+                              accelerator_fallthrough ? 0u : 1u);
+        emit_store32_disp_imm(e, REG_CPU,
+                              (int32_t)CPU_OFF_JIT_FALLTHROUGH,
+                              accelerator_fallthrough ? 1u : 0u);
         /* Flag a fall-through onto LEND so jit_pc_hook can tell a genuine
          * back-edge from a side exit that merely branches there. This must
          * not ride on _pc_written: clearing that would also close the hook
@@ -3506,14 +3628,13 @@ static void jit_chain_new_block(jit_state_t *jit, uint32_t pc, uint32_t wb,
      * LEND. */
     if (lv != 0u) return;
     uint32_t idx = jit_pend_key(pc, wb);
-    uint32_t tag = jit_make_tag(pc, wb, 0u);
     chain_pending_t *p = &jit->pend[idx];
-    if (p->tag != tag) return;
+    if (p->n == 0u || p->pc != pc || p->windowbase != (uint8_t)wb)
+        return;
     for (uint32_t i = 0; i < p->n; i++) {
         jit_patch_chain_site(p->site[i], entry_ptr);
         jit->stats.chains_patched++;
     }
-    p->tag = 0;
     p->n = 0;
 }
 
@@ -3554,9 +3675,13 @@ static void jit_chain_record(jit_state_t *jit, uint32_t target_pc,
     }
 
     uint32_t idx = jit_pend_key(target_pc, target_wb);
-    uint32_t tag = jit_make_tag(target_pc, target_wb, 0u);
     chain_pending_t *p = &jit->pend[idx];
-    if (p->tag != tag) { p->tag = tag; p->n = 0; }
+    if (p->n == 0u || p->pc != target_pc ||
+        p->windowbase != (uint8_t)target_wb) {
+        p->pc = target_pc;
+        p->windowbase = (uint8_t)target_wb;
+        p->n = 0;
+    }
     if (p->n < CHAIN_PENDING_MAX)
         p->site[p->n++] = jmp_site;
     /* else: full — chain opportunity dropped, exit still works via epilogue */
@@ -3620,6 +3745,8 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     /* C entry: zero the guest-insn accumulator. Chained blocks arrive
      * with REG_ACC already accumulated from predecessor blocks. */
     emit_acc_zero(&e);
+    emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_JIT_TIME_PREFIX, 0u);
+    emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_JIT_TIME_ACCOUNTED, 0u);
 #ifdef JIT_ARCH_ARM64
     emit_load32_disp(&e, REG_CHAIN_LIMIT, REG_CPU,
                      (int32_t)CPU_OFF_JIT_CHAIN_LIMIT);
@@ -3750,7 +3877,7 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
      * interrupt or timer-schedule changes lower the limit to zero. This keeps
      * the boundary architectural without rebuilding ccount/IRQ state in every
      * hot block. */
-    int cap_ok = emit_acc_cap_jcc(&e);
+    int cap_ok = emit_acc_cap_jcc(&e, (unsigned)scan->count);
     /* The self-loop form has to write its registers back before leaving, and
      * which ones are dirty is only known once the body is emitted, so its
      * exit is deferred to a stub after the body. */
@@ -3763,6 +3890,12 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     side_exit_t sx[JIT_MAX_BLOCK_INSNS];
     int sx_count = 0;
 
+    /* Deferred interrupt-poll exits.  They are kept out of the hot body so
+     * the common path pays only a byte load, test and predicted-not-taken
+     * branch. */
+    irq_exit_t ix[JIT_MAX_BLOCK_INSNS];
+    int ix_count = 0;
+
     /* Compile each instruction */
     int last_compiled = 0;
     for (int i = 0; i < scan->count; i++) {
@@ -3773,11 +3906,24 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         if (!ok) {
             if (i == 0) { jit_wx_write_end(code_start, 0); return NULL; }
             /* End block before this instruction */
-            emit_block_exit_ra(&e, &ra, wb4, scan->pcs[i], i, jit, false);
+            emit_block_exit_ra(&e, &ra, wb4, scan->pcs[i], i, jit,
+                               false, true);
             last_compiled = i;
             break;
         }
         last_compiled = i + 1;
+
+        /* A native block may only continue past an instruction while no
+         * interrupt-state change is waiting to be observed. Terminators
+         * emit their exit inline and cannot reach a checkpoint here. Every
+         * other instruction needs one, including the final fallthrough: that
+         * exit may be patched directly to a compiled successor, so treating
+         * it as an implicit dispatcher boundary can defer an IRQ across an
+         * entire native chain. */
+        int cls = classify_for_jit(scan->insns[i], scan->ilens[i]);
+        if (cls != 1)
+            jit_add_irq_checkpoint(&e, &ra, next_pc, i + 1,
+                                   ix, &ix_count);
     }
 
     /* If last instruction wasn't a terminator, add fallthrough exit.
@@ -3785,13 +3931,13 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     if (last_compiled == scan->count) {
         int last_cls = classify_for_jit(scan->insns[scan->count - 1], scan->ilens[scan->count - 1]);
         if (last_cls == 0 || last_cls == 3) {
-            if (jit_block_self_loops(cpu, scan, pc))
+            if (self_loop)
                 emit_loop_backedge_exit(&e, &ra, wb4, cpu->lbeg, cpu->lend,
                                         scan->count, jit, loop_entry,
                                         recheck_sr);
             else
                 emit_block_exit_ra(&e, &ra, wb4, scan->end_pc, scan->count,
-                                   jit, scan->ends_at_lend);
+                                   jit, scan->ends_at_lend, true);
         }
     }
 
@@ -3834,6 +3980,22 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
         } else {
             emit_side_exit_body(&e, &ra, wb4, &sx[k], jit);
         }
+    }
+
+    /* Return at the precise instruction boundary where irq_check became
+     * observable.  Ordinary blocks flush only values written by that prefix.
+     * A native self-loop must flush the complete final dirty set: on its
+     * second and later iterations, values written later in the previous
+     * iteration remain resident in the preloaded host registers. */
+    for (int k = 0; k < ix_count; k++) {
+        emit_patch_rel32(&e, ix[k].patch_site);
+        uint8_t dirty = ra.defer_flush ? ra.dirty : ix[k].dirty;
+        ra_flush_mask(&e, &ra, wb4, dirty);
+        emit_store_cpu32_imm(&e, (int32_t)CPU_OFF_PC, ix[k].next_pc);
+        emit_store32_disp_imm(&e, REG_CPU,
+                              (int32_t)CPU_OFF_PC_WRITTEN, 1);
+        emit_acc_add(&e, ix[k].insn_count);
+        emit_jmp_to_epilogue(&e, jit);
     }
 
     /* Keep the uncommon register-window transition out of the hot block
@@ -4139,11 +4301,10 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
     mem_journal_begin();
     /* A stub emulates a whole guest function in a single dispatch, so it
      * costs one instruction of the reference run's budget while standing in
-     * for many; native code cannot enter ROM at all, since jit_pc_hook sends
-     * everything below 0x40070000 straight to the stub. Either way a run that
-     * passes through a stub covers different ground than a replay of the same
-     * instruction count, so the two are no longer comparable. Skip rather
-     * than report a mismatch that is an artefact of how stubs are counted. */
+     * for many. Exact service-hook addresses cannot occur inside a translated
+     * block, but either side of a verified replay may reach one after the
+     * block exits. Such runs cover different ground for the same instruction
+     * budget, so skip rather than report a mismatch caused by stub counting. */
     uint64_t stubs_before = jit->verify_stub_hits;
     uint64_t irqs_before = g_xtensa_irq_dispatched;
     jit->verify_active = true;
@@ -4172,6 +4333,7 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
         mem_journal_end();
         cpu->ccount = before.ccount;
         cpu->cycle_count = before.cycle_count;
+        cpu->insn_count = before.insn_count;
         return n_jit;
     }
 
@@ -4222,6 +4384,7 @@ static int jit_run_block_verified(jit_state_t *jit, xtensa_cpu_t *cpu,
      * step that dispatched here. */
     cpu->ccount = before.ccount;
     cpu->cycle_count = before.cycle_count;
+    cpu->insn_count = before.insn_count;
     return n_jit;
 }
 
@@ -4279,9 +4442,26 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
         return 0;
     }
 
-    /* Skip JIT lookup for ROM range (0x40000000-0x4006FFFF) — always stubs.
-     * This avoids a hash table access for the ~35M stub calls per 100M cycles. */
-    if (__builtin_expect(pc < 0x40070000u, 0)) {
+    /* Exact service addresses can never contain translated guest code. Skip
+     * JIT metadata entirely for them: this preserves ordinary ROM translation
+     * without making high-frequency ROM calls pay a hash lookup. A bitmap bit
+     * is deliberately insufficient here because it aliases unrelated PCs. */
+    bool original_hook_maybe = true;
+    if (jit->orig_bitmap) {
+        uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
+        original_hook_maybe =
+            ((jit->orig_bitmap[idx / 64] >> (idx & 63)) & 1u) != 0u;
+    }
+    if (original_hook_maybe && cpu->pc_hook_contains &&
+        cpu->pc_hook_contains(pc, cpu->pc_hook_contains_ctx)) {
+        if (jit->original_hook && !accelerator_fallthrough)
+            return jit->original_hook(cpu, pc, jit->original_hook_ctx);
+        return 0;
+    }
+
+    /* Addresses outside the target's translation profile remain on the
+     * original hook/interpreter path without paying for a hash probe. */
+    if (__builtin_expect(!jit_pc_is_candidate(cpu, pc), 0)) {
         if (jit->original_hook && !accelerator_fallthrough)
             return jit->original_hook(cpu, pc, jit->original_hook_ctx);
         return 0;
@@ -4291,19 +4471,18 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     uint32_t wb = cpu->windowbase;
     uint32_t lv = jit_loop_variant(cpu, pc);
     jit_block_t *set = jit_set_of(jit, pc, wb, lv);
-    uint32_t tag = jit_make_tag(pc, wb, lv);
     jit_block_t *b = set;
     jit_block_t *known = b;
     /* Way scan. A hit is overwhelmingly in way 0 because a compiled block is
      * only displaced within its set when every way holds compiled code, so the
      * common case is one compare. */
-    if (__builtin_expect(!(b->code && b->pc == tag), 0)) {
+    if (__builtin_expect(!(b->code &&
+                           jit_block_matches(b, pc, wb, lv)), 0)) {
         b = NULL;
         known = NULL;
         for (unsigned w = 0; w < JIT_WAYS; w++) {
             jit_block_t *candidate = &set[w];
-            if ((candidate->flags & JIT_BLK_VALID) &&
-                candidate->pc == tag) {
+            if (jit_block_matches(candidate, pc, wb, lv)) {
                 known = candidate;
                 if (candidate->code)
                     b = candidate;
@@ -4354,9 +4533,18 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
              * comparison, so skip it there. */
             if (!jit->verify) jit_apply_block_exit(cpu);
 
-            /* Advance ccount by block_insns - 1 (the interpreter adds 1) */
-            cpu->ccount += (uint32_t)(block_insns - 1);
-            cpu->cycle_count += (uint64_t)(block_insns - 1);
+            /* Slow MMIO paths publish the exact native prefix before calling
+             * a device model. Charge only the remainder here; the enclosing
+             * interpreter dispatch adds the final instruction below us. */
+            uint32_t accounted = cpu->jit_time_accounted;
+            cpu->jit_time_accounted = 0u;
+            cpu->jit_time_prefix = 0u;
+            uint32_t before_dispatch = (uint32_t)(block_insns - 1);
+            if (accounted > before_dispatch)
+                accounted = before_dispatch;
+            uint32_t remaining = before_dispatch - accounted;
+            cpu->ccount += remaining;
+            cpu->cycle_count += (uint64_t)remaining;
 
             jit->stats.blocks_executed++;
             jit->stats.insns_jitted += (uint64_t)block_insns;
@@ -4364,11 +4552,9 @@ static int jit_pc_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
             /* Grow the chain: hot-count the block's exit target. After a
              * few visits it compiles and this block's exit gets patched
              * to jump straight into it. Without this, compilation only
-             * triggers on jit_run's 1-per-1000 batch sampling and chains
-             * never form. */
+             * triggers on jit_run's batch sampling and chains never form. */
             uint32_t npc = cpu->pc;
-            if (__builtin_expect(npc >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
-                                 npc < ESP32_INSN_ADDR_HIGH, 1))
+            if (__builtin_expect(jit_pc_is_candidate(cpu, npc), 1))
                 jit_get_block(jit, cpu, npc);
 
             return block_insns; /* Handled; expose exact guest work */
@@ -4395,8 +4581,7 @@ static void jit_code_invalidate(void *ctx, uint32_t addr, size_t len) {
 /* Install JIT as a pc_hook, chaining with the existing hook */
 void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) {
     if (!jit || !cpu) return;
-    if (!cpu->target ||
-        cpu->target->core_generation != FLEXE_XTENSA_LX6) {
+    if (!jit_target_supported(cpu->target)) {
         fprintf(stderr,
                 "[jit] %s native translation is not validated; using the interpreter\n",
                 cpu->target ? cpu->target->display_name : "unknown-target");
@@ -4609,8 +4794,7 @@ static jit_block_fn jit_consider_block(jit_state_t *jit, xtensa_cpu_t *cpu,
 }
 
 jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
-    if (!jit || !cpu || !cpu->target ||
-        cpu->target->core_generation != FLEXE_XTENSA_LX6)
+    if (!jit || !cpu || !jit_pc_is_candidate(cpu, pc))
         return NULL;
     uint32_t wb = cpu->windowbase;
     uint32_t lv = jit_loop_variant(cpu, pc);
@@ -4628,48 +4812,30 @@ jit_block_fn jit_get_block(jit_state_t *jit, xtensa_cpu_t *cpu, uint32_t pc) {
  * and compilation work in mostly-cold production firmware. */
 __attribute__((hot))
 int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
-    /* LX7 shares much of the ISA, but native blocks must not be emitted until
-     * its differing opcodes and architectural state have differential tests.
-     * The interpreter is an intentional, useful fallback in the meantime. */
-    if (!jit || !cpu || !cpu->target ||
-        cpu->target->core_generation != FLEXE_XTENSA_LX6)
+    if (!jit || !cpu || !jit_target_supported(cpu->target))
         return xtensa_run(cpu, max_cycles);
 
-    int executed = 0;
     uint64_t jit_insns_before = jit->stats.insns_jitted;
 
-    while (__builtin_expect(cpu->running, 1) &&
-           __builtin_expect(!cpu->breakpoint_hit, 1) &&
-           __builtin_expect(!cpu->debug_break, 1) &&
-           executed < max_cycles) {
-        int remaining = max_cycles - executed;
+    /* Match xtensa_run(): even a core whose running flag is clear gets one
+     * dispatch so a hook at its current PC can complete a stop/start service
+     * transition.  Gating the wrapper on running skipped that dispatch only
+     * when JIT support was installed, changing dual-core scheduling even if
+     * no block had compiled. */
+    int executed = xtensa_run(cpu, max_cycles);
 
-        if (__builtin_expect(cpu->halted, 0)) {
-            /* xtensa_step_impl already advances halted time and checks the
-             * wake interrupt on every cycle. Running one dispatch per outer
-             * iteration turned WAITI-heavy firmware into thousands of tiny C
-             * calls per frontend batch, more than doubling NerdMiner's wall
-             * time. Let the tight runner consume the remaining batch; if an
-             * interrupt wakes the core it naturally resumes guest code. */
-            int ran = xtensa_run(cpu, remaining);
-            if (ran <= 0) break;
-            executed += ran;
-            continue;
-        }
-
-        int batch = remaining;
-        int ran = xtensa_run(cpu, batch);
-        if (ran > 0)
-            executed += ran;
-
-        /* Hot-counting: check if current PC is a JIT candidate.
-         * Triggers compilation for frequently-visited firmware PCs.
-         * Once compiled, the bitmap ensures the hook dispatches directly. */
-        uint32_t pc = cpu->pc;
-        if (__builtin_expect(pc >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
-                             pc < ESP32_INSN_ADDR_HIGH, 1)) {
-            jit_get_block(jit, cpu, pc);
-        }
+    /* Hot-counting: check if current PC is a JIT candidate.
+     * Triggers compilation for frequently-visited firmware PCs.
+     * Once compiled, the bitmap ensures the hook dispatches directly.
+     *
+     * Do not re-enter xtensa_run() here when it returns short. A short return
+     * is an execution-boundary decision made by the CPU core (for example a
+     * dual-core handoff), and the session scheduler must observe it before
+     * deciding which core runs next. */
+    uint32_t pc = cpu->pc;
+    if (__builtin_expect(jit_pc_is_candidate(cpu, pc), 1)) {
+        jit_get_block(jit, cpu, pc);
+    }
         /* Also offer the two most recent control-transfer targets.
          *
          * The batch-boundary PC alone is a poor candidate: it is wherever the
@@ -4688,13 +4854,12 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
          * The benefit is not from compiling *more* -- JIT coverage barely
          * moves -- but from compiling blocks that start where control flow
          * actually enters, which chain far better. */
-        for (unsigned k = 0; k < XT_BR_RING_SIZE; k++) {
-            uint32_t bt = cpu->br_ring[(cpu->br_ring_idx - 1u - k) &
-                                       (XT_BR_RING_SIZE - 1)];
-            if (bt >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
-                bt < ESP32_INSN_ADDR_HIGH && bt != pc)
-                jit_get_block(jit, cpu, bt);
-        }
+    for (unsigned k = 0; k < XT_BR_RING_SIZE; k++) {
+        uint32_t bt = cpu->br_ring[(cpu->br_ring_idx - 1u - k) &
+                                   (XT_BR_RING_SIZE - 1)];
+        if (bt != pc && jit_pc_is_candidate(cpu, bt))
+            jit_get_block(jit, cpu, bt);
+    }
         /* Inside an active zero-overhead loop, sample LBEG as well.  LOOP
          * itself is not compilable, so a block sampled at an arbitrary PC in
          * the body can only ever reach LEND — yielding short tail fragments
@@ -4703,23 +4868,10 @@ int jit_run(jit_state_t *jit, xtensa_cpu_t *cpu, int max_cycles) {
          * already branches back to when a block ends at LEND.  Compilers emit
          * LOOP for exactly the hot inner loops that matter most, so without
          * this the JIT stays near interpreter speed on loop-heavy code. */
-        if (__builtin_expect(cpu->lcount > 0, 0)) {
-            uint32_t lbeg = cpu->lbeg;
-            if (lbeg != pc && lbeg >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
-                lbeg < ESP32_INSN_ADDR_HIGH)
-                jit_get_block(jit, cpu, lbeg);
-        }
-
-        if (__builtin_expect(ran < batch, 0)) {
-            /* The other emulated core owns an ESP-IDF spinlock. Returning to
-             * the session scheduler is the only way it can run and release
-             * that lock; immediately entering xtensa_run() again would clear
-             * the hint and spend the rest of this batch spinning. */
-            if (cpu->core_handoff) break;
-            if (!cpu->running || cpu->halted || cpu->breakpoint_hit ||
-                cpu->debug_break) break;
-            if (ran <= 0) break;
-        }
+    if (__builtin_expect(cpu->lcount > 0, 0)) {
+        uint32_t lbeg = cpu->lbeg;
+        if (lbeg != pc && jit_pc_is_candidate(cpu, lbeg))
+            jit_get_block(jit, cpu, lbeg);
     }
 
     /* CCOUNT is hardware time, not an instruction-retirement counter: delay

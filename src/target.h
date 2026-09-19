@@ -53,7 +53,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 44u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 45u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -99,6 +99,16 @@ typedef enum {
     FLEXE_XTENSA_LX6 = 6,
     FLEXE_XTENSA_LX7 = 7,
 } flexe_xtensa_generation_t;
+
+/* Native translation is selected independently from the marketing core
+ * generation. A backend may implement the instruction subset shared by
+ * several Xtensa generations and leave every other opcode to the interpreter;
+ * targets opt into that exact contract instead of being admitted by a chip or
+ * firmware-name check. */
+typedef enum {
+    FLEXE_XTENSA_TRANSLATE_NONE = 0,
+    FLEXE_XTENSA_TRANSLATE_WINDOWED_COMMON,
+} flexe_xtensa_translation_profile_t;
 
 typedef enum {
     FLEXE_TARGET_UNAVAILABLE = 0,
@@ -968,6 +978,7 @@ typedef struct {
     const char                 *display_name;
     uint16_t                    image_chip_id;
     flexe_xtensa_generation_t   core_generation;
+    flexe_xtensa_translation_profile_t translation_profile;
     uint8_t                     core_count;
     flexe_target_support_t      support_level;
     uint64_t                    capabilities;

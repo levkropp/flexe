@@ -686,7 +686,10 @@ TEST(test_jit_rsil) {
     cpu.ps = 0x00040023; /* INTLEVEL=3 */
     /* RSIL a2, 5: op0=0, op1=0, op2=0, r=6, s=5, t=2 */
     put_insn3(&cpu, BASE, rrr(0, 0, 6, 5, 2));
-    test_block_differential(&cpu, 1, "rsil");
+    put_insn2(&cpu, BASE + 3u, narrow(0xD, 15, 0, 3));
+    /* RSIL requests an interrupt recheck.  A native block now returns at
+     * that exact boundary, then xtensa_run resumes at the following NOP. */
+    test_run_differential(&cpu, 2, "rsil");
     teardown(&cpu);
 }
 
@@ -696,6 +699,84 @@ TEST(test_jit_init_destroy) {
     const jit_stats_t *stats = jit_get_stats(jit);
     ASSERT_EQ(stats->blocks_compiled, 0);
     jit_destroy(jit);
+}
+
+TEST(test_jit_lx7_common_profile_matches_interpreter_in_iram) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const uint32_t pc = 0x40370000u;
+    xtensa_cpu_t cpu;
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem_create_for_target(s3);
+    ASSERT_TRUE(cpu.mem != NULL);
+    if (!cpu.mem) return;
+    cpu.pc = pc;
+
+    put_insn3(&cpu, pc + 0u, rri8(0xA, 0, 4, 19)); /* MOVI a4, 19 */
+    put_insn3(&cpu, pc + 3u, rri8(0xA, 0, 5, 23)); /* MOVI a5, 23 */
+    put_insn3(&cpu, pc + 6u, rrr(8, 0, 3, 4, 5));  /* ADD a3, a4, a5 */
+
+    test_block_differential(&cpu, 3, "lx7 common IRAM profile");
+    mem_destroy(cpu.mem);
+}
+
+TEST(test_jit_lx7_uses_target_flash_geometry_for_literals) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const uint32_t literal = 0x420000F0u;
+    const uint32_t pc = 0x42000100u;
+    xtensa_cpu_t cpu;
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem_create_for_target(s3);
+    ASSERT_TRUE(cpu.mem != NULL);
+    if (!cpu.mem) return;
+    cpu.pc = pc;
+
+    mem_write32(cpu.mem, literal, 0x10203040u);
+    put_insn3(&cpu, pc, encode_test_l32r(pc, literal, 2)); /* L32R a2 */
+    put_insn3(&cpu, pc + 3u, rri8(0xC, 2, 3, 5));         /* ADDI a3,a2,5 */
+
+    test_block_differential(&cpu, 2, "lx7 flash literal geometry");
+    mem_destroy(cpu.mem);
+}
+
+TEST(test_jit_lx7_accepts_unhooked_rom_and_firmware_ranges) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const uint32_t iram_pc = 0x40370000u;
+    xtensa_cpu_t cpu;
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem_create_for_target(s3);
+    ASSERT_TRUE(cpu.mem != NULL);
+    if (!cpu.mem) return;
+    cpu.pc = iram_pc;
+    put_insn2(&cpu, iram_pc, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, iram_pc + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, 0x40001000u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, 0x40001002u, narrow(0xD, 15, 0, 3));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        mem_destroy(cpu.mem);
+        return;
+    }
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, 0x40001000u);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, 0x40001000u) != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, iram_pc);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, iram_pc) != NULL);
+
+    jit_install_hook(jit, &cpu);
+    ASSERT_TRUE(cpu.record_branch_targets);
+
+    jit_destroy(jit);
+    mem_destroy(cpu.mem);
 }
 
 TEST(test_branch_target_ring_is_disabled_without_a_jit_consumer) {
@@ -817,6 +898,31 @@ TEST(test_jit_verify_keeps_cross_block_chains_disabled) {
     ASSERT_EQ(fn(&cpu), 4);
     ASSERT_EQ(cpu.pc, target);
     ASSERT_EQ64(jit_get_stats(jit)->chains_patched, 0u);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_verify_counts_reference_replay_only_once) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    for (unsigned i = 0; i < 4u; i++)
+        put_insn2(&cpu, BASE + i * 2u, narrow(0xD, 15, 0, 3));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_set_verify(jit, true);
+    jit_install_hook(jit, &cpu);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+
+    cpu.running = true;
+    cpu._pc_written = true;
+    cpu.insn_count = 123u;
+    ASSERT_EQ(xtensa_run(&cpu, 4), 4);
+    ASSERT_EQ64(cpu.insn_count, 127u);
+    ASSERT_EQ64(jit_verify_mismatch_count(jit), 0u);
 
     jit_destroy(jit);
     teardown(&cpu);
@@ -2412,7 +2518,15 @@ TEST(test_jit_flash_mmu_remap_flushes_upper_window) {
     cpu.pc = pc;
     cpu.running = true;
     cpu._pc_written = true;
-    ASSERT_EQ(xtensa_run(&cpu, 1), 4u);
+    ASSERT_EQ(xtensa_run(&cpu, 1), 1u);
+    ASSERT_EQ(cpu.pc, pc + 2u);
+    ASSERT_EQ(jit_get_stats(jit)->blocks_executed, 0u);
+
+    /* With enough scheduler room, the same replacement-page block remains
+     * eligible and runs natively. */
+    cpu.pc = pc;
+    cpu._pc_written = true;
+    ASSERT_EQ(xtensa_run(&cpu, 4), 4u);
     ASSERT_EQ(cpu.pc, pc + 8u);
     ASSERT_TRUE(jit_get_stats(jit)->blocks_executed >= 1u);
 
@@ -2441,9 +2555,109 @@ TEST(test_jit_xtensa_run_counts_guest_instructions) {
     uint32_t ccount_before = cpu.ccount;
     uint64_t cycles_before = cpu.cycle_count;
     int ran = xtensa_run(&cpu, 1);
+    ASSERT_EQ(ran, 1);
+    ASSERT_EQ(cpu.ccount - ccount_before, 1);
+    ASSERT_EQ64(cpu.cycle_count - cycles_before, 1);
+
+    /* Native dispatch is allowed once the complete block fits inside the
+     * caller's budget. */
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    ccount_before = cpu.ccount;
+    cycles_before = cpu.cycle_count;
+    ran = xtensa_run(&cpu, 4);
     ASSERT_EQ(ran, 4);
     ASSERT_EQ(cpu.ccount - ccount_before, 4);
     ASSERT_EQ64(cpu.cycle_count - cycles_before, 4);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+typedef struct {
+    xtensa_cpu_t *cpu;
+    uint32_t value;
+} jit_irq_mmio_t;
+
+static uint32_t jit_irq_mmio_read(void *opaque, uint32_t addr) {
+    (void)addr;
+    jit_irq_mmio_t *ctx = opaque;
+    ctx->cpu->interrupt |= 1u << 6;
+    xtensa_request_irq_check(ctx->cpu);
+    return ctx->value;
+}
+
+TEST(test_jit_mmio_irq_exits_at_precise_instruction) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    jit_irq_mmio_t ctx = {&cpu, 0xC001D00Du};
+    ASSERT_EQ(mem_register_mmio(cpu.mem, 0, jit_irq_mmio_read, NULL, &ctx), 0);
+    cpu.intenable = 1u << 6;
+    ar_write(&cpu, 3, 0x3FF00000u);
+    ar_write(&cpu, 4, 0u);
+
+    /* The MMIO load asserts an interrupt.  The ADDI must remain unexecuted
+     * until the dispatcher has observed that request. */
+    put_insn3(&cpu, BASE, 0x22u | (0x23u << 8)); /* L32I a2, a3, 0 */
+    put_insn2(&cpu, BASE + 3u, narrow(0xB, 4, 4, 1));
+    put_insn2(&cpu, BASE + 5u, narrow(0xD, 15, 0, 3));
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(fn != NULL);
+
+    ASSERT_EQ(fn(&cpu), 1);
+    ASSERT_EQ(cpu.pc, BASE + 3u);
+    ASSERT_EQ(ar_read(&cpu, 2), ctx.value);
+    ASSERT_EQ(ar_read(&cpu, 4), 0u);
+    ASSERT_TRUE(cpu.irq_check);
+    ASSERT_TRUE(cpu._pc_written);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+TEST(test_jit_final_mmio_irq_stops_before_chained_successor) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+
+    jit_irq_mmio_t ctx = {&cpu, 0x5A5AA5A5u};
+    ASSERT_EQ(mem_register_mmio(cpu.mem, 0, jit_irq_mmio_read, NULL, &ctx), 0);
+    ar_write(&cpu, 3, 0x3FF00000u);
+    ar_write(&cpu, 4, 0u);
+
+    /* Put the MMIO load at the final two bytes of an executable page. The
+     * scanner therefore makes it the source block's final fallthrough while
+     * the next page starts an independently compiled successor. */
+    const uint32_t source = BASE + 0xFFEu;
+    const uint32_t target = BASE + 0x1000u;
+    put_insn2(&cpu, source, narrow(0x8, 0, 3, 2)); /* L32I.N a2, a3, 0 */
+    put_insn2(&cpu, target, narrow(0xB, 4, 4, 1)); /* ADDI.N a4, a4, 1 */
+    put_insn2(&cpu, target + 2u, narrow(0xD, 15, 0, 0)); /* RET.N */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+    cpu.pc = source;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, source);
+    jit_block_fn fn = jit_get_block(jit, &cpu, source);
+    ASSERT_TRUE(fn != NULL);
+    ASSERT_TRUE(jit_get_stats(jit)->chains_patched >= 1u);
+
+    cpu.pc = source;
+    cpu.jit_chain_limit = JIT_CHAIN_CAP;
+    ASSERT_EQ(fn(&cpu), 1);
+    ASSERT_EQ(cpu.pc, target);
+    ASSERT_EQ(ar_read(&cpu, 2), ctx.value);
+    ASSERT_EQ(ar_read(&cpu, 4), 0u);
+    ASSERT_TRUE(cpu.irq_check);
 
     jit_destroy(jit);
     teardown(&cpu);
@@ -2690,7 +2904,8 @@ TEST(test_jit_wsr_ps_rearms_irq_check) {
         (void)jit_get_block(jit, &cpu, BASE);
     jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
     ASSERT_TRUE(fn != NULL);
-    ASSERT_EQ(fn(&cpu), 4);
+    ASSERT_EQ(fn(&cpu), 1);
+    ASSERT_EQ(cpu.pc, BASE + 3u);
     ASSERT_EQ(cpu.ps, 0x00060000u);
     ASSERT_TRUE(cpu.irq_check);
 
@@ -2819,7 +3034,7 @@ TEST(test_jit_entry_dispatches_compiled_callee_body) {
     teardown(&cpu);
 }
 
-TEST(test_jit_entry_chains_to_runtime_window) {
+TEST(test_jit_entry_redispatches_under_runtime_window) {
     xtensa_cpu_t cpu;
     setup(&cpu);
     cpu.ps = 0;
@@ -2836,7 +3051,9 @@ TEST(test_jit_entry_chains_to_runtime_window) {
     jit_install_hook(jit, &cpu);
 
     /* Precompile the body under all four windows ENTRY can select, including
-     * wraparound, then compile ENTRY under its caller window. */
+     * wraparound, then compile ENTRY under its caller window. ENTRY must end
+     * one native run and privately redispatch the body under the runtime
+     * window rather than chain across the context transition. */
     for (uint32_t ci = 0; ci < 4; ci++) {
         cpu.windowbase = (14u + ci) & 15u;
         for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
@@ -2862,7 +3079,7 @@ TEST(test_jit_entry_chains_to_runtime_window) {
         ASSERT_EQ(cpu.windowbase, (14u + ci) & 15u);
         ASSERT_EQ(cpu.pc, BASE + 11u);
         ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - insns_before, 5u);
-        ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
+        ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 2u);
     }
 
     jit_destroy(jit);
@@ -3028,6 +3245,47 @@ TEST(test_jit_exact_hook_query_distinguishes_bitmap_collisions) {
     teardown(&cpu);
 }
 
+TEST(test_jit_lx7_rom_service_hook_remains_dispatch_boundary) {
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const uint32_t ordinary_rom_pc = 0x40001000u;
+    const uint32_t service_rom_pc = 0x40001100u;
+    xtensa_cpu_t cpu;
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem_create_for_target(s3);
+    ASSERT_TRUE(cpu.mem != NULL);
+    if (!cpu.mem) return;
+
+    put_insn2(&cpu, ordinary_rom_pc, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, ordinary_rom_pc + 2u, narrow(0xD, 15, 0, 3));
+    put_insn2(&cpu, service_rom_pc, narrow(0xD, 15, 0, 3));
+
+    jit_exact_hook_t exact = {.exact_pc = service_rom_pc};
+    cpu.pc_hook_contains = jit_exact_hook_contains;
+    cpu.pc_hook_contains_ctx = &exact;
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        mem_destroy(cpu.mem);
+        return;
+    }
+    jit_install_hook(jit, &cpu);
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, ordinary_rom_pc);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, ordinary_rom_pc) != NULL);
+
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, service_rom_pc);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, service_rom_pc) == NULL);
+    ASSERT_TRUE(exact.queries > 0);
+
+    jit_destroy(jit);
+    mem_destroy(cpu.mem);
+}
+
 static int jit_entry_spy_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
     (void)cpu;
     jit_entry_spy_t *spy = ctx;
@@ -3036,6 +3294,61 @@ static int jit_entry_spy_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
         spy->last_pc = pc;
     }
     return 0;  /* Observe the entry, then execute the guest instruction. */
+}
+
+static int jit_any_entry_spy_hook(xtensa_cpu_t *cpu, uint32_t pc, void *ctx) {
+    (void)cpu;
+    jit_entry_spy_t *spy = ctx;
+    spy->calls++;
+    spy->last_pc = pc;
+    return 0;
+}
+
+TEST(test_jit_private_fallthrough_expires_without_bitmap_hit) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE + 8u;
+    uint32_t jump_offset = (target - (BASE + 4u)) & 0x3FFFFu;
+    put_insn3(&cpu, BASE, (jump_offset << 6) | 6u); /* J target */
+    put_insn2(&cpu, target, narrow(0xD, 15, 0, 3)); /* NOP.N */
+
+    uint64_t *hook_bitmap = calloc(HOOK_BITMAP_WORDS, sizeof(*hook_bitmap));
+    ASSERT_TRUE(hook_bitmap != NULL);
+    if (!hook_bitmap) {
+        teardown(&cpu);
+        return;
+    }
+    uint32_t target_bit = (target >> 2) & (HOOK_BITMAP_BITS - 1);
+    hook_bitmap[target_bit / 64] |= 1ULL << (target_bit & 63);
+
+    jit_entry_spy_t spy = {0};
+    cpu.pc_hook = jit_any_entry_spy_hook;
+    cpu.pc_hook_ctx = &spy;
+    cpu.pc_hook_bitmap = hook_bitmap;
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    if (!jit) {
+        free(hook_bitmap);
+        teardown(&cpu);
+        return;
+    }
+    jit_install_hook(jit, &cpu);
+
+    /* Model a private accelerator that returned to a PC whose bitmap bit is
+     * clear. The marker belongs only to that boundary; it must not suppress
+     * the real observer reached by the following guest branch. */
+    cpu.jit_fallthrough_dispatch = 1u;
+    cpu.running = true;
+    cpu._pc_written = false;
+    ASSERT_EQ(xtensa_run(&cpu, 2), 2);
+    ASSERT_EQ(spy.calls, 1u);
+    ASSERT_EQ(spy.last_pc, target);
+    ASSERT_FALSE(cpu.jit_fallthrough_dispatch);
+
+    jit_destroy(jit);
+    free(hook_bitmap);
+    teardown(&cpu);
 }
 
 TEST(test_jit_entry_fallthrough_does_not_repeat_original_hook) {
@@ -3245,7 +3558,8 @@ TEST(test_jit_windowed_indirect_call_round_trip) {
     jit_install_hook(jit, &cpu);
 
     /* Compile every destination under the window in which it executes, then
-     * restore the caller state before entering the native chain. */
+     * restore the caller state. ENTRY deliberately contributes the second
+     * hook dispatch so the rotated window becomes an observed boundary. */
     cpu.windowbase = 2u;
     for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
         (void)jit_get_block(jit, &cpu, continuation);
@@ -3284,7 +3598,7 @@ TEST(test_jit_windowed_indirect_call_round_trip) {
     ASSERT_EQ(ar_read(&cpu, 2), 41u);
     ASSERT_EQ(cpu.ar[4u * 4u + 2u], 42u);
     ASSERT_EQ64(jit_get_stats(jit)->insns_jitted - insns_before, 8u);
-    ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 1u);
+    ASSERT_EQ64(jit_get_stats(jit)->hook_calls - hooks_before, 2u);
 
     jit_destroy(jit);
     teardown(&cpu);
@@ -3659,10 +3973,14 @@ TEST(test_jit_window_underflow_vector_is_native) {
 static void run_jit_tests(void) {
     TEST_SUITE("jit");
     RUN_TEST(test_jit_init_destroy);
+    RUN_TEST(test_jit_lx7_common_profile_matches_interpreter_in_iram);
+    RUN_TEST(test_jit_lx7_uses_target_flash_geometry_for_literals);
+    RUN_TEST(test_jit_lx7_accepts_unhooked_rom_and_firmware_ranges);
     RUN_TEST(test_branch_target_ring_is_disabled_without_a_jit_consumer);
     RUN_TEST(test_jit_fallback_stops_at_debug_break_boundary);
     RUN_TEST(test_jit_verify_toggle_recompiles_blocks);
     RUN_TEST(test_jit_verify_keeps_cross_block_chains_disabled);
+    RUN_TEST(test_jit_verify_counts_reference_replay_only_once);
     RUN_TEST(test_jit_hot_threshold);
     RUN_TEST(test_jit_hash_collision_uses_free_way);
     RUN_TEST(test_jit_one_instruction_straight_line_compiles_when_hot);
@@ -3698,6 +4016,8 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_flush);
     RUN_TEST(test_jit_flash_mmu_remap_flushes_upper_window);
     RUN_TEST(test_jit_xtensa_run_counts_guest_instructions);
+    RUN_TEST(test_jit_mmio_irq_exits_at_precise_instruction);
+    RUN_TEST(test_jit_final_mmio_irq_stops_before_chained_successor);
     RUN_TEST(test_jit_run_does_not_count_delay_ccount_as_instructions);
     RUN_TEST(test_jit_nop);
     RUN_TEST(test_jit_movi);
@@ -3743,13 +4063,15 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_wsr_ps_exits_before_pending_irq);
     RUN_TEST(test_jit_rur_wur_user_registers);
     RUN_TEST(test_jit_entry_dispatches_compiled_callee_body);
-    RUN_TEST(test_jit_entry_chains_to_runtime_window);
+    RUN_TEST(test_jit_entry_redispatches_under_runtime_window);
     RUN_TEST(test_jit_rotw_flushes_old_mapping_and_wraps);
     RUN_TEST(test_jit_rotw_legacy_without_woe_is_native);
     RUN_TEST(test_jit_rotw_legacy_woe_falls_back);
     RUN_TEST(test_jit_rotw_chains_under_destination_window);
     RUN_TEST(test_jit_entry_fallthrough_does_not_repeat_original_hook);
     RUN_TEST(test_jit_exact_hook_query_distinguishes_bitmap_collisions);
+    RUN_TEST(test_jit_lx7_rom_service_hook_remains_dispatch_boundary);
+    RUN_TEST(test_jit_private_fallthrough_expires_without_bitmap_hit);
     RUN_TEST(test_jit_call4_windowed);
     RUN_TEST(test_jit_call0_full_return_address);
     RUN_TEST(test_jit_callx_chains_to_runtime_callee);

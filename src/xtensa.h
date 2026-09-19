@@ -519,6 +519,15 @@ struct xtensa_cpu {
      * its epilogue, so it is deliberately not serialized in savestates. */
     uint32_t jit_acc;
 
+    /* A native chain normally charges CCOUNT/cycle_count when it returns.
+     * MMIO callbacks need the exact guest time at the instruction that
+     * reached them, so a slow memory path publishes the already-retired
+     * prefix first. `jit_time_prefix` is generated code's requested absolute
+     * prefix and `jit_time_accounted` is the portion already charged. Both
+     * are transient and deliberately omitted from savestates. */
+    uint32_t jit_time_prefix;
+    uint32_t jit_time_accounted;
+
     /* Maximum accumulated guest instructions the current native JIT chain
      * may execute before returning to the dispatcher. The JIT derives it
      * from its ordinary chain cap, the nearest timer, and the remaining

@@ -640,6 +640,8 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3 != NULL);
     ASSERT_EQ(esp32->descriptor_version, FLEXE_TARGET_DESCRIPTOR_VERSION);
     ASSERT_EQ(esp32->core_generation, FLEXE_XTENSA_LX6);
+    ASSERT_EQ(esp32->translation_profile,
+              FLEXE_XTENSA_TRANSLATE_WINDOWED_COMMON);
     ASSERT_EQ(esp32->support_level, FLEXE_TARGET_STABLE);
     ASSERT_TRUE(esp32->capabilities &
                 FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS);
@@ -660,6 +662,8 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(esp32->sha.dma_peripheral_id, UINT8_MAX);
     ASSERT_EQ(s3->image_chip_id, 9u);
     ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
+    ASSERT_EQ(s3->translation_profile,
+              FLEXE_XTENSA_TRANSLATE_WINDOWED_COMMON);
     ASSERT_EQ(s3->support_level, FLEXE_TARGET_EXPERIMENTAL);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT);

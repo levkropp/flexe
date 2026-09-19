@@ -5,9 +5,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* JIT compiler for Xtensa LX6 → x86-64 and ARM64 native code.
- * Translates hot basic blocks to native machine code, falling back
- * to the interpreter for cold code and complex instructions. */
+/* JIT compiler for the target-described common windowed Xtensa profile →
+ * x86-64 and ARM64 native code. Translates hot basic blocks to native machine
+ * code, falling back to the interpreter for cold or unsupported instructions. */
 
 /* Code cache: 128MB mmap'd executable region (lazily committed) */
 #define JIT_CODE_CACHE_SIZE  (128u * 1024 * 1024)
@@ -59,7 +59,7 @@
 
 /* Block entry in the hash table */
 typedef struct {
-    uint32_t pc;            /* Guest PC (tag for collision detection) */
+    uint32_t pc;            /* Exact guest PC; window/loop key is in flags */
     uint32_t end_pc;        /* First guest PC past the block */
     void    *code;          /* Pointer into code cache (NULL = empty) */
     void    *chain_entry;   /* Entry point for chained blocks (after prologue) */
@@ -89,8 +89,10 @@ typedef struct {
  * round-trip, never correctness. */
 #define CHAIN_PENDING_MAX 4
 typedef struct {
-    uint32_t  tag;                    /* pc ^ (wb<<28), 0 = empty */
-    uint32_t  n;                      /* sites used (≤ CHAIN_PENDING_MAX) */
+    uint32_t  pc;
+    uint8_t   windowbase;
+    uint8_t   n;                      /* sites used (≤ CHAIN_PENDING_MAX) */
+    uint16_t  reserved;
     uint8_t  *site[CHAIN_PENDING_MAX];
 } chain_pending_t;
 

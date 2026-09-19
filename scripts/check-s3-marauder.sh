@@ -57,8 +57,9 @@ wait_for_uart() {
 }
 
 mkfifo "$tmpdir/input"
-"$runner" -N -q --no-jit --target esp32s3 -R "$S3_ROM_ELF" \
-    --sandbox-events --unhandled-report -c 5500000000 "$S3_MARAUDER_BIN" \
+"$runner" -N -q --target esp32s3 -R "$S3_ROM_ELF" \
+    --jit-stats --sandbox-events \
+    -c 5500000000 "$S3_MARAUDER_BIN" \
     < "$tmpdir/input" > "$tmpdir/events" 2> "$tmpdir/emu.err" &
 emu_pid=$!
 exec 3> "$tmpdir/input"
@@ -106,5 +107,8 @@ fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
 [[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 7068 ]] ||
     fail "unsupported-access count exceeded the accepted bootstrap baseline"
+jit_insns=$(awk '/^  Insns JIT:/{print $3; exit}' "$tmpdir/emu.err")
+[[ -n "$jit_insns" && "$jit_insns" -gt 0 ]] ||
+    fail "the JIT gate did not execute native guest instructions"
 
-echo "PASS: Marauder S3 v1.16.0 executed an injected UART help command and returned to its prompt; $unhandled unsupported accesses remain visible"
+echo "PASS: Marauder S3 v1.16.0 executed an injected UART help command and returned to its prompt under the JIT; $unhandled unsupported accesses remain visible"

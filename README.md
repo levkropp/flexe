@@ -1,8 +1,8 @@
 # Flexe
 
 **F**ree **l**ittle **x**tensa **e**mulator: a lightweight ESP32/Xtensa LX6
-emulator with experimental ESP32-S3/LX7 support, written in C. Flexe boots
-unmodified ESP-IDF and Arduino firmware,
+emulator with experimental ESP32-S3/LX7 interpreter and JIT support, written
+in C. Flexe boots unmodified ESP-IDF and Arduino firmware,
 models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
 backends.
 
@@ -138,8 +138,10 @@ MESHTASTIC_BIN=/path/to/meshtastic.bin ./scripts/bench-stock-roms.sh
 
 In the current Apple-silicon release benchmark, every image in the five-ROM
 generic corpus clears real time in both engines. The stricter repeated WLED
-acceptance benchmark sustains 1.482x interpreted and 3.522x under the JIT. See
-[Performance](docs/performance.md) for dated results and methodology.
+acceptance benchmark sustains 1.482x interpreted and 3.522x under the JIT.
+The pinned S3 WLED gate sustains at least 1.43x interpreted and 2.54x under the
+JIT with exact frame parity. See [Performance](docs/performance.md) for dated
+results and methodology.
 
 ## Architecture
 

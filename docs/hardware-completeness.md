@@ -45,7 +45,7 @@ even when a firmware workflow succeeds.
 | Classic GPIO, UART, SPI/I2C, DMA | Partial (MMIO plus host devices) | `tests/test_peripherals.c`, compiled Arduino hardware gates, `scripts/check-stock-roms.sh` | Electrical and all controller/driver combinations remain outside the validated set. |
 | Classic timers, PWM/RMT, watchdogs | Partial (MMIO) | `tools/ledc_pwm_test.c`, `tools/rmt_tx_test.c`, timer/watchdog unit and firmware gates | Aggregate output and event timing do not imply cycle-accurate waveforms or all reset causes. |
 | Classic network/Bluetooth | Partial (service shims and device models) | Meshtastic, Marauder, NerdMiner and WLED compatibility scenarios | RF/PHY propagation and general controller equivalence are unsupported. |
-| S3 LX7, interrupts, dual-core startup | Partial | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, target and interrupt-matrix unit tests | Sustained queue handoffs and CPU1 stall/resume pass; broader FreeRTOS and interrupt workloads remain to validate. |
+| S3 LX7, interrupts, dual-core startup | Partial (interpreter and JIT) | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, CPU/JIT differential tests, and the JIT-gated WLED/Marauder scenarios | The common windowed LX7 profile, sustained queue handoffs, and CPU1 stall/resume pass; LX7-specific extensions and broader FreeRTOS/interrupt workloads remain to validate. |
 | S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c` (4/8 MiB GigaDevice SFDP; 4 MiB BP/CMP protection), `scripts/check-s3-nerdminer-portal.sh` | Other flash protection profiles, cache behavior, and bootloader paths remain unverified. |
 | S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
@@ -574,11 +574,21 @@ and its matching ELF SHA-256 is
 For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and
-321,448 pulse words on channel 0. Repeated interpreter runs yielded 13,605
-chunks and the `30EAB266` pulse-stream digest; 7,070 unsupported peripheral
-accesses remain. S3 JIT is not enabled, so no JIT parity is claimed. This
-establishes sustained hardware-output progress, not
-correct colors on a physical LED strip.
+321,448 pulse words in 13,605 chunks on channel 0. The interpreter and JIT
+match at every completed-frame boundary and finish with the same `30EAB266`
+pulse-stream digest, CPU state, and firmware-visible time; 7,023 unsupported
+peripheral accesses remain. The JIT executes 1,779,451,292 of 1,819,293,599
+retired instructions natively (97.8%). Ordinary code in the target-described
+mask-ROM range is eligible for translation, while the ROM loader's exact
+service hooks remain interpreter boundaries. This establishes sustained,
+engine-equivalent hardware-output progress, not correct colors on a physical
+LED strip.
+
+On an Apple-silicon MacBook, a `Release`/LTO/native build completed three
+sequential interpreter runs in 11.27--11.62 seconds (1.43--1.48x real time)
+and three JIT runs in 6.43--6.57 seconds (2.54--2.59x). These are throughput
+results for this pinned scenario, not cycle-accuracy claims; host load and
+thermal state still matter.
 
 In a separate unhandled-access audit of this WLED image, the busiest addresses
 outside the PHY aperture were `0x6002600C`, `0x60026014`, and `0x60026018`:
@@ -736,6 +746,8 @@ runs its native controller far enough to deliver and consume the NimBLE HCI
 Reset completion, tears Bluetooth down, initializes/starts/stops/deinitializes
 the native Wi-Fi stack, completes its LED and absent-GPS delays, and prints the
 v1.16.0 command prompt without an assertion, watchdog, or software reset. The
+gate now requires nonzero native instruction retirement, so this path is
+exercised under the S3 JIT rather than merely with JIT-capable code present. The
 GPS probe makes the application-ready boundary occur near 5 billion aggregate
 cycles; the earlier 2-billion-cycle cutoff was a normal `WAITI` during those
 firmware delays, not a deadlock. Pin and replay that boundary with:

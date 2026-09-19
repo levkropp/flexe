@@ -544,7 +544,8 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
      * backend exists; jit_init() returns NULL on unsupported hosts. */
     /* FLEXE_DISABLE_JIT is an operational escape hatch for embedded
      * frontends that do not expose the config flag on their own CLI. */
-    if (classic_compat && !cfg->disable_jit &&
+    if (target->translation_profile != FLEXE_XTENSA_TRANSLATE_NONE &&
+        !cfg->disable_jit &&
         getenv("FLEXE_DISABLE_JIT") == NULL) {
         s->jit = jit_init();
         if (s->jit) {
@@ -552,7 +553,8 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
             if (!cfg->single_core)
                 jit_install_hook(s->jit, &s->cpu[1]);
         }
-    } else if (!classic_compat && !cfg->disable_jit &&
+    } else if (target->translation_profile == FLEXE_XTENSA_TRANSLATE_NONE &&
+               !cfg->disable_jit &&
                getenv("FLEXE_DISABLE_JIT") == NULL) {
         fprintf(stderr,
                 "flexe: %s JIT is not enabled yet; using the interpreter\n",
@@ -969,8 +971,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     /* Compatibility for frontends built against the older API which still
      * call xtensa_run(core0) directly.  Sample the batch boundary just like
      * jit_run() so hot core-0 PCs become native after the normal threshold. */
-    if (s->jit && s->cpu[0].pc >= ESP32_FIRMWARE_INSN_ADDR_LOW &&
-        s->cpu[0].pc < ESP32_INSN_ADDR_HIGH)
+    if (s->jit)
         (void)jit_get_block(s->jit, &s->cpu[0], s->cpu[0].pc);
 
     /* Preemptive timeslice check for core 0 — skip in native mode

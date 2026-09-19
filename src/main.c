@@ -49,6 +49,9 @@ typedef struct {
     uint64_t items;
     uint64_t completions;
     uint32_t digest;
+    uint64_t completed_chunks;
+    uint64_t completed_items;
+    uint32_t completed_digest;
 } rmt_channel_stats_t;
 
 static void rmt_stats_observe(void *ctx, int channel,
@@ -64,12 +67,30 @@ static void rmt_stats_observe(void *ctx, int channel,
     if (!s->chunks) s->digest = 2166136261u;
     s->chunks++;
     s->items += count;
-    if (finished) s->completions++;
     for (size_t i = 0; i < count; i++) {
         for (unsigned byte = 0; byte < 4u; byte++) {
             s->digest ^= (items[i] >> (byte * 8u)) & 0xFFu;
             s->digest *= 16777619u;
         }
+    }
+    if (finished) {
+        s->completions++;
+        /* Preserve the cumulative stream exactly at a completed-frame
+         * boundary. The aggregate cycle limit can stop halfway through the
+         * next refill, making raw chunk totals unsuitable for engine parity. */
+        s->completed_chunks = s->chunks;
+        s->completed_items = s->items;
+        s->completed_digest = s->digest;
+        static int trace_frames = -1;
+        if (trace_frames < 0)
+            trace_frames = getenv("FLEXE_RMT_FRAME_STATS") != NULL;
+        if (trace_frames)
+            fprintf(stderr,
+                    "[rmt-frame] ch=%d n=%llu chunks=%llu items=%llu fnv32=%08X\n",
+                    channel, (unsigned long long)s->completions,
+                    (unsigned long long)s->completed_chunks,
+                    (unsigned long long)s->completed_items,
+                    s->completed_digest);
     }
 }
 
@@ -2005,6 +2026,12 @@ int main(int argc, char *argv[]) {
                     channel, (unsigned long long)s->chunks,
                     (unsigned long long)s->items,
                     (unsigned long long)s->completions, s->digest);
+            if (s->completions)
+                fprintf(stderr,
+                        "RMT done%d:  %llu chunks, %llu items, fnv32=%08X\n",
+                        channel, (unsigned long long)s->completed_chunks,
+                        (unsigned long long)s->completed_items,
+                        s->completed_digest);
         }
         const flexe_target_desc_t *rmt_target = mem_target(mem);
         if (rmt_target &&

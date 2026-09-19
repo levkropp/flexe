@@ -10,9 +10,10 @@ Booting to one UART line is not considered a pass.
 Flexe reads the Espressif chip ID and revision bounds from each image header.
 `--target auto` is the default; `--target esp32` or `--target esp32s3` turns
 the selection into an assertion suitable for CI. Classic ESP32 execution is
-supported. ESP32-S3 chip ID `0x0009` has experimental interpreter support for
-the LX7 core, native memory map, flash/cache-MMU windows, mask ROM, dual-core
-startup, system timer, timer groups and main watchdogs, SPI-memory controllers,
+supported. ESP32-S3 chip ID `0x0009` has experimental interpreter and JIT
+support for the common windowed LX7 instruction profile, native memory map,
+flash/cache-MMU windows, mask ROM, dual-core startup, system timer, timer
+groups and main watchdogs, SPI-memory controllers,
 general-purpose SPI2/SPI3 controllers and bidirectional AHB GDMA,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only
@@ -21,10 +22,12 @@ Serial/JTAG, digital GPIO matrix, external I2C controllers, and interrupt
 matrix. Its unified SHA accelerator supports direct and GDMA-fed SHA-1,
 SHA-224, SHA-256, SHA-384, and SHA-512 blocks.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
-(`-R /path/to/esp32s3_rev0_rom.elf`). The classic compatibility services and
-JIT are deliberately not composed into S3 sessions: their ABI and fixed ROM
-addresses belong to the classic target. Missing S3 devices remain explicit
-and S3 is not yet a production-supported target.
+(`-R /path/to/esp32s3_rev0_rom.elf`). Native translation is selected by the
+target descriptor rather than a firmware identity or PC list. Unsupported
+opcodes fall back to the interpreter; exact ROM/service hooks remain dispatch
+boundaries while ordinary code in target-described ROM, IRAM, RTC-fast, and
+mapped-flash ranges may compile. Missing S3 devices remain explicit, and S3
+is not yet a production-supported target.
 
 Boards populated with the [AP Memory APS6408L-3OBMx 64-Mbit octal
 PSRAM](https://www.apmemory.com/en/downloadFiles/0324112221b2583847) can opt

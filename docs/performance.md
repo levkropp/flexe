@@ -53,6 +53,25 @@ produced the pinned `F29E02EB` LED waveform. These accelerators are selected by
 complete instruction signatures and decoded call/literal targets, never by a
 WLED address; unsafe or unfamiliar calls continue in the guest.
 
+## ESP32-S3 WLED baseline
+
+The pinned WLED 16.0.1 ESP32-S3 4M QSPI scenario was measured on 2026-09-19
+on an Apple-silicon MacBook with a `Release`, LTO, host-native build. Each run
+executed 4 billion aggregate cycles (16.667 nominal ESP32 seconds) and had to
+match all 317 completed RMT frames, 13,605 chunks, 321,448 pulse words, final
+CPU/time state, and the `30EAB266` pulse digest:
+
+| Engine | Three wall-time samples | Real-time range | Native coverage |
+|---|---:|---:|---:|
+| Interpreter | 11.27, 11.53, 11.62 s | 1.43--1.48x | n/a |
+| JIT | 6.43, 6.49, 6.57 s | 2.54--2.59x | 97.8% |
+
+The JIT now translates ordinary code in every target-described executable
+range, including unhooked mask-ROM code. The scanner still asks the exact ROM
+hook registry before every instruction, so a service boundary cannot be
+compiled merely because a neighboring ROM address is eligible. This is a
+target-level mechanism shared by firmware rather than a WLED address list.
+
 ## Reproducible compute benchmark
 
 `bench-compute.sh` builds an in-repository Arduino sketch and executes a fixed
