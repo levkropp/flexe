@@ -45,6 +45,55 @@ TEST(esp32s3_radio_windows_retain_independent_configuration)
     mem_destroy(mem);
 }
 
+TEST(esp32s3_bt_controller_identity_has_hardware_reset_semantics)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    const uint32_t identity = 0x60031004u;
+    ASSERT_EQ(mem_read32(mem, identity), 0x09001B00u);
+    mem_write32(mem, identity, 0u);
+    ASSERT_EQ(mem_read32(mem, identity), 0x09001B00u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(esp32s3_bt_register_init_command_is_consumed)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    const uint32_t control = 0x60031000u;
+    mem_write32(mem, control, 0x81234567u);
+    ASSERT_EQ(mem_read32(mem, control), 0x01234567u);
+    mem_write32(mem, control, 0x89ABCDEFu);
+    ASSERT_EQ(mem_read32(mem, control), 0x09ABCDEFu);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(esp32s3_rom_iq_estimation_completes_from_control_protocol)
 {
     const flexe_target_desc_t *s3 =
@@ -231,12 +280,22 @@ TEST(radio_rejects_absent_capability_and_overlapping_windows)
     radio = flexe_radio_create(mem, NULL, NULL, NULL);
     ASSERT_TRUE(radio == NULL);
     mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.radio.reg[0].address = 0x60000000u;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    radio = flexe_radio_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(radio == NULL);
+    mem_destroy(mem);
 }
 
 static void run_radio_tests(void)
 {
     TEST_SUITE("Target-described radio registers");
     RUN_TEST(esp32s3_radio_windows_retain_independent_configuration);
+    RUN_TEST(esp32s3_bt_controller_identity_has_hardware_reset_semantics);
+    RUN_TEST(esp32s3_bt_register_init_command_is_consumed);
     RUN_TEST(esp32s3_rom_iq_estimation_completes_from_control_protocol);
     RUN_TEST(esp32s3_wifi_mac_reset_reports_ready);
     RUN_TEST(esp32s3_wdev_random_source_is_deterministic_and_live);

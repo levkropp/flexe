@@ -59,7 +59,7 @@ even when a firmware workflow succeeds.
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
-| S3 Bluetooth baseband clock | Partial (MMIO) | `tests/test_radio.c` checks half-slot/subslot phase against guest time | Controller scheduler, packets, and RF are unsupported; Marauder still asserts before its CLI. |
+| S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup to its CLI | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
 
 S3 UART0/1/2 now obey their independent
@@ -710,30 +710,39 @@ not modeled RF/PHY, wireless client association, cache timing, or
 cycle-accurate network delivery. The S3 network workflow is still partial
 outside the validated AP scenario.
 
-The S3 Bluetooth register window now includes a captured baseband clock:
+The S3 Bluetooth register window includes a captured baseband clock:
 requesting a latch publishes a half-slot count and a down-counting subslot
-phase from shared guest time. Its register protocol and 312.5 µs half-slot
-interpretation are inferred from `r_rwip_time_get` in the official
-`esp32s3_rev0_rom.elf`, not from a public Bluetooth-controller register
-specification. This removes Marauder's unbounded poll of the latch command,
-but does not make its Bluetooth controller functional. The unmodified Marauder
-v1.12.1 multiboard S3 image (SHA-256
-`62292a502635f02eab9e515bc3f18fbf43330f81abe2c006c1afe43bd21b57ea`)
-then reports `assert lld.c 292` and reboots on an interrupt watchdog before
-its CLI. The [official v1.16.0 MultiBoard S3 release](https://github.com/justcallmekoko/ESP32Marauder/releases/tag/v1.16.0)
+phase from shared guest time. Its register protocol and 312.5 us half-slot
+interpretation come from `r_rwip_time_get` in the official
+`esp32s3_rev0_rom.elf`. The target descriptor also supplies the immutable
+link-layer identity at `0x60031004` and consumes bit 31 of the adjacent
+register-initialization command. Those two semantics were recovered from the
+exact Arduino-ESP32 2.0.11 controller archive: `r_lld_core_init` validates
+identity `0x09001B00`, while `r_rwip_driver_init` waits for hardware to consume
+the command. They are reset-state and write-mask descriptors in the generic
+radio aperture, not firmware-PC hooks or fabricated HCI success.
+
+With those semantics, the [official v1.16.0 MultiBoard S3 release](https://github.com/justcallmekoko/ESP32Marauder/releases/tag/v1.16.0)
 (SHA-256 `b6b61e6c6c41bc78422d405d14117ab5aa6ec0cdee751327ea568232e52dd0be`)
-still reaches the same assertion. A 2-billion-cycle interpreter run of that
-image reports 20,879 unsupported accesses across 318 address/PC/core/
-direction sites because the audit survives each of its three software resets;
-the hottest sites are RF/PHY reads in `0x6000E000`. Neither image is an
-accepted interactive S3 scenario. The controller scheduler and RF/packet
-behavior remain unsupported, and the assertion is not suppressed.
+runs its native controller far enough to deliver and consume the NimBLE HCI
+Reset completion, tears Bluetooth down, initializes/starts/stops/deinitializes
+the native Wi-Fi stack, completes its LED and absent-GPS delays, and prints the
+v1.16.0 command prompt without an assertion, watchdog, or software reset. The
+GPS probe makes the application-ready boundary occur near 5 billion aggregate
+cycles; the earlier 2-billion-cycle cutoff was a normal `WAITI` during those
+firmware delays, not a deadlock. Pin and replay that boundary with:
 
 ```sh
-./build/xtensa-emu -N -q --no-jit --target esp32s3 \
-  -R "$FLEXE_S3_ROM_ELF" --unhandled-report -c 2000000000 \
-  "$FLEXE_S3_MARAUDER_BIN"
+S3_MARAUDER_BIN=/path/to/esp32_marauder_v1_16_0_multiboardS3.bin \
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/check-s3-marauder.sh
 ```
+
+This is a controller-bootstrap compatibility boundary, not a claim that
+Bluetooth packets, scanning, coexistence timing, RF propagation, or the
+private analog PHY are complete. Unsupported-access diagnostics remain
+visible during the accepted boot instead of being converted into fake radio
+success.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),

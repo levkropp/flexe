@@ -117,7 +117,8 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
     const flexe_radio_desc_t *desc = &target->radio;
     if (desc->window_count == 0u ||
         desc->window_count > FLEXE_TARGET_RADIO_WINDOW_MAX ||
-        desc->completion_count > FLEXE_TARGET_RADIO_COMPLETION_MAX)
+        desc->completion_count > FLEXE_TARGET_RADIO_COMPLETION_MAX ||
+        desc->register_count > FLEXE_TARGET_RADIO_REGISTER_MAX)
         return false;
 
     for (unsigned i = 0u; i < desc->window_count; i++) {
@@ -194,6 +195,13 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
                 return false;
         }
     }
+
+    for (unsigned i = 0u; i < desc->register_count; i++) {
+        const flexe_radio_register_desc_t *reg = &desc->reg[i];
+        if (!radio_address_in_window(desc, reg->address)) return false;
+        for (unsigned j = 0u; j < i; j++)
+            if (reg->address == desc->reg[j].address) return false;
+    }
     return true;
 }
 
@@ -253,15 +261,22 @@ static void radio_write(void *ctx, uint32_t address, uint32_t value)
     if (address == desc->random_address)
         return; /* Hardware entropy source is read-only. */
 
-    uint32_t read_only = 0u;
+    uint32_t writable = UINT32_MAX;
+    for (unsigned i = 0u; i < desc->register_count; i++) {
+        const flexe_radio_register_desc_t *reg = &desc->reg[i];
+        if (reg->address == address) {
+            writable &= reg->writable_mask;
+            break;
+        }
+    }
     for (unsigned i = 0u; i < desc->completion_count; i++) {
         const flexe_radio_completion_desc_t *completion =
             &desc->completion[i];
         if (completion->active_mask != 0u &&
             completion->status_address == address)
-            read_only |= completion->status_mask;
+            writable &= ~completion->status_mask;
     }
-    *word = (value & ~read_only) | (*word & read_only);
+    *word = (value & writable) | (*word & ~writable);
 
     for (unsigned i = 0u; i < desc->completion_count; i++) {
         const flexe_radio_completion_desc_t *completion =
@@ -310,6 +325,10 @@ flexe_radio_t *flexe_radio_create(
                                     radio_read, radio_write, radio) != 0)
             goto fail;
         registered++;
+    }
+    for (unsigned i = 0u; i < target->radio.register_count; i++) {
+        const flexe_radio_register_desc_t *reg = &target->radio.reg[i];
+        *radio_word(radio, reg->address) = reg->reset;
     }
     return radio;
 

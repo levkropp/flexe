@@ -89,6 +89,8 @@ known failures.
 
 The S3 production gates also use external pinned images and the official ROM
 ELF. `check-s3-nerdminer-portal.sh` exercises provisioning and reset,
+`check-s3-marauder.sh` runs the official v1.16.0 MultiBoard S3 image through
+native Bluetooth/Wi-Fi initialization and its absent-GPS probe to the CLI,
 `check-s3-wled-rmt.sh` checks the release image's LED pulse stream, and
 `check-s3-wled-http.sh` checks a matching WLED source-build image/ELF pair
 through its own raw-lwIP web server. The HTTP gate needs a build with

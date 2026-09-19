@@ -46,13 +46,14 @@
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 13u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
+#define FLEXE_TARGET_RADIO_REGISTER_MAX 8u
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
 #define FLEXE_TARGET_SHA_MODE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 43u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 44u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -639,6 +640,16 @@ typedef struct {
     uint32_t status_mask;
 } flexe_radio_completion_desc_t;
 
+/* Most private radio words are ordinary retained configuration. A small
+ * target-specific subset instead has architectural reset state or read-only
+ * identity fields. Describing those words here keeps the generic aperture
+ * model independent of firmware versions and link addresses. */
+typedef struct {
+    uint32_t address;
+    uint32_t reset;
+    uint32_t writable_mask;
+} flexe_radio_register_desc_t;
+
 /* The private BT controller can snapshot its baseband half-slot clock into
  * two registers. The ROM's time_get path requests a latch then reads the
  * half-slot count and its down-counting subslot phase. */
@@ -654,10 +665,13 @@ typedef struct {
 typedef struct {
     uint8_t window_count;
     uint8_t completion_count;
+    uint8_t register_count;
     flexe_radio_window_desc_t
         window[FLEXE_TARGET_RADIO_WINDOW_MAX];
     flexe_radio_completion_desc_t
         completion[FLEXE_TARGET_RADIO_COMPLETION_MAX];
+    flexe_radio_register_desc_t
+        reg[FLEXE_TARGET_RADIO_REGISTER_MAX];
     uint32_t random_address;
     uint64_t random_seed;
     flexe_radio_time_latch_desc_t time_latch;

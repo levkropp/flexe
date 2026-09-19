@@ -959,7 +959,8 @@ static const flexe_target_desc_t TARGETS[] = {
         },
         .radio = {
             .window_count = 9u,
-            .completion_count = 2u,
+            .completion_count = 3u,
+            .register_count = 1u,
             .window = {
                 { 0x60005000u, 0x1000u }, /* FE2 */
                 { 0x60006000u, 0x1000u }, /* FE */
@@ -989,6 +990,23 @@ static const flexe_target_desc_t TARGETS[] = {
                     .active_mask = 1u << 1,
                     .status_address = 0x60033D14u,
                     .status_mask = 1u << 0,
+                },
+                /* The BLE link-layer controller starts its register-bank
+                 * initialization by setting this command bit, then waits
+                 * for hardware to consume it before programming the bank. */
+                {
+                    .control_address = 0x60031000u,
+                    .self_clear_mask = 1u << 31,
+                },
+            },
+            .reg = {
+                /* BLE link-layer hardware identity. Arduino-ESP32 2.0.11's
+                 * S3 controller library verifies this immutable value in
+                 * r_lld_core_init and asserts at lld.c:292 if it differs. */
+                {
+                    .address = 0x60031004u,
+                    .reset = 0x09001B00u,
+                    .writable_mask = 0u,
                 },
             },
             /* WDEV_RND_REG from the public ESP32-S3 register header. */
