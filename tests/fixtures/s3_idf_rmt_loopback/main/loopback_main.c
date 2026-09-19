@@ -7,6 +7,7 @@
 #include "driver/rmt_rx.h"
 #include "driver/rmt_tx.h"
 #include "esp_err.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -15,7 +16,7 @@
 
 static TaskHandle_t receiver_task;
 static volatile size_t received_count;
-static rmt_symbol_word_t received[16];
+static rmt_symbol_word_t received[32];
 
 static bool receive_done(rmt_channel_handle_t channel,
                          const rmt_rx_done_event_data_t *event,
@@ -214,6 +215,33 @@ void app_main(void)
         fail("loop-pulse-data", ESP_ERR_INVALID_RESPONSE);
     printf("RMT_LOOP_COUNT_OK count=%u\n", (unsigned)received_count);
     fflush(stdout);
+
+    received_count = 0;
+    check("infinite-receive", rmt_receive(rx, received, sizeof(received),
+                                           &receive_config));
+    const rmt_symbol_word_t infinite_frame[] = {
+        {.level0 = 1, .duration0 = 100, .level1 = 0, .duration1 = 100},
+    };
+    rmt_transmit_config_t infinite_config = {.loop_count = -1};
+    check("infinite-transmit", rmt_transmit(tx, encoder, infinite_frame,
+                                             sizeof(infinite_frame),
+                                             &infinite_config));
+    esp_rom_delay_us(900);
+    check("infinite-stop", rmt_disable(tx));
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0)
+        fail("infinite-rx-timeout", ESP_ERR_TIMEOUT);
+    if (received_count < 4u || received_count > 8u)
+        fail("infinite-count", ESP_ERR_INVALID_RESPONSE);
+    /* TX_STOP can truncate the final symbol, but every completed preceding
+     * iteration must retain the programmed widths. */
+    for (size_t i = 0; i + 1u < received_count; i++) {
+        if (!near(received[i].duration0, 100u) ||
+            !near(received[i].duration1, 100u))
+            fail("infinite-pulse-data", ESP_ERR_INVALID_RESPONSE);
+    }
+    printf("RMT_INFINITE_LOOP_OK count=%u\n", (unsigned)received_count);
+    fflush(stdout);
+    check("re-enable-tx", rmt_enable(tx));
     check("disable-rx", rmt_disable(rx));
     /* The driver splits counts above the 10-bit hardware limit into
      * multiple loop-interrupt batches. The second batch must finish too. */

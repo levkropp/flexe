@@ -55,7 +55,7 @@ even when a firmware workflow succeeds.
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
-| S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF TX/RX drivers exercise plain, carrier, and finite counted-loop output through GPIO4 | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. Counted end-marker loops with hardware auto-stop work, including driver batching beyond 1023; unbounded/manual-stop or markerless loops, always-on carrier, synchronized TX, silicon-calibrated carrier phase, and fine status remain unsupported. |
+| S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF TX/RX drivers exercise plain, carrier, finite counted-loop, and explicitly stopped infinite-loop output through GPIO4 | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`. Markerless loops, counted loops without auto-stop, always-on carrier, synchronized TX, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
@@ -476,7 +476,10 @@ stock drivers then configure 38 kHz data-only TX modulation and 25 kHz RX
 carrier removal, recovering a second three-symbol frame through GPIO4 with
 the first two high/low pairs within one carrier cycle of their input widths.
 Next, the stock driver sends a two-symbol frame three times with counted
-auto-stop; RX measures all six symbols, including loop boundaries. A final
+auto-stop; RX measures all six symbols, including loop boundaries. It then
+sends a 100/100-tick waveform with `loop_count = -1`; RX observes repeated
+iterations until `rmt_disable()` issues `TX_STOP`, after which the same TX
+channel is re-enabled and reused. A final
 1,024-iteration transaction crosses the 10-bit hardware count limit and
 completes through two loop-interrupt batches without a driver patch. This
 follows the [S3 RMT loop-count contract](https://docs.espressif.com/projects/esp-idf/en/release-v5.3/esp32s3/api-reference/peripherals/rmt.html).
@@ -500,13 +503,18 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 ```
 
 The fixture's pinned image SHA-256 is
-`b12a1494302858b512e3f7bc6fcace3a779561341c07b235f1aad1cf94c50b96`
+`34bc99fb85d9017434bcc1333d321d9a5300d1becc7a6012f68b15571e715881`
 and its matching ELF SHA-256 is
-`1d0ba45b5f521e83021bc08b8cd49dff4e56350aaeec772cb005f776436bd85c`.
+`eac18e0a486eede892745efbe1853fc96ba8c2d8dc3188a365eb9e53956dfd16`.
 Individual TX pad edges are scheduled only when a watched matrix input or
 GPIO interrupt can observe them; the latter has its own rising-edge unit gate.
 With no such consumer, the aggregate pulse sink records the full stream
 without scheduling every edge; the pinned WLED pulse digest is unchanged.
+An infinite loop with neither a pad observer nor an aggregate pulse sink has
+no interrupt to deliver, so its phase advances arithmetically on demand
+instead of waking the CPU scheduler once per waveform period. This keeps
+short background clocks from becoming a host-side event storm while
+preserving `GPIO_IN` phase sampling and explicit stop behavior.
 A `GPIO_IN` read samples plain or data-only-carrier TX directly from the
 planned pulse words and SCLK phase at that guest cycle, including matrix
 inversion, software output-enable selection, and IO_MUX input-buffer gating.
@@ -531,8 +539,8 @@ carrier duty discrimination and exact demodulation phase/frequency tolerance
 are not calibrated against physical S3 silicon. Host-decoded injection still
 bypasses GPIO, filtering,
 and demodulation. DMA and overrun/error behavior when the guest fails to
-service a threshold in time remain unsupported. Unbounded/manual-stop and
-markerless counted TX loops, plus synchronized TX, remain unsupported and
+service a threshold in time remain unsupported. Markerless loops and counted
+loops without auto-stop, plus synchronized TX, remain unsupported and
 diagnostic. Odd final
 half-symbol encoding and GPIO route changes mid-frame also lack hardware
 validation. Recheck the RX path with the compiled fixture

@@ -396,6 +396,28 @@ static bool rmt_tx_has_counted_autostop(const rmt_tx_channel_t *tx)
            ((tx->tx_limit >> 9u) & 0x3FFu) != 0u;
 }
 
+static bool rmt_tx_has_supported_loop(const rmt_tx_channel_t *tx)
+{
+    if (!(tx->conf & RMT_TX_CONTINUOUS)) return false;
+    /* With counting disabled, end markers restart indefinitely until the
+     * channel receives TX_STOP. This is ESP-IDF's loop_count == -1 path. */
+    if (!(tx->tx_limit & RMT_TX_LOOP_COUNT_EN)) return true;
+    return rmt_tx_has_counted_autostop(tx);
+}
+
+static bool rmt_tx_is_infinite_loop(const rmt_tx_channel_t *tx)
+{
+    return (tx->conf & RMT_TX_CONTINUOUS) &&
+           !(tx->tx_limit & RMT_TX_LOOP_COUNT_EN);
+}
+
+static bool rmt_tx_output_observed(flexe_rmt_v1_t *rmt, unsigned channel)
+{
+    return rmt->tx_cb[channel] ||
+           (rmt->tx_edge_changed && rmt->tx_edge_needed &&
+            rmt->tx_edge_needed(rmt->tx_edge_ctx, channel));
+}
+
 static void rmt_abort_rx_frame(rmt_rx_channel_t *rx)
 {
     free(rx->frame);
@@ -553,9 +575,9 @@ static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
         return;
     }
     if ((tx->conf & RMT_TX_CONTINUOUS) &&
-        !rmt_tx_has_counted_autostop(tx)) {
-        /* Unbounded and manually stopped loops need a different event
-         * policy. Do not turn them into finite, fake-success streams. */
+        !rmt_tx_has_supported_loop(tx)) {
+        /* Counted loops without auto-stop need a different event policy.
+         * Do not turn them into finite, fake-success streams. */
         tx->event = RMT_EVENT_ERROR;
         tx->deadline = start_cycle + 1u;
         return;
@@ -598,10 +620,21 @@ static void rmt_plan_segment(flexe_rmt_v1_t *rmt, unsigned channel,
         }
         ticks += high;
     }
+    if (tx->event == RMT_EVENT_LOOP && tx->segment_count == 0u) {
+        /* An immediate marker has no positive-duration period to schedule.
+         * Keep it visible instead of creating a zero-time event loop. */
+        tx->event = RMT_EVENT_ERROR;
+        tx->deadline = start_cycle + 1u;
+        rmt->fallback_write(rmt->fallback_ctx,
+                            rmt->desc->base + RMT_TX_CONF_OFF +
+                            channel * 4u, tx->conf);
+        return;
+    }
     if (tx->event == RMT_EVENT_NONE) {
         if (tx->conf & RMT_TX_CONTINUOUS) {
-            /* A counted S3 loop increments only at an end marker. Without
-             * one, auto-stop and the loop interrupt can never occur. */
+            /* ESP-IDF's finite and infinite loop encoders insert an end
+             * marker. Keep markerless wrap-at-capacity behavior diagnostic
+             * until its hardware memory boundary semantics are covered. */
             tx->event = RMT_EVENT_ERROR;
             rmt->fallback_write(rmt->fallback_ctx,
                                 rmt->desc->base + RMT_TX_CONF_OFF +
@@ -859,6 +892,22 @@ void flexe_rmt_v1_eval(flexe_rmt_v1_t *rmt)
     for (unsigned channel = 0u; channel < rmt->desc->tx_channel_count;
          channel++) {
         rmt_tx_channel_t *tx = &rmt->tx[channel];
+        if (tx->active && tx->event == RMT_EVENT_LOOP &&
+            rmt_tx_is_infinite_loop(tx) &&
+            !rmt_tx_output_observed(rmt, channel) &&
+            tx->deadline <= now) {
+            /* A silent periodic output has no interrupt or host-visible
+             * edge to deliver. Advance its phase arithmetically so a short
+             * waveform cannot turn into millions of scheduler events.
+             * GPIO_IN polling still samples the current phase below. */
+            uint64_t period = tx->deadline - tx->segment_start;
+            if (period) {
+                uint64_t loops = (now - tx->segment_start) / period;
+                tx->segment_start += loops * period;
+                tx->deadline = tx->segment_start > UINT64_MAX - period ?
+                               UINT64_MAX : tx->segment_start + period;
+            }
+        }
         unsigned segment_safety = 0u;
         while (tx->active && tx->event != RMT_EVENT_NONE &&
                segment_safety < 1024u) {
@@ -906,7 +955,7 @@ bool flexe_rmt_v1_tx_sample(flexe_rmt_v1_t *rmt, unsigned channel,
         return true;
     }
     if ((tx->conf & RMT_TX_CONTINUOUS) &&
-        !rmt_tx_has_counted_autostop(tx))
+        !rmt_tx_has_supported_loop(tx))
         return false;
     if (tx->segment_count == 0u)
         return false;
@@ -953,6 +1002,9 @@ uint32_t flexe_rmt_v1_next_event(flexe_rmt_v1_t *rmt,
          channel++) {
         const rmt_tx_channel_t *tx = &rmt->tx[channel];
         if (!tx->active || tx->event == RMT_EVENT_NONE) continue;
+        if (tx->event == RMT_EVENT_LOOP && rmt_tx_is_infinite_loop(tx) &&
+            !rmt_tx_output_observed(rmt, channel))
+            continue;
         uint64_t d = tx->deadline > now ? tx->deadline - now : 0u;
         if (d < distance) distance = d;
         if (tx->edge_active && tx->edge_deadline < tx->deadline) {
@@ -1105,7 +1157,7 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             tx->read_index = 0u;
             tx->carrier_start = rmt_clock_now(rmt);
             if ((tx->conf & RMT_TX_CONTINUOUS) &&
-                !rmt_tx_has_counted_autostop(tx))
+                !rmt_tx_has_supported_loop(tx))
                 rmt->fallback_write(rmt->fallback_ctx, address, value);
             rmt_tx_start_segment(rmt, channel, tx->carrier_start);
         }

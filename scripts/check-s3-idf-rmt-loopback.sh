@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Native ESP-IDF 5.3.2 S3 RMT TX -> GPIO pad -> RMT RX driver gate,
-# including TX carrier modulation, RX carrier removal, and counted TX loops.
+# including TX carrier modulation, RX carrier removal, and finite/infinite loops.
 # Build tests/fixtures/s3_idf_rmt_loopback with the official ESP-IDF toolchain.
 set -euo pipefail
 
@@ -10,8 +10,8 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
-expected_bin=${S3_IDF_RMT_LOOPBACK_BIN_SHA256:-b12a1494302858b512e3f7bc6fcace3a779561341c07b235f1aad1cf94c50b96}
-expected_elf=${S3_IDF_RMT_LOOPBACK_ELF_SHA256:-1d0ba45b5f521e83021bc08b8cd49dff4e56350aaeec772cb005f776436bd85c}
+expected_bin=${S3_IDF_RMT_LOOPBACK_BIN_SHA256:-34bc99fb85d9017434bcc1333d321d9a5300d1becc7a6012f68b15571e715881}
+expected_elf=${S3_IDF_RMT_LOOPBACK_ELF_SHA256:-eac18e0a486eede892745efbe1853fc96ba8c2d8dc3188a365eb9e53956dfd16}
 expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
 for entry in "$S3_IDF_RMT_LOOPBACK_BIN:$expected_bin" \
              "$S3_IDF_RMT_LOOPBACK_ELF:$expected_elf" \
@@ -54,6 +54,8 @@ grep -q '^RMT_CARRIER_LOOPBACK_OK count=3' "$tmpdir/guest.out" ||
     fail "stock-driver carrier TX/RX callback did not recover the pulse envelope"
 grep -q '^RMT_LOOP_COUNT_OK count=6' "$tmpdir/guest.out" ||
     fail "three-iteration loop did not deliver six GPIO/RX symbols"
+grep -q '^RMT_INFINITE_LOOP_OK count=' "$tmpdir/guest.out" ||
+    fail "infinite loop did not repeat through GPIO/RX and stop cleanly"
 grep -q '^RMT_LOOP_BATCH_OK count=1024' "$tmpdir/guest.out" ||
     fail "stock-driver loop interrupt did not complete both hardware count batches"
 grep -q '^RMT_LOOPBACK_ALIVE 10' "$tmpdir/guest.out" ||
@@ -82,4 +84,4 @@ cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
 cmp -s "$tmpdir/emu.err" "$tmpdir/emu.replay" ||
     fail "the emulator state and MMIO report differ on replay"
 
-echo "PASS: stock ESP-IDF S3 RMT TX/GPIO/RX callback measured plain, carrier, and three-iteration loop pulses; a 1024-iteration loop crossed the hardware count limit; replay and FreeRTOS heartbeat match, with $rmt_demod demodulation and $rmt_teardown memory-power-down writes diagnostic"
+echo "PASS: stock ESP-IDF S3 RMT TX/GPIO/RX callback measured plain, carrier, finite, and explicitly stopped infinite-loop pulses; a 1024-iteration loop crossed the hardware count limit; replay and FreeRTOS heartbeat match, with $rmt_demod demodulation and $rmt_teardown memory-power-down writes diagnostic"

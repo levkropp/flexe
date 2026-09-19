@@ -104,7 +104,8 @@ I2C-master image against a host register device, including repeated-START,
 FIFO refill, and NACK handling. `check-s3-idf-rmt-loopback.sh` verifies the
 stock RMT TX/RX drivers through GPIO4 and their ISR callback, including exact
 plain pulse widths, carrier-demodulated envelopes, finite counted-loop
-interrupts, and sustained FreeRTOS execution. Build commands and
+interrupts, explicitly stopped infinite loops, and sustained FreeRTOS
+execution. Build commands and
 artifact hashes are in [Hardware completeness](hardware-completeness.md).
 
 ## JIT verification
