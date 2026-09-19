@@ -4,10 +4,12 @@
 
 #define S3_RMT_BASE       0x60016000u
 #define S3_RMT_CONF0      0x020u
+#define S3_RMT_CONF1      0x024u
 #define S3_RMT_CONF3      0x02Cu
 #define S3_RMT_RX_CONF4   0x030u
 #define S3_RMT_RX_CTRL4   0x034u
 #define S3_RMT_STATUS0    0x050u
+#define S3_RMT_STATUS1    0x054u
 #define S3_RMT_RX_STATUS4 0x060u
 #define S3_RMT_INT_RAW    0x070u
 #define S3_RMT_INT_ST     0x074u
@@ -22,12 +24,14 @@
 #define S3_RMT_REF_RST    0x0C8u
 #define S3_RMT_DATE       0x0CCu
 #define S3_RMT_MEM0       0x800u
+#define S3_RMT_MEM1       0x8C0u
 #define S3_RMT_RX_MEM4    0xB00u
 #define S3_GPIO_BASE      0x60004000u
 #define S3_GPIO_RMT_RX0   (0x154u + 81u * 4u)
 #define S3_GPIO_FUNC_OUT4 (0x554u + 4u * 4u)
 
 typedef struct {
+    int channel;
     unsigned calls;
     unsigned items;
     unsigned completions;
@@ -42,7 +46,7 @@ static void rmt_v1_tx_observed(void *ctx, int channel,
                                bool complete)
 {
     rmt_v1_probe_t *probe = ctx;
-    if (channel != 0) return;
+    if (channel != probe->channel) return;
     probe->calls++;
     probe->items += (unsigned)count;
     if (count) probe->last_item = items[count - 1u];
@@ -1252,6 +1256,70 @@ TEST(s3_rmt_v1_unobserved_infinite_loop_fast_forwards_without_wakeups)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_sync_group_waits_for_final_channel_and_starts_together)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    xtensa_cpu_t cpu0;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_init_for_target(&cpu0, s3);
+    cpu0.mem = mem;
+    periph_attach_cpus(periph, &cpu0, NULL);
+    rmt_v1_probe_t probe0 = {0};
+    rmt_v1_probe_t probe1 = {.channel = 1};
+    ASSERT_EQ(periph_set_rmt_tx_callback(periph, 0,
+                                         rmt_v1_tx_observed, &probe0), 0);
+    ASSERT_EQ(periph_set_rmt_tx_callback(periph, 1,
+                                         rmt_v1_tx_observed, &probe1), 0);
+    const uint32_t pulse = 10u | (1u << 15u) | (20u << 16u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0, pulse);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0 + 4u, 0u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM1, pulse);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM1 + 4u, 0u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_INT_ENA, 3u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_SIM,
+                (1u << 4u) | 3u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_TX_SIM), 0x13u);
+
+    uint32_t conf0 = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF0);
+    uint32_t conf1 = mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF1);
+    cpu0.ccount = 100u;
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
+                (conf0 & ~(1u << 21u)) | 1u);
+    cpu0.ccount = 400u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
+    ASSERT_EQ(probe0.calls, 0u);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0) >> 22u) & 7u,
+              0u);
+
+    cpu0.ccount = 500u;
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF1,
+                (conf1 & ~(1u << 21u)) | 1u);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS0) >> 22u) & 7u,
+              1u);
+    ASSERT_EQ((mem_read32(mem, S3_RMT_BASE + S3_RMT_STATUS1) >> 22u) & 7u,
+              1u);
+    cpu0.ccount = 739u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_RAW), 0u);
+    cpu0.ccount = 740u;
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_INT_ST), 3u);
+    ASSERT_EQ(probe0.calls, 1u);
+    ASSERT_EQ(probe1.calls, 1u);
+    ASSERT_EQ(probe0.completions, 1u);
+    ASSERT_EQ(probe1.completions, 1u);
+    ASSERT_EQ(probe0.last_item, pulse);
+    ASSERT_EQ(probe1.last_item, pulse);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_markerless_and_empty_loops_stay_diagnostic)
 {
     const flexe_target_desc_t *s3 =
@@ -1313,9 +1381,10 @@ TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic)
     mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
                 (1u << 3) | 1u); /* counted loop without auto-stop */
     mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF3, 1u << 25);
-    mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_SIM, 1u << 4);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_TX_SIM, 1u << 5);
     mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_CONF4, 1u << 23);
     ASSERT_EQ(periph_unhandled_count(periph), 4u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_TX_SIM), 0u);
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_CONF3) & (1u << 25),
               0u);
     periph_destroy(periph);
@@ -1344,6 +1413,7 @@ static void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_counted_tx_loop_repeats_pad_and_autostops_on_loop_irq);
     RUN_TEST(s3_rmt_v1_infinite_tx_loop_repeats_until_explicit_stop);
     RUN_TEST(s3_rmt_v1_unobserved_infinite_loop_fast_forwards_without_wakeups);
+    RUN_TEST(s3_rmt_v1_sync_group_waits_for_final_channel_and_starts_together);
     RUN_TEST(s3_rmt_v1_markerless_and_empty_loops_stay_diagnostic);
     RUN_TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic);
 }

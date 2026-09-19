@@ -30,6 +30,8 @@
 #define RMT_LOOP_COUNT_RESET  (1u << 20)
 #define RMT_TX_LOOP_COUNT_EN  (1u << 19)
 #define RMT_TX_LOOP_STOP_EN   (1u << 21)
+#define RMT_TX_SIM_ENABLE     (1u << 4)
+#define RMT_TX_SIM_MASK       0x1Fu
 
 #define RMT_TX_START          (1u << 0)
 #define RMT_MEM_RD_RST        (1u << 1)
@@ -105,6 +107,7 @@ typedef struct {
     bool edge_second;
     bool edge_active;
     bool loop_has_marker;
+    bool sync_armed;
     uint64_t deadline;
     rmt_event_kind_t event;
     bool active;
@@ -724,6 +727,47 @@ static void rmt_tx_start_segment(flexe_rmt_v1_t *rmt, unsigned channel,
     rmt_tx_emit_edge_level(rmt, channel, start_cycle);
 }
 
+static void rmt_tx_begin(flexe_rmt_v1_t *rmt, unsigned channel,
+                         uint64_t start_cycle)
+{
+    rmt_tx_channel_t *tx = &rmt->tx[channel];
+    tx->sync_armed = false;
+    tx->active = true;
+    tx->read_index = 0u;
+    tx->carrier_start = start_cycle;
+    if ((tx->conf & RMT_TX_CONTINUOUS) &&
+        !rmt_tx_has_supported_loop(tx))
+        rmt->fallback_write(rmt->fallback_ctx,
+                            rmt->desc->base + RMT_TX_CONF_OFF +
+                            channel * 4u, tx->conf | RMT_TX_START);
+    rmt_tx_start_segment(rmt, channel, start_cycle);
+}
+
+static void rmt_tx_start_or_arm(flexe_rmt_v1_t *rmt, unsigned channel,
+                                uint64_t start_cycle)
+{
+    uint32_t channel_mask = (1u << rmt->desc->tx_channel_count) - 1u;
+    uint32_t selected = rmt->tx_sim & channel_mask;
+    if (!(rmt->tx_sim & RMT_TX_SIM_ENABLE) ||
+        !(selected & (1u << channel))) {
+        rmt_tx_begin(rmt, channel, start_cycle);
+        return;
+    }
+
+    rmt_tx_channel_t *tx = &rmt->tx[channel];
+    tx->active = false;
+    tx->sync_armed = true;
+    for (unsigned i = 0u; i < rmt->desc->tx_channel_count; i++) {
+        if ((selected & (1u << i)) && !rmt->tx[i].sync_armed)
+            return;
+    }
+    /* The final selected TX_START releases every channel on the same RMT
+     * clock edge. Plan all streams from that one shared guest timestamp. */
+    for (unsigned i = 0u; i < rmt->desc->tx_channel_count; i++) {
+        if (selected & (1u << i)) rmt_tx_begin(rmt, i, start_cycle);
+    }
+}
+
 static void rmt_tx_advance_edge(flexe_rmt_v1_t *rmt, unsigned channel,
                                  uint64_t cycle)
 {
@@ -1147,21 +1191,16 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         if (value & RMT_APB_MEM_RST) tx->apb_index = 0u;
         if (value & RMT_TX_STOP) {
             tx->active = false;
+            tx->sync_armed = false;
             tx->event = RMT_EVENT_NONE;
             tx->edge_active = false;
             tx->carrier_deadline = UINT64_MAX;
             rmt_tx_emit_idle(rmt, channel, rmt_clock_now(rmt));
         }
         if (value & RMT_TX_START) {
-            tx->active = true;
-            tx->read_index = 0u;
-            tx->carrier_start = rmt_clock_now(rmt);
-            if ((tx->conf & RMT_TX_CONTINUOUS) &&
-                !rmt_tx_has_supported_loop(tx))
-                rmt->fallback_write(rmt->fallback_ctx, address, value);
-            rmt_tx_start_segment(rmt, channel, tx->carrier_start);
+            rmt_tx_start_or_arm(rmt, channel, rmt_clock_now(rmt));
         }
-        if (!tx->active)
+        if (!tx->active && !tx->sync_armed)
             rmt_tx_emit_idle(rmt, channel, rmt_clock_now(rmt));
         rmt_notify_state(rmt);
         return;
@@ -1243,9 +1282,14 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         return;
     }
     if (off == RMT_TX_SIM_OFF) {
-        if (value & (1u << 4))
+        bool armed = false;
+        for (unsigned channel = 0u;
+             channel < rmt->desc->tx_channel_count; channel++)
+            armed |= rmt->tx[channel].sync_armed;
+        if ((value & ~RMT_TX_SIM_MASK) ||
+            (armed && (value & RMT_TX_SIM_MASK) != rmt->tx_sim))
             rmt->fallback_write(rmt->fallback_ctx, address, value);
-        rmt->tx_sim = value;
+        rmt->tx_sim = value & RMT_TX_SIM_MASK;
         return;
     }
     if (off == RMT_REF_CNT_RST_OFF) {

@@ -17,6 +17,8 @@
 static TaskHandle_t receiver_task;
 static volatile size_t received_count;
 static rmt_symbol_word_t received[32];
+static volatile bool sync_tx0_done;
+static volatile bool sync_tx1_done;
 
 static bool receive_done(rmt_channel_handle_t channel,
                          const rmt_rx_done_event_data_t *event,
@@ -28,6 +30,16 @@ static bool receive_done(rmt_channel_handle_t channel,
     received_count = event->num_symbols;
     vTaskNotifyGiveFromISR(receiver_task, &woken);
     return woken == pdTRUE;
+}
+
+static bool transmit_done(rmt_channel_handle_t channel,
+                          const rmt_tx_done_event_data_t *event,
+                          void *ctx)
+{
+    (void)channel;
+    (void)event;
+    *(volatile bool *)ctx = true;
+    return false;
 }
 
 static void fail(const char *stage, esp_err_t error)
@@ -251,9 +263,54 @@ void app_main(void)
     check("batch-tx-complete", rmt_tx_wait_all_done(tx, 1000));
     printf("RMT_LOOP_BATCH_OK count=1024\n");
     fflush(stdout);
+
+    rmt_channel_handle_t sync_tx = NULL;
+    rmt_encoder_handle_t sync_encoder = NULL;
+    rmt_tx_channel_config_t sync_tx_config = tx_config;
+    sync_tx_config.gpio_num = LOOPBACK_GPIO + 1;
+    check("new-sync-tx", rmt_new_tx_channel(&sync_tx_config, &sync_tx));
+    check("new-sync-encoder", rmt_new_copy_encoder(
+        &encoder_config, &sync_encoder));
+    rmt_tx_event_callbacks_t tx_callbacks = {
+        .on_trans_done = transmit_done,
+    };
+    check("tx0-callback", rmt_tx_register_event_callbacks(
+        tx, &tx_callbacks, (void *)&sync_tx0_done));
+    check("tx1-callback", rmt_tx_register_event_callbacks(
+        sync_tx, &tx_callbacks, (void *)&sync_tx1_done));
+    check("enable-sync-tx", rmt_enable(sync_tx));
+    rmt_channel_handle_t sync_channels[] = {tx, sync_tx};
+    rmt_sync_manager_config_t sync_config = {
+        .tx_channel_array = sync_channels,
+        .array_size = 2,
+    };
+    rmt_sync_manager_handle_t sync = NULL;
+    check("new-sync-manager", rmt_new_sync_manager(&sync_config, &sync));
+    check("sync-reset", rmt_sync_reset(sync));
+    sync_tx0_done = false;
+    sync_tx1_done = false;
+    check("sync-transmit-0", rmt_transmit(tx, encoder, loop_frame,
+                                           sizeof(loop_frame),
+                                           &transmit_config));
+    esp_rom_delay_us(500);
+    if (sync_tx0_done)
+        fail("sync-started-early", ESP_ERR_INVALID_STATE);
+    check("sync-transmit-1", rmt_transmit(sync_tx, sync_encoder, loop_frame,
+                                           sizeof(loop_frame),
+                                           &transmit_config));
+    check("sync-tx0-complete", rmt_tx_wait_all_done(tx, 1000));
+    check("sync-tx1-complete", rmt_tx_wait_all_done(sync_tx, 1000));
+    if (!sync_tx0_done || !sync_tx1_done)
+        fail("sync-callbacks", ESP_ERR_INVALID_RESPONSE);
+    printf("RMT_SYNC_START_OK channels=2\n");
+    fflush(stdout);
+    check("delete-sync-manager", rmt_del_sync_manager(sync));
+    check("disable-sync-tx", rmt_disable(sync_tx));
     check("disable-tx", rmt_disable(tx));
+    check("delete-sync-tx", rmt_del_channel(sync_tx));
     check("delete-tx", rmt_del_channel(tx));
     check("delete-rx", rmt_del_channel(rx));
+    check("delete-sync-encoder", rmt_del_encoder(sync_encoder));
     check("delete-encoder", rmt_del_encoder(encoder));
     for (unsigned beat = 1u; beat <= 10u; beat++) {
         vTaskDelay(pdMS_TO_TICKS(100));
