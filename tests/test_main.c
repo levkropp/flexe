@@ -21,6 +21,7 @@ volatile int emu_app_running = 1;
 #include "test_radio.c"
 #include "test_esp32s3_extmem.c"
 #include "test_system_clock.c"
+#include "test_sandbox_input.c"
 #include "test_systimer.c"
 #include "test_timer_group.c"
 #include "test_rmt_v1.c"
@@ -80,6 +81,7 @@ int main(void) {
     run_radio_tests();
     run_esp32s3_extmem_tests();
     run_system_clock_tests();
+    run_sandbox_input_tests();
     run_systimer_tests();
     run_timer_group_target_tests();
     run_rmt_v1_tests();

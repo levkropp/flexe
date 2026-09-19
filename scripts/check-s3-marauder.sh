@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Optional production gate: unmodified ESP32 Marauder v1.16.0 MultiBoard S3
 # reaches its UART command prompt after native Bluetooth, Wi-Fi, LED, and GPS
-# initialization. The release image and official ROM ELF are external inputs.
+# initialization, then accepts a real command through the host UART transport.
+# The release image and official ROM ELF are external inputs.
 set -euo pipefail
 
 : "${S3_MARAUDER_BIN:?set S3_MARAUDER_BIN to the Marauder v1.16.0 MultiBoard S3 image}"
@@ -17,38 +18,85 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
 fi
 
 tmpdir=$(mktemp -d)
+emu_pid=
 cleanup() {
-    rm -f "$tmpdir/guest.out" "$tmpdir/emu.err"
+    exec 3>&- || true
+    if [[ -n "$emu_pid" ]] && kill -0 "$emu_pid" 2>/dev/null; then
+        kill "$emu_pid" 2>/dev/null || true
+        wait "$emu_pid" 2>/dev/null || true
+    fi
+    rm -f "$tmpdir/input" "$tmpdir/events" "$tmpdir/uart" \
+        "$tmpdir/uart.tmp" "$tmpdir/emu.err"
     rmdir "$tmpdir"
 }
 trap cleanup EXIT
 
 fail() {
     echo "FAIL: $1" >&2
-    tail -35 "$tmpdir/guest.out" >&2
-    tail -35 "$tmpdir/emu.err" >&2
+    [[ ! -f "$tmpdir/uart" ]] || tail -35 "$tmpdir/uart" >&2
+    [[ ! -f "$tmpdir/emu.err" ]] || tail -35 "$tmpdir/emu.err" >&2
     exit 1
 }
 
+decode_uart() {
+    awk -F'"b":' '/"t":"uart"/ {split($2, x, /[,}]/); printf "%c", x[1]}' \
+        "$tmpdir/events" > "$tmpdir/uart.tmp"
+    mv "$tmpdir/uart.tmp" "$tmpdir/uart"
+}
+
+wait_for_uart() {
+    local marker=$1
+    for ((attempt = 0; attempt < 18000; attempt++)); do
+        decode_uart
+        grep -Fq "$marker" "$tmpdir/uart" && return 0
+        kill -0 "$emu_pid" 2>/dev/null ||
+            fail "firmware exited before printing $marker"
+        sleep 0.01
+    done
+    fail "timed out waiting for $marker"
+}
+
+mkfifo "$tmpdir/input"
 "$runner" -N -q --no-jit --target esp32s3 -R "$S3_ROM_ELF" \
-    --unhandled-report -c 5300000000 "$S3_MARAUDER_BIN" \
-    > "$tmpdir/guest.out" 2> "$tmpdir/emu.err"
+    --sandbox-events --unhandled-report -c 5500000000 "$S3_MARAUDER_BIN" \
+    < "$tmpdir/input" > "$tmpdir/events" 2> "$tmpdir/emu.err" &
+emu_pid=$!
+exec 3> "$tmpdir/input"
+
+# Keep the transport connected until startup is complete. Flexe freezes an
+# all-WAITI guest with no internal deadline instead of consuming its cycle
+# budget while it waits for the next host event.
+wait_for_uart 'v1.16.0'
+printf '{"t":"uart_in","u":0,"hex":"68656c700a"}\n' >&3
+exec 3>&-
+if ! wait "$emu_pid"; then
+    emu_pid=
+    fail "emulator exited with an error"
+fi
+emu_pid=
+decode_uart
 
 grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err" ||
     fail "firmware did not sustain native dual-core execution"
-grep -q 'ESP32 Marauder' "$tmpdir/guest.out" ||
+grep -q 'ESP32 Marauder' "$tmpdir/uart" ||
     fail "Marauder CLI banner was not printed"
-grep -q 'v1\.16\.0' "$tmpdir/guest.out" ||
+grep -q 'v1\.16\.0' "$tmpdir/uart" ||
     fail "unexpected Marauder version"
-grep -q '^> ' "$tmpdir/guest.out" ||
+grep -q '^> #help' "$tmpdir/uart" ||
+    fail "Marauder did not consume the injected UART command"
+grep -q '^============ Commands ============' "$tmpdir/uart" ||
+    fail "Marauder did not execute its help command"
+grep -q '^channel \[-s <channel>\]' "$tmpdir/uart" ||
+    fail "Marauder help response was incomplete"
+[[ $(grep -c '^> ' "$tmpdir/uart" || true) -ge 2 ]] ||
     fail "Marauder command prompt was not reached"
-grep -q 'Could not detect GPS baudrate' "$tmpdir/guest.out" ||
+grep -q 'Could not detect GPS baudrate' "$tmpdir/uart" ||
     fail "the complete absent-GPS probe did not finish"
-grep -q 'GPS Not Found' "$tmpdir/guest.out" ||
+grep -q 'GPS Not Found' "$tmpdir/uart" ||
     fail "GPS fallback did not complete"
 
 if grep -Eiq 'assert|panic|Guru Meditation|Interrupt wdt timeout' \
-        "$tmpdir/guest.out" "$tmpdir/emu.err"; then
+        "$tmpdir/uart" "$tmpdir/emu.err"; then
     fail "firmware asserted or panicked during startup"
 fi
 if grep -q '^\[reset\] system reset requested' "$tmpdir/emu.err"; then
@@ -56,6 +104,7 @@ if grep -q '^\[reset\] system reset requested' "$tmpdir/emu.err"; then
 fi
 
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" ]] || fail "missing unsupported-access diagnostics"
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 7068 ]] ||
+    fail "unsupported-access count exceeded the accepted bootstrap baseline"
 
-echo "PASS: Marauder S3 v1.16.0 reached its CLI without an assertion or reset; $unhandled unsupported accesses remain visible"
+echo "PASS: Marauder S3 v1.16.0 executed an injected UART help command and returned to its prompt; $unhandled unsupported accesses remain visible"

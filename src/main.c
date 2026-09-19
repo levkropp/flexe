@@ -13,6 +13,7 @@
 #include "freertos_stubs.h"
 #include "savestate.h"
 #include "hierarchical_trace.h"
+#include "sandbox_input.h"
 #include "sandbox_events.h"
 #include "aot.h"
 #ifndef _MSC_VER
@@ -23,6 +24,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <errno.h>
 #ifndef _MSC_VER
 #include <getopt.h>
 #endif
@@ -667,6 +669,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
     fprintf(stderr, "  --psram <chip>  Attach optional S3 PSRAM: ap-8m-opi (default: none)\n");
     fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
+    fprintf(stderr, "  --sandbox-events  Emit peripheral NDJSON and accept GPIO/touch/ADC/UART input on stdin\n");
     fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
@@ -736,75 +739,72 @@ static int sandbox_touch_state_fn(int *x, int *y, void *ctx) {
 
 /* ===== Sandbox stdin command reader =====
  * When --sandbox-events is active, the Node bridge may push commands
- * (button presses, firmware reloads, GPIO input drives, touch taps) to
+ * (GPIO input drives, touch taps, ADC samples, and UART traffic) to
  * flexe's stdin as NDJSON lines. We set stdin non-blocking once and
  * drain it at the top of every run-loop batch. Recognised commands:
  *   {"t":"gpio_in","pin":0,"lvl":1}
  *   {"t":"touch_in","x":120,"y":80,"pressed":1}
+ *   {"t":"adc_in","ch":3,"raw":2048}
+ *   {"t":"uart_in","u":0,"hex":"68656c700a"}
+ *   {"t":"uart_break","u":0}
  * Unknown shapes are silently ignored. */
 #include <fcntl.h>
 #include <unistd.h>
 
 static char   g_stdin_buf[4096];
 static size_t g_stdin_len = 0;
+static int    g_stdin_eof = 0;
 
 static void sandbox_stdin_init(void) {
+    g_stdin_eof = 0;
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     if (flags >= 0) fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 }
 
-static int json_int_field(const char *s, const char *key, long *out) {
-    /* Tiny scanner: find "\"key\":" then parse the integer that follows. */
-    char pat[32];
-    int n = snprintf(pat, sizeof(pat), "\"%s\"", key);
-    if (n <= 0) return 0;
-    const char *p = strstr(s, pat);
-    if (!p) return 0;
-    p += n;
-    while (*p && (*p == ' ' || *p == ':')) p++;
-    if (!*p) return 0;
-    char *end = NULL;
-    long v = strtol(p, &end, 10);
-    if (end == p) return 0;
-    *out = v;
-    return 1;
-}
-
-static void sandbox_process_line(esp32_periph_t *periph, const char *line) {
-    if (!line || !*line) return;
-    const char *t = strstr(line, "\"t\"");
-    if (!t) return;
-    if (strstr(line, "\"gpio_in\"")) {
-        long pin = -1, lvl = -1;
-        if (json_int_field(line, "pin", &pin) && json_int_field(line, "lvl", &lvl)) {
-            periph_gpio_set_input(periph, (int)pin, (int)lvl);
-        }
-    } else if (strstr(line, "\"touch_in\"")) {
-        long x = 0, y = 0, pressed = 0;
-        json_int_field(line, "x", &x);
-        json_int_field(line, "y", &y);
-        json_int_field(line, "pressed", &pressed);
-        g_touch_x = (int)x;
-        g_touch_y = (int)y;
-        g_touch_pressed = (int)pressed;
-        periph_gpio_set_input(periph, CYD_TOUCH_IRQ_PIN, pressed ? 0 : 1);
-    } else if (strstr(line, "\"adc_in\"")) {
-        long ch = -1, raw = 0;
-        if (json_int_field(line, "ch", &ch) &&
-            json_int_field(line, "raw", &raw)) {
-            if (raw < 0) raw = 0;
-            if (raw > 0xFFFF) raw = 0xFFFF;
-            periph_set_adc_value(periph, (int)ch, (uint16_t)raw);
-        }
+static bool sandbox_process_line(esp32_periph_t *periph, const char *line) {
+    sbx_input_event_t event;
+    if (!sbx_input_parse(line, &event)) return false;
+    switch (event.kind) {
+    case SBX_INPUT_GPIO:
+        periph_gpio_set_input(periph, event.gpio.pin, event.gpio.level);
+        return true;
+    case SBX_INPUT_TOUCH:
+        g_touch_x = event.touch.x;
+        g_touch_y = event.touch.y;
+        g_touch_pressed = event.touch.pressed;
+        periph_gpio_set_input(periph, CYD_TOUCH_IRQ_PIN,
+                              event.touch.pressed ? 0 : 1);
+        return true;
+    case SBX_INPUT_ADC:
+        periph_set_adc_value(periph, event.adc.channel, event.adc.raw);
+        return true;
+    case SBX_INPUT_UART:
+        return periph_uart_rx_inject_num(periph, event.uart.port,
+                                         event.uart.data,
+                                         event.uart.len) != 0u;
+    case SBX_INPUT_UART_BREAK:
+        return periph_uart_rx_break_num(periph, event.uart_break.port);
+    case SBX_INPUT_NONE:
+        return false;
     }
+    return false;
 }
 
-static void sandbox_drain_stdin(esp32_periph_t *periph) {
+static bool sandbox_drain_stdin(esp32_periph_t *periph) {
+    bool applied = false;
     for (;;) {
         if (g_stdin_len >= sizeof(g_stdin_buf) - 1) g_stdin_len = 0;
         ssize_t n = read(STDIN_FILENO, g_stdin_buf + g_stdin_len,
                          sizeof(g_stdin_buf) - 1 - g_stdin_len);
-        if (n <= 0) break;
+        if (n == 0) {
+            g_stdin_eof = 1;
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) g_stdin_eof = 1;
+            break;
+        }
         g_stdin_len += (size_t)n;
         g_stdin_buf[g_stdin_len] = '\0';
         /* Split on newlines and process complete lines. */
@@ -813,7 +813,7 @@ static void sandbox_drain_stdin(esp32_periph_t *periph) {
             char *nl = strchr(start, '\n');
             if (!nl) break;
             *nl = '\0';
-            sandbox_process_line(periph, start);
+            applied |= sandbox_process_line(periph, start);
             start = nl + 1;
         }
         /* Move any tail back to the front */
@@ -823,6 +823,32 @@ static void sandbox_drain_stdin(esp32_periph_t *periph) {
         g_stdin_buf[g_stdin_len] = '\0';
         if (n < 1024) break;  /* avoid starving the main loop */
     }
+    return applied;
+}
+
+/* A frontend may remain connected after firmware reaches an all-WAITI idle
+ * state. Freeze guest time while there is no internal timer or enabled
+ * interrupt to observe, and sample host input at human-interactive latency.
+ * This avoids both busy-spinning and racing a finite cycle budget to expiry
+ * before the next keypress arrives. */
+static bool sandbox_cpu_quiescent(const xtensa_cpu_t *cpu) {
+    if (!cpu || !cpu->running) return true;
+    if (!cpu->halted) return false;
+    if (cpu->interrupt & cpu->intenable) return false;
+    return cpu->next_timer_event == UINT32_MAX;
+}
+
+static bool sandbox_session_quiescent(const xtensa_cpu_t *cpu0,
+                                      const xtensa_cpu_t *cpu1) {
+    bool has_waiting_core = (cpu0 && cpu0->running && cpu0->halted) ||
+                            (cpu1 && cpu1->running && cpu1->halted);
+    return has_waiting_core && sandbox_cpu_quiescent(cpu0) &&
+           sandbox_cpu_quiescent(cpu1);
+}
+
+static void sandbox_wait_for_input(void) {
+    const struct timespec interval = { .tv_sec = 0, .tv_nsec = 1000000 };
+    (void)nanosleep(&interval, NULL);
 }
 
 /* ===== Sandbox event JSON sink =====
@@ -1521,7 +1547,20 @@ int main(int argc, char *argv[]) {
            !cpu->breakpoint_hit && !cpu->debug_break &&
            !(cpu1_any && cpu1_any->breakpoint_hit) &&
            !(cpu1_any && cpu1_any->debug_break)) {
-        if (sandbox_events) sandbox_drain_stdin(periph);
+        if (sandbox_events) {
+            bool applied = sandbox_drain_stdin(periph);
+            if (!applied && !g_stdin_eof &&
+                sandbox_session_quiescent(cpu, cpu1_any)) {
+                sandbox_wait_for_input();
+                applied = sandbox_drain_stdin(periph);
+                /* A connected network frontend is another possible source of
+                 * wakeup while both CPUs are idle. */
+                flexe_host_net_pump(host_net);
+                if (!applied && !g_stdin_eof &&
+                    sandbox_session_quiescent(cpu, cpu1_any))
+                    continue;
+            }
+        }
         /* Are we in a trace window?
          * Use cpu->cycle_count (virtual time including FreeRTOS skips)
          * so trace windows match event log timestamps. */
@@ -1616,7 +1655,8 @@ int main(int argc, char *argv[]) {
                     stop_reason = STOP_DEBUG_BREAK;
                     break;
                 }
-                if (cpu->halted) {
+                if (cpu->halted &&
+                    !(sandbox_events && !g_stdin_eof)) {
                     trace_emit("CPU halted (WAITI) at cycle %llu\n",
                             (unsigned long long)cycles);
                     stop_reason = STOP_HALT;
@@ -1720,10 +1760,11 @@ int main(int argc, char *argv[]) {
                  * Only break on !running if core 1 is also dead — otherwise
                  * keep the outer loop alive so core 1 can continue executing
                  * via flexe_session_post_batch(). */
+                bool wait_for_host = sandbox_events && !g_stdin_eof;
                 if (cpu->breakpoint_hit || cpu->debug_break ||
                     (cpu1_any && cpu1_any->breakpoint_hit) ||
                     (cpu1_any && cpu1_any->debug_break) ||
-                    (!was_gpio_sleeping && cpu->halted) ||
+                    (!was_gpio_sleeping && cpu->halted && !wait_for_host) ||
                     (!was_gpio_sleeping && !cpu->running &&
                      !(cpu1_any && cpu1_any->running))) break;
             }

@@ -112,6 +112,7 @@ set(LIB_SOURCES
     src/flexe_session.c
     src/savestate.c
     src/hierarchical_trace.c
+    src/sandbox_input.c
     src/sandbox_events.c
     src/aot.c
 )
