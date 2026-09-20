@@ -15,6 +15,7 @@ Environment:
   FLEXE_ARDUINO_CONFIG                optional Arduino CLI config file
   FLEXE_S3_ARDUINO_BUILD_ROOT         persistent external artifact root
   FLEXE_S3_ARDUINO_CACHE_PATH         shared compiled-core cache
+  FLEXE_FIXTURE_GATE_JOBS             concurrent read-only gates (default: host-aware)
   FLEXE_S3_ARDUINO_ALLOW_UNPINNED     1 permits a core other than 3.3.11
   FLEXE_BUILD_DIR                     host CMake build used by --check
   S3_ROM_ELF                          official S3 ROM ELF (auto-detected)
@@ -69,6 +70,11 @@ elif [[ " $* " == *" all "* ]]; then
 fi
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$repo/scripts/fixture-gate-pool.sh"
+gate_jobs=
+if [[ "$run_checks" -eq 1 ]]; then
+    gate_jobs=$(flexe_fixture_gate_jobs) || exit $?
+fi
 if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
     cache_home=$XDG_CACHE_HOME
 elif [[ -n "${HOME:-}" ]]; then
@@ -430,10 +436,14 @@ for index in "${!names[@]}"; do
             echo "error: built runner is not executable: $gate_runner" >&2
             exit 1
         }
-        echo "==> checking $name"
-        env "${prefix}_BIN=$firmware" "${prefix}_ELF=$symbols" \
-            "${prefix}_BIN_SHA256=$bin_hash" \
-            "${prefix}_ELF_SHA256=$elf_hash" \
-            "S3_ROM_ELF=$S3_ROM_ELF" "RUNNER=$gate_runner" "$gate"
+        flexe_fixture_gate_queue_artifact "$name" "$gate" "$prefix" \
+            "$firmware" "$symbols" "$bin_hash" "$elf_hash" \
+            "$S3_ROM_ELF" "$gate_runner"
     fi
 done
+
+if [[ "$run_checks" -eq 1 ]]; then
+    gate_status=0
+    flexe_fixture_gate_run_queued "$gate_jobs" || gate_status=$?
+    [[ "$gate_status" -eq 0 ]] || exit "$gate_status"
+fi

@@ -119,7 +119,11 @@ and installed core version. An unchanged run therefore bypasses Arduino CLI's
 expensive dependency scan entirely; a cache miss still shares the compiled
 core across fixtures. Use `--rebuild` to force compilation, `--verbose` to see
 the compiler output, or the variables listed by `--help` to relocate caches
-and select nonstandard tools.
+and select nonstandard tools. After all mutable build work finishes, independent
+gates run through a shared bounded process pool with ordered logs. The default
+reserves two logical CPUs per gate and caps concurrency at four; set
+`FLEXE_FIXTURE_GATE_JOBS=1` for serialized diagnosis or choose another positive
+limit for the host.
 
 ## Production ROM gates
 
@@ -218,7 +222,10 @@ Interrupted configure/builds retain a pending configuration stamp and resume
 their valid Ninja tree on the next invocation. When `ccache` is installed,
 common ESP-IDF components are shared safely across independent projects:
 generated header contents remain part of the cache key, so projects with
-different `sdkconfig` values cannot reuse the wrong object. Set
+different `sdkconfig` values cannot reuse the wrong object. Like the S3 Arduino
+builder, it defers read-only behavior gates until every firmware build is done,
+then uses the shared `FLEXE_FIXTURE_GATE_JOBS` pool so emulator validation does
+not compete with compilation. Set
 `FLEXE_IDF_BUILD_ROOT` or
 `FLEXE_IDF_CCACHE_DIR` to relocate those caches; the script's `--help` lists
 the remaining controls.

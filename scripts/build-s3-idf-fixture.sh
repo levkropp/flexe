@@ -18,6 +18,7 @@ Environment:
   FLEXE_IDF_CCACHE           auto (default), 1 (required), or 0
   FLEXE_IDF_CCACHE_DIR       shared compiler-cache directory
   FLEXE_IDF_CCACHE_MAXSIZE   cache limit (default: 2G)
+  FLEXE_FIXTURE_GATE_JOBS    concurrent read-only gates (default: host-aware)
   FLEXE_IDF_ALLOW_UNPINNED   1 permits an IDF revision other than v5.3.2
   FLEXE_IDF_VERBOSE          1 streams build output and ccache statistics
   FLEXE_BUILD_DIR            host CMake build used by --check
@@ -81,6 +82,11 @@ elif [[ " $* " == *" all "* ]]; then
 fi
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$repo/scripts/fixture-gate-pool.sh"
+gate_jobs=
+if [[ "$run_checks" -eq 1 ]]; then
+    gate_jobs=$(flexe_fixture_gate_jobs) || exit $?
+fi
 
 if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
     cache_home=$XDG_CACHE_HOME
@@ -704,11 +710,8 @@ for index in "${!projects[@]}"; do
 
     if [[ "$run_checks" -eq 1 ]]; then
         gate="$repo/scripts/check-$(printf '%s' "$key" | tr '_' '-').sh"
-        gate_env=("${prefix}_BIN=$bin" "${prefix}_ELF=$elf"
-            "${prefix}_BIN_SHA256=$bin_hash"
-            "${prefix}_ELF_SHA256=$elf_hash" "S3_ROM_ELF=$S3_ROM_ELF")
         if [[ -n "${RUNNER:-}" ]]; then
-            gate_env+=("RUNNER=$RUNNER")
+            gate_runner=$RUNNER
         else
             host_target_for_key "$key"
             gate_runner="$host_build/$host_target"
@@ -716,12 +719,18 @@ for index in "${!projects[@]}"; do
                 echo "error: built runner is not executable: $gate_runner" >&2
                 exit 1
             }
-            gate_env+=("RUNNER=$gate_runner")
         fi
-        echo "==> checking $key"
-        env "${gate_env[@]}" "$gate"
+        flexe_fixture_gate_queue_artifact "$key" "$gate" "$prefix" \
+            "$bin" "$elf" "$bin_hash" "$elf_hash" \
+            "$S3_ROM_ELF" "$gate_runner"
     fi
 done
+
+if [[ "$run_checks" -eq 1 ]]; then
+    gate_status=0
+    flexe_fixture_gate_run_queued "$gate_jobs" || gate_status=$?
+    [[ "$gate_status" -eq 0 ]] || exit "$gate_status"
+fi
 
 if [[ ${#idf_cache_args[@]} -ne 0 && "$verbose" -eq 1 ]]; then
     echo "==> ccache summary"
