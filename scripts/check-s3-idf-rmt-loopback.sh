@@ -69,21 +69,12 @@ fi
 grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err" ||
     fail "guest did not sustain native FreeRTOS execution"
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 76 ]] ||
-    fail "unsupported MMIO count exceeded the pinned baseline"
-rmt_demod=$(awk '$2 == "W" && $3 == "0x60016034" {count += $1} END {print count + 0}' "$tmpdir/emu.err")
-[[ "$rmt_demod" -eq 1 ]] ||
-    fail "the RX demodulation approximation diagnostic changed"
-rmt_teardown=$(awk '$2 == "W" && $3 == "0x600160C0" {count += $1} END {print count + 0}' "$tmpdir/emu.err")
-[[ "$rmt_teardown" -eq 2 ]] ||
-    fail "the two RMT memory-power-down diagnostics changed"
-if awk '$3 ~ /^0x60016/ && $3 != "0x600160C0" && $3 != "0x60016034" {found = 1} END {exit !found}' \
-        "$tmpdir/emu.err"; then
-    fail "an active RMT operation used unsupported MMIO"
-fi
+unhandled=${unhandled:-0}
+[[ "$unhandled" == 0 ]] ||
+    fail "the RMT loopback replay used unsupported MMIO"
 cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
     fail "the guest UART transcript differs on replay"
 cmp -s "$tmpdir/emu.err" "$tmpdir/emu.replay" ||
     fail "the emulator state and MMIO report differ on replay"
 
-echo "PASS: stock ESP-IDF S3 RMT measured plain, carrier, finite, infinite, and synchronized TX; a 1024-iteration loop crossed the hardware count limit; replay and FreeRTOS heartbeat match, with $rmt_demod demodulation and $rmt_teardown memory-power-down writes diagnostic"
+echo "PASS: stock ESP-IDF S3 RMT measured plain, carrier, finite, infinite, and synchronized TX; a 1024-iteration loop crossed the hardware count limit; replay and FreeRTOS heartbeat match with zero unsupported MMIO accesses"

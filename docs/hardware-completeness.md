@@ -59,7 +59,7 @@ even when a firmware workflow succeeds.
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (masked RTC configuration, supply, analog-control and power/isolation-domain resolution, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, zero-unsupported native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; OPTIONS0, ANA_CONF, SLP_REJECT_CONF, SDIO/BIAS/drive configuration, digital-pad/global isolation, digital domains, and RTC-local domains have architectural state, with selected consumers connected. Brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
-| S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
+| S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback with zero unsupported accesses | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path; pulse RAM becomes inaccessible and loses contents under `RMT_MEM_FORCE_PD`. DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh`, WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response, next prompt, and zero unsupported accesses | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
@@ -506,12 +506,12 @@ blocked for 500 us, then arms TX1 and receives both completion callbacks.
 Both streams use the final channel's `TX_START` guest timestamp, matching the
 [TRM simultaneous-TX sequence](https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf).
 Channel teardown succeeds, and a ten-beat FreeRTOS heartbeat continues. Two
-interpreter runs have identical guest and MMIO reports. The remaining RMT
-diagnostics are one RX demodulation configuration (exact silicon
-phase/frequency tolerance is uncalibrated) and two `RMT_SYS_CONF` writes
-powering down pulse RAM during driver teardown; Flexe does not yet model
-whether contents survive that power transition. Rebuild and replay with the
-official ROM ELF:
+interpreter runs have identical guest and MMIO reports with zero unsupported
+accesses. ESP-IDF's two `RMT_SYS_CONF` bitfield writes during teardown now
+exercise the modeled pulse-RAM power domain: `RMT_MEM_FORCE_PD` gates APB and
+engine capacity and loses RAM contents, while force-up or PMU control restores
+access without restoring stale pulses. Rebuild and replay with the official
+ROM ELF:
 
 ```sh
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
@@ -542,18 +542,15 @@ high/low register encoding and group clock; its exact silicon start phase
 has not been measured. Mid-segment route changes and electrical line behavior
 are not modeled.
 The carrier remover joins short opposite-polarity gaps according to the
-channel-clock thresholds in the
+selected carrier polarity and encoded channel-clock high/low thresholds in the
 [S3 technical reference manual](https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf).
 The stock RX fixture arms a three-channel-tick filter minimum, rejects a
 one-tick GPIO4 glitch, and then uses Arduino's `rmtSetCarrier()` to demodulate
 a 38 kHz-style carrier with 25 kHz tolerance into a two-symbol frame. Unit
-tests cover both carrier polarities. Two pinned interpreter replays match
-byte-for-byte with one expected demodulation MMIO diagnostic and no other
-unsupported RMT sites. This is a functional
-envelope model that uses the opposite-polarity gap threshold; same-polarity
-carrier duty discrimination and exact demodulation phase/frequency tolerance
-are not calibrated against physical S3 silicon. Host-decoded injection still
-bypasses GPIO, filtering,
+tests cover both carrier polarities and exact threshold boundaries. Two pinned
+interpreter replays match byte-for-byte with zero unsupported RMT sites. The
+digital envelope follows guest-clock thresholds; electrical jitter and analog
+tolerance are not modeled. Host-decoded injection still bypasses GPIO, filtering,
 and demodulation. DMA and overrun/error behavior when the guest fails to
 service a threshold in time remain unsupported. Markerless loops, counted
 loops without auto-stop, and dynamic sync-group changes remain unsupported
@@ -563,7 +560,8 @@ validation. Recheck the RX path with the compiled fixture
 and official ROM ELF:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- tests/fixtures/s3_rmt_rx) \
+arduino-cli compile --clean --fqbn esp32:esp32:esp32s3 \
   --build-path /tmp/flexe-s3-rmt-rx-build tests/fixtures/s3_rmt_rx
 S3_RMT_RX_BIN=/tmp/flexe-s3-rmt-rx-build/s3_rmt_rx.ino.merged.bin \
 S3_RMT_RX_ELF=/tmp/flexe-s3-rmt-rx-build/s3_rmt_rx.ino.elf \
@@ -572,9 +570,11 @@ RUNNER=./build/flexe-s3-rmt-rx-test ./scripts/check-s3-rmt-rx.sh
 ```
 
 The RX fixture's pinned merged image SHA-256 is
-`27c4a14c42ac478cd6bfbaf509f1068ffb15d7371c6626c148a088772eee41cd`
+`c2e9ac0fa7ee6540d4ff511c35a1be5126868b06e77dfe64f4f9ad3ea9cd9717`
 and its matching ELF SHA-256 is
-`0eedeb00430d938805517f0ff008147f890111dfcbc3b67e6b2b18af8193f81f`.
+`b7e2cbf74fb0b5374c469d43578fbf548b93329557d14060e3c0b56854fefab3`.
+`SOURCE_DATE_EPOCH` fixes Arduino-ESP32's embedded compile date and time to
+the fixture revision, so a clean rebuild reproduces both hashes.
 For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and

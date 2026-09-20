@@ -237,22 +237,14 @@ int main(int argc, char **argv)
     }
     uint64_t cycles = cpu->cycle_count;
     unsigned unhandled = periph_unhandled_count(periph);
-    unsigned rmt_partial = 0u;
     unsigned rmt_unhandled = 0u;
     for (size_t i = 0u; i < periph_unhandled_audit_count(periph); i++) {
         periph_unhandled_site_t site;
         if (periph_unhandled_audit_get(periph, i, &site) &&
             site.address >= 0x60016000u && site.address < 0x60017000u) {
-            bool partial_demod = site.write &&
-                site.address == RMT_RX_CONF4 &&
-                site.count == 1u &&
-                (site.first_value & (1u << 15)) != 0u &&
-                (mem_read32(mem, RMT_RX_CONF0) & (1u << 28)) != 0u;
-            if (partial_demod) rmt_partial++;
-            else rmt_unhandled++;
-            fprintf(stderr, "[s3-rmt-rx] %s RMT %c 0x%08X "
+            rmt_unhandled++;
+            fprintf(stderr, "[s3-rmt-rx] unsupported RMT %c 0x%08X "
                     "pc=0x%08X value=0x%08X count=%llu\n",
-                    partial_demod ? "partial demod" : "unsupported",
                     site.write ? 'W' : 'R', site.address, site.pc,
                     site.first_value, (unsigned long long)site.count);
         }
@@ -268,21 +260,20 @@ int main(int argc, char **argv)
         pulse_close_to(carrier_second, 0u, 1u, 10u);
     int ok = gpio_short && injected_long && gpio_carrier &&
              stage == SUCCESS_MARKER && short_match && long_match &&
-             carrier_match && rmt_partial == 1u &&
-             rmt_unhandled == 0u;
+             carrier_match && rmt_unhandled == 0u;
     fprintf(stderr,
             "[s3-rmt-rx] stage=0x%08X gpio=%d injected_long=%d "
             "gpio_carrier=%d counts=%u,%u,%u short=%08X,%08X "
             "carrier=%08X,%08X short_match=%d long_match=%d "
             "carrier_match=%d "
             "cycles=%llu unhandled=%u "
-            "rmt_partial_sites=%u rmt_unhandled_sites=%u\n",
+            "rmt_unhandled_sites=%u\n",
             stage, gpio_short, injected_long, gpio_carrier,
             count, long_count, carrier_count, first, second,
             carrier_first, carrier_second,
             short_match, long_match, carrier_match,
             (unsigned long long)cycles, unhandled,
-            rmt_partial, rmt_unhandled);
+            rmt_unhandled);
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);
     return ok ? 0 : 1;

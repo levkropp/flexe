@@ -201,6 +201,50 @@ TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline)
     mem_destroy(mem);
 }
 
+TEST(s3_rmt_v1_memory_power_down_loses_and_gates_pulse_ram)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t sys_conf = mem_read32(mem, S3_RMT_BASE + S3_RMT_SYS_CONF);
+    ASSERT_EQ(sys_conf, 0x05000010u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0, 0x12345678u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4, 0x89ABCDEFu);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_MEM0), 0x12345678u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0x89ABCDEFu);
+
+    /* FORCE_PD makes the shared pulse RAM inaccessible and loses its
+     * contents. Repeated bitfield writes from rmt_hal_deinit are idempotent. */
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_SYS_CONF,
+                sys_conf | (1u << 2u));
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_SYS_CONF,
+                sys_conf | (1u << 2u));
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_SYS_CONF),
+              sys_conf | (1u << 2u));
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_MEM0), 0u);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4), 0u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_MEM0), 0u);
+
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_SYS_CONF,
+                sys_conf | (1u << 3u));
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_MEM0), 0u);
+    mem_write32(mem, S3_RMT_BASE + S3_RMT_MEM0, 0x55AA33CCu);
+    ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_MEM0), 0x55AA33CCu);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq)
 {
     const flexe_target_desc_t *s3 =
@@ -619,7 +663,7 @@ TEST(s3_rmt_v1_data_only_carrier_reaches_gpio_and_rx_demodulator)
     mem_write32(mem, S3_RMT_BASE + S3_RMT_CONF0,
                 conf | (1u << 5) | 1u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
-    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
     ASSERT_EQ(mem_read32(mem, S3_GPIO_BASE + 0x03Cu) & (1u << 4),
               1u << 4);
     cpu0.ccount = 7u;
@@ -639,7 +683,7 @@ TEST(s3_rmt_v1_data_only_carrier_reaches_gpio_and_rx_demodulator)
     ASSERT_EQ(probe.carrier_hz, 13333333u);
     ASSERT_EQ(probe.completions, 1u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
-    ASSERT_EQ(periph_unhandled_count(periph), 1u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
     periph_destroy(periph);
     mem_destroy(mem);
 }
@@ -932,7 +976,7 @@ TEST(s3_rmt_v1_rx_demodulates_both_carrier_polarities)
     periph_gpio_set_input(periph, 4, 0);
     ASSERT_EQ(mem_read32(mem, S3_RMT_BASE + S3_RMT_RX_MEM4),
               14u | ((10u | (1u << 15)) << 16));
-    ASSERT_EQ(periph_unhandled_count(periph), 2u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
     periph_destroy(periph);
     mem_destroy(mem);
 }
@@ -1398,6 +1442,7 @@ void run_rmt_v1_tests(void)
     RUN_TEST(s3_rmt_v1_tx_completes_on_pulse_deadline_and_asserts_irq);
     RUN_TEST(s3_rmt_v1_threshold_and_empty_terminator_are_distinct_events);
     RUN_TEST(s3_rmt_v1_fractional_divider_uses_exact_pulse_deadline);
+    RUN_TEST(s3_rmt_v1_memory_power_down_loses_and_gates_pulse_ram);
     RUN_TEST(s3_rmt_v1_rx_decoded_symbols_complete_after_idle_and_raise_irq);
     RUN_TEST(s3_rmt_v1_rx_captures_gpio_matrix_edges_in_guest_time);
     RUN_TEST(s3_rmt_v1_rx_captures_gpio_output_loopback_edges);

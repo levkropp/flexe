@@ -33,6 +33,9 @@
 #define RMT_TX_LOOP_STOP_EN   (1u << 21)
 #define RMT_TX_SIM_ENABLE     (1u << 4)
 #define RMT_TX_SIM_MASK       0x1Fu
+#define RMT_MEM_FORCE_PD      (1u << 2)
+#define RMT_MEM_FORCE_PU      (1u << 3)
+#define RMT_SYS_CONF_MASK     0x87FFFFFFu
 
 #define RMT_TX_START          (1u << 0)
 #define RMT_MEM_RD_RST        (1u << 1)
@@ -376,6 +379,7 @@ static bool rmt_tx_pad_level(const flexe_rmt_v1_t *rmt,
 
 static uint32_t rmt_capacity(const flexe_rmt_v1_t *rmt, unsigned channel)
 {
+    if (rmt->sys_conf & RMT_MEM_FORCE_PD) return 0u;
     uint32_t blocks = (rmt->tx[channel].conf >> 16) & 0xFu;
     uint32_t available = rmt->desc->tx_channel_count - channel;
     if (blocks > available) blocks = available;
@@ -385,6 +389,7 @@ static uint32_t rmt_capacity(const flexe_rmt_v1_t *rmt, unsigned channel)
 static uint32_t rmt_rx_capacity(const flexe_rmt_v1_t *rmt,
                                 unsigned channel)
 {
+    if (rmt->sys_conf & RMT_MEM_FORCE_PD) return 0u;
     unsigned physical = rmt->desc->tx_channel_count + channel;
     uint32_t blocks = (rmt->rx[channel].conf0 >> 24) & 0xFu;
     uint32_t available = rmt->desc->channel_count - physical;
@@ -544,11 +549,10 @@ static void rmt_rx_accept_level(flexe_rmt_v1_t *rmt, unsigned index,
     }
     if (!rx->edge_started || rx->edge_level != carrier_level) return;
 
-    /* The opposite-level gap must remain for its programmed number of
-     * channel ticks before the carrier envelope ends. The register encodes
-     * a period minus one (S3 RMT_CHm_RX_CARRIER_RM_REG). Preserve the
-     * original edge timestamp when the gap qualifies. Same-polarity duty
-     * discrimination is outside this functional envelope model. */
+    /* The demodulated envelope changes only after the opposite-polarity
+     * interval reaches its programmed high/low threshold. The register
+     * encodes a period minus one (S3 RMT_CHm_RX_CARRIER_RM_REG). Preserve
+     * the original edge timestamp when the gap qualifies. */
     uint32_t threshold = carrier_level ?
         (rx->carrier & 0xFFFFu) + 1u :
         ((rx->carrier >> 16u) & 0xFFFFu) + 1u;
@@ -1122,8 +1126,10 @@ static uint32_t rmt_read(void *ctx, uint32_t address)
     flexe_rmt_v1_eval(rmt);
     if (off >= rmt->desc->memory_offset &&
         off < rmt->desc->memory_offset +
-              rmt->desc->channel_count * rmt->desc->words_per_channel * 4u)
+              rmt->desc->channel_count * rmt->desc->words_per_channel * 4u) {
+        if (rmt->sys_conf & RMT_MEM_FORCE_PD) return 0u;
         return rmt->memory[(off - rmt->desc->memory_offset) / 4u];
+    }
     if (off >= RMT_TX_CONF_OFF && off < RMT_TX_CONF_OFF +
                                             rmt->desc->tx_channel_count * 4u)
         return rmt->tx[(off - RMT_TX_CONF_OFF) / 4u].conf;
@@ -1174,7 +1180,8 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
     if (off >= rmt->desc->memory_offset &&
         off < rmt->desc->memory_offset +
               rmt->desc->channel_count * rmt->desc->words_per_channel * 4u) {
-        rmt->memory[(off - rmt->desc->memory_offset) / 4u] = value;
+        if (!(rmt->sys_conf & RMT_MEM_FORCE_PD))
+            rmt->memory[(off - rmt->desc->memory_offset) / 4u] = value;
         return;
     }
     if (off >= RMT_TX_CONF_OFF && off < RMT_TX_CONF_OFF +
@@ -1227,11 +1234,6 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
             if (value & RMT_RX_CONF_UPDATE) {
                 bool was_active = rx->active;
                 rx->active = (rx->conf1 & RMT_RX_EN) != 0u;
-                /* The envelope path models opposite-level gaps, but not
-                 * same-level carrier duty recognition or silicon phase.
-                 * Keep that partial mode visible in the MMIO audit. */
-                if (rx->active && (rx->conf0 & RMT_RX_DEMOD_EN))
-                    rmt->fallback_write(rmt->fallback_ctx, address, value);
                 if (!was_active || !rx->active) rmt_abort_rx_frame(rx);
                 rmt_notify_state(rmt);
             }
@@ -1277,9 +1279,16 @@ static void rmt_write(void *ctx, uint32_t address, uint32_t value)
         return;
     }
     if (off == RMT_SYS_CONF_OFF) {
-        if (value & (1u << 2))
+        if ((value & ~RMT_SYS_CONF_MASK) ||
+            (value & (RMT_MEM_FORCE_PD | RMT_MEM_FORCE_PU)) ==
+                (RMT_MEM_FORCE_PD | RMT_MEM_FORCE_PU))
             rmt->fallback_write(rmt->fallback_ctx, address, value);
-        rmt->sys_conf = value;
+        uint32_t next = value & RMT_SYS_CONF_MASK;
+        if (!(rmt->sys_conf & RMT_MEM_FORCE_PD) &&
+            (next & RMT_MEM_FORCE_PD))
+            memset(rmt->memory, 0, sizeof(rmt->memory));
+        rmt->sys_conf = next;
+        rmt_notify_state(rmt);
         return;
     }
     if (off == RMT_TX_SIM_OFF) {
