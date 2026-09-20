@@ -22,20 +22,25 @@ for entry in \
 done
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/flexe-s3-i2c-slave.XXXXXX")
-cleanup() {
-    rm -f -- "$tmpdir/run1" "$tmpdir/run2"
-    rmdir -- "$tmpdir"
-}
-trap cleanup EXIT
-for run in 1 2; do
-    "$runner" --no-jit --s3 "$S3_I2C_SLAVE_BIN" \
-        "$S3_I2C_SLAVE_ELF" "$S3_ROM_ELF" >"$tmpdir/run$run" 2>&1
+trap 'rm -rf -- "$tmpdir"' EXIT
+for engine in interp jit; do
+    runner_args=(--s3)
+    if [[ "$engine" == interp ]]; then
+        runner_args=(--no-jit --s3)
+    fi
+    for run in 1 2; do
+        "$runner" "${runner_args[@]}" "$S3_I2C_SLAVE_BIN" \
+            "$S3_I2C_SLAVE_ELF" "$S3_ROM_ELF" \
+            >"$tmpdir/$engine.$run" 2>&1
+    done
+    cmp -s "$tmpdir/$engine.1" "$tmpdir/$engine.2" || {
+        echo "FAIL: S3 I2C slave $engine outcomes differ on replay" >&2
+        diff -u "$tmpdir/$engine.1" "$tmpdir/$engine.2" >&2 || true
+        exit 1
+    }
+    grep -Fq "engine=$engine stage=0x12C51AEE staged=3 guest_got=4 guest_bytes=EFBEADDE accepted=4 read_back=112233" \
+        "$tmpdir/$engine.1"
+    grep -Fq 'unhandled=0 i2c_unhandled_sites=0 unregistered=0' \
+        "$tmpdir/$engine.1"
 done
-cmp -s "$tmpdir/run1" "$tmpdir/run2" || {
-    echo "FAIL: S3 I2C slave guest/host outcomes differ on replay" >&2
-    diff -u "$tmpdir/run1" "$tmpdir/run2" >&2 || true
-    exit 1
-}
-grep -Fq 'engine=interp stage=0x12C51AEE staged=3 guest_got=4 guest_bytes=EFBEADDE accepted=4 read_back=112233' "$tmpdir/run1"
-grep -Fq 'i2c_unhandled_sites=0 unregistered=0' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 I2C slave received host bytes and returned staged bytes through the real driver, with no unsupported I2C MMIO and byte-identical replay"
+echo "PASS: stock Arduino S3 I2C slave received host bytes and returned staged bytes through the real driver in interpreter and JIT; byte-identical replay; zero unsupported accesses"

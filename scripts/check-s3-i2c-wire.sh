@@ -23,12 +23,21 @@ done
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/flexe-s3-i2c.XXXXXX")
 trap 'rm -rf -- "$tmpdir"' EXIT
-for run in 1 2; do
-    "$runner" --no-jit --s3 "$S3_I2C_BIN" "$S3_I2C_ELF" "$S3_ROM_ELF" \
-        >"$tmpdir/run$run" 2>&1
+for engine in interp jit; do
+    runner_args=(--s3)
+    if [[ "$engine" == interp ]]; then
+        runner_args=(--no-jit --s3)
+    fi
+    for run in 1 2; do
+        "$runner" "${runner_args[@]}" "$S3_I2C_BIN" "$S3_I2C_ELF" \
+            "$S3_ROM_ELF" >"$tmpdir/$engine.$run" 2>&1
+    done
+    cmp "$tmpdir/$engine.1" "$tmpdir/$engine.2"
+    grep -q "engine=$engine stage=0x1C2C0040 result=0/0/40/0x95AED6CC" \
+        "$tmpdir/$engine.1"
+    grep -q 'calls=8 write_bytes=84 read_bytes=80 memory_ok=1' \
+        "$tmpdir/$engine.1"
+    grep -q 'unhandled=0 i2c_unhandled_sites=0 resets=1' \
+        "$tmpdir/$engine.1"
 done
-cmp "$tmpdir/run1" "$tmpdir/run2"
-grep -q 'stage=0x1C2C0040 result=0/0/40/0x95AED6CC' "$tmpdir/run1"
-grep -q 'calls=8 write_bytes=84 read_bytes=80 memory_ok=1' "$tmpdir/run1"
-grep -q 'i2c_unhandled_sites=0 resets=1' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 Wire transferred 40 bytes through real driver/FIFO/ISR, repeated START, and NACK across a controller reset; byte-identical replay"
+echo "PASS: stock Arduino S3 Wire transferred 40 bytes through real driver/FIFO/ISR, repeated START, and NACK across a controller reset in interpreter and JIT; byte-identical replay; zero unsupported accesses"

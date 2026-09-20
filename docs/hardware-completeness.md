@@ -47,11 +47,11 @@ even when a firmware workflow succeeds.
 | Classic network/Bluetooth | Partial (service shims and device models) | Meshtastic, Marauder, NerdMiner and WLED compatibility scenarios | RF/PHY propagation and general controller equivalence are unsupported. |
 | S3 LX7, interrupts, dual-core startup | Partial (interpreter and JIT) | `scripts/check-s3-idf-hello.sh`, `scripts/check-s3-idf-crosscore.sh`, CPU/JIT differential tests, and the JIT-gated WLED/Marauder scenarios | The common windowed LX7 profile, sustained queue handoffs, and CPU1 stall/resume pass; LX7-specific extensions and broader FreeRTOS/interrupt workloads remain to validate. |
 | S3 ROM, image, flash/MMU/partitions | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c` (4/8 MiB GigaDevice SFDP; 4 MiB BP/CMP protection), `scripts/check-s3-nerdminer-portal.sh` | Other flash protection profiles, cache behavior, and bootloader paths remain unverified. |
-| S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
+| S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic in both engines with zero unsupported accesses; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, `scripts/check-s3-idf-gpio-isr.sh`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Stock ESP-IDF's per-pin ISR, FreeRTOS task notification, digital open-drain release, IO_MUX input-buffer gating, driven-output input feedback, RTC GPIO wake, and pad hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; target-described UART TX producers route through the GPIO matrix with an idle-high pad state; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior, baud-rate edges, and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; target-described I2C SDA/SCL and GP-SPI clock/data/chip-select producers route through the GPIO matrix; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, GP-SPI wire edges, and segmented/slave modes remain. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; target-described I2C SDA/SCL and GP-SPI clock/data/chip-select producers route through the GPIO matrix; stock Arduino Wire, I2C-slave, and SPI-master gates replay in both engines with zero unsupported accesses; direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, GP-SPI wire edges, and segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks controller-wide clock/arbitration/AHB-reset configuration, chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks, four flash/four PSRAM access-control regions, and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, access-fault generation, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_syscon_memory.c`, `tests/test_esp32s3_extmem.c`, WLED and zero-unsupported stock Arduino production audits | Cache-array/internal-SRAM ownership has exact reset, masking, and sticky locks; external flash/PSRAM access regions have exact reset, masking, and semantic state. Cache topology/timing, the external-region lock, and protection-fault generation remain unsupported. |
@@ -374,10 +374,9 @@ The harness then requests a software reset and lets the same guest image run
 the transfer again. The external slave registration and its host-held register
 contents persist, while the SoC I2C controller is rebuilt. A separate unit
 test covers all three classic I2C bus attachments across reset. Two complete
-S3 replay runs match byte-for-byte, with no unsupported I2C MMIO sites;
-350 unrelated startup accesses across the two boots remain unsupported. This
-gate does not test a guest-initiated restart, electrical timing, bus
-contention, or other devices:
+runs of each engine match byte-for-byte and both execute the two guest boots
+with zero unsupported accesses. This gate does not test a guest-initiated
+restart, electrical timing, bus contention, or other devices:
 
 ```sh
 ./scripts/build-s3-arduino-fixture.sh --check i2c-wire
@@ -416,8 +415,8 @@ reserved for flash/PSRAM ([Espressif GPIO guide](https://docs.espressif.com/proj
 The merged image and ELF hashes are
 `bdfd7cdf30381de4f3c9e26a588c114ddd8721638c397bdd84cd6f9a018ed290`
 and `5477d38fc97a858da0ea0e11cd1bd7a75c0f1a30bd28595dd37f80496c29fcfa`.
-Two complete interpreter runs replay byte-for-byte with no unsupported I2C
-MMIO sites. Clock stretching, overflow, electrical bus timing, and other
+Two complete runs of each engine replay byte-for-byte with zero unsupported
+accesses. Clock stretching, overflow, electrical bus timing, and other
 slave-driver implementations remain unverified:
 
 ```sh
@@ -438,11 +437,11 @@ merged image/ELF SHA-256 values are
 The harness then resets the guest machine and repeats all seven transfers
 through the same host-side probe endpoint. Its registration survives, while
 the GP-SPI and GDMA register files start fresh; the session reset unit test
-also covers per-host probe, device, and select callbacks. Two interpreter
-replays match byte-for-byte with no unsupported GP-SPI sites; 350 unrelated
-startup accesses remain across the two boots. The reset is harness-requested,
-not a guest `esp_restart()`. This does not validate SPI slave mode, segmented
-transfer, exact bus timing, or physical pin levels:
+also covers per-host probe, device, and select callbacks. Two runs of each
+engine match byte-for-byte and execute both guest boots with zero unsupported
+accesses. The reset is harness-requested, not a guest `esp_restart()`. This
+does not validate SPI slave mode, segmented transfer, exact bus timing, or
+physical pin levels:
 
 ```sh
 ./scripts/build-s3-arduino-fixture.sh --check spi-master
@@ -764,8 +763,10 @@ the exact inputs, and can reproduce the artifact with `--rebuild`:
 The optional AP Memory 8 MiB OPI profile is selected by the board, not
 inferred from firmware: `--psram ap-8m-opi` attaches it on CS1. The pinned
 stock Arduino-ESP32 3.3.11 fixture checks 8 KiB of allocated external RAM
-repeatedly; its second replay must be byte-identical, and the same image
-without the flag must report no PSRAM. Build and run it with:
+repeatedly; two runs of each engine must be byte-identical and agree on guest
+output, the JIT must retire native instructions, and the interpreter must use
+zero unsupported accesses. The same image without the flag must report no
+PSRAM. Build and run it with:
 
 ```sh
 ./scripts/build-s3-arduino-fixture.sh --check psram-opi

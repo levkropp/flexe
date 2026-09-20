@@ -26,28 +26,53 @@ for entry in "$S3_PSRAM_BIN:$expected_bin" "$S3_PSRAM_ELF:$expected_elf" \
 done
 
 tmpdir=$(mktemp -d)
-trap 'rm -f "$tmpdir/out.1" "$tmpdir/out.2" "$tmpdir/err.1" "$tmpdir/err.2" "$tmpdir/absent.out" "$tmpdir/absent.err"; rmdir "$tmpdir"' EXIT
-for replay in 1 2; do
-    "$runner" -N -q --no-jit --target esp32s3 --psram ap-8m-opi \
-        -R "$S3_ROM_ELF" -s "$S3_PSRAM_ELF" --unhandled-report \
-        -c 2000000000 "$S3_PSRAM_BIN" \
-        > "$tmpdir/out.$replay" 2> "$tmpdir/err.$replay"
-    if ! grep -qx 'S3_PSRAM_READY size=8388608' "$tmpdir/out.$replay" ||
-       (( $(grep -c '^S3_PSRAM_PASS ' "$tmpdir/out.$replay" || true) < 10 )) ||
-       grep -q 'S3_PSRAM_.*FAIL' "$tmpdir/out.$replay" ||
-       grep -Eq '0x6000(20|30)' "$tmpdir/err.$replay" ||
-       grep -Eq '0x600080(1C|20|24|28|2C|30)' \
-           "$tmpdir/err.$replay" ||
-       ! grep -q '^Stop reason: halt (WAITI)' "$tmpdir/err.$replay"; then
-        echo "FAIL: selected OPI PSRAM did not sustain Arduino array traffic" >&2
-        tail -30 "$tmpdir/out.$replay" >&2
-        tail -30 "$tmpdir/err.$replay" >&2
+trap 'rm -rf -- "$tmpdir"' EXIT
+for engine in interp jit; do
+    for replay in 1 2; do
+        if [[ "$engine" == interp ]]; then
+            "$runner" -N -q --no-jit --target esp32s3 \
+                --psram ap-8m-opi -R "$S3_ROM_ELF" -s "$S3_PSRAM_ELF" \
+                --unhandled-report -c 2000000000 "$S3_PSRAM_BIN" \
+                > "$tmpdir/$engine.out.$replay" \
+                2> "$tmpdir/$engine.err.$replay"
+        else
+            "$runner" -N -q --jit-stats --target esp32s3 \
+                --psram ap-8m-opi -R "$S3_ROM_ELF" -s "$S3_PSRAM_ELF" \
+                -c 2000000000 "$S3_PSRAM_BIN" \
+                > "$tmpdir/$engine.out.$replay" \
+                2> "$tmpdir/$engine.err.$replay"
+        fi
+        if ! grep -qx 'S3_PSRAM_READY size=8388608' \
+                "$tmpdir/$engine.out.$replay" ||
+           (( $(grep -c '^S3_PSRAM_PASS ' \
+                "$tmpdir/$engine.out.$replay" || true) < 10 )) ||
+           grep -q 'S3_PSRAM_.*FAIL' "$tmpdir/$engine.out.$replay" ||
+           ! grep -q '^Stop reason: halt (WAITI)' \
+                "$tmpdir/$engine.err.$replay"; then
+            echo "FAIL: selected OPI PSRAM did not sustain $engine array traffic" >&2
+            tail -30 "$tmpdir/$engine.out.$replay" >&2
+            tail -30 "$tmpdir/$engine.err.$replay" >&2
+            exit 1
+        fi
+    done
+    if ! cmp -s "$tmpdir/$engine.out.1" "$tmpdir/$engine.out.2" ||
+       ! cmp -s "$tmpdir/$engine.err.1" "$tmpdir/$engine.err.2"; then
+        echo "FAIL: OPI PSRAM $engine replay was not byte-identical" >&2
         exit 1
     fi
 done
-if ! cmp -s "$tmpdir/out.1" "$tmpdir/out.2" ||
-   ! cmp -s "$tmpdir/err.1" "$tmpdir/err.2"; then
-    echo "FAIL: OPI PSRAM replay was not byte-identical" >&2
+if grep -Eq '0x6000(20|30)|0x600080(1C|20|24|28|2C|30)' \
+        "$tmpdir/interp.err.1"; then
+    echo "FAIL: OPI PSRAM or startup MMIO fell back" >&2
+    exit 1
+fi
+if ! grep -Eq '^  Insns JIT:[[:space:]]+[1-9][0-9]* of ' \
+        "$tmpdir/jit.err.1"; then
+    echo "FAIL: OPI PSRAM JIT replay retired no native instructions" >&2
+    exit 1
+fi
+if ! cmp -s "$tmpdir/interp.out.1" "$tmpdir/jit.out.1"; then
+    echo "FAIL: OPI PSRAM interpreter and JIT output differs" >&2
     exit 1
 fi
 
@@ -61,6 +86,11 @@ if ! grep -qx 'S3_PSRAM_SIZE_FAIL 0' "$tmpdir/absent.out" ||
     exit 1
 fi
 
-passes=$(grep -c '^S3_PSRAM_PASS ' "$tmpdir/out.1")
-unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/err.1")
-echo "PASS: stock Arduino S3 OPI PSRAM completed $passes array checks on both deterministic replays; default board reports no PSRAM; $unhandled unrelated accesses remain visible"
+passes=$(grep -c '^S3_PSRAM_PASS ' "$tmpdir/interp.out.1")
+unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/interp.err.1")
+unhandled=${unhandled:-0}
+if [[ "$unhandled" != 0 ]]; then
+    echo "FAIL: stock Arduino S3 OPI PSRAM used $unhandled unsupported accesses" >&2
+    exit 1
+fi
+echo "PASS: stock Arduino S3 OPI PSRAM completed $passes array checks in interpreter and JIT; deterministic replay; default board reports no PSRAM; zero unsupported accesses"

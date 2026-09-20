@@ -23,12 +23,21 @@ done
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/flexe-s3-spi.XXXXXX")
 trap 'rm -rf -- "$tmpdir"' EXIT
-for run in 1 2; do
-    "$runner" --no-jit --s3 "$S3_SPI_BIN" "$S3_SPI_ELF" "$S3_ROM_ELF" \
-        >"$tmpdir/run$run" 2>&1
+for engine in interp jit; do
+    runner_args=(--s3)
+    if [[ "$engine" == interp ]]; then
+        runner_args=(--no-jit --s3)
+    fi
+    for run in 1 2; do
+        "$runner" "${runner_args[@]}" "$S3_SPI_BIN" "$S3_SPI_ELF" \
+            "$S3_ROM_ELF" >"$tmpdir/$engine.$run" 2>&1
+    done
+    cmp "$tmpdir/$engine.1" "$tmpdir/$engine.2"
+    grep -q "engine=$engine stage=0x5D100D1E transfers=14 mosi_bytes=128" \
+        "$tmpdir/$engine.1"
+    grep -q 'lens=1/4/5/17/33 cmdaddr=0x1E314093 queued=1 err=0x00000000' \
+        "$tmpdir/$engine.1"
+    grep -q 'unhandled=0 spi_unhandled_sites=0 unregistered=0 resets=1' \
+        "$tmpdir/$engine.1"
 done
-cmp "$tmpdir/run1" "$tmpdir/run2"
-grep -q 'stage=0x5D100D1E transfers=14 mosi_bytes=128' "$tmpdir/run1"
-grep -q 'lens=1/4/5/17/33 cmdaddr=0x1E314093 queued=1 err=0x00000000' "$tmpdir/run1"
-grep -q 'spi_unhandled_sites=0 unregistered=0 resets=1' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 spi_master repeated seven synchronous/queued GDMA transfers across an SoC reset without GP-SPI fallback; byte-identical replay"
+echo "PASS: stock Arduino S3 spi_master repeated seven synchronous/queued GDMA transfers across an SoC reset in interpreter and JIT; byte-identical replay; zero unsupported accesses"
