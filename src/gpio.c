@@ -110,6 +110,7 @@ struct flexe_gpio {
     uint64_t watched_input_signal[GPIO_FUNC_IN_WORDS];
     uint32_t func_out[GPIO_PIN_REGISTER_COUNT];
     uint64_t modeled_output_signal[GPIO_FUNC_OUT_SIGNAL_WORDS];
+    uint64_t sampled_output_signal[GPIO_FUNC_OUT_SIGNAL_WORDS];
     uint64_t driven_output_signal[GPIO_FUNC_OUT_SIGNAL_WORDS];
     uint64_t output_signal_level[GPIO_FUNC_OUT_SIGNAL_WORDS];
     uint64_t output_signal_enable[GPIO_FUNC_OUT_SIGNAL_WORDS];
@@ -214,6 +215,17 @@ void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
         UINT64_C(1) << (signal % 64u);
 }
 
+void flexe_gpio_set_output_signal_sampled(flexe_gpio_t *gpio,
+                                          unsigned signal)
+{
+    if (!gpio || signal >= GPIO_FUNC_OUT_SIGNAL_COUNT ||
+        signal == GPIO_FUNC_OUT_SOFTWARE)
+        return;
+    flexe_gpio_set_output_signal_modeled(gpio, signal);
+    gpio->sampled_output_signal[signal / 64u] |=
+        UINT64_C(1) << (signal % 64u);
+}
+
 void flexe_gpio_drive_output_signal(flexe_gpio_t *gpio, unsigned signal,
                                     int level, int enabled)
 {
@@ -255,6 +267,36 @@ static bool gpio_output_signal_modeled(const flexe_gpio_t *gpio,
     return signal < GPIO_FUNC_OUT_SIGNAL_COUNT &&
            (gpio->modeled_output_signal[signal / 64u] &
             (UINT64_C(1) << (signal % 64u))) != 0u;
+}
+
+static bool gpio_output_signal_sampled(const flexe_gpio_t *gpio,
+                                       unsigned signal)
+{
+    return signal < GPIO_FUNC_OUT_SIGNAL_COUNT &&
+           (gpio->sampled_output_signal[signal / 64u] &
+            (UINT64_C(1) << (signal % 64u))) != 0u;
+}
+
+static uint32_t gpio_output_sample_candidates(const flexe_gpio_t *gpio,
+                                              unsigned bank)
+{
+    if (!gpio->output_sample) return 0u;
+    uint64_t unavailable = gpio->held_pins | gpio->rtc_owned;
+    uint32_t blocked = bank == 0u ? (uint32_t)unavailable :
+                                    (uint32_t)(unavailable >> 32u);
+    uint32_t pins = gpio->input_enable[bank] &
+                    gpio_valid_bank_mask(gpio, bank) &
+                    ~gpio->host_valid[bank] & ~blocked;
+    uint32_t sampled = 0u;
+    while (pins != 0u) {
+        unsigned bit = (unsigned)__builtin_ctz(pins);
+        uint32_t mask = 1u << bit;
+        pins &= pins - 1u;
+        unsigned pin = bank * 32u + bit;
+        unsigned signal = gpio->func_out[pin] & GPIO_FUNC_OUT_SIGNAL_MASK;
+        if (gpio_output_signal_sampled(gpio, signal)) sampled |= mask;
+    }
+    return sampled;
 }
 
 static int gpio_sample_output_pad(flexe_gpio_t *gpio, unsigned pin)
@@ -700,7 +742,8 @@ static uint32_t gpio_read(void *ctx, uint32_t addr)
                            gpio->input_enable[bank] & ~rtc_owned;
         uint32_t value = gpio->input[bank] &
                          gpio->input_enable[bank] & ~rtc_owned;
-        uint32_t candidates = unknown;
+        uint32_t candidates = unknown |
+            gpio_output_sample_candidates(gpio, bank);
         while (candidates != 0u) {
             unsigned bit = (unsigned)__builtin_ctz(candidates);
             uint32_t mask = 1u << bit;

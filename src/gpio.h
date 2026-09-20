@@ -68,6 +68,13 @@ void flexe_gpio_set_rtc_state(flexe_gpio_t *gpio, uint64_t owned,
  * GPIO model's unsupported-behavior accounting. */
 void flexe_gpio_set_output_signal_modeled(flexe_gpio_t *gpio,
                                           unsigned signal);
+/* Mark a modeled producer whose level can advance without calling
+ * flexe_gpio_drive_output_signal() for every edge. GPIO_IN reads then ask the
+ * installed sample handler for that signal's level at the current guest time.
+ * This keeps polled PWM/pulse outputs exact without filling the event queue
+ * when no interrupt or matrix-input consumer needs the intervening edges. */
+void flexe_gpio_set_output_signal_sampled(flexe_gpio_t *gpio,
+                                          unsigned signal);
 /* Drive a modeled peripheral output through every selected GPIO matrix pad.
  * The signal level and output-enable remain distinct for open-drain and
  * software-controlled output-enable routes. */

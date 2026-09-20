@@ -8744,7 +8744,7 @@ static int mcpwm_register_target(esp32_periph_t *p) {
                  operator_index < MCPWM_OPERATOR_COUNT; operator_index++)
                 for (unsigned generator = 0u;
                      generator < MCPWM_GENERATOR_COUNT; generator++)
-                    flexe_gpio_set_output_signal_modeled(
+                    flexe_gpio_set_output_signal_sampled(
                         p->target_gpio,
                         desc->output_signal[unit][operator_index][generator]);
             for (unsigned channel = 0u; channel < MCPWM_TIMER_COUNT;
@@ -15743,7 +15743,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                                 (unsigned)desc->tx_channel_count;
             for (unsigned ch = 0u;
                  ch < (unsigned)desc->tx_channel_count; ch++)
-                flexe_gpio_set_output_signal_modeled(
+                flexe_gpio_set_output_signal_sampled(
                     p->target_gpio, desc->output_signal_base + ch);
             flexe_gpio_set_input_signal_handler(
                 p->target_gpio, target_gpio_input_signal_changed, p);

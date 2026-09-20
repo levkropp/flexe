@@ -118,6 +118,10 @@ TEST(esp32s3_mcpwm_drives_both_groups_and_obeys_system_gates)
                   mcpwm_capture_output, &group1), 0);
     mcpwm_route_output(&fixture, 4u, desc->output_signal[0][0][0], false);
     mcpwm_route_output(&fixture, 5u, desc->output_signal[1][2][1], true);
+    mem_write32(fixture.mem,
+                fixture.target->io_mux.base +
+                    fixture.target->io_mux.gpio_register_offset[4],
+                fixture.target->io_mux.input_enable_mask);
     mem_write32(fixture.mem, S3_SYSTEM_CLK_EN0,
                 clocks | S3_SYSTEM_PWM0 | S3_SYSTEM_PWM1);
 
@@ -141,12 +145,18 @@ TEST(esp32s3_mcpwm_drives_both_groups_and_obeys_system_gates)
     ASSERT_TRUE(group0.info.enabled);
     ASSERT_EQ(periph_gpio_pin_level(fixture.periph, 4), 1);
     ASSERT_EQ(periph_gpio_output_enabled(fixture.periph, 4), 1);
+    ASSERT_EQ(mem_read32(fixture.mem, fixture.target->gpio.base + 0x03Cu) &
+              (1u << 4u), 1u << 4u);
     mcpwm_advance(&fixture, 39999u);
     ASSERT_EQ(mem_read32(fixture.mem, base0 + 0x010u) & 0xFFFFu, 249u);
     ASSERT_EQ(periph_gpio_pin_level(fixture.periph, 4), 1);
+    ASSERT_EQ(mem_read32(fixture.mem, fixture.target->gpio.base + 0x03Cu) &
+              (1u << 4u), 1u << 4u);
     mcpwm_advance(&fixture, 1u);
     ASSERT_EQ(mem_read32(fixture.mem, base0 + 0x010u) & 0xFFFFu, 250u);
     ASSERT_EQ(periph_gpio_pin_level(fixture.periph, 4), 0);
+    ASSERT_EQ(mem_read32(fixture.mem, fixture.target->gpio.base + 0x03Cu) &
+              (1u << 4u), 0u);
 
     /* Group 1 independently selects timer 2 for operator 2B. Matrix
      * inversion makes its physical pin low during the generator's high

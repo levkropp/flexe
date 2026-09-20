@@ -119,7 +119,12 @@ inputs, host-driven digital inputs, IO_MUX `FUN_IE` gating of digital reads,
 matrix inputs and interrupts, driven-output input feedback, edge/level status
 latching, W1TS/W1TC aliases, and the shared normal/NMI sources routed through
 both cores' target interrupt matrices. The virtual target currently supplies
-zero-valued strap inputs. Unattached peripheral matrix outputs and BT/SDIO
+zero-valued strap inputs. Time-varying producers such as RMT and MCPWM are
+sampled at the current guest time on every relevant `GPIO_IN` read; only a
+matrix-input or GPIO-interrupt consumer asks the event queue to retain their
+individual edges. Host samples, pad hold, RTC ownership, output inversion,
+output enable, and open-drain release keep their normal precedence on that
+lazy path. Unattached peripheral matrix outputs and BT/SDIO
 pad ownership are not modeled. Open-drain net voltage, input synchronizer/filter
 timing, and clock-gate effects are also absent. Digital open-drain release is
 modeled, but a floating pad without a host sample defaults low; host-injected

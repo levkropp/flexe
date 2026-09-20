@@ -11,6 +11,13 @@ typedef struct {
     int enabled;
 } gpio_pad_probe_t;
 
+typedef struct {
+    unsigned calls;
+    unsigned signal;
+    int level;
+    int enabled;
+} gpio_sample_probe_t;
+
 static void gpio_pad_probe_changed(void *ctx, unsigned pin, int level,
                                    int enabled)
 {
@@ -19,6 +26,17 @@ static void gpio_pad_probe_changed(void *ctx, unsigned pin, int level,
     probe->pin = pin;
     probe->level = level;
     probe->enabled = enabled;
+}
+
+static bool gpio_sample_probe_output(void *ctx, unsigned signal,
+                                     int *level, int *enabled)
+{
+    gpio_sample_probe_t *probe = ctx;
+    probe->calls++;
+    probe->signal = signal;
+    *level = probe->level;
+    *enabled = probe->enabled;
+    return true;
 }
 
 TEST(target_gpio_models_s3_banks_masks_and_software_output)
@@ -294,6 +312,73 @@ TEST(target_gpio_peripheral_output_resolves_matrix_inversion_and_enable)
     mem_destroy(mem);
 }
 
+TEST(target_gpio_resamples_lazy_peripheral_output_on_every_input_poll)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    flexe_gpio_t *gpio = mem ? flexe_gpio_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL) : NULL;
+    ASSERT_TRUE(gpio != NULL);
+    if (!gpio) {
+        mem_destroy(mem);
+        return;
+    }
+
+    gpio_sample_probe_t probe = {
+        .level = 1,
+        .enabled = 1,
+    };
+    unsigned signal = s3->rmt_v1.output_signal_base;
+    uint32_t route4 = s3->gpio.base + 0x554u + 4u * 4u;
+    uint32_t mask = 1u << 4u;
+    flexe_gpio_set_output_signal_sampled(gpio, signal);
+    flexe_gpio_set_output_sample_handler(
+        gpio, gpio_sample_probe_output, &probe);
+    mem_write32(mem, route4, signal);
+
+    /* Seed a known low cache entry. A lazy producer can advance without an
+     * edge callback, so GPIO_IN must consult it even though the cached value
+     * is not marked unknown. */
+    flexe_gpio_drive_output_signal(gpio, signal, 0, 1);
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, mask);
+    ASSERT_EQ(probe.calls, 1u);
+    ASSERT_EQ(probe.signal, signal);
+
+    probe.level = 0;
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, 0u);
+    ASSERT_EQ(probe.calls, 2u);
+
+    mem_write32(mem, route4, signal | (1u << 9u));
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, mask);
+    ASSERT_EQ(probe.calls, 3u);
+
+    probe.level = 1;
+    probe.enabled = 0;
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, 0u);
+    ASSERT_EQ(probe.calls, 4u);
+
+    /* A host pad sample has physical priority and must not invoke the lazy
+     * peripheral producer underneath it. */
+    flexe_gpio_set_input(gpio, 4u, true);
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & mask, mask);
+    ASSERT_EQ(probe.calls, 4u);
+
+    /* Modeled producers that do not opt into lazy sampling retain their
+     * cached drive and add no work to GPIO_IN polls. */
+    unsigned cached_signal = signal + 1u;
+    uint32_t cached_mask = 1u << 5u;
+    flexe_gpio_set_output_signal_modeled(gpio, cached_signal);
+    mem_write32(mem, s3->gpio.base + 0x554u + 5u * 4u,
+                cached_signal);
+    flexe_gpio_drive_output_signal(gpio, cached_signal, 0, 1);
+    ASSERT_EQ(mem_read32(mem, s3->gpio.base + 0x03Cu) & cached_mask, 0u);
+    ASSERT_EQ(probe.calls, 4u);
+
+    flexe_gpio_destroy(gpio);
+    mem_destroy(mem);
+}
+
 TEST(target_gpio_accepts_target_described_serial_output_producers)
 {
     const flexe_target_desc_t *s3 =
@@ -559,6 +644,7 @@ void run_target_gpio_tests(void)
     RUN_TEST(target_gpio_input_buffer_gates_host_samples_and_interrupts);
     RUN_TEST(target_gpio_driven_output_feeds_enabled_input_without_host_sample);
     RUN_TEST(target_gpio_peripheral_output_resolves_matrix_inversion_and_enable);
+    RUN_TEST(target_gpio_resamples_lazy_peripheral_output_on_every_input_poll);
     RUN_TEST(target_gpio_accepts_target_described_serial_output_producers);
     RUN_TEST(target_gpio_rejects_invalid_serial_output_geometry);
     RUN_TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads);
