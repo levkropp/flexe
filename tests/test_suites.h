@@ -28,6 +28,7 @@ void run_rmt_v1_tests(void);
 void run_i2s_v2_tests(void);
 void run_twai_target_tests(void);
 void run_pcnt_target_tests(void);
+void run_mcpwm_target_tests(void);
 void run_ledc_v1_tests(void);
 void run_usb_serial_jtag_tests(void);
 void run_spi_mem_tests(void);

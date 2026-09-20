@@ -57,8 +57,6 @@ static inline int gpio_dbg(void) {
 #define EMAC_EXT_BASE   0x3FF69800u
 #define EMAC_MAC_BASE   0x3FF6A000u
 #define RMT_BASE        0x3FF56000u
-#define MCPWM0_BASE     0x3FF5E000u
-#define MCPWM1_BASE     0x3FF6C000u
 #define GPIO_BASE       0x3FF44000u
 #define GPIO_SD_BASE    0x3FF44F00u
 #define FRC_TIMER_BASE  0x3FF47000u
@@ -1059,7 +1057,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 /* Classic ESP32 motor-control PWM register file. Both units have three
  * timers, three operators, two generators per operator, and a shared
  * capture/fault/sync/interrupt block. */
-#define MCPWM_UNIT_COUNT             2u
+#define MCPWM_UNIT_COUNT             FLEXE_TARGET_MCPWM_GROUP_MAX
 #define MCPWM_TIMER_COUNT            3u
 #define MCPWM_OPERATOR_COUNT         3u
 #define MCPWM_GENERATOR_COUNT        2u
@@ -1102,13 +1100,10 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define MCPWM_CLK_OFF                0x120u
 #define MCPWM_VERSION_OFF            0x124u
 #define MCPWM_INT_VALID_MASK         0x3FFFFFFFu
-#define MCPWM_VERSION_RESET          0x02107230u
 #define MCPWM_TIMER_PERIOD_RESET     0x0000FF00u
 #define MCPWM_GEN_FORCE_RESET        0x00000020u
 #define MCPWM_DT_CFG_RESET           0x00018000u
 #define MCPWM_UPDATE_CFG_RESET       0x00000055u
-#define MCPWM_SOURCE_CLOCK_MHZ       160u
-#define MCPWM_CAPTURE_CLOCK_MHZ      80u
 #define MCPWM_UPDATE_EVENT_TEZ       (1u << 0)
 #define MCPWM_UPDATE_EVENT_TEP       (1u << 1)
 #define MCPWM_UPDATE_EVENT_SYNC      (1u << 2)
@@ -1245,9 +1240,17 @@ static void pcnt_gpio_input_changed(esp32_periph_t *p, int gpio);
 static void target_gpio_input_signal_changed(void *ctx, unsigned signal,
                                              bool old_level, bool level);
 static void target_gpio_input_route_changed(void *ctx, unsigned signal);
+static bool target_gpio_output_sample(void *ctx, unsigned signal,
+                                      int *level, int *enabled);
 static uint32_t mcpwm_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void mcpwm_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void mcpwm_reset_unit(esp32_periph_t *p, unsigned unit);
+static void mcpwm_set_system_state(esp32_periph_t *p, unsigned unit,
+                                   bool clock_enabled,
+                                   bool reset_asserted);
+static uint64_t mcpwm_now_cycles(esp32_periph_t *p);
+static void mcpwm_sync_all_to(esp32_periph_t *p, uint64_t now);
+static void mcpwm_clock_update(esp32_periph_t *p);
 static uint64_t timg_now_cycles(esp32_periph_t *p);
 static void timg_sync_all_to(esp32_periph_t *p, uint64_t now);
 static uint32_t timg_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -1816,6 +1819,8 @@ typedef struct {
 typedef struct {
     mcpwm_unit_state_t unit[MCPWM_UNIT_COUNT];
     periph_clock_t clock;
+    bool system_clock_enabled[MCPWM_UNIT_COUNT];
+    bool system_reset_asserted[MCPWM_UNIT_COUNT];
 } mcpwm_state_t;
 
 typedef struct {
@@ -2032,8 +2037,9 @@ struct esp32_periph {
     bool pcnt_system_clock_enabled;
     bool pcnt_system_reset_asserted;
 
-    /* Two classic ESP32 motor-control PWM units. */
+    /* Target-described motor-control PWM groups. */
     mcpwm_state_t mcpwm;
+    uint32_t mcpwm_gpio_route[FLEXE_TARGET_GPIO_MAX];
 
     /* Two independent classic ESP32 I2S controllers with circular DMA. */
     i2s_state_t i2s[I2S_PORT_COUNT];
@@ -2620,11 +2626,13 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         break;
     case DPORT_PERIP_CLK_EN_OFF:
         timg_sync_all_to(p, timg_now_cycles(p));
+        mcpwm_sync_all_to(p, mcpwm_now_cycles(p));
         p->dport_perip_clk_en = val;
         uhci_dport_update(p);
         twai_clock_update(p);
         pcnt_update_irq(p);
         pcnt_kick(p);
+        mcpwm_clock_update(p);
         timg_kick(p);
         break;
     case DPORT_WIFI_CLK_EN_OFF:
@@ -2647,6 +2655,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         break;
     case DPORT_PERIP_RST_EN_OFF:
         timg_sync_all_to(p, timg_now_cycles(p));
+        mcpwm_sync_all_to(p, mcpwm_now_cycles(p));
         p->dport_perip_rst_en = val;
         if (val & DPORT_UHCI0_MODULE_BIT)
             uhci_reset_state(p, 0);
@@ -2672,6 +2681,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         twai_clock_update(p);
         pcnt_update_irq(p);
         pcnt_kick(p);
+        mcpwm_clock_update(p);
         timg_kick(p);
         break;
     case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
@@ -6931,6 +6941,10 @@ static bool mcpwm_operator_has_active_cbc_fault(
     const mcpwm_unit_state_t *state, unsigned operator_index);
 static void mcpwm_clear_operator_cbc(esp32_periph_t *p, unsigned unit,
                                       unsigned operator_index);
+static bool mcpwm_generator_pin_level(const esp32_periph_t *p,
+                                      unsigned unit,
+                                      unsigned operator_index,
+                                      unsigned generator);
 
 static uint32_t mcpwm_timer_offset(unsigned timer) {
     return MCPWM_TIMER_BASE_OFF + timer * MCPWM_TIMER_STRIDE;
@@ -6941,57 +6955,80 @@ static uint32_t mcpwm_operator_offset(unsigned operator_index) {
            operator_index * MCPWM_OPERATOR_STRIDE;
 }
 
-static unsigned mcpwm_addr_unit(uint32_t addr) {
-    return addr >= MCPWM1_BASE ? 1u : 0u;
+static const flexe_mcpwm_desc_t *mcpwm_desc(const esp32_periph_t *p) {
+    return p && p->target &&
+           (p->target->capabilities & FLEXE_TARGET_CAP_MCPWM_V1) ?
+        &p->target->mcpwm : NULL;
 }
 
-static uint32_t mcpwm_unit_base(unsigned unit) {
-    return unit ? MCPWM1_BASE : MCPWM0_BASE;
+static int mcpwm_addr_unit(const esp32_periph_t *p, uint32_t addr) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc) return -1;
+    for (unsigned unit = 0u; unit < desc->group_count; unit++)
+        if (addr >= desc->base[unit] &&
+            addr - desc->base[unit] < desc->register_size)
+            return (int)unit;
+    return -1;
+}
+
+static uint32_t mcpwm_unit_base(const esp32_periph_t *p, unsigned unit) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    return desc && unit < desc->group_count ? desc->base[unit] : 0u;
 }
 
 static uint32_t mcpwm_unit_dport_bit(unsigned unit) {
     return unit ? DPORT_PWM1_MODULE_BIT : DPORT_PWM0_MODULE_BIT;
 }
 
-static int mcpwm_unit_interrupt_source(unsigned unit) {
-    return unit ? 40 : 39;
+static int mcpwm_unit_interrupt_source(const esp32_periph_t *p,
+                                       unsigned unit) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    return desc && unit < desc->group_count ?
+        desc->interrupt_source[unit] : -1;
 }
 
-static uint32_t mcpwm_output_signal(unsigned unit,
+static uint32_t mcpwm_output_signal(const esp32_periph_t *p, unsigned unit,
                                     unsigned operator_index,
                                     unsigned generator) {
-    return (unit ? 108u : 32u) + operator_index * 2u + generator;
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    return desc->output_signal[unit][operator_index][generator];
 }
 
-static uint32_t mcpwm_sync_signal(unsigned unit, unsigned channel) {
-    return (unit ? 103u : 31u) + channel;
+static uint32_t mcpwm_sync_signal(const esp32_periph_t *p, unsigned unit,
+                                  unsigned channel) {
+    return mcpwm_desc(p)->sync_input_signal[unit][channel];
 }
 
-static uint32_t mcpwm_fault_signal(unsigned unit, unsigned channel) {
-    return (unit ? 106u : 34u) + channel;
+static uint32_t mcpwm_fault_signal(const esp32_periph_t *p, unsigned unit,
+                                   unsigned channel) {
+    return mcpwm_desc(p)->fault_input_signal[unit][channel];
 }
 
-static uint32_t mcpwm_capture_signal(unsigned unit, unsigned channel) {
-    return (unit ? 112u : 109u) + channel;
+static uint32_t mcpwm_capture_signal(const esp32_periph_t *p, unsigned unit,
+                                     unsigned channel) {
+    return mcpwm_desc(p)->capture_input_signal[unit][channel];
 }
 
-static bool mcpwm_decode_input_signal(unsigned signal, unsigned *unit,
+static bool mcpwm_decode_input_signal(const esp32_periph_t *p,
+                                      unsigned signal, unsigned *unit,
                                       unsigned *kind, unsigned *channel) {
-    for (unsigned candidate = 0; candidate < MCPWM_UNIT_COUNT; candidate++) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc) return false;
+    for (unsigned candidate = 0; candidate < desc->group_count; candidate++) {
         for (unsigned index = 0; index < MCPWM_TIMER_COUNT; index++) {
-            if (signal == mcpwm_sync_signal(candidate, index)) {
+            if (signal == mcpwm_sync_signal(p, candidate, index)) {
                 if (unit) *unit = candidate;
                 if (kind) *kind = 0;
                 if (channel) *channel = index;
                 return true;
             }
-            if (signal == mcpwm_fault_signal(candidate, index)) {
+            if (signal == mcpwm_fault_signal(p, candidate, index)) {
                 if (unit) *unit = candidate;
                 if (kind) *kind = 1;
                 if (channel) *channel = index;
                 return true;
             }
-            if (signal == mcpwm_capture_signal(candidate, index)) {
+            if (signal == mcpwm_capture_signal(p, candidate, index)) {
                 if (unit) *unit = candidate;
                 if (kind) *kind = 2;
                 if (channel) *channel = index;
@@ -7002,8 +7039,28 @@ static bool mcpwm_decode_input_signal(unsigned signal, unsigned *unit,
     return false;
 }
 
+static bool mcpwm_decode_output_signal(const esp32_periph_t *p,
+                                       unsigned signal, unsigned *unit,
+                                       unsigned *operator_index,
+                                       unsigned *generator) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc) return false;
+    for (unsigned candidate = 0u; candidate < desc->group_count;
+         candidate++)
+        for (unsigned op = 0u; op < MCPWM_OPERATOR_COUNT; op++)
+            for (unsigned gen = 0u; gen < MCPWM_GENERATOR_COUNT; gen++)
+                if (signal == desc->output_signal[candidate][op][gen]) {
+                    if (unit) *unit = candidate;
+                    if (operator_index) *operator_index = op;
+                    if (generator) *generator = gen;
+                    return true;
+                }
+    return false;
+}
+
 static int mcpwm_matrix_input_gpio(const esp32_periph_t *p,
                                    unsigned signal) {
+    if (p->target_gpio) return -1;
     uint32_t route = p->gpio.func_in_sel[signal];
     if (!(route & (1u << 7))) return -1;
     unsigned gpio = route & 0x3Fu;
@@ -7012,6 +7069,10 @@ static int mcpwm_matrix_input_gpio(const esp32_periph_t *p,
 
 static bool mcpwm_matrix_input_level(const esp32_periph_t *p,
                                      unsigned signal) {
+    if (p->target_gpio) {
+        int level = flexe_gpio_input_signal_level(p->target_gpio, signal);
+        return level > 0;
+    }
     uint32_t route = p->gpio.func_in_sel[signal];
     bool level = false;
     if (route & (1u << 7)) {
@@ -7030,20 +7091,26 @@ static bool mcpwm_matrix_input_level(const esp32_periph_t *p,
 static int mcpwm_output_gpio(const esp32_periph_t *p, unsigned unit,
                              unsigned operator_index, unsigned generator,
                              bool *inverted) {
-    uint32_t signal = mcpwm_output_signal(unit, operator_index, generator);
-    for (int gpio = 0; gpio < 40; gpio++) {
-        uint32_t route = p->gpio.func_out_sel[gpio];
+    uint32_t signal = mcpwm_output_signal(
+        p, unit, operator_index, generator);
+    unsigned gpio_count = p->target_gpio ? p->target->gpio.gpio_count : 40u;
+    for (unsigned gpio = 0u; gpio < gpio_count; gpio++) {
+        uint32_t route = p->target_gpio ?
+            (uint32_t)flexe_gpio_out_route(p->target_gpio, gpio) :
+            p->gpio.func_out_sel[gpio];
         if ((route & 0x1FFu) != signal) continue;
         if (inverted) *inverted = (route & (1u << 9)) != 0;
-        return gpio;
+        return (int)gpio;
     }
     if (inverted) *inverted = false;
     return -1;
 }
 
 static uint32_t mcpwm_cpu_mhz(const esp32_periph_t *p) {
-    uint32_t mhz = mem_read32(p->mem, ESP32_CPU_TICKS_PER_US_ADDR);
-    return mhz >= 10u && mhz <= 240u ? mhz : 240u;
+    uint32_t mhz = p->target->cpu_frequency_word ?
+        mem_read32(p->mem, p->target->cpu_frequency_word) : 0u;
+    return mhz >= 10u && mhz <= 1000u ?
+        mhz : p->target->default_cpu_frequency_mhz;
 }
 
 static uint64_t mcpwm_now_cycles(esp32_periph_t *p) {
@@ -7051,6 +7118,12 @@ static uint64_t mcpwm_now_cycles(esp32_periph_t *p) {
 }
 
 static bool mcpwm_unit_clocked(const esp32_periph_t *p, unsigned unit) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc || unit >= desc->group_count) return false;
+    if (!(p->target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
+        return p->mcpwm.system_clock_enabled[unit] &&
+               !p->mcpwm.system_reset_asserted[unit];
     uint32_t bit = mcpwm_unit_dport_bit(unit);
     return (p->dport_perip_clk_en & bit) != 0 &&
            (p->dport_perip_rst_en & bit) == 0;
@@ -7063,8 +7136,16 @@ static uint32_t mcpwm_group_divider(const mcpwm_unit_state_t *state) {
 static uint32_t mcpwm_group_frequency_hz(const esp32_periph_t *p,
                                          unsigned unit) {
     if (!mcpwm_unit_clocked(p, unit)) return 0;
-    return MCPWM_SOURCE_CLOCK_MHZ * 1000000u /
+    return mcpwm_desc(p)->source_clock_hz /
            mcpwm_group_divider(&p->mcpwm.unit[unit]);
+}
+
+static uint32_t mcpwm_source_clock_mhz(const esp32_periph_t *p) {
+    return mcpwm_desc(p)->source_clock_hz / 1000000u;
+}
+
+static uint32_t mcpwm_capture_clock_mhz(const esp32_periph_t *p) {
+    return mcpwm_desc(p)->capture_clock_hz / 1000000u;
 }
 
 static uint32_t mcpwm_timer_cycle(const mcpwm_timer_state_t *timer) {
@@ -7110,7 +7191,7 @@ static uint32_t mcpwm_timer_frequency_hz(const esp32_periph_t *p,
         ((uint32_t)timer->active_prescale + 1u) *
         mcpwm_timer_cycle(timer);
     return denominator ?
-        (uint32_t)((uint64_t)MCPWM_SOURCE_CLOCK_MHZ * 1000000u /
+        (uint32_t)((uint64_t)mcpwm_desc(p)->source_clock_hz /
                    denominator) : 0u;
 }
 
@@ -7189,6 +7270,17 @@ static void mcpwm_emit_output(esp32_periph_t *p, unsigned unit,
     info.fault_active = op->cbc_on || op->ost_on;
     info.forced_level = (int8_t)mcpwm_forced_level(op, generator);
 
+    if (p->target_gpio) {
+        bool enabled = mcpwm_unit_clocked(p, unit) && timer->running &&
+                       timer->mode != 0u;
+        flexe_gpio_drive_output_signal(
+            p->target_gpio,
+            mcpwm_output_signal(p, unit, operator_index, generator),
+            mcpwm_generator_pin_level(
+                p, unit, operator_index, generator),
+            enabled);
+    }
+
     bool changed = !op->output_reported[generator] ||
                    !mcpwm_info_equal(&info, &op->last_info[generator]);
     if (!force && !changed) return;
@@ -7221,11 +7313,12 @@ static void mcpwm_update_irq(esp32_periph_t *p, unsigned unit) {
     mcpwm_unit_state_t *state = &p->mcpwm.unit[unit];
     uint32_t raw = state->regs[MCPWM_INT_RAW_OFF / 4u];
     uint32_t ena = state->regs[MCPWM_INT_ENA_OFF / 4u];
-    if (raw & ena)
-        periph_assert_interrupt_status(p, mcpwm_unit_interrupt_source(unit),
+    if (mcpwm_unit_clocked(p, unit) && (raw & ena))
+        periph_assert_interrupt_status(
+            p, mcpwm_unit_interrupt_source(p, unit),
                                        raw & ena);
     else
-        periph_deassert_interrupt(p, mcpwm_unit_interrupt_source(unit));
+        periph_deassert_interrupt(p, mcpwm_unit_interrupt_source(p, unit));
 }
 
 static void mcpwm_kick(esp32_periph_t *p) {
@@ -7649,9 +7742,10 @@ static void mcpwm_sync_timer_to(esp32_periph_t *p, unsigned unit,
     }
     uint64_t denominator = mcpwm_timer_denominator(p, unit, timer);
     if (!denominator) return;
+    uint32_t source_mhz = mcpwm_source_clock_mhz(p);
     uint64_t product = elapsed > (UINT64_MAX - timer->tick_remainder) /
-                                 MCPWM_SOURCE_CLOCK_MHZ ? UINT64_MAX :
-        timer->tick_remainder + elapsed * MCPWM_SOURCE_CLOCK_MHZ;
+                                 source_mhz ? UINT64_MAX :
+        timer->tick_remainder + elapsed * source_mhz;
     uint64_t ticks = product / denominator;
     timer->tick_remainder = product % denominator;
     if (ticks) mcpwm_advance_timer_ticks(p, unit, timer_index, ticks);
@@ -7673,9 +7767,10 @@ static void mcpwm_sync_capture_to(esp32_periph_t *p, unsigned unit,
         return;
     }
     uint64_t denominator = mcpwm_capture_denominator(p);
+    uint32_t capture_mhz = mcpwm_capture_clock_mhz(p);
     uint64_t product = elapsed > (UINT64_MAX - state->capture_remainder) /
-                                 MCPWM_CAPTURE_CLOCK_MHZ ? UINT64_MAX :
-        state->capture_remainder + elapsed * MCPWM_CAPTURE_CLOCK_MHZ;
+                                 capture_mhz ? UINT64_MAX :
+        state->capture_remainder + elapsed * capture_mhz;
     uint64_t ticks = denominator ? product / denominator : 0u;
     state->capture_remainder = denominator ? product % denominator : 0u;
     state->capture_counter += (uint32_t)ticks;
@@ -7870,7 +7965,7 @@ static void mcpwm_external_sync_event(esp32_periph_t *p, unsigned unit,
 static bool mcpwm_effective_sync_level(const esp32_periph_t *p,
                                         unsigned unit, unsigned channel) {
     bool level = mcpwm_matrix_input_level(p,
-        mcpwm_sync_signal(unit, channel));
+        mcpwm_sync_signal(p, unit, channel));
     uint32_t cfg =
         p->mcpwm.unit[unit].regs[MCPWM_TIMER_SYNCI_CFG_OFF / 4u];
     if (cfg & (1u << (9u + channel))) level = !level;
@@ -7881,7 +7976,7 @@ static bool mcpwm_effective_capture_level(const esp32_periph_t *p,
                                            unsigned unit,
                                            unsigned channel) {
     bool level = mcpwm_matrix_input_level(p,
-        mcpwm_capture_signal(unit, channel));
+        mcpwm_capture_signal(p, unit, channel));
     uint32_t cfg = p->mcpwm.unit[unit].regs[
         (MCPWM_CAP_CH_CFG_OFF + channel * 4u) / 4u];
     if (cfg & (1u << 11)) level = !level;
@@ -7895,6 +7990,19 @@ static void mcpwm_handle_input_signal(esp32_periph_t *p, unsigned unit,
     mcpwm_sync_capture_to(p, unit, now);
     for (unsigned timer = 0; timer < MCPWM_TIMER_COUNT; timer++)
         mcpwm_sync_timer_to(p, unit, timer, now);
+    if (!mcpwm_unit_clocked(p, unit)) {
+        if (kind == 0u)
+            state->sync_level[channel] =
+                mcpwm_effective_sync_level(p, unit, channel);
+        else if (kind == 1u)
+            state->fault_level[channel] = mcpwm_matrix_input_level(
+                p, mcpwm_fault_signal(p, unit, channel));
+        else
+            state->capture_level[channel] =
+                mcpwm_effective_capture_level(p, unit, channel);
+        mcpwm_kick(p);
+        return;
+    }
     if (kind == 0u) {
         bool level = mcpwm_effective_sync_level(p, unit, channel);
         bool before = state->sync_level[channel];
@@ -7902,7 +8010,7 @@ static void mcpwm_handle_input_signal(esp32_periph_t *p, unsigned unit,
         if (!before && level) mcpwm_external_sync_event(p, unit, channel);
     } else if (kind == 1u) {
         bool level = mcpwm_matrix_input_level(p,
-            mcpwm_fault_signal(unit, channel));
+            mcpwm_fault_signal(p, unit, channel));
         state->fault_level[channel] = level;
         mcpwm_refresh_fault(p, unit, channel);
     } else {
@@ -7922,7 +8030,7 @@ static void mcpwm_rebind_input_signal(esp32_periph_t *p, unsigned unit,
             mcpwm_effective_sync_level(p, unit, channel);
     else if (kind == 1u)
         state->fault_level[channel] = mcpwm_matrix_input_level(
-            p, mcpwm_fault_signal(unit, channel));
+            p, mcpwm_fault_signal(p, unit, channel));
     else
         state->capture_level[channel] =
             mcpwm_effective_capture_level(p, unit, channel);
@@ -7933,19 +8041,22 @@ static void mcpwm_gpio_input_route_changed(esp32_periph_t *p,
     unsigned unit;
     unsigned kind;
     unsigned channel;
-    if (!mcpwm_decode_input_signal(signal, &unit, &kind, &channel)) return;
+    if (!mcpwm_decode_input_signal(
+            p, signal, &unit, &kind, &channel)) return;
     mcpwm_rebind_input_signal(p, unit, kind, channel);
     if (kind == 1u) mcpwm_refresh_fault(p, unit, channel);
     mcpwm_kick(p);
 }
 
 static void mcpwm_gpio_input_changed(esp32_periph_t *p, int gpio) {
-    for (unsigned unit = 0; unit < MCPWM_UNIT_COUNT; unit++) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc || p->target_gpio) return;
+    for (unsigned unit = 0; unit < desc->group_count; unit++) {
         for (unsigned channel = 0; channel < MCPWM_TIMER_COUNT; channel++) {
             uint32_t signals[3] = {
-                mcpwm_sync_signal(unit, channel),
-                mcpwm_fault_signal(unit, channel),
-                mcpwm_capture_signal(unit, channel),
+                mcpwm_sync_signal(p, unit, channel),
+                mcpwm_fault_signal(p, unit, channel),
+                mcpwm_capture_signal(p, unit, channel),
             };
             for (unsigned kind = 0; kind < 3u; kind++) {
                 if (mcpwm_matrix_input_gpio(p, signals[kind]) == gpio)
@@ -7961,14 +8072,13 @@ static void mcpwm_gpio_output_route_changed(esp32_periph_t *p, int gpio,
     (void)gpio;
     uint32_t signals[2] = {before & 0x1FFu, after & 0x1FFu};
     for (unsigned which = 0; which < 2u; which++) {
-        for (unsigned unit = 0; unit < MCPWM_UNIT_COUNT; unit++) {
-            uint32_t base = mcpwm_output_signal(unit, 0, 0);
-            if (signals[which] < base || signals[which] >= base + 6u)
-                continue;
-            unsigned relative = signals[which] - base;
-            mcpwm_emit_output(p, unit, relative / 2u, relative & 1u,
-                               false);
-        }
+        unsigned unit;
+        unsigned operator_index;
+        unsigned generator;
+        if (mcpwm_decode_output_signal(
+                p, signals[which], &unit, &operator_index, &generator))
+            mcpwm_emit_output(
+                p, unit, operator_index, generator, false);
     }
 }
 
@@ -8005,7 +8115,9 @@ static void mcpwm_sync_unit_to(esp32_periph_t *p, unsigned unit,
 }
 
 static void mcpwm_sync_all_to(esp32_periph_t *p, uint64_t now) {
-    for (unsigned unit = 0; unit < MCPWM_UNIT_COUNT; unit++)
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc) return;
+    for (unsigned unit = 0; unit < desc->group_count; unit++)
         mcpwm_sync_unit_to(p, unit, now);
 }
 
@@ -8193,8 +8305,10 @@ static void mcpwm_software_capture(esp32_periph_t *p, unsigned unit,
 
 static uint32_t mcpwm_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
-    unsigned unit = mcpwm_addr_unit(addr);
-    uint32_t off = addr - mcpwm_unit_base(unit);
+    int decoded = mcpwm_addr_unit(p, addr);
+    if (decoded < 0) return default_read(ctx, addr);
+    unsigned unit = (unsigned)decoded;
+    uint32_t off = addr - mcpwm_unit_base(p, unit);
     if ((off & 3u) || off > MCPWM_VERSION_OFF)
         return default_read(ctx, addr);
     uint64_t now = mcpwm_now_cycles(p);
@@ -8232,8 +8346,13 @@ static uint32_t mcpwm_read(void *ctx, uint32_t addr) {
 
 static void mcpwm_write(void *ctx, uint32_t addr, uint32_t val) {
     esp32_periph_t *p = ctx;
-    unsigned unit = mcpwm_addr_unit(addr);
-    uint32_t off = addr - mcpwm_unit_base(unit);
+    int decoded = mcpwm_addr_unit(p, addr);
+    if (decoded < 0) {
+        default_write(ctx, addr, val);
+        return;
+    }
+    unsigned unit = (unsigned)decoded;
+    uint32_t off = addr - mcpwm_unit_base(p, unit);
     if ((off & 3u) || off > MCPWM_VERSION_OFF) {
         default_write(ctx, addr, val);
         return;
@@ -8386,6 +8505,26 @@ static bool mcpwm_timer_has_deferred_boundary_work(
     return false;
 }
 
+static bool mcpwm_timer_has_output_consumer(const esp32_periph_t *p,
+                                             unsigned unit,
+                                             unsigned timer_index) {
+    if (!p->target_gpio) return false;
+    const mcpwm_unit_state_t *state = &p->mcpwm.unit[unit];
+    for (unsigned operator_index = 0u;
+         operator_index < MCPWM_OPERATOR_COUNT; operator_index++) {
+        if (mcpwm_operator_timer(state, operator_index) != timer_index)
+            continue;
+        for (unsigned generator = 0u;
+             generator < MCPWM_GENERATOR_COUNT; generator++)
+            if (flexe_gpio_output_signal_has_input_consumer(
+                    p->target_gpio,
+                    mcpwm_output_signal(
+                        p, unit, operator_index, generator)))
+                return true;
+    }
+    return false;
+}
+
 static uint64_t mcpwm_cycles_until_ticks(const esp32_periph_t *p,
                                           unsigned unit,
                                           const mcpwm_timer_state_t *timer,
@@ -8394,8 +8533,8 @@ static uint64_t mcpwm_cycles_until_ticks(const esp32_periph_t *p,
     uint64_t needed = (uint64_t)ticks * denominator;
     if (needed <= timer->tick_remainder) return 0;
     needed -= timer->tick_remainder;
-    return (needed + MCPWM_SOURCE_CLOCK_MHZ - 1u) /
-           MCPWM_SOURCE_CLOCK_MHZ;
+    uint32_t source_mhz = mcpwm_source_clock_mhz(p);
+    return (needed + source_mhz - 1u) / source_mhz;
 }
 
 static uint32_t mcpwm_deadline_ccount(const xtensa_cpu_t *cpu,
@@ -8413,7 +8552,9 @@ static uint32_t mcpwm_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     bool have = false;
     uint32_t best = UINT32_MAX;
     uint32_t best_distance = 0;
-    for (unsigned unit = 0; unit < MCPWM_UNIT_COUNT; unit++) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc) return UINT32_MAX;
+    for (unsigned unit = 0; unit < desc->group_count; unit++) {
         mcpwm_unit_state_t *state = &p->mcpwm.unit[unit];
         uint32_t raw = state->regs[MCPWM_INT_RAW_OFF / 4u];
         uint32_t ena = state->regs[MCPWM_INT_ENA_OFF / 4u];
@@ -8426,6 +8567,8 @@ static uint32_t mcpwm_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu) {
                 !mcpwm_unit_clocked(p, unit))
                 continue;
             if (!timed_irq_pending && !internal_sync &&
+                !mcpwm_timer_has_output_consumer(
+                    p, unit, timer_index) &&
                 !mcpwm_timer_has_deferred_boundary_work(state,
                                                         timer_index))
                 continue;
@@ -8449,13 +8592,16 @@ static void mcpwm_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
     if (!p || !cpu || cpu != p->cpu[0]) return;
     uint64_t now = mcpwm_now_cycles(p);
     mcpwm_sync_all_to(p, now);
-    for (unsigned unit = 0; unit < MCPWM_UNIT_COUNT; unit++)
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc) return;
+    for (unsigned unit = 0; unit < desc->group_count; unit++)
         mcpwm_update_irq(p, unit);
     mcpwm_kick(p);
 }
 
 static void mcpwm_reset_unit(esp32_periph_t *p, unsigned unit) {
-    if (!p || unit >= MCPWM_UNIT_COUNT) return;
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc || unit >= desc->group_count) return;
     mcpwm_unit_state_t *state = &p->mcpwm.unit[unit];
     periph_mcpwm_output_fn callbacks[MCPWM_OPERATOR_COUNT]
                                       [MCPWM_GENERATOR_COUNT];
@@ -8502,7 +8648,7 @@ static void mcpwm_reset_unit(esp32_periph_t *p, unsigned unit) {
         }
     }
     state->regs[MCPWM_UPDATE_CFG_OFF / 4u] = MCPWM_UPDATE_CFG_RESET;
-    state->regs[MCPWM_VERSION_OFF / 4u] = MCPWM_VERSION_RESET;
+    state->regs[MCPWM_VERSION_OFF / 4u] = desc->version_reset;
     state->capture_last_cycles = now;
     for (unsigned channel = 0; channel < MCPWM_TIMER_COUNT; channel++) {
         mcpwm_rebind_input_signal(p, unit, 0u, channel);
@@ -8513,6 +8659,153 @@ static void mcpwm_reset_unit(esp32_periph_t *p, unsigned unit) {
     for (unsigned operator_index = 0;
          operator_index < MCPWM_OPERATOR_COUNT; operator_index++)
         mcpwm_emit_operator(p, unit, operator_index);
+    mcpwm_kick(p);
+}
+
+static bool mcpwm_geometry_valid(const flexe_target_desc_t *target) {
+    if (!target || !(target->capabilities & FLEXE_TARGET_CAP_MCPWM_V1))
+        return false;
+    const flexe_mcpwm_desc_t *desc = &target->mcpwm;
+    if (desc->group_count == 0u ||
+        desc->group_count > FLEXE_TARGET_MCPWM_GROUP_MAX ||
+        desc->register_size != 0x1000u ||
+        desc->source_clock_hz == 0u ||
+        desc->capture_clock_hz == 0u ||
+        (desc->source_clock_hz % 1000000u) != 0u ||
+        (desc->capture_clock_hz % 1000000u) != 0u)
+        return false;
+
+    for (unsigned unit = 0u; unit < desc->group_count; unit++) {
+        if ((desc->base[unit] & 0xFFFu) != 0u ||
+            desc->base[unit] < target->peripheral_start ||
+            desc->base[unit] >= target->peripheral_end ||
+            desc->register_size > target->peripheral_end - desc->base[unit] ||
+            desc->interrupt_source[unit] >=
+                FLEXE_TARGET_INTERRUPT_SOURCE_MAX)
+            return false;
+        if ((target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) &&
+            desc->interrupt_source[unit] >=
+                target->interrupt_matrix.source_count)
+            return false;
+        for (unsigned previous = 0u; previous < unit; previous++)
+            if (desc->base[previous] == desc->base[unit]) return false;
+
+        for (unsigned operator_index = 0u;
+             operator_index < MCPWM_OPERATOR_COUNT; operator_index++)
+            for (unsigned generator = 0u;
+                 generator < MCPWM_GENERATOR_COUNT; generator++)
+                if (desc->output_signal[unit][operator_index][generator] >=
+                    FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT)
+                    return false;
+        for (unsigned channel = 0u; channel < MCPWM_TIMER_COUNT; channel++) {
+            const uint16_t inputs[] = {
+                desc->sync_input_signal[unit][channel],
+                desc->fault_input_signal[unit][channel],
+                desc->capture_input_signal[unit][channel],
+            };
+            for (size_t index = 0u;
+                 index < sizeof(inputs) / sizeof(inputs[0]); index++)
+                if (inputs[index] >= FLEXE_TARGET_GPIO_MATRIX_INPUT_COUNT)
+                    return false;
+        }
+    }
+    if ((target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) &&
+        !(target->capabilities & FLEXE_TARGET_CAP_GPIO_V1))
+        return false;
+    return true;
+}
+
+static int mcpwm_register_target(esp32_periph_t *p) {
+    if (!(p->target->capabilities & FLEXE_TARGET_CAP_MCPWM_V1)) return 0;
+    if (!mcpwm_geometry_valid(p->target)) return -1;
+    const flexe_mcpwm_desc_t *desc = &p->target->mcpwm;
+
+    for (unsigned unit = 0u; unit < desc->group_count; unit++) {
+        if (p->target->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1) {
+            if (!flexe_system_clock_gate_state(
+                    p->system_clock, FLEXE_SYSTEM_DEVICE_MCPWM, unit,
+                    &p->mcpwm.system_clock_enabled[unit],
+                    &p->mcpwm.system_reset_asserted[unit]))
+                return -1;
+        } else {
+            p->mcpwm.system_clock_enabled[unit] = true;
+            p->mcpwm.system_reset_asserted[unit] = false;
+        }
+        mcpwm_reset_unit(p, unit);
+        if (mem_register_mmio_range(
+                p->mem, desc->base[unit], desc->register_size,
+                mcpwm_read, mcpwm_write, p) != 0)
+            return -1;
+    }
+
+    if (p->target_gpio) {
+        for (unsigned unit = 0u; unit < desc->group_count; unit++) {
+            for (unsigned operator_index = 0u;
+                 operator_index < MCPWM_OPERATOR_COUNT; operator_index++)
+                for (unsigned generator = 0u;
+                     generator < MCPWM_GENERATOR_COUNT; generator++)
+                    flexe_gpio_set_output_signal_modeled(
+                        p->target_gpio,
+                        desc->output_signal[unit][operator_index][generator]);
+            for (unsigned channel = 0u; channel < MCPWM_TIMER_COUNT;
+                 channel++) {
+                flexe_gpio_watch_input_signal(
+                    p->target_gpio, desc->sync_input_signal[unit][channel]);
+                flexe_gpio_watch_input_signal(
+                    p->target_gpio, desc->fault_input_signal[unit][channel]);
+                flexe_gpio_watch_input_signal(
+                    p->target_gpio,
+                    desc->capture_input_signal[unit][channel]);
+            }
+        }
+        flexe_gpio_set_input_signal_handler(
+            p->target_gpio, target_gpio_input_signal_changed, p);
+        flexe_gpio_set_input_route_handler(
+            p->target_gpio, target_gpio_input_route_changed, p);
+        flexe_gpio_set_output_sample_handler(
+            p->target_gpio, target_gpio_output_sample, p);
+    }
+    return 0;
+}
+
+static void mcpwm_set_system_state(esp32_periph_t *p, unsigned unit,
+                                   bool clock_enabled,
+                                   bool reset_asserted) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc || unit >= desc->group_count) return;
+    uint64_t now = mcpwm_now_cycles(p);
+    mcpwm_sync_unit_to(p, unit, now);
+    bool reset_edge = reset_asserted &&
+                      !p->mcpwm.system_reset_asserted[unit];
+    bool state_changed =
+        clock_enabled != p->mcpwm.system_clock_enabled[unit] ||
+        reset_asserted != p->mcpwm.system_reset_asserted[unit];
+    p->mcpwm.system_clock_enabled[unit] = clock_enabled;
+    p->mcpwm.system_reset_asserted[unit] = reset_asserted;
+    if (reset_edge) {
+        mcpwm_reset_unit(p, unit);
+        return;
+    }
+    if (state_changed)
+        for (unsigned operator_index = 0u;
+             operator_index < MCPWM_OPERATOR_COUNT; operator_index++)
+            mcpwm_emit_operator(p, unit, operator_index);
+    if (state_changed && clock_enabled && !reset_asserted)
+        for (unsigned fault = 0u; fault < MCPWM_TIMER_COUNT; fault++)
+            mcpwm_refresh_fault(p, unit, fault);
+    mcpwm_update_irq(p, unit);
+    mcpwm_kick(p);
+}
+
+static void mcpwm_clock_update(esp32_periph_t *p) {
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc) return;
+    for (unsigned unit = 0u; unit < desc->group_count; unit++) {
+        mcpwm_update_irq(p, unit);
+        for (unsigned operator_index = 0u;
+             operator_index < MCPWM_OPERATOR_COUNT; operator_index++)
+            mcpwm_emit_operator(p, unit, operator_index);
+    }
     mcpwm_kick(p);
 }
 
@@ -14559,6 +14852,10 @@ static void system_clock_gate_changed(
         if (instance == 0u)
             pcnt_set_system_state(p, clock_enabled, reset_asserted);
         break;
+    case FLEXE_SYSTEM_DEVICE_MCPWM:
+        mcpwm_set_system_state(
+            p, instance, clock_enabled, reset_asserted);
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -14751,6 +15048,10 @@ static void target_gpio_input_signal_changed(void *ctx, unsigned signal,
     bool control;
     if (pcnt_decode_signal(p, signal, &unit, &channel, &control))
         pcnt_handle_signal_level(p, unit, channel, control);
+    unsigned kind;
+    if (mcpwm_decode_input_signal(
+            p, signal, &unit, &kind, &channel))
+        mcpwm_handle_input_signal(p, unit, kind, channel);
     if (p->rmt_v1) {
         const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
         unsigned rx_count = desc->channel_count - desc->tx_channel_count;
@@ -14774,6 +15075,7 @@ static void target_gpio_input_route_changed(void *ctx, unsigned signal)
     esp32_periph_t *p = ctx;
     if (!p) return;
     pcnt_gpio_route_changed(p, signal);
+    mcpwm_gpio_input_route_changed(p, signal);
 }
 
 static void rmt_v1_tx_edge_changed(void *ctx, unsigned channel,
@@ -14806,13 +15108,34 @@ static bool target_gpio_output_sample(void *ctx, unsigned signal,
                                       int *level, int *enabled)
 {
     esp32_periph_t *p = ctx;
-    if (!p || !p->rmt_v1) return false;
-    const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
-    if (signal < desc->output_signal_base ||
-        signal >= desc->output_signal_base + desc->tx_channel_count)
-        return false;
-    return flexe_rmt_v1_tx_sample(
-        p->rmt_v1, signal - desc->output_signal_base, level, enabled);
+    if (!p) return false;
+    unsigned unit;
+    unsigned operator_index;
+    unsigned generator;
+    if (mcpwm_decode_output_signal(
+            p, signal, &unit, &operator_index, &generator)) {
+        mcpwm_sync_unit_to(p, unit, mcpwm_now_cycles(p));
+        unsigned timer_index = mcpwm_operator_timer(
+            &p->mcpwm.unit[unit], operator_index);
+        const mcpwm_timer_state_t *timer =
+            &p->mcpwm.unit[unit].timer[timer_index];
+        if (level)
+            *level = mcpwm_generator_pin_level(
+                p, unit, operator_index, generator);
+        if (enabled)
+            *enabled = mcpwm_unit_clocked(p, unit) && timer->running &&
+                       timer->mode != 0u;
+        return true;
+    }
+    if (p->rmt_v1) {
+        const flexe_rmt_v1_desc_t *desc = &p->target->rmt_v1;
+        if (signal >= desc->output_signal_base &&
+            signal < desc->output_signal_base + desc->tx_channel_count)
+            return flexe_rmt_v1_tx_sample(
+                p->rmt_v1, signal - desc->output_signal_base,
+                level, enabled);
+    }
+    return false;
 }
 
 static void usb_serial_jtag_irq_changed(void *ctx, bool level)
@@ -14855,6 +15178,16 @@ static void target_gpio_output_changed(void *ctx, unsigned gpio,
                 ledc_emit_channel(p, 1u, old - base, false);
             if (next >= base && next < base + LEDC_CHANNEL_COUNT)
                 ledc_emit_channel(p, 1u, next - base, false);
+        }
+    }
+    if (p && mcpwm_desc(p) && gpio < FLEXE_TARGET_GPIO_MAX) {
+        int selected = flexe_gpio_out_route(p->target_gpio, gpio);
+        if (selected >= 0 &&
+            p->mcpwm_gpio_route[gpio] != (uint32_t)selected) {
+            uint32_t old = p->mcpwm_gpio_route[gpio];
+            p->mcpwm_gpio_route[gpio] = (uint32_t)selected;
+            mcpwm_gpio_output_route_changed(
+                p, (int)gpio, old, (uint32_t)selected);
         }
     }
     /* Existing sandbox events describe a digital value rather than a
@@ -15567,6 +15900,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         return NULL;
     }
 
+    if (mcpwm_register_target(p) != 0) {
+        periph_destroy(p);
+        return NULL;
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_SYSCON_MEMORY_V1) {
         p->syscon_memory = flexe_syscon_memory_create(
             mem, default_read, default_write, p);
@@ -15673,10 +16011,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
      * the ESP32 peripheral version value from the vendor register map. */
     ledc_reset_state(p);
 
-    /* Both motor-control PWM units have independent reset domains. */
-    mcpwm_reset_unit(p, 0);
-    mcpwm_reset_unit(p, 1);
-
     /* Bootloader-style initial flash MMU contents (app at flash 0x10000) */
     flash_mmu_init_bootloader(p);
 
@@ -15733,12 +16067,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
 
     /* Eight-channel RMT register file plus its shared 512-word pulse RAM. */
     mem_register_mmio(mem, (int)PAGE_OF(RMT_BASE), rmt_read, rmt_write, p);
-
-    /* Two motor-control PWM units (interrupt sources 39/40). */
-    mem_register_mmio(mem, (int)PAGE_OF(MCPWM0_BASE),
-                      mcpwm_read, mcpwm_write, p);
-    mem_register_mmio(mem, (int)PAGE_OF(MCPWM1_BASE),
-                      mcpwm_read, mcpwm_write, p);
 
     /* TIMG0 */
     mem_register_mmio(mem, (int)PAGE_OF(TIMG0_BASE), timg_read, timg_write, p);
@@ -15806,18 +16134,35 @@ int periph_set_system_state_handler(esp32_periph_t *p,
 
 int periph_gpio_pin_level(const esp32_periph_t *p, int pin) {
     if (!p || pin < 0) return -1;
-    if (p->target_gpio)
+    if (p->target_gpio) {
+        int route = flexe_gpio_out_route(p->target_gpio, (unsigned)pin);
+        unsigned unit;
+        unsigned operator_index;
+        unsigned generator;
+        if (route >= 0 && mcpwm_decode_output_signal(
+                p, (unsigned)route & 0x1FFu, &unit,
+                &operator_index, &generator)) {
+            esp32_periph_t *mutable = (esp32_periph_t *)p;
+            mcpwm_sync_unit_to(
+                mutable, unit, mcpwm_now_cycles(mutable));
+            bool level = mcpwm_generator_pin_level(
+                p, unit, operator_index, generator);
+            if ((uint32_t)route & (1u << 9)) level = !level;
+            return level ? 1 : 0;
+        }
         return flexe_gpio_pin_level(p->target_gpio, (unsigned)pin);
+    }
     if (pin > 39) return -1;
 
     uint32_t route = p->gpio.func_out_sel[pin];
     uint32_t signal = route & 0x1FFu;
-    for (unsigned unit = 0; unit < MCPWM_UNIT_COUNT; unit++) {
-        uint32_t base = mcpwm_output_signal(unit, 0, 0);
-        if (signal < base || signal >= base + 6u) continue;
-        unsigned relative = signal - base;
+    unsigned unit;
+    unsigned operator_index;
+    unsigned generator;
+    if (mcpwm_decode_output_signal(
+            p, signal, &unit, &operator_index, &generator)) {
         bool level = mcpwm_generator_pin_level(
-            p, unit, relative / 2u, relative & 1u);
+            p, unit, operator_index, generator);
         if (route & (1u << 9)) level = !level;
         return level ? 1 : 0;
     }
@@ -15950,6 +16295,13 @@ void periph_destroy(esp32_periph_t *p) {
         for (unsigned port = 0u; port < desc->instance_count; port++)
             (void)mem_register_mmio_range(
                 p->mem, desc->instance[port].base, desc->register_size,
+                NULL, NULL, NULL);
+    }
+    if (p->target->capabilities & FLEXE_TARGET_CAP_MCPWM_V1) {
+        const flexe_mcpwm_desc_t *desc = &p->target->mcpwm;
+        for (unsigned group = 0u; group < desc->group_count; group++)
+            (void)mem_register_mmio_range(
+                p->mem, desc->base[group], desc->register_size,
                 NULL, NULL, NULL);
     }
     if (p->target->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1)
@@ -16320,7 +16672,8 @@ int periph_set_sigmadelta_output_callback(
 int periph_set_mcpwm_output_callback(esp32_periph_t *p, int unit,
                                      int operator_index, int generator,
                                      periph_mcpwm_output_fn fn, void *ctx) {
-    if (!p || unit < 0 || unit >= (int)MCPWM_UNIT_COUNT ||
+    const flexe_mcpwm_desc_t *desc = mcpwm_desc(p);
+    if (!desc || unit < 0 || unit >= (int)desc->group_count ||
         operator_index < 0 ||
         operator_index >= (int)MCPWM_OPERATOR_COUNT || generator < 0 ||
         generator >= (int)MCPWM_GENERATOR_COUNT)
@@ -16640,6 +16993,8 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         candidates |= 1u << PERIPH_EVENT_TWAI;
     if (p->target->capabilities & FLEXE_TARGET_CAP_PCNT_V1)
         candidates |= 1u << PERIPH_EVENT_PCNT;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_MCPWM_V1)
+        candidates |= 1u << PERIPH_EVENT_MCPWM;
     p->event_source_registered_mask = candidates;
     p->event_source_candidates[0] = candidates;
     p->event_source_candidates[1] = candidates;
@@ -16653,13 +17008,21 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         p->event_clock.valid[core] = cpu != NULL;
     }
 
+    if (p->target->capabilities & FLEXE_TARGET_CAP_MCPWM_V1) {
+        for (unsigned core = 0u; core < 2u; core++) {
+            xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;
+            p->mcpwm.clock.core_cycles[core] = p->mcpwm.clock.cycles;
+            p->mcpwm.clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
+            p->mcpwm.clock.valid[core] = cpu != NULL;
+        }
+    }
+
     if (classic) {
         /* Re-anchor every shared clock against the newly attached cores.
          * Listing them here rather than open-coding each one keeps a clock
          * added later from being silently left un-anchored. */
         periph_clock_t *clocks[] = {
-            &p->timg_clock, &p->mcpwm.clock, &p->sigmadelta.clock,
-            &p->ledc_clock,
+            &p->timg_clock, &p->sigmadelta.clock, &p->ledc_clock,
         };
         for (unsigned core = 0; core < 2u; core++) {
             xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;

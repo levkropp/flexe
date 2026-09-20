@@ -29,6 +29,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
                         FLEXE_TARGET_CAP_TWAI_V1 |
                         FLEXE_TARGET_CAP_PCNT_V1 |
+                        FLEXE_TARGET_CAP_MCPWM_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -166,6 +167,28 @@ static const flexe_target_desc_t TARGETS[] = {
             .unit_count = 8u,
             .channel_count = 2u,
             .interrupt_source = 48u,
+        },
+        .mcpwm = {
+            .base = { 0x3FF5E000u, 0x3FF6C000u },
+            .register_size = 0x1000u,
+            .source_clock_hz = 160000000u,
+            .capture_clock_hz = 80000000u,
+            .version_reset = 0x02107230u,
+            .output_signal = {
+                { { 32u, 33u }, { 34u, 35u }, { 36u, 37u } },
+                { { 108u, 109u }, { 110u, 111u }, { 112u, 113u } },
+            },
+            .sync_input_signal = {
+                { 31u, 32u, 33u }, { 103u, 104u, 105u },
+            },
+            .fault_input_signal = {
+                { 34u, 35u, 36u }, { 106u, 107u, 108u },
+            },
+            .capture_input_signal = {
+                { 109u, 110u, 111u }, { 112u, 113u, 114u },
+            },
+            .group_count = 2u,
+            .interrupt_source = { 39u, 40u },
         },
         .io_mux = {
             .base = 0x3FF49000u,
@@ -400,6 +423,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
                         FLEXE_TARGET_CAP_TWAI_V1 |
                         FLEXE_TARGET_CAP_PCNT_V1 |
+                        FLEXE_TARGET_CAP_MCPWM_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -565,6 +589,28 @@ static const flexe_target_desc_t TARGETS[] = {
             .channel_count = 2u,
             .interrupt_source = 41u,
         },
+        .mcpwm = {
+            .base = { 0x6001E000u, 0x6002C000u },
+            .register_size = 0x1000u,
+            .source_clock_hz = 160000000u,
+            .capture_clock_hz = 80000000u,
+            .version_reset = 0x02107230u,
+            .output_signal = {
+                { { 160u, 161u }, { 162u, 163u }, { 164u, 165u } },
+                { { 166u, 167u }, { 168u, 169u }, { 170u, 171u } },
+            },
+            .sync_input_signal = {
+                { 160u, 161u, 162u }, { 169u, 170u, 171u },
+            },
+            .fault_input_signal = {
+                { 163u, 164u, 165u }, { 172u, 173u, 174u },
+            },
+            .capture_input_signal = {
+                { 166u, 167u, 168u }, { 175u, 176u, 177u },
+            },
+            .group_count = 2u,
+            .interrupt_source = { 31u, 32u },
+        },
         .secondary_core = {
             .base = 0x600C0000u,
             .register_size = 0x1000u,
@@ -585,7 +631,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 8u,
-            .gate_count = 20u,
+            .gate_count = 22u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -761,6 +807,22 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x024u,
                     .clock_mask = 1u << 1,
                     .reset_mask = 1u << 1,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_MCPWM,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 17,
+                    .reset_mask = 1u << 17,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_MCPWM,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 20,
+                    .reset_mask = 1u << 20,
                 },
             },
             .low_power = {

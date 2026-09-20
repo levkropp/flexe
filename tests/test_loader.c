@@ -656,6 +656,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_PCNT_V1);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_MCPWM_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(esp32->i2c.instance_count, 2u);
     ASSERT_EQ(esp32->i2c.instance[0].base, 0x3FF53000u);
@@ -683,6 +684,15 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(esp32->pcnt.base, 0x3FF57000u);
     ASSERT_EQ(esp32->pcnt.unit_count, 8u);
     ASSERT_EQ(esp32->pcnt.interrupt_source, 48u);
+    ASSERT_EQ(esp32->mcpwm.base[0], 0x3FF5E000u);
+    ASSERT_EQ(esp32->mcpwm.base[1], 0x3FF6C000u);
+    ASSERT_EQ(esp32->mcpwm.group_count, 2u);
+    ASSERT_EQ(esp32->mcpwm.interrupt_source[0], 39u);
+    ASSERT_EQ(esp32->mcpwm.interrupt_source[1], 40u);
+    ASSERT_EQ(esp32->mcpwm.output_signal[0][0][0], 32u);
+    ASSERT_EQ(esp32->mcpwm.output_signal[1][2][1], 113u);
+    ASSERT_EQ(esp32->mcpwm.capture_input_signal[0][0], 109u);
+    ASSERT_EQ(esp32->mcpwm.capture_input_signal[1][2], 114u);
     ASSERT_EQ(s3->image_chip_id, 9u);
     ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
     ASSERT_EQ(s3->translation_profile,
@@ -713,6 +723,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_PCNT_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_MCPWM_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_AES_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GP_SPI);
@@ -728,6 +739,23 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->pcnt.interrupt_source, 41u);
     ASSERT_EQ(s3->pcnt.pulse_input_signal[3][1], 46u);
     ASSERT_EQ(s3->pcnt.control_input_signal[3][1], 48u);
+    ASSERT_EQ(s3->mcpwm.base[0], 0x6001E000u);
+    ASSERT_EQ(s3->mcpwm.base[1], 0x6002C000u);
+    ASSERT_EQ(s3->mcpwm.register_size, 0x1000u);
+    ASSERT_EQ(s3->mcpwm.source_clock_hz, 160000000u);
+    ASSERT_EQ(s3->mcpwm.capture_clock_hz, 80000000u);
+    ASSERT_EQ(s3->mcpwm.version_reset, 0x02107230u);
+    ASSERT_EQ(s3->mcpwm.group_count, 2u);
+    ASSERT_EQ(s3->mcpwm.interrupt_source[0], 31u);
+    ASSERT_EQ(s3->mcpwm.interrupt_source[1], 32u);
+    ASSERT_EQ(s3->mcpwm.output_signal[0][0][0], 160u);
+    ASSERT_EQ(s3->mcpwm.output_signal[1][2][1], 171u);
+    ASSERT_EQ(s3->mcpwm.sync_input_signal[0][0], 160u);
+    ASSERT_EQ(s3->mcpwm.sync_input_signal[1][2], 171u);
+    ASSERT_EQ(s3->mcpwm.fault_input_signal[0][0], 163u);
+    ASSERT_EQ(s3->mcpwm.fault_input_signal[1][2], 174u);
+    ASSERT_EQ(s3->mcpwm.capture_input_signal[0][0], 166u);
+    ASSERT_EQ(s3->mcpwm.capture_input_signal[1][2], 177u);
     ASSERT_EQ(s3->i2c.instance_count, 2u);
     ASSERT_EQ(s3->i2c.instance[0].base, 0x60013000u);
     ASSERT_EQ(s3->i2c.instance[1].base, 0x60027000u);
@@ -784,7 +812,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 8u);
-    ASSERT_EQ(s3->system_clock.gate_count, 20u);
+    ASSERT_EQ(s3->system_clock.gate_count, 22u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
@@ -819,6 +847,16 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
               FLEXE_SYSTEM_DEVICE_AES);
     ASSERT_EQ(s3->system_clock.gate[19].clock_mask, 1u << 1);
     ASSERT_EQ(s3->system_clock.gate[19].reset_mask, 1u << 1);
+    ASSERT_EQ(s3->system_clock.gate[20].device,
+              FLEXE_SYSTEM_DEVICE_MCPWM);
+    ASSERT_EQ(s3->system_clock.gate[20].instance, 0u);
+    ASSERT_EQ(s3->system_clock.gate[20].clock_mask, 1u << 17);
+    ASSERT_EQ(s3->system_clock.gate[20].reset_mask, 1u << 17);
+    ASSERT_EQ(s3->system_clock.gate[21].device,
+              FLEXE_SYSTEM_DEVICE_MCPWM);
+    ASSERT_EQ(s3->system_clock.gate[21].instance, 1u);
+    ASSERT_EQ(s3->system_clock.gate[21].clock_mask, 1u << 20);
+    ASSERT_EQ(s3->system_clock.gate[21].reset_mask, 1u << 20);
     ASSERT_EQ(s3->system_clock.gate[7].device,
               FLEXE_SYSTEM_DEVICE_SHA);
     ASSERT_EQ(s3->system_clock.gate[7].clock_mask, 1u << 2);

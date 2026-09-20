@@ -137,7 +137,7 @@ typedef void (*periph_sigmadelta_output_fn)(void *ctx, int channel, int gpio,
                                             int8_t duty, bool enabled,
                                             bool inverted);
 
-/* Aggregate configuration for one classic ESP32 MCPWM generator output.
+/* Aggregate configuration for one target-described MCPWM generator output.
  * `period_ticks` and `compare_ticks` use the selected operator timer's
  * resolution. Dead-time delays use `deadtime_clock_hz`; carrier_duty_eighths
  * is the hardware's 0/8..7/8 encoding. `forced_level` is -1 when neither a

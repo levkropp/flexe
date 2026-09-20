@@ -208,6 +208,9 @@ GPIO routes, interrupt queues, alerts, and host-injected frames in both engines.
 `check-s3-idf-pcnt.sh` runs the stock pulse-counter driver twice in each
 engine, checking GPIO loopback, glitch filtering, direction control, limits,
 ISR watch-point order, teardown, JIT retirement, and zero unsupported MMIO.
+`check-s3-idf-mcpwm.sh` does the same for both MCPWM groups, covering native
+timer/comparator/capture callbacks, GPIO loopback, live compare updates,
+continuous force levels, complete teardown, and zero unsupported MMIO.
 `check-s3-idf-aes.sh` likewise runs the public mbedTLS AES API twice per engine,
 covering all six S3 block modes, AES-128/256 known-answer vectors, partial CTR,
 and a 4 KiB interrupt-driven GDMA round trip.
@@ -230,7 +233,7 @@ keeps Ninja output and `sdkconfig` files under the user cache, outside the
 repository. A content fingerprint covers the project sources, generated
 configuration, pinned IDF/tool metadata, build flags, deterministic timestamp,
 and both artifact hashes. An unchanged run therefore skips the IDF environment
-export and Ninja entirely; all fifteen artifact lookups take about one second on
+export and Ninja entirely; all sixteen artifact lookups take about one second on
 the reference MacBook. A cache miss retains full logs and prints only progress,
 exact artifact paths and hashes, and gate results. Pass `--verbose` when live
 compiler output and ccache statistics are useful. `--check` also updates just

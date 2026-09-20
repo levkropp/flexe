@@ -64,6 +64,7 @@ even when a firmware workflow succeeds.
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (masked RTC configuration, supply, analog-control and power/isolation-domain resolution, fault-injection selection, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, zero-unsupported native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; OPTIONS0, ANA_CONF, SLP_REJECT_CONF, SDIO/BIAS/drive configuration, FIB reset-source selection, digital-pad/global isolation, digital domains, and RTC-local domains have architectural state, with selected consumers connected. Brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties in both engines, byte-identical replay, and zero unsupported accesses | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 PCNT pulse counter | Partial (MMIO and timed GPIO-matrix input) | `tests/test_pcnt.c`; `scripts/check-s3-idf-pcnt.sh` runs ESP-IDF 5.3.2's unmodified driver in interpreter and JIT through GPIO loopback, APB glitch filtering, edge/control actions, high/low limits, four ISR watch points, and teardown with zero unsupported accesses | Four S3 units with two channels, event/interrupt state, SYSTEM clock/reset, and matrix inversion are modeled. Silicon synchronizer/metastability behavior, calibrated edge limits, software overflow accumulation, and broader quadrature workloads remain unverified. |
+| S3 MCPWM | Partial (MMIO and timed GPIO-matrix I/O) | `tests/test_mcpwm.c`; `scripts/check-s3-idf-mcpwm.sh` runs ESP-IDF 5.3.2's unmodified driver twice in each engine across both groups, timer/comparator/capture ISRs, GPIO loopback, live compare updates, force levels, and teardown with zero unsupported accesses | The shared classic/S3 V1 engine models three timers and operators per group, A/B generators, capture, sync, faults, SYSTEM clock/reset, and target interrupt/matrix wiring. Electrical dead-time/carrier waveforms, silicon edge jitter, all brake/sync driver combinations, and calibrated latency remain unverified. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame in both engines with zero unsupported startup/device accesses; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback with zero unsupported accesses | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path; pulse RAM becomes inaccessible and loses contents under `RMT_MEM_FORCE_PD`. DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` (deterministic interpreter/JIT replay with zero unsupported accesses), WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
@@ -510,6 +511,45 @@ Rebuild and replay it with:
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check pcnt
 ```
+
+The MCPWM V1 timer/operator engine is likewise selected entirely from target
+data. Classic ESP32 and S3 descriptors provide the two group apertures,
+160 MHz source and 80 MHz capture clocks, interrupt sources, twelve output
+signals, eighteen sync/fault/capture inputs, and their clock/reset owners.
+The shared model therefore has no firmware name, fixed PC, or S3-address
+branch. Each group retains three independent timers and operators, two
+generators per operator, compare shadow updates, timer/generator actions,
+continuous and event force, dead-time/carrier configuration, brake state,
+capture timestamps, and level interrupts. S3 output and input routes use the
+live target GPIO matrix. A routed pad is sampled at its current virtual time,
+while individual PWM edges enter the scheduler only when a matrix-input
+watcher or GPIO interrupt can observe them; unobserved aggregate PWM does not
+impose a per-edge execution cost.
+
+The native `tests/fixtures/s3_idf_mcpwm` project uses ESP-IDF 5.3.2's public
+`mcpwm_prelude` API without emulator hooks. It runs one 1 kHz generator in
+each hardware group, receives timer-empty and compare callbacks from native
+interrupt sources 31 and 32, changes the compare points from 250/750 to
+400/600 ticks, verifies both GPIO loopback levels under continuous force,
+captures positive and negative GPIO6 edges through the group-0 capture ISR,
+then deletes every driver object. Two runs in each engine are byte-identical,
+the JIT retires native instructions, and all four runs report zero unsupported
+MMIO. Its pinned application image SHA-256 is
+`002d199595041406f6b9af3aaf4e014ced79519213b2bc896e27344aeb5810f7`;
+the matching ELF SHA-256 is
+`584a464b02524583364ed53df445eb791fd8788677a7887701630caaa152f8a7`.
+Rebuild and replay it with:
+
+```sh
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/build-s3-idf-fixture.sh --check mcpwm
+```
+
+This establishes functional driver behavior and guest-time ordering, not
+electrical or cycle accuracy. Dead-time and carrier settings are exposed to
+aggregate sinks, but their analog transition shape and phase are not modeled;
+the stock gate also does not yet cover every fault/brake and cross-timer sync
+combination.
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,
 threshold refill interrupts, end/error interrupts, pulse-timed TX and
