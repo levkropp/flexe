@@ -17,6 +17,8 @@ struct flexe_regi2c {
     uint32_t config2;
     uint32_t aux_register[FLEXE_TARGET_REGI2C_AUX_REGISTER_MAX];
     uint8_t *registers;
+    uint32_t *private_registers;
+    uint32_t *indexed_words;
     size_t address_count;
     unsigned bbpll_reads;
     bool bbpll_calibrating;
@@ -35,6 +37,16 @@ static bool byte_field_valid(uint32_t mask, unsigned shift)
     uint32_t field = mask >> shift;
     return (mask & below) == 0u && field <= UINT8_MAX &&
            (field & (field + 1u)) == 0u;
+}
+
+static bool regi2c_private_offset_valid(
+    const flexe_regi2c_desc_t *desc, uint32_t offset)
+{
+    return desc->private_register_size >= sizeof(uint32_t) &&
+           (offset & 3u) == 0u &&
+           offset >= desc->private_register_offset &&
+           offset - desc->private_register_offset <=
+               desc->private_register_size - sizeof(uint32_t);
 }
 
 static bool regi2c_geometry_valid(const flexe_target_desc_t *target)
@@ -58,8 +70,28 @@ static bool regi2c_geometry_valid(const flexe_target_desc_t *target)
         (desc->config2_offset & 3u) != 0u ||
         desc->analog_control_offset > desc->register_size - 4u ||
         desc->config_offset > desc->register_size - 4u ||
-        desc->config2_offset > desc->register_size - 4u)
+        desc->config2_offset > desc->register_size - 4u ||
+        (desc->private_register_size != 0u &&
+         (desc->private_register_size < sizeof(uint32_t) ||
+          ((desc->private_register_offset |
+            desc->private_register_size) & 3u) != 0u ||
+          desc->private_register_offset > desc->register_size ||
+          desc->private_register_size >
+              desc->register_size - desc->private_register_offset)))
         return false;
+
+    if (desc->private_register_size != 0u) {
+        if (regi2c_private_offset_valid(desc,
+                                        desc->analog_control_offset) ||
+            regi2c_private_offset_valid(desc, desc->config_offset) ||
+            regi2c_private_offset_valid(desc, desc->config2_offset))
+            return false;
+        for (unsigned host = 0u; host < desc->host_count; host++)
+            if (regi2c_private_offset_valid(
+                    desc, desc->command_offset +
+                          host * desc->command_stride))
+                return false;
+    }
 
     for (unsigned index = 0u; index < desc->aux_register_count; index++) {
         uint32_t offset = desc->aux_register[index].offset;
@@ -67,7 +99,8 @@ static bool regi2c_geometry_valid(const flexe_target_desc_t *target)
             offset > desc->register_size - sizeof(uint32_t) ||
             offset == desc->analog_control_offset ||
             offset == desc->config_offset ||
-            offset == desc->config2_offset)
+            offset == desc->config2_offset ||
+            regi2c_private_offset_valid(desc, offset))
             return false;
         for (unsigned host = 0u; host < desc->host_count; host++)
             if (offset == desc->command_offset +
@@ -105,6 +138,64 @@ static bool regi2c_geometry_valid(const flexe_target_desc_t *target)
         ((desc->bbpll_stop_high_mask | desc->bbpll_stop_low_mask) &
          ~desc->analog_control_writable_mask) != 0u)
         return false;
+
+    const flexe_regi2c_result_bank_desc_t *results =
+        &desc->result_bank;
+    if (results->count != 0u) {
+        uint64_t last = (uint64_t)results->offset +
+            (uint64_t)(results->count - 1u) * results->stride;
+        if (results->stride == 0u || (results->stride & 3u) != 0u ||
+            results->value_mask == 0u || last > UINT32_MAX ||
+            !regi2c_private_offset_valid(desc, results->offset) ||
+            !regi2c_private_offset_valid(desc, (uint32_t)last))
+            return false;
+    }
+
+    const flexe_regi2c_indexed_memory_desc_t *indexed =
+        &desc->indexed_memory;
+    if (indexed->word_count != 0u) {
+        uint32_t offsets[] = {
+            indexed->control_offset,
+            indexed->read_data_offset,
+            indexed->write_data_offset,
+            indexed->status_offset,
+            indexed->result_offset,
+        };
+        for (unsigned i = 0u;
+             i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+            if (!regi2c_private_offset_valid(desc, offsets[i]))
+                return false;
+            for (unsigned j = 0u; j < i; j++)
+                if (offsets[i] == offsets[j]) return false;
+        }
+        if (!byte_field_valid(indexed->index_mask,
+                              indexed->index_shift) ||
+            !byte_field_valid(indexed->result_index_mask,
+                              indexed->result_index_shift) ||
+            indexed->word_count !=
+                (indexed->index_mask >> indexed->index_shift) + 1u ||
+            !one_bit(indexed->write_trigger_mask) ||
+            !one_bit(indexed->operation_trigger_mask) ||
+            !one_bit(indexed->busy_mask) ||
+            (indexed->index_mask &
+             (indexed->write_trigger_mask |
+              indexed->operation_trigger_mask)) != 0u ||
+            (indexed->write_trigger_mask &
+             indexed->operation_trigger_mask) != 0u ||
+            indexed->index_to_result_shift >= 8u ||
+            (((indexed->word_count - 1u) >>
+              indexed->index_to_result_shift) >
+             (indexed->result_index_mask >>
+              indexed->result_index_shift)))
+            return false;
+
+        for (unsigned i = 0u; i < results->count; i++) {
+            uint32_t offset = results->offset + i * results->stride;
+            for (unsigned j = 0u;
+                 j < sizeof(offsets) / sizeof(offsets[0]); j++)
+                if (offset == offsets[j]) return false;
+        }
+    }
     return true;
 }
 
@@ -124,6 +215,64 @@ static int regi2c_aux_register(const flexe_regi2c_t *regi2c, uint32_t off)
     for (unsigned index = 0u; index < desc->aux_register_count; index++)
         if (desc->aux_register[index].offset == off) return (int)index;
     return -1;
+}
+
+static uint32_t *regi2c_private_word(flexe_regi2c_t *regi2c,
+                                     uint32_t offset)
+{
+    const flexe_regi2c_desc_t *desc = &regi2c->target->regi2c;
+    if (!regi2c->private_registers ||
+        !regi2c_private_offset_valid(desc, offset))
+        return NULL;
+    return &regi2c->private_registers[
+        (offset - desc->private_register_offset) / sizeof(uint32_t)];
+}
+
+static bool regi2c_result_word(const flexe_regi2c_t *regi2c,
+                               uint32_t offset)
+{
+    const flexe_regi2c_result_bank_desc_t *results =
+        &regi2c->target->regi2c.result_bank;
+    if (results->count == 0u || offset < results->offset)
+        return false;
+    uint32_t relative = offset - results->offset;
+    return relative % results->stride == 0u &&
+           relative / results->stride < results->count;
+}
+
+static void regi2c_write_indexed_control(flexe_regi2c_t *regi2c,
+                                         uint32_t value)
+{
+    const flexe_regi2c_indexed_memory_desc_t *indexed =
+        &regi2c->target->regi2c.indexed_memory;
+    uint32_t *control = regi2c_private_word(
+        regi2c, indexed->control_offset);
+    uint32_t *read_data = regi2c_private_word(
+        regi2c, indexed->read_data_offset);
+    uint32_t *write_data = regi2c_private_word(
+        regi2c, indexed->write_data_offset);
+    uint32_t *status = regi2c_private_word(
+        regi2c, indexed->status_offset);
+    uint32_t *result = regi2c_private_word(
+        regi2c, indexed->result_offset);
+    size_t index =
+        (value & indexed->index_mask) >> indexed->index_shift;
+
+    *control = value;
+    if (value & indexed->write_trigger_mask)
+        regi2c->indexed_words[index] = *write_data;
+    *read_data = regi2c->indexed_words[index];
+
+    if (value & indexed->operation_trigger_mask) {
+        uint32_t result_index =
+            ((uint32_t)index >> indexed->index_to_result_shift) <<
+            indexed->result_index_shift;
+        *result = (*result & ~indexed->result_index_mask) |
+                  (result_index & indexed->result_index_mask);
+    }
+    /* Functional mode completes the private operation synchronously. A
+     * timed implementation can expose busy until its scheduled event. */
+    *status &= ~indexed->busy_mask;
 }
 
 static size_t regi2c_index(const flexe_regi2c_t *regi2c,
@@ -164,6 +313,15 @@ static uint32_t regi2c_read(void *ctx, uint32_t addr)
     if (off == desc->config2_offset) return regi2c->config2;
     int aux = regi2c_aux_register(regi2c, off);
     if (aux >= 0) return regi2c->aux_register[aux];
+    uint32_t *private_word = regi2c_private_word(regi2c, off);
+    if (private_word) {
+        if (regi2c_result_word(regi2c, off))
+            return *private_word & desc->result_bank.value_mask;
+        if (desc->indexed_memory.word_count != 0u &&
+            off == desc->indexed_memory.status_offset)
+            return *private_word & ~desc->indexed_memory.busy_mask;
+        return *private_word;
+    }
     return regi2c->fallback_read
         ? regi2c->fallback_read(regi2c->fallback_ctx, addr) : 0u;
 }
@@ -251,6 +409,25 @@ static void regi2c_write(void *ctx, uint32_t addr, uint32_t value)
             (value & writable);
         return;
     }
+    uint32_t *private_word = regi2c_private_word(regi2c, off);
+    if (private_word) {
+        const flexe_regi2c_indexed_memory_desc_t *indexed =
+            &desc->indexed_memory;
+        if (regi2c_result_word(regi2c, off))
+            return;
+        if (indexed->word_count != 0u) {
+            if (off == indexed->control_offset) {
+                regi2c_write_indexed_control(regi2c, value);
+                return;
+            }
+            if (off == indexed->read_data_offset ||
+                off == indexed->status_offset ||
+                off == indexed->result_offset)
+                return;
+        }
+        *private_word = value;
+        return;
+    }
     if (regi2c->fallback_write)
         regi2c->fallback_write(regi2c->fallback_ctx, addr, value);
 }
@@ -277,9 +454,17 @@ flexe_regi2c_t *flexe_regi2c_create(xtensa_mem_t *mem,
     size_t slave_count =
         ((desc->slave_mask >> desc->slave_shift) + 1u);
     regi2c->registers = calloc(slave_count, regi2c->address_count);
-    if (!regi2c->registers) {
-        free(regi2c);
-        return NULL;
+    if (!regi2c->registers) goto fail;
+    if (desc->private_register_size != 0u) {
+        regi2c->private_registers = calloc(
+            desc->private_register_size / sizeof(uint32_t),
+            sizeof(uint32_t));
+        if (!regi2c->private_registers) goto fail;
+    }
+    if (desc->indexed_memory.word_count != 0u) {
+        regi2c->indexed_words = calloc(
+            desc->indexed_memory.word_count, sizeof(uint32_t));
+        if (!regi2c->indexed_words) goto fail;
     }
     regi2c->analog_control = desc->analog_control_reset;
     regi2c->config = desc->config_reset;
@@ -289,11 +474,16 @@ flexe_regi2c_t *flexe_regi2c_create(xtensa_mem_t *mem,
 
     if (mem_register_mmio_range(mem, desc->base, desc->register_size,
                                 regi2c_read, regi2c_write, regi2c) != 0) {
-        free(regi2c->registers);
-        free(regi2c);
-        return NULL;
+        goto fail;
     }
     return regi2c;
+
+fail:
+    free(regi2c->indexed_words);
+    free(regi2c->private_registers);
+    free(regi2c->registers);
+    free(regi2c);
+    return NULL;
 }
 
 void flexe_regi2c_destroy(flexe_regi2c_t *regi2c)
@@ -302,6 +492,8 @@ void flexe_regi2c_destroy(flexe_regi2c_t *regi2c)
     const flexe_regi2c_desc_t *desc = &regi2c->target->regi2c;
     (void)mem_register_mmio_range(regi2c->mem, desc->base,
                                   desc->register_size, NULL, NULL, NULL);
+    free(regi2c->indexed_words);
+    free(regi2c->private_registers);
     free(regi2c->registers);
     free(regi2c);
 }

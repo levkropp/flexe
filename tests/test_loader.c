@@ -828,6 +828,17 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->regi2c.aux_register[0].reset, 0x01000000u);
     ASSERT_EQ(s3->regi2c.aux_register[1].offset, 0x050u);
     ASSERT_EQ(s3->regi2c.aux_register[1].reset, 0x07000000u);
+    ASSERT_EQ(s3->regi2c.private_register_offset, 0x054u);
+    ASSERT_EQ(s3->regi2c.private_register_size, 0x120u);
+    ASSERT_EQ(s3->regi2c.result_bank.offset, 0x080u);
+    ASSERT_EQ(s3->regi2c.result_bank.count, 8u);
+    ASSERT_EQ(s3->regi2c.result_bank.value_mask, 0x1FFFu);
+    ASSERT_EQ(s3->regi2c.indexed_memory.control_offset, 0x0C4u);
+    ASSERT_EQ(s3->regi2c.indexed_memory.read_data_offset, 0x0C0u);
+    ASSERT_EQ(s3->regi2c.indexed_memory.write_data_offset, 0x148u);
+    ASSERT_EQ(s3->regi2c.indexed_memory.status_offset, 0x168u);
+    ASSERT_EQ(s3->regi2c.indexed_memory.result_offset, 0x170u);
+    ASSERT_EQ(s3->regi2c.indexed_memory.word_count, 256u);
     ASSERT_EQ(s3->sensitive_memprot.base, 0x600C1000u);
     ASSERT_EQ(s3->sensitive_memprot.register_size, 0x1000u);
     ASSERT_EQ(s3->systimer.base, 0x60023000u);

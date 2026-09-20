@@ -58,13 +58,13 @@ WLED address; unsafe or unfamiliar calls continue in the guest.
 The pinned WLED 16.0.1 ESP32-S3 4M QSPI scenario was measured on 2026-09-19
 on an Apple-silicon MacBook with a `Release`, LTO, host-native build. Each run
 executed 4 billion aggregate cycles (16.667 nominal ESP32 seconds) and had to
-match all 317 completed RMT frames, 13,605 chunks, 321,448 pulse words, final
-CPU/time state, and the `30EAB266` pulse digest:
+match all 317 completed RMT frames, 13,601 chunks, 321,352 pulse words, final
+CPU/time state, and the `8525660D` pulse digest:
 
 | Engine | Three wall-time samples | Real-time range | Native coverage |
 |---|---:|---:|---:|
-| Interpreter | 11.27, 11.53, 11.62 s | 1.43--1.48x | n/a |
-| JIT | 6.43, 6.49, 6.57 s | 2.54--2.59x | 97.8% |
+| Interpreter | 11.36, 11.96, 12.19 s | 1.37--1.47x | n/a |
+| JIT | 7.23, 7.32, 7.33 s | 2.27--2.31x | 97.9% |
 
 The JIT now translates ordinary code in every target-described executable
 range, including unhooked mask-ROM code. The scanner still asks the exact ROM

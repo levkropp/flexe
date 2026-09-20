@@ -53,7 +53,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 45u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 46u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -553,6 +553,39 @@ typedef struct {
     uint32_t writable_mask;
 } flexe_regi2c_aux_register_desc_t;
 
+/* Some internal-analog apertures also expose a bank of conversion results.
+ * The values are supplied by analog hardware and therefore remain read-only
+ * to the guest even when adjacent private PHY configuration words retain
+ * writes. A headless target starts these words at the quiet-input value 0. */
+typedef struct {
+    uint32_t offset;
+    uint32_t stride;
+    uint32_t value_mask;
+    uint8_t  count;
+} flexe_regi2c_result_bank_desc_t;
+
+/* Private PHY hardware can expose an indexed word memory alongside the
+ * internal analog bus. Selecting an index publishes its word at read_data;
+ * write_trigger commits write_data, and operation_trigger completes a
+ * frequency-selection command. Functional mode resolves both operations at
+ * the MMIO write boundary while retaining the hardware-visible protocol. */
+typedef struct {
+    uint32_t control_offset;
+    uint32_t read_data_offset;
+    uint32_t write_data_offset;
+    uint32_t status_offset;
+    uint32_t result_offset;
+    uint32_t index_mask;
+    uint32_t write_trigger_mask;
+    uint32_t operation_trigger_mask;
+    uint32_t busy_mask;
+    uint32_t result_index_mask;
+    uint16_t word_count;
+    uint8_t  index_shift;
+    uint8_t  result_index_shift;
+    uint8_t  index_to_result_shift;
+} flexe_regi2c_indexed_memory_desc_t;
+
 /* RTC-domain sensor controller. Temperature and polled SAR ADC register
  * geometry live here rather than in the machine frontend.
  * In fast mode a powered, clocked conversion completes synchronously; timed
@@ -742,9 +775,9 @@ typedef struct {
  * code. This is distinct from the externally routed I2C controllers. The ROM
  * command ABI is described here so the same device model can serve targets
  * whose host count, register locations, or bit fields differ. Some revisions
- * expose adjacent analog-controller state in the same aperture; auxiliary
- * register descriptors give those surfaces explicit reset and access masks
- * without baking target addresses into the device implementation. */
+ * expose adjacent analog-controller state and private PHY storage in the same
+ * aperture. Auxiliary words, a retained target-described private window, and
+ * its small hardware protocols keep those surfaces out of firmware hooks. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -775,6 +808,10 @@ typedef struct {
     uint8_t  aux_register_count;
     flexe_regi2c_aux_register_desc_t
         aux_register[FLEXE_TARGET_REGI2C_AUX_REGISTER_MAX];
+    uint32_t private_register_offset;
+    uint32_t private_register_size;
+    flexe_regi2c_result_bank_desc_t result_bank;
+    flexe_regi2c_indexed_memory_desc_t indexed_memory;
 } flexe_regi2c_desc_t;
 
 /* Security/memory-protection register IP shared by compatible targets. The

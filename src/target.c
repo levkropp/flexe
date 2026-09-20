@@ -875,6 +875,37 @@ static const flexe_target_desc_t TARGETS[] = {
                  * completes its internal analog conversion synchronously. */
                 { 0x050u, 0x07000000u, 0xF8FFFFFFu },
             },
+            /* The official S3 PHY library treats 0x054..0x170 as one
+             * retained private-PHY register bank. rom_read_sar_dout exposes
+             * eight read-only 13-bit conversion words within that bank. */
+            .private_register_offset = 0x054u,
+            .private_register_size = 0x120u,
+            .result_bank = {
+                .offset = 0x080u,
+                .stride = 0x004u,
+                .value_mask = 0x00001FFFu,
+                .count = 8u,
+            },
+            /* phy_hw_freq.o selects one of 256 words through the low byte of
+             * 0x0C4, transfers data through 0x0C0/0x148, and uses bits 8/9
+             * as operation/write strobes. A completed channel operation
+             * echoes index/2 in result bits 23:17; bit 31 is busy. */
+            .indexed_memory = {
+                .control_offset = 0x0C4u,
+                .read_data_offset = 0x0C0u,
+                .write_data_offset = 0x148u,
+                .status_offset = 0x168u,
+                .result_offset = 0x170u,
+                .index_mask = 0x000000FFu,
+                .write_trigger_mask = 1u << 9,
+                .operation_trigger_mask = 1u << 8,
+                .busy_mask = 1u << 31,
+                .result_index_mask = 0x7Fu << 17,
+                .word_count = 256u,
+                .index_shift = 0u,
+                .result_index_shift = 17u,
+                .index_to_result_shift = 1u,
+            },
         },
         .sens = {
             .base = 0x60008800u,

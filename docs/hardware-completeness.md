@@ -574,19 +574,31 @@ and its matching ELF SHA-256 is
 For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and
-321,448 pulse words in 13,605 chunks on channel 0. The interpreter and JIT
-match at every completed-frame boundary and finish with the same `30EAB266`
-pulse-stream digest, CPU state, and firmware-visible time; 7,023 unsupported
-peripheral accesses remain. The JIT executes 1,779,451,292 of 1,819,293,599
-retired instructions natively (97.8%). Ordinary code in the target-described
+321,352 pulse words in 13,601 chunks on channel 0. The interpreter and JIT
+match at every completed-frame boundary and finish with the same `8525660D`
+pulse-stream digest, CPU state, and firmware-visible time; 223 unsupported
+peripheral accesses remain. The JIT executes 1,779,976,162 of 1,817,717,178
+retired instructions natively (97.9%). Ordinary code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
 service hooks remain interpreter boundaries. This establishes sustained,
 engine-equivalent hardware-output progress, not correct colors on a physical
 LED strip.
 
+The `0x6000E000` page is shared by the internal analog I2C host and a private
+PHY register bank. Flexe now retains the target-described `0x054..0x170`
+configuration window, exposes the eight `rom_read_sar_dout` words as read-only
+13-bit quiet-input results, and implements the PHY library's 256-word indexed
+RF-frequency memory. Index selection publishes the saved word, the write and
+operation strobes complete synchronously in functional mode, the busy bit
+clears, and the result field reports the selected channel. The geometry and
+bit protocol live in the S3 target descriptor; there are no firmware PCs or
+WLED-specific hooks. This removed 6,800 unsupported accesses from the pinned
+WLED run while preserving diagnostics outside the modeled bank. It does not
+simulate RF propagation, analog calibration noise, or physical SAR voltages.
+
 On an Apple-silicon MacBook, a `Release`/LTO/native build completed three
-sequential interpreter runs in 11.27--11.62 seconds (1.43--1.48x real time)
-and three JIT runs in 6.43--6.57 seconds (2.54--2.59x). These are throughput
+sequential interpreter runs in 11.36--12.19 seconds (1.37--1.47x real time)
+and three JIT runs in 7.23--7.33 seconds (2.27--2.31x). These are throughput
 results for this pinned scenario, not cycle-accuracy claims; host load and
 thermal state still matter.
 
@@ -747,10 +759,12 @@ Reset completion, tears Bluetooth down, initializes/starts/stops/deinitializes
 the native Wi-Fi stack, completes its LED and absent-GPS delays, and prints the
 v1.16.0 command prompt without an assertion, watchdog, or software reset. The
 gate now requires nonzero native instruction retirement, so this path is
-exercised under the S3 JIT rather than merely with JIT-capable code present. The
-GPS probe makes the application-ready boundary occur near 5 billion aggregate
-cycles; the earlier 2-billion-cycle cutoff was a normal `WAITI` during those
-firmware delays, not a deadlock. Pin and replay that boundary with:
+exercised under the S3 JIT rather than merely with JIT-capable code present. Its
+unsupported-access ceiling is 248 after the shared internal analog/private-PHY
+model described below. The GPS probe makes the application-ready boundary
+occur near 5 billion aggregate cycles; the earlier 2-billion-cycle cutoff was
+a normal `WAITI` during those firmware delays, not a deadlock. Pin and replay
+that boundary with:
 
 ```sh
 S3_MARAUDER_BIN=/path/to/esp32_marauder_v1_16_0_multiboardS3.bin \
@@ -761,7 +775,7 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 The gate keeps the general sandbox transport connected through the initial
 prompt, sends the bytes for `help\n` through UART0, checks the firmware's
 command header and a representative entry, and requires a second prompt.
-The accepted run retains an upper bound of 7,068 unsupported accesses so the
+The accepted run retains an upper bound of 248 unsupported accesses so the
 interaction cannot hide a register-model regression.
 
 This is a controller-bootstrap compatibility boundary, not a claim that
@@ -782,16 +796,15 @@ profiles remain explicitly unsupported. The latter clears this image's one
 bootloader SFDP diagnostic. Six previously reported SPI1 commands are
 16-bit octal-PSRAM register probes on CS1: with no PSRAM attached in Flexe's
 default S3 profile, they now clock through and return undriven high bits,
-without pretending to supply PSRAM. Of these, 6,728 are in the `0x6000E000`
-RF/PHY window; the hottest named callers include `wr_rf_freq_mem`,
-`set_chan_freq_sw_start`, and `bt_txpwr_freq`. That concentration identifies
-a network-controller boundary, not evidence that the reads and writes are
-harmless or that a zero-returning PHY model is correct. The remaining
-inventory includes documented SYSCON, RTC, and sensor
-registers. The `--unhandled-report` inventory and total now accumulate across
-firmware-requested resets; neither this output nor the working network
-scenario proves real RF behavior. Repeat the measurement with the matching
-application and ROM ELFs:
+without pretending to supply PSRAM. Of these, 6,728 were in the `0x6000E000`
+RF/PHY window; the hottest named callers included `wr_rf_freq_mem`,
+`set_chan_freq_sw_start`, and `bt_txpwr_freq`. That inventory motivated the
+target-described private-PHY bank and indexed-memory protocol above rather
+than a firmware-address bypass. The remaining historical inventory includes
+documented SYSCON, RTC, and sensor registers. The `--unhandled-report`
+inventory and total accumulate across firmware-requested resets; neither a
+smaller count nor the working network scenario proves real RF behavior.
+Repeat the measurement with the matching application and ROM ELFs:
 
 ```sh
 ./build/xtensa-emu -N --target esp32s3 -R "$FLEXE_S3_ROM_ELF" \

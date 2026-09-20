@@ -107,7 +107,9 @@ TEST(unhandled_mmio_audit_groups_sites_without_changing_fallback) {
 
     uint32_t old_pc = g_dbg_pc;
     int old_core = g_dbg_core;
-    const uint32_t addr = 0x6000E0C4u;
+    /* Keep the audit fixture on an explicitly unsupported word just beyond
+     * the target-described S3 private-PHY register bank. */
+    const uint32_t addr = 0x6000E174u;
     g_dbg_pc = 0x40374000u;
     g_dbg_core = 0;
     ASSERT_EQ(mem_read32(mem, addr), 0u);
@@ -152,7 +154,7 @@ TEST(unhandled_mmio_audit_groups_sites_without_changing_fallback) {
 TEST(unhandled_mmio_audit_survives_rebuilt_peripherals) {
     const flexe_target_desc_t *target =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
-    const uint32_t addr = 0x6000E0C4u;
+    const uint32_t addr = 0x6000E174u;
     uint32_t old_pc = g_dbg_pc;
     int old_core = g_dbg_core;
     periph_unhandled_audit_snapshot_t snapshot = {0};

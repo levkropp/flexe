@@ -474,9 +474,67 @@ TEST(peripherals_model_target_described_internal_regi2c) {
     ASSERT_EQ(mem_read32(mem, sar_status), UINT32_MAX);
     mem_write32(mem, sar_status, 0u);
     ASSERT_EQ(mem_read32(mem, sar_status), 0x07000000u);
+
+    /* The adjacent private-PHY window retains ordinary configuration words.
+     * Conversion results are hardware-owned, so a headless quiet RF input
+     * reads zero and guest writes cannot manufacture samples. */
     int before = periph_unhandled_count(periph);
-    ASSERT_EQ(mem_read32(mem, desc->base + 0x05Cu), 0u);
-    mem_write32(mem, desc->base + 0x05Cu, 1u);
+    uint32_t private_config = desc->base + 0x05Cu;
+    mem_write32(mem, private_config, 0x55AA1234u);
+    ASSERT_EQ(mem_read32(mem, private_config), 0x55AA1234u);
+
+    uint32_t sample = desc->base + desc->result_bank.offset +
+                      3u * desc->result_bank.stride;
+    ASSERT_EQ(mem_read32(mem, sample), 0u);
+    mem_write32(mem, sample, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, sample), 0u);
+
+    /* The RF-frequency memory is an indexed hardware register file. A write
+     * strobe commits the data port, index selection publishes the saved word,
+     * and a channel operation finishes synchronously in functional mode. */
+    const flexe_regi2c_indexed_memory_desc_t *indexed =
+        &desc->indexed_memory;
+    uint32_t indexed_control = desc->base + indexed->control_offset;
+    uint32_t indexed_read = desc->base + indexed->read_data_offset;
+    uint32_t indexed_write = desc->base + indexed->write_data_offset;
+    uint32_t indexed_status = desc->base + indexed->status_offset;
+    uint32_t indexed_result = desc->base + indexed->result_offset;
+    uint32_t memory_index = 42u;
+    mem_write32(mem, indexed_write, 0xA55A1234u);
+    mem_write32(mem, indexed_control,
+                memory_index | indexed->write_trigger_mask);
+    ASSERT_EQ(mem_read32(mem, indexed_read), 0xA55A1234u);
+    mem_write32(mem, indexed_control, 7u);
+    ASSERT_EQ(mem_read32(mem, indexed_read), 0u);
+    mem_write32(mem, indexed_control, memory_index);
+    ASSERT_EQ(mem_read32(mem, indexed_read), 0xA55A1234u);
+
+    uint32_t channel = 14u;
+    uint32_t operation_index =
+        channel << indexed->index_to_result_shift;
+    mem_write32(mem, indexed_control,
+                operation_index | indexed->operation_trigger_mask);
+    ASSERT_EQ(mem_read32(mem, indexed_status) & indexed->busy_mask, 0u);
+    ASSERT_EQ(mem_read32(mem, indexed_result) &
+              indexed->result_index_mask,
+              channel << indexed->result_index_shift);
+
+    /* Data/status/result ports are hardware-owned. */
+    uint32_t selected_data = mem_read32(mem, indexed_read);
+    uint32_t selected_result = mem_read32(mem, indexed_result);
+    mem_write32(mem, indexed_read, UINT32_MAX);
+    mem_write32(mem, indexed_status, UINT32_MAX);
+    mem_write32(mem, indexed_result, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, indexed_read), selected_data);
+    ASSERT_EQ(mem_read32(mem, indexed_status) & indexed->busy_mask, 0u);
+    ASSERT_EQ(mem_read32(mem, indexed_result), selected_result);
+    ASSERT_EQ(periph_unhandled_count(periph), before);
+
+    /* Addresses beyond the target-described private bank stay diagnostic. */
+    uint32_t unsupported = desc->base + desc->private_register_offset +
+                           desc->private_register_size;
+    ASSERT_EQ(mem_read32(mem, unsupported), 0u);
+    mem_write32(mem, unsupported, 1u);
     ASSERT_EQ(periph_unhandled_count(periph), before + 2);
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
 
