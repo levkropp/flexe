@@ -300,6 +300,7 @@ TEST(uart_tx_capture) {
 #define TEST_SLC_INT_RX_DSCR_ERR (1u << 20)
 
 #define TEST_SDMMC_BASE 0x3FF68000u
+#define TEST_S3_SDMMC_BASE 0x60028000u
 #define TEST_SDMMC_CMD_RESP (1u << 6)
 #define TEST_SDMMC_CMD_DATA (1u << 9)
 #define TEST_SDMMC_CMD_WRITE (1u << 10)
@@ -1386,6 +1387,107 @@ TEST(sdmmc_slot1_clock_gate_idmac_write_and_media_errors) {
     ASSERT_EQ(mem_read32(mem, TEST_SDMMC_BASE + 0x44u) &
               ((1u << 2) | (1u << 8)), (1u << 2) | (1u << 8));
     ASSERT_EQ(periph_unhandled_count(p), 0);
+
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(sdmmc_s3_target_clock_reset_command_and_interrupt) {
+    const uint32_t desc = 0x3FC95000u;
+    const uint32_t buffer = 0x3FC95200u;
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *p = periph_create(mem);
+    test_sdmmc_card_t card = {0};
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(p != NULL);
+    if (!mem || !p) {
+        periph_destroy(p);
+        mem_destroy(mem);
+        return;
+    }
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x14u), UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x1Cu), 512u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x6Cu), 0x5342240Au);
+    ASSERT_EQ(periph_sdmmc_attach_card(p, 1, 2048u,
+                                      test_sdmmc_read_blocks,
+                                      test_sdmmc_write_blocks, &card), 0);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x50u), 1u);
+
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x00u, TEST_SDMMC_CTRL_INT);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x24u, 1u << 2);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x28u, 0x1AAu);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x2Cu,
+                TEST_SDMMC_CMD_START | TEST_SDMMC_CMD_RESP |
+                (1u << 16) | 8u);
+    ASSERT_TRUE(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x2Cu) &
+                TEST_SDMMC_CMD_START);
+
+    const uint32_t system = 0x600C0000u;
+    uint32_t clocks = mem_read32(mem, system + 0x01Cu);
+    uint32_t resets = mem_read32(mem, system + 0x024u);
+    ASSERT_FALSE(clocks & (1u << 7));
+    ASSERT_TRUE(resets & (1u << 7));
+    mem_write32(mem, system + 0x01Cu, clocks | (1u << 7));
+    mem_write32(mem, system + 0x024u, resets & ~(1u << 7));
+
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x2Cu,
+                TEST_SDMMC_CMD_START | TEST_SDMMC_CMD_RESP |
+                (1u << 16) | 8u);
+    ASSERT_FALSE(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x2Cu) &
+                 TEST_SDMMC_CMD_START);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x30u), 0x1AAu);
+    ASSERT_TRUE(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x44u) & (1u << 2));
+    ASSERT_TRUE(periph_interrupt_pending(p, 30));
+
+    /* A target-described host must also register its asynchronous DMA source
+     * with the common peripheral deadline scheduler. A command-only test
+     * would miss this and let production firmware wait until its own timeout
+     * before an MMIO poll happened to finish the descriptor. */
+    for (unsigned index = 0u; index < 512u; index++)
+        card.block[1][index] = (uint8_t)(index ^ 0xA6u);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x44u, UINT32_MAX);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x00u,
+                TEST_SDMMC_CTRL_INT | TEST_SDMMC_CTRL_DMA |
+                TEST_SDMMC_CTRL_IDMAC);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x80u, 1u << 7);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x90u,
+                (1u << 1) | (1u << 8));
+    test_sdmmc_desc(mem, desc,
+                    TEST_SDMMC_DESC_OWNER | TEST_SDMMC_DESC_FIRST |
+                    TEST_SDMMC_DESC_LAST,
+                    512u, buffer, 0u);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x88u, desc);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x20u, 512u);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x1Cu, 512u);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x28u, 1u);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x2Cu,
+                TEST_SDMMC_CMD_START | TEST_SDMMC_CMD_RESP |
+                TEST_SDMMC_CMD_DATA | (1u << 16) | 17u);
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x44u, 1u << 2);
+    ASSERT_TRUE(cpu.next_timer_event != UINT32_MAX);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 8192u);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_FALSE(mem_read32(mem, desc) & TEST_SDMMC_DESC_OWNER);
+    ASSERT_EQ(card.reads, 1u);
+    for (unsigned index = 0u; index < 512u; index++)
+        ASSERT_EQ(mem_read8(mem, buffer + index),
+                  (uint8_t)(index ^ 0xA6u));
+
+    mem_write32(mem, TEST_S3_SDMMC_BASE + 0x68u, 0x12345678u);
+    mem_write32(mem, system + 0x024u, resets | (1u << 7));
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x68u), 0u);
+    ASSERT_EQ(mem_read32(mem, TEST_S3_SDMMC_BASE + 0x50u), 1u);
+    ASSERT_FALSE(periph_interrupt_pending(p, 30));
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
 
     periph_destroy(p);
     mem_destroy(mem);
@@ -6870,6 +6972,7 @@ void run_peripheral_tests(void) {
     RUN_TEST(sdmmc_commands_responses_and_pio_fifo);
     RUN_TEST(sdmmc_idmac_chains_writeback_interrupts_and_errors);
     RUN_TEST(sdmmc_slot1_clock_gate_idmac_write_and_media_errors);
+    RUN_TEST(sdmmc_s3_target_clock_reset_command_and_interrupt);
     RUN_TEST(twai_reset_acceptance_fifo_overrun_interrupt_and_dport);
     RUN_TEST(twai_wire_timing_self_reception_retry_busoff_and_recovery);
     RUN_TEST(emac_reset_clock_extension_and_clause22_mdio);

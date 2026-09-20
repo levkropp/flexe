@@ -53,7 +53,6 @@ static inline int gpio_dbg(void) {
 #define HINF_BASE       0x3FF4B000u
 #define SLCHOST_BASE    0x3FF55000u
 #define SLC_BASE        0x3FF58000u
-#define SDMMC_BASE      0x3FF68000u
 #define EMAC_DMA_BASE   0x3FF69000u
 #define EMAC_EXT_BASE   0x3FF69800u
 #define EMAC_MAC_BASE   0x3FF6A000u
@@ -545,13 +544,11 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define HINF_CFG_DATA16_RESET        0x33336666u
 #define HINF_DATE_RESET              0x15030200u
 
-/* Classic ESP32 DesignWare SD/MMC host. Two logical slots share one command,
- * FIFO, and internal-DMA engine. The register block extends through the clock
+/* DesignWare SD/MMC host. Up to two logical slots share one command, FIFO,
+ * and internal-DMA engine. The register block extends through the clock
  * register at +0x800 but remains inside one 4 KiB APB page. */
-#define SDMMC_SLOT_COUNT             2u
 #define SDMMC_REG_FILE_SIZE          0x804u
 #define SDMMC_FIFO_WORDS             32u
-#define SDMMC_INTR_SOURCE            37
 #define SDMMC_DMA_MAX_DESCRIPTORS    256u
 #define SDMMC_TRANSFER_MAX           (16u * 1024u * 1024u)
 
@@ -664,8 +661,6 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define SDMMC_STATUS_DATA_FSM_BUSY   (1u << 10)
 #define SDMMC_STATUS_RESP_SHIFT      11u
 #define SDMMC_STATUS_FIFO_SHIFT      17u
-
-#define SDMMC_VERID_RESET            0x5342240Au
 
 /* Classic ESP32 TWAI controller. The peripheral is an SJA1000-compatible
  * PeliCAN core whose 8-bit registers occupy the low byte of 32-bit APB words. */
@@ -1215,7 +1210,7 @@ static bool uhci_uart_rx_break(esp32_periph_t *p, int uart_num);
 static uint32_t sdmmc_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void sdmmc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void sdmmc_reset_state(esp32_periph_t *p);
-static void sdmmc_dport_update(esp32_periph_t *p);
+static void sdmmc_clock_update(esp32_periph_t *p);
 static uint32_t twai_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void twai_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void twai_reset_state(esp32_periph_t *p);
@@ -1518,7 +1513,7 @@ typedef struct {
     uint8_t fifo_head;
     uint8_t fifo_count;
 
-    sdmmc_card_state_t card[SDMMC_SLOT_COUNT];
+    sdmmc_card_state_t card[FLEXE_TARGET_SDMMC_SLOT_MAX];
 
     uint8_t *transfer;
     size_t transfer_capacity;
@@ -2049,6 +2044,8 @@ struct esp32_periph {
 
     /* Dual-slot native SD/MMC host, FIFO, and DesignWare internal DMA. */
     sdmmc_state_t sdmmc;
+    bool sdmmc_system_clock_enabled;
+    bool sdmmc_system_reset_asserted;
 
     /* SJA1000-compatible classic ESP32 TWAI/CAN controller and RX FIFO. */
     twai_state_t twai;
@@ -2633,7 +2630,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
     case DPORT_WIFI_CLK_EN_OFF:
         p->dport_wifi_clk_en = val;
         sdio_slave_dport_update(p);
-        sdmmc_dport_update(p);
+        sdmmc_clock_update(p);
         emac_dport_update(p);
         break;
     case DPORT_CORE_RST_EN_OFF:
@@ -2645,7 +2642,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         if (val & DPORT_EMAC_RST_BIT)
             emac_reset_state(p);
         sdio_slave_dport_update(p);
-        sdmmc_dport_update(p);
+        sdmmc_clock_update(p);
         emac_dport_update(p);
         break;
     case DPORT_PERIP_RST_EN_OFF:
@@ -11114,7 +11111,19 @@ void periph_sdio_slave_host_interrupt_clear(esp32_periph_t *p,
 
 /* ---- Native SDMMC host + FIFO/IDMAC ---- */
 
+static const flexe_sdmmc_host_desc_t *sdmmc_desc(
+    const esp32_periph_t *p)
+{
+    return p &&
+           (p->target->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1) ?
+        &p->target->sdmmc_host : NULL;
+}
+
 static bool sdmmc_clocked(const esp32_periph_t *p) {
+    if (!sdmmc_desc(p)) return false;
+    if (p->system_clock)
+        return p->sdmmc_system_clock_enabled &&
+               !p->sdmmc_system_reset_asserted;
     return (p->dport_wifi_clk_en & DPORT_SDIO_HOST_CLK_BIT) != 0u &&
            (p->dport_core_rst_en & DPORT_SDIO_HOST_RST_BIT) == 0u;
 }
@@ -11130,6 +11139,8 @@ static void sdmmc_kick(esp32_periph_t *p) {
 }
 
 static void sdmmc_irq_update(esp32_periph_t *p) {
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    if (!desc) return;
     sdmmc_state_t *s = &p->sdmmc;
     uint32_t ctrl = s->regs[SDMMC_CTRL_OFF / 4u];
     uint32_t normal = s->rintsts & s->regs[SDMMC_INTMASK_OFF / 4u];
@@ -11137,9 +11148,10 @@ static void sdmmc_irq_update(esp32_periph_t *p) {
     bool active = sdmmc_clocked(p) && (ctrl & SDMMC_CTRL_INT_ENABLE) &&
                   (normal != 0u || dma != 0u);
     if (active)
-        periph_assert_interrupt_status(p, SDMMC_INTR_SOURCE, normal | dma);
+        periph_assert_interrupt_status(p, desc->interrupt_source,
+                                       normal | dma);
     else
-        periph_deassert_interrupt(p, SDMMC_INTR_SOURCE);
+        periph_deassert_interrupt(p, desc->interrupt_source);
 }
 
 static void sdmmc_cancel_transfer(sdmmc_state_t *s) {
@@ -11161,10 +11173,11 @@ static void sdmmc_cancel_transfer(sdmmc_state_t *s) {
 }
 
 static void sdmmc_reset_state(esp32_periph_t *p) {
-    if (!p) return;
-    periph_deassert_interrupt(p, SDMMC_INTR_SOURCE);
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    if (!desc) return;
+    periph_deassert_interrupt(p, desc->interrupt_source);
     sdmmc_state_t *s = &p->sdmmc;
-    sdmmc_card_state_t cards[SDMMC_SLOT_COUNT];
+    sdmmc_card_state_t cards[FLEXE_TARGET_SDMMC_SLOT_MAX];
     memcpy(cards, s->card, sizeof(cards));
     uint8_t *transfer = s->transfer;
     size_t transfer_capacity = s->transfer_capacity;
@@ -11177,8 +11190,8 @@ static void sdmmc_reset_state(esp32_periph_t *p) {
     s->regs[SDMMC_BYTCNT_OFF / 4u] = 0x200u;
     s->regs[SDMMC_FIFOTH_OFF / 4u] = 0x00070008u;
     s->regs[SDMMC_DEBNCE_OFF / 4u] = 0x00FFFFFFu;
-    s->regs[SDMMC_VERID_OFF / 4u] = SDMMC_VERID_RESET;
-    for (unsigned slot = 0; slot < SDMMC_SLOT_COUNT; slot++) {
+    s->regs[SDMMC_VERID_OFF / 4u] = desc->version_reset;
+    for (unsigned slot = 0; slot < desc->slot_count; slot++) {
         s->card[slot].ready = false;
         s->card[slot].selected = false;
         s->card[slot].app_cmd = false;
@@ -11187,39 +11200,49 @@ static void sdmmc_reset_state(esp32_periph_t *p) {
     }
 }
 
-static void sdmmc_dport_update(esp32_periph_t *p) {
-    if (!p) return;
+static void sdmmc_clock_update(esp32_periph_t *p) {
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    if (!desc) return;
     if (!sdmmc_clocked(p)) {
         p->sdmmc.transfer_event_armed = false;
-        periph_deassert_interrupt(p, SDMMC_INTR_SOURCE);
+        periph_deassert_interrupt(p, desc->interrupt_source);
     } else {
         sdmmc_irq_update(p);
     }
     sdmmc_kick(p);
 }
 
-static uint32_t sdmmc_card_detect(const sdmmc_state_t *s) {
+static uint32_t sdmmc_card_detect(const esp32_periph_t *p) {
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    const sdmmc_state_t *s = &p->sdmmc;
     uint32_t value = 0u;
-    for (unsigned slot = 0; slot < SDMMC_SLOT_COUNT; slot++)
+    for (unsigned slot = 0; slot < desc->slot_count; slot++)
         if (!s->card[slot].attached) value |= 1u << slot;
     return value;
 }
 
-static uint32_t sdmmc_write_protect(const sdmmc_state_t *s) {
+static uint32_t sdmmc_write_protect(const esp32_periph_t *p) {
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    const sdmmc_state_t *s = &p->sdmmc;
     uint32_t value = 0u;
-    for (unsigned slot = 0; slot < SDMMC_SLOT_COUNT; slot++)
+    for (unsigned slot = 0; slot < desc->slot_count; slot++)
         if (s->card[slot].write_protected ||
             (s->card[slot].attached && !s->card[slot].write_fn))
             value |= 1u << slot;
     return value;
 }
 
-static uint32_t sdmmc_status(const sdmmc_state_t *s) {
+static uint32_t sdmmc_status(const esp32_periph_t *p) {
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    const sdmmc_state_t *s = &p->sdmmc;
     uint32_t value = 0u;
     if (s->fifo_count == 0u) value |= SDMMC_STATUS_FIFO_EMPTY;
     if (s->fifo_count >= SDMMC_FIFO_WORDS) value |= SDMMC_STATUS_FIFO_FULL;
-    if (s->card[0].attached || s->card[1].attached)
-        value |= SDMMC_STATUS_CARD_PRESENT;
+    for (unsigned slot = 0; slot < desc->slot_count; slot++)
+        if (s->card[slot].attached) {
+            value |= SDMMC_STATUS_CARD_PRESENT;
+            break;
+        }
     if (s->transfer_active)
         value |= SDMMC_STATUS_DATA_BUSY | SDMMC_STATUS_DATA_FSM_BUSY;
     value |= ((uint32_t)s->transfer_cmd & 0x3Fu) <<
@@ -11639,7 +11662,8 @@ static void sdmmc_execute_command(esp32_periph_t *p, uint32_t value) {
     uint32_t status = SDMMC_INT_CMD_DONE;
     bool data = (value & SDMMC_CMD_DATA_EXPECTED) != 0u;
 
-    if (slot >= SDMMC_SLOT_COUNT || !s->card[slot].attached) {
+    if (slot >= p->target->sdmmc_host.slot_count ||
+        !s->card[slot].attached) {
         if (value & SDMMC_CMD_RESPONSE_EXPECT)
             status |= SDMMC_INT_RESP_TIMEOUT;
         s->rintsts |= status;
@@ -11790,7 +11814,7 @@ static void sdmmc_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 static uint32_t sdmmc_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
     sdmmc_state_t *s = &p->sdmmc;
-    uint32_t off = addr - SDMMC_BASE;
+    uint32_t off = addr - p->target->sdmmc_host.base;
     xtensa_cpu_t *cpu = sdmmc_event_cpu(p);
     if (cpu) sdmmc_eval_events(p, cpu);
     if ((off & 3u) != 0u || off >= SDMMC_REG_FILE_SIZE)
@@ -11801,9 +11825,9 @@ static uint32_t sdmmc_read(void *ctx, uint32_t addr) {
     case SDMMC_MINTSTS_OFF:
         return s->rintsts & s->regs[SDMMC_INTMASK_OFF / 4u];
     case SDMMC_RINTSTS_OFF: return s->rintsts;
-    case SDMMC_STATUS_OFF: return sdmmc_status(s);
-    case SDMMC_CDETECT_OFF: return sdmmc_card_detect(s);
-    case SDMMC_WRTPRT_OFF: return sdmmc_write_protect(s);
+    case SDMMC_STATUS_OFF: return sdmmc_status(p);
+    case SDMMC_CDETECT_OFF: return sdmmc_card_detect(p);
+    case SDMMC_WRTPRT_OFF: return sdmmc_write_protect(p);
     case SDMMC_IDSTS_OFF: return s->idsts;
     default: return s->regs[off / 4u];
     }
@@ -11812,7 +11836,7 @@ static uint32_t sdmmc_read(void *ctx, uint32_t addr) {
 static void sdmmc_write(void *ctx, uint32_t addr, uint32_t value) {
     esp32_periph_t *p = ctx;
     sdmmc_state_t *s = &p->sdmmc;
-    uint32_t off = addr - SDMMC_BASE;
+    uint32_t off = addr - p->target->sdmmc_host.base;
     xtensa_cpu_t *cpu = sdmmc_event_cpu(p);
     if (cpu) sdmmc_eval_events(p, cpu);
     if ((off & 3u) != 0u || off >= SDMMC_REG_FILE_SIZE) {
@@ -11902,6 +11926,76 @@ static void sdmmc_write(void *ctx, uint32_t addr, uint32_t value) {
         s->regs[off / 4u] = value;
         return;
     }
+}
+
+static bool sdmmc_geometry_valid(const flexe_target_desc_t *target)
+{
+    if (!target || !(target->capabilities &
+                     FLEXE_TARGET_CAP_SDMMC_HOST_V1))
+        return false;
+    const flexe_sdmmc_host_desc_t *desc = &target->sdmmc_host;
+    if ((desc->base & 0xFFFu) != 0u ||
+        (desc->register_size & 0xFFFu) != 0u ||
+        desc->register_size < SDMMC_REG_FILE_SIZE ||
+        desc->base < target->peripheral_start ||
+        desc->base >= target->peripheral_end ||
+        desc->register_size > target->peripheral_end - desc->base ||
+        desc->interrupt_source >= FLEXE_TARGET_INTERRUPT_SOURCE_MAX ||
+        desc->slot_count == 0u ||
+        desc->slot_count > FLEXE_TARGET_SDMMC_SLOT_MAX ||
+        desc->version_reset == 0u)
+        return false;
+    for (unsigned slot = 0u; slot < desc->slot_count; slot++) {
+        const flexe_sdmmc_host_slot_desc_t *signals = &desc->slot[slot];
+        if (signals->data_signal_count > FLEXE_TARGET_SDMMC_DATA_MAX)
+            return false;
+        if (!(target->capabilities & FLEXE_TARGET_CAP_GPIO_V1)) continue;
+        if (signals->clock_output_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            signals->command_io_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT)
+            return false;
+        for (unsigned data = 0u; data < signals->data_signal_count; data++)
+            if (signals->data_io_signal[data] >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT)
+                return false;
+    }
+    return true;
+}
+
+static int sdmmc_register_target(esp32_periph_t *p)
+{
+    if (!(p->target->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1))
+        return 0;
+    if (!sdmmc_geometry_valid(p->target)) return -1;
+    const flexe_sdmmc_host_desc_t *desc = &p->target->sdmmc_host;
+    for (unsigned slot = 0u; slot < desc->slot_count; slot++) {
+        const flexe_sdmmc_host_slot_desc_t *signals = &desc->slot[slot];
+        if (!p->target_gpio) continue;
+        flexe_gpio_set_output_signal_modeled(
+            p->target_gpio, signals->clock_output_signal);
+        flexe_gpio_set_output_signal_modeled(
+            p->target_gpio, signals->command_io_signal);
+        for (unsigned data = 0u; data < signals->data_signal_count; data++)
+            flexe_gpio_set_output_signal_modeled(
+                p->target_gpio, signals->data_io_signal[data]);
+    }
+    sdmmc_reset_state(p);
+    return mem_register_mmio_range(p->mem, desc->base, desc->register_size,
+                                   sdmmc_read, sdmmc_write, p);
+}
+
+static void sdmmc_set_system_state(esp32_periph_t *p,
+                                   bool clock_enabled,
+                                   bool reset_asserted)
+{
+    if (!p) return;
+    bool reset_edge = reset_asserted &&
+                      !p->sdmmc_system_reset_asserted;
+    p->sdmmc_system_clock_enabled = clock_enabled;
+    p->sdmmc_system_reset_asserted = reset_asserted;
+    if (reset_edge) sdmmc_reset_state(p);
+    sdmmc_clock_update(p);
 }
 
 /* ---- Classic ESP32 TWAI/CAN (SJA1000-compatible PeliCAN core) ---- */
@@ -14117,6 +14211,10 @@ static void system_clock_gate_changed(
         flexe_i2s_v2_set_system_state(
             p->i2s_v2, instance, clock_enabled, reset_asserted);
         break;
+    case FLEXE_SYSTEM_DEVICE_SDMMC:
+        if (instance == 0u)
+            sdmmc_set_system_state(p, clock_enabled, reset_asserted);
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -15095,6 +15193,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         return NULL;
     }
 
+    if (sdmmc_register_target(p) != 0) {
+        periph_destroy(p);
+        return NULL;
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_SYSCON_MEMORY_V1) {
         p->syscon_memory = flexe_syscon_memory_create(
             mem, default_read, default_write, p);
@@ -15195,9 +15298,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* External SDIO-slave endpoint and its two SLC descriptor engines. */
     sdio_slave_reset_state(p);
 
-    /* Native SDMMC host reset state; cards can be attached after creation. */
-    sdmmc_reset_state(p);
-
     /* Classic SJA1000-compatible TWAI controller starts in reset mode. */
     twai_reset_state(p);
 
@@ -15234,10 +15334,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     mem_register_mmio(mem, (int)PAGE_OF(SLCHOST_BASE),
                       slchost_read, slchost_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(SLC_BASE), slc_read, slc_write, p);
-
-    /* Dual-slot native SD/MMC host (interrupt source 37). */
-    mem_register_mmio(mem, (int)PAGE_OF(SDMMC_BASE),
-                      sdmmc_read, sdmmc_write, p);
 
     /* Classic TWAI/CAN controller (interrupt source 45). */
     mem_register_mmio(mem, (int)PAGE_OF(TWAI_BASE),
@@ -15498,6 +15594,10 @@ void periph_destroy(esp32_periph_t *p) {
                 p->mem, desc->instance[port].base, desc->register_size,
                 NULL, NULL, NULL);
     }
+    if (p->target->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1)
+        (void)mem_register_mmio_range(
+            p->mem, p->target->sdmmc_host.base,
+            p->target->sdmmc_host.register_size, NULL, NULL, NULL);
     for (unsigned port = 0u; port < I2C_PORT_COUNT; port++)
         free(p->i2c[port].pending_write);
     free(p->sdmmc.transfer);
@@ -15517,7 +15617,8 @@ int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,
                              periph_sdmmc_read_blocks_fn read_fn,
                              periph_sdmmc_write_blocks_fn write_fn,
                              void *ctx) {
-    if (!p || slot < 0 || slot >= (int)SDMMC_SLOT_COUNT ||
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    if (!desc || slot < 0 || slot >= (int)desc->slot_count ||
         (read_fn && sector_count < 1024u))
         return -1;
     sdmmc_card_state_t *card = &p->sdmmc.card[slot];
@@ -15543,7 +15644,8 @@ int periph_sdmmc_attach_card(esp32_periph_t *p, int slot,
 
 int periph_sdmmc_set_write_protected(esp32_periph_t *p, int slot,
                                      bool write_protected) {
-    if (!p || slot < 0 || slot >= (int)SDMMC_SLOT_COUNT ||
+    const flexe_sdmmc_host_desc_t *desc = sdmmc_desc(p);
+    if (!desc || slot < 0 || slot >= (int)desc->slot_count ||
         !p->sdmmc.card[slot].attached)
         return -1;
     p->sdmmc.card[slot].write_protected = write_protected;
@@ -16174,6 +16276,8 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     if (p->rmt_v1) candidates |= 1u << PERIPH_EVENT_RMT_V1;
     if (p->target->capabilities & FLEXE_TARGET_CAP_LEDC_V1)
         candidates |= 1u << PERIPH_EVENT_LEDC;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1)
+        candidates |= 1u << PERIPH_EVENT_SDMMC;
     p->event_source_registered_mask = candidates;
     p->event_source_candidates[0] = candidates;
     p->event_source_candidates[1] = candidates;

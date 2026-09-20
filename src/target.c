@@ -25,6 +25,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_RADIO_REGS_V1 |
                         FLEXE_TARGET_CAP_SHA_V1 |
                         FLEXE_TARGET_CAP_GP_SPI |
+                        FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -107,6 +108,13 @@ static const flexe_target_desc_t TARGETS[] = {
                 { .base = 0x3FF67000u, .interrupt_source = 50u,
                   .scl_output_signal = 95u, .sda_output_signal = 96u },
             },
+        },
+        .sdmmc_host = {
+            .base = 0x3FF68000u,
+            .register_size = 0x1000u,
+            .version_reset = 0x5342240Au,
+            .interrupt_source = 37u,
+            .slot_count = 2u,
         },
         .io_mux = {
             .base = 0x3FF49000u,
@@ -329,6 +337,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_ASSIST_DEBUG_V1 |
                         FLEXE_TARGET_CAP_APB_SARADC_V1 |
                         FLEXE_TARGET_CAP_I2S_V2 |
+                        FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -424,6 +433,33 @@ static const flexe_target_desc_t TARGETS[] = {
                   .scl_output_signal = 91u, .sda_output_signal = 92u },
             },
         },
+        .sdmmc_host = {
+            .base = 0x60028000u,
+            .register_size = 0x1000u,
+            .version_reset = 0x5342240Au,
+            .interrupt_source = 30u,
+            .slot_count = 2u,
+            .slot = {
+                {
+                    .clock_output_signal = 172u,
+                    .command_io_signal = 178u,
+                    .data_io_signal = {
+                        180u, 181u, 182u, 183u,
+                        184u, 185u, 186u, 187u,
+                    },
+                    .data_signal_count = 8u,
+                },
+                {
+                    .clock_output_signal = 173u,
+                    .command_io_signal = 179u,
+                    .data_io_signal = {
+                        213u, 214u, 215u, 216u,
+                        217u, 218u, 219u, 220u,
+                    },
+                    .data_signal_count = 8u,
+                },
+            },
+        },
         .secondary_core = {
             .base = 0x600C0000u,
             .register_size = 0x1000u,
@@ -444,7 +480,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 8u,
-            .gate_count = 16u,
+            .gate_count = 17u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -589,6 +625,14 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x020u,
                     .clock_mask = 1u << 21,
                     .reset_mask = 1u << 21,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_SDMMC,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 7,
+                    .reset_mask = 1u << 7,
                 },
             },
             .low_power = {

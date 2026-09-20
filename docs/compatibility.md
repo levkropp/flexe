@@ -16,6 +16,7 @@ flash/cache-MMU windows, mask ROM, dual-core startup, system timer, timer
 groups and main watchdogs, SPI-memory controllers,
 general-purpose SPI2/SPI3 controllers and bidirectional AHB GDMA,
 I2S0/I2S1 v2 controllers with timed circular-GDMA transport,
+the native SD/MMC host with timed internal DMA and host-backed block media,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only
 revision-0 eFuse profile, digital pad configuration, UARTs, native USB
@@ -241,6 +242,25 @@ Slave mode, segmented/config-buffer transactions, bus arbitration, signal
 edges, and clock-derived transfer duration remain outside this functional envelope.
 Unsupported framing and invalid DMA setup are diagnosed instead of silently
 reported as successful transfers.
+
+The native SD/MMC host is selected by a target descriptor rather than a fixed
+classic address. Classic ESP32 and ESP32-S3 supply their controller base,
+interrupt source, version, slot count, and GPIO-matrix clock/command/data
+signals; S3 also connects the model to its SYSTEM clock and reset gate. The
+DesignWare command/response, FIFO, and internal-DMA paths support host-backed
+SDHC block media, descriptor ownership and write-back, chained single- and
+multi-block transfers, completion/error interrupts, and both logical slots.
+Timed descriptors use the common peripheral deadline scheduler, including
+when the device is introduced by a non-classic target capability.
+`scripts/check-s3-idf-sdmmc-host.sh` runs ESP-IDF 5.3.2's stock host driver and
+ISR queue through slot 1 in interpreter and JIT, verifies 41 read and 41 write
+blocks, the target's GPIO routes, identical results, and zero unsupported
+accesses. Its application image SHA-256 is
+`cfca7b6f64c7053f55b7d9f53bb21c4a646b2707fea707cfd84c4afb49fcb613`
+and matching ELF SHA-256 is
+`5ddb0c08e529a9be44b6a17ab64616e52e4f2556817bfb24d93b1f37ef94c87d`.
+SDIO functions, UHS/DDR signaling, wire-level bus width and timing, hot removal,
+and general media-fault injection remain outside this functional model.
 
 The S3 I2S v2 model is also selected entirely by target geometry: the two
 controller bases, SYSTEM clock/reset bits, interrupt sources, GDMA trigger

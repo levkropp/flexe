@@ -50,7 +50,7 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 16u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 17u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
@@ -59,12 +59,14 @@
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
 #define FLEXE_TARGET_I2S_MAX 2u
 #define FLEXE_TARGET_I2S_DATA_OUT_MAX 2u
+#define FLEXE_TARGET_SDMMC_SLOT_MAX 2u
+#define FLEXE_TARGET_SDMMC_DATA_MAX 8u
 #define FLEXE_TARGET_SHA_MODE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 60u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 61u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -101,6 +103,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SYSCON_MEMORY_V1             = 1ull << 28,
     FLEXE_TARGET_CAP_ASSIST_DEBUG_V1               = 1ull << 29,
     FLEXE_TARGET_CAP_I2S_V2                        = 1ull << 30,
+    FLEXE_TARGET_CAP_SDMMC_HOST_V1                  = 1ull << 31,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -981,6 +984,27 @@ typedef struct {
     flexe_i2s_v2_instance_desc_t instance[FLEXE_TARGET_I2S_MAX];
 } flexe_i2s_v2_desc_t;
 
+/* DesignWare mobile-storage host shared by classic ESP32 and later targets.
+ * The command/FIFO/IDMAC register semantics belong to the IP generation;
+ * placement, card slots, revision identity, and interrupt wiring are SoC
+ * properties. register_size is the owned MMIO aperture, including the clock
+ * register at +0x800. */
+typedef struct {
+    uint16_t clock_output_signal;
+    uint16_t command_io_signal;
+    uint16_t data_io_signal[FLEXE_TARGET_SDMMC_DATA_MAX];
+    uint8_t data_signal_count;
+} flexe_sdmmc_host_slot_desc_t;
+
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t version_reset;
+    uint8_t interrupt_source;
+    uint8_t slot_count;
+    flexe_sdmmc_host_slot_desc_t slot[FLEXE_TARGET_SDMMC_SLOT_MAX];
+} flexe_sdmmc_host_desc_t;
+
 typedef enum {
     FLEXE_SHA_LAYOUT_NONE = 0,
     /* Classic ESP32: one START/CONTINUE/LOAD/BUSY quartet per algorithm and
@@ -1372,6 +1396,9 @@ struct flexe_target_desc {
     /* Optional general-purpose DMA fabric and streaming audio controller. */
     flexe_gdma_desc_t             gdma;
     flexe_i2s_v2_desc_t           i2s_v2;
+
+    /* Optional DesignWare SD/MMC host with FIFO and internal descriptor DMA. */
+    flexe_sdmmc_host_desc_t       sdmmc_host;
 
     /* Optional SHA accelerator. */
     flexe_sha_desc_t              sha;

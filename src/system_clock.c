@@ -183,6 +183,9 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
              gate->instance < FLEXE_TARGET_I2S_MAX &&
              gate->instance < target->i2s_v2.instance_count &&
              (target->capabilities & FLEXE_TARGET_CAP_I2S_V2)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_SDMMC &&
+             gate->instance == 0u &&
+             (target->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1)) ||
             (gate->device == FLEXE_SYSTEM_DEVICE_EDMA &&
              gate->instance == 0u);
         int bank = system_clock_peripheral_bank_index(

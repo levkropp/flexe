@@ -1,11 +1,13 @@
-/* Run Espressif's compiled classic-ESP32 SDMMC host driver against Flexe's
- * native controller model. The guest owns command sequencing, ISR delivery,
- * queues, and DesignWare IDMAC descriptors; this host owns only card media. */
+/* Run Espressif's compiled SDMMC host driver against Flexe's target-described
+ * controller model. The guest owns command sequencing, ISR delivery, queues,
+ * GPIO routing, and DesignWare IDMAC descriptors; the host owns only media. */
 #include "elf_symbols.h"
 #include "flexe_session.h"
+#include "jit.h"
 #include "memory.h"
 #include "peripherals.h"
 #include "rom_stubs.h"
+#include "target.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,7 +15,8 @@
 #include <string.h>
 
 #define SUCCESS_MARKER 0x53444D4Du
-#define MAX_CYCLES     180000000ull
+#define CLASSIC_MAX_CYCLES UINT64_C(180000000)
+#define S3_MAX_CYCLES UINT64_C(3000000000)
 #define RESULT_COUNT   24u
 #define CARD_SECTORS   128u
 #define SECTOR_BYTES   512u
@@ -79,12 +82,18 @@ int main(int argc, char **argv) {
         disable_jit = 1;
         argi++;
     }
-    if (argc - argi != 2) {
+    int positional = argc - argi;
+    if (positional != 2 && positional != 3) {
         fprintf(stderr,
-                "usage: %s [--no-jit] FIRMWARE.bin FIRMWARE.elf\n",
+                "usage: %s [--no-jit] FIRMWARE.bin FIRMWARE.elf "
+                "[ROM.elf]\n",
                 argv[0]);
         return 2;
     }
+    bool s3 = positional == 3;
+    flexe_target_id_t target_id = s3 ? FLEXE_TARGET_ESP32S3 :
+                                      FLEXE_TARGET_ESP32;
+    const flexe_target_desc_t *target = flexe_target_by_id(target_id);
 
     elf_symbols_t *symbols = elf_symbols_load(argv[argi + 1]);
     uint32_t stage_addr = 0;
@@ -102,7 +111,11 @@ int main(int argc, char **argv) {
     flexe_session_config_t config = {
         .bin_path = argv[argi],
         .elf_path = argv[argi + 1],
+        .rom_elf_path = s3 ? argv[argi + 2] : NULL,
+        .native_freertos = s3,
         .disable_jit = disable_jit,
+        .target = target_id,
+        .unhandled_audit = s3,
     };
     flexe_session_t *session = flexe_session_create(&config);
     if (!session) {
@@ -125,10 +138,12 @@ int main(int argc, char **argv) {
     }
 
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
+    xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
     xtensa_mem_t *mem = flexe_session_mem(session);
+    uint64_t max_cycles = s3 ? S3_MAX_CYCLES : CLASSIC_MAX_CYCLES;
     uint32_t stage = 0;
     uint32_t last_stage = UINT32_MAX;
-    while (cpu->cycle_count < MAX_CYCLES) {
+    while (cpu->cycle_count < max_cycles) {
         stage = mem_read32(mem, stage_addr);
         if (stage != last_stage) {
             fprintf(stderr,
@@ -139,7 +154,8 @@ int main(int argc, char **argv) {
             last_stage = stage;
         }
         if (stage == SUCCESS_MARKER ||
-            (stage & 0xFFF00000u) == 0xBAD00000u)
+            (stage & 0xFFF00000u) == 0xBAD00000u ||
+            !cpu->running || (cpu1 && cpu1->debug_break))
             break;
         (void)flexe_session_run_core(session, 0, 10000);
         flexe_session_post_batch(session, 10000);
@@ -153,20 +169,30 @@ int main(int argc, char **argv) {
     int unregistered = rom_stubs_unregistered_count(
         flexe_session_rom(session));
     bool media_ok = writes_match(&card);
+    int clock_route = s3 ? periph_gpio_out_signal(periph, 14) : -1;
+    int command_route = s3 ? periph_gpio_out_signal(periph, 15) : -1;
+    int data_route = s3 ? periph_gpio_out_signal(periph, 2) : -1;
+    uint64_t jit_instructions = 0u;
+    jit_state_t *jit = flexe_session_jit(session);
+    if (jit) jit_instructions = jit_get_stats(jit)->insns_jitted;
 
-    printf("engine=%s stage=0x%08X result=",
+    printf("target=%s engine=%s stage=0x%08X result=",
+           target->name,
            flexe_session_jit(session) ? "jit" : "interp", stage);
     for (unsigned index = 0; index < RESULT_COUNT; ++index)
         printf("%s0x%08X", index ? "/" : "", result[index]);
     printf(" reads=%zu/%zu writes=%zu/%zu media=%d "
-           "unhandled=%d unregistered=%d cycles=%llu\n",
+           "routes=%d,%d,%d unhandled=%d unregistered=%d "
+           "cycles=%llu jit_insns=%llu\n",
            card.read_calls, card.read_blocks,
            card.write_calls, card.write_blocks, media_ok,
+           clock_route, command_route, data_route,
            unhandled, unregistered,
-           (unsigned long long)cpu->cycle_count);
+           (unsigned long long)cpu->cycle_count,
+           (unsigned long long)jit_instructions);
 
     if (stage != SUCCESS_MARKER) {
-        const uint32_t base = 0x3FF68000u;
+        const uint32_t base = target->sdmmc_host.base;
         fprintf(stderr,
                 "[sdmmc-fixture] ctrl=%08X mask=%08X mint=%08X "
                 "raw=%08X status=%08X idsts=%08X idinten=%08X "
@@ -208,7 +234,10 @@ int main(int argc, char **argv) {
              result[17] == 1u && result[20] == 1u &&
              card.read_calls == 2u && card.read_blocks == 41u &&
              card.write_calls == 2u && card.write_blocks == 41u &&
-             media_ok && unhandled == 0 && unregistered == 0;
+             media_ok && unhandled == 0 && unregistered == 0 &&
+             (!s3 || (clock_route == 173 && command_route == 179 &&
+                      data_route == 213)) &&
+             (disable_jit || jit_instructions != 0u);
 
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);
