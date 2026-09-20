@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Official ESP-IDF 5.3.2 S3 standard-I2S circular-GDMA replay in the
+# Official ESP-IDF 5.3.2 S3 standard-I2S TX/RX circular-GDMA replay in the
 # interpreter and JIT. The two engines run concurrently to keep this focused
 # hardware gate cheap during model iteration.
 set -euo pipefail
@@ -10,8 +10,8 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-idf-i2s-std-test"}
-pinned_bin=256de5d384e41c448a926fef7a188447b4558480e6b6a129bb1d571dd2cbfe34
-pinned_elf=539322a28486c7dacfb5174355598531a5b9c2557eefeb9b60233b53787bc067
+pinned_bin=120af4ccf7b40c52d72f0fa3b849843daa651e9b721f161cc42de54ac6738a83
+pinned_elf=c635474e01534e88c60c7ed6846e2ada7bd055dab0b3846a86a67eaa87509b63
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
 expected_bin=${S3_IDF_I2S_STD_BIN_SHA256:-$pinned_bin}
 expected_elf=${S3_IDF_I2S_STD_ELF_SHA256:-$pinned_elf}
@@ -57,7 +57,8 @@ fi
 for engine in interp jit; do
     grep -Eq "^PASS: ESP-IDF S3 I2S std engine=$engine "\
 "stage=0x1232A5D0 preload=1024 writes=1024,1024 checksum=7EF6A3C5 "\
-"callbacks=8 patterns=2 metadata_errors=0 routes=22,24,25 unhandled=0 " \
+"callbacks=8 patterns=2 metadata_errors=0 routes=22,24,25 "\
+"rx=1024/E9E32BC5 inject=1024 pending=0 rx_routes=31,32,9 unhandled=0 " \
         "$tmpdir/$engine.out" || {
             echo "FAIL: $engine I2S/GDMA result changed" >&2
             cat "$tmpdir/$engine.out" >&2
@@ -79,4 +80,4 @@ cmp -s "$tmpdir/interp.normalized" "$tmpdir/jit.normalized" || {
     exit 1
 }
 
-echo "PASS: stock ESP-IDF S3 standard I2S streamed a circular GDMA ring, woke blocking writers, and routed BCLK/WS/data identically in interpreter and JIT with zero unsupported MMIO"
+echo "PASS: stock ESP-IDF S3 standard I2S streamed port-0 TX and host-fed port-1 RX through circular GDMA, woke blocking tasks, and routed clocks/data identically in interpreter and JIT with zero unsupported MMIO"

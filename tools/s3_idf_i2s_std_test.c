@@ -1,6 +1,6 @@
-/* Replay the stock ESP-IDF 5.3 standard-I2S driver through S3 I2S v2,
- * circular GDMA, native FreeRTOS, GPIO matrix routing, and the host stream
- * API. No guest function is replaced. */
+/* Replay the stock ESP-IDF 5.3 standard-I2S driver through both S3 I2S v2
+ * instances, circular TX/RX GDMA, native FreeRTOS, GPIO matrix routing, and
+ * the host stream API. No guest function is replaced. */
 #include "elf_symbols.h"
 #include "flexe_session.h"
 #include "jit.h"
@@ -14,9 +14,16 @@
 #include <string.h>
 
 #define I2S_DONE UINT32_C(0x1232A5D0)
-#define AUDIO_BYTES 1024u
+#define I2S_RX_READY 4u
+#define TX_AUDIO_BYTES 1024u
+#define RX_AUDIO_BYTES 1024u
 #define MAX_CYCLES UINT64_C(3000000000)
 #define BATCH 10000
+#define S3_GPIO_BASE UINT32_C(0x60004000)
+#define S3_GPIO_FUNC_IN_BASE UINT32_C(0x154)
+#define S3_GPIO_FUNC_IN_SEL UINT32_C(0x3F)
+#define S3_GPIO_FUNC_IN_MATRIX (UINT32_C(1) << 7)
+#define S3_I2S1_DATA_IN_SIGNAL 30u
 
 volatile int emu_app_running = 1;
 
@@ -27,7 +34,7 @@ typedef struct {
 } uart_capture_t;
 
 typedef struct {
-    uint8_t expected[AUDIO_BYTES];
+    uint8_t expected[TX_AUDIO_BYTES];
     size_t match;
     uint64_t bytes;
     unsigned callbacks;
@@ -89,6 +96,12 @@ static uint32_t checksum(const uint8_t *data, size_t length)
     return value;
 }
 
+static void fill_rx_audio(uint8_t *data, size_t length)
+{
+    for (size_t index = 0u; index < length; index++)
+        data[index] = (uint8_t)((index * 29u + 0x5Bu) ^ (index >> 3u));
+}
+
 int main(int argc, char **argv)
 {
     int argi = 1;
@@ -148,9 +161,30 @@ int main(int argc, char **argv)
     xtensa_cpu_t *cpu0 = flexe_session_cpu(session, 0);
     xtensa_cpu_t *cpu1 = flexe_session_cpu(session, 1);
     xtensa_mem_t *mem = flexe_session_mem(session);
+    uint8_t rx_audio[RX_AUDIO_BYTES];
+    fill_rx_audio(rx_audio, sizeof(rx_audio));
+    bool rx_injection_attempted = false;
+    size_t rx_injected = 0u;
+    int rx_bclk_route = -1;
+    int rx_ws_route = -1;
+    int rx_data_route = -1;
+    bool rx_data_matrix = false;
     uint32_t stage = 0u;
     while (cpu0->cycle_count < MAX_CYCLES) {
         stage = mem_read32(mem, stage_address);
+        if (stage == I2S_RX_READY && !rx_injection_attempted) {
+            rx_injection_attempted = true;
+            rx_bclk_route = periph_gpio_out_signal(periph, 7);
+            rx_ws_route = periph_gpio_out_signal(periph, 8);
+            uint32_t input_config = mem_read32(
+                mem, S3_GPIO_BASE + S3_GPIO_FUNC_IN_BASE +
+                     S3_I2S1_DATA_IN_SIGNAL * sizeof(uint32_t));
+            rx_data_route = (int)(input_config & S3_GPIO_FUNC_IN_SEL);
+            rx_data_matrix =
+                (input_config & S3_GPIO_FUNC_IN_MATRIX) != 0u;
+            rx_injected = periph_i2s_rx_inject(
+                periph, 1, rx_audio, sizeof(rx_audio));
+        }
         if ((stage == I2S_DONE &&
              strstr(uart.data, "I2S_STD_DONE") != NULL) ||
             (stage & UINT32_C(0xFFFF0000)) == UINT32_C(0xBAD00000) ||
@@ -166,37 +200,50 @@ int main(int argc, char **argv)
     uint32_t preload = mem_read32(mem, result_address);
     uint32_t write0 = mem_read32(mem, result_address + 4u);
     uint32_t write1 = mem_read32(mem, result_address + 8u);
-    uint32_t guest_checksum = mem_read32(mem, result_address + 12u);
-    uint32_t failure = mem_read32(mem, result_address + 16u);
+    uint32_t guest_tx_checksum = mem_read32(mem, result_address + 12u);
+    uint32_t received = mem_read32(mem, result_address + 16u);
+    uint32_t guest_rx_checksum = mem_read32(mem, result_address + 20u);
+    uint32_t failure = mem_read32(mem, result_address + 24u);
+    size_t rx_pending = periph_i2s_rx_pending(periph, 1);
     uint64_t jit_instructions = 0u;
     jit_state_t *jit = flexe_session_jit(session);
     if (jit) jit_instructions = jit_get_stats(jit)->insns_jitted;
     unsigned unhandled = (unsigned)periph_unhandled_count(periph);
-    bool ok = stage == I2S_DONE && preload == AUDIO_BYTES &&
-              write0 == AUDIO_BYTES && write1 == AUDIO_BYTES &&
-              guest_checksum == checksum(audio.expected,
-                                         sizeof(audio.expected)) &&
+    bool ok = stage == I2S_DONE && preload == TX_AUDIO_BYTES &&
+              write0 == TX_AUDIO_BYTES && write1 == TX_AUDIO_BYTES &&
+              guest_tx_checksum == checksum(audio.expected,
+                                            sizeof(audio.expected)) &&
               audio.callbacks >= 8u && audio.pattern_matches >= 2u &&
               audio.metadata_errors == 0u && audio.sampled_routes &&
               audio.bclk_route == 22 && audio.ws_route == 24 &&
-              audio.data_route == 25 && unhandled == 0u &&
+              audio.data_route == 25 && rx_injection_attempted &&
+              rx_injected == RX_AUDIO_BYTES && received == RX_AUDIO_BYTES &&
+              guest_rx_checksum == checksum(rx_audio, sizeof(rx_audio)) &&
+              rx_pending == 0u && rx_bclk_route == 31 &&
+              rx_ws_route == 32 && rx_data_route == 9 && rx_data_matrix &&
+              unhandled == 0u &&
               strstr(uart.data, "I2S_STD_DONE") != NULL &&
               (disable_jit || jit_instructions != 0u);
 
     printf("%s: ESP-IDF S3 I2S std engine=%s stage=0x%08X "
            "preload=%u writes=%u,%u checksum=%08X callbacks=%u "
            "patterns=%u metadata_errors=%u routes=%d,%d,%d "
+           "rx=%u/%08X inject=%zu pending=%zu rx_routes=%d,%d,%d "
            "unhandled=%u cycles=%llu jit_insns=%llu\n",
            ok ? "PASS" : "FAIL", disable_jit ? "interp" : "jit",
-           stage, preload, write0, write1, guest_checksum,
+           stage, preload, write0, write1, guest_tx_checksum,
            audio.callbacks, audio.pattern_matches, audio.metadata_errors,
-           audio.bclk_route, audio.ws_route, audio.data_route, unhandled,
+           audio.bclk_route, audio.ws_route, audio.data_route,
+           received, guest_rx_checksum, rx_injected, rx_pending,
+           rx_bclk_route, rx_ws_route, rx_data_route, unhandled,
            (unsigned long long)cpu0->cycle_count,
            (unsigned long long)jit_instructions);
     if (!ok)
         fprintf(stderr,
-                "failure=0x%08X audio_bytes=%llu UART tail: %s\n",
+                "failure=0x%08X tx_bytes=%llu rx_attempted=%d "
+                "rx_matrix=%d UART tail: %s\n",
                 failure, (unsigned long long)audio.bytes,
+                rx_injection_attempted, rx_data_matrix,
                 uart.data + (uart.length > 800u ? uart.length - 800u : 0u));
 
     flexe_session_destroy(session);

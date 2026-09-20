@@ -77,6 +77,28 @@ static int hex_nibble(char c)
     return -1;
 }
 
+static bool json_hex_bytes(const char *line, const char *key,
+                           uint8_t *out, size_t capacity, size_t *length)
+{
+    const char *p = json_value(line, key);
+    if (!p || *p++ != '"' || capacity == 0u) return false;
+
+    size_t bytes = 0u;
+    while (*p && *p != '"') {
+        if (bytes >= capacity) return false;
+        int high = hex_nibble(*p++);
+        if (high < 0 || !*p || *p == '"') return false;
+        int low = hex_nibble(*p++);
+        if (low < 0) return false;
+        out[bytes++] = (uint8_t)((high << 4) | low);
+    }
+    if (*p++ != '"' || bytes == 0u) return false;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ',' && *p != '}') return false;
+    *length = bytes;
+    return true;
+}
+
 static bool parse_port(const char *line, int *port)
 {
     long value;
@@ -136,8 +158,12 @@ bool sbx_input_parse(const char *line, sbx_input_event_t *out)
 
     if (strcmp(type, "uart_in") == 0) {
         if (!parse_port(line, &out->uart.port)) return false;
+        bool has_byte = json_value(line, "b") != NULL;
+        bool has_hex = json_value(line, "hex") != NULL;
+        if (has_byte == has_hex) return false;
         long byte;
-        if (json_long(line, "b", &byte)) {
+        if (has_byte) {
+            if (!json_long(line, "b", &byte)) return false;
             if (byte < 0 || byte > UINT8_MAX) return false;
             out->kind = SBX_INPUT_UART;
             out->uart.data[0] = (uint8_t)byte;
@@ -145,18 +171,9 @@ bool sbx_input_parse(const char *line, sbx_input_event_t *out)
             return true;
         }
 
-        char hex[SBX_INPUT_UART_MAX * 2u + 1u];
-        size_t hex_len;
-        if (!json_string(line, "hex", hex, sizeof(hex), &hex_len) ||
-            hex_len == 0u || (hex_len & 1u) != 0u)
-            return false;
-        size_t bytes = hex_len / 2u;
-        for (size_t i = 0u; i < bytes; i++) {
-            int high = hex_nibble(hex[i * 2u]);
-            int low = hex_nibble(hex[i * 2u + 1u]);
-            if (high < 0 || low < 0) return false;
-            out->uart.data[i] = (uint8_t)((high << 4) | low);
-        }
+        size_t bytes;
+        if (!json_hex_bytes(line, "hex", out->uart.data,
+                            sizeof(out->uart.data), &bytes)) return false;
         out->kind = SBX_INPUT_UART;
         out->uart.len = bytes;
         return true;
@@ -165,6 +182,15 @@ bool sbx_input_parse(const char *line, sbx_input_event_t *out)
     if (strcmp(type, "uart_break") == 0) {
         if (!parse_port(line, &out->uart_break.port)) return false;
         out->kind = SBX_INPUT_UART_BREAK;
+        return true;
+    }
+
+    if (strcmp(type, "i2s_in") == 0) {
+        if (!parse_port(line, &out->i2s.port) ||
+            !json_hex_bytes(line, "hex", out->i2s.data,
+                            sizeof(out->i2s.data), &out->i2s.len))
+            return false;
+        out->kind = SBX_INPUT_I2S;
         return true;
     }
 

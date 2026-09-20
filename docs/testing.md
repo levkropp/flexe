@@ -175,8 +175,9 @@ interrupts, explicitly stopped infinite loops, a two-channel simultaneous
 start barrier, and sustained FreeRTOS execution. Build commands and
 artifact hashes are in [Hardware completeness](hardware-completeness.md).
 `check-s3-idf-i2s-std.sh` runs the stock standard-I2S driver in interpreter
-and JIT concurrently, checking circular GDMA progress, blocking-writer wakeup,
-audio metadata, and GPIO-matrix routing with zero unsupported MMIO.
+and JIT concurrently, checking port-0 TX and asynchronously host-fed port-1 RX
+through circular GDMA, blocking-task wakeup, audio metadata, exact captured
+bytes, and both GPIO-matrix routes with zero unsupported MMIO.
 
 Use the fixture builder rather than making disposable build directories by
 hand. It finds the pinned ESP-IDF v5.3.2 checkout from `FLEXE_IDF_PATH`, an

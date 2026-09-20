@@ -1,6 +1,6 @@
-/* Exercise ESP-IDF 5.3's standard-mode I2S driver, its circular GDMA ring,
- * blocking writer wakeup, clock/reset gates, and GPIO matrix setup without
- * replacing any guest driver function. */
+/* Exercise ESP-IDF 5.3's standard-mode I2S driver, both controller instances,
+ * circular TX/RX GDMA rings, blocking task wakeup, clock/reset gates, and GPIO
+ * matrix setup without replacing any guest driver function. */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -10,14 +10,15 @@
 #include "freertos/task.h"
 
 #define I2S_DONE UINT32_C(0x1232A5D0)
-#define AUDIO_BYTES 1024u
+#define TX_AUDIO_BYTES 1024u
+#define RX_AUDIO_BYTES 1024u
 
 volatile uint32_t flexe_i2s_stage;
-volatile uint32_t flexe_i2s_result[5];
+volatile uint32_t flexe_i2s_result[7];
 
 static void fail(const char *stage, esp_err_t error)
 {
-    flexe_i2s_result[4] = (uint32_t)error;
+    flexe_i2s_result[6] = (uint32_t)error;
     flexe_i2s_stage = UINT32_C(0xBAD00000);
     printf("I2S_FAIL %s %d\n", stage, (int)error);
     fflush(stdout);
@@ -39,10 +40,11 @@ static uint32_t checksum(const uint8_t *data, size_t length)
 
 void app_main(void)
 {
-    static uint8_t audio[AUDIO_BYTES];
-    for (size_t index = 0u; index < sizeof(audio); index++)
-        audio[index] = (uint8_t)((index * 73u + 19u) ^ (index >> 2u));
-    flexe_i2s_result[3] = checksum(audio, sizeof(audio));
+    static uint8_t tx_audio[TX_AUDIO_BYTES];
+    static uint8_t rx_audio[RX_AUDIO_BYTES];
+    for (size_t index = 0u; index < sizeof(tx_audio); index++)
+        tx_audio[index] = (uint8_t)((index * 73u + 19u) ^ (index >> 2u));
+    flexe_i2s_result[3] = checksum(tx_audio, sizeof(tx_audio));
 
     i2s_chan_config_t channel_config =
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -74,7 +76,7 @@ void app_main(void)
     for (;;) {
         size_t loaded = 0u;
         check("preload", i2s_channel_preload_data(
-            tx, audio, sizeof(audio), &loaded));
+            tx, tx_audio, sizeof(tx_audio), &loaded));
         preloaded_total += loaded;
         if (loaded == 0u) break;
     }
@@ -85,20 +87,65 @@ void app_main(void)
     for (unsigned round = 0u; round < 2u; round++) {
         size_t written = 0u;
         check("write", i2s_channel_write(
-            tx, audio, sizeof(audio), &written, pdMS_TO_TICKS(1000)));
-        if (written != sizeof(audio)) fail("short-write", ESP_FAIL);
+            tx, tx_audio, sizeof(tx_audio), &written, pdMS_TO_TICKS(1000)));
+        if (written != sizeof(tx_audio)) fail("short-write", ESP_FAIL);
         flexe_i2s_result[1u + round] = (uint32_t)written;
         flexe_i2s_stage = 2u + round;
     }
 
     check("disable", i2s_channel_disable(tx));
     check("delete", i2s_del_channel(tx));
+
+    channel_config =
+        (i2s_chan_config_t)I2S_CHANNEL_DEFAULT_CONFIG(
+            I2S_NUM_1, I2S_ROLE_MASTER);
+    channel_config.dma_desc_num = 4u;
+    channel_config.dma_frame_num = 64u;
+    i2s_chan_handle_t rx;
+    check("new-rx-channel", i2s_new_channel(
+        &channel_config, NULL, &rx));
+
+    standard_config = (i2s_std_config_t) {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(32000),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = GPIO_NUM_7,
+            .ws = GPIO_NUM_8,
+            .dout = I2S_GPIO_UNUSED,
+            .din = GPIO_NUM_9,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    check("init-rx-standard", i2s_channel_init_std_mode(
+        rx, &standard_config));
+    check("enable-rx", i2s_channel_enable(rx));
+    flexe_i2s_stage = 4u;
+
+    size_t received = 0u;
+    check("read", i2s_channel_read(
+        rx, rx_audio, sizeof(rx_audio), &received, pdMS_TO_TICKS(1000)));
+    if (received != sizeof(rx_audio)) fail("short-read", ESP_FAIL);
+    flexe_i2s_result[4] = (uint32_t)received;
+    flexe_i2s_result[5] = checksum(rx_audio, received);
+    flexe_i2s_stage = 5u;
+
+    check("disable-rx", i2s_channel_disable(rx));
+    check("delete-rx", i2s_del_channel(rx));
     flexe_i2s_stage = I2S_DONE;
-    printf("I2S_STD_DONE preload=%u writes=%u,%u checksum=%08X\n",
+    printf("I2S_STD_DONE preload=%u writes=%u,%u tx_checksum=%08X "
+           "rx=%u rx_checksum=%08X\n",
            (unsigned)flexe_i2s_result[0],
            (unsigned)flexe_i2s_result[1],
            (unsigned)flexe_i2s_result[2],
-           (unsigned)flexe_i2s_result[3]);
+           (unsigned)flexe_i2s_result[3],
+           (unsigned)flexe_i2s_result[4],
+           (unsigned)flexe_i2s_result[5]);
     fflush(stdout);
     for (;;) vTaskDelay(pdMS_TO_TICKS(100));
 }

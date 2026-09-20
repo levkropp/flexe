@@ -298,6 +298,16 @@ static bool i2s_v2_arm_direction(flexe_i2s_v2_t *i2s, unsigned port,
         *armed = false;
         return changed;
     }
+    /* Host-fed receive samples are an asynchronous peripheral input. Keep the
+     * descriptor owned by hardware, and therefore a blocking guest reader
+     * asleep, until one complete DMA buffer is available. Silently padding an
+     * empty host stream with zeroes makes a disconnected source look like a
+     * successful capture and races input injected after the channel starts. */
+    if (receive && state->rx_length < length) {
+        bool changed = *armed;
+        *armed = false;
+        return changed;
+    }
     if (*armed) return false;
     uint64_t duration = i2s_v2_descriptor_cycles(
         i2s, port, receive, length);
@@ -670,6 +680,7 @@ size_t flexe_i2s_v2_rx_inject(flexe_i2s_v2_t *i2s, unsigned port,
         state->rx_fifo[tail] = data[index];
         state->rx_length++;
     }
+    if (accepted) i2s_v2_refresh(i2s);
     return accepted;
 }
 

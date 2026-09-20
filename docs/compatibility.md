@@ -250,11 +250,13 @@ dual-core virtual timeline; finite and circular lists retain the controller's
 ownership, EOF, completion, park, and level-interrupt behavior. The pinned
 ESP-IDF 5.3.2 `s3_idf_i2s_std` fixture uses the stock standard-mode driver to
 preload a four-descriptor ring and complete two blocking 48 kHz, stereo,
-16-bit writes. `scripts/check-s3-idf-i2s-std.sh` runs interpreter and JIT in
-parallel and requires identical payload, metadata, BCLK/WS/data matrix routes,
-and zero unsupported MMIO. It does not claim wire-level clock/data edges,
-PDM, slave/external clocks, calibrated underrun latency, or general audio-codec
-behavior.
+16-bit writes on port 0. It then starts port 1 as a 32 kHz stereo receiver,
+blocks with all four DMA descriptors still hardware-owned until the host feeds
+1,024 deterministic bytes, and wakes to return the exact capture. The gate runs
+interpreter and JIT in parallel and requires identical payloads, metadata,
+both ports' BCLK/WS/data matrix routes, and zero unsupported MMIO. It does not
+claim wire-level clock/data edges, PDM, slave/external clocks, calibrated
+underrun/overrun latency, or general audio-codec behavior.
 
 The S3 SHA model uses target-described mode mappings and consumes the active
 AHB GDMA v1 transmit chain selected for SHA, including chained descriptors,

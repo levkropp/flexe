@@ -28,7 +28,7 @@ TEST(sandbox_input_parses_existing_physical_inputs)
     ASSERT_EQ(event.adc.raw, 65535);
 }
 
-TEST(sandbox_input_parses_binary_uart_and_break_events)
+TEST(sandbox_input_parses_binary_stream_and_break_events)
 {
     sbx_input_event_t event;
 
@@ -52,6 +52,15 @@ TEST(sandbox_input_parses_binary_uart_and_break_events)
         "{\"t\":\"uart_break\",\"port\":1}", &event));
     ASSERT_EQ(event.kind, SBX_INPUT_UART_BREAK);
     ASSERT_EQ(event.uart_break.port, 1);
+
+    ASSERT_TRUE(sbx_input_parse(
+        "{\"hex\":\"0055AaFf\",\"port\":1,\"t\":\"i2s_in\"}",
+        &event));
+    static const uint8_t audio[] = {0x00, 0x55, 0xAA, 0xFF};
+    ASSERT_EQ(event.kind, SBX_INPUT_I2S);
+    ASSERT_EQ(event.i2s.port, 1);
+    ASSERT_EQ(event.i2s.len, sizeof(audio));
+    ASSERT_TRUE(memcmp(event.i2s.data, audio, sizeof(audio)) == 0);
 }
 
 TEST(sandbox_input_rejects_ambiguous_or_malformed_events)
@@ -71,12 +80,19 @@ TEST(sandbox_input_rejects_ambiguous_or_malformed_events)
         "{\"t\":\"uart_in\",\"u\":0,\"hex\":\"xz\"}", &event));
     ASSERT_FALSE(sbx_input_parse(
         "{\"t\":\"uart_in\",\"u\":-1,\"b\":1}", &event));
+    ASSERT_FALSE(sbx_input_parse(
+        "{\"t\":\"uart_in\",\"u\":0,\"b\":1,\"hex\":\"01\"}",
+        &event));
+    ASSERT_FALSE(sbx_input_parse(
+        "{\"t\":\"i2s_in\",\"port\":1,\"hex\":\"123\"}", &event));
+    ASSERT_FALSE(sbx_input_parse(
+        "{\"t\":\"i2s_in\",\"port\":-1,\"hex\":\"00\"}", &event));
 }
 
 void run_sandbox_input_tests(void)
 {
     TEST_SUITE("Sandbox host input");
     RUN_TEST(sandbox_input_parses_existing_physical_inputs);
-    RUN_TEST(sandbox_input_parses_binary_uart_and_break_events);
+    RUN_TEST(sandbox_input_parses_binary_stream_and_break_events);
     RUN_TEST(sandbox_input_rejects_ambiguous_or_malformed_events);
 }

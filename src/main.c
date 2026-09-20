@@ -692,7 +692,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
     fprintf(stderr, "  --psram <chip>  Attach optional S3 PSRAM: ap-8m-opi (default: none)\n");
     fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
-    fprintf(stderr, "  --sandbox-events  Emit peripheral NDJSON and accept GPIO/touch/ADC/UART input on stdin\n");
+    fprintf(stderr, "  --sandbox-events  Emit peripheral NDJSON and accept GPIO/touch/ADC/UART/I2S input on stdin\n");
     fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
@@ -762,7 +762,7 @@ static int sandbox_touch_state_fn(int *x, int *y, void *ctx) {
 
 /* ===== Sandbox stdin command reader =====
  * When --sandbox-events is active, the Node bridge may push commands
- * (GPIO input drives, touch taps, ADC samples, and UART traffic) to
+ * (GPIO input drives, touch taps, ADC samples, UART traffic, and I2S samples) to
  * flexe's stdin as NDJSON lines. We set stdin non-blocking once and
  * drain it at the top of every run-loop batch. Recognised commands:
  *   {"t":"gpio_in","pin":0,"lvl":1}
@@ -770,11 +770,12 @@ static int sandbox_touch_state_fn(int *x, int *y, void *ctx) {
  *   {"t":"adc_in","ch":3,"raw":2048}
  *   {"t":"uart_in","u":0,"hex":"68656c700a"}
  *   {"t":"uart_break","u":0}
+ *   {"t":"i2s_in","port":1,"hex":"0055aaff"}
  * Unknown shapes are silently ignored. */
 #include <fcntl.h>
 #include <unistd.h>
 
-static char   g_stdin_buf[4096];
+static char   g_stdin_buf[SBX_INPUT_BINARY_MAX * 2u + 256u];
 static size_t g_stdin_len = 0;
 static int    g_stdin_eof = 0;
 
@@ -807,6 +808,9 @@ static bool sandbox_process_line(esp32_periph_t *periph, const char *line) {
                                          event.uart.len) != 0u;
     case SBX_INPUT_UART_BREAK:
         return periph_uart_rx_break_num(periph, event.uart_break.port);
+    case SBX_INPUT_I2S:
+        return periph_i2s_rx_inject(periph, event.i2s.port,
+                                    event.i2s.data, event.i2s.len) != 0u;
     case SBX_INPUT_NONE:
         return false;
     }

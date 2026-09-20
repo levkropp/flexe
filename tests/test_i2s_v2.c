@@ -9,21 +9,24 @@
 #define S3_SYSTEM_CLK_EN0       0x600C0018u
 #define S3_SYSTEM_RST_EN0       0x600C0020u
 #define S3_SYSTEM_I2S0          (1u << 4)
+#define S3_SYSTEM_I2S1          (1u << 21)
 
 #define S3_I2S0_BASE            0x6000F000u
-#define S3_I2S_INT_RAW          (S3_I2S0_BASE + 0x00Cu)
-#define S3_I2S_INT_ST           (S3_I2S0_BASE + 0x010u)
-#define S3_I2S_INT_ENA          (S3_I2S0_BASE + 0x014u)
-#define S3_I2S_INT_CLR          (S3_I2S0_BASE + 0x018u)
-#define S3_I2S_RX_CONF          (S3_I2S0_BASE + 0x020u)
-#define S3_I2S_TX_CONF          (S3_I2S0_BASE + 0x024u)
-#define S3_I2S_RX_CONF1         (S3_I2S0_BASE + 0x028u)
-#define S3_I2S_TX_CONF1         (S3_I2S0_BASE + 0x02Cu)
-#define S3_I2S_RX_CLKM_CONF     (S3_I2S0_BASE + 0x030u)
-#define S3_I2S_TX_CLKM_CONF     (S3_I2S0_BASE + 0x034u)
-#define S3_I2S_RX_TDM_CTRL      (S3_I2S0_BASE + 0x050u)
-#define S3_I2S_TX_TDM_CTRL      (S3_I2S0_BASE + 0x054u)
-#define S3_I2S_DATE             (S3_I2S0_BASE + 0x080u)
+#define S3_I2S1_BASE            0x6002D000u
+#define S3_I2S_INT_RAW_OFF      0x00Cu
+#define S3_I2S_INT_ST_OFF       0x010u
+#define S3_I2S_INT_ENA_OFF      0x014u
+#define S3_I2S_INT_CLR_OFF      0x018u
+#define S3_I2S_RX_CONF_OFF      0x020u
+#define S3_I2S_TX_CONF_OFF      0x024u
+#define S3_I2S_RX_CONF1_OFF     0x028u
+#define S3_I2S_TX_CONF1_OFF     0x02Cu
+#define S3_I2S_RX_CLKM_CONF_OFF 0x030u
+#define S3_I2S_TX_CLKM_CONF_OFF 0x034u
+#define S3_I2S_RX_TDM_CTRL_OFF  0x050u
+#define S3_I2S_TX_TDM_CTRL_OFF  0x054u
+#define S3_I2S_DATE_OFF         0x080u
+#define S3_I2S0_REG(off)        (S3_I2S0_BASE + (off))
 
 #define S3_I2S_START            (1u << 2)
 #define S3_I2S_UPDATE           (1u << 8)
@@ -45,6 +48,7 @@
 #define S3_GDMA_DESC_EOF        (1u << 30)
 #define S3_GDMA_DESC_OWNER      (1u << 31)
 #define S3_GDMA_I2S0_TRIGGER    3u
+#define S3_GDMA_I2S1_TRIGGER    4u
 
 typedef struct {
     xtensa_mem_t *mem;
@@ -120,16 +124,20 @@ static uint32_t i2s_v2_service_next(i2s_v2_fixture_t *fixture)
     return deadline;
 }
 
-static void i2s_v2_configure_standard_clock(xtensa_mem_t *mem, bool receive)
+static void i2s_v2_configure_standard_clock(xtensa_mem_t *mem,
+                                            uint32_t base, bool receive)
 {
     uint32_t conf1 = (15u << 24u) | (15u << 13u) | (9u << 7u);
     uint32_t clkm = S3_I2S_CORE_CLK_EN | S3_I2S_CLK_SEL_160M |
                     S3_I2S_CLK_ACTIVE | 10u;
-    mem_write32(mem, receive ? S3_I2S_RX_CONF1 : S3_I2S_TX_CONF1,
+    mem_write32(mem, base + (receive ? S3_I2S_RX_CONF1_OFF :
+                                      S3_I2S_TX_CONF1_OFF),
                 conf1);
-    mem_write32(mem, receive ? S3_I2S_RX_TDM_CTRL : S3_I2S_TX_TDM_CTRL,
+    mem_write32(mem, base + (receive ? S3_I2S_RX_TDM_CTRL_OFF :
+                                      S3_I2S_TX_TDM_CTRL_OFF),
                 (1u << 16u) | 3u);
-    mem_write32(mem, receive ? S3_I2S_RX_CLKM_CONF : S3_I2S_TX_CLKM_CONF,
+    mem_write32(mem, base + (receive ? S3_I2S_RX_CLKM_CONF_OFF :
+                                      S3_I2S_TX_CLKM_CONF_OFF),
                 clkm);
 }
 
@@ -146,7 +154,8 @@ TEST(esp32s3_i2s_v2_streams_circular_tx_descriptors_at_audio_rate)
     i2s_v2_capture_t capture = {0};
     ASSERT_EQ(periph_set_i2s_tx_callback(
                   fixture.periph, 0, i2s_v2_capture, &capture), 0);
-    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S_DATE), 0x02009070u);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S0_REG(S3_I2S_DATE_OFF)),
+              0x02009070u);
     uint32_t unrelated_deadline =
         fixture.cpu.periph_next_event(&fixture.cpu);
 
@@ -163,11 +172,11 @@ TEST(esp32s3_i2s_v2_streams_circular_tx_descriptors_at_audio_rate)
     i2s_v2_descriptor(fixture.mem, descriptor1, buffer1, 8u, 8u, true,
                       descriptor0);
 
-    i2s_v2_configure_standard_clock(fixture.mem, false);
+    i2s_v2_configure_standard_clock(fixture.mem, S3_I2S0_BASE, false);
     mem_write32(fixture.mem, S3_GDMA_OUT_PERI_SEL, S3_GDMA_I2S0_TRIGGER);
     mem_write32(fixture.mem, S3_GDMA_OUT_LINK,
                 (descriptor0 & 0xFFFFFu) | S3_GDMA_OUT_LINK_START);
-    mem_write32(fixture.mem, S3_I2S_TX_CONF,
+    mem_write32(fixture.mem, S3_I2S0_REG(S3_I2S_TX_CONF_OFF),
                 S3_I2S_START | S3_I2S_UPDATE);
 
     /* The descriptor is ready, but the architectural SYSTEM gate owns the
@@ -207,7 +216,7 @@ TEST(esp32s3_i2s_v2_streams_circular_tx_descriptors_at_audio_rate)
     i2s_v2_fixture_destroy(&fixture);
 }
 
-TEST(esp32s3_i2s_v2_rx_uses_host_fifo_and_reports_completion)
+TEST(esp32s3_i2s_v2_port1_rx_waits_for_host_samples_and_reports_completion)
 {
     i2s_v2_fixture_t fixture;
     bool ready = i2s_v2_fixture_init(&fixture);
@@ -219,39 +228,47 @@ TEST(esp32s3_i2s_v2_rx_uses_host_fifo_and_reports_completion)
 
     mem_write32(fixture.mem, S3_SYSTEM_CLK_EN0,
                 mem_read32(fixture.mem, S3_SYSTEM_CLK_EN0) |
-                S3_SYSTEM_I2S0);
+                S3_SYSTEM_I2S1);
     const uint8_t input[] = {0x91u, 0x82u, 0x73u, 0x64u, 0x55u, 0x46u};
-    ASSERT_EQ(periph_i2s_rx_inject(
-                  fixture.periph, 0, input, sizeof(input)), sizeof(input));
-    ASSERT_EQ(periph_i2s_rx_pending(fixture.periph, 0), sizeof(input));
 
     const uint32_t descriptor = 0x3FC8F100u;
     const uint32_t buffer = 0x3FC90100u;
     i2s_v2_descriptor(fixture.mem, descriptor, buffer,
                       sizeof(input), 0u, true, 0u);
-    i2s_v2_configure_standard_clock(fixture.mem, true);
-    mem_write32(fixture.mem, S3_GDMA_IN_PERI_SEL, S3_GDMA_I2S0_TRIGGER);
+    i2s_v2_configure_standard_clock(fixture.mem, S3_I2S1_BASE, true);
+    mem_write32(fixture.mem, S3_GDMA_IN_PERI_SEL, S3_GDMA_I2S1_TRIGGER);
     mem_write32(fixture.mem, S3_GDMA_IN_LINK,
                 (descriptor & 0xFFFFFu) | S3_GDMA_IN_LINK_START);
-    mem_write32(fixture.mem, S3_I2S_INT_ENA, 1u);
-    periph_intr_matrix_set(fixture.periph, 0, 8, 25);
-    mem_write32(fixture.mem, S3_I2S_RX_CONF,
+    mem_write32(fixture.mem, S3_I2S1_BASE + S3_I2S_INT_ENA_OFF, 1u);
+    periph_intr_matrix_set(fixture.periph, 0, 8, 26);
+    uint32_t unrelated_deadline =
+        fixture.cpu.periph_next_event(&fixture.cpu);
+    mem_write32(fixture.mem, S3_I2S1_BASE + S3_I2S_RX_CONF_OFF,
                 S3_I2S_START | S3_I2S_UPDATE);
 
+    ASSERT_EQ(fixture.cpu.periph_next_event(&fixture.cpu),
+              unrelated_deadline);
+    ASSERT_EQ(mem_read32(fixture.mem, descriptor) & S3_GDMA_DESC_OWNER,
+              S3_GDMA_DESC_OWNER);
+    ASSERT_EQ(periph_i2s_rx_inject(
+                  fixture.periph, 1, input, sizeof(input)), sizeof(input));
+    ASSERT_EQ(periph_i2s_rx_pending(fixture.periph, 1), sizeof(input));
     ASSERT_EQ(i2s_v2_service_next(&fixture), 4800u);
-    ASSERT_EQ(periph_i2s_rx_pending(fixture.periph, 0), 0u);
+    ASSERT_EQ(periph_i2s_rx_pending(fixture.periph, 1), 0u);
     for (unsigned index = 0u; index < sizeof(input); index++)
         ASSERT_EQ(mem_read8(fixture.mem, buffer + index), input[index]);
     ASSERT_EQ((mem_read32(fixture.mem, descriptor) >> 12u) & 0xFFFu,
               sizeof(input));
     ASSERT_EQ(mem_read32(fixture.mem, descriptor) & S3_GDMA_DESC_OWNER, 0u);
     ASSERT_EQ(mem_read32(fixture.mem, S3_GDMA_IN_INT_RAW), 3u);
-    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S_INT_RAW), 1u);
-    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S_INT_ST), 1u);
-    ASSERT_TRUE(periph_interrupt_pending(fixture.periph, 25));
+    ASSERT_EQ(mem_read32(fixture.mem,
+                         S3_I2S1_BASE + S3_I2S_INT_RAW_OFF), 1u);
+    ASSERT_EQ(mem_read32(fixture.mem,
+                         S3_I2S1_BASE + S3_I2S_INT_ST_OFF), 1u);
+    ASSERT_TRUE(periph_interrupt_pending(fixture.periph, 26));
     ASSERT_EQ(fixture.cpu.interrupt & (1u << 8u), 1u << 8u);
-    mem_write32(fixture.mem, S3_I2S_INT_CLR, 1u);
-    ASSERT_FALSE(periph_interrupt_pending(fixture.periph, 25));
+    mem_write32(fixture.mem, S3_I2S1_BASE + S3_I2S_INT_CLR_OFF, 1u);
+    ASSERT_FALSE(periph_interrupt_pending(fixture.periph, 26));
     ASSERT_EQ(periph_unhandled_count(fixture.periph), 0u);
 
     i2s_v2_fixture_destroy(&fixture);
@@ -277,11 +294,11 @@ TEST(esp32s3_i2s_v2_system_reset_cancels_an_armed_stream)
     mem_write32(fixture.mem, S3_SYSTEM_CLK_EN0,
                 mem_read32(fixture.mem, S3_SYSTEM_CLK_EN0) |
                 S3_SYSTEM_I2S0);
-    i2s_v2_configure_standard_clock(fixture.mem, false);
+    i2s_v2_configure_standard_clock(fixture.mem, S3_I2S0_BASE, false);
     mem_write32(fixture.mem, S3_GDMA_OUT_PERI_SEL, S3_GDMA_I2S0_TRIGGER);
     mem_write32(fixture.mem, S3_GDMA_OUT_LINK,
                 (descriptor & 0xFFFFFu) | S3_GDMA_OUT_LINK_START);
-    mem_write32(fixture.mem, S3_I2S_TX_CONF, S3_I2S_START);
+    mem_write32(fixture.mem, S3_I2S0_REG(S3_I2S_TX_CONF_OFF), S3_I2S_START);
     ASSERT_TRUE(fixture.cpu.periph_next_event(&fixture.cpu) != UINT32_MAX);
 
     mem_write32(fixture.mem, S3_SYSTEM_RST_EN0,
@@ -289,9 +306,10 @@ TEST(esp32s3_i2s_v2_system_reset_cancels_an_armed_stream)
                 S3_SYSTEM_I2S0);
     ASSERT_EQ(fixture.cpu.periph_next_event(&fixture.cpu),
               unrelated_deadline);
-    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S_TX_CONF),
+    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S0_REG(S3_I2S_TX_CONF_OFF)),
               (1u << 15u) | (1u << 13u) | (1u << 12u) | (1u << 9u));
-    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S_DATE), 0x02009070u);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_I2S0_REG(S3_I2S_DATE_OFF)),
+              0x02009070u);
     ASSERT_EQ(periph_unhandled_count(fixture.periph), 0u);
 
     i2s_v2_fixture_destroy(&fixture);
@@ -301,6 +319,7 @@ void run_i2s_v2_tests(void)
 {
     TEST_SUITE("S3 I2S v2/GDMA");
     RUN_TEST(esp32s3_i2s_v2_streams_circular_tx_descriptors_at_audio_rate);
-    RUN_TEST(esp32s3_i2s_v2_rx_uses_host_fifo_and_reports_completion);
+    RUN_TEST(
+        esp32s3_i2s_v2_port1_rx_waits_for_host_samples_and_reports_completion);
     RUN_TEST(esp32s3_i2s_v2_system_reset_cancels_an_armed_stream);
 }
