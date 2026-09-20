@@ -136,16 +136,16 @@ static const flexe_target_desc_t TARGETS[] = {
             .window_count = 10u,
             .completion_count = 2u,
             .window = {
-                { 0x3FF45000u, 0x1000u }, /* FE2 */
-                { 0x3FF46000u, 0x1000u }, /* FE */
-                { 0x3FF4E000u, 0x1000u }, /* private PHY */
-                { 0x3FF51000u, 0x1000u }, /* BT */
-                { 0x3FF5C000u, 0x1000u }, /* private NRX + NRX */
-                { 0x3FF5D000u, 0x1000u }, /* BB */
-                { 0x3FF71000u, 0x1000u }, /* private BT */
-                { 0x3FF72000u, 0x1000u }, /* BT MAC */
-                { 0x3FF73000u, 0x2000u }, /* Wi-Fi MAC */
-                { 0x3FF75000u, 0x1000u }, /* WDEV */
+                { 0x3FF45000u, 0x1000u, 0u }, /* FE2 */
+                { 0x3FF46000u, 0x1000u, 0u }, /* FE */
+                { 0x3FF4E000u, 0x1000u, 0u }, /* private PHY */
+                { 0x3FF51000u, 0x1000u, 0u }, /* BT */
+                { 0x3FF5C000u, 0x1000u, 0u }, /* private NRX + NRX */
+                { 0x3FF5D000u, 0x1000u, 0u }, /* BB */
+                { 0x3FF71000u, 0x1000u, 0u }, /* private BT */
+                { 0x3FF72000u, 0x1000u, 0u }, /* BT MAC */
+                { 0x3FF73000u, 0x2000u, 0u }, /* Wi-Fi MAC */
+                { 0x3FF75000u, 0x1000u, 0u }, /* WDEV */
             },
             .completion = {
                 /* Wi-Fi MAC reset request bit 1 reports ready in bit 0. */
@@ -972,7 +972,6 @@ static const flexe_target_desc_t TARGETS[] = {
                         (3u << 16) | 0xFFu,
                     .reader_invert_mask = 1u << 29,
                     .mux_writable_mask = 0xF0000000u,
-                    .mux_unsupported_mask = 7u << 28,
                     .calibration_ground_mask = 1u << 7,
                     .mux_rtc_bypass_mask = 1u << 31,
                     .arbiter_controlled = true,
@@ -995,15 +994,17 @@ static const flexe_target_desc_t TARGETS[] = {
             .completion_count = 3u,
             .register_count = 1u,
             .window = {
-                { 0x60005000u, 0x1000u }, /* FE2 */
-                { 0x60006000u, 0x1000u }, /* FE */
-                { 0x60011000u, 0x1000u }, /* BT */
-                { 0x6001C000u, 0x1000u }, /* private NRX + NRX */
-                { 0x6001D000u, 0x1000u }, /* BB */
-                { 0x60031000u, 0x1000u }, /* private BT */
-                { 0x60032000u, 0x1000u }, /* BT MAC */
-                { 0x60033000u, 0x2000u }, /* Wi-Fi MAC */
-                { 0x60035000u, 0x1000u }, /* WDEV */
+                { 0x60005000u, 0x1000u, 1u << 1 }, /* FE2 */
+                { 0x60006000u, 0x1000u, 1u << 1 }, /* FE */
+                { 0x60011000u, 0x1000u,
+                  (1u << 3) | (1u << 13) },         /* BT BB */
+                { 0x6001C000u, 0x1000u, 1u << 0 }, /* private NRX + NRX */
+                { 0x6001D000u, 0x1000u, 1u << 0 }, /* Wi-Fi BB */
+                { 0x60031000u, 0x1000u, 1u << 11 },/* private BT registers */
+                { 0x60032000u, 0x1000u,
+                  (1u << 4) | (1u << 9) },          /* BT MAC */
+                { 0x60033000u, 0x2000u, 1u << 2 }, /* Wi-Fi MAC */
+                { 0x60035000u, 0x1000u, 1u << 2 }, /* WDEV */
             },
             .completion = {
                 /* ESP32-S3 rev-0 ROM rom_iq_est_enable writes enable bits
@@ -1015,6 +1016,7 @@ static const flexe_target_desc_t TARGETS[] = {
                     .active_mask = (1u << 1) | (1u << 0),
                     .status_address = 0x60006174u,
                     .status_mask = 1u << 16,
+                    .clock_mask = 1u << 22,
                 },
                 /* The S3 Wi-Fi HAL asserts MAC reset bit 1 and waits for
                  * the controller's ready response in bit 0. */
@@ -1023,6 +1025,10 @@ static const flexe_target_desc_t TARGETS[] = {
                     .active_mask = 1u << 1,
                     .status_address = 0x60033D14u,
                     .status_mask = 1u << 0,
+                    /* Espressif's S3 header names bit 6 as the Wi-Fi-only
+                     * clock even though an old generated aggregate macro
+                     * accidentally encodes that one-bit group as zero. */
+                    .clock_mask = 1u << 6,
                 },
                 /* The BLE link-layer controller starts its register-bank
                  * initialization by setting this command bit, then waits
@@ -1030,6 +1036,7 @@ static const flexe_target_desc_t TARGETS[] = {
                 {
                     .control_address = 0x60031000u,
                     .self_clear_mask = 1u << 31,
+                    .clock_mask = (1u << 16) | (1u << 17),
                 },
             },
             .reg = {
@@ -1044,14 +1051,29 @@ static const flexe_target_desc_t TARGETS[] = {
             },
             /* WDEV_RND_REG from the public ESP32-S3 register header. */
             .random_address = 0x6003507Cu,
+            .random_clock_mask = 1u << 15,
             .random_seed = UINT64_C(0x12345678ABCDEF01),
             .time_latch = {
                 .count_address = 0x6003101Cu,
                 .phase_address = 0x60031020u,
                 .capture_mask = 1u << 31,
                 .count_mask = 0x0FFFFFFFu,
+                .clock_mask = 1u << 11,
                 .tick_hz = 2000000u,
                 .ticks_per_half_slot = 625u,
+            },
+            .control = {
+                .base = 0x60026000u,
+                .register_size = 0x1000u,
+                .bb_config_offset = 0x00Cu,
+                .bb_config2_offset = 0x010u,
+                .clock_offset = 0x014u,
+                .reset_offset = 0x018u,
+                .bb_config_writable_mask = UINT32_MAX,
+                .bb_config2_writable_mask = UINT32_MAX,
+                .clock_reset = 0xFFFCE030u,
+                .clock_writable_mask = UINT32_MAX,
+                .reset_writable_mask = UINT32_MAX,
             },
         },
         .gdma = {

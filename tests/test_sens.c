@@ -325,8 +325,12 @@ TEST(sens_s3_rtc_adc_rejects_unmodeled_conversions)
     mem_write32(mem, measure, start | (1u << 19));
     ASSERT_EQ(mem_read32(mem, measure) & (1u << 16), 0u);
     ASSERT_EQ(fallback.writes, 3u); /* Digital controller is not RTC ADC. */
+    /* Power-detector capacitance is an ordinary retained analog tuning
+     * field. It does not fabricate an RF sample on the quiet-input model. */
     mem_write32(mem, desc->base + desc->adc_unit[1].mux_offset, 7u << 28);
-    ASSERT_EQ(fallback.writes, 4u); /* RF power-detector trim is not modeled. */
+    ASSERT_EQ(mem_read32(mem, desc->base +
+                        desc->adc_unit[1].mux_offset), 7u << 28);
+    ASSERT_EQ(fallback.writes, 3u);
 
     flexe_sens_destroy(sens);
     mem_destroy(mem);

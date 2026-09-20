@@ -53,7 +53,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 46u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 47u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -673,6 +673,10 @@ typedef struct {
 typedef struct {
     uint32_t base;
     uint32_t register_size;
+    /* A nonzero mask holds this aperture in reset while any selected modem
+     * reset bit is asserted. Ordinary words read their architectural reset
+     * state and ignore writes until reset is released. */
+    uint32_t reset_mask;
 } flexe_radio_window_desc_t;
 
 typedef struct {
@@ -681,6 +685,9 @@ typedef struct {
     uint32_t self_clear_mask;
     uint32_t status_address;
     uint32_t status_mask;
+    /* All selected modem clocks must run before the operation can complete.
+     * Zero keeps the operation independent of the optional control block. */
+    uint32_t clock_mask;
 } flexe_radio_completion_desc_t;
 
 /* Most private radio words are ordinary retained configuration. A small
@@ -701,9 +708,31 @@ typedef struct {
     uint32_t phase_address;
     uint32_t capture_mask;
     uint32_t count_mask;
+    uint32_t clock_mask;
     uint32_t tick_hz;
     uint16_t ticks_per_half_slot;
 } flexe_radio_time_latch_desc_t;
+
+/* Public SYSCON/APB control registers governing the private radio apertures.
+ * The surrounding page is intentionally not a generic retained window:
+ * unlisted registers continue through the diagnostic fallback until their
+ * own hardware behavior is modeled. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint16_t bb_config_offset;
+    uint16_t bb_config2_offset;
+    uint16_t clock_offset;
+    uint16_t reset_offset;
+    uint32_t bb_config_reset;
+    uint32_t bb_config_writable_mask;
+    uint32_t bb_config2_reset;
+    uint32_t bb_config2_writable_mask;
+    uint32_t clock_reset;
+    uint32_t clock_writable_mask;
+    uint32_t reset_reset;
+    uint32_t reset_writable_mask;
+} flexe_radio_control_desc_t;
 
 typedef struct {
     uint8_t window_count;
@@ -716,8 +745,10 @@ typedef struct {
     flexe_radio_register_desc_t
         reg[FLEXE_TARGET_RADIO_REGISTER_MAX];
     uint32_t random_address;
+    uint32_t random_clock_mask;
     uint64_t random_seed;
     flexe_radio_time_latch_desc_t time_latch;
+    flexe_radio_control_desc_t control;
 } flexe_radio_desc_t;
 
 /* General-purpose DMA v1 is the five-channel AHB DMA shared by several

@@ -21,12 +21,27 @@ struct flexe_radio {
     mmio_write_fn fallback_write;
     void *fallback_ctx;
     flexe_radio_window_t window[FLEXE_TARGET_RADIO_WINDOW_MAX];
+    uint32_t bb_config;
+    uint32_t bb_config2;
+    uint32_t clock_enable;
+    uint32_t reset_enable;
     uint64_t random_state;
     xtensa_cpu_t *cpu[2];
     flexe_radio_clock_t clock[2];
 };
 
 static uint32_t *radio_word(flexe_radio_t *radio, uint32_t address);
+
+static bool radio_clock_enabled(const flexe_radio_t *radio, uint32_t mask)
+{
+    return mask == 0u || (radio->clock_enable & mask) == mask;
+}
+
+static bool radio_control_offset_valid(uint16_t offset, uint32_t size)
+{
+    return (offset & 3u) == 0u && size >= sizeof(uint32_t) &&
+           offset <= size - sizeof(uint32_t);
+}
 
 static uint64_t radio_add_saturating(uint64_t a, uint64_t b)
 {
@@ -115,36 +130,97 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
                      FLEXE_TARGET_CAP_RADIO_REGS_V1))
         return false;
     const flexe_radio_desc_t *desc = &target->radio;
+    const flexe_radio_control_desc_t *control = &desc->control;
     if (desc->window_count == 0u ||
         desc->window_count > FLEXE_TARGET_RADIO_WINDOW_MAX ||
         desc->completion_count > FLEXE_TARGET_RADIO_COMPLETION_MAX ||
         desc->register_count > FLEXE_TARGET_RADIO_REGISTER_MAX)
         return false;
 
+    bool has_control = control->register_size != 0u;
+    if (!has_control) {
+        if (control->base != 0u || control->bb_config_offset != 0u ||
+            control->bb_config2_offset != 0u ||
+            control->clock_offset != 0u || control->reset_offset != 0u ||
+            control->bb_config_reset != 0u ||
+            control->bb_config_writable_mask != 0u ||
+            control->bb_config2_reset != 0u ||
+            control->bb_config2_writable_mask != 0u ||
+            control->clock_reset != 0u ||
+            control->clock_writable_mask != 0u ||
+            control->reset_reset != 0u ||
+            control->reset_writable_mask != 0u)
+            return false;
+    } else {
+        const uint16_t offsets[] = {
+            control->bb_config_offset,
+            control->bb_config2_offset,
+            control->clock_offset,
+            control->reset_offset,
+        };
+        if (((control->base | control->register_size) & 0xFFFu) != 0u ||
+            control->base < target->peripheral_start ||
+            control->base >= target->peripheral_end ||
+            control->register_size > target->peripheral_end - control->base ||
+            control->bb_config_writable_mask == 0u ||
+            control->bb_config2_writable_mask == 0u ||
+            control->clock_writable_mask == 0u ||
+            control->reset_writable_mask == 0u ||
+            (control->bb_config_reset &
+             ~control->bb_config_writable_mask) != 0u ||
+            (control->bb_config2_reset &
+             ~control->bb_config2_writable_mask) != 0u ||
+            (control->clock_reset & ~control->clock_writable_mask) != 0u ||
+            (control->reset_reset & ~control->reset_writable_mask) != 0u)
+            return false;
+        for (unsigned i = 0u;
+             i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+            if (!radio_control_offset_valid(offsets[i],
+                                            control->register_size))
+                return false;
+            for (unsigned j = 0u; j < i; j++)
+                if (offsets[i] == offsets[j]) return false;
+        }
+    }
+
+    uint32_t mapped_reset_mask = 0u;
     for (unsigned i = 0u; i < desc->window_count; i++) {
         const flexe_radio_window_desc_t *window = &desc->window[i];
         if (window->register_size == 0u ||
             ((window->base | window->register_size) & 0xFFFu) != 0u ||
             window->base < target->peripheral_start ||
             window->base >= target->peripheral_end ||
-            window->register_size > target->peripheral_end - window->base)
+            window->register_size > target->peripheral_end - window->base ||
+            (!has_control && window->reset_mask != 0u) ||
+            (has_control &&
+             (window->reset_mask & ~control->reset_writable_mask) != 0u))
             return false;
+        mapped_reset_mask |= window->reset_mask;
         for (unsigned j = 0u; j < i; j++) {
             const flexe_radio_window_desc_t *other = &desc->window[j];
             if (window->base < other->base + other->register_size &&
                 other->base < window->base + window->register_size)
                 return false;
         }
+        if (has_control &&
+            window->base < control->base + control->register_size &&
+            control->base < window->base + window->register_size)
+            return false;
     }
+    if (has_control && mapped_reset_mask == 0u) return false;
 
     if ((desc->random_address == 0u) != (desc->random_seed == 0u) ||
         (desc->random_address != 0u &&
-         !radio_address_in_window(desc, desc->random_address)))
+         !radio_address_in_window(desc, desc->random_address)) ||
+        (!has_control && desc->random_clock_mask != 0u) ||
+        (has_control &&
+         (desc->random_clock_mask & ~control->clock_writable_mask) != 0u))
         return false;
 
     const flexe_radio_time_latch_desc_t *latch = &desc->time_latch;
     if (latch->count_address != 0u || latch->phase_address != 0u ||
         latch->capture_mask != 0u || latch->count_mask != 0u ||
+        latch->clock_mask != 0u ||
         latch->tick_hz != 0u || latch->ticks_per_half_slot != 0u) {
         if (!radio_address_in_window(desc, latch->count_address) ||
             !radio_address_in_window(desc, latch->phase_address) ||
@@ -153,6 +229,9 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
             (latch->capture_mask & (latch->capture_mask - 1u)) != 0u ||
             latch->count_mask == 0u ||
             (latch->count_mask & latch->capture_mask) != 0u ||
+            (!has_control && latch->clock_mask != 0u) ||
+            (has_control &&
+             (latch->clock_mask & ~control->clock_writable_mask) != 0u) ||
             latch->tick_hz == 0u || latch->ticks_per_half_slot == 0u)
             return false;
     }
@@ -163,7 +242,11 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
         if (!radio_address_in_window(desc, completion->control_address) ||
             (completion->active_mask == 0u &&
              completion->self_clear_mask == 0u) ||
-            (completion->active_mask & completion->self_clear_mask) != 0u)
+            (completion->active_mask & completion->self_clear_mask) != 0u ||
+            (!has_control && completion->clock_mask != 0u) ||
+            (has_control &&
+             (completion->clock_mask &
+              ~control->clock_writable_mask) != 0u))
             return false;
         if (completion->active_mask != 0u) {
             if (completion->status_mask == 0u ||
@@ -205,32 +288,130 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
     return true;
 }
 
-static uint32_t *radio_word(flexe_radio_t *radio, uint32_t address)
+static int radio_window_index(const flexe_radio_desc_t *desc,
+                              uint32_t address)
 {
-    if ((address & 3u) != 0u) return NULL;
-    const flexe_radio_desc_t *desc = &radio->target->radio;
+    if ((address & 3u) != 0u) return -1;
     for (unsigned i = 0u; i < desc->window_count; i++) {
         uint32_t base = desc->window[i].base;
         if (address >= base &&
             address - base < desc->window[i].register_size)
-            return &radio->window[i].words[(address - base) / 4u];
+            return (int)i;
     }
-    return NULL;
+    return -1;
+}
+
+static uint32_t *radio_word(flexe_radio_t *radio, uint32_t address)
+{
+    const flexe_radio_desc_t *desc = &radio->target->radio;
+    int index = radio_window_index(desc, address);
+    if (index < 0) return NULL;
+    uint32_t base = desc->window[index].base;
+    return &radio->window[index].words[(address - base) / 4u];
+}
+
+static bool radio_window_in_reset(const flexe_radio_t *radio,
+                                  unsigned index)
+{
+    uint32_t mask = radio->target->radio.window[index].reset_mask;
+    return mask != 0u && (radio->reset_enable & mask) != 0u;
+}
+
+static void radio_reset_window(flexe_radio_t *radio, unsigned index)
+{
+    const flexe_radio_desc_t *desc = &radio->target->radio;
+    const flexe_radio_window_desc_t *window = &desc->window[index];
+    for (uint32_t word = 0u;
+         word < window->register_size / sizeof(uint32_t); word++)
+        radio->window[index].words[word] = 0u;
+
+    for (unsigned i = 0u; i < desc->register_count; i++) {
+        const flexe_radio_register_desc_t *reg = &desc->reg[i];
+        if (reg->address >= window->base &&
+            reg->address - window->base < window->register_size)
+            *radio_word(radio, reg->address) = reg->reset;
+    }
+    if (desc->random_address >= window->base &&
+        desc->random_address - window->base < window->register_size)
+        radio->random_state = desc->random_seed;
+}
+
+static bool radio_control_read(const flexe_radio_t *radio,
+                               uint32_t address, uint32_t *value)
+{
+    const flexe_radio_control_desc_t *control =
+        &radio->target->radio.control;
+    if (control->register_size == 0u || address < control->base ||
+        address - control->base >= control->register_size)
+        return false;
+    uint32_t offset = address - control->base;
+    if (offset == control->bb_config_offset) *value = radio->bb_config;
+    else if (offset == control->bb_config2_offset)
+        *value = radio->bb_config2;
+    else if (offset == control->clock_offset)
+        *value = radio->clock_enable;
+    else if (offset == control->reset_offset)
+        *value = radio->reset_enable;
+    else return false;
+    return true;
+}
+
+static bool radio_control_write(flexe_radio_t *radio,
+                                uint32_t address, uint32_t value)
+{
+    const flexe_radio_desc_t *desc = &radio->target->radio;
+    const flexe_radio_control_desc_t *control = &desc->control;
+    if (control->register_size == 0u || address < control->base ||
+        address - control->base >= control->register_size)
+        return false;
+    uint32_t offset = address - control->base;
+    if (offset == control->bb_config_offset) {
+        radio->bb_config =
+            (radio->bb_config & ~control->bb_config_writable_mask) |
+            (value & control->bb_config_writable_mask);
+    } else if (offset == control->bb_config2_offset) {
+        radio->bb_config2 =
+            (radio->bb_config2 & ~control->bb_config2_writable_mask) |
+            (value & control->bb_config2_writable_mask);
+    } else if (offset == control->clock_offset) {
+        radio->clock_enable =
+            (radio->clock_enable & ~control->clock_writable_mask) |
+            (value & control->clock_writable_mask);
+    } else if (offset == control->reset_offset) {
+        radio->reset_enable =
+            (radio->reset_enable & ~control->reset_writable_mask) |
+            (value & control->reset_writable_mask);
+        for (unsigned i = 0u; i < desc->window_count; i++)
+            if (radio_window_in_reset(radio, i))
+                radio_reset_window(radio, i);
+    } else {
+        return false;
+    }
+    return true;
 }
 
 static uint32_t radio_read(void *ctx, uint32_t address)
 {
     flexe_radio_t *radio = ctx;
     const flexe_radio_desc_t *desc = &radio->target->radio;
+    uint32_t control_value = 0u;
+    if (radio_control_read(radio, address, &control_value))
+        return control_value;
+    int window = radio_window_index(desc, address);
+    uint32_t *word = radio_word(radio, address);
+    if (word && window >= 0 && radio_window_in_reset(
+            radio, (unsigned)window))
+        return *word;
     if (address == desc->random_address) {
         /* Deterministic per-machine entropy keeps replay exact while retaining
          * the hardware contract that consecutive reads normally differ. */
-        radio->random_state ^= radio->random_state << 13;
-        radio->random_state ^= radio->random_state >> 7;
-        radio->random_state ^= radio->random_state << 17;
+        if (radio_clock_enabled(radio, desc->random_clock_mask)) {
+            radio->random_state ^= radio->random_state << 13;
+            radio->random_state ^= radio->random_state >> 7;
+            radio->random_state ^= radio->random_state << 17;
+        }
         return (uint32_t)radio->random_state;
     }
-    uint32_t *word = radio_word(radio, address);
     if (word) return *word;
     return radio->fallback_read ?
         radio->fallback_read(radio->fallback_ctx, address) : 0u;
@@ -240,20 +421,28 @@ static void radio_write(void *ctx, uint32_t address, uint32_t value)
 {
     flexe_radio_t *radio = ctx;
     const flexe_radio_desc_t *desc = &radio->target->radio;
+    if (radio_control_write(radio, address, value)) return;
+
+    int window = radio_window_index(desc, address);
+    uint32_t *word = radio_word(radio, address);
+    if (!word) {
+        if (radio->fallback_write)
+            radio->fallback_write(radio->fallback_ctx, address, value);
+        return;
+    }
+    if (window >= 0 && radio_window_in_reset(radio, (unsigned)window))
+        return;
+
     const flexe_radio_time_latch_desc_t *latch = &desc->time_latch;
     if (latch->count_address && address == latch->count_address) {
-        if (value & latch->capture_mask) radio_capture_time(radio);
+        if ((value & latch->capture_mask) &&
+            radio_clock_enabled(radio, latch->clock_mask))
+            radio_capture_time(radio);
         if (value != latch->capture_mask && radio->fallback_write)
             radio->fallback_write(radio->fallback_ctx, address, value);
         return;
     }
     if (latch->phase_address && address == latch->phase_address) {
-        if (radio->fallback_write)
-            radio->fallback_write(radio->fallback_ctx, address, value);
-        return;
-    }
-    uint32_t *word = radio_word(radio, address);
-    if (!word) {
         if (radio->fallback_write)
             radio->fallback_write(radio->fallback_ctx, address, value);
         return;
@@ -282,6 +471,7 @@ static void radio_write(void *ctx, uint32_t address, uint32_t value)
         const flexe_radio_completion_desc_t *completion =
             &desc->completion[i];
         if (completion->control_address != address) continue;
+        if (!radio_clock_enabled(radio, completion->clock_mask)) continue;
         *word &= ~completion->self_clear_mask;
         if (completion->active_mask == 0u) continue;
 
@@ -312,8 +502,14 @@ flexe_radio_t *flexe_radio_create(
     radio->fallback_write = fallback_write;
     radio->fallback_ctx = fallback_ctx;
     radio->random_state = target->radio.random_seed;
+    const flexe_radio_control_desc_t *control = &target->radio.control;
+    radio->bb_config = control->bb_config_reset;
+    radio->bb_config2 = control->bb_config2_reset;
+    radio->clock_enable = control->clock_reset;
+    radio->reset_enable = control->reset_reset;
 
     unsigned registered = 0u;
+    bool control_registered = false;
     for (unsigned i = 0u; i < target->radio.window_count; i++) {
         const flexe_radio_window_desc_t *window = &target->radio.window[i];
         radio->window[i].words =
@@ -326,6 +522,13 @@ flexe_radio_t *flexe_radio_create(
             goto fail;
         registered++;
     }
+    if (control->register_size != 0u) {
+        if (mem_register_mmio_range(mem, control->base,
+                                    control->register_size,
+                                    radio_read, radio_write, radio) != 0)
+            goto fail;
+        control_registered = true;
+    }
     for (unsigned i = 0u; i < target->radio.register_count; i++) {
         const flexe_radio_register_desc_t *reg = &target->radio.reg[i];
         *radio_word(radio, reg->address) = reg->reset;
@@ -333,6 +536,10 @@ flexe_radio_t *flexe_radio_create(
     return radio;
 
 fail:
+    if (control_registered)
+        (void)mem_register_mmio_range(
+            mem, control->base, control->register_size,
+            fallback_read, fallback_write, fallback_ctx);
     for (unsigned i = 0u; i < registered; i++) {
         const flexe_radio_window_desc_t *window = &target->radio.window[i];
         (void)mem_register_mmio_range(
@@ -363,6 +570,12 @@ void flexe_radio_destroy(flexe_radio_t *radio)
 {
     if (!radio) return;
     const flexe_radio_desc_t *desc = &radio->target->radio;
+    if (desc->control.register_size != 0u)
+        (void)mem_register_mmio_range(
+            radio->mem, desc->control.base,
+            desc->control.register_size,
+            radio->fallback_read, radio->fallback_write,
+            radio->fallback_ctx);
     for (unsigned i = 0u; i < desc->window_count; i++) {
         const flexe_radio_window_desc_t *window = &desc->window[i];
         (void)mem_register_mmio_range(

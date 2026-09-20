@@ -59,7 +59,7 @@ even when a firmware workflow succeeds.
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
-| S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response and next prompt | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
+| S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response and next prompt | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
 
 S3 UART0/1/2 now obey their independent
@@ -574,11 +574,12 @@ and its matching ELF SHA-256 is
 For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and
-321,352 pulse words in 13,601 chunks on channel 0. The interpreter and JIT
-match at every completed-frame boundary and finish with the same `8525660D`
-pulse-stream digest, CPU state, and firmware-visible time; 223 unsupported
-peripheral accesses remain. The JIT executes 1,779,976,162 of 1,817,717,178
-retired instructions natively (97.9%). Ordinary code in the target-described
+321,304 pulse words in 13,599 chunks on channel 0. The interpreter and JIT
+match at every completed-frame boundary and finish with the same `46F65AC5`
+pulse-stream digest, CPU state, and firmware-visible time; 74 unsupported
+peripheral accesses remain across 68 attributed sites. The JIT executes
+1,780,691,463 of 1,819,518,818 retired instructions natively (97.9%). Ordinary
+code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
 service hooks remain interpreter boundaries. This establishes sustained,
 engine-equivalent hardware-output progress, not correct colors on a physical
@@ -596,19 +597,32 @@ WLED-specific hooks. This removed 6,800 unsupported accesses from the pinned
 WLED run while preserving diagnostics outside the modeled bank. It does not
 simulate RF propagation, analog calibration noise, or physical SAR voltages.
 
+The radio model also composes the public S3
+[SYSCON modem controls](https://github.com/espressif/esp-idf/blob/v5.5.1/components/soc/esp32s3/register/soc/apb_ctrl_reg.h)
+at `0x6002600C..0x60026018` with those private apertures. The two baseband
+configuration words retain their writable state; target-described reset bits
+restore and hold only their selected FE, NRX/baseband, Bluetooth, Wi-Fi MAC,
+or WDEV banks; and the documented clock bits qualify IQ estimation, Wi-Fi MAC
+ready, Bluetooth register initialization, the random source, and the
+baseband-time latch. Unknown words on the same SYSCON page remain diagnostic.
+The SENS model now also retains the SAR2 power-detector capacitance trim while
+its quiet RF input continues to produce no fabricated sample. These are
+general register/domain relationships, not firmware-PC hooks or automatic
+radio success.
+
 On an Apple-silicon MacBook, a `Release`/LTO/native build completed three
-sequential interpreter runs in 11.36--12.19 seconds (1.37--1.47x real time)
-and three JIT runs in 7.23--7.33 seconds (2.27--2.31x). These are throughput
+alternating interpreter runs in 11.21--12.40 seconds (1.34--1.49x real time)
+and three JIT runs in 6.86--7.27 seconds (2.29--2.43x). These are throughput
 results for this pinned scenario, not cycle-accuracy claims; host load and
 thermal state still matter.
 
-In a separate unhandled-access audit of this WLED image, the busiest addresses
-outside the PHY aperture were `0x6002600C`, `0x60026014`, and `0x60026018`:
-Espressif identifies them as Wi-Fi baseband configuration, clock enable, and
-reset enable registers
-([S3 register definitions](https://github.com/espressif/esp-idf/blob/v5.5.1/components/soc/esp32s3/register/soc/apb_ctrl_reg.h)).
-They remain diagnostic until the radio subsystem has corresponding behavior;
-mere register readback would overstate hardware support.
+The same audit fell from 223 to 74 unsupported accesses when the modem-control
+behavior above replaced fallback handling. The remaining inventory is still
+visible: RTC power/configuration words in `0x60008000`, unmodeled SYSCON words
+such as `0x6002609C`, `0x600260A8`, and `0x600260B0`, SYSTEM/PCR and memory-
+protection setup in `0x600C0000`, plus two low-count startup writes at
+`0x600CE0D8` and `0x600CE0DC`. Flexe does not turn those accesses into generic
+readback merely to reach zero diagnostics.
 
 Recheck with the external image and ROM ELF:
 
@@ -760,11 +774,11 @@ the native Wi-Fi stack, completes its LED and absent-GPS delays, and prints the
 v1.16.0 command prompt without an assertion, watchdog, or software reset. The
 gate now requires nonzero native instruction retirement, so this path is
 exercised under the S3 JIT rather than merely with JIT-capable code present. Its
-unsupported-access ceiling is 248 after the shared internal analog/private-PHY
-model described below. The GPS probe makes the application-ready boundary
-occur near 5 billion aggregate cycles; the earlier 2-billion-cycle cutoff was
-a normal `WAITI` during those firmware delays, not a deadlock. Pin and replay
-that boundary with:
+unsupported-access ceiling is 109 after the shared internal analog/private-PHY
+and modem clock/reset models described below. The GPS probe makes the
+application-ready boundary occur near 5 billion aggregate cycles; the earlier
+2-billion-cycle cutoff was a normal `WAITI` during those firmware delays, not
+a deadlock. Pin and replay that boundary with:
 
 ```sh
 S3_MARAUDER_BIN=/path/to/esp32_marauder_v1_16_0_multiboardS3.bin \
@@ -775,7 +789,7 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 The gate keeps the general sandbox transport connected through the initial
 prompt, sends the bytes for `help\n` through UART0, checks the firmware's
 command header and a representative entry, and requires a second prompt.
-The accepted run retains an upper bound of 248 unsupported accesses so the
+The accepted run retains an upper bound of 109 unsupported accesses so the
 interaction cannot hide a register-model regression.
 
 This is a controller-bootstrap compatibility boundary, not a claim that

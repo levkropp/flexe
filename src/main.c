@@ -1757,11 +1757,6 @@ int main(int argc, char *argv[]) {
                 if (to_window < (uint64_t)n) n = (int)to_window;
             }
             int ran = flexe_session_run_core(session, 0, n);
-            /* If core 0 is stopped but core 1 is still running, count budget
-             * against core 1's batch (which will run inside post_batch). */
-            if (ran == 0 && !cpu->running && cpu1_any && cpu1_any->running) {
-                ran = n;
-            }
             cycles += ran;
 
             /* Event log: check exception after batch */
@@ -1802,8 +1797,16 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Preemptive timeslice + core 1 management */
-        flexe_session_post_batch(session, batch);
+        /* Preemptive timeslice + core 1 management. The -c limit is an
+         * aggregate dual-core budget, so core 1 may consume only what core 0
+         * left in this final outer iteration. Previously both cores received
+         * the whole remainder and the run overshot by an engine-dependent
+         * amount at a final WAITI boundary. */
+        uint64_t core1_room = cycles < max_cycles_u64
+                            ? max_cycles_u64 - cycles : 0u;
+        int core1_batch = core1_room < (uint64_t)batch
+                        ? (int)core1_room : batch;
+        flexe_session_post_batch(session, core1_batch);
 
         /* A session reset replaces peripheral and compatibility providers
          * while retaining the CPU and memory objects. Do not keep pointers
@@ -1826,7 +1829,7 @@ int main(int argc, char *argv[]) {
             uint32_t d1 = cpu1_any->ccount - prev_cc1;
             prev_cc1 = cpu1_any->ccount;
             if (!was_gpio_sleeping &&
-                d1 <= (uint32_t)batch * 4)   /* clamps ccount resets/xwsr */
+                d1 <= (uint32_t)core1_batch * 4) /* clamps resets/xwsr */
                 cycles += d1;
         }
 

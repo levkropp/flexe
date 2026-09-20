@@ -38,7 +38,7 @@ run_engine() {
 run_engine interp --no-jit
 run_engine jit --jit-stats
 
-expected='RMT TX0:    13601 chunks, 321352 items, 317 completions, fnv32=8525660D'
+expected='RMT TX0:    13599 chunks, 321304 items, 317 completions, fnv32=46F65AC5'
 for name in interp jit; do
     actual=$(awk '/^RMT TX0:/{print; exit}' "$tmpdir/$name.err")
     if [[ "$actual" != "$expected" ]]; then

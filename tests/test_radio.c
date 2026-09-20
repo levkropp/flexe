@@ -84,6 +84,15 @@ TEST(esp32s3_bt_register_init_command_is_consumed)
     }
 
     const uint32_t control = 0x60031000u;
+    const flexe_radio_control_desc_t *domain = &s3->radio.control;
+    uint32_t clock = domain->base + domain->clock_offset;
+    uint32_t command_clock = s3->radio.completion[2].clock_mask;
+    /* With the BT link-controller clocks stopped, the command remains
+     * pending instead of being consumed by hardware. */
+    mem_write32(mem, control, 0x81234567u);
+    ASSERT_EQ(mem_read32(mem, control), 0x81234567u);
+    mem_write32(mem, control, 0u);
+    mem_write32(mem, clock, mem_read32(mem, clock) | command_clock);
     mem_write32(mem, control, 0x81234567u);
     ASSERT_EQ(mem_read32(mem, control), 0x01234567u);
     mem_write32(mem, control, 0x89ABCDEFu);
@@ -152,7 +161,18 @@ TEST(esp32s3_wifi_mac_reset_reports_ready)
     }
 
     const uint32_t mac_init_control = 0x60033D14u;
+    const flexe_radio_control_desc_t *control = &s3->radio.control;
+    uint32_t clock = control->base + control->clock_offset;
     ASSERT_EQ(mem_read32(mem, mac_init_control), 0u);
+    mem_write32(mem, clock,
+                mem_read32(mem, clock) &
+                ~s3->radio.completion[1].clock_mask);
+    mem_write32(mem, mac_init_control, 1u << 1);
+    ASSERT_EQ(mem_read32(mem, mac_init_control) & 3u, 1u << 1);
+    mem_write32(mem, mac_init_control, 0u);
+    mem_write32(mem, clock,
+                mem_read32(mem, clock) |
+                s3->radio.completion[1].clock_mask);
     mem_write32(mem, mac_init_control, 1u << 1);
     ASSERT_EQ(mem_read32(mem, mac_init_control) & 3u, 3u);
     mem_write32(mem, mac_init_control, 0u);
@@ -197,6 +217,74 @@ TEST(esp32s3_wdev_random_source_is_deterministic_and_live)
     mem_destroy(mem_b);
 }
 
+TEST(esp32s3_modem_control_resets_only_selected_radio_domains)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_radio_control_desc_t *control = &s3->radio.control;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t bb_config = control->base + control->bb_config_offset;
+    uint32_t bb_config2 = control->base + control->bb_config2_offset;
+    uint32_t clock = control->base + control->clock_offset;
+    uint32_t reset = control->base + control->reset_offset;
+    ASSERT_EQ(mem_read32(mem, bb_config), control->bb_config_reset);
+    ASSERT_EQ(mem_read32(mem, bb_config2), control->bb_config2_reset);
+    ASSERT_EQ(mem_read32(mem, clock), control->clock_reset);
+    ASSERT_EQ(mem_read32(mem, reset), control->reset_reset);
+    mem_write32(mem, bb_config, 0x12345678u);
+    mem_write32(mem, bb_config2, 0x89ABCDEFu);
+    ASSERT_EQ(mem_read32(mem, bb_config), 0x12345678u);
+    ASSERT_EQ(mem_read32(mem, bb_config2), 0x89ABCDEFu);
+
+    const uint32_t fe_config = 0x60006090u;
+    const uint32_t bt_config = 0x60011020u;
+    const uint32_t private_bt_config = 0x6003120Cu;
+    const uint32_t wifi_config = 0x600340B8u;
+    mem_write32(mem, fe_config, 0x11111111u);
+    mem_write32(mem, bt_config, 0x22222222u);
+    mem_write32(mem, private_bt_config, 0x33333333u);
+    mem_write32(mem, wifi_config, 0x44444444u);
+
+    uint32_t selected_reset = s3->radio.window[1].reset_mask |
+                              s3->radio.window[5].reset_mask |
+                              s3->radio.window[7].reset_mask;
+    mem_write32(mem, reset, selected_reset);
+    ASSERT_EQ(mem_read32(mem, reset), selected_reset);
+    ASSERT_EQ(mem_read32(mem, fe_config), 0u);
+    ASSERT_EQ(mem_read32(mem, private_bt_config), 0u);
+    ASSERT_EQ(mem_read32(mem, wifi_config), 0u);
+    ASSERT_EQ(mem_read32(mem, bt_config), 0x22222222u);
+    /* A block held in reset ignores writes and retains reset state after the
+     * reset line is released. Unselected domains remain independent. */
+    mem_write32(mem, fe_config, UINT32_MAX);
+    mem_write32(mem, reset, 0u);
+    ASSERT_EQ(mem_read32(mem, fe_config), 0u);
+    ASSERT_EQ(mem_read32(mem, bt_config), 0x22222222u);
+
+    /* The public RNG clock freezes its deterministic sample stream. */
+    uint32_t random = s3->radio.random_address;
+    mem_write32(mem, clock,
+                mem_read32(mem, clock) & ~s3->radio.random_clock_mask);
+    uint32_t frozen = mem_read32(mem, random);
+    ASSERT_EQ(mem_read32(mem, random), frozen);
+    mem_write32(mem, clock,
+                mem_read32(mem, clock) | s3->radio.random_clock_mask);
+    ASSERT_TRUE(mem_read32(mem, random) != frozen);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock)
 {
     const flexe_target_desc_t *s3 =
@@ -220,6 +308,11 @@ TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock)
     const uint32_t count = s3->radio.time_latch.count_address;
     const uint32_t phase = s3->radio.time_latch.phase_address;
     const uint32_t capture = s3->radio.time_latch.capture_mask;
+    const flexe_radio_control_desc_t *control = &s3->radio.control;
+    uint32_t clock = control->base + control->clock_offset;
+    mem_write32(mem, clock,
+                mem_read32(mem, clock) |
+                s3->radio.time_latch.clock_mask);
     mem_write32(mem, count, capture);
     ASSERT_EQ(mem_read32(mem, count), 0u);
     ASSERT_EQ(mem_read32(mem, phase), 624u);
@@ -288,6 +381,23 @@ TEST(radio_rejects_absent_capability_and_overlapping_windows)
     radio = flexe_radio_create(mem, NULL, NULL, NULL);
     ASSERT_TRUE(radio == NULL);
     mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.radio.control.bb_config2_offset =
+        invalid.radio.control.bb_config_offset;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    radio = flexe_radio_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(radio == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.radio.control.base = invalid.radio.window[0].base;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    radio = flexe_radio_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(radio == NULL);
+    mem_destroy(mem);
 }
 
 static void run_radio_tests(void)
@@ -299,6 +409,7 @@ static void run_radio_tests(void)
     RUN_TEST(esp32s3_rom_iq_estimation_completes_from_control_protocol);
     RUN_TEST(esp32s3_wifi_mac_reset_reports_ready);
     RUN_TEST(esp32s3_wdev_random_source_is_deterministic_and_live);
+    RUN_TEST(esp32s3_modem_control_resets_only_selected_radio_domains);
     RUN_TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock);
     RUN_TEST(radio_rejects_absent_capability_and_overlapping_windows);
 }

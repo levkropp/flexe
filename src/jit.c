@@ -3761,6 +3761,16 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     emit_fwd_barrier(&e);   /* chained blocks enter here */
     uint8_t *chain_entry = e.ptr;
 
+    /* A chained predecessor may have consumed the complete scheduler/timer
+     * horizon. Check the next whole block before any of its entry guards:
+     * the register-window collision guard below can itself take a precise
+     * guest exception, so placing the cap after it let that instruction run
+     * one step beyond the caller's batch. Direct entries which do not fit
+     * return zero and are retried by the interpreter. */
+    int entry_cap_ok = emit_acc_cap_jcc(&e, (unsigned)scan->count);
+    emit_jmp_to_epilogue(&e, jit);
+    emit_patch_rel32(&e, entry_cap_ok);
+
     /* Native blocks address the physical AR file directly, so they must test
      * register-window collisions before touching an aliased high register.
      * Determine the highest adjacent window this block's actual operands
@@ -3871,20 +3881,17 @@ static jit_block_fn jit_compile_block(jit_state_t *jit, xtensa_cpu_t *cpu,
     emit_fwd_barrier(&e);   /* the native back-edge enters here */
     uint8_t *loop_entry = e.ptr;
 
-    /* The dispatcher folds the ordinary JIT_CHAIN_CAP together with its
-     * scheduler room and nearest timer into one limit. Every static, dynamic,
-     * and self-loop chain reaches this check before executing its successor;
-     * interrupt or timer-schedule changes lower the limit to zero. This keeps
-     * the boundary architectural without rebuilding ccount/IRQ state in every
-     * hot block. */
-    int cap_ok = emit_acc_cap_jcc(&e, (unsigned)scan->count);
-    /* The self-loop form has to write its registers back before leaving, and
-     * which ones are dirty is only known once the body is emitted, so its
-     * exit is deferred to a stub after the body. */
+    /* Native self-loop back-edges re-enter below the external entry check so
+     * resident guest registers stay in host registers. Recheck their horizon
+     * here on every iteration. The failing exit must flush those registers;
+     * which ones are dirty is only known once the body is emitted, so it is
+     * deferred to a stub after the body. */
     int cap_fail = -1;
-    if (self_loop) cap_fail = emit_jmp_rel32(&e);
-    else           emit_jmp_to_epilogue(&e, jit);
-    emit_patch_rel32(&e, cap_ok);
+    if (self_loop) {
+        int cap_ok = emit_acc_cap_jcc(&e, (unsigned)scan->count);
+        cap_fail = emit_jmp_rel32(&e);
+        emit_patch_rel32(&e, cap_ok);
+    }
 
     /* Deferred side exits for conditional branches */
     side_exit_t sx[JIT_MAX_BLOCK_INSNS];

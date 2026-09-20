@@ -839,6 +839,15 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->regi2c.indexed_memory.status_offset, 0x168u);
     ASSERT_EQ(s3->regi2c.indexed_memory.result_offset, 0x170u);
     ASSERT_EQ(s3->regi2c.indexed_memory.word_count, 256u);
+    ASSERT_EQ(s3->radio.control.base, 0x60026000u);
+    ASSERT_EQ(s3->radio.control.bb_config_offset, 0x00Cu);
+    ASSERT_EQ(s3->radio.control.clock_offset, 0x014u);
+    ASSERT_EQ(s3->radio.control.reset_offset, 0x018u);
+    ASSERT_EQ(s3->radio.control.clock_reset, 0xFFFCE030u);
+    ASSERT_EQ(s3->radio.window[0].reset_mask, 1u << 1);
+    ASSERT_EQ(s3->radio.window[4].reset_mask, 1u << 0);
+    ASSERT_EQ(s3->radio.window[7].reset_mask, 1u << 2);
+    ASSERT_EQ(s3->radio.random_clock_mask, 1u << 15);
     ASSERT_EQ(s3->sensitive_memprot.base, 0x600C1000u);
     ASSERT_EQ(s3->sensitive_memprot.register_size, 0x1000u);
     ASSERT_EQ(s3->systimer.base, 0x60023000u);

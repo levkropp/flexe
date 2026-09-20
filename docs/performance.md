@@ -58,13 +58,19 @@ WLED address; unsafe or unfamiliar calls continue in the guest.
 The pinned WLED 16.0.1 ESP32-S3 4M QSPI scenario was measured on 2026-09-19
 on an Apple-silicon MacBook with a `Release`, LTO, host-native build. Each run
 executed 4 billion aggregate cycles (16.667 nominal ESP32 seconds) and had to
-match all 317 completed RMT frames, 13,601 chunks, 321,352 pulse words, final
-CPU/time state, and the `8525660D` pulse digest:
+match all 317 completed RMT frames, 13,599 chunks, 321,304 pulse words, final
+CPU/time state, and the `46F65AC5` pulse digest:
 
 | Engine | Three wall-time samples | Real-time range | Native coverage |
 |---|---:|---:|---:|
-| Interpreter | 11.36, 11.96, 12.19 s | 1.37--1.47x | n/a |
-| JIT | 7.23, 7.32, 7.33 s | 2.27--2.31x | 97.9% |
+| Interpreter | 11.21, 12.13, 12.40 s | 1.34--1.49x | n/a |
+| JIT | 6.86, 7.17, 7.27 s | 2.29--2.43x | 97.9% |
+
+Both engines retired exactly 1,819,518,818 instructions and stopped on the
+4,000,000,000-cycle aggregate boundary. The JIT retired 1,780,691,463 of
+those instructions natively. Its chained-block horizon is checked before
+entry guards that can raise a precise LX7 window exception, so a final short
+timeslice cannot retire one instruction beyond the frontend budget.
 
 The JIT now translates ordinary code in every target-described executable
 range, including unhooked mask-ROM code. The scanner still asks the exact ROM

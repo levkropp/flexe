@@ -1300,11 +1300,10 @@ TEST(test_jit_chained_run_accounts_every_block) {
     /* Virtual time must advance by exactly what the run reports. */
     ASSERT_EQ64(cycles_after - cycles_before, (uint64_t)ran);
 
-    /* The cap must bound the run: an infinite guest loop whose chain never
-     * re-checks the budget never returns here. Overshoot is limited to the
-     * final block, which the cap can only observe at its exit. */
-    ASSERT_TRUE(ran >= budget);
-    ASSERT_TRUE(ran <= budget + JIT_CHAIN_CAP + JIT_MAX_BLOCK_INSNS);
+    /* The native horizon admits only complete blocks which fit. If the next
+     * block is too large, the dispatcher retires the remaining instructions
+     * without crossing the caller's exact budget. */
+    ASSERT_EQ(ran, budget);
 
     /* Guard against the case degenerating into interpreted stepping, which
      * would not exercise chained accounting at all: one dispatch has to
@@ -1312,6 +1311,54 @@ TEST(test_jit_chained_run_accounts_every_block) {
     const jit_stats_t *stats = jit_get_stats(jit);
     ASSERT_TRUE(stats->insns_jitted >= (uint64_t)budget);
     ASSERT_TRUE(stats->blocks_executed < iterations);
+
+    jit_destroy(jit);
+    teardown(&cpu);
+}
+
+/* Entry guards are part of the guest instruction they protect. A predecessor
+ * which exactly consumes the native span must stop before a chained block's
+ * window-collision guard; otherwise that guard can raise the next
+ * instruction's exception beyond the scheduler budget. */
+TEST(test_jit_chain_budget_precedes_successor_window_guard) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    const uint32_t target = BASE + 5u;
+
+    put_insn2(&cpu, BASE, narrow(0xD, 15, 0, 3)); /* NOP.N */
+    put_insn3(&cpu, BASE + 2u, rrr(4, 0, 8, 0, 1)); /* ROTW 1 */
+    put_insn3(&cpu, target, rrr(1, 0, 12, 12, 12)); /* AND a12,a12,a12 */
+    put_insn2(&cpu, target + 3u, narrow(0xD, 15, 0, 0)); /* RET.N */
+
+    jit_state_t *jit = jit_init();
+    ASSERT_TRUE(jit != NULL);
+    jit_install_hook(jit, &cpu);
+
+    cpu.windowbase = 1u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, target);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, target) != NULL);
+
+    cpu.windowbase = 0u;
+    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+        (void)jit_get_block(jit, &cpu, BASE);
+    ASSERT_TRUE(jit_get_block(jit, &cpu, BASE) != NULL);
+    ASSERT_TRUE(jit_get_stats(jit)->chains_patched > 0u);
+
+    cpu.real_window_vectors = true;
+    cpu.vecbase = BASE;
+    cpu.ps = 1u << 18; /* WOE, outside an exception */
+    cpu.windowstart = (1u << 0) | (1u << 1) |
+                      (1u << 2) | (1u << 4);
+    cpu.pc = BASE;
+    cpu._pc_written = true;
+    cpu.running = true;
+
+    ASSERT_EQ(xtensa_run(&cpu, 2), 2);
+    ASSERT_EQ(cpu.pc, target);
+    ASSERT_EQ(cpu.windowbase, 1u);
+    ASSERT_TRUE(!XT_PS_EXCM(cpu.ps));
+    ASSERT_EQ(cpu.epc[0], 0u);
 
     jit_destroy(jit);
     teardown(&cpu);
@@ -3992,6 +4039,7 @@ static void run_jit_tests(void) {
     RUN_TEST(test_jit_stale_loop_past_lend_does_not_truncate_block);
     RUN_TEST(test_jit_contended_spinlock_returns_to_scheduler);
     RUN_TEST(test_jit_chained_run_accounts_every_block);
+    RUN_TEST(test_jit_chain_budget_precedes_successor_window_guard);
     RUN_TEST(test_jit_loop_backedge_dispatches_native_body);
     RUN_TEST(test_jit_loop_fallthrough_dispatches_first_body);
     RUN_TEST(test_jit_compiles_loop_setup_family);
