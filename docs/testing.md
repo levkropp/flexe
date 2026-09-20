@@ -81,9 +81,12 @@ Configuration:
 | `ARDUINO_CLI` | Arduino CLI executable |
 | `FLEXE_ARDUINO_CONFIG` | Optional Arduino CLI config file |
 | `FLEXE_ARDUINO_FQBN` | Board and menu configuration |
+| `ARDUINO_BUILD_CACHE_PATH` | Persistent compiled-core cache root |
 | `FLEXE_BUILD_DIR` | Configured host CMake build directory |
 | `FLEXE_FIXTURE_BUILD_ROOT` | Fixture build root, or `temporary` for disposable builds |
 | `FLEXE_FIXTURE_REBUILD` | Set to `1` to ignore valid cached fixture firmware |
+| `FLEXE_FIXTURE_BUILD_JOBS` | Concurrent cache-miss builds; host-aware by default |
+| `FLEXE_FIXTURE_GATE_JOBS` | Concurrent fixture gates; host-aware by default |
 | `FLEXE_FIXTURE_ENGINE_JOBS` | `2` (default) runs JIT and interpreter together; `1` serializes them |
 
 Compiled sketch outputs persist under `FLEXE_BUILD_DIR/arduino-fixtures` by
@@ -91,10 +94,13 @@ default, and a content fingerprint covers the fixture source, FQBN,
 optimization, Arduino CLI and installed core versions, executable wrapper,
 and explicit config. An unchanged focused rerun skips Arduino CLI entirely
 instead of merely asking it to rediscover an unchanged dependency graph. A
-cache miss leaves the intermediate build path under Arduino CLI's shared
-compilation cache, so multiple changed fixtures reuse the same compiled core.
-The two execution engines read the same immutable artifacts and run in parallel
-by default, with separately captured logs so CI diagnostics remain ordered.
+toolchain/FQBN cache miss primes one persistent compiled-core archive, then
+independent sketches build through a bounded pool. Per-sketch intermediate
+trees are discarded after their final image and ELF are retained, avoiding
+roughly 20 MiB of cache growth per fixture. After every mutable build completes,
+independent gates use a second bounded pool; each gate runs its JIT and
+interpreter together, and logs remain in request order. Set all three job
+variables to `1` for completely serialized diagnosis.
 Set `FLEXE_FIXTURE_BUILD_ROOT` to another directory to isolate a
 board/toolchain configuration, or to `temporary` for a clean disposable
 build.

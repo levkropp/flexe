@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Bounded process pool for independent firmware gates. Source this file from a
-# fixture builder after all mutable build work is complete, then submit gates
-# that only read immutable artifacts. Each gate already runs its interpreter
-# and JIT together, so the default reserves two logical CPUs per gate and caps
-# the pool to keep emulator address spaces from dominating host memory.
+# Bounded process pool for independent fixture work. S3 builders use it after
+# all mutable builds are complete; the classic builder also uses it for
+# cache-miss compiles after priming its shared core. Each behavior gate already
+# runs interpreter and JIT together, so its default reserves two logical CPUs
+# and caps concurrency to keep emulator address spaces from dominating memory.
 
-flexe_fixture_gate_default_jobs() {
-    local processors jobs
+flexe_fixture_processor_count() {
+    local processors
     processors=1
     if [[ "$(uname -s 2>/dev/null || true)" == Darwin ]] &&
        command -v sysctl >/dev/null 2>&1; then
@@ -19,6 +19,12 @@ flexe_fixture_gate_default_jobs() {
     case "$processors" in
     ''|*[!0-9]*|0) processors=1 ;;
     esac
+    printf '%s\n' "$processors"
+}
+
+flexe_fixture_gate_default_jobs() {
+    local processors jobs
+    processors=$(flexe_fixture_processor_count)
     jobs=$((processors / 2))
     [[ "$jobs" -ge 1 ]] || jobs=1
     [[ "$jobs" -le 4 ]] || jobs=4
@@ -31,6 +37,30 @@ flexe_fixture_gate_jobs() {
     case "$jobs" in
     ''|*[!0-9]*|0)
         echo "error: FLEXE_FIXTURE_GATE_JOBS must be a positive integer" >&2
+        return 2
+        ;;
+    esac
+    printf '%s\n' "$jobs"
+}
+
+# An Arduino/ESP-IDF compiler already parallelizes within one firmware build.
+# Give each outer build at least three logical CPUs, while still allowing
+# independent cache misses to overlap on larger developer machines.
+flexe_fixture_build_default_jobs() {
+    local processors jobs
+    processors=$(flexe_fixture_processor_count)
+    jobs=$((processors / 3))
+    [[ "$jobs" -ge 1 ]] || jobs=1
+    [[ "$jobs" -le 4 ]] || jobs=4
+    printf '%s\n' "$jobs"
+}
+
+flexe_fixture_build_jobs() {
+    local jobs=${FLEXE_FIXTURE_BUILD_JOBS:-$(
+        flexe_fixture_build_default_jobs)}
+    case "$jobs" in
+    ''|*[!0-9]*|0)
+        echo "error: FLEXE_FIXTURE_BUILD_JOBS must be a positive integer" >&2
         return 2
         ;;
     esac
@@ -61,14 +91,15 @@ flexe_fixture_gate_pool_init() {
 }
 
 flexe_fixture_gate_pool_submit() {
-    local label=$1 token index log
+    local label=$1 token index log verb
     shift
     IFS= read -r token <&9
     index=${#FLEXE_GATE_POOL_PIDS[@]}
     log=$FLEXE_GATE_POOL_DIR/$index.log
     FLEXE_GATE_POOL_LABELS+=("$label")
     FLEXE_GATE_POOL_LOGS+=("$log")
-    echo "==> checking $label"
+    verb=${FLEXE_FIXTURE_POOL_VERB:-checking}
+    echo "==> $verb $label"
     (
         local status=0
         "$@" >"$log" 2>&1 || status=$?
@@ -89,11 +120,44 @@ flexe_fixture_gate_pool_cleanup() {
     FLEXE_GATE_POOL_ACTIVE=0
 }
 
+flexe_fixture_process_tree_signal() {
+    local signal=$1 pid=$2 child
+    local children=()
+    if command -v pgrep >/dev/null 2>&1; then
+        while IFS= read -r child; do
+            [[ -n "$child" ]] && children+=("$child")
+        done < <(pgrep -P "$pid" 2>/dev/null || true)
+    fi
+    kill -s "$signal" "$pid" 2>/dev/null || true
+    for child in "${children[@]}"; do
+        flexe_fixture_process_tree_signal "$signal" "$child"
+    done
+}
+
 flexe_fixture_gate_pool_abort() {
-    local pid
+    local pid attempt alive
     [[ "${FLEXE_GATE_POOL_ACTIVE:-0}" -eq 1 ]] || return 0
     for pid in "${FLEXE_GATE_POOL_PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+        flexe_fixture_process_tree_signal TERM "$pid"
+    done
+    # A gate may have installed a TERM trap that only removes temporary files.
+    # Bound shutdown so such a child cannot keep CI or an interrupted local
+    # validation alive indefinitely, then reap every wrapper below.
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        alive=0
+        for pid in "${FLEXE_GATE_POOL_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                alive=1
+                break
+            fi
+        done
+        [[ "$alive" -eq 1 ]] || break
+        sleep 0.05
+    done
+    for pid in "${FLEXE_GATE_POOL_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            flexe_fixture_process_tree_signal KILL "$pid"
+        fi
     done
     for pid in "${FLEXE_GATE_POOL_PIDS[@]}"; do
         wait "$pid" 2>/dev/null || true
@@ -102,8 +166,9 @@ flexe_fixture_gate_pool_abort() {
 }
 
 flexe_fixture_gate_pool_wait() {
-    local index status gate_status
+    local index status gate_status verb
     status=0
+    verb=${FLEXE_FIXTURE_POOL_VERB:-checking}
     for index in "${!FLEXE_GATE_POOL_PIDS[@]}"; do
         gate_status=0
         if wait "${FLEXE_GATE_POOL_PIDS[$index]}"; then
@@ -114,7 +179,7 @@ flexe_fixture_gate_pool_wait() {
         fi
         cat "${FLEXE_GATE_POOL_LOGS[$index]}"
         if [[ "$gate_status" -ne 0 ]]; then
-            echo "error: ${FLEXE_GATE_POOL_LABELS[$index]} gate failed "\
+            echo "error: $verb ${FLEXE_GATE_POOL_LABELS[$index]} failed "\
 "with status $gate_status" >&2
         fi
     done
