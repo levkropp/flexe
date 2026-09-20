@@ -139,6 +139,7 @@ int main(int argc, char **argv)
     run_apb_saradc_tests();
     run_radio_tests();
     run_esp32s3_extmem_tests();
+    run_assist_debug_tests();
     run_sensitive_memprot_tests();
     run_system_clock_tests();
     run_syscon_memory_tests();

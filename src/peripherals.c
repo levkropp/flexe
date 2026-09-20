@@ -1,5 +1,6 @@
 #include "peripherals.h"
 #include "target.h"
+#include "assist_debug.h"
 #include "apb_saradc.h"
 #include "esp32s3_extmem.h"
 #include "efuse.h"
@@ -1851,6 +1852,7 @@ struct esp32_periph {
     flexe_radio_t *radio_regs;
     flexe_sens_t *target_sens;
     flexe_apb_saradc_t *target_apb_saradc;
+    flexe_assist_debug_t *assist_debug;
     flexe_sensitive_memprot_t *sensitive_memprot;
     flexe_syscon_memory_t *syscon_memory;
     flexe_system_clock_t *system_clock;
@@ -14688,6 +14690,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_ASSIST_DEBUG_V1) {
+        p->assist_debug = flexe_assist_debug_create(
+            mem, default_read, default_write, p);
+        if (!p->assist_debug) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_SYSTIMER_V1) {
         p->systimer = flexe_systimer_create(
             mem, default_read, default_write, p,
@@ -15240,6 +15251,7 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_timer_group_destroy(p->target_timer_group);
     flexe_systimer_destroy(p->systimer);
+    flexe_assist_debug_destroy(p->assist_debug);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
     flexe_rtc_cntl_set_digital_domain_listener(
@@ -15937,6 +15949,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     flexe_rmt_v1_attach_cpus(p->rmt_v1, cpu0, cpu1);
     flexe_radio_attach_cpus(p->radio_regs, cpu0, cpu1);
     flexe_rtc_cntl_attach_cpus(p->target_rtc_cntl, cpu0, cpu1);
+    flexe_assist_debug_attach_cpus(p->assist_debug, cpu0, cpu1);
 
     bool classic = (p->target->capabilities &
                     FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;

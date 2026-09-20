@@ -57,7 +57,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 54u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 55u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -92,6 +92,7 @@ typedef enum {
     FLEXE_TARGET_CAP_RTC_IO_V1                    = 1ull << 26,
     FLEXE_TARGET_CAP_LEDC_V1                      = 1ull << 27,
     FLEXE_TARGET_CAP_SYSCON_MEMORY_V1             = 1ull << 28,
+    FLEXE_TARGET_CAP_ASSIST_DEBUG_V1               = 1ull << 29,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -982,6 +983,26 @@ typedef struct {
     uint32_t register_size;
 } flexe_sensitive_memprot_desc_t;
 
+/* Per-core CPU debug recorder found on S2/S3-generation parts. V1 describes
+ * the independent enable/recording controls and the live-or-frozen PC/SP
+ * record exposed by the ESP32-S3 layout. Other ASSIST_DEBUG functions remain
+ * separate so a target cannot acquire range-watch semantics accidentally. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t core_stride;
+    uint32_t pdebug_enable_offset;
+    uint32_t recording_offset;
+    uint32_t pc_offset;
+    uint32_t sp_offset;
+    uint32_t pdebug_enable_mask;
+    uint32_t recording_mask;
+    uint32_t date_offset;
+    uint32_t date_reset;
+    uint32_t date_writable_mask;
+    uint8_t  core_count;
+} flexe_assist_debug_desc_t;
+
 /* System-timer IP used by newer ESP32-family SoCs. V1 has two 52-bit
  * counters and three comparators; counts and field widths remain described
  * so machine construction rejects an incompatible target rather than
@@ -1264,6 +1285,9 @@ struct flexe_target_desc {
 
     /* Optional SENSITIVE v1 memory-protection configuration block. */
     flexe_sensitive_memprot_desc_t sensitive_memprot;
+
+    /* Optional per-core processor-debug recorder. */
+    flexe_assist_debug_desc_t       assist_debug;
 
     /* Optional V1 system-timer register block. */
     flexe_systimer_desc_t         systimer;

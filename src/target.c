@@ -317,6 +317,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_RMT_V1 |
                         FLEXE_TARGET_CAP_LEDC_V1 |
                         FLEXE_TARGET_CAP_SYSCON_MEMORY_V1 |
+                        FLEXE_TARGET_CAP_ASSIST_DEBUG_V1 |
                         FLEXE_TARGET_CAP_APB_SARADC_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
@@ -1243,6 +1244,21 @@ static const flexe_target_desc_t TARGETS[] = {
         .sensitive_memprot = {
             .base = 0x600C1000u,
             .register_size = 0x1000u,
+        },
+        .assist_debug = {
+            .base = 0x600CE000u,
+            .register_size = 0x1000u,
+            .core_stride = 0x090u,
+            .pdebug_enable_offset = 0x048u,
+            .recording_offset = 0x04Cu,
+            .pc_offset = 0x05Cu,
+            .sp_offset = 0x06Cu,
+            .pdebug_enable_mask = 0x00000001u,
+            .recording_mask = 0x00000001u,
+            .date_offset = 0x1FCu,
+            .date_reset = 0x02003040u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            .core_count = 2u,
         },
         .systimer = {
             .base = 0x60023000u,

@@ -71,6 +71,9 @@ Both engines retired exactly 1,819,518,818 instructions and stopped on the
 those instructions natively. Its chained-block horizon is checked before
 entry guards that can raise a precise LX7 window exception, so a final short
 timeslice cannot retire one instruction beyond the frontend budget.
+The 2026-09-20 unsupported-MMIO audit of the same run reports zero sites; the
+dual-core ASSIST_DEBUG recorder is read on demand and adds no dispatch-loop
+work.
 
 The JIT now translates ordinary code in every target-described executable
 range, including unhooked mask-ROM code. The scanner still asks the exact ROM

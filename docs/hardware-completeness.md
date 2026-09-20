@@ -55,6 +55,7 @@ even when a firmware workflow succeeds.
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_esp32s3_extmem.c`, WLED production audit | Cache-array/internal-SRAM ownership has exact reset, masking, locks, and semantic state; protection configuration retains documented policy. Cache topology/timing and access-fault generation remain unsupported. |
+| S3 CPU assist/debug recorder | Partial (MMIO) | `tests/test_assist_debug.c`, zero-site WLED production audit | Both cores implement target-described PDEBUG enable, live/frozen PC and SP recording, and silicon DATE behavior without an instruction-loop hook. Detailed debug-bus payload, stack/area watchpoints, exception records, and trace memory remain diagnostic. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (supply, analog-control and power/isolation-domain resolution, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; OPTIONS0, ANA_CONF, digital-pad/global isolation, digital domains, and RTC-local domains publish normalized state, with selected consumers connected. Brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
@@ -674,6 +675,17 @@ consumers. This removed all eight accesses at `0x600C1004` and `0x600C1014`
 from WLED without pretending that selecting banks already models cache
 topology or latency.
 
+The target-described ASSIST_DEBUG recorder implements the independent
+PDEBUG-enable and recording controls for both S3 cores. While both controls
+are set, its PC and architectural SP registers reflect live emulator state;
+clearing either control freezes the latest pair for the crash-record path.
+The model also supplies the masked silicon DATE register and adds no work to
+the instruction dispatch loop. ESP-IDF's normal APP-CPU startup writes at
+`0x600CE0D8` and `0x600CE0DC` therefore exercise real recorder state rather
+than an address whitelist. Area/stack watchpoint interrupts, detailed
+instruction and load/store debug-bus fields, exception records, and trace
+memory remain unsupported and diagnostic.
+
 Both S3 SYSTEM peripheral clock/reset banks are also represented as one
 target-described 64-domain state surface. Reserved bank-one positions remain
 masked, device-specific callbacks still drive the attached timer, UART, I2C,
@@ -706,12 +718,14 @@ SENSITIVE cache/SRAM allocation policy, then to 10 after exposing the complete
 SYSTEM peripheral clock/reset banks, and then to 9 after completing the SENS
 peripheral clock/reset fabric, and then to 2 after completing the target-
 described RTC OPTIONS0, ANA_CONF, and digital pad/global isolation controls.
-DIG_PWC, PWC, REG's force pairs, the modeled domain fields of DIG_ISO,
-CLK_CONF's fast selector, DATE, OPTIONS0, ANA_CONF, MEM_PD_MASK, and
-BT_LPCK_DIV no longer appear in the inventory. The only remaining accesses are
-two low-count startup writes at `0x600CE0D8` and `0x600CE0DC`; they stay visible
-until their owning hardware block has a real model rather than generic
-readback.
+The final two sites disappeared after composing the dual-core ASSIST_DEBUG
+recorder, leaving zero unsupported MMIO sites in the pinned four-billion-cycle
+WLED run. DIG_PWC, PWC, REG's force pairs, the modeled domain fields of
+DIG_ISO, CLK_CONF's fast selector, DATE, OPTIONS0, ANA_CONF, MEM_PD_MASK,
+BT_LPCK_DIV, and the APP-CPU recorder controls no longer appear in the
+inventory. This zero is specific to the exercised WLED path; unmodeled
+ASSIST_DEBUG functions and unexercised peripherals remain explicitly
+diagnostic.
 
 Recheck with the external image and ROM ELF:
 

@@ -184,6 +184,14 @@ allocation, MAC-dump/log use, and retention disable. Cache topology and access
 latency are not yet derived from that policy, and protection violations are not
 yet generated from the broader retained memory-protection register set.
 
+The S3 ASSIST_DEBUG recorder is also a target-described device rather than a
+startup-address exception. Its per-core PDEBUG and recording controls expose
+live PC/SP state while active and freeze the latest sample when recording is
+stopped, which supports the standard ESP-IDF crash-record setup without a
+per-instruction performance tax. Stack/area watchpoint interrupts, detailed
+debug-bus fields, exception records, and trace memory are still unsupported and
+continue through the diagnostic fallback.
+
 The external I2C model is shared by classic ESP32 and ESP32-S3 through target
 descriptors rather than fixed addresses or command encodings. It implements
 both native instances, their FIFO command lists, master writes and repeated-
