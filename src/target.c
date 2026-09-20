@@ -634,11 +634,34 @@ static const flexe_target_desc_t TARGETS[] = {
             .cpu_stall_options_offset = 0x000u,
             .cpu_stall_high_offset = 0x0BCu,
             .cpu_stall_options_reset = 0x1C00A000u,
+            .cpu_stall_options_writable_mask = 0x7F83FFCFu,
             .cpu_stall_low_shift = { 2u, 0u },
             .cpu_stall_high_shift = { 26u, 20u },
             .software_reset_cpu0_mask = 1u << 5,
             .software_reset_cpu1_mask = 1u << 4,
             .software_reset_system_mask = 1u << 31,
+            .options_xtal_wait_mask = 0xFu << 14,
+            .options_xtal_wait_shift = 14u,
+            /* Crystal, BBPLL, BBPLL-I2C, and baseband-I2C supplies. */
+            .options_supply_count = 4u,
+            .options_supply = {
+                { 1u << 13, 1u << 12 },
+                { 1u << 11, 1u << 10 },
+                { 1u << 9, 1u << 8 },
+                { 1u << 7, 1u << 6 },
+            },
+            /* Analog top, PLL, and crystal isolation. */
+            .options_isolation_count = 3u,
+            .options_isolation = {
+                { 1u << 28, 1u << 25 },
+                { 1u << 27, 1u << 24 },
+                { 1u << 26, 1u << 23 },
+            },
+            /* Digital-wrapper reset. */
+            .options_reset_count = 1u,
+            .options_reset = {
+                { 1u << 30, 1u << 29 },
+            },
             .clock_conf_offset = 0x074u,
             .slow_clock_select_shift = 30u,
             .time_update_mask = 0x80000000u,
@@ -673,9 +696,24 @@ static const flexe_target_desc_t TARGETS[] = {
              * I2C_RESET_POR_FORCE_PD are set on S3 revision 0. */
             .analog_conf_reset = (1u << 22) | (1u << 18),
             .analog_conf_writable_mask =
-                (1u << 31) | (1u << 30) | (1u << 28) | (1u << 27) |
+                (1u << 31) | (1u << 30) | (1u << 29) | (1u << 28) |
+                (1u << 27) |
                 (1u << 26) | (1u << 25) | (1u << 24) | (1u << 23) |
                 (1u << 22) | (1u << 20) | (1u << 19) | (1u << 18),
+            /* PLL-I2C, CKGEN-I2C, ROM-private I2C power, RFRX-PBUS,
+             * TXRF-I2C, PVTMON, BBPLL sleep calibration, analog-top
+             * monitor/sleep isolation, SAR-I2C, and glitch reset enable.
+             * Revision-0 ROM's rom_open_i2c_xpd explicitly sets bit 29;
+             * the public register header leaves that silicon control
+             * unnamed, so it remains target data instead of a guest-PC
+             * special case. */
+            .analog_control_count = 11u,
+            .analog_control_mask = {
+                1u << 31, 1u << 30, 1u << 29, 1u << 28,
+                1u << 27, 1u << 26, 1u << 25, 1u << 24,
+                1u << 23, 1u << 22, 1u << 20,
+            },
+            .analog_reset_por_supply = { 1u << 19, 1u << 18 },
             .sar_i2c_power_mask = 1u << 22,
             /* RTC_CNTL_USB_CONF_REG: the default eFuse route attaches the
              * internal FSLS PHY to USB Serial/JTAG. */
@@ -781,6 +819,9 @@ static const flexe_target_desc_t TARGETS[] = {
             .digital_iso_strobe_mask = 1u << 10,
             .digital_pad_force_hold_mask = 1u << 15,
             .digital_pad_force_unhold_mask = 1u << 14,
+            .digital_pad_isolation = { 1u << 12, 1u << 13 },
+            .digital_pad_autohold_enable_mask = 1u << 11,
+            .digital_isolation = { 1u << 7, 1u << 8 },
             .digital_power_reset = 0x00545010u,
             .digital_power_writable_mask = 0xF07E7818u,
             /* DIG_PWC/DIG_ISO domains in hardware register order. Radio

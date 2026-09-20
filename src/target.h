@@ -38,6 +38,8 @@
 #define FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX 8u
 #define FLEXE_TARGET_RTC_POWER_DOMAIN_MAX 4u
 #define FLEXE_TARGET_RTC_SUPPLY_MAX 4u
+#define FLEXE_TARGET_RTC_OPTION_DOMAIN_MAX 4u
+#define FLEXE_TARGET_RTC_ANALOG_CONTROL_MAX 16u
 #define FLEXE_TARGET_RTC_WDT_STAGE_MAX 4u
 #define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
@@ -55,7 +57,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 53u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 54u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -360,6 +362,14 @@ typedef struct {
     uint32_t force_power_down_mask;
 } flexe_rtc_supply_desc_t;
 
+/* Generic force-clear/force-set pair. This describes controls such as
+ * no-isolation/isolation and no-reset/reset without teaching the RTC model
+ * chip-specific register positions. Force-set wins a conflicting pair. */
+typedef struct {
+    uint32_t force_clear_mask;
+    uint32_t force_set_mask;
+} flexe_rtc_force_pair_desc_t;
+
 /* Always-on RTC controller state shared by the ROM, bootloader and
  * application. Offsets are explicit because the register layout, timer
  * width, interrupt bank, watchdog, and routed source vary across the ESP32
@@ -385,11 +395,26 @@ typedef struct {
     uint16_t cpu_stall_options_offset;
     uint16_t cpu_stall_high_offset;
     uint32_t cpu_stall_options_reset;
+    uint32_t cpu_stall_options_writable_mask;
     uint8_t cpu_stall_low_shift[2];
     uint8_t cpu_stall_high_shift[2];
     uint32_t software_reset_cpu0_mask;
     uint32_t software_reset_cpu1_mask;
     uint32_t software_reset_system_mask;
+    /* OPTIONS0 also owns oscillator/I2C supplies plus analog isolation and
+     * reset force pairs. Bit N in the normalized RTC control state maps to
+     * entry N in these target-described arrays. */
+    uint32_t options_xtal_wait_mask;
+    uint8_t options_xtal_wait_shift;
+    uint8_t options_supply_count;
+    flexe_rtc_supply_desc_t
+        options_supply[FLEXE_TARGET_RTC_SUPPLY_MAX];
+    uint8_t options_isolation_count;
+    flexe_rtc_force_pair_desc_t
+        options_isolation[FLEXE_TARGET_RTC_OPTION_DOMAIN_MAX];
+    uint8_t options_reset_count;
+    flexe_rtc_force_pair_desc_t
+        options_reset[FLEXE_TARGET_RTC_OPTION_DOMAIN_MAX];
     uint16_t clock_conf_offset;
     uint8_t  slow_clock_select_shift;
     uint32_t time_update_mask;
@@ -410,12 +435,17 @@ typedef struct {
     uint8_t regulator_supply_count;
     flexe_rtc_supply_desc_t
         regulator_supply[FLEXE_TARGET_RTC_SUPPLY_MAX];
-    /* RTC analog power controls. The SAR-I2C bit gates access to the
-     * internal SAR analog-register slave; other writable bits retain their
-     * register value but remain diagnostic until their consumers exist. */
+    /* RTC analog controls. Bit N in enabled_analog_controls maps to entry N
+     * in analog_control_mask. The reset-POR supply is a force pair because
+     * it has deterministic functional state even without an analog timing
+     * model. The SAR-I2C bit additionally gates its register slave. */
     uint16_t analog_conf_offset;
     uint32_t analog_conf_reset;
     uint32_t analog_conf_writable_mask;
+    uint8_t analog_control_count;
+    uint32_t
+        analog_control_mask[FLEXE_TARGET_RTC_ANALOG_CONTROL_MAX];
+    flexe_rtc_supply_desc_t analog_reset_por_supply;
     uint32_t sar_i2c_power_mask;
     /* Optional RTC USB PHY mux. Only the software override and selection
      * bits are functional; analog USB controls remain diagnostic. */
@@ -487,9 +517,8 @@ typedef struct {
     uint8_t rtc_follow_cpu_domain;
     flexe_rtc_power_domain_desc_t
         rtc_power_domain[FLEXE_TARGET_RTC_POWER_DOMAIN_MAX];
-    /* Digital-domain isolation and pad force-hold register. Described domain
-     * force pairs have functional power-consumer effects; remaining pad
-     * isolation/autohold controls stay software-visible diagnostics. */
+    /* Digital-domain isolation and pad force-hold register. Domain, pad and
+     * global force pairs all resolve to normalized functional state. */
     uint16_t digital_iso_offset;
     uint32_t digital_iso_reset;
     uint32_t digital_iso_writable_mask;
@@ -497,6 +526,9 @@ typedef struct {
     uint32_t digital_iso_strobe_mask;
     uint32_t digital_pad_force_hold_mask;
     uint32_t digital_pad_force_unhold_mask;
+    flexe_rtc_force_pair_desc_t digital_pad_isolation;
+    uint32_t digital_pad_autohold_enable_mask;
+    flexe_rtc_force_pair_desc_t digital_isolation;
     uint32_t digital_power_reset;
     uint32_t digital_power_writable_mask;
     uint8_t digital_domain_count;

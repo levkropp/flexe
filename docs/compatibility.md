@@ -243,8 +243,12 @@ scaling, and switching among the nominal 136 kHz RC slow, 32.768 kHz crystal,
 and RC-fast/256 sources are modeled. The independent fast-clock mux reports
 the selected 20 MHz XTAL/2 or nominal 17.5 MHz RC_FAST source, and the S3
 DATE/LDO-trim word has exact reset and masked readback. Oscillator drift,
-calibration error, analog trim effects, and electrical effects of the other RTC
-clock-control fields are not modeled. The RTC
+calibration error, analog trim effects, and analog transition timing are not
+modeled. OPTIONS0's oscillator/I2C supplies, isolation/reset pairs and crystal
+wait plus ANA_CONF's analog enables/reset-POR pair publish normalized logical
+state; DIG_ISO does the same for pad/global isolation and autohold policy.
+Unattached consumers do not turn those controls into invented electrical or RF
+behavior. The RTC
 interrupt bank implements target-described enable/raw/masked-status/W1C state
 and level routing; physical producers such as brownout, touch, and ULP remain
 unsupported until their respective device models attach to that API. The
@@ -255,7 +259,7 @@ whole-machine reset; their distinct reset domains and post-reset causes are
 not yet modeled. Pause-in-sleep, reset-signal widths, per-core reset selection,
 and reserved stage actions remain explicit unsupported-access diagnostics when
 firmware changes them. Changing any other unmodeled RTC control field remains
-visible in the same diagnostics.
+visible in the same diagnostics, as do reserved register bits.
 
 The experimental USB Serial/JTAG model implements the 64-byte serial endpoint
 FIFOs, packet flush and backpressure behavior, host RX/TX, interrupt

@@ -73,6 +73,8 @@ struct flexe_rtc_cntl {
     void *rtc_domain_ctx;
     flexe_rtc_cntl_supply_state_fn supply_changed;
     void *supply_ctx;
+    flexe_rtc_cntl_control_state_fn control_changed;
+    void *control_ctx;
 };
 
 static bool rtc_offset_valid(uint16_t offset, uint32_t register_size);
@@ -202,6 +204,83 @@ static bool rtc_optional_one_bit(uint32_t value)
     return value == 0u || (value & (value - 1u)) == 0u;
 }
 
+static bool rtc_supply_powered(
+    uint32_t value, const flexe_rtc_supply_desc_t *supply)
+{
+    if ((value & supply->force_power_down_mask) != 0u) return false;
+    if ((value & supply->force_power_up_mask) != 0u) return true;
+    return true;
+}
+
+static bool rtc_force_pair_set(
+    uint32_t value, const flexe_rtc_force_pair_desc_t *pair)
+{
+    if ((value & pair->force_set_mask) != 0u) return true;
+    if ((value & pair->force_clear_mask) != 0u) return false;
+    return false;
+}
+
+static bool rtc_force_pair_valid(
+    const flexe_rtc_force_pair_desc_t *pair, uint32_t reset,
+    uint32_t writable_mask)
+{
+    uint32_t fields = pair->force_clear_mask | pair->force_set_mask;
+    return rtc_optional_one_bit(pair->force_clear_mask) &&
+           pair->force_clear_mask != 0u &&
+           rtc_optional_one_bit(pair->force_set_mask) &&
+           pair->force_set_mask != 0u &&
+           pair->force_clear_mask != pair->force_set_mask &&
+           (fields & ~writable_mask) == 0u &&
+           !((reset & pair->force_clear_mask) != 0u &&
+             (reset & pair->force_set_mask) != 0u);
+}
+
+static bool rtc_supply_array_valid(
+    const flexe_rtc_supply_desc_t *supplies, unsigned count,
+    unsigned maximum, uint32_t reset, uint32_t writable_mask,
+    uint32_t *fields_out)
+{
+    if (count == 0u || count > maximum) return false;
+    uint32_t fields = 0u;
+    for (unsigned i = 0u; i < count; i++) {
+        const flexe_rtc_supply_desc_t *supply = &supplies[i];
+        uint32_t pair = supply->force_power_up_mask |
+                        supply->force_power_down_mask;
+        if (!rtc_optional_one_bit(supply->force_power_up_mask) ||
+            supply->force_power_up_mask == 0u ||
+            !rtc_optional_one_bit(supply->force_power_down_mask) ||
+            supply->force_power_down_mask == 0u ||
+            supply->force_power_up_mask == supply->force_power_down_mask ||
+            (pair & fields) != 0u ||
+            (pair & ~writable_mask) != 0u ||
+            ((reset & supply->force_power_up_mask) != 0u &&
+             (reset & supply->force_power_down_mask) != 0u))
+            return false;
+        fields |= pair;
+    }
+    if (fields_out) *fields_out = fields;
+    return true;
+}
+
+static bool rtc_force_pair_array_valid(
+    const flexe_rtc_force_pair_desc_t *pairs, unsigned count,
+    unsigned maximum, uint32_t reset, uint32_t writable_mask,
+    uint32_t *fields_out)
+{
+    if (count == 0u || count > maximum) return false;
+    uint32_t fields = 0u;
+    for (unsigned i = 0u; i < count; i++) {
+        uint32_t pair = pairs[i].force_clear_mask |
+                        pairs[i].force_set_mask;
+        if (!rtc_force_pair_valid(&pairs[i], reset, writable_mask) ||
+            (pair & fields) != 0u)
+            return false;
+        fields |= pair;
+    }
+    if (fields_out) *fields_out = fields;
+    return true;
+}
+
 static bool rtc_masks_disjoint(const uint32_t *masks, unsigned count)
 {
     uint32_t used = 0u;
@@ -210,6 +289,74 @@ static bool rtc_masks_disjoint(const uint32_t *masks, unsigned count)
         used |= masks[i];
     }
     return true;
+}
+
+static bool rtc_options_controls_valid(
+    const flexe_rtc_cntl_desc_t *desc)
+{
+    uint32_t supply_fields = 0u;
+    uint32_t isolation_fields = 0u;
+    uint32_t reset_fields = 0u;
+    uint32_t wait = desc->options_xtal_wait_mask;
+    if (desc->cpu_stall_options_writable_mask == 0u ||
+        (desc->cpu_stall_options_reset &
+         ~desc->cpu_stall_options_writable_mask) != 0u ||
+        desc->options_xtal_wait_shift >= 32u ||
+        wait == 0u ||
+        (wait & ~desc->cpu_stall_options_writable_mask) != 0u ||
+        (wait & ((1u << desc->options_xtal_wait_shift) - 1u)) != 0u)
+        return false;
+    uint32_t wait_value = wait >> desc->options_xtal_wait_shift;
+    if (wait_value > UINT8_MAX ||
+        (wait_value & (wait_value + 1u)) != 0u ||
+        !rtc_supply_array_valid(
+            desc->options_supply, desc->options_supply_count,
+            FLEXE_TARGET_RTC_SUPPLY_MAX, desc->cpu_stall_options_reset,
+            desc->cpu_stall_options_writable_mask, &supply_fields) ||
+        !rtc_force_pair_array_valid(
+            desc->options_isolation, desc->options_isolation_count,
+            FLEXE_TARGET_RTC_OPTION_DOMAIN_MAX,
+            desc->cpu_stall_options_reset,
+            desc->cpu_stall_options_writable_mask, &isolation_fields) ||
+        !rtc_force_pair_array_valid(
+            desc->options_reset, desc->options_reset_count,
+            FLEXE_TARGET_RTC_OPTION_DOMAIN_MAX,
+            desc->cpu_stall_options_reset,
+            desc->cpu_stall_options_writable_mask, &reset_fields))
+        return false;
+    const uint32_t masks[] = {
+        rtc_stall_low_mask(desc), wait, supply_fields,
+        isolation_fields, reset_fields,
+    };
+    return rtc_masks_disjoint(masks, sizeof(masks) / sizeof(masks[0])) &&
+           (rtc_stall_low_mask(desc) | wait | supply_fields |
+            isolation_fields | reset_fields) ==
+               desc->cpu_stall_options_writable_mask;
+}
+
+static bool rtc_analog_controls_valid(
+    const flexe_rtc_cntl_desc_t *desc)
+{
+    uint32_t fields = 0u;
+    if (desc->analog_control_count == 0u ||
+        desc->analog_control_count > FLEXE_TARGET_RTC_ANALOG_CONTROL_MAX ||
+        !rtc_supply_array_valid(
+            &desc->analog_reset_por_supply, 1u, 1u,
+            desc->analog_conf_reset, desc->analog_conf_writable_mask,
+            &fields))
+        return false;
+
+    for (unsigned i = 0u; i < desc->analog_control_count; i++) {
+        uint32_t mask = desc->analog_control_mask[i];
+        if (!rtc_optional_one_bit(mask) || mask == 0u ||
+            (mask & fields) != 0u ||
+            (mask & ~desc->analog_conf_writable_mask) != 0u)
+            return false;
+        fields |= mask;
+    }
+    return fields == desc->analog_conf_writable_mask &&
+           (desc->sar_i2c_power_mask & fields) ==
+               desc->sar_i2c_power_mask;
 }
 
 static uint32_t rtc_digital_power_fields(
@@ -222,18 +369,6 @@ static uint32_t rtc_digital_power_fields(
         fields |= domain->sleep_power_down_mask |
                   domain->force_power_up_mask |
                   domain->force_power_down_mask;
-    }
-    return fields;
-}
-
-static uint32_t rtc_digital_iso_domain_fields(
-    const flexe_rtc_cntl_desc_t *desc)
-{
-    uint32_t fields = 0u;
-    for (unsigned i = 0u; i < desc->digital_domain_count; i++) {
-        const flexe_rtc_digital_domain_desc_t *domain =
-            &desc->digital_domain[i];
-        fields |= domain->force_noiso_mask | domain->force_iso_mask;
     }
     return fields;
 }
@@ -377,7 +512,23 @@ static bool rtc_digital_domains_valid(const flexe_rtc_cntl_desc_t *desc)
         (desc->digital_iso_reset &
          ~(desc->digital_iso_writable_mask |
            desc->digital_iso_read_only_mask)) != 0u ||
-        (desc->digital_iso_reset & desc->digital_iso_strobe_mask) != 0u)
+        (desc->digital_iso_reset & desc->digital_iso_strobe_mask) != 0u ||
+        !rtc_optional_one_bit(desc->digital_iso_read_only_mask) ||
+        desc->digital_iso_read_only_mask == 0u ||
+        !rtc_optional_one_bit(desc->digital_iso_strobe_mask) ||
+        desc->digital_iso_strobe_mask == 0u ||
+        !rtc_optional_one_bit(desc->digital_pad_force_hold_mask) ||
+        desc->digital_pad_force_hold_mask == 0u ||
+        !rtc_optional_one_bit(desc->digital_pad_force_unhold_mask) ||
+        desc->digital_pad_force_unhold_mask == 0u ||
+        !rtc_optional_one_bit(desc->digital_pad_autohold_enable_mask) ||
+        desc->digital_pad_autohold_enable_mask == 0u ||
+        !rtc_force_pair_valid(&desc->digital_pad_isolation,
+                              desc->digital_iso_reset,
+                              desc->digital_iso_writable_mask) ||
+        !rtc_force_pair_valid(&desc->digital_isolation,
+                              desc->digital_iso_reset,
+                              desc->digital_iso_writable_mask))
         return false;
 
     uint32_t power_fields = 0u;
@@ -429,8 +580,31 @@ static bool rtc_digital_domains_valid(const flexe_rtc_cntl_desc_t *desc)
         power_fields |= power;
         iso_fields |= iso;
     }
+    uint32_t misc_fields =
+        desc->digital_iso_strobe_mask |
+        desc->digital_pad_force_hold_mask |
+        desc->digital_pad_force_unhold_mask |
+        desc->digital_pad_isolation.force_clear_mask |
+        desc->digital_pad_isolation.force_set_mask |
+        desc->digital_pad_autohold_enable_mask |
+        desc->digital_isolation.force_clear_mask |
+        desc->digital_isolation.force_set_mask;
+    const uint32_t iso_groups[] = {
+        iso_fields,
+        desc->digital_iso_strobe_mask,
+        desc->digital_iso_read_only_mask,
+        desc->digital_pad_force_hold_mask,
+        desc->digital_pad_force_unhold_mask,
+        desc->digital_pad_isolation.force_clear_mask,
+        desc->digital_pad_isolation.force_set_mask,
+        desc->digital_pad_autohold_enable_mask,
+        desc->digital_isolation.force_clear_mask,
+        desc->digital_isolation.force_set_mask,
+    };
     return power_fields == desc->digital_power_writable_mask &&
-           (iso_fields & ~desc->digital_iso_writable_mask) == 0u &&
+           rtc_masks_disjoint(
+               iso_groups, sizeof(iso_groups) / sizeof(iso_groups[0])) &&
+           (iso_fields | misc_fields) == desc->digital_iso_writable_mask &&
            (desc->digital_wrap_power_down_mask & power_fields) ==
                desc->digital_wrap_power_down_mask;
 }
@@ -586,6 +760,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
     if (!rtc_offset_valid(desc->analog_conf_offset, desc->register_size) ||
         desc->analog_conf_writable_mask == 0u ||
         desc->sar_i2c_power_mask == 0u ||
+        !rtc_analog_controls_valid(desc) ||
         (desc->analog_conf_reset & ~desc->analog_conf_writable_mask) != 0u ||
         (desc->sar_i2c_power_mask & desc->analog_conf_writable_mask) !=
             desc->sar_i2c_power_mask ||
@@ -675,7 +850,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
     if (desc->cpu_stall_high_offset != 0u) {
         uint16_t low = desc->cpu_stall_options_offset;
         uint16_t high = desc->cpu_stall_high_offset;
-        if (!rtc_offset_valid(low, desc->register_size) ||
+        if (!rtc_options_controls_valid(desc) ||
+            !rtc_offset_valid(low, desc->register_size) ||
             !rtc_offset_valid(high, desc->register_size) ||
             low == high ||
             desc->cpu_stall_low_shift[0] > 30u ||
@@ -688,6 +864,16 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
              (0x3Fu << desc->cpu_stall_high_shift[1])) != 0u ||
             (desc->cpu_stall_options_reset &
              rtc_stall_low_mask(desc)) != 0u ||
+            !rtc_optional_one_bit(desc->software_reset_cpu0_mask) ||
+            desc->software_reset_cpu0_mask == 0u ||
+            !rtc_optional_one_bit(desc->software_reset_cpu1_mask) ||
+            desc->software_reset_cpu1_mask == 0u ||
+            !rtc_optional_one_bit(desc->software_reset_system_mask) ||
+            desc->software_reset_system_mask == 0u ||
+            ((desc->software_reset_cpu0_mask |
+              desc->software_reset_cpu1_mask |
+              desc->software_reset_system_mask) &
+             desc->cpu_stall_options_writable_mask) != 0u ||
             (desc->software_reset_cpu0_mask &
              (desc->software_reset_cpu1_mask |
               desc->software_reset_system_mask |
@@ -1179,6 +1365,40 @@ static void rtc_cntl_publish_supplies(flexe_rtc_cntl_t *rtc)
                         flexe_rtc_cntl_powered_supplies(rtc));
 }
 
+static bool rtc_control_states_equal(
+    const flexe_rtc_cntl_control_state_t *a,
+    const flexe_rtc_cntl_control_state_t *b)
+{
+    return a->powered_options_supplies == b->powered_options_supplies &&
+           a->isolated_options_domains == b->isolated_options_domains &&
+           a->reset_options_domains == b->reset_options_domains &&
+           a->enabled_analog_controls == b->enabled_analog_controls &&
+           a->xtal_enable_wait == b->xtal_enable_wait &&
+           a->analog_reset_por_powered == b->analog_reset_por_powered &&
+           a->digital_pad_isolated == b->digital_pad_isolated &&
+           a->digital_pad_autohold_enabled ==
+               b->digital_pad_autohold_enabled &&
+           a->digital_isolation_enabled == b->digital_isolation_enabled;
+}
+
+static void rtc_cntl_publish_controls(flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc || !rtc->control_changed) return;
+    flexe_rtc_cntl_control_state_t state;
+    flexe_rtc_cntl_control_state(rtc, &state);
+    rtc->control_changed(rtc->control_ctx, &state);
+}
+
+static void rtc_cntl_publish_controls_if_changed(
+    flexe_rtc_cntl_t *rtc,
+    const flexe_rtc_cntl_control_state_t *old_state)
+{
+    flexe_rtc_cntl_control_state_t state;
+    flexe_rtc_cntl_control_state(rtc, &state);
+    if (!rtc_control_states_equal(old_state, &state))
+        rtc_cntl_publish_controls(rtc);
+}
+
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
 {
     flexe_rtc_cntl_t *rtc = ctx;
@@ -1502,31 +1722,38 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
             return;
         }
         if (offset == desc->digital_iso_offset) {
+            flexe_rtc_cntl_control_state_t old_control;
+            flexe_rtc_cntl_control_state(rtc, &old_control);
+            uint32_t old_powered =
+                flexe_rtc_cntl_powered_digital_domains(rtc);
+            uint32_t old_isolated =
+                flexe_rtc_cntl_isolated_digital_domains(rtc);
             uint32_t old = rtc->digital_iso_control;
             /* Write-only commands do not latch; read-only status survives a
-             * guest RMW but cannot be replaced by it. */
+             * guest RMW but cannot be replaced by it. The clear command
+             * consumes any modeled autohold status synchronously. */
             uint32_t next =
                 (value & desc->digital_iso_writable_mask &
                  ~desc->digital_iso_strobe_mask) |
                 (old & desc->digital_iso_read_only_mask);
+            if ((value & desc->digital_iso_strobe_mask) != 0u)
+                next &= ~desc->digital_iso_read_only_mask;
             rtc->digital_iso_control = next;
             uint32_t hold_bits = desc->digital_pad_force_hold_mask |
                                  desc->digital_pad_force_unhold_mask;
-            uint32_t modeled = hold_bits |
-                               rtc_digital_iso_domain_fields(desc);
             if (((old ^ next) & hold_bits) != 0u &&
                 rtc->pad_hold_changed)
                 rtc->pad_hold_changed(rtc->pad_hold_ctx,
                                       rtc_all_pad_hold_pins(rtc));
-            if ((((old ^ next) & ~modeled) != 0u ||
-                 (value & desc->digital_iso_strobe_mask) != 0u ||
-                 (value & desc->digital_iso_read_only_mask) != 0u ||
-                 (value & ~(desc->digital_iso_writable_mask |
-                            desc->digital_iso_read_only_mask)) != 0u ||
-                 (next & hold_bits) == hold_bits) &&
+            if ((value & ~(desc->digital_iso_writable_mask |
+                           desc->digital_iso_read_only_mask)) != 0u &&
                 rtc->fallback_write)
                 rtc->fallback_write(rtc->fallback_ctx, addr, value);
-            if (old != next) rtc_cntl_publish_digital_domains(rtc);
+            if (old_powered != flexe_rtc_cntl_powered_digital_domains(rtc) ||
+                old_isolated !=
+                    flexe_rtc_cntl_isolated_digital_domains(rtc))
+                rtc_cntl_publish_digital_domains(rtc);
+            rtc_cntl_publish_controls_if_changed(rtc, &old_control);
             return;
         }
         if (offset == desc->ext_wakeup_config_offset) {
@@ -1565,20 +1792,20 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
     }
     if (desc->cpu_stall_high_offset != 0u &&
         offset == desc->cpu_stall_options_offset) {
+        flexe_rtc_cntl_control_state_t old_control;
+        flexe_rtc_cntl_control_state(rtc, &old_control);
         uint32_t reset_mask = desc->software_reset_cpu0_mask |
                               desc->software_reset_cpu1_mask |
                               desc->software_reset_system_mask;
-        uint32_t next = value & ~reset_mask;
-        uint32_t changed = rtc->cpu_stall_options ^ next;
+        uint32_t next = value & desc->cpu_stall_options_writable_mask;
         rtc->cpu_stall_options = next;
-        if (changed & ~rtc_stall_low_mask(desc)) {
-            if (rtc->fallback_write)
-                rtc->fallback_write(rtc->fallback_ctx, addr, value);
-        } else if (value & desc->software_reset_cpu1_mask) {
-            /* APP CPU-only reset is not yet modeled. */
-            if (rtc->fallback_write)
-                rtc->fallback_write(rtc->fallback_ctx, addr, value);
-        }
+        bool unsupported =
+            (value & ~(desc->cpu_stall_options_writable_mask |
+                       reset_mask)) != 0u ||
+            (value & desc->software_reset_cpu1_mask) != 0u;
+        /* APP CPU-only reset is not yet modeled. */
+        if (unsupported && rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
         if (rtc->reset_requested) {
             if (value & desc->software_reset_system_mask)
                 rtc->reset_requested(rtc->reset_ctx,
@@ -1587,6 +1814,7 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
                 rtc->reset_requested(rtc->reset_ctx,
                                      FLEXE_RTC_CNTL_SW_RESET_CPU);
         }
+        rtc_cntl_publish_controls_if_changed(rtc, &old_control);
         return;
     }
     if (desc->cpu_stall_high_offset != 0u &&
@@ -1623,13 +1851,13 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         return;
     }
     if (offset == desc->analog_conf_offset) {
-        uint32_t old = rtc->analog_conf;
+        flexe_rtc_cntl_control_state_t old_control;
+        flexe_rtc_cntl_control_state(rtc, &old_control);
         rtc->analog_conf = value & desc->analog_conf_writable_mask;
-        if ((((old ^ rtc->analog_conf) &
-              ~desc->sar_i2c_power_mask) != 0u ||
-             (value & ~desc->analog_conf_writable_mask) != 0u) &&
+        if ((value & ~desc->analog_conf_writable_mask) != 0u &&
             rtc->fallback_write)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        rtc_cntl_publish_controls_if_changed(rtc, &old_control);
         return;
     }
     if (offset == desc->date_offset) {
@@ -1918,6 +2146,52 @@ bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc)
                    rtc->target->rtc_cntl.sar_i2c_power_mask) != 0u;
 }
 
+void flexe_rtc_cntl_control_state(
+    const flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_control_state_t *out)
+{
+    if (!out) return;
+    *out = (flexe_rtc_cntl_control_state_t){0};
+    if (!rtc) return;
+
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    for (unsigned i = 0u; i < desc->options_supply_count; i++)
+        if (rtc_supply_powered(rtc->cpu_stall_options,
+                               &desc->options_supply[i]))
+            out->powered_options_supplies |= 1u << i;
+    for (unsigned i = 0u; i < desc->options_isolation_count; i++)
+        if (rtc_force_pair_set(rtc->cpu_stall_options,
+                               &desc->options_isolation[i]))
+            out->isolated_options_domains |= 1u << i;
+    for (unsigned i = 0u; i < desc->options_reset_count; i++)
+        if (rtc_force_pair_set(rtc->cpu_stall_options,
+                               &desc->options_reset[i]))
+            out->reset_options_domains |= 1u << i;
+    out->xtal_enable_wait = (uint8_t)(
+        (rtc->cpu_stall_options & desc->options_xtal_wait_mask) >>
+        desc->options_xtal_wait_shift);
+    for (unsigned i = 0u; i < desc->analog_control_count; i++)
+        if ((rtc->analog_conf & desc->analog_control_mask[i]) != 0u)
+            out->enabled_analog_controls |= 1u << i;
+    out->analog_reset_por_powered = rtc_supply_powered(
+        rtc->analog_conf, &desc->analog_reset_por_supply);
+    out->digital_pad_isolated = rtc_force_pair_set(
+        rtc->digital_iso_control, &desc->digital_pad_isolation);
+    out->digital_pad_autohold_enabled =
+        (rtc->digital_iso_control &
+         desc->digital_pad_autohold_enable_mask) != 0u;
+    out->digital_isolation_enabled = rtc_force_pair_set(
+        rtc->digital_iso_control, &desc->digital_isolation);
+}
+
+void flexe_rtc_cntl_set_control_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_control_state_fn fn, void *ctx)
+{
+    if (!rtc) return;
+    rtc->control_changed = fn;
+    rtc->control_ctx = fn ? ctx : NULL;
+    rtc_cntl_publish_controls(rtc);
+}
+
 uint32_t flexe_rtc_cntl_fast_clock_hz(const flexe_rtc_cntl_t *rtc)
 {
     if (!rtc) return 0u;
@@ -2047,13 +2321,8 @@ uint32_t flexe_rtc_cntl_powered_supplies(const flexe_rtc_cntl_t *rtc)
     for (unsigned i = 0u; i < desc->regulator_supply_count; i++) {
         const flexe_rtc_supply_desc_t *supply =
             &desc->regulator_supply[i];
-        bool value = true;
-        if ((rtc->regulator_control & supply->force_power_down_mask) != 0u)
-            value = false;
-        else if ((rtc->regulator_control &
-                  supply->force_power_up_mask) != 0u)
-            value = true;
-        if (value) powered |= 1u << i;
+        if (rtc_supply_powered(rtc->regulator_control, supply))
+            powered |= 1u << i;
     }
     return powered;
 }

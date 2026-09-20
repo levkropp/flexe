@@ -28,6 +28,11 @@ typedef struct {
     uint32_t powered;
 } rtc_cntl_supply_probe_t;
 
+typedef struct {
+    unsigned changes;
+    flexe_rtc_cntl_control_state_t state;
+} rtc_cntl_control_probe_t;
+
 static uint32_t rtc_cntl_test_fallback_read(void *ctx, uint32_t addr)
 {
     rtc_cntl_fallback_t *fallback = ctx;
@@ -65,6 +70,14 @@ static void rtc_cntl_test_supply_changed(void *ctx, uint32_t powered)
     rtc_cntl_supply_probe_t *probe = ctx;
     probe->changes++;
     probe->powered = powered;
+}
+
+static void rtc_cntl_test_control_changed(
+    void *ctx, const flexe_rtc_cntl_control_state_t *state)
+{
+    rtc_cntl_control_probe_t *probe = ctx;
+    probe->changes++;
+    probe->state = *state;
 }
 
 static void rtc_cntl_test_reset_requested(
@@ -119,26 +132,152 @@ TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands)
     ASSERT_FALSE(flexe_rtc_cntl_cpu_stalled(rtc, 0u));
     ASSERT_EQ(fallback.writes, 0u);
 
-    /* Other OPTIONS0 power controls keep readback but remain diagnostic. */
+    /* OPTIONS0 power controls retain exact readback and are exposed through
+     * normalized state rather than being treated as unsupported MMIO. */
     uint32_t other = desc->cpu_stall_options_reset ^ (1u << 13);
     mem_write32(mem, options, other);
     ASSERT_EQ(mem_read32(mem, options), other);
-    ASSERT_EQ(fallback.writes, 1u);
-    ASSERT_EQ(fallback.last_write_addr, options);
+    ASSERT_EQ(fallback.writes, 0u);
     mem_write32(mem, high, 1u);
     ASSERT_EQ(mem_read32(mem, high), 1u);
-    ASSERT_EQ(fallback.writes, 2u);
+    ASSERT_EQ(fallback.writes, 1u);
 
     /* Write-only reset commands are not sticky register bits. */
     mem_write32(mem, options, other | desc->software_reset_cpu1_mask);
     ASSERT_EQ(mem_read32(mem, options), other);
-    ASSERT_EQ(fallback.writes, 3u);
+    ASSERT_EQ(fallback.writes, 2u);
     mem_write32(mem, options, other | desc->software_reset_cpu0_mask);
     ASSERT_EQ(reset, FLEXE_RTC_CNTL_SW_RESET_CPU);
     ASSERT_EQ(mem_read32(mem, options), other);
     mem_write32(mem, options, other | desc->software_reset_system_mask);
     ASSERT_EQ(reset, FLEXE_RTC_CNTL_SW_RESET_SYSTEM);
     ASSERT_EQ(mem_read32(mem, options), other);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_control_fabric_resolves_force_pairs_and_notifies)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(desc->options_supply_count, 4u);
+    ASSERT_EQ(desc->options_isolation_count, 3u);
+    ASSERT_EQ(desc->options_reset_count, 1u);
+    ASSERT_EQ(desc->analog_control_count, 11u);
+    flexe_rtc_cntl_control_state_t state;
+    flexe_rtc_cntl_control_state(rtc, &state);
+    ASSERT_EQ(state.powered_options_supplies, 0xFu);
+    ASSERT_EQ(state.isolated_options_domains, 0u);
+    ASSERT_EQ(state.reset_options_domains, 0u);
+    ASSERT_EQ(state.enabled_analog_controls, 1u << 9u);
+    ASSERT_EQ(state.xtal_enable_wait, 2u);
+    ASSERT_FALSE(state.analog_reset_por_powered);
+    ASSERT_FALSE(state.digital_pad_isolated);
+    ASSERT_FALSE(state.digital_pad_autohold_enabled);
+    ASSERT_FALSE(state.digital_isolation_enabled);
+
+    rtc_cntl_control_probe_t probe = {0};
+    flexe_rtc_cntl_set_control_listener(
+        rtc, rtc_cntl_test_control_changed, &probe);
+    ASSERT_EQ(probe.changes, 1u);
+
+    uint32_t options = 7u << desc->options_xtal_wait_shift;
+    options |= desc->options_supply[0].force_power_down_mask;
+    options |= desc->options_supply[1].force_power_up_mask;
+    options |= desc->options_supply[2].force_power_down_mask;
+    options |= desc->options_supply[3].force_power_up_mask |
+               desc->options_supply[3].force_power_down_mask;
+    options |= desc->options_isolation[0].force_set_mask;
+    options |= desc->options_isolation[1].force_clear_mask |
+               desc->options_isolation[1].force_set_mask;
+    options |= desc->options_isolation[2].force_clear_mask;
+    options |= desc->options_reset[0].force_clear_mask |
+               desc->options_reset[0].force_set_mask;
+    uint32_t options_addr = desc->base + desc->cpu_stall_options_offset;
+    mem_write32(mem, options_addr, options);
+    ASSERT_EQ(mem_read32(mem, options_addr), options);
+    ASSERT_EQ(probe.changes, 2u);
+    ASSERT_EQ(probe.state.powered_options_supplies, 1u << 1u);
+    ASSERT_EQ(probe.state.isolated_options_domains, 3u);
+    ASSERT_EQ(probe.state.reset_options_domains, 1u);
+    ASSERT_EQ(probe.state.xtal_enable_wait, 7u);
+
+    /* Set wins conflicting isolation/reset pairs; power-down wins supplies.
+     * Repeating normalized state does not emit a spurious transition. */
+    mem_write32(mem, options_addr, options);
+    ASSERT_EQ(probe.changes, 2u);
+    mem_write32(mem, options_addr, options | (1u << 22u));
+    ASSERT_EQ(mem_read32(mem, options_addr), options);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(probe.changes, 2u);
+
+    uint32_t analog = desc->analog_control_mask[0] |
+                      desc->analog_control_mask[2] |
+                      desc->analog_control_mask[9] |
+                      desc->analog_control_mask[10] |
+                      desc->analog_reset_por_supply.force_power_up_mask |
+                      desc->analog_reset_por_supply.force_power_down_mask;
+    uint32_t analog_addr = desc->base + desc->analog_conf_offset;
+    mem_write32(mem, analog_addr, analog);
+    ASSERT_EQ(mem_read32(mem, analog_addr), analog);
+    ASSERT_EQ(probe.changes, 3u);
+    ASSERT_EQ(probe.state.enabled_analog_controls,
+              (1u << 0u) | (1u << 2u) | (1u << 9u) | (1u << 10u));
+    ASSERT_FALSE(probe.state.analog_reset_por_powered);
+    analog &= ~desc->analog_reset_por_supply.force_power_down_mask;
+    mem_write32(mem, analog_addr, analog);
+    ASSERT_TRUE(probe.state.analog_reset_por_powered);
+    ASSERT_EQ(probe.changes, 4u);
+    ASSERT_TRUE(mem_read32(mem, analog_addr) &
+                desc->analog_control_mask[2]);
+    mem_write32(mem, analog_addr, analog | (1u << 21u));
+    ASSERT_EQ(mem_read32(mem, analog_addr), analog);
+    ASSERT_EQ(fallback.writes, 2u);
+    ASSERT_EQ(probe.changes, 4u);
+
+    uint32_t iso = desc->digital_iso_reset;
+    iso &= ~desc->digital_pad_isolation.force_clear_mask;
+    iso |= desc->digital_pad_isolation.force_set_mask |
+           desc->digital_pad_autohold_enable_mask;
+    iso &= ~desc->digital_isolation.force_clear_mask;
+    iso |= desc->digital_isolation.force_set_mask;
+    uint32_t iso_addr = desc->base + desc->digital_iso_offset;
+    mem_write32(mem, iso_addr, iso);
+    ASSERT_EQ(mem_read32(mem, iso_addr), iso);
+    ASSERT_EQ(probe.changes, 5u);
+    ASSERT_TRUE(probe.state.digital_pad_isolated);
+    ASSERT_TRUE(probe.state.digital_pad_autohold_enabled);
+    ASSERT_TRUE(probe.state.digital_isolation_enabled);
+
+    mem_write32(mem, iso_addr,
+                iso | desc->digital_pad_isolation.force_clear_mask);
+    ASSERT_EQ(probe.changes, 5u);
+    mem_write32(mem, iso_addr, iso | desc->digital_iso_strobe_mask);
+    ASSERT_EQ(mem_read32(mem, iso_addr), iso);
+    ASSERT_EQ(probe.changes, 5u);
+    mem_write32(mem, iso_addr, iso | desc->digital_iso_read_only_mask);
+    ASSERT_EQ(mem_read32(mem, iso_addr), iso);
+    ASSERT_EQ(fallback.writes, 2u);
+    mem_write32(mem, iso_addr, iso | 1u);
+    ASSERT_EQ(mem_read32(mem, iso_addr), iso);
+    ASSERT_EQ(fallback.writes, 3u);
+    ASSERT_EQ(fallback.last_write_addr, iso_addr);
 
     flexe_rtc_cntl_destroy(rtc);
     mem_destroy(mem);
@@ -347,16 +486,17 @@ TEST(rtc_cntl_sar_i2c_power_gates_analog_slave)
         s3->sens.adc_calibration_address, &data));
     ASSERT_EQ(data, 0xA6u);
 
-    /* Register retention is not a claim that RF/PLL controls are modeled. */
+    /* Analog controls publish normalized state even when no electrical/RF
+     * consumer is attached. Reserved bits remain diagnostic. */
     mem_write32(mem, analog, rtc_desc->analog_conf_reset | (1u << 31));
+    ASSERT_EQ(mem_read32(mem, analog),
+              rtc_desc->analog_conf_reset | (1u << 31));
+    ASSERT_EQ(fallback.writes, 1u);
+    mem_write32(mem, analog, rtc_desc->analog_conf_reset | (1u << 31) | 1u);
     ASSERT_EQ(mem_read32(mem, analog),
               rtc_desc->analog_conf_reset | (1u << 31));
     ASSERT_EQ(fallback.writes, 2u);
     ASSERT_EQ(fallback.last_write_addr, analog);
-    mem_write32(mem, analog, rtc_desc->analog_conf_reset | (1u << 31) | 1u);
-    ASSERT_EQ(mem_read32(mem, analog),
-              rtc_desc->analog_conf_reset | (1u << 31));
-    ASSERT_EQ(fallback.writes, 3u);
 
     flexe_regi2c_destroy(regi2c);
     flexe_rtc_cntl_destroy(rtc);
@@ -690,7 +830,7 @@ TEST(rtc_cntl_s3_regulator_force_pairs_are_functional_and_trim_is_diagnostic)
     mem_destroy(mem);
 }
 
-TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry)
+TEST(rtc_cntl_rejects_invalid_clock_and_control_geometry)
 {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
@@ -706,6 +846,36 @@ TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry)
     invalid = *s3;
     invalid.rtc_cntl.fast_clock_select_mask =
         invalid.rtc_cntl.slow_clock_select_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.options_supply[1].force_power_up_mask =
+        invalid.rtc_cntl.options_supply[0].force_power_up_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.analog_control_mask[0] =
+        invalid.rtc_cntl.analog_reset_por_supply.force_power_up_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.digital_pad_isolation.force_clear_mask =
+        invalid.rtc_cntl.digital_domain[0].force_noiso_mask;
     mem = mem_create_for_target(&invalid);
     ASSERT_TRUE(mem != NULL);
     rtc = flexe_rtc_cntl_create(
@@ -1470,14 +1640,15 @@ TEST(rtc_cntl_s3_digital_force_hold_freezes_digital_pads_only)
     mem_write32(mem, digital_hold, 0u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 26), 0);
 
-    /* Other isolation controls and the autohold-clear strobe are not
-     * silently accepted as electrical behavior. */
+    /* Pad isolation and the autohold-clear command are real modeled control
+     * state. Their downstream electrical effects remain independently
+     * attachable through the normalized listener. */
     mem_write32(mem, iso, rtc->digital_iso_reset | (1u << 13u));
     ASSERT_EQ(mem_read32(mem, iso), rtc->digital_iso_reset | (1u << 13u));
-    ASSERT_EQ(periph_unhandled_count(periph), 1);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
     mem_write32(mem, iso, rtc->digital_iso_reset | (1u << 10u));
     ASSERT_EQ(mem_read32(mem, iso), rtc->digital_iso_reset);
-    ASSERT_EQ(periph_unhandled_count(periph), 2);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
     periph_destroy(periph);
     mem_destroy(mem);
 }
@@ -2181,6 +2352,7 @@ void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
     RUN_TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands);
+    RUN_TEST(rtc_cntl_s3_control_fabric_resolves_force_pairs_and_notifies);
     RUN_TEST(rtc_cntl_s3_sequence_timers_read_back_and_enable_cpu_stall);
     RUN_TEST(rtc_cntl_storage_resets_persists_and_delegates);
     RUN_TEST(rtc_cntl_sar_i2c_power_gates_analog_slave);
@@ -2190,7 +2362,7 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
     RUN_TEST(rtc_cntl_s3_fast_clock_and_date_register_follow_descriptor);
     RUN_TEST(rtc_cntl_s3_regulator_force_pairs_are_functional_and_trim_is_diagnostic);
-    RUN_TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry);
+    RUN_TEST(rtc_cntl_rejects_invalid_clock_and_control_geometry);
     RUN_TEST(rtc_cntl_rejects_invalid_regulator_and_rtc_power_geometry);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
     RUN_TEST(rtc_cntl_digital_domains_resolve_force_and_sleep_policy);
