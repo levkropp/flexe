@@ -8,6 +8,7 @@
 
 typedef struct flexe_regi2c flexe_regi2c_t;
 typedef struct flexe_apb_saradc flexe_apb_saradc_t;
+typedef struct flexe_touch_v2 flexe_touch_v2_t;
 
 typedef struct flexe_sens flexe_sens_t;
 
@@ -40,6 +41,8 @@ void flexe_sens_attach_regi2c(flexe_sens_t *sens,
                               const flexe_regi2c_t *regi2c);
 void flexe_sens_attach_apb_saradc(flexe_sens_t *sens,
                                   const flexe_apb_saradc_t *apb_saradc);
+void flexe_sens_attach_touch_v2(flexe_sens_t *sens,
+                                flexe_touch_v2_t *touch);
 
 bool flexe_sens_peripheral_state(
     const flexe_sens_t *sens, flexe_sens_peripheral_state_t *state);

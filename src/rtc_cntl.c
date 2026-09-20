@@ -76,6 +76,8 @@ struct flexe_rtc_cntl {
     void *supply_ctx;
     flexe_rtc_cntl_control_state_fn control_changed;
     void *control_ctx;
+    flexe_rtc_cntl_config_fn config_changed;
+    void *config_ctx;
 };
 
 static bool rtc_offset_valid(uint16_t offset, uint32_t register_size);
@@ -186,7 +188,11 @@ static bool rtc_interrupt_offset(const flexe_rtc_cntl_desc_t *desc,
     return offset == desc->interrupt_enable_offset ||
            offset == desc->interrupt_raw_offset ||
            offset == desc->interrupt_status_offset ||
-           offset == desc->interrupt_clear_offset;
+           offset == desc->interrupt_clear_offset ||
+           (desc->interrupt_enable_set_offset != 0u &&
+            offset == desc->interrupt_enable_set_offset) ||
+           (desc->interrupt_enable_clear_offset != 0u &&
+            offset == desc->interrupt_enable_clear_offset);
 }
 
 static bool rtc_wdt_offset(const flexe_rtc_cntl_desc_t *desc,
@@ -807,6 +813,31 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
          desc->interrupt_source >= target->interrupt_matrix.source_count))
         return false;
 
+    if ((desc->interrupt_enable_set_offset == 0u) !=
+            (desc->interrupt_enable_clear_offset == 0u) ||
+        (desc->interrupt_enable_set_offset != 0u &&
+         (!rtc_offset_valid(desc->interrupt_enable_set_offset,
+                            desc->register_size) ||
+          !rtc_offset_valid(desc->interrupt_enable_clear_offset,
+                            desc->register_size) ||
+          desc->interrupt_enable_set_offset ==
+              desc->interrupt_enable_clear_offset ||
+          desc->interrupt_enable_set_offset ==
+              desc->interrupt_enable_offset ||
+          desc->interrupt_enable_set_offset == desc->interrupt_raw_offset ||
+          desc->interrupt_enable_set_offset ==
+              desc->interrupt_status_offset ||
+          desc->interrupt_enable_set_offset ==
+              desc->interrupt_clear_offset ||
+          desc->interrupt_enable_clear_offset ==
+              desc->interrupt_enable_offset ||
+          desc->interrupt_enable_clear_offset == desc->interrupt_raw_offset ||
+          desc->interrupt_enable_clear_offset ==
+              desc->interrupt_status_offset ||
+          desc->interrupt_enable_clear_offset ==
+              desc->interrupt_clear_offset)))
+        return false;
+
     if (!rtc_offset_valid(desc->analog_conf_offset, desc->register_size) ||
         desc->analog_conf_writable_mask == 0u ||
         desc->sar_i2c_power_mask == 0u ||
@@ -1219,6 +1250,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             reg->writable_mask == 0u ||
             (reg->writable_mask & reg->read_only_mask) != 0u ||
             (reg->supported_mask & ~reg->writable_mask) != 0u ||
+            (reg->write_strobe_mask & ~reg->writable_mask) != 0u ||
+            (reg->reset & reg->write_strobe_mask) != 0u ||
             (reg->reset &
              ~(reg->writable_mask | reg->read_only_mask)) != 0u ||
             rtc_existing_register_offset(desc, reg->offset))
@@ -1565,6 +1598,11 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return rtc->interrupt_raw & rtc->interrupt_enable;
     if (offset == desc->interrupt_clear_offset)
         return 0u;
+    if ((desc->interrupt_enable_set_offset != 0u &&
+         offset == desc->interrupt_enable_set_offset) ||
+        (desc->interrupt_enable_clear_offset != 0u &&
+         offset == desc->interrupt_enable_clear_offset))
+        return 0u;
     if (offset == desc->wdt_feed_offset)
         return 0u;
     if (offset == desc->wdt_write_protect_offset)
@@ -1638,14 +1676,19 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         const flexe_rtc_config_register_desc_t *reg =
             &desc->config_register[index];
         uint32_t old = rtc->config_reg[index];
-        uint32_t next = (old & ~reg->writable_mask) |
-                        (value & reg->writable_mask);
+        uint32_t state_mask = reg->writable_mask &
+                              ~reg->write_strobe_mask;
+        uint32_t command = value & reg->write_strobe_mask;
+        uint32_t next = (old & ~state_mask) | (value & state_mask);
         rtc->config_reg[index] = next;
         bool unsupported =
             (value & ~(reg->writable_mask | reg->read_only_mask)) != 0u ||
-            ((old ^ next) & ~reg->supported_mask) != 0u;
+            (((old ^ next) | command) & ~reg->supported_mask) != 0u;
         if (unsupported && rtc->fallback_write)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        if ((old != next || command != 0u) && rtc->config_changed)
+            rtc->config_changed(
+                rtc->config_ctx, reg->offset, next | command);
         return;
     }
     index = rtc_wdt_config_index(desc, offset);
@@ -2010,6 +2053,18 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         rtc_cntl_update_interrupt(rtc);
         return;
     }
+    if (desc->interrupt_enable_set_offset != 0u &&
+        offset == desc->interrupt_enable_set_offset) {
+        rtc->interrupt_enable |= value & desc->interrupt_valid_mask;
+        rtc_cntl_update_interrupt(rtc);
+        return;
+    }
+    if (desc->interrupt_enable_clear_offset != 0u &&
+        offset == desc->interrupt_enable_clear_offset) {
+        rtc->interrupt_enable &= ~(value & desc->interrupt_valid_mask);
+        rtc_cntl_update_interrupt(rtc);
+        return;
+    }
     if (offset == desc->wdt_feed_offset) {
         if ((value & ~desc->wdt_feed_mask) != 0u && rtc->fallback_write)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
@@ -2306,6 +2361,18 @@ void flexe_rtc_cntl_set_control_listener(
     rtc->control_changed = fn;
     rtc->control_ctx = fn ? ctx : NULL;
     rtc_cntl_publish_controls(rtc);
+}
+
+void flexe_rtc_cntl_set_config_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_config_fn fn, void *ctx)
+{
+    if (!rtc) return;
+    rtc->config_changed = fn;
+    rtc->config_ctx = fn ? ctx : NULL;
+    if (!fn) return;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    for (unsigned i = 0u; i < desc->config_register_count; i++)
+        fn(ctx, desc->config_register[i].offset, rtc->config_reg[i]);
 }
 
 uint32_t flexe_rtc_cntl_fast_clock_hz(const flexe_rtc_cntl_t *rtc)

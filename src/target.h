@@ -39,7 +39,8 @@
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX 6u
-#define FLEXE_TARGET_RTC_CONFIG_REGISTER_MAX 8u
+#define FLEXE_TARGET_RTC_CONFIG_REGISTER_MAX 16u
+#define FLEXE_TARGET_TOUCH_CHANNEL_MAX 15u
 #define FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX 8u
 #define FLEXE_TARGET_RTC_POWER_DOMAIN_MAX 4u
 #define FLEXE_TARGET_RTC_SUPPLY_MAX 4u
@@ -74,7 +75,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 67u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 68u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -117,6 +118,7 @@ typedef enum {
     FLEXE_TARGET_CAP_AES_V1                         = 1ull << 34,
     FLEXE_TARGET_CAP_MCPWM_V1                       = 1ull << 35,
     FLEXE_TARGET_CAP_LCD_CAM_V1                      = 1ull << 36,
+    FLEXE_TARGET_CAP_TOUCH_V2                        = 1ull << 37,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -366,13 +368,15 @@ typedef struct {
  * supported_mask identifies fields whose functional-mode treatment is
  * complete, including analog/electrical settings deliberately collapsed to
  * retained state. Changes outside supported_mask remain auditable. Read-only
- * fields survive guest read-modify-write sequences without being replaced. */
+ * fields survive guest read-modify-write sequences without being replaced;
+ * write_strobe_mask commands are delivered to listeners and self-clear. */
 typedef struct {
     uint16_t offset;
     uint32_t reset;
     uint32_t writable_mask;
     uint32_t read_only_mask;
     uint32_t supported_mask;
+    uint32_t write_strobe_mask;
 } flexe_rtc_config_register_desc_t;
 
 /* One independently sequenced digital power/isolation domain. Masks name
@@ -510,6 +514,9 @@ typedef struct {
     uint16_t interrupt_raw_offset;
     uint16_t interrupt_status_offset;
     uint16_t interrupt_clear_offset;
+    /* Optional write-one aliases for atomic interrupt-enable updates. */
+    uint16_t interrupt_enable_set_offset;
+    uint16_t interrupt_enable_clear_offset;
     uint32_t interrupt_enable_reset;
     uint32_t interrupt_raw_reset;
     uint32_t interrupt_valid_mask;
@@ -625,6 +632,8 @@ typedef struct {
     uint32_t register_size;
     uint8_t gpio_count;
     uint8_t data_shift;
+    uint16_t pin_base_offset;
+    uint32_t pin_writable_mask;
     uint16_t pad_base_offset;
     uint32_t pad_mux_mask;
     uint16_t ext0_select_offset;
@@ -632,6 +641,67 @@ typedef struct {
     uint8_t ext0_select_width;
     uint32_t pad_reset[FLEXE_TARGET_RTC_IO_PIN_MAX];
 } flexe_rtc_io_desc_t;
+
+/* ESP32-S2/S3-generation capacitive-touch controller. The digital control
+ * registers live in RTC_CNTL while thresholds and measurement results live
+ * in SENS; keeping both maps in one target descriptor lets the reusable
+ * state machine span those independently owned MMIO pages without assuming
+ * chip addresses. */
+typedef struct {
+    uint8_t channel_count;
+    uint8_t first_external_channel;
+
+    uint16_t rtc_control2_offset;
+    uint16_t rtc_scan_control_offset;
+    uint16_t rtc_sleep_threshold_offset;
+    uint16_t rtc_approach_offset;
+    uint16_t rtc_filter_offset;
+    uint32_t rtc_clock_enable_mask;
+    uint32_t rtc_reset_mask;
+    uint32_t rtc_start_force_mask;
+    uint32_t rtc_start_enable_mask;
+    uint32_t rtc_timer_enable_mask;
+    uint32_t rtc_scan_channel_mask;
+    uint8_t rtc_scan_channel_shift;
+    uint32_t rtc_sleep_channel_mask;
+    uint8_t rtc_sleep_channel_shift;
+    uint32_t rtc_sleep_threshold_mask;
+    uint32_t rtc_sleep_benchmark_clear_mask;
+
+    uint16_t sens_config_offset;
+    uint16_t sens_denoise_offset;
+    uint16_t sens_threshold_base_offset;
+    uint16_t sens_channel_status_offset;
+    uint16_t sens_status_base_offset;
+    uint16_t sens_sleep_status_offset;
+    uint16_t sens_approach_status_offset;
+    uint32_t sens_config_reset;
+    uint32_t sens_approach_channel_mask[3];
+    uint8_t sens_approach_channel_shift[3];
+    uint32_t sens_unit_done_mask;
+    uint32_t sens_denoise_done_mask;
+    uint32_t sens_data_select_mask;
+    uint8_t sens_data_select_shift;
+    uint32_t sens_status_clear_mask;
+    uint32_t sens_output_enable_mask;
+    uint32_t sens_threshold_mask;
+    uint32_t sens_measure_done_mask;
+    uint32_t sens_channel_clear_mask;
+    uint8_t sens_channel_clear_shift;
+    uint32_t sens_active_mask;
+    uint32_t sens_current_channel_mask;
+    uint8_t sens_current_channel_shift;
+    uint32_t sens_data_mask;
+    uint32_t sens_debounce_mask;
+    uint8_t sens_debounce_shift;
+
+    uint32_t interrupt_done_mask;
+    uint32_t interrupt_active_mask;
+    uint32_t interrupt_inactive_mask;
+    uint32_t interrupt_scan_done_mask;
+    uint32_t interrupt_timeout_mask;
+    uint32_t interrupt_approach_done_mask;
+} flexe_touch_v2_desc_t;
 
 /* Read views of a virtual chip's one-time-programmable fuse blocks. Burning
  * fuses is intentionally a separate capability: a read-only profile must not
@@ -1569,6 +1639,7 @@ struct flexe_target_desc {
 
     /* Optional RTC-domain ADC/touch/temperature sensor controller. */
     flexe_sens_desc_t             sens;
+    flexe_touch_v2_desc_t         touch_v2;
     flexe_apb_saradc_desc_t       apb_saradc;
 
     /* Optional RF/baseband/controller register and calibration surfaces. */

@@ -25,6 +25,8 @@ typedef void (*flexe_rtc_cntl_pad_hold_fn)(void *ctx, uint64_t gpio_mask);
 typedef void (*flexe_rtc_cntl_domain_state_fn)(
     void *ctx, uint32_t powered, uint32_t isolated);
 typedef void (*flexe_rtc_cntl_supply_state_fn)(void *ctx, uint32_t powered);
+typedef void (*flexe_rtc_cntl_config_fn)(void *ctx, uint16_t offset,
+                                         uint32_t value);
 
 /* Normalized state for the RTC controller's analog, oscillator, isolation,
  * and reset controls. Array-backed bitsets correspond to the same-numbered
@@ -103,6 +105,12 @@ void flexe_rtc_cntl_control_state(
     const flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_control_state_t *out);
 void flexe_rtc_cntl_set_control_listener(
     flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_control_state_fn fn, void *ctx);
+
+/* Target-described retained configuration can feed peripheral state machines
+ * whose controls physically reside in RTC_CNTL. Installing a listener
+ * publishes every current config word before subsequent changed values. */
+void flexe_rtc_cntl_set_config_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_config_fn fn, void *ctx);
 
 /* Nominal frequency selected by the target's RTC_FAST_CLK mux. Functional
  * mode exposes the selected source frequency without inventing oscillator

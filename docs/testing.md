@@ -222,6 +222,11 @@ unsupported MMIO.
 driver twice in each engine, checking ADC1 pattern decoding, two distinct
 host-fed type-2 frames, trigger-8 GDMA ownership, ISR/task notification, the
 driver ring buffer, teardown, deterministic replay, and zero unsupported MMIO.
+`check-s3-idf-touch.sh` runs the public ESP32-S3 touch-v2 driver twice per
+engine. It feeds an electrode through inactive, active, and released values;
+checks raw and benchmark selection, active/inactive RTC interrupts and their
+ISR-to-task notifications; and verifies complete driver teardown with zero
+unsupported MMIO.
 `check-s3-idf-aes.sh` likewise runs the public mbedTLS AES API twice per engine,
 covering all six S3 block modes, AES-128/256 known-answer vectors, partial CTR,
 and a 4 KiB interrupt-driven GDMA round trip.
@@ -248,7 +253,7 @@ Thus official external components remain content-pinned without dirtying or
 bloating the source tree. A content fingerprint covers the project sources,
 generated configuration, pinned IDF/tool metadata, build flags, deterministic
 timestamp, and both artifact hashes. An unchanged run therefore skips the IDF
-environment export and Ninja entirely; all nineteen artifact lookups take under
+environment export and Ninja entirely; all twenty artifact lookups take under
 two seconds on the reference MacBook. A cache miss retains full logs and prints only progress,
 exact artifact paths and hashes, and gate results. Pass `--verbose` when live
 compiler output and ccache statistics are useful. `--check` also updates just

@@ -1019,20 +1019,26 @@ TEST(rtc_cntl_s3_configuration_bank_masks_retains_and_audits)
     }
 
     const uint16_t expected_offset[] = {
-        0x068u, 0x07Cu, 0x080u, 0x08Cu, 0x10Cu, 0x148u,
+        0x068u, 0x07Cu, 0x080u, 0x08Cu, 0x108u, 0x10Cu, 0x110u,
+        0x114u, 0x118u, 0x11Cu, 0x124u, 0x148u, 0x14Cu, 0x150u,
     };
     const uint32_t expected_reset[] = {
         0x00000000u, 0x0AB0BE0Au, 0x00010800u,
-        0x00000000u, 0x000840CCu, 0x00000007u,
+        0x00000000u, 0x10000100u, 0x000840CCu, 0xF0000102u,
+        0x78000000u, 0x50000000u, 0x96AA8800u, 0x007FFFFFu,
+        0x00000007u, 0x00000000u, 0x00000000u,
     };
     const uint32_t expected_writable[] = {
         0xFFFFF000u, 0xFEFFFEFFu, 0x3FFFFC00u,
-        0x0FFFFFFFu, 0xFFFFFFFCu, 0x00000007u,
+        0x0FFFFFFFu, UINT32_MAX, 0xFFFFFFFCu, 0xFFFFFF07u,
+        0xFC3FFFFFu, 0xFF800000u, 0xFFFFFF80u, 0x007FFFFFu,
+        0x00000007u, 0xFFFFFFFCu, 0xFFFE0000u,
     };
     const uint32_t expected_read_only[] = {
-        0u, 0x01000000u, 0u, 0u, 0u, 0u,
+        0u, 0x01000000u, 0u, 0u, 0u, 0u, 0u,
+        0u, 0u, 0u, 0u, 0u, 0u, 0u,
     };
-    ASSERT_EQ(desc->config_register_count, 6u);
+    ASSERT_EQ(desc->config_register_count, 14u);
     for (unsigned i = 0u; i < desc->config_register_count; i++) {
         const flexe_rtc_config_register_desc_t *reg =
             &desc->config_register[i];
@@ -1041,9 +1047,10 @@ TEST(rtc_cntl_s3_configuration_bank_masks_retains_and_audits)
         ASSERT_EQ(reg->writable_mask, expected_writable[i]);
         ASSERT_EQ(reg->read_only_mask, expected_read_only[i]);
         ASSERT_EQ(mem_read32(mem, desc->base + reg->offset), reg->reset);
-        if (reg->supported_mask != 0u) {
-            uint32_t bit = reg->supported_mask &
-                           (0u - reg->supported_mask);
+        uint32_t retained_supported = reg->supported_mask &
+                                      ~reg->write_strobe_mask;
+        if (retained_supported != 0u) {
+            uint32_t bit = retained_supported & (0u - retained_supported);
             uint32_t changed = reg->reset ^ bit;
             mem_write32(mem, desc->base + reg->offset, changed);
             ASSERT_EQ(mem_read32(mem, desc->base + reg->offset), changed);
@@ -1061,19 +1068,33 @@ TEST(rtc_cntl_s3_configuration_bank_masks_retains_and_audits)
     ASSERT_EQ(mem_read32(mem, sdio_addr), sdio_before);
     ASSERT_EQ(fallback.writes, 0u);
 
-    /* Touch configuration reads its architectural reset, while activating
-     * its unimplemented FSM remains visible to the access audit. */
+    /* Touch configuration is functional state. Reserved bits still remain
+     * visible instead of disappearing into the modeled register bank. */
     const flexe_rtc_config_register_desc_t *touch =
-        &desc->config_register[4];
+        &desc->config_register[5];
     uint32_t touch_addr = desc->base + touch->offset;
     mem_write32(mem, touch_addr, touch->reset | (1u << 31u));
     ASSERT_EQ(mem_read32(mem, touch_addr), touch->reset | (1u << 31u));
+    ASSERT_EQ(fallback.writes, 0u);
+    mem_write32(mem, touch_addr, touch->reset | 1u);
+    ASSERT_EQ(mem_read32(mem, touch_addr), touch->reset);
+    ASSERT_EQ(fallback.writes, 1u);
+
+    /* TOUCH_SLP_CHANNEL_CLR is a supported write command, not retained
+     * configuration state. */
+    const flexe_rtc_config_register_desc_t *approach =
+        &desc->config_register[8];
+    ASSERT_EQ(approach->write_strobe_mask, 1u << 23);
+    mem_write32(mem, desc->base + approach->offset,
+                approach->reset | approach->write_strobe_mask);
+    ASSERT_EQ(mem_read32(mem, desc->base + approach->offset),
+              approach->reset);
     ASSERT_EQ(fallback.writes, 1u);
 
     /* Clearing the FIB brownout selector gives software ownership to the
      * modeled brownout configuration without fabricating a voltage event. */
     const flexe_rtc_config_register_desc_t *fib =
-        &desc->config_register[5];
+        &desc->config_register[11];
     uint32_t fib_addr = desc->base + fib->offset;
     mem_write32(mem, fib_addr, fib->reset & ~(1u << 1u));
     ASSERT_EQ(mem_read32(mem, fib_addr), 0x5u);
@@ -1137,6 +1158,16 @@ TEST(rtc_cntl_rejects_invalid_configuration_bank_geometry)
 
     invalid = *s3;
     invalid.rtc_cntl.config_register[0].supported_mask = 1u;
+    mem = mem_create_for_target(&invalid);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc == NULL);
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.config_register[0].write_strobe_mask = 1u;
     mem = mem_create_for_target(&invalid);
     rtc = flexe_rtc_cntl_create(
         mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);

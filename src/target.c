@@ -425,6 +425,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_PCNT_V1 |
                         FLEXE_TARGET_CAP_MCPWM_V1 |
                         FLEXE_TARGET_CAP_LCD_CAM_V1 |
+                        FLEXE_TARGET_CAP_TOUCH_V2 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -1023,6 +1024,8 @@ static const flexe_target_desc_t TARGETS[] = {
             .interrupt_raw_offset = 0x044u,
             .interrupt_status_offset = 0x048u,
             .interrupt_clear_offset = 0x04Cu,
+            .interrupt_enable_set_offset = 0x138u,
+            .interrupt_enable_clear_offset = 0x13Cu,
             .interrupt_enable_reset = 0u,
             .interrupt_raw_reset = 0u,
             .interrupt_valid_mask = 0x001FFFFFu,
@@ -1083,33 +1086,55 @@ static const flexe_target_desc_t TARGETS[] = {
                 { 0x02Cu, 0x00008000u, 0x0000FF00u },
                 { 0x030u, 0x10200A08u, UINT32_MAX },
             },
-            /* Remaining RTC sleep-path configuration. Functional mode keeps
-             * analog bias/drive values as exact architectural state while
-             * deliberately collapsing their electrical voltage and settling
-             * effects. TOUCH_CTRL2 is readable at reset, but writes remain
-             * diagnostic until a touch FSM consumes them. */
-            .config_register_count = 6u,
+            /* Remaining RTC sleep-path and touch-v2 configuration.
+             * Functional mode keeps analog bias/drive values as exact state
+             * while collapsing their electrical voltage and settling time.
+             * The touch engine consumes the digital controls below. */
+            .config_register_count = 14u,
             .config_register = {
                 /* SLP_REJECT_CONF */
                 { 0x068u, 0x00000000u, 0xFFFFF000u,
-                  0x00000000u, 0xFFFFF000u },
+                  0x00000000u, 0xFFFFF000u, 0u },
                 /* SDIO_CONF; REG1P8_READY is physically read-only. */
                 { 0x07Cu, 0x0AB0BE0Au, 0xFEFFFEFFu,
-                  0x01000000u, 0xFEFFFEFFu },
+                  0x01000000u, 0xFEFFFEFFu, 0u },
                 /* BIAS_CONF */
                 { 0x080u, 0x00010800u, 0x3FFFFC00u,
-                  0x00000000u, 0x3FFFFC00u },
+                  0x00000000u, 0x3FFFFC00u, 0u },
                 /* REGULATOR_DRV_CTRL */
                 { 0x08Cu, 0x00000000u, 0x0FFFFFFFu,
-                  0x00000000u, 0x0FFFFFFFu },
+                  0x00000000u, 0x0FFFFFFFu, 0u },
+                /* TOUCH_CTRL1: measurement and inter-scan lengths. */
+                { 0x108u, 0x10000100u, UINT32_MAX,
+                  0x00000000u, UINT32_MAX, 0u },
                 /* TOUCH_CTRL2 */
                 { 0x10Cu, 0x000840CCu, 0xFFFFFFFCu,
-                  0x00000000u, 0x00000000u },
+                  0x00000000u, 0xFFFFFFFCu, 0u },
+                /* TOUCH_SCAN_CTRL */
+                { 0x110u, 0xF0000102u, 0xFFFFFF07u,
+                  0x00000000u, 0xFFFFFF07u, 0u },
+                /* TOUCH_SLP_THRES */
+                { 0x114u, 0x78000000u, 0xFC3FFFFFu,
+                  0x00000000u, 0xFC3FFFFFu, 0u },
+                /* TOUCH_APPROACH; SLP_CHANNEL_CLR is a write strobe. */
+                { 0x118u, 0x50000000u, 0xFF800000u,
+                  0x00000000u, 0xFF800000u, 1u << 23 },
+                /* TOUCH_FILTER_CTRL */
+                { 0x11Cu, 0x96AA8800u, 0xFFFFFF80u,
+                  0x00000000u, 0xFFFFFF80u, 0u },
+                /* TOUCH_TIMEOUT_CTRL */
+                { 0x124u, 0x007FFFFFu, 0x007FFFFFu,
+                  0x00000000u, 0x007FFFFFu, 0u },
                 /* FIB_SEL: software ownership for power-glitch, brownout,
                  * and super-watchdog reset paths. Detector injection is a
                  * separate capability from retaining this selector. */
                 { 0x148u, 0x00000007u, 0x00000007u,
-                  0x00000000u, 0x00000007u },
+                  0x00000000u, 0x00000007u, 0u },
+                /* TOUCH_DAC / TOUCH_DAC1 per-channel slope fields. */
+                { 0x14Cu, 0x00000000u, 0xFFFFFFFCu,
+                  0x00000000u, 0xFFFFFFFCu, 0u },
+                { 0x150u, 0x00000000u, 0xFFFE0000u,
+                  0x00000000u, 0xFFFE0000u, 0u },
             },
             .cpu_stall_enable_offset = 0x01Cu,
             .cpu_stall_enable_mask = 1u,
@@ -1196,6 +1221,8 @@ static const flexe_target_desc_t TARGETS[] = {
             .register_size = 0x200u,
             .gpio_count = 22u,
             .data_shift = 10u,
+            .pin_base_offset = 0x028u,
+            .pin_writable_mask = 0x00000784u,
             .pad_base_offset = 0x084u,
             .pad_mux_mask = 1u << 19,
             .ext0_select_offset = 0x0DCu,
@@ -1418,6 +1445,60 @@ static const flexe_target_desc_t TARGETS[] = {
                     .arbiter_controlled = true,
                 },
             },
+        },
+        .touch_v2 = {
+            .channel_count = 15u,
+            .first_external_channel = 1u,
+            .rtc_control2_offset = 0x10Cu,
+            .rtc_scan_control_offset = 0x110u,
+            .rtc_sleep_threshold_offset = 0x114u,
+            .rtc_approach_offset = 0x118u,
+            .rtc_filter_offset = 0x11Cu,
+            .rtc_clock_enable_mask = 1u << 31,
+            .rtc_reset_mask = 1u << 29,
+            .rtc_start_force_mask = 1u << 16,
+            .rtc_start_enable_mask = 1u << 15,
+            .rtc_timer_enable_mask = 1u << 13,
+            .rtc_scan_channel_mask = 0x7FFFu << 10,
+            .rtc_scan_channel_shift = 10u,
+            .rtc_sleep_channel_mask = 0x1Fu << 27,
+            .rtc_sleep_channel_shift = 27u,
+            .rtc_sleep_threshold_mask = 0x003FFFFFu,
+            .rtc_sleep_benchmark_clear_mask = 1u << 23,
+            .sens_config_offset = 0x05Cu,
+            .sens_denoise_offset = 0x060u,
+            .sens_threshold_base_offset = 0x064u,
+            .sens_channel_status_offset = 0x09Cu,
+            .sens_status_base_offset = 0x0A0u,
+            .sens_sleep_status_offset = 0x0DCu,
+            .sens_approach_status_offset = 0x0E0u,
+            .sens_config_reset = 0xFFF07FFFu,
+            .sens_approach_channel_mask = {
+                0xFu << 28, 0xFu << 24, 0xFu << 20,
+            },
+            .sens_approach_channel_shift = { 28u, 24u, 20u },
+            .sens_unit_done_mask = 1u << 19,
+            .sens_denoise_done_mask = 1u << 18,
+            .sens_data_select_mask = 3u << 16,
+            .sens_data_select_shift = 16u,
+            .sens_status_clear_mask = 1u << 15,
+            .sens_output_enable_mask = 0x7FFFu,
+            .sens_threshold_mask = 0x003FFFFFu,
+            .sens_measure_done_mask = 1u << 31,
+            .sens_channel_clear_mask = 0x7FFFu << 15,
+            .sens_channel_clear_shift = 15u,
+            .sens_active_mask = 0x7FFFu,
+            .sens_current_channel_mask = 0xFu << 22,
+            .sens_current_channel_shift = 22u,
+            .sens_data_mask = 0x003FFFFFu,
+            .sens_debounce_mask = 7u << 29,
+            .sens_debounce_shift = 29u,
+            .interrupt_done_mask = 1u << 6,
+            .interrupt_active_mask = 1u << 7,
+            .interrupt_inactive_mask = 1u << 8,
+            .interrupt_scan_done_mask = 1u << 4,
+            .interrupt_timeout_mask = 1u << 18,
+            .interrupt_approach_done_mask = 1u << 20,
         },
         .apb_saradc = {
             .base = 0x60040000u,

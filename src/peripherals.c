@@ -22,6 +22,7 @@
 #include "system_clock.h"
 #include "systimer.h"
 #include "timer_group.h"
+#include "touch_v2.h"
 #include "usb_serial_jtag.h"
 #include "spi_display.h"
 #include "sandbox_events.h"
@@ -1861,6 +1862,7 @@ struct esp32_periph {
     flexe_regi2c_t *regi2c;
     flexe_radio_t *radio_regs;
     flexe_sens_t *target_sens;
+    flexe_touch_v2_t *touch_v2;
     flexe_apb_saradc_t *target_apb_saradc;
     flexe_assist_debug_t *assist_debug;
     flexe_sensitive_memprot_t *sensitive_memprot;
@@ -14793,6 +14795,21 @@ static void target_sens_conversion_done(void *ctx)
         p->target_rtc_cntl, p->target->sens.rtc_interrupt_mask, true);
 }
 
+static void target_touch_irq(void *ctx, uint32_t mask)
+{
+    esp32_periph_t *p = ctx;
+    if (p && p->target_rtc_cntl)
+        flexe_rtc_cntl_set_interrupts(p->target_rtc_cntl, mask, true);
+}
+
+static void target_touch_rtc_config_changed(
+    void *ctx, uint16_t offset, uint32_t value)
+{
+    esp32_periph_t *p = ctx;
+    if (p)
+        flexe_touch_v2_rtc_config_changed(p->touch_v2, offset, value);
+}
+
 static uint16_t target_apb_saradc_sample(
     void *ctx, unsigned unit, unsigned channel)
 {
@@ -15918,6 +15935,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 flexe_rtc_cntl_set_pad_hold_listener(
                     p->target_rtc_cntl, target_rtc_pad_hold_changed, p);
         }
+        if (target->capabilities & FLEXE_TARGET_CAP_TOUCH_V2) {
+            p->touch_v2 = flexe_touch_v2_create(
+                mem, target_touch_irq, p);
+            flexe_sens_attach_touch_v2(p->target_sens, p->touch_v2);
+            if (p->target_rtc_cntl && p->touch_v2)
+                flexe_rtc_cntl_set_config_listener(
+                    p->target_rtc_cntl,
+                    target_touch_rtc_config_changed, p);
+        }
         if (target->flash_mmu.shared_instruction_data)
             p->shared_flash_mmu = flexe_flash_mmu_create(mem);
         if (target->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM) {
@@ -15934,6 +15960,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
              !p->target_rtc_io) ||
             ((target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) &&
              !p->target_rtc_cntl) ||
+            ((target->capabilities & FLEXE_TARGET_CAP_TOUCH_V2) &&
+             !p->touch_v2) ||
             (target->flash_mmu.shared_instruction_data &&
              !p->shared_flash_mmu) ||
             ((target->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM) &&
@@ -16317,6 +16345,7 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_regi2c_destroy(p->regi2c);
     flexe_rtc_cntl_set_digital_domain_listener(
         p->target_rtc_cntl, NULL, NULL);
+    flexe_rtc_cntl_set_config_listener(p->target_rtc_cntl, NULL, NULL);
     flexe_radio_destroy(p->radio_regs);
     flexe_syscon_memory_destroy(p->syscon_memory);
     flexe_efuse_destroy(p->target_efuse);
@@ -16326,6 +16355,7 @@ void periph_destroy(esp32_periph_t *p) {
             p->target->efuse.register_size, NULL, NULL, NULL);
     flexe_rtc_cntl_destroy(p->target_rtc_cntl);
     flexe_sens_destroy(p->target_sens);
+    flexe_touch_v2_destroy(p->touch_v2);
     flexe_rtc_io_destroy(p->target_rtc_io);
     if (p->target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1)
         (void)mem_register_mmio_range(
@@ -17401,15 +17431,31 @@ uint8_t periph_dac_value(const esp32_periph_t *p, int channel) {
     return rtcio_dac_value(p->rtcio_regs[off / 4u]);
 }
 
-/* Inject a touch-pad reading. Counts fall as capacitance rises, so a "touched"
- * pad is one whose value is below its threshold; the gate drives it that way.
- * A scan runs immediately when the FSM is on, which is what lets a host-side
- * touch raise the interrupt without the guest polling for it. */
+/* Inject a touch-pad reading. Classic ESP32 counts fall with capacitance;
+ * touch-v2 targets count upward. Both engines resolve a scan immediately in
+ * functional fast mode when their FSM is active. */
 void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value) {
-    if (!p || pad < 0 || pad >= SENS_TOUCH_PAD_COUNT) return;
+    if (!p || pad < 0) return;
+    if (p->touch_v2) {
+        flexe_touch_v2_set_raw(p->touch_v2, (unsigned)pad, value);
+        return;
+    }
+    if (pad >= SENS_TOUCH_PAD_COUNT) return;
     p->touch_value[pad] = (uint16_t)value;
     if (touch_fsm_running(p))
         touch_run_measurement(p);
+}
+
+uint64_t periph_touch_scan_count(const esp32_periph_t *p) {
+    return p ? flexe_touch_v2_scan_count(p->touch_v2) : 0u;
+}
+
+uint32_t periph_touch_active_mask(const esp32_periph_t *p) {
+    return p ? flexe_touch_v2_active_mask(p->touch_v2) : 0u;
+}
+
+bool periph_touch_running(const esp32_periph_t *p) {
+    return p && flexe_touch_v2_running(p->touch_v2);
 }
 
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {

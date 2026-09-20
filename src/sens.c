@@ -3,6 +3,7 @@
 
 #include "apb_saradc.h"
 #include "regi2c.h"
+#include "touch_v2.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -46,6 +47,7 @@ struct flexe_sens {
     void *peripheral_ctx;
     const flexe_regi2c_t *regi2c;
     const flexe_apb_saradc_t *apb_saradc;
+    flexe_touch_v2_t *touch_v2;
     uint32_t adc_power;
     uint32_t adc_status_addr;
     sens_adc_unit_t adc[FLEXE_TARGET_SENS_ADC_UNIT_MAX];
@@ -502,6 +504,9 @@ uint32_t flexe_sens_mmio_read(void *ctx, uint32_t addr)
     if (offset == desc->reset_offset) return sens->reset;
     uint32_t adc_value = 0u;
     if (sens_adc_read(sens, offset, &adc_value)) return adc_value;
+    uint32_t touch_value = 0u;
+    if (flexe_touch_v2_sens_read(sens->touch_v2, offset, &touch_value))
+        return touch_value;
     return sens->fallback_read ?
         sens->fallback_read(sens->fallback_ctx, addr) : 0u;
 }
@@ -554,6 +559,7 @@ void flexe_sens_mmio_write(void *ctx, uint32_t addr, uint32_t value)
         return;
     }
     if (sens_adc_write(sens, offset, addr, value)) return;
+    if (flexe_touch_v2_sens_write(sens->touch_v2, offset, value)) return;
     sens_fallback_write(sens, addr, value);
 }
 
@@ -612,6 +618,12 @@ void flexe_sens_attach_apb_saradc(flexe_sens_t *sens,
                                   const flexe_apb_saradc_t *apb_saradc)
 {
     if (sens) sens->apb_saradc = apb_saradc;
+}
+
+void flexe_sens_attach_touch_v2(flexe_sens_t *sens,
+                                flexe_touch_v2_t *touch)
+{
+    if (sens) sens->touch_v2 = touch;
 }
 
 void flexe_sens_set_peripheral_listener(

@@ -136,6 +136,7 @@ int main(int argc, char **argv)
     run_rtc_cntl_tests();
     run_rtc_io_tests();
     run_sens_tests();
+    run_touch_v2_tests();
     run_apb_saradc_tests();
     run_radio_tests();
     run_esp32s3_extmem_tests();

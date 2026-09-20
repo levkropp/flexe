@@ -7,8 +7,9 @@
 
 /* ESP32-S3 rtc_io_reg.h. Output, output-enable, sampled input, EXT0 pin
  * selection and the pad-owner mux have functional effects, including
- * RTC_CNTL pad hold. Other documented pad fields retain their register
- * value but remain diagnostic when changed. */
+ * RTC_CNTL pad hold. Pull/drive/touch controls retain architectural state;
+ * electrical effects and nonzero pin wake/open-drain controls remain
+ * diagnostic when changed. */
 #define RTC_GPIO_OUT_OFF         0x000u
 #define RTC_GPIO_OUT_SET_OFF     0x004u
 #define RTC_GPIO_OUT_CLEAR_OFF   0x008u
@@ -33,6 +34,7 @@ struct flexe_rtc_io {
     void *fallback_ctx;
     uint32_t output;
     uint32_t enabled;
+    uint32_t pin[FLEXE_TARGET_RTC_IO_PIN_MAX];
     uint32_t ext0_select;
     uint32_t pad[FLEXE_TARGET_RTC_IO_PIN_MAX];
     uint32_t held_mask;
@@ -78,6 +80,11 @@ static bool rtc_io_geometry_valid(const flexe_target_desc_t *target)
         desc->gpio_count != FLEXE_TARGET_RTC_IO_PIN_MAX ||
         desc->data_shift >= 32u ||
         desc->data_shift + desc->gpio_count > 32u ||
+        desc->pin_base_offset < RTC_GPIO_IN_OFF + 4u ||
+        (desc->pin_base_offset & 3u) != 0u ||
+        desc->pin_base_offset + 4u * desc->gpio_count >
+            desc->pad_base_offset ||
+        desc->pin_writable_mask == 0u ||
         desc->pad_base_offset < RTC_GPIO_IN_OFF + 4u ||
         (desc->pad_base_offset & 3u) != 0u ||
         desc->pad_base_offset + 4u * desc->gpio_count >
@@ -170,6 +177,10 @@ uint32_t flexe_rtc_io_mmio_read(void *ctx, uint32_t addr)
     }
     if (off == desc->ext0_select_offset)
         return rtc_io->ext0_select << desc->ext0_select_shift;
+    if (off >= desc->pin_base_offset &&
+        off < desc->pin_base_offset + 4u * desc->gpio_count &&
+        (off & 3u) == 0u)
+        return rtc_io->pin[(off - desc->pin_base_offset) / 4u];
     if (off >= desc->pad_base_offset &&
         off < desc->pad_base_offset + 4u * desc->gpio_count &&
         (off & 3u) == 0u)
@@ -216,6 +227,20 @@ void flexe_rtc_io_mmio_write(void *ctx, uint32_t addr, uint32_t value)
     return;
 
 pad_or_fallback:
+    if (off >= desc->pin_base_offset &&
+        off < desc->pin_base_offset + 4u * desc->gpio_count &&
+        (off & 3u) == 0u) {
+        unsigned pin = (off - desc->pin_base_offset) / 4u;
+        uint32_t old = rtc_io->pin[pin];
+        rtc_io->pin[pin] = value & desc->pin_writable_mask;
+        /* Per-pin wake type and open-drain state are retained. Their GPIO
+         * wake/electrical effects stay diagnostic only when software changes
+         * them; ordinary driver writes of the reset value are fully handled. */
+        if (((old ^ rtc_io->pin[pin]) & desc->pin_writable_mask) != 0u ||
+            (value & ~desc->pin_writable_mask) != 0u)
+            rtc_io_fallback_write(rtc_io, addr, value);
+        return;
+    }
     if (off == desc->ext0_select_offset) {
         uint32_t mask = ((1u << desc->ext0_select_width) - 1u) <<
                         desc->ext0_select_shift;
@@ -233,8 +258,7 @@ pad_or_fallback:
         uint32_t old = rtc_io->pad[pin];
         uint32_t writable = pad_writable_mask(pin);
         rtc_io->pad[pin] = value & writable;
-        if (((old ^ rtc_io->pad[pin]) &
-             ~(desc->pad_mux_mask | RTC_PAD_INPUT_ENABLE)) != 0u ||
+        if (((old ^ rtc_io->pad[pin]) & RTC_PAD_FUNCTION_MASK) != 0u ||
             (value & ~writable) != 0u)
             rtc_io_fallback_write(rtc_io, addr, value);
         rtc_io_publish(rtc_io);

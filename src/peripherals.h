@@ -547,6 +547,9 @@ void periph_gpio_set_input(esp32_periph_t *p, int pin, int level);
  * as capacitance rises, so a touched pad reads below its threshold. Pads are
  * 0-9, mapping to GPIO 4, 0, 2, 15, 13, 12, 14, 27, 33, 32. */
 void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value);
+uint64_t periph_touch_scan_count(const esp32_periph_t *p);
+uint32_t periph_touch_active_mask(const esp32_periph_t *p);
+bool periph_touch_running(const esp32_periph_t *p);
 
 /* ADC input injection. Channels 0-39 cover both ADC1 (0-9) and ADC2 (0-9)
  * plus the GPIO-number oriented indexing used by some APIs; we over-allocate

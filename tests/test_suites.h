@@ -14,6 +14,7 @@ void run_io_mux_tests(void);
 void run_rtc_cntl_tests(void);
 void run_rtc_io_tests(void);
 void run_sens_tests(void);
+void run_touch_v2_tests(void);
 void run_apb_saradc_tests(void);
 void run_radio_tests(void);
 void run_esp32s3_extmem_tests(void);

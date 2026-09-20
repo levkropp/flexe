@@ -69,6 +69,7 @@ even when a firmware workflow succeeds.
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame in both engines with zero unsupported startup/device accesses; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback with zero unsupported accesses | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path; pulse RAM becomes inaccessible and loses contents under `RMT_MEM_FORCE_PD`. DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 SENS clocks, RTC and continuous SAR ADC, temperature sensor | Partial (MMIO/GDMA plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh`, and `scripts/check-s3-idf-adc-continuous.sh`; the latter runs ESP-IDF 5.3.2's stock continuous driver through pattern scan, trigger-8 GDMA, ISR callbacks, its FreeRTOS ring buffer, and teardown twice in each engine with zero unsupported accesses | RTC one-shot and functional ADC1 continuous conversion are driver-gated. ADC2 contention, calibrated conversion cadence, digital IIR/monitor behavior, ULP execution, analog attenuation/calibration, and electrical fidelity remain unsupported. |
+| S3 capacitive touch v2 | Partial (MMIO plus host samples) | `tests/test_touch_v2.c`; `scripts/check-s3-idf-touch.sh` runs ESP-IDF 5.3.2's public touch driver twice in each engine through initialization, timer scans, raw/benchmark reads, threshold transitions, RTC active/inactive interrupts, ISR-to-task notification, and teardown with zero unsupported accesses | Upward-count threshold scanning and software-visible filter/approach/DAC state are modeled in functional fast mode. Calibrated charge/discharge cadence, IIR/jitter/debounce timing, approach sensing, timeout behavior, touch wake from sleep, ULP integration, and electrical capacitance remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response, next prompt, and zero unsupported accesses | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
@@ -241,14 +242,31 @@ so this is functional wake ordering, not calibrated sleep duration. Touch/ULP
 wake and analog voltage-transition timing are not modeled; an unarmed timer or
 those sources do not synthesize a wake.
 The target-described RTC configuration bank gives SLP_REJECT_CONF, SDIO_CONF,
-BIAS_CONF, REGULATOR_DRV_CTRL, and TOUCH_CTRL2 exact reset, masking, and
-readback behavior without teaching the device model S3 addresses. Bias and
-drive values are retained while their electrical voltage/settling effects are
-deliberately collapsed in functional mode. SDIO's readiness field remains
-read-only, reserved writes remain diagnostic, and activating the touch FSM
-still reports an unsupported effect until a touch engine consumes it. Valid
+BIAS_CONF, REGULATOR_DRV_CTRL, and the complete touch-v2 control/DAC bank exact
+reset, masking, and readback behavior without teaching the device model S3
+addresses. Bias and drive values are retained while their electrical
+voltage/settling effects are deliberately collapsed in functional mode.
+SDIO's readiness field remains read-only, reserved writes remain diagnostic,
+and a separate touch engine consumes the digital scan controls. Valid
 oscillator gating fields in CLK_CONF likewise retain their exact value while
 the modeled slow/fast muxes resolve immediately.
+
+The touch-v2 engine composes RTC_CNTL, SENS, and RTCIO rather than intercepting
+driver functions. It scans target-described channel masks, preserves raw,
+benchmark, smooth, threshold, debounce, filter, approach, timeout, and slope
+state, uses S3's upward-count threshold direction, and raises DONE, SCAN_DONE,
+ACTIVE, and INACTIVE bits through the ordinary RTC interrupt bank. Host input
+changes complete scans immediately in functional fast mode. The pinned public
+ESP-IDF 5.3.2 fixture configures pad 4, establishes a 1000-count benchmark,
+crosses a 200-count threshold at 1400, releases it at 1050, and delivers both
+transitions through the stock RTC ISR and a FreeRTOS task notification before
+teardown. Its image SHA-256 is
+`1d0c4ffebcedb1637421cb34cb3bd4f4a61d0da2fc41c65c5a644b3c453753b2` and
+matching ELF SHA-256 is
+`c53b7ae278cd5d54480deeb833cc3e7e62414c905f48a60ed560ae905cfcc6d0`.
+Two interpreter and two JIT replays are deterministic and report zero
+unsupported MMIO. This gate does not claim calibrated scan timing, electrical
+capacitance, approach/timeout transitions, or touch wake from sleep.
 The separate RTC fast-clock mux now selects the target-described 20 MHz XTAL/2
 or nominal 17.5 MHz RC_FAST source, while the slow counter keeps its own mux and
 phase. `RTC_CNTL_DATE_REG` resets to the S3 revision value and retains its

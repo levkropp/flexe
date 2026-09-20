@@ -121,6 +121,7 @@ set(LIB_SOURCES
     src/regi2c.c
     src/radio.c
     src/sens.c
+    src/touch_v2.c
     src/sensitive_memprot.c
     src/syscon_memory.c
     src/system_clock.c
@@ -247,6 +248,7 @@ set(TEST_SOURCES
     tests/test_rtc_cntl.c
     tests/test_rtc_io.c
     tests/test_sens.c
+    tests/test_touch_v2.c
     tests/test_apb_saradc.c
     tests/test_radio.c
     tests/test_esp32s3_extmem.c
@@ -411,6 +413,7 @@ if(UNIX)
     add_flexe_fixture_entry(s3_idf_camera s3_idf_camera_test.c)
     add_flexe_fixture_entry(s3_idf_adc_continuous
         s3_idf_adc_continuous_test.c)
+    add_flexe_fixture_entry(s3_idf_touch s3_idf_touch_test.c)
 
     # The driver-level EMAC gate intentionally reuses the HAL harness with an
     # extra command-line mode rather than compiling a second entry object.
@@ -450,6 +453,7 @@ if(UNIX)
     add_flexe_runner(flexe-s3-idf-camera-test s3_idf_camera_test.c)
     add_flexe_runner(flexe-s3-idf-adc-continuous-test
         s3_idf_adc_continuous_test.c)
+    add_flexe_runner(flexe-s3-idf-touch-test s3_idf_touch_test.c)
     add_flexe_runner(flexe-rtc-gpio-test rtc_gpio_test.c)
     add_flexe_runner(flexe-rtc-i2c-test rtc_i2c_test.c)
     add_flexe_runner(flexe-scheduler-test scheduler_test.c)
