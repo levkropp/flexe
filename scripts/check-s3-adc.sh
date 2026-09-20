@@ -31,7 +31,7 @@ for engine in interp jit; do
             printf '%s\n' \
                 '{"t":"adc_in","ch":3,"raw":2645}' \
                 '{"t":"adc_in","ch":10,"raw":1450}' | \
-                "$runner" -N -q --no-jit --target esp32s3 \
+                "$runner" -N -q --no-jit --strict-mmio --target esp32s3 \
                     -R "$S3_ROM_ELF" -s "$S3_ADC_ELF" --sandbox-events \
                     --unhandled-report -c 2000000000 "$S3_ADC_BIN" \
                     > "$tmpdir/$engine.events.$replay" \
@@ -40,7 +40,7 @@ for engine in interp jit; do
             printf '%s\n' \
                 '{"t":"adc_in","ch":3,"raw":2645}' \
                 '{"t":"adc_in","ch":10,"raw":1450}' | \
-                "$runner" -N -q --jit-stats --target esp32s3 \
+                "$runner" -N -q --jit-stats --strict-mmio --target esp32s3 \
                     -R "$S3_ROM_ELF" -s "$S3_ADC_ELF" --sandbox-events \
                     -c 2000000000 "$S3_ADC_BIN" \
                     > "$tmpdir/$engine.events.$replay" \

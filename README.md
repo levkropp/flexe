@@ -91,6 +91,7 @@ Common options:
 | `--usb-console` | Use native USB Serial/JTAG instead of UART0 for console output |
 | `--sandbox-events` | Stream peripheral NDJSON and accept GPIO, touch, ADC, or binary UART input on stdin |
 | `--unhandled-report` | Rank unsupported MMIO by register, guest PC, core, and direction; uses the interpreter for accurate attribution |
+| `--strict-mmio` | Fail on any unsupported MMIO access without disabling the JIT |
 | `-c N` | Stop after `N` aggregate emulated cycles |
 | `-q` | Suppress emulator diagnostics |
 | `-T` | Emit an instruction trace to stderr |

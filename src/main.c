@@ -653,6 +653,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -v              Verbose register dump on exit\n");
     fprintf(stderr, "  -q              Quiet: suppress per-access unhandled peripheral warnings\n");
     fprintf(stderr, "  --unhandled-report  Rank unsupported MMIO sites by count (interpreter diagnostic)\n");
+    fprintf(stderr, "  --strict-mmio   Fail if any unsupported MMIO access occurs (JIT-safe)\n");
     fprintf(stderr, "  --rmt-stats     Summarize transmitted RMT pulse chunks and completions\n");
     fprintf(stderr, "  -e <addr>       Override entry point (hex)\n");
     fprintf(stderr, "  -s <file.elf>   Load ELF symbols for trace/breakpoints\n");
@@ -1022,6 +1023,7 @@ int main(int argc, char *argv[]) {
     int verbose = 0;
     int quiet_unhandled = 0;
     int unhandled_report = 0;
+    int strict_mmio = 0;
     int rmt_stats_enabled = 0;
     rmt_channel_stats_t rmt_stats[RMT_STATS_CHANNELS] = {0};
     int call_trace = 0;
@@ -1118,6 +1120,12 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--unhandled-report") == 0) {
             unhandled_report = 1;
+            memmove(&argv[i], &argv[i + 1],
+                    (size_t)(argc - i) * sizeof(char *));
+            argc -= 1;
+            continue;
+        } else if (strcmp(argv[i], "--strict-mmio") == 0) {
+            strict_mmio = 1;
             memmove(&argv[i], &argv[i + 1],
                     (size_t)(argc - i) * sizeof(char *));
             argc -= 1;
@@ -2091,10 +2099,14 @@ int main(int argc, char *argv[]) {
     if (rom_stubs_unregistered_count(rom) > 0)
         fprintf(stderr, "Unregistered ROM calls: %d\n", rom_stubs_unregistered_count(rom));
 
-    if (!quiet_unhandled || periph_unhandled_count(periph) > 0)
-        fprintf(stderr, "Unhandled:  %d peripheral accesses\n", periph_unhandled_count(periph));
+    int unhandled_count = periph_unhandled_count(periph);
+    if (!quiet_unhandled || unhandled_count > 0)
+        fprintf(stderr, "Unhandled:  %d peripheral accesses\n", unhandled_count);
     if (unhandled_report)
         print_unhandled_report(periph, syms);
+    if (strict_mmio)
+        fprintf(stderr, "Strict MMIO: %d unsupported peripheral accesses\n",
+                unhandled_count);
 
     /* -U: Audit unhooked firmware functions.
      * Uses the ROM call stats from the completed run + symbol lookup
@@ -2180,5 +2192,5 @@ int main(int argc, char *argv[]) {
     }
     flexe_host_net_destroy(host_net);
     flexe_session_destroy(session);
-    return 0;
+    return strict_mmio && unhandled_count != 0 ? 1 : 0;
 }

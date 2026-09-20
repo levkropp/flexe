@@ -35,12 +35,18 @@ trap cleanup EXIT HUP INT TERM
 run_engine() {
     local name=$1
     shift
-    FLEXE_RMT_FRAME_STATS=1 "$runner" -N -q "$@" \
+    FLEXE_RMT_FRAME_STATS=1 "$runner" -N -q --strict-mmio "$@" \
         --target esp32s3 -R "$S3_ROM_ELF" --rmt-stats \
         -c 4000000000 "$S3_WLED_BIN" \
         > /dev/null 2> "$tmpdir/$name.err"
     if ! grep -q '^Stop reason: halt (WAITI)' "$tmpdir/$name.err"; then
         echo "FAIL: WLED S3 did not sustain $name execution" >&2
+        tail -30 "$tmpdir/$name.err" >&2
+        exit 1
+    fi
+    if ! grep -qx 'Strict MMIO: 0 unsupported peripheral accesses' \
+            "$tmpdir/$name.err"; then
+        echo "FAIL: WLED S3 $name used unsupported MMIO" >&2
         tail -30 "$tmpdir/$name.err" >&2
         exit 1
     fi
@@ -94,4 +100,4 @@ if [[ -z "$jit_insns" || "$jit_insns" -eq 0 ]]; then
     exit 1
 fi
 
-echo "PASS: WLED S3 interpreter and JIT emitted the same 317-frame pinned RMT stream ($jit_insns native instructions)"
+echo "PASS: WLED S3 interpreter and JIT emitted the same 317-frame pinned RMT stream with zero unsupported MMIO ($jit_insns native instructions)"

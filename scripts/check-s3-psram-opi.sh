@@ -30,13 +30,13 @@ trap 'rm -rf -- "$tmpdir"' EXIT
 for engine in interp jit; do
     for replay in 1 2; do
         if [[ "$engine" == interp ]]; then
-            "$runner" -N -q --no-jit --target esp32s3 \
+            "$runner" -N -q --no-jit --strict-mmio --target esp32s3 \
                 --psram ap-8m-opi -R "$S3_ROM_ELF" -s "$S3_PSRAM_ELF" \
                 --unhandled-report -c 2000000000 "$S3_PSRAM_BIN" \
                 > "$tmpdir/$engine.out.$replay" \
                 2> "$tmpdir/$engine.err.$replay"
         else
-            "$runner" -N -q --jit-stats --target esp32s3 \
+            "$runner" -N -q --jit-stats --strict-mmio --target esp32s3 \
                 --psram ap-8m-opi -R "$S3_ROM_ELF" -s "$S3_PSRAM_ELF" \
                 -c 2000000000 "$S3_PSRAM_BIN" \
                 > "$tmpdir/$engine.out.$replay" \
@@ -76,7 +76,7 @@ if ! cmp -s "$tmpdir/interp.out.1" "$tmpdir/jit.out.1"; then
     exit 1
 fi
 
-"$runner" -N -q --no-jit --target esp32s3 \
+"$runner" -N -q --no-jit --strict-mmio --target esp32s3 \
     -R "$S3_ROM_ELF" -s "$S3_PSRAM_ELF" -c 1000000000 \
     "$S3_PSRAM_BIN" > "$tmpdir/absent.out" 2> "$tmpdir/absent.err"
 if ! grep -qx 'S3_PSRAM_SIZE_FAIL 0' "$tmpdir/absent.out" ||

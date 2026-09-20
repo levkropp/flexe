@@ -218,6 +218,11 @@ correctness investigations:
 `FLEXE_JIT_STATS=1` prints compilation, coverage, and chaining counters from
 the stock-ROM runner.
 
+Use `--strict-mmio` in acceptance gates that must reject every unsupported
+peripheral access. Unlike `--unhandled-report`, it only checks the aggregate
+counter and therefore leaves the JIT enabled; rerun a failure with
+`--unhandled-report` to attribute registers and guest PCs in the interpreter.
+
 ## Traces
 
 Use `-T` to write a verbose emulator trace, then narrow it with

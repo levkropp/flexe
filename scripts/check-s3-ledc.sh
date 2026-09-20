@@ -28,13 +28,15 @@ trap 'rm -rf -- "$tmpdir"' EXIT
 for engine in interp jit; do
     for replay in 1 2; do
         if [[ "$engine" == interp ]]; then
-            "$runner" -N -q --no-jit --target esp32s3 -R "$S3_ROM_ELF" \
+            "$runner" -N -q --no-jit --strict-mmio --target esp32s3 \
+                -R "$S3_ROM_ELF" \
                 -s "$S3_LEDC_ELF" --sandbox-events --unhandled-report \
                 -c 2000000000 "$S3_LEDC_BIN" \
                 > "$tmpdir/$engine.events.$replay" \
                 2> "$tmpdir/$engine.guest.$replay"
         else
-            "$runner" -N -q --jit-stats --target esp32s3 -R "$S3_ROM_ELF" \
+            "$runner" -N -q --jit-stats --strict-mmio --target esp32s3 \
+                -R "$S3_ROM_ELF" \
                 -s "$S3_LEDC_ELF" --sandbox-events \
                 -c 2000000000 "$S3_LEDC_BIN" \
                 > "$tmpdir/$engine.events.$replay" \
