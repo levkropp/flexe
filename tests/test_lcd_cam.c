@@ -10,6 +10,9 @@
 #define S3_SYSTEM_LCD_CAM       (1u << 8)
 
 #define S3_LCD_CAM_BASE         0x60041000u
+#define S3_CAM_CTRL             (S3_LCD_CAM_BASE + 0x004u)
+#define S3_CAM_CTRL1            (S3_LCD_CAM_BASE + 0x008u)
+#define S3_CAM_RGB_YUV          (S3_LCD_CAM_BASE + 0x00Cu)
 #define S3_LCD_USER             (S3_LCD_CAM_BASE + 0x014u)
 #define S3_LCD_MISC             (S3_LCD_CAM_BASE + 0x018u)
 #define S3_LCD_CTRL             (S3_LCD_CAM_BASE + 0x01Cu)
@@ -20,7 +23,11 @@
 #define S3_LCD_INT_ST           (S3_LCD_CAM_BASE + 0x06Cu)
 #define S3_LCD_INT_CLR          (S3_LCD_CAM_BASE + 0x070u)
 #define S3_LCD_DATE             (S3_LCD_CAM_BASE + 0x0FCu)
-#define S3_CAM_CTRL1            (S3_LCD_CAM_BASE + 0x008u)
+
+#define S3_CAM_BYTE_ORDER       (1u << 5)
+#define S3_CAM_BIT_ORDER        (1u << 6)
+#define S3_CAM_2BYTE            (1u << 24)
+#define S3_CAM_START            (1u << 29)
 
 #define S3_LCD_ALWAYS_OUT       (1u << 13)
 #define S3_LCD_SWIZZLE          (1u << 19)
@@ -31,6 +38,7 @@
 #define S3_LCD_COMMAND          (1u << 26)
 #define S3_LCD_START            (1u << 27)
 #define S3_LCD_TRANS_DONE       (1u << 1)
+#define S3_CAM_VSYNC            (1u << 2)
 
 #define S3_GDMA_BASE            0x6003F000u
 #define S3_GDMA_OUT_INT_RAW     (S3_GDMA_BASE + 0x068u)
@@ -38,7 +46,14 @@
 #define S3_GDMA_OUT_EOF_DESC    (S3_GDMA_BASE + 0x088u)
 #define S3_GDMA_OUT_DESC        (S3_GDMA_BASE + 0x090u)
 #define S3_GDMA_OUT_PERI_SEL    (S3_GDMA_BASE + 0x0A8u)
+#define S3_GDMA_IN_INT_RAW      (S3_GDMA_BASE + 0x008u)
+#define S3_GDMA_IN_INT_CLR      (S3_GDMA_BASE + 0x014u)
+#define S3_GDMA_IN_LINK         (S3_GDMA_BASE + 0x020u)
+#define S3_GDMA_IN_SUC_EOF_DESC (S3_GDMA_BASE + 0x028u)
+#define S3_GDMA_IN_DESC         (S3_GDMA_BASE + 0x030u)
+#define S3_GDMA_IN_PERI_SEL     (S3_GDMA_BASE + 0x048u)
 #define S3_GDMA_OUT_LINK_START  (1u << 21)
+#define S3_GDMA_IN_LINK_START   (1u << 22)
 #define S3_GDMA_DESC_EOF        (1u << 30)
 #define S3_GDMA_DESC_OWNER      (1u << 31)
 #define S3_GDMA_LCD_TRIGGER     5u
@@ -229,7 +244,74 @@ TEST(esp32s3_lcd_cam_i80_drains_gdma_chain_in_wire_order)
     lcd_cam_fixture_destroy(&fixture);
 }
 
-TEST(esp32s3_lcd_cam_diagnoses_unimplemented_transfer_modes)
+TEST(esp32s3_lcd_cam_camera_rx_preserves_dma_eof_and_vsync_boundaries)
+{
+    lcd_cam_fixture_t fixture;
+    bool ready = lcd_cam_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        lcd_cam_fixture_destroy(&fixture);
+        return;
+    }
+    lcd_cam_enable(&fixture);
+
+    const uint32_t descriptor0 = 0x3FC8F500u;
+    const uint32_t descriptor1 = descriptor0 + 12u;
+    const uint32_t buffer0 = 0x3FC90500u;
+    const uint32_t buffer1 = buffer0 + 4u;
+    lcd_cam_descriptor(fixture.mem, descriptor0, buffer0, 4u, false,
+                       descriptor1);
+    lcd_cam_descriptor(fixture.mem, descriptor1, buffer1, 4u, false, 0u);
+    mem_write32(fixture.mem, S3_GDMA_IN_PERI_SEL, S3_GDMA_LCD_TRIGGER);
+    mem_write32(fixture.mem, S3_GDMA_IN_LINK,
+                (descriptor0 & 0xFFFFFu) | S3_GDMA_IN_LINK_START);
+    mem_write32(fixture.mem, S3_CAM_CTRL,
+                S3_CAM_BYTE_ORDER | S3_CAM_BIT_ORDER);
+    mem_write32(fixture.mem, S3_CAM_CTRL1,
+                S3_CAM_2BYTE | S3_CAM_START | 7u);
+
+    const uint8_t frame[] = {
+        0x12u, 0x34u, 0x56u, 0x78u,
+        0x9Au, 0xBCu, 0xDEu, 0xF0u,
+    };
+    ASSERT_EQ(periph_lcd_cam_camera_rx_inject(
+                  fixture.periph, frame, 3u), 0u);
+    ASSERT_EQ(mem_read32(fixture.mem, descriptor0) & S3_GDMA_DESC_OWNER,
+              S3_GDMA_DESC_OWNER);
+    ASSERT_EQ(periph_lcd_cam_camera_rx_inject(
+                  fixture.periph, frame, sizeof(frame)), 4u);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_GDMA_IN_INT_RAW), 1u);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_GDMA_IN_SUC_EOF_DESC), 0u);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_GDMA_IN_DESC), descriptor0);
+    const uint8_t expected0[] = { 0x2Cu, 0x48u, 0x1Eu, 0x6Au };
+    for (unsigned index = 0u; index < sizeof(expected0); index++)
+        ASSERT_EQ(mem_read8(fixture.mem, buffer0 + index), expected0[index]);
+
+    mem_write32(fixture.mem, S3_GDMA_IN_INT_CLR, UINT32_MAX);
+    ASSERT_EQ(periph_lcd_cam_camera_rx_inject(
+                  fixture.periph, frame + 4u, 4u), 4u);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_GDMA_IN_INT_RAW), 3u);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_GDMA_IN_SUC_EOF_DESC),
+              descriptor1);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_GDMA_IN_DESC), descriptor1);
+    const uint8_t expected1[] = { 0x3Du, 0x59u, 0x0Fu, 0x7Bu };
+    for (unsigned index = 0u; index < sizeof(expected1); index++)
+        ASSERT_EQ(mem_read8(fixture.mem, buffer1 + index), expected1[index]);
+
+    periph_intr_matrix_set(fixture.periph, 0, 10, 24);
+    mem_write32(fixture.mem, S3_LCD_INT_ENA, S3_CAM_VSYNC);
+    ASSERT_EQ(periph_lcd_cam_camera_vsync(fixture.periph), 1);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_LCD_INT_RAW), S3_CAM_VSYNC);
+    ASSERT_EQ(mem_read32(fixture.mem, S3_LCD_INT_ST), S3_CAM_VSYNC);
+    ASSERT_TRUE(fixture.cpu.interrupt & (1u << 10u));
+    mem_write32(fixture.mem, S3_LCD_INT_CLR, S3_CAM_VSYNC);
+    ASSERT_FALSE(fixture.cpu.interrupt & (1u << 10u));
+    ASSERT_EQ(periph_unhandled_count(fixture.periph), 0u);
+
+    lcd_cam_fixture_destroy(&fixture);
+}
+
+TEST(esp32s3_lcd_cam_diagnoses_unimplemented_converter_and_lcd_modes)
 {
     lcd_cam_fixture_t fixture;
     bool ready = lcd_cam_fixture_init(&fixture);
@@ -241,8 +323,13 @@ TEST(esp32s3_lcd_cam_diagnoses_unimplemented_transfer_modes)
     lcd_cam_enable(&fixture);
     ASSERT_EQ(periph_unhandled_count(fixture.periph), 0u);
 
-    mem_write32(fixture.mem, S3_CAM_CTRL1, 1u << 29);
+    const uint8_t pixel = 0xA5u;
+    mem_write32(fixture.mem, S3_CAM_CTRL1, S3_CAM_START);
+    mem_write32(fixture.mem, S3_CAM_RGB_YUV, 1u << 31);
+    ASSERT_EQ(periph_lcd_cam_camera_rx_inject(
+                  fixture.periph, &pixel, 1u), 0u);
     ASSERT_EQ(periph_unhandled_count(fixture.periph), 1u);
+
     mem_write32(fixture.mem, S3_LCD_CTRL, 1u << 31);
     mem_write32(fixture.mem, S3_LCD_USER,
                 S3_LCD_DUMMY | S3_LCD_START);
@@ -260,8 +347,9 @@ TEST(esp32s3_lcd_cam_diagnoses_unimplemented_transfer_modes)
 
 void run_lcd_cam_tests(void)
 {
-    TEST_SUITE("S3 LCD_CAM i80/GDMA");
+    TEST_SUITE("S3 LCD_CAM display/camera GDMA");
     RUN_TEST(esp32s3_lcd_cam_register_gate_command_and_interrupt_semantics);
     RUN_TEST(esp32s3_lcd_cam_i80_drains_gdma_chain_in_wire_order);
-    RUN_TEST(esp32s3_lcd_cam_diagnoses_unimplemented_transfer_modes);
+    RUN_TEST(esp32s3_lcd_cam_camera_rx_preserves_dma_eof_and_vsync_boundaries);
+    RUN_TEST(esp32s3_lcd_cam_diagnoses_unimplemented_converter_and_lcd_modes);
 }

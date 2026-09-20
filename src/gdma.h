@@ -73,5 +73,13 @@ int flexe_gdma_write_rx_descriptor(flexe_gdma_t *gdma,
                                    uint8_t peripheral_id,
                                    const uint8_t *data, size_t length,
                                    flexe_gdma_descriptor_t *completed);
+/* Complete one RX descriptor while preserving the peripheral's independent
+ * EOF boundary. Streaming peripherals may span one EOF interval across
+ * several descriptors; the compatibility wrapper above treats each
+ * descriptor as an EOF, matching its historical contract. */
+int flexe_gdma_write_rx_descriptor_eof(
+    flexe_gdma_t *gdma, uint8_t peripheral_id,
+    const uint8_t *data, size_t length, bool peripheral_eof,
+    flexe_gdma_descriptor_t *completed);
 
 #endif /* FLEXE_GDMA_H */

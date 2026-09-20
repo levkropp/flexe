@@ -1,4 +1,4 @@
-/* Target-described ESP32-S3-generation LCD_CAM i80 transmit controller. */
+/* Target-described ESP32-S3-generation LCD_CAM display/camera controller. */
 #ifndef FLEXE_LCD_CAM_H
 #define FLEXE_LCD_CAM_H
 
@@ -42,5 +42,14 @@ void flexe_lcd_cam_set_system_state(flexe_lcd_cam_t *lcd_cam,
 int flexe_lcd_cam_set_i80_callback(flexe_lcd_cam_t *lcd_cam,
                                    flexe_lcd_cam_i80_tx_fn callback,
                                    void *ctx);
+
+/* Feed one complete camera DMA quantum and signal frame boundaries. RX
+ * injection consumes at most one descriptor (and never a partial descriptor)
+ * so the host can let the guest service each GDMA EOF interrupt before
+ * supplying more data. VSYNC raises the shared LCD_CAM interrupt independently
+ * of GDMA, as the physical parallel sensor does. */
+size_t flexe_lcd_cam_camera_rx_inject(flexe_lcd_cam_t *lcd_cam,
+                                      const uint8_t *data, size_t length);
+int flexe_lcd_cam_camera_vsync(flexe_lcd_cam_t *lcd_cam);
 
 #endif /* FLEXE_LCD_CAM_H */

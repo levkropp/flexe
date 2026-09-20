@@ -25,11 +25,16 @@
 
 #define LCD_CAM_INT_VALID_MASK         0x0000000Fu
 #define LCD_CAM_INT_LCD_TRANS_DONE     (1u << 1)
+#define LCD_CAM_INT_CAM_VSYNC          (1u << 2)
 
 #define LCD_CAM_CAM_UPDATE             (1u << 4)
+#define LCD_CAM_CAM_BYTE_ORDER         (1u << 5)
+#define LCD_CAM_CAM_BIT_ORDER          (1u << 6)
 #define LCD_CAM_CAM_START              (1u << 29)
 #define LCD_CAM_CAM_RESET              (1u << 30)
 #define LCD_CAM_CAM_AFIFO_RESET        (1u << 31)
+#define LCD_CAM_CAM_2BYTE_ENABLE       (1u << 24)
+#define LCD_CAM_CAM_CONVERTER_ENABLE   (1u << 31)
 
 #define LCD_CAM_LCD_ALWAYS_OUT         (1u << 13)
 #define LCD_CAM_LCD_8BITS_ORDER        (1u << 19)
@@ -62,6 +67,7 @@ struct flexe_lcd_cam {
     flexe_lcd_cam_i80_tx_fn tx_callback;
     void *tx_ctx;
     uint32_t regs[0x100u / sizeof(uint32_t)];
+    size_t camera_bytes_until_eof;
     bool clock_enabled;
     bool reset_asserted;
     bool irq_level;
@@ -115,6 +121,7 @@ static void lcd_cam_reset(flexe_lcd_cam_t *lcd_cam)
     memset(lcd_cam->regs, 0, sizeof(lcd_cam->regs));
     lcd_cam->regs[LCD_CAM_LCD_MISC_OFF / 4u] = 17u << 1u;
     lcd_cam->regs[LCD_CAM_DATE_OFF / 4u] = lcd_cam->desc->date_reset;
+    lcd_cam->camera_bytes_until_eof = 0u;
     lcd_cam->tx_callback = callback;
     lcd_cam->tx_ctx = callback_ctx;
     lcd_cam->clock_enabled = clock_enabled;
@@ -158,6 +165,24 @@ static void lcd_cam_order_i80_data(uint8_t *data, size_t length,
         (wide && (user & LCD_CAM_LCD_BYTE_ORDER) != 0u) !=
         ((user & LCD_CAM_LCD_8BITS_ORDER) != 0u);
     if (swap_bytes) {
+        for (size_t index = 0u; index + 1u < length; index += 2u) {
+            uint8_t swap = data[index];
+            data[index] = data[index + 1u];
+            data[index + 1u] = swap;
+        }
+    }
+}
+
+static void lcd_cam_order_camera_data(uint8_t *data, size_t length,
+                                      uint32_t control,
+                                      uint32_t control1)
+{
+    if (control & LCD_CAM_CAM_BIT_ORDER) {
+        for (size_t index = 0u; index < length; index++)
+            data[index] = lcd_cam_reverse8(data[index]);
+    }
+    if ((control & LCD_CAM_CAM_BYTE_ORDER) != 0u &&
+        (control1 & LCD_CAM_CAM_2BYTE_ENABLE) != 0u) {
         for (size_t index = 0u; index + 1u < length; index += 2u) {
             uint8_t swap = data[index];
             data[index] = data[index + 1u];
@@ -304,9 +329,9 @@ static void lcd_cam_write(void *ctx, uint32_t address, uint32_t value)
     case LCD_CAM_CAM_CTRL1_OFF:
         lcd_cam->regs[offset / 4u] = value &
             ~(LCD_CAM_CAM_RESET | LCD_CAM_CAM_AFIFO_RESET);
-        if ((value & LCD_CAM_CAM_START) != 0u &&
-            lcd_cam->clock_enabled && !lcd_cam->reset_asserted)
-            lcd_cam_report_unsupported(lcd_cam, offset, value);
+        if ((value & (LCD_CAM_CAM_RESET | LCD_CAM_CAM_AFIFO_RESET)) != 0u ||
+            (value & LCD_CAM_CAM_START) == 0u)
+            lcd_cam->camera_bytes_until_eof = 0u;
         return;
     case LCD_CAM_CAM_RGB_YUV_OFF:
         lcd_cam->regs[offset / 4u] = value & 0xFFE00000u;
@@ -353,7 +378,7 @@ static bool lcd_cam_geometry_valid(const flexe_target_desc_t *target,
                                    const flexe_gdma_t *gdma)
 {
     if (!target || !gdma ||
-        !(target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_I80_V1) ||
+        !(target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_V1) ||
         !(target->capabilities & FLEXE_TARGET_CAP_GDMA_V1) ||
         !(target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) ||
         !(target->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1))
@@ -433,4 +458,61 @@ int flexe_lcd_cam_set_i80_callback(flexe_lcd_cam_t *lcd_cam,
     lcd_cam->tx_callback = callback;
     lcd_cam->tx_ctx = callback ? ctx : NULL;
     return 0;
+}
+
+size_t flexe_lcd_cam_camera_rx_inject(flexe_lcd_cam_t *lcd_cam,
+                                      const uint8_t *data, size_t length)
+{
+    if (!lcd_cam || (!data && length != 0u) || length == 0u ||
+        !lcd_cam->clock_enabled || lcd_cam->reset_asserted)
+        return 0u;
+    uint32_t control = lcd_cam->regs[LCD_CAM_CAM_CTRL_OFF / 4u];
+    uint32_t control1 = lcd_cam->regs[LCD_CAM_CAM_CTRL1_OFF / 4u];
+    if ((control1 & LCD_CAM_CAM_START) == 0u)
+        return 0u;
+    if ((lcd_cam->regs[LCD_CAM_CAM_RGB_YUV_OFF / 4u] &
+         LCD_CAM_CAM_CONVERTER_ENABLE) != 0u) {
+        lcd_cam_report_unsupported(lcd_cam, LCD_CAM_CAM_CTRL1_OFF, control1);
+        return 0u;
+    }
+    size_t capacity = 0u;
+    if (!flexe_gdma_pending_length(lcd_cam->gdma,
+                                   lcd_cam->desc->gdma_peripheral_id,
+                                   true, &capacity))
+        return 0u;
+    size_t bytes_until_eof = lcd_cam->camera_bytes_until_eof ?
+        lcd_cam->camera_bytes_until_eof : (control1 & 0xFFFFu) + 1u;
+    size_t required = capacity < bytes_until_eof ?
+                      capacity : bytes_until_eof;
+    if (required == 0u || required > LCD_CAM_DMA_DESCRIPTOR_MAX ||
+        length < required)
+        return 0u;
+    if ((control1 & LCD_CAM_CAM_2BYTE_ENABLE) != 0u &&
+        (required & 1u) != 0u) {
+        lcd_cam_report_unsupported(lcd_cam, LCD_CAM_CAM_CTRL1_OFF, control1);
+        return 0u;
+    }
+    uint8_t ordered[LCD_CAM_DMA_DESCRIPTOR_MAX];
+    memcpy(ordered, data, required);
+    lcd_cam_order_camera_data(ordered, required, control, control1);
+    bool eof = required == bytes_until_eof;
+    if (flexe_gdma_write_rx_descriptor_eof(
+            lcd_cam->gdma, lcd_cam->desc->gdma_peripheral_id,
+            ordered, required, eof, NULL) != 0)
+        return 0u;
+    lcd_cam->camera_bytes_until_eof = eof ? 0u :
+        bytes_until_eof - required;
+    return required;
+}
+
+int flexe_lcd_cam_camera_vsync(flexe_lcd_cam_t *lcd_cam)
+{
+    if (!lcd_cam || !lcd_cam->clock_enabled || lcd_cam->reset_asserted ||
+        (lcd_cam->regs[LCD_CAM_CAM_CTRL1_OFF / 4u] &
+         LCD_CAM_CAM_START) == 0u)
+        return 0;
+    lcd_cam->camera_bytes_until_eof = 0u;
+    lcd_cam->regs[LCD_CAM_INT_RAW_OFF / 4u] |= LCD_CAM_INT_CAM_VSYNC;
+    lcd_cam_update_irq(lcd_cam);
+    return 1;
 }

@@ -424,7 +424,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_TWAI_V1 |
                         FLEXE_TARGET_CAP_PCNT_V1 |
                         FLEXE_TARGET_CAP_MCPWM_V1 |
-                        FLEXE_TARGET_CAP_LCD_CAM_I80_V1 |
+                        FLEXE_TARGET_CAP_LCD_CAM_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -1620,6 +1620,15 @@ static const flexe_target_desc_t TARGETS[] = {
             .vsync_output_signal = 152u,
             .dc_output_signal = 153u,
             .pclk_output_signal = 154u,
+            .camera_data_input_signal = {
+                133u, 134u, 135u, 136u, 137u, 138u, 139u, 140u,
+                141u, 142u, 143u, 144u, 145u, 146u, 147u, 148u,
+            },
+            .camera_pclk_input_signal = 149u,
+            .camera_h_enable_input_signal = 150u,
+            .camera_hsync_input_signal = 151u,
+            .camera_vsync_input_signal = 152u,
+            .camera_xclk_output_signal = 149u,
             .interrupt_source = 24u,
             .gdma_peripheral_id = 5u,
             .data_output_count = 16u,

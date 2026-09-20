@@ -202,7 +202,7 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             (gate->device == FLEXE_SYSTEM_DEVICE_LCD_CAM &&
              gate->instance == 0u &&
              (target->capabilities &
-              FLEXE_TARGET_CAP_LCD_CAM_I80_V1)) ||
+              FLEXE_TARGET_CAP_LCD_CAM_V1)) ||
             (gate->device == FLEXE_SYSTEM_DEVICE_EDMA &&
              gate->instance == 0u);
         int bank = system_clock_peripheral_bank_index(

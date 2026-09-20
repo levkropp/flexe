@@ -384,6 +384,9 @@ size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port);
  * descriptor; command-only transfers carry no data. */
 int periph_set_lcd_cam_i80_callback(esp32_periph_t *p,
                                     flexe_lcd_cam_i80_tx_fn fn, void *ctx);
+size_t periph_lcd_cam_camera_rx_inject(esp32_periph_t *p,
+                                       const uint8_t *data, size_t len);
+int periph_lcd_cam_camera_vsync(esp32_periph_t *p);
 
 /* Attach a host pulse sink to a classic channel 0..7 or S3 TX channel 0..3.
  * RX injection accepts already-decoded RMT symbols after firmware enables

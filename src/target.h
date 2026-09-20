@@ -74,7 +74,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 66u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 67u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -116,7 +116,7 @@ typedef enum {
     FLEXE_TARGET_CAP_PCNT_V1                        = 1ull << 33,
     FLEXE_TARGET_CAP_AES_V1                         = 1ull << 34,
     FLEXE_TARGET_CAP_MCPWM_V1                       = 1ull << 35,
-    FLEXE_TARGET_CAP_LCD_CAM_I80_V1                 = 1ull << 36,
+    FLEXE_TARGET_CAP_LCD_CAM_V1                      = 1ull << 36,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -997,11 +997,9 @@ typedef struct {
     flexe_i2s_v2_instance_desc_t instance[FLEXE_TARGET_I2S_MAX];
 } flexe_i2s_v2_desc_t;
 
-/* ESP32-S3-generation LCD_CAM register block. This capability currently
- * covers the i80 transmit path: placement, SYSTEM ownership, interrupt and
- * GDMA routing, and GPIO-matrix producers are all SoC wiring. Camera capture
- * and continuous RGB scanout remain separate behavioral milestones even
- * though their configuration words share this aperture. */
+/* ESP32-S3-generation LCD_CAM register block. Placement, SYSTEM ownership,
+ * interrupt/GDMA routing, and GPIO-matrix signals are all SoC wiring shared
+ * by the i80 transmit and parallel-camera receive engines. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
@@ -1013,6 +1011,12 @@ typedef struct {
     uint16_t vsync_output_signal;
     uint16_t dc_output_signal;
     uint16_t pclk_output_signal;
+    uint16_t camera_data_input_signal[FLEXE_TARGET_LCD_CAM_DATA_MAX];
+    uint16_t camera_pclk_input_signal;
+    uint16_t camera_h_enable_input_signal;
+    uint16_t camera_hsync_input_signal;
+    uint16_t camera_vsync_input_signal;
+    uint16_t camera_xclk_output_signal;
     uint8_t  interrupt_source;
     uint8_t  gdma_peripheral_id;
     uint8_t  data_output_count;

@@ -7361,7 +7361,7 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
     bool native_lcd_cam_i80 =
         stubs->cpu && stubs->cpu->target &&
         (stubs->cpu->target->capabilities &
-         FLEXE_TARGET_CAP_LCD_CAM_I80_V1) != 0u &&
+         FLEXE_TARGET_CAP_LCD_CAM_V1) != 0u &&
         elf_symbols_find(syms, "esp_lcd_new_i80_bus",
                          &lcd_i80_bus_addr) == 0 &&
         elf_symbols_find(syms, "esp_lcd_new_panel_io_i80",

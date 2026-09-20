@@ -14999,7 +14999,7 @@ static void lcd_cam_irq_changed(void *ctx, bool level)
 {
     esp32_periph_t *p = ctx;
     if (!p || !p->lcd_cam ||
-        !(p->target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_I80_V1))
+        !(p->target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_V1))
         return;
     int source = p->target->lcd_cam.interrupt_source;
     if (level) periph_assert_interrupt(p, source);
@@ -15684,7 +15684,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
-    if (target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_I80_V1) {
+    if (target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_V1) {
         p->lcd_cam = flexe_lcd_cam_create(
             mem, p->gdma, default_read, default_write, p,
             lcd_cam_irq_changed, p);
@@ -15710,6 +15710,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                  index < sizeof(controls) / sizeof(controls[0]); index++)
                 flexe_gpio_set_output_signal_modeled(
                     p->target_gpio, controls[index]);
+            flexe_gpio_set_output_signal_modeled(
+                p->target_gpio, lcd->camera_xclk_output_signal);
         }
     }
 
@@ -16679,6 +16681,17 @@ int periph_set_lcd_cam_i80_callback(esp32_periph_t *p,
                                     flexe_lcd_cam_i80_tx_fn fn, void *ctx) {
     return p && p->lcd_cam ?
         flexe_lcd_cam_set_i80_callback(p->lcd_cam, fn, ctx) : -1;
+}
+
+size_t periph_lcd_cam_camera_rx_inject(esp32_periph_t *p,
+                                       const uint8_t *data, size_t len) {
+    return p && p->lcd_cam ?
+        flexe_lcd_cam_camera_rx_inject(p->lcd_cam, data, len) : 0u;
+}
+
+int periph_lcd_cam_camera_vsync(esp32_periph_t *p) {
+    return p && p->lcd_cam ?
+        flexe_lcd_cam_camera_vsync(p->lcd_cam) : 0;
 }
 
 int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,

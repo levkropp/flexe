@@ -724,7 +724,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_PCNT_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_MCPWM_V1);
-    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_LCD_CAM_I80_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_LCD_CAM_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_AES_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GP_SPI);
@@ -793,6 +793,13 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->lcd_cam.data_output_signal[15], 148u);
     ASSERT_EQ(s3->lcd_cam.dc_output_signal, 153u);
     ASSERT_EQ(s3->lcd_cam.pclk_output_signal, 154u);
+    ASSERT_EQ(s3->lcd_cam.camera_data_input_signal[0], 133u);
+    ASSERT_EQ(s3->lcd_cam.camera_data_input_signal[15], 148u);
+    ASSERT_EQ(s3->lcd_cam.camera_pclk_input_signal, 149u);
+    ASSERT_EQ(s3->lcd_cam.camera_h_enable_input_signal, 150u);
+    ASSERT_EQ(s3->lcd_cam.camera_hsync_input_signal, 151u);
+    ASSERT_EQ(s3->lcd_cam.camera_vsync_input_signal, 152u);
+    ASSERT_EQ(s3->lcd_cam.camera_xclk_output_signal, 149u);
     ASSERT_EQ(s3->sdmmc_host.base, 0x60028000u);
     ASSERT_EQ(s3->sdmmc_host.register_size, 0x1000u);
     ASSERT_EQ(s3->sdmmc_host.version_reset, 0x5342240Au);

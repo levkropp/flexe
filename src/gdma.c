@@ -778,10 +778,10 @@ int flexe_gdma_read_tx_descriptor(flexe_gdma_t *gdma,
     return 0;
 }
 
-int flexe_gdma_write_rx_descriptor(flexe_gdma_t *gdma,
-                                   uint8_t peripheral_id,
-                                   const uint8_t *data, size_t length,
-                                   flexe_gdma_descriptor_t *completed)
+int flexe_gdma_write_rx_descriptor_eof(
+    flexe_gdma_t *gdma, uint8_t peripheral_id,
+    const uint8_t *data, size_t length, bool peripheral_eof,
+    flexe_gdma_descriptor_t *completed)
 {
     if (!gdma || (!data && length != 0u)) return -1;
     int selected = gdma_active_rx_channel(gdma, peripheral_id);
@@ -823,8 +823,10 @@ int flexe_gdma_write_rx_descriptor(flexe_gdma_t *gdma,
         gdma, channel, GDMA_V1_IN_INT_RAW_OFF));
     uint32_t *success_desc = gdma_reg(gdma, gdma_channel_addr(
         gdma, channel, GDMA_V1_IN_SUC_EOF_DESC_OFF));
-    if (raw) *raw |= GDMA_V1_IN_DONE_INT | GDMA_V1_IN_SUC_EOF_INT;
-    if (success_desc) *success_desc = descriptor;
+    if (raw)
+        *raw |= GDMA_V1_IN_DONE_INT |
+                (peripheral_eof ? GDMA_V1_IN_SUC_EOF_INT : 0u);
+    if (peripheral_eof && success_desc) *success_desc = descriptor;
     rx->next_desc = next;
     if (!next) {
         rx->active = false;
@@ -840,10 +842,19 @@ int flexe_gdma_write_rx_descriptor(flexe_gdma_t *gdma,
         completed->descriptor_address = descriptor;
         completed->buffer_address = buffer;
         completed->length = length;
-        completed->eof = true;
+        completed->eof = peripheral_eof;
         completed->chain_complete = next == 0u;
     }
     return 0;
+}
+
+int flexe_gdma_write_rx_descriptor(flexe_gdma_t *gdma,
+                                   uint8_t peripheral_id,
+                                   const uint8_t *data, size_t length,
+                                   flexe_gdma_descriptor_t *completed)
+{
+    return flexe_gdma_write_rx_descriptor_eof(
+        gdma, peripheral_id, data, length, true, completed);
 }
 
 int flexe_gdma_read_tx(flexe_gdma_t *gdma, uint8_t peripheral_id,
