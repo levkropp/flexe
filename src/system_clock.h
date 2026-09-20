@@ -34,6 +34,18 @@ typedef struct {
 typedef void (*flexe_system_low_power_fn)(
     void *ctx, const flexe_system_low_power_state_t *state);
 
+/* Complete target peripheral clock/reset fabric. Bank zero occupies bits
+ * 0..31 and bank one bits 32..63; valid_mask distinguishes implemented target
+ * domains from reserved positions. Device-specific effects remain attached
+ * through the gate mappings in the target descriptor. */
+typedef struct {
+    uint64_t clock_enabled;
+    uint64_t reset_asserted;
+    uint64_t valid_mask;
+} flexe_system_peripheral_state_t;
+typedef void (*flexe_system_peripheral_fn)(
+    void *ctx, const flexe_system_peripheral_state_t *state);
+
 /* Create the V1 register block described by mem's target. Unrecognized
  * offsets delegate to the supplied owner, allowing clock selection,
  * secondary-core control, and software interrupts to share one SYSTEM page.
@@ -60,5 +72,11 @@ bool flexe_system_clock_low_power_state(
     flexe_system_low_power_state_t *state);
 void flexe_system_clock_set_low_power_listener(
     flexe_system_clock_t *clock, flexe_system_low_power_fn fn, void *ctx);
+
+bool flexe_system_clock_peripheral_state(
+    const flexe_system_clock_t *clock,
+    flexe_system_peripheral_state_t *state);
+void flexe_system_clock_set_peripheral_listener(
+    flexe_system_clock_t *clock, flexe_system_peripheral_fn fn, void *ctx);
 
 #endif /* FLEXE_SYSTEM_CLOCK_H */

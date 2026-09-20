@@ -66,6 +66,11 @@ typedef struct {
     flexe_system_low_power_state_t state;
 } sc_low_power_probe_t;
 
+typedef struct {
+    unsigned changes;
+    flexe_system_peripheral_state_t state;
+} sc_peripheral_probe_t;
+
 static uint32_t sc_fallback_read(void *ctx, uint32_t addr)
 {
     sc_fallback_probe_t *probe = ctx;
@@ -86,6 +91,14 @@ static void sc_low_power_changed(
     void *ctx, const flexe_system_low_power_state_t *state)
 {
     sc_low_power_probe_t *probe = ctx;
+    probe->changes++;
+    probe->state = *state;
+}
+
+static void sc_peripheral_changed(
+    void *ctx, const flexe_system_peripheral_state_t *state)
+{
+    sc_peripheral_probe_t *probe = ctx;
     probe->changes++;
     probe->state = *state;
 }
@@ -381,6 +394,90 @@ TEST(system_clock_gates_and_resets_target_devices_at_exact_boundaries)
     mem_destroy(mem);
 }
 
+TEST(system_clock_publishes_complete_peripheral_banks)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_system_peripheral_banks_desc_t *banks =
+        &s3->system_clock.peripheral_banks;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    sc_fallback_probe_t fallback = {0};
+    flexe_system_clock_t *clock = flexe_system_clock_create(
+        mem, sc_fallback_read, sc_fallback_write, &fallback,
+        NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(clock != NULL);
+    if (!mem || !clock) {
+        flexe_system_clock_destroy(clock);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(banks->bank_count, 2u);
+    ASSERT_EQ(banks->clock_offset[0], SC_PERIP_CLK_EN0_OFF);
+    ASSERT_EQ(banks->clock_offset[1], SC_PERIP_CLK_EN1_OFF);
+    ASSERT_EQ(banks->reset_offset[0], SC_PERIP_RST_EN0_OFF);
+    ASSERT_EQ(banks->reset_offset[1], SC_PERIP_RST_EN1_OFF);
+    ASSERT_EQ(banks->valid_mask[0], UINT32_MAX);
+    ASSERT_EQ(banks->valid_mask[1], 0x7FFu);
+
+    flexe_system_peripheral_state_t state = {0};
+    ASSERT_TRUE(flexe_system_clock_peripheral_state(clock, &state));
+    ASSERT_EQ(state.valid_mask,
+              (UINT64_C(0x7FF) << 32u) | UINT32_MAX);
+    ASSERT_EQ(state.clock_enabled,
+              (UINT64_C(0x600) << 32u) | UINT64_C(0xF9C1E06F));
+    ASSERT_EQ(state.reset_asserted, UINT64_C(0x1FE) << 32u);
+
+    sc_peripheral_probe_t probe = {0};
+    flexe_system_clock_set_peripheral_listener(
+        clock, sc_peripheral_changed, &probe);
+    ASSERT_EQ(probe.changes, 1u);
+
+    /* Full-register writes used during multicore ESP-IDF startup publish
+     * every real clock/reset domain without turning reserved bits into state. */
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN0_OFF,
+                0x7100E207u);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN0_OFF,
+                0x8EFF1DF8u);
+    ASSERT_EQ(probe.changes, 3u);
+    ASSERT_EQ((uint32_t)probe.state.clock_enabled, 0x7100E207u);
+    ASSERT_EQ((uint32_t)probe.state.reset_asserted, 0x8EFF1DF8u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN1_OFF,
+                UINT32_MAX);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN1_OFF,
+                UINT32_MAX);
+    ASSERT_EQ(probe.changes, 5u);
+    ASSERT_EQ(probe.state.clock_enabled >> 32u, 0x7FFu);
+    ASSERT_EQ(probe.state.reset_asserted >> 32u, 0x7FFu);
+    ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN1_OFF),
+              0x7FFu);
+    ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN1_OFF),
+              0x7FFu);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    flexe_system_clock_set_peripheral_listener(clock, NULL, NULL);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN0_OFF, 0u);
+    ASSERT_EQ(probe.changes, 5u);
+    ASSERT_FALSE(flexe_system_clock_peripheral_state(NULL, &state));
+    ASSERT_FALSE(flexe_system_clock_peripheral_state(clock, NULL));
+
+    flexe_system_clock_destroy(clock);
+    mem_destroy(mem);
+
+    flexe_target_desc_t invalid = *s3;
+    invalid.system_clock.peripheral_banks.valid_mask[1] = 1u << 31;
+    mem = mem_create_for_target(&invalid);
+    clock = flexe_system_clock_create(
+        mem, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(clock == NULL);
+    flexe_system_clock_destroy(clock);
+    mem_destroy(mem);
+}
+
 TEST(system_clock_uart_gates_and_resets_are_per_port)
 {
     const flexe_target_desc_t *s3 =
@@ -466,5 +563,6 @@ void run_system_clock_tests(void)
     RUN_TEST(system_clock_reset_masks_and_shared_page_composition);
     RUN_TEST(system_clock_low_power_policy_is_target_described_and_observable);
     RUN_TEST(system_clock_gates_and_resets_target_devices_at_exact_boundaries);
+    RUN_TEST(system_clock_publishes_complete_peripheral_banks);
     RUN_TEST(system_clock_uart_gates_and_resets_are_per_port);
 }

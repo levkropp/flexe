@@ -14,6 +14,8 @@ struct flexe_system_clock {
     void *gate_ctx;
     flexe_system_low_power_fn low_power_changed;
     void *low_power_ctx;
+    flexe_system_peripheral_fn peripheral_changed;
+    void *peripheral_ctx;
     uint32_t cpu_per_conf;
     uint32_t sysclk_conf;
     uint32_t reg[FLEXE_TARGET_SYSTEM_REGISTER_MAX];
@@ -56,6 +58,31 @@ static unsigned system_clock_mask_shift(uint32_t mask)
     return shift;
 }
 
+static int system_clock_peripheral_bank_index(
+    const flexe_system_clock_desc_t *desc,
+    uint32_t clock_offset, uint32_t reset_offset)
+{
+    const flexe_system_peripheral_banks_desc_t *banks =
+        &desc->peripheral_banks;
+    for (unsigned bank = 0u; bank < banks->bank_count; bank++)
+        if (banks->clock_offset[bank] == clock_offset &&
+            banks->reset_offset[bank] == reset_offset)
+            return (int)bank;
+    return -1;
+}
+
+static bool system_clock_peripheral_offset(
+    const flexe_system_clock_desc_t *desc, uint32_t offset)
+{
+    const flexe_system_peripheral_banks_desc_t *banks =
+        &desc->peripheral_banks;
+    for (unsigned bank = 0u; bank < banks->bank_count; bank++)
+        if (banks->clock_offset[bank] == offset ||
+            banks->reset_offset[bank] == offset)
+            return true;
+    return false;
+}
+
 static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
 {
     if (!target || !(target->capabilities &
@@ -76,7 +103,10 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
         desc->cpu_per_conf_writable_mask == 0u ||
         desc->sysclk_conf_writable_mask == 0u ||
         desc->register_count > FLEXE_TARGET_SYSTEM_REGISTER_MAX ||
-        desc->gate_count > FLEXE_TARGET_SYSTEM_GATE_MAX)
+        desc->gate_count > FLEXE_TARGET_SYSTEM_GATE_MAX ||
+        desc->peripheral_banks.bank_count == 0u ||
+        desc->peripheral_banks.bank_count >
+            FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX)
         return false;
 
     for (unsigned index = 0u; index < desc->register_count; index++) {
@@ -90,6 +120,29 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             return false;
         for (unsigned old = 0u; old < index; old++)
             if (reg->offset == desc->reg[old].offset) return false;
+    }
+
+    const flexe_system_peripheral_banks_desc_t *banks =
+        &desc->peripheral_banks;
+    for (unsigned bank = 0u; bank < banks->bank_count; bank++) {
+        int clock_reg = system_clock_register_index(
+            desc, banks->clock_offset[bank]);
+        int reset_reg = system_clock_register_index(
+            desc, banks->reset_offset[bank]);
+        if (clock_reg < 0 || reset_reg < 0 ||
+            banks->clock_offset[bank] == banks->reset_offset[bank] ||
+            banks->valid_mask[bank] == 0u ||
+            (banks->valid_mask[bank] &
+             ~desc->reg[clock_reg].writable_mask) != 0u ||
+            (banks->valid_mask[bank] &
+             ~desc->reg[reset_reg].writable_mask) != 0u)
+            return false;
+        for (unsigned old = 0u; old < bank; old++)
+            if (banks->clock_offset[bank] == banks->clock_offset[old] ||
+                banks->clock_offset[bank] == banks->reset_offset[old] ||
+                banks->reset_offset[bank] == banks->clock_offset[old] ||
+                banks->reset_offset[bank] == banks->reset_offset[old])
+                return false;
     }
 
     for (unsigned index = 0u; index < desc->gate_count; index++) {
@@ -126,13 +179,17 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
              gate->instance == 0u &&
              (target->capabilities &
               FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1));
-        if (!device_valid || clock_reg < 0 || reset_reg < 0 ||
+        int bank = system_clock_peripheral_bank_index(
+            desc, gate->clock_offset, gate->reset_offset);
+        if (!device_valid || clock_reg < 0 || reset_reg < 0 || bank < 0 ||
             !system_clock_single_bit(gate->clock_mask) ||
             !system_clock_single_bit(gate->reset_mask) ||
             (gate->clock_mask &
              ~desc->reg[clock_reg].writable_mask) != 0u ||
             (gate->reset_mask &
-             ~desc->reg[reset_reg].writable_mask) != 0u)
+             ~desc->reg[reset_reg].writable_mask) != 0u ||
+            (gate->clock_mask & ~banks->valid_mask[bank]) != 0u ||
+            (gate->reset_mask & ~banks->valid_mask[bank]) != 0u)
             return false;
         for (unsigned old = 0u; old < index; old++)
             if (gate->device == desc->gate[old].device &&
@@ -208,6 +265,13 @@ static uint32_t system_clock_mapped_mask(
                 low->source_rtc_slow_mask | low->source_internal_mask |
                 low->source_xtal_mask | low->source_xtal32k_mask |
                 low->rtc_clock_enable_mask;
+    const flexe_system_peripheral_banks_desc_t *banks =
+        &desc->peripheral_banks;
+    for (unsigned bank = 0u; bank < banks->bank_count; bank++) {
+        if (offset == banks->clock_offset[bank] ||
+            offset == banks->reset_offset[bank])
+            mask |= banks->valid_mask[bank];
+    }
     return mask;
 }
 
@@ -225,6 +289,14 @@ static void system_clock_publish_low_power(flexe_system_clock_t *clock)
     flexe_system_low_power_state_t state;
     if (flexe_system_clock_low_power_state(clock, &state))
         clock->low_power_changed(clock->low_power_ctx, &state);
+}
+
+static void system_clock_publish_peripheral(flexe_system_clock_t *clock)
+{
+    if (!clock->peripheral_changed) return;
+    flexe_system_peripheral_state_t state;
+    if (flexe_system_clock_peripheral_state(clock, &state))
+        clock->peripheral_changed(clock->peripheral_ctx, &state);
 }
 
 static void system_clock_publish_gate(flexe_system_clock_t *clock,
@@ -305,6 +377,8 @@ static void system_clock_write(void *ctx, uint32_t addr, uint32_t value)
         if (system_clock_low_power_offset(&desc->low_power, offset) &&
             (changed & system_clock_mapped_mask(desc, offset)) != 0u)
             system_clock_publish_low_power(clock);
+        if (system_clock_peripheral_offset(desc, offset))
+            system_clock_publish_peripheral(clock);
         return;
     }
     if (clock->fallback_write)
@@ -426,6 +500,41 @@ void flexe_system_clock_set_low_power_listener(
     clock->low_power_changed = fn;
     clock->low_power_ctx = fn ? ctx : NULL;
     system_clock_publish_low_power(clock);
+}
+
+bool flexe_system_clock_peripheral_state(
+    const flexe_system_clock_t *clock,
+    flexe_system_peripheral_state_t *state)
+{
+    if (!clock || !state) return false;
+    const flexe_system_clock_desc_t *desc = &clock->target->system_clock;
+    const flexe_system_peripheral_banks_desc_t *banks =
+        &desc->peripheral_banks;
+    *state = (flexe_system_peripheral_state_t){0};
+    for (unsigned bank = 0u; bank < banks->bank_count; bank++) {
+        int clock_reg = system_clock_register_index(
+            desc, banks->clock_offset[bank]);
+        int reset_reg = system_clock_register_index(
+            desc, banks->reset_offset[bank]);
+        if (clock_reg < 0 || reset_reg < 0) return false;
+        unsigned shift = bank * 32u;
+        uint64_t mask = (uint64_t)banks->valid_mask[bank] << shift;
+        state->valid_mask |= mask;
+        state->clock_enabled |=
+            ((uint64_t)clock->reg[clock_reg] << shift) & mask;
+        state->reset_asserted |=
+            ((uint64_t)clock->reg[reset_reg] << shift) & mask;
+    }
+    return true;
+}
+
+void flexe_system_clock_set_peripheral_listener(
+    flexe_system_clock_t *clock, flexe_system_peripheral_fn fn, void *ctx)
+{
+    if (!clock) return;
+    clock->peripheral_changed = fn;
+    clock->peripheral_ctx = fn ? ctx : NULL;
+    system_clock_publish_peripheral(clock);
 }
 
 void flexe_system_clock_destroy(flexe_system_clock_t *clock)

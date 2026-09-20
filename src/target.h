@@ -45,6 +45,7 @@
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
 #define FLEXE_TARGET_SYSTEM_GATE_MAX 13u
+#define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
 #define FLEXE_TARGET_RADIO_REGISTER_MAX 8u
@@ -54,7 +55,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 51u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 52u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -247,6 +248,16 @@ typedef struct {
     uint32_t rtc_clock_enable_mask;
 } flexe_system_low_power_desc_t;
 
+/* Complete peripheral clock/reset banks. Device-specific gate mappings above
+ * attach functional consumers to selected bits; this descriptor preserves
+ * the remaining domain state without pretending an unattached device exists. */
+typedef struct {
+    uint8_t bank_count;
+    uint16_t clock_offset[FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX];
+    uint16_t reset_offset[FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX];
+    uint32_t valid_mask[FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX];
+} flexe_system_peripheral_banks_desc_t;
+
 /* CPU/system-clock and peripheral clock/reset registers used by S2/S3-style
  * clock trees. Register geometry and device mappings are target data; the
  * reusable owner preserves register state and publishes exact gate edges.
@@ -267,6 +278,7 @@ typedef struct {
         reg[FLEXE_TARGET_SYSTEM_REGISTER_MAX];
     flexe_system_gate_desc_t gate[FLEXE_TARGET_SYSTEM_GATE_MAX];
     flexe_system_low_power_desc_t low_power;
+    flexe_system_peripheral_banks_desc_t peripheral_banks;
 } flexe_system_clock_desc_t;
 
 /* Digital pad configuration register file. GPIO-to-register routing belongs

@@ -719,6 +719,9 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 7u);
     ASSERT_EQ(s3->system_clock.gate_count, 13u);
+    ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
+    ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
+    ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_LEDC_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSCON_MEMORY_V1);
     ASSERT_EQ(s3->ledc_v1.base, 0x60019000u);

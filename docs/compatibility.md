@@ -162,11 +162,13 @@ exact clock-gate boundaries, and their independent reset pulses restore device
 state and interrupt lines. The external I2C and GP-SPI controllers and the
 session-owned SHA accelerator also consume their target-described clock/reset
 gates; SHA commands cannot complete with its clock off or reset asserted, and
-a reset pulse clears its register and digest state. The memory/radio state is
+a reset pulse clears its register and digest state. Both complete peripheral
+clock/reset banks are available as a masked 64-domain state surface for future
+consumers; domains without an attached device model do not imply functional
+reset or clock effects. The memory/radio state is
 available to downstream consumers without fabricating memory loss, RF, or
-radio-controller behavior that is not modeled yet. Effects for other peripheral
-fields remain explicit unsupported-access diagnostics even though their
-architectural register values are retained.
+radio-controller behavior that is not modeled yet. Other SYSTEM fields remain
+explicit unsupported-access diagnostics unless they have a semantic consumer.
 
 The S3 SYSCON memory-policy owner supplies exact reset and masked readback for
 the RF front-end controls and the 11 SRAM/3 ROM bank clock, force-down, and

@@ -563,6 +563,12 @@ static const flexe_target_desc_t TARGETS[] = {
                 .source_xtal32k_mask = 1u << 27,
                 .rtc_clock_enable_mask = 1u << 28,
             },
+            .peripheral_banks = {
+                .bank_count = 2u,
+                .clock_offset = { 0x018u, 0x01Cu },
+                .reset_offset = { 0x020u, 0x024u },
+                .valid_mask = { UINT32_MAX, 0x000007FFu },
+            },
         },
         .io_mux = {
             .base = 0x60009000u,

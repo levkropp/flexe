@@ -53,7 +53,7 @@ even when a firmware workflow succeeds.
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
-| S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Peripheral gates and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; cache timing and actual bank power loss remain unsupported. |
+| S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_esp32s3_extmem.c`, WLED production audit | Cache-array/internal-SRAM ownership has exact reset, masking, locks, and semantic state; protection configuration retains documented policy. Cache topology/timing and access-fault generation remain unsupported. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (supply and power-domain resolution, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; digital and RTC-local domain state is observable and selected digital consumers are connected, but brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
@@ -609,8 +609,8 @@ For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 4 billion aggregate cycles produced 317 completed RMT transmissions and
 321,304 pulse words in 13,599 chunks on channel 0. The interpreter and JIT
 match at every completed-frame boundary and finish with the same `46F65AC5`
-pulse-stream digest, CPU state, and firmware-visible time; 15 unsupported
-peripheral accesses remain across 13 attributed sites. The JIT executes
+pulse-stream digest, CPU state, and firmware-visible time; 10 unsupported
+peripheral accesses remain across 9 attributed sites. The JIT executes
 1,780,691,463 of 1,819,518,818 retired instructions natively (97.9%). Ordinary
 code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
@@ -661,6 +661,14 @@ consumers. This removed all eight accesses at `0x600C1004` and `0x600C1014`
 from WLED without pretending that selecting banks already models cache
 topology or latency.
 
+Both S3 SYSTEM peripheral clock/reset banks are also represented as one
+target-described 64-domain state surface. Reserved bank-one positions remain
+masked, device-specific callbacks still drive the attached timer, UART, I2C,
+SPI, LEDC, SHA, and USB Serial/JTAG models, and the complete state is observable
+for additional consumers. This removed all five accesses at `0x600C0018` and
+`0x600C0020`; it does not claim reset or clock effects for device models that
+have not yet attached a consumer.
+
 On an Apple-silicon MacBook, a `Release`/LTO/native build completed three
 alternating interpreter runs in 11.21--12.40 seconds (1.34--1.49x real time)
 and three JIT runs in 6.86--7.27 seconds (2.29--2.43x). These are throughput
@@ -674,12 +682,13 @@ RTC fast-clock mux and DATE/LDO-trim readback, then to 38 after resolving the
 RTC regulator force pairs and RTC-local PWC domains, then to 34 after exposing
 the SYSTEM light-sleep memory policy and radio low-power clock state, then to 23
 after modeling the SYSCON on-chip-memory policy, then to 15 after modeling the
-SENSITIVE cache/SRAM allocation policy. DIG_PWC,
+SENSITIVE cache/SRAM allocation policy, then to 10 after exposing the complete
+SYSTEM peripheral clock/reset banks. DIG_PWC,
 PWC, REG's force pairs, the modeled domain fields of DIG_ISO, CLK_CONF's fast
 selector, DATE, MEM_PD_MASK, and BT_LPCK_DIV no longer appear in the inventory.
 Remaining accesses stay visible: RTC analog
-and pad-isolation configuration in `0x60008000`, SYSTEM/PCR setup in
-`0x600C0000`, plus two low-count
+and pad-isolation configuration in `0x60008000`, one SENS analog-control write,
+plus two low-count
 startup writes at `0x600CE0D8` and `0x600CE0DC`. Flexe does not turn those
 accesses into generic readback merely to reach zero diagnostics.
 
