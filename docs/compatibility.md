@@ -10,8 +10,8 @@ Booting to one UART line is not considered a pass.
 Flexe reads the Espressif chip ID and revision bounds from each image header.
 `--target auto` is the default; `--target esp32` or `--target esp32s3` turns
 the selection into an assertion suitable for CI. Classic ESP32 execution is
-supported. ESP32-S3 chip ID `0x0009` has experimental interpreter and JIT
-support for the common windowed LX7 instruction profile, native memory map,
+supported. ESP32-S3 chip ID `0x0009` supports functional interpreter and JIT
+execution for the common windowed LX7 instruction profile, native memory map,
 flash/cache-MMU windows, mask ROM, dual-core startup, system timer, timer
 groups and main watchdogs, SPI-memory controllers,
 general-purpose SPI2/SPI3 controllers and bidirectional AHB GDMA,
@@ -26,8 +26,10 @@ Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 target descriptor rather than a firmware identity or PC list. Unsupported
 opcodes fall back to the interpreter; exact ROM/service hooks remain dispatch
 boundaries while ordinary code in target-described ROM, IRAM, RTC-fast, and
-mapped-flash ranges may compile. Missing S3 devices remain explicit, and S3
-is not yet a production-supported target.
+mapped-flash ranges may compile. Missing S3 devices remain explicit. This is a
+supported functional target, not a claim of cycle, RF, electrical, or complete
+peripheral equivalence; the exact boundary is tracked in the
+[hardware-completeness matrix](hardware-completeness.md#current-capability-matrix).
 
 Boards populated with the [AP Memory APS6408L-3OBMx 64-Mbit octal
 PSRAM](https://www.apmemory.com/en/downloadFiles/0324112221b2583847) can opt
@@ -129,8 +131,8 @@ pad functions report unknown output and retain diagnostics; RTC GPIO
 interrupts remain unsupported. EXT0/EXT1 wake has a native ESP-IDF
 replay gate. This follows Espressif's
 [S3 RTC GPIO mapping](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
-This is useful functional GPIO support for the
-experimental S3 target, not hardware-calibrated timing or electrical evidence.
+This is useful functional GPIO support for the S3 target, not
+hardware-calibrated timing or electrical evidence.
 S3 RTC and digital pad-hold registers are connected to the shared pad model:
 RTC GPIO0..21 and digital GPIO21..47 retain physical output level and enable,
 RTC owner mux and input-enable selection while the register latches keep
@@ -284,7 +286,7 @@ unsupported-access diagnostics when firmware changes them. Changing any other
 unmodeled RTC control field remains visible in the same diagnostics, as do
 reserved register bits.
 
-The experimental USB Serial/JTAG model implements the 64-byte serial endpoint
+The functional USB Serial/JTAG model implements the 64-byte serial endpoint
 FIFOs, packet flush and backpressure behavior, host RX/TX, interrupt
 enable/status/clear routing, connection state, and fast-mode SOF liveness.
 `--usb-console` routes CLI output from this endpoint instead of UART0. It does

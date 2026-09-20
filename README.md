@@ -1,8 +1,8 @@
 # Flexe
 
 **F**ree **l**ittle **x**tensa **e**mulator: a lightweight ESP32/Xtensa LX6
-emulator with experimental ESP32-S3/LX7 interpreter and JIT support, written
-in C. Flexe boots unmodified ESP-IDF and Arduino firmware,
+and ESP32-S3/LX7 emulator with interpreter and JIT support, written in C.
+Flexe boots unmodified ESP-IDF and Arduino firmware,
 models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
 backends.
 

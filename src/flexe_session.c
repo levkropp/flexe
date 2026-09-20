@@ -137,7 +137,7 @@ session_resolve_target(const flexe_session_config_t *cfg,
           FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) &&
         !cfg->native_freertos) {
         fprintf(stderr,
-                "flexe: experimental %s execution currently requires "
+                "flexe: %s execution currently requires "
                 "native FreeRTOS mode (-N)\n",
                 target->display_name);
         return NULL;
@@ -153,7 +153,7 @@ session_resolve_target(const flexe_session_config_t *cfg,
     if (target->id == FLEXE_TARGET_ESP32S3 &&
         (!cfg->rom_elf_path || !*cfg->rom_elf_path)) {
         fprintf(stderr,
-                "flexe: experimental ESP32-S3 execution requires a matching "
+                "flexe: ESP32-S3 execution requires a matching "
                 "official ROM ELF (-R or FLEXE_ROM_ELF)\n");
         return NULL;
     }
@@ -311,7 +311,7 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
     /* GP-SPI controllers are constructed from the target descriptor even in
      * headless sessions. This optional layer only attaches board-side devices.
      * Classic compatibility keeps its historical board-profile defaults;
-     * experimental targets require explicit positive pin numbers. */
+     * non-classic targets require explicit positive pin numbers. */
     if (target->capabilities & FLEXE_TARGET_CAP_GP_SPI) {
         bool openhasp_lanbon = classic_compat &&
             rom_stubs_firmware_profile(s->rom) ==

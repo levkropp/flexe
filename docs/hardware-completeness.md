@@ -22,7 +22,8 @@ The milestone is complete only when:
    production and WLED realtime gates remain green; S3 needs dual-core
    FreeRTOS, sustained Arduino loop, filesystem/NVS/device basics, and at
    least one interactive production scenario before its label advances past
-   experimental.
+   experimental. S3 now meets that functional-support boundary; the matrix
+   below continues to mark incomplete hardware areas as partial or unsupported.
 3. Each newly modeled behavior has a focused automated test, a reproducible
    firmware gate where available, architectural or hardware evidence, and an
    explicit documented limit. Interpreter/JIT paths must agree wherever JIT
@@ -113,16 +114,17 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 Independently rebuilt images may provide matching `*_SHA256` overrides,
 because ESP-IDF embeds build metadata.
 
-S3 remains experimental. The NerdMiner filesystem result is a meaningful
-end-to-end flash-format/mount check. With the matching application ELF, the
-host-backed socket/select boundary now lets the unmodified firmware serve
-`GET /wifi` as `200 OK` with its 4,985-byte configuration HTML. This is a
-service shim, not a modeled Wi-Fi radio: the page reports no networks, and
-an earlier full POST/restart/reload replay reported about 35,000 unsupported
-accesses. The fixed 4-billion-cycle interpreter audit and current full replay
-now require zero unsupported MMIO sites after the target-described RF/PHY,
-clock/power, serial-routing, and GDMA control work below. This does not turn
-the network service into a radio model. The S3 application handoff now clears
+S3 now meets the supported functional-target boundary. The NerdMiner
+filesystem result is a meaningful end-to-end flash-format/mount check. With
+the matching application ELF, the host-backed socket/select boundary lets the
+unmodified firmware serve `GET /wifi` as `200 OK` with its 4,985-byte
+configuration HTML. This is a service shim, not a modeled Wi-Fi radio: the
+page reports no networks. An earlier full POST/restart/reload replay reported
+about 35,000 unsupported accesses; the fixed 4-billion-cycle interpreter
+audit and current full replay now require zero unsupported MMIO sites after
+the target-described RF/PHY, clock/power, serial-routing, and GDMA control work
+below. This does not turn the network service into a radio model. The S3
+application handoff now clears
 the power-on flash-boot watchdog mode skipped with the second-stage bootloader.
 Restoring ROM-owned
 BSS and interface state from the official ROM ELF during a software restart
@@ -131,9 +133,11 @@ panicking during PSRAM setup, while physical SRAM outside those sections
 remains intact for app `.noinit`.
 The scripted POST/restart/reload gate exercises that full path. WLED now
 provides a second, independently sourced production interactive network and
-output scenario. The remaining RF/PHY gaps prohibit a
-production-support claim. ROM images and third-party firmware binaries are
-not copied into this repository.
+output scenario; Marauder supplies an independent interactive UART/controller
+scenario. The remaining RF/PHY gaps prohibit claims of radio or silicon
+equivalence, but do not invalidate the documented functional support tier.
+ROM images and third-party firmware binaries are not copied into this
+repository.
 
 The official ESP-IDF v5.3.2 `examples/get-started/hello_world` image built
 from commit `9d7f2d69f50d1288526d4f1027108e314e8c879f` (application image

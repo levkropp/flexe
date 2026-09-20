@@ -299,7 +299,7 @@ static const flexe_target_desc_t TARGETS[] = {
         .core_generation = FLEXE_XTENSA_LX7,
         .translation_profile = FLEXE_XTENSA_TRANSLATE_WINDOWED_COMMON,
         .core_count = 2,
-        .support_level = FLEXE_TARGET_EXPERIMENTAL,
+        .support_level = FLEXE_TARGET_STABLE,
         .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM |
                         FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT |
                         FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL |

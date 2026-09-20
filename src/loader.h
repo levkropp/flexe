@@ -39,7 +39,7 @@ int loader_probe_bin(const char *path, loader_image_info_t *info,
 
 /* Auto-detect by default, or require an explicit target. The memory object
  * must have been constructed for that target. Loading itself is permitted for
- * recognized experimental targets; execution readiness belongs to sessions. */
+ * recognized executable targets; execution readiness belongs to sessions. */
 load_result_t loader_load_bin(xtensa_mem_t *mem, const char *path);
 load_result_t loader_load_bin_for_target(xtensa_mem_t *mem, const char *path,
                                          flexe_target_id_t expected_target);
