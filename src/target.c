@@ -27,6 +27,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
                         FLEXE_TARGET_CAP_TWAI_V1 |
+                        FLEXE_TARGET_CAP_PCNT_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -131,6 +132,39 @@ static const flexe_target_desc_t TARGETS[] = {
             .interrupt_source = 45u,
             .interrupt_enable_writable_mask = 0xFFu,
             .brp_divider_mask = 1u << 4,
+        },
+        .pcnt = {
+            .base = 0x3FF57000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .conf0_reset = 0x00003C10u,
+            .control_reset = 0x00005555u,
+            .control_writable_mask = 0x0001FFFFu,
+            .date_reset = 0x14122600u,
+            .conf_stride = 0x00Cu,
+            .count_offset = 0x060u,
+            .interrupt_raw_offset = 0x080u,
+            .interrupt_status_offset = 0x084u,
+            .interrupt_enable_offset = 0x088u,
+            .interrupt_clear_offset = 0x08Cu,
+            .unit_status_offset = 0x090u,
+            .control_offset = 0x0B0u,
+            .date_offset = 0x0FCu,
+            .pulse_input_signal = {
+                { 39u, 40u }, { 43u, 44u },
+                { 47u, 48u }, { 51u, 52u },
+                { 55u, 56u }, { 71u, 72u },
+                { 75u, 76u }, { 79u, 80u },
+            },
+            .control_input_signal = {
+                { 41u, 42u }, { 45u, 46u },
+                { 49u, 50u }, { 53u, 54u },
+                { 57u, 58u }, { 73u, 74u },
+                { 77u, 78u }, { 81u, 82u },
+            },
+            .unit_count = 8u,
+            .channel_count = 2u,
+            .interrupt_source = 48u,
         },
         .io_mux = {
             .base = 0x3FF49000u,
@@ -355,6 +389,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_I2S_V2 |
                         FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
                         FLEXE_TARGET_CAP_TWAI_V1 |
+                        FLEXE_TARGET_CAP_PCNT_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -491,6 +526,35 @@ static const flexe_target_desc_t TARGETS[] = {
             .interrupt_source = 37u,
             .interrupt_enable_writable_mask = 0xEFu,
         },
+        .pcnt = {
+            .base = 0x60017000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .conf0_reset = 0x00003C10u,
+            .control_reset = 0x00000055u,
+            .control_writable_mask = 0x000100FFu,
+            .date_reset = 0x19072601u,
+            .conf_stride = 0x00Cu,
+            .count_offset = 0x030u,
+            .interrupt_raw_offset = 0x040u,
+            .interrupt_status_offset = 0x044u,
+            .interrupt_enable_offset = 0x048u,
+            .interrupt_clear_offset = 0x04Cu,
+            .unit_status_offset = 0x050u,
+            .control_offset = 0x060u,
+            .date_offset = 0x0FCu,
+            .pulse_input_signal = {
+                { 33u, 34u }, { 37u, 38u },
+                { 41u, 42u }, { 45u, 46u },
+            },
+            .control_input_signal = {
+                { 35u, 36u }, { 39u, 40u },
+                { 43u, 44u }, { 47u, 48u },
+            },
+            .unit_count = 4u,
+            .channel_count = 2u,
+            .interrupt_source = 41u,
+        },
         .secondary_core = {
             .base = 0x600C0000u,
             .register_size = 0x1000u,
@@ -511,7 +575,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 8u,
-            .gate_count = 18u,
+            .gate_count = 19u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -672,6 +736,13 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x020u,
                     .clock_mask = 1u << 19,
                     .reset_mask = 1u << 19,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_PCNT,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 10,
+                    .reset_mask = 1u << 10,
                 },
             },
             .low_power = {

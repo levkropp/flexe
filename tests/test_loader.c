@@ -654,6 +654,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_GP_SPI);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_PCNT_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(esp32->i2c.instance_count, 2u);
     ASSERT_EQ(esp32->i2c.instance[0].base, 0x3FF53000u);
@@ -674,6 +675,9 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(esp32->twai.interrupt_source, 45u);
     ASSERT_EQ(esp32->twai.brp_mask, 0x3Fu);
     ASSERT_EQ(esp32->twai.brp_divider_mask, 1u << 4);
+    ASSERT_EQ(esp32->pcnt.base, 0x3FF57000u);
+    ASSERT_EQ(esp32->pcnt.unit_count, 8u);
+    ASSERT_EQ(esp32->pcnt.interrupt_source, 48u);
     ASSERT_EQ(s3->image_chip_id, 9u);
     ASSERT_EQ(s3->core_generation, FLEXE_XTENSA_LX7);
     ASSERT_EQ(s3->translation_profile,
@@ -703,6 +707,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_I2S_V2);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_PCNT_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GP_SPI);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
@@ -712,6 +717,11 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->twai.bus_timing_0_writable_mask, 0xDFFFu);
     ASSERT_EQ(s3->twai.tx_output_signal, 116u);
     ASSERT_EQ(s3->twai.rx_input_signal, 116u);
+    ASSERT_EQ(s3->pcnt.base, 0x60017000u);
+    ASSERT_EQ(s3->pcnt.unit_count, 4u);
+    ASSERT_EQ(s3->pcnt.interrupt_source, 41u);
+    ASSERT_EQ(s3->pcnt.pulse_input_signal[3][1], 46u);
+    ASSERT_EQ(s3->pcnt.control_input_signal[3][1], 48u);
     ASSERT_EQ(s3->i2c.instance_count, 2u);
     ASSERT_EQ(s3->i2c.instance[0].base, 0x60013000u);
     ASSERT_EQ(s3->i2c.instance[1].base, 0x60027000u);
@@ -763,7 +773,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 8u);
-    ASSERT_EQ(s3->system_clock.gate_count, 18u);
+    ASSERT_EQ(s3->system_clock.gate_count, 19u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
@@ -791,6 +801,9 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.gate[17].device,
               FLEXE_SYSTEM_DEVICE_TWAI);
     ASSERT_EQ(s3->system_clock.gate[17].clock_mask, 1u << 19);
+    ASSERT_EQ(s3->system_clock.gate[18].device,
+              FLEXE_SYSTEM_DEVICE_PCNT);
+    ASSERT_EQ(s3->system_clock.gate[18].clock_mask, 1u << 10);
     ASSERT_EQ(s3->system_clock.gate[7].device,
               FLEXE_SYSTEM_DEVICE_SHA);
     ASSERT_EQ(s3->system_clock.gate[7].clock_mask, 1u << 2);

@@ -23,6 +23,7 @@ typedef void (*flexe_gpio_output_fn)(void *ctx, unsigned gpio,
 typedef void (*flexe_gpio_irq_fn)(void *ctx, bool nmi, bool level);
 typedef void (*flexe_gpio_input_signal_fn)(void *ctx, unsigned signal,
                                            bool old_level, bool level);
+typedef void (*flexe_gpio_input_route_fn)(void *ctx, unsigned signal);
 /* Resolve a peripheral output at the instant GPIO_IN is read. Returns false
  * for signals that cannot be sampled (for example, unmodeled carrier phase).
  * This does not synthesize missed edges or alter interrupt history. */
@@ -87,6 +88,12 @@ bool flexe_gpio_output_signal_has_input_consumer(const flexe_gpio_t *gpio,
 void flexe_gpio_set_input_signal_handler(flexe_gpio_t *gpio,
                                          flexe_gpio_input_signal_fn changed,
                                          void *ctx);
+/* Route changes are distinct from pad edges: a peripheral may need to cancel
+ * an in-flight filter and sample the newly selected source without inventing
+ * a pulse. */
+void flexe_gpio_set_input_route_handler(flexe_gpio_t *gpio,
+                                        flexe_gpio_input_route_fn changed,
+                                        void *ctx);
 void flexe_gpio_watch_input_signal(flexe_gpio_t *gpio, unsigned signal);
 
 /* IO_MUX controls the digital input buffer. Standalone GPIO models default

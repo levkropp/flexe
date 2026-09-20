@@ -149,6 +149,7 @@ int main(int argc, char **argv)
     run_rmt_v1_tests();
     run_i2s_v2_tests();
     run_twai_target_tests();
+    run_pcnt_target_tests();
     run_ledc_v1_tests();
     run_usb_serial_jtag_tests();
     run_spi_mem_tests();

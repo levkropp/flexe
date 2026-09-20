@@ -73,7 +73,7 @@ done
 [[ $# -gt 0 ]] || { usage >&2; exit 2; }
 
 all_fixtures=(hello crosscore nvs sleep gpio-wake gpio-isr \
-    usb-serial-jtag i2c-master i2s-std sdmmc-host twai rmt-loopback \
+    usb-serial-jtag i2c-master i2s-std sdmmc-host twai pcnt rmt-loopback \
     socket-range)
 if [[ $# -eq 1 && "$1" == all ]]; then
     set -- "${all_fixtures[@]}"

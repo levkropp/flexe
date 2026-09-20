@@ -259,6 +259,7 @@ set(TEST_SOURCES
     tests/test_rmt_v1.c
     tests/test_i2s_v2.c
     tests/test_twai.c
+    tests/test_pcnt.c
     tests/test_ledc_v1.c
     tests/test_usb_serial_jtag.c
     tests/test_spi_mem.c

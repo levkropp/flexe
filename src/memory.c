@@ -394,15 +394,26 @@ uint8_t mem_read8_slow(xtensa_mem_t *mem, uint32_t addr) {
     if (__builtin_expect(g_mem_journal_en, 0)) g_mem_journal_unsafe = 1;
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
-    if (h && h->read) return (uint8_t)h->read(h->ctx, xaddr);
+    if (h && h->read) {
+        unsigned shift = (xaddr & 3u) * 8u;
+        return (uint8_t)(h->read(h->ctx, xaddr & ~3u) >> shift);
+    }
     return 0;
 }
 
 uint16_t mem_read16_slow(xtensa_mem_t *mem, uint32_t addr) {
     if (__builtin_expect(g_mem_journal_en, 0)) g_mem_journal_unsafe = 1;
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
+    if ((xaddr & 3u) == 3u) {
+        uint16_t low = mem_read8_slow(mem, addr);
+        uint16_t high = mem_read8_slow(mem, addr + 1u);
+        return (uint16_t)(low | (high << 8));
+    }
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
-    if (h && h->read) return (uint16_t)h->read(h->ctx, xaddr);
+    if (h && h->read) {
+        unsigned shift = (xaddr & 3u) * 8u;
+        return (uint16_t)(h->read(h->ctx, xaddr & ~3u) >> shift);
+    }
     return 0;
 }
 
@@ -444,19 +455,39 @@ uint32_t mem_unmapped_first(const xtensa_mem_t *mem) {
 void mem_write8_slow(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
-    if (h && h->write) h->write(h->ctx, xaddr, val);
+    if (h && h->masked_write) {
+        unsigned shift = (xaddr & 3u) * 8u;
+        h->masked_write(h->ctx, xaddr & ~3u,
+                        (uint32_t)val << shift, 0xFFu << shift);
+    } else if (h && h->write) {
+        h->write(h->ctx, xaddr, val);
+    }
 }
 
 void mem_write16_slow(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
+    if ((xaddr & 3u) == 3u) {
+        mem_write8_slow(mem, addr, (uint8_t)val);
+        mem_write8_slow(mem, addr + 1u, (uint8_t)(val >> 8));
+        return;
+    }
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
-    if (h && h->write) h->write(h->ctx, xaddr, val);
+    if (h && h->masked_write) {
+        unsigned shift = (xaddr & 3u) * 8u;
+        h->masked_write(h->ctx, xaddr & ~3u,
+                        (uint32_t)val << shift, 0xFFFFu << shift);
+    } else if (h && h->write) {
+        h->write(h->ctx, xaddr, val);
+    }
 }
 
 void mem_write32_slow(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
-    if (h && h->write) h->write(h->ctx, xaddr, val);
+    if (h && h->masked_write)
+        h->masked_write(h->ctx, xaddr, val, UINT32_MAX);
+    else if (h && h->write)
+        h->write(h->ctx, xaddr, val);
 }
 
 int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len) {
@@ -485,7 +516,36 @@ int mem_register_mmio(xtensa_mem_t *mem, int page_index,
         return -1;
     mem->mmio[page_index].read  = read_fn;
     mem->mmio[page_index].write = write_fn;
+    mem->mmio[page_index].masked_write = NULL;
     mem->mmio[page_index].ctx   = ctx;
+    return 0;
+}
+
+int mem_register_mmio_masked(
+    xtensa_mem_t *mem, int page_index, mmio_read_fn read_fn,
+    mmio_masked_write_fn write_fn, void *ctx) {
+    if (!mem || page_index < 0 || (uint32_t)page_index >= mem->mmio_page_count)
+        return -1;
+    mem->mmio[page_index].read = read_fn;
+    mem->mmio[page_index].write = NULL;
+    mem->mmio[page_index].masked_write = write_fn;
+    mem->mmio[page_index].ctx = ctx;
+    return 0;
+}
+
+int mem_register_mmio_masked_range(
+    xtensa_mem_t *mem, uint32_t base, uint32_t size, mmio_read_fn read_fn,
+    mmio_masked_write_fn write_fn, void *ctx) {
+    if (!mem || size == 0 || base < mem->target->peripheral_start ||
+        base >= mem->target->peripheral_end ||
+        size > mem->target->peripheral_end - base)
+        return -1;
+    uint32_t first_offset = base - mem->target->peripheral_start;
+    uint32_t last_offset = first_offset + size - 1u;
+    int start_page = first_offset / PAGE_SIZE;
+    int num_pages = (int)(last_offset / PAGE_SIZE) - start_page + 1;
+    for (int i = 0; i < num_pages; i++)
+        mem_register_mmio_masked(mem, start_page + i, read_fn, write_fn, ctx);
     return 0;
 }
 

@@ -189,6 +189,9 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             (gate->device == FLEXE_SYSTEM_DEVICE_TWAI &&
              gate->instance == 0u &&
              (target->capabilities & FLEXE_TARGET_CAP_TWAI_V1)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_PCNT &&
+             gate->instance == 0u &&
+             (target->capabilities & FLEXE_TARGET_CAP_PCNT_V1)) ||
             (gate->device == FLEXE_SYSTEM_DEVICE_EDMA &&
              gate->instance == 0u);
         int bank = system_clock_peripheral_bank_index(

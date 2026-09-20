@@ -51,7 +51,7 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 18u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 19u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
@@ -63,11 +63,13 @@
 #define FLEXE_TARGET_SDMMC_SLOT_MAX 2u
 #define FLEXE_TARGET_SDMMC_DATA_MAX 8u
 #define FLEXE_TARGET_SHA_MODE_MAX 8u
+#define FLEXE_TARGET_PCNT_UNIT_MAX 8u
+#define FLEXE_TARGET_PCNT_CHANNEL_MAX 2u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 62u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 63u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -106,6 +108,7 @@ typedef enum {
     FLEXE_TARGET_CAP_I2S_V2                        = 1ull << 30,
     FLEXE_TARGET_CAP_SDMMC_HOST_V1                  = 1ull << 31,
     FLEXE_TARGET_CAP_TWAI_V1                        = 1ull << 32,
+    FLEXE_TARGET_CAP_PCNT_V1                        = 1ull << 33,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -1029,6 +1032,36 @@ typedef struct {
     uint8_t  brp_divider_mask;
 } flexe_twai_desc_t;
 
+/* Pulse-counter V1 instances share channel/event semantics across ESP32
+ * generations while changing register geometry, unit count, interrupt
+ * routing, and GPIO-matrix signal numbers. Keeping those differences in the
+ * target descriptor lets one edge/filter/limit engine serve both layouts. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t source_clock_hz;
+    uint32_t conf0_reset;
+    uint32_t control_reset;
+    uint32_t control_writable_mask;
+    uint32_t date_reset;
+    uint16_t conf_stride;
+    uint16_t count_offset;
+    uint16_t interrupt_raw_offset;
+    uint16_t interrupt_status_offset;
+    uint16_t interrupt_enable_offset;
+    uint16_t interrupt_clear_offset;
+    uint16_t unit_status_offset;
+    uint16_t control_offset;
+    uint16_t date_offset;
+    uint16_t pulse_input_signal[FLEXE_TARGET_PCNT_UNIT_MAX]
+                               [FLEXE_TARGET_PCNT_CHANNEL_MAX];
+    uint16_t control_input_signal[FLEXE_TARGET_PCNT_UNIT_MAX]
+                                 [FLEXE_TARGET_PCNT_CHANNEL_MAX];
+    uint8_t unit_count;
+    uint8_t channel_count;
+    uint8_t interrupt_source;
+} flexe_pcnt_desc_t;
+
 typedef enum {
     FLEXE_SHA_LAYOUT_NONE = 0,
     /* Classic ESP32: one START/CONTINUE/LOAD/BUSY quartet per algorithm and
@@ -1426,6 +1459,9 @@ struct flexe_target_desc {
 
     /* Optional SJA1000-compatible TWAI/CAN controller. */
     flexe_twai_desc_t             twai;
+
+    /* Optional edge/filter/limit pulse-counter controller. */
+    flexe_pcnt_desc_t             pcnt;
 
     /* Optional SHA accelerator. */
     flexe_sha_desc_t              sha;

@@ -8,12 +8,25 @@
 typedef struct {
     uint32_t last_addr;
     uint32_t value;
+    uint32_t write_value;
+    uint32_t write_mask;
+    unsigned write_count;
 } target_mmio_probe_t;
 
 static uint32_t target_mmio_read(void *ctx, uint32_t addr) {
     target_mmio_probe_t *probe = ctx;
     probe->last_addr = addr;
     return probe->value;
+}
+
+static void target_mmio_masked_write(void *ctx, uint32_t addr,
+                                     uint32_t value, uint32_t mask) {
+    target_mmio_probe_t *probe = ctx;
+    probe->last_addr = addr;
+    probe->write_value = value;
+    probe->write_mask = mask;
+    probe->write_count++;
+    probe->value = mmio_merge_write(probe->value, value, mask);
 }
 
 /* ===== SRAM data region ===== */
@@ -36,6 +49,39 @@ TEST(mem_rw32_sram_data) {
     xtensa_mem_t *mem = mem_create();
     mem_write32(mem, 0x3FFB0000, 0xDEADBEEF);
     ASSERT_EQ(mem_read32(mem, 0x3FFB0000), 0xDEADBEEF);
+    mem_destroy(mem);
+}
+
+TEST(mem_mmio_subword_access_preserves_byte_lanes) {
+    xtensa_mem_t *mem = mem_create();
+    target_mmio_probe_t probe = {.value = 0x44332211u};
+    const uint32_t base = 0x3FF00000u;
+    ASSERT_EQ(mem_register_mmio_masked(
+        mem, 0, target_mmio_read, target_mmio_masked_write, &probe), 0);
+
+    ASSERT_EQ(mem_read8(mem, base + 0u), 0x11u);
+    ASSERT_EQ(mem_read8(mem, base + 1u), 0x22u);
+    ASSERT_EQ(mem_read8(mem, base + 3u), 0x44u);
+    ASSERT_EQ(mem_read16(mem, base + 1u), 0x3322u);
+    ASSERT_EQ(probe.last_addr, base);
+
+    mem_write8(mem, base + 1u, 0xABu);
+    ASSERT_EQ(probe.last_addr, base);
+    ASSERT_EQ(probe.write_value, 0x0000AB00u);
+    ASSERT_EQ(probe.write_mask, 0x0000FF00u);
+    ASSERT_EQ(probe.value, 0x4433AB11u);
+
+    mem_write16(mem, base + 2u, 0xCDEFu);
+    ASSERT_EQ(probe.last_addr, base);
+    ASSERT_EQ(probe.write_value, 0xCDEF0000u);
+    ASSERT_EQ(probe.write_mask, 0xFFFF0000u);
+    ASSERT_EQ(probe.value, 0xCDEFAB11u);
+
+    mem_write32(mem, base, 0x89ABCDEFu);
+    ASSERT_EQ(probe.write_value, 0x89ABCDEFu);
+    ASSERT_EQ(probe.write_mask, UINT32_MAX);
+    ASSERT_EQ(probe.value, 0x89ABCDEFu);
+    ASSERT_EQ(probe.write_count, 3u);
     mem_destroy(mem);
 }
 
@@ -138,8 +184,8 @@ TEST(mem_esp32s3_mmio_is_native_not_classic_alias) {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
     xtensa_mem_t *mem = mem_create_for_target(s3);
-    target_mmio_probe_t low = {0, 0x11223344u};
-    target_mmio_probe_t high = {0, 0x55667788u};
+    target_mmio_probe_t low = {.value = 0x11223344u};
+    target_mmio_probe_t high = {.value = 0x55667788u};
     ASSERT_TRUE(mem != NULL);
     if (!mem) return;
 
@@ -419,6 +465,7 @@ void run_memory_tests(void) {
     RUN_TEST(mem_rw8_sram_data);
     RUN_TEST(mem_rw16_sram_data);
     RUN_TEST(mem_rw32_sram_data);
+    RUN_TEST(mem_mmio_subword_access_preserves_byte_lanes);
     RUN_TEST(mem_sram_alias);
     RUN_TEST(mem_esp32s3_native_map_and_diram_alias);
     RUN_TEST(mem_flash_capacity_follows_image_and_rom_handoff);

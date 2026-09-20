@@ -89,6 +89,8 @@ struct flexe_gpio {
     void *irq_ctx;
     flexe_gpio_input_signal_fn input_signal_changed;
     void *input_signal_ctx;
+    flexe_gpio_input_route_fn input_route_changed;
+    void *input_route_ctx;
     flexe_gpio_output_sample_fn output_sample;
     void *output_sample_ctx;
 
@@ -321,6 +323,15 @@ void flexe_gpio_set_input_signal_handler(flexe_gpio_t *gpio,
     if (!gpio) return;
     gpio->input_signal_changed = changed;
     gpio->input_signal_ctx = changed ? ctx : NULL;
+}
+
+void flexe_gpio_set_input_route_handler(flexe_gpio_t *gpio,
+                                        flexe_gpio_input_route_fn changed,
+                                        void *ctx)
+{
+    if (!gpio) return;
+    gpio->input_route_changed = changed;
+    gpio->input_route_ctx = changed ? ctx : NULL;
 }
 
 void flexe_gpio_watch_input_signal(flexe_gpio_t *gpio, unsigned signal)
@@ -903,7 +914,11 @@ static void gpio_write(void *ctx, uint32_t addr, uint32_t value)
     if (off >= GPIO_FUNC_IN_BASE_OFF &&
         off < GPIO_FUNC_IN_BASE_OFF + GPIO_FUNC_IN_COUNT * 4u) {
         unsigned signal = (off - GPIO_FUNC_IN_BASE_OFF) / 4u;
-        gpio->func_in[signal] = value & GPIO_FUNC_IN_MASK;
+        uint32_t route = value & GPIO_FUNC_IN_MASK;
+        old = gpio->func_in[signal];
+        gpio->func_in[signal] = route;
+        if (old != route && gpio->input_route_changed)
+            gpio->input_route_changed(gpio->input_route_ctx, signal);
         return;
     }
 

@@ -14,6 +14,12 @@
 /* MMIO callback types */
 typedef uint32_t (*mmio_read_fn)(void *ctx, uint32_t addr);
 typedef void     (*mmio_write_fn)(void *ctx, uint32_t addr, uint32_t val);
+/* Byte-enable-aware writes receive a word-aligned address plus lane-positioned
+ * data and mask.  A byte store of 0xAB at register+1 is therefore delivered
+ * as value=0x0000AB00, mask=0x0000FF00.  Devices with W1C, FIFO, or strobe
+ * registers can implement the bus transaction without a synthetic read. */
+typedef void (*mmio_masked_write_fn)(void *ctx, uint32_t addr,
+                                     uint32_t val, uint32_t mask);
 
 /* Constants for struct definition */
 #define MEM_PAGE_TABLE_SIZE (1u << 20)  /* 1M pages covering 4GB */
@@ -21,6 +27,7 @@ typedef void     (*mmio_write_fn)(void *ctx, uint32_t addr, uint32_t val);
 typedef struct {
     mmio_read_fn  read;
     mmio_write_fn write;
+    mmio_masked_write_fn masked_write;
     void         *ctx;
 } mmio_handler_t;
 
@@ -91,6 +98,18 @@ int mem_register_mmio(xtensa_mem_t *mem, int page_index,
                       mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx);
 int mem_register_mmio_range(xtensa_mem_t *mem, uint32_t base, uint32_t size,
                             mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx);
+int mem_register_mmio_masked(
+    xtensa_mem_t *mem, int page_index, mmio_read_fn read_fn,
+    mmio_masked_write_fn write_fn, void *ctx);
+int mem_register_mmio_masked_range(
+    xtensa_mem_t *mem, uint32_t base, uint32_t size, mmio_read_fn read_fn,
+    mmio_masked_write_fn write_fn, void *ctx);
+
+static inline uint32_t mmio_merge_write(uint32_t old_value,
+                                        uint32_t write_value,
+                                        uint32_t write_mask) {
+    return (old_value & ~write_mask) | (write_value & write_mask);
+}
 
 /* MMIO slow-path functions (called from inline fast paths on page table miss) */
 uint32_t mem_read32_slow(xtensa_mem_t *mem, uint32_t addr);
