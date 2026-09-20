@@ -36,6 +36,8 @@ of both cores.
 
 Requirements: a C17 compiler, CMake, OpenSSL, zlib, and pthreads.
 S3 Ethernet host forwarding is optional and additionally needs libslirp 4.9+.
+If `ccache` is installed, CMake uses it automatically; pass
+`-DFLEXE_CCACHE=OFF` to disable it.
 
 ```sh
 cmake -S . -B build

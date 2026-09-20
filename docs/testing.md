@@ -11,10 +11,11 @@ cmake --build build --target xtensa-tests -j
 ./build/xtensa-tests
 ```
 
-For repeated clean or multi-configuration builds, an installed `ccache` can
-be enabled with `-DCMAKE_C_COMPILER_LAUNCHER=ccache`; CI uses separate caches
-for GCC, Clang, sanitizers, AArch64, and fixture runners so incompatible flags
-cannot contaminate one another.
+An installed `ccache` is detected and used automatically, including for
+separate release, sanitizer, and profiling trees. Pass `-DFLEXE_CCACHE=OFF`
+to opt out or set `CMAKE_C_COMPILER_LAUNCHER` explicitly to choose another
+launcher. CI uses separate caches for GCC, Clang, sanitizers, AArch64, and
+fixture runners so incompatible flags cannot contaminate one another.
 
 Each test file is compiled independently, so editing one suite rebuilds only
 that suite and the final test executable. Case-insensitive filters select by

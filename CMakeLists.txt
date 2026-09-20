@@ -38,6 +38,17 @@ endif()
 option(NATIVE_ARCH "Tune Release builds for the building machine's CPU" ON)
 option(FLEXE_LTO "Enable LTO in optimized production builds" ON)
 option(FLEXE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(FLEXE_CCACHE "Use ccache automatically when it is available" ON)
+
+if(FLEXE_CCACHE AND NOT MSVC AND NOT CMAKE_C_COMPILER_LAUNCHER)
+    find_program(FLEXE_CCACHE_EXECUTABLE ccache)
+    if(FLEXE_CCACHE_EXECUTABLE)
+        # Keep the automatic choice out of the cache so FLEXE_CCACHE=OFF
+        # also takes effect when an existing build tree is reconfigured.
+        set(CMAKE_C_COMPILER_LAUNCHER "${FLEXE_CCACHE_EXECUTABLE}")
+        message(STATUS "Compiler cache: ${FLEXE_CCACHE_EXECUTABLE}")
+    endif()
+endif()
 
 if(FLEXE_SANITIZERS AND MSVC)
     message(FATAL_ERROR "FLEXE_SANITIZERS requires GCC or Clang")
