@@ -270,7 +270,7 @@ static int gpio_sample_output_pad(flexe_gpio_t *gpio, unsigned pin)
     if (route & GPIO_FUNC_OUT_OEN_SELECT) {
         unsigned bank;
         uint32_t mask;
-        (void)gpio_pin_bit(pin, &bank, &mask);
+        if (!gpio_pin_bit(pin, &bank, &mask)) return -1;
         enabled = (gpio->enable[bank] & mask) != 0u;
     }
     if (route & GPIO_FUNC_OUT_OEN_INVERT) enabled = !enabled;
@@ -291,7 +291,7 @@ bool flexe_gpio_output_signal_has_input_consumer(const flexe_gpio_t *gpio,
             continue;
         unsigned bank;
         uint32_t mask;
-        (void)gpio_pin_bit(pin, &bank, &mask);
+        if (!gpio_pin_bit(pin, &bank, &mask)) continue;
         if ((gpio->input_enable[bank] & mask) == 0u ||
             (gpio->host_valid[bank] & mask) != 0u)
             continue;
@@ -426,7 +426,7 @@ static void gpio_refresh_input_pin(flexe_gpio_t *gpio, unsigned pin)
 {
     unsigned bank;
     uint32_t mask;
-    (void)gpio_pin_bit(pin, &bank, &mask);
+    if (!gpio_pin_bit(pin, &bank, &mask)) return;
     bool old = (gpio->input[bank] & mask) != 0u;
     bool old_unknown = (gpio->peripheral_unknown[bank] & mask) != 0u;
     bool level;
@@ -622,7 +622,7 @@ static void gpio_latch_active_levels(flexe_gpio_t *gpio)
         if (type != 4u && type != 5u) continue;
         unsigned bank;
         uint32_t mask;
-        (void)gpio_pin_bit(pin, &bank, &mask);
+        if (!gpio_pin_bit(pin, &bank, &mask)) continue;
         if ((gpio->rtc_owned & (UINT64_C(1) << pin)) != 0u ||
             (gpio->peripheral_unknown[bank] & mask) != 0u ||
             (gpio->input_enable[bank] & mask) == 0u)
@@ -988,7 +988,7 @@ void flexe_gpio_set_input_enable(flexe_gpio_t *gpio, unsigned pin,
     if (!gpio_pin_valid(gpio, pin)) return;
     unsigned bank;
     uint32_t mask;
-    (void)gpio_pin_bit(pin, &bank, &mask);
+    if (!gpio_pin_bit(pin, &bank, &mask)) return;
     bool old_enabled = (gpio->input_enable[bank] & mask) != 0u;
     if (old_enabled == enabled) return;
     if (enabled) gpio->input_enable[bank] |= mask;
@@ -1006,7 +1006,7 @@ void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level)
     if (!gpio_pin_valid(gpio, pin)) return;
     unsigned bank;
     uint32_t mask;
-    (void)gpio_pin_bit(pin, &bank, &mask);
+    if (!gpio_pin_bit(pin, &bank, &mask)) return;
     gpio->host_valid[bank] |= mask;
     if (level) gpio->host_input[bank] |= mask;
     else       gpio->host_input[bank] &= ~mask;
@@ -1019,7 +1019,7 @@ int flexe_gpio_input_level(const flexe_gpio_t *gpio, unsigned pin)
     if (!gpio_pin_valid(gpio, pin)) return -1;
     unsigned bank;
     uint32_t mask;
-    (void)gpio_pin_bit(pin, &bank, &mask);
+    if (!gpio_pin_bit(pin, &bank, &mask)) return -1;
     if ((gpio->peripheral_unknown[bank] & mask) != 0u) return -1;
     return (gpio->input[bank] & mask) != 0u;
 }
@@ -1041,7 +1041,7 @@ int flexe_gpio_input_signal_level(const flexe_gpio_t *gpio, unsigned signal)
             return -1;
         unsigned bank;
         uint32_t mask;
-        (void)gpio_pin_bit(input, &bank, &mask);
+        if (!gpio_pin_bit(input, &bank, &mask)) return -1;
         if ((gpio->peripheral_unknown[bank] & mask) != 0u)
             return -1;
         level = (gpio->input_enable[bank] & mask) != 0u &&
