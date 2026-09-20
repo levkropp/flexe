@@ -244,6 +244,7 @@ set(TEST_SOURCES
     tests/test_apb_saradc.c
     tests/test_radio.c
     tests/test_esp32s3_extmem.c
+    tests/test_sensitive_memprot.c
     tests/test_system_clock.c
     tests/test_syscon_memory.c
     tests/test_sandbox_input.c

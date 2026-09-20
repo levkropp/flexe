@@ -175,6 +175,13 @@ consumers and composes with the radio owner on their shared MMIO page. Flexe
 does not yet model cache timing or erase backing memory when firmware requests
 that a bank be powered down.
 
+The SENSITIVE v1 model likewise retains the cache-data-array and internal-SRAM
+allocation policy with documented reset values, reserved-bit masks, and sticky
+configuration locks. Its normalized state covers CPU and cache use, trace
+allocation, MAC-dump/log use, and retention disable. Cache topology and access
+latency are not yet derived from that policy, and protection violations are not
+yet generated from the broader retained memory-protection register set.
+
 The external I2C model is shared by classic ESP32 and ESP32-S3 through target
 descriptors rather than fixed addresses or command encodings. It implements
 both native instances, their FIFO command lists, master writes and repeated-

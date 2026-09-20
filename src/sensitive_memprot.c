@@ -4,11 +4,15 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-/* Offsets and field masks are from ESP32-S3 sensitive_reg.h. This first
- * functional model covers the complete CPU SRAM/PIF protection register
- * interval. It records the policy, masks reserved bits, and honors write-once
- * configuration locks. Access-fault generation will consume the same state in
- * timed/cycle modes; status registers remain read-only zero until then. */
+/* Offsets and field masks are from ESP32-S3 sensitive_reg.h. The functional
+ * model covers cache/SRAM allocation policy plus the complete CPU SRAM/PIF
+ * protection interval. It records the policy, masks reserved bits, and honors
+ * write-once configuration locks. Access-fault generation will consume the
+ * same state in timed/cycle modes; status registers remain read-only zero until
+ * then. */
+#define MEMORY_POLICY_LAST_OFF 0x024u
+#define MEMORY_POLICY_WORDS \
+    ((MEMORY_POLICY_LAST_OFF / sizeof(uint32_t)) + 1u)
 #define MEMPROT_FIRST_OFF 0x0C0u
 #define MEMPROT_LAST_OFF  0x278u
 #define MEMPROT_WORDS \
@@ -21,7 +25,10 @@ struct flexe_sensitive_memprot {
     mmio_read_fn fallback_read;
     mmio_write_fn fallback_write;
     void *fallback_ctx;
+    uint32_t memory_policy[MEMORY_POLICY_WORDS];
     uint32_t reg[MEMPROT_WORDS];
+    flexe_sensitive_memory_usage_fn memory_usage_changed;
+    void *memory_usage_ctx;
 };
 
 static bool memprot_geometry_valid(const flexe_target_desc_t *target)
@@ -38,11 +45,25 @@ static bool memprot_geometry_valid(const flexe_target_desc_t *target)
            desc->register_size <= target->peripheral_end - desc->base;
 }
 
+static bool memory_policy_offset(uint32_t off)
+{
+    switch (off) {
+    case 0x000u: case 0x004u:
+    case 0x010u: case 0x014u: case 0x018u: case 0x01Cu:
+    case 0x020u: case 0x024u:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint32_t *memprot_reg(flexe_sensitive_memprot_t *memprot,
                              uint32_t off)
 {
-    if ((off & 3u) != 0u || off < MEMPROT_FIRST_OFF ||
-        off > MEMPROT_LAST_OFF)
+    if ((off & 3u) != 0u) return NULL;
+    if (memory_policy_offset(off))
+        return &memprot->memory_policy[off / sizeof(uint32_t)];
+    if (off < MEMPROT_FIRST_OFF || off > MEMPROT_LAST_OFF)
         return NULL;
     return &memprot->reg[(off - MEMPROT_FIRST_OFF) / sizeof(uint32_t)];
 }
@@ -50,6 +71,19 @@ static uint32_t *memprot_reg(flexe_sensitive_memprot_t *memprot,
 static uint32_t writable_mask(uint32_t off)
 {
     switch (off) {
+    case 0x000u: case 0x010u: case 0x024u:
+        return 0x00000001u;
+    case 0x004u:
+        return 0x000000FFu;
+    case 0x014u:
+        return 0x000007FFu;
+    case 0x018u:
+        return 0x0003FFFFu;
+    case 0x01Cu:
+        return 0x0000000Fu;
+    case 0x020u:
+        return 0x0000007Fu;
+
     case 0x0C0u: case 0x0D8u: case 0x0E4u: case 0x0F0u:
     case 0x0FCu: case 0x104u: case 0x114u: case 0x124u:
     case 0x160u: case 0x19Cu: case 0x1B8u: case 0x1C8u:
@@ -111,6 +145,7 @@ static uint32_t writable_mask(uint32_t off)
 static bool lock_register(uint32_t off)
 {
     switch (off) {
+    case 0x000u: case 0x010u:
     case 0x0C0u: case 0x0D8u: case 0x0E4u: case 0x0F0u:
     case 0x0FCu: case 0x104u: case 0x114u: case 0x124u:
     case 0x160u: case 0x19Cu: case 0x1B8u: case 0x1C8u:
@@ -124,6 +159,8 @@ static bool lock_register(uint32_t off)
 
 static uint32_t protecting_lock(uint32_t off)
 {
+    if (off == 0x004u) return 0x000u;
+    if (off >= 0x014u && off <= 0x020u) return 0x010u;
     if (off >= 0x0C4u && off <= 0x0D4u) return 0x0C0u;
     if (off == 0x0DCu || off == 0x0E0u) return 0x0D8u;
     if (off == 0x0E8u) return 0x0E4u;
@@ -142,6 +179,46 @@ static uint32_t protecting_lock(uint32_t off)
     if (off >= 0x268u && off <= 0x270u) return 0x264u;
     if (off == 0x278u) return 0x274u;
     return NO_LOCK;
+}
+
+static bool read_memory_usage(
+    const flexe_sensitive_memprot_t *memprot,
+    flexe_sensitive_memory_usage_state_t *state)
+{
+    if (!memprot || !state) return false;
+    const uint32_t *reg = memprot->memory_policy;
+    *state = (flexe_sensitive_memory_usage_state_t) {
+        .cache_data_array_locked = (reg[0x000u / 4u] & 1u) != 0u,
+        .cache_data_array_connection =
+            (uint8_t)(reg[0x004u / 4u] & 0xFFu),
+        .internal_sram_usage_locked = (reg[0x010u / 4u] & 1u) != 0u,
+        .internal_sram_icache_usage =
+            (uint8_t)(reg[0x014u / 4u] & 0x3u),
+        .internal_sram_dcache_usage =
+            (uint8_t)((reg[0x014u / 4u] >> 2u) & 0x3u),
+        .internal_sram_cpu_usage =
+            (uint8_t)((reg[0x014u / 4u] >> 4u) & 0x7Fu),
+        .core0_trace_usage =
+            (uint8_t)(reg[0x018u / 4u] & 0x7Fu),
+        .core1_trace_usage =
+            (uint8_t)((reg[0x018u / 4u] >> 7u) & 0x7Fu),
+        .core0_trace_allocation =
+            (uint8_t)((reg[0x018u / 4u] >> 14u) & 0x3u),
+        .core1_trace_allocation =
+            (uint8_t)((reg[0x018u / 4u] >> 16u) & 0x3u),
+        .mac_dump_usage = (uint8_t)(reg[0x01Cu / 4u] & 0xFu),
+        .log_usage = (uint8_t)(reg[0x020u / 4u] & 0x7Fu),
+        .retention_disabled = (reg[0x024u / 4u] & 1u) != 0u,
+    };
+    return true;
+}
+
+static void publish_memory_usage(flexe_sensitive_memprot_t *memprot)
+{
+    if (!memprot || !memprot->memory_usage_changed) return;
+    flexe_sensitive_memory_usage_state_t state;
+    if (read_memory_usage(memprot, &state))
+        memprot->memory_usage_changed(memprot->memory_usage_ctx, &state);
 }
 
 static uint32_t memprot_read(void *ctx, uint32_t addr)
@@ -168,7 +245,10 @@ static void memprot_write(void *ctx, uint32_t addr, uint32_t value)
     uint32_t mask = writable_mask(off);
     if (mask == 0u) return;
     if (lock_register(off)) {
-        *reg |= value & mask; /* Lock bits cannot be cleared until reset. */
+        uint32_t next = *reg | (value & mask);
+        if (next == *reg) return;
+        *reg = next; /* Lock bits cannot be cleared until reset. */
+        if (memory_policy_offset(off)) publish_memory_usage(memprot);
         return;
     }
 
@@ -177,7 +257,10 @@ static void memprot_write(void *ctx, uint32_t addr, uint32_t value)
         uint32_t *lock = memprot_reg(memprot, lock_off);
         if (lock && (*lock & 1u) != 0u) return;
     }
-    *reg = (*reg & ~mask) | (value & mask);
+    uint32_t next = (*reg & ~mask) | (value & mask);
+    if (next == *reg) return;
+    *reg = next;
+    if (memory_policy_offset(off)) publish_memory_usage(memprot);
 }
 
 flexe_sensitive_memprot_t *flexe_sensitive_memprot_create(
@@ -195,6 +278,10 @@ flexe_sensitive_memprot_t *flexe_sensitive_memprot_create(
     memprot->fallback_read = fallback_read;
     memprot->fallback_write = fallback_write;
     memprot->fallback_ctx = fallback_ctx;
+
+    /* All cache data arrays and CPU/cache SRAM banks reset available. */
+    *memprot_reg(memprot, 0x004u) = 0x000000FFu;
+    *memprot_reg(memprot, 0x014u) = 0x000007FFu;
 
     /* Both exception-loop override controls reset enabled. */
     *memprot_reg(memprot, 0x1CCu) = 1u;
@@ -215,7 +302,26 @@ void flexe_sensitive_memprot_destroy(flexe_sensitive_memprot_t *memprot)
     if (!memprot) return;
     const flexe_sensitive_memprot_desc_t *desc =
         &memprot->target->sensitive_memprot;
-    (void)mem_register_mmio_range(memprot->mem, desc->base,
-                                  desc->register_size, NULL, NULL, NULL);
+    (void)mem_register_mmio_range(
+        memprot->mem, desc->base, desc->register_size,
+        memprot->fallback_read, memprot->fallback_write,
+        memprot->fallback_ctx);
     free(memprot);
+}
+
+bool flexe_sensitive_memprot_memory_usage(
+    const flexe_sensitive_memprot_t *memprot,
+    flexe_sensitive_memory_usage_state_t *state)
+{
+    return read_memory_usage(memprot, state);
+}
+
+void flexe_sensitive_memprot_set_memory_usage_listener(
+    flexe_sensitive_memprot_t *memprot,
+    flexe_sensitive_memory_usage_fn fn, void *ctx)
+{
+    if (!memprot) return;
+    memprot->memory_usage_changed = fn;
+    memprot->memory_usage_ctx = fn ? ctx : NULL;
+    publish_memory_usage(memprot);
 }
