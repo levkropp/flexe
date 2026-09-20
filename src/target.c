@@ -26,6 +26,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SHA_V1 |
                         FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
+                        FLEXE_TARGET_CAP_TWAI_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -115,6 +116,21 @@ static const flexe_target_desc_t TARGETS[] = {
             .version_reset = 0x5342240Au,
             .interrupt_source = 37u,
             .slot_count = 2u,
+        },
+        .twai = {
+            .base = 0x3FF6B000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .bus_timing_0_writable_mask = 0x000000FFu,
+            .brp_mask = 0x0000003Fu,
+            .clock_divider_writable_mask = 0x0000008Fu,
+            .tx_output_signal = 123u,
+            .rx_input_signal = 94u,
+            .bus_off_output_signal = 124u,
+            .clock_output_signal = 125u,
+            .interrupt_source = 45u,
+            .interrupt_enable_writable_mask = 0xFFu,
+            .brp_divider_mask = 1u << 4,
         },
         .io_mux = {
             .base = 0x3FF49000u,
@@ -338,6 +354,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_APB_SARADC_V1 |
                         FLEXE_TARGET_CAP_I2S_V2 |
                         FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
+                        FLEXE_TARGET_CAP_TWAI_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -460,6 +477,20 @@ static const flexe_target_desc_t TARGETS[] = {
                 },
             },
         },
+        .twai = {
+            .base = 0x6002B000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .bus_timing_0_writable_mask = 0x0000DFFFu,
+            .brp_mask = 0x00001FFFu,
+            .clock_divider_writable_mask = 0x000001FFu,
+            .tx_output_signal = 116u,
+            .rx_input_signal = 116u,
+            .bus_off_output_signal = 117u,
+            .clock_output_signal = 118u,
+            .interrupt_source = 37u,
+            .interrupt_enable_writable_mask = 0xEFu,
+        },
         .secondary_core = {
             .base = 0x600C0000u,
             .register_size = 0x1000u,
@@ -480,7 +511,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 8u,
-            .gate_count = 17u,
+            .gate_count = 18u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -633,6 +664,14 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x024u,
                     .clock_mask = 1u << 7,
                     .reset_mask = 1u << 7,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_TWAI,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 19,
+                    .reset_mask = 1u << 19,
                 },
             },
             .low_power = {

@@ -30,6 +30,7 @@
 #define FLEXE_TARGET_GP_SPI_CS_MAX 6u
 #define FLEXE_TARGET_GP_SPI_DATA_MAX 8u
 #define FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT 512u
+#define FLEXE_TARGET_GPIO_MATRIX_INPUT_COUNT 256u
 #define FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT 256u
 #define FLEXE_TARGET_INTERRUPT_CORE_MAX 2u
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
@@ -50,7 +51,7 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 17u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 18u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
@@ -66,7 +67,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 61u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 62u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -104,6 +105,7 @@ typedef enum {
     FLEXE_TARGET_CAP_ASSIST_DEBUG_V1               = 1ull << 29,
     FLEXE_TARGET_CAP_I2S_V2                        = 1ull << 30,
     FLEXE_TARGET_CAP_SDMMC_HOST_V1                  = 1ull << 31,
+    FLEXE_TARGET_CAP_TWAI_V1                        = 1ull << 32,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -1005,6 +1007,28 @@ typedef struct {
     flexe_sdmmc_host_slot_desc_t slot[FLEXE_TARGET_SDMMC_SLOT_MAX];
 } flexe_sdmmc_host_desc_t;
 
+/* SJA1000-compatible PeliCAN controller used across several ESP32-family
+ * targets. The frame, FIFO, interrupt, and error-confinement behavior is one
+ * reusable IP model. SoC revisions widen BTR0/CDR fields and move the block,
+ * clock gate, interrupt, and GPIO-matrix wiring; those differences remain
+ * explicit target data. brp_divider_mask names the classic ESP32 extension
+ * in IER and is zero when BTR0 contains the complete prescaler. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t source_clock_hz;
+    uint32_t bus_timing_0_writable_mask;
+    uint32_t brp_mask;
+    uint32_t clock_divider_writable_mask;
+    uint16_t tx_output_signal;
+    uint16_t rx_input_signal;
+    uint16_t bus_off_output_signal;
+    uint16_t clock_output_signal;
+    uint8_t  interrupt_source;
+    uint8_t  interrupt_enable_writable_mask;
+    uint8_t  brp_divider_mask;
+} flexe_twai_desc_t;
+
 typedef enum {
     FLEXE_SHA_LAYOUT_NONE = 0,
     /* Classic ESP32: one START/CONTINUE/LOAD/BUSY quartet per algorithm and
@@ -1399,6 +1423,9 @@ struct flexe_target_desc {
 
     /* Optional DesignWare SD/MMC host with FIFO and internal descriptor DMA. */
     flexe_sdmmc_host_desc_t       sdmmc_host;
+
+    /* Optional SJA1000-compatible TWAI/CAN controller. */
+    flexe_twai_desc_t             twai;
 
     /* Optional SHA accelerator. */
     flexe_sha_desc_t              sha;

@@ -73,7 +73,8 @@ done
 [[ $# -gt 0 ]] || { usage >&2; exit 2; }
 
 all_fixtures=(hello crosscore nvs sleep gpio-wake gpio-isr \
-    usb-serial-jtag i2c-master i2s-std sdmmc-host rmt-loopback socket-range)
+    usb-serial-jtag i2c-master i2s-std sdmmc-host twai rmt-loopback \
+    socket-range)
 if [[ $# -eq 1 && "$1" == all ]]; then
     set -- "${all_fixtures[@]}"
 elif [[ " $* " == *" all "* ]]; then
@@ -406,6 +407,7 @@ host_target_for_key() {
     s3_idf_i2c_master) host_target=flexe-s3-idf-i2c-master-test ;;
     s3_idf_i2s_std) host_target=flexe-s3-idf-i2s-std-test ;;
     s3_idf_sdmmc_host) host_target=flexe-sdmmc-host-test ;;
+    s3_idf_twai) host_target=flexe-twai-bus-test ;;
     s3_idf_usb_serial_jtag) host_target=flexe-s3-idf-usb-serial-jtag-test ;;
     *) host_target=xtensa-emu ;;
     esac

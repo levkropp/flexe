@@ -56,7 +56,6 @@ static inline int gpio_dbg(void) {
 #define EMAC_DMA_BASE   0x3FF69000u
 #define EMAC_EXT_BASE   0x3FF69800u
 #define EMAC_MAC_BASE   0x3FF6A000u
-#define TWAI_BASE       0x3FF6B000u
 #define RMT_BASE        0x3FF56000u
 #define PCNT_BASE       0x3FF57000u
 #define MCPWM0_BASE     0x3FF5E000u
@@ -662,10 +661,9 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define SDMMC_STATUS_RESP_SHIFT      11u
 #define SDMMC_STATUS_FIFO_SHIFT      17u
 
-/* Classic ESP32 TWAI controller. The peripheral is an SJA1000-compatible
- * PeliCAN core whose 8-bit registers occupy the low byte of 32-bit APB words. */
+/* Target-described TWAI controller. The peripheral is an SJA1000-compatible
+ * PeliCAN core whose logical registers occupy 32-bit APB words. */
 #define TWAI_REG_FILE_SIZE            0x080u
-#define TWAI_INTR_SOURCE              45
 #define TWAI_RX_FIFO_BYTES            64u
 #define TWAI_RX_FIFO_FRAMES           32u
 
@@ -1214,7 +1212,7 @@ static void sdmmc_clock_update(esp32_periph_t *p);
 static uint32_t twai_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void twai_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void twai_reset_state(esp32_periph_t *p);
-static void twai_dport_update(esp32_periph_t *p);
+static void twai_clock_update(esp32_periph_t *p);
 static void emac_reset_state(esp32_periph_t *p);
 static void emac_dport_update(esp32_periph_t *p);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
@@ -1543,7 +1541,7 @@ typedef struct {
     uint8_t mode;
     uint8_t int_raw;
     uint8_t int_ena;
-    uint8_t bus_timing_0;
+    uint32_t bus_timing_0;
     uint8_t bus_timing_1;
     uint8_t arbitration_lost_capture;
     uint8_t error_code_capture;
@@ -1552,7 +1550,7 @@ typedef struct {
     uint16_t tx_error_count;
     uint8_t acceptance_code[4];
     uint8_t acceptance_mask[4];
-    uint8_t clock_divider;
+    uint32_t clock_divider;
 
     uint8_t tx_buffer[13];
     periph_twai_frame_t tx_frame;
@@ -2047,8 +2045,10 @@ struct esp32_periph {
     bool sdmmc_system_clock_enabled;
     bool sdmmc_system_reset_asserted;
 
-    /* SJA1000-compatible classic ESP32 TWAI/CAN controller and RX FIFO. */
+    /* Target-described SJA1000-compatible TWAI/CAN controller and RX FIFO. */
     twai_state_t twai;
+    bool twai_system_clock_enabled;
+    bool twai_system_reset_asserted;
 
     /* Synopsys GMAC DMA/MAC plus Espressif's MII/RMII extension registers. */
     emac_state_t emac;
@@ -2624,7 +2624,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         timg_sync_all_to(p, timg_now_cycles(p));
         p->dport_perip_clk_en = val;
         uhci_dport_update(p);
-        twai_dport_update(p);
+        twai_clock_update(p);
         timg_kick(p);
         break;
     case DPORT_WIFI_CLK_EN_OFF:
@@ -2669,7 +2669,7 @@ static void dport_write(void *ctx, uint32_t addr, uint32_t val) {
         if (val & DPORT_PWM1_MODULE_BIT)
             mcpwm_reset_unit(p, 1);
         uhci_dport_update(p);
-        twai_dport_update(p);
+        twai_clock_update(p);
         timg_kick(p);
         break;
     case 0x0D4: p->bt_lpck[0] = val; break;  /* DPORT_BT_LPCK_DIV_INT */
@@ -11998,11 +11998,24 @@ static void sdmmc_set_system_state(esp32_periph_t *p,
     sdmmc_clock_update(p);
 }
 
-/* ---- Classic ESP32 TWAI/CAN (SJA1000-compatible PeliCAN core) ---- */
+/* ---- Target-described TWAI/CAN (SJA1000-compatible PeliCAN core) ---- */
+
+static const flexe_twai_desc_t *twai_desc(const esp32_periph_t *p) {
+    return p && p->target &&
+           (p->target->capabilities & FLEXE_TARGET_CAP_TWAI_V1) ?
+           &p->target->twai : NULL;
+}
 
 static bool twai_clocked(const esp32_periph_t *p) {
-    return (p->dport_perip_clk_en & DPORT_TWAI_MODULE_BIT) != 0u &&
-           (p->dport_perip_rst_en & DPORT_TWAI_MODULE_BIT) == 0u;
+    if (!twai_desc(p)) return false;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1)
+        return p->twai_system_clock_enabled &&
+               !p->twai_system_reset_asserted;
+    if (p->target->capabilities &
+        FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)
+        return (p->dport_perip_clk_en & DPORT_TWAI_MODULE_BIT) != 0u &&
+               (p->dport_perip_rst_en & DPORT_TWAI_MODULE_BIT) == 0u;
+    return true;
 }
 
 static xtensa_cpu_t *twai_event_cpu(esp32_periph_t *p) {
@@ -12030,15 +12043,17 @@ static uint8_t twai_status(const twai_state_t *s) {
 }
 
 static void twai_irq_update(esp32_periph_t *p) {
+    const flexe_twai_desc_t *desc = twai_desc(p);
+    if (!desc) return;
     twai_state_t *s = &p->twai;
     bool active = twai_clocked(p) &&
                   (s->int_raw & s->int_ena & TWAI_INT_VALID_MASK) != 0u;
     if (active)
-        periph_assert_interrupt_status(p, TWAI_INTR_SOURCE,
+        periph_assert_interrupt_status(p, desc->interrupt_source,
                                        s->int_raw & s->int_ena &
                                        TWAI_INT_VALID_MASK);
     else
-        periph_deassert_interrupt(p, TWAI_INTR_SOURCE);
+        periph_deassert_interrupt(p, desc->interrupt_source);
 }
 
 static void twai_clear_rx_fifo(twai_state_t *s) {
@@ -12050,8 +12065,9 @@ static void twai_clear_rx_fifo(twai_state_t *s) {
 }
 
 static void twai_reset_state(esp32_periph_t *p) {
-    if (!p) return;
-    periph_deassert_interrupt(p, TWAI_INTR_SOURCE);
+    const flexe_twai_desc_t *desc = twai_desc(p);
+    if (!desc) return;
+    periph_deassert_interrupt(p, desc->interrupt_source);
     twai_state_t *s = &p->twai;
     periph_twai_tx_fn tx_cb = s->tx_cb;
     void *tx_cb_ctx = s->tx_cb_ctx;
@@ -12065,15 +12081,16 @@ static void twai_reset_state(esp32_periph_t *p) {
     twai_kick(p);
 }
 
-static void twai_dport_update(esp32_periph_t *p) {
-    if (!p) return;
+static void twai_clock_update(esp32_periph_t *p) {
+    const flexe_twai_desc_t *desc = twai_desc(p);
+    if (!desc) return;
     twai_state_t *s = &p->twai;
     if (!twai_clocked(p)) {
         s->tx_event_armed = false;
         s->recovery_event_armed = false;
         s->tx_busy = false;
         s->tx_complete = true;
-        periph_deassert_interrupt(p, TWAI_INTR_SOURCE);
+        periph_deassert_interrupt(p, desc->interrupt_source);
     } else {
         twai_irq_update(p);
     }
@@ -12309,14 +12326,19 @@ static uint32_t twai_frame_wire_bits(const periph_twai_frame_t *frame) {
 }
 
 static uint32_t twai_bit_cycles(const esp32_periph_t *p) {
+    const flexe_twai_desc_t *desc = twai_desc(p);
+    if (!desc) return 1u;
     const twai_state_t *s = &p->twai;
-    uint32_t brp = 2u * ((s->bus_timing_0 & 0x3Fu) + 1u);
-    if (s->int_ena & (1u << 4)) brp *= 2u;
+    uint32_t brp = 2u * ((s->bus_timing_0 & desc->brp_mask) + 1u);
+    if (desc->brp_divider_mask &&
+        (s->int_ena & desc->brp_divider_mask))
+        brp *= 2u;
     uint32_t tseg1 = (s->bus_timing_1 & 0x0Fu) + 1u;
     uint32_t tseg2 = ((s->bus_timing_1 >> 4) & 0x07u) + 1u;
     uint64_t numerator = (uint64_t)brp * (1u + tseg1 + tseg2) *
-                         timg_cpu_mhz((esp32_periph_t *)p);
-    uint32_t cycles = (uint32_t)((numerator + 79u) / 80u);
+                         timg_cpu_mhz((esp32_periph_t *)p) * 1000000u;
+    uint32_t cycles = (uint32_t)((numerator + desc->source_clock_hz - 1u) /
+                                 desc->source_clock_hz);
     return cycles != 0u ? cycles : 1u;
 }
 
@@ -12521,8 +12543,10 @@ static void twai_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu) {
 
 static uint32_t twai_read(void *ctx, uint32_t addr) {
     esp32_periph_t *p = ctx;
+    const flexe_twai_desc_t *desc = twai_desc(p);
+    if (!desc) return default_read(ctx, addr);
     twai_state_t *s = &p->twai;
-    uint32_t off = addr - TWAI_BASE;
+    uint32_t off = addr - desc->base;
     xtensa_cpu_t *cpu = twai_event_cpu(p);
     if (cpu) twai_eval_events(p, cpu);
     if ((off & 3u) != 0u || off >= TWAI_REG_FILE_SIZE)
@@ -12585,8 +12609,13 @@ static void twai_write_mode(esp32_periph_t *p, uint8_t value) {
 
 static void twai_write(void *ctx, uint32_t addr, uint32_t value) {
     esp32_periph_t *p = ctx;
+    const flexe_twai_desc_t *desc = twai_desc(p);
+    if (!desc) {
+        default_write(ctx, addr, value);
+        return;
+    }
     twai_state_t *s = &p->twai;
-    uint32_t off = addr - TWAI_BASE;
+    uint32_t off = addr - desc->base;
     xtensa_cpu_t *cpu = twai_event_cpu(p);
     if (cpu) twai_eval_events(p, cpu);
     if ((off & 3u) != 0u || off >= TWAI_REG_FILE_SIZE) {
@@ -12613,11 +12642,14 @@ static void twai_write(void *ctx, uint32_t addr, uint32_t value) {
         return;
     }
     case TWAI_INTERRUPT_ENABLE_OFF:
-        if (s->mode & TWAI_MODE_RESET) s->int_ena = byte;
+        if (s->mode & TWAI_MODE_RESET)
+            s->int_ena = byte & desc->interrupt_enable_writable_mask;
         twai_irq_update(p);
         return;
     case TWAI_BUS_TIMING_0_OFF:
-        if (s->mode & TWAI_MODE_RESET) s->bus_timing_0 = byte;
+        if (s->mode & TWAI_MODE_RESET)
+            s->bus_timing_0 = value &
+                              desc->bus_timing_0_writable_mask;
         return;
     case TWAI_BUS_TIMING_1_OFF:
         if (s->mode & TWAI_MODE_RESET) s->bus_timing_1 = byte;
@@ -12633,7 +12665,8 @@ static void twai_write(void *ctx, uint32_t addr, uint32_t value) {
         return;
     case TWAI_CLOCK_DIVIDER_OFF:
         if (s->mode & TWAI_MODE_RESET)
-            s->clock_divider = byte & 0x8Fu;
+            s->clock_divider = value &
+                               desc->clock_divider_writable_mask;
         return;
     case TWAI_STATUS_OFF:
     case TWAI_INTERRUPT_OFF:
@@ -12654,6 +12687,89 @@ static void twai_write(void *ctx, uint32_t addr, uint32_t value) {
         }
         return;
     }
+}
+
+static bool twai_geometry_valid(const flexe_target_desc_t *target) {
+    if (!target || !(target->capabilities & FLEXE_TARGET_CAP_TWAI_V1))
+        return false;
+    const flexe_twai_desc_t *desc = &target->twai;
+    if ((desc->base & 0xFFFu) != 0u ||
+        (desc->register_size & 0xFFFu) != 0u ||
+        desc->register_size < TWAI_REG_FILE_SIZE ||
+        desc->base < target->peripheral_start ||
+        desc->base >= target->peripheral_end ||
+        desc->register_size > target->peripheral_end - desc->base ||
+        desc->interrupt_source >= FLEXE_TARGET_INTERRUPT_SOURCE_MAX ||
+        desc->source_clock_hz == 0u || desc->brp_mask == 0u ||
+        (desc->brp_mask & (desc->brp_mask + 1u)) != 0u ||
+        (desc->brp_mask & ~desc->bus_timing_0_writable_mask) != 0u ||
+        (desc->bus_timing_0_writable_mask & ~0x0000FFFFu) != 0u ||
+        desc->clock_divider_writable_mask == 0u ||
+        (desc->clock_divider_writable_mask & ~0x000001FFu) != 0u ||
+        (desc->interrupt_enable_writable_mask & TWAI_INT_VALID_MASK) !=
+            TWAI_INT_VALID_MASK ||
+        (desc->brp_divider_mask &
+         ~desc->interrupt_enable_writable_mask) != 0u ||
+        (desc->brp_divider_mask & TWAI_INT_VALID_MASK) != 0u ||
+        (desc->brp_divider_mask != 0u &&
+         (desc->brp_divider_mask & (desc->brp_divider_mask - 1u)) != 0u))
+        return false;
+    if (target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) {
+        if (desc->interrupt_source >=
+            target->interrupt_matrix.source_count)
+            return false;
+    }
+    if (target->capabilities & FLEXE_TARGET_CAP_GPIO_V1) {
+        if (desc->tx_output_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            desc->bus_off_output_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            desc->clock_output_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            desc->rx_input_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_INPUT_COUNT)
+            return false;
+    }
+    return true;
+}
+
+static int twai_register_target(esp32_periph_t *p) {
+    if (!(p->target->capabilities & FLEXE_TARGET_CAP_TWAI_V1)) return 0;
+    if (!twai_geometry_valid(p->target)) return -1;
+    const flexe_twai_desc_t *desc = &p->target->twai;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1) {
+        if (!flexe_system_clock_gate_state(
+                p->system_clock, FLEXE_SYSTEM_DEVICE_TWAI, 0u,
+                &p->twai_system_clock_enabled,
+                &p->twai_system_reset_asserted))
+            return -1;
+    } else {
+        p->twai_system_clock_enabled = true;
+        p->twai_system_reset_asserted = false;
+    }
+    if (p->target_gpio) {
+        flexe_gpio_set_output_signal_modeled(
+            p->target_gpio, desc->tx_output_signal);
+        flexe_gpio_set_output_signal_modeled(
+            p->target_gpio, desc->bus_off_output_signal);
+        flexe_gpio_set_output_signal_modeled(
+            p->target_gpio, desc->clock_output_signal);
+    }
+    twai_reset_state(p);
+    return mem_register_mmio_range(p->mem, desc->base, desc->register_size,
+                                   twai_read, twai_write, p);
+}
+
+static void twai_set_system_state(esp32_periph_t *p,
+                                  bool clock_enabled,
+                                  bool reset_asserted) {
+    if (!twai_desc(p)) return;
+    bool reset_edge = reset_asserted &&
+                      !p->twai_system_reset_asserted;
+    p->twai_system_clock_enabled = clock_enabled;
+    p->twai_system_reset_asserted = reset_asserted;
+    if (reset_edge) twai_reset_state(p);
+    twai_clock_update(p);
 }
 
 /* ---- Classic ESP32 Ethernet MAC + enhanced descriptor DMA ---- */
@@ -14215,6 +14331,10 @@ static void system_clock_gate_changed(
         if (instance == 0u)
             sdmmc_set_system_state(p, clock_enabled, reset_asserted);
         break;
+    case FLEXE_SYSTEM_DEVICE_TWAI:
+        if (instance == 0u)
+            twai_set_system_state(p, clock_enabled, reset_asserted);
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -15198,6 +15318,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         return NULL;
     }
 
+    if (twai_register_target(p) != 0) {
+        periph_destroy(p);
+        return NULL;
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_SYSCON_MEMORY_V1) {
         p->syscon_memory = flexe_syscon_memory_create(
             mem, default_read, default_write, p);
@@ -15298,9 +15423,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     /* External SDIO-slave endpoint and its two SLC descriptor engines. */
     sdio_slave_reset_state(p);
 
-    /* Classic SJA1000-compatible TWAI controller starts in reset mode. */
-    twai_reset_state(p);
-
     /* Classic DesignWare Ethernet MAC/DMA and RMII extension reset state. */
     emac_reset_state(p);
 
@@ -15334,10 +15456,6 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     mem_register_mmio(mem, (int)PAGE_OF(SLCHOST_BASE),
                       slchost_read, slchost_write, p);
     mem_register_mmio(mem, (int)PAGE_OF(SLC_BASE), slc_read, slc_write, p);
-
-    /* Classic TWAI/CAN controller (interrupt source 45). */
-    mem_register_mmio(mem, (int)PAGE_OF(TWAI_BASE),
-                      twai_read, twai_write, p);
 
     /* Ethernet DMA/EXT share one page; MAC registers occupy the next page
      * (interrupt source 38). */
@@ -15654,7 +15772,7 @@ int periph_sdmmc_set_write_protected(esp32_periph_t *p, int slot,
 
 int periph_set_twai_tx_callback(esp32_periph_t *p, periph_twai_tx_fn fn,
                                 void *ctx) {
-    if (!p) return -1;
+    if (!twai_desc(p)) return -1;
     p->twai.tx_cb = fn;
     p->twai.tx_cb_ctx = fn ? ctx : NULL;
     return 0;
@@ -15662,12 +15780,12 @@ int periph_set_twai_tx_callback(esp32_periph_t *p, periph_twai_tx_fn fn,
 
 int periph_twai_rx_inject(esp32_periph_t *p,
                           const periph_twai_frame_t *frame) {
-    if (!p) return 0;
+    if (!twai_desc(p)) return 0;
     return twai_enqueue_rx(p, frame, true);
 }
 
 size_t periph_twai_rx_pending(const esp32_periph_t *p) {
-    return p ? p->twai.rx_count : 0u;
+    return twai_desc(p) ? p->twai.rx_count : 0u;
 }
 
 int periph_set_emac_tx_callback(esp32_periph_t *p, periph_emac_tx_fn fn,
@@ -16278,9 +16396,20 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
         candidates |= 1u << PERIPH_EVENT_LEDC;
     if (p->target->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1)
         candidates |= 1u << PERIPH_EVENT_SDMMC;
+    if (p->target->capabilities & FLEXE_TARGET_CAP_TWAI_V1)
+        candidates |= 1u << PERIPH_EVENT_TWAI;
     p->event_source_registered_mask = candidates;
     p->event_source_candidates[0] = candidates;
     p->event_source_candidates[1] = candidates;
+
+    /* Board-level deferred work and target-described TWAI use this shared
+     * timeline on every target, not only on classic ESP32. */
+    for (unsigned core = 0u; core < 2u; core++) {
+        xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;
+        p->event_clock.core_cycles[core] = p->event_clock.cycles;
+        p->event_clock.last_ccount[core] = cpu ? cpu->ccount : 0u;
+        p->event_clock.valid[core] = cpu != NULL;
+    }
 
     if (classic) {
         /* Re-anchor every shared clock against the newly attached cores.
@@ -16288,7 +16417,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
          * added later from being silently left un-anchored. */
         periph_clock_t *clocks[] = {
             &p->timg_clock, &p->mcpwm.clock, &p->sigmadelta.clock,
-            &p->ledc_clock, &p->event_clock,
+            &p->ledc_clock,
         };
         for (unsigned core = 0; core < 2u; core++) {
             xtensa_cpu_t *cpu = core == 0u ? cpu0 : cpu1;

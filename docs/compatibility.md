@@ -262,6 +262,20 @@ and matching ELF SHA-256 is
 SDIO functions, UHS/DDR signaling, wire-level bus width and timing, hot removal,
 and general media-fault injection remain outside this functional model.
 
+TWAI is likewise one target-described SJA1000-compatible model on classic
+ESP32 and ESP32-S3. Target data supplies the base, APB source clock, interrupt,
+GPIO-matrix signals, classic BRP divider extension, and S3's widened 13-bit
+prescaler and 9-bit clock-divider register. The pinned stock ESP-IDF 5.3.2
+driver gate exercises ISR-backed queues, alerts, self-reception, and host CAN
+frames in interpreter and JIT with identical results and no unsupported MMIO.
+Its application image SHA-256 is
+`98b418fca45ac689a16e848ca63f3429912eca0857501a6e2f7e2ce79552e348`
+and matching ELF SHA-256 is
+`7210164d889b792d89ab8668664f9f800ccd4ea942ae5f5bf801f1144226c718`.
+Frame-duration scheduling follows configured nominal bit timing; electrical
+sampling, transceiver state, and simultaneous multi-node bit arbitration are
+outside the functional model.
+
 The S3 I2S v2 model is also selected entirely by target geometry: the two
 controller bases, SYSTEM clock/reset bits, interrupt sources, GDMA trigger
 IDs, source clocks, and GPIO-matrix producers are descriptor data. Standard

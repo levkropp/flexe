@@ -186,6 +186,9 @@ bytes, and both GPIO-matrix routes with zero unsupported MMIO.
 the stock S3 host driver and ISR queue in both engines, checking slot-1
 command/response, timed IDMAC single- and multi-block media I/O, target GPIO
 routes, and zero unsupported MMIO.
+`check-s3-idf-twai.sh` similarly reuses the classic CAN-bus endpoint runner
+for the stock S3 driver, checking target-specific timing-register widths,
+GPIO routes, interrupt queues, alerts, and host-injected frames in both engines.
 
 Use the fixture builder rather than making disposable build directories by
 hand. It finds the pinned ESP-IDF v5.3.2 checkout from `FLEXE_IDF_PATH`, an
@@ -205,7 +208,7 @@ keeps Ninja output and `sdkconfig` files under the user cache, outside the
 repository. A content fingerprint covers the project sources, generated
 configuration, pinned IDF/tool metadata, build flags, deterministic timestamp,
 and both artifact hashes. An unchanged run therefore skips the IDF environment
-export and Ninja entirely; all twelve artifact lookups take about one second on
+export and Ninja entirely; all thirteen artifact lookups take about one second on
 the reference MacBook. A cache miss retains full logs and prints only progress,
 exact artifact paths and hashes, and gate results. Pass `--verbose` when live
 compiler output and ccache statistics are useful. `--check` also updates just

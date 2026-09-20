@@ -3,9 +3,11 @@
  * peer that acknowledges/captures TX and injects two RX frames. */
 #include "elf_symbols.h"
 #include "flexe_session.h"
+#include "jit.h"
 #include "memory.h"
 #include "peripherals.h"
 #include "rom_stubs.h"
+#include "target.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,7 +15,8 @@
 #include <string.h>
 
 #define SUCCESS_MARKER 0x54574149u
-#define MAX_CYCLES     100000000ull
+#define CLASSIC_MAX_CYCLES UINT64_C(100000000)
+#define S3_MAX_CYCLES      UINT64_C(3000000000)
 #define RESULT_COUNT   32u
 #define TX_COUNT       3u
 
@@ -23,6 +26,11 @@ typedef struct {
     periph_twai_frame_t frames[TX_COUNT];
     size_t count;
     bool overflow;
+    esp32_periph_t *periph;
+    xtensa_mem_t *mem;
+    const flexe_target_desc_t *target;
+    int active_tx_route;
+    int active_rx_route;
 } twai_capture_t;
 
 static periph_twai_tx_result_t capture_twai(
@@ -32,6 +40,13 @@ static periph_twai_tx_result_t capture_twai(
         capture->frames[capture->count] = *frame;
     else
         capture->overflow = true;
+    if (capture->count == 0u && capture->target->id == FLEXE_TARGET_ESP32S3) {
+        capture->active_tx_route =
+            periph_gpio_out_signal(capture->periph, 5);
+        capture->active_rx_route = (int)mem_read32(
+            capture->mem, capture->target->gpio.base + 0x154u +
+                          capture->target->twai.rx_input_signal * 4u);
+    }
     capture->count++;
     return PERIPH_TWAI_TX_ACK;
 }
@@ -71,8 +86,9 @@ static bool captured_frames_ok(const twai_capture_t *capture) {
            frame_data_equal(self, self_data, sizeof(self_data));
 }
 
-static void dump_twai(xtensa_mem_t *mem, flexe_session_t *session) {
-    const uint32_t base = 0x3FF6B000u;
+static void dump_twai(xtensa_mem_t *mem, flexe_session_t *session,
+                      const flexe_target_desc_t *target) {
+    const uint32_t base = target->twai.base;
     fprintf(stderr,
             "[twai-fixture] mode=%02X cmd=%02X status=%02X "
             "irq=%02X ena=%02X btr=%02X/%02X alc=%02X ecc=%02X "
@@ -125,12 +141,18 @@ int main(int argc, char **argv) {
         disable_jit = 1;
         argi++;
     }
-    if (argc - argi != 2) {
+    int positional = argc - argi;
+    if (positional != 2 && positional != 3) {
         fprintf(stderr,
-                "usage: %s [--no-jit] FIRMWARE.bin FIRMWARE.elf\n",
+                "usage: %s [--no-jit] FIRMWARE.bin FIRMWARE.elf "
+                "[ROM.elf]\n",
                 argv[0]);
         return 2;
     }
+    bool s3 = positional == 3;
+    flexe_target_id_t target_id = s3 ? FLEXE_TARGET_ESP32S3 :
+                                      FLEXE_TARGET_ESP32;
+    const flexe_target_desc_t *target = flexe_target_by_id(target_id);
 
     const char *firmware_path = argv[argi];
     const char *elf_path = argv[argi + 1];
@@ -150,7 +172,11 @@ int main(int argc, char **argv) {
     flexe_session_config_t config = {
         .bin_path = firmware_path,
         .elf_path = elf_path,
+        .rom_elf_path = s3 ? argv[argi + 2] : NULL,
+        .native_freertos = s3,
         .disable_jit = disable_jit,
+        .target = target_id,
+        .unhandled_audit = s3,
     };
     flexe_session_t *session = flexe_session_create(&config);
     if (!session) {
@@ -161,7 +187,13 @@ int main(int argc, char **argv) {
     esp32_periph_t *periph = flexe_session_periph(session);
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
     xtensa_mem_t *mem = flexe_session_mem(session);
-    twai_capture_t capture = {0};
+    twai_capture_t capture = {
+        .periph = periph,
+        .mem = mem,
+        .target = target,
+        .active_tx_route = -1,
+        .active_rx_route = -1,
+    };
     if (periph_set_twai_tx_callback(periph, capture_twai, &capture) != 0) {
         fprintf(stderr, "error: could not attach virtual TWAI peer\n");
         flexe_session_destroy(session);
@@ -174,7 +206,8 @@ int main(int argc, char **argv) {
     bool injected = false;
     int inject_standard = 0;
     int inject_extended = 0;
-    while (cpu->cycle_count < MAX_CYCLES) {
+    uint64_t max_cycles = s3 ? S3_MAX_CYCLES : CLASSIC_MAX_CYCLES;
+    while (cpu->cycle_count < max_cycles) {
         stage = mem_read32(mem, stage_addr);
         if (stage != last_stage) {
             fprintf(stderr,
@@ -221,18 +254,25 @@ int main(int argc, char **argv) {
         flexe_session_rom(session));
 
     if (stage != SUCCESS_MARKER)
-        dump_twai(mem, session);
+        dump_twai(mem, session, target);
 
-    printf("engine=%s stage=0x%08X result=",
-           flexe_session_jit(session) ? "jit" : "interp", stage);
+    uint64_t jit_instructions = 0u;
+    jit_state_t *jit = flexe_session_jit(session);
+    if (jit) jit_instructions = jit_get_stats(jit)->insns_jitted;
+
+    printf("target=%s engine=%s stage=0x%08X result=", target->name,
+           jit ? "jit" : "interp", stage);
     for (unsigned i = 0; i < RESULT_COUNT; ++i)
         printf("%s%08X", i ? "/" : "", results[i]);
     printf(" tx=%zu frames=%d overflow=%d inject=%d/%d pending=%zu "
-           "unhandled=%d unregistered=%d cycles=%llu\n",
+           "routes=%d/%d unhandled=%d unregistered=%d cycles=%llu "
+           "jit_insns=%llu\n",
            capture.count, frames_ok, capture.overflow,
            inject_standard, inject_extended, rx_pending,
+           capture.active_tx_route, capture.active_rx_route,
            unhandled, unregistered,
-           (unsigned long long)cpu->cycle_count);
+           (unsigned long long)cpu->cycle_count,
+           (unsigned long long)jit_instructions);
 
     bool results_ok = true;
     for (unsigned i = 0; i < RESULT_COUNT; ++i) {
@@ -255,7 +295,11 @@ int main(int argc, char **argv) {
     int ok = stage == SUCCESS_MARKER && results_ok && guest_data_ok &&
              frames_ok && injected && inject_standard == 1 &&
              inject_extended == 1 && rx_pending == 0u &&
-             unhandled == 0 && unregistered == 0;
+             (!s3 || (capture.active_tx_route ==
+                          target->twai.tx_output_signal &&
+                      capture.active_rx_route == ((1u << 7u) | 4u))) &&
+             unhandled == 0 && unregistered == 0 &&
+             (disable_jit || jit_instructions != 0u);
 
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);

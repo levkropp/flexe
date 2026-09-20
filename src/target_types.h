@@ -32,6 +32,7 @@ typedef enum {
     FLEXE_SYSTEM_DEVICE_EDMA,
     FLEXE_SYSTEM_DEVICE_I2S,
     FLEXE_SYSTEM_DEVICE_SDMMC,
+    FLEXE_SYSTEM_DEVICE_TWAI,
 } flexe_system_device_t;
 
 /* Optional board population; zero retains the target's standard board. The
