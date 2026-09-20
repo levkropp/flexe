@@ -287,7 +287,7 @@
           <span class="term-dot y"></span>
           <span class="term-dot g"></span>
         </div>
-        <pre><span class="p">$</span> cmake -S . -B build && cmake --build build -j
+        <pre><span class="p">$</span> cmake -S . -B build && cmake --build build --target xtensa-emu -j
 <span class="c"># c17, cmake, openssl, zlib, and pthreads.</span>
 
 <span class="p">$</span> ./build/xtensa-emu -q -s hello_world.elf -c 5000000 hello_world.bin

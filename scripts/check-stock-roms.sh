@@ -27,7 +27,7 @@ runner=${RUNNER:-"$script_dir/build/flexe-stock-rom-test"}
 
 if [[ ! -x "$runner" ]]; then
     echo "error: runner is not executable: $runner" >&2
-    echo "build it first with: cmake --build build -j" >&2
+    echo "build it first with: cmake --build build --target flexe-stock-rom-test -j" >&2
     exit 2
 fi
 

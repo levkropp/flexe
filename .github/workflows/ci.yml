@@ -34,7 +34,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} -DNATIVE_ARCH=OFF
       - name: Build
-        run: cmake --build build -j"$(nproc)"
+        run: cmake --build build --target xtensa-tests -j"$(nproc)"
       - name: Unit tests
         run: ./build/xtensa-tests
 
@@ -52,8 +52,7 @@ jobs:
           cmake -S . -B build-asan -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DNATIVE_ARCH=OFF \
-            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+            -DFLEXE_SANITIZERS=ON
       - name: Build
         run: cmake --build build-asan --target xtensa-tests -j"$(nproc)"
       - name: Unit tests
@@ -129,10 +128,9 @@ jobs:
             fi
             sleep "$((attempt * 10))"
           done
-      - name: Build
+      - name: Configure host build
         run: |
-          cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF
-          cmake --build build -j"$(nproc)"
+          cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF
       - name: Run gates
         env:
           ARDUINO_CLI: /home/runner/bin/arduino-cli

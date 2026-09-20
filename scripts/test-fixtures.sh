@@ -56,18 +56,12 @@ if [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = all ]; }; then
     set -- $all_fixtures
 fi
 
-fixture_build=
-remove_fixture_build=0
-cleanup() {
-    if [ "$remove_fixture_build" -eq 1 ] && [ -n "$fixture_build" ]; then
-        rm -rf -- "$fixture_build"
-    fi
-    fixture_build=
-    remove_fixture_build=0
-}
-trap cleanup EXIT HUP INT TERM
-
-status=0
+# Validate the complete request before doing work, then let the build tool
+# compile all required host runners in one parallel dependency graph. Calling
+# CMake once per fixture serialized expensive links, especially under LTO or
+# sanitizers. The names below come only from all_fixtures, so intentional word
+# splitting is safe.
+host_targets=
 for requested in "$@"; do
     fixture=$(printf '%s\n' "$requested" | tr '-' '_')
     known_fixture=0
@@ -82,7 +76,35 @@ for requested in "$@"; do
         usage
         exit 2
     fi
+    slug=$(printf '%s\n' "$fixture" | tr '_' '-')
+    target="flexe-$slug-test"
+    if [ "$fixture" = emac_driver ]; then
+        target=flexe-emac-hal-test
+    fi
+    case " $host_targets " in
+        *" $target "*) ;;
+        *) host_targets="$host_targets $target" ;;
+    esac
+done
 
+echo "==> building requested host fixture runners"
+# shellcheck disable=SC2086 -- target names were validated above.
+cmake --build "$host_build" --target $host_targets -j
+
+fixture_build=
+remove_fixture_build=0
+cleanup() {
+    if [ "$remove_fixture_build" -eq 1 ] && [ -n "$fixture_build" ]; then
+        rm -rf -- "$fixture_build"
+    fi
+    fixture_build=
+    remove_fixture_build=0
+}
+trap cleanup EXIT HUP INT TERM
+
+status=0
+for requested in "$@"; do
+    fixture=$(printf '%s\n' "$requested" | tr '-' '_')
     slug=$(printf '%s\n' "$fixture" | tr '_' '-')
     target="flexe-$slug-test"
     driver_mode=0
@@ -122,11 +144,6 @@ for requested in "$@"; do
         fi
     fi
 
-    if ! cmake --build "$host_build" --target "$target" -j; then
-        status=1
-        cleanup
-        continue
-    fi
     runner="$host_build/$target"
     firmware="$fixture_build/$fixture.ino.bin"
     symbols="$fixture_build/$fixture.ino.elf"

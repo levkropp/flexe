@@ -6,8 +6,8 @@ and a successful production boot catch different classes of defects.
 ## Unit and differential suite
 
 ```sh
-cmake -S . -B build
-cmake --build build -j
+cmake -S . -B build -DFLEXE_LTO=OFF
+cmake --build build --target xtensa-tests -j
 ./build/xtensa-tests
 ```
 
@@ -23,19 +23,23 @@ For host-memory validation:
 cmake -S . -B build-asan \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DNATIVE_ARCH=OFF \
-  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-cmake --build build-asan -j
+  -DFLEXE_SANITIZERS=ON
+cmake --build build-asan --target xtensa-tests -j
 ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
   ./build-asan/xtensa-tests
 ```
+
+`FLEXE_SANITIZERS=ON` enables ASan+UBSan and disables LTO for this build, which
+keeps instrumented relinks dependency-scoped. Apple's ASan runtime does not
+provide LeakSanitizer; use `ASAN_OPTIONS=detect_leaks=0` on macOS.
 
 ## Compiled-firmware hardware gates
 
 The fixtures under `tests/fixtures/` are real Arduino-ESP32 sketches. Their C
 runners under `tools/` attach host endpoints, inject input, and assert the
-guest's observable output. The consolidated entry point builds and runs every
-fixture with both the JIT and interpreter:
+guest's observable output. The consolidated entry point validates the request,
+builds only the required host runners in one parallel CMake invocation, then
+builds and runs every requested fixture with both the JIT and interpreter:
 
 ```sh
 ./scripts/test-fixtures.sh

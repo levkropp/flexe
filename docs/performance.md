@@ -165,7 +165,7 @@ affect normal measurements:
 
 ```sh
 cmake -S . -B build-prof -DFLEXE_PROFILE=ON
-cmake --build build-prof -j
+cmake --build build-prof --target flexe-generic-rom-test -j
 FLEXE_PROFILE=1 ./build-prof/flexe-generic-rom-test firmware.bin
 ```
 

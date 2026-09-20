@@ -9,10 +9,19 @@ endif()
 
 # Profile-guided optimization (PGO)
 # Usage:
-#   1. cmake -B build-pgo -DPGO=generate && cmake --build build-pgo
+#   1. cmake -B build-pgo -DPGO=generate &&
+#      cmake --build build-pgo --target xtensa-emu
 #   2. ./build-pgo/xtensa-emu -q -c 100000000 -s firmware.elf firmware.bin
-#   3. cmake -B build-pgo -DPGO=use && cmake --build build-pgo
-option(PGO "PGO mode: 'generate' to collect profiles, 'use' to apply them" "")
+#   3. cmake -B build-pgo -DPGO=use &&
+#      cmake --build build-pgo --target xtensa-emu
+set(PGO "" CACHE STRING "PGO mode: 'generate' to collect profiles, 'use' to apply them")
+# Older build trees cached this string-valued setting as a BOOL because it was
+# previously declared with option(). Migrate the normal disabled value in
+# place so developers do not need to throw away their build directories.
+if(PGO STREQUAL "OFF")
+    set(PGO "" CACHE STRING "PGO mode: 'generate' to collect profiles, 'use' to apply them" FORCE)
+endif()
+set_property(CACHE PGO PROPERTY STRINGS "" generate use)
 set(PREDECODE_FLASH_MB "4" CACHE STRING "Pre-decode table flash coverage in MB (0=disabled, 2/4/8/16)")
 # -march=native bakes the building machine's CPU into the binary, which is
 # what you want locally and not what you want on a shared CI runner: the
@@ -27,17 +36,42 @@ if(FLEXE_PROFILE)
 endif()
 
 option(NATIVE_ARCH "Tune Release builds for the building machine's CPU" ON)
+option(FLEXE_LTO "Enable LTO in optimized production builds" ON)
+option(FLEXE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
-# LTO and native tuning for Release builds (GCC/Clang only)
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    include(CheckIPOSupported)
-    check_ipo_supported(RESULT IPO_SUPPORTED)
-    if(IPO_SUPPORTED AND NOT PGO)
-        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-    endif()
+if(FLEXE_SANITIZERS AND MSVC)
+    message(FATAL_ERROR "FLEXE_SANITIZERS requires GCC or Clang")
+endif()
+if(NOT PGO STREQUAL "" AND
+   NOT PGO STREQUAL "generate" AND
+   NOT PGO STREQUAL "use")
+    message(FATAL_ERROR "PGO must be empty, 'generate', or 'use' (got '${PGO}')")
+endif()
+if(FLEXE_SANITIZERS AND PGO)
+    message(FATAL_ERROR "FLEXE_SANITIZERS and PGO are separate build modes")
+endif()
+
+# LTO and native tuning are independent controls for optimized GCC/Clang
+# builds: disabling expensive whole-program links must not silently make the
+# resulting emulator less representative of a normal local build.
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR
+   CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     if(NOT MSVC AND NATIVE_ARCH)
         add_compile_options(-march=native)
     endif()
+    if(FLEXE_LTO AND NOT FLEXE_SANITIZERS)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT IPO_SUPPORTED)
+        if(IPO_SUPPORTED AND NOT PGO)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+        endif()
+    endif()
+endif()
+
+if(FLEXE_SANITIZERS)
+    message(STATUS "Sanitizers: address,undefined (LTO disabled)")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
 endif()
 
 if(PGO STREQUAL "generate")
@@ -55,7 +89,7 @@ elseif(PGO STREQUAL "use")
     # Re-enable LTO for PGO use builds
     include(CheckIPOSupported)
     check_ipo_supported(RESULT IPO_SUPPORTED)
-    if(IPO_SUPPORTED)
+    if(IPO_SUPPORTED AND FLEXE_LTO)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
     endif()
 endif()
@@ -188,8 +222,10 @@ elseif(NOT MSVC)
     target_link_options(xtensa-emu PRIVATE -rdynamic)
 endif()
 
-# Test runner
-add_executable(xtensa-tests tests/test_main.c)
+# Developer-only binaries are explicit targets.  Keeping them out of `all`
+# makes an ordinary production build link the emulator once, while CI and the
+# documented test commands still request exactly what they need.
+add_executable(xtensa-tests EXCLUDE_FROM_ALL tests/test_main.c)
 target_link_libraries(xtensa-tests PRIVATE xtensa-emu-lib)
 if(MSVC)
     target_compile_options(xtensa-tests PRIVATE /W4 /wd4100 /wd4244 /wd4267)
@@ -199,7 +235,7 @@ else()
 endif()
 
 # Disassembler tool
-add_executable(xt-dis tools/xt-dis.c)
+add_executable(xt-dis EXCLUDE_FROM_ALL tools/xt-dis.c)
 target_link_libraries(xt-dis PRIVATE xtensa-emu-lib)
 if(MSVC)
     target_compile_options(xt-dis PRIVATE /W4 /wd4100)
@@ -209,7 +245,7 @@ else()
 endif()
 
 # Trace filter tool
-add_executable(trace-filter tools/trace-filter.c)
+add_executable(trace-filter EXCLUDE_FROM_ALL tools/trace-filter.c)
 if(MSVC)
     target_compile_options(trace-filter PRIVATE /W4 /wd4100)
     target_compile_definitions(trace-filter PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -221,7 +257,9 @@ endif()
 # outside the core build; these targets provide their host-side harnesses.
 if(UNIX)
     function(add_flexe_runner target source)
-        add_executable(${target} tools/${source})
+        # Each runner links the full emulator. Keep these opt-in so an edit to
+        # the core does not relink every fixture during an ordinary build.
+        add_executable(${target} EXCLUDE_FROM_ALL tools/${source})
         target_link_libraries(${target} PRIVATE xtensa-emu-lib)
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})

@@ -32,7 +32,7 @@ clock_hz=240000000
 
 if [[ ! -x "$runner" ]]; then
     echo "error: runner is not executable: $runner" >&2
-    echo "build it first with: cmake --build build -j" >&2
+    echo "build it first with: cmake --build build --target flexe-generic-rom-test -j" >&2
     exit 2
 fi
 

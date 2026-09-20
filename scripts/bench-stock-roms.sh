@@ -24,7 +24,7 @@ esp_hz=${ESP_HZ:-240000000}
 
 if [[ ! -x "$emu" ]]; then
     echo "error: emulator is not executable: $emu" >&2
-    echo "build it first with: cmake --build build -j" >&2
+    echo "build it first with: cmake --build build --target xtensa-emu -j" >&2
     exit 2
 fi
 

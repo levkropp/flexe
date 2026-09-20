@@ -39,17 +39,17 @@ S3 Ethernet host forwarding is optional and additionally needs libslirp 4.9+.
 
 ```sh
 cmake -S . -B build
-cmake --build build -j
+cmake --build build --target xtensa-emu -j
 ```
 
 On macOS with Homebrew OpenSSL:
 
 ```sh
 cmake -S . -B build -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
-cmake --build build -j
+cmake --build build --target xtensa-emu -j
 ```
 
-The main outputs are:
+Build additional outputs only when needed:
 
 - `build/xtensa-emu` — emulator CLI
 - `build/xtensa-tests` — unit and differential test suite
@@ -57,7 +57,9 @@ The main outputs are:
 - `build/flexe-generic-rom-test` — arbitrary production-ROM probe
 
 Release builds use LTO and host-native tuning by default. Pass
-`-DNATIVE_ARCH=OFF` for portable binaries.
+`-DNATIVE_ARCH=OFF` for portable binaries or `-DFLEXE_LTO=OFF` for faster
+edit/test links. Fixture runners are intentionally excluded from CMake's
+default `all` target; their scripts build exactly the runners they need.
 
 ## Run firmware
 
@@ -105,6 +107,7 @@ assertions, and remaining board-specific coverage.
 ## Test
 
 ```sh
+cmake --build build --target xtensa-tests -j
 ./build/xtensa-tests
 ./scripts/test-fixtures.sh                 # all Arduino hardware gates
 ./scripts/test-fixtures.sh spi-master i2c-wire
