@@ -2,7 +2,10 @@
 #ifndef FLEXE_RTC_CNTL_H
 #define FLEXE_RTC_CNTL_H
 
+#include <stdbool.h>
+
 #include "memory.h"
+#include "target_types.h"
 
 typedef struct xtensa_cpu xtensa_cpu_t;
 typedef struct flexe_rtc_cntl flexe_rtc_cntl_t;

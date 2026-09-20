@@ -3,6 +3,7 @@
 #endif
 
 #include "flexe_session.h"
+#include "target.h"
 #include "xtensa.h"
 #include "memory.h"
 #include "peripherals.h"

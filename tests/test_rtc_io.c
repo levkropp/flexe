@@ -2,6 +2,7 @@
 #include "test_helpers.h"
 #include "peripherals.h"
 #include "rtc_io.h"
+#include "target.h"
 
 TEST(rtc_io_s3_mux_selects_rtc_or_digital_output)
 {

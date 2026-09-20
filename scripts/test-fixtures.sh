@@ -8,7 +8,10 @@ arduino_cli=${ARDUINO_CLI:-arduino-cli}
 arduino_config=${FLEXE_ARDUINO_CONFIG:-}
 fqbn=${FLEXE_ARDUINO_FQBN:-esp32:esp32:d32:PartitionScheme=min_spiffs}
 host_build=${FLEXE_BUILD_DIR:-"$repo_dir/build"}
-fixture_build_root=${FLEXE_FIXTURE_BUILD_ROOT:-}
+fixture_build_root=${FLEXE_FIXTURE_BUILD_ROOT:-"$host_build/arduino-fixtures"}
+if [ "$fixture_build_root" = temporary ]; then
+    fixture_build_root=
+fi
 
 all_fixtures='analog_dac
 deep_sleep

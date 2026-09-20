@@ -2,7 +2,7 @@
 #define SAVESTATE_H
 
 #include <stdint.h>
-#include "target.h"
+#include "target_types.h"
 
 /* Forward declarations */
 typedef struct xtensa_cpu xtensa_cpu_t;

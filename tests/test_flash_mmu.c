@@ -1,6 +1,7 @@
 /* Shared instruction/data flash-MMU tests (ESP32-S3 geometry). */
 #include "test_helpers.h"
 #include "flash_mmu.h"
+#include "target.h"
 
 typedef struct {
     unsigned calls;

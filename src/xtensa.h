@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "target.h"
+#include "target_types.h"
 
 /* Forward declarations */
 typedef struct xtensa_mem xtensa_mem_t;

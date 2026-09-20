@@ -5,6 +5,7 @@
 #include "mpi_stubs.h"
 #include "peripherals.h"
 #include "gdma.h"
+#include "target.h"
 
 #define AES_BASE_ADDR 0x3FF01000u
 
@@ -851,7 +852,7 @@ TEST(firmware_profile_does_not_authorize_mbedtls_sha256) {
     teardown(&cpu);
 }
 
-static void run_crypto_tests(void) {
+void run_crypto_tests(void) {
     TEST_SUITE("Crypto MMIO");
     RUN_TEST(sha_accelerator_matches_known_answers);
     RUN_TEST(esp32s3_sha_direct_modes_match_known_answers);

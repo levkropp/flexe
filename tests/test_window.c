@@ -4,6 +4,7 @@
  * MOVSP, L32E/S32E, RFWO/RFWU, plus integration tests.
  */
 #include "test_helpers.h"
+#include "target.h"
 #include <string.h>
 
 /* ===== Instruction builders ===== */
@@ -1471,7 +1472,7 @@ TEST(interrupt_flush_stale_callsize) {
     teardown(&cpu);
 }
 
-static void run_window_tests(void) {
+void run_window_tests(void) {
     TEST_SUITE("Window Registers (M5)");
     RUN_TEST(call4_entry_retw);
     RUN_TEST(call8_entry_retw);

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "target_types.h"
 #include "memory.h"
 #include "gpio.h"
 #include "rtc_io.h"

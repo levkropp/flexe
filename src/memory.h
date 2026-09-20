@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
-#include "target.h"
+#include "target_types.h"
 
 #ifdef _MSC_VER
 #include "msvc_compat.h"

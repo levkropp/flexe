@@ -2,6 +2,7 @@
 #ifndef FLEXE_SYSTIMER_H
 #define FLEXE_SYSTIMER_H
 
+#include <stdbool.h>
 #include "memory.h"
 
 typedef struct xtensa_cpu xtensa_cpu_t;

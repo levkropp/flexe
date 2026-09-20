@@ -1,4 +1,5 @@
 #include "regi2c.h"
+#include "target.h"
 #include "rtc_cntl.h"
 
 #include <stdbool.h>

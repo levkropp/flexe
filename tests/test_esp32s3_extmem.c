@@ -2,6 +2,7 @@
 #include "test_helpers.h"
 #include "esp32s3_extmem.h"
 #include "peripherals.h"
+#include "target.h"
 
 #define S3_EXTMEM_BASE 0x600C4000u
 

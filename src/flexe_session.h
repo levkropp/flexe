@@ -18,7 +18,7 @@
 #include "bt_stubs.h"
 #include "peripherals.h"
 #include "jit.h"
-#include "target.h"
+#include "target_types.h"
 #include <stdint.h>
 #include <pthread.h>
 

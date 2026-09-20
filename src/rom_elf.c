@@ -1,4 +1,5 @@
 #include "rom_elf.h"
+#include "target.h"
 
 #include <stdarg.h>
 #include <stdio.h>

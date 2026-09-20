@@ -3,6 +3,7 @@
 #include "apb_saradc.h"
 #include "peripherals.h"
 #include "sens.h"
+#include "target.h"
 
 typedef struct {
     unsigned reads;

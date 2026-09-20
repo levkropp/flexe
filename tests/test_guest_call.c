@@ -1,4 +1,5 @@
 /* Regression tests for emulator-to-guest callback entry. */
+#include "test_helpers.h"
 #include "guest_call.h"
 
 static uint32_t guest_call_test_rri8(int subop, int s, int t, int imm8)
@@ -178,7 +179,7 @@ TEST(sync_injection_requires_all_live_cores_to_be_quiescent)
     teardown(&target);
 }
 
-static void run_guest_call_tests(void)
+void run_guest_call_tests(void)
 {
     TEST_SUITE("Guest Calls");
     RUN_TEST(async_call_preserves_window_spill_area);

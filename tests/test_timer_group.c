@@ -1,6 +1,7 @@
 /* Descriptor-driven ESP32-family timer-group and MWDT tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "target.h"
 
 #define S3_TIMG0_BASE       0x6001F000u
 #define S3_TIMG1_BASE       0x60020000u

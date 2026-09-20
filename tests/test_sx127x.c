@@ -1,3 +1,4 @@
+#include "test_helpers.h"
 #include "sx127x.h"
 
 #include <string.h>
@@ -222,7 +223,7 @@ TEST(sx127x_preserves_command_across_byte_transfers) {
     mem_destroy(mem);
 }
 
-static void run_sx127x_tests(void) {
+void run_sx127x_tests(void) {
     TEST_SUITE("SX127x radio");
     RUN_TEST(sx127x_registers_fifo_tx_and_dio0);
     RUN_TEST(sx127x_packet_injection_populates_rx_fifo);

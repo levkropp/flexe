@@ -1,6 +1,7 @@
 /* ESP32-S3 low-speed-only LEDC register, fade, gate, and IRQ tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "target.h"
 
 #define S3_LEDC_BASE         0x60019000u
 #define S3_LEDC_CH0_CONF0    0x000u

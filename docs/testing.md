@@ -11,6 +11,16 @@ cmake --build build --target xtensa-tests -j
 ./build/xtensa-tests
 ```
 
+Each test file is compiled independently, so editing one suite rebuilds only
+that suite and the final test executable. Case-insensitive filters select by
+suite or test name; multiple filters are ORed. A filter matching nothing is an
+error, which keeps misspelled focused checks from silently passing:
+
+```sh
+./build/xtensa-tests system_clock
+./build/xtensa-tests --list rmt
+```
+
 The suite covers instruction decode and execution, memory translation,
 register windows, exceptions, interrupts, peripheral registers and timing,
 FreeRTOS/service stubs, and both JIT backends. The encoding-space sweep compiles
@@ -59,10 +69,12 @@ Configuration:
 | `FLEXE_ARDUINO_CONFIG` | Optional Arduino CLI config file |
 | `FLEXE_ARDUINO_FQBN` | Board and menu configuration |
 | `FLEXE_BUILD_DIR` | Configured host CMake build directory |
-| `FLEXE_FIXTURE_BUILD_ROOT` | Persistent root for compiled fixture artifacts |
+| `FLEXE_FIXTURE_BUILD_ROOT` | Fixture build root, or `temporary` for disposable builds |
 
-Without a persistent fixture root, each sketch is built in a temporary
-directory and removed after its gate finishes.
+Compiled sketches persist under `FLEXE_BUILD_DIR/arduino-fixtures` by default,
+so a focused rerun can reuse Arduino's dependency cache. Set
+`FLEXE_FIXTURE_BUILD_ROOT` to another directory to isolate a board/toolchain
+configuration, or to `temporary` for a clean disposable build.
 
 ## Production ROM gates
 

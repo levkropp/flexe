@@ -1,4 +1,5 @@
 #include "sens.h"
+#include "target.h"
 
 #include "apb_saradc.h"
 #include "regi2c.h"

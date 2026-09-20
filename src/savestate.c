@@ -1,4 +1,5 @@
 #include "savestate.h"
+#include "target.h"
 #include "xtensa.h"
 #include "memory.h"
 #include "freertos_stubs.h"

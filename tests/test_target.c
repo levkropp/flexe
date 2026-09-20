@@ -1,6 +1,7 @@
 /* Target/core-descriptor tests. */
 #include "test_helpers.h"
 #include "savestate.h"
+#include "target.h"
 
 TEST(target_reset_uses_lx7_core_configuration) {
     const flexe_target_desc_t *s3 =

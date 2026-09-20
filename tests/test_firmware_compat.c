@@ -5,8 +5,11 @@
  * - Firmware symbol hooks
  * - software_reset_cpu
  */
+#include "test_helpers.h"
 #include "rom_stubs.h"
 #include "peripherals.h"
+
+#include <stdlib.h>
 
 /* ===== NVS stub tests ===== */
 
@@ -701,7 +704,7 @@ TEST(test_vfs_stubs_spiffs_host_roundtrip) {
 
 /* ===== Suite runner ===== */
 
-static void run_firmware_compat_tests(void) {
+void run_firmware_compat_tests(void) {
     TEST_SUITE("firmware_compat");
     /* NVS */
     RUN_TEST(test_nvs_flash_init_returns_ok);

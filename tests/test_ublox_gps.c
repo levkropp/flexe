@@ -1,3 +1,4 @@
+#include "test_helpers.h"
 #include "ublox_gps.h"
 
 #include <string.h>
@@ -111,7 +112,7 @@ TEST(ublox_gps_streams_valid_nmea_fix)
     mem_destroy(mem);
 }
 
-static void run_ublox_gps_tests(void)
+void run_ublox_gps_tests(void)
 {
     TEST_SUITE("u-blox GPS");
     RUN_TEST(ublox_gps_answers_probe_and_mon_ver);

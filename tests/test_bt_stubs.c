@@ -537,7 +537,7 @@ TEST(meshtastic_tbeam_completes_nimble_hci_startup) {
     teardown(&cpu);
 }
 
-static void run_bt_stub_tests(void) {
+void run_bt_stub_tests(void) {
     TEST_SUITE("Bluetooth stubs");
     RUN_TEST(production_scan_delivers_nimble_gap_advertisement);
     RUN_TEST(v11423_fingerprint_selects_shifted_nimble_entries);

@@ -2,6 +2,7 @@
 #define TEST_HELPERS_H
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include "xtensa.h"
 #include "memory.h"
@@ -9,6 +10,9 @@
 extern int test_count;
 extern int test_passes;
 extern int test_failures;
+void test_set_suite(const char *name);
+bool test_begin(const char *name);
+const char *test_build_symbol_elf(void);
 
 #define ASSERT_EQ(a, b) do { \
     uint32_t _a = (uint32_t)(a), _b = (uint32_t)(b); \
@@ -33,6 +37,7 @@ extern int test_failures;
 
 #define TEST(name) static void name(void)
 #define RUN_TEST(name) do { \
+    if (!test_begin(#name)) break; \
     printf("  %s... ", #name); \
     int _before = test_failures; \
     name(); \
@@ -41,7 +46,7 @@ extern int test_failures;
     else printf("\n"); \
 } while(0)
 
-#define TEST_SUITE(name) printf("Suite: %s\n", name)
+#define TEST_SUITE(name) test_set_suite(name)
 
 /*
  * Shared test helpers: instruction builders, setup/teardown

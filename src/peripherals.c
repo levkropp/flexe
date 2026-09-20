@@ -1,4 +1,5 @@
 #include "peripherals.h"
+#include "target.h"
 #include "apb_saradc.h"
 #include "esp32s3_extmem.h"
 #include "efuse.h"

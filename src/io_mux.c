@@ -1,4 +1,5 @@
 #include "io_mux.h"
+#include "target.h"
 
 #include <stdbool.h>
 #include <stdlib.h>

@@ -7,6 +7,7 @@
 
 #include "msvc_compat.h"
 #include "flexe_session.h"
+#include "target.h"
 #include "memory.h"
 #include "loader.h"
 #include "rom_elf.h"

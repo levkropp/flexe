@@ -2,6 +2,7 @@
 #ifndef FLEXE_TIMER_GROUP_H
 #define FLEXE_TIMER_GROUP_H
 
+#include <stdbool.h>
 #include "memory.h"
 
 typedef struct xtensa_cpu xtensa_cpu_t;

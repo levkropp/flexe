@@ -2,7 +2,7 @@
 #define LOADER_H
 
 #include "memory.h"
-#include "target.h"
+#include "target_types.h"
 #include <stddef.h>
 #include <stdint.h>
 

@@ -1,4 +1,5 @@
 #include "esp32s3_extmem.h"
+#include "target.h"
 #include "xtensa.h"
 
 #include <stdbool.h>

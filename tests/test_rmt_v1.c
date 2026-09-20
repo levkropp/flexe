@@ -1,6 +1,7 @@
 /* ESP32-S3 RMT V1 TX/RX register, pulse-timing and interrupt tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "target.h"
 
 #define S3_RMT_BASE       0x60016000u
 #define S3_RMT_CONF0      0x020u
@@ -1391,7 +1392,7 @@ TEST(s3_rmt_v1_unmodeled_modes_remain_diagnostic)
     mem_destroy(mem);
 }
 
-static void run_rmt_v1_tests(void)
+void run_rmt_v1_tests(void)
 {
     TEST_SUITE("ESP32-S3 RMT V1");
     RUN_TEST(s3_rmt_v1_tx_completes_on_pulse_deadline_and_asserts_irq);

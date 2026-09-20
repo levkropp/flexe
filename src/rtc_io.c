@@ -1,4 +1,5 @@
 #include "rtc_io.h"
+#include "target.h"
 
 #include <stdbool.h>
 #include <stdlib.h>

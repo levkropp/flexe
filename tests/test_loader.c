@@ -7,6 +7,7 @@
 #include "peripherals.h"
 #include "spi_display.h"
 #include "flash_mmu.h"
+#include "target.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

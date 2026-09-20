@@ -1,4 +1,5 @@
 #include "timer_group.h"
+#include "target.h"
 
 #include "xtensa.h"
 

@@ -1,4 +1,5 @@
 #include "sha_stubs.h"
+#include "target.h"
 #include "firmware_scan.h"
 #include "rom_stubs.h"
 #include "memory.h"

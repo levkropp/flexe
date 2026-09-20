@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "target_types.h"
 
 #define FLEXE_TARGET_EXEC_RANGE_MAX 5u
 #define FLEXE_TARGET_MEM_REGION_MAX 10u
@@ -26,7 +27,6 @@
 #define FLEXE_TARGET_TIMER_GROUP_TIMER_MAX 2u
 #define FLEXE_TARGET_TIMER_GROUP_EVENT_MAX 3u
 #define FLEXE_TARGET_SPI_MEM_HOST_MAX 2u
-#define FLEXE_TARGET_GP_SPI_HOST_MAX 2u
 #define FLEXE_TARGET_GP_SPI_CS_MAX 6u
 #define FLEXE_TARGET_INTERRUPT_CORE_MAX 2u
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
@@ -34,12 +34,10 @@
 #define FLEXE_TARGET_GPIO_MAX 54u
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
-#define FLEXE_TARGET_RTC_STORE_MAX 8u
 #define FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX 6u
 #define FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX 8u
 #define FLEXE_TARGET_RTC_POWER_DOMAIN_MAX 4u
 #define FLEXE_TARGET_RTC_SUPPLY_MAX 4u
-#define FLEXE_TARGET_RTC_IO_PIN_MAX 22u
 #define FLEXE_TARGET_RTC_WDT_STAGE_MAX 4u
 #define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
@@ -93,12 +91,6 @@ typedef enum {
 } flexe_target_capability_t;
 
 typedef enum {
-    FLEXE_TARGET_AUTO = 0,
-    FLEXE_TARGET_ESP32,
-    FLEXE_TARGET_ESP32S3,
-} flexe_target_id_t;
-
-typedef enum {
     FLEXE_XTENSA_LX6 = 6,
     FLEXE_XTENSA_LX7 = 7,
 } flexe_xtensa_generation_t;
@@ -123,19 +115,6 @@ typedef struct {
     uint32_t start;
     uint32_t end;   /* exclusive */
 } flexe_addr_range_t;
-
-/* Host allocations used by the target's memory map. Multiple guest regions
- * may reference the same backing (for example S3 D/IRAM aliases). */
-typedef enum {
-    FLEXE_MEM_SRAM = 0,
-    FLEXE_MEM_ROM,
-    FLEXE_MEM_FLASH_DATA,
-    FLEXE_MEM_FLASH_INSN,
-    FLEXE_MEM_RTC_FAST,
-    FLEXE_MEM_RTC_SLOW,
-    FLEXE_MEM_PSRAM,
-    FLEXE_MEM_BACKING_COUNT,
-} flexe_mem_backing_t;
 
 typedef struct {
     uint32_t              start;
@@ -227,18 +206,6 @@ typedef struct {
     uint32_t clock_gate_mask;
     uint32_t runstall_mask;
 } flexe_secondary_core_desc_t;
-
-typedef enum {
-    FLEXE_SYSTEM_DEVICE_NONE = 0,
-    FLEXE_SYSTEM_DEVICE_SYSTIMER,
-    FLEXE_SYSTEM_DEVICE_TIMER_GROUP,
-    FLEXE_SYSTEM_DEVICE_I2C,
-    FLEXE_SYSTEM_DEVICE_GP_SPI,
-    FLEXE_SYSTEM_DEVICE_SHA,
-    FLEXE_SYSTEM_DEVICE_LEDC,
-    FLEXE_SYSTEM_DEVICE_UART,
-    FLEXE_SYSTEM_DEVICE_USB_SERIAL_JTAG,
-} flexe_system_device_t;
 
 typedef struct {
     uint16_t offset;
@@ -1067,13 +1034,6 @@ typedef enum {
     FLEXE_SPI_MEM_PSRAM_AP_8M_OPI,
 } flexe_spi_mem_psram_kind_t;
 
-/* Optional board population; zero retains the target's standard board.
- * The AP profile represents a physical 64-Mbit APS6408L-3OBMx on S3 CS1. */
-typedef enum {
-    FLEXE_BOARD_PSRAM_DEFAULT = 0,
-    FLEXE_BOARD_PSRAM_AP_8M_OPI,
-} flexe_board_psram_t;
-
 typedef struct {
     uint32_t                base[FLEXE_TARGET_SPI_MEM_HOST_MAX];
     uint32_t                register_size;
@@ -1131,7 +1091,7 @@ typedef struct {
     uint8_t  endpoint_size;
 } flexe_usb_serial_jtag_desc_t;
 
-typedef struct {
+struct flexe_target_desc {
     /* Increment when the descriptor ABI or the meaning of a field changes. */
     uint32_t                    descriptor_version;
     flexe_target_id_t           id;
@@ -1272,7 +1232,7 @@ typedef struct {
     /* All architecturally executable windows, including reset/RTC memory. */
     uint8_t                     executable_range_count;
     flexe_addr_range_t          executable[FLEXE_TARGET_EXEC_RANGE_MAX];
-} flexe_target_desc_t;
+};
 
 const flexe_target_desc_t *flexe_target_by_id(flexe_target_id_t id);
 const flexe_target_desc_t *flexe_target_by_image_chip_id(uint16_t chip_id);

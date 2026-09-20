@@ -1,6 +1,7 @@
 /*
  * M6: Exception and interrupt tests
  */
+#include "test_helpers.h"
 
 /* Instruction encodings */
 #define INSN_ILL        rrr(0, 0, 0, 0, 0)       /* ILL: op0=0,op1=0,op2=0,r=0,s=0,t=0 */
@@ -24,14 +25,6 @@
 
 /* WSR at, sr: op0=0, op1=3, op2=1, r=sr>>4, s=sr&0xF, t=at */
 #define INSN_WSR(at, sr) ((uint32_t)(0 | ((at)<<4) | (((sr)&0xF)<<8) | (((sr)>>4)<<12) | (3<<16) | (1<<20)))
-
-/* MOVI at, imm12: op0=2, r=0xA, s=imm[11:8], t=at, imm8=imm[7:0] */
-static inline uint32_t insn_movi(int at, int32_t imm) {
-    uint32_t u = (uint32_t)imm & 0xFFF;
-    uint32_t imm8 = u & 0xFF;
-    uint32_t s_field = (u >> 8) & 0xF;
-    return 2 | ((uint32_t)at << 4) | (s_field << 8) | (0xA << 12) | (imm8 << 16);
-}
 
 /* QUOU r, s, t: op0=0, op1=2, op2=12, RRR format */
 #define INSN_QUOU(r, s, t) rrr(12, 2, (r), (s), (t))

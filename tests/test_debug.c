@@ -68,7 +68,7 @@ typedef struct {
  *          some_data (OBJECT) @ 0x3FFB0000 size 4
  *          minimal FreeRTOS startup and IPC symbols used by scheduler tests
  */
-static const char *build_test_elf(void) {
+const char *test_build_symbol_elf(void) {
     static const char *path = "/tmp/xt_test_debug.elf";
 
     enum {
@@ -275,7 +275,7 @@ TEST(test_elf_load_bad_class) {
 }
 
 TEST(test_elf_rejects_section_table_out_of_bounds) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     ASSERT_TRUE(path != NULL);
 
     FILE *f = fopen(path, "r+b");
@@ -291,7 +291,7 @@ TEST(test_elf_rejects_section_table_out_of_bounds) {
 }
 
 TEST(test_elf_rejects_symbol_table_out_of_bounds) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     ASSERT_TRUE(path != NULL);
 
     FILE *f = fopen(path, "r+b");
@@ -311,7 +311,7 @@ TEST(test_elf_rejects_symbol_table_out_of_bounds) {
 }
 
 TEST(test_elf_rejects_symbol_name_out_of_bounds) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     ASSERT_TRUE(path != NULL);
 
     FILE *f = fopen(path, "r+b");
@@ -332,7 +332,7 @@ TEST(test_elf_rejects_symbol_name_out_of_bounds) {
 }
 
 TEST(test_elf_load_valid) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     ASSERT_TRUE(path != NULL);
 
     elf_symbols_t *s = elf_symbols_load(path);
@@ -344,7 +344,7 @@ TEST(test_elf_load_valid) {
 }
 
 TEST(test_elf_lookup_exact) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *s = elf_symbols_load(path);
     ASSERT_TRUE(s != NULL);
 
@@ -360,7 +360,7 @@ TEST(test_elf_lookup_exact) {
 }
 
 TEST(test_elf_lookup_with_offset) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *s = elf_symbols_load(path);
 
     elf_sym_info_t info;
@@ -373,7 +373,7 @@ TEST(test_elf_lookup_with_offset) {
 }
 
 TEST(test_elf_lookup_no_match) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *s = elf_symbols_load(path);
 
     elf_sym_info_t info;
@@ -385,7 +385,7 @@ TEST(test_elf_lookup_no_match) {
 }
 
 TEST(test_elf_lookup_size_boundary) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *s = elf_symbols_load(path);
 
     elf_sym_info_t info;
@@ -404,7 +404,7 @@ TEST(test_elf_lookup_size_boundary) {
 }
 
 TEST(test_elf_find_by_name) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *s = elf_symbols_load(path);
 
     uint32_t addr;
@@ -416,7 +416,7 @@ TEST(test_elf_find_by_name) {
 }
 
 TEST(test_elf_find_not_found) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *s = elf_symbols_load(path);
 
     uint32_t addr;
@@ -427,7 +427,7 @@ TEST(test_elf_find_not_found) {
 }
 
 TEST(test_elf_finds_object_symbols) {
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *s = elf_symbols_load(path);
 
     /* some_data is an OBJECT symbol — should now be found */
@@ -601,7 +601,7 @@ TEST(test_rom_stub_call_count) {
 
 /* ===== Run all ===== */
 
-static void run_debug_tests(void) {
+void run_debug_tests(void) {
     TEST_SUITE("ELF Symbols");
     RUN_TEST(test_elf_load_null_path);
     RUN_TEST(test_elf_load_nonexistent);

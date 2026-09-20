@@ -2,6 +2,7 @@
 #include "test_helpers.h"
 #include "efuse.h"
 #include "peripherals.h"
+#include "target.h"
 
 typedef struct {
     unsigned reads;

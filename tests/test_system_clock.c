@@ -2,6 +2,7 @@
 #include "test_helpers.h"
 #include "peripherals.h"
 #include "system_clock.h"
+#include "target.h"
 
 #define SC_SYSTEM_BASE          0x600C0000u
 #define SC_CPU_PER_CONF_OFF     0x010u

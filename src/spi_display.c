@@ -18,6 +18,7 @@
  */
 
 #include "spi_display.h"
+#include "target.h"
 #include "gdma.h"
 #include "memory.h"
 #include "sandbox_events.h"

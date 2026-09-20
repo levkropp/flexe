@@ -126,7 +126,7 @@ TEST(function_family_fingerprints_resolve_in_one_pass) {
     teardown(&cpu);
 }
 
-static void run_firmware_scan_tests(void) {
+void run_firmware_scan_tests(void) {
     TEST_SUITE("Firmware scanning");
     RUN_TEST(xtensa_firmware_fingerprint_normalizes_relocations);
     RUN_TEST(relocatable_function_fingerprint_normalizes_jump_and_requires_unique);

@@ -3,6 +3,7 @@
 #endif
 
 #include "xtensa.h"
+#include "target.h"
 #include "guest_call.h"
 #include "memory.h"
 #include "rom_stubs.h"

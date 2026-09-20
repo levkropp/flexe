@@ -1,8 +1,10 @@
 /* Tests for host-backed WiFi and synthetic promiscuous-radio delivery. */
 #include "test_helpers.h"
+#include "firmware_scan.h"
 #include "rom_stubs.h"
 #include "wifi_stubs.h"
 #include "elf_symbols.h"
+#include "target.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1441,7 +1443,7 @@ TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time) {
 #endif
 }
 
-static void run_wifi_stub_tests(void) {
+void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks);
     RUN_TEST(s3_socket_range_uses_only_lwip_vfs_registration);

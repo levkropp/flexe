@@ -1,4 +1,5 @@
 #include "gpio.h"
+#include "target.h"
 
 #include <limits.h>
 #include <stdint.h>

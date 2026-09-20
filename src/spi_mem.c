@@ -1,4 +1,5 @@
 #include "spi_mem.h"
+#include "target.h"
 
 #include <errno.h>
 #include <stdbool.h>

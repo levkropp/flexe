@@ -2,6 +2,7 @@
 #include "test_helpers.h"
 #include "gpio.h"
 #include "peripherals.h"
+#include "target.h"
 
 typedef struct {
     unsigned calls;

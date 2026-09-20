@@ -1,6 +1,7 @@
 /*
  * FreeRTOS stub tests
  */
+#include "test_helpers.h"
 #include "freertos_stubs.h"
 #include "rom_stubs.h"
 #include "peripherals.h"
@@ -667,7 +668,7 @@ TEST(test_scheduler_start_sets_dual_core_ready_flags) {
     cpu1.core_id = 1;
     freertos_stubs_attach_cpu(frt, 1, &cpu1);
 
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *syms = elf_symbols_load(path);
     ASSERT_TRUE(syms != NULL);
     ASSERT_TRUE(freertos_stubs_hook_symbols(frt, syms) >= 2);
@@ -700,7 +701,7 @@ TEST(test_compat_ipc_stall_sequence_is_atomic_noop) {
     freertos_stubs_t *frt;
     frt_setup(&cpu, &rom, &frt);
 
-    const char *path = build_test_elf();
+    const char *path = test_build_symbol_elf();
     elf_symbols_t *syms = elf_symbols_load(path);
     ASSERT_TRUE(syms != NULL);
     ASSERT_TRUE(freertos_stubs_hook_symbols(frt, syms) >= 6);
@@ -1357,7 +1358,7 @@ TEST(test_vPortFree_noop) {
 
 /* ===== Suite runner ===== */
 
-static void run_freertos_tests(void) {
+void run_freertos_tests(void) {
     TEST_SUITE("freertos_stubs");
     RUN_TEST(test_recursive_mutex_reentry_and_ownership);
     RUN_TEST(test_static_queue_buffers_round_trip_for_capability_wrappers);

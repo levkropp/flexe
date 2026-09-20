@@ -1,4 +1,5 @@
 #include "freertos_stubs.h"
+#include "target.h"
 #include "rom_stubs.h"
 #include "memory.h"
 #include "guest_call.h"

@@ -1,6 +1,7 @@
 #include "test_helpers.h"
 #include "loader.h"
 #include "peripherals.h"
+#include "target.h"
 
 /* ====== RTC DRAM tests ====== */
 
@@ -206,7 +207,7 @@ TEST(test_loader_segment_info) {
 
 /* ====== Suite runner ====== */
 
-static void run_memory_map_tests(void) {
+void run_memory_map_tests(void) {
     TEST_SUITE("Memory Map");
     RUN_TEST(test_rtc_dram_read_write);
     RUN_TEST(test_rtc_dram_iram_alias);

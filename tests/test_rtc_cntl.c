@@ -3,6 +3,7 @@
 #include "peripherals.h"
 #include "regi2c.h"
 #include "rtc_cntl.h"
+#include "target.h"
 
 typedef struct {
     unsigned reads;

@@ -1,68 +1,108 @@
 #include "test_helpers.h"
+#include "test_suites.h"
+
+#include <string.h>
 
 int test_count = 0, test_passes = 0, test_failures = 0;
 /* Session-based tests link the same touch-stub lifecycle as the CLI. */
 volatile int emu_app_running = 1;
 
-#include "test_decode.c"
-#include "test_alu.c"
-#include "test_shift.c"
-#include "test_move.c"
-#include "test_loadstore.c"
-#include "test_memory.c"
-#include "test_flash_mmu.c"
-#include "test_efuse.c"
-#include "test_gpio.c"
-#include "test_io_mux.c"
-#include "test_rtc_cntl.c"
-#include "test_rtc_io.c"
-#include "test_sens.c"
-#include "test_apb_saradc.c"
-#include "test_radio.c"
-#include "test_esp32s3_extmem.c"
-#include "test_system_clock.c"
-#include "test_sandbox_input.c"
-#include "test_systimer.c"
-#include "test_timer_group.c"
-#include "test_rmt_v1.c"
-#include "test_ledc_v1.c"
-#include "test_usb_serial_jtag.c"
-#include "test_spi_mem.c"
-#include "test_firmware_scan.c"
-#include "test_loader.c"
-#include "test_target.c"
-#include "test_rom_elf.c"
-#include "test_branch.c"
-#include "test_loop.c"
-#include "test_integration.c"
-#include "test_window.c"
-#include "test_guest_call.c"
-#include "test_exception.c"
-#include "test_boolean.c"
-#include "test_mac16.c"
-#include "test_fp_ldst.c"
-#include "test_fp_arith.c"
-#include "test_peripherals.c"
-#include "test_sx127x.c"
-#include "test_axp192.c"
-#include "test_ublox_gps.c"
-#include "test_crypto.c"
-#include "test_wifi_stubs.c"
-#include "test_bt_stubs.c"
-#include "test_rom_stubs.c"
-#include "test_debug.c"
-#include "test_memory_map.c"
-#include "test_freertos.c"
-#include "test_esp_timer.c"
-#include "test_firmware_compat.c"
-#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)
-#include "test_jit.c"
-#else
-static void run_jit_tests(void) { printf("JIT tests skipped (no native backend)\n"); }
+static const char *test_suite = "";
+static const char *test_filters[64];
+static int test_filter_count;
+static int test_matches;
+static bool test_suite_printed;
+static bool test_list_only;
+
+static unsigned char test_ascii_lower(unsigned char ch)
+{
+    return ch >= 'A' && ch <= 'Z' ?
+        (unsigned char)(ch + ('a' - 'A')) : ch;
+}
+
+static bool test_contains_folded(const char *text, const char *pattern)
+{
+    if (!*pattern) return true;
+    for (; *text; text++) {
+        const char *candidate = text;
+        const char *needle = pattern;
+        while (*candidate && *needle &&
+               test_ascii_lower((unsigned char)*candidate) ==
+               test_ascii_lower((unsigned char)*needle)) {
+            candidate++;
+            needle++;
+        }
+        if (!*needle) return true;
+    }
+    return false;
+}
+
+static bool test_selected(const char *name)
+{
+    if (test_filter_count == 0) return true;
+    for (int index = 0; index < test_filter_count; index++)
+        if (test_contains_folded(test_suite, test_filters[index]) ||
+            test_contains_folded(name, test_filters[index]))
+            return true;
+    return false;
+}
+
+void test_set_suite(const char *name)
+{
+    test_suite = name;
+    test_suite_printed = false;
+}
+
+bool test_begin(const char *name)
+{
+    if (!test_selected(name)) return false;
+    test_matches++;
+    if (test_list_only) {
+        printf("%s :: %s\n", test_suite, name);
+        return false;
+    }
+    if (!test_suite_printed) {
+        printf("Suite: %s\n", test_suite);
+        test_suite_printed = true;
+    }
+    return true;
+}
+
+#ifndef FLEXE_HAS_JIT
+static void run_jit_tests(void)
+{
+    printf("JIT tests skipped (no native backend)\n");
+}
 #endif
 
-int main(void) {
-    printf("Running xtensa-emulator tests...\n\n");
+static void test_usage(const char *program)
+{
+    fprintf(stderr,
+            "usage: %s [--list] [FILTER ...]\n"
+            "Run all tests by default, or tests whose suite/test name "
+            "contains any FILTER.\n",
+            program);
+}
+
+int main(int argc, char **argv)
+{
+    for (int index = 1; index < argc; index++) {
+        if (strcmp(argv[index], "--list") == 0) {
+            test_list_only = true;
+        } else if (strcmp(argv[index], "-h") == 0 ||
+                   strcmp(argv[index], "--help") == 0) {
+            test_usage(argv[0]);
+            return 0;
+        } else if (test_filter_count <
+                   (int)(sizeof(test_filters) / sizeof(test_filters[0]))) {
+            test_filters[test_filter_count++] = argv[index];
+        } else {
+            fprintf(stderr, "error: too many test filters\n");
+            return 2;
+        }
+    }
+
+    if (!test_list_only) printf("Running xtensa-emulator tests...\n\n");
 
     run_decode_tests();
     run_alu_tests();
@@ -117,6 +157,11 @@ int main(void) {
     run_firmware_compat_tests();
     run_jit_tests();
 
+    if (test_matches == 0 && test_filter_count != 0) {
+        fprintf(stderr, "error: no test suite or test matched the filter(s)\n");
+        return 2;
+    }
+    if (test_list_only) return 0;
     printf("\n%d tests, %d passed, %d failed\n",
            test_count, test_passes, test_failures);
     return test_failures > 0 ? 1 : 0;

@@ -4,6 +4,7 @@
 #include "peripherals.h"
 #include "regi2c.h"
 #include "sens.h"
+#include "target.h"
 
 typedef struct {
     unsigned reads;

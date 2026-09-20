@@ -1,3 +1,4 @@
+#include "test_helpers.h"
 #include "axp192.h"
 
 #include <string.h>
@@ -83,7 +84,7 @@ TEST(axp192_input_changes_and_irq_write_one_to_clear)
     axp192_destroy(pmu);
 }
 
-static void run_axp192_tests(void)
+void run_axp192_tests(void)
 {
     TEST_SUITE("AXP192 PMU");
     RUN_TEST(axp192_register_protocol_and_power_outputs);

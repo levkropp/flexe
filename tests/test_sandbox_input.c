@@ -73,7 +73,7 @@ TEST(sandbox_input_rejects_ambiguous_or_malformed_events)
         "{\"t\":\"uart_in\",\"u\":-1,\"b\":1}", &event));
 }
 
-static void run_sandbox_input_tests(void)
+void run_sandbox_input_tests(void)
 {
     TEST_SUITE("Sandbox host input");
     RUN_TEST(sandbox_input_parses_existing_physical_inputs);

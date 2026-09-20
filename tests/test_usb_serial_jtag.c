@@ -1,6 +1,7 @@
 /* ESP32-S3 native USB Serial/JTAG endpoint tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "target.h"
 
 #include <string.h>
 

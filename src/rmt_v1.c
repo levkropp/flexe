@@ -1,4 +1,5 @@
 #include "rmt_v1.h"
+#include "target.h"
 
 #include <limits.h>
 #include <stdbool.h>

@@ -1,4 +1,5 @@
 #include "rtc_cntl.h"
+#include "target.h"
 
 #include "xtensa.h"
 

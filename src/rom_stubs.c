@@ -1,4 +1,5 @@
 #include "rom_stubs.h"
+#include "target.h"
 #include "elf_symbols.h"
 #include "memory.h"
 #include "firmware_scan.h"

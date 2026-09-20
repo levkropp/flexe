@@ -2,7 +2,10 @@
 #ifndef FLEXE_SYSTEM_CLOCK_H
 #define FLEXE_SYSTEM_CLOCK_H
 
+#include <stdbool.h>
+
 #include "memory.h"
+#include "target_types.h"
 
 typedef struct flexe_system_clock flexe_system_clock_t;
 typedef void (*flexe_system_clock_gate_fn)(

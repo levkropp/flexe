@@ -1,6 +1,7 @@
 /* Target-described digital pad configuration tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "target.h"
 
 TEST(io_mux_preserves_classic_routing_contract)
 {

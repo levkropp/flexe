@@ -3,6 +3,7 @@
 #else
 
 #include "jit.h"
+#include "target.h"
 #if defined(__aarch64__)
 #  include "jit_emit_arm64.h"
 #  define JIT_ARCH_ARM64 1

@@ -1,6 +1,7 @@
 /* Target-described SPI-memory controller and NOR flash tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "target.h"
 
 #define SPI_CMD_USR             (1u << 18)
 #define SPI_CMD_FLASH_CE        (1u << 22)

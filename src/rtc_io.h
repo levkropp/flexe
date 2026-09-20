@@ -3,6 +3,7 @@
 #define FLEXE_RTC_IO_H
 
 #include "gpio.h"
+#include "target_types.h"
 
 typedef struct flexe_rtc_io flexe_rtc_io_t;
 

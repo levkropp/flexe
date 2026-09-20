@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include "peripherals.h"
-#include "target.h"
+#include "target_types.h"
 
 /* Target-described GP-SPI controller plus optional board devices. The shared
  * controller handles native ESP32 and S2/S3-generation register layouts;

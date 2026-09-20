@@ -1,4 +1,5 @@
 #include "flash_mmu.h"
+#include "target.h"
 #include "xtensa.h"
 
 #include <stdlib.h>

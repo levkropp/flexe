@@ -2,6 +2,7 @@
 #include "test_helpers.h"
 #include "peripherals.h"
 #include "radio.h"
+#include "target.h"
 
 TEST(esp32s3_radio_windows_retain_independent_configuration)
 {
@@ -494,7 +495,7 @@ TEST(radio_rejects_absent_capability_and_overlapping_windows)
     mem_destroy(mem);
 }
 
-static void run_radio_tests(void)
+void run_radio_tests(void)
 {
     TEST_SUITE("Target-described radio registers");
     RUN_TEST(esp32s3_radio_windows_retain_independent_configuration);

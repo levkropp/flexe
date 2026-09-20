@@ -5,6 +5,7 @@
 #include "test_helpers.h"
 #include "peripherals.h"
 #include "rom_stubs.h"
+#include "target.h"
 #include <string.h>
 
 /* NOP: op0=0, op1=0, op2=0, r=2, s=0, t=15 */
@@ -2951,7 +2952,7 @@ TEST(test_bt_rom_table_accessors_use_bounded_scratch) {
 
 /* ===== Run all ===== */
 
-static void run_rom_stub_tests(void) {
+void run_rom_stub_tests(void) {
     TEST_SUITE("ROM Stubs (M10)");
     RUN_TEST(test_pc_hook_fires);
     RUN_TEST(test_pc_hook_skips_non_match);

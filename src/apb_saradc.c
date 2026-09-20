@@ -1,4 +1,5 @@
 #include "apb_saradc.h"
+#include "target.h"
 
 #include <stdbool.h>
 #include <stdlib.h>

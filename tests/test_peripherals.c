@@ -1,7 +1,9 @@
+#include "test_helpers.h"
 #include "peripherals.h"
 #include "sandbox_events.h"
 #include "sdcard_stubs.h"
 #include "spi_display.h"
+#include "target.h"
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6808,14 +6810,14 @@ TEST(rmt_dport_module_reset_clears_hardware_and_preserves_endpoint) {
 TEST(excmlevel3_masks_level3) {
     /* With EXCMLEVEL=3, level-3 interrupts should be masked when EXCM=1 */
     xtensa_cpu_t cpu;
-    setup_exc(&cpu);
+    setup(&cpu);
     cpu.ps = 0;
     XT_PS_SET_EXCM(cpu.ps, 1);  /* EXCM=1 */
     cpu.int_level[3] = 3;
     cpu.interrupt = (1u << 3);
     cpu.intenable = (1u << 3);
     cpu.irq_check = true;
-    put_insn3(&cpu, BASE, INSN_NOP);
+    put_insn3(&cpu, BASE, rrr(0, 0, 2, 0, 15));
     uint32_t pc_before = cpu.pc;
     xtensa_step(&cpu);
     /* Level-3 masked by EXCMLEVEL=3: should NOT dispatch */
@@ -6823,7 +6825,7 @@ TEST(excmlevel3_masks_level3) {
     teardown(&cpu);
 }
 
-static void run_peripheral_tests(void) {
+void run_peripheral_tests(void) {
     TEST_SUITE("peripherals");
     RUN_TEST(mmio_hook_read32);
     RUN_TEST(mmio_hook_write32);

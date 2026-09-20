@@ -1,6 +1,7 @@
 /*
  * esp_timer stub tests
  */
+#include "test_helpers.h"
 #include "esp_timer_stubs.h"
 #include "rom_stubs.h"
 #include "peripherals.h"
@@ -586,7 +587,7 @@ TEST(test_delay_advances_virtual_time_and_ccount_at_runtime_frequency) {
     et_teardown(&cpu, rom, et);
 }
 
-static void run_esp_timer_tests(void) {
+void run_esp_timer_tests(void) {
     TEST_SUITE("esp_timer_stubs");
     RUN_TEST(test_esp_timer_create_returns_ok);
     RUN_TEST(test_esp_timer_start_stop);

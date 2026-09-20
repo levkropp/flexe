@@ -1,11 +1,20 @@
 /* Tests for loading Espressif Xtensa ROM ELF data into target ROM maps. */
 #include "test_helpers.h"
 #include "rom_elf.h"
+#include "target.h"
 
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void put_le32(uint8_t *buffer, uint32_t value)
+{
+    buffer[0] = (uint8_t)value;
+    buffer[1] = (uint8_t)(value >> 8u);
+    buffer[2] = (uint8_t)(value >> 16u);
+    buffer[3] = (uint8_t)(value >> 24u);
+}
 
 #pragma pack(push, 1)
 typedef struct {
@@ -327,7 +336,7 @@ TEST(rom_elf_rejects_non_xtensa_elf) {
     mem_destroy(mem);
 }
 
-static void run_rom_elf_tests(void)
+void run_rom_elf_tests(void)
 {
     TEST_SUITE("Target ROM ELF Loader");
     RUN_TEST(rom_elf_loads_immutable_sections_and_data_images);

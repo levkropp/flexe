@@ -10,6 +10,7 @@
 #endif
 
 #include "wifi_stubs.h"
+#include "target.h"
 #include "guest_call.h"
 #include "rom_stubs.h"
 #include "memory.h"

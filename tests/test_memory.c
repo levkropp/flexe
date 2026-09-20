@@ -2,6 +2,7 @@
  * Tests for the memory subsystem (address translation, read/write, mem_load).
  */
 #include "test_helpers.h"
+#include "target.h"
 #include <string.h>
 
 typedef struct {

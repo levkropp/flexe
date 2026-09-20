@@ -225,7 +225,63 @@ endif()
 # Developer-only binaries are explicit targets.  Keeping them out of `all`
 # makes an ordinary production build link the emulator once, while CI and the
 # documented test commands still request exactly what they need.
-add_executable(xtensa-tests EXCLUDE_FROM_ALL tests/test_main.c)
+set(TEST_SOURCES
+    tests/test_main.c
+    tests/test_decode.c
+    tests/test_alu.c
+    tests/test_shift.c
+    tests/test_move.c
+    tests/test_loadstore.c
+    tests/test_memory.c
+    tests/test_flash_mmu.c
+    tests/test_efuse.c
+    tests/test_gpio.c
+    tests/test_io_mux.c
+    tests/test_rtc_cntl.c
+    tests/test_rtc_io.c
+    tests/test_sens.c
+    tests/test_apb_saradc.c
+    tests/test_radio.c
+    tests/test_esp32s3_extmem.c
+    tests/test_system_clock.c
+    tests/test_sandbox_input.c
+    tests/test_systimer.c
+    tests/test_timer_group.c
+    tests/test_rmt_v1.c
+    tests/test_ledc_v1.c
+    tests/test_usb_serial_jtag.c
+    tests/test_spi_mem.c
+    tests/test_firmware_scan.c
+    tests/test_loader.c
+    tests/test_target.c
+    tests/test_rom_elf.c
+    tests/test_branch.c
+    tests/test_loop.c
+    tests/test_integration.c
+    tests/test_window.c
+    tests/test_guest_call.c
+    tests/test_exception.c
+    tests/test_boolean.c
+    tests/test_mac16.c
+    tests/test_fp_ldst.c
+    tests/test_fp_arith.c
+    tests/test_peripherals.c
+    tests/test_sx127x.c
+    tests/test_axp192.c
+    tests/test_ublox_gps.c
+    tests/test_crypto.c
+    tests/test_wifi_stubs.c
+    tests/test_bt_stubs.c
+    tests/test_rom_stubs.c
+    tests/test_debug.c
+    tests/test_memory_map.c
+    tests/test_freertos.c
+    tests/test_esp_timer.c
+    tests/test_firmware_compat.c)
+if(FLEXE_HAS_JIT)
+    list(APPEND TEST_SOURCES tests/test_jit.c)
+endif()
+add_executable(xtensa-tests EXCLUDE_FROM_ALL ${TEST_SOURCES})
 target_link_libraries(xtensa-tests PRIVATE xtensa-emu-lib)
 if(MSVC)
     target_compile_options(xtensa-tests PRIVATE /W4 /wd4100 /wd4244 /wd4267)

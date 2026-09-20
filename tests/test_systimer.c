@@ -1,6 +1,7 @@
 /* Descriptor-driven ESP32-family SYSTIMER tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "target.h"
 
 #define S3_SYSTIMER_BASE       0x60023000u
 #define ST_CONF                0x000u

@@ -2,11 +2,27 @@
  * Each test assembles a small block, runs via interpreter, runs via JIT,
  * and compares all state. */
 
+#include "test_helpers.h"
+
 #ifndef _MSC_VER
 
 #include "jit.h"
 #include "peripherals.h"
+#include "rom_stubs.h"
 #include "savestate.h"
+#include "target.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define DATA_BASE 0x3FFB0000u
+
+static uint32_t rri8(int subop, int s, int t, int imm8)
+{
+    return (uint32_t)(((imm8 & 0xFF) << 16) | (subop << 12) |
+                      (s << 8) | (t << 4) | 2);
+}
 
 /* ===== Helpers ===== */
 
@@ -4017,7 +4033,7 @@ TEST(test_jit_window_underflow_vector_is_native) {
 
 /* ===== Test suite runner ===== */
 
-static void run_jit_tests(void) {
+void run_jit_tests(void) {
     TEST_SUITE("jit");
     RUN_TEST(test_jit_init_destroy);
     RUN_TEST(test_jit_lx7_common_profile_matches_interpreter_in_iram);
@@ -4140,7 +4156,7 @@ static void run_jit_tests(void) {
 
 #else /* _MSC_VER */
 
-static void run_jit_tests(void) {
+void run_jit_tests(void) {
     TEST_SUITE("jit (disabled on MSVC)");
 }
 
