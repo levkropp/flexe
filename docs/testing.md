@@ -174,7 +174,10 @@ directly, retains full logs, and prints only progress, exact artifact paths and
 hashes, and gate results. Pass `--verbose` when live compiler output and ccache
 statistics are useful. `--check` also updates just the selected host emulator
 and endpoint-harness targets, avoiding stale runners. The helper rejects an
-accidental ESP-IDF revision mismatch. When `ccache` is installed, common
+accidental ESP-IDF revision mismatch. It also prevents ESP-IDF's generated
+Ninja graph from treating the parent Flexe Git revision as a firmware input,
+so committing emulator work does not reconfigure or rebuild unchanged
+fixtures. When `ccache` is installed, common
 ESP-IDF components are shared safely across independent projects: generated
 header contents remain part of the cache key, so projects with different
 `sdkconfig` values cannot reuse the wrong object. Set `FLEXE_IDF_BUILD_ROOT` or

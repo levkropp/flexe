@@ -225,7 +225,15 @@ fi
 # also lets ccache retain its safe default directory hashing while recognizing
 # that the compiler's recorded working directory is intentionally canonical.
 original_extra_cppflags=${EXTRA_CPPFLAGS:-}
-helper_config_version=3
+# These projects live below the Flexe checkout, but their fixed project
+# versions make the parent repository revision irrelevant to their output.
+# Stop Git discovery at the checkout root so ESP-IDF's generated Ninja graph
+# does not depend on .git/HEAD and rebuild every fixture after a Flexe commit.
+fixture_git_ceiling=$repo
+if [[ -n "${GIT_CEILING_DIRECTORIES:-}" ]]; then
+    fixture_git_ceiling="$repo:$GIT_CEILING_DIRECTORIES"
+fi
+helper_config_version=4
 
 run_logged() {
     local description=$1 log=$2 status
@@ -366,7 +374,8 @@ for index in "${!projects[@]}"; do
         export CCACHE_BASEDIR=$build_dir
     fi
     config_signature=$(printf '%s\n' "$helper_config_version" \
-        "$actual_idf_commit" "$cache_state" "$helper_extra_cppflags" |
+        "$actual_idf_commit" "$cache_state" "$helper_extra_cppflags" \
+        "$fixture_git_ceiling" |
         openssl dgst -sha256 | awk '{print $NF}')
     config_stamp="$build_dir/.flexe-idf-helper-config"
     prior_signature=
@@ -377,23 +386,27 @@ for index in "${!projects[@]}"; do
     if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
         echo "==> configuring and building $key"
         run_logged "$key configure/build" "$build_log" \
-            env "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
+            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
+            "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
             "$idf_py" "${idf_cache_args[@]}" -C "$project" \
                 -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
                 -D IDF_TARGET=esp32s3 build
     elif [[ "$prior_signature" != "$config_signature" ]]; then
         echo "==> refreshing $key configuration"
         run_logged "$key reconfiguration" "$build_log" \
-            env "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
+            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
+            "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
             "$idf_py" "${idf_cache_args[@]}" -C "$project" \
                 -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
                 -D IDF_TARGET=esp32s3 reconfigure
         echo "==> building $key"
         run_logged "$key build" "$build_log" \
+            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
             cmake --build "$build_dir" --parallel
     else
         echo "==> building $key"
         run_logged "$key build" "$build_log" \
+            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
             cmake --build "$build_dir" --parallel
     fi
     printf '%s\n' "$config_signature" > "$config_stamp"
