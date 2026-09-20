@@ -49,6 +49,7 @@ struct flexe_rtc_cntl {
     uint32_t clock_conf;
     uint32_t analog_conf;
     uint32_t usb_conf;
+    uint32_t date;
     uint32_t interrupt_enable;
     uint32_t interrupt_raw;
     bool interrupt_level;
@@ -150,6 +151,7 @@ static bool rtc_hold_geometry_valid(const flexe_target_desc_t *target,
             offset != desc->time_update_offset &&
             offset != desc->time_low_offset &&
             offset != desc->time_high_offset &&
+            offset != desc->date_offset &&
             !rtc_interrupt_offset(desc, offset) &&
             !rtc_wdt_offset(desc, offset));
 }
@@ -362,6 +364,16 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         desc->slow_clock_select_shift > 30u ||
         desc->slow_clock_select_mask !=
             (3u << desc->slow_clock_select_shift) ||
+        !rtc_optional_one_bit(desc->fast_clock_select_mask) ||
+        desc->fast_clock_select_mask == 0u ||
+        (desc->fast_clock_select_mask &
+         ~desc->clock_conf_writable_mask) != 0u ||
+        (desc->fast_clock_select_mask &
+         desc->slow_clock_select_mask) != 0u ||
+        desc->fast_clock_source_hz[0] == 0u ||
+        desc->fast_clock_source_hz[0] > 1000000000u ||
+        desc->fast_clock_source_hz[1] == 0u ||
+        desc->fast_clock_source_hz[1] > 1000000000u ||
         desc->slow_clock_source_hz[0] != desc->slow_clock_hz ||
         !rtc_offset_valid(desc->interrupt_enable_offset,
                           desc->register_size) ||
@@ -435,6 +447,20 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
         rtc_pad_hold_offset(desc, desc->analog_conf_offset))
         return false;
 
+    if (!rtc_offset_valid(desc->date_offset, desc->register_size) ||
+        desc->date_writable_mask == 0u ||
+        (desc->date_reset & ~desc->date_writable_mask) != 0u ||
+        desc->date_offset == desc->time_update_offset ||
+        desc->date_offset == desc->time_low_offset ||
+        desc->date_offset == desc->time_high_offset ||
+        desc->date_offset == desc->reset_state_offset ||
+        desc->date_offset == desc->clock_conf_offset ||
+        desc->date_offset == desc->analog_conf_offset ||
+        rtc_interrupt_offset(desc, desc->date_offset) ||
+        rtc_wdt_offset(desc, desc->date_offset) ||
+        rtc_pad_hold_offset(desc, desc->date_offset))
+        return false;
+
     uint32_t action_fields = 0u;
     for (unsigned stage = 0u; stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX;
          stage++) {
@@ -462,6 +488,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             rtc_pad_hold_offset(desc, offset) ||
             offset == desc->clock_conf_offset ||
             offset == desc->analog_conf_offset ||
+            offset == desc->date_offset ||
             (desc->wdt_config_reset[i] &
              ~desc->wdt_config_writable_mask[i]) != 0u)
             return false;
@@ -484,6 +511,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             rtc_pad_hold_offset(desc, offset) ||
             offset == desc->clock_conf_offset ||
             offset == desc->analog_conf_offset ||
+            offset == desc->date_offset ||
             rtc_interrupt_offset(desc, offset) ||
             rtc_wdt_offset(desc, offset))
             return false;
@@ -528,6 +556,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
                 offset == desc->reset_state_offset ||
                 offset == desc->clock_conf_offset ||
                 offset == desc->analog_conf_offset ||
+                offset == desc->date_offset ||
                 rtc_interrupt_offset(desc, offset) ||
                 rtc_wdt_offset(desc, offset) ||
                 rtc_pad_hold_offset(desc, offset))
@@ -650,6 +679,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
                 offset == desc->reset_state_offset ||
                 offset == desc->clock_conf_offset ||
                 offset == desc->analog_conf_offset ||
+                offset == desc->date_offset ||
                 rtc_interrupt_offset(desc, offset) ||
                 rtc_wdt_offset(desc, offset) ||
                 rtc_pad_hold_offset(desc, offset) ||
@@ -679,6 +709,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             offset == desc->reset_state_offset ||
             offset == desc->clock_conf_offset ||
             offset == desc->analog_conf_offset ||
+            offset == desc->date_offset ||
             rtc_interrupt_offset(desc, offset) ||
             rtc_wdt_offset(desc, offset) ||
             rtc_pad_hold_offset(desc, offset) ||
@@ -742,6 +773,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             offset == desc->reset_state_offset ||
             offset == desc->clock_conf_offset ||
             offset == desc->analog_conf_offset ||
+            offset == desc->date_offset ||
             rtc_interrupt_offset(desc, offset) ||
             rtc_wdt_offset(desc, offset) ||
             rtc_pad_hold_offset(desc, offset) ||
@@ -1029,6 +1061,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
         return rtc->clock_conf;
     if (offset == desc->analog_conf_offset)
         return rtc->analog_conf;
+    if (offset == desc->date_offset)
+        return rtc->date;
     if (desc->usb_conf_offset != 0u &&
         offset == desc->usb_conf_offset)
         return rtc->usb_conf;
@@ -1351,7 +1385,8 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
             desc->slow_clock_select_shift;
         bool unsupported =
             ((old ^ rtc->clock_conf) &
-             ~desc->slow_clock_select_mask) != 0u ||
+             ~(desc->slow_clock_select_mask |
+               desc->fast_clock_select_mask)) != 0u ||
             desc->slow_clock_source_hz[source] == 0u;
         if (unsupported && rtc->fallback_write)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
@@ -1369,6 +1404,13 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         if ((((old ^ rtc->analog_conf) &
               ~desc->sar_i2c_power_mask) != 0u ||
              (value & ~desc->analog_conf_writable_mask) != 0u) &&
+            rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
+        return;
+    }
+    if (offset == desc->date_offset) {
+        rtc->date = value & desc->date_writable_mask;
+        if ((value & ~desc->date_writable_mask) != 0u &&
             rtc->fallback_write)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
         return;
@@ -1480,6 +1522,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->cpu_stall_options = desc->cpu_stall_options_reset;
     rtc->analog_conf = desc->analog_conf_reset;
     rtc->usb_conf = desc->usb_conf_reset;
+    rtc->date = desc->date_reset;
     rtc->interrupt_enable = desc->interrupt_enable_reset;
     rtc->interrupt_raw = desc->interrupt_raw_reset;
     for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++)
@@ -1648,6 +1691,14 @@ bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc)
 {
     return rtc && (rtc->analog_conf &
                    rtc->target->rtc_cntl.sar_i2c_power_mask) != 0u;
+}
+
+uint32_t flexe_rtc_cntl_fast_clock_hz(const flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc) return 0u;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    unsigned source = (rtc->clock_conf & desc->fast_clock_select_mask) != 0u;
+    return desc->fast_clock_source_hz[source];
 }
 
 static bool rtc_digital_domain_powered(const flexe_rtc_cntl_t *rtc,

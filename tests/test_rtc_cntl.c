@@ -521,11 +521,11 @@ TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary)
     ASSERT_EQ64(rtc_capture(mem, desc), 201u);
     ASSERT_EQ(periph_unhandled_count(periph), 0);
 
-    /* Fast-clock selection is retained for correct register readback, but
-     * its unmodeled electrical effect remains an explicit diagnostic. */
+    /* RTC_FAST_CLK is a separate one-bit mux: XTAL/2 and RC_FAST are both
+     * modeled target sources and do not disturb the slow-counter phase. */
     mem_write32(mem, clock_addr, xtal32k | (1u << 29u));
     ASSERT_TRUE(mem_read32(mem, clock_addr) & (1u << 29u));
-    ASSERT_EQ(periph_unhandled_count(periph), 1);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
 
     /* The fourth mux value is reserved. Preserve what firmware wrote, use
      * the deterministic target fallback rate, and never claim support. */
@@ -534,9 +534,82 @@ TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary)
         desc->slow_clock_select_mask;
     mem_write32(mem, clock_addr, reserved);
     ASSERT_EQ(mem_read32(mem, clock_addr), reserved);
-    ASSERT_EQ(periph_unhandled_count(periph), 2);
+    ASSERT_EQ(periph_unhandled_count(periph), 1);
 
     periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_fast_clock_and_date_register_follow_descriptor)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t clock = desc->base + desc->clock_conf_offset;
+    ASSERT_EQ(desc->fast_clock_source_hz[0], 20000000u);
+    ASSERT_EQ(desc->fast_clock_source_hz[1], 17500000u);
+    ASSERT_EQ(flexe_rtc_cntl_fast_clock_hz(rtc), 20000000u);
+    mem_write32(mem, clock,
+                desc->clock_conf_reset | desc->fast_clock_select_mask);
+    ASSERT_EQ(flexe_rtc_cntl_fast_clock_hz(rtc), 17500000u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    uint32_t date = desc->base + desc->date_offset;
+    ASSERT_EQ(mem_read32(mem, date), 0x02101271u);
+    /* DATE[18:13] is also the documented six-bit LDO trim payload. Its
+     * electrical voltage is outside functional mode, but its register state
+     * must be exact for ROM and IDF read-modify-write sequences. */
+    uint32_t trim_mask = 0x3Fu << 13u;
+    uint32_t trimmed = (desc->date_reset & ~trim_mask) | (7u << 13u);
+    mem_write32(mem, date, trimmed);
+    ASSERT_EQ(mem_read32(mem, date), trimmed);
+    ASSERT_EQ(fallback.reads, 0u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    mem_write32(mem, date, UINT32_MAX);
+    ASSERT_EQ(mem_read32(mem, date), desc->date_writable_mask);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(fallback.last_write_addr, date);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    flexe_target_desc_t invalid = *s3;
+    invalid.rtc_cntl.date_offset = invalid.rtc_cntl.analog_conf_offset;
+    xtensa_mem_t *mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.fast_clock_select_mask =
+        invalid.rtc_cntl.slow_clock_select_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
     mem_destroy(mem);
 }
 
@@ -1829,6 +1902,8 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_watchdog_reports_unmodeled_configuration);
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);
     RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
+    RUN_TEST(rtc_cntl_s3_fast_clock_and_date_register_follow_descriptor);
+    RUN_TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
     RUN_TEST(rtc_cntl_digital_domains_resolve_force_and_sleep_policy);
     RUN_TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches);

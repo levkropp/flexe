@@ -72,6 +72,11 @@ void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
  * A detached/missing RTC cannot claim that power domain is available. */
 bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc);
 
+/* Nominal frequency selected by the target's RTC_FAST_CLK mux. Functional
+ * mode exposes the selected source frequency without inventing oscillator
+ * drift or analog settling time. */
+uint32_t flexe_rtc_cntl_fast_clock_hz(const flexe_rtc_cntl_t *rtc);
+
 /* Logical state of the target-described DIG_PWC/DIG_ISO domains. Bit N
  * corresponds to digital_domain[N] in the target descriptor. These queries
  * resolve force pairs and automatic sleep policy; they do not expose raw

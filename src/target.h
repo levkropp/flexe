@@ -376,6 +376,8 @@ typedef struct {
     uint32_t clock_conf_writable_mask;
     uint32_t slow_clock_select_mask;
     uint32_t slow_clock_source_hz[4];
+    uint32_t fast_clock_select_mask;
+    uint32_t fast_clock_source_hz[2];
     /* RTC analog power controls. The SAR-I2C bit gates access to the
      * internal SAR analog-register slave; other writable bits retain their
      * register value but remain diagnostic until their consumers exist. */
@@ -390,6 +392,12 @@ typedef struct {
     uint32_t usb_conf_writable_mask;
     uint32_t usb_phy_override_mask;
     uint32_t usb_phy_select_mask;
+    /* Silicon revision/date word. Some targets overlap analog trim fields
+     * with the writable date payload; functional mode retains those bits but
+     * deliberately does not simulate their electrical voltage effect. */
+    uint16_t date_offset;
+    uint32_t date_reset;
+    uint32_t date_writable_mask;
     uint16_t interrupt_enable_offset;
     uint16_t interrupt_raw_offset;
     uint16_t interrupt_status_offset;

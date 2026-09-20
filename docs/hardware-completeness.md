@@ -213,6 +213,12 @@ slow-clock model yielded about 48.9/19.3 ms for the guest's requested 50/20 ms,
 so this is functional wake ordering, not calibrated sleep duration. Touch/ULP
 wake and analog voltage-transition timing are not modeled; an unarmed timer or
 those sources do not synthesize a wake.
+The separate RTC fast-clock mux now selects the target-described 20 MHz XTAL/2
+or nominal 17.5 MHz RC_FAST source, while the slow counter keeps its own mux and
+phase. `RTC_CNTL_DATE_REG` resets to the S3 revision value and retains its
+documented 28-bit payload, including the overlapping six-bit LDO-slave trim.
+Functional mode exposes that software-visible state but does not turn trim
+values into simulated supply voltages or oscillator settling delays.
 The S3 `RTC_CNTL_BROWN_OUT_REG` now retains documented configuration fields,
 resets to the specified defaults, and treats counter-clear as a write-only
 strobe. Its detector remains clear under Flexe's fixed nominal supply; analog
@@ -588,8 +594,8 @@ For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 4 billion aggregate cycles produced 317 completed RMT transmissions and
 321,304 pulse words in 13,599 chunks on channel 0. The interpreter and JIT
 match at every completed-frame boundary and finish with the same `46F65AC5`
-pulse-stream digest, CPU state, and firmware-visible time; 55 unsupported
-peripheral accesses remain across 51 attributed sites. The JIT executes
+pulse-stream digest, CPU state, and firmware-visible time; 48 unsupported
+peripheral accesses remain across 46 attributed sites. The JIT executes
 1,780,691,463 of 1,819,518,818 retired instructions natively (97.9%). Ordinary
 code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
@@ -630,9 +636,11 @@ thermal state still matter.
 
 The same audit fell from 223 to 74 unsupported accesses when modem-control
 behavior replaced fallback handling, then to 55 when the target-described RTC
-digital domains became functional. DIG_PWC and the domain fields of DIG_ISO no
-longer appear in the inventory. Remaining accesses stay visible: RTC analog,
-regulator, date/trim, and pad-isolation configuration in `0x60008000`,
+digital domains became functional, and to 48 after modeling the independent
+RTC fast-clock mux and DATE/LDO-trim readback. DIG_PWC, the modeled domain
+fields of DIG_ISO, CLK_CONF's fast selector, and DATE no longer appear in the
+inventory. Remaining accesses stay visible: RTC analog, regulator, and
+pad-isolation configuration in `0x60008000`,
 unmodeled SYSCON words such as `0x6002609C`, `0x600260A8`, and `0x600260B0`,
 SYSTEM/PCR and memory-protection setup in `0x600C0000`, plus two low-count
 startup writes at `0x600CE0D8` and `0x600CE0DC`. Flexe does not turn those

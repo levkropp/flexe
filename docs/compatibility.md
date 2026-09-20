@@ -220,9 +220,11 @@ with a diagnostic rather than returning invented digest data.
 The S3 RTC counter advances on the same shared dual-core virtual timeline as
 the other target-described timers. Its two-half latch, runtime CPU-frequency
 scaling, and switching among the nominal 136 kHz RC slow, 32.768 kHz crystal,
-and RC-fast/256 sources are modeled. Oscillator drift, calibration error,
-sleep continuity, reset causes other than initial power-on, and the electrical
-effects of the other RTC clock-control fields are not yet modeled. The RTC
+and RC-fast/256 sources are modeled. The independent fast-clock mux reports
+the selected 20 MHz XTAL/2 or nominal 17.5 MHz RC_FAST source, and the S3
+DATE/LDO-trim word has exact reset and masked readback. Oscillator drift,
+calibration error, analog trim effects, and electrical effects of the other RTC
+clock-control fields are not modeled. The RTC
 interrupt bank implements target-described enable/raw/masked-status/W1C state
 and level routing; physical producers such as brownout, touch, and ULP remain
 unsupported until their respective device models attach to that API. The

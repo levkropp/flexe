@@ -633,6 +633,9 @@ static const flexe_target_desc_t TARGETS[] = {
             .slow_clock_source_hz = {
                 136000u, 32768u, 68359u, 0u,
             },
+            .fast_clock_select_mask = 1u << 29,
+            /* ESP32-S3 RTC_FAST_CLK selects XTAL/2 or nominal RC_FAST. */
+            .fast_clock_source_hz = { 20000000u, 17500000u },
             .analog_conf_offset = 0x034u,
             /* RTC_CNTL_ANA_CONF reset: SAR_I2C_PU and
              * I2C_RESET_POR_FORCE_PD are set on S3 revision 0. */
@@ -649,6 +652,10 @@ static const flexe_target_desc_t TARGETS[] = {
             .usb_conf_writable_mask = (1u << 20) | (1u << 19),
             .usb_phy_override_mask = 1u << 20,
             .usb_phy_select_mask = 1u << 19,
+            /* DATE[18:13] doubles as the six-bit LDO-slave trim field. */
+            .date_offset = 0x1FCu,
+            .date_reset = 0x02101271u,
+            .date_writable_mask = 0x0FFFFFFFu,
             .interrupt_enable_offset = 0x040u,
             .interrupt_raw_offset = 0x044u,
             .interrupt_status_offset = 0x048u,
