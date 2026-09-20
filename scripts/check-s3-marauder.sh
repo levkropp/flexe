@@ -57,7 +57,7 @@ wait_for_uart() {
 }
 
 mkfifo "$tmpdir/input"
-"$runner" -N -q --target esp32s3 -R "$S3_ROM_ELF" \
+"$runner" -N -q --strict-mmio --target esp32s3 -R "$S3_ROM_ELF" \
     --jit-stats --sandbox-events \
     -c 5500000000 "$S3_MARAUDER_BIN" \
     < "$tmpdir/input" > "$tmpdir/events" 2> "$tmpdir/emu.err" &
@@ -104,9 +104,8 @@ if grep -q '^\[reset\] system reset requested' "$tmpdir/emu.err"; then
     fail "firmware reset before reaching the CLI"
 fi
 
-unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-unhandled=${unhandled:-0}
-[[ "$unhandled" -eq 0 ]] ||
+grep -qx 'Strict MMIO: 0 unsupported peripheral accesses' \
+    "$tmpdir/emu.err" ||
     fail "the accepted bootstrap and CLI interaction had unsupported accesses"
 jit_insns=$(awk '/^  Insns JIT:/{print $3; exit}' "$tmpdir/emu.err")
 [[ -n "$jit_insns" && "$jit_insns" -gt 0 ]] ||

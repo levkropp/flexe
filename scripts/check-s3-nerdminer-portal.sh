@@ -39,8 +39,9 @@ fail() {
     exit 1
 }
 
-"$runner" -N -q --target esp32s3 -R "$S3_ROM_ELF" -s "$S3_APP_ELF" \
-    --usb-console --unhandled-report -c 45000000000 "$S3_FACTORY_BIN" \
+"$runner" -N -q --strict-mmio --target esp32s3 -R "$S3_ROM_ELF" \
+    -s "$S3_APP_ELF" --usb-console --unhandled-report \
+    -c 45000000000 "$S3_FACTORY_BIN" \
     > "$tmpdir/guest.out" 2> "$tmpdir/emu.err" &
 emu_pid=$!
 
