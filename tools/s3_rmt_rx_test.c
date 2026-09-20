@@ -2,6 +2,7 @@
  * and wrap/ping-pong pulse frames injected through the hardware boundary. */
 #include "elf_symbols.h"
 #include "flexe_session.h"
+#include "jit.h"
 #include "memory.h"
 #include "peripherals.h"
 
@@ -236,6 +237,9 @@ int main(int argc, char **argv)
         }
     }
     uint64_t cycles = cpu->cycle_count;
+    jit_state_t *jit = flexe_session_jit(session);
+    uint64_t jit_insns = jit ? jit_get_stats(jit)->insns_jitted : 0u;
+    int jit_ok = disable_jit || jit_insns > 0u;
     unsigned unhandled = periph_unhandled_count(periph);
     unsigned rmt_unhandled = 0u;
     for (size_t i = 0u; i < periph_unhandled_audit_count(periph); i++) {
@@ -260,19 +264,21 @@ int main(int argc, char **argv)
         pulse_close_to(carrier_second, 0u, 1u, 10u);
     int ok = gpio_short && injected_long && gpio_carrier &&
              stage == SUCCESS_MARKER && short_match && long_match &&
-             carrier_match && unhandled == 0u && rmt_unhandled == 0u;
+             carrier_match && unhandled == 0u && rmt_unhandled == 0u &&
+             jit_ok;
     fprintf(stderr,
-            "[s3-rmt-rx] stage=0x%08X gpio=%d injected_long=%d "
+            "[s3-rmt-rx] engine=%s stage=0x%08X gpio=%d injected_long=%d "
             "gpio_carrier=%d counts=%u,%u,%u short=%08X,%08X "
             "carrier=%08X,%08X short_match=%d long_match=%d "
             "carrier_match=%d "
-            "cycles=%llu unhandled=%u "
+            "cycles=%llu jit_insns=%llu unhandled=%u "
             "rmt_unhandled_sites=%u\n",
-            stage, gpio_short, injected_long, gpio_carrier,
+            disable_jit ? "interp" : "jit", stage, gpio_short,
+            injected_long, gpio_carrier,
             count, long_count, carrier_count, first, second,
             carrier_first, carrier_second,
             short_match, long_match, carrier_match,
-            (unsigned long long)cycles, unhandled,
+            (unsigned long long)cycles, (unsigned long long)jit_insns, unhandled,
             rmt_unhandled);
     flexe_session_destroy(session);
     elf_symbols_destroy(symbols);

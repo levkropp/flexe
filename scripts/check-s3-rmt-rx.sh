@@ -25,21 +25,30 @@ for entry in "$S3_RMT_RX_BIN:$expected_bin" "$S3_RMT_RX_ELF:$expected_elf" \
 done
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/flexe-s3-rmt-rx.XXXXXX")
-cleanup() {
-    rm -f -- "$tmpdir/run1" "$tmpdir/run2"
-    rmdir -- "$tmpdir"
-}
-trap cleanup EXIT
-for run in 1 2; do
-    "$runner" --no-jit "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" "$S3_ROM_ELF" \
-        >"$tmpdir/run$run" 2>&1
+trap 'rm -rf -- "$tmpdir"' EXIT
+for engine in interp jit; do
+    for run in 1 2; do
+        if [[ "$engine" == interp ]]; then
+            "$runner" --no-jit "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" \
+                "$S3_ROM_ELF" >"$tmpdir/$engine.$run" 2>&1
+        else
+            "$runner" "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" "$S3_ROM_ELF" \
+                >"$tmpdir/$engine.$run" 2>&1
+        fi
+    done
+    cmp -s "$tmpdir/$engine.1" "$tmpdir/$engine.2" || {
+        echo "FAIL: S3 RMT RX $engine replay changed guest/host output" >&2
+        diff -u "$tmpdir/$engine.1" "$tmpdir/$engine.2" >&2 || true
+        exit 1
+    }
+    grep -Fq "engine=$engine stage=0x01A7C0DE gpio=1 injected_long=1 gpio_carrier=1 counts=2,96,2" \
+        "$tmpdir/$engine.1"
+    grep -Fq 'short_match=1 long_match=1 carrier_match=1' \
+        "$tmpdir/$engine.1"
+    grep -Fq 'unhandled=0 rmt_unhandled_sites=0' "$tmpdir/$engine.1"
 done
-cmp -s "$tmpdir/run1" "$tmpdir/run2" || {
-    echo "FAIL: S3 RMT RX replay changed guest/host output" >&2
-    diff -u "$tmpdir/run1" "$tmpdir/run2" >&2 || true
+if ! grep -Eq 'jit_insns=[1-9][0-9]* unhandled=0' "$tmpdir/jit.1"; then
+    echo "FAIL: S3 RMT RX JIT replay retired no native instructions" >&2
     exit 1
-}
-grep -Fq 'gpio=1 injected_long=1 gpio_carrier=1 counts=2,96,2' "$tmpdir/run1"
-grep -Fq 'short_match=1 long_match=1 carrier_match=1' "$tmpdir/run1"
-grep -Fq 'unhandled=0 rmt_unhandled_sites=0' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 filtered GPIO4 glitches, demodulated a carrier frame, and received 96 host symbols through its RX ISR with zero unsupported accesses and byte-identical replay"
+fi
+echo "PASS: stock Arduino S3 filtered GPIO4 glitches, demodulated a carrier frame, and received 96 host symbols through its RX ISR in interpreter and JIT; byte-identical replay; zero unsupported accesses"
