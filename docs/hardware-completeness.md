@@ -59,7 +59,7 @@ even when a firmware workflow succeeds.
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
-| S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
+| S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh`, WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response and next prompt | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
@@ -609,8 +609,8 @@ For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 4 billion aggregate cycles produced 317 completed RMT transmissions and
 321,304 pulse words in 13,599 chunks on channel 0. The interpreter and JIT
 match at every completed-frame boundary and finish with the same `46F65AC5`
-pulse-stream digest, CPU state, and firmware-visible time; 10 unsupported
-peripheral accesses remain across 9 attributed sites. The JIT executes
+pulse-stream digest, CPU state, and firmware-visible time; 9 unsupported
+peripheral accesses remain across 8 attributed sites. The JIT executes
 1,780,691,463 of 1,819,518,818 retired instructions natively (97.9%). Ordinary
 code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
@@ -669,6 +669,13 @@ for additional consumers. This removed all five accesses at `0x600C0018` and
 `0x600C0020`; it does not claim reset or clock effects for device models that
 have not yet attached a consumer.
 
+The SENS peripheral clock/reset pair is likewise complete and target
+described. It publishes named IO-mux, SAR ADC, temperature-sensor, RTC-I2C,
+and coprocessor state while retaining the existing ADC and temperature reset
+effects; reserved bits still reach the diagnostic owner. This removed WLED's
+`0x60008904` write without teaching the model a firmware PC or treating the
+rest of the SENS page as generic storage.
+
 On an Apple-silicon MacBook, a `Release`/LTO/native build completed three
 alternating interpreter runs in 11.21--12.40 seconds (1.34--1.49x real time)
 and three JIT runs in 6.86--7.27 seconds (2.29--2.43x). These are throughput
@@ -683,13 +690,13 @@ RTC regulator force pairs and RTC-local PWC domains, then to 34 after exposing
 the SYSTEM light-sleep memory policy and radio low-power clock state, then to 23
 after modeling the SYSCON on-chip-memory policy, then to 15 after modeling the
 SENSITIVE cache/SRAM allocation policy, then to 10 after exposing the complete
-SYSTEM peripheral clock/reset banks. DIG_PWC,
+SYSTEM peripheral clock/reset banks, and then to 9 after completing the SENS
+peripheral clock/reset fabric. DIG_PWC,
 PWC, REG's force pairs, the modeled domain fields of DIG_ISO, CLK_CONF's fast
 selector, DATE, MEM_PD_MASK, and BT_LPCK_DIV no longer appear in the inventory.
-Remaining accesses stay visible: RTC analog
-and pad-isolation configuration in `0x60008000`, one SENS analog-control write,
-plus two low-count
-startup writes at `0x600CE0D8` and `0x600CE0DC`. Flexe does not turn those
+Remaining accesses stay visible: RTC analog and pad-isolation configuration
+in `0x60008000`, plus two low-count startup writes at `0x600CE0D8` and
+`0x600CE0DC`. Flexe does not turn those
 accesses into generic readback merely to reach zero diagnostics.
 
 Recheck with the external image and ROM ELF:

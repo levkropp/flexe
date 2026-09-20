@@ -42,6 +42,8 @@ struct flexe_sens {
     uint16_t input_raw;
     uint16_t output;
     bool ready;
+    flexe_sens_peripheral_fn peripheral_changed;
+    void *peripheral_ctx;
     const flexe_regi2c_t *regi2c;
     const flexe_apb_saradc_t *apb_saradc;
     uint32_t adc_power;
@@ -77,6 +79,18 @@ static bool output_field_valid(uint32_t mask, uint16_t reset)
     uint32_t field = mask >> shift;
     return field <= UINT16_MAX && (field & (field + 1u)) == 0u &&
            reset <= field;
+}
+
+static bool register_is_partitioned_by(
+    uint32_t writable_mask, const uint32_t *fields, size_t count)
+{
+    uint32_t combined = 0u;
+    for (size_t i = 0u; i < count; i++) {
+        if (!one_bit(fields[i]) || (combined & fields[i]) != 0u)
+            return false;
+        combined |= fields[i];
+    }
+    return combined == writable_mask;
 }
 
 static bool sens_geometry_valid(const flexe_target_desc_t *target)
@@ -131,14 +145,29 @@ static bool sens_geometry_valid(const flexe_target_desc_t *target)
         desc->xpd_force_mask == 0u ||
         (desc->xpd_force_mask & ~desc->control2_writable_mask) != 0u ||
         (desc->control2_reset & ~desc->control2_writable_mask) != 0u ||
-        !one_bit(desc->clock_enable_mask) ||
-        (desc->clock_enable_mask &
-         ~desc->clock_gate_writable_mask) != 0u ||
         (desc->clock_gate_reset &
          ~desc->clock_gate_writable_mask) != 0u ||
-        !one_bit(desc->reset_mask) ||
-        (desc->reset_mask & ~desc->reset_writable_mask) != 0u ||
         (desc->reset_reset & ~desc->reset_writable_mask) != 0u)
+        return false;
+
+    const uint32_t clock_fields[] = {
+        desc->io_mux_clock_enable_mask,
+        desc->adc_clock_enable_mask,
+        desc->temperature_clock_enable_mask,
+        desc->rtc_i2c_clock_enable_mask,
+    };
+    const uint32_t reset_fields[] = {
+        desc->adc_reset_mask,
+        desc->temperature_reset_mask,
+        desc->rtc_i2c_reset_mask,
+        desc->coprocessor_reset_mask,
+    };
+    if (!register_is_partitioned_by(
+            desc->clock_gate_writable_mask, clock_fields,
+            sizeof(clock_fields) / sizeof(clock_fields[0])) ||
+        !register_is_partitioned_by(
+            desc->reset_writable_mask, reset_fields,
+            sizeof(reset_fields) / sizeof(reset_fields[0])))
         return false;
 
     if (desc->rtc_interrupt_mask != 0u) {
@@ -232,8 +261,8 @@ static void sens_reset_temperature(flexe_sens_t *sens)
 static bool sens_temperature_enabled(const flexe_sens_t *sens)
 {
     const flexe_sens_desc_t *desc = &sens->target->sens;
-    return (sens->clock_gate & desc->clock_enable_mask) != 0u &&
-           (sens->reset & desc->reset_mask) == 0u &&
+    return (sens->clock_gate & desc->temperature_clock_enable_mask) != 0u &&
+           (sens->reset & desc->temperature_reset_mask) == 0u &&
            (sens->control & desc->power_up_force_mask) != 0u &&
            (sens->control & desc->power_up_mask) != 0u &&
            (sens->control2 & desc->xpd_force_mask) != 0u;
@@ -267,6 +296,41 @@ static void sens_fallback_write(flexe_sens_t *sens, uint32_t addr,
 {
     if (sens->fallback_write)
         sens->fallback_write(sens->fallback_ctx, addr, value);
+}
+
+bool flexe_sens_peripheral_state(
+    const flexe_sens_t *sens, flexe_sens_peripheral_state_t *state)
+{
+    if (!sens || !state) return false;
+    const flexe_sens_desc_t *desc = &sens->target->sens;
+    *state = (flexe_sens_peripheral_state_t) {
+        .io_mux_clock_enabled =
+            (sens->clock_gate & desc->io_mux_clock_enable_mask) != 0u,
+        .adc_clock_enabled =
+            (sens->clock_gate & desc->adc_clock_enable_mask) != 0u,
+        .temperature_clock_enabled =
+            (sens->clock_gate &
+             desc->temperature_clock_enable_mask) != 0u,
+        .rtc_i2c_clock_enabled =
+            (sens->clock_gate & desc->rtc_i2c_clock_enable_mask) != 0u,
+        .adc_reset_asserted =
+            (sens->reset & desc->adc_reset_mask) != 0u,
+        .temperature_reset_asserted =
+            (sens->reset & desc->temperature_reset_mask) != 0u,
+        .rtc_i2c_reset_asserted =
+            (sens->reset & desc->rtc_i2c_reset_mask) != 0u,
+        .coprocessor_reset_asserted =
+            (sens->reset & desc->coprocessor_reset_mask) != 0u,
+    };
+    return true;
+}
+
+static void sens_publish_peripheral(flexe_sens_t *sens)
+{
+    if (!sens || !sens->peripheral_changed) return;
+    flexe_sens_peripheral_state_t state;
+    if (flexe_sens_peripheral_state(sens, &state))
+        sens->peripheral_changed(sens->peripheral_ctx, &state);
 }
 
 static void sens_adc_reset(flexe_sens_t *sens)
@@ -469,30 +533,22 @@ void flexe_sens_mmio_write(void *ctx, uint32_t addr, uint32_t value)
     if (offset == desc->clock_gate_offset) {
         uint32_t old = sens->clock_gate;
         sens->clock_gate = value & desc->clock_gate_writable_mask;
-        uint32_t supported = desc->clock_enable_mask |
-                             desc->adc_clock_enable_mask;
-        uint32_t unsupported =
-            ((old ^ sens->clock_gate) &
-             ~supported) |
-            (value & ~desc->clock_gate_writable_mask);
-        if (unsupported != 0u)
+        if ((value & ~desc->clock_gate_writable_mask) != 0u)
             sens_fallback_write(sens, addr, value);
+        if (old != sens->clock_gate) sens_publish_peripheral(sens);
         sens_update_conversion(sens);
         return;
     }
     if (offset == desc->reset_offset) {
         uint32_t old = sens->reset;
         sens->reset = value & desc->reset_writable_mask;
-        uint32_t supported = desc->reset_mask | desc->adc_reset_mask;
-        uint32_t unsupported =
-            ((old ^ sens->reset) & ~supported) |
-            (value & ~desc->reset_writable_mask);
-        if (unsupported != 0u)
+        if ((value & ~desc->reset_writable_mask) != 0u)
             sens_fallback_write(sens, addr, value);
-        if ((sens->reset & desc->reset_mask) != 0u)
+        if ((sens->reset & desc->temperature_reset_mask) != 0u)
             sens_reset_temperature(sens);
         if ((sens->reset & desc->adc_reset_mask) != 0u)
             sens_adc_reset(sens);
+        if (old != sens->reset) sens_publish_peripheral(sens);
         sens_update_conversion(sens);
         return;
     }
@@ -555,6 +611,15 @@ void flexe_sens_attach_apb_saradc(flexe_sens_t *sens,
                                   const flexe_apb_saradc_t *apb_saradc)
 {
     if (sens) sens->apb_saradc = apb_saradc;
+}
+
+void flexe_sens_set_peripheral_listener(
+    flexe_sens_t *sens, flexe_sens_peripheral_fn fn, void *ctx)
+{
+    if (!sens) return;
+    sens->peripheral_changed = fn;
+    sens->peripheral_ctx = fn ? ctx : NULL;
+    sens_publish_peripheral(sens);
 }
 
 void flexe_sens_set_temperature_raw(flexe_sens_t *sens, uint16_t raw)

@@ -55,7 +55,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 52u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 53u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -711,8 +711,12 @@ typedef struct {
     uint32_t ready_mask;
     uint32_t output_mask;
     uint32_t xpd_force_mask;
-    uint32_t clock_enable_mask;
-    uint32_t reset_mask;
+    uint32_t io_mux_clock_enable_mask;
+    uint32_t temperature_clock_enable_mask;
+    uint32_t rtc_i2c_clock_enable_mask;
+    uint32_t temperature_reset_mask;
+    uint32_t rtc_i2c_reset_mask;
+    uint32_t coprocessor_reset_mask;
     uint32_t rtc_interrupt_mask;
     uint16_t default_output;
     uint8_t adc_unit_count;

@@ -17,6 +17,11 @@ typedef struct {
     unsigned completions;
 } sens_conversion_probe_t;
 
+typedef struct {
+    unsigned changes;
+    flexe_sens_peripheral_state_t state;
+} sens_peripheral_probe_t;
+
 static uint32_t sens_test_fallback_read(void *ctx, uint32_t addr)
 {
     sens_fallback_t *fallback = ctx;
@@ -38,6 +43,14 @@ static void sens_test_conversion_done(void *ctx)
 {
     sens_conversion_probe_t *probe = ctx;
     probe->completions++;
+}
+
+static void sens_test_peripheral_changed(
+    void *ctx, const flexe_sens_peripheral_state_t *state)
+{
+    sens_peripheral_probe_t *probe = ctx;
+    probe->changes++;
+    probe->state = *state;
 }
 
 static uint32_t sens_field_value(uint32_t value, uint32_t mask)
@@ -84,7 +97,7 @@ TEST(sens_temperature_conversion_obeys_power_clock_and_reset)
     ASSERT_EQ(mem_read32(mem, control_addr) & desc->ready_mask, 0u);
     ASSERT_EQ(conversion.completions, 0u);
 
-    mem_write32(mem, clock_addr, desc->clock_enable_mask);
+    mem_write32(mem, clock_addr, desc->temperature_clock_enable_mask);
     uint32_t completed = mem_read32(mem, control_addr);
     ASSERT_EQ(completed & desc->ready_mask, desc->ready_mask);
     ASSERT_EQ(sens_field_value(completed, desc->output_mask),
@@ -115,18 +128,21 @@ TEST(sens_temperature_conversion_obeys_power_clock_and_reset)
               0xBDu);
     ASSERT_EQ(fallback.writes, 0u);
 
-    mem_write32(mem, reset_addr, desc->reset_mask);
+    mem_write32(mem, reset_addr, desc->temperature_reset_mask);
     ASSERT_EQ(mem_read32(mem, control_addr), desc->control_reset);
     ASSERT_EQ(mem_read32(mem, control2_addr), desc->control2_reset);
     mem_write32(mem, reset_addr, 0u);
 
-    /* Other documented clock fields retain readback but explicitly report
-     * that their device behavior is outside this model. */
+    /* Every documented clock field is semantic; reserved bits remain
+     * diagnostic instead of silently turning into generic readback. */
     uint32_t other_clock =
-        desc->clock_gate_writable_mask & ~desc->clock_enable_mask;
+        desc->clock_gate_writable_mask &
+        ~desc->temperature_clock_enable_mask;
     other_clock &= 0u - other_clock;
     mem_write32(mem, clock_addr, other_clock);
     ASSERT_EQ(mem_read32(mem, clock_addr), other_clock);
+    ASSERT_EQ(fallback.writes, 0u);
+    mem_write32(mem, clock_addr, other_clock | 1u);
     ASSERT_EQ(fallback.writes, 1u);
     ASSERT_EQ(fallback.last_addr, clock_addr);
 
@@ -163,7 +179,7 @@ TEST(sens_composes_with_rtc_page_and_latches_interrupt)
     periph_set_temperature_raw(periph, 0x55u);
     ASSERT_EQ(periph_get_temperature_raw(periph), 0x55u);
     mem_write32(mem, sens->base + sens->clock_gate_offset,
-                sens->clock_enable_mask);
+                sens->temperature_clock_enable_mask);
     mem_write32(mem, sens->base + sens->control2_offset,
                 sens->control2_reset |
                 (sens->xpd_force_mask & (0u - sens->xpd_force_mask)));
@@ -419,6 +435,87 @@ TEST(sens_s3_internal_ground_requires_analog_mux)
     mem_destroy(mem);
 }
 
+TEST(sens_publishes_complete_peripheral_clock_reset_state)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_sens_desc_t *desc = &s3->sens;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    sens_fallback_t fallback = {0};
+    flexe_sens_t *sens = flexe_sens_create(
+        mem, sens_test_fallback_read, sens_test_fallback_write,
+        &fallback, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(sens != NULL);
+    if (!mem || !sens) {
+        flexe_sens_destroy(sens);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(desc->clock_gate_writable_mask, 0xE8000000u);
+    ASSERT_EQ(desc->reset_writable_mask, 0x6A000000u);
+    ASSERT_EQ(desc->io_mux_clock_enable_mask, 1u << 31);
+    ASSERT_EQ(desc->adc_clock_enable_mask, 1u << 30);
+    ASSERT_EQ(desc->temperature_clock_enable_mask, 1u << 29);
+    ASSERT_EQ(desc->rtc_i2c_clock_enable_mask, 1u << 27);
+    ASSERT_EQ(desc->adc_reset_mask, 1u << 30);
+    ASSERT_EQ(desc->temperature_reset_mask, 1u << 29);
+    ASSERT_EQ(desc->rtc_i2c_reset_mask, 1u << 27);
+    ASSERT_EQ(desc->coprocessor_reset_mask, 1u << 25);
+
+    sens_peripheral_probe_t probe = {0};
+    flexe_sens_set_peripheral_listener(
+        sens, sens_test_peripheral_changed, &probe);
+    ASSERT_EQ(probe.changes, 1u);
+    ASSERT_FALSE(probe.state.io_mux_clock_enabled);
+    ASSERT_FALSE(probe.state.adc_clock_enabled);
+    ASSERT_FALSE(probe.state.temperature_clock_enabled);
+    ASSERT_FALSE(probe.state.rtc_i2c_clock_enabled);
+    ASSERT_FALSE(probe.state.adc_reset_asserted);
+    ASSERT_FALSE(probe.state.temperature_reset_asserted);
+    ASSERT_FALSE(probe.state.rtc_i2c_reset_asserted);
+    ASSERT_FALSE(probe.state.coprocessor_reset_asserted);
+
+    uint32_t clock = desc->base + desc->clock_gate_offset;
+    uint32_t reset = desc->base + desc->reset_offset;
+    mem_write32(mem, clock, desc->clock_gate_writable_mask);
+    ASSERT_EQ(probe.changes, 2u);
+    ASSERT_TRUE(probe.state.io_mux_clock_enabled);
+    ASSERT_TRUE(probe.state.adc_clock_enabled);
+    ASSERT_TRUE(probe.state.temperature_clock_enabled);
+    ASSERT_TRUE(probe.state.rtc_i2c_clock_enabled);
+    ASSERT_EQ(mem_read32(mem, clock), desc->clock_gate_writable_mask);
+
+    mem_write32(mem, reset, desc->reset_writable_mask);
+    ASSERT_EQ(probe.changes, 3u);
+    ASSERT_TRUE(probe.state.adc_reset_asserted);
+    ASSERT_TRUE(probe.state.temperature_reset_asserted);
+    ASSERT_TRUE(probe.state.rtc_i2c_reset_asserted);
+    ASSERT_TRUE(probe.state.coprocessor_reset_asserted);
+    ASSERT_EQ(mem_read32(mem, reset), desc->reset_writable_mask);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* Reserved fields remain visible to the diagnostic owner. */
+    mem_write32(mem, clock, desc->clock_gate_writable_mask | 1u);
+    ASSERT_EQ(probe.changes, 3u);
+    ASSERT_EQ(fallback.writes, 1u);
+
+    flexe_sens_peripheral_state_t queried = {0};
+    ASSERT_TRUE(flexe_sens_peripheral_state(sens, &queried));
+    ASSERT_TRUE(queried.rtc_i2c_clock_enabled);
+    ASSERT_TRUE(queried.coprocessor_reset_asserted);
+    ASSERT_FALSE(flexe_sens_peripheral_state(NULL, &queried));
+    ASSERT_FALSE(flexe_sens_peripheral_state(sens, NULL));
+
+    flexe_sens_set_peripheral_listener(sens, NULL, NULL);
+    mem_write32(mem, clock, 0u);
+    ASSERT_EQ(probe.changes, 3u);
+
+    flexe_sens_destroy(sens);
+    mem_destroy(mem);
+}
+
 TEST(sens_rejects_targets_without_the_capability)
 {
     const flexe_target_desc_t *classic =
@@ -439,5 +536,6 @@ void run_sens_tests(void)
     RUN_TEST(sens_s3_rtc_adc_rejects_unmodeled_conversions);
     RUN_TEST(sens_s3_host_adc_injection_reaches_mmio);
     RUN_TEST(sens_s3_internal_ground_requires_analog_mux);
+    RUN_TEST(sens_publishes_complete_peripheral_clock_reset_state);
     RUN_TEST(sens_rejects_targets_without_the_capability);
 }
