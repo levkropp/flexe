@@ -636,6 +636,17 @@ static const flexe_target_desc_t TARGETS[] = {
             .fast_clock_select_mask = 1u << 29,
             /* ESP32-S3 RTC_FAST_CLK selects XTAL/2 or nominal RC_FAST. */
             .fast_clock_source_hz = { 20000000u, 17500000u },
+            /* RTC_CNTL_REG: RTC LDO and digital boost force pairs are
+             * functional. SCK_DCAP and DIG_CAL retain their values as
+             * diagnostic analog controls. */
+            .regulator_offset = 0x084u,
+            .regulator_reset = 0xA0000000u,
+            .regulator_writable_mask = 0xF03FC080u,
+            .regulator_supply_count = 2u,
+            .regulator_supply = {
+                { 1u << 31, 1u << 30 }, /* RTC regulator */
+                { 1u << 29, 1u << 28 }, /* digital boost */
+            },
             .analog_conf_offset = 0x034u,
             /* RTC_CNTL_ANA_CONF reset: SAR_I2C_PU and
              * I2C_RESET_POR_FORCE_PD are set on S3 revision 0. */
@@ -723,10 +734,23 @@ static const flexe_target_desc_t TARGETS[] = {
             .wakeup_state_offset = 0x03Cu,
             .digital_power_offset = 0x090u,
             .wakeup_cause_offset = 0x130u,
-            /* RTC_CNTL_PWC_REG: PAD_FORCE_HOLD freezes all RTCIO pads. */
+            /* RTC_CNTL_PWC_REG: RTC peripheral and memory domains share the
+             * register with the global RTCIO pad hold. */
             .rtc_power_offset = 0x088u,
             .rtc_power_reset = 0x00000925u,
+            .rtc_power_writable_mask = 0x003C0FFFu,
             .rtc_pad_force_hold_mask = 1u << 21,
+            .rtc_power_domain_count = 3u,
+            /* CPU top / SRAM4 is digital_domain[2]. */
+            .rtc_follow_cpu_domain = 3u,
+            .rtc_power_domain = {
+                { 1u << 20, 1u << 19, 1u << 18, 0u,
+                  1u << 5, 1u << 4 }, /* RTC peripheral */
+                { 0u, 1u << 11, 1u << 10, 1u << 9,
+                  1u << 2, 1u << 3 }, /* RTC slow memory */
+                { 0u, 1u << 8, 1u << 7, 1u << 6,
+                  1u << 0, 1u << 1 }, /* RTC fast memory */
+            },
             /* RTC_CNTL_DIG_ISO_REG: digital pads use a separate global
              * force-hold source and force-unhold override. */
             .digital_iso_offset = 0x094u,

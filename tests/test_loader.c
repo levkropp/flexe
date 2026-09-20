@@ -760,6 +760,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.clock_conf_offset, 0x74u);
     ASSERT_EQ(s3->rtc_cntl.clock_conf_reset, 0x1158321Cu);
     ASSERT_EQ(s3->rtc_cntl.slow_clock_source_hz[1], 32768u);
+    ASSERT_EQ(s3->rtc_cntl.regulator_offset, 0x84u);
+    ASSERT_EQ(s3->rtc_cntl.regulator_reset, 0xA0000000u);
+    ASSERT_EQ(s3->rtc_cntl.regulator_writable_mask, 0xF03FC080u);
+    ASSERT_EQ(s3->rtc_cntl.regulator_supply_count, 2u);
     ASSERT_EQ(s3->rtc_cntl.interrupt_enable_offset, 0x40u);
     ASSERT_EQ(s3->rtc_cntl.interrupt_clear_offset, 0x4Cu);
     ASSERT_EQ(s3->rtc_cntl.interrupt_valid_mask, 0x001FFFFFu);
@@ -783,7 +787,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->rtc_cntl.wakeup_cause_offset, 0x130u);
     ASSERT_EQ(s3->rtc_cntl.rtc_power_offset, 0x88u);
     ASSERT_EQ(s3->rtc_cntl.rtc_power_reset, 0x925u);
+    ASSERT_EQ(s3->rtc_cntl.rtc_power_writable_mask, 0x003C0FFFu);
     ASSERT_EQ(s3->rtc_cntl.rtc_pad_force_hold_mask, 1u << 21u);
+    ASSERT_EQ(s3->rtc_cntl.rtc_power_domain_count, 3u);
+    ASSERT_EQ(s3->rtc_cntl.rtc_follow_cpu_domain, 3u);
     ASSERT_EQ(s3->rtc_cntl.digital_iso_offset, 0x94u);
     ASSERT_EQ(s3->rtc_cntl.digital_iso_reset, 0xAA805080u);
     ASSERT_EQ(s3->rtc_cntl.digital_pad_force_hold_mask, 1u << 15u);

@@ -36,6 +36,7 @@ struct flexe_rtc_cntl {
     uint32_t sleep_state;
     uint32_t wakeup_enable;
     uint32_t wakeup_cause;
+    uint32_t regulator_control;
     uint32_t rtc_power_control;
     uint32_t digital_iso_control;
     uint32_t digital_power;
@@ -67,6 +68,10 @@ struct flexe_rtc_cntl {
     void *pad_hold_ctx;
     flexe_rtc_cntl_domain_state_fn digital_domain_changed;
     void *digital_domain_ctx;
+    flexe_rtc_cntl_domain_state_fn rtc_domain_changed;
+    void *rtc_domain_ctx;
+    flexe_rtc_cntl_supply_state_fn supply_changed;
+    void *supply_ctx;
 };
 
 static bool rtc_offset_valid(uint16_t offset, uint32_t register_size);
@@ -196,6 +201,16 @@ static bool rtc_optional_one_bit(uint32_t value)
     return value == 0u || (value & (value - 1u)) == 0u;
 }
 
+static bool rtc_masks_disjoint(const uint32_t *masks, unsigned count)
+{
+    uint32_t used = 0u;
+    for (unsigned i = 0u; i < count; i++) {
+        if ((masks[i] & used) != 0u) return false;
+        used |= masks[i];
+    }
+    return true;
+}
+
 static uint32_t rtc_digital_power_fields(
     const flexe_rtc_cntl_desc_t *desc)
 {
@@ -220,6 +235,130 @@ static uint32_t rtc_digital_iso_domain_fields(
         fields |= domain->force_noiso_mask | domain->force_iso_mask;
     }
     return fields;
+}
+
+static uint32_t rtc_regulator_supply_fields(
+    const flexe_rtc_cntl_desc_t *desc)
+{
+    uint32_t fields = 0u;
+    for (unsigned i = 0u; i < desc->regulator_supply_count; i++) {
+        const flexe_rtc_supply_desc_t *supply =
+            &desc->regulator_supply[i];
+        fields |= supply->force_power_up_mask |
+                  supply->force_power_down_mask;
+    }
+    return fields;
+}
+
+static bool rtc_regulator_supplies_valid(
+    const flexe_rtc_cntl_desc_t *desc)
+{
+    if (desc->regulator_supply_count == 0u ||
+        desc->regulator_supply_count > FLEXE_TARGET_RTC_SUPPLY_MAX ||
+        desc->regulator_writable_mask == 0u ||
+        (desc->regulator_reset & ~desc->regulator_writable_mask) != 0u)
+        return false;
+
+    uint32_t fields = 0u;
+    for (unsigned i = 0u; i < desc->regulator_supply_count; i++) {
+        const flexe_rtc_supply_desc_t *supply =
+            &desc->regulator_supply[i];
+        uint32_t pair = supply->force_power_up_mask |
+                        supply->force_power_down_mask;
+        if (!rtc_optional_one_bit(supply->force_power_up_mask) ||
+            supply->force_power_up_mask == 0u ||
+            !rtc_optional_one_bit(supply->force_power_down_mask) ||
+            supply->force_power_down_mask == 0u ||
+            supply->force_power_up_mask == supply->force_power_down_mask ||
+            (pair & fields) != 0u ||
+            (pair & ~desc->regulator_writable_mask) != 0u ||
+            ((desc->regulator_reset & supply->force_power_up_mask) != 0u &&
+             (desc->regulator_reset & supply->force_power_down_mask) != 0u))
+            return false;
+        fields |= pair;
+    }
+    return true;
+}
+
+static uint32_t rtc_power_domain_fields(
+    const flexe_rtc_cntl_desc_t *desc)
+{
+    uint32_t fields = desc->rtc_pad_force_hold_mask;
+    for (unsigned i = 0u; i < desc->rtc_power_domain_count; i++) {
+        const flexe_rtc_power_domain_desc_t *domain =
+            &desc->rtc_power_domain[i];
+        fields |= domain->sleep_power_down_mask |
+                  domain->force_power_up_mask |
+                  domain->force_power_down_mask |
+                  domain->follow_cpu_mask |
+                  domain->force_noiso_mask |
+                  domain->force_iso_mask;
+    }
+    return fields;
+}
+
+static bool rtc_power_domains_valid(const flexe_rtc_cntl_desc_t *desc)
+{
+    if (desc->rtc_power_domain_count == 0u ||
+        desc->rtc_power_domain_count > FLEXE_TARGET_RTC_POWER_DOMAIN_MAX ||
+        desc->rtc_power_writable_mask == 0u ||
+        (desc->rtc_power_reset & ~desc->rtc_power_writable_mask) != 0u ||
+        !rtc_optional_one_bit(desc->rtc_pad_force_hold_mask) ||
+        desc->rtc_pad_force_hold_mask == 0u ||
+        (desc->rtc_pad_force_hold_mask &
+         ~desc->rtc_power_writable_mask) != 0u)
+        return false;
+
+    uint32_t fields = desc->rtc_pad_force_hold_mask;
+    bool follows_cpu = false;
+    for (unsigned i = 0u; i < desc->rtc_power_domain_count; i++) {
+        const flexe_rtc_power_domain_desc_t *domain =
+            &desc->rtc_power_domain[i];
+        uint32_t power = domain->sleep_power_down_mask |
+                         domain->force_power_up_mask |
+                         domain->force_power_down_mask |
+                         domain->follow_cpu_mask;
+        uint32_t iso = domain->force_noiso_mask | domain->force_iso_mask;
+        uint32_t all = power | iso;
+        const uint32_t masks[] = {
+            domain->sleep_power_down_mask,
+            domain->force_power_up_mask,
+            domain->force_power_down_mask,
+            domain->follow_cpu_mask,
+            domain->force_noiso_mask,
+            domain->force_iso_mask,
+        };
+        if (!rtc_optional_one_bit(domain->sleep_power_down_mask) ||
+            !rtc_optional_one_bit(domain->force_power_up_mask) ||
+            domain->force_power_up_mask == 0u ||
+            !rtc_optional_one_bit(domain->force_power_down_mask) ||
+            domain->force_power_down_mask == 0u ||
+            domain->force_power_up_mask == domain->force_power_down_mask ||
+            !rtc_optional_one_bit(domain->follow_cpu_mask) ||
+            !rtc_optional_one_bit(domain->force_noiso_mask) ||
+            !rtc_optional_one_bit(domain->force_iso_mask) ||
+            ((domain->force_noiso_mask == 0u) !=
+             (domain->force_iso_mask == 0u)) ||
+            (domain->force_noiso_mask != 0u &&
+             domain->force_noiso_mask == domain->force_iso_mask) ||
+            !rtc_masks_disjoint(masks,
+                                sizeof(masks) / sizeof(masks[0])) ||
+            (all & fields) != 0u ||
+            (all & ~desc->rtc_power_writable_mask) != 0u ||
+            ((desc->rtc_power_reset & domain->force_power_up_mask) != 0u &&
+             (desc->rtc_power_reset & domain->force_power_down_mask) != 0u) ||
+            ((desc->rtc_power_reset & domain->force_noiso_mask) != 0u &&
+             (desc->rtc_power_reset & domain->force_iso_mask) != 0u))
+            return false;
+        fields |= all;
+        follows_cpu |= domain->follow_cpu_mask != 0u;
+    }
+    if (fields != desc->rtc_power_writable_mask)
+        return false;
+    if (follows_cpu)
+        return desc->rtc_follow_cpu_domain != 0u &&
+               desc->rtc_follow_cpu_domain <= desc->digital_domain_count;
+    return desc->rtc_follow_cpu_domain == 0u;
 }
 
 static bool rtc_digital_domains_valid(const flexe_rtc_cntl_desc_t *desc)
@@ -249,6 +388,15 @@ static bool rtc_digital_domains_valid(const flexe_rtc_cntl_desc_t *desc)
                          domain->force_power_up_mask |
                          domain->force_power_down_mask;
         uint32_t iso = domain->force_noiso_mask | domain->force_iso_mask;
+        const uint32_t power_masks[] = {
+            domain->sleep_power_down_mask,
+            domain->force_power_up_mask,
+            domain->force_power_down_mask,
+        };
+        const uint32_t iso_masks[] = {
+            domain->force_noiso_mask,
+            domain->force_iso_mask,
+        };
         if (!rtc_optional_one_bit(domain->sleep_power_down_mask) ||
             !rtc_optional_one_bit(domain->force_power_up_mask) ||
             domain->force_power_up_mask == 0u ||
@@ -261,6 +409,11 @@ static bool rtc_digital_domains_valid(const flexe_rtc_cntl_desc_t *desc)
              (domain->force_iso_mask == 0u)) ||
             (domain->force_noiso_mask != 0u &&
              domain->force_noiso_mask == domain->force_iso_mask) ||
+            !rtc_masks_disjoint(
+                power_masks,
+                sizeof(power_masks) / sizeof(power_masks[0])) ||
+            !rtc_masks_disjoint(iso_masks,
+                                sizeof(iso_masks) / sizeof(iso_masks[0])) ||
             (power & power_fields) != 0u ||
             (iso & iso_fields) != 0u ||
             ((desc->digital_power_reset &
@@ -570,7 +723,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
             desc->sleep_state_offset, desc->wakeup_state_offset,
             desc->digital_power_offset, desc->wakeup_cause_offset,
-            desc->rtc_power_offset, desc->digital_iso_offset,
+            desc->regulator_offset, desc->rtc_power_offset,
+            desc->digital_iso_offset,
             desc->ext_wakeup_config_offset, desc->ext1_select_offset,
             desc->ext1_status_offset, desc->brownout_offset,
         };
@@ -582,6 +736,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             (desc->rtc_pad_force_hold_mask &
              (desc->rtc_pad_force_hold_mask - 1u)) != 0u ||
             (desc->rtc_power_reset & desc->rtc_pad_force_hold_mask) != 0u ||
+            !rtc_regulator_supplies_valid(desc) ||
+            !rtc_power_domains_valid(desc) ||
             desc->digital_iso_offset == 0u ||
             desc->digital_pad_hold_count == 0u ||
             desc->digital_pad_force_hold_mask == 0u ||
@@ -725,6 +881,7 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
                 desc->wakeup_state_offset,
                 desc->digital_power_offset,
                 desc->wakeup_cause_offset,
+                desc->regulator_offset,
                 desc->rtc_power_offset,
                 desc->digital_iso_offset,
                 desc->ext_wakeup_config_offset,
@@ -790,7 +947,8 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
                 desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
                 desc->sleep_state_offset, desc->wakeup_state_offset,
                 desc->digital_power_offset, desc->wakeup_cause_offset,
-                desc->rtc_power_offset, desc->digital_iso_offset,
+                desc->regulator_offset, desc->rtc_power_offset,
+                desc->digital_iso_offset,
                 desc->ext_wakeup_config_offset, desc->ext1_select_offset,
                 desc->ext1_status_offset, desc->brownout_offset,
             };
@@ -1004,6 +1162,22 @@ static void rtc_cntl_publish_digital_domains(flexe_rtc_cntl_t *rtc)
         flexe_rtc_cntl_isolated_digital_domains(rtc));
 }
 
+static void rtc_cntl_publish_rtc_domains(flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc || !rtc->rtc_domain_changed) return;
+    rtc->rtc_domain_changed(
+        rtc->rtc_domain_ctx,
+        flexe_rtc_cntl_powered_rtc_domains(rtc),
+        flexe_rtc_cntl_isolated_rtc_domains(rtc));
+}
+
+static void rtc_cntl_publish_supplies(flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc || !rtc->supply_changed) return;
+    rtc->supply_changed(rtc->supply_ctx,
+                        flexe_rtc_cntl_powered_supplies(rtc));
+}
+
 static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
 {
     flexe_rtc_cntl_t *rtc = ctx;
@@ -1038,6 +1212,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
             return rtc->digital_power;
         if (offset == desc->wakeup_cause_offset)
             return rtc->wakeup_cause;
+        if (offset == desc->regulator_offset)
+            return rtc->regulator_control;
         if (offset == desc->rtc_power_offset)
             return rtc->rtc_power_control;
         if (offset == desc->digital_iso_offset)
@@ -1198,6 +1374,10 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         }
         if (offset == desc->sleep_state_offset) {
             uint32_t old = rtc->sleep_state;
+            uint32_t old_rtc_powered =
+                flexe_rtc_cntl_powered_rtc_domains(rtc);
+            uint32_t old_rtc_isolated =
+                flexe_rtc_cntl_isolated_rtc_domains(rtc);
             rtc->sleep_state =
                 (value & ~desc->sleep_wakeup_mask) |
                 (old & desc->sleep_wakeup_mask);
@@ -1233,6 +1413,11 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
                 rtc->fallback_write(rtc->fallback_ctx, addr, value);
             if (old != rtc->sleep_state) {
                 rtc_cntl_publish_digital_domains(rtc);
+                if (old_rtc_powered !=
+                        flexe_rtc_cntl_powered_rtc_domains(rtc) ||
+                    old_rtc_isolated !=
+                        flexe_rtc_cntl_isolated_rtc_domains(rtc))
+                    rtc_cntl_publish_rtc_domains(rtc);
                 rtc_cntl_notify(rtc);
             }
             return;
@@ -1252,6 +1437,10 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
             return;
         }
         if (offset == desc->digital_power_offset) {
+            uint32_t old_rtc_powered =
+                flexe_rtc_cntl_powered_rtc_domains(rtc);
+            uint32_t old_rtc_isolated =
+                flexe_rtc_cntl_isolated_rtc_domains(rtc);
             uint32_t old = rtc->digital_power;
             rtc->digital_power = value &
                                  desc->digital_power_writable_mask;
@@ -1260,21 +1449,55 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
                  (value & ~desc->digital_power_writable_mask) != 0u) &&
                 rtc->fallback_write)
                 rtc->fallback_write(rtc->fallback_ctx, addr, value);
-            if (changed != 0u) rtc_cntl_publish_digital_domains(rtc);
+            if (changed != 0u) {
+                rtc_cntl_publish_digital_domains(rtc);
+                if (old_rtc_powered !=
+                        flexe_rtc_cntl_powered_rtc_domains(rtc) ||
+                    old_rtc_isolated !=
+                        flexe_rtc_cntl_isolated_rtc_domains(rtc))
+                    rtc_cntl_publish_rtc_domains(rtc);
+            }
             return;
         }
         if (offset == desc->wakeup_cause_offset)
             return; /* Physically read-only. */
+        if (offset == desc->regulator_offset) {
+            uint32_t old_powered =
+                flexe_rtc_cntl_powered_supplies(rtc);
+            uint32_t old = rtc->regulator_control;
+            rtc->regulator_control =
+                value & desc->regulator_writable_mask;
+            uint32_t changed = old ^ rtc->regulator_control;
+            if ((((changed & ~rtc_regulator_supply_fields(desc)) != 0u) ||
+                 (value & ~desc->regulator_writable_mask) != 0u) &&
+                rtc->fallback_write)
+                rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            if ((changed & rtc_regulator_supply_fields(desc)) != 0u &&
+                old_powered != flexe_rtc_cntl_powered_supplies(rtc))
+                rtc_cntl_publish_supplies(rtc);
+            return;
+        }
         if (offset == desc->rtc_power_offset) {
-            uint32_t changed = rtc->rtc_power_control ^ value;
-            rtc->rtc_power_control = value;
+            uint32_t old_powered =
+                flexe_rtc_cntl_powered_rtc_domains(rtc);
+            uint32_t old_isolated =
+                flexe_rtc_cntl_isolated_rtc_domains(rtc);
+            uint32_t old = rtc->rtc_power_control;
+            rtc->rtc_power_control =
+                value & desc->rtc_power_writable_mask;
+            uint32_t changed = old ^ rtc->rtc_power_control;
             if ((changed & desc->rtc_pad_force_hold_mask) != 0u &&
                 rtc->pad_hold_changed)
                 rtc->pad_hold_changed(rtc->pad_hold_ctx,
                                       rtc_all_pad_hold_pins(rtc));
-            if ((changed & ~desc->rtc_pad_force_hold_mask) != 0u &&
+            if ((value & ~desc->rtc_power_writable_mask) != 0u &&
                 rtc->fallback_write)
                 rtc->fallback_write(rtc->fallback_ctx, addr, value);
+            if ((changed & (rtc_power_domain_fields(desc) &
+                            ~desc->rtc_pad_force_hold_mask)) != 0u &&
+                (old_powered != flexe_rtc_cntl_powered_rtc_domains(rtc) ||
+                 old_isolated != flexe_rtc_cntl_isolated_rtc_domains(rtc)))
+                rtc_cntl_publish_rtc_domains(rtc);
             return;
         }
         if (offset == desc->digital_iso_offset) {
@@ -1515,6 +1738,7 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
     rtc->clock_conf = desc->clock_conf_reset;
     rtc->reset_state = desc->reset_state_reset;
     rtc->wakeup_enable = desc->wakeup_enable_reset;
+    rtc->regulator_control = desc->regulator_reset;
     rtc->rtc_power_control = desc->rtc_power_reset;
     rtc->digital_iso_control = desc->digital_iso_reset;
     rtc->digital_power = desc->digital_power_reset;
@@ -1756,6 +1980,92 @@ void flexe_rtc_cntl_set_digital_domain_listener(
     rtc_cntl_publish_digital_domains(rtc);
 }
 
+static bool rtc_power_domain_powered(const flexe_rtc_cntl_t *rtc,
+                                     unsigned index)
+{
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    const flexe_rtc_power_domain_desc_t *domain =
+        &desc->rtc_power_domain[index];
+    if ((rtc->rtc_power_control & domain->force_power_down_mask) != 0u)
+        return false;
+    if ((rtc->rtc_power_control & domain->force_power_up_mask) != 0u)
+        return true;
+    if (domain->follow_cpu_mask != 0u &&
+        (rtc->rtc_power_control & domain->follow_cpu_mask) != 0u) {
+        unsigned cpu_domain = desc->rtc_follow_cpu_domain - 1u;
+        return rtc_digital_domain_powered(rtc, cpu_domain);
+    }
+    bool sleeping = (rtc->sleep_state & desc->sleep_enable_mask) != 0u;
+    return !sleeping || domain->sleep_power_down_mask == 0u ||
+           (rtc->rtc_power_control & domain->sleep_power_down_mask) == 0u;
+}
+
+uint32_t flexe_rtc_cntl_powered_rtc_domains(const flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc) return 0u;
+    uint32_t powered = 0u;
+    unsigned count = rtc->target->rtc_cntl.rtc_power_domain_count;
+    for (unsigned i = 0u; i < count; i++)
+        if (rtc_power_domain_powered(rtc, i)) powered |= 1u << i;
+    return powered;
+}
+
+uint32_t flexe_rtc_cntl_isolated_rtc_domains(const flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc) return UINT32_MAX;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    uint32_t isolated = 0u;
+    for (unsigned i = 0u; i < desc->rtc_power_domain_count; i++) {
+        const flexe_rtc_power_domain_desc_t *domain =
+            &desc->rtc_power_domain[i];
+        bool value = !rtc_power_domain_powered(rtc, i);
+        if ((rtc->rtc_power_control & domain->force_iso_mask) != 0u)
+            value = true;
+        else if ((rtc->rtc_power_control &
+                  domain->force_noiso_mask) != 0u)
+            value = false;
+        if (value) isolated |= 1u << i;
+    }
+    return isolated;
+}
+
+void flexe_rtc_cntl_set_rtc_domain_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_domain_state_fn fn, void *ctx)
+{
+    if (!rtc) return;
+    rtc->rtc_domain_changed = fn;
+    rtc->rtc_domain_ctx = fn ? ctx : NULL;
+    rtc_cntl_publish_rtc_domains(rtc);
+}
+
+uint32_t flexe_rtc_cntl_powered_supplies(const flexe_rtc_cntl_t *rtc)
+{
+    if (!rtc) return 0u;
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    uint32_t powered = 0u;
+    for (unsigned i = 0u; i < desc->regulator_supply_count; i++) {
+        const flexe_rtc_supply_desc_t *supply =
+            &desc->regulator_supply[i];
+        bool value = true;
+        if ((rtc->regulator_control & supply->force_power_down_mask) != 0u)
+            value = false;
+        else if ((rtc->regulator_control &
+                  supply->force_power_up_mask) != 0u)
+            value = true;
+        if (value) powered |= 1u << i;
+    }
+    return powered;
+}
+
+void flexe_rtc_cntl_set_supply_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_supply_state_fn fn, void *ctx)
+{
+    if (!rtc) return;
+    rtc->supply_changed = fn;
+    rtc->supply_ctx = fn ? ctx : NULL;
+    rtc_cntl_publish_supplies(rtc);
+}
+
 bool flexe_rtc_cntl_usb_serial_jtag_internal_phy(
     const flexe_rtc_cntl_t *rtc)
 {
@@ -1877,6 +2187,10 @@ void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause)
 {
     if (!rtc || rtc->target->rtc_cntl.sleep_timer_low_offset == 0u) return;
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    uint32_t old_rtc_powered =
+        flexe_rtc_cntl_powered_rtc_domains(rtc);
+    uint32_t old_rtc_isolated =
+        flexe_rtc_cntl_isolated_rtc_domains(rtc);
     rtc->wakeup_cause = cause & desc->wakeup_valid_mask;
     rtc->sleep_state &= ~desc->sleep_enable_mask;
     rtc->sleep_state |= desc->sleep_wakeup_mask;
@@ -1885,6 +2199,9 @@ void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause)
     rtc->interrupt_raw |= desc->sleep_wakeup_interrupt_mask;
     rtc_cntl_update_interrupt(rtc);
     rtc_cntl_publish_digital_domains(rtc);
+    if (old_rtc_powered != flexe_rtc_cntl_powered_rtc_domains(rtc) ||
+        old_rtc_isolated != flexe_rtc_cntl_isolated_rtc_domains(rtc))
+        rtc_cntl_publish_rtc_domains(rtc);
     rtc_cntl_notify(rtc);
 }
 

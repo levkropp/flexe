@@ -16,6 +16,17 @@ typedef struct {
     bool level;
 } rtc_cntl_irq_probe_t;
 
+typedef struct {
+    unsigned changes;
+    uint32_t powered;
+    uint32_t isolated;
+} rtc_cntl_domain_probe_t;
+
+typedef struct {
+    unsigned changes;
+    uint32_t powered;
+} rtc_cntl_supply_probe_t;
+
 static uint32_t rtc_cntl_test_fallback_read(void *ctx, uint32_t addr)
 {
     rtc_cntl_fallback_t *fallback = ctx;
@@ -37,6 +48,22 @@ static void rtc_cntl_test_irq_changed(void *ctx, bool level)
     rtc_cntl_irq_probe_t *probe = ctx;
     probe->changes++;
     probe->level = level;
+}
+
+static void rtc_cntl_test_domain_changed(void *ctx, uint32_t powered,
+                                         uint32_t isolated)
+{
+    rtc_cntl_domain_probe_t *probe = ctx;
+    probe->changes++;
+    probe->powered = powered;
+    probe->isolated = isolated;
+}
+
+static void rtc_cntl_test_supply_changed(void *ctx, uint32_t powered)
+{
+    rtc_cntl_supply_probe_t *probe = ctx;
+    probe->changes++;
+    probe->powered = powered;
 }
 
 static void rtc_cntl_test_reset_requested(
@@ -589,6 +616,79 @@ TEST(rtc_cntl_s3_fast_clock_and_date_register_follow_descriptor)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_s3_regulator_force_pairs_are_functional_and_trim_is_diagnostic)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(desc->regulator_offset, 0x84u);
+    ASSERT_EQ(desc->regulator_reset, 0xA0000000u);
+    ASSERT_EQ(desc->regulator_writable_mask, 0xF03FC080u);
+    ASSERT_EQ(desc->regulator_supply_count, 2u);
+    uint32_t addr = desc->base + desc->regulator_offset;
+    uint32_t supplies = (1u << desc->regulator_supply_count) - 1u;
+    ASSERT_EQ(mem_read32(mem, addr), desc->regulator_reset);
+    ASSERT_EQ(flexe_rtc_cntl_powered_supplies(rtc), supplies);
+
+    rtc_cntl_supply_probe_t probe = {0};
+    flexe_rtc_cntl_set_supply_listener(
+        rtc, rtc_cntl_test_supply_changed, &probe);
+    ASSERT_EQ(probe.changes, 1u);
+    ASSERT_EQ(probe.powered, supplies);
+
+    /* Removing force-up leaves both supplies powered in functional mode and
+     * therefore does not manufacture a logical transition. */
+    mem_write32(mem, addr, 0u);
+    ASSERT_EQ(mem_read32(mem, addr), 0u);
+    ASSERT_EQ(flexe_rtc_cntl_powered_supplies(rtc), supplies);
+    ASSERT_EQ(probe.changes, 1u);
+
+    const flexe_rtc_supply_desc_t *regulator =
+        &desc->regulator_supply[0];
+    mem_write32(mem, addr, regulator->force_power_down_mask);
+    ASSERT_EQ(flexe_rtc_cntl_powered_supplies(rtc), 2u);
+    ASSERT_EQ(probe.changes, 2u);
+    ASSERT_EQ(probe.powered, 2u);
+    mem_write32(mem, addr, regulator->force_power_down_mask |
+                           regulator->force_power_up_mask);
+    ASSERT_EQ(flexe_rtc_cntl_powered_supplies(rtc), 2u);
+    ASSERT_EQ(probe.changes, 2u); /* Force-down wins the conflict. */
+
+    mem_write32(mem, addr, desc->regulator_reset);
+    ASSERT_EQ(flexe_rtc_cntl_powered_supplies(rtc), supplies);
+    ASSERT_EQ(probe.changes, 3u);
+
+    /* SCK_DCAP and DIG_CAL retain their documented values, but changing
+     * analog calibration remains visible to the unsupported-access audit. */
+    uint32_t diagnostic = desc->regulator_reset |
+                          (0x5Au << 14u) | (1u << 7u);
+    mem_write32(mem, addr, diagnostic);
+    ASSERT_EQ(mem_read32(mem, addr), diagnostic);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(probe.changes, 3u);
+    mem_write32(mem, addr, diagnostic | (1u << 13u));
+    ASSERT_EQ(mem_read32(mem, addr), diagnostic);
+    ASSERT_EQ(fallback.writes, 2u);
+    ASSERT_EQ(fallback.last_write_addr, addr);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry)
 {
     const flexe_target_desc_t *s3 =
@@ -605,6 +705,70 @@ TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry)
     invalid = *s3;
     invalid.rtc_cntl.fast_clock_select_mask =
         invalid.rtc_cntl.slow_clock_select_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_rejects_invalid_regulator_and_rtc_power_geometry)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    flexe_target_desc_t invalid = *s3;
+    invalid.rtc_cntl.regulator_offset = invalid.rtc_cntl.analog_conf_offset;
+    xtensa_mem_t *mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.regulator_supply[1].force_power_up_mask =
+        invalid.rtc_cntl.regulator_supply[0].force_power_up_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.rtc_power_domain[1].follow_cpu_mask =
+        invalid.rtc_cntl.rtc_power_domain[2].follow_cpu_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.rtc_power_domain[1].follow_cpu_mask =
+        invalid.rtc_cntl.rtc_power_domain[1].force_power_up_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.digital_domain[0].sleep_power_down_mask =
+        invalid.rtc_cntl.digital_domain[0].force_power_up_mask;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(rtc == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.rtc_follow_cpu_domain =
+        invalid.rtc_cntl.digital_domain_count + 1u;
     mem = mem_create_for_target(&invalid);
     ASSERT_TRUE(mem != NULL);
     rtc = flexe_rtc_cntl_create(
@@ -725,6 +889,127 @@ TEST(rtc_cntl_digital_domains_resolve_force_and_sleep_policy)
     ASSERT_EQ(flexe_rtc_cntl_isolated_digital_domains(rtc) &
               (1u << wrap_index), 0u);
     ASSERT_EQ(fallback.writes, 0u);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_rtc_domains_resolve_force_follow_cpu_and_sleep_policy)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(desc->rtc_power_domain_count, 3u);
+    ASSERT_EQ(desc->rtc_follow_cpu_domain, 3u);
+    ASSERT_EQ(desc->rtc_power_writable_mask, 0x003C0FFFu);
+    uint32_t domains = (1u << desc->rtc_power_domain_count) - 1u;
+    uint32_t power_addr = desc->base + desc->rtc_power_offset;
+    uint32_t digital_addr = desc->base + desc->digital_power_offset;
+    ASSERT_EQ(mem_read32(mem, power_addr), desc->rtc_power_reset);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 0u);
+
+    rtc_cntl_domain_probe_t probe = {0};
+    flexe_rtc_cntl_set_rtc_domain_listener(
+        rtc, rtc_cntl_test_domain_changed, &probe);
+    ASSERT_EQ(probe.changes, 1u);
+    ASSERT_EQ(probe.powered, domains);
+    ASSERT_EQ(probe.isolated, 0u);
+
+    /* Active-mode automatic sequencing keeps domains available when neither
+     * force is asserted, so clearing the register is not a state change. */
+    mem_write32(mem, power_addr, 0u);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 0u);
+    ASSERT_EQ(probe.changes, 1u);
+
+    const flexe_rtc_power_domain_desc_t *peri =
+        &desc->rtc_power_domain[0];
+    uint32_t power = peri->force_power_down_mask |
+                     peri->force_iso_mask;
+    mem_write32(mem, power_addr, power);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains & ~1u);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 1u);
+    ASSERT_EQ(probe.changes, 2u);
+    power |= peri->force_power_up_mask | peri->force_noiso_mask;
+    mem_write32(mem, power_addr, power);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains & ~1u);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 1u);
+    ASSERT_EQ(probe.changes, 2u); /* Down and isolation win conflicts. */
+
+    mem_write32(mem, power_addr, desc->rtc_power_reset);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 0u);
+    ASSERT_EQ(probe.changes, 3u);
+
+    /* Slow memory follows the target-described CPU-top domain only after its
+     * follow bit replaces force-up. No S3-specific domain index lives in the
+     * RTC device model. */
+    const flexe_rtc_power_domain_desc_t *slow =
+        &desc->rtc_power_domain[1];
+    unsigned cpu_index = desc->rtc_follow_cpu_domain - 1u;
+    const flexe_rtc_digital_domain_desc_t *cpu =
+        &desc->digital_domain[cpu_index];
+    power = (desc->rtc_power_reset & ~slow->force_power_up_mask) |
+            slow->follow_cpu_mask;
+    mem_write32(mem, power_addr, power);
+    ASSERT_EQ(probe.changes, 3u);
+    uint32_t digital =
+        (desc->digital_power_reset & ~cpu->force_power_up_mask) |
+        cpu->force_power_down_mask;
+    mem_write32(mem, digital_addr, digital);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains & ~(1u << 1));
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 0u);
+    ASSERT_EQ(probe.changes, 4u);
+
+    power = (power & ~slow->force_noiso_mask) | slow->force_iso_mask;
+    mem_write32(mem, power_addr, power);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 1u << 1);
+    ASSERT_EQ(probe.changes, 5u);
+    mem_write32(mem, digital_addr, desc->digital_power_reset);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_rtc_domains(rtc), 1u << 1);
+    ASSERT_EQ(probe.changes, 6u);
+
+    /* RTC-peripheral sleep PD applies only while the sleep state is active
+     * and reverses at wake, just like the digital-domain policy. */
+    mem_write32(mem, power_addr,
+                desc->rtc_power_reset | peri->sleep_power_down_mask);
+    ASSERT_EQ(probe.changes, 7u); /* Removes slow-memory force isolation. */
+    mem_write32(mem, desc->base + desc->sleep_timer_low_offset, 100u);
+    mem_write32(mem, desc->base + desc->sleep_timer_high_offset,
+                desc->sleep_alarm_enable_mask);
+    mem_write32(mem, desc->base + desc->wakeup_state_offset,
+                desc->timer_wakeup_mask << desc->wakeup_enable_shift);
+    mem_write32(mem, desc->base + desc->sleep_state_offset,
+                desc->sleep_enable_mask);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains & ~1u);
+    ASSERT_EQ(probe.changes, 8u);
+    flexe_rtc_cntl_finish_wake(rtc, desc->timer_wakeup_mask);
+    ASSERT_EQ(flexe_rtc_cntl_powered_rtc_domains(rtc), domains);
+    ASSERT_EQ(probe.changes, 9u);
+
+    /* Reserved PWC bits do not contaminate the register and remain visible
+     * to the unsupported-access audit. */
+    mem_write32(mem, power_addr, desc->rtc_power_reset | (1u << 12u));
+    ASSERT_EQ(mem_read32(mem, power_addr), desc->rtc_power_reset);
+    ASSERT_EQ(fallback.writes, 1u);
+    ASSERT_EQ(fallback.last_write_addr, power_addr);
+    ASSERT_EQ(probe.changes, 9u);
 
     flexe_rtc_cntl_destroy(rtc);
     mem_destroy(mem);
@@ -1041,12 +1326,12 @@ TEST(rtc_cntl_s3_force_hold_freezes_all_rtc_pads_and_preserves_sources)
     mem_write32(mem, hold, 0u);
     ASSERT_EQ(periph_gpio_pin_level(periph, 4), 0);
     ASSERT_EQ(periph_unhandled_count(periph), 0);
-    /* Other PWC power-domain controls retain register state but their
-     * electrical effect stays visible as unsupported. */
+    /* RTC-peripheral sleep policy shares PWC with pad hold and is modeled
+     * independently; touching it must not become an unsupported access. */
     mem_write32(mem, power, rtc->rtc_power_reset | (1u << 20u));
     ASSERT_EQ(mem_read32(mem, power),
               rtc->rtc_power_reset | (1u << 20u));
-    ASSERT_EQ(periph_unhandled_count(periph), 1);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
 
     periph_destroy(periph);
     mem_destroy(mem);
@@ -1903,9 +2188,12 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);
     RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
     RUN_TEST(rtc_cntl_s3_fast_clock_and_date_register_follow_descriptor);
+    RUN_TEST(rtc_cntl_s3_regulator_force_pairs_are_functional_and_trim_is_diagnostic);
     RUN_TEST(rtc_cntl_rejects_overlapping_date_and_fast_clock_geometry);
+    RUN_TEST(rtc_cntl_rejects_invalid_regulator_and_rtc_power_geometry);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
     RUN_TEST(rtc_cntl_digital_domains_resolve_force_and_sleep_policy);
+    RUN_TEST(rtc_cntl_rtc_domains_resolve_force_follow_cpu_and_sleep_policy);
     RUN_TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches);
     RUN_TEST(rtc_cntl_digital_pad_hold_survives_rebuild_without_unheld_gpio);
     RUN_TEST(rtc_cntl_rtc_pad_hold_freezes_mux_input_and_output);

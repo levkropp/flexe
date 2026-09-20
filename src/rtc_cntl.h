@@ -20,6 +20,7 @@ typedef void (*flexe_rtc_cntl_reset_fn)(
 typedef void (*flexe_rtc_cntl_pad_hold_fn)(void *ctx, uint64_t gpio_mask);
 typedef void (*flexe_rtc_cntl_domain_state_fn)(
     void *ctx, uint32_t powered, uint32_t isolated);
+typedef void (*flexe_rtc_cntl_supply_state_fn)(void *ctx, uint32_t powered);
 
 /* The RTC slow counter and STORE registers remain powered through an S3
  * software reset/deep-sleep wake. Volatile WDT, alarm, and interrupt state
@@ -92,6 +93,23 @@ uint32_t flexe_rtc_cntl_isolated_digital_domains(
  * state immediately. */
 void flexe_rtc_cntl_set_digital_domain_listener(
     flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_domain_state_fn fn, void *ctx);
+
+/* Logical RTC-peripheral/RTC-memory state. Bit N corresponds to
+ * rtc_power_domain[N] in the target descriptor. RTC memory follow-CPU fields
+ * resolve against the target-described digital domain instead of assuming a
+ * chip-specific index in the device model. */
+uint32_t flexe_rtc_cntl_powered_rtc_domains(const flexe_rtc_cntl_t *rtc);
+uint32_t flexe_rtc_cntl_isolated_rtc_domains(const flexe_rtc_cntl_t *rtc);
+void flexe_rtc_cntl_set_rtc_domain_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_domain_state_fn fn, void *ctx);
+
+/* Logical state of target-described RTC regulator force pairs. Bit N
+ * corresponds to regulator_supply[N]. Force-down wins conflicts; absent
+ * forces mean powered in functional mode because analog sequencing and
+ * voltage ramp timing are intentionally outside this model. */
+uint32_t flexe_rtc_cntl_powered_supplies(const flexe_rtc_cntl_t *rtc);
+void flexe_rtc_cntl_set_supply_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_supply_state_fn fn, void *ctx);
 
 /* S3 RTC USB mux selection. The default virtual board has its internal PHY
  * attached to USB Serial/JTAG unless software routes it to USB OTG. */

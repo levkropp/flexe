@@ -53,7 +53,7 @@ even when a firmware workflow succeeds.
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
-| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power sequencing, digital-domain resolution, sleep/wake, and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; DIG_PWC/DIG_ISO state controls connected consumers, but brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
+| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (supply and power-domain resolution, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; digital and RTC-local domain state is observable and selected digital consumers are connected, but brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
@@ -219,11 +219,24 @@ phase. `RTC_CNTL_DATE_REG` resets to the S3 revision value and retains its
 documented 28-bit payload, including the overlapping six-bit LDO-slave trim.
 Functional mode exposes that software-visible state but does not turn trim
 values into simulated supply voltages or oscillator settling delays.
+`RTC_CNTL_REG` likewise resolves the target-described RTC-regulator and
+digital-boost force pairs, with force-down winning a conflicting pair and no
+force meaning powered in functional mode. SCK_DCAP and DIG_CAL fields retain
+their documented values but remain diagnostic because oscillator capacitance,
+voltage ramps, and analog calibration timing are not simulated. Supply
+consumers can subscribe to logical transitions without touching the RTC event
+scheduler.
 The S3 `RTC_CNTL_BROWN_OUT_REG` now retains documented configuration fields,
 resets to the specified defaults, and treats counter-clear as a write-only
 strobe. Its detector remains clear under Flexe's fixed nominal supply; analog
 thresholds, voltage injection, brownout interrupts, and resets are not modeled.
-`RTC_CNTL_PWC_REG`'s global RTC pad-force-hold bit freezes all 22 RTC-capable
+`RTC_CNTL_PWC_REG` resolves target-described RTC-peripheral, slow-memory, and
+fast-memory power/isolation domains in addition to its global pad-force-hold.
+Force-down and force-isolation win conflicts, RTC-peripheral sleep PD applies
+only during sleep, and each RTC-memory follow bit uses the descriptor's CPU-top
+domain rather than a chip-specific index. Logical transitions are exposed to
+future memory/peripheral consumers; this does not yet erase or hide backing
+memory when a domain loses power. The global hold freezes all 22 RTC-capable
 pads through the same physical hold model as individual bits. ROM boot clears
 the global source, while individually held pads retain their state across a
 deep-sleep rebuild. Releasing global hold does not release an individual pad.
@@ -594,8 +607,8 @@ For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 4 billion aggregate cycles produced 317 completed RMT transmissions and
 321,304 pulse words in 13,599 chunks on channel 0. The interpreter and JIT
 match at every completed-frame boundary and finish with the same `46F65AC5`
-pulse-stream digest, CPU state, and firmware-visible time; 48 unsupported
-peripheral accesses remain across 46 attributed sites. The JIT executes
+pulse-stream digest, CPU state, and firmware-visible time; 38 unsupported
+peripheral accesses remain across 36 attributed sites. The JIT executes
 1,780,691,463 of 1,819,518,818 retired instructions natively (97.9%). Ordinary
 code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
@@ -637,10 +650,11 @@ thermal state still matter.
 The same audit fell from 223 to 74 unsupported accesses when modem-control
 behavior replaced fallback handling, then to 55 when the target-described RTC
 digital domains became functional, and to 48 after modeling the independent
-RTC fast-clock mux and DATE/LDO-trim readback. DIG_PWC, the modeled domain
-fields of DIG_ISO, CLK_CONF's fast selector, and DATE no longer appear in the
-inventory. Remaining accesses stay visible: RTC analog, regulator, and
-pad-isolation configuration in `0x60008000`,
+RTC fast-clock mux and DATE/LDO-trim readback, then to 38 after resolving the
+RTC regulator force pairs and RTC-local PWC domains. DIG_PWC, PWC, REG's force
+pairs, the modeled domain fields of DIG_ISO, CLK_CONF's fast selector, and DATE
+no longer appear in the inventory. Remaining accesses stay visible: RTC analog
+and pad-isolation configuration in `0x60008000`,
 unmodeled SYSCON words such as `0x6002609C`, `0x600260A8`, and `0x600260B0`,
 SYSTEM/PCR and memory-protection setup in `0x600C0000`, plus two low-count
 startup writes at `0x600CE0D8` and `0x600CE0DC`. Flexe does not turn those

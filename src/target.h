@@ -37,6 +37,8 @@
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
 #define FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX 6u
 #define FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX 8u
+#define FLEXE_TARGET_RTC_POWER_DOMAIN_MAX 4u
+#define FLEXE_TARGET_RTC_SUPPLY_MAX 4u
 #define FLEXE_TARGET_RTC_IO_PIN_MAX 22u
 #define FLEXE_TARGET_RTC_WDT_STAGE_MAX 4u
 #define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
@@ -54,7 +56,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 48u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 49u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -337,6 +339,26 @@ typedef struct {
     uint32_t force_iso_mask;
 } flexe_rtc_digital_domain_desc_t;
 
+/* One RTC-local power/isolation domain. Unlike the digital domains above,
+ * all controls live in a single PWC register and RTC memories can optionally
+ * follow a target-described digital CPU domain. */
+typedef struct {
+    uint32_t sleep_power_down_mask;
+    uint32_t force_power_up_mask;
+    uint32_t force_power_down_mask;
+    uint32_t follow_cpu_mask;
+    uint32_t force_noiso_mask;
+    uint32_t force_iso_mask;
+} flexe_rtc_power_domain_desc_t;
+
+/* Force pair for an RTC-local analog supply. Functional mode resolves the
+ * pair deterministically while leaving analog voltage and settling behavior
+ * to a future timed model. */
+typedef struct {
+    uint32_t force_power_up_mask;
+    uint32_t force_power_down_mask;
+} flexe_rtc_supply_desc_t;
+
 /* Always-on RTC controller state shared by the ROM, bootloader and
  * application. Offsets are explicit because the register layout, timer
  * width, interrupt bank, watchdog, and routed source vary across the ESP32
@@ -378,6 +400,15 @@ typedef struct {
     uint32_t slow_clock_source_hz[4];
     uint32_t fast_clock_select_mask;
     uint32_t fast_clock_source_hz[2];
+    /* RTC regulator/supply force pairs. Other writable trim/calibration bits
+     * retain their values but remain diagnostic until an analog model uses
+     * them. A force-down bit wins if both members of a pair are asserted. */
+    uint16_t regulator_offset;
+    uint32_t regulator_reset;
+    uint32_t regulator_writable_mask;
+    uint8_t regulator_supply_count;
+    flexe_rtc_supply_desc_t
+        regulator_supply[FLEXE_TARGET_RTC_SUPPLY_MAX];
     /* RTC analog power controls. The SAR-I2C bit gates access to the
      * internal SAR analog-register slave; other writable bits retain their
      * register value but remain diagnostic until their consumers exist. */
@@ -447,7 +478,14 @@ typedef struct {
     uint16_t wakeup_cause_offset;
     uint16_t rtc_power_offset;
     uint32_t rtc_power_reset;
+    uint32_t rtc_power_writable_mask;
     uint32_t rtc_pad_force_hold_mask;
+    uint8_t rtc_power_domain_count;
+    /* One-based digital_domain index followed by RTC memories. Zero means
+     * the target has no follow-CPU relationship. */
+    uint8_t rtc_follow_cpu_domain;
+    flexe_rtc_power_domain_desc_t
+        rtc_power_domain[FLEXE_TARGET_RTC_POWER_DOMAIN_MAX];
     /* Digital-domain isolation and pad force-hold register. Described domain
      * force pairs have functional power-consumer effects; remaining pad
      * isolation/autohold controls stay software-visible diagnostics. */
