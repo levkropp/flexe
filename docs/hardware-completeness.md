@@ -156,9 +156,10 @@ heartbeats. Its image SHA-256 is
 `f1b90e7ae15c5eba69d75aef6372fa0cbf387acadb75265a26d0d4cdb6943631`
 and ELF SHA-256 is
 `84e74cdcdfac1bbc67caef66b9fa49366d8f6940c81f794c8253d47301a4f230`.
-Both external-image gates compare a complete second replay byte-for-byte,
-including the unsupported-MMIO report; hello-world reports 156 unsupported
-accesses across its two boots and cross-core reports 70 in one boot. This
+Both external-image gates compare a complete second replay byte-for-byte and
+require zero unsupported MMIO accesses. RTC `OPTIONS0` software-reset pulses
+reset APP CPU architectural state independently at a safe execution boundary;
+PRO CPU and system reset requests retain the full-machine reset path. This
 proves these FreeRTOS interactions, not simultaneous core execution or timing
 fidelity. Run with matching external artifacts:
 
@@ -391,7 +392,7 @@ partition table and SPIFFS volume. The pinned NVS image SHA-256 is
 `6eb44365aa80da064ab9b861ecc8210c31c4326216d89902da8d432afee04989`
 and ELF SHA-256 is
 `0992d03138cdfd968b974968c6abcf1f4fec01ab35a233d737dada8b81414588`.
-The gate checks two byte-identical runs and still reports 156 unsupported
+The gate checks two byte-identical runs and requires zero unsupported MMIO
 accesses across its two boots:
 
 ```sh

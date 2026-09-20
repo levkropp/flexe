@@ -144,8 +144,9 @@ TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands)
 
     /* Write-only reset commands are not sticky register bits. */
     mem_write32(mem, options, other | desc->software_reset_cpu1_mask);
+    ASSERT_EQ(reset, FLEXE_RTC_CNTL_SW_RESET_CPU1);
     ASSERT_EQ(mem_read32(mem, options), other);
-    ASSERT_EQ(fallback.writes, 2u);
+    ASSERT_EQ(fallback.writes, 1u);
     mem_write32(mem, options, other | desc->software_reset_cpu0_mask);
     ASSERT_EQ(reset, FLEXE_RTC_CNTL_SW_RESET_CPU);
     ASSERT_EQ(mem_read32(mem, options), other);
@@ -154,6 +155,45 @@ TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands)
     ASSERT_EQ(mem_read32(mem, options), other);
 
     flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_s3_routes_app_cpu_reset_without_system_reset)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    uint32_t options = desc->base + desc->cpu_stall_options_offset;
+    int before = periph_unhandled_count(periph);
+    mem_write32(mem, options,
+                desc->cpu_stall_options_reset |
+                desc->software_reset_cpu1_mask);
+    ASSERT_TRUE(periph_take_cpu_reset_request(periph, 1u));
+    ASSERT_FALSE(periph_take_cpu_reset_request(periph, 1u));
+    ASSERT_FALSE(periph_take_cpu_reset_request(periph, 0u));
+    ASSERT_FALSE(periph_take_reset_request(periph));
+    ASSERT_EQ(mem_read32(mem, options),
+              desc->cpu_stall_options_reset);
+    ASSERT_EQ(periph_unhandled_count(periph), before);
+
+    mem_write32(mem, options,
+                desc->cpu_stall_options_reset |
+                desc->software_reset_cpu0_mask);
+    ASSERT_TRUE(periph_take_reset_request(periph));
+    ASSERT_FALSE(periph_take_reset_request(periph));
+    ASSERT_FALSE(periph_take_cpu_reset_request(periph, 1u));
+
+    periph_destroy(periph);
     mem_destroy(mem);
 }
 
@@ -2550,6 +2590,7 @@ void run_rtc_cntl_tests(void)
 {
     TEST_SUITE("Target RTC controller");
     RUN_TEST(rtc_cntl_software_stall_uses_both_fields_and_preserves_reset_commands);
+    RUN_TEST(rtc_cntl_s3_routes_app_cpu_reset_without_system_reset);
     RUN_TEST(rtc_cntl_s3_control_fabric_resolves_force_pairs_and_notifies);
     RUN_TEST(rtc_cntl_s3_sequence_timers_read_back_and_enable_cpu_stall);
     RUN_TEST(rtc_cntl_storage_resets_persists_and_delegates);

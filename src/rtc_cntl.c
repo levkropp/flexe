@@ -1912,9 +1912,7 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         rtc->cpu_stall_options = next;
         bool unsupported =
             (value & ~(desc->cpu_stall_options_writable_mask |
-                       reset_mask)) != 0u ||
-            (value & desc->software_reset_cpu1_mask) != 0u;
-        /* APP CPU-only reset is not yet modeled. */
+                       reset_mask)) != 0u;
         if (unsupported && rtc->fallback_write)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
         if (rtc->reset_requested) {
@@ -1924,6 +1922,9 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
             else if (value & desc->software_reset_cpu0_mask)
                 rtc->reset_requested(rtc->reset_ctx,
                                      FLEXE_RTC_CNTL_SW_RESET_CPU);
+            else if (value & desc->software_reset_cpu1_mask)
+                rtc->reset_requested(rtc->reset_ctx,
+                                     FLEXE_RTC_CNTL_SW_RESET_CPU1);
         }
         rtc_cntl_publish_controls_if_changed(rtc, &old_control);
         return;

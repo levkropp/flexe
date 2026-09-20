@@ -71,12 +71,15 @@ if grep -Eq 'NVS_FAIL|^\[TRAP\]|Guru Meditation|panic' \
         "$tmpdir/guest.out" "$tmpdir/emu.err"; then
     fail "guest failed, trapped, or panicked"
 fi
-unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 224 ]] ||
-    fail "unsupported MMIO count changed from the pinned baseline"
+unhandled=$(awk '
+    /^Unhandled:/ { print $2; exit }
+    /^--- Unsupported MMIO sites \(0,/ { print 0; exit }
+' "$tmpdir/emu.err")
+[[ "$unhandled" == 0 ]] ||
+    fail "stock NVS/restart must have zero unsupported MMIO accesses"
 cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
     fail "guest UART transcript differs on replay"
 cmp -s "$tmpdir/emu.err" "$tmpdir/emu.replay" ||
     fail "emulator state and MMIO report differ on replay"
 
-echo "PASS: native ESP-IDF S3 NVS committed, restarted with software-reset cause and retained RTC STORE, reloaded 0x5a17c0de, and sustained app_main with identical replay; $unhandled unsupported accesses remain visible"
+echo "PASS: native ESP-IDF S3 NVS committed, restarted with software-reset cause and retained RTC STORE, reloaded 0x5a17c0de, sustained app_main with identical replay, and used zero unsupported MMIO accesses"

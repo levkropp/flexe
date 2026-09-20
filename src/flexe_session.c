@@ -919,6 +919,62 @@ int flexe_session_run_core(flexe_session_t *s, int core, int max_cycles)
 
 /* ===== Post-batch hook ===== */
 
+/* Apply the APP-CPU software-reset pulse at a scheduler boundary. The Xtensa
+ * architectural state and CCOUNT reset, while shared SoC state and the
+ * emulator's host-side execution bindings remain attached. This is also why
+ * the reset cannot be performed inside the RTC MMIO callback: a native block
+ * may still be using the CPU structure which issued that write. */
+static void session_reset_app_cpu(flexe_session_t *s)
+{
+    xtensa_cpu_t *cpu = &s->cpu[1];
+    xtensa_cpu_t old = *cpu;
+
+    xtensa_cpu_reset_for_target(cpu, s->target);
+    cpu->mem = old.mem;
+    cpu->predecode = old.predecode;
+    cpu->core_id = 1;
+    cpu->prid = 0xABAB;
+    XT_PS_SET_EXCM(cpu->ps, 0);
+    cpu->running = false;
+    uint32_t sp = s->cfg.initial_sp ? s->cfg.initial_sp + 0x8000u :
+                  flexe_target_bootstrap_stack(s->target, 1);
+    ar_write(cpu, 1, sp);
+    cpu->seed_entry_link = true;
+
+    /* These are debugger/translator/session bindings, not Xtensa state. */
+    cpu->pc_hook = old.pc_hook;
+    cpu->pc_hook_ctx = old.pc_hook_ctx;
+    cpu->pc_hook_bitmap = old.pc_hook_bitmap;
+    cpu->pc_hook_contains = old.pc_hook_contains;
+    cpu->pc_hook_contains_ctx = old.pc_hook_contains_ctx;
+    cpu->aot = old.aot;
+    cpu->aot_lookup_fn = old.aot_lookup_fn;
+    cpu->aot_bitmap = old.aot_bitmap;
+    cpu->code_invalidate = old.code_invalidate;
+    cpu->code_invalidate_ctx = old.code_invalidate_ctx;
+    cpu->accelerated_blocks = old.accelerated_blocks;
+    cpu->record_branch_targets = old.record_branch_targets;
+    cpu->window_trace = old.window_trace;
+    cpu->spill_verify = old.spill_verify;
+    memcpy(cpu->poll_spin_pc, old.poll_spin_pc,
+           sizeof(cpu->poll_spin_pc));
+    cpu->poll_spin_count = old.poll_spin_count;
+    cpu->poll_spin_insns = old.poll_spin_insns;
+    memcpy(cpu->breakpoints, old.breakpoints, sizeof(cpu->breakpoints));
+    cpu->breakpoint_count = old.breakpoint_count;
+
+    /* Host accounting remains monotonic even though architectural CCOUNT
+     * restarts at zero. */
+    cpu->cycle_count = old.cycle_count;
+    cpu->insn_count = old.insn_count;
+    cpu->virtual_time_us = old.virtual_time_us;
+
+    s->app_cpu_started = false;
+    periph_attach_cpus(s->periph, &s->cpu[0], cpu);
+    if (!s->single_core && s->frt)
+        freertos_stubs_attach_cpu(s->frt, 1, cpu);
+}
+
 static void session_finish_gpio_sleep(flexe_session_t *s, uint32_t cause)
 {
     uint64_t slept = s->gpio_sleep_elapsed_cycles / s->gpio_sleep_mhz;
@@ -939,6 +995,9 @@ static void session_finish_gpio_sleep(flexe_session_t *s, uint32_t cause)
 void flexe_session_post_batch(flexe_session_t *s, int batch_size)
 {
     if (!s) return;
+
+    if (periph_take_cpu_reset_request(s->periph, 1u))
+        session_reset_app_cpu(s);
 
     /* XPT2046 PENIRQ is active-low.  Sampling the frontend's touch callback
      * at batch boundaries turns a newly pressed host touch into the falling

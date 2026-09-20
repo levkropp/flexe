@@ -63,9 +63,12 @@ grep -q 'CORE1 started' "$tmpdir/emu.err" ||
     fail "secondary core did not start"
 grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err" ||
     fail "guest did not sustain native FreeRTOS execution"
-unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 70 ]] ||
-    fail "unsupported MMIO count changed from the pinned baseline"
+unhandled=$(awk '
+    /^Unhandled:/ { print $2; exit }
+    /^--- Unsupported MMIO sites \(0,/ { print 0; exit }
+' "$tmpdir/emu.err")
+[[ "$unhandled" == 0 ]] ||
+    fail "stock cross-core traffic must have zero unsupported MMIO accesses"
 if grep -Eq '  [RW]  0x600080(1C|20|24|28|2C|30) ' "$tmpdir/emu.err"; then
     fail "RTC power-sequencer MMIO remains unsupported"
 fi
@@ -74,4 +77,4 @@ cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
 cmp -s "$tmpdir/emu.err" "$tmpdir/emu.replay" ||
     fail "the emulator state and MMIO report differ on replay"
 
-echo "PASS: ESP-IDF S3 ran 32 CPU1-to-CPU0 queue/notify handoffs, paused and resumed CPU1, and sustained app_main with identical replay; $unhandled unsupported accesses remain visible"
+echo "PASS: ESP-IDF S3 ran 32 CPU1-to-CPU0 queue/notify handoffs, paused and resumed CPU1, sustained app_main with identical replay, and used zero unsupported MMIO accesses"

@@ -15,6 +15,7 @@ typedef enum {
     FLEXE_RTC_CNTL_WDT_RESET_RTC = 4,
     FLEXE_RTC_CNTL_SW_RESET_CPU = 5,
     FLEXE_RTC_CNTL_SW_RESET_SYSTEM = 6,
+    FLEXE_RTC_CNTL_SW_RESET_CPU1 = 7,
 } flexe_rtc_cntl_reset_action_t;
 typedef void (*flexe_rtc_cntl_state_fn)(void *ctx);
 typedef void (*flexe_rtc_cntl_irq_fn)(void *ctx, bool level);

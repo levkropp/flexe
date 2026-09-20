@@ -1830,6 +1830,9 @@ typedef struct {
 struct esp32_periph {
     /* Set when firmware or a modeled watchdog requests a system reset. */
     bool reset_requested;
+    /* CPU-only reset pulses are consumed by the session at its next safe
+     * dual-core boundary. Bit N corresponds to CPU N. */
+    uint32_t cpu_reset_requested;
     xtensa_mem_t *mem;
     const flexe_target_desc_t *target;
 
@@ -13998,7 +14001,11 @@ static void target_rtc_cntl_reset_requested(
         fprintf(stderr, "[reset] RTC %s action %d requested reset\n",
                 action >= FLEXE_RTC_CNTL_SW_RESET_CPU ? "software" : "watchdog",
                 (int)action);
-    if (p) p->reset_requested = true;
+    if (!p) return;
+    if (action == FLEXE_RTC_CNTL_SW_RESET_CPU1)
+        p->cpu_reset_requested |= 1u << 1u;
+    else
+        p->reset_requested = true;
 }
 
 static void target_sens_conversion_done(void *ctx)
@@ -15884,6 +15891,15 @@ bool periph_take_reset_request(esp32_periph_t *p)
 {
     if (!p || !p->reset_requested) return false;
     p->reset_requested = false;
+    return true;
+}
+
+bool periph_take_cpu_reset_request(esp32_periph_t *p, unsigned core)
+{
+    if (!p || core >= p->target->core_count || core >= 32u) return false;
+    uint32_t mask = 1u << core;
+    if ((p->cpu_reset_requested & mask) == 0u) return false;
+    p->cpu_reset_requested &= ~mask;
     return true;
 }
 

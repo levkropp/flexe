@@ -557,6 +557,11 @@ uint8_t periph_dac_value(const esp32_periph_t *p, int channel);
  * reading it clears the request. */
 bool periph_take_reset_request(esp32_periph_t *p);
 
+/* Consume a target CPU's write-only software-reset pulse. CPU-only reset is
+ * kept separate from a system reset so the session can rebuild just that
+ * execution engine without disturbing shared memory or peripherals. */
+bool periph_take_cpu_reset_request(esp32_periph_t *p, unsigned core);
+
 /* Sleep. The peripheral decides *whether* the chip sleeps and what would wake
  * it; the session owns the clock and the reset path, so it takes the request
  * and steps time forward itself. */

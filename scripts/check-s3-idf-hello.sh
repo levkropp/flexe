@@ -70,9 +70,12 @@ grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err" ||
 if grep -Eq '^\[TRAP\]|Guru Meditation|panic' "$tmpdir/emu.err" "$tmpdir/guest.out"; then
     fail "guest trapped or panicked"
 fi
-unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 156 ]] ||
-    fail "unsupported MMIO count changed from the pinned baseline"
+unhandled=$(awk '
+    /^Unhandled:/ { print $2; exit }
+    /^--- Unsupported MMIO sites \(0,/ { print 0; exit }
+' "$tmpdir/emu.err")
+[[ "$unhandled" == 0 ]] ||
+    fail "stock hello/restart must have zero unsupported MMIO accesses"
 if grep -Eq '  [RW]  0x600080(1C|20|24|28|2C|30|E8) ' "$tmpdir/emu.err"; then
     fail "S3 RTC sequencer or brownout MMIO remains unsupported"
 fi
@@ -81,4 +84,4 @@ cmp -s "$tmpdir/guest.out" "$tmpdir/guest.replay" ||
 cmp -s "$tmpdir/emu.err" "$tmpdir/emu.replay" ||
     fail "the emulator state and MMIO report differ on replay"
 
-echo "PASS: official ESP-IDF 5.3.2 S3 hello_world ran app_main on both boots, observed two cores, counted down, restarted, and replayed identically; $unhandled unsupported accesses remain visible"
+echo "PASS: official ESP-IDF 5.3.2 S3 hello_world ran app_main on both boots, observed two cores, counted down, restarted, replayed identically, and used zero unsupported MMIO accesses"
