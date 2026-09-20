@@ -103,10 +103,13 @@ echo "==> building requested host fixture runners"
 cmake --build "$host_build" --target $host_targets -j
 
 # A no-change arduino-cli invocation still spends tens of seconds walking the
-# core and dependency graph on macOS. Persisted build paths let us skip that
-# process entirely when every input that selects the firmware is identical.
-# The installed core version is sufficient for packaged cores; a custom CLI
-# wrapper and an explicit config file are hashed as inputs too.
+# core and dependency graph on macOS. Persisted output artifacts let us skip
+# that process entirely when every input that selects the firmware is
+# identical. Cache misses deliberately use --output-dir rather than
+# --build-path: Arduino CLI 1.x disables its shared compilation cache whenever
+# a custom build path is supplied. The installed core version is sufficient
+# for packaged cores; a custom CLI wrapper and an explicit config file are
+# hashed as inputs too.
 arduino_executable=$(command -v "$arduino_cli" 2>/dev/null || true)
 arduino_version=$("$arduino_cli" version)
 if [ -n "$arduino_config" ]; then
@@ -138,7 +141,8 @@ fixture_fingerprint() {
         printf 'cli-sha256=%s\n' "$arduino_executable_hash"
         printf 'cores=%s\n' "$arduino_cores"
         printf 'config-sha256=%s\n' "$arduino_config_hash"
-        find "$fixture_dir" -type f -print | LC_ALL=C sort |
+        find "$fixture_dir" -path "$fixture_dir/build" -prune -o \
+            -type f -print | LC_ALL=C sort |
             while IFS= read -r input; do
                 relative=${input#"$fixture_dir"/}
                 digest=$(openssl dgst -sha256 "$input" |
@@ -150,7 +154,15 @@ fixture_fingerprint() {
 
 fixture_build=
 remove_fixture_build=0
+fixture_source_root=
+cleanup_source() {
+    if [ -n "$fixture_source_root" ]; then
+        rm -rf -- "$fixture_source_root"
+    fi
+    fixture_source_root=
+}
 cleanup() {
+    cleanup_source
     if [ "$remove_fixture_build" -eq 1 ] && [ -n "$fixture_build" ]; then
         rm -rf -- "$fixture_build"
     fi
@@ -192,12 +204,19 @@ for requested in "$@"; do
         echo "==> reusing unchanged $slug firmware"
     else
         echo "==> compiling $slug"
+        # Some platform versions export auxiliary files below sketch/build
+        # whenever --output-dir is used. Compile an exact temporary source
+        # copy so a toolchain cannot dirty the fixture or its fingerprint.
+        fixture_source_root=$(mktemp -d \
+            "${TMPDIR:-/tmp}/flexe-$slug-source.XXXXXX")
+        fixture_source="$fixture_source_root/$fixture"
+        cp -R "$repo_dir/tests/fixtures/$fixture" "$fixture_source"
         if [ -n "$arduino_config" ]; then
             if ! "$arduino_cli" --config-file "$arduino_config" compile \
                     --fqbn "$fqbn" \
-                    --build-path "$fixture_build" \
+                    --output-dir "$fixture_build" \
                     --build-property compiler.optimization_flags=-Os \
-                    "$repo_dir/tests/fixtures/$fixture"; then
+                    "$fixture_source"; then
                 status=1
                 cleanup
                 continue
@@ -205,14 +224,15 @@ for requested in "$@"; do
         else
             if ! "$arduino_cli" compile \
                     --fqbn "$fqbn" \
-                    --build-path "$fixture_build" \
+                    --output-dir "$fixture_build" \
                     --build-property compiler.optimization_flags=-Os \
-                    "$repo_dir/tests/fixtures/$fixture"; then
+                    "$fixture_source"; then
                 status=1
                 cleanup
                 continue
             fi
         fi
+        cleanup_source
         if [ ! -s "$firmware" ] || [ ! -s "$symbols" ]; then
             echo "error: Arduino compile produced no firmware for $slug" >&2
             status=1

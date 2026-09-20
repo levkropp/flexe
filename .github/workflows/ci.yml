@@ -10,6 +10,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CCACHE_COMPRESS: "true"
+  CCACHE_MAXSIZE: 500M
+
 jobs:
   # Two compilers, because the tree is built with -Werror and they disagree
   # about which warnings exist.
@@ -25,14 +29,23 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev ${{ matrix.cc }}
+          sudo apt-get install -y cmake ninja-build ccache libssl-dev ${{ matrix.cc }}
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-v1-unit-${{ runner.os }}-${{ matrix.cc }}-${{ hashFiles('.github/workflows/ci.yml', 'CMakeLists.txt', 'src/**', 'tests/**') }}
+          restore-keys: |
+            ccache-v1-unit-${{ runner.os }}-${{ matrix.cc }}-
       - name: Configure
         # -DNATIVE_ARCH=OFF: a shared runner's CPU should not be baked into
         # the build, and -march=native there produced a feature combination
         # clang rejects under -Werror.
         run: |
           cmake -S . -B build -G Ninja \
-            -DCMAKE_C_COMPILER=${{ matrix.cc }} -DNATIVE_ARCH=OFF
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DNATIVE_ARCH=OFF
       - name: Build
         run: cmake --build build --target xtensa-tests -j"$(nproc)"
       - name: Unit tests
@@ -46,11 +59,19 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev
+          sudo apt-get install -y cmake ninja-build ccache libssl-dev
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-v1-asan-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', 'CMakeLists.txt', 'src/**', 'tests/**') }}
+          restore-keys: |
+            ccache-v1-asan-${{ runner.os }}-
       - name: Configure
         run: |
           cmake -S . -B build-asan -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DNATIVE_ARCH=OFF \
             -DFLEXE_SANITIZERS=ON
       - name: Build
@@ -77,19 +98,36 @@ jobs:
       - name: Install cross toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y ccache gcc-aarch64-linux-gnu
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-v1-aarch64-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', 'src/**') }}
+          restore-keys: |
+            ccache-v1-aarch64-${{ runner.os }}-
       - name: Compile every backend-relevant source
         run: |
-          status=0
+          sources=()
           for f in src/*.c; do
             case "$(basename "$f")" in
               loader.c|mpi_stubs.c|sha_stubs.c|wifi_stubs.c) continue ;;
             esac
-            # gnu17, not c11: c11 hides pread/pwrite behind feature macros.
-            aarch64-linux-gnu-gcc -std=gnu17 -O2 -Wall -Wextra \
-              -Wno-unused-parameter -c -I src "$f" -o /dev/null || status=1
+            sources+=("$f")
           done
-          exit $status
+          build_dir="$RUNNER_TEMP/flexe-aarch64"
+          mkdir -p "$build_dir"
+          # Compile independent translation units concurrently. gnu17, not
+          # c11: c11 hides pread/pwrite behind feature macros.
+          printf '%s\0' "${sources[@]}" | \
+            xargs -0 -n1 -P"$(nproc)" bash -c '
+              build_dir=$1
+              source=$2
+              object="$build_dir/$(basename "${source%.c}").o"
+              exec ccache aarch64-linux-gnu-gcc \
+                -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter \
+                -c -I src "$source" -o "$object"
+            ' _ "$build_dir"
 
   # Compiled-firmware coverage. Slower than the rest, and the only job that
   # needs a toolchain download, so it is kept separate: a failure here means
@@ -103,7 +141,14 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev
+          sudo apt-get install -y cmake ninja-build ccache libssl-dev
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-v1-gates-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', 'CMakeLists.txt', 'src/**', 'tools/**') }}
+          restore-keys: |
+            ccache-v1-gates-${{ runner.os }}-
       - name: Restore pinned Arduino toolchain
         uses: actions/cache@v4
         with:
@@ -145,11 +190,18 @@ jobs:
             build/arduino-fixtures/*/*.ino.bin
             build/arduino-fixtures/*/*.ino.elf
             build/arduino-fixtures/*/.flexe-fixture.sha256
-          key: arduino-fixtures-v1-esp32-2.0.11-${{ runner.os }}-${{ hashFiles('tests/fixtures/**/*.ino', 'scripts/test-fixtures.sh') }}
+            build/arduino-cache/cores
+          key: arduino-fixtures-v2-esp32-2.0.11-${{ runner.os }}-${{ hashFiles('tests/fixtures/**/*.ino', 'scripts/test-fixtures.sh') }}
+          restore-keys: |
+            arduino-fixtures-v2-esp32-2.0.11-${{ runner.os }}-
+            arduino-fixtures-v1-esp32-2.0.11-${{ runner.os }}-
       - name: Configure host build
         run: |
-          cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF
+          cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
       - name: Run gates
         env:
           ARDUINO_CLI: /home/runner/bin/arduino-cli
+          ARDUINO_BUILD_CACHE_PATH: ${{ github.workspace }}/build/arduino-cache
+          ARDUINO_BUILD_CACHE_COMPILATIONS_BEFORE_PURGE: 0
         run: ./scripts/test-fixtures.sh

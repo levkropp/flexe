@@ -69,8 +69,11 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR
 endif()
 
 if(FLEXE_SANITIZERS)
-    message(STATUS "Sanitizers: address,undefined (LTO disabled)")
-    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    message(STATUS "Sanitizers: address,undefined at -O1 (LTO disabled)")
+    # RelWithDebInfo otherwise selects -O2. Sanitizer builds are substantially
+    # cheaper at -O1 while retaining optimized control flow and useful stacks.
+    add_compile_options(
+        -fsanitize=address,undefined -fno-omit-frame-pointer -O1)
     add_link_options(-fsanitize=address,undefined)
 endif()
 

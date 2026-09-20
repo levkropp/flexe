@@ -11,6 +11,11 @@ cmake --build build --target xtensa-tests -j
 ./build/xtensa-tests
 ```
 
+For repeated clean or multi-configuration builds, an installed `ccache` can
+be enabled with `-DCMAKE_C_COMPILER_LAUNCHER=ccache`; CI uses separate caches
+for GCC, Clang, sanitizers, AArch64, and fixture runners so incompatible flags
+cannot contaminate one another.
+
 Each test file is compiled independently, so editing one suite rebuilds only
 that suite and the final test executable. Case-insensitive filters select by
 suite or test name; multiple filters are ORed. A filter matching nothing is an
@@ -80,15 +85,19 @@ Configuration:
 | `FLEXE_FIXTURE_BUILD_ROOT` | Fixture build root, or `temporary` for disposable builds |
 | `FLEXE_FIXTURE_REBUILD` | Set to `1` to ignore valid cached fixture firmware |
 
-Compiled sketches persist under `FLEXE_BUILD_DIR/arduino-fixtures` by default,
-and a content fingerprint covers the fixture source, FQBN, optimization,
-Arduino CLI and installed core versions, executable wrapper, and explicit
-config. An unchanged focused rerun skips Arduino CLI entirely instead of
-merely asking it to rediscover an unchanged dependency graph. Set
-`FLEXE_FIXTURE_BUILD_ROOT` to another directory to isolate a board/toolchain
-configuration, or to `temporary` for a clean disposable build.
-CI caches the pinned Arduino core and only the compact firmware/ELF/stamp
-triples, not each fixture's much larger intermediate build tree.
+Compiled sketch outputs persist under `FLEXE_BUILD_DIR/arduino-fixtures` by
+default, and a content fingerprint covers the fixture source, FQBN,
+optimization, Arduino CLI and installed core versions, executable wrapper,
+and explicit config. An unchanged focused rerun skips Arduino CLI entirely
+instead of merely asking it to rediscover an unchanged dependency graph. A
+cache miss leaves the intermediate build path under Arduino CLI's shared
+compilation cache, so multiple changed fixtures reuse the same compiled core.
+Set `FLEXE_FIXTURE_BUILD_ROOT` to another directory to isolate a
+board/toolchain configuration, or to `temporary` for a clean disposable
+build.
+CI restores older per-fixture outputs as a fallback, recompiles only fixtures
+whose fingerprints changed, and caches the shared compiled core without each
+fixture's much larger intermediate build tree.
 
 ## Production ROM gates
 
