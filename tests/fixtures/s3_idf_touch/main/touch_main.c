@@ -6,6 +6,7 @@
 #include "driver/touch_pad.h"
 #include "esp_attr.h"
 #include "esp_err.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -14,13 +15,13 @@
 #define TEST_PAD_MASK (UINT32_C(1) << TEST_PAD)
 
 volatile uint32_t flexe_touch_stage;
-volatile uint32_t flexe_touch_result[12];
+volatile uint32_t flexe_touch_result[16];
 
 static TaskHandle_t consumer_task;
 
 static void fail(uint32_t stage, int32_t detail)
 {
-    flexe_touch_result[11] = (uint32_t)detail;
+    flexe_touch_result[15] = (uint32_t)detail;
     flexe_touch_stage = UINT32_C(0xBAD00000) | stage;
     printf("TOUCH_FAIL stage=%u detail=%ld\n",
            (unsigned)stage, (long)detail);
@@ -98,24 +99,43 @@ void app_main(void)
         flexe_touch_result[7] != 1050u)
         fail(14u, (int32_t)flexe_touch_result[6]);
 
-    flexe_touch_stage = 3u;
     require_ok(15u, touch_pad_intr_disable(
         TOUCH_PAD_INTR_MASK_ACTIVE | TOUCH_PAD_INTR_MASK_INACTIVE));
-    require_ok(16u, touch_pad_fsm_stop());
-    require_ok(17u, touch_pad_deinit());
+    require_ok(16u, touch_pad_set_thresh(TEST_PAD, 1000u));
+    require_ok(17u, touch_pad_sleep_channel_enable(TEST_PAD, true));
+    require_ok(18u, touch_pad_sleep_set_threshold(TEST_PAD, 200u));
+    require_ok(19u, esp_sleep_enable_touchpad_wakeup());
+    require_ok(20u, esp_sleep_enable_timer_wakeup(500000u));
 
-    flexe_touch_result[10] = touch_pad_get_status();
-    flexe_touch_result[11] = 0u;
+    flexe_touch_stage = 3u;
+    require_ok(21u, esp_light_sleep_start());
+    flexe_touch_result[10] = (uint32_t)esp_sleep_get_wakeup_cause();
+    flexe_touch_result[11] =
+        (uint32_t)esp_sleep_get_touchpad_wakeup_status();
+    if (flexe_touch_result[10] != ESP_SLEEP_WAKEUP_TOUCHPAD ||
+        flexe_touch_result[11] != TEST_PAD)
+        fail(22u, (int32_t)flexe_touch_result[10]);
+    require_ok(23u,
+               esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+
+    require_ok(24u, touch_pad_fsm_stop());
+    require_ok(25u, touch_pad_deinit());
+
+    flexe_touch_result[13] = touch_pad_get_status();
+    flexe_touch_result[15] = 0u;
     flexe_touch_stage = TOUCH_DONE;
     printf("TOUCH_DONE active=%u inactive=%u baseline=%u/%u "
-           "active_raw=%u inactive_raw=%u teardown_status=%u\n",
+           "active_raw=%u inactive_raw=%u wake=%u pad=%u "
+           "teardown_status=%u\n",
            (unsigned)flexe_touch_result[0],
            (unsigned)flexe_touch_result[1],
            (unsigned)flexe_touch_result[8],
            (unsigned)flexe_touch_result[9],
            (unsigned)flexe_touch_result[4],
            (unsigned)flexe_touch_result[7],
-           (unsigned)flexe_touch_result[10]);
+           (unsigned)flexe_touch_result[10],
+           (unsigned)flexe_touch_result[11],
+           (unsigned)flexe_touch_result[13]);
     fflush(stdout);
     for (;;) vTaskDelay(pdMS_TO_TICKS(100));
 }

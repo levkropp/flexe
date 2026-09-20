@@ -87,6 +87,8 @@ int main(int argc, char **argv)
 
     bool active_injected = false;
     bool inactive_injected = false;
+    bool sleep_observed = false;
+    bool wake_injected = false;
     uint32_t stage = 0u;
     while (cpu0->cycle_count < MAX_CYCLES) {
         stage = mem_read32(mem, stage_address);
@@ -98,6 +100,12 @@ int main(int argc, char **argv)
             inactive_injected = true;
             periph_touch_set_value(periph, 4, 1050u);
         }
+        if (stage == 3u && flexe_session_async_sleeping(session) &&
+            !wake_injected) {
+            sleep_observed = true;
+            wake_injected = true;
+            periph_touch_set_value(periph, 4, 1400u);
+        }
         if ((stage == TOUCH_DONE && strstr(uart.data, "TOUCH_DONE")) ||
             (stage & UINT32_C(0xFFFF0000)) == UINT32_C(0xBAD00000) ||
             strstr(uart.data, "TOUCH_FAIL") || uart.overflow ||
@@ -108,8 +116,8 @@ int main(int argc, char **argv)
     }
 
     stage = mem_read32(mem, stage_address);
-    uint32_t result[12];
-    for (unsigned i = 0u; i < 12u; i++)
+    uint32_t result[16];
+    for (unsigned i = 0u; i < 16u; i++)
         result[i] = mem_read32(mem, result_address + i * 4u);
     uint64_t jit_instructions = 0u;
     jit_state_t *jit = flexe_session_jit(session);
@@ -119,29 +127,33 @@ int main(int argc, char **argv)
     uint32_t model_active = periph_touch_active_mask(periph);
     bool running = periph_touch_running(periph);
     bool ok = stage == TOUCH_DONE && active_injected && inactive_injected &&
+              sleep_observed && wake_injected &&
               result[0] == 1u && result[1] == 1u &&
               result[3] == (1u << 4) && result[4] == 1400u &&
               result[6] == 0u && result[7] == 1050u &&
               result[8] == 1000u && result[9] == 1000u &&
-              result[10] == 0u && result[11] == 0u &&
+              result[10] == 5u && result[11] == 4u &&
+              result[13] == 0u && result[15] == 0u &&
               scans >= 3u && model_active == 0u && !running &&
               unhandled == 0u && strstr(uart.data, "TOUCH_DONE") &&
               (disable_jit || jit_instructions != 0u);
 
     printf("%s: ESP-IDF S3 touch-v2 engine=%s stage=0x%08X "
            "active=%u inactive=%u baseline=%u/%u raws=%u/%u "
-           "status=%u/%u teardown=%u scans=%llu model_active=%u "
-           "running=%u unhandled=%u cycles=%llu "
+           "status=%u/%u wake=%u pad=%u sleep_observed=%u "
+           "teardown=%u scans=%llu model_active=%u running=%u "
+           "unhandled=%u cycles=%llu "
            "jit_insns=%llu\n",
            ok ? "PASS" : "FAIL", disable_jit ? "interp" : "jit", stage,
            result[0], result[1], result[8], result[9], result[4], result[7],
-           result[3], result[6], result[10],
+           result[3], result[6], result[10], result[11],
+           sleep_observed ? 1u : 0u, result[13],
            (unsigned long long)scans, model_active, running ? 1u : 0u,
            unhandled,
            (unsigned long long)cpu0->cycle_count,
            (unsigned long long)jit_instructions);
     if (!ok) {
-        fprintf(stderr, "failure=0x%08X UART tail: %s\n", result[11],
+        fprintf(stderr, "failure=0x%08X UART tail: %s\n", result[15],
                 uart.data + (uart.length > 1000u ? uart.length - 1000u : 0u));
         for (size_t i = 0u; i < periph_unhandled_audit_count(periph); i++) {
             periph_unhandled_site_t site;

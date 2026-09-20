@@ -86,7 +86,15 @@ static bool touch_geometry_valid(const flexe_target_desc_t *target,
         desc->sens_data_mask == 0u ||
         desc->sens_threshold_mask != desc->sens_data_mask ||
         desc->sens_active_mask !=
-            ((1u << desc->channel_count) - 1u))
+            ((1u << desc->channel_count) - 1u) ||
+        desc->rtc_wakeup_mask == 0u ||
+        (desc->rtc_wakeup_mask & (desc->rtc_wakeup_mask - 1u)) != 0u ||
+        (desc->rtc_wakeup_mask &
+         ~target->rtc_cntl.wakeup_valid_mask) != 0u ||
+        (desc->rtc_wakeup_mask &
+         (target->rtc_cntl.timer_wakeup_mask |
+          target->rtc_cntl.ext0_wakeup_mask |
+          target->rtc_cntl.ext1_wakeup_mask)) != 0u)
         return false;
     return true;
 }
@@ -395,6 +403,24 @@ uint64_t flexe_touch_v2_scan_count(const flexe_touch_v2_t *touch)
 uint32_t flexe_touch_v2_active_mask(const flexe_touch_v2_t *touch)
 {
     return touch ? touch->active : 0u;
+}
+
+bool flexe_touch_v2_sleep_wake_asserted(const flexe_touch_v2_t *touch)
+{
+    if (!touch || !touch_running_internal(touch)) return false;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
+    unsigned channel = (touch->rtc_sleep_threshold &
+                        desc->rtc_sleep_channel_mask) >>
+                       desc->rtc_sleep_channel_shift;
+    if (channel < desc->first_external_channel ||
+        channel >= desc->channel_count ||
+        (touch_scan_mask(touch) & (1u << channel)) == 0u)
+        return false;
+    uint32_t raw = touch->raw[channel] & desc->sens_data_mask;
+    uint32_t baseline = touch->benchmark[channel] & desc->sens_data_mask;
+    uint32_t threshold = touch->rtc_sleep_threshold &
+                         desc->rtc_sleep_threshold_mask;
+    return raw > baseline && raw - baseline > threshold;
 }
 
 bool flexe_touch_v2_running(const flexe_touch_v2_t *touch)

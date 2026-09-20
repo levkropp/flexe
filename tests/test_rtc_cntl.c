@@ -2333,6 +2333,58 @@ TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_device_wake_sources_register_without_device_layout_knowledge)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    const uint32_t device = 1u << 8u;
+    ASSERT_FALSE(flexe_rtc_cntl_register_wake_sources(NULL, device));
+    ASSERT_FALSE(flexe_rtc_cntl_register_wake_sources(rtc, 0u));
+    ASSERT_FALSE(flexe_rtc_cntl_register_wake_sources(
+        rtc, desc->timer_wakeup_mask));
+    ASSERT_FALSE(flexe_rtc_cntl_register_wake_sources(
+        rtc, 1u << 31u));
+    ASSERT_TRUE(flexe_rtc_cntl_register_wake_sources(rtc, device));
+    ASSERT_FALSE(flexe_rtc_cntl_register_wake_sources(rtc, device));
+
+    mem_write32(mem, desc->base + desc->wakeup_state_offset,
+                device << desc->wakeup_enable_shift);
+    mem_write32(mem, desc->base + desc->sleep_state_offset,
+                desc->sleep_enable_mask);
+    bool deep = true;
+    uint64_t timeout_us = 0u;
+    ASSERT_TRUE(flexe_rtc_cntl_take_sleep_request(
+        rtc, &deep, &timeout_us));
+    ASSERT_FALSE(deep);
+    ASSERT_EQ64(timeout_us, UINT64_MAX);
+    ASSERT_TRUE(flexe_rtc_cntl_has_async_wake(rtc));
+    ASSERT_EQ(flexe_rtc_cntl_poll_wake(rtc, -1, 0u, 0u), 0u);
+    ASSERT_EQ(flexe_rtc_cntl_poll_wake(
+        rtc, -1, 0u, device | (1u << 9u)), device);
+    flexe_rtc_cntl_finish_wake(rtc, device);
+    ASSERT_EQ(mem_read32(mem, desc->base + desc->wakeup_cause_offset),
+              device);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_s3_ext0_ext1_wake_samples_gpio_and_latches_status)
 {
     const flexe_target_desc_t *s3 =
@@ -2372,7 +2424,7 @@ TEST(rtc_cntl_s3_ext0_ext1_wake_samples_gpio_and_latches_status)
     ASSERT_FALSE(deep);
     ASSERT_EQ64(timeout_us, PERIPH_SLEEP_FOREVER);
     ASSERT_EQ(cause, 0u);
-    ASSERT_TRUE(periph_sleep_has_gpio_wake(periph));
+    ASSERT_TRUE(periph_sleep_has_async_wake(periph));
     ASSERT_EQ(periph_sleep_poll_wake(periph), 0u);
     mem_write32(mem, pad4, io->pad_reset[4] | io->pad_mux_mask |
                             (1u << 13u));
@@ -2662,6 +2714,7 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_watchdog_pause_in_sleep_preserves_stage);
     RUN_TEST(rtc_cntl_s3_timer_sleep_wakes_and_reports_cause);
     RUN_TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources);
+    RUN_TEST(rtc_cntl_device_wake_sources_register_without_device_layout_knowledge);
     RUN_TEST(rtc_cntl_s3_ext0_ext1_wake_samples_gpio_and_latches_status);
     RUN_TEST(rtc_cntl_s3_gpio_wake_rejects_invalid_selection_and_retains_status);
     RUN_TEST(rtc_cntl_s3_gpio_wake_preempts_armed_timer);

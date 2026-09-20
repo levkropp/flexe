@@ -592,7 +592,7 @@ bool periph_take_sleep_request(esp32_periph_t *p, bool *deep,
 /* Level-triggered wake sources (EXT0/EXT1/touch), polled while time advances.
  * Returns the rtc.h trigger bits, or 0. */
 uint32_t periph_sleep_poll_wake(esp32_periph_t *p);
-bool periph_sleep_has_gpio_wake(const esp32_periph_t *p);
+bool periph_sleep_has_async_wake(const esp32_periph_t *p);
 void periph_finish_wake(esp32_periph_t *p, uint32_t cause);
 /* Carry the wake and reset cause across a deep-sleep reset, which rebuilds the
  * peripheral model from scratch. */

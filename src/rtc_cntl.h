@@ -163,14 +163,21 @@ void flexe_rtc_cntl_retained_snapshot(
 void flexe_rtc_cntl_retained_restore(
     flexe_rtc_cntl_t *rtc, const flexe_rtc_cntl_retained_t *snapshot);
 
-/* Supported timer/EXT0/EXT1 sleep is consumed by the session's virtual
- * clock/reset path. Unsupported wake sources never produce a synthetic wake. */
+/* Register device-owned wake triggers such as capacitive touch. The RTC
+ * controller validates them against the target wake bitmap and composes them
+ * with its native timer/EXT0/EXT1 sources; unsupported triggers remain
+ * diagnostic instead of producing a synthetic wake. */
+bool flexe_rtc_cntl_register_wake_sources(flexe_rtc_cntl_t *rtc,
+                                          uint32_t mask);
+
+/* Supported sleep is consumed by the session's virtual clock/reset path. */
 bool flexe_rtc_cntl_take_sleep_request(flexe_rtc_cntl_t *rtc,
                                        bool *deep, uint64_t *timeout_us);
-bool flexe_rtc_cntl_has_gpio_wake(const flexe_rtc_cntl_t *rtc);
-uint32_t flexe_rtc_cntl_poll_gpio_wake(flexe_rtc_cntl_t *rtc,
-                                       int ext0_level,
-                                       uint32_t ext1_high_mask);
+bool flexe_rtc_cntl_has_async_wake(const flexe_rtc_cntl_t *rtc);
+uint32_t flexe_rtc_cntl_poll_wake(flexe_rtc_cntl_t *rtc,
+                                  int ext0_level,
+                                  uint32_t ext1_high_mask,
+                                  uint32_t asserted_device_mask);
 void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause);
 void flexe_rtc_cntl_set_wake_state(flexe_rtc_cntl_t *rtc,
                                    uint32_t cause, uint32_t reset_cause);

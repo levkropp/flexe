@@ -236,8 +236,10 @@ driver ring buffer, teardown, deterministic replay, and zero unsupported MMIO.
 `check-s3-idf-touch.sh` runs the public ESP32-S3 touch-v2 driver twice per
 engine. It feeds an electrode through inactive, active, and released values;
 checks raw and benchmark selection, active/inactive RTC interrupts and their
-ISR-to-task notifications; and verifies complete driver teardown with zero
-unsupported MMIO.
+ISR-to-task notifications; arms the public touch wake API, observes the guest
+stop in light sleep, injects a second threshold crossing, verifies the touch
+wake cause and pad; and checks complete driver teardown with zero unsupported
+MMIO.
 `check-s3-idf-aes.sh` likewise runs the public mbedTLS AES API twice per engine,
 covering all six S3 block modes, AES-128/256 known-answer vectors, partial CTR,
 and a 4 KiB interrupt-driven GDMA round trip.

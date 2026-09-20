@@ -123,6 +123,35 @@ TEST(touch_v2_scans_host_samples_and_routes_rtc_interrupts)
                           touch->sens_debounce_mask,
                           touch->sens_debounce_shift), 0u);
 
+    /* Device-owned wake registration lets the RTC controller accept the
+     * touch trigger without teaching RTC_CNTL about touch register layout. */
+    uint32_t sleep_threshold =
+        (channel << touch->rtc_sleep_channel_shift) | 200u;
+    mem_write32(mem, threshold_addr, 1000u);
+    mem_write32(mem, rtc->base + touch->rtc_sleep_threshold_offset,
+                sleep_threshold);
+    mem_write32(mem, rtc->base + rtc->wakeup_state_offset,
+                touch->rtc_wakeup_mask << rtc->wakeup_enable_shift);
+    mem_write32(mem, rtc->base + rtc->sleep_state_offset,
+                rtc->sleep_enable_mask);
+    bool deep = true;
+    uint64_t timeout_us = 0u;
+    uint32_t cause = UINT32_MAX;
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                          &cause));
+    ASSERT_FALSE(deep);
+    ASSERT_EQ64(timeout_us, PERIPH_SLEEP_FOREVER);
+    ASSERT_EQ(cause, 0u);
+    ASSERT_TRUE(periph_sleep_has_async_wake(periph));
+    ASSERT_EQ(periph_sleep_poll_wake(periph), 0u);
+    periph_touch_set_value(periph, (int)channel, 1400u);
+    ASSERT_EQ(periph_touch_active_mask(periph), 0u);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), touch->rtc_wakeup_mask);
+    periph_finish_wake(periph, touch->rtc_wakeup_mask);
+    ASSERT_EQ(mem_read32(mem, rtc->base + rtc->wakeup_cause_offset),
+              touch->rtc_wakeup_mask);
+    ASSERT_EQ(periph_sleep_poll_wake(periph), 0u);
+
     mem_write32(mem, rtc->base + touch->rtc_control2_offset,
                 control | touch->rtc_reset_mask);
     ASSERT_FALSE(periph_touch_running(periph));
@@ -149,6 +178,15 @@ TEST(touch_v2_rejects_invalid_or_absent_geometry)
     flexe_touch_v2_desc_t invalid_touch =
         *flexe_touch_v2_descriptor(s3);
     invalid_touch.channel_count = FLEXE_TARGET_TOUCH_CHANNEL_MAX + 1u;
+    invalid.extension[0].descriptor = &invalid_touch;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(flexe_touch_v2_create(mem, NULL, NULL) == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid_touch = *flexe_touch_v2_descriptor(s3);
+    invalid_touch.rtc_wakeup_mask = s3->rtc_cntl.timer_wakeup_mask;
     invalid.extension[0].descriptor = &invalid_touch;
     mem = mem_create_for_target(&invalid);
     ASSERT_TRUE(mem != NULL);

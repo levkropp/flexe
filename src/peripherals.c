@@ -15941,6 +15941,13 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             p->touch_v2 = flexe_touch_v2_create(
                 mem, target_touch_irq, p);
             flexe_sens_attach_touch_v2(p->target_sens, p->touch_v2);
+            if (p->target_rtc_cntl && p->touch_v2 &&
+                !flexe_rtc_cntl_register_wake_sources(
+                    p->target_rtc_cntl,
+                    touch_v2_desc->rtc_wakeup_mask)) {
+                periph_destroy(p);
+                return NULL;
+            }
             if (p->target_rtc_cntl && p->touch_v2)
                 flexe_rtc_cntl_set_config_listener(
                     p->target_rtc_cntl,
@@ -16914,21 +16921,27 @@ uint32_t periph_sleep_poll_wake(esp32_periph_t *p)
 {
     if (p && p->target_rtc_cntl) {
         uint32_t high = 0u;
+        uint32_t devices = 0u;
         int ext0 = flexe_rtc_io_ext0_selector(p->target_rtc_io);
         int ext0_level = ext0 >= 0 ?
             flexe_rtc_io_input_level(p->target_rtc_io, (unsigned)ext0) : -1;
         for (unsigned pin = 0u; pin < p->target->rtc_io.gpio_count; pin++)
             if (flexe_gpio_input_level(p->target_gpio, pin) == 1)
                 high |= 1u << pin;
-        return flexe_rtc_cntl_poll_gpio_wake(p->target_rtc_cntl,
-                                             ext0_level, high);
+        const flexe_touch_v2_desc_t *touch_desc =
+            flexe_touch_v2_descriptor(p->target);
+        if (touch_desc &&
+            flexe_touch_v2_sleep_wake_asserted(p->touch_v2))
+            devices |= touch_desc->rtc_wakeup_mask;
+        return flexe_rtc_cntl_poll_wake(p->target_rtc_cntl, ext0_level,
+                                        high, devices);
     }
     return p ? rtc_wake_condition(p) : 0;
 }
 
-bool periph_sleep_has_gpio_wake(const esp32_periph_t *p)
+bool periph_sleep_has_async_wake(const esp32_periph_t *p)
 {
-    return p && flexe_rtc_cntl_has_gpio_wake(p->target_rtc_cntl);
+    return p && flexe_rtc_cntl_has_async_wake(p->target_rtc_cntl);
 }
 
 /* Record why the chip woke and release the guest's wait. Light sleep resumes

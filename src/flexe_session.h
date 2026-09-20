@@ -103,7 +103,9 @@ int                flexe_session_is_native_freertos(const flexe_session_t *s);
 /* How many times the machine has been rebuilt: software resets and
  * deep-sleep wakes. */
 unsigned           flexe_session_reset_count(const flexe_session_t *s);
-/* True while an S3 EXT0/EXT1 wake is waiting for host-driven GPIO input. */
+/* True while an asynchronous S3 wake source is waiting for host input. */
+bool               flexe_session_async_sleeping(const flexe_session_t *s);
+/* Compatibility alias for frontends written before touch wake support. */
 bool               flexe_session_gpio_sleeping(const flexe_session_t *s);
 jit_state_t       *flexe_session_jit(flexe_session_t *s);
 

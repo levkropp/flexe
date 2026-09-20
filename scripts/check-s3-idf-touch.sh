@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pinned ESP-IDF 5.3.2 capacitive-touch-v2 replay in both engines, repeated
-# to gate host sample delivery, RTC interrupt ordering, and teardown.
+# to gate host sample delivery, RTC interrupt ordering, touch wake, and teardown.
 set -euo pipefail
 
 : "${S3_IDF_TOUCH_BIN:?set S3_IDF_TOUCH_BIN to the application image}"
@@ -13,8 +13,8 @@ runner_command=("$runner")
 if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
     runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
 fi
-pinned_bin=1d0c4ffebcedb1637421cb34cb3bd4f4a61d0da2fc41c65c5a644b3c453753b2
-pinned_elf=c53b7ae278cd5d54480deeb833cc3e7e62414c905f48a60ed560ae905cfcc6d0
+pinned_bin=02103cf54ec367268861e28cb5f8211c07cbe09a4b04b3f51d192fe1698141cd
+pinned_elf=b3ea2e3d5d9dbd9e74fe55ba7818ce01734cbf82d60ee0b207faf13cd9afa9ed
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
 expected_bin=${S3_IDF_TOUCH_BIN_SHA256:-$pinned_bin}
 expected_elf=${S3_IDF_TOUCH_ELF_SHA256:-$pinned_elf}
@@ -78,7 +78,8 @@ for engine in interp jit; do
         error="$tmpdir/$engine-$replay.err"
         grep -Eq "^PASS: ESP-IDF S3 touch-v2 engine=$engine "\
 "stage=0x544F5543 active=1 inactive=1 baseline=1000/1000 "\
-"raws=1400/1050 status=16/0 teardown=0 scans=7 "\
+"raws=1400/1050 status=16/0 wake=5 pad=4 sleep_observed=1 "\
+"teardown=0 scans=8 "\
 "model_active=0 running=0 unhandled=0 " "$output" || {
             echo "FAIL: $engine $replay touch-v2 result changed" >&2
             cat "$output" "$error" >&2
@@ -115,4 +116,4 @@ cmp -s "$tmpdir/interp-first.normalized" \
     exit 1
 }
 
-echo "PASS: ESP-IDF S3 touch-v2 scanned host-fed electrode values, reported active/inactive RTC interrupts, retained benchmark/raw data, and tore down identically in interpreter and JIT with zero unsupported MMIO"
+echo "PASS: ESP-IDF S3 touch-v2 scanned host-fed electrode values, reported active/inactive RTC interrupts, woke light sleep through the registered touch source, retained benchmark/raw data, and tore down identically in interpreter and JIT with zero unsupported MMIO"

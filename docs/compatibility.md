@@ -342,8 +342,9 @@ state; DIG_ISO does the same for pad/global isolation and autohold policy.
 Unattached consumers do not turn those controls into invented electrical or RF
 behavior. The RTC
 interrupt bank implements target-described enable/raw/masked-status/W1C state
-and level routing; physical producers such as brownout, touch, and ULP remain
-unsupported until their respective device models attach to that API. The
+and level routing. Touch-v2 attaches its interrupts and light-sleep trigger
+through device-owned APIs; physical producers such as brownout and ULP remain
+unsupported until their respective device models attach. The
 four-stage RTC watchdog runs from the selected slow clock and implements the
 revision-profile stage-0 multiplier, feed, write protection, interrupt, and
 reset actions, including pause-in-sleep behavior. Watchdog CPU/system/RTC reset

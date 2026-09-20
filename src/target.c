@@ -57,6 +57,7 @@ static const flexe_touch_v2_desc_t ESP32S3_TOUCH_V2 = {
     .interrupt_scan_done_mask = 1u << 4,
     .interrupt_timeout_mask = 1u << 18,
     .interrupt_approach_done_mask = 1u << 20,
+    .rtc_wakeup_mask = 1u << 8,
 };
 
 /* Image chip IDs follow Espressif's public esp_chip_id_t values. The mapped

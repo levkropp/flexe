@@ -69,6 +69,7 @@ typedef struct {
     uint32_t interrupt_scan_done_mask;
     uint32_t interrupt_timeout_mask;
     uint32_t interrupt_approach_done_mask;
+    uint32_t rtc_wakeup_mask;
 } flexe_touch_v2_desc_t;
 
 typedef struct flexe_touch_v2 flexe_touch_v2_t;
@@ -100,6 +101,7 @@ void flexe_touch_v2_set_raw(
     flexe_touch_v2_t *touch, unsigned channel, uint32_t value);
 uint64_t flexe_touch_v2_scan_count(const flexe_touch_v2_t *touch);
 uint32_t flexe_touch_v2_active_mask(const flexe_touch_v2_t *touch);
+bool flexe_touch_v2_sleep_wake_asserted(const flexe_touch_v2_t *touch);
 bool flexe_touch_v2_running(const flexe_touch_v2_t *touch);
 
 #endif /* FLEXE_TOUCH_V2_H */

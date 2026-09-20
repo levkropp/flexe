@@ -78,12 +78,12 @@ struct flexe_session {
     uint32_t           initial_sp;
     unsigned           resets;
     int                preserve_rtc_mem;
-    bool               gpio_sleeping;
-    bool               gpio_sleep_deep;
-    uint64_t           gpio_sleep_timeout_us;
-    uint64_t           gpio_sleep_elapsed_cycles;
-    uint32_t           gpio_sleep_phase_cycles;
-    uint32_t           gpio_sleep_mhz;
+    bool               async_sleeping;
+    bool               async_sleep_deep;
+    uint64_t           async_sleep_timeout_us;
+    uint64_t           async_sleep_elapsed_cycles;
+    uint32_t           async_sleep_phase_cycles;
+    uint32_t           async_sleep_mhz;
 };
 
 /* Let the esp_timer delay()/usleep() shims block on the FreeRTOS scheduler
@@ -698,7 +698,7 @@ void flexe_session_reset(flexe_session_t *s)
 {
     if (!s) return;
     bool flash_power_cycle = s->preserve_rtc_mem != 0;
-    s->gpio_sleeping = false;
+    s->async_sleeping = false;
     uint64_t cycles = s->cpu[0].cycle_count;
 
     /* RTC-held pads keep their state across the reset, including S3 RTC and
@@ -866,9 +866,14 @@ unsigned flexe_session_reset_count(const flexe_session_t *s)
     return s ? s->resets : 0u;
 }
 
+bool flexe_session_async_sleeping(const flexe_session_t *s)
+{
+    return s && s->async_sleeping;
+}
+
 bool flexe_session_gpio_sleeping(const flexe_session_t *s)
 {
-    return s && s->gpio_sleeping;
+    return flexe_session_async_sleeping(s);
 }
 
 int flexe_session_is_native_freertos(const flexe_session_t *s)
@@ -884,24 +889,24 @@ jit_state_t *flexe_session_jit(flexe_session_t *s)
 int flexe_session_run_core(flexe_session_t *s, int core, int max_cycles)
 {
     if (!s || core < 0 || core > 1 || max_cycles <= 0) return 0;
-    if (s->gpio_sleeping) {
+    if (s->async_sleeping) {
         if (core != 0) return 0;
         uint64_t step = (uint32_t)max_cycles;
-        uint64_t slice = (uint64_t)s->gpio_sleep_mhz * 1000u;
+        uint64_t slice = (uint64_t)s->async_sleep_mhz * 1000u;
         if (step > slice) step = slice;
-        if (s->gpio_sleep_timeout_us != PERIPH_SLEEP_FOREVER) {
-            uint64_t deadline = s->gpio_sleep_timeout_us *
-                                s->gpio_sleep_mhz;
-            uint64_t left = s->gpio_sleep_elapsed_cycles < deadline ?
-                deadline - s->gpio_sleep_elapsed_cycles : 0u;
+        if (s->async_sleep_timeout_us != PERIPH_SLEEP_FOREVER) {
+            uint64_t deadline = s->async_sleep_timeout_us *
+                                s->async_sleep_mhz;
+            uint64_t left = s->async_sleep_elapsed_cycles < deadline ?
+                deadline - s->async_sleep_elapsed_cycles : 0u;
             if (step > left) step = left;
         }
         if (step == 0u) return 0;
         /* An external event arrives in host time. Do not race the finite
-         * CLI cycle budget to completion before a host GPIO command can be
+         * CLI cycle budget to completion before a host input event can be
          * delivered; at most one guest millisecond is waited per batch. */
-        uint64_t wait_us = (s->gpio_sleep_phase_cycles + step) /
-                           s->gpio_sleep_mhz;
+        uint64_t wait_us = (s->async_sleep_phase_cycles + step) /
+                           s->async_sleep_mhz;
         if (wait_us != 0u) {
             struct timespec wait = {
                 .tv_sec = (time_t)(wait_us / 1000000u),
@@ -909,10 +914,10 @@ int flexe_session_run_core(flexe_session_t *s, int core, int max_cycles)
             };
             (void)nanosleep(&wait, NULL);
         }
-        s->gpio_sleep_elapsed_cycles += step;
-        uint64_t phase = s->gpio_sleep_phase_cycles + step;
-        uint64_t whole_us = phase / s->gpio_sleep_mhz;
-        s->gpio_sleep_phase_cycles = (uint32_t)(phase % s->gpio_sleep_mhz);
+        s->async_sleep_elapsed_cycles += step;
+        uint64_t phase = s->async_sleep_phase_cycles + step;
+        uint64_t whole_us = phase / s->async_sleep_mhz;
+        s->async_sleep_phase_cycles = (uint32_t)(phase % s->async_sleep_mhz);
         for (unsigned c = 0u; c < 2u; c++) {
             s->cpu[c].virtual_time_us += whole_us;
             xtensa_advance_idle_cycles(&s->cpu[c], step);
@@ -985,14 +990,14 @@ static void session_reset_app_cpu(flexe_session_t *s)
         freertos_stubs_attach_cpu(s->frt, 1, cpu);
 }
 
-static void session_finish_gpio_sleep(flexe_session_t *s, uint32_t cause)
+static void session_finish_async_sleep(flexe_session_t *s, uint32_t cause)
 {
-    uint64_t slept = s->gpio_sleep_elapsed_cycles / s->gpio_sleep_mhz;
+    uint64_t slept = s->async_sleep_elapsed_cycles / s->async_sleep_mhz;
     fprintf(stderr, "[sleep] %s sleep, woke after %llu us, cause=0x%X\n",
-            s->gpio_sleep_deep ? "deep" : "light",
+            s->async_sleep_deep ? "deep" : "light",
             (unsigned long long)slept, cause);
-    bool deep = s->gpio_sleep_deep;
-    s->gpio_sleeping = false;
+    bool deep = s->async_sleep_deep;
+    s->async_sleeping = false;
     if (deep) {
         s->preserve_rtc_mem = 1;
         flexe_session_reset(s);
@@ -1024,17 +1029,18 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
         }
     }
 
-    /* EXT wake is cooperative: a sleeping chip retires no instructions on
-     * either core, but each host batch may drive a GPIO input before we
-     * sample the RTC wake circuit. The timer, if armed, is a fallback. */
-    if (s->gpio_sleeping) {
+    /* Asynchronous wake is cooperative: a sleeping chip retires no
+     * instructions on either core, but each host batch may drive a GPIO or
+     * device input before we sample the RTC wake circuit. The timer, if
+     * armed, is a fallback. */
+    if (s->async_sleeping) {
         uint32_t cause = periph_sleep_poll_wake(s->periph);
         if (cause == 0u &&
-            s->gpio_sleep_timeout_us != PERIPH_SLEEP_FOREVER &&
-            s->gpio_sleep_elapsed_cycles >=
-                s->gpio_sleep_timeout_us * s->gpio_sleep_mhz)
+            s->async_sleep_timeout_us != PERIPH_SLEEP_FOREVER &&
+            s->async_sleep_elapsed_cycles >=
+                s->async_sleep_timeout_us * s->async_sleep_mhz)
             cause = RTC_TIMER_WAKE_CAUSE;
-        if (cause != 0u) session_finish_gpio_sleep(s, cause);
+        if (cause != 0u) session_finish_async_sleep(s, cause);
         return;
     }
 
@@ -1150,14 +1156,14 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
             fprintf(stderr, "[sleep] request deep=%d timeout_us=%llu cause=0x%X "
                     "cycles=%llu\n", deep, (unsigned long long)timeout_us, cause,
                     (unsigned long long)s->cpu[0].cycle_count);
-            if (periph_sleep_has_gpio_wake(s->periph)) {
-                s->gpio_sleeping = true;
-                s->gpio_sleep_deep = deep;
-                s->gpio_sleep_timeout_us = timeout_us;
-                s->gpio_sleep_elapsed_cycles = 0u;
-                s->gpio_sleep_phase_cycles = 0u;
-                s->gpio_sleep_mhz = xtensa_cpu_freq_mhz(&s->cpu[0]);
-                if (cause != 0u) session_finish_gpio_sleep(s, cause);
+            if (periph_sleep_has_async_wake(s->periph)) {
+                s->async_sleeping = true;
+                s->async_sleep_deep = deep;
+                s->async_sleep_timeout_us = timeout_us;
+                s->async_sleep_elapsed_cycles = 0u;
+                s->async_sleep_phase_cycles = 0u;
+                s->async_sleep_mhz = xtensa_cpu_freq_mhz(&s->cpu[0]);
+                if (cause != 0u) session_finish_async_sleep(s, cause);
                 return;
             }
             /* A sleep with nothing armed to end it would step forward for
