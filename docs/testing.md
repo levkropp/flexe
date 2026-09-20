@@ -24,12 +24,15 @@ error, which keeps misspelled focused checks from silently passing:
 ```sh
 ./build/xtensa-tests system_clock
 ./build/xtensa-tests --list rmt
-./build/xtensa-tests --quiet
+./scripts/run-unit-tests.sh
+./scripts/run-unit-tests.sh system_clock
 ```
 
-`--quiet` retains assertion diagnostics and the final totals without printing
-one line per passing test. It is the default CI form and keeps full-suite logs
-small during rapid hardware-model iterations.
+The wrapper runs the binary with `--quiet`, captures expected emulator
+diagnostics, and prints only the totals after a successful run. On failure it
+replays complete stdout and stderr, so compact routine runs do not trade away
+debug information. Set `FLEXE_BUILD_DIR` for another build tree or
+`FLEXE_TEST_BINARY` for an explicit executable. CI uses the same entry point.
 
 Peripheral-specific target geometry belongs in the owning device header and
 is attached through the target extension registry. Do not add new device
@@ -56,7 +59,7 @@ cmake -S . -B build-asan \
   -DFLEXE_SANITIZERS=ON
 cmake --build build-asan --target xtensa-tests -j
 ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
-  ./build-asan/xtensa-tests
+  FLEXE_BUILD_DIR=build-asan ./scripts/run-unit-tests.sh
 ```
 
 `FLEXE_SANITIZERS=ON` enables ASan+UBSan and disables LTO for this build, which
