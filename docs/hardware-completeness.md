@@ -57,7 +57,7 @@ even when a firmware workflow succeeds.
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_syscon_memory.c`, `tests/test_esp32s3_extmem.c`, WLED and zero-unsupported stock Arduino production audits | Cache-array/internal-SRAM ownership has exact reset, masking, and sticky locks; external flash/PSRAM access regions have exact reset, masking, and semantic state. Cache topology/timing, the external-region lock, and protection-fault generation remain unsupported. |
 | S3 CPU assist/debug recorder | Partial (MMIO) | `tests/test_assist_debug.c`, zero-site WLED production audit | Both cores implement target-described PDEBUG enable, live/frozen PC and SP recording, and silicon DATE behavior without an instruction-loop hook. Detailed debug-bus payload, stack/area watchpoints, exception records, and trace memory remain diagnostic. |
 | S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (masked RTC configuration, supply, analog-control and power/isolation-domain resolution, fault-injection selection, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, zero-unsupported native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; OPTIONS0, ANA_CONF, SLP_REJECT_CONF, SDIO/BIAS/drive configuration, FIB reset-source selection, digital-pad/global isolation, digital domains, and RTC-local domains have architectural state, with selected consumers connected. Brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
-| S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
+| S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties, byte-identical replay, and zero unsupported accesses | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame with zero unsupported startup/device accesses; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback with zero unsupported accesses | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path; pulse RAM becomes inaccessible and loses contents under `RMT_MEM_FORCE_PD`. DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh`, WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
@@ -779,14 +779,16 @@ feature. The stock Arduino-ESP32 3.3.11
 `tests/fixtures/s3_ledc/s3_ledc.ino` sets GPIO4 to 5 kHz at 8-bit
 resolution, cycles through duties 64/192/96/0, and reads each back after a
 PWM period. The pinned merged image SHA-256 is
-`72e3198ed282afaf1cffb6c478b715ec8d7c6d40965e7a90df4fd5c0f838e60e`,
+`510702d6b837ed5115776882cd3658a900e82f3ad72d51b7b7ce87430df7268e`,
 with ELF SHA-256
-`47b844193180ca6e8323157d33eeff5dc72f6ec38896589c1bef938006d23e83`.
-`scripts/check-s3-ledc.sh` requires byte-identical event replay and no LEDC
-MMIO fallback, while 132 unrelated unsupported accesses stay visible:
+`61a0c58e32a915e09fbf15b4dd5f63c2346370fb8e436d0a995e14a381596ef7`.
+`scripts/check-s3-ledc.sh` requires byte-identical event replay and zero
+unsupported accesses. `SOURCE_DATE_EPOCH` makes the artifact reproducible
+across clean rebuilds:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- tests/fixtures/s3_ledc) \
+arduino-cli compile --clean --fqbn esp32:esp32:esp32s3 \
   --build-path /tmp/flexe-s3-ledc-fixture-build \
   --build-property compiler.optimization_flags=-Os tests/fixtures/s3_ledc
 S3_LEDC_BIN=/tmp/flexe-s3-ledc-fixture-build/s3_ledc.ino.merged.bin \

@@ -9,9 +9,9 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
-expected_bin=72e3198ed282afaf1cffb6c478b715ec8d7c6d40965e7a90df4fd5c0f838e60e
-expected_elf=47b844193180ca6e8323157d33eeff5dc72f6ec38896589c1bef938006d23e83
-expected_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
+expected_bin=${S3_LEDC_BIN_SHA256:-510702d6b837ed5115776882cd3658a900e82f3ad72d51b7b7ce87430df7268e}
+expected_elf=${S3_LEDC_ELF_SHA256:-61a0c58e32a915e09fbf15b4dd5f63c2346370fb8e436d0a995e14a381596ef7}
+expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
 for entry in "$S3_LEDC_BIN:$expected_bin" "$S3_LEDC_ELF:$expected_elf" \
              "$S3_ROM_ELF:$expected_rom"; do
     file=${entry%:*}
@@ -71,4 +71,9 @@ if ! grep -q '"gpio":4,"speed":1,"ch":0,"freq":5000,"duty":0,"max":255,"en":1,"i
     exit 1
 fi
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/guest.1")
-echo "PASS: stock Arduino S3 LEDC drove GPIO4 at 5 kHz through four duties; deterministic replay; $unhandled unrelated unsupported accesses remain visible"
+unhandled=${unhandled:-0}
+if [[ "$unhandled" != 0 ]]; then
+    echo "FAIL: stock Arduino S3 LEDC used $unhandled unsupported accesses" >&2
+    exit 1
+fi
+echo "PASS: stock Arduino S3 LEDC drove GPIO4 at 5 kHz through four duties; deterministic replay; zero unsupported accesses"
