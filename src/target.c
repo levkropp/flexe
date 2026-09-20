@@ -811,6 +811,29 @@ static const flexe_target_desc_t TARGETS[] = {
                 { 0x02Cu, 0x00008000u, 0x0000FF00u },
                 { 0x030u, 0x10200A08u, UINT32_MAX },
             },
+            /* Remaining RTC sleep-path configuration. Functional mode keeps
+             * analog bias/drive values as exact architectural state while
+             * deliberately collapsing their electrical voltage and settling
+             * effects. TOUCH_CTRL2 is readable at reset, but writes remain
+             * diagnostic until a touch FSM consumes them. */
+            .config_register_count = 5u,
+            .config_register = {
+                /* SLP_REJECT_CONF */
+                { 0x068u, 0x00000000u, 0xFFFFF000u,
+                  0x00000000u, 0xFFFFF000u },
+                /* SDIO_CONF; REG1P8_READY is physically read-only. */
+                { 0x07Cu, 0x0AB0BE0Au, 0xFEFFFEFFu,
+                  0x01000000u, 0xFEFFFEFFu },
+                /* BIAS_CONF */
+                { 0x080u, 0x00010800u, 0x3FFFFC00u,
+                  0x00000000u, 0x3FFFFC00u },
+                /* REGULATOR_DRV_CTRL */
+                { 0x08Cu, 0x00000000u, 0x0FFFFFFFu,
+                  0x00000000u, 0x0FFFFFFFu },
+                /* TOUCH_CTRL2 */
+                { 0x10Cu, 0x000840CCu, 0xFFFFFFFCu,
+                  0x00000000u, 0x00000000u },
+            },
             .cpu_stall_enable_offset = 0x01Cu,
             .cpu_stall_enable_mask = 1u,
             .wakeup_state_offset = 0x03Cu,

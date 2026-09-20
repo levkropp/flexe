@@ -56,7 +56,7 @@ even when a firmware workflow succeeds.
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_esp32s3_extmem.c`, WLED production audit | Cache-array/internal-SRAM ownership has exact reset, masking, locks, and semantic state; protection configuration retains documented policy. Cache topology/timing and access-fault generation remain unsupported. |
 | S3 CPU assist/debug recorder | Partial (MMIO) | `tests/test_assist_debug.c`, zero-site WLED production audit | Both cores implement target-described PDEBUG enable, live/frozen PC and SP recording, and silicon DATE behavior without an instruction-loop hook. Detailed debug-bus payload, stack/area watchpoints, exception records, and trace memory remain diagnostic. |
-| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (supply, analog-control and power/isolation-domain resolution, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; OPTIONS0, ANA_CONF, digital-pad/global isolation, digital domains, and RTC-local domains publish normalized state, with selected consumers connected. Brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
+| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (masked RTC configuration, supply, analog-control and power/isolation-domain resolution, CPU-follow, sleep/wake, and stall enable), ESP-IDF cross-core, restart, zero-unsupported native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; OPTIONS0, ANA_CONF, SLP_REJECT_CONF, SDIO/BIAS/drive configuration, digital-pad/global isolation, digital domains, and RTC-local domains have architectural state, with selected consumers connected. Brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
@@ -212,13 +212,22 @@ FreeRTOS heartbeat afterward. Its image SHA-256 is
 `cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2`
 and matching ELF SHA-256 is
 `a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294`.
-The two complete replays are byte-identical; 162 other unsupported accesses
-across both boots remain visible. No unsupported sites remain for S3 sleep
-timer, state, wake-enable, cause, or digital-domain fields. The nominal
+The two complete replays are byte-identical and the full reports contain zero
+unsupported MMIO accesses. No unsupported sites remain in the validated S3
+timer-sleep boot, sleep, reset, and second-boot path. The nominal
 slow-clock model yielded about 48.9/19.3 ms for the guest's requested 50/20 ms,
 so this is functional wake ordering, not calibrated sleep duration. Touch/ULP
 wake and analog voltage-transition timing are not modeled; an unarmed timer or
 those sources do not synthesize a wake.
+The target-described RTC configuration bank gives SLP_REJECT_CONF, SDIO_CONF,
+BIAS_CONF, REGULATOR_DRV_CTRL, and TOUCH_CTRL2 exact reset, masking, and
+readback behavior without teaching the device model S3 addresses. Bias and
+drive values are retained while their electrical voltage/settling effects are
+deliberately collapsed in functional mode. SDIO's readiness field remains
+read-only, reserved writes remain diagnostic, and activating the touch FSM
+still reports an unsupported effect until a touch engine consumes it. Valid
+oscillator gating fields in CLK_CONF likewise retain their exact value while
+the modeled slow/fast muxes resolve immediately.
 The separate RTC fast-clock mux now selects the target-described 20 MHz XTAL/2
 or nominal 17.5 MHz RC_FAST source, while the slow counter keeps its own mux and
 phase. `RTC_CNTL_DATE_REG` resets to the S3 revision value and retains its
@@ -308,8 +317,9 @@ Its image SHA-256 is
 `d4897a5ea5b5805bfda3ac3f624788f2600c9f17653e07f8dee7bea67df91314`
 and ELF SHA-256 is
 `27a2d3710e867e0310494a29a6c3612878ec10796a5ea32beeb30a4eca627d4d`.
-The gate reports 162 unrelated unsupported accesses across both boots; the
-EXT selection/state/status and digital-domain sites are modeled.
+Both complete reports contain zero unsupported MMIO accesses; the EXT
+selection/state/status, digital-domain, and shared RTC configuration sites are
+all modeled.
 Physical pull resistors, voltage thresholds, glitches/filtering, and pad
 electrical behavior are not inferred from the host's digital level:
 

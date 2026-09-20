@@ -67,12 +67,15 @@ grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.1" ||
 if grep -Eq '  [RW]  0x600080(04|08|18|1C|20|24|28|2C|30|3C) |  [RW]  0x60008130 ' "$tmpdir/emu.1"; then
     fail "RTC timer, sequencing, sleep state, or wake-cause MMIO remains unsupported"
 fi
-unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.1")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 162 ]] ||
-    fail "unrelated unsupported MMIO count changed from pinned baseline"
+unhandled=$(awk '
+    /^Unhandled:/ { print $2; exit }
+    /^--- Unsupported MMIO sites \(0,/ { print 0; exit }
+' "$tmpdir/emu.1")
+[[ "$unhandled" == 0 ]] ||
+    fail "stock timer sleep must have zero unsupported MMIO accesses"
 cmp -s "$tmpdir/guest.1" "$tmpdir/guest.2" ||
     fail "guest UART/USB transcript differs on replay"
 cmp -s "$tmpdir/emu.1" "$tmpdir/emu.2" ||
     fail "sleep/reset timing or MMIO report differs on replay"
 
-echo "PASS: native ESP-IDF S3 timer light/deep sleep, RTC retention, wake/reset cause, sustained second boot and byte-identical replay; $unhandled unrelated unsupported accesses remain visible"
+echo "PASS: native ESP-IDF S3 timer light/deep sleep, RTC retention, wake/reset cause, sustained second boot, byte-identical replay, and zero unsupported MMIO accesses"

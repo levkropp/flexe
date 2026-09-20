@@ -57,6 +57,7 @@ struct flexe_rtc_cntl {
     bool interrupt_level;
     uint32_t wdt_config[FLEXE_TARGET_RTC_WDT_CONFIG_MAX];
     uint32_t sequence_reg[FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX];
+    uint32_t config_reg[FLEXE_TARGET_RTC_CONFIG_REGISTER_MAX];
     uint32_t wdt_write_protect;
     uint64_t wdt_stage_ticks;
     uint8_t wdt_stage;
@@ -617,6 +618,55 @@ static int rtc_sequence_index(const flexe_rtc_cntl_desc_t *desc,
     return -1;
 }
 
+static int rtc_config_index(const flexe_rtc_cntl_desc_t *desc,
+                            uint32_t offset)
+{
+    for (unsigned i = 0u; i < desc->config_register_count; i++)
+        if (offset == desc->config_register[i].offset) return (int)i;
+    return -1;
+}
+
+static bool rtc_existing_register_offset(
+    const flexe_rtc_cntl_desc_t *desc, uint16_t offset)
+{
+    if (offset == desc->time_update_offset ||
+        offset == desc->time_low_offset ||
+        offset == desc->time_high_offset ||
+        offset == desc->reset_state_offset ||
+        offset == desc->clock_conf_offset ||
+        offset == desc->analog_conf_offset ||
+        offset == desc->date_offset ||
+        rtc_interrupt_offset(desc, offset) ||
+        rtc_wdt_offset(desc, offset) ||
+        rtc_pad_hold_offset(desc, offset))
+        return true;
+    for (unsigned i = 0u; i < desc->store_count; i++)
+        if (offset == desc->store_offset[i]) return true;
+    for (unsigned i = 0u; i < desc->sequence_register_count; i++)
+        if (offset == desc->sequence_register[i].offset) return true;
+    if (desc->cpu_stall_high_offset != 0u &&
+        (offset == desc->cpu_stall_options_offset ||
+         offset == desc->cpu_stall_high_offset))
+        return true;
+    if (desc->usb_conf_offset != 0u && offset == desc->usb_conf_offset)
+        return true;
+    if (desc->sleep_timer_low_offset != 0u) {
+        const uint16_t sleep_offsets[] = {
+            desc->sleep_timer_low_offset, desc->sleep_timer_high_offset,
+            desc->sleep_state_offset, desc->wakeup_state_offset,
+            desc->digital_power_offset, desc->wakeup_cause_offset,
+            desc->regulator_offset, desc->rtc_power_offset,
+            desc->digital_iso_offset, desc->ext_wakeup_config_offset,
+            desc->ext1_select_offset, desc->ext1_status_offset,
+            desc->brownout_offset,
+        };
+        for (unsigned i = 0u;
+             i < sizeof(sleep_offsets) / sizeof(sleep_offsets[0]); i++)
+            if (offset == sleep_offsets[i]) return true;
+    }
+    return false;
+}
+
 static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
 {
     if (!target || !(target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1))
@@ -1159,6 +1209,24 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
                 if (offset == sleep_offsets[i]) return false;
         }
     }
+    if (desc->config_register_count >
+        FLEXE_TARGET_RTC_CONFIG_REGISTER_MAX)
+        return false;
+    for (unsigned i = 0u; i < desc->config_register_count; i++) {
+        const flexe_rtc_config_register_desc_t *reg =
+            &desc->config_register[i];
+        if (!rtc_offset_valid(reg->offset, desc->register_size) ||
+            reg->writable_mask == 0u ||
+            (reg->writable_mask & reg->read_only_mask) != 0u ||
+            (reg->supported_mask & ~reg->writable_mask) != 0u ||
+            (reg->reset &
+             ~(reg->writable_mask | reg->read_only_mask)) != 0u ||
+            rtc_existing_register_offset(desc, reg->offset))
+            return false;
+        for (unsigned j = 0u; j < i; j++)
+            if (reg->offset == desc->config_register[j].offset)
+                return false;
+    }
     return true;
 }
 
@@ -1433,6 +1501,8 @@ static uint32_t rtc_cntl_read(void *ctx, uint32_t addr)
     if (index >= 0) return rtc->store[index];
     index = rtc_sequence_index(desc, offset);
     if (index >= 0) return rtc->sequence_reg[index];
+    index = rtc_config_index(desc, offset);
+    if (index >= 0) return rtc->config_reg[index];
     index = rtc_wdt_config_index(desc, offset);
     if (index >= 0) return rtc->wdt_config[index];
     if (offset == desc->time_update_offset) return 0u;
@@ -1561,6 +1631,21 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         if (offset == desc->cpu_stall_enable_offset &&
             ((old ^ next) & desc->cpu_stall_enable_mask) != 0u)
             rtc_cntl_notify(rtc);
+        return;
+    }
+    index = rtc_config_index(desc, offset);
+    if (index >= 0) {
+        const flexe_rtc_config_register_desc_t *reg =
+            &desc->config_register[index];
+        uint32_t old = rtc->config_reg[index];
+        uint32_t next = (old & ~reg->writable_mask) |
+                        (value & reg->writable_mask);
+        rtc->config_reg[index] = next;
+        bool unsupported =
+            (value & ~(reg->writable_mask | reg->read_only_mask)) != 0u ||
+            ((old ^ next) & ~reg->supported_mask) != 0u;
+        if (unsupported && rtc->fallback_write)
+            rtc->fallback_write(rtc->fallback_ctx, addr, value);
         return;
     }
     index = rtc_wdt_config_index(desc, offset);
@@ -1861,10 +1946,12 @@ static void rtc_cntl_write(void *ctx, uint32_t addr, uint32_t value)
         unsigned source =
             (rtc->clock_conf & desc->slow_clock_select_mask) >>
             desc->slow_clock_select_shift;
+        /* All documented fields retain their exact value. Functional mode
+         * resolves the two frequency muxes immediately and deliberately
+         * collapses oscillator power/gating/trim timing. Reserved bits and
+         * the reserved fourth slow-clock source remain diagnostic. */
         bool unsupported =
-            ((old ^ rtc->clock_conf) &
-             ~(desc->slow_clock_select_mask |
-               desc->fast_clock_select_mask)) != 0u ||
+            (value & ~desc->clock_conf_writable_mask) != 0u ||
             desc->slow_clock_source_hz[source] == 0u;
         if (unsupported && rtc->fallback_write)
             rtc->fallback_write(rtc->fallback_ctx, addr, value);
@@ -2011,6 +2098,8 @@ flexe_rtc_cntl_t *flexe_rtc_cntl_create(
         rtc->store[i] = desc->store_reset[i];
     for (unsigned i = 0u; i < desc->sequence_register_count; i++)
         rtc->sequence_reg[i] = desc->sequence_register[i].reset;
+    for (unsigned i = 0u; i < desc->config_register_count; i++)
+        rtc->config_reg[i] = desc->config_register[i].reset;
 
     if (mem_register_mmio_range(mem, desc->base, desc->register_size,
                                 rtc_cntl_read, rtc_cntl_write, rtc) != 0) {

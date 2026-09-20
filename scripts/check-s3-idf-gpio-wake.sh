@@ -103,9 +103,12 @@ for replay in 1 2; do
         "$emu"; then
         fail "EXT wake selection, state, or status MMIO remains unsupported"
     fi
-    unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$emu")
-    [[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 162 ]] ||
-        fail "unrelated unsupported MMIO count exceeded the pinned baseline"
+    unhandled=$(awk '
+        /^Unhandled:/ { print $2; exit }
+        /^--- Unsupported MMIO sites \(0,/ { print 0; exit }
+    ' "$emu")
+    [[ "$unhandled" == 0 ]] ||
+        fail "stock GPIO sleep must have zero unsupported MMIO accesses"
 done
 
 # Host input timing can vary by a millisecond, so compare guest-observed
@@ -113,8 +116,10 @@ done
 cmp -s <(grep '^GPIO_EXT' "$tmpdir/uart.1") \
        <(grep '^GPIO_EXT' "$tmpdir/uart.2") ||
     fail "EXT wake outcomes differ on replay"
-cmp -s <(awk '/^Unhandled:/{show=1} show' "$tmpdir/emu.1") \
-       <(awk '/^Unhandled:/{show=1} show' "$tmpdir/emu.2") ||
+cmp -s <(awk '/^Unhandled:|^--- Unsupported MMIO sites/{show=1} show' \
+              "$tmpdir/emu.1") \
+       <(awk '/^Unhandled:|^--- Unsupported MMIO sites/{show=1} show' \
+              "$tmpdir/emu.2") ||
     fail "unsupported MMIO sites differ on replay"
 
-echo "PASS: native ESP-IDF S3 EXT0 light/EXT1 deep sleep woke from host GPIO4/GPIO12, retained status across reset, and replayed guest wake outcomes; $unhandled unrelated unsupported accesses remain visible"
+echo "PASS: native ESP-IDF S3 EXT0 light/EXT1 deep sleep woke from host GPIO4/GPIO12, retained status across reset, replayed guest wake outcomes, and had zero unsupported MMIO accesses"

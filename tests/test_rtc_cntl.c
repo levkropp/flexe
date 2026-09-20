@@ -740,6 +740,12 @@ TEST(rtc_cntl_s3_fast_clock_and_date_register_follow_descriptor)
                 desc->clock_conf_reset | desc->fast_clock_select_mask);
     ASSERT_EQ(flexe_rtc_cntl_fast_clock_hz(rtc), 17500000u);
     ASSERT_EQ(fallback.writes, 0u);
+    /* Oscillator gating is exact retained configuration in functional mode;
+     * analog start/stop latency is deliberately collapsed. */
+    uint32_t gated = mem_read32(mem, clock) & ~(1u << 28u);
+    mem_write32(mem, clock, gated);
+    ASSERT_EQ(mem_read32(mem, clock), gated);
+    ASSERT_EQ(fallback.writes, 0u);
 
     uint32_t date = desc->base + desc->date_offset;
     ASSERT_EQ(mem_read32(mem, date), 0x02101271u);
@@ -953,33 +959,141 @@ TEST(rtc_cntl_rejects_invalid_regulator_and_rtc_power_geometry)
     mem_destroy(mem);
 }
 
-TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported)
+TEST(rtc_cntl_s3_configuration_bank_masks_retains_and_audits)
 {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
     const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
     xtensa_mem_t *mem = mem_create_for_target(s3);
-    esp32_periph_t *periph = periph_create(mem);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
     ASSERT_TRUE(mem != NULL);
-    ASSERT_TRUE(periph != NULL);
-    if (!mem || !periph) {
-        periph_destroy(periph);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
         mem_destroy(mem);
         return;
     }
 
-    int before = periph_unhandled_count(periph);
-    ASSERT_EQ(mem_read32(mem, desc->base + 0x7Cu), 0u);
-    mem_write32(mem, desc->base + 0x7Cu, 1u);
-    ASSERT_EQ(periph_unhandled_count(periph), before + 2);
+    const uint16_t expected_offset[] = {
+        0x068u, 0x07Cu, 0x080u, 0x08Cu, 0x10Cu,
+    };
+    const uint32_t expected_reset[] = {
+        0x00000000u, 0x0AB0BE0Au, 0x00010800u,
+        0x00000000u, 0x000840CCu,
+    };
+    const uint32_t expected_writable[] = {
+        0xFFFFF000u, 0xFEFFFEFFu, 0x3FFFFC00u,
+        0x0FFFFFFFu, 0xFFFFFFFCu,
+    };
+    const uint32_t expected_read_only[] = {
+        0u, 0x01000000u, 0u, 0u, 0u,
+    };
+    ASSERT_EQ(desc->config_register_count, 5u);
+    for (unsigned i = 0u; i < desc->config_register_count; i++) {
+        const flexe_rtc_config_register_desc_t *reg =
+            &desc->config_register[i];
+        ASSERT_EQ(reg->offset, expected_offset[i]);
+        ASSERT_EQ(reg->reset, expected_reset[i]);
+        ASSERT_EQ(reg->writable_mask, expected_writable[i]);
+        ASSERT_EQ(reg->read_only_mask, expected_read_only[i]);
+        ASSERT_EQ(mem_read32(mem, desc->base + reg->offset), reg->reset);
+        if (reg->supported_mask != 0u) {
+            uint32_t bit = reg->supported_mask &
+                           (0u - reg->supported_mask);
+            uint32_t changed = reg->reset ^ bit;
+            mem_write32(mem, desc->base + reg->offset, changed);
+            ASSERT_EQ(mem_read32(mem, desc->base + reg->offset), changed);
+        }
+    }
+    ASSERT_EQ(fallback.reads, 0u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* SDIO's readiness bit is read-only and ignored by a normal RMW. */
+    const flexe_rtc_config_register_desc_t *sdio =
+        &desc->config_register[1];
+    uint32_t sdio_addr = desc->base + sdio->offset;
+    uint32_t sdio_before = mem_read32(mem, sdio_addr);
+    mem_write32(mem, sdio_addr, sdio_before | sdio->read_only_mask);
+    ASSERT_EQ(mem_read32(mem, sdio_addr), sdio_before);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* Touch configuration reads its architectural reset, while activating
+     * its unimplemented FSM remains visible to the access audit. */
+    const flexe_rtc_config_register_desc_t *touch =
+        &desc->config_register[4];
+    uint32_t touch_addr = desc->base + touch->offset;
+    mem_write32(mem, touch_addr, touch->reset | (1u << 31u));
+    ASSERT_EQ(mem_read32(mem, touch_addr), touch->reset | (1u << 31u));
+    ASSERT_EQ(fallback.writes, 1u);
+
+    /* Reserved bits neither latch nor disappear from the audit. */
+    const flexe_rtc_config_register_desc_t *reject =
+        &desc->config_register[0];
+    uint32_t reject_addr = desc->base + reject->offset;
+    uint32_t reject_before = mem_read32(mem, reject_addr);
+    mem_write32(mem, reject_addr, reject_before | 1u);
+    ASSERT_EQ(mem_read32(mem, reject_addr), reject_before);
+    ASSERT_EQ(fallback.writes, 2u);
 
     /* Unsupported timestamp-control bits share TIME_UPDATE with the modeled
      * latch command and must still produce an explicit diagnostic. */
     mem_write32(mem, desc->base + desc->time_update_offset,
                 desc->time_update_mask | (1u << 29u));
-    ASSERT_EQ(periph_unhandled_count(periph), before + 3);
+    ASSERT_EQ(fallback.writes, 3u);
 
-    periph_destroy(periph);
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
+TEST(rtc_cntl_rejects_invalid_configuration_bank_geometry)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    flexe_target_desc_t invalid = *s3;
+    invalid.rtc_cntl.config_register_count =
+        FLEXE_TARGET_RTC_CONFIG_REGISTER_MAX + 1u;
+    xtensa_mem_t *mem = mem_create_for_target(&invalid);
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc == NULL);
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.config_register[1].offset =
+        invalid.rtc_cntl.config_register[0].offset;
+    mem = mem_create_for_target(&invalid);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc == NULL);
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.config_register[0].offset =
+        invalid.rtc_cntl.clock_conf_offset;
+    mem = mem_create_for_target(&invalid);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc == NULL);
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.config_register[0].supported_mask = 1u;
+    mem = mem_create_for_target(&invalid);
+    rtc = flexe_rtc_cntl_create(
+        mem, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc == NULL);
+    flexe_rtc_cntl_destroy(rtc);
     mem_destroy(mem);
 }
 
@@ -2448,7 +2562,8 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_s3_regulator_force_pairs_are_functional_and_trim_is_diagnostic);
     RUN_TEST(rtc_cntl_rejects_invalid_clock_and_control_geometry);
     RUN_TEST(rtc_cntl_rejects_invalid_regulator_and_rtc_power_geometry);
-    RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
+    RUN_TEST(rtc_cntl_s3_configuration_bank_masks_retains_and_audits);
+    RUN_TEST(rtc_cntl_rejects_invalid_configuration_bank_geometry);
     RUN_TEST(rtc_cntl_digital_domains_resolve_force_and_sleep_policy);
     RUN_TEST(rtc_cntl_rtc_domains_resolve_force_follow_cpu_and_sleep_policy);
     RUN_TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches);

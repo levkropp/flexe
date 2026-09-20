@@ -38,6 +38,7 @@
 #define FLEXE_TARGET_IO_MUX_REGISTER_MAX 64u
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX 6u
+#define FLEXE_TARGET_RTC_CONFIG_REGISTER_MAX 8u
 #define FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX 8u
 #define FLEXE_TARGET_RTC_POWER_DOMAIN_MAX 4u
 #define FLEXE_TARGET_RTC_SUPPLY_MAX 4u
@@ -60,7 +61,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 57u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 58u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -336,6 +337,20 @@ typedef struct {
     uint32_t writable_mask;
 } flexe_rtc_sequence_register_desc_t;
 
+/* Software-visible RTC configuration which does not warrant a dedicated
+ * device register. Writable fields always retain their architectural value;
+ * supported_mask identifies fields whose functional-mode treatment is
+ * complete, including analog/electrical settings deliberately collapsed to
+ * retained state. Changes outside supported_mask remain auditable. Read-only
+ * fields survive guest read-modify-write sequences without being replaced. */
+typedef struct {
+    uint16_t offset;
+    uint32_t reset;
+    uint32_t writable_mask;
+    uint32_t read_only_mask;
+    uint32_t supported_mask;
+} flexe_rtc_config_register_desc_t;
+
 /* One independently sequenced digital power/isolation domain. Masks name
  * the architectural fields rather than assigning chip-specific meanings in
  * the RTC model. A zero sleep or isolation mask means that the target has no
@@ -517,6 +532,9 @@ typedef struct {
     uint8_t sequence_register_count;
     flexe_rtc_sequence_register_desc_t
         sequence_register[FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX];
+    uint8_t config_register_count;
+    flexe_rtc_config_register_desc_t
+        config_register[FLEXE_TARGET_RTC_CONFIG_REGISTER_MAX];
     uint16_t cpu_stall_enable_offset;
     uint32_t cpu_stall_enable_mask;
     uint16_t wakeup_state_offset;
