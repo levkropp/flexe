@@ -44,15 +44,15 @@ grep -q '^PASS: ESP-IDF S3 GPIO ISR service handled two host rising edges,' \
         exit 1
     }
 unsupported=$(sed -n 's/^PASS: .*; \([0-9][0-9]*\) other unsupported accesses remain visible$/\1/p' "$tmpdir/first.out")
-if [[ -z "$unsupported" || "$unsupported" -gt 70 ]]; then
-    echo "FAIL: unsupported access count exceeds the pinned baseline" >&2
+if [[ "$unsupported" != 0 ]]; then
+    echo "FAIL: unsupported accesses remain in the GPIO ISR replay" >&2
     exit 1
 fi
 if [[ "$expected_bin" == "$pinned_bin" &&
       "$expected_elf" == "$pinned_elf" &&
       "$expected_rom" == "$pinned_rom" ]]; then
     for marker in 'UART: 140 bytes fnv32=18E90165' \
-                  'MMIO: 30 sites fnv32=8564F5A6'; do
+                  'MMIO: 0 sites fnv32=811C9DC5'; do
         grep -Fxq "$marker" "$tmpdir/first.out" || {
             echo "FAIL: pinned UART or MMIO digest changed: $marker" >&2
             exit 1
@@ -68,4 +68,4 @@ cmp -s "$tmpdir/first.err" "$tmpdir/second.err" || {
     exit 1
 }
 
-echo "PASS: ESP-IDF S3 GPIO4 ISR and GPIO5 open-drain output completed with byte-identical replay; $unsupported other unsupported accesses remain visible"
+echo "PASS: ESP-IDF S3 GPIO4 ISR and GPIO5 open-drain output completed with byte-identical replay and zero unsupported MMIO accesses"

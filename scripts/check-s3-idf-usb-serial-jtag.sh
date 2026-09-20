@@ -44,8 +44,8 @@ grep -q '^PASS: ESP-IDF USB Serial/JTAG driver completed two host-to-guest-to-ho
         exit 1
     }
 unsupported=$(sed -n 's/^PASS: .*; \([0-9][0-9]*\) other unsupported accesses remain visible$/\1/p' "$tmpdir/first.out")
-if [[ -z "$unsupported" || "$unsupported" -gt 70 ]]; then
-    echo "FAIL: unsupported access count exceeds the pinned baseline" >&2
+if [[ "$unsupported" != 0 ]]; then
+    echo "FAIL: unsupported accesses remain in the USB driver replay" >&2
     exit 1
 fi
 if [[ "$expected_bin" == "$pinned_bin" &&
@@ -53,7 +53,7 @@ if [[ "$expected_bin" == "$pinned_bin" &&
       "$expected_rom" == "$pinned_rom" ]]; then
     for marker in 'UART: 1546 bytes fnv32=16543E8C' \
                   'USB: 1426 bytes fnv32=89FE630D' \
-                  'MMIO: 30 sites fnv32=8564F5A6'; do
+                  'MMIO: 0 sites fnv32=811C9DC5'; do
         grep -Fxq "$marker" "$tmpdir/first.out" || {
             echo "FAIL: pinned UART, USB, or MMIO digest changed: $marker" >&2
             exit 1
@@ -69,4 +69,4 @@ cmp -s "$tmpdir/first.err" "$tmpdir/second.err" || {
     exit 1
 }
 
-echo "PASS: ESP-IDF USB Serial/JTAG driver completed two deterministic host RX/guest TX rounds; $unsupported other unsupported accesses remain visible"
+echo "PASS: ESP-IDF USB Serial/JTAG driver completed two deterministic host RX/guest TX rounds with zero unsupported MMIO accesses"

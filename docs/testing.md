@@ -153,6 +153,29 @@ interrupts, explicitly stopped infinite loops, a two-channel simultaneous
 start barrier, and sustained FreeRTOS execution. Build commands and
 artifact hashes are in [Hardware completeness](hardware-completeness.md).
 
+Source the export script for the pinned ESP-IDF v5.3.2 checkout, then use the
+fixture builder rather than making disposable build directories by hand:
+
+```sh
+source /path/to/esp-idf/export.sh
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/build-s3-idf-fixture.sh --check \
+    hello crosscore nvs i2c-master
+```
+
+The helper accepts short names for every `tests/fixtures/s3_idf_*` project,
+keeps Ninja output and `sdkconfig` files in a persistent directory outside the
+repository, prints the exact artifact paths and hashes, and supplies those
+artifacts directly to each matching gate. `--check` also updates just the
+selected host emulator and endpoint-harness targets, avoiding stale runners.
+The helper rejects an accidental ESP-IDF revision mismatch. When `ccache` is
+installed, common ESP-IDF components are shared safely across independent
+projects: generated header contents remain part of the cache key, so projects
+with different `sdkconfig` values cannot reuse the wrong object. Set
+`FLEXE_IDF_BUILD_ROOT` or
+`FLEXE_IDF_CCACHE_DIR` to relocate those caches; the script's `--help` lists
+the remaining controls.
+
 ## JIT verification
 
 `--jit-verify` runs each eligible compiled block natively, rolls back its memory

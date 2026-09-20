@@ -94,26 +94,20 @@ The ESP-IDF v5.3.2 `tests/fixtures/s3_idf_usb_serial_jtag` application
 installs the [stock interrupt-driven USB Serial/JTAG driver](https://github.com/espressif/esp-idf/blob/v5.3.2/components/esp_driver_usb_serial_jtag/include/driver/usb_serial_jtag.h), writes a greeting,
 then receives two host-injected `ping` packets and replies `USJ_PONG_1/2`
 through the driver's TX ring buffer. The gate runs the complete interaction
-twice with byte-identical UART, USB, and unsupported-MMIO digests. Neither
-the USB controller aperture nor the RTC USB PHY mux has unsupported
-accesses; 70 other accesses remain diagnostic. The pinned
+twice with byte-identical UART, USB, and unsupported-MMIO digests. The entire
+driver replay now uses zero unsupported MMIO accesses, including the USB
+controller aperture and RTC USB PHY mux. The pinned
 application image SHA-256 is
 `b8cc669dbd8fb46f5dc93c5dad948cba266fb773ea6a62656455e9e60de82b37`
 and matching ELF SHA-256 is
 `42e6c6e2e38372272955ad2df6e09340178c619fb7bd82957c000b0c28608678`.
 This checks driver-level packet and interrupt progress, not USB enumeration,
 electrical timing, or large/bursty packet stress. Rebuild with ESP-IDF commit
-`9d7f2d69f50d1288526d4f1027108e314e8c879f` and run with external artifacts:
+`9d7f2d69f50d1288526d4f1027108e314e8c879f` and run:
 
 ```sh
-idf.py -C tests/fixtures/s3_idf_usb_serial_jtag \
-  -B /tmp/flexe-s3-usj-build -D SDKCONFIG=/tmp/flexe-s3-usj-sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-cmake --build build --target flexe-s3-idf-usb-serial-jtag-test
-S3_IDF_USJ_BIN=/tmp/flexe-s3-usj-build/s3_idf_usb_serial_jtag.bin \
-S3_IDF_USJ_ELF=/tmp/flexe-s3-usj-build/s3_idf_usb_serial_jtag.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  scripts/check-s3-idf-usb-serial-jtag.sh
+  ./scripts/build-s3-idf-fixture.sh --check usb-serial-jtag
 ```
 
 Independently rebuilt images may provide matching `*_SHA256` overrides,
@@ -161,32 +155,17 @@ require zero unsupported MMIO accesses. RTC `OPTIONS0` software-reset pulses
 reset APP CPU architectural state independently at a safe execution boundary;
 PRO CPU and system reset requests retain the full-machine reset path. This
 proves these FreeRTOS interactions, not simultaneous core execution or timing
-fidelity. Run with matching external artifacts:
+fidelity. Rebuild and run both gates with the pinned ESP-IDF checkout:
 
 ```sh
-S3_IDF_HELLO_BIN=/path/to/hello_world.bin \
-S3_IDF_HELLO_ELF=/path/to/hello_world.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-idf-hello.sh
-S3_IDF_CROSSCORE_BIN=/path/to/s3_idf_crosscore.bin \
-S3_IDF_CROSSCORE_ELF=/path/to/s3_idf_crosscore.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-idf-crosscore.sh
+  ./scripts/build-s3-idf-fixture.sh --check hello crosscore
 ```
 
 The gates default to these pinned image/ELF hashes and the official revision-0
 ROM ELF SHA-256 `c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd`.
-With ESP-IDF v5.3.2 installed, build from its unmodified example and the
-in-tree cross-core fixture (keep generated configuration outside the repo):
-
-```sh
-idf.py -C "$IDF_PATH/examples/get-started/hello_world" \
-  -B /tmp/flexe-s3-hello-build -D SDKCONFIG=/tmp/flexe-s3-hello-sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-idf.py -C tests/fixtures/s3_idf_crosscore \
-  -B /tmp/flexe-s3-crosscore-build -D SDKCONFIG=/tmp/flexe-s3-crosscore-sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-```
+The fixture helper keeps generated configuration outside the repository and
+shares safely cached ESP-IDF components across projects.
 
 Independently rebuilt images can supply matching `*_SHA256` overrides, since
 ESP-IDF embeds build metadata in the application.
@@ -288,16 +267,11 @@ accessible as its own target-described endpoint even though its address lies
 inside the WDEV range. Other domain consumers and analog transition delays are
 not yet connected, and reserved fields remain diagnostic.
 
-Rebuild and run with the matching external artifacts:
+Rebuild and run with the pinned ESP-IDF checkout:
 
 ```sh
-idf.py -C tests/fixtures/s3_idf_sleep \
-  -B /tmp/flexe-s3-sleep-build -D SDKCONFIG=/tmp/flexe-s3-sleep-build/sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-S3_IDF_SLEEP_BIN=/tmp/flexe-s3-sleep-build/s3_idf_sleep.bin \
-S3_IDF_SLEEP_ELF=/tmp/flexe-s3-sleep-build/s3_idf_sleep.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-idf-sleep.sh
+  ./scripts/build-s3-idf-fixture.sh --check sleep
 ```
 
 The S3 RTC controller also models the documented EXT0/EXT1 wake configuration
@@ -325,14 +299,8 @@ Physical pull resistors, voltage thresholds, glitches/filtering, and pad
 electrical behavior are not inferred from the host's digital level:
 
 ```sh
-idf.py -C tests/fixtures/s3_idf_gpio_wake \
-  -B /tmp/flexe-s3-gpio-wake-build \
-  -D SDKCONFIG=/tmp/flexe-s3-gpio-wake-build/sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-S3_IDF_GPIO_WAKE_BIN=/tmp/flexe-s3-gpio-wake-build/s3_idf_gpio_wake.bin \
-S3_IDF_GPIO_WAKE_ELF=/tmp/flexe-s3-gpio-wake-build/s3_idf_gpio_wake.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-idf-gpio-wake.sh
+  ./scripts/build-s3-idf-fixture.sh --check gpio-wake
 ```
 
 The separate `tests/fixtures/s3_idf_gpio_isr` project uses the [stock
@@ -344,10 +312,8 @@ as open-drain and alternates released-high and driven-low states. The GPIO
 model's output listener and output-enable query expose the effective drive
 state rather than treating the high latch as a driven voltage. The older
 sandbox GPIO event still carries only the output-latch level. Two interpreter
-replays have
-identical UART and unsupported-MMIO digests, with no unsupported GPIO
-controller or GPIO4 IO_MUX access. The other 70 startup accesses remain
-diagnostic. The pinned image SHA-256 is
+replays have identical UART and unsupported-MMIO digests, with zero
+unsupported MMIO accesses. The pinned image SHA-256 is
 `af96acd3c647184f2b92e6d07df25a20ed28e9a28bcb4084a59479d7c02c9186`
 and matching ELF SHA-256 is
 `d3bea1061d45252a05cc973720e4f0ab77ca4ea5945ac854bb6961de59ef66f1`.
@@ -366,15 +332,8 @@ Rebuild with ESP-IDF commit
 `9d7f2d69f50d1288526d4f1027108e314e8c879f`:
 
 ```sh
-idf.py -C tests/fixtures/s3_idf_gpio_isr \
-  -B /tmp/flexe-s3-gpio-isr-build \
-  -D SDKCONFIG=/tmp/flexe-s3-gpio-isr-sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-cmake --build build --target flexe-s3-idf-gpio-isr-test
-S3_IDF_GPIO_ISR_BIN=/tmp/flexe-s3-gpio-isr-build/s3_idf_gpio_isr.bin \
-S3_IDF_GPIO_ISR_ELF=/tmp/flexe-s3-gpio-isr-build/s3_idf_gpio_isr.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  scripts/check-s3-idf-gpio-isr.sh
+  ./scripts/build-s3-idf-fixture.sh --check gpio-isr
 ```
 
 Independent builds may supply matching `*_SHA256` overrides for the
@@ -396,13 +355,8 @@ The gate checks two byte-identical runs and requires zero unsupported MMIO
 accesses across its two boots:
 
 ```sh
-idf.py -C tests/fixtures/s3_idf_nvs \
-  -B /tmp/flexe-s3-nvs-build -D SDKCONFIG=/tmp/flexe-s3-nvs-sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-S3_IDF_NVS_BIN=/path/to/s3_idf_nvs.bin \
-S3_IDF_NVS_ELF=/path/to/s3_idf_nvs.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-idf-nvs.sh
+  ./scripts/build-s3-idf-fixture.sh --check nvs
 ```
 
 The shared Arduino Wire fixture also runs unmodified on S3 with valid S3
@@ -439,9 +393,9 @@ register write to a host-attached device, then performs a repeated-START
 40-byte read through the controller's interrupt/FIFO path. It verifies every
 returned byte and an unattached-address NACK (`ESP_ERR_NOT_FOUND`). Two
 interpreter replays have identical UART and unsupported-MMIO digests, with
-no unsupported I2C controller accesses. The other 72 accesses remain
-diagnostic: 70 startup accesses plus the SDA/SCL GPIO-matrix output routes
-for signals 90/89. The MMIO transaction works, but Flexe does not claim
+no unsupported I2C controller or startup accesses. Only the SDA/SCL
+GPIO-matrix output routes for signals 90/89 remain diagnostic. The MMIO
+transaction works, but Flexe does not claim
 to emit their electrical pin waveforms. The pinned image SHA-256 is
 `10934e17ec7ca440c4d81689225373b7fc1809b898700a5a8b813ab9a02c1ccc`
 and the matching ELF SHA-256 is
@@ -450,15 +404,8 @@ both matched across two clean build directories using ESP-IDF commit
 `9d7f2d69f50d1288526d4f1027108e314e8c879f`:
 
 ```sh
-idf.py -C tests/fixtures/s3_idf_i2c_master \
-  -B /tmp/flexe-s3-idf-i2c-master-build \
-  -D SDKCONFIG=/tmp/flexe-s3-idf-i2c-master-sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-cmake --build build --target flexe-s3-idf-i2c-master-test
-S3_IDF_I2C_MASTER_BIN=/tmp/flexe-s3-idf-i2c-master-build/s3_idf_i2c_master.bin \
-S3_IDF_I2C_MASTER_ELF=/tmp/flexe-s3-idf-i2c-master-build/s3_idf_i2c_master.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  scripts/check-s3-idf-i2c-master.sh
+  ./scripts/build-s3-idf-fixture.sh --check i2c-master
 ```
 
 Matching independently built artifacts can supply `*_SHA256` overrides.
@@ -565,14 +512,8 @@ whether contents survive that power transition. Rebuild and replay with the
 official ROM ELF:
 
 ```sh
-idf.py -C tests/fixtures/s3_idf_rmt_loopback \
-  -B /tmp/flexe-s3-idf-rmt-loopback-final \
-  -D SDKCONFIG=/tmp/flexe-s3-idf-rmt-loopback-final-sdkconfig \
-  -D IDF_TARGET=esp32s3 build
-S3_IDF_RMT_LOOPBACK_BIN=/tmp/flexe-s3-idf-rmt-loopback-final/s3_idf_rmt_loopback.bin \
-S3_IDF_RMT_LOOPBACK_ELF=/tmp/flexe-s3-idf-rmt-loopback-final/s3_idf_rmt_loopback.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-idf-rmt-loopback.sh
+  ./scripts/build-s3-idf-fixture.sh --check rmt-loopback
 ```
 
 The fixture's pinned image SHA-256 is
@@ -987,13 +928,11 @@ ELF SHA-256
 `2dbbafa1ac2915298c40918e76bb3ff0afb0dc63f58c23eb332bbf5ffbfef881`).
 Without the VFS registration symbols or for a range beyond Flexe's current
 64-FD `select()` layout, the bridge does not guess a base and reports the
-unsupported condition. Run the external-image gate with:
+unsupported condition. Rebuild and run the gate with:
 
 ```sh
-S3_IDF_SOCKET_BIN=/path/to/s3_idf_socket_range.bin \
-S3_IDF_SOCKET_ELF=/path/to/s3_idf_socket_range.elf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-idf-socket-range.sh
+  ./scripts/build-s3-idf-fixture.sh --check socket-range
 ```
 
 The

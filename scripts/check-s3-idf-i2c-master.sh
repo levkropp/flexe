@@ -50,15 +50,15 @@ grep -q 'i2c_unhandled_sites=0 unmodeled_matrix_routes=2' \
         exit 1
     }
 unsupported=$(sed -n 's/^PASS: .* unhandled=\([0-9][0-9]*\) cycles=.*$/\1/p' "$tmpdir/first.out")
-if [[ -z "$unsupported" || "$unsupported" -gt 72 ]]; then
-    echo "FAIL: unsupported access count exceeds the pinned baseline" >&2
+if [[ "$unsupported" != 2 ]]; then
+    echo "FAIL: expected only the two unmodeled I2C matrix routes" >&2
     exit 1
 fi
 if [[ "$expected_bin" == "$pinned_bin" &&
       "$expected_elf" == "$pinned_elf" &&
       "$expected_rom" == "$pinned_rom" ]]; then
     for marker in 'UART: 44 bytes fnv32=9B923665' \
-                  'MMIO: 32 sites fnv32=A882FEED'; do
+                  'MMIO: 2 sites fnv32=698E82BE'; do
         grep -Fxq "$marker" "$tmpdir/first.out" || {
             echo "FAIL: pinned UART or MMIO digest changed: $marker" >&2
             exit 1
@@ -74,4 +74,4 @@ cmp -s "$tmpdir/first.err" "$tmpdir/second.err" || {
     exit 1
 }
 
-echo "PASS: ESP-IDF S3 I2C master completed write, repeated-start read, and NACK with byte-identical replay; $unsupported unsupported accesses remain visible"
+echo "PASS: ESP-IDF S3 I2C master completed write, repeated-start read, and NACK with byte-identical replay; only two unmodeled matrix routes remain visible"
