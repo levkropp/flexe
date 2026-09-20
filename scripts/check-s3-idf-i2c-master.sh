@@ -8,6 +8,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-idf-i2c-master-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 pinned_bin=10934e17ec7ca440c4d81689225373b7fc1809b898700a5a8b813ab9a02c1ccc
 pinned_elf=5ef3ea1fb67a20e5748d98124c791197a9404cac0b6dd953a28b441e3d3fd734
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
@@ -29,7 +33,7 @@ done
 tmpdir=$(mktemp -d)
 trap 'rm -f "$tmpdir/first.out" "$tmpdir/first.err" "$tmpdir/second.out" "$tmpdir/second.err"; rmdir "$tmpdir"' EXIT
 for replay in first second; do
-    "$runner" "$S3_IDF_I2C_MASTER_BIN" "$S3_IDF_I2C_MASTER_ELF" \
+    "${runner_command[@]}" "$S3_IDF_I2C_MASTER_BIN" "$S3_IDF_I2C_MASTER_ELF" \
         "$S3_ROM_ELF" > "$tmpdir/$replay.out" \
         2> "$tmpdir/$replay.err" || {
             echo "FAIL: ESP-IDF I2C master transaction did not complete" >&2

@@ -8,6 +8,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-i2c-wire-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 for entry in \
     "$S3_I2C_BIN:${S3_I2C_BIN_SHA256:-91440bdbb4f0a057bf95fab104bc27602555f254d904d7a97b3c032fcb3cb49e}" \
     "$S3_I2C_ELF:${S3_I2C_ELF_SHA256:-271630096105d3afef3946cf0d91f5413f50ac8ce99be39b05cd39e235f45121}" \
@@ -29,7 +33,7 @@ for engine in interp jit; do
         runner_args=(--no-jit --s3)
     fi
     for run in 1 2; do
-        "$runner" "${runner_args[@]}" "$S3_I2C_BIN" "$S3_I2C_ELF" \
+        "${runner_command[@]}" "${runner_args[@]}" "$S3_I2C_BIN" "$S3_I2C_ELF" \
             "$S3_ROM_ELF" >"$tmpdir/$engine.$run" 2>&1
     done
     cmp "$tmpdir/$engine.1" "$tmpdir/$engine.2"

@@ -337,6 +337,89 @@ if(UNIX)
     add_flexe_runner(flexe-generic-rom-test generic_rom_test.c)
     add_flexe_runner(flexe-bench-compute bench_compute.c)
 
+    # Hardware fixtures used to be one executable apiece.  That made a core
+    # edit relink the emulator dozens of times before the behavior gates could
+    # start.  Compile each small harness as a renamed entry point and link one
+    # multicall binary instead; the fixture scripts select the entry by name.
+    # Keep the individual targets below for compatibility with direct users.
+    set(FLEXE_FIXTURE_ENTRY_OBJECTS)
+    set(FLEXE_FIXTURE_DECLARATIONS)
+    set(FLEXE_FIXTURE_TABLE)
+    function(add_flexe_fixture_entry entry source)
+        string(REPLACE "-" "_" entry_symbol "${entry}")
+        string(REPLACE "_" "-" entry_name "${entry}")
+        set(object_target "flexe-fixture-${entry}-entry")
+        add_library(${object_target} OBJECT EXCLUDE_FROM_ALL tools/${source})
+        target_link_libraries(${object_target} PRIVATE xtensa-emu-lib)
+        target_compile_definitions(${object_target} PRIVATE
+            "main=flexe_fixture_${entry_symbol}_main"
+            "emu_app_running=flexe_fixture_${entry_symbol}_app_running")
+        target_compile_options(${object_target} PRIVATE
+            -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+        list(APPEND FLEXE_FIXTURE_ENTRY_OBJECTS
+            "$<TARGET_OBJECTS:${object_target}>")
+        string(APPEND FLEXE_FIXTURE_DECLARATIONS
+            "int flexe_fixture_${entry_symbol}_main(int argc, char **argv);\n")
+        string(APPEND FLEXE_FIXTURE_TABLE
+            "    {\"${entry_name}\", flexe_fixture_${entry_symbol}_main},\n")
+        set(FLEXE_FIXTURE_ENTRY_OBJECTS
+            "${FLEXE_FIXTURE_ENTRY_OBJECTS}" PARENT_SCOPE)
+        set(FLEXE_FIXTURE_DECLARATIONS
+            "${FLEXE_FIXTURE_DECLARATIONS}" PARENT_SCOPE)
+        set(FLEXE_FIXTURE_TABLE "${FLEXE_FIXTURE_TABLE}" PARENT_SCOPE)
+    endfunction()
+
+    add_flexe_fixture_entry(analog_dac analog_dac_test.c)
+    add_flexe_fixture_entry(deep_sleep deep_sleep_test.c)
+    add_flexe_fixture_entry(emac_hal emac_hal_test.c)
+    add_flexe_fixture_entry(esp_timer esp_timer_test.c)
+    add_flexe_fixture_entry(event_group event_group_test.c)
+    add_flexe_fixture_entry(frc_timer frc_timer_test.c)
+    add_flexe_fixture_entry(frt_timer frt_timer_test.c)
+    add_flexe_fixture_entry(gpio_isr gpio_isr_test.c)
+    add_flexe_fixture_entry(guest_clock guest_clock_test.c)
+    add_flexe_fixture_entry(i2c_slave i2c_slave_test.c)
+    add_flexe_fixture_entry(i2c_wire i2c_wire_test.c)
+    add_flexe_fixture_entry(i2s_dma i2s_dma_test.c)
+    add_flexe_fixture_entry(ledc_pwm ledc_pwm_test.c)
+    add_flexe_fixture_entry(mcpwm_motor mcpwm_motor_test.c)
+    add_flexe_fixture_entry(pcnt_pulse pcnt_pulse_test.c)
+    add_flexe_fixture_entry(rmt_tx rmt_tx_test.c)
+    add_flexe_fixture_entry(rtc_gpio rtc_gpio_test.c)
+    add_flexe_fixture_entry(rtc_i2c rtc_i2c_test.c)
+    add_flexe_fixture_entry(scheduler scheduler_test.c)
+    add_flexe_fixture_entry(sdio_slave sdio_slave_test.c)
+    add_flexe_fixture_entry(sdmmc_host sdmmc_host_test.c)
+    add_flexe_fixture_entry(sigmadelta sigmadelta_test.c)
+    add_flexe_fixture_entry(spi_master spi_master_test.c)
+    add_flexe_fixture_entry(task_queue task_queue_test.c)
+    add_flexe_fixture_entry(task_wdt task_wdt_test.c)
+    add_flexe_fixture_entry(timer_group timer_group_test.c)
+    add_flexe_fixture_entry(touch_pad touch_pad_test.c)
+    add_flexe_fixture_entry(twai_bus twai_bus_test.c)
+    add_flexe_fixture_entry(uhci_dma uhci_dma_test.c)
+    add_flexe_fixture_entry(wifi_client wifi_client_test.c)
+    add_flexe_fixture_entry(s3_rmt_rx s3_rmt_rx_test.c)
+    add_flexe_fixture_entry(s3_idf_usb_serial_jtag
+        s3_idf_usb_serial_jtag_test.c)
+    add_flexe_fixture_entry(s3_idf_gpio_isr s3_idf_gpio_isr_test.c)
+    add_flexe_fixture_entry(s3_idf_i2c_master s3_idf_i2c_master_test.c)
+    add_flexe_fixture_entry(s3_idf_i2s_std s3_idf_i2s_std_test.c)
+
+    # The driver-level EMAC gate intentionally reuses the HAL harness with an
+    # extra command-line mode rather than compiling a second entry object.
+    string(APPEND FLEXE_FIXTURE_TABLE
+        "    {\"emac-driver\", flexe_fixture_emac_hal_main},\n")
+    configure_file(tools/fixture_test.c.in
+        ${CMAKE_CURRENT_BINARY_DIR}/fixture_test.c @ONLY)
+
+    add_executable(flexe-fixture-test EXCLUDE_FROM_ALL
+        ${CMAKE_CURRENT_BINARY_DIR}/fixture_test.c
+        ${FLEXE_FIXTURE_ENTRY_OBJECTS})
+    target_link_libraries(flexe-fixture-test PRIVATE xtensa-emu-lib)
+    target_compile_options(flexe-fixture-test PRIVATE
+        -Wall -Wextra -Werror -Wno-unused-parameter ${PGO_NOWARN})
+
     add_flexe_runner(flexe-analog-dac-test analog_dac_test.c)
     add_flexe_runner(flexe-deep-sleep-test deep_sleep_test.c)
     add_flexe_runner(flexe-emac-hal-test emac_hal_test.c)

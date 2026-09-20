@@ -10,6 +10,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-rmt-rx-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 expected_bin=${S3_RMT_RX_BIN_SHA256:-c2e9ac0fa7ee6540d4ff511c35a1be5126868b06e77dfe64f4f9ad3ea9cd9717}
 expected_elf=${S3_RMT_RX_ELF_SHA256:-b7e2cbf74fb0b5374c469d43578fbf548b93329557d14060e3c0b56854fefab3}
 expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
@@ -29,10 +33,10 @@ trap 'rm -rf -- "$tmpdir"' EXIT
 for engine in interp jit; do
     for run in 1 2; do
         if [[ "$engine" == interp ]]; then
-            "$runner" --no-jit "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" \
+            "${runner_command[@]}" --no-jit "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" \
                 "$S3_ROM_ELF" >"$tmpdir/$engine.$run" 2>&1
         else
-            "$runner" "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" "$S3_ROM_ELF" \
+            "${runner_command[@]}" "$S3_RMT_RX_BIN" "$S3_RMT_RX_ELF" "$S3_ROM_ELF" \
                 >"$tmpdir/$engine.$run" 2>&1
         fi
     done

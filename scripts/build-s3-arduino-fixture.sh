@@ -180,6 +180,7 @@ projects=()
 fqbns=()
 prefixes=()
 host_targets=()
+host_entries=()
 sketches=()
 for requested in "$@"; do
     normalized=$(printf '%s' "$requested" | tr '-' '_')
@@ -189,20 +190,23 @@ for requested in "$@"; do
         project="$repo/tests/fixtures/s3_adc"
         prefix=S3_ADC
         host_target=xtensa-emu
+        host_entry=
         fqbn=esp32:esp32:esp32s3
         ;;
     i2c_slave|s3_i2c_slave)
         name=i2c-slave
         project="$repo/tests/fixtures/i2c_slave"
         prefix=S3_I2C_SLAVE
-        host_target=flexe-i2c-slave-test
+        host_target=flexe-fixture-test
+        host_entry=i2c-slave
         fqbn=esp32:esp32:esp32s3
         ;;
     i2c_wire|s3_i2c_wire)
         name=i2c-wire
         project="$repo/tests/fixtures/i2c_wire"
         prefix=S3_I2C
-        host_target=flexe-i2c-wire-test
+        host_target=flexe-fixture-test
+        host_entry=i2c-wire
         fqbn=esp32:esp32:esp32s3
         ;;
     ledc|s3_ledc)
@@ -210,6 +214,7 @@ for requested in "$@"; do
         project="$repo/tests/fixtures/s3_ledc"
         prefix=S3_LEDC
         host_target=xtensa-emu
+        host_entry=
         fqbn=esp32:esp32:esp32s3
         ;;
     psram_opi|s3_psram_opi)
@@ -217,20 +222,23 @@ for requested in "$@"; do
         project="$repo/tests/fixtures/s3_psram_opi"
         prefix=S3_PSRAM
         host_target=xtensa-emu
+        host_entry=
         fqbn=esp32:esp32:esp32s3:FlashSize=8M,PSRAM=opi
         ;;
     rmt_rx|s3_rmt_rx)
         name=rmt-rx
         project="$repo/tests/fixtures/s3_rmt_rx"
         prefix=S3_RMT_RX
-        host_target=flexe-s3-rmt-rx-test
+        host_target=flexe-fixture-test
+        host_entry=s3-rmt-rx
         fqbn=esp32:esp32:esp32s3
         ;;
     spi_master|s3_spi_master)
         name=spi-master
         project="$repo/tests/fixtures/spi_master"
         prefix=S3_SPI
-        host_target=flexe-spi-master-test
+        host_target=flexe-fixture-test
+        host_entry=spi-master
         fqbn=esp32:esp32:esp32s3
         ;;
     *)
@@ -254,6 +262,7 @@ for requested in "$@"; do
     fqbns+=("$fqbn")
     prefixes+=("$prefix")
     host_targets+=("$host_target")
+    host_entries+=("$host_entry")
     sketches+=("$(basename "$project")")
 done
 
@@ -335,6 +344,7 @@ for index in "${!names[@]}"; do
     fqbn=${fqbns[$index]}
     prefix=${prefixes[$index]}
     host_target=${host_targets[$index]}
+    host_entry=${host_entries[$index]}
     sketch=${sketches[$index]}
 
     epoch=$requested_epoch
@@ -356,7 +366,8 @@ for index in "${!names[@]}"; do
         printf 'cli-sha256=%s\n' "$arduino_executable_hash"
         printf 'config-sha256=%s\n' "$arduino_config_hash"
         printf 'esp32-core=%s\n' "$core_version"
-        find "$project" -type f -print | LC_ALL=C sort |
+        find "$project" -path '*/build' -prune -o -type f -print |
+            LC_ALL=C sort |
             while IFS= read -r input; do
                 relative=${input#"$project"/}
                 digest=$(openssl dgst -sha256 "$input" | awk '{print $NF}')
@@ -368,6 +379,13 @@ for index in "${!names[@]}"; do
     firmware="$output_dir/$sketch.ino.merged.bin"
     symbols="$output_dir/$sketch.ino.elf"
     stamp="$output_dir/.flexe-fixture.sha256"
+    source_parent="$build_root/sources"
+    source_root="$source_parent/$name-$fingerprint"
+    source_copy="$source_root/$sketch"
+    # Arduino creates this full intermediate tree below the staged sketch even
+    # with --output-dir. A fingerprint hit never invokes Arduino, so retaining
+    # the exact current fixture's tree cannot accelerate the next check.
+    rm -rf -- "$source_copy/build"
     cached_fingerprint=
     if [[ -f "$stamp" ]]; then
         IFS= read -r cached_fingerprint < "$stamp" || true
@@ -377,9 +395,6 @@ for index in "${!names[@]}"; do
           "$cached_fingerprint" == "$fingerprint" ]]; then
         echo "==> reusing unchanged $name firmware"
     else
-        source_parent="$build_root/sources"
-        source_root="$source_parent/$name-$fingerprint"
-        source_copy="$source_root/$sketch"
         if [[ ! -d "$source_copy" ]]; then
             mkdir -p -- "$source_parent"
             source_stage=$(mktemp -d "$source_parent/.$name.XXXXXX")
@@ -387,6 +402,7 @@ for index in "${!names[@]}"; do
                 rm -rf -- "$source_stage"
                 exit 1
             fi
+            rm -rf -- "$source_stage/$sketch/build"
             if ! mv "$source_stage" "$source_root" 2>/dev/null; then
                 rm -rf -- "$source_stage"
                 [[ -d "$source_copy" ]] || {
@@ -410,9 +426,17 @@ for index in "${!names[@]}"; do
             echo "error: Arduino compile produced no merged image/ELF for $name" >&2
             exit 1
         }
+        rm -rf -- "$source_copy/build"
         printf '%s\n' "$fingerprint" > "$stamp.tmp"
         mv "$stamp.tmp" "$stamp"
     fi
+
+    # Only the merged flash image and ELF feed the S3 gates. Avoid retaining
+    # Arduino's large map and redundant split images in every artifact cache.
+    rm -f -- "$output_dir/$sketch.ino.map" \
+        "$output_dir/$sketch.ino.bin" \
+        "$output_dir/$sketch.ino.bootloader.bin" \
+        "$output_dir/$sketch.ino.partitions.bin"
 
     bin_hash=$(openssl dgst -sha256 "$firmware" | awk '{print $NF}')
     elf_hash=$(openssl dgst -sha256 "$symbols" | awk '{print $NF}')
@@ -429,8 +453,13 @@ for index in "${!names[@]}"; do
         }
         if [[ -n "${RUNNER:-}" ]]; then
             gate_runner=$RUNNER
+            gate_runner_entry=
+            if [[ "$(basename -- "$RUNNER")" == flexe-fixture-test ]]; then
+                gate_runner_entry=$host_entry
+            fi
         else
             gate_runner="$host_build/$host_target"
+            gate_runner_entry=$host_entry
         fi
         [[ -x "$gate_runner" ]] || {
             echo "error: built runner is not executable: $gate_runner" >&2
@@ -438,7 +467,7 @@ for index in "${!names[@]}"; do
         }
         flexe_fixture_gate_queue_artifact "$name" "$gate" "$prefix" \
             "$firmware" "$symbols" "$bin_hash" "$elf_hash" \
-            "$S3_ROM_ELF" "$gate_runner"
+            "$S3_ROM_ELF" "$gate_runner" "$gate_runner_entry"
     fi
 done
 

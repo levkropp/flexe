@@ -9,6 +9,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-sdmmc-host-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 pinned_bin=cfca7b6f64c7053f55b7d9f53bb21c4a646b2707fea707cfd84c4afb49fcb613
 pinned_elf=5ddb0c08e529a9be44b6a17ab64616e52e4f2556817bfb24d93b1f37ef94c87d
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
@@ -36,11 +40,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$runner" --no-jit "$S3_IDF_SDMMC_HOST_BIN" \
+"${runner_command[@]}" --no-jit "$S3_IDF_SDMMC_HOST_BIN" \
     "$S3_IDF_SDMMC_HOST_ELF" "$S3_ROM_ELF" \
     >"$tmpdir/interp.out" 2>"$tmpdir/interp.err" &
 interp_pid=$!
-"$runner" "$S3_IDF_SDMMC_HOST_BIN" "$S3_IDF_SDMMC_HOST_ELF" \
+"${runner_command[@]}" "$S3_IDF_SDMMC_HOST_BIN" "$S3_IDF_SDMMC_HOST_ELF" \
     "$S3_ROM_ELF" >"$tmpdir/jit.out" 2>"$tmpdir/jit.err" &
 jit_pid=$!
 

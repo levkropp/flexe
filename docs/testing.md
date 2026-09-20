@@ -59,10 +59,10 @@ LeakSanitizer.
 ## Compiled-firmware hardware gates
 
 The fixtures under `tests/fixtures/` are real Arduino-ESP32 sketches. Their C
-runners under `tools/` attach host endpoints, inject input, and assert the
+harnesses under `tools/` attach host endpoints, inject input, and assert the
 guest's observable output. The consolidated entry point validates the request,
-builds only the required host runners in one parallel CMake invocation, then
-builds and runs every requested fixture with both the JIT and interpreter:
+links their renamed entry points into one `flexe-fixture-test` multicall runner,
+then builds and runs every requested fixture with both the JIT and interpreter:
 
 ```sh
 ./scripts/test-fixtures.sh
@@ -96,8 +96,10 @@ and explicit config. An unchanged focused rerun skips Arduino CLI entirely
 instead of merely asking it to rediscover an unchanged dependency graph. A
 toolchain/FQBN cache miss primes one persistent compiled-core archive, then
 independent sketches build through a bounded pool. Per-sketch intermediate
-trees are discarded after their final image and ELF are retained, avoiding
-roughly 20 MiB of cache growth per fixture. After every mutable build completes,
+trees and redundant map/merged/boot/partition outputs are discarded after the
+application image and ELF are retained, avoiding roughly 15 MiB of cache growth
+per fixture. A core edit therefore performs one harness link rather than one
+full-emulator link per fixture. After every mutable build completes,
 independent gates use a second bounded pool; each gate runs its JIT and
 interpreter together, and logs remain in request order. Set all three job
 variables to `1` for completely serialized diagnosis.
@@ -123,7 +125,9 @@ stay under the user cache rather than dirtying the repository. Its fingerprint
 covers every fixture input, board options, timestamp, CLI binary and config,
 and installed core version. An unchanged run therefore bypasses Arduino CLI's
 expensive dependency scan entirely; a cache miss still shares the compiled
-core across fixtures. Use `--rebuild` to force compilation, `--verbose` to see
+core across fixtures. Generated `build/` trees are excluded from both the
+fingerprint and staged source cache, and only the merged image, ELF, build log,
+and stamp persist. Use `--rebuild` to force compilation, `--verbose` to see
 the compiler output, or the variables listed by `--help` to relocate caches
 and select nonstandard tools. After all mutable build work finishes, independent
 gates run through a shared bounded process pool with ordered logs. The default

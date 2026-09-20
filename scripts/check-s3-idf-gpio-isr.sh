@@ -8,6 +8,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-idf-gpio-isr-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 pinned_bin=af96acd3c647184f2b92e6d07df25a20ed28e9a28bcb4084a59479d7c02c9186
 pinned_elf=d3bea1061d45252a05cc973720e4f0ab77ca4ea5945ac854bb6961de59ef66f1
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
@@ -29,7 +33,7 @@ done
 tmpdir=$(mktemp -d)
 trap 'rm -f "$tmpdir/first.out" "$tmpdir/first.err" "$tmpdir/second.out" "$tmpdir/second.err"; rmdir "$tmpdir"' EXIT
 for replay in first second; do
-    "$runner" "$S3_IDF_GPIO_ISR_BIN" "$S3_IDF_GPIO_ISR_ELF" \
+    "${runner_command[@]}" "$S3_IDF_GPIO_ISR_BIN" "$S3_IDF_GPIO_ISR_ELF" \
         "$S3_ROM_ELF" > "$tmpdir/$replay.out" \
         2> "$tmpdir/$replay.err" || {
             echo "FAIL: ESP-IDF GPIO ISR service did not complete" >&2

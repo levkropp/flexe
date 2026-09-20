@@ -8,6 +8,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-spi-master-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 for entry in \
     "$S3_SPI_BIN:${S3_SPI_BIN_SHA256:-f4a50104a5cd08c91d563eb30cc38ad86bb9df72f36a5420a43cb5e62ca01940}" \
     "$S3_SPI_ELF:${S3_SPI_ELF_SHA256:-ea7494ab15e49a75da094b40b5cad7b4cf25e186832e89de4800f562e2b9dba4}" \
@@ -29,7 +33,7 @@ for engine in interp jit; do
         runner_args=(--no-jit --s3)
     fi
     for run in 1 2; do
-        "$runner" "${runner_args[@]}" "$S3_SPI_BIN" "$S3_SPI_ELF" \
+        "${runner_command[@]}" "${runner_args[@]}" "$S3_SPI_BIN" "$S3_SPI_ELF" \
             "$S3_ROM_ELF" >"$tmpdir/$engine.$run" 2>&1
     done
     cmp "$tmpdir/$engine.1" "$tmpdir/$engine.2"

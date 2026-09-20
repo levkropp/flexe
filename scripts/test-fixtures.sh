@@ -84,9 +84,7 @@ fi
 
 fixtures=()
 slugs=()
-targets=()
 driver_modes=()
-host_targets=()
 for requested in "$@"; do
     fixture=${requested//-/_}
     known_fixture=0
@@ -108,25 +106,23 @@ for requested in "$@"; do
         fi
     done
     slug=${fixture//_/-}
-    target="flexe-$slug-test"
     driver_mode=0
     if [[ "$fixture" == emac_driver ]]; then
-        target=flexe-emac-hal-test
         driver_mode=1
     fi
     fixtures+=("$fixture")
     slugs+=("$slug")
-    targets+=("$target")
     driver_modes+=("$driver_mode")
-    duplicate_target=0
-    for candidate in "${host_targets[@]-}"; do
-        [[ "$candidate" == "$target" ]] && duplicate_target=1
-    done
-    [[ "$duplicate_target" -eq 1 ]] || host_targets+=("$target")
 done
 
 echo "==> building requested host fixture runners"
-cmake --build "$host_build" --target "${host_targets[@]}" -j
+host_build_log="$host_build/.flexe-fixture-build.log"
+if ! cmake --build "$host_build" --target flexe-fixture-test -j \
+        >"$host_build_log" 2>&1; then
+    echo "error: host fixture runner build failed (full log: $host_build_log)" >&2
+    tail -n 200 "$host_build_log" >&2
+    exit 1
+fi
 
 # A no-change Arduino CLI invocation spends tens of seconds walking the core
 # and dependency graph. Persist final artifacts behind a complete content
@@ -268,6 +264,14 @@ compile_fixture() {
         echo "error: Arduino compile produced no firmware for $slug" >&2
         return 1
     fi
+    # The harness consumes only the application image and ELF. Arduino also
+    # copies a roughly 11 MiB map, a merged flash image, and boot/partition
+    # images into --output-dir; retaining those for every classic fixture used
+    # hundreds of MiB without making a subsequent check any faster.
+    rm -f -- "$output_dir/$fixture.ino.map" \
+        "$output_dir/$fixture.ino.merged.bin" \
+        "$output_dir/$fixture.ino.bootloader.bin" \
+        "$output_dir/$fixture.ino.partitions.bin"
     printf '%s\n' "$fingerprint" > "$stamp.tmp" || return
     mv "$stamp.tmp" "$stamp" || return
     compile_cleanup
@@ -305,7 +309,7 @@ for index in "${!fixtures[@]}"; do
     symbols_files+=("$symbols")
     stamps+=("$stamp")
     fingerprints+=("$fingerprint")
-    runner_paths+=("$host_build/${targets[$index]}")
+    runner_paths+=("$host_build/flexe-fixture-test")
     if [[ "$fixture_rebuild" -eq 0 && -s "$firmware" &&
           -s "$symbols" && "$cached_fingerprint" == "$fingerprint" ]]; then
         echo "==> reusing unchanged $slug firmware"
@@ -359,6 +363,12 @@ if [[ ${#stale_indices[@]} -ne 0 ]]; then
 fi
 
 for index in "${!fixtures[@]}"; do
+    # Also migrate cache entries produced by older helper versions without
+    # forcing a firmware rebuild.
+    rm -f -- "${output_dirs[$index]}/${fixtures[$index]}.ino.map" \
+        "${output_dirs[$index]}/${fixtures[$index]}.ino.merged.bin" \
+        "${output_dirs[$index]}/${fixtures[$index]}.ino.bootloader.bin" \
+        "${output_dirs[$index]}/${fixtures[$index]}.ino.partitions.bin"
     [[ -s "${firmwares[$index]}" && -s "${symbols_files[$index]}" ]] || {
         echo "error: missing compiled artifacts for ${slugs[$index]}" >&2
         exit 1
@@ -370,17 +380,17 @@ for index in "${!fixtures[@]}"; do
 done
 
 run_fixture_engine() {
-    local engine=$1 runner=$2 firmware=$3 symbols=$4 driver_mode=$5
+    local engine=$1 runner=$2 entry=$3 firmware=$4 symbols=$5 driver_mode=$6
     if [[ "$engine" == interpreter ]]; then
         if [[ "$driver_mode" -eq 1 ]]; then
-            "$runner" --no-jit --driver "$firmware" "$symbols"
+            "$runner" "$entry" --no-jit --driver "$firmware" "$symbols"
         else
-            "$runner" --no-jit "$firmware" "$symbols"
+            "$runner" "$entry" --no-jit "$firmware" "$symbols"
         fi
     elif [[ "$driver_mode" -eq 1 ]]; then
-        "$runner" --driver "$firmware" "$symbols"
+        "$runner" "$entry" --driver "$firmware" "$symbols"
     else
-        "$runner" "$firmware" "$symbols"
+        "$runner" "$entry" "$firmware" "$symbols"
     fi
 }
 
@@ -407,10 +417,10 @@ run_fixture_pair() {
     local pair_engine_jobs=$6 status=0 jit_status=0 interpreter_status=0
     if [[ "$pair_engine_jobs" -eq 1 ]]; then
         echo "==> testing $slug (JIT)"
-        run_fixture_engine jit "$runner" "$firmware" "$symbols" \
+        run_fixture_engine jit "$runner" "$slug" "$firmware" "$symbols" \
             "$driver_mode" || status=1
         echo "==> testing $slug (interpreter)"
-        run_fixture_engine interpreter "$runner" "$firmware" "$symbols" \
+        run_fixture_engine interpreter "$runner" "$slug" "$firmware" "$symbols" \
             "$driver_mode" || status=1
         return "$status"
     fi
@@ -423,10 +433,10 @@ run_fixture_pair() {
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    run_fixture_engine jit "$runner" "$firmware" "$symbols" \
+    run_fixture_engine jit "$runner" "$slug" "$firmware" "$symbols" \
         "$driver_mode" >"$PAIR_LOG_DIR/jit.log" 2>&1 &
     PAIR_JIT_PID=$!
-    run_fixture_engine interpreter "$runner" "$firmware" "$symbols" \
+    run_fixture_engine interpreter "$runner" "$slug" "$firmware" "$symbols" \
         "$driver_mode" >"$PAIR_LOG_DIR/interpreter.log" 2>&1 &
     PAIR_INTERP_PID=$!
     wait "$PAIR_JIT_PID" || jit_status=$?

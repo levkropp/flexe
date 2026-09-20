@@ -8,6 +8,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-twai-bus-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 pinned_bin=98b418fca45ac689a16e848ca63f3429912eca0857501a6e2f7e2ce79552e348
 pinned_elf=7210164d889b792d89ab8668664f9f800ccd4ea942ae5f5bf801f1144226c718
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
@@ -35,10 +39,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$runner" --no-jit "$S3_IDF_TWAI_BIN" "$S3_IDF_TWAI_ELF" \
+"${runner_command[@]}" --no-jit "$S3_IDF_TWAI_BIN" "$S3_IDF_TWAI_ELF" \
     "$S3_ROM_ELF" >"$tmpdir/interp.out" 2>"$tmpdir/interp.err" &
 interp_pid=$!
-"$runner" "$S3_IDF_TWAI_BIN" "$S3_IDF_TWAI_ELF" "$S3_ROM_ELF" \
+"${runner_command[@]}" "$S3_IDF_TWAI_BIN" "$S3_IDF_TWAI_ELF" "$S3_ROM_ELF" \
     >"$tmpdir/jit.out" 2>"$tmpdir/jit.err" &
 jit_pid=$!
 

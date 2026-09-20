@@ -402,13 +402,32 @@ resolve_project() {
 }
 
 host_target_for_key() {
+    host_entry=
     case "$1" in
-    s3_idf_gpio_isr) host_target=flexe-s3-idf-gpio-isr-test ;;
-    s3_idf_i2c_master) host_target=flexe-s3-idf-i2c-master-test ;;
-    s3_idf_i2s_std) host_target=flexe-s3-idf-i2s-std-test ;;
-    s3_idf_sdmmc_host) host_target=flexe-sdmmc-host-test ;;
-    s3_idf_twai) host_target=flexe-twai-bus-test ;;
-    s3_idf_usb_serial_jtag) host_target=flexe-s3-idf-usb-serial-jtag-test ;;
+    s3_idf_gpio_isr)
+        host_target=flexe-fixture-test
+        host_entry=s3-idf-gpio-isr
+        ;;
+    s3_idf_i2c_master)
+        host_target=flexe-fixture-test
+        host_entry=s3-idf-i2c-master
+        ;;
+    s3_idf_i2s_std)
+        host_target=flexe-fixture-test
+        host_entry=s3-idf-i2s-std
+        ;;
+    s3_idf_sdmmc_host)
+        host_target=flexe-fixture-test
+        host_entry=sdmmc-host
+        ;;
+    s3_idf_twai)
+        host_target=flexe-fixture-test
+        host_entry=twai-bus
+        ;;
+    s3_idf_usb_serial_jtag)
+        host_target=flexe-fixture-test
+        host_entry=s3-idf-usb-serial-jtag
+        ;;
     *) host_target=xtensa-emu ;;
     esac
 }
@@ -714,9 +733,15 @@ for index in "${!projects[@]}"; do
         gate="$repo/scripts/check-$(printf '%s' "$key" | tr '_' '-').sh"
         if [[ -n "${RUNNER:-}" ]]; then
             gate_runner=$RUNNER
+            gate_runner_entry=
+            if [[ "$(basename -- "$RUNNER")" == flexe-fixture-test ]]; then
+                host_target_for_key "$key"
+                gate_runner_entry=$host_entry
+            fi
         else
             host_target_for_key "$key"
             gate_runner="$host_build/$host_target"
+            gate_runner_entry=$host_entry
             [[ -x "$gate_runner" ]] || {
                 echo "error: built runner is not executable: $gate_runner" >&2
                 exit 1
@@ -724,7 +749,7 @@ for index in "${!projects[@]}"; do
         fi
         flexe_fixture_gate_queue_artifact "$key" "$gate" "$prefix" \
             "$bin" "$elf" "$bin_hash" "$elf_hash" \
-            "$S3_ROM_ELF" "$gate_runner"
+            "$S3_ROM_ELF" "$gate_runner" "$gate_runner_entry"
     fi
 done
 

@@ -9,6 +9,10 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-idf-usb-serial-jtag-test"}
+runner_command=("$runner")
+if [[ -n "${FLEXE_FIXTURE_RUNNER_ENTRY:-}" ]]; then
+    runner_command+=("$FLEXE_FIXTURE_RUNNER_ENTRY")
+fi
 pinned_bin=6afea3c1ad908202bdbaa4c3ae19b72f850aa96b38d3a1ff55b2796c1bff14d5
 pinned_elf=a47a4f5468108aebaaba6d3ab9aab74817dd52eded39848e1d81dc62cf8e6cbc
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
@@ -30,7 +34,7 @@ done
 tmpdir=$(mktemp -d)
 trap 'rm -f "$tmpdir/first.out" "$tmpdir/first.err" "$tmpdir/second.out" "$tmpdir/second.err"; rmdir "$tmpdir"' EXIT
 for replay in first second; do
-    "$runner" "$S3_IDF_USJ_BIN" "$S3_IDF_USJ_ELF" "$S3_ROM_ELF" \
+    "${runner_command[@]}" "$S3_IDF_USJ_BIN" "$S3_IDF_USJ_ELF" "$S3_ROM_ELF" \
         > "$tmpdir/$replay.out" 2> "$tmpdir/$replay.err" || {
             echo "FAIL: USB Serial/JTAG guest exchange failed" >&2
             tail -25 "$tmpdir/$replay.err" >&2

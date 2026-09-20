@@ -1,0 +1,53 @@
+#include <stdio.h>
+#include <string.h>
+
+typedef int (*fixture_main_fn)(int argc, char **argv);
+
+/* A few asynchronous stubs use this process-wide stop flag. Each standalone
+ * harness historically supplied an identical definition; renamed entry
+ * objects keep their private definitions while the shared core uses this one. */
+volatile int emu_app_running = 1;
+
+@FLEXE_FIXTURE_DECLARATIONS@
+typedef struct {
+    const char *name;
+    fixture_main_fn main_fn;
+} fixture_entry_t;
+
+static const fixture_entry_t fixture_entries[] = {
+@FLEXE_FIXTURE_TABLE@};
+
+static const fixture_entry_t *find_fixture(const char *name) {
+    size_t count = sizeof(fixture_entries) / sizeof(fixture_entries[0]);
+    for (size_t index = 0; index < count; index++) {
+        if (strcmp(name, fixture_entries[index].name) == 0)
+            return &fixture_entries[index];
+    }
+    return NULL;
+}
+
+static void list_fixtures(FILE *stream) {
+    size_t count = sizeof(fixture_entries) / sizeof(fixture_entries[0]);
+    for (size_t index = 0; index < count; index++)
+        fprintf(stream, "%s\n", fixture_entries[index].name);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--list") == 0) {
+        list_fixtures(stdout);
+        return 0;
+    }
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s FIXTURE [FIXTURE-ARGS...]\n", argv[0]);
+        fprintf(stderr, "       %s --list\n", argv[0]);
+        return 2;
+    }
+
+    const fixture_entry_t *entry = find_fixture(argv[1]);
+    if (!entry) {
+        fprintf(stderr, "unknown fixture entry: %s\n", argv[1]);
+        return 2;
+    }
+
+    return entry->main_fn(argc - 1, argv + 1);
+}

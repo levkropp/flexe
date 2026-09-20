@@ -200,6 +200,7 @@ FLEXE_GATE_QUEUE_BIN_HASHES=()
 FLEXE_GATE_QUEUE_ELF_HASHES=()
 FLEXE_GATE_QUEUE_ROMS=()
 FLEXE_GATE_QUEUE_RUNNERS=()
+FLEXE_GATE_QUEUE_RUNNER_ENTRIES=()
 
 flexe_fixture_gate_queue_artifact() {
     FLEXE_GATE_QUEUE_LABELS+=("$1")
@@ -211,6 +212,7 @@ flexe_fixture_gate_queue_artifact() {
     FLEXE_GATE_QUEUE_ELF_HASHES+=("$7")
     FLEXE_GATE_QUEUE_ROMS+=("$8")
     FLEXE_GATE_QUEUE_RUNNERS+=("$9")
+    FLEXE_GATE_QUEUE_RUNNER_ENTRIES+=("${10:-}")
 }
 
 flexe_fixture_gate_run_queued() {
@@ -229,6 +231,7 @@ flexe_fixture_gate_run_queued() {
             "${prefix}_ELF_SHA256=${FLEXE_GATE_QUEUE_ELF_HASHES[$index]}" \
             "S3_ROM_ELF=${FLEXE_GATE_QUEUE_ROMS[$index]}" \
             "RUNNER=${FLEXE_GATE_QUEUE_RUNNERS[$index]}" \
+            "FLEXE_FIXTURE_RUNNER_ENTRY=${FLEXE_GATE_QUEUE_RUNNER_ENTRIES[$index]}" \
             "${FLEXE_GATE_QUEUE_GATES[$index]}"
     done
     status=0
