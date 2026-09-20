@@ -553,6 +553,12 @@ void periph_touch_set_value(esp32_periph_t *p, int pad, uint32_t value);
  * to 40 slots for simplicity. Default value is 0. */
 void     periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw);
 uint16_t periph_get_adc_value(const esp32_periph_t *p, int channel);
+/* Complete one frame for an active target-described continuous-ADC stream.
+ * The frame follows the guest's pattern table and GDMA descriptor geometry. */
+size_t   periph_adc_continuous_inject(esp32_periph_t *p);
+bool     periph_adc_continuous_active(const esp32_periph_t *p);
+uint64_t periph_adc_continuous_frame_count(const esp32_periph_t *p);
+uint64_t periph_adc_continuous_sample_count(const esp32_periph_t *p);
 
 /* Physical-side raw code for a target-described on-die temperature sensor.
  * The next conversion latches this input. Unsupported targets ignore writes

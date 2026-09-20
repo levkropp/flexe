@@ -14793,6 +14793,14 @@ static void target_sens_conversion_done(void *ctx)
         p->target_rtc_cntl, p->target->sens.rtc_interrupt_mask, true);
 }
 
+static uint16_t target_apb_saradc_sample(
+    void *ctx, unsigned unit, unsigned channel)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || unit >= 2u || channel >= 10u) return 0u;
+    return p->adc_value[unit * 10u + channel];
+}
+
 /* ---- Target-described system timer ---- */
 
 static void system_clock_gate_changed(
@@ -14863,6 +14871,11 @@ static void system_clock_gate_changed(
         if (instance == 0u)
             flexe_lcd_cam_set_system_state(
                 p->lcd_cam, clock_enabled, reset_asserted);
+        break;
+    case FLEXE_SYSTEM_DEVICE_APB_SARADC:
+        if (instance == 0u)
+            flexe_apb_saradc_set_system_state(
+                p->target_apb_saradc, clock_enabled, reset_asserted);
         break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
@@ -15855,7 +15868,8 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 mem, default_read, default_write, p);
         if (target->capabilities & FLEXE_TARGET_CAP_APB_SARADC_V1)
             p->target_apb_saradc = flexe_apb_saradc_create(
-                mem, default_read, default_write, p);
+                mem, p->gdma, target_apb_saradc_sample, p,
+                default_read, default_write, p);
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_IO_V1)
             p->target_rtc_io = flexe_rtc_io_create(
                 mem, p->target_gpio, default_read, default_write, p);
@@ -15868,6 +15882,15 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 target_sens_conversion_done, p);
         flexe_sens_attach_regi2c(p->target_sens, p->regi2c);
         flexe_sens_attach_apb_saradc(p->target_sens, p->target_apb_saradc);
+        if (p->target_apb_saradc && p->system_clock) {
+            bool clock_enabled = false;
+            bool reset_asserted = true;
+            if (flexe_system_clock_gate_state(
+                    p->system_clock, FLEXE_SYSTEM_DEVICE_APB_SARADC, 0u,
+                    &clock_enabled, &reset_asserted))
+                flexe_apb_saradc_set_system_state(
+                    p->target_apb_saradc, clock_enabled, reset_asserted);
+        }
         if (target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) {
             mmio_read_fn fallback_read = p->target_sens
                 ? flexe_sens_mmio_read :
@@ -17334,6 +17357,22 @@ void periph_set_adc_value(esp32_periph_t *p, int channel, uint16_t raw) {
                                    (unsigned)channel / channels,
                                    (unsigned)channel % channels, raw);
     }
+}
+
+size_t periph_adc_continuous_inject(esp32_periph_t *p) {
+    return p ? flexe_apb_saradc_inject_frame(p->target_apb_saradc) : 0u;
+}
+
+bool periph_adc_continuous_active(const esp32_periph_t *p) {
+    return p && flexe_apb_saradc_stream_active(p->target_apb_saradc);
+}
+
+uint64_t periph_adc_continuous_frame_count(const esp32_periph_t *p) {
+    return p ? flexe_apb_saradc_frame_count(p->target_apb_saradc) : 0u;
+}
+
+uint64_t periph_adc_continuous_sample_count(const esp32_periph_t *p) {
+    return p ? flexe_apb_saradc_sample_count(p->target_apb_saradc) : 0u;
 }
 
 void periph_set_temperature_raw(esp32_periph_t *p, uint16_t raw) {

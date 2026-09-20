@@ -16,6 +16,7 @@ flash/cache-MMU windows, mask ROM, dual-core startup, system timer, timer
 groups and main watchdogs, SPI-memory controllers,
 general-purpose SPI2/SPI3 controllers and bidirectional AHB GDMA,
 I2S0/I2S1 v2 controllers with timed circular-GDMA transport,
+APB_SARADC continuous ADC1 pattern scans with host-fed GDMA frames,
 the native SD/MMC host with timed internal DMA and host-backed block media,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only

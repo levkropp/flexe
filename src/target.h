@@ -51,7 +51,7 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 23u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 24u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
@@ -764,17 +764,62 @@ typedef struct {
     bool arbiter_controlled;
 } flexe_sens_adc_unit_desc_t;
 
-/* APB SAR ADC2 arbitration. Only the RTC requester is currently modeled;
- * digital DMA and Wi-Fi/PWDET requests remain explicit unsupported paths. */
+/* S2/S3-generation APB SAR ADC digital controller and ADC2 arbitration.
+ * Register geometry, output packing, and the central-GDMA trigger are target
+ * data so the reusable converter does not depend on a chip name or firmware
+ * address. Analog values remain board/host inputs. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
+    uint16_t control_offset;
+    uint16_t control2_offset;
+    uint16_t fsm_wait_offset;
+    uint16_t pattern_offset[2];
     uint16_t arbiter_offset;
+    uint16_t filter_control_offset;
+    uint16_t dma_config_offset;
+    uint16_t clock_config_offset;
+    uint16_t data_status_offset[2];
+    uint16_t date_offset;
+    uint32_t control_reset;
+    uint32_t control_writable_mask;
+    uint32_t control2_reset;
+    uint32_t control2_writable_mask;
+    uint32_t fsm_wait_reset;
+    uint32_t fsm_wait_writable_mask;
+    uint32_t pattern_writable_mask;
     uint32_t arbiter_reset;
     uint32_t arbiter_writable_mask;
+    uint32_t filter_control_reset;
+    uint32_t filter_control_writable_mask;
+    uint32_t dma_config_reset;
+    uint32_t dma_config_writable_mask;
+    uint32_t clock_config_reset;
+    uint32_t clock_config_writable_mask;
+    uint32_t date_reset;
+    uint32_t date_writable_mask;
+    uint32_t pattern_length_mask[2];
+    uint32_t pattern_clear_mask[2];
+    uint32_t unit_select_mask;
+    uint32_t work_mode_mask;
+    uint32_t sar_clock_gate_mask;
+    uint32_t sample_invert_mask[2];
+    uint32_t timer_select_mask;
+    uint32_t timer_enable_mask;
+    uint32_t dma_enable_mask;
+    uint32_t dma_reset_mask;
+    uint32_t dma_eof_mask;
     uint32_t grant_force_mask;
+    uint32_t apb_force_mask;
     uint32_t rtc_force_mask;
     uint32_t force_selection_mask;
+    uint8_t pattern_register_count;
+    uint8_t pattern_entries_per_register;
+    uint8_t gdma_peripheral_id;
+    uint8_t channels_per_unit;
+    uint8_t sample_data_bits;
+    uint8_t sample_channel_shift;
+    uint8_t sample_unit_shift;
 } flexe_apb_saradc_desc_t;
 
 typedef struct {

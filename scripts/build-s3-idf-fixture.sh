@@ -74,7 +74,7 @@ done
 
 all_fixtures=(hello crosscore nvs sleep gpio-wake gpio-isr \
     usb-serial-jtag i2c-master i2s-std sdmmc-host twai pcnt rmt-loopback \
-    socket-range aes mcpwm lcd-i80 camera)
+    socket-range aes mcpwm lcd-i80 camera adc-continuous)
 if [[ $# -eq 1 && "$1" == all ]]; then
     set -- "${all_fixtures[@]}"
 elif [[ " $* " == *" all "* ]]; then
@@ -441,6 +441,10 @@ host_target_for_key() {
     s3_idf_camera)
         host_target=flexe-fixture-test
         host_entry=s3-idf-camera
+        ;;
+    s3_idf_adc_continuous)
+        host_target=flexe-fixture-test
+        host_entry=s3-idf-adc-continuous
         ;;
     s3_idf_sdmmc_host)
         host_target=flexe-fixture-test

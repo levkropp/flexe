@@ -218,6 +218,10 @@ interrupt callbacks, and teardown in both engines with zero unsupported MMIO.
 runs its unmodified OV2640 SCCB, GPIO, LCD_CAM, circular-GDMA, ISR, camera-task,
 full-frame validation, and teardown paths twice in each engine with zero
 unsupported MMIO.
+`check-s3-idf-adc-continuous.sh` runs ESP-IDF 5.3.2's public continuous-ADC
+driver twice in each engine, checking ADC1 pattern decoding, two distinct
+host-fed type-2 frames, trigger-8 GDMA ownership, ISR/task notification, the
+driver ring buffer, teardown, deterministic replay, and zero unsupported MMIO.
 `check-s3-idf-aes.sh` likewise runs the public mbedTLS AES API twice per engine,
 covering all six S3 block modes, AES-128/256 known-answer vectors, partial CTR,
 and a 4 KiB interrupt-driven GDMA round trip.
@@ -244,7 +248,7 @@ Thus official external components remain content-pinned without dirtying or
 bloating the source tree. A content fingerprint covers the project sources,
 generated configuration, pinned IDF/tool metadata, build flags, deterministic
 timestamp, and both artifact hashes. An unchanged run therefore skips the IDF
-environment export and Ninja entirely; all eighteen artifact lookups take under
+environment export and Ninja entirely; all nineteen artifact lookups take under
 two seconds on the reference MacBook. A cache miss retains full logs and prints only progress,
 exact artifact paths and hashes, and gate results. Pass `--verbose` when live
 compiler output and ccache statistics are useful. `--check` also updates just

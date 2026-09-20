@@ -220,7 +220,8 @@ TEST(sens_s3_rtc_adc_latches_channel_and_obeys_clock_reset)
         mem, sens_test_fallback_read, sens_test_fallback_write,
         &fallback, NULL, NULL);
     flexe_apb_saradc_t *apb = flexe_apb_saradc_create(
-        mem, sens_test_fallback_read, sens_test_fallback_write, &fallback);
+        mem, NULL, NULL, NULL,
+        sens_test_fallback_read, sens_test_fallback_write, &fallback);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(sens != NULL);
     ASSERT_TRUE(apb != NULL);

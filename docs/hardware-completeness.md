@@ -57,7 +57,7 @@ even when a firmware workflow succeeds.
 | S3 LCD_CAM i80 TX / camera RX | Partial (MMIO/GDMA and host buses) | `tests/test_lcd_cam.c`; `scripts/check-s3-idf-lcd-i80.sh` runs ESP-IDF 5.3.2's unmodified i80 driver twice in each engine. `scripts/check-s3-idf-camera.sh` runs pinned official `esp32-camera` 2.1.7 through OV2640 SCCB detection/configuration, GPIO routing, ten descriptor completions on a circular ring, five independent peripheral EOFs, VSYNC, ISR/task wakeups, a complete 160x120 RGB565 frame, and teardown twice in both engines with zero unsupported accesses | Command and DMA-controlled i80 output plus host-fed raw camera input, 8/16-bit stride, and bit/byte order are modeled. Finite non-DMA LCD counts, RGB scanout, camera color conversion, line timing, pad-edge timing, additional sensors/formats, and electrical behavior remain diagnostic or unverified. |
 | S3 SD/MMC host | Partial (MMIO, timed IDMAC, and host media) | `tests/test_peripherals.c`; `scripts/check-s3-idf-sdmmc-host.sh` runs ESP-IDF 5.3.2's unmodified host driver and ISR queue in both engines, exercises slot-1 command/response plus single- and 20 KiB multi-block reads/writes, verifies GPIO-matrix routes and media, and leaves zero unsupported accesses | SDHC block media and both logical slots are modeled. SDIO cards, UHS/DDR signaling, bus-width electrical behavior, calibrated clock timing, card removal, and media-error injection remain unverified. |
 | S3 TWAI/CAN | Partial (MMIO, timed frames, and host bus) | `tests/test_twai.c`; `scripts/check-s3-idf-twai.sh` runs ESP-IDF 5.3.2's unmodified driver in both engines through GPIO routing, ISR-backed TX/RX queues, alerts, self-reception, and host-injected standard/extended frames with zero unsupported accesses | CAN 2.0 frame/FIFO/filter, arbitration-loss, retry, error confinement, bus-off, and recovery state are modeled. Electrical bit arbitration, transceiver behavior, multi-node wire timing, and calibrated error injection remain unverified. |
-| S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks controller-wide clock/arbitration/AHB-reset configuration, finite chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_i2s_v2.c` and `tests/test_lcd_cam.c` check streaming consumers and distinct descriptor/peripheral-EOF boundaries; GP-SPI, stock I2S, stock LCD i80, and host-fed camera coverage exercise independent consumers plus I2S trigger IDs 3/4 and LCD_CAM trigger 5 | Full priority/arbitration behavior and other streaming consumers such as continuous ADC remain unverified. |
+| S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks controller-wide clock/arbitration/AHB-reset configuration, finite chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_i2s_v2.c`, `tests/test_lcd_cam.c`, and `tests/test_apb_saradc.c` check streaming consumers and descriptor/peripheral-EOF boundaries; GP-SPI, stock I2S, stock LCD i80, host-fed camera, and stock continuous ADC exercise independent consumers plus I2S trigger IDs 3/4, LCD_CAM trigger 5, and ADC trigger 8 | Full priority/arbitration behavior and additional streaming consumers remain unverified. |
 | S3 AES | Modeled (functional MMIO/GDMA) | `tests/test_crypto.c`; `scripts/check-s3-idf-aes.sh` runs ESP-IDF 5.3.2's unmodified mbedTLS driver twice in each engine through AES-128/256 ECB, CBC, CTR, OFB, CFB8, and CFB128 plus a 4 KiB interrupt-driven transfer | Operations complete immediately. Nondefault `ENDIAN` transformations are retained but not applied; AES-192 and accelerator GCM are not S3 hardware capabilities. |
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks, four flash/four PSRAM access-control regions, and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, access-fault generation, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_syscon_memory.c`, `tests/test_esp32s3_extmem.c`, WLED and zero-unsupported stock Arduino production audits | Cache-array/internal-SRAM ownership has exact reset, masking, and sticky locks; external flash/PSRAM access regions have exact reset, masking, and semantic state. Cache topology/timing, the external-region lock, and protection-fault generation remain unsupported. |
@@ -68,7 +68,7 @@ even when a firmware workflow succeeds.
 | S3 MCPWM | Partial (MMIO and timed GPIO-matrix I/O) | `tests/test_mcpwm.c`; `scripts/check-s3-idf-mcpwm.sh` runs ESP-IDF 5.3.2's unmodified driver twice in each engine across both groups, timer/comparator/capture ISRs, GPIO loopback, live compare updates, force levels, and teardown with zero unsupported accesses | The shared classic/S3 V1 engine models three timers and operators per group, A/B generators, capture, sync, faults, SYSTEM clock/reset, and target interrupt/matrix wiring. Electrical dead-time/carrier waveforms, silicon edge jitter, all brake/sync driver combinations, and calibrated latency remain unverified. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame in both engines with zero unsupported startup/device accesses; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback with zero unsupported accesses | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path; pulse RAM becomes inaccessible and loses contents under `RMT_MEM_FORCE_PD`. DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
-| S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` (deterministic interpreter/JIT replay with zero unsupported accesses), WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
+| S3 SENS clocks, RTC and continuous SAR ADC, temperature sensor | Partial (MMIO/GDMA plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh`, and `scripts/check-s3-idf-adc-continuous.sh`; the latter runs ESP-IDF 5.3.2's stock continuous driver through pattern scan, trigger-8 GDMA, ISR callbacks, its FreeRTOS ring buffer, and teardown twice in each engine with zero unsupported accesses | RTC one-shot and functional ADC1 continuous conversion are driver-gated. ADC2 contention, calibrated conversion cadence, digital IIR/monitor behavior, ULP execution, analog attenuation/calibration, and electrical fidelity remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response, next prompt, and zero unsupported accesses | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
@@ -106,7 +106,10 @@ target-described UART, and `uart_break` drives the controller's receive-break
 path. These events enter the same FIFO, timeout, interrupt, and UHCI paths as
 other host UART injection. `i2s_in` carries bounded hexadecimal sample bytes to
 either I2S port and enters the same RX FIFO and DMA path as an attached audio
-source. If a connected frontend is the only possible
+source. `adc_in` updates the selected raw board sample; while the S3 continuous
+controller is active, the event also completes one queued pattern frame through
+the same APB_SARADC and GDMA path as another attached analog source. If a
+connected frontend is the only possible
 wake source while all guest cores are in `WAITI`, Flexe freezes guest time and
 waits in short host-time intervals instead of busy-spinning or exhausting the
 cycle budget before the next input arrives.
@@ -899,12 +902,44 @@ requester, unforced RTC conversion proceeds. Digital and Wi-Fi/PWDET
 requesters and simultaneous contention are still unsupported, and forcing
 those owners remains diagnostic. The interpreter's complete production run
 uses zero unsupported accesses. This is raw-code functional behavior, not
-physical analog, attenuation, calibration accuracy, or continuous/DMA ADC
-fidelity. Recheck with the external compiled fixture:
+physical analog, attenuation, or calibration accuracy. Recheck with the
+external compiled fixture:
 
 ```sh
 ./scripts/build-s3-arduino-fixture.sh --check adc
 ```
+
+The target-described APB_SARADC model adds the digital continuous-conversion
+path without replacing any guest driver routine. It retains the S3 control,
+FSM wait, pattern, ADC2 arbiter, filter-selection, DMA, clock, data-status, and
+DATE registers; obeys the SYSTEM clock/reset gate; decodes each ADC1/ADC2
+pattern entry; packs native type-2 results; and writes complete frames through
+the active trigger-8 GDMA receive descriptor. Host code can atomically update
+raw unit/channel inputs and explicitly complete a frame, while `adc_in`
+sandbox events provide the same behavior to interactive frontends.
+
+The independent `tests/fixtures/s3_idf_adc_continuous` project uses only
+ESP-IDF 5.3.2's public `adc_continuous_*` API. It scans ADC1 channels 2 and 3,
+blocks in the driver's FreeRTOS ring buffer, consumes two 64-byte frames with
+different host values, validates all 32 unit/channel/data records, observes two
+ISR callbacks, and stops and deletes the driver. Two runs in each engine are
+byte-identical, JIT executes native instructions, and all four runs report zero
+unsupported accesses. Its application image SHA-256 is
+`169e5bf63ea7dde1e4f50ad2da93deacb72d2dba44f85d6e4e02a22ca72ed0a3`;
+the matching ELF SHA-256 is
+`75d662344a23752128a8b6c7aa44381c5ec1b06df0ff90b459cda0f707433d5a`.
+Rebuild and replay it with:
+
+```sh
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/build-s3-idf-fixture.sh --check adc-continuous
+```
+
+Fast mode produces one initial frame when the stock driver starts and later
+frames when a host source supplies samples. It does not synthesize an ongoing
+sample-rate clock. ADC2 requester contention, simultaneous-conversion timing,
+IIR filtering, threshold monitors, conversion latency, and physical analog
+behavior remain explicit unsupported or unverified boundaries.
 
 The S3 LEDC model follows Espressif's `esp32s3` `ledc_reg.h`,
 `system_reg.h`, `gpio_sig_map.h`, and `interrupts.h`: eight low-speed-only

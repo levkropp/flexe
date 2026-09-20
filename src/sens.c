@@ -471,8 +471,9 @@ static bool sens_adc_write(flexe_sens_t *sens, uint32_t offset,
         } else if (offset == model->mux_offset) {
             unit->mux = value & model->mux_writable_mask;
             if ((value & ~model->mux_writable_mask) != 0u ||
-                (unit->mux & (model->mux_rtc_block_mask |
-                              model->mux_unsupported_mask)) != 0u)
+                (unit->mux & model->mux_unsupported_mask) != 0u ||
+                ((unit->mux & model->mux_rtc_block_mask) != 0u &&
+                 !sens->apb_saradc))
                 sens_fallback_write(sens, addr, value);
         } else if (offset == model->atten_offset) {
             unit->atten = value;

@@ -831,7 +831,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 8u);
-    ASSERT_EQ(s3->system_clock.gate_count, 23u);
+    ASSERT_EQ(s3->system_clock.gate_count, 24u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
@@ -880,6 +880,20 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
               FLEXE_SYSTEM_DEVICE_LCD_CAM);
     ASSERT_EQ(s3->system_clock.gate[22].clock_mask, 1u << 8);
     ASSERT_EQ(s3->system_clock.gate[22].reset_mask, 1u << 8);
+    ASSERT_EQ(s3->system_clock.gate[23].device,
+              FLEXE_SYSTEM_DEVICE_APB_SARADC);
+    ASSERT_EQ(s3->system_clock.gate[23].instance, 0u);
+    ASSERT_EQ(s3->system_clock.gate[23].clock_mask, 1u << 28);
+    ASSERT_EQ(s3->system_clock.gate[23].reset_mask, 1u << 28);
+    ASSERT_EQ(s3->apb_saradc.base, 0x60040000u);
+    ASSERT_EQ(s3->apb_saradc.date_offset, 0x3FCu);
+    ASSERT_EQ(s3->apb_saradc.gdma_peripheral_id, 8u);
+    ASSERT_EQ(s3->apb_saradc.pattern_register_count, 4u);
+    ASSERT_EQ(s3->apb_saradc.pattern_entries_per_register, 4u);
+    ASSERT_EQ(s3->apb_saradc.channels_per_unit, 10u);
+    ASSERT_EQ(s3->apb_saradc.sample_data_bits, 12u);
+    ASSERT_EQ(s3->apb_saradc.sample_channel_shift, 13u);
+    ASSERT_EQ(s3->apb_saradc.sample_unit_shift, 17u);
     ASSERT_EQ(s3->system_clock.gate[7].device,
               FLEXE_SYSTEM_DEVICE_SHA);
     ASSERT_EQ(s3->system_clock.gate[7].clock_mask, 1u << 2);

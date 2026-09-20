@@ -37,6 +37,7 @@ typedef enum {
     FLEXE_SYSTEM_DEVICE_PCNT,
     FLEXE_SYSTEM_DEVICE_MCPWM,
     FLEXE_SYSTEM_DEVICE_LCD_CAM,
+    FLEXE_SYSTEM_DEVICE_APB_SARADC,
 } flexe_system_device_t;
 
 /* Optional board population; zero retains the target's standard board. The

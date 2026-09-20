@@ -801,6 +801,8 @@ static bool sandbox_process_line(esp32_periph_t *periph, const char *line) {
         return true;
     case SBX_INPUT_ADC:
         periph_set_adc_value(periph, event.adc.channel, event.adc.raw);
+        if (periph_adc_continuous_active(periph))
+            (void)periph_adc_continuous_inject(periph);
         return true;
     case SBX_INPUT_UART:
         return periph_uart_rx_inject_num(periph, event.uart.port,
