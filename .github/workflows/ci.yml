@@ -104,6 +104,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev
+      - name: Restore pinned Arduino toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15
+          key: arduino-cli-1.5.1-esp32-2.0.11-${{ runner.os }}
       - name: Install arduino-cli and ESP32 core 2.0.11
         run: |
           mkdir -p "$HOME/bin"
@@ -115,19 +120,32 @@ jobs:
             "$RUNNER_TEMP/arduino-cli.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/arduino-cli.tar.gz" -C "$HOME/bin" arduino-cli
           "$HOME/bin/arduino-cli" version
-          "$HOME/bin/arduino-cli" core update-index \
-            --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          for attempt in 1 2 3 4; do
-            if "$HOME/bin/arduino-cli" core install esp32:esp32@2.0.11 \
-                --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json; then
-              break
-            fi
-            if [[ "$attempt" -eq 4 ]]; then
-              echo "ESP32 core installation failed after four attempts" >&2
-              exit 1
-            fi
-            sleep "$((attempt * 10))"
-          done
+          if "$HOME/bin/arduino-cli" core list 2>/dev/null | \
+              grep -Eq '^esp32:esp32[[:space:]]+2\.0\.11'; then
+            echo "Reusing cached ESP32 core 2.0.11"
+          else
+            "$HOME/bin/arduino-cli" core update-index \
+              --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+            for attempt in 1 2 3 4; do
+              if "$HOME/bin/arduino-cli" core install esp32:esp32@2.0.11 \
+                  --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json; then
+                break
+              fi
+              if [[ "$attempt" -eq 4 ]]; then
+                echo "ESP32 core installation failed after four attempts" >&2
+                exit 1
+              fi
+              sleep "$((attempt * 10))"
+            done
+          fi
+      - name: Restore compiled fixture firmware
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/arduino-fixtures/*/*.ino.bin
+            build/arduino-fixtures/*/*.ino.elf
+            build/arduino-fixtures/*/.flexe-fixture.sha256
+          key: arduino-fixtures-v1-esp32-2.0.11-${{ runner.os }}-${{ hashFiles('tests/fixtures/**/*.ino', 'scripts/test-fixtures.sh') }}
       - name: Configure host build
         run: |
           cmake -S . -B build -G Ninja -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF

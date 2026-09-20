@@ -16,7 +16,21 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
 fi
 
 tmpdir=$(mktemp -d)
-trap 'rm -f "$tmpdir"/*; rmdir "$tmpdir"' EXIT
+interp_pid=
+jit_pid=
+cleanup() {
+    for pid in "$interp_pid" "$jit_pid"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -f "$tmpdir/interp.err" "$tmpdir/interp.frames" \
+          "$tmpdir/interp.state" "$tmpdir/jit.err" \
+          "$tmpdir/jit.frames" "$tmpdir/jit.state"
+    rmdir "$tmpdir"
+}
+trap cleanup EXIT HUP INT TERM
 
 run_engine() {
     local name=$1
@@ -35,8 +49,22 @@ run_engine() {
         "$tmpdir/$name.err" > "$tmpdir/$name.state"
 }
 
-run_engine interp --no-jit
-run_engine jit --jit-stats
+# The two engines consume immutable inputs and write disjoint artifacts. Run
+# them concurrently so the strict differential gate costs roughly the slower
+# engine rather than the sum of both engine times.
+run_engine interp --no-jit &
+interp_pid=$!
+run_engine jit --jit-stats &
+jit_pid=$!
+run_failed=0
+if ! wait "$interp_pid"; then run_failed=1; fi
+interp_pid=
+if ! wait "$jit_pid"; then run_failed=1; fi
+jit_pid=
+if [[ "$run_failed" -ne 0 ]]; then
+    echo "FAIL: a WLED S3 execution engine failed" >&2
+    exit 1
+fi
 
 expected='RMT TX0:    13599 chunks, 321304 items, 317 completions, fnv32=46F65AC5'
 for name in interp jit; do

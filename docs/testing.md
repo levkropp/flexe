@@ -78,11 +78,17 @@ Configuration:
 | `FLEXE_ARDUINO_FQBN` | Board and menu configuration |
 | `FLEXE_BUILD_DIR` | Configured host CMake build directory |
 | `FLEXE_FIXTURE_BUILD_ROOT` | Fixture build root, or `temporary` for disposable builds |
+| `FLEXE_FIXTURE_REBUILD` | Set to `1` to ignore valid cached fixture firmware |
 
 Compiled sketches persist under `FLEXE_BUILD_DIR/arduino-fixtures` by default,
-so a focused rerun can reuse Arduino's dependency cache. Set
+and a content fingerprint covers the fixture source, FQBN, optimization,
+Arduino CLI and installed core versions, executable wrapper, and explicit
+config. An unchanged focused rerun skips Arduino CLI entirely instead of
+merely asking it to rediscover an unchanged dependency graph. Set
 `FLEXE_FIXTURE_BUILD_ROOT` to another directory to isolate a board/toolchain
 configuration, or to `temporary` for a clean disposable build.
+CI caches the pinned Arduino core and only the compact firmware/ELF/stamp
+triples, not each fixture's much larger intermediate build tree.
 
 ## Production ROM gates
 
@@ -116,9 +122,10 @@ ELF. `check-s3-nerdminer-portal.sh` exercises provisioning and reset,
 `check-s3-marauder.sh` runs the official v1.16.0 MultiBoard S3 image through
 native Bluetooth/Wi-Fi initialization and its absent-GPS probe, then injects
 `help` through UART0 and verifies the command response and following prompt,
-and requires nonzero JIT retirement. `check-s3-wled-rmt.sh` runs both engines,
-compares every completed LED frame plus the final CPU/time summary, and also
-requires nonzero JIT retirement. `check-s3-wled-http.sh` checks a matching
+and requires nonzero JIT retirement. `check-s3-wled-rmt.sh` runs both engines
+concurrently, compares every completed LED frame plus the final CPU/time
+summary, and also requires nonzero JIT retirement. `check-s3-wled-http.sh`
+checks a matching
 WLED source-build image/ELF pair through its own raw-lwIP web server. The HTTP
 gate needs a build with
 libslirp 4.9 or newer and `jq`; it binds a randomly selected host loopback
