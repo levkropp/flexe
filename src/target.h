@@ -56,7 +56,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 49u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 50u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -259,6 +259,26 @@ typedef struct {
     uint32_t reset_mask;
 } flexe_system_gate_desc_t;
 
+/* Light-sleep memory policy and the Wi-Fi/Bluetooth low-power clock divider.
+ * The source controls are independent hardware bits rather than an encoded
+ * enum, so consumers can observe invalid/multiple selections without the
+ * reusable model inventing a target-specific priority. A set memory inhibit
+ * bit prevents SoC memories from powering down during light sleep. */
+typedef struct {
+    uint16_t memory_power_down_offset;
+    uint16_t divider_integer_offset;
+    uint16_t divider_fraction_offset;
+    uint32_t memory_power_down_inhibit_mask;
+    uint32_t divider_integer_mask;
+    uint32_t divider_a_mask;
+    uint32_t divider_b_mask;
+    uint32_t source_rtc_slow_mask;
+    uint32_t source_internal_mask;
+    uint32_t source_xtal_mask;
+    uint32_t source_xtal32k_mask;
+    uint32_t rtc_clock_enable_mask;
+} flexe_system_low_power_desc_t;
+
 /* CPU/system-clock and peripheral clock/reset registers used by S2/S3-style
  * clock trees. Register geometry and device mappings are target data; the
  * reusable owner preserves register state and publishes exact gate edges.
@@ -278,6 +298,7 @@ typedef struct {
     flexe_system_register_desc_t
         reg[FLEXE_TARGET_SYSTEM_REGISTER_MAX];
     flexe_system_gate_desc_t gate[FLEXE_TARGET_SYSTEM_GATE_MAX];
+    flexe_system_low_power_desc_t low_power;
 } flexe_system_clock_desc_t;
 
 /* Digital pad configuration register file. GPIO-to-register routing belongs

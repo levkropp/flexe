@@ -154,15 +154,19 @@ not modeled yet, and an MWDT CPU-reset action currently requests the same
 whole-machine reset as a system-reset action.
 
 The target-described S3 SYSTEM bank exposes documented reset state and masked
-readback for peripheral clock/reset controls, low-sleep memory power masking,
-and Bluetooth low-power-clock division. SYSTIMER and both timer groups pause at
+readback for peripheral clock/reset controls. Its low-sleep memory-power mask
+now publishes whether SoC-memory power-down is allowed, and its Wi-Fi/Bluetooth
+low-power clock publishes all source controls plus the exact integer and
+fractional-divider tuple. SYSTIMER and both timer groups pause at
 exact clock-gate boundaries, and their independent reset pulses restore device
 state and interrupt lines. The external I2C and GP-SPI controllers and the
 session-owned SHA accelerator also consume their target-described clock/reset
 gates; SHA commands cannot complete with its clock off or reset asserted, and
-a reset pulse clears its register and digest state. Effects for other peripheral,
-memory-power, and Bluetooth clock fields remain explicit unsupported-access
-diagnostics even though their architectural register values are retained.
+a reset pulse clears its register and digest state. The memory/radio state is
+available to downstream consumers without fabricating memory loss, RF, or
+radio-controller behavior that is not modeled yet. Effects for other peripheral
+fields remain explicit unsupported-access diagnostics even though their
+architectural register values are retained.
 
 The external I2C model is shared by classic ESP32 and ESP32-S3 through target
 descriptors rather than fixed addresses or command encodings. It implements

@@ -607,8 +607,8 @@ For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 4 billion aggregate cycles produced 317 completed RMT transmissions and
 321,304 pulse words in 13,599 chunks on channel 0. The interpreter and JIT
 match at every completed-frame boundary and finish with the same `46F65AC5`
-pulse-stream digest, CPU state, and firmware-visible time; 38 unsupported
-peripheral accesses remain across 36 attributed sites. The JIT executes
+pulse-stream digest, CPU state, and firmware-visible time; 34 unsupported
+peripheral accesses remain across 32 attributed sites. The JIT executes
 1,780,691,463 of 1,819,518,818 retired instructions natively (97.9%). Ordinary
 code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
@@ -651,9 +651,11 @@ The same audit fell from 223 to 74 unsupported accesses when modem-control
 behavior replaced fallback handling, then to 55 when the target-described RTC
 digital domains became functional, and to 48 after modeling the independent
 RTC fast-clock mux and DATE/LDO-trim readback, then to 38 after resolving the
-RTC regulator force pairs and RTC-local PWC domains. DIG_PWC, PWC, REG's force
-pairs, the modeled domain fields of DIG_ISO, CLK_CONF's fast selector, and DATE
-no longer appear in the inventory. Remaining accesses stay visible: RTC analog
+RTC regulator force pairs and RTC-local PWC domains, then to 34 after exposing
+the SYSTEM light-sleep memory policy and radio low-power clock state. DIG_PWC,
+PWC, REG's force pairs, the modeled domain fields of DIG_ISO, CLK_CONF's fast
+selector, DATE, MEM_PD_MASK, and BT_LPCK_DIV no longer appear in the inventory.
+Remaining accesses stay visible: RTC analog
 and pad-isolation configuration in `0x60008000`,
 unmodeled SYSCON words such as `0x6002609C`, `0x600260A8`, and `0x600260B0`,
 SYSTEM/PCR and memory-protection setup in `0x600C0000`, plus two low-count

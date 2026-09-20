@@ -11,6 +11,8 @@ struct flexe_system_clock {
     void *fallback_ctx;
     flexe_system_clock_gate_fn gate_changed;
     void *gate_ctx;
+    flexe_system_low_power_fn low_power_changed;
+    void *low_power_ctx;
     uint32_t cpu_per_conf;
     uint32_t sysclk_conf;
     uint32_t reg[FLEXE_TARGET_SYSTEM_REGISTER_MAX];
@@ -34,6 +36,23 @@ static int system_clock_register_index(
 static bool system_clock_single_bit(uint32_t mask)
 {
     return mask != 0u && (mask & (mask - 1u)) == 0u;
+}
+
+static bool system_clock_contiguous_mask(uint32_t mask)
+{
+    if (mask == 0u) return false;
+    while ((mask & 1u) == 0u) mask >>= 1u;
+    return (mask & (mask + 1u)) == 0u;
+}
+
+static unsigned system_clock_mask_shift(uint32_t mask)
+{
+    unsigned shift = 0u;
+    while ((mask & 1u) == 0u) {
+        mask >>= 1u;
+        shift++;
+    }
+    return shift;
 }
 
 static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
@@ -119,6 +138,53 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
                 gate->instance == desc->gate[old].instance)
                 return false;
     }
+
+    const flexe_system_low_power_desc_t *low = &desc->low_power;
+    uint32_t fraction_mask = low->divider_a_mask |
+                             low->divider_b_mask |
+                             low->source_rtc_slow_mask |
+                             low->source_internal_mask |
+                             low->source_xtal_mask |
+                             low->source_xtal32k_mask |
+                             low->rtc_clock_enable_mask;
+    const uint32_t fraction_fields[] = {
+        low->divider_a_mask,
+        low->divider_b_mask,
+        low->source_rtc_slow_mask,
+        low->source_internal_mask,
+        low->source_xtal_mask,
+        low->source_xtal32k_mask,
+        low->rtc_clock_enable_mask,
+    };
+    uint32_t occupied = 0u;
+    for (unsigned index = 0u;
+         index < sizeof(fraction_fields) / sizeof(fraction_fields[0]);
+         index++) {
+        if ((occupied & fraction_fields[index]) != 0u) return false;
+        occupied |= fraction_fields[index];
+    }
+    int memory_reg = system_clock_register_index(
+        desc, low->memory_power_down_offset);
+    int integer_reg = system_clock_register_index(
+        desc, low->divider_integer_offset);
+    int fraction_reg = system_clock_register_index(
+        desc, low->divider_fraction_offset);
+    if (memory_reg < 0 || integer_reg < 0 || fraction_reg < 0 ||
+        !system_clock_single_bit(low->memory_power_down_inhibit_mask) ||
+        !system_clock_contiguous_mask(low->divider_integer_mask) ||
+        !system_clock_contiguous_mask(low->divider_a_mask) ||
+        !system_clock_contiguous_mask(low->divider_b_mask) ||
+        !system_clock_single_bit(low->source_rtc_slow_mask) ||
+        !system_clock_single_bit(low->source_internal_mask) ||
+        !system_clock_single_bit(low->source_xtal_mask) ||
+        !system_clock_single_bit(low->source_xtal32k_mask) ||
+        !system_clock_single_bit(low->rtc_clock_enable_mask) ||
+        (low->memory_power_down_inhibit_mask &
+         ~desc->reg[memory_reg].writable_mask) != 0u ||
+        (low->divider_integer_mask &
+         ~desc->reg[integer_reg].writable_mask) != 0u ||
+        (fraction_mask & ~desc->reg[fraction_reg].writable_mask) != 0u)
+        return false;
     return true;
 }
 
@@ -131,7 +197,33 @@ static uint32_t system_clock_mapped_mask(
         if (gate->clock_offset == offset) mask |= gate->clock_mask;
         if (gate->reset_offset == offset) mask |= gate->reset_mask;
     }
+    const flexe_system_low_power_desc_t *low = &desc->low_power;
+    if (offset == low->memory_power_down_offset)
+        mask |= low->memory_power_down_inhibit_mask;
+    if (offset == low->divider_integer_offset)
+        mask |= low->divider_integer_mask;
+    if (offset == low->divider_fraction_offset)
+        mask |= low->divider_a_mask | low->divider_b_mask |
+                low->source_rtc_slow_mask | low->source_internal_mask |
+                low->source_xtal_mask | low->source_xtal32k_mask |
+                low->rtc_clock_enable_mask;
     return mask;
+}
+
+static bool system_clock_low_power_offset(
+    const flexe_system_low_power_desc_t *low, uint32_t offset)
+{
+    return offset == low->memory_power_down_offset ||
+           offset == low->divider_integer_offset ||
+           offset == low->divider_fraction_offset;
+}
+
+static void system_clock_publish_low_power(flexe_system_clock_t *clock)
+{
+    if (!clock->low_power_changed) return;
+    flexe_system_low_power_state_t state;
+    if (flexe_system_clock_low_power_state(clock, &state))
+        clock->low_power_changed(clock->low_power_ctx, &state);
 }
 
 static void system_clock_publish_gate(flexe_system_clock_t *clock,
@@ -209,6 +301,9 @@ static void system_clock_write(void *ctx, uint32_t addr, uint32_t value)
                  (changed & mapping->reset_mask) != 0u);
             if (affected) system_clock_publish_gate(clock, gate);
         }
+        if (system_clock_low_power_offset(&desc->low_power, offset) &&
+            (changed & system_clock_mapped_mask(desc, offset)) != 0u)
+            system_clock_publish_low_power(clock);
         return;
     }
     if (clock->fallback_write)
@@ -280,6 +375,56 @@ void flexe_system_clock_publish_gates(flexe_system_clock_t *clock)
     for (unsigned index = 0u;
          index < clock->target->system_clock.gate_count; index++)
         system_clock_publish_gate(clock, index);
+}
+
+bool flexe_system_clock_low_power_state(
+    const flexe_system_clock_t *clock,
+    flexe_system_low_power_state_t *state)
+{
+    if (!clock || !state) return false;
+    const flexe_system_clock_desc_t *desc = &clock->target->system_clock;
+    const flexe_system_low_power_desc_t *low = &desc->low_power;
+    int memory_reg = system_clock_register_index(
+        desc, low->memory_power_down_offset);
+    int integer_reg = system_clock_register_index(
+        desc, low->divider_integer_offset);
+    int fraction_reg = system_clock_register_index(
+        desc, low->divider_fraction_offset);
+    if (memory_reg < 0 || integer_reg < 0 || fraction_reg < 0) return false;
+
+    uint32_t fraction = clock->reg[fraction_reg];
+    *state = (flexe_system_low_power_state_t){
+        .memory_power_down_allowed =
+            (clock->reg[memory_reg] &
+             low->memory_power_down_inhibit_mask) == 0u,
+        .rtc_clock_enabled =
+            (fraction & low->rtc_clock_enable_mask) != 0u,
+        .divider_integer =
+            (clock->reg[integer_reg] & low->divider_integer_mask) >>
+            system_clock_mask_shift(low->divider_integer_mask),
+        .divider_a = (fraction & low->divider_a_mask) >>
+                     system_clock_mask_shift(low->divider_a_mask),
+        .divider_b = (fraction & low->divider_b_mask) >>
+                     system_clock_mask_shift(low->divider_b_mask),
+    };
+    if ((fraction & low->source_rtc_slow_mask) != 0u)
+        state->selected_sources |= FLEXE_SYSTEM_LOW_POWER_SOURCE_RTC_SLOW;
+    if ((fraction & low->source_internal_mask) != 0u)
+        state->selected_sources |= FLEXE_SYSTEM_LOW_POWER_SOURCE_INTERNAL;
+    if ((fraction & low->source_xtal_mask) != 0u)
+        state->selected_sources |= FLEXE_SYSTEM_LOW_POWER_SOURCE_XTAL;
+    if ((fraction & low->source_xtal32k_mask) != 0u)
+        state->selected_sources |= FLEXE_SYSTEM_LOW_POWER_SOURCE_XTAL32K;
+    return true;
+}
+
+void flexe_system_clock_set_low_power_listener(
+    flexe_system_clock_t *clock, flexe_system_low_power_fn fn, void *ctx)
+{
+    if (!clock) return;
+    clock->low_power_changed = fn;
+    clock->low_power_ctx = fn ? ctx : NULL;
+    system_clock_publish_low_power(clock);
 }
 
 void flexe_system_clock_destroy(flexe_system_clock_t *clock)

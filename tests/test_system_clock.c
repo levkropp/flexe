@@ -1,6 +1,7 @@
 /* Target-described CPU/system-clock register tests. */
 #include "test_helpers.h"
 #include "peripherals.h"
+#include "system_clock.h"
 
 #define SC_SYSTEM_BASE          0x600C0000u
 #define SC_CPU_PER_CONF_OFF     0x010u
@@ -51,6 +52,42 @@
 #define SC_UART_INT_ENA         0x00Cu
 #define SC_UART_CONF1           0x024u
 #define SC_UART_DATE            0x07Cu
+
+typedef struct {
+    unsigned reads;
+    unsigned writes;
+    uint32_t last_addr;
+    uint32_t last_value;
+} sc_fallback_probe_t;
+
+typedef struct {
+    unsigned changes;
+    flexe_system_low_power_state_t state;
+} sc_low_power_probe_t;
+
+static uint32_t sc_fallback_read(void *ctx, uint32_t addr)
+{
+    sc_fallback_probe_t *probe = ctx;
+    probe->reads++;
+    probe->last_addr = addr;
+    return 0u;
+}
+
+static void sc_fallback_write(void *ctx, uint32_t addr, uint32_t value)
+{
+    sc_fallback_probe_t *probe = ctx;
+    probe->writes++;
+    probe->last_addr = addr;
+    probe->last_value = value;
+}
+
+static void sc_low_power_changed(
+    void *ctx, const flexe_system_low_power_state_t *state)
+{
+    sc_low_power_probe_t *probe = ctx;
+    probe->changes++;
+    probe->state = *state;
+}
 
 static uint32_t sc_systimer_value(xtensa_mem_t *mem)
 {
@@ -147,21 +184,108 @@ TEST(system_clock_reset_masks_and_shared_page_composition)
     ASSERT_EQ(mem_read32(mem, from_cpu), 0u);
     ASSERT_EQ(periph_unhandled_count(periph), before);
 
-    /* Register readback is architectural even before every downstream
-     * electrical effect exists. Changes outside semantic gate mappings stay
-     * visible as unsupported instead of becoming silent fake behavior. */
+    /* These fields publish semantic low-power policy rather than being
+     * treated as unexplained register storage. */
     mem_write32(mem, SC_SYSTEM_BASE + SC_MEM_PD_MASK_OFF, 0u);
     mem_write32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_INT_OFF, 0u);
     ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_MEM_PD_MASK_OFF), 0u);
     ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_INT_OFF), 0u);
-    ASSERT_EQ(periph_unhandled_count(periph), before + 2);
+    ASSERT_EQ(periph_unhandled_count(periph), before);
 
+    /* Changes outside a semantic mapping remain explicit diagnostics. */
     ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + 0x008u), 0u);
     mem_write32(mem, SC_SYSTEM_BASE + 0x008u, 1u);
-    ASSERT_EQ(periph_unhandled_count(periph), before + 4);
+    ASSERT_EQ(periph_unhandled_count(periph), before + 2);
     ASSERT_EQ(mem_unmapped_count(mem), 0u);
 
     periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(system_clock_low_power_policy_is_target_described_and_observable)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_system_low_power_desc_t *desc =
+        &s3->system_clock.low_power;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    sc_fallback_probe_t fallback = {0};
+    flexe_system_clock_t *clock = flexe_system_clock_create(
+        mem, sc_fallback_read, sc_fallback_write, &fallback,
+        NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(clock != NULL);
+    if (!mem || !clock) {
+        flexe_system_clock_destroy(clock);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(desc->memory_power_down_offset, SC_MEM_PD_MASK_OFF);
+    ASSERT_EQ(desc->divider_integer_offset, SC_BT_LPCK_DIV_INT_OFF);
+    ASSERT_EQ(desc->divider_fraction_offset, SC_BT_LPCK_DIV_FRAC_OFF);
+    flexe_system_low_power_state_t state = {0};
+    ASSERT_TRUE(flexe_system_clock_low_power_state(clock, &state));
+    ASSERT_FALSE(state.memory_power_down_allowed);
+    ASSERT_FALSE(state.rtc_clock_enabled);
+    ASSERT_EQ(state.selected_sources,
+              FLEXE_SYSTEM_LOW_POWER_SOURCE_INTERNAL);
+    ASSERT_EQ(state.divider_integer, 255u);
+    ASSERT_EQ(state.divider_a, 1u);
+    ASSERT_EQ(state.divider_b, 1u);
+
+    sc_low_power_probe_t probe = {0};
+    flexe_system_clock_set_low_power_listener(
+        clock, sc_low_power_changed, &probe);
+    ASSERT_EQ(probe.changes, 1u);
+    ASSERT_FALSE(probe.state.memory_power_down_allowed);
+
+    mem_write32(mem, SC_SYSTEM_BASE + SC_MEM_PD_MASK_OFF, 0u);
+    ASSERT_EQ(probe.changes, 2u);
+    ASSERT_TRUE(probe.state.memory_power_down_allowed);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_INT_OFF, 7u);
+    ASSERT_EQ(probe.changes, 3u);
+    ASSERT_EQ(probe.state.divider_integer, 7u);
+
+    uint32_t rtc_fraction = desc->rtc_clock_enable_mask |
+                            desc->source_rtc_slow_mask |
+                            (3u << 12u) | 2u;
+    mem_write32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_FRAC_OFF,
+                rtc_fraction);
+    ASSERT_EQ(probe.changes, 4u);
+    ASSERT_TRUE(probe.state.rtc_clock_enabled);
+    ASSERT_EQ(probe.state.selected_sources,
+              FLEXE_SYSTEM_LOW_POWER_SOURCE_RTC_SLOW);
+    ASSERT_EQ(probe.state.divider_a, 3u);
+    ASSERT_EQ(probe.state.divider_b, 2u);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_FRAC_OFF,
+                rtc_fraction);
+    ASSERT_EQ(probe.changes, 4u);
+    ASSERT_EQ(fallback.reads, 0u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* The hardware exposes independent source bits. Preserve conflicts for
+     * a consumer to diagnose rather than selecting an arbitrary winner. */
+    mem_write32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_FRAC_OFF,
+                rtc_fraction | desc->source_xtal_mask);
+    ASSERT_EQ(probe.changes, 5u);
+    ASSERT_EQ(probe.state.selected_sources,
+              FLEXE_SYSTEM_LOW_POWER_SOURCE_RTC_SLOW |
+              FLEXE_SYSTEM_LOW_POWER_SOURCE_XTAL);
+
+    flexe_system_clock_set_low_power_listener(clock, NULL, NULL);
+    flexe_system_clock_destroy(clock);
+    mem_destroy(mem);
+
+    flexe_target_desc_t invalid = *s3;
+    invalid.system_clock.low_power.source_xtal_mask =
+        invalid.system_clock.low_power.divider_a_mask;
+    mem = mem_create_for_target(&invalid);
+    clock = flexe_system_clock_create(
+        mem, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(clock == NULL);
+    flexe_system_clock_destroy(clock);
     mem_destroy(mem);
 }
 
@@ -339,6 +463,7 @@ void run_system_clock_tests(void)
 {
     TEST_SUITE("Target system clock");
     RUN_TEST(system_clock_reset_masks_and_shared_page_composition);
+    RUN_TEST(system_clock_low_power_policy_is_target_described_and_observable);
     RUN_TEST(system_clock_gates_and_resets_target_devices_at_exact_boundaries);
     RUN_TEST(system_clock_uart_gates_and_resets_are_per_port);
 }
