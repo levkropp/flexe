@@ -10,6 +10,7 @@ fqbn=${FLEXE_ARDUINO_FQBN:-esp32:esp32:d32:PartitionScheme=min_spiffs}
 host_build=${FLEXE_BUILD_DIR:-"$repo_dir/build"}
 fixture_build_root=${FLEXE_FIXTURE_BUILD_ROOT:-"$host_build/arduino-fixtures"}
 fixture_rebuild=${FLEXE_FIXTURE_REBUILD:-0}
+engine_jobs=${FLEXE_FIXTURE_ENGINE_JOBS:-2}
 if [ "$fixture_build_root" = temporary ]; then
     fixture_build_root=
 fi
@@ -17,6 +18,13 @@ case "$fixture_rebuild" in
     0|1) ;;
     *)
         echo "error: FLEXE_FIXTURE_REBUILD must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+case "$engine_jobs" in
+    1|2) ;;
+    *)
+        echo "error: FLEXE_FIXTURE_ENGINE_JOBS must be 1 or 2" >&2
         exit 2
         ;;
 esac
@@ -155,13 +163,33 @@ fixture_fingerprint() {
 fixture_build=
 remove_fixture_build=0
 fixture_source_root=
+engine_log_dir=
+jit_pid=
+interpreter_pid=
 cleanup_source() {
     if [ -n "$fixture_source_root" ]; then
         rm -rf -- "$fixture_source_root"
     fi
     fixture_source_root=
 }
+cleanup_engine_runs() {
+    if [ -n "$jit_pid" ]; then
+        kill "$jit_pid" 2>/dev/null || true
+    fi
+    if [ -n "$interpreter_pid" ]; then
+        kill "$interpreter_pid" 2>/dev/null || true
+    fi
+    jit_pid=
+    interpreter_pid=
+    if [ -n "$engine_log_dir" ]; then
+        rm -f -- "$engine_log_dir/jit.log" \
+            "$engine_log_dir/interpreter.log"
+        rmdir -- "$engine_log_dir" 2>/dev/null || true
+    fi
+    engine_log_dir=
+}
 cleanup() {
+    cleanup_engine_runs
     cleanup_source
     if [ "$remove_fixture_build" -eq 1 ] && [ -n "$fixture_build" ]; then
         rm -rf -- "$fixture_build"
@@ -170,6 +198,20 @@ cleanup() {
     remove_fixture_build=0
 }
 trap cleanup EXIT HUP INT TERM
+
+run_fixture_engine() {
+    if [ "$1" = interpreter ]; then
+        if [ "$driver_mode" -eq 1 ]; then
+            "$runner" --no-jit --driver "$firmware" "$symbols"
+        else
+            "$runner" --no-jit "$firmware" "$symbols"
+        fi
+    elif [ "$driver_mode" -eq 1 ]; then
+        "$runner" --driver "$firmware" "$symbols"
+    else
+        "$runner" "$firmware" "$symbols"
+    fi
+}
 
 status=0
 for requested in "$@"; do
@@ -245,20 +287,38 @@ for requested in "$@"; do
 
     runner="$host_build/$target"
 
-    echo "==> testing $slug (JIT)"
-    if [ "$driver_mode" -eq 1 ]; then
-        if ! "$runner" --driver "$firmware" "$symbols"; then status=1; fi
-    else
-        if ! "$runner" "$firmware" "$symbols"; then status=1; fi
-    fi
-
-    echo "==> testing $slug (interpreter)"
-    if [ "$driver_mode" -eq 1 ]; then
-        if ! "$runner" --no-jit --driver "$firmware" "$symbols"; then
+    if [ "$engine_jobs" -eq 2 ]; then
+        # The engines consume the same immutable artifacts and have no shared
+        # state. Capture each log separately so using both host cores halves
+        # gate latency without interleaving diagnostics in CI.
+        engine_log_dir=$(mktemp -d \
+            "${TMPDIR:-/tmp}/flexe-$slug-engines.XXXXXX")
+        run_fixture_engine jit >"$engine_log_dir/jit.log" 2>&1 &
+        jit_pid=$!
+        run_fixture_engine interpreter \
+            >"$engine_log_dir/interpreter.log" 2>&1 &
+        interpreter_pid=$!
+        if wait "$jit_pid"; then jit_status=0; else jit_status=$?; fi
+        jit_pid=
+        if wait "$interpreter_pid"; then
+            interpreter_status=0
+        else
+            interpreter_status=$?
+        fi
+        interpreter_pid=
+        echo "==> testing $slug (JIT)"
+        cat "$engine_log_dir/jit.log"
+        echo "==> testing $slug (interpreter)"
+        cat "$engine_log_dir/interpreter.log"
+        if [ "$jit_status" -ne 0 ] || [ "$interpreter_status" -ne 0 ]; then
             status=1
         fi
+        cleanup_engine_runs
     else
-        if ! "$runner" --no-jit "$firmware" "$symbols"; then status=1; fi
+        echo "==> testing $slug (JIT)"
+        if ! run_fixture_engine jit; then status=1; fi
+        echo "==> testing $slug (interpreter)"
+        if ! run_fixture_engine interpreter; then status=1; fi
     fi
 
     cleanup

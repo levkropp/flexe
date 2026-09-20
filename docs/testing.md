@@ -84,6 +84,7 @@ Configuration:
 | `FLEXE_BUILD_DIR` | Configured host CMake build directory |
 | `FLEXE_FIXTURE_BUILD_ROOT` | Fixture build root, or `temporary` for disposable builds |
 | `FLEXE_FIXTURE_REBUILD` | Set to `1` to ignore valid cached fixture firmware |
+| `FLEXE_FIXTURE_ENGINE_JOBS` | `2` (default) runs JIT and interpreter together; `1` serializes them |
 
 Compiled sketch outputs persist under `FLEXE_BUILD_DIR/arduino-fixtures` by
 default, and a content fingerprint covers the fixture source, FQBN,
@@ -92,6 +93,8 @@ and explicit config. An unchanged focused rerun skips Arduino CLI entirely
 instead of merely asking it to rediscover an unchanged dependency graph. A
 cache miss leaves the intermediate build path under Arduino CLI's shared
 compilation cache, so multiple changed fixtures reuse the same compiled core.
+The two execution engines read the same immutable artifacts and run in parallel
+by default, with separately captured logs so CI diagnostics remain ordered.
 Set `FLEXE_FIXTURE_BUILD_ROOT` to another directory to isolate a
 board/toolchain configuration, or to `temporary` for a clean disposable
 build.
@@ -201,8 +204,13 @@ the selected host emulator and endpoint-harness targets, avoiding stale
 runners. `--rebuild` performs a safe IDF full-clean and configure, and should
 reproduce both hashes. The helper rejects an accidental ESP-IDF revision
 mismatch. It also prevents ESP-IDF's generated Ninja graph from treating the
-parent Flexe Git revision as a firmware input, so committing emulator work does
-not reconfigure or rebuild unchanged fixtures. When `ccache` is installed,
+parent Flexe Git revision as a firmware input and retains the automatically
+chosen source epoch per build directory, so committing already-validated
+fixture source does not rebuild identical firmware. The cache format is
+versioned only when firmware-generation semantics change; adding a fixture
+alias, host runner, or behavior gate does not invalidate existing artifacts.
+Interrupted configure/builds retain a pending configuration stamp and resume
+their valid Ninja tree on the next invocation. When `ccache` is installed,
 common ESP-IDF components are shared safely across independent projects:
 generated header contents remain part of the cache key, so projects with
 different `sdkconfig` values cannot reuse the wrong object. Set

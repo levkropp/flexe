@@ -265,7 +265,13 @@ fixture_git_ceiling=$repo
 if [[ -n "${GIT_CEILING_DIRECTORIES:-}" ]]; then
     fixture_git_ceiling="$repo:$GIT_CEILING_DIRECTORIES"
 fi
-helper_config_version=7
+# This version describes only inputs that affect ESP-IDF's generated build
+# graph or firmware. Adding a fixture alias, host runner, or behavior gate must
+# not invalidate every existing firmware artifact. Version 7 was accidentally
+# used for the catalog-only I2S addition and is therefore metadata-compatible
+# with version 6; accept it once and rewrite the stamp without rebuilding.
+firmware_cache_version=6
+compatible_firmware_cache_versions=(7)
 
 idf_py_hash=$(openssl dgst -sha256 "$idf_py" | awk '{print $NF}')
 cmake_version=$(cmake --version | sed -n '1p')
@@ -321,9 +327,10 @@ run_logged() {
 
 fixture_fingerprint() {
     local project_dir=$1 sdkconfig_file=$2 config_signature=$3 epoch=$4
+    local cache_version=$5
     local input relative digest variable value
     {
-        printf 'flexe-s3-idf-helper=%s\n' "$helper_config_version"
+        printf 'flexe-s3-idf-helper=%s\n' "$cache_version"
         printf 'project=%s\n' "$project_dir"
         printf 'idf-path=%s\n' "$IDF_PATH"
         printf 'idf-commit=%s\n' "$actual_idf_commit"
@@ -354,6 +361,13 @@ fixture_fingerprint() {
             printf 'sdkconfig=missing\n'
         fi
     } | openssl dgst -sha256 | awk '{print $NF}'
+}
+
+configuration_signature() {
+    local cache_version=$1 extra_cppflags=$2 epoch=$3
+    printf '%s\n' "$cache_version" "$actual_idf_commit" "$cache_state" \
+        "$extra_cppflags" "$fixture_git_ceiling" "$epoch" |
+        openssl dgst -sha256 | awk '{print $NF}'
 }
 
 resolve_project() {
@@ -479,13 +493,39 @@ for index in "${!projects[@]}"; do
     build_dir="$build_root/$key-build"
     sdkconfig="$build_root/$key-sdkconfig"
     mkdir -p -- "$build_dir"
+    input_stamp="$build_dir/.flexe-idf-input.sha256"
+    automatic_epoch_stamp="$build_dir/.flexe-source-date-epoch"
     epoch=$requested_epoch
     if [[ -z "$epoch" ]]; then
-        epoch=$(git -C "$project" log -1 --format=%ct -- . 2>/dev/null || true)
-    fi
-    if [[ -z "$epoch" ]]; then
-        epoch=$(git -C "$IDF_PATH" show -s --format=%ct \
-            "$actual_idf_commit" 2>/dev/null || true)
+        automatic_epoch=
+        if [[ -f "$automatic_epoch_stamp" ]]; then
+            IFS= read -r automatic_epoch < "$automatic_epoch_stamp" || true
+        fi
+        # Migrate builds created before the dedicated epoch stamp. Retaining
+        # their recorded value avoids a rebuild merely because the source was
+        # committed after its pre-commit validation build.
+        if [[ ! "$automatic_epoch" =~ ^[0-9]+$ && -f "$input_stamp" ]]; then
+            automatic_epoch=$(sed -n '4p' "$input_stamp")
+        fi
+        # An interrupted legacy build has no input stamp yet. Preserve its old
+        # project-commit policy so Ninja can resume instead of full-cleaning.
+        if [[ ! "$automatic_epoch" =~ ^[0-9]+$ &&
+              -f "$build_dir/CMakeCache.txt" ]]; then
+            automatic_epoch=$(git -C "$project" log -1 --format=%ct -- . \
+                2>/dev/null || true)
+        fi
+        # New build directories use the pinned toolchain epoch. Source content
+        # is fingerprinted independently, while this value remains stable
+        # across the edit/build/commit cycle.
+        if [[ ! "$automatic_epoch" =~ ^[0-9]+$ ]]; then
+            automatic_epoch=$(git -C "$IDF_PATH" show -s --format=%ct \
+                "$actual_idf_commit" 2>/dev/null || true)
+        fi
+        epoch=$automatic_epoch
+        if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$epoch" > "$automatic_epoch_stamp.tmp"
+            mv "$automatic_epoch_stamp.tmp" "$automatic_epoch_stamp"
+        fi
     fi
     [[ "$epoch" =~ ^[0-9]+$ ]] || {
         echo "error: could not derive SOURCE_DATE_EPOCH for $project" >&2
@@ -495,19 +535,38 @@ for index in "${!projects[@]}"; do
     if [[ ${#idf_cache_args[@]} -ne 0 ]]; then
         export CCACHE_BASEDIR=$build_dir
     fi
-    config_signature=$(printf '%s\n' "$helper_config_version" \
-        "$actual_idf_commit" "$cache_state" "$helper_extra_cppflags" \
-        "$fixture_git_ceiling" "$epoch" |
-        openssl dgst -sha256 | awk '{print $NF}')
+    config_signature=$(configuration_signature "$firmware_cache_version" \
+        "$helper_extra_cppflags" "$epoch")
     config_stamp="$build_dir/.flexe-idf-helper-config"
+    pending_config_stamp="$build_dir/.flexe-idf-pending-config"
     prior_signature=
+    using_pending_config=0
     if [[ -f "$config_stamp" ]]; then
         IFS= read -r prior_signature < "$config_stamp" || true
+    elif [[ -f "$build_dir/CMakeCache.txt" &&
+            -f "$pending_config_stamp" ]]; then
+        # A configure-and-build command may have been interrupted after CMake
+        # completed. Its pending stamp makes that partial tree safely resumable.
+        IFS= read -r prior_signature < "$pending_config_stamp" || true
+        using_pending_config=1
+    fi
+    prior_cache_version=
+    if [[ "$prior_signature" == "$config_signature" ]]; then
+        prior_cache_version=$firmware_cache_version
+    else
+        for compatible_version in \
+                "${compatible_firmware_cache_versions[@]}"; do
+            compatible_signature=$(configuration_signature \
+                "$compatible_version" "$helper_extra_cppflags" "$epoch")
+            if [[ "$prior_signature" == "$compatible_signature" ]]; then
+                prior_cache_version=$compatible_version
+                break
+            fi
+        done
     fi
     build_log="$build_dir/.flexe-build.log"
-    input_stamp="$build_dir/.flexe-idf-input.sha256"
     input_fingerprint=$(fixture_fingerprint "$project" "$sdkconfig" \
-        "$config_signature" "$epoch")
+        "$config_signature" "$epoch" "$firmware_cache_version")
     shopt -s nullglob
     elf_candidates=("$build_dir"/*.elf)
     shopt -u nullglob
@@ -540,15 +599,27 @@ for index in "${!projects[@]}"; do
           "$cached_build_environment" != "$build_environment_state" ]]; then
         build_environment_changed=1
     fi
+    matching_fingerprint=$input_fingerprint
+    if [[ -n "$prior_cache_version" &&
+          "$prior_cache_version" != "$firmware_cache_version" ]]; then
+        matching_fingerprint=$(fixture_fingerprint "$project" "$sdkconfig" \
+            "$prior_signature" "$epoch" "$prior_cache_version")
+    fi
     if [[ "$force_rebuild" -eq 0 && -f "$build_dir/CMakeCache.txt" &&
-          "$prior_signature" == "$config_signature" &&
-          -n "$bin_hash" && -n "$elf_hash" &&
-          "$cached_fingerprint" == "$input_fingerprint" &&
+          -n "$prior_cache_version" && -n "$bin_hash" && -n "$elf_hash" &&
+          "$cached_fingerprint" == "$matching_fingerprint" &&
           "$cached_bin_hash" == "$bin_hash" &&
           "$cached_elf_hash" == "$elf_hash" &&
           "$cached_epoch" == "$epoch" ]]; then
         echo "==> reusing unchanged $key firmware"
-        if [[ -z "$cached_build_environment" ]]; then
+        if [[ "$prior_cache_version" != "$firmware_cache_version" ||
+              "$using_pending_config" -eq 1 ]]; then
+            printf '%s\n' "$config_signature" > "$config_stamp.tmp"
+            mv "$config_stamp.tmp" "$config_stamp"
+            rm -f -- "$pending_config_stamp"
+        fi
+        if [[ -z "$cached_build_environment" ||
+              "$prior_cache_version" != "$firmware_cache_version" ]]; then
             printf '%s\n%s\n%s\n%s\n%s\n' "$input_fingerprint" \
                 "$bin_hash" "$elf_hash" "$epoch" \
                 "$build_environment_state" > "$input_stamp.tmp"
@@ -559,7 +630,7 @@ for index in "${!projects[@]}"; do
         initialize_idf_environment
         if [[ -f "$build_dir/CMakeCache.txt" &&
               ( "$force_rebuild" -eq 1 ||
-                "$prior_signature" != "$config_signature" ||
+                -z "$prior_cache_version" ||
                 "$build_environment_changed" -eq 1 ) ]]; then
             if [[ "$force_rebuild" -eq 1 ]]; then
                 echo "==> rebuilding $key from a clean configuration"
@@ -574,6 +645,8 @@ for index in "${!projects[@]}"; do
         fi
         if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
             echo "==> configuring and building $key"
+            printf '%s\n' "$config_signature" > "$pending_config_stamp.tmp"
+            mv "$pending_config_stamp.tmp" "$pending_config_stamp"
             run_logged "$key configure/build" "$build_log" \
                 env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
                 "SOURCE_DATE_EPOCH=$epoch" \
@@ -590,6 +663,7 @@ for index in "${!projects[@]}"; do
         fi
         printf '%s\n' "$config_signature" > "$config_stamp.tmp"
         mv "$config_stamp.tmp" "$config_stamp"
+        rm -f -- "$pending_config_stamp"
 
         shopt -s nullglob
         elf_candidates=("$build_dir"/*.elf)
@@ -607,7 +681,7 @@ for index in "${!projects[@]}"; do
         bin_hash=$(openssl dgst -sha256 "$bin" | awk '{print $NF}')
         elf_hash=$(openssl dgst -sha256 "$elf" | awk '{print $NF}')
         input_fingerprint=$(fixture_fingerprint "$project" "$sdkconfig" \
-            "$config_signature" "$epoch")
+            "$config_signature" "$epoch" "$firmware_cache_version")
         printf '%s\n%s\n%s\n%s\n%s\n' "$input_fingerprint" "$bin_hash" \
             "$elf_hash" "$epoch" "$build_environment_state" \
             > "$input_stamp.tmp"
