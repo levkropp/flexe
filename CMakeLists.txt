@@ -113,6 +113,7 @@ set(LIB_SOURCES
     src/gpio.c
     src/gdma.c
     src/i2s_v2.c
+    src/lcd_cam.c
     src/rmt_v1.c
     src/io_mux.c
     src/rtc_cntl.c
@@ -258,6 +259,7 @@ set(TEST_SOURCES
     tests/test_timer_group.c
     tests/test_rmt_v1.c
     tests/test_i2s_v2.c
+    tests/test_lcd_cam.c
     tests/test_twai.c
     tests/test_pcnt.c
     tests/test_mcpwm.c

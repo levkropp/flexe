@@ -724,6 +724,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_PCNT_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_MCPWM_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_LCD_CAM_I80_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_AES_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GP_SPI);
@@ -781,6 +782,17 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->i2s_v2.instance[1].base, 0x6002D000u);
     ASSERT_EQ(s3->i2s_v2.instance[1].interrupt_source, 26u);
     ASSERT_EQ(s3->i2s_v2.instance[1].gdma_peripheral_id, 4u);
+    ASSERT_EQ(s3->lcd_cam.base, 0x60041000u);
+    ASSERT_EQ(s3->lcd_cam.register_size, 0x1000u);
+    ASSERT_EQ(s3->lcd_cam.date_reset, 0x02003020u);
+    ASSERT_EQ(s3->lcd_cam.interrupt_source, 24u);
+    ASSERT_EQ(s3->lcd_cam.gdma_peripheral_id, 5u);
+    ASSERT_EQ(s3->lcd_cam.data_output_count, 16u);
+    ASSERT_EQ(s3->lcd_cam.chip_select_output_signal, 132u);
+    ASSERT_EQ(s3->lcd_cam.data_output_signal[0], 133u);
+    ASSERT_EQ(s3->lcd_cam.data_output_signal[15], 148u);
+    ASSERT_EQ(s3->lcd_cam.dc_output_signal, 153u);
+    ASSERT_EQ(s3->lcd_cam.pclk_output_signal, 154u);
     ASSERT_EQ(s3->sdmmc_host.base, 0x60028000u);
     ASSERT_EQ(s3->sdmmc_host.register_size, 0x1000u);
     ASSERT_EQ(s3->sdmmc_host.version_reset, 0x5342240Au);
@@ -812,7 +824,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 8u);
-    ASSERT_EQ(s3->system_clock.gate_count, 22u);
+    ASSERT_EQ(s3->system_clock.gate_count, 23u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
@@ -857,6 +869,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.gate[21].instance, 1u);
     ASSERT_EQ(s3->system_clock.gate[21].clock_mask, 1u << 20);
     ASSERT_EQ(s3->system_clock.gate[21].reset_mask, 1u << 20);
+    ASSERT_EQ(s3->system_clock.gate[22].device,
+              FLEXE_SYSTEM_DEVICE_LCD_CAM);
+    ASSERT_EQ(s3->system_clock.gate[22].clock_mask, 1u << 8);
+    ASSERT_EQ(s3->system_clock.gate[22].reset_mask, 1u << 8);
     ASSERT_EQ(s3->system_clock.gate[7].device,
               FLEXE_SYSTEM_DEVICE_SHA);
     ASSERT_EQ(s3->system_clock.gate[7].clock_mask, 1u << 2);

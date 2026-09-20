@@ -424,6 +424,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_TWAI_V1 |
                         FLEXE_TARGET_CAP_PCNT_V1 |
                         FLEXE_TARGET_CAP_MCPWM_V1 |
+                        FLEXE_TARGET_CAP_LCD_CAM_I80_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -631,7 +632,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 8u,
-            .gate_count = 22u,
+            .gate_count = 23u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -823,6 +824,14 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x020u,
                     .clock_mask = 1u << 20,
                     .reset_mask = 1u << 20,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_LCD_CAM,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 8,
+                    .reset_mask = 1u << 8,
                 },
             },
             .low_power = {
@@ -1596,6 +1605,24 @@ static const flexe_target_desc_t TARGETS[] = {
                     .data_output_count = 1u,
                 },
             },
+        },
+        .lcd_cam = {
+            .base = 0x60041000u,
+            .register_size = 0x1000u,
+            .date_reset = 0x02003020u,
+            .chip_select_output_signal = 132u,
+            .data_output_signal = {
+                133u, 134u, 135u, 136u, 137u, 138u, 139u, 140u,
+                141u, 142u, 143u, 144u, 145u, 146u, 147u, 148u,
+            },
+            .h_enable_output_signal = 150u,
+            .hsync_output_signal = 151u,
+            .vsync_output_signal = 152u,
+            .dc_output_signal = 153u,
+            .pclk_output_signal = 154u,
+            .interrupt_source = 24u,
+            .gdma_peripheral_id = 5u,
+            .data_output_count = 16u,
         },
         .sha = {
             .base = 0x6003B000u,

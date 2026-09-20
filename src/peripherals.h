@@ -10,6 +10,7 @@
 #include "rtc_io.h"
 #include "rtc_cntl.h"
 #include "spi_mem.h"
+#include "lcd_cam.h"
 
 /* Forward declaration */
 typedef struct xtensa_cpu xtensa_cpu_t;
@@ -377,6 +378,12 @@ int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,
 size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
                             const uint8_t *data, size_t len);
 size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port);
+
+/* Observe native LCD_CAM i80 traffic after the controller has applied its
+ * data-order controls. Each callback chunk corresponds to one GDMA
+ * descriptor; command-only transfers carry no data. */
+int periph_set_lcd_cam_i80_callback(esp32_periph_t *p,
+                                    flexe_lcd_cam_i80_tx_fn fn, void *ctx);
 
 /* Attach a host pulse sink to a classic channel 0..7 or S3 TX channel 0..3.
  * RX injection accepts already-decoded RMT symbols after firmware enables

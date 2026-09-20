@@ -51,7 +51,7 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 22u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 23u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
@@ -69,11 +69,12 @@
 #define FLEXE_TARGET_MCPWM_OPERATOR_MAX 3u
 #define FLEXE_TARGET_MCPWM_GENERATOR_MAX 2u
 #define FLEXE_TARGET_MCPWM_INPUT_MAX 3u
+#define FLEXE_TARGET_LCD_CAM_DATA_MAX 16u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 65u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 66u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -115,6 +116,7 @@ typedef enum {
     FLEXE_TARGET_CAP_PCNT_V1                        = 1ull << 33,
     FLEXE_TARGET_CAP_AES_V1                         = 1ull << 34,
     FLEXE_TARGET_CAP_MCPWM_V1                       = 1ull << 35,
+    FLEXE_TARGET_CAP_LCD_CAM_I80_V1                 = 1ull << 36,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -995,6 +997,27 @@ typedef struct {
     flexe_i2s_v2_instance_desc_t instance[FLEXE_TARGET_I2S_MAX];
 } flexe_i2s_v2_desc_t;
 
+/* ESP32-S3-generation LCD_CAM register block. This capability currently
+ * covers the i80 transmit path: placement, SYSTEM ownership, interrupt and
+ * GDMA routing, and GPIO-matrix producers are all SoC wiring. Camera capture
+ * and continuous RGB scanout remain separate behavioral milestones even
+ * though their configuration words share this aperture. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint32_t date_reset;
+    uint16_t chip_select_output_signal;
+    uint16_t data_output_signal[FLEXE_TARGET_LCD_CAM_DATA_MAX];
+    uint16_t h_enable_output_signal;
+    uint16_t hsync_output_signal;
+    uint16_t vsync_output_signal;
+    uint16_t dc_output_signal;
+    uint16_t pclk_output_signal;
+    uint8_t  interrupt_source;
+    uint8_t  gdma_peripheral_id;
+    uint8_t  data_output_count;
+} flexe_lcd_cam_desc_t;
+
 /* DesignWare mobile-storage host shared by classic ESP32 and later targets.
  * The command/FIFO/IDMAC register semantics belong to the IP generation;
  * placement, card slots, revision identity, and interrupt wiring are SoC
@@ -1505,9 +1528,10 @@ struct flexe_target_desc {
     /* Optional on-chip memory clock and power policy in the SYSCON page. */
     flexe_syscon_memory_desc_t    syscon_memory;
 
-    /* Optional general-purpose DMA fabric and streaming audio controller. */
+    /* Optional general-purpose DMA fabric and streaming peripherals. */
     flexe_gdma_desc_t             gdma;
     flexe_i2s_v2_desc_t           i2s_v2;
+    flexe_lcd_cam_desc_t          lcd_cam;
 
     /* Optional DesignWare SD/MMC host with FIFO and internal descriptor DMA. */
     flexe_sdmmc_host_desc_t       sdmmc_host;

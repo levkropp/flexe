@@ -7346,10 +7346,26 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         }
     }
 
-    /* ESP-IDF SPI + LCD panel stubs (no-ops, display handled at higher level).
+    /* ESP-IDF SPI + LCD panel compatibility stubs.
      * NOTE: spi_bus_initialize is deliberately NOT stubbed — the real driver
      * must run so GP-SPI transactions reach the raw SPI2/SPI3 sniffer
-     * (spi_display.c), which is what renders symbol-less firmware. */
+     * (spi_display.c), which is what renders symbol-less firmware.
+     *
+     * A target with native LCD_CAM i80 support must likewise execute the
+     * public panel-IO wrappers when the linked image contains that driver.
+     * Interface-symbol detection is deliberately generic: it removes the
+     * old fake-success boundary for every i80 application without naming a
+     * firmware or recognizing a call site. */
+    uint32_t lcd_i80_bus_addr = 0u;
+    uint32_t lcd_i80_io_addr = 0u;
+    bool native_lcd_cam_i80 =
+        stubs->cpu && stubs->cpu->target &&
+        (stubs->cpu->target->capabilities &
+         FLEXE_TARGET_CAP_LCD_CAM_I80_V1) != 0u &&
+        elf_symbols_find(syms, "esp_lcd_new_i80_bus",
+                         &lcd_i80_bus_addr) == 0 &&
+        elf_symbols_find(syms, "esp_lcd_new_panel_io_i80",
+                         &lcd_i80_io_addr) == 0;
     static const char *lcd_noop_fns[] = {
         "esp_lcd_new_panel_io_spi",
         "esp_lcd_new_panel_st7789",
@@ -7364,6 +7380,10 @@ int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs,
         NULL
     };
     for (int i = 0; lcd_noop_fns[i]; i++) {
+        if (native_lcd_cam_i80 &&
+            (strcmp(lcd_noop_fns[i], "esp_lcd_panel_io_tx_param") == 0 ||
+             strcmp(lcd_noop_fns[i], "esp_lcd_panel_io_tx_color") == 0))
+            continue;
         uint32_t addr;
         if (elf_symbols_find(syms, lcd_noop_fns[i], &addr) == 0) {
             rom_stubs_register(stubs, addr, stub_unregistered, lcd_noop_fns[i]);

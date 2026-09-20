@@ -148,6 +148,7 @@ int main(int argc, char **argv)
     run_timer_group_target_tests();
     run_rmt_v1_tests();
     run_i2s_v2_tests();
+    run_lcd_cam_tests();
     run_twai_target_tests();
     run_pcnt_target_tests();
     run_mcpwm_target_tests();

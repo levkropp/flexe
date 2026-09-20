@@ -26,6 +26,7 @@ void run_systimer_tests(void);
 void run_timer_group_target_tests(void);
 void run_rmt_v1_tests(void);
 void run_i2s_v2_tests(void);
+void run_lcd_cam_tests(void);
 void run_twai_target_tests(void);
 void run_pcnt_target_tests(void);
 void run_mcpwm_target_tests(void);

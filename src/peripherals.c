@@ -9,6 +9,7 @@
 #include "gpio.h"
 #include "io_mux.h"
 #include "i2s_v2.h"
+#include "lcd_cam.h"
 #include "rtc_cntl.h"
 #include "rtc_io.h"
 #include "regi2c.h"
@@ -1205,6 +1206,7 @@ static uint32_t i2s_v2_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_v2_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_v2_state_changed(void *ctx);
 static void i2s_v2_irq_changed(void *ctx, unsigned port, bool level);
+static void lcd_cam_irq_changed(void *ctx, bool level);
 static void i2s_v2_emit_tx(void *ctx, int port, const uint8_t *data,
                            size_t len, uint32_t sample_rate,
                            uint8_t bits_per_sample, uint8_t channels);
@@ -1847,6 +1849,7 @@ struct esp32_periph {
     flexe_efuse_t *target_efuse;
     flexe_gdma_t *gdma;
     flexe_i2s_v2_t *i2s_v2;
+    flexe_lcd_cam_t *lcd_cam;
     flexe_gp_spi_t *gp_spi;
     flexe_rmt_v1_t *rmt_v1;
     uint64_t rmt_tx_edge_cycle;
@@ -14856,6 +14859,11 @@ static void system_clock_gate_changed(
         mcpwm_set_system_state(
             p, instance, clock_enabled, reset_asserted);
         break;
+    case FLEXE_SYSTEM_DEVICE_LCD_CAM:
+        if (instance == 0u)
+            flexe_lcd_cam_set_system_state(
+                p->lcd_cam, clock_enabled, reset_asserted);
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -14983,6 +14991,17 @@ static void i2s_v2_irq_changed(void *ctx, unsigned port, bool level)
         port >= p->target->i2s_v2.instance_count)
         return;
     int source = p->target->i2s_v2.instance[port].interrupt_source;
+    if (level) periph_assert_interrupt(p, source);
+    else periph_deassert_interrupt(p, source);
+}
+
+static void lcd_cam_irq_changed(void *ctx, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !p->lcd_cam ||
+        !(p->target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_I80_V1))
+        return;
+    int source = p->target->lcd_cam.interrupt_source;
     if (level) periph_assert_interrupt(p, source);
     else periph_deassert_interrupt(p, source);
 }
@@ -15665,6 +15684,35 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_LCD_CAM_I80_V1) {
+        p->lcd_cam = flexe_lcd_cam_create(
+            mem, p->gdma, default_read, default_write, p,
+            lcd_cam_irq_changed, p);
+        if (!p->lcd_cam) {
+            periph_destroy(p);
+            return NULL;
+        }
+        if (p->target_gpio) {
+            const flexe_lcd_cam_desc_t *lcd = &target->lcd_cam;
+            flexe_gpio_set_output_signal_modeled(
+                p->target_gpio, lcd->chip_select_output_signal);
+            for (unsigned data = 0u; data < lcd->data_output_count; data++)
+                flexe_gpio_set_output_signal_modeled(
+                    p->target_gpio, lcd->data_output_signal[data]);
+            const uint16_t controls[] = {
+                lcd->h_enable_output_signal,
+                lcd->hsync_output_signal,
+                lcd->vsync_output_signal,
+                lcd->dc_output_signal,
+                lcd->pclk_output_signal,
+            };
+            for (size_t index = 0u;
+                 index < sizeof(controls) / sizeof(controls[0]); index++)
+                flexe_gpio_set_output_signal_modeled(
+                    p->target_gpio, controls[index]);
+        }
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_I2S_V2) {
         p->i2s_v2 = flexe_i2s_v2_create(
             mem, p->gdma, default_read, default_write, p,
@@ -16233,6 +16281,8 @@ void periph_destroy(esp32_periph_t *p) {
     p->rmt_v1 = NULL;
     flexe_i2s_v2_destroy(p->i2s_v2);
     p->i2s_v2 = NULL;
+    flexe_lcd_cam_destroy(p->lcd_cam);
+    p->lcd_cam = NULL;
     flexe_gdma_destroy(p->gdma);
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_timer_group_destroy(p->target_timer_group);
@@ -16623,6 +16673,12 @@ size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port) {
         return flexe_i2s_v2_rx_pending(
             p->i2s_v2, (unsigned)port);
     return p->i2s[port].rx_len;
+}
+
+int periph_set_lcd_cam_i80_callback(esp32_periph_t *p,
+                                    flexe_lcd_cam_i80_tx_fn fn, void *ctx) {
+    return p && p->lcd_cam ?
+        flexe_lcd_cam_set_i80_callback(p->lcd_cam, fn, ctx) : -1;
 }
 
 int periph_set_rmt_tx_callback(esp32_periph_t *p, int channel,
