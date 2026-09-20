@@ -153,26 +153,31 @@ interrupts, explicitly stopped infinite loops, a two-channel simultaneous
 start barrier, and sustained FreeRTOS execution. Build commands and
 artifact hashes are in [Hardware completeness](hardware-completeness.md).
 
-Source the export script for the pinned ESP-IDF v5.3.2 checkout, then use the
-fixture builder rather than making disposable build directories by hand:
+Use the fixture builder rather than making disposable build directories by
+hand. It finds the pinned ESP-IDF v5.3.2 checkout from `FLEXE_IDF_PATH`, an
+active IDF environment, or the conventional `~/esp/esp-idf` install, and
+initializes that environment itself. It likewise finds the matching official
+ROM in the normal Espressif tools directory; set either path explicitly for a
+nonstandard install:
 
 ```sh
-source /path/to/esp-idf/export.sh
+FLEXE_IDF_PATH=/path/to/esp-idf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check \
     hello crosscore nvs i2c-master
 ```
 
-The helper accepts short names for every `tests/fixtures/s3_idf_*` project,
-keeps Ninja output and `sdkconfig` files in a persistent directory outside the
-repository, prints the exact artifact paths and hashes, and supplies those
-artifacts directly to each matching gate. `--check` also updates just the
-selected host emulator and endpoint-harness targets, avoiding stale runners.
-The helper rejects an accidental ESP-IDF revision mismatch. When `ccache` is
-installed, common ESP-IDF components are shared safely across independent
-projects: generated header contents remain part of the cache key, so projects
-with different `sdkconfig` values cannot reuse the wrong object. Set
-`FLEXE_IDF_BUILD_ROOT` or
+The helper accepts short names for every `tests/fixtures/s3_idf_*` project and
+keeps Ninja output and `sdkconfig` files under the user cache, outside the
+repository. After the first IDF configure it invokes the generated build
+directly, retains full logs, and prints only progress, exact artifact paths and
+hashes, and gate results. Pass `--verbose` when live compiler output and ccache
+statistics are useful. `--check` also updates just the selected host emulator
+and endpoint-harness targets, avoiding stale runners. The helper rejects an
+accidental ESP-IDF revision mismatch. When `ccache` is installed, common
+ESP-IDF components are shared safely across independent projects: generated
+header contents remain part of the cache key, so projects with different
+`sdkconfig` values cannot reuse the wrong object. Set `FLEXE_IDF_BUILD_ROOT` or
 `FLEXE_IDF_CCACHE_DIR` to relocate those caches; the script's `--help` lists
 the remaining controls.
 

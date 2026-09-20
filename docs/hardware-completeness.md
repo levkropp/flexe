@@ -164,8 +164,9 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 
 The gates default to these pinned image/ELF hashes and the official revision-0
 ROM ELF SHA-256 `c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd`.
-The fixture helper keeps generated configuration outside the repository and
-shares safely cached ESP-IDF components across projects.
+The fixture helper auto-discovers and initializes the pinned toolchain and ROM,
+keeps persistent generated configuration outside the repository, and shares
+safely cached ESP-IDF components across projects.
 
 Independently rebuilt images can supply matching `*_SHA256` overrides, since
 ESP-IDF embeds build metadata in the application.

@@ -6,28 +6,42 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-usage: build-s3-idf-fixture.sh [--check] NAME...
+usage: build-s3-idf-fixture.sh [--check] [--verbose] NAME...
 
 Names may be short aliases such as hello, crosscore, nvs, or sleep; an
 in-tree s3_idf_* project name; or a path to another ESP-IDF project.
 
 Environment:
+  FLEXE_IDF_PATH             pinned ESP-IDF checkout (auto-detected otherwise)
   FLEXE_IDF_BUILD_ROOT       persistent external output root
   FLEXE_IDF_CCACHE           auto (default), 1 (required), or 0
   FLEXE_IDF_CCACHE_DIR       shared compiler-cache directory
   FLEXE_IDF_CCACHE_MAXSIZE   cache limit (default: 2G)
   FLEXE_IDF_ALLOW_UNPINNED   1 permits an IDF revision other than v5.3.2
+  FLEXE_IDF_VERBOSE          1 streams build output and ccache statistics
   FLEXE_BUILD_DIR            host CMake build used by --check
-  S3_ROM_ELF                 official ROM ELF required by --check
+  S3_ROM_ELF                 official ROM ELF (auto-detected for --check)
   RUNNER                     custom runner used by every requested check
 EOF
 }
 
 run_checks=0
+verbose=${FLEXE_IDF_VERBOSE:-0}
+case "$verbose" in
+0|1) ;;
+*)
+    echo "error: FLEXE_IDF_VERBOSE must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 while [[ $# -gt 0 ]]; do
     case "$1" in
     --check)
         run_checks=1
+        shift
+        ;;
+    --verbose)
+        verbose=1
         shift
         ;;
     -h|--help)
@@ -51,16 +65,45 @@ done
 [[ $# -gt 0 ]] || { usage >&2; exit 2; }
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-: "${IDF_PATH:?source the ESP-IDF export script before building fixtures}"
-command -v idf.py >/dev/null 2>&1 || {
-    echo "error: idf.py is not on PATH; source \"\$IDF_PATH/export.sh\"" >&2
+
+if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+    cache_home=$XDG_CACHE_HOME
+elif [[ -n "${HOME:-}" ]]; then
+    cache_home=$HOME/.cache
+else
+    cache_home=${TMPDIR:-/tmp}/flexe-cache
+fi
+
+# A normal fixture check should work from a fresh shell. Prefer an explicit
+# checkout, then an existing ESP-IDF environment, then the conventional IDF
+# install location. The exact revision is still enforced below.
+if [[ -n "${FLEXE_IDF_PATH:-}" ]]; then
+    idf_candidate=$FLEXE_IDF_PATH
+elif [[ -n "${IDF_PATH:-}" ]]; then
+    idf_candidate=$IDF_PATH
+elif command -v idf.py >/dev/null 2>&1; then
+    idf_candidate=$(dirname -- "$(command -v idf.py)")/..
+elif [[ -n "${HOME:-}" && -f "$HOME/esp/esp-idf/export.sh" ]]; then
+    idf_candidate=$HOME/esp/esp-idf
+else
+    echo "error: could not find ESP-IDF; set FLEXE_IDF_PATH or IDF_PATH" >&2
+    exit 1
+fi
+IDF_PATH=$(CDPATH= cd -- "$idf_candidate" 2>/dev/null && pwd -P) || {
+    echo "error: ESP-IDF directory does not exist: $idf_candidate" >&2
+    exit 1
+}
+export IDF_PATH
+idf_py=$IDF_PATH/tools/idf.py
+[[ -x "$idf_py" && -f "$IDF_PATH/export.sh" ]] || {
+    echo "error: not an ESP-IDF checkout: $IDF_PATH" >&2
     exit 1
 }
 
-# All pinned fixture evidence currently uses the official v5.3.2 tree. A
-# deliberate toolchain update can opt out while producing fresh artifact
-# hashes, but an accidental local checkout mismatch must not silently alter a
-# compatibility result.
+# All pinned fixture evidence currently uses the official v5.3.2 tree. Check
+# the checkout before sourcing any of its shell code. A deliberate toolchain
+# update can opt out while producing fresh artifact hashes, but an accidental
+# local checkout mismatch must not silently alter a compatibility result.
 expected_idf_commit=9d7f2d69f50d1288526d4f1027108e314e8c879f
 actual_idf_commit=$(git -C "$IDF_PATH" rev-parse HEAD 2>/dev/null || true)
 if [[ "${FLEXE_IDF_ALLOW_UNPINNED:-0}" != 1 &&
@@ -69,6 +112,47 @@ if [[ "${FLEXE_IDF_ALLOW_UNPINNED:-0}" != 1 &&
     echo "       found ${actual_idf_commit:-a non-git IDF tree}" >&2
     echo "       set FLEXE_IDF_ALLOW_UNPINNED=1 for an intentional upgrade" >&2
     exit 1
+fi
+
+# Source the selected checkout only when this shell is not already ready for
+# it. Capturing the export chatter keeps routine agent and developer runs
+# concise; a failure retains and prints the complete diagnostic.
+active_idf_py=$(command -v idf.py 2>/dev/null || true)
+if [[ "$active_idf_py" != "$idf_py" ]] ||
+   ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
+    if [[ -z "${IDF_PYTHON_ENV_PATH:-}" &&
+          "$actual_idf_commit" == "$expected_idf_commit" ]]; then
+        idf_tools_root=${IDF_TOOLS_PATH:-${HOME:+$HOME/.espressif}}
+        python_env_candidates=()
+        if [[ -n "$idf_tools_root" ]]; then
+            shopt -s nullglob
+            python_env_candidates=(
+                "$idf_tools_root"/python_env/idf5.3_py*_env)
+            shopt -u nullglob
+        fi
+        for python_env_candidate in "${python_env_candidates[@]}"; do
+            if [[ -x "$python_env_candidate/bin/python" &&
+                  -f "$python_env_candidate/idf_version.txt" ]] &&
+               [[ "$(<"$python_env_candidate/idf_version.txt")" == 5.3 ]]; then
+                export IDF_PYTHON_ENV_PATH=$python_env_candidate
+                break
+            fi
+        done
+    fi
+    export_log=$(mktemp "${TMPDIR:-/tmp}/flexe-idf-export.XXXXXX")
+    set +e
+    set +u
+    source "$IDF_PATH/export.sh" >"$export_log" 2>&1
+    idf_export_status=$?
+    set -u
+    set -e
+    if [[ "$idf_export_status" -ne 0 ]]; then
+        echo "error: could not initialize ESP-IDF from $IDF_PATH" >&2
+        cat "$export_log" >&2
+        rm -f -- "$export_log"
+        exit 1
+    fi
+    rm -f -- "$export_log"
 fi
 
 canonicalize_dir_target() {
@@ -86,7 +170,7 @@ canonicalize_dir_target() {
     printf '%s%s\n' "$candidate" "$suffix"
 }
 
-build_root=${FLEXE_IDF_BUILD_ROOT:-"${TMPDIR:-/tmp}/flexe-idf-fixtures"}
+build_root=${FLEXE_IDF_BUILD_ROOT:-"$cache_home/flexe/esp-idf-fixtures"}
 build_root=$(canonicalize_dir_target "$build_root") || {
     echo "error: FLEXE_IDF_BUILD_ROOT has a non-directory parent" >&2
     exit 1
@@ -112,7 +196,6 @@ esac
 idf_cache_args=()
 cache_state=compiler
 if [[ "$ccache_mode" != 0 ]] && command -v ccache >/dev/null 2>&1; then
-    cache_home=${XDG_CACHE_HOME:-"${HOME}/.cache"}
     export CCACHE_DIR=${FLEXE_IDF_CCACHE_DIR:-"$cache_home/flexe/esp-idf"}
     export CCACHE_COMPRESS=1
     export CCACHE_MAXSIZE=${FLEXE_IDF_CCACHE_MAXSIZE:-2G}
@@ -127,7 +210,9 @@ if [[ "$ccache_mode" != 0 ]] && command -v ccache >/dev/null 2>&1; then
     mkdir -p -- "$CCACHE_DIR"
     idf_cache_args=(--ccache)
     cache_state=ccache
-    echo "==> shared ESP-IDF ccache: $CCACHE_DIR"
+    if [[ "$verbose" -eq 1 ]]; then
+        echo "==> shared ESP-IDF ccache: $CCACHE_DIR"
+    fi
 elif [[ "$ccache_mode" == 1 ]]; then
     echo "error: FLEXE_IDF_CCACHE=1 but ccache is not installed" >&2
     exit 1
@@ -141,6 +226,24 @@ fi
 # that the compiler's recorded working directory is intentionally canonical.
 original_extra_cppflags=${EXTRA_CPPFLAGS:-}
 helper_config_version=3
+
+run_logged() {
+    local description=$1 log=$2 status
+    shift 2
+    if [[ "$verbose" -eq 1 ]]; then
+        "$@"
+        return
+    fi
+    if "$@" >"$log" 2>&1; then
+        return
+    else
+        status=$?
+    fi
+    echo "error: $description failed (full log: $log)" >&2
+    echo "----- last 200 log lines -----" >&2
+    tail -n 200 "$log" >&2
+    return "$status"
+}
 
 resolve_project() {
     local requested=$1 normalized
@@ -191,7 +294,29 @@ done
 
 host_build=
 if [[ "$run_checks" -eq 1 ]]; then
-    : "${S3_ROM_ELF:?set S3_ROM_ELF to the official ESP32-S3 ROM ELF for --check}"
+    if [[ -z "${S3_ROM_ELF:-}" ]]; then
+        idf_tools_root=${IDF_TOOLS_PATH:-${HOME:+$HOME/.espressif}}
+        rom_candidates=()
+        if [[ -n "$idf_tools_root" ]]; then
+            shopt -s nullglob
+            rom_candidates=(
+                "$idf_tools_root"/tools/esp-rom-elfs/*/esp32s3_rev0_rom.elf)
+            shopt -u nullglob
+        fi
+        pinned_rom_hash=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
+        for rom_candidate in "${rom_candidates[@]}"; do
+            rom_hash=$(openssl dgst -sha256 "$rom_candidate" | awk '{print $NF}')
+            if [[ "$rom_hash" == "$pinned_rom_hash" ]]; then
+                S3_ROM_ELF=$rom_candidate
+                break
+            fi
+        done
+    fi
+    if [[ -z "${S3_ROM_ELF:-}" || ! -f "$S3_ROM_ELF" ]]; then
+        echo "error: set S3_ROM_ELF to the official ESP32-S3 revision-0 ROM ELF" >&2
+        exit 1
+    fi
+    export S3_ROM_ELF
     for key in "${keys[@]}"; do
         gate="$repo/scripts/check-$(printf '%s' "$key" | tr '_' '-').sh"
         [[ -x "$gate" ]] || {
@@ -211,7 +336,9 @@ if [[ "$run_checks" -eq 1 ]]; then
         }
         if [[ ! -f "$host_build/CMakeCache.txt" ]]; then
             echo "==> configuring host runners"
-            cmake -S "$repo" -B "$host_build"
+            run_logged "host runner configuration" \
+                "$build_root/host-configure.log" \
+                cmake -S "$repo" -B "$host_build"
         fi
         host_targets=()
         for key in "${keys[@]}"; do
@@ -222,7 +349,8 @@ if [[ "$run_checks" -eq 1 ]]; then
             esac
         done
         echo "==> building host runners"
-        cmake --build "$host_build" --target "${host_targets[@]}" -j
+        run_logged "host runner build" "$build_root/host-build.log" \
+            cmake --build "$host_build" --target "${host_targets[@]}" -j
     fi
 fi
 
@@ -245,17 +373,29 @@ for index in "${!projects[@]}"; do
     if [[ -f "$config_stamp" ]]; then
         IFS= read -r prior_signature < "$config_stamp" || true
     fi
-    if [[ -f "$build_dir/CMakeCache.txt" &&
-          "$prior_signature" != "$config_signature" ]]; then
+    build_log="$build_dir/.flexe-build.log"
+    if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
+        echo "==> configuring and building $key"
+        run_logged "$key configure/build" "$build_log" \
+            env "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
+            "$idf_py" "${idf_cache_args[@]}" -C "$project" \
+                -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
+                -D IDF_TARGET=esp32s3 build
+    elif [[ "$prior_signature" != "$config_signature" ]]; then
         echo "==> refreshing $key configuration"
-        EXTRA_CPPFLAGS="$helper_extra_cppflags" \
-            idf.py "${idf_cache_args[@]}" -C "$project" -B "$build_dir" \
-                -D "SDKCONFIG=$sdkconfig" -D IDF_TARGET=esp32s3 reconfigure
+        run_logged "$key reconfiguration" "$build_log" \
+            env "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
+            "$idf_py" "${idf_cache_args[@]}" -C "$project" \
+                -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
+                -D IDF_TARGET=esp32s3 reconfigure
+        echo "==> building $key"
+        run_logged "$key build" "$build_log" \
+            cmake --build "$build_dir" --parallel
+    else
+        echo "==> building $key"
+        run_logged "$key build" "$build_log" \
+            cmake --build "$build_dir" --parallel
     fi
-    echo "==> building $key"
-    EXTRA_CPPFLAGS="$helper_extra_cppflags" \
-        idf.py "${idf_cache_args[@]}" -C "$project" -B "$build_dir" \
-            -D "SDKCONFIG=$sdkconfig" -D IDF_TARGET=esp32s3 build
     printf '%s\n' "$config_signature" > "$config_stamp"
 
     shopt -s nullglob
@@ -307,7 +447,7 @@ for index in "${!projects[@]}"; do
     fi
 done
 
-if [[ ${#idf_cache_args[@]} -ne 0 ]]; then
+if [[ ${#idf_cache_args[@]} -ne 0 && "$verbose" -eq 1 ]]; then
     echo "==> ccache summary"
     ccache --show-stats
 fi
