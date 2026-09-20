@@ -51,7 +51,7 @@ even when a firmware workflow succeeds.
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, `scripts/check-s3-idf-gpio-isr.sh`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Stock ESP-IDF's per-pin ISR, FreeRTOS task notification, digital open-drain release, IO_MUX input-buffer gating, driven-output input feedback, RTC GPIO wake, and pad hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; target-described UART TX producers route through the GPIO matrix with an idle-high pad state; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior, baud-rate edges, and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; target-described GP-SPI clock/data/chip-select producers route through the GPIO matrix; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, GP-SPI wire edges, and segmented/slave modes remain. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; target-described I2C SDA/SCL and GP-SPI clock/data/chip-select producers route through the GPIO matrix; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, GP-SPI wire edges, and segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks controller-wide clock/arbitration/AHB-reset configuration, chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_esp32s3_extmem.c`, WLED production audit | Cache-array/internal-SRAM ownership has exact reset, masking, locks, and semantic state; protection configuration retains documented policy. Cache topology/timing and access-fault generation remain unsupported. |
@@ -393,10 +393,11 @@ register write to a host-attached device, then performs a repeated-START
 40-byte read through the controller's interrupt/FIFO path. It verifies every
 returned byte and an unattached-address NACK (`ESP_ERR_NOT_FOUND`). Two
 interpreter replays have identical UART and unsupported-MMIO digests, with
-no unsupported I2C controller or startup accesses. Only the SDA/SCL
-GPIO-matrix output routes for signals 90/89 remain diagnostic. The MMIO
-transaction works, but Flexe does not claim
-to emit their electrical pin waveforms. The pinned image SHA-256 is
+zero unsupported accesses. Target-described I2C0 SDA/SCL GPIO-matrix
+producers 90/89 expose released-high open-drain pad state between aggregate
+transactions; both controller instances and the classic ESP32 use their own
+descriptor signal IDs. Flexe does not synthesize I2C wire edges or claim
+electrical bus timing. The pinned image SHA-256 is
 `10934e17ec7ca440c4d81689225373b7fc1809b898700a5a8b813ab9a02c1ccc`
 and the matching ELF SHA-256 is
 `5ef3ea1fb67a20e5748d98124c791197a9404cac0b6dd953a28b441e3d3fd734`;

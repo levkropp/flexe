@@ -25,6 +25,11 @@ typedef struct {
     unsigned calls;
     size_t written;
     size_t read;
+    esp32_periph_t *periph;
+    int active_sda_level;
+    int active_sda_enabled;
+    int active_scl_level;
+    int active_scl_enabled;
 } register_device_t;
 
 typedef struct {
@@ -38,6 +43,16 @@ static int register_xfer(void *ctx, int port, uint8_t address,
 {
     register_device_t *device = ctx;
     if (port != 0 || address != 0x34) return -1;
+    if (device->calls == 0u) {
+        device->active_sda_level =
+            periph_gpio_pin_level(device->periph, 8);
+        device->active_sda_enabled =
+            periph_gpio_output_enabled(device->periph, 8);
+        device->active_scl_level =
+            periph_gpio_pin_level(device->periph, 9);
+        device->active_scl_enabled =
+            periph_gpio_output_enabled(device->periph, 9);
+    }
     device->calls++;
     device->written += write_len;
     device->read += read_len;
@@ -112,7 +127,7 @@ int main(int argc, char **argv)
         return 2;
     }
     esp32_periph_t *periph = flexe_session_periph(session);
-    register_device_t device = {0};
+    register_device_t device = { .periph = periph };
     if (periph_i2c_attach_device(periph, 0, 0x34,
                                  register_xfer, &device) != 0) {
         fprintf(stderr, "could not attach host I2C device\n");
@@ -176,23 +191,37 @@ int main(int argc, char **argv)
             }
         }
     }
+    int final_sda_level = periph_gpio_pin_level(periph, 8);
+    int final_sda_enabled = periph_gpio_output_enabled(periph, 8);
+    int final_scl_level = periph_gpio_pin_level(periph, 9);
+    int final_scl_enabled = periph_gpio_output_enabled(periph, 9);
     bool ok = stage == I2C_DONE && checksum == expected_checksum &&
               nack == 0x105u &&
               memory_ok && device.calls == 4u &&
               device.written == 42u && device.read == 40u &&
-              i2c_unhandled_sites == 0u && unmodeled_matrix_routes == 2u &&
+              i2c_unhandled_sites == 0u && unmodeled_matrix_routes == 0u &&
+              periph_unhandled_count(periph) == 0 &&
               periph_gpio_out_signal(periph, 8) == 90 &&
               periph_gpio_out_signal(periph, 9) == 89 &&
-              periph_gpio_pin_level(periph, 8) == -1 &&
-              periph_gpio_pin_level(periph, 9) == -1 &&
+              device.active_sda_level == 1 &&
+              device.active_sda_enabled == 0 &&
+              device.active_scl_level == 1 &&
+              device.active_scl_enabled == 0 &&
+              final_sda_level == -1 && final_sda_enabled == -1 &&
+              final_scl_level == -1 && final_scl_enabled == -1 &&
               strstr(uart.data, "I2C_MASTER_DONE") != NULL;
     printf("%s: ESP-IDF S3 I2C master stage=0x%08X checksum=%08X "
            "nack=0x%08X calls=%u write=%zu read=%zu memory_ok=%d "
            "i2c_unhandled_sites=%u unmodeled_matrix_routes=%u "
+           "matrix_active=%d/%d,%d/%d matrix_teardown=%d/%d,%d/%d "
            "unhandled=%d cycles=%llu\n",
            ok ? "PASS" : "FAIL", stage, checksum, nack, device.calls,
            device.written, device.read, memory_ok, i2c_unhandled_sites,
            unmodeled_matrix_routes,
+           device.active_sda_level, device.active_sda_enabled,
+           device.active_scl_level, device.active_scl_enabled,
+           final_sda_level, final_sda_enabled,
+           final_scl_level, final_scl_enabled,
            periph_unhandled_count(periph),
            (unsigned long long)cpu->cycle_count);
     printf("UART: %zu bytes fnv32=%08X\n", uart.len,

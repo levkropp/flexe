@@ -2366,6 +2366,18 @@ TEST(i2c_s3_native_instances_opcodes_interrupts_and_reset) {
     periph_intr_matrix_set(p, 0, 8, 42); /* Native I2C0 source. */
     periph_intr_matrix_set(p, 0, 9, 43); /* Native I2C1 source. */
 
+    /* Matrix producer IDs are target data. With the reset-default clocks
+     * disabled, selecting either I2C0 line is supported but has no drive. */
+    uint32_t scl_route = s3->gpio.base + 0x554u + 4u * 4u;
+    uint32_t sda_route = s3->gpio.base + 0x554u + 5u * 4u;
+    mem_write32(mem, scl_route, s3->i2c.instance[0].scl_output_signal);
+    mem_write32(mem, sda_route, s3->i2c.instance[0].sda_output_signal);
+    ASSERT_EQ(periph_gpio_pin_level(p, 4), -1);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 4), -1);
+    ASSERT_EQ(periph_gpio_pin_level(p, 5), -1);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 5), -1);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+
     test_i2c_device_t device0 = {0};
     device0.regs[0x10] = 0xA5u;
     device0.regs[0x11] = 0x5Au;
@@ -2389,12 +2401,20 @@ TEST(i2c_s3_native_instances_opcodes_interrupts_and_reset) {
     uint32_t clocks = mem_read32(mem, TEST_S3_SYSTEM_BASE + 0x18u);
     mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x18u,
                 clocks | (1u << 7) | (1u << 18));
+    ASSERT_EQ(periph_gpio_pin_level(p, 4), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 4), 1);
+    ASSERT_EQ(periph_gpio_pin_level(p, 5), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 5), 1);
     /* A real driver pulses module reset after enabling the clock. It clears
      * the stale disabled-clock command state without detaching the board. */
     mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x20u, 1u << 7);
+    ASSERT_EQ(periph_gpio_pin_level(p, 4), -1);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 4), -1);
     ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0xF8u), 0x20070201u);
     ASSERT_EQ(mem_read32(mem, TEST_S3_I2C0_BASE + 0x04u), 0u);
     mem_write32(mem, TEST_S3_SYSTEM_BASE + 0x20u, 0u);
+    ASSERT_EQ(periph_gpio_pin_level(p, 4), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(p, 4), 1);
 
     /* ESP32-S3 HAL opcodes are RESTART=6, WRITE=1, READ=3, STOP=2. */
     mem_write32(mem, TEST_S3_I2C0_BASE + 0x1Cu, 0x34u << 1);

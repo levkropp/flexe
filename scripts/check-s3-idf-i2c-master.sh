@@ -44,21 +44,21 @@ grep -q '^PASS: ESP-IDF S3 I2C master stage=0x1C2C5343 checksum=95AED6CC nack=0x
         echo "FAIL: expected I2C transaction result absent" >&2
         exit 1
     }
-grep -q 'i2c_unhandled_sites=0 unmodeled_matrix_routes=2' \
+grep -q 'i2c_unhandled_sites=0 unmodeled_matrix_routes=0 matrix_active=1/0,1/0 matrix_teardown=-1/-1,-1/-1' \
     "$tmpdir/first.out" || {
         echo "FAIL: controller or matrix diagnostics changed" >&2
         exit 1
     }
 unsupported=$(sed -n 's/^PASS: .* unhandled=\([0-9][0-9]*\) cycles=.*$/\1/p' "$tmpdir/first.out")
-if [[ "$unsupported" != 2 ]]; then
-    echo "FAIL: expected only the two unmodeled I2C matrix routes" >&2
+if [[ "$unsupported" != 0 ]]; then
+    echo "FAIL: unsupported accesses remain in the I2C master replay" >&2
     exit 1
 fi
 if [[ "$expected_bin" == "$pinned_bin" &&
       "$expected_elf" == "$pinned_elf" &&
       "$expected_rom" == "$pinned_rom" ]]; then
     for marker in 'UART: 44 bytes fnv32=9B923665' \
-                  'MMIO: 2 sites fnv32=698E82BE'; do
+                  'MMIO: 0 sites fnv32=811C9DC5'; do
         grep -Fxq "$marker" "$tmpdir/first.out" || {
             echo "FAIL: pinned UART or MMIO digest changed: $marker" >&2
             exit 1
@@ -74,4 +74,4 @@ cmp -s "$tmpdir/first.err" "$tmpdir/second.err" || {
     exit 1
 }
 
-echo "PASS: ESP-IDF S3 I2C master completed write, repeated-start read, and NACK with byte-identical replay; only two unmodeled matrix routes remain visible"
+echo "PASS: ESP-IDF S3 I2C master completed write, repeated-start read, NACK, and released-high matrix outputs with byte-identical replay and zero unsupported MMIO accesses"

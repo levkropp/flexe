@@ -5040,6 +5040,7 @@ static bool i2c_single_bit(uint32_t mask) {
 
 static bool i2c_geometry_valid(const esp32_periph_t *p) {
     const flexe_i2c_desc_t *desc = i2c_desc(p);
+    bool output_signal_seen[FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT] = {0};
     if (!desc || desc->instance_count == 0u ||
         desc->instance_count > I2C_PORT_COUNT ||
         desc->command_count == 0u ||
@@ -5106,8 +5107,21 @@ static bool i2c_geometry_valid(const esp32_periph_t *p) {
             instance->base >= p->target->peripheral_end ||
             desc->register_size >
                 p->target->peripheral_end - instance->base ||
-            instance->interrupt_source >= intr_matrix_source_count(p))
+            instance->interrupt_source >= intr_matrix_source_count(p) ||
+            instance->scl_output_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            instance->sda_output_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            instance->scl_output_signal ==
+                FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT ||
+            instance->sda_output_signal ==
+                FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT ||
+            instance->scl_output_signal == instance->sda_output_signal ||
+            output_signal_seen[instance->scl_output_signal] ||
+            output_signal_seen[instance->sda_output_signal])
             return false;
+        output_signal_seen[instance->scl_output_signal] = true;
+        output_signal_seen[instance->sda_output_signal] = true;
         for (unsigned old = 0u; old < port; old++) {
             uint32_t old_base = desc->instance[old].base;
             if (instance->base <= old_base ?
@@ -5204,6 +5218,24 @@ static void i2c_reset_state(esp32_periph_t *p, unsigned port) {
         p, (int)desc->instance[port].interrupt_source);
 }
 
+static void i2c_update_gpio_output(esp32_periph_t *p, unsigned port)
+{
+    if (!p->target_gpio || !i2c_port_valid(p, (int)port)) return;
+    const flexe_i2c_instance_desc_t *instance = i2c_instance(p, (int)port);
+    const i2c_state_t *i2c = &p->i2c[port];
+    bool active = i2c->clock_enabled && !i2c->reset_asserted;
+    /* Transfers are aggregate host-bus operations in fast mode, so do not
+     * invent wire edges. Publish the architecturally useful idle/released
+     * state and make clock/reset disconnection explicit. GPIO open-drain
+     * handling converts driven-high into a high-impedance pad. */
+    flexe_gpio_drive_output_signal(
+        p->target_gpio, instance->scl_output_signal,
+        active ? 1 : -1, active ? 1 : -1);
+    flexe_gpio_drive_output_signal(
+        p->target_gpio, instance->sda_output_signal,
+        active ? 1 : -1, active ? 1 : -1);
+}
+
 static void i2c_set_system_state(esp32_periph_t *p, unsigned port,
                                  bool clock_enabled,
                                  bool reset_asserted)
@@ -5215,6 +5247,7 @@ static void i2c_set_system_state(esp32_periph_t *p, unsigned port,
     i2c->reset_asserted = reset_asserted;
     if (reset_rising) i2c_reset_state(p, port);
     i2c_intr_update(p, (int)port);
+    i2c_update_gpio_output(p, port);
 }
 
 static void i2c_tx_reset(i2c_state_t *i2c) {
@@ -5772,6 +5805,13 @@ static int i2c_register_target(esp32_periph_t *p) {
     if (!i2c_geometry_valid(p)) return -1;
 
     for (unsigned port = 0u; port < desc->instance_count; port++) {
+        const flexe_i2c_instance_desc_t *instance = &desc->instance[port];
+        if (p->target_gpio) {
+            flexe_gpio_set_output_signal_modeled(
+                p->target_gpio, instance->scl_output_signal);
+            flexe_gpio_set_output_signal_modeled(
+                p->target_gpio, instance->sda_output_signal);
+        }
         bool clock_enabled = true;
         bool reset_asserted = false;
         (void)flexe_system_clock_gate_state(
@@ -5780,8 +5820,9 @@ static int i2c_register_target(esp32_periph_t *p) {
         p->i2c[port].clock_enabled = clock_enabled;
         p->i2c[port].reset_asserted = reset_asserted;
         i2c_reset_state(p, port);
+        i2c_update_gpio_output(p, port);
         if (mem_register_mmio_range(
-                p->mem, desc->instance[port].base, desc->register_size,
+                p->mem, instance->base, desc->register_size,
                 i2c_read, i2c_write, p) != 0)
             return -1;
     }

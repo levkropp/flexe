@@ -655,6 +655,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(esp32->i2c.instance_count, 2u);
     ASSERT_EQ(esp32->i2c.instance[0].base, 0x3FF53000u);
+    ASSERT_EQ(esp32->i2c.instance[0].scl_output_signal, 29u);
+    ASSERT_EQ(esp32->i2c.instance[0].sda_output_signal, 30u);
+    ASSERT_EQ(esp32->i2c.instance[1].scl_output_signal, 95u);
+    ASSERT_EQ(esp32->i2c.instance[1].sda_output_signal, 96u);
     ASSERT_EQ(esp32->i2c.opcode_restart, 0u);
     ASSERT_EQ(esp32->i2c.command_count, 16u);
     ASSERT_EQ(esp32->sha.base, 0x3FF03000u);
@@ -695,6 +699,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->i2c.instance[1].base, 0x60027000u);
     ASSERT_EQ(s3->i2c.instance[0].interrupt_source, 42u);
     ASSERT_EQ(s3->i2c.instance[1].interrupt_source, 43u);
+    ASSERT_EQ(s3->i2c.instance[0].scl_output_signal, 89u);
+    ASSERT_EQ(s3->i2c.instance[0].sda_output_signal, 90u);
+    ASSERT_EQ(s3->i2c.instance[1].scl_output_signal, 91u);
+    ASSERT_EQ(s3->i2c.instance[1].sda_output_signal, 92u);
     ASSERT_EQ(s3->i2c.opcode_restart, 6u);
     ASSERT_EQ(s3->i2c.opcode_read, 3u);
     ASSERT_EQ(s3->i2c.opcode_stop, 2u);

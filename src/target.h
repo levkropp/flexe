@@ -179,6 +179,10 @@ typedef struct {
 typedef struct {
     uint32_t base;
     uint8_t  interrupt_source;
+    /* GPIO-matrix producers. Fast mode exports complete bus transactions;
+     * between them both open-drain lines are at their released-high state. */
+    uint16_t scl_output_signal;
+    uint16_t sda_output_signal;
 } flexe_i2c_instance_desc_t;
 
 typedef struct {

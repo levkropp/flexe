@@ -102,8 +102,10 @@ static const flexe_target_desc_t TARGETS[] = {
             .opcode_stop = 3u,
             .opcode_end = 4u,
             .instance = {
-                { .base = 0x3FF53000u, .interrupt_source = 49u },
-                { .base = 0x3FF67000u, .interrupt_source = 50u },
+                { .base = 0x3FF53000u, .interrupt_source = 49u,
+                  .scl_output_signal = 29u, .sda_output_signal = 30u },
+                { .base = 0x3FF67000u, .interrupt_source = 50u,
+                  .scl_output_signal = 95u, .sda_output_signal = 96u },
             },
         },
         .io_mux = {
@@ -415,8 +417,10 @@ static const flexe_target_desc_t TARGETS[] = {
             .opcode_stop = 2u,
             .opcode_end = 4u,
             .instance = {
-                { .base = 0x60013000u, .interrupt_source = 42u },
-                { .base = 0x60027000u, .interrupt_source = 43u },
+                { .base = 0x60013000u, .interrupt_source = 42u,
+                  .scl_output_signal = 89u, .sda_output_signal = 90u },
+                { .base = 0x60027000u, .interrupt_source = 43u,
+                  .scl_output_signal = 91u, .sda_output_signal = 92u },
             },
         },
         .secondary_core = {

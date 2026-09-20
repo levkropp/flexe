@@ -169,10 +169,11 @@ reset or clock effects. The memory/radio state is
 available to downstream consumers without fabricating memory loss, RF, or
 radio-controller behavior that is not modeled yet. Other SYSTEM fields remain
 explicit unsupported-access diagnostics unless they have a semantic consumer.
-Target-described UART TX and GP-SPI clock/data/chip-select producers are also
-valid GPIO-matrix routes across firmware builds. UART exports complete bytes
-and an idle-high pad, while GP-SPI exports complete transactions; fast mode
-does not fabricate baud or serial-clock edges.
+Target-described UART TX, I2C SDA/SCL, and GP-SPI clock/data/chip-select
+producers are also valid GPIO-matrix routes across firmware builds. UART
+exports complete bytes, I2C exports aggregate transactions plus released-high
+idle state, and GP-SPI exports complete transactions; fast mode does not
+fabricate baud or serial-clock edges.
 
 The S3 SYSCON memory-policy owner supplies exact reset and masked readback for
 the RF front-end controls and the 11 SRAM/3 ROM bank clock, force-down, and
@@ -203,7 +204,11 @@ start reads, address NACKs, raw/enable/status/clear interrupt state, native
 interrupt routing, host-attachable bus devices, and guest-slave transfers. The
 S3 descriptor supplies its eight-command depth, different HAL opcodes, native
 interrupt sources, peripheral identity, and independent SYSTEM clock/reset
-gates. Tests cover both target layouts, and an S3 application built with the
+gates. Each instance also supplies its target-specific SDA/SCL GPIO-matrix
+producer IDs. Fast mode publishes released-high open-drain state while a
+controller is active and disconnects those producers when its clock is gated
+or reset, without fabricating individual wire edges. Tests cover both target
+layouts, and an S3 application built with the
 official ESP-IDF 5.3.2 toolchain and legacy production `driver/i2c.h` path
 reaches `app_main`, installs the driver, and completes an absent-device
 transfer with a NACK instead of timing out. This is functional fast-mode
