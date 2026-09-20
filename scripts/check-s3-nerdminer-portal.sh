@@ -11,6 +11,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
+waiter="$root/scripts/wait_for_output.py"
 expected_sha=${S3_FACTORY_SHA256:-8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22}
 actual_sha=$(openssl dgst -sha256 "$S3_FACTORY_BIN" | awk '{print $NF}')
 if [[ "$actual_sha" != "$expected_sha" ]]; then
@@ -45,15 +46,9 @@ fail() {
     > "$tmpdir/guest.out" 2> "$tmpdir/emu.err" &
 emu_pid=$!
 
-port=
-for ((attempt = 0; attempt < 2000; attempt++)); do
-    port=$(awk -F: '/\[wifi\] bind\(slot [0-9]+\) firmware port 80/{print $NF; exit}' \
-        "$tmpdir/emu.err")
-    [[ -n "$port" ]] && break
-    kill -0 "$emu_pid" 2>/dev/null || fail "guest exited before HTTP bind"
-    sleep 0.01
-done
-[[ -n "$port" ]] || fail "no guest HTTP listener"
+port=$("$waiter" --file "$tmpdir/emu.err" --pid "$emu_pid" --timeout 20 \
+    --regex 'firmware port 80 .*:([0-9]+)' --group 1) ||
+    fail "guest exited or timed out before HTTP bind"
 
 curl --silent --show-error --max-time 30 \
     --header 'Host: 192.168.4.1' \

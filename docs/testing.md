@@ -176,6 +176,12 @@ gate needs a build with
 libslirp 4.9 or newer and `jq`; it binds a randomly selected host loopback
 port and checks page delivery, a JSON state change, readback, and Ethernet
 delivery.
+Interactive gates use one bounded incremental output watcher for readiness and
+UART markers. It reads only newly appended bytes (and can decode sandbox JSONL
+UART events in-stream), replacing tight shell loops that repeatedly rescanned
+ever-growing logs and launched thousands of `grep`, `awk`, and `sleep`
+processes. The watcher has a wall deadline and monitors the emulator PID, so a
+failed guest still terminates with the gate's normal diagnostics.
 See [Hardware completeness](hardware-completeness.md) for exact inputs and
 scope.
 

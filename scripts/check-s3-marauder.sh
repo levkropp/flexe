@@ -10,6 +10,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
+waiter="$root/scripts/wait_for_output.py"
 expected_sha=b6b61e6c6c41bc78422d405d14117ab5aa6ec0cdee751327ea568232e52dd0be
 actual_sha=$(openssl dgst -sha256 "$S3_MARAUDER_BIN" | awk '{print $NF}')
 if [[ "$actual_sha" != "$expected_sha" ]]; then
@@ -46,14 +47,9 @@ decode_uart() {
 
 wait_for_uart() {
     local marker=$1
-    for ((attempt = 0; attempt < 18000; attempt++)); do
-        decode_uart
-        grep -Fq "$marker" "$tmpdir/uart" && return 0
-        kill -0 "$emu_pid" 2>/dev/null ||
-            fail "firmware exited before printing $marker"
-        sleep 0.01
-    done
-    fail "timed out waiting for $marker"
+    "$waiter" --file "$tmpdir/events" --sandbox-uart \
+        --contains "$marker" --pid "$emu_pid" --timeout 180 ||
+        fail "firmware exited or timed out before printing $marker"
 }
 
 mkfifo "$tmpdir/input"

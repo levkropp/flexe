@@ -8,6 +8,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
+waiter="$root/scripts/wait_for_output.py"
 expected_bin=${S3_IDF_GPIO_WAKE_BIN_SHA256:-3fd036c2e52c1ee50b826c1fb3f63d18e8d09c2d01f93bc455518d71ec8fe575}
 expected_elf=${S3_IDF_GPIO_WAKE_ELF_SHA256:-a007e5da15a99804a4ee8d228be7cf5912480a2bb9d9594511e7ede0348048a0}
 expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
@@ -50,12 +51,9 @@ fail() {
 
 wait_for_sleep() {
     local deep=$1
-    for ((attempt = 0; attempt < 3000; attempt++)); do
-        grep -q "^\[sleep\] request deep=$deep " "$emu" && return 0
-        kill -0 "$emu_pid" 2>/dev/null || fail "guest exited before deep=$deep sleep"
-        sleep 0.002
-    done
-    fail "guest did not enter deep=$deep sleep"
+    "$waiter" --file "$emu" --contains "[sleep] request deep=$deep " \
+        --pid "$emu_pid" --timeout 6 ||
+        fail "guest exited or timed out before deep=$deep sleep"
 }
 
 for replay in 1 2; do

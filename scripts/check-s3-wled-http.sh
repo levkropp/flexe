@@ -9,6 +9,7 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
+waiter="$root/scripts/wait_for_output.py"
 expected_bin_sha=${S3_WLED_SHA256:-8e165290df301b0bcea5763637db1f0ec9d4ad5b1d07b8588a1baa5ebd50bad5}
 expected_elf_sha=${S3_WLED_APP_SHA256:-a6ca2cb74ce281fd4f3846b6347e3f2abc434d1ced2d553630ba3a8478fe1965}
 for item in "bin:$S3_WLED_BIN:$expected_bin_sha" "elf:$S3_WLED_APP_ELF:$expected_elf_sha"; do
@@ -57,12 +58,8 @@ emu_pid=$!
 # Web listen begins at about 1.16 billion guest cycles in this pinned image.
 # Wait for guest progress before connecting, especially under sanitizers where
 # eager host SYN/ARP retries can overflow a still-booting receive queue.
-for ((attempt = 0; attempt < 12000; attempt++)); do
-    grep -q '^\[1300000' "$tmpdir/emu.err" && break
-    kill -0 "$emu_pid" 2>/dev/null || fail "WLED exited before web startup"
-    sleep 0.01
-done
-grep -q '^\[1300000' "$tmpdir/emu.err" || fail "WLED did not reach web startup"
+"$waiter" --file "$tmpdir/emu.err" --pid "$emu_pid" --timeout 120 \
+    --regex '^\[1300000' || fail "WLED exited before web startup"
 
 ready=0
 for ((attempt = 0; attempt < 200; attempt++)); do
