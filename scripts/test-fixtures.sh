@@ -13,6 +13,7 @@ host_build=${FLEXE_BUILD_DIR:-"$repo_dir/build"}
 fixture_build_root=${FLEXE_FIXTURE_BUILD_ROOT:-"$host_build/arduino-fixtures"}
 fixture_rebuild=${FLEXE_FIXTURE_REBUILD:-0}
 engine_jobs=${FLEXE_FIXTURE_ENGINE_JOBS:-2}
+verbose=${FLEXE_FIXTURE_VERBOSE:-0}
 build_jobs=$(flexe_fixture_build_jobs) || exit $?
 gate_jobs=$(flexe_fixture_gate_jobs) || exit $?
 processors=$(flexe_fixture_processor_count)
@@ -28,6 +29,13 @@ case "$engine_jobs" in
 1|2) ;;
 *)
     echo "error: FLEXE_FIXTURE_ENGINE_JOBS must be 1 or 2" >&2
+    exit 2
+    ;;
+esac
+case "$verbose" in
+0|1) ;;
+*)
+    echo "error: FLEXE_FIXTURE_VERBOSE must be 0 or 1" >&2
     exit 2
     ;;
 esac
@@ -320,6 +328,7 @@ done
 
 run_build_pool() {
     local outer_jobs=$1 inner_jobs=$2 status index
+    local FLEXE_FIXTURE_POOL_SUCCESS_OUTPUT=quiet
     shift 2
     local indices=("$@")
     [[ ${#indices[@]} -ne 0 ]] || return 0
@@ -415,16 +424,6 @@ pair_cleanup() {
 run_fixture_pair() {
     local slug=$1 runner=$2 firmware=$3 symbols=$4 driver_mode=$5
     local pair_engine_jobs=$6 status=0 jit_status=0 interpreter_status=0
-    if [[ "$pair_engine_jobs" -eq 1 ]]; then
-        echo "==> testing $slug (JIT)"
-        run_fixture_engine jit "$runner" "$slug" "$firmware" "$symbols" \
-            "$driver_mode" || status=1
-        echo "==> testing $slug (interpreter)"
-        run_fixture_engine interpreter "$runner" "$slug" "$firmware" "$symbols" \
-            "$driver_mode" || status=1
-        return "$status"
-    fi
-
     PAIR_LOG_DIR=$(mktemp -d \
         "${TMPDIR:-/tmp}/flexe-$slug-engines.XXXXXX") || return
     PAIR_JIT_PID=
@@ -433,20 +432,51 @@ run_fixture_pair() {
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    run_fixture_engine jit "$runner" "$slug" "$firmware" "$symbols" \
-        "$driver_mode" >"$PAIR_LOG_DIR/jit.log" 2>&1 &
-    PAIR_JIT_PID=$!
-    run_fixture_engine interpreter "$runner" "$slug" "$firmware" "$symbols" \
-        "$driver_mode" >"$PAIR_LOG_DIR/interpreter.log" 2>&1 &
-    PAIR_INTERP_PID=$!
-    wait "$PAIR_JIT_PID" || jit_status=$?
-    PAIR_JIT_PID=
-    wait "$PAIR_INTERP_PID" || interpreter_status=$?
-    PAIR_INTERP_PID=
+    if [[ "$pair_engine_jobs" -eq 2 ]]; then
+        run_fixture_engine jit "$runner" "$slug" "$firmware" "$symbols" \
+            "$driver_mode" >"$PAIR_LOG_DIR/jit.log" 2>&1 &
+        PAIR_JIT_PID=$!
+        run_fixture_engine interpreter "$runner" "$slug" "$firmware" \
+            "$symbols" "$driver_mode" \
+            >"$PAIR_LOG_DIR/interpreter.log" 2>&1 &
+        PAIR_INTERP_PID=$!
+        wait "$PAIR_JIT_PID" || jit_status=$?
+        PAIR_JIT_PID=
+        wait "$PAIR_INTERP_PID" || interpreter_status=$?
+        PAIR_INTERP_PID=
+    else
+        run_fixture_engine jit "$runner" "$slug" "$firmware" "$symbols" \
+            "$driver_mode" >"$PAIR_LOG_DIR/jit.log" 2>&1 || jit_status=$?
+        run_fixture_engine interpreter "$runner" "$slug" "$firmware" \
+            "$symbols" "$driver_mode" \
+            >"$PAIR_LOG_DIR/interpreter.log" 2>&1 || interpreter_status=$?
+    fi
     echo "==> testing $slug (JIT)"
-    cat "$PAIR_LOG_DIR/jit.log"
+    if [[ "$verbose" -eq 1 || "$jit_status" -ne 0 ||
+          "$interpreter_status" -ne 0 ]]; then
+        cat "$PAIR_LOG_DIR/jit.log"
+    else
+        awk '/^(engine|profile|target)=/ { summary = $0 }
+             END { if (summary != "") print summary; else exit 1 }' \
+            "$PAIR_LOG_DIR/jit.log" || {
+                echo "error: $slug JIT emitted no result summary" >&2
+                cat "$PAIR_LOG_DIR/jit.log"
+                status=1
+            }
+    fi
     echo "==> testing $slug (interpreter)"
-    cat "$PAIR_LOG_DIR/interpreter.log"
+    if [[ "$verbose" -eq 1 || "$jit_status" -ne 0 ||
+          "$interpreter_status" -ne 0 ]]; then
+        cat "$PAIR_LOG_DIR/interpreter.log"
+    else
+        awk '/^(engine|profile|target)=/ { summary = $0 }
+             END { if (summary != "") print summary; else exit 1 }' \
+            "$PAIR_LOG_DIR/interpreter.log" || {
+                echo "error: $slug interpreter emitted no result summary" >&2
+                cat "$PAIR_LOG_DIR/interpreter.log"
+                status=1
+            }
+    fi
     if [[ "$jit_status" -ne 0 || "$interpreter_status" -ne 0 ]]; then
         status=1
     fi

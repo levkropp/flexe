@@ -273,6 +273,13 @@ not compete with compilation. Set
 `FLEXE_IDF_CCACHE_DIR` to relocate those caches; the script's `--help` lists
 the remaining controls.
 
+The classic `test-fixtures.sh` gate keeps full per-engine loader and device
+traces in temporary logs and prints only each successful runner's result line.
+On failure it emits both complete logs so diagnostics are not lost. Set
+`FLEXE_FIXTURE_VERBOSE=1` when full successful traces are useful. Successful
+parallel compiler jobs are likewise quiet by default, while failed jobs retain
+their complete output.
+
 ## JIT verification
 
 `--jit-verify` runs each eligible compiled block natively, rolls back its memory

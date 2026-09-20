@@ -166,9 +166,18 @@ flexe_fixture_gate_pool_abort() {
 }
 
 flexe_fixture_gate_pool_wait() {
-    local index status gate_status verb
+    local index status gate_status verb success_output
     status=0
     verb=${FLEXE_FIXTURE_POOL_VERB:-checking}
+    success_output=${FLEXE_FIXTURE_POOL_SUCCESS_OUTPUT:-full}
+    case "$success_output" in
+    full|quiet) ;;
+    *)
+        echo "error: FLEXE_FIXTURE_POOL_SUCCESS_OUTPUT must be full or quiet" >&2
+        flexe_fixture_gate_pool_abort
+        return 2
+        ;;
+    esac
     for index in "${!FLEXE_GATE_POOL_PIDS[@]}"; do
         gate_status=0
         if wait "${FLEXE_GATE_POOL_PIDS[$index]}"; then
@@ -177,7 +186,9 @@ flexe_fixture_gate_pool_wait() {
             gate_status=$?
             status=1
         fi
-        cat "${FLEXE_GATE_POOL_LOGS[$index]}"
+        if [[ "$gate_status" -ne 0 || "$success_output" == full ]]; then
+            cat "${FLEXE_GATE_POOL_LOGS[$index]}"
+        fi
         if [[ "$gate_status" -ne 0 ]]; then
             echo "error: $verb ${FLEXE_GATE_POOL_LABELS[$index]} failed "\
 "with status $gate_status" >&2
