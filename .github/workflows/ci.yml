@@ -45,7 +45,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DNATIVE_ARCH=OFF
+            -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF
       - name: Build
         run: cmake --build build --target xtensa-tests -j"$(nproc)"
       - name: Unit tests

@@ -182,4 +182,6 @@ Use `-T` to write a verbose emulator trace, then narrow it with
 ```
 
 CI builds with GCC and Clang, runs ASan+UBSan, cross-compiles backend-relevant
-sources for AArch64, and executes the compiled-firmware gate set.
+sources for AArch64, and executes the compiled-firmware gate set. Correctness
+jobs disable expensive whole-program linking; normal optimized emulator builds
+retain LTO by default.
