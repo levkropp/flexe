@@ -37,6 +37,13 @@
 #define GDMA_V1_OUT_DESC_PREV2_OFF  0x098u
 #define GDMA_V1_OUT_PERI_SEL_OFF    0x0A8u
 
+/* Controller-wide GDMA v1 configuration registers follow the channel bank.
+ * MISC_CONF is shared by all channels: CLK_EN and ARB_PRI_DIS are retained
+ * controls, while the two AHB-master reset controls are software strobes that
+ * remain readable until software clears them. */
+#define GDMA_V1_MISC_CONF_OFF        0x3C8u
+#define GDMA_V1_MISC_CONF_MASK       0x00000017u
+
 #define GDMA_V1_OUT_RESET           (1u << 0)
 #define GDMA_V1_OUT_AUTO_WRBACK     (1u << 2)
 #define GDMA_V1_OUT_CHECK_OWNER     (1u << 12)
@@ -279,6 +286,11 @@ static void gdma_tx_power_on_reset(flexe_gdma_t *gdma, unsigned channel)
 static uint32_t gdma_read(void *ctx, uint32_t addr)
 {
     flexe_gdma_t *gdma = ctx;
+    const flexe_gdma_desc_t *desc = &gdma->target->gdma;
+    if (addr == desc->base + GDMA_V1_MISC_CONF_OFF) {
+        uint32_t *reg = gdma_reg(gdma, addr);
+        return reg ? *reg : 0u;
+    }
     unsigned channel;
     uint32_t off;
     if (!gdma_decode_channel(gdma, addr, &channel, &off))
@@ -318,6 +330,12 @@ static uint32_t gdma_read(void *ctx, uint32_t addr)
 static void gdma_write(void *ctx, uint32_t addr, uint32_t value)
 {
     flexe_gdma_t *gdma = ctx;
+    const flexe_gdma_desc_t *desc = &gdma->target->gdma;
+    if (addr == desc->base + GDMA_V1_MISC_CONF_OFF) {
+        uint32_t *reg = gdma_reg(gdma, addr);
+        if (reg) *reg = value & GDMA_V1_MISC_CONF_MASK;
+        return;
+    }
     unsigned channel;
     uint32_t off;
     if (!gdma_decode_channel(gdma, addr, &channel, &off)) {

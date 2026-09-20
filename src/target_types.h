@@ -29,6 +29,7 @@ typedef enum {
     FLEXE_SYSTEM_DEVICE_LEDC,
     FLEXE_SYSTEM_DEVICE_UART,
     FLEXE_SYSTEM_DEVICE_USB_SERIAL_JTAG,
+    FLEXE_SYSTEM_DEVICE_EDMA,
 } flexe_system_device_t;
 
 /* Optional board population; zero retains the target's standard board. The

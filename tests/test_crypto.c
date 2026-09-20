@@ -327,6 +327,7 @@ TEST(sha_accelerator_matches_known_answers) {
 #define S3_GDMA_OUT_DESC        (S3_GDMA_BASE + 0x090u)
 #define S3_GDMA_OUT_DESC_PREV   (S3_GDMA_BASE + 0x094u)
 #define S3_GDMA_OUT_PERI_SEL    (S3_GDMA_BASE + 0x0A8u)
+#define S3_GDMA_MISC_CONF        (S3_GDMA_BASE + 0x3C8u)
 
 #define S3_GDMA_LINK_START      (1u << 21)
 #define S3_GDMA_LINK_PARK       (1u << 23)
@@ -516,6 +517,25 @@ static void s3_gdma_descriptor(xtensa_mem_t *mem, uint32_t descriptor,
     mem_write32(mem, descriptor, dw0);
     mem_write32(mem, descriptor + 4u, buffer);
     mem_write32(mem, descriptor + 8u, next);
+}
+
+TEST(esp32s3_gdma_misc_configuration_is_retained_and_masked) {
+    s3_sha_fixture_t fixture;
+    bool ready = s3_sha_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_sha_fixture_destroy(&fixture);
+        return;
+    }
+
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_MISC_CONF), 0u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_MISC_CONF, UINT32_MAX);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_MISC_CONF), 0x17u);
+    mem_write32(fixture.cpu.mem, S3_GDMA_MISC_CONF, 1u << 4);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_GDMA_MISC_CONF), 1u << 4);
+    ASSERT_EQ(periph_unhandled_count(fixture.periph), 0u);
+
+    s3_sha_fixture_destroy(&fixture);
 }
 
 TEST(esp32s3_sha_consumes_chained_gdma_descriptors) {
@@ -857,6 +877,7 @@ void run_crypto_tests(void) {
     RUN_TEST(sha_accelerator_matches_known_answers);
     RUN_TEST(esp32s3_sha_direct_modes_match_known_answers);
     RUN_TEST(esp32s3_sha_honors_system_clock_and_reset);
+    RUN_TEST(esp32s3_gdma_misc_configuration_is_retained_and_masked);
     RUN_TEST(esp32s3_sha_consumes_chained_gdma_descriptors);
     RUN_TEST(esp32s3_gdma_honors_owner_check_and_writeback);
     RUN_TEST(esp32s3_gdma_receives_chained_descriptors_and_reports_errors);

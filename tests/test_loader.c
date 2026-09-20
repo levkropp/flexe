@@ -717,8 +717,8 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.cpu_per_conf_reset, 0x0Cu);
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
-    ASSERT_EQ(s3->system_clock.register_count, 7u);
-    ASSERT_EQ(s3->system_clock.gate_count, 13u);
+    ASSERT_EQ(s3->system_clock.register_count, 8u);
+    ASSERT_EQ(s3->system_clock.gate_count, 14u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
@@ -747,6 +747,13 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
               FLEXE_SYSTEM_DEVICE_SHA);
     ASSERT_EQ(s3->system_clock.gate[7].clock_mask, 1u << 2);
     ASSERT_EQ(s3->system_clock.gate[7].reset_mask, 1u << 2);
+    ASSERT_EQ(s3->system_clock.reg[7].offset, 0x44u);
+    ASSERT_EQ(s3->system_clock.reg[7].reset, 1u);
+    ASSERT_EQ(s3->system_clock.gate[13].device,
+              FLEXE_SYSTEM_DEVICE_EDMA);
+    ASSERT_EQ(s3->system_clock.gate[13].clock_mask, 1u);
+    ASSERT_EQ(s3->system_clock.gate[13].reset_mask, 1u << 1);
+    ASSERT_EQ(s3->rtc_cntl.wdt_pause_in_sleep_mask, 1u << 9);
     ASSERT_EQ(s3->io_mux.base, 0x60009000u);
     ASSERT_EQ(s3->io_mux.gpio_count, 49u);
     ASSERT_EQ(s3->io_mux.gpio_register_offset[26], 0x6Cu);

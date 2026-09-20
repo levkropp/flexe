@@ -576,20 +576,25 @@ TEST(rtc_cntl_watchdog_reports_unmodeled_configuration)
     ASSERT_EQ(mem_read32(mem, config0), value);
     ASSERT_EQ(fallback.writes, 1u);
 
-    /* Changing a defined but behaviorally unmodeled field is also explicit,
-     * while moving back to supported stage actions is handled normally. */
+    /* Moving back to supported stage actions is handled normally. Reset
+     * target enables and pulse-width fields have exact architectural
+     * readback; functional mode intentionally collapses their pulse timing
+     * into the atomic reset boundary. */
     mem_write32(mem, protect, desc->wdt_write_protect_key);
     mem_write32(mem, config0, desc->wdt_config_reset[0]);
     ASSERT_EQ(fallback.writes, 1u);
     mem_write32(mem, config0, desc->wdt_config_reset[0] ^ 1u);
-    ASSERT_EQ(fallback.writes, 2u);
-    ASSERT_EQ(fallback.last_write_addr, config0);
+    ASSERT_EQ(mem_read32(mem, config0), desc->wdt_config_reset[0] ^ 1u);
+    ASSERT_EQ(fallback.writes, 1u);
+    mem_write32(mem, config0, 0x0007EE00u);
+    ASSERT_EQ(mem_read32(mem, config0), 0x0007EE00u);
+    ASSERT_EQ(fallback.writes, 1u);
 
     /* Feed is a one-bit write-only command; unexpected command bits remain
      * visible to the common unsupported-access path. */
     uint32_t feed = desc->base + desc->wdt_feed_offset;
     mem_write32(mem, feed, desc->wdt_feed_mask | 1u);
-    ASSERT_EQ(fallback.writes, 3u);
+    ASSERT_EQ(fallback.writes, 2u);
     ASSERT_EQ(fallback.last_write_addr, feed);
 
     flexe_rtc_cntl_destroy(rtc);
@@ -1915,6 +1920,85 @@ TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_watchdog_pause_in_sleep_preserves_stage)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    periph_attach_cpus(periph, &cpu, NULL);
+
+    uint32_t config0 = desc->base + desc->wdt_config_offset[0];
+    uint32_t stage0_hold = desc->base + desc->wdt_config_offset[1];
+    uint32_t low = desc->base + desc->sleep_timer_low_offset;
+    uint32_t high = desc->base + desc->sleep_timer_high_offset;
+    uint32_t wakeup = desc->base + desc->wakeup_state_offset;
+    uint32_t state = desc->base + desc->sleep_state_offset;
+    uint32_t action_fields = 0u;
+    for (unsigned stage = 0u; stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX;
+         stage++)
+        action_fields |= (uint32_t)desc->wdt_stage_action_mask <<
+                         desc->wdt_stage_action_shift[stage];
+    uint32_t base_config = desc->wdt_config_reset[0] &
+        ~(desc->wdt_enable_mask | desc->wdt_flashboot_enable_mask |
+          action_fields);
+    mem_write32(mem, config0, base_config);
+    mem_write32(mem, stage0_hold, 2u);
+    mem_write32(mem, config0,
+                base_config | desc->wdt_enable_mask |
+                desc->wdt_pause_in_sleep_mask |
+                ((uint32_t)FLEXE_RTC_CNTL_WDT_RESET_SYSTEM <<
+                 desc->wdt_stage_action_shift[0]));
+    uint32_t running_deadline = cpu.next_timer_event;
+    ASSERT_TRUE(running_deadline != UINT32_MAX);
+
+    uint64_t alarm = rtc_capture(mem, desc) + 1360u;
+    mem_write32(mem, low, (uint32_t)alarm);
+    mem_write32(mem, high, (uint32_t)(alarm >> 32u));
+    mem_write32(mem, high,
+                (uint32_t)(alarm >> 32u) |
+                desc->sleep_alarm_enable_mask);
+    mem_write32(mem, wakeup,
+                desc->timer_wakeup_mask << desc->wakeup_enable_shift);
+    mem_write32(mem, state, desc->sleep_enable_mask);
+    bool deep = true;
+    uint64_t timeout_us = 0u;
+    uint32_t cause = UINT32_MAX;
+    ASSERT_TRUE(periph_take_sleep_request(periph, &deep, &timeout_us,
+                                           &cause));
+    ASSERT_FALSE(deep);
+
+    /* Cross the watchdog's original deadline while sleep is active. */
+    cpu.ccount = running_deadline + 1u;
+    cpu.periph_event(&cpu);
+    ASSERT_FALSE(periph_take_reset_request(periph));
+
+    /* Waking resumes the unconsumed stage interval. */
+    periph_finish_wake(periph, desc->timer_wakeup_mask);
+    uint32_t resumed_deadline = cpu.next_timer_event;
+    ASSERT_TRUE(resumed_deadline != UINT32_MAX);
+    ASSERT_TRUE((int32_t)(resumed_deadline - cpu.ccount) > 0);
+    cpu.ccount = resumed_deadline;
+    cpu.periph_event(&cpu);
+    ASSERT_TRUE(periph_take_reset_request(periph));
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_s3_timer_sleep_wakes_and_reports_cause)
 {
     const flexe_target_desc_t *s3 =
@@ -2379,6 +2463,7 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_interrupt_bank_latches_masks_clears_and_publishes_level);
     RUN_TEST(rtc_cntl_interrupt_routes_through_target_matrix);
     RUN_TEST(rtc_cntl_watchdog_schedules_feed_interrupt_and_reset);
+    RUN_TEST(rtc_cntl_watchdog_pause_in_sleep_preserves_stage);
     RUN_TEST(rtc_cntl_s3_timer_sleep_wakes_and_reports_cause);
     RUN_TEST(rtc_cntl_s3_sleep_rejects_unmodeled_wake_sources);
     RUN_TEST(rtc_cntl_s3_ext0_ext1_wake_samples_gpio_and_latches_status);

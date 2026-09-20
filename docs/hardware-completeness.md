@@ -52,7 +52,7 @@ even when a firmware workflow succeeds.
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, `scripts/check-s3-idf-gpio-isr.sh`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Stock ESP-IDF's per-pin ISR, FreeRTOS task notification, digital open-drain release, IO_MUX input-buffer gating, driven-output input feedback, RTC GPIO wake, and pad hold work; physical pulls, drive strength, and electrical levels are not complete. |
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; target-described UART TX producers route through the GPIO matrix with an idle-high pad state; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior, baud-rate edges, and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; target-described GP-SPI clock/data/chip-select producers route through the GPIO matrix; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, GP-SPI wire edges, and segmented/slave modes remain. |
-| S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
+| S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks controller-wide clock/arbitration/AHB-reset configuration, chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_esp32s3_extmem.c`, WLED production audit | Cache-array/internal-SRAM ownership has exact reset, masking, locks, and semantic state; protection configuration retains documented policy. Cache topology/timing and access-fault generation remain unsupported. |
 | S3 CPU assist/debug recorder | Partial (MMIO) | `tests/test_assist_debug.c`, zero-site WLED production audit | Both cores implement target-described PDEBUG enable, live/frozen PC and SP recording, and silicon DATE behavior without an instruction-loop hook. Detailed debug-bus payload, stack/area watchpoints, exception records, and trace memory remain diagnostic. |
@@ -124,10 +124,13 @@ end-to-end flash-format/mount check. With the matching application ELF, the
 host-backed socket/select boundary now lets the unmodified firmware serve
 `GET /wifi` as `200 OK` with its 4,985-byte configuration HTML. This is a
 service shim, not a modeled Wi-Fi radio: the page reports no networks, and
-the full POST/restart/reload replay still reports about 35,000 unsupported
-accesses. The separate 4-billion-cycle audit below counts 6,919 (mostly
-RF/PHY). The S3 application handoff now clears the power-on flash-boot
-watchdog mode skipped with the second-stage bootloader. Restoring ROM-owned
+an earlier full POST/restart/reload replay reported about 35,000 unsupported
+accesses. The fixed 4-billion-cycle interpreter audit and current full replay
+now require zero unsupported MMIO sites after the target-described RF/PHY,
+clock/power, serial-routing, and GDMA control work below. This does not turn
+the network service into a radio model. The S3 application handoff now clears
+the power-on flash-boot watchdog mode skipped with the second-stage bootloader.
+Restoring ROM-owned
 BSS and interface state from the official ROM ELF during a software restart
 lets NerdMiner initialize again and reload its saved settings instead of
 panicking during PSRAM setup, while physical SRAM outside those sections
@@ -908,7 +911,20 @@ private analog PHY are complete.
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
 an earlier interpreter audit, before RTC power-sequencer support, reported
-6,919 unsupported accesses at 4 billion aggregate cycles. GigaDevice `0x5A`
+6,919 unsupported accesses at 4 billion aggregate cycles. The same fixed audit
+now reports zero unsupported MMIO sites. Its final pair was the documented
+read-modify-write that enables the controller-wide AHB GDMA v1 clock; Flexe
+now retains and masks the shared clock, arbitration-disable, and AHB-master
+reset controls instead of routing them through generic MMIO fallback. The
+full POST/reset replay subsequently exposed nine one-shot restart-path sites:
+five RTC watchdog configuration writes and four external-memory DMA
+clock/reset accesses. Target-described watchdog reset controls now retain
+their exact readback, pause-in-sleep is functional, and reset selectors and
+pulse widths converge on Flexe's atomic reset boundary. The SYSTEM model
+publishes the EDMA clock/reset gate as standalone device state. The EDMA
+transfer engine itself and reset-pulse electrical duration are not claimed.
+
+GigaDevice `0x5A`
 SFDP reads now use the documented
 [GD25Q32C 4 MiB](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf)
 or [GD25Q64C 8 MiB](https://download.gigadevice.com/Datasheet/DS-00111-GD25Q64C-Rev3.2.pdf)
@@ -936,8 +952,8 @@ Repeat the measurement with the matching application and ROM ELFs:
 The app/ROM binaries are external inputs. The interactive gate drives a real
 `GET /wifi` request against the guest's WebServer and WiFiManager, submits the
 provisioning form, waits for the firmware's requested reset, and checks that
-the new boot loads the saved pool and wallet from SPIFFS. Unsupported-access
-diagnostics must remain visible:
+the new boot loads the saved pool and wallet from SPIFFS. The complete replay
+must finish with zero unsupported MMIO sites:
 
 ```sh
 S3_FACTORY_BIN=/path/to/NerdminerV2_factory.bin \

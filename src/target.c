@@ -438,8 +438,8 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_offset = 0x060u,
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
-            .register_count = 7u,
-            .gate_count = 13u,
+            .register_count = 8u,
+            .gate_count = 14u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -455,6 +455,9 @@ static const flexe_target_desc_t TARGETS[] = {
                   .writable_mask = 0x00000FFFu },
                 { .offset = 0x02Cu, .reset = 0x02001001u,
                   .writable_mask = 0x1FFFFFFFu },
+                /* External-memory DMA clock/reset control. */
+                { .offset = 0x044u, .reset = 0x00000001u,
+                  .writable_mask = 0x00000003u },
             },
             .gate = {
                 {
@@ -558,6 +561,13 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x024u,
                     .clock_mask = 1u << 10,
                     .reset_mask = 1u << 10,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_EDMA,
+                    .clock_offset = 0x044u,
+                    .reset_offset = 0x044u,
+                    .clock_mask = 1u << 0,
+                    .reset_mask = 1u << 1,
                 },
             },
             .low_power = {
@@ -763,6 +773,8 @@ static const flexe_target_desc_t TARGETS[] = {
             },
             .wdt_enable_mask = 1u << 31,
             .wdt_flashboot_enable_mask = 1u << 12,
+            .wdt_pause_in_sleep_mask = 1u << 9,
+            .wdt_auxiliary_control_mask = 0x0007EDFFu,
             .wdt_feed_mask = 1u << 31,
             .wdt_write_protect_key = 0x50D83AA1u,
             .wdt_interrupt_mask = 1u << 3,

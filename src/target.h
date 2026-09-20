@@ -48,8 +48,8 @@
     (FLEXE_TARGET_RTC_WDT_STAGE_MAX + 1u)
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
-#define FLEXE_TARGET_SYSTEM_REGISTER_MAX 7u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 13u
+#define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 14u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
@@ -60,7 +60,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 56u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 57u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -483,6 +483,14 @@ typedef struct {
     uint32_t wdt_config_writable_mask[FLEXE_TARGET_RTC_WDT_CONFIG_MAX];
     uint32_t wdt_enable_mask;
     uint32_t wdt_flashboot_enable_mask;
+    /* When asserted, stop watchdog stage accounting while the target RTC
+     * sleep state is active. Zero means that the target exposes no such
+     * control. */
+    uint32_t wdt_pause_in_sleep_mask;
+    /* Software-visible watchdog controls whose values are retained exactly,
+     * while pulse widths and reset electrical timing collapse into Flexe's
+     * atomic functional reset boundary. */
+    uint32_t wdt_auxiliary_control_mask;
     uint32_t wdt_feed_mask;
     uint32_t wdt_write_protect_key;
     uint32_t wdt_interrupt_mask;

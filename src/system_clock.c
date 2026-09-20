@@ -178,18 +178,25 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             (gate->device == FLEXE_SYSTEM_DEVICE_USB_SERIAL_JTAG &&
              gate->instance == 0u &&
              (target->capabilities &
-              FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1));
+              FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_EDMA &&
+             gate->instance == 0u);
         int bank = system_clock_peripheral_bank_index(
             desc, gate->clock_offset, gate->reset_offset);
-        if (!device_valid || clock_reg < 0 || reset_reg < 0 || bank < 0 ||
+        bool references_bank = system_clock_peripheral_offset(
+            desc, gate->clock_offset) ||
+            system_clock_peripheral_offset(desc, gate->reset_offset);
+        if (!device_valid || clock_reg < 0 || reset_reg < 0 ||
             !system_clock_single_bit(gate->clock_mask) ||
             !system_clock_single_bit(gate->reset_mask) ||
             (gate->clock_mask &
              ~desc->reg[clock_reg].writable_mask) != 0u ||
             (gate->reset_mask &
              ~desc->reg[reset_reg].writable_mask) != 0u ||
-            (gate->clock_mask & ~banks->valid_mask[bank]) != 0u ||
-            (gate->reset_mask & ~banks->valid_mask[bank]) != 0u)
+            (references_bank && bank < 0) ||
+            (bank >= 0 &&
+             ((gate->clock_mask & ~banks->valid_mask[bank]) != 0u ||
+              (gate->reset_mask & ~banks->valid_mask[bank]) != 0u)))
             return false;
         for (unsigned old = 0u; old < index; old++)
             if (gate->device == desc->gate[old].device &&

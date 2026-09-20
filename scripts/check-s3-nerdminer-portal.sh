@@ -95,8 +95,10 @@ if grep -q 'PSRAM ID read error' "$tmpdir/guest.out"; then
 fi
 grep -q '^Stop reason: halt (WAITI)' "$tmpdir/emu.err" ||
     fail "guest did not sustain execution after restart"
-unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 ]] ||
-    fail "unsupported-access diagnostics disappeared"
+unsupported_sites=$(sed -n \
+    's/^--- Unsupported MMIO sites (\([0-9][0-9]*\),.*$/\1/p' \
+    "$tmpdir/emu.err" | head -1)
+[[ "$unsupported_sites" == 0 ]] ||
+    fail "guest left ${unsupported_sites:-unknown} unsupported MMIO sites"
 
-echo "PASS: guest NerdMiner S3 served $(wc -c < "$tmpdir/body" | tr -d ' ') bytes, saved SPIFFS, restarted, and reloaded configuration; $unhandled unsupported accesses remain visible"
+echo "PASS: guest NerdMiner S3 served $(wc -c < "$tmpdir/body" | tr -d ' ') bytes, saved SPIFFS, restarted, reloaded configuration, and reported zero unsupported MMIO sites"

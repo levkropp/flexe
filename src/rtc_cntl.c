@@ -803,6 +803,21 @@ static bool rtc_cntl_geometry_valid(const flexe_target_desc_t *target)
             return false;
         action_fields |= field;
     }
+    if (!rtc_optional_one_bit(desc->wdt_pause_in_sleep_mask) ||
+        (desc->wdt_pause_in_sleep_mask != 0u &&
+         (desc->sleep_timer_low_offset == 0u ||
+          desc->sleep_enable_mask == 0u)) ||
+        ((desc->wdt_pause_in_sleep_mask |
+          desc->wdt_auxiliary_control_mask) &
+         (desc->wdt_enable_mask | desc->wdt_flashboot_enable_mask |
+          action_fields)) != 0u ||
+        (desc->wdt_pause_in_sleep_mask &
+         desc->wdt_auxiliary_control_mask) != 0u ||
+        (desc->wdt_pause_in_sleep_mask &
+         ~desc->wdt_config_writable_mask[0]) != 0u ||
+        (desc->wdt_auxiliary_control_mask &
+         ~desc->wdt_config_writable_mask[0]) != 0u)
+        return false;
 
     for (unsigned i = 0u; i < FLEXE_TARGET_RTC_WDT_CONFIG_MAX; i++) {
         uint16_t offset = desc->wdt_config_offset[i];
@@ -1245,6 +1260,14 @@ static bool rtc_wdt_active(const flexe_rtc_cntl_t *rtc)
              desc->wdt_flashboot_enable_mask)) != 0u;
 }
 
+static bool rtc_wdt_paused(const flexe_rtc_cntl_t *rtc)
+{
+    const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
+    return desc->wdt_pause_in_sleep_mask != 0u &&
+           (rtc->wdt_config[0] & desc->wdt_pause_in_sleep_mask) != 0u &&
+           (rtc->sleep_state & desc->sleep_enable_mask) != 0u;
+}
+
 static uint64_t rtc_wdt_stage_hold(const flexe_rtc_cntl_t *rtc)
 {
     uint64_t hold = rtc->wdt_config[1u + rtc->wdt_stage];
@@ -1266,6 +1289,7 @@ static unsigned rtc_wdt_stage_action(const flexe_rtc_cntl_t *rtc)
 
 static bool rtc_advance_wdt(flexe_rtc_cntl_t *rtc, uint64_t ticks)
 {
+    if (rtc_wdt_paused(rtc)) return false;
     bool changed = false;
     while (ticks != 0u && rtc_wdt_active(rtc)) {
         uint64_t hold = rtc_wdt_stage_hold(rtc);
@@ -1502,7 +1526,9 @@ static uint32_t rtc_wdt_config0_modeled_mask(
     const flexe_rtc_cntl_desc_t *desc)
 {
     uint32_t mask = desc->wdt_enable_mask |
-                    desc->wdt_flashboot_enable_mask;
+                    desc->wdt_flashboot_enable_mask |
+                    desc->wdt_pause_in_sleep_mask |
+                    desc->wdt_auxiliary_control_mask;
     for (unsigned stage = 0u; stage < FLEXE_TARGET_RTC_WDT_STAGE_MAX;
          stage++)
         mask |= (uint32_t)desc->wdt_stage_action_mask <<
@@ -2102,7 +2128,7 @@ uint32_t flexe_rtc_cntl_next_event(flexe_rtc_cntl_t *rtc,
     if (!rtc || !cpu) return UINT32_MAX;
     (void)rtc_sync(rtc);
     uint32_t nearest = UINT32_MAX;
-    if (rtc_wdt_active(rtc)) {
+    if (rtc_wdt_active(rtc) && !rtc_wdt_paused(rtc)) {
         uint64_t hold = rtc_wdt_stage_hold(rtc);
         uint64_t ticks = rtc->wdt_stage_ticks < hold ?
                          hold - rtc->wdt_stage_ticks : 1u;
@@ -2456,6 +2482,9 @@ uint32_t flexe_rtc_cntl_poll_gpio_wake(flexe_rtc_cntl_t *rtc,
 void flexe_rtc_cntl_finish_wake(flexe_rtc_cntl_t *rtc, uint32_t cause)
 {
     if (!rtc || rtc->target->rtc_cntl.sleep_timer_low_offset == 0u) return;
+    /* Account for the final interval while SLEEP_ENA is still visible so a
+     * watchdog configured to pause in sleep does not consume it on resume. */
+    (void)rtc_sync(rtc);
     const flexe_rtc_cntl_desc_t *desc = &rtc->target->rtc_cntl;
     uint32_t old_rtc_powered =
         flexe_rtc_cntl_powered_rtc_domains(rtc);

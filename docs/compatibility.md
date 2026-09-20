@@ -224,7 +224,9 @@ Automated tests cover both hosts, matrix and native routes, clock/reset
 isolation, full-duplex DMA, malformed and exhausted receive chains, and the
 original classic display/SD paths. GDMA completion/error status now drives
 the [S3's separate level interrupt source for each RX and TX channel](https://github.com/espressif/esp-idf/blob/v5.3.2/components/soc/esp32s3/include/soc/interrupts.h),
-including both CPU interrupt matrices and late enable/clear transitions.
+including both CPU interrupt matrices and late enable/clear transitions. The
+controller-wide GDMA clock, arbitration-disable, and AHB-master reset controls
+also have their architectural reset, masking, and readback behavior.
 Slave mode, segmented/config-buffer transactions, bus arbitration, signal
 edges, and clock-derived transfer duration remain outside this functional envelope.
 Unsupported framing and invalid DMA setup are diagnosed instead of silently
@@ -244,7 +246,7 @@ SPIFFS save, software restart, and configuration-reload scenario; a separately
 built WLED S3 image passes an AP web UI and JSON state-change scenario through
 its own raw-lwIP stack. Fast mode
 completes each block immediately; SHA/GDMA
-latency, arbitration, GDMA CPU interrupt delivery, and SHA-512/224, SHA-512/256,
+latency, arbitration timing, and SHA-512/224, SHA-512/256,
 and configurable SHA-512/t are not yet modeled.
 Requests for the unsupported SHA modes or malformed DMA chains are rejected
 with a diagnostic rather than returning invented digest data.
@@ -266,12 +268,14 @@ and level routing; physical producers such as brownout, touch, and ULP remain
 unsupported until their respective device models attach to that API. The
 four-stage RTC watchdog runs from the selected slow clock and implements the
 revision-profile stage-0 multiplier, feed, write protection, interrupt, and
-reset actions. Watchdog CPU/system/RTC reset actions currently converge on a
-whole-machine reset; their distinct reset domains and post-reset causes are
-not yet modeled. Pause-in-sleep, reset-signal widths, per-core reset selection,
-and reserved stage actions remain explicit unsupported-access diagnostics when
-firmware changes them. Changing any other unmodeled RTC control field remains
-visible in the same diagnostics, as do reserved register bits.
+reset actions, including pause-in-sleep behavior. Watchdog CPU/system/RTC reset
+actions currently converge on a whole-machine reset; their distinct reset
+domains and post-reset causes are not yet modeled. Reset-signal widths and
+per-core reset-selection fields retain their architectural values but converge
+on that atomic reset boundary. Reserved stage actions remain explicit
+unsupported-access diagnostics when firmware changes them. Changing any other
+unmodeled RTC control field remains visible in the same diagnostics, as do
+reserved register bits.
 
 The experimental USB Serial/JTAG model implements the 64-byte serial endpoint
 FIFOs, packet flush and backpressure behavior, host RX/TX, interrupt

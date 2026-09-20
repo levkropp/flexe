@@ -14051,6 +14051,10 @@ static void system_clock_gate_changed(
             flexe_usb_serial_jtag_set_system_state(
                 p->usb_serial_jtag, clock_enabled, reset_asserted);
         break;
+    case FLEXE_SYSTEM_DEVICE_EDMA:
+        /* The control state is queryable and attachable even though no
+         * external-memory DMA data engine is present yet. */
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }

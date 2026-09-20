@@ -13,6 +13,7 @@
 #define SC_PERIP_RST_EN1_OFF    0x024u
 #define SC_BT_LPCK_DIV_INT_OFF  0x028u
 #define SC_BT_LPCK_DIV_FRAC_OFF 0x02Cu
+#define SC_EDMA_CTRL_OFF         0x044u
 #define SC_SYSCLK_CONF_OFF      0x060u
 #define SC_CPU_WAIT_FORCE_ON    (1u << 3)
 #define SC_PLL_480M_SELECT      (1u << 2)
@@ -157,6 +158,7 @@ TEST(system_clock_reset_masks_and_shared_page_composition)
               0x000000FFu);
     ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_FRAC_OFF),
               0x02001001u);
+    ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_EDMA_CTRL_OFF), 1u);
 
     int before = periph_unhandled_count(periph);
     mem_write32(mem, SC_SYSTEM_BASE + SC_CPU_PER_CONF_OFF, UINT32_MAX);
@@ -204,6 +206,10 @@ TEST(system_clock_reset_masks_and_shared_page_composition)
     mem_write32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_INT_OFF, 0u);
     ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_MEM_PD_MASK_OFF), 0u);
     ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_BT_LPCK_DIV_INT_OFF), 0u);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_EDMA_CTRL_OFF, 3u);
+    ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_EDMA_CTRL_OFF), 3u);
+    mem_write32(mem, SC_SYSTEM_BASE + SC_EDMA_CTRL_OFF, 1u);
+    ASSERT_EQ(mem_read32(mem, SC_SYSTEM_BASE + SC_EDMA_CTRL_OFF), 1u);
     ASSERT_EQ(periph_unhandled_count(periph), before);
 
     /* Changes outside a semantic mapping remain explicit diagnostics. */
