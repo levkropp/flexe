@@ -11,9 +11,9 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
-expected_bin=c2696dda4347c24fbc9d49bb7d54b680e2dfb60ac73bf3799a87ba0ba080562e
-expected_elf=38ca3c7a3d3c7e3cb22b20295124222cc99b130a820332976b4dec96b72c98e7
-expected_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
+expected_bin=${S3_PSRAM_BIN_SHA256:-c2696dda4347c24fbc9d49bb7d54b680e2dfb60ac73bf3799a87ba0ba080562e}
+expected_elf=${S3_PSRAM_ELF_SHA256:-38ca3c7a3d3c7e3cb22b20295124222cc99b130a820332976b4dec96b72c98e7}
+expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
 for entry in "$S3_PSRAM_BIN:$expected_bin" "$S3_PSRAM_ELF:$expected_elf" \
              "$S3_ROM_ELF:$expected_rom"; do
     file=${entry%:*}

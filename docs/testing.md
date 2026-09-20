@@ -99,6 +99,25 @@ CI restores older per-fixture outputs as a fallback, recompiles only fixtures
 whose fingerprints changed, and caches the shared compiled core separately
 without each fixture's much larger intermediate build tree.
 
+The stock ESP32-S3 Arduino gates use Arduino-ESP32 3.3.11 and have their own
+cached entry point:
+
+```sh
+./scripts/build-s3-arduino-fixture.sh --check ledc rmt-rx
+./scripts/build-s3-arduino-fixture.sh --check all
+```
+
+It validates the installed core, derives a stable `SOURCE_DATE_EPOCH`, builds
+only the required host runners, finds the official S3 ROM ELF, and passes the
+resulting artifact hashes to each behavior gate. Firmware and source mirrors
+stay under the user cache rather than dirtying the repository. Its fingerprint
+covers every fixture input, board options, timestamp, CLI binary and config,
+and installed core version. An unchanged run therefore bypasses Arduino CLI's
+expensive dependency scan entirely; a cache miss still shares the compiled
+core across fixtures. Use `--rebuild` to force compilation, `--verbose` to see
+the compiler output, or the variables listed by `--help` to relocate caches
+and select nonstandard tools.
+
 ## Production ROM gates
 
 The curated scenarios require external images:

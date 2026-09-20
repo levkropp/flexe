@@ -9,9 +9,11 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
-expected_bin=5178a6d97110c3682664ecbe602e0bbce40367c639ebc46ab3f714d879c4ec34
-expected_elf=7c156185527896c78a8cf8de1155b10f417350ac1dad27a7ef255298fdad99d0
-for entry in "$S3_ADC_BIN:$expected_bin" "$S3_ADC_ELF:$expected_elf"; do
+expected_bin=${S3_ADC_BIN_SHA256:-5178a6d97110c3682664ecbe602e0bbce40367c639ebc46ab3f714d879c4ec34}
+expected_elf=${S3_ADC_ELF_SHA256:-7c156185527896c78a8cf8de1155b10f417350ac1dad27a7ef255298fdad99d0}
+expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
+for entry in "$S3_ADC_BIN:$expected_bin" "$S3_ADC_ELF:$expected_elf" \
+             "$S3_ROM_ELF:$expected_rom"; do
     file=${entry%:*}
     expected=${entry#*:}
     actual=$(openssl dgst -sha256 "$file" | awk '{print $NF}')

@@ -380,13 +380,7 @@ gate does not test a guest-initiated restart, electrical timing, bus
 contention, or other devices:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 \
-  --build-path /tmp/flexe-s3-i2c-wire-build \
-  --build-property compiler.optimization_flags=-Os tests/fixtures/i2c_wire
-S3_I2C_BIN=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.merged.bin \
-S3_I2C_ELF=/tmp/flexe-s3-i2c-wire-build/i2c_wire.ino.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-RUNNER=./build/flexe-i2c-wire-test ./scripts/check-s3-i2c-wire.sh
+./scripts/build-s3-arduino-fixture.sh --check i2c-wire
 ```
 
 The separate `tests/fixtures/s3_idf_i2c_master` project calls ESP-IDF
@@ -427,13 +421,7 @@ MMIO sites. Clock stretching, overflow, electrical bus timing, and other
 slave-driver implementations remain unverified:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 \
-  --build-path /tmp/flexe-s3-i2c-slave-build \
-  --build-property compiler.optimization_flags=-Os tests/fixtures/i2c_slave
-S3_I2C_SLAVE_BIN=/tmp/flexe-s3-i2c-slave-build/i2c_slave.ino.merged.bin \
-S3_I2C_SLAVE_ELF=/tmp/flexe-s3-i2c-slave-build/i2c_slave.ino.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-RUNNER=./build/flexe-i2c-slave-test ./scripts/check-s3-i2c-slave.sh
+./scripts/build-s3-arduino-fixture.sh --check i2c-slave
 ```
 
 The S3 GP-SPI gate compiles the same ESP-IDF `spi_master` fixture used for
@@ -457,13 +445,7 @@ not a guest `esp_restart()`. This does not validate SPI slave mode, segmented
 transfer, exact bus timing, or physical pin levels:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 \
-  --build-path /tmp/flexe-s3-spi-master-build \
-  --build-property compiler.optimization_flags=-Os tests/fixtures/spi_master
-S3_SPI_BIN=/tmp/flexe-s3-spi-master-build/spi_master.ino.merged.bin \
-S3_SPI_ELF=/tmp/flexe-s3-spi-master-build/spi_master.ino.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-RUNNER=./build/flexe-spi-master-test ./scripts/check-s3-spi-master.sh
+./scripts/build-s3-arduino-fixture.sh --check spi-master
 ```
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,
@@ -563,13 +545,7 @@ validation. Recheck the RX path with the compiled fixture
 and official ROM ELF:
 
 ```sh
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- tests/fixtures/s3_rmt_rx) \
-arduino-cli compile --clean --fqbn esp32:esp32:esp32s3 \
-  --build-path /tmp/flexe-s3-rmt-rx-build tests/fixtures/s3_rmt_rx
-S3_RMT_RX_BIN=/tmp/flexe-s3-rmt-rx-build/s3_rmt_rx.ino.merged.bin \
-S3_RMT_RX_ELF=/tmp/flexe-s3-rmt-rx-build/s3_rmt_rx.ino.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-RUNNER=./build/flexe-s3-rmt-rx-test ./scripts/check-s3-rmt-rx.sh
+./scripts/build-s3-arduino-fixture.sh --check rmt-rx
 ```
 
 The RX fixture's pinned merged image SHA-256 is
@@ -759,13 +735,7 @@ functional behavior, not physical analog, attenuation, calibration accuracy, or
 continuous/DMA ADC fidelity. Recheck with the external compiled fixture:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 \
-  --build-path /tmp/flexe-s3-adc-fixture-build \
-  --build-property compiler.optimization_flags=-Os tests/fixtures/s3_adc
-S3_ADC_BIN=/tmp/flexe-s3-adc-fixture-build/s3_adc.ino.merged.bin \
-S3_ADC_ELF=/tmp/flexe-s3-adc-fixture-build/s3_adc.ino.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-adc.sh
+./scripts/build-s3-arduino-fixture.sh --check adc
 ```
 
 The S3 LEDC model follows Espressif's `esp32s3` `ledc_reg.h`,
@@ -783,18 +753,11 @@ PWM period. The pinned merged image SHA-256 is
 with ELF SHA-256
 `61a0c58e32a915e09fbf15b4dd5f63c2346370fb8e436d0a995e14a381596ef7`.
 `scripts/check-s3-ledc.sh` requires byte-identical event replay and zero
-unsupported accesses. `SOURCE_DATE_EPOCH` makes the artifact reproducible
-across clean rebuilds:
+unsupported accesses. The fixture helper derives `SOURCE_DATE_EPOCH`, caches
+the exact inputs, and can reproduce the artifact with `--rebuild`:
 
 ```sh
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- tests/fixtures/s3_ledc) \
-arduino-cli compile --clean --fqbn esp32:esp32:esp32s3 \
-  --build-path /tmp/flexe-s3-ledc-fixture-build \
-  --build-property compiler.optimization_flags=-Os tests/fixtures/s3_ledc
-S3_LEDC_BIN=/tmp/flexe-s3-ledc-fixture-build/s3_ledc.ino.merged.bin \
-S3_LEDC_ELF=/tmp/flexe-s3-ledc-fixture-build/s3_ledc.ino.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-ledc.sh
+./scripts/build-s3-arduino-fixture.sh --check ledc
 ```
 
 The optional AP Memory 8 MiB OPI profile is selected by the board, not
@@ -804,15 +767,7 @@ repeatedly; its second replay must be byte-identical, and the same image
 without the flag must report no PSRAM. Build and run it with:
 
 ```sh
-arduino-cli compile \
-  --fqbn 'esp32:esp32:esp32s3:FlashSize=8M,PSRAM=opi' \
-  --build-path /tmp/flexe-s3-psram-opi-build \
-  --build-property compiler.optimization_flags=-Os \
-  tests/fixtures/s3_psram_opi
-S3_PSRAM_BIN=/tmp/flexe-s3-psram-opi-build/s3_psram_opi.ino.merged.bin \
-S3_PSRAM_ELF=/tmp/flexe-s3-psram-opi-build/s3_psram_opi.ino.elf \
-S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/check-s3-psram-opi.sh
+./scripts/build-s3-arduino-fixture.sh --check psram-opi
 ```
 
 The native S3 `esp_wifi_internal_tx`/`tx_by_ref` and
