@@ -41,5 +41,5 @@ cmp -s "$tmpdir/run1" "$tmpdir/run2" || {
 }
 grep -Fq 'gpio=1 injected_long=1 gpio_carrier=1 counts=2,96,2' "$tmpdir/run1"
 grep -Fq 'short_match=1 long_match=1 carrier_match=1' "$tmpdir/run1"
-grep -Fq 'rmt_unhandled_sites=0' "$tmpdir/run1"
-echo "PASS: stock Arduino S3 filtered GPIO4 glitches, demodulated a carrier frame, and received 96 host symbols through its RX ISR with zero unsupported RMT accesses and byte-identical replay"
+grep -Fq 'unhandled=0 rmt_unhandled_sites=0' "$tmpdir/run1"
+echo "PASS: stock Arduino S3 filtered GPIO4 glitches, demodulated a carrier frame, and received 96 host symbols through its RX ISR with zero unsupported accesses and byte-identical replay"

@@ -55,13 +55,14 @@
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
 #define FLEXE_TARGET_RADIO_REGISTER_MAX 8u
+#define FLEXE_TARGET_SYSCON_ACE_REGION_MAX 4u
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
 #define FLEXE_TARGET_SHA_MODE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 58u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 59u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -859,12 +860,32 @@ typedef struct {
     uint16_t ticks_per_half_slot;
 } flexe_radio_time_latch_desc_t;
 
-/* Public SYSCON controls for on-chip ROM/SRAM and RF front-end memories.
+/* One target-described external-memory access-control bank. Each region has
+ * an attribute word and a start/size pair; the size unit and attribute-bit
+ * meaning remain properties of the target's MSPI fabric. */
+typedef struct {
+    uint16_t attribute_offset;
+    uint16_t address_offset;
+    uint16_t size_offset;
+    uint32_t attribute_reset;
+    uint32_t attribute_writable_mask;
+    uint32_t address_reset[FLEXE_TARGET_SYSCON_ACE_REGION_MAX];
+    uint32_t address_writable_mask;
+    uint32_t size_reset;
+    uint32_t size_writable_mask;
+} flexe_syscon_ace_desc_t;
+
+/* Public SYSCON controls for external-memory access policy, on-chip ROM/SRAM,
+ * and RF front-end memories.
  * The bank masks are target data: later family members may expose different
  * bank counts or place the controls elsewhere in the shared SYSCON page. */
 typedef struct {
     uint32_t base;
     uint32_t register_size;
+    uint8_t ace_region_count;
+    uint16_t ace_region_stride;
+    flexe_syscon_ace_desc_t flash_ace;
+    flexe_syscon_ace_desc_t sram_ace;
     uint16_t front_end_power_offset;
     uint16_t clock_force_on_offset;
     uint16_t power_down_offset;

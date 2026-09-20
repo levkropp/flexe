@@ -6,12 +6,25 @@
 #include <stdint.h>
 
 #include "memory.h"
+#include "target.h"
 
 typedef struct flexe_syscon_memory flexe_syscon_memory_t;
 
-/* Bank selections are normalized to bit zero, independent of their raw
- * register placement. Front-end bits are packed in ascending register order. */
 typedef struct {
+    uint32_t attributes;
+    uint32_t address;
+    uint32_t size_pages;
+} flexe_syscon_ace_region_state_t;
+
+/* Bank selections are normalized to bit zero, independent of their raw
+ * register placement. Front-end bits are packed in ascending register order.
+ * External-memory access-control regions retain their target-native units. */
+typedef struct {
+    uint8_t ace_region_count;
+    flexe_syscon_ace_region_state_t
+        flash_ace[FLEXE_TARGET_SYSCON_ACE_REGION_MAX];
+    flexe_syscon_ace_region_state_t
+        sram_ace[FLEXE_TARGET_SYSCON_ACE_REGION_MAX];
     uint8_t front_end_force_power_down;
     uint8_t front_end_force_power_up;
     uint16_t sram_clock_force_on;

@@ -260,7 +260,7 @@ int main(int argc, char **argv)
         pulse_close_to(carrier_second, 0u, 1u, 10u);
     int ok = gpio_short && injected_long && gpio_carrier &&
              stage == SUCCESS_MARKER && short_match && long_match &&
-             carrier_match && rmt_unhandled == 0u;
+             carrier_match && unhandled == 0u && rmt_unhandled == 0u;
     fprintf(stderr,
             "[s3-rmt-rx] stage=0x%08X gpio=%d injected_long=%d "
             "gpio_carrier=%d counts=%u,%u,%u short=%08X,%08X "

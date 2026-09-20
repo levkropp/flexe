@@ -176,11 +176,13 @@ idle state, and GP-SPI exports complete transactions; fast mode does not
 fabricate baud or serial-clock edges.
 
 The S3 SYSCON memory-policy owner supplies exact reset and masked readback for
-the RF front-end controls and the 11 SRAM/3 ROM bank clock, force-down, and
-force-up policies. It publishes normalized semantic state for cache and power
+the four flash and four PSRAM access-control regions, RF front-end controls,
+and the 11 SRAM/3 ROM bank clock, force-down, and force-up policies. It
+publishes normalized semantic state for memory-protection, cache, and power
 consumers and composes with the radio owner on their shared MMIO page. Flexe
-does not yet model cache timing or erase backing memory when firmware requests
-that a bank be powered down.
+does not yet generate access faults from restrictive external-memory regions,
+model cache timing, or erase backing memory when firmware requests that a bank
+be powered down.
 
 The SENSITIVE v1 model likewise retains the cache-data-array and internal-SRAM
 allocation policy with documented reset values, reserved-bit masks, and sticky

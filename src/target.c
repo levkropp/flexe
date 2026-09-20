@@ -820,7 +820,7 @@ static const flexe_target_desc_t TARGETS[] = {
              * deliberately collapsing their electrical voltage and settling
              * effects. TOUCH_CTRL2 is readable at reset, but writes remain
              * diagnostic until a touch FSM consumes them. */
-            .config_register_count = 5u,
+            .config_register_count = 6u,
             .config_register = {
                 /* SLP_REJECT_CONF */
                 { 0x068u, 0x00000000u, 0xFFFFF000u,
@@ -837,6 +837,11 @@ static const flexe_target_desc_t TARGETS[] = {
                 /* TOUCH_CTRL2 */
                 { 0x10Cu, 0x000840CCu, 0xFFFFFFFCu,
                   0x00000000u, 0x00000000u },
+                /* FIB_SEL: software ownership for power-glitch, brownout,
+                 * and super-watchdog reset paths. Detector injection is a
+                 * separate capability from retaining this selector. */
+                { 0x148u, 0x00000007u, 0x00000007u,
+                  0x00000000u, 0x00000007u },
             },
             .cpu_stall_enable_offset = 0x01Cu,
             .cpu_stall_enable_mask = 1u,
@@ -1160,6 +1165,38 @@ static const flexe_target_desc_t TARGETS[] = {
         .syscon_memory = {
             .base = 0x60026000u,
             .register_size = 0x1000u,
+            /* ESP32-S3 SYSCON external-memory PMS: four 64-KiB-page
+             * access-policy regions each for flash and PSRAM. */
+            .ace_region_count = 4u,
+            .ace_region_stride = 4u,
+            .flash_ace = {
+                .attribute_offset = 0x028u,
+                .address_offset = 0x038u,
+                .size_offset = 0x048u,
+                .attribute_reset = 0x000000FFu,
+                .attribute_writable_mask = 0x000001FFu,
+                .address_reset = {
+                    0x00000000u, 0x10000000u,
+                    0x20000000u, 0x30000000u,
+                },
+                .address_writable_mask = UINT32_MAX,
+                .size_reset = 0x00001000u,
+                .size_writable_mask = 0x0000FFFFu,
+            },
+            .sram_ace = {
+                .attribute_offset = 0x058u,
+                .address_offset = 0x068u,
+                .size_offset = 0x078u,
+                .attribute_reset = 0x000000FFu,
+                .attribute_writable_mask = 0x000001FFu,
+                .address_reset = {
+                    0x00000000u, 0x10000000u,
+                    0x20000000u, 0x30000000u,
+                },
+                .address_writable_mask = UINT32_MAX,
+                .size_reset = 0x00001000u,
+                .size_writable_mask = 0x0000FFFFu,
+            },
             .front_end_power_offset = 0x09Cu,
             .clock_force_on_offset = 0x0A8u,
             .power_down_offset = 0x0ACu,

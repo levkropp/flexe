@@ -1019,20 +1019,20 @@ TEST(rtc_cntl_s3_configuration_bank_masks_retains_and_audits)
     }
 
     const uint16_t expected_offset[] = {
-        0x068u, 0x07Cu, 0x080u, 0x08Cu, 0x10Cu,
+        0x068u, 0x07Cu, 0x080u, 0x08Cu, 0x10Cu, 0x148u,
     };
     const uint32_t expected_reset[] = {
         0x00000000u, 0x0AB0BE0Au, 0x00010800u,
-        0x00000000u, 0x000840CCu,
+        0x00000000u, 0x000840CCu, 0x00000007u,
     };
     const uint32_t expected_writable[] = {
         0xFFFFF000u, 0xFEFFFEFFu, 0x3FFFFC00u,
-        0x0FFFFFFFu, 0xFFFFFFFCu,
+        0x0FFFFFFFu, 0xFFFFFFFCu, 0x00000007u,
     };
     const uint32_t expected_read_only[] = {
-        0u, 0x01000000u, 0u, 0u, 0u,
+        0u, 0x01000000u, 0u, 0u, 0u, 0u,
     };
-    ASSERT_EQ(desc->config_register_count, 5u);
+    ASSERT_EQ(desc->config_register_count, 6u);
     for (unsigned i = 0u; i < desc->config_register_count; i++) {
         const flexe_rtc_config_register_desc_t *reg =
             &desc->config_register[i];
@@ -1068,6 +1068,15 @@ TEST(rtc_cntl_s3_configuration_bank_masks_retains_and_audits)
     uint32_t touch_addr = desc->base + touch->offset;
     mem_write32(mem, touch_addr, touch->reset | (1u << 31u));
     ASSERT_EQ(mem_read32(mem, touch_addr), touch->reset | (1u << 31u));
+    ASSERT_EQ(fallback.writes, 1u);
+
+    /* Clearing the FIB brownout selector gives software ownership to the
+     * modeled brownout configuration without fabricating a voltage event. */
+    const flexe_rtc_config_register_desc_t *fib =
+        &desc->config_register[5];
+    uint32_t fib_addr = desc->base + fib->offset;
+    mem_write32(mem, fib_addr, fib->reset & ~(1u << 1u));
+    ASSERT_EQ(mem_read32(mem, fib_addr), 0x5u);
     ASSERT_EQ(fallback.writes, 1u);
 
     /* Reserved bits neither latch nor disappear from the audit. */

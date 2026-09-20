@@ -57,6 +57,61 @@ TEST(syscon_memory_exposes_s3_reset_and_masked_readback)
     }
 
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SYSCON_MEMORY_V1);
+    ASSERT_EQ(desc->ace_region_count, 4u);
+    for (unsigned i = 0u; i < desc->ace_region_count; i++) {
+        uint32_t delta = i * desc->ace_region_stride;
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->flash_ace.attribute_offset + delta),
+                  desc->flash_ace.attribute_reset);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->flash_ace.address_offset + delta),
+                  desc->flash_ace.address_reset[i]);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->flash_ace.size_offset + delta),
+                  desc->flash_ace.size_reset);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->sram_ace.attribute_offset + delta),
+                  desc->sram_ace.attribute_reset);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->sram_ace.address_offset + delta),
+                  desc->sram_ace.address_reset[i]);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->sram_ace.size_offset + delta),
+                  desc->sram_ace.size_reset);
+
+        mem_write32(mem, desc->base +
+                    desc->flash_ace.attribute_offset + delta, UINT32_MAX);
+        mem_write32(mem, desc->base +
+                    desc->flash_ace.address_offset + delta,
+                    0x01020304u + i);
+        mem_write32(mem, desc->base +
+                    desc->flash_ace.size_offset + delta, UINT32_MAX);
+        mem_write32(mem, desc->base +
+                    desc->sram_ace.attribute_offset + delta, UINT32_MAX);
+        mem_write32(mem, desc->base +
+                    desc->sram_ace.address_offset + delta,
+                    0xA1020304u + i);
+        mem_write32(mem, desc->base +
+                    desc->sram_ace.size_offset + delta, UINT32_MAX);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->flash_ace.attribute_offset + delta),
+                  desc->flash_ace.attribute_writable_mask);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->flash_ace.address_offset + delta),
+                  0x01020304u + i);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->flash_ace.size_offset + delta),
+                  desc->flash_ace.size_writable_mask);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->sram_ace.attribute_offset + delta),
+                  desc->sram_ace.attribute_writable_mask);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->sram_ace.address_offset + delta),
+                  0xA1020304u + i);
+        ASSERT_EQ(mem_read32(mem, desc->base +
+                             desc->sram_ace.size_offset + delta),
+                  desc->sram_ace.size_writable_mask);
+    }
     ASSERT_EQ(mem_read32(mem, desc->base + desc->front_end_power_offset),
               desc->front_end_power_reset);
     ASSERT_EQ(mem_read32(mem, desc->base + desc->clock_force_on_offset),
@@ -115,6 +170,13 @@ TEST(syscon_memory_publishes_normalized_bank_policy)
     flexe_syscon_memory_set_state_listener(
         memory, syscon_state_changed, &probe);
     ASSERT_EQ(probe.calls, 1u);
+    ASSERT_EQ(probe.state.ace_region_count, 4u);
+    ASSERT_EQ(probe.state.flash_ace[0].attributes, 0xFFu);
+    ASSERT_EQ(probe.state.flash_ace[0].address, 0u);
+    ASSERT_EQ(probe.state.flash_ace[0].size_pages, 0x1000u);
+    ASSERT_EQ(probe.state.sram_ace[3].attributes, 0xFFu);
+    ASSERT_EQ(probe.state.sram_ace[3].address, 0x30000000u);
+    ASSERT_EQ(probe.state.sram_ace[3].size_pages, 0x1000u);
     ASSERT_EQ(probe.state.front_end_force_power_down, 0u);
     ASSERT_EQ(probe.state.front_end_force_power_up, 0xFu);
     ASSERT_EQ(probe.state.sram_clock_force_on, 0x7FFu);
@@ -128,7 +190,26 @@ TEST(syscon_memory_publishes_normalized_bank_policy)
     mem_write32(mem, desc->base + desc->clock_force_on_offset, 0x0AADu);
     mem_write32(mem, desc->base + desc->power_down_offset, 0x001Au);
     mem_write32(mem, desc->base + desc->power_up_offset, 0x2001u);
-    ASSERT_EQ(probe.calls, 5u);
+    mem_write32(mem, desc->base + desc->flash_ace.attribute_offset,
+                0xDBu);
+    mem_write32(mem, desc->base + desc->flash_ace.address_offset,
+                0x12340000u);
+    mem_write32(mem, desc->base + desc->flash_ace.size_offset,
+                0x4000u);
+    uint32_t sram3_delta = 3u * desc->ace_region_stride;
+    mem_write32(mem, desc->base + desc->sram_ace.attribute_offset +
+                sram3_delta, 0x1A5u);
+    mem_write32(mem, desc->base + desc->sram_ace.address_offset +
+                sram3_delta, 0x3FC00000u);
+    mem_write32(mem, desc->base + desc->sram_ace.size_offset +
+                sram3_delta, 0x80u);
+    ASSERT_EQ(probe.calls, 11u);
+    ASSERT_EQ(probe.state.flash_ace[0].attributes, 0xDBu);
+    ASSERT_EQ(probe.state.flash_ace[0].address, 0x12340000u);
+    ASSERT_EQ(probe.state.flash_ace[0].size_pages, 0x4000u);
+    ASSERT_EQ(probe.state.sram_ace[3].attributes, 0x1A5u);
+    ASSERT_EQ(probe.state.sram_ace[3].address, 0x3FC00000u);
+    ASSERT_EQ(probe.state.sram_ace[3].size_pages, 0x80u);
     ASSERT_EQ(probe.state.front_end_force_power_down, 0xFu);
     ASSERT_EQ(probe.state.front_end_force_power_up, 0u);
     ASSERT_EQ(probe.state.sram_clock_force_on, 0x155u);
@@ -141,9 +222,10 @@ TEST(syscon_memory_publishes_normalized_bank_policy)
     flexe_syscon_memory_state_t queried = {0};
     ASSERT_TRUE(flexe_syscon_memory_state(memory, &queried));
     ASSERT_EQ(queried.sram_clock_force_on, 0x155u);
+    ASSERT_EQ(queried.flash_ace[0].attributes, 0xDBu);
     flexe_syscon_memory_set_state_listener(memory, NULL, NULL);
     mem_write32(mem, desc->base + desc->power_up_offset, 0u);
-    ASSERT_EQ(probe.calls, 5u);
+    ASSERT_EQ(probe.calls, 11u);
 
     flexe_syscon_memory_destroy(memory);
     mem_destroy(mem);
@@ -209,6 +291,32 @@ TEST(syscon_memory_rejects_invalid_descriptors)
 
     invalid = *s3;
     invalid.syscon_memory.front_end_power_reset = UINT32_MAX;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    memory = flexe_syscon_memory_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(memory == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.syscon_memory.ace_region_count =
+        FLEXE_TARGET_SYSCON_ACE_REGION_MAX + 1u;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    memory = flexe_syscon_memory_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(memory == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.syscon_memory.sram_ace.attribute_offset =
+        invalid.syscon_memory.flash_ace.attribute_offset;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    memory = flexe_syscon_memory_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(memory == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.syscon_memory.flash_ace.attribute_reset = UINT32_MAX;
     mem = mem_create_for_target(&invalid);
     ASSERT_TRUE(mem != NULL);
     memory = flexe_syscon_memory_create(mem, NULL, NULL, NULL);
