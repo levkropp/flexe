@@ -182,24 +182,28 @@ nonstandard install:
 ```sh
 FLEXE_IDF_PATH=/path/to/esp-idf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
-  ./scripts/build-s3-idf-fixture.sh --check \
-    hello crosscore nvs i2c-master
+  ./scripts/build-s3-idf-fixture.sh --check all
 ```
 
 The helper accepts short names for every `tests/fixtures/s3_idf_*` project and
 keeps Ninja output and `sdkconfig` files under the user cache, outside the
-repository. After the first IDF configure it invokes the generated build
-directly, retains full logs, and prints only progress, exact artifact paths and
-hashes, and gate results. Pass `--verbose` when live compiler output and ccache
-statistics are useful. `--check` also updates just the selected host emulator
-and endpoint-harness targets, avoiding stale runners. The helper rejects an
-accidental ESP-IDF revision mismatch. It also prevents ESP-IDF's generated
-Ninja graph from treating the parent Flexe Git revision as a firmware input,
-so committing emulator work does not reconfigure or rebuild unchanged
-fixtures. When `ccache` is installed, common
-ESP-IDF components are shared safely across independent projects: generated
-header contents remain part of the cache key, so projects with different
-`sdkconfig` values cannot reuse the wrong object. Set `FLEXE_IDF_BUILD_ROOT` or
+repository. A content fingerprint covers the project sources, generated
+configuration, pinned IDF/tool metadata, build flags, deterministic timestamp,
+and both artifact hashes. An unchanged run therefore skips the IDF environment
+export and Ninja entirely; all ten artifact lookups take about one second on
+the reference MacBook. A cache miss retains full logs and prints only progress,
+exact artifact paths and hashes, and gate results. Pass `--verbose` when live
+compiler output and ccache statistics are useful. `--check` also updates just
+the selected host emulator and endpoint-harness targets, avoiding stale
+runners. `--rebuild` performs a safe IDF full-clean and configure, and should
+reproduce both hashes. The helper rejects an accidental ESP-IDF revision
+mismatch. It also prevents ESP-IDF's generated Ninja graph from treating the
+parent Flexe Git revision as a firmware input, so committing emulator work does
+not reconfigure or rebuild unchanged fixtures. When `ccache` is installed,
+common ESP-IDF components are shared safely across independent projects:
+generated header contents remain part of the cache key, so projects with
+different `sdkconfig` values cannot reuse the wrong object. Set
+`FLEXE_IDF_BUILD_ROOT` or
 `FLEXE_IDF_CCACHE_DIR` to relocate those caches; the script's `--help` lists
 the remaining controls.
 

@@ -115,6 +115,7 @@ cmake --build build --target xtensa-tests -j
 ./scripts/test-fixtures.sh                 # all Arduino hardware gates
 ./scripts/test-fixtures.sh spi-master i2c-wire
 ./scripts/build-s3-arduino-fixture.sh --check ledc rmt-rx
+./scripts/build-s3-idf-fixture.sh --check all
 ./scripts/check-stock-roms.sh              # curated external ROMs
 FLEXE_ROMS=/path/to/roms ./scripts/check-firmware.sh
 ```

@@ -99,9 +99,9 @@ twice with byte-identical UART, USB, and unsupported-MMIO digests. The entire
 driver replay now uses zero unsupported MMIO accesses, including the USB
 controller aperture and RTC USB PHY mux. The pinned
 application image SHA-256 is
-`b8cc669dbd8fb46f5dc93c5dad948cba266fb773ea6a62656455e9e60de82b37`
+`6afea3c1ad908202bdbaa4c3ae19b72f850aa96b38d3a1ff55b2796c1bff14d5`
 and matching ELF SHA-256 is
-`42e6c6e2e38372272955ad2df6e09340178c619fb7bd82957c000b0c28608678`.
+`a47a4f5468108aebaaba6d3ab9aab74817dd52eded39848e1d81dc62cf8e6cbc`.
 This checks driver-level packet and interrupt progress, not USB enumeration,
 electrical timing, or large/bursty packet stress. Rebuild with ESP-IDF commit
 `9d7f2d69f50d1288526d4f1027108e314e8c879f` and run:
@@ -111,8 +111,10 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check usb-serial-jtag
 ```
 
-Independently rebuilt images may provide matching `*_SHA256` overrides,
-because ESP-IDF embeds build metadata.
+The fixture helper derives a stable `SOURCE_DATE_EPOCH` and normalizes its
+external build path, so a clean pinned build reproduces these hashes. An
+intentional toolchain, source, flag, or timestamp change may provide matching
+`*_SHA256` overrides to its gate.
 
 S3 now meets the supported functional-target boundary. The NerdMiner
 filesystem result is a meaningful end-to-end flash-format/mount check. With
@@ -141,8 +143,8 @@ repository.
 
 The official ESP-IDF v5.3.2 `examples/get-started/hello_world` image built
 from commit `9d7f2d69f50d1288526d4f1027108e314e8c879f` (application image
-SHA-256 `e9ce7296ec826e19216ef9ee3940857f561184fefef06a4d4dfa20a5494dfc54`,
-ELF `643073d572d06dce114bb9a70f41ef975ff2ce76dd87696316baf31af20216d8`)
+SHA-256 `aff0d18eac38ebeb05181d58fbe9c13e7897fb83680d924a0a48bc0abe7c4221`,
+ELF `1ef4206eaabfc6b3b148b69bcb9244a2d756f983cefe14addbdfa190496384f3`)
 now reaches `app_main()`, counts down through ten guest seconds, requests its
 own software reset, and does so again after both cores restart. The separate
 `tests/fixtures/s3_idf_crosscore` project, built with the same IDF, pins a
@@ -151,9 +153,9 @@ producer to CPU1 and checks 32 queue-message/notification round trips with
 `esp_cpu_unstall(1)` calls to verify that an active CPU1 task stops making
 progress and resumes without losing its state, before sustained 100 ms
 heartbeats. Its image SHA-256 is
-`f1b90e7ae15c5eba69d75aef6372fa0cbf387acadb75265a26d0d4cdb6943631`
+`184e23dfb61fcdd2bb3fc999efddd8a3f863c08a523789bb69515f05e4eafcbe`
 and ELF SHA-256 is
-`84e74cdcdfac1bbc67caef66b9fa49366d8f6940c81f794c8253d47301a4f230`.
+`fb748fd11ef199d5cb268d0401e4dd8577196fb22282fd409af011e7bec5f8b3`.
 Both external-image gates compare a complete second replay byte-for-byte and
 require zero unsupported MMIO accesses. RTC `OPTIONS0` software-reset pulses
 reset APP CPU architectural state independently at a safe execution boundary;
@@ -172,8 +174,9 @@ The fixture helper auto-discovers and initializes the pinned toolchain and ROM,
 keeps persistent generated configuration outside the repository, and shares
 safely cached ESP-IDF components across projects.
 
-Independently rebuilt images can supply matching `*_SHA256` overrides, since
-ESP-IDF embeds build metadata in the application.
+Clean builds through the fixture helper reproduce these hashes by fixing the
+embedded timestamp and normalizing the external build path. Intentional input
+changes can supply their matching `*_SHA256` overrides.
 
 The S3 RTC controller now owns its documented 48-bit sleep alarm, wake enable,
 sleep state, timer interrupt, target-described digital power/isolation fields,
@@ -194,9 +197,9 @@ sleep and checks the timer wake cause, deep-sleep reset reason, RTC_DATA marker,
 and STORE0 marker on its second `app_main()`. The guest also measures RTC
 ticks through each sleep, including the second boot's startup, and sustains a
 FreeRTOS heartbeat afterward. Its image SHA-256 is
-`cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2`
+`bca98a4f1806266286ca5090a489e668d3e80d42b21b1cd8ecc6154259485246`
 and matching ELF SHA-256 is
-`a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294`.
+`b58b49d5b4012c4ac80445c070a602115b413403a77437914394484c45722be9`.
 The two complete replays are byte-identical and the full reports contain zero
 unsupported MMIO accesses. No unsupported sites remain in the validated S3
 timer-sleep boot, sleep, reset, and second-boot path. The nominal
@@ -296,9 +299,9 @@ wake causes, EXT1's GPIO12 status across the deep-sleep reset, and sustained
 FreeRTOS execution afterward. Two replays match on guest wake outcomes and
 unsupported MMIO sites; the exact wake duration varies with host input timing.
 Its image SHA-256 is
-`d4897a5ea5b5805bfda3ac3f624788f2600c9f17653e07f8dee7bea67df91314`
+`3fd036c2e52c1ee50b826c1fb3f63d18e8d09c2d01f93bc455518d71ec8fe575`
 and ELF SHA-256 is
-`27a2d3710e867e0310494a29a6c3612878ec10796a5ea32beeb30a4eca627d4d`.
+`a007e5da15a99804a4ee8d228be7cf5912480a2bb9d9594511e7ede0348048a0`.
 Both complete reports contain zero unsupported MMIO accesses; the EXT
 selection/state/status, digital-domain, and shared RTC configuration sites are
 all modeled.
@@ -355,9 +358,9 @@ Neither its API nor its SPI-flash transactions are replaced by host NVS shims.
 Its direct application image uses Flexe's documented synthesized NVS
 partition; NerdMiner's factory-image gate separately exercises a real
 partition table and SPIFFS volume. The pinned NVS image SHA-256 is
-`6eb44365aa80da064ab9b861ecc8210c31c4326216d89902da8d432afee04989`
+`86d87f33b9b8730f9d60e15456a23ee713e7dbcfd742ceac5502724a000a8777`
 and ELF SHA-256 is
-`0992d03138cdfd968b974968c6abcf1f4fec01ab35a233d737dada8b81414588`.
+`f83e27a89adf22ad65d28193a7d12fd31ef4e4efc47292652e040681f5d4ae18`.
 The gate checks two byte-identical runs and requires zero unsupported MMIO
 accesses across its two boots:
 
@@ -901,9 +904,9 @@ guest implementation intact. The stock ESP-IDF v5.3.2 fixture in
 `tests/fixtures/s3_idf_socket_range` builds with `CONFIG_LWIP_MAX_SOCKETS=10`
 and demonstrates guest FDs `54..63`, `select()`, exhaustion, and byte-identical
 interpreter replays (image SHA-256
-`9b28227195225f9ecf9b59edc5d9e6d962eb561a069a6b8d5501c41627dec353`,
+`a3b70aeb8d5689d81d246a14ef3ed4df7add3139eee6a4cd3710c2ed6a53799d`,
 ELF SHA-256
-`2dbbafa1ac2915298c40918e76bb3ff0afb0dc63f58c23eb332bbf5ffbfef881`).
+`282bca88e2aaffc68d399fce5f71cdd4175f3a4e5d2cef19be35efe3186de553`).
 Without the VFS registration symbols or for a range beyond Flexe's current
 64-FD `select()` layout, the bridge does not guess a base and reports the
 unsupported condition. Rebuild and run the gate with:

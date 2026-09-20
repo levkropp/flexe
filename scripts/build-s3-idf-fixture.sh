@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Build one or more pinned ESP-IDF S3 fixtures outside the source tree.
-# Persistent build directories handle incremental rebuilds; a shared ccache
-# avoids recompiling the same IDF components for every independent project.
+# Persistent build directories handle incremental rebuilds; an input/artifact
+# fingerprint bypasses Ninja's always-run IDF post-build steps when nothing
+# changed, and a shared ccache avoids recompiling common IDF components.
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-usage: build-s3-idf-fixture.sh [--check] [--verbose] NAME...
+usage: build-s3-idf-fixture.sh [--check] [--rebuild] [--verbose] NAME...
 
 Names may be short aliases such as hello, crosscore, nvs, or sleep; an
-in-tree s3_idf_* project name; or a path to another ESP-IDF project.
+in-tree s3_idf_* project name; a path to another ESP-IDF project; or all.
 
 Environment:
   FLEXE_IDF_PATH             pinned ESP-IDF checkout (auto-detected otherwise)
@@ -22,10 +23,12 @@ Environment:
   FLEXE_BUILD_DIR            host CMake build used by --check
   S3_ROM_ELF                 official ROM ELF (auto-detected for --check)
   RUNNER                     custom runner used by every requested check
+  SOURCE_DATE_EPOCH          explicit artifact timestamp
 EOF
 }
 
 run_checks=0
+force_rebuild=0
 verbose=${FLEXE_IDF_VERBOSE:-0}
 case "$verbose" in
 0|1) ;;
@@ -38,6 +41,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
     --check)
         run_checks=1
+        shift
+        ;;
+    --rebuild)
+        force_rebuild=1
         shift
         ;;
     --verbose)
@@ -63,6 +70,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+
+all_fixtures=(hello crosscore nvs sleep gpio-wake gpio-isr \
+    usb-serial-jtag i2c-master rmt-loopback socket-range)
+if [[ $# -eq 1 && "$1" == all ]]; then
+    set -- "${all_fixtures[@]}"
+elif [[ " $* " == *" all "* ]]; then
+    echo "error: 'all' cannot be combined with fixture names" >&2
+    exit 2
+fi
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
@@ -114,46 +130,57 @@ if [[ "${FLEXE_IDF_ALLOW_UNPINNED:-0}" != 1 &&
     exit 1
 fi
 
-# Source the selected checkout only when this shell is not already ready for
-# it. Capturing the export chatter keeps routine agent and developer runs
-# concise; a failure retains and prints the complete diagnostic.
-active_idf_py=$(command -v idf.py 2>/dev/null || true)
-if [[ "$active_idf_py" != "$idf_py" ]] ||
-   ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
-    if [[ -z "${IDF_PYTHON_ENV_PATH:-}" &&
-          "$actual_idf_commit" == "$expected_idf_commit" ]]; then
-        idf_tools_root=${IDF_TOOLS_PATH:-${HOME:+$HOME/.espressif}}
-        python_env_candidates=()
-        if [[ -n "$idf_tools_root" ]]; then
+# A warm artifact hit must not pay ESP-IDF's roughly half-second shell export.
+# Initialize the Python environment and compiler lazily on the first cache
+# miss. Capturing the export chatter keeps routine runs concise while a failure
+# retains the complete diagnostic.
+idf_tools_root=${IDF_TOOLS_PATH:-${HOME:+$HOME/.espressif}}
+idf_environment_ready=0
+initialize_idf_environment() {
+    local active_idf_py export_log idf_export_status
+    local python_env_candidate
+    local python_env_candidates=()
+    [[ "$idf_environment_ready" -eq 0 ]] || return 0
+    active_idf_py=$(command -v idf.py 2>/dev/null || true)
+    if [[ "$active_idf_py" != "$idf_py" ]] ||
+       ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
+        if [[ -z "${IDF_PYTHON_ENV_PATH:-}" &&
+              "$actual_idf_commit" == "$expected_idf_commit" &&
+              -n "$idf_tools_root" ]]; then
             shopt -s nullglob
             python_env_candidates=(
                 "$idf_tools_root"/python_env/idf5.3_py*_env)
             shopt -u nullglob
+            for python_env_candidate in "${python_env_candidates[@]}"; do
+                if [[ -x "$python_env_candidate/bin/python" &&
+                      -f "$python_env_candidate/idf_version.txt" ]] &&
+                   [[ "$(<"$python_env_candidate/idf_version.txt")" == 5.3 ]]; then
+                    export IDF_PYTHON_ENV_PATH=$python_env_candidate
+                    break
+                fi
+            done
         fi
-        for python_env_candidate in "${python_env_candidates[@]}"; do
-            if [[ -x "$python_env_candidate/bin/python" &&
-                  -f "$python_env_candidate/idf_version.txt" ]] &&
-               [[ "$(<"$python_env_candidate/idf_version.txt")" == 5.3 ]]; then
-                export IDF_PYTHON_ENV_PATH=$python_env_candidate
-                break
-            fi
-        done
-    fi
-    export_log=$(mktemp "${TMPDIR:-/tmp}/flexe-idf-export.XXXXXX")
-    set +e
-    set +u
-    source "$IDF_PATH/export.sh" >"$export_log" 2>&1
-    idf_export_status=$?
-    set -u
-    set -e
-    if [[ "$idf_export_status" -ne 0 ]]; then
-        echo "error: could not initialize ESP-IDF from $IDF_PATH" >&2
-        cat "$export_log" >&2
+        export_log=$(mktemp "${TMPDIR:-/tmp}/flexe-idf-export.XXXXXX")
+        set +e
+        set +u
+        source "$IDF_PATH/export.sh" >"$export_log" 2>&1
+        idf_export_status=$?
+        set -u
+        set -e
+        if [[ "$idf_export_status" -ne 0 ]]; then
+            echo "error: could not initialize ESP-IDF from $IDF_PATH" >&2
+            cat "$export_log" >&2
+            rm -f -- "$export_log"
+            exit 1
+        fi
         rm -f -- "$export_log"
-        exit 1
     fi
-    rm -f -- "$export_log"
-fi
+    command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1 || {
+        echo "error: ESP32-S3 compiler was not initialized by ESP-IDF" >&2
+        exit 1
+    }
+    idf_environment_ready=1
+}
 
 canonicalize_dir_target() {
     local candidate=${1%/} suffix= part
@@ -225,6 +252,11 @@ fi
 # also lets ccache retain its safe default directory hashing while recognizing
 # that the compiler's recorded working directory is intentionally canonical.
 original_extra_cppflags=${EXTRA_CPPFLAGS:-}
+requested_epoch=${SOURCE_DATE_EPOCH:-}
+if [[ -n "$requested_epoch" && ! "$requested_epoch" =~ ^[0-9]+$ ]]; then
+    echo "error: SOURCE_DATE_EPOCH must be an integer" >&2
+    exit 2
+fi
 # These projects live below the Flexe checkout, but their fixed project
 # versions make the parent repository revision irrelevant to their output.
 # Stop Git discovery at the checkout root so ESP-IDF's generated Ninja graph
@@ -233,7 +265,41 @@ fixture_git_ceiling=$repo
 if [[ -n "${GIT_CEILING_DIRECTORIES:-}" ]]; then
     fixture_git_ceiling="$repo:$GIT_CEILING_DIRECTORIES"
 fi
-helper_config_version=4
+helper_config_version=6
+
+idf_py_hash=$(openssl dgst -sha256 "$idf_py" | awk '{print $NF}')
+cmake_version=$(cmake --version | sed -n '1p')
+ninja_version=$(ninja --version 2>/dev/null || printf 'unavailable')
+idf_tools_state=$({
+    printf 'root=%s\n' "$idf_tools_root"
+    for tools_metadata in "$IDF_PATH/tools/tools.json" \
+            "$idf_tools_root/idf-env.json"; do
+        if [[ -f "$tools_metadata" ]]; then
+            tools_metadata_hash=$(openssl dgst -sha256 "$tools_metadata" |
+                awk '{print $NF}')
+            printf '%s=%s\n' "$tools_metadata" "$tools_metadata_hash"
+        else
+            printf '%s=missing\n' "$tools_metadata"
+        fi
+    done
+} | openssl dgst -sha256 | awk '{print $NF}')
+idf_tree_state=clean
+if ! git -C "$IDF_PATH" diff --quiet HEAD -- 2>/dev/null; then
+    idf_tree_state=$(git -C "$IDF_PATH" diff --binary HEAD -- |
+        openssl dgst -sha256 | awk '{print $NF}')
+fi
+build_environment_state=$({
+    printf 'idf-py=%s\n' "$idf_py_hash"
+    printf 'idf-tools=%s\n' "$idf_tools_state"
+    printf 'cmake=%s\n' "$cmake_version"
+    printf 'ninja=%s\n' "$ninja_version"
+    for build_variable in PROJECT_VER PROJECT_VER_NUMBER SDKCONFIG_DEFAULTS \
+            EXTRA_CFLAGS EXTRA_CXXFLAGS EXTRA_CPPFLAGS CFLAGS CXXFLAGS \
+            CPPFLAGS LDFLAGS; do
+        build_value=$(printenv "$build_variable" 2>/dev/null || true)
+        printf '%s=%s\n' "$build_variable" "$build_value"
+    done
+} | openssl dgst -sha256 | awk '{print $NF}')
 
 run_logged() {
     local description=$1 log=$2 status
@@ -251,6 +317,43 @@ run_logged() {
     echo "----- last 200 log lines -----" >&2
     tail -n 200 "$log" >&2
     return "$status"
+}
+
+fixture_fingerprint() {
+    local project_dir=$1 sdkconfig_file=$2 config_signature=$3 epoch=$4
+    local input relative digest variable value
+    {
+        printf 'flexe-s3-idf-helper=%s\n' "$helper_config_version"
+        printf 'project=%s\n' "$project_dir"
+        printf 'idf-path=%s\n' "$IDF_PATH"
+        printf 'idf-commit=%s\n' "$actual_idf_commit"
+        printf 'idf-tree=%s\n' "$idf_tree_state"
+        printf 'idf-py-sha256=%s\n' "$idf_py_hash"
+        printf 'idf-tools=%s\n' "$idf_tools_state"
+        printf 'cmake=%s\n' "$cmake_version"
+        printf 'ninja=%s\n' "$ninja_version"
+        printf 'configuration=%s\n' "$config_signature"
+        printf 'source-date-epoch=%s\n' "$epoch"
+        for variable in PROJECT_VER PROJECT_VER_NUMBER SDKCONFIG_DEFAULTS \
+                EXTRA_CFLAGS EXTRA_CXXFLAGS \
+                EXTRA_CPPFLAGS CFLAGS CXXFLAGS CPPFLAGS LDFLAGS; do
+            value=$(printenv "$variable" 2>/dev/null || true)
+            printf 'environment-%s=%s\n' "$variable" "$value"
+        done
+        find "$project_dir" -type f \
+                ! -path '*/.git/*' ! -path '*/build/*' -print |
+            LC_ALL=C sort | while IFS= read -r input; do
+                relative=${input#"$project_dir"/}
+                digest=$(openssl dgst -sha256 "$input" | awk '{print $NF}')
+                printf 'source=%s:%s\n' "$relative" "$digest"
+            done
+        if [[ -f "$sdkconfig_file" ]]; then
+            digest=$(openssl dgst -sha256 "$sdkconfig_file" | awk '{print $NF}')
+            printf 'sdkconfig=%s\n' "$digest"
+        else
+            printf 'sdkconfig=missing\n'
+        fi
+    } | openssl dgst -sha256 | awk '{print $NF}'
 }
 
 resolve_project() {
@@ -296,6 +399,12 @@ for requested in "$@"; do
         echo "error: not an ESP-IDF project: $requested ($project)" >&2
         exit 2
     fi
+    case " ${keys[*]-} " in
+    *" $key "*)
+        echo "error: duplicate fixture: $requested" >&2
+        exit 2
+        ;;
+    esac
     projects+=("$project")
     keys+=("$key")
 done
@@ -369,13 +478,25 @@ for index in "${!projects[@]}"; do
     build_dir="$build_root/$key-build"
     sdkconfig="$build_root/$key-sdkconfig"
     mkdir -p -- "$build_dir"
+    epoch=$requested_epoch
+    if [[ -z "$epoch" ]]; then
+        epoch=$(git -C "$project" log -1 --format=%ct -- . 2>/dev/null || true)
+    fi
+    if [[ -z "$epoch" ]]; then
+        epoch=$(git -C "$IDF_PATH" show -s --format=%ct \
+            "$actual_idf_commit" 2>/dev/null || true)
+    fi
+    [[ "$epoch" =~ ^[0-9]+$ ]] || {
+        echo "error: could not derive SOURCE_DATE_EPOCH for $project" >&2
+        exit 1
+    }
     helper_extra_cppflags="${original_extra_cppflags:+$original_extra_cppflags }-fdebug-prefix-map=$build_dir=."
     if [[ ${#idf_cache_args[@]} -ne 0 ]]; then
         export CCACHE_BASEDIR=$build_dir
     fi
     config_signature=$(printf '%s\n' "$helper_config_version" \
         "$actual_idf_commit" "$cache_state" "$helper_extra_cppflags" \
-        "$fixture_git_ceiling" |
+        "$fixture_git_ceiling" "$epoch" |
         openssl dgst -sha256 | awk '{print $NF}')
     config_stamp="$build_dir/.flexe-idf-helper-config"
     prior_signature=
@@ -383,49 +504,115 @@ for index in "${!projects[@]}"; do
         IFS= read -r prior_signature < "$config_stamp" || true
     fi
     build_log="$build_dir/.flexe-build.log"
-    if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
-        echo "==> configuring and building $key"
-        run_logged "$key configure/build" "$build_log" \
-            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
-            "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
-            "$idf_py" "${idf_cache_args[@]}" -C "$project" \
-                -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
-                -D IDF_TARGET=esp32s3 build
-    elif [[ "$prior_signature" != "$config_signature" ]]; then
-        echo "==> refreshing $key configuration"
-        run_logged "$key reconfiguration" "$build_log" \
-            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
-            "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
-            "$idf_py" "${idf_cache_args[@]}" -C "$project" \
-                -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
-                -D IDF_TARGET=esp32s3 reconfigure
-        echo "==> building $key"
-        run_logged "$key build" "$build_log" \
-            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
-            cmake --build "$build_dir" --parallel
-    else
-        echo "==> building $key"
-        run_logged "$key build" "$build_log" \
-            env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
-            cmake --build "$build_dir" --parallel
-    fi
-    printf '%s\n' "$config_signature" > "$config_stamp"
-
+    input_stamp="$build_dir/.flexe-idf-input.sha256"
+    input_fingerprint=$(fixture_fingerprint "$project" "$sdkconfig" \
+        "$config_signature" "$epoch")
     shopt -s nullglob
     elf_candidates=("$build_dir"/*.elf)
     shopt -u nullglob
-    if [[ ${#elf_candidates[@]} -ne 1 ]]; then
-        echo "error: expected one application ELF in $build_dir" >&2
-        exit 1
+    elf=
+    bin=
+    bin_hash=
+    elf_hash=
+    if [[ ${#elf_candidates[@]} -eq 1 ]]; then
+        elf=${elf_candidates[0]}
+        bin=${elf%.elf}.bin
+        if [[ -s "$bin" && -s "$elf" ]]; then
+            bin_hash=$(openssl dgst -sha256 "$bin" | awk '{print $NF}')
+            elf_hash=$(openssl dgst -sha256 "$elf" | awk '{print $NF}')
+        fi
     fi
-    elf=${elf_candidates[0]}
-    bin=${elf%.elf}.bin
-    [[ -s "$bin" ]] || {
-        echo "error: build produced no matching application image: $bin" >&2
-        exit 1
-    }
-    bin_hash=$(openssl dgst -sha256 "$bin" | awk '{print $NF}')
-    elf_hash=$(openssl dgst -sha256 "$elf" | awk '{print $NF}')
+    cached_fingerprint=
+    cached_bin_hash=
+    cached_elf_hash=
+    cached_epoch=
+    cached_build_environment=
+    build_environment_changed=0
+    if [[ -f "$input_stamp" ]]; then
+        cached_fingerprint=$(sed -n '1p' "$input_stamp")
+        cached_bin_hash=$(sed -n '2p' "$input_stamp")
+        cached_elf_hash=$(sed -n '3p' "$input_stamp")
+        cached_epoch=$(sed -n '4p' "$input_stamp")
+        cached_build_environment=$(sed -n '5p' "$input_stamp")
+    fi
+    if [[ -n "$cached_build_environment" &&
+          "$cached_build_environment" != "$build_environment_state" ]]; then
+        build_environment_changed=1
+    fi
+    if [[ "$force_rebuild" -eq 0 && -f "$build_dir/CMakeCache.txt" &&
+          "$prior_signature" == "$config_signature" &&
+          -n "$bin_hash" && -n "$elf_hash" &&
+          "$cached_fingerprint" == "$input_fingerprint" &&
+          "$cached_bin_hash" == "$bin_hash" &&
+          "$cached_elf_hash" == "$elf_hash" &&
+          "$cached_epoch" == "$epoch" ]]; then
+        echo "==> reusing unchanged $key firmware"
+        if [[ -z "$cached_build_environment" ]]; then
+            printf '%s\n%s\n%s\n%s\n%s\n' "$input_fingerprint" \
+                "$bin_hash" "$elf_hash" "$epoch" \
+                "$build_environment_state" > "$input_stamp.tmp"
+            mv "$input_stamp.tmp" "$input_stamp"
+        fi
+    else
+        rm -f -- "$input_stamp"
+        initialize_idf_environment
+        if [[ -f "$build_dir/CMakeCache.txt" &&
+              ( "$force_rebuild" -eq 1 ||
+                "$prior_signature" != "$config_signature" ||
+                "$build_environment_changed" -eq 1 ) ]]; then
+            if [[ "$force_rebuild" -eq 1 ]]; then
+                echo "==> rebuilding $key from a clean configuration"
+            else
+                echo "==> refreshing $key build configuration"
+            fi
+            run_logged "$key full clean" "$build_root/$key-fullclean.log" \
+                env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
+                "SOURCE_DATE_EPOCH=$epoch" \
+                "$idf_py" -C "$project" -B "$build_dir" fullclean
+            prior_signature=
+        fi
+        if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
+            echo "==> configuring and building $key"
+            run_logged "$key configure/build" "$build_log" \
+                env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
+                "SOURCE_DATE_EPOCH=$epoch" \
+                "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
+                "$idf_py" "${idf_cache_args[@]}" -C "$project" \
+                    -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
+                    -D IDF_TARGET=esp32s3 build
+        else
+            echo "==> building $key"
+            run_logged "$key build" "$build_log" \
+                env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
+                "SOURCE_DATE_EPOCH=$epoch" \
+                cmake --build "$build_dir" --parallel
+        fi
+        printf '%s\n' "$config_signature" > "$config_stamp.tmp"
+        mv "$config_stamp.tmp" "$config_stamp"
+
+        shopt -s nullglob
+        elf_candidates=("$build_dir"/*.elf)
+        shopt -u nullglob
+        if [[ ${#elf_candidates[@]} -ne 1 ]]; then
+            echo "error: expected one application ELF in $build_dir" >&2
+            exit 1
+        fi
+        elf=${elf_candidates[0]}
+        bin=${elf%.elf}.bin
+        [[ -s "$bin" ]] || {
+            echo "error: build produced no matching application image: $bin" >&2
+            exit 1
+        }
+        bin_hash=$(openssl dgst -sha256 "$bin" | awk '{print $NF}')
+        elf_hash=$(openssl dgst -sha256 "$elf" | awk '{print $NF}')
+        input_fingerprint=$(fixture_fingerprint "$project" "$sdkconfig" \
+            "$config_signature" "$epoch")
+        printf '%s\n%s\n%s\n%s\n%s\n' "$input_fingerprint" "$bin_hash" \
+            "$elf_hash" "$epoch" "$build_environment_state" \
+            > "$input_stamp.tmp"
+        mv "$input_stamp.tmp" "$input_stamp"
+    fi
+
     prefix=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')
     # Two early gates predate the fixture-directory naming convention. Keep
     # their public environment variables stable while still accepting the

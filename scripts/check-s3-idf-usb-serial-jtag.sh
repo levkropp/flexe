@@ -9,8 +9,8 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/flexe-s3-idf-usb-serial-jtag-test"}
-pinned_bin=b8cc669dbd8fb46f5dc93c5dad948cba266fb773ea6a62656455e9e60de82b37
-pinned_elf=42e6c6e2e38372272955ad2df6e09340178c619fb7bd82957c000b0c28608678
+pinned_bin=6afea3c1ad908202bdbaa4c3ae19b72f850aa96b38d3a1ff55b2796c1bff14d5
+pinned_elf=a47a4f5468108aebaaba6d3ab9aab74817dd52eded39848e1d81dc62cf8e6cbc
 pinned_rom=c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd
 expected_bin=${S3_IDF_USJ_BIN_SHA256:-$pinned_bin}
 expected_elf=${S3_IDF_USJ_ELF_SHA256:-$pinned_elf}
@@ -51,8 +51,8 @@ fi
 if [[ "$expected_bin" == "$pinned_bin" &&
       "$expected_elf" == "$pinned_elf" &&
       "$expected_rom" == "$pinned_rom" ]]; then
-    for marker in 'UART: 1546 bytes fnv32=16543E8C' \
-                  'USB: 1426 bytes fnv32=89FE630D' \
+    for marker in 'UART: 1546 bytes fnv32=65FC375A' \
+                  'USB: 1426 bytes fnv32=C2447A67' \
                   'MMIO: 0 sites fnv32=811C9DC5'; do
         grep -Fxq "$marker" "$tmpdir/first.out" || {
             echo "FAIL: pinned UART, USB, or MMIO digest changed: $marker" >&2

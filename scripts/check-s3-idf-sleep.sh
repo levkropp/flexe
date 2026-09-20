@@ -9,8 +9,8 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=${RUNNER:-"$root/build/xtensa-emu"}
-expected_bin=${S3_IDF_SLEEP_BIN_SHA256:-cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2}
-expected_elf=${S3_IDF_SLEEP_ELF_SHA256:-a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294}
+expected_bin=${S3_IDF_SLEEP_BIN_SHA256:-bca98a4f1806266286ca5090a489e668d3e80d42b21b1cd8ecc6154259485246}
+expected_elf=${S3_IDF_SLEEP_ELF_SHA256:-b58b49d5b4012c4ac80445c070a602115b413403a77437914394484c45722be9}
 expected_rom=${S3_ROM_ELF_SHA256:-c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd}
 for entry in "$S3_IDF_SLEEP_BIN:$expected_bin" \
              "$S3_IDF_SLEEP_ELF:$expected_elf" \
