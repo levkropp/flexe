@@ -15,6 +15,12 @@ flexe_radio_t *flexe_radio_create(
     mmio_write_fn fallback_write, void *fallback_ctx);
 void flexe_radio_attach_cpus(flexe_radio_t *radio,
                               xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu1);
+/* Publish resolved RTC domain state. Power loss restores a window's hardware
+ * reset image; isolation only makes the bus aperture inaccessible, retaining
+ * state for release. */
+void flexe_radio_set_rtc_domain_state(flexe_radio_t *radio,
+                                      uint32_t powered,
+                                      uint32_t isolated);
 void flexe_radio_destroy(flexe_radio_t *radio);
 
 #endif /* FLEXE_RADIO_H */

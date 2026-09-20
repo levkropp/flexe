@@ -53,13 +53,13 @@ even when a firmware workflow succeeds.
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, and GP-SPI segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
-| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power-sequencer reset/readback and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; brownout configuration reads back under a nominal fixed supply, but voltage detection/reset, touch/ULP wake, analog power-transition timing, and other reset causes remain unsupported. |
+| S3 timers, watchdogs, RTC | Partial (MMIO) | `tests/test_systimer.c`, `tests/test_timer_group.c`, `tests/test_rtc_cntl.c` (power sequencing, digital-domain resolution, sleep/wake, and stall enable), ESP-IDF cross-core, restart, native timer and GPIO light/deep-sleep gates | Timer and EXT0/EXT1 wake work; DIG_PWC/DIG_ISO state controls connected consumers, but brownout voltage detection/reset, touch/ULP wake, analog transition timing, and other reset causes remain unsupported. |
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties and byte-identical replay | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 RTC SAR ADC | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` | Digital/DMA conversion, ULP, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
-| S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response and next prompt | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
+| S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response and next prompt | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
 
 S3 UART0/1/2 now obey their independent
@@ -185,10 +185,11 @@ Independently rebuilt images can supply matching `*_SHA256` overrides, since
 ESP-IDF embeds build metadata in the application.
 
 The S3 RTC controller now owns its documented 48-bit sleep alarm, wake enable,
-sleep state, timer interrupt, digital-wrap power-down selection, and separate
-wake-cause register. The session advances the shared virtual clock through
-timer-only light sleep or resets after timer-only deep sleep; the always-on
-counter, fractional tick phase, and STORE0-7 survive that rebuild. The
+sleep state, timer interrupt, target-described digital power/isolation fields,
+and separate wake-cause register. The session advances the shared virtual
+clock through timer-only light sleep or resets after timer-only deep sleep;
+the always-on counter, fractional tick phase, and STORE0-7 survive that
+rebuild. The
 [S3 RTC TIMER1..TIMER6 registers](https://github.com/espressif/esp-idf/blob/v5.5.1/components/soc/esp32s3/register/soc/rtc_cntl_reg.h)
 now retain their specified power-on and writable fields. TIMER1's CPU_STALL_EN
 bit gates the real two-register CPU stall key; reserved writes remain
@@ -205,13 +206,13 @@ FreeRTOS heartbeat afterward. Its image SHA-256 is
 `cce3abfb4191663a0c6125180e0ea91804bf8f71387aeeff807e9b40bb2175a2`
 and matching ELF SHA-256 is
 `a7cbc0ff14284c65573b2ca075bfea0a85a28707c1df35c131d39fd39bb0e294`.
-The two complete replays are byte-identical; 206 other unsupported accesses
-across both boots remain visible, mainly RTC power/isolation configuration.
-No unsupported sites remain for S3 sleep timer, state, wake-enable, or cause
-registers. The nominal slow-clock model yielded about 48.9/19.3 ms for the
-guest's requested 50/20 ms, so this is functional wake ordering, not calibrated
-sleep duration. Touch/ULP wake and voltage/power-domain transitions are not
-modeled; an unarmed timer or those sources do not synthesize a wake.
+The two complete replays are byte-identical; 162 other unsupported accesses
+across both boots remain visible. No unsupported sites remain for S3 sleep
+timer, state, wake-enable, cause, or digital-domain fields. The nominal
+slow-clock model yielded about 48.9/19.3 ms for the guest's requested 50/20 ms,
+so this is functional wake ordering, not calibrated sleep duration. Touch/ULP
+wake and analog voltage-transition timing are not modeled; an unarmed timer or
+those sources do not synthesize a wake.
 The S3 `RTC_CNTL_BROWN_OUT_REG` now retains documented configuration fields,
 resets to the specified defaults, and treats counter-clear as a write-only
 strobe. Its detector remains clear under Flexe's fixed nominal supply; analog
@@ -225,9 +226,20 @@ so GPIO26 is its first usable pad, while GPIO21 uses the RTC hold register.
 `RTC_CNTL_DIG_ISO_REG`'s global digital force-hold freezes bonded GPIO26–48;
 its force-unhold bit releases that source without clearing individual holds.
 ROM boot clears global digital hold, but individually held pads keep their
-latched state. Digital autohold and non-pad isolation effects remain diagnostic.
-Other RTC power/isolation fields read back but their power
-effects remain diagnostic and are not treated as implemented.
+latched state. Digital autohold and unconnected pad-isolation effects remain
+diagnostic.
+
+`RTC_CNTL_DIG_PWC_REG` and `RTC_CNTL_DIG_ISO_REG` resolve six
+target-described domains, including automatic sleep power-down and force-up,
+force-down, force-no-isolation, and force-isolation pairs. Force-down and
+force-isolation win conflicting pairs. Consumers receive logical domain state
+rather than chip-specific register bits: S3 Wi-Fi and Bluetooth apertures are
+independently connected today. Isolation hides an aperture while retaining its
+register state; loss of power restores its reset image. The hardware RNG stays
+accessible as its own target-described endpoint even though its address lies
+inside the WDEV range. Other domain consumers and analog transition delays are
+not yet connected, and reserved fields remain diagnostic.
+
 Rebuild and run with the matching external artifacts:
 
 ```sh
@@ -258,8 +270,8 @@ Its image SHA-256 is
 `d4897a5ea5b5805bfda3ac3f624788f2600c9f17653e07f8dee7bea67df91314`
 and ELF SHA-256 is
 `27a2d3710e867e0310494a29a6c3612878ec10796a5ea32beeb30a4eca627d4d`.
-The gate reports 206 unrelated unsupported accesses across both boots, mainly
-RTC power/isolation setup; the EXT selection/state/status sites are modeled.
+The gate reports 162 unrelated unsupported accesses across both boots; the
+EXT selection/state/status and digital-domain sites are modeled.
 Physical pull resistors, voltage thresholds, glitches/filtering, and pad
 electrical behavior are not inferred from the host's digital level:
 
@@ -576,8 +588,8 @@ For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 4 billion aggregate cycles produced 317 completed RMT transmissions and
 321,304 pulse words in 13,599 chunks on channel 0. The interpreter and JIT
 match at every completed-frame boundary and finish with the same `46F65AC5`
-pulse-stream digest, CPU state, and firmware-visible time; 74 unsupported
-peripheral accesses remain across 68 attributed sites. The JIT executes
+pulse-stream digest, CPU state, and firmware-visible time; 55 unsupported
+peripheral accesses remain across 51 attributed sites. The JIT executes
 1,780,691,463 of 1,819,518,818 retired instructions natively (97.9%). Ordinary
 code in the target-described
 mask-ROM range is eligible for translation, while the ROM loader's exact
@@ -616,13 +628,15 @@ and three JIT runs in 6.86--7.27 seconds (2.29--2.43x). These are throughput
 results for this pinned scenario, not cycle-accuracy claims; host load and
 thermal state still matter.
 
-The same audit fell from 223 to 74 unsupported accesses when the modem-control
-behavior above replaced fallback handling. The remaining inventory is still
-visible: RTC power/configuration words in `0x60008000`, unmodeled SYSCON words
-such as `0x6002609C`, `0x600260A8`, and `0x600260B0`, SYSTEM/PCR and memory-
-protection setup in `0x600C0000`, plus two low-count startup writes at
-`0x600CE0D8` and `0x600CE0DC`. Flexe does not turn those accesses into generic
-readback merely to reach zero diagnostics.
+The same audit fell from 223 to 74 unsupported accesses when modem-control
+behavior replaced fallback handling, then to 55 when the target-described RTC
+digital domains became functional. DIG_PWC and the domain fields of DIG_ISO no
+longer appear in the inventory. Remaining accesses stay visible: RTC analog,
+regulator, date/trim, and pad-isolation configuration in `0x60008000`,
+unmodeled SYSCON words such as `0x6002609C`, `0x600260A8`, and `0x600260B0`,
+SYSTEM/PCR and memory-protection setup in `0x600C0000`, plus two low-count
+startup writes at `0x600CE0D8` and `0x600CE0DC`. Flexe does not turn those
+accesses into generic readback merely to reach zero diagnostics.
 
 Recheck with the external image and ROM ELF:
 
@@ -774,11 +788,11 @@ the native Wi-Fi stack, completes its LED and absent-GPS delays, and prints the
 v1.16.0 command prompt without an assertion, watchdog, or software reset. The
 gate now requires nonzero native instruction retirement, so this path is
 exercised under the S3 JIT rather than merely with JIT-capable code present. Its
-unsupported-access ceiling is 109 after the shared internal analog/private-PHY
-and modem clock/reset models described below. The GPS probe makes the
-application-ready boundary occur near 5 billion aggregate cycles; the earlier
-2-billion-cycle cutoff was a normal `WAITI` during those firmware delays, not
-a deadlock. Pin and replay that boundary with:
+unsupported-access ceiling is 88 after the shared internal analog/private-PHY,
+modem clock/reset, and RTC digital-domain models described below. The GPS probe
+makes the application-ready boundary occur near 5 billion aggregate cycles;
+the earlier 2-billion-cycle cutoff was a normal `WAITI` during those firmware
+delays, not a deadlock. Pin and replay that boundary with:
 
 ```sh
 S3_MARAUDER_BIN=/path/to/esp32_marauder_v1_16_0_multiboardS3.bin \
@@ -789,7 +803,7 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 The gate keeps the general sandbox transport connected through the initial
 prompt, sends the bytes for `help\n` through UART0, checks the firmware's
 command header and a representative entry, and requires a second prompt.
-The accepted run retains an upper bound of 109 unsupported accesses so the
+The accepted run retains an upper bound of 88 unsupported accesses so the
 interaction cannot hide a register-model regression.
 
 This is a controller-bootstrap compatibility boundary, not a claim that

@@ -1174,6 +1174,8 @@ static uint32_t target_rtc_cntl_next_fire(esp32_periph_t *p,
 static void target_rtc_cntl_eval_events(esp32_periph_t *p,
                                         xtensa_cpu_t *cpu);
 static void target_rtc_cntl_state_changed(void *ctx);
+static void target_rtc_cntl_domain_state_changed(
+    void *ctx, uint32_t powered, uint32_t isolated);
 static void target_rtc_cntl_irq_changed(void *ctx, bool level);
 static void target_rtc_cntl_reset_requested(
     void *ctx, flexe_rtc_cntl_reset_action_t action);
@@ -13943,6 +13945,15 @@ static void target_rtc_cntl_state_changed(void *ctx)
         if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
 }
 
+static void target_rtc_cntl_domain_state_changed(
+    void *ctx, uint32_t powered, uint32_t isolated)
+{
+    esp32_periph_t *p = ctx;
+    if (p && p->radio_regs)
+        flexe_radio_set_rtc_domain_state(
+            p->radio_regs, powered, isolated);
+}
+
 static void target_rtc_cntl_irq_changed(void *ctx, bool level)
 {
     esp32_periph_t *p = ctx;
@@ -14893,6 +14904,9 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             periph_destroy(p);
             return NULL;
         }
+        flexe_rtc_cntl_set_digital_domain_listener(
+            p->target_rtc_cntl,
+            target_rtc_cntl_domain_state_changed, p);
     }
 
     flexe_system_clock_publish_gates(p->system_clock);
@@ -15204,6 +15218,8 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_systimer_destroy(p->systimer);
     flexe_sensitive_memprot_destroy(p->sensitive_memprot);
     flexe_regi2c_destroy(p->regi2c);
+    flexe_rtc_cntl_set_digital_domain_listener(
+        p->target_rtc_cntl, NULL, NULL);
     flexe_radio_destroy(p->radio_regs);
     flexe_efuse_destroy(p->target_efuse);
     if (p->target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)

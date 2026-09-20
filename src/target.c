@@ -136,16 +136,16 @@ static const flexe_target_desc_t TARGETS[] = {
             .window_count = 10u,
             .completion_count = 2u,
             .window = {
-                { 0x3FF45000u, 0x1000u, 0u }, /* FE2 */
-                { 0x3FF46000u, 0x1000u, 0u }, /* FE */
-                { 0x3FF4E000u, 0x1000u, 0u }, /* private PHY */
-                { 0x3FF51000u, 0x1000u, 0u }, /* BT */
-                { 0x3FF5C000u, 0x1000u, 0u }, /* private NRX + NRX */
-                { 0x3FF5D000u, 0x1000u, 0u }, /* BB */
-                { 0x3FF71000u, 0x1000u, 0u }, /* private BT */
-                { 0x3FF72000u, 0x1000u, 0u }, /* BT MAC */
-                { 0x3FF73000u, 0x2000u, 0u }, /* Wi-Fi MAC */
-                { 0x3FF75000u, 0x1000u, 0u }, /* WDEV */
+                { 0x3FF45000u, 0x1000u, 0u, 0u }, /* FE2 */
+                { 0x3FF46000u, 0x1000u, 0u, 0u }, /* FE */
+                { 0x3FF4E000u, 0x1000u, 0u, 0u }, /* private PHY */
+                { 0x3FF51000u, 0x1000u, 0u, 0u }, /* BT */
+                { 0x3FF5C000u, 0x1000u, 0u, 0u }, /* private NRX + NRX */
+                { 0x3FF5D000u, 0x1000u, 0u, 0u }, /* BB */
+                { 0x3FF71000u, 0x1000u, 0u, 0u }, /* private BT */
+                { 0x3FF72000u, 0x1000u, 0u, 0u }, /* BT MAC */
+                { 0x3FF73000u, 0x2000u, 0u, 0u }, /* Wi-Fi MAC */
+                { 0x3FF75000u, 0x1000u, 0u, 0u }, /* WDEV */
             },
             .completion = {
                 /* Wi-Fi MAC reset request bit 1 reports ready in bit 0. */
@@ -724,9 +724,30 @@ static const flexe_target_desc_t TARGETS[] = {
              * force-hold source and force-unhold override. */
             .digital_iso_offset = 0x094u,
             .digital_iso_reset = 0xAA805080u,
+            .digital_iso_writable_mask = 0xFFC0FD80u,
+            .digital_iso_read_only_mask = 1u << 9,
+            .digital_iso_strobe_mask = 1u << 10,
             .digital_pad_force_hold_mask = 1u << 15,
             .digital_pad_force_unhold_mask = 1u << 14,
             .digital_power_reset = 0x00545010u,
+            .digital_power_writable_mask = 0xF07E7818u,
+            /* DIG_PWC/DIG_ISO domains in hardware register order. Radio
+             * windows reference these entries by one-based index. */
+            .digital_domain_count = 6u,
+            .digital_domain = {
+                { 1u << 31, 1u << 20, 1u << 19,
+                  1u << 31, 1u << 30 }, /* digital wrapper */
+                { 1u << 30, 1u << 18, 1u << 17,
+                  1u << 29, 1u << 28 }, /* Wi-Fi */
+                { 1u << 29, 1u << 22, 1u << 21,
+                  1u << 27, 1u << 26 }, /* CPU top / SRAM4 */
+                { 1u << 28, 1u << 14, 1u << 13,
+                  1u << 25, 1u << 24 }, /* digital peripheral / SRAM3 */
+                { 0u, 1u << 12, 1u << 11,
+                  1u << 23, 1u << 22 }, /* Bluetooth / SRAM2 */
+                { 0u, 1u << 4, 1u << 3,
+                  0u, 0u },             /* light-sleep digital memory */
+            },
             .sleep_enable_mask = 1u << 31,
             .sleep_wakeup_mask = 1u << 29,
             .sleep_alarm_enable_mask = 1u << 16,
@@ -994,17 +1015,17 @@ static const flexe_target_desc_t TARGETS[] = {
             .completion_count = 3u,
             .register_count = 1u,
             .window = {
-                { 0x60005000u, 0x1000u, 1u << 1 }, /* FE2 */
-                { 0x60006000u, 0x1000u, 1u << 1 }, /* FE */
+                { 0x60005000u, 0x1000u, 1u << 1, 2u }, /* FE2 */
+                { 0x60006000u, 0x1000u, 1u << 1, 2u }, /* FE */
                 { 0x60011000u, 0x1000u,
-                  (1u << 3) | (1u << 13) },         /* BT BB */
-                { 0x6001C000u, 0x1000u, 1u << 0 }, /* private NRX + NRX */
-                { 0x6001D000u, 0x1000u, 1u << 0 }, /* Wi-Fi BB */
-                { 0x60031000u, 0x1000u, 1u << 11 },/* private BT registers */
+                  (1u << 3) | (1u << 13), 5u },      /* BT BB */
+                { 0x6001C000u, 0x1000u, 1u << 0, 2u }, /* private NRX + NRX */
+                { 0x6001D000u, 0x1000u, 1u << 0, 2u }, /* Wi-Fi BB */
+                { 0x60031000u, 0x1000u, 1u << 11, 5u },/* private BT registers */
                 { 0x60032000u, 0x1000u,
-                  (1u << 4) | (1u << 9) },          /* BT MAC */
-                { 0x60033000u, 0x2000u, 1u << 2 }, /* Wi-Fi MAC */
-                { 0x60035000u, 0x1000u, 1u << 2 }, /* WDEV */
+                  (1u << 4) | (1u << 9), 5u },       /* BT MAC */
+                { 0x60033000u, 0x2000u, 1u << 2, 2u }, /* Wi-Fi MAC */
+                { 0x60035000u, 0x1000u, 1u << 2, 2u }, /* WDEV */
             },
             .completion = {
                 /* ESP32-S3 rev-0 ROM rom_iq_est_enable writes enable bits

@@ -36,6 +36,7 @@
 #define FLEXE_TARGET_IO_MUX_OFFSET_NONE UINT16_MAX
 #define FLEXE_TARGET_RTC_STORE_MAX 8u
 #define FLEXE_TARGET_RTC_SEQUENCE_REGISTER_MAX 6u
+#define FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX 8u
 #define FLEXE_TARGET_RTC_IO_PIN_MAX 22u
 #define FLEXE_TARGET_RTC_WDT_STAGE_MAX 4u
 #define FLEXE_TARGET_RTC_WDT_CONFIG_MAX \
@@ -53,7 +54,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 47u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 48u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -323,6 +324,19 @@ typedef struct {
     uint32_t writable_mask;
 } flexe_rtc_sequence_register_desc_t;
 
+/* One independently sequenced digital power/isolation domain. Masks name
+ * the architectural fields rather than assigning chip-specific meanings in
+ * the RTC model. A zero sleep or isolation mask means that the target has no
+ * corresponding control for this domain. Force power-down/isolation wins
+ * when software asserts both members of a force pair. */
+typedef struct {
+    uint32_t sleep_power_down_mask;
+    uint32_t force_power_up_mask;
+    uint32_t force_power_down_mask;
+    uint32_t force_noiso_mask;
+    uint32_t force_iso_mask;
+} flexe_rtc_digital_domain_desc_t;
+
 /* Always-on RTC controller state shared by the ROM, bootloader and
  * application. Offsets are explicit because the register layout, timer
  * width, interrupt bank, watchdog, and routed source vary across the ESP32
@@ -426,13 +440,21 @@ typedef struct {
     uint16_t rtc_power_offset;
     uint32_t rtc_power_reset;
     uint32_t rtc_pad_force_hold_mask;
-    /* Digital-pad isolation/force-hold register. Other isolation controls
-     * remain visible but are not electrically modeled. */
+    /* Digital-domain isolation and pad force-hold register. Described domain
+     * force pairs have functional power-consumer effects; remaining pad
+     * isolation/autohold controls stay software-visible diagnostics. */
     uint16_t digital_iso_offset;
     uint32_t digital_iso_reset;
+    uint32_t digital_iso_writable_mask;
+    uint32_t digital_iso_read_only_mask;
+    uint32_t digital_iso_strobe_mask;
     uint32_t digital_pad_force_hold_mask;
     uint32_t digital_pad_force_unhold_mask;
     uint32_t digital_power_reset;
+    uint32_t digital_power_writable_mask;
+    uint8_t digital_domain_count;
+    flexe_rtc_digital_domain_desc_t
+        digital_domain[FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX];
     uint32_t sleep_enable_mask;
     uint32_t sleep_wakeup_mask;
     uint32_t sleep_alarm_enable_mask;
@@ -677,6 +699,10 @@ typedef struct {
      * reset bit is asserted. Ordinary words read their architectural reset
      * state and ignore writes until reset is released. */
     uint32_t reset_mask;
+    /* One plus the RTC digital-domain index, or zero when the aperture is
+     * outside RTC power/isolation control. The one-based representation
+     * keeps omitted fields in older/other target descriptions detached. */
+    uint8_t rtc_power_domain;
 } flexe_radio_window_desc_t;
 
 typedef struct {

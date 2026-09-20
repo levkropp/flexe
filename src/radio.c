@@ -26,6 +26,8 @@ struct flexe_radio {
     uint32_t clock_enable;
     uint32_t reset_enable;
     uint64_t random_state;
+    uint32_t rtc_domains_powered;
+    uint32_t rtc_domains_isolated;
     xtensa_cpu_t *cpu[2];
     flexe_radio_clock_t clock[2];
 };
@@ -35,6 +37,14 @@ static uint32_t *radio_word(flexe_radio_t *radio, uint32_t address);
 static bool radio_clock_enabled(const flexe_radio_t *radio, uint32_t mask)
 {
     return mask == 0u || (radio->clock_enable & mask) == mask;
+}
+
+static uint32_t radio_valid_rtc_domains(
+    const flexe_target_desc_t *target)
+{
+    unsigned count = target->rtc_cntl.digital_domain_count;
+    if (count == 0u) return 0u;
+    return count >= 32u ? UINT32_MAX : (1u << count) - 1u;
 }
 
 static bool radio_control_offset_valid(uint16_t offset, uint32_t size)
@@ -129,6 +139,9 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
     if (!target || !(target->capabilities &
                      FLEXE_TARGET_CAP_RADIO_REGS_V1))
         return false;
+    if (target->rtc_cntl.digital_domain_count >
+        FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX)
+        return false;
     const flexe_radio_desc_t *desc = &target->radio;
     const flexe_radio_control_desc_t *control = &desc->control;
     if (desc->window_count == 0u ||
@@ -193,7 +206,13 @@ static bool radio_geometry_valid(const flexe_target_desc_t *target)
             window->register_size > target->peripheral_end - window->base ||
             (!has_control && window->reset_mask != 0u) ||
             (has_control &&
-             (window->reset_mask & ~control->reset_writable_mask) != 0u))
+             (window->reset_mask & ~control->reset_writable_mask) != 0u) ||
+            (window->rtc_power_domain != 0u &&
+             (!(target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) ||
+              window->rtc_power_domain >
+                  FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX ||
+              window->rtc_power_domain >
+                  target->rtc_cntl.digital_domain_count)))
             return false;
         mapped_reset_mask |= window->reset_mask;
         for (unsigned j = 0u; j < i; j++) {
@@ -317,6 +336,22 @@ static bool radio_window_in_reset(const flexe_radio_t *radio,
     return mask != 0u && (radio->reset_enable & mask) != 0u;
 }
 
+static uint32_t radio_window_domain_bit(const flexe_radio_t *radio,
+                                        unsigned index)
+{
+    unsigned domain = radio->target->radio.window[index].rtc_power_domain;
+    return domain == 0u ? 0u : 1u << (domain - 1u);
+}
+
+static bool radio_window_available(const flexe_radio_t *radio,
+                                   unsigned index)
+{
+    uint32_t domain = radio_window_domain_bit(radio, index);
+    return domain == 0u ||
+        ((radio->rtc_domains_powered & domain) != 0u &&
+         (radio->rtc_domains_isolated & domain) == 0u);
+}
+
 static void radio_reset_window(flexe_radio_t *radio, unsigned index)
 {
     const flexe_radio_desc_t *desc = &radio->target->radio;
@@ -397,14 +432,10 @@ static uint32_t radio_read(void *ctx, uint32_t address)
     uint32_t control_value = 0u;
     if (radio_control_read(radio, address, &control_value))
         return control_value;
-    int window = radio_window_index(desc, address);
-    uint32_t *word = radio_word(radio, address);
-    if (word && window >= 0 && radio_window_in_reset(
-            radio, (unsigned)window))
-        return *word;
     if (address == desc->random_address) {
-        /* Deterministic per-machine entropy keeps replay exact while retaining
-         * the hardware contract that consecutive reads normally differ. */
+        /* The target's RNG is an independent peripheral endpoint even when
+         * its address lies inside a WDEV aperture. RF power/isolation does
+         * not remove it; its described clock controls sample progression. */
         if (radio_clock_enabled(radio, desc->random_clock_mask)) {
             radio->random_state ^= radio->random_state << 13;
             radio->random_state ^= radio->random_state >> 7;
@@ -412,6 +443,14 @@ static uint32_t radio_read(void *ctx, uint32_t address)
         }
         return (uint32_t)radio->random_state;
     }
+    int window = radio_window_index(desc, address);
+    uint32_t *word = radio_word(radio, address);
+    if (word && window >= 0 &&
+        !radio_window_available(radio, (unsigned)window))
+        return 0u;
+    if (word && window >= 0 && radio_window_in_reset(
+            radio, (unsigned)window))
+        return *word;
     if (word) return *word;
     return radio->fallback_read ?
         radio->fallback_read(radio->fallback_ctx, address) : 0u;
@@ -430,6 +469,9 @@ static void radio_write(void *ctx, uint32_t address, uint32_t value)
             radio->fallback_write(radio->fallback_ctx, address, value);
         return;
     }
+    if (window >= 0 &&
+        !radio_window_available(radio, (unsigned)window))
+        return;
     if (window >= 0 && radio_window_in_reset(radio, (unsigned)window))
         return;
 
@@ -502,6 +544,7 @@ flexe_radio_t *flexe_radio_create(
     radio->fallback_write = fallback_write;
     radio->fallback_ctx = fallback_ctx;
     radio->random_state = target->radio.random_seed;
+    radio->rtc_domains_powered = radio_valid_rtc_domains(target);
     const flexe_radio_control_desc_t *control = &target->radio.control;
     radio->bb_config = control->bb_config_reset;
     radio->bb_config2 = control->bb_config2_reset;
@@ -564,6 +607,23 @@ void flexe_radio_attach_cpus(flexe_radio_t *radio,
         radio->clock[core].last_ccount = cpu ? cpu->ccount : 0u;
         radio->clock[core].valid = cpu != NULL;
     }
+}
+
+void flexe_radio_set_rtc_domain_state(flexe_radio_t *radio,
+                                      uint32_t powered,
+                                      uint32_t isolated)
+{
+    if (!radio) return;
+    uint32_t valid = radio_valid_rtc_domains(radio->target);
+    powered &= valid;
+    isolated &= valid;
+    uint32_t lost_power = radio->rtc_domains_powered & ~powered;
+    radio->rtc_domains_powered = powered;
+    radio->rtc_domains_isolated = isolated;
+    if (lost_power == 0u) return;
+    for (unsigned i = 0u; i < radio->target->radio.window_count; i++)
+        if ((radio_window_domain_bit(radio, i) & lost_power) != 0u)
+            radio_reset_window(radio, i);
 }
 
 void flexe_radio_destroy(flexe_radio_t *radio)

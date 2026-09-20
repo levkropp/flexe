@@ -285,6 +285,82 @@ TEST(esp32s3_modem_control_resets_only_selected_radio_domains)
     mem_destroy(mem);
 }
 
+TEST(esp32s3_rtc_power_and_isolation_control_radio_apertures)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    const unsigned wifi_window = 7u;
+    const unsigned bt_window = 5u;
+    ASSERT_TRUE(s3->radio.window[wifi_window].rtc_power_domain != 0u);
+    ASSERT_TRUE(s3->radio.window[bt_window].rtc_power_domain != 0u);
+    unsigned wifi_index =
+        s3->radio.window[wifi_window].rtc_power_domain - 1u;
+    unsigned bt_index = s3->radio.window[bt_window].rtc_power_domain - 1u;
+    ASSERT_TRUE(wifi_index != bt_index);
+    const flexe_rtc_digital_domain_desc_t *wifi =
+        &rtc->digital_domain[wifi_index];
+    uint32_t power_addr = rtc->base + rtc->digital_power_offset;
+    uint32_t iso_addr = rtc->base + rtc->digital_iso_offset;
+    const uint32_t wifi_register = 0x600340B8u;
+    const uint32_t bt_register = 0x6003120Cu;
+    mem_write32(mem, wifi_register, 0x12345678u);
+    mem_write32(mem, bt_register, 0x89ABCDEFu);
+
+    /* Isolation blocks bus visibility without erasing retained state. */
+    uint32_t iso = (rtc->digital_iso_reset &
+                    ~wifi->force_noiso_mask) |
+                   wifi->force_iso_mask;
+    mem_write32(mem, iso_addr, iso);
+    ASSERT_EQ(mem_read32(mem, wifi_register), 0u);
+    ASSERT_EQ(mem_read32(mem, bt_register), 0x89ABCDEFu);
+    uint32_t isolated_random = mem_read32(mem, s3->radio.random_address);
+    ASSERT_TRUE(mem_read32(mem, s3->radio.random_address) !=
+                isolated_random);
+    mem_write32(mem, wifi_register, UINT32_MAX);
+    mem_write32(mem, iso_addr, rtc->digital_iso_reset);
+    ASSERT_EQ(mem_read32(mem, wifi_register), 0x12345678u);
+
+    /* A complete power cycle must reset the device even if firmware never
+     * accesses any radio register while the domain is down. */
+    uint32_t power = (rtc->digital_power_reset &
+                      ~wifi->force_power_up_mask) |
+                     wifi->force_power_down_mask;
+    mem_write32(mem, power_addr, power);
+    mem_write32(mem, power_addr, rtc->digital_power_reset);
+    ASSERT_EQ(mem_read32(mem, wifi_register), 0u);
+    mem_write32(mem, wifi_register, 0x12345678u);
+
+    /* Removing domain power resets every Wi-Fi aperture while leaving the
+     * separately described Bluetooth domain untouched. The hardware RNG is
+     * its own endpoint inside the WDEV address range and remains live. */
+    mem_write32(mem, power_addr, power);
+    ASSERT_EQ(mem_read32(mem, wifi_register), 0u);
+    ASSERT_EQ(mem_read32(mem, bt_register), 0x89ABCDEFu);
+    uint32_t powered_down_random =
+        mem_read32(mem, s3->radio.random_address);
+    ASSERT_TRUE(mem_read32(mem, s3->radio.random_address) !=
+                powered_down_random);
+    mem_write32(mem, wifi_register, UINT32_MAX);
+    mem_write32(mem, power_addr, rtc->digital_power_reset);
+    ASSERT_EQ(mem_read32(mem, wifi_register), 0u);
+    ASSERT_EQ(mem_read32(mem, bt_register), 0x89ABCDEFu);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock)
 {
     const flexe_target_desc_t *s3 =
@@ -398,6 +474,24 @@ TEST(radio_rejects_absent_capability_and_overlapping_windows)
     radio = flexe_radio_create(mem, NULL, NULL, NULL);
     ASSERT_TRUE(radio == NULL);
     mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.radio.window[0].rtc_power_domain =
+        (uint8_t)(invalid.rtc_cntl.digital_domain_count + 1u);
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    radio = flexe_radio_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(radio == NULL);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.rtc_cntl.digital_domain_count =
+        FLEXE_TARGET_RTC_DIGITAL_DOMAIN_MAX + 1u;
+    mem = mem_create_for_target(&invalid);
+    ASSERT_TRUE(mem != NULL);
+    radio = flexe_radio_create(mem, NULL, NULL, NULL);
+    ASSERT_TRUE(radio == NULL);
+    mem_destroy(mem);
 }
 
 static void run_radio_tests(void)
@@ -410,6 +504,7 @@ static void run_radio_tests(void)
     RUN_TEST(esp32s3_wifi_mac_reset_reports_ready);
     RUN_TEST(esp32s3_wdev_random_source_is_deterministic_and_live);
     RUN_TEST(esp32s3_modem_control_resets_only_selected_radio_domains);
+    RUN_TEST(esp32s3_rtc_power_and_isolation_control_radio_apertures);
     RUN_TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock);
     RUN_TEST(radio_rejects_absent_capability_and_overlapping_windows);
 }

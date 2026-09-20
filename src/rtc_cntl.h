@@ -18,6 +18,8 @@ typedef void (*flexe_rtc_cntl_irq_fn)(void *ctx, bool level);
 typedef void (*flexe_rtc_cntl_reset_fn)(
     void *ctx, flexe_rtc_cntl_reset_action_t action);
 typedef void (*flexe_rtc_cntl_pad_hold_fn)(void *ctx, uint64_t gpio_mask);
+typedef void (*flexe_rtc_cntl_domain_state_fn)(
+    void *ctx, uint32_t powered, uint32_t isolated);
 
 /* The RTC slow counter and STORE registers remain powered through an S3
  * software reset/deep-sleep wake. Volatile WDT, alarm, and interrupt state
@@ -69,6 +71,22 @@ void flexe_rtc_cntl_set_interrupts(flexe_rtc_cntl_t *rtc,
 /* RTC_CNTL_ANA_CONF powers the internal SAR analog-register I2C slave.
  * A detached/missing RTC cannot claim that power domain is available. */
 bool flexe_rtc_cntl_sar_i2c_powered(const flexe_rtc_cntl_t *rtc);
+
+/* Logical state of the target-described DIG_PWC/DIG_ISO domains. Bit N
+ * corresponds to digital_domain[N] in the target descriptor. These queries
+ * resolve force pairs and automatic sleep policy; they do not expose raw
+ * register encoding to consuming devices. */
+uint32_t flexe_rtc_cntl_powered_digital_domains(
+    const flexe_rtc_cntl_t *rtc);
+uint32_t flexe_rtc_cntl_isolated_digital_domains(
+    const flexe_rtc_cntl_t *rtc);
+/* Domain consumers receive every transition synchronously, including a full
+ * power cycle with no intervening access to the consumer. This notification
+ * is separate from the RTC timer scheduler and cannot manufacture a CPU
+ * wakeup or timeslice boundary. Installing a listener publishes the current
+ * state immediately. */
+void flexe_rtc_cntl_set_digital_domain_listener(
+    flexe_rtc_cntl_t *rtc, flexe_rtc_cntl_domain_state_fn fn, void *ctx);
 
 /* S3 RTC USB mux selection. The default virtual board has its internal PHY
  * attached to USB Serial/JTAG unless software routes it to USB OTG. */

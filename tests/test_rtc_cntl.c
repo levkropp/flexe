@@ -570,6 +570,93 @@ TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported)
     mem_destroy(mem);
 }
 
+TEST(rtc_cntl_digital_domains_resolve_force_and_sleep_policy)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_rtc_cntl_desc_t *desc = &s3->rtc_cntl;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    rtc_cntl_fallback_t fallback = {0};
+    flexe_rtc_cntl_t *rtc = flexe_rtc_cntl_create(
+        mem, rtc_cntl_test_fallback_read,
+        rtc_cntl_test_fallback_write, &fallback,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(rtc != NULL);
+    if (!mem || !rtc) {
+        flexe_rtc_cntl_destroy(rtc);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(desc->digital_domain_count, 6u);
+    uint32_t domains = (1u << desc->digital_domain_count) - 1u;
+    ASSERT_EQ(flexe_rtc_cntl_powered_digital_domains(rtc), domains);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_digital_domains(rtc), 0u);
+
+    const unsigned wifi_index = 1u;
+    const flexe_rtc_digital_domain_desc_t *wifi =
+        &desc->digital_domain[wifi_index];
+    uint32_t power_addr = desc->base + desc->digital_power_offset;
+    uint32_t iso_addr = desc->base + desc->digital_iso_offset;
+    uint32_t power = desc->digital_power_reset &
+                     ~wifi->force_power_up_mask;
+    power |= wifi->force_power_down_mask;
+    mem_write32(mem, power_addr, power);
+    ASSERT_EQ(flexe_rtc_cntl_powered_digital_domains(rtc) &
+              (1u << wifi_index), 0u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* Force-down and force-isolation win deterministic conflicts, just as
+     * the consuming device needs while firmware changes a pair by RMW. */
+    mem_write32(mem, power_addr, power | wifi->force_power_up_mask);
+    ASSERT_EQ(flexe_rtc_cntl_powered_digital_domains(rtc) &
+              (1u << wifi_index), 0u);
+    uint32_t iso = (desc->digital_iso_reset &
+                    ~wifi->force_noiso_mask) |
+                   wifi->force_iso_mask;
+    mem_write32(mem, iso_addr, iso);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_digital_domains(rtc) &
+              (1u << wifi_index), 1u << wifi_index);
+    mem_write32(mem, iso_addr, iso | wifi->force_noiso_mask);
+    ASSERT_EQ(flexe_rtc_cntl_isolated_digital_domains(rtc) &
+              (1u << wifi_index), 1u << wifi_index);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    /* With neither force asserted, sleep PD policy takes effect only while
+     * the RTC sleep state is active and is undone at wake. */
+    const unsigned wrap_index = 0u;
+    const flexe_rtc_digital_domain_desc_t *wrap =
+        &desc->digital_domain[wrap_index];
+    power = desc->digital_power_reset & ~wrap->force_power_up_mask;
+    power |= wrap->sleep_power_down_mask;
+    mem_write32(mem, power_addr, power);
+    iso = desc->digital_iso_reset & ~wrap->force_noiso_mask;
+    mem_write32(mem, iso_addr, iso);
+    ASSERT_TRUE(flexe_rtc_cntl_powered_digital_domains(rtc) &
+                (1u << wrap_index));
+    mem_write32(mem, desc->base + desc->sleep_timer_low_offset, 100u);
+    mem_write32(mem, desc->base + desc->sleep_timer_high_offset,
+                desc->sleep_alarm_enable_mask);
+    mem_write32(mem, desc->base + desc->wakeup_state_offset,
+                desc->timer_wakeup_mask << desc->wakeup_enable_shift);
+    mem_write32(mem, desc->base + desc->sleep_state_offset,
+                desc->sleep_enable_mask);
+    ASSERT_EQ(flexe_rtc_cntl_powered_digital_domains(rtc) &
+              (1u << wrap_index), 0u);
+    ASSERT_TRUE(flexe_rtc_cntl_isolated_digital_domains(rtc) &
+                (1u << wrap_index));
+    flexe_rtc_cntl_finish_wake(rtc, desc->timer_wakeup_mask);
+    ASSERT_TRUE(flexe_rtc_cntl_powered_digital_domains(rtc) &
+                (1u << wrap_index));
+    ASSERT_EQ(flexe_rtc_cntl_isolated_digital_domains(rtc) &
+              (1u << wrap_index), 0u);
+    ASSERT_EQ(fallback.writes, 0u);
+
+    flexe_rtc_cntl_destroy(rtc);
+    mem_destroy(mem);
+}
+
 TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches)
 {
     const flexe_target_desc_t *s3 =
@@ -1743,6 +1830,7 @@ void run_rtc_cntl_tests(void)
     RUN_TEST(rtc_cntl_counter_tracks_shared_time_and_frequency);
     RUN_TEST(rtc_cntl_switches_slow_clock_at_an_exact_boundary);
     RUN_TEST(rtc_cntl_unmodeled_power_registers_remain_unsupported);
+    RUN_TEST(rtc_cntl_digital_domains_resolve_force_and_sleep_policy);
     RUN_TEST(rtc_cntl_digital_pad_hold_freezes_physical_gpio_not_latches);
     RUN_TEST(rtc_cntl_digital_pad_hold_survives_rebuild_without_unheld_gpio);
     RUN_TEST(rtc_cntl_rtc_pad_hold_freezes_mux_input_and_output);
