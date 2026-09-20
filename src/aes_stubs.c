@@ -1,6 +1,11 @@
 #include "aes_stubs.h"
+#include "target.h"
 #include "rom_stubs.h"
 #include "memory.h"
+#include "gdma.h"
+#include "peripherals.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -13,20 +18,69 @@
 #define AES_MAX_ROUNDS   14
 #define AES_MAX_RK       60
 
-/* Original ESP32 AES accelerator register layout.  Unlike later ESP32
- * variants, input and output share AES_TEXT_BASE. */
-#define AES_PERIPH_BASE  0x3FF01000u
-#define AES_PERIPH_PAGE  1
-#define AES_START_OFF    0x00u
-#define AES_IDLE_OFF     0x04u
-#define AES_MODE_OFF     0x08u
-#define AES_KEY_OFF      0x10u
-#define AES_TEXT_OFF     0x30u
-#define AES_ENDIAN_OFF   0x40u
+#define AES_KEY_WORDS       8u
+#define AES_BLOCK_WORDS     4u
+#define AES_BLOCK_BYTES     16u
+#define AES_DMA_DESC_LIMIT  1024u
+#define AES_DMA_DESC_MAX    4095u
+#define AES_DMA_MAX_BYTES   (AES_DMA_DESC_LIMIT * AES_DMA_DESC_MAX)
+
+/* Original ESP32 AES register offsets. */
+#define AES32_START_OFF     0x00u
+#define AES32_IDLE_OFF      0x04u
+#define AES32_MODE_OFF      0x08u
+#define AES32_KEY_OFF       0x10u
+#define AES32_TEXT_OFF      0x30u
+#define AES32_ENDIAN_OFF    0x40u
+
+/* S2/S3-generation AES register offsets. */
+#define AES2_KEY_OFF        0x00u
+#define AES2_TEXT_IN_OFF    0x20u
+#define AES2_TEXT_OUT_OFF   0x30u
+#define AES2_MODE_OFF       0x40u
+#define AES2_ENDIAN_OFF     0x44u
+#define AES2_TRIGGER_OFF    0x48u
+#define AES2_STATE_OFF      0x4Cu
+#define AES2_IV_OFF         0x50u
+#define AES2_DMA_ENABLE_OFF 0x90u
+#define AES2_BLOCK_MODE_OFF 0x94u
+#define AES2_BLOCK_NUM_OFF  0x98u
+#define AES2_INC_SEL_OFF    0x9Cu
+#define AES2_AAD_NUM_OFF    0xA0u
+#define AES2_VALID_BITS_OFF 0xA4u
+#define AES2_CONTINUE_OFF   0xA8u
+#define AES2_INT_CLEAR_OFF  0xACu
+#define AES2_INT_ENABLE_OFF 0xB0u
+#define AES2_DATE_OFF       0xB4u
+#define AES2_DMA_EXIT_OFF   0xB8u
+
+enum {
+    AES_STATE_IDLE = 0u,
+    AES_STATE_BUSY = 1u,
+    AES_STATE_DONE = 2u,
+};
+
+enum {
+    AES_BLOCK_MODE_ECB = 0u,
+    AES_BLOCK_MODE_CBC = 1u,
+    AES_BLOCK_MODE_OFB = 2u,
+    AES_BLOCK_MODE_CTR = 3u,
+    AES_BLOCK_MODE_CFB8 = 4u,
+    AES_BLOCK_MODE_CFB128 = 5u,
+};
 
 struct aes_stubs {
     xtensa_cpu_t      *cpu;
     esp32_rom_stubs_t *rom;
+    const flexe_target_desc_t *target;
+    flexe_gdma_t      *gdma;
+    mmio_read_fn       fallback_read;
+    mmio_write_fn      fallback_write;
+    void              *fallback_ctx;
+    esp32_periph_t     *system_periph;
+    bool                system_clock_enabled;
+    bool                system_reset_asserted;
+    bool                interrupt_pending;
 
     /* Per-core key state so interleaved batches don't corrupt */
     uint32_t round_key[2][AES_MAX_RK];
@@ -35,10 +89,23 @@ struct aes_stubs {
 
     /* The physical accelerator is shared by both CPUs.  Keep its raw MMIO
      * register state separate from the per-core HAL-hook state above. */
-    uint32_t hw_key[8];
-    uint32_t hw_text[4];
+    uint32_t hw_key[AES_KEY_WORDS];
+    uint32_t hw_text_in[AES_BLOCK_WORDS];
+    uint32_t hw_text_out[AES_BLOCK_WORDS];
+    uint32_t hw_iv[AES_BLOCK_WORDS];
     uint32_t hw_mode;
     uint32_t hw_endian;
+    uint32_t hw_state;
+    uint32_t hw_dma_enable;
+    uint32_t hw_block_mode;
+    uint32_t hw_block_num;
+    uint32_t hw_inc_sel;
+    uint32_t hw_aad_num;
+    uint32_t hw_valid_bits;
+    uint32_t hw_int_enable;
+    uint32_t hw_date;
+    bool warned_dma;
+    bool warned_continue;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -277,77 +344,375 @@ static uint32_t aes_bytes_to_word(const uint8_t in[4]) {
            ((uint32_t)in[3] << 24);
 }
 
-static void aes_mmio_transform(aes_stubs_t *as) {
+static bool aes_mode_key(aes_stubs_t *as, uint32_t *round_key,
+                         int *rounds) {
     unsigned key_size_code = as->hw_mode & 3u;
-    if (key_size_code > 2u)
-        return; /* reserved hardware mode */
+    if (key_size_code > 2u ||
+        (as->target->aes.key_size_mask & (1u << key_size_code)) == 0u)
+        return false;
 
     int key_bytes = 16 + (int)key_size_code * 8;
     uint8_t key[32] = {0};
-    uint8_t in[16];
-    uint8_t out[16];
-    uint32_t round_key[AES_MAX_RK];
-
     for (int i = 0; i < key_bytes / 4; i++)
         aes_word_to_bytes(as->hw_key[i], &key[i * 4]);
-    for (int i = 0; i < 4; i++)
-        aes_word_to_bytes(as->hw_text[i], &in[i * 4]);
+    *rounds = aes_key_expand(key, key_bytes, round_key);
+    return true;
+}
 
-    int nr = aes_key_expand(key, key_bytes, round_key);
+static void aes_words_to_block(const uint32_t words[AES_BLOCK_WORDS],
+                               uint8_t block[AES_BLOCK_BYTES]) {
+    for (unsigned i = 0u; i < AES_BLOCK_WORDS; i++)
+        aes_word_to_bytes(words[i], &block[i * sizeof(uint32_t)]);
+}
+
+static void aes_block_to_words(const uint8_t block[AES_BLOCK_BYTES],
+                               uint32_t words[AES_BLOCK_WORDS]) {
+    for (unsigned i = 0u; i < AES_BLOCK_WORDS; i++)
+        words[i] = aes_bytes_to_word(&block[i * sizeof(uint32_t)]);
+}
+
+static bool aes_transform_direct(aes_stubs_t *as) {
+    uint8_t in[AES_BLOCK_BYTES];
+    uint8_t out[AES_BLOCK_BYTES];
+    uint32_t round_key[AES_MAX_RK];
+    int rounds = 0;
+    if (!aes_mode_key(as, round_key, &rounds)) return false;
+    aes_words_to_block(as->hw_text_in, in);
+
     if (as->hw_mode & 4u)
-        aes_decrypt_block(in, out, round_key, nr);
+        aes_decrypt_block(in, out, round_key, rounds);
     else
-        aes_encrypt_block(in, out, round_key, nr);
+        aes_encrypt_block(in, out, round_key, rounds);
 
-    for (int i = 0; i < 4; i++)
-        as->hw_text[i] = aes_bytes_to_word(&out[i * 4]);
+    if (as->target->aes.layout == FLEXE_AES_LAYOUT_ESP32)
+        aes_block_to_words(out, as->hw_text_in);
+    else
+        aes_block_to_words(out, as->hw_text_out);
+    return true;
+}
+
+static void aes_counter_increment(uint8_t counter[AES_BLOCK_BYTES],
+                                  bool increment_128) {
+    unsigned first = increment_128 ? 0u : 12u;
+    for (unsigned i = AES_BLOCK_BYTES; i-- > first; )
+        if (++counter[i] != 0u) break;
+}
+
+static void aes_xor_block(uint8_t out[AES_BLOCK_BYTES],
+                          const uint8_t left[AES_BLOCK_BYTES],
+                          const uint8_t right[AES_BLOCK_BYTES]) {
+    for (unsigned i = 0u; i < AES_BLOCK_BYTES; i++)
+        out[i] = left[i] ^ right[i];
+}
+
+static bool aes_transform_dma(aes_stubs_t *as) {
+    uint32_t round_key[AES_MAX_RK];
+    int rounds = 0;
+    if (!aes_mode_key(as, round_key, &rounds) || !as->gdma ||
+        as->target->aes.dma_peripheral_id == UINT8_MAX ||
+        as->hw_block_num == 0u ||
+        as->hw_block_num > AES_DMA_MAX_BYTES / AES_BLOCK_BYTES ||
+        as->hw_block_mode > AES_BLOCK_MODE_CFB128)
+        return false;
+
+    size_t length = (size_t)as->hw_block_num * AES_BLOCK_BYTES;
+    uint8_t *input = malloc(length);
+    uint8_t *output = malloc(length);
+    if (!input || !output ||
+        flexe_gdma_read_tx(as->gdma, as->target->aes.dma_peripheral_id,
+                           input, length) != 0) {
+        free(input);
+        free(output);
+        return false;
+    }
+
+    uint8_t iv[AES_BLOCK_BYTES];
+    uint8_t tmp[AES_BLOCK_BYTES];
+    uint8_t stream[AES_BLOCK_BYTES];
+    aes_words_to_block(as->hw_iv, iv);
+    bool decrypt = (as->hw_mode & 4u) != 0u;
+
+    for (size_t offset = 0u; offset < length; offset += AES_BLOCK_BYTES) {
+        const uint8_t *in = &input[offset];
+        uint8_t *out = &output[offset];
+        switch (as->hw_block_mode) {
+        case AES_BLOCK_MODE_ECB:
+            if (decrypt)
+                aes_decrypt_block(in, out, round_key, rounds);
+            else
+                aes_encrypt_block(in, out, round_key, rounds);
+            break;
+        case AES_BLOCK_MODE_CBC:
+            if (decrypt) {
+                aes_decrypt_block(in, tmp, round_key, rounds);
+                aes_xor_block(out, tmp, iv);
+                memcpy(iv, in, AES_BLOCK_BYTES);
+            } else {
+                aes_xor_block(tmp, in, iv);
+                aes_encrypt_block(tmp, out, round_key, rounds);
+                memcpy(iv, out, AES_BLOCK_BYTES);
+            }
+            break;
+        case AES_BLOCK_MODE_OFB:
+            aes_encrypt_block(iv, stream, round_key, rounds);
+            aes_xor_block(out, in, stream);
+            memcpy(iv, stream, AES_BLOCK_BYTES);
+            break;
+        case AES_BLOCK_MODE_CTR:
+            aes_encrypt_block(iv, stream, round_key, rounds);
+            aes_xor_block(out, in, stream);
+            aes_counter_increment(iv, as->hw_inc_sel != 0u);
+            break;
+        case AES_BLOCK_MODE_CFB8:
+            for (unsigned byte = 0u; byte < AES_BLOCK_BYTES; byte++) {
+                aes_encrypt_block(iv, stream, round_key, rounds);
+                out[byte] = in[byte] ^ stream[0];
+                memmove(iv, iv + 1u, AES_BLOCK_BYTES - 1u);
+                iv[AES_BLOCK_BYTES - 1u] = decrypt ? in[byte] : out[byte];
+            }
+            break;
+        case AES_BLOCK_MODE_CFB128:
+            aes_encrypt_block(iv, stream, round_key, rounds);
+            aes_xor_block(out, in, stream);
+            memcpy(iv, decrypt ? in : out, AES_BLOCK_BYTES);
+            break;
+        default:
+            free(input);
+            free(output);
+            return false;
+        }
+    }
+
+    bool success = flexe_gdma_write_rx(
+        as->gdma, as->target->aes.dma_peripheral_id,
+        output, length) == 0;
+    if (success && as->hw_block_mode != AES_BLOCK_MODE_ECB)
+        aes_block_to_words(iv, as->hw_iv);
+    free(input);
+    free(output);
+    return success;
+}
+
+static bool aes_operational(const aes_stubs_t *as) {
+    return as->system_clock_enabled && !as->system_reset_asserted;
+}
+
+static void aes_update_interrupt(aes_stubs_t *as) {
+    if (!as || !as->system_periph ||
+        as->target->aes.interrupt_source == UINT8_MAX)
+        return;
+    if (as->interrupt_pending && as->hw_int_enable &&
+        aes_operational(as))
+        periph_assert_interrupt_status(
+            as->system_periph, as->target->aes.interrupt_source, 1u);
+    else
+        periph_deassert_interrupt(
+            as->system_periph, as->target->aes.interrupt_source);
+}
+
+static void aes_hardware_reset(aes_stubs_t *as) {
+    memset(as->hw_key, 0, sizeof(as->hw_key));
+    memset(as->hw_text_in, 0, sizeof(as->hw_text_in));
+    memset(as->hw_text_out, 0, sizeof(as->hw_text_out));
+    memset(as->hw_iv, 0, sizeof(as->hw_iv));
+    as->hw_mode = 0u;
+    as->hw_endian = 0u;
+    as->hw_state = AES_STATE_IDLE;
+    as->hw_dma_enable = 0u;
+    as->hw_block_mode = AES_BLOCK_MODE_ECB;
+    as->hw_block_num = 0u;
+    as->hw_inc_sel = 0u;
+    as->hw_aad_num = 0u;
+    as->hw_valid_bits = 0u;
+    as->hw_int_enable = 0u;
+    as->hw_date = as->target->aes.date_reset;
+    as->interrupt_pending = false;
+    aes_update_interrupt(as);
+}
+
+static void aes_system_state_changed(void *ctx, bool clock_enabled,
+                                     bool reset_asserted) {
+    aes_stubs_t *as = ctx;
+    if (!as) return;
+    bool reset_rising = reset_asserted && !as->system_reset_asserted;
+    as->system_clock_enabled = clock_enabled;
+    as->system_reset_asserted = reset_asserted;
+    if (reset_rising) aes_hardware_reset(as);
+    aes_update_interrupt(as);
+}
+
+static void aes_trigger(aes_stubs_t *as) {
+    if (!aes_operational(as)) return;
+    as->hw_state = AES_STATE_BUSY;
+    if (as->target->aes.layout == FLEXE_AES_LAYOUT_S2_S3 &&
+        as->hw_dma_enable) {
+        if (aes_transform_dma(as)) {
+            as->hw_state = AES_STATE_DONE;
+            as->interrupt_pending = true;
+            aes_update_interrupt(as);
+        } else {
+            as->hw_state = AES_STATE_IDLE;
+            if (!as->warned_dma) {
+                fprintf(stderr,
+                        "[aes] target %s rejected an absent or malformed "
+                        "GDMA operation\n", as->target->name);
+                as->warned_dma = true;
+            }
+        }
+        return;
+    }
+    (void)aes_transform_direct(as);
+    as->hw_state = AES_STATE_IDLE;
 }
 
 static uint32_t aes_mmio_read(void *ctx, uint32_t addr) {
     aes_stubs_t *as = ctx;
-    uint32_t off = addr - AES_PERIPH_BASE;
+    const flexe_aes_desc_t *desc = &as->target->aes;
+    if (addr < desc->base || addr >= desc->base + desc->register_size)
+        return as->fallback_read
+            ? as->fallback_read(as->fallback_ctx, addr) : 0u;
+    uint32_t off = addr - desc->base;
 
-    if (off >= AES_KEY_OFF && off < AES_KEY_OFF + sizeof(as->hw_key))
-        return as->hw_key[(off - AES_KEY_OFF) / 4];
-    if (off >= AES_TEXT_OFF && off < AES_TEXT_OFF + sizeof(as->hw_text))
-        return as->hw_text[(off - AES_TEXT_OFF) / 4];
-
-    switch (off) {
-    case AES_START_OFF:  return 0;
-    case AES_IDLE_OFF:   return 1;
-    case AES_MODE_OFF:   return as->hw_mode;
-    case AES_ENDIAN_OFF: return as->hw_endian;
-    default:             return 0;
+    if (desc->layout == FLEXE_AES_LAYOUT_ESP32) {
+        if (off >= AES32_KEY_OFF &&
+            off < AES32_KEY_OFF + sizeof(as->hw_key))
+            return as->hw_key[(off - AES32_KEY_OFF) / 4u];
+        if (off >= AES32_TEXT_OFF &&
+            off < AES32_TEXT_OFF + sizeof(as->hw_text_in))
+            return as->hw_text_in[(off - AES32_TEXT_OFF) / 4u];
+        switch (off) {
+        case AES32_START_OFF:  return 0u;
+        case AES32_IDLE_OFF:   return 1u;
+        case AES32_MODE_OFF:   return as->hw_mode;
+        case AES32_ENDIAN_OFF: return as->hw_endian;
+        default: break;
+        }
+    } else if (desc->layout == FLEXE_AES_LAYOUT_S2_S3) {
+        if (off < AES2_KEY_OFF + sizeof(as->hw_key))
+            return as->hw_key[(off - AES2_KEY_OFF) / 4u];
+        if (off >= AES2_TEXT_IN_OFF &&
+            off < AES2_TEXT_IN_OFF + sizeof(as->hw_text_in))
+            return as->hw_text_in[(off - AES2_TEXT_IN_OFF) / 4u];
+        if (off >= AES2_TEXT_OUT_OFF &&
+            off < AES2_TEXT_OUT_OFF + sizeof(as->hw_text_out))
+            return as->hw_text_out[(off - AES2_TEXT_OUT_OFF) / 4u];
+        if (off >= AES2_IV_OFF && off < AES2_IV_OFF + sizeof(as->hw_iv))
+            return as->hw_iv[(off - AES2_IV_OFF) / 4u];
+        switch (off) {
+        case AES2_MODE_OFF:       return as->hw_mode;
+        case AES2_ENDIAN_OFF:     return as->hw_endian;
+        case AES2_TRIGGER_OFF:    return 0u;
+        case AES2_STATE_OFF:      return as->hw_state;
+        case AES2_DMA_ENABLE_OFF: return as->hw_dma_enable;
+        case AES2_BLOCK_MODE_OFF: return as->hw_block_mode;
+        case AES2_BLOCK_NUM_OFF:  return as->hw_block_num;
+        case AES2_INC_SEL_OFF:    return as->hw_inc_sel;
+        case AES2_AAD_NUM_OFF:    return as->hw_aad_num;
+        case AES2_VALID_BITS_OFF: return as->hw_valid_bits;
+        case AES2_CONTINUE_OFF:   return 0u;
+        case AES2_INT_CLEAR_OFF:  return 0u;
+        case AES2_INT_ENABLE_OFF: return as->hw_int_enable;
+        case AES2_DATE_OFF:       return as->hw_date;
+        case AES2_DMA_EXIT_OFF:   return 0u;
+        default: break;
+        }
     }
+    return as->fallback_read
+        ? as->fallback_read(as->fallback_ctx, addr) : 0u;
 }
 
 static void aes_mmio_write(void *ctx, uint32_t addr, uint32_t val) {
     aes_stubs_t *as = ctx;
-    uint32_t off = addr - AES_PERIPH_BASE;
-
-    if (off >= AES_KEY_OFF && off < AES_KEY_OFF + sizeof(as->hw_key)) {
-        as->hw_key[(off - AES_KEY_OFF) / 4] = val;
+    const flexe_aes_desc_t *desc = &as->target->aes;
+    if (addr < desc->base || addr >= desc->base + desc->register_size) {
+        if (as->fallback_write)
+            as->fallback_write(as->fallback_ctx, addr, val);
         return;
     }
-    if (off >= AES_TEXT_OFF && off < AES_TEXT_OFF + sizeof(as->hw_text)) {
-        as->hw_text[(off - AES_TEXT_OFF) / 4] = val;
-        return;
-    }
+    uint32_t off = addr - desc->base;
+    if (as->system_reset_asserted) return;
 
-    switch (off) {
-    case AES_START_OFF:
-        if (val & 1u)
-            aes_mmio_transform(as);
-        break;
-    case AES_MODE_OFF:
-        as->hw_mode = val & 7u;
-        break;
-    case AES_ENDIAN_OFF:
-        as->hw_endian = val;
-        break;
-    default:
-        break;
+    if (desc->layout == FLEXE_AES_LAYOUT_ESP32) {
+        if (off >= AES32_KEY_OFF &&
+            off < AES32_KEY_OFF + sizeof(as->hw_key)) {
+            as->hw_key[(off - AES32_KEY_OFF) / 4u] = val;
+            return;
+        }
+        if (off >= AES32_TEXT_OFF &&
+            off < AES32_TEXT_OFF + sizeof(as->hw_text_in)) {
+            as->hw_text_in[(off - AES32_TEXT_OFF) / 4u] = val;
+            return;
+        }
+        switch (off) {
+        case AES32_START_OFF:
+            if (val & 1u) aes_trigger(as);
+            return;
+        case AES32_MODE_OFF: as->hw_mode = val & 7u; return;
+        case AES32_ENDIAN_OFF: as->hw_endian = val; return;
+        case AES32_IDLE_OFF: return;
+        default: break;
+        }
+    } else if (desc->layout == FLEXE_AES_LAYOUT_S2_S3) {
+        if (off < AES2_KEY_OFF + sizeof(as->hw_key)) {
+            as->hw_key[(off - AES2_KEY_OFF) / 4u] = val;
+            return;
+        }
+        if (off >= AES2_TEXT_IN_OFF &&
+            off < AES2_TEXT_IN_OFF + sizeof(as->hw_text_in)) {
+            as->hw_text_in[(off - AES2_TEXT_IN_OFF) / 4u] = val;
+            return;
+        }
+        if (off >= AES2_TEXT_OUT_OFF &&
+            off < AES2_TEXT_OUT_OFF + sizeof(as->hw_text_out)) {
+            as->hw_text_out[(off - AES2_TEXT_OUT_OFF) / 4u] = val;
+            return;
+        }
+        if (off >= AES2_IV_OFF && off < AES2_IV_OFF + sizeof(as->hw_iv)) {
+            as->hw_iv[(off - AES2_IV_OFF) / 4u] = val;
+            return;
+        }
+        switch (off) {
+        case AES2_MODE_OFF: as->hw_mode = val & 7u; return;
+        case AES2_ENDIAN_OFF: as->hw_endian = val & 0x3Fu; return;
+        case AES2_TRIGGER_OFF:
+            if (val & 1u) aes_trigger(as);
+            return;
+        case AES2_STATE_OFF: return;
+        case AES2_DMA_ENABLE_OFF: as->hw_dma_enable = val & 1u; return;
+        case AES2_BLOCK_MODE_OFF: as->hw_block_mode = val & 7u; return;
+        case AES2_BLOCK_NUM_OFF: as->hw_block_num = val; return;
+        case AES2_INC_SEL_OFF: as->hw_inc_sel = val & 1u; return;
+        case AES2_AAD_NUM_OFF: as->hw_aad_num = val; return;
+        case AES2_VALID_BITS_OFF: as->hw_valid_bits = val & 0x7Fu; return;
+        case AES2_CONTINUE_OFF:
+            if ((val & 1u) && !as->warned_continue) {
+                fprintf(stderr,
+                        "[aes] target %s GCM continuation is unsupported\n",
+                        as->target->name);
+                as->warned_continue = true;
+            }
+            return;
+        case AES2_INT_CLEAR_OFF:
+            if (val & 1u) {
+                as->interrupt_pending = false;
+                aes_update_interrupt(as);
+            }
+            return;
+        case AES2_INT_ENABLE_OFF:
+            as->hw_int_enable = val & 1u;
+            aes_update_interrupt(as);
+            return;
+        case AES2_DATE_OFF:
+            as->hw_date = val & 0x3FFFFFFFu;
+            return;
+        case AES2_DMA_EXIT_OFF:
+            as->hw_state = AES_STATE_IDLE;
+            return;
+        default: break;
+        }
     }
+    if (as->fallback_write)
+        as->fallback_write(as->fallback_ctx, addr, val);
 }
 
 /* ===== Hardware acquire/release stubs ===== */
@@ -423,23 +788,98 @@ static void stub_aes_hal_transform_block(xtensa_cpu_t *cpu, void *ctx) {
 
 /* ===== Public API ===== */
 
-aes_stubs_t *aes_stubs_create(xtensa_cpu_t *cpu) {
+static bool aes_geometry_valid(const flexe_target_desc_t *target) {
+    if (!target || !(target->capabilities & FLEXE_TARGET_CAP_AES_V1))
+        return false;
+    const flexe_aes_desc_t *desc = &target->aes;
+    uint32_t minimum = desc->layout == FLEXE_AES_LAYOUT_ESP32 ? 0x44u :
+        desc->layout == FLEXE_AES_LAYOUT_S2_S3 ? 0xBCu : 0u;
+    if (minimum == 0u || desc->base < target->peripheral_start ||
+        desc->base >= target->peripheral_end ||
+        (desc->base & 0xFFFu) != 0u ||
+        desc->register_size != 0x1000u ||
+        desc->register_size > target->peripheral_end - desc->base ||
+        desc->register_size < minimum ||
+        desc->key_size_mask == 0u || (desc->key_size_mask & ~0x07u) != 0u)
+        return false;
+    if (desc->layout == FLEXE_AES_LAYOUT_ESP32)
+        return desc->dma_peripheral_id == UINT8_MAX &&
+               desc->interrupt_source == UINT8_MAX;
+    return desc->dma_peripheral_id != UINT8_MAX &&
+           (target->capabilities & FLEXE_TARGET_CAP_GDMA_V1) &&
+           desc->interrupt_source != UINT8_MAX &&
+           (target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) &&
+           desc->interrupt_source < target->interrupt_matrix.source_count;
+}
+
+aes_stubs_t *aes_stubs_create(xtensa_cpu_t *cpu, flexe_gdma_t *gdma) {
+    if (!cpu || !cpu->mem || !aes_geometry_valid(mem_target(cpu->mem)))
+        return NULL;
     aes_stubs_t *as = calloc(1, sizeof(*as));
     if (!as) return NULL;
     as->cpu = cpu;
+    as->target = mem_target(cpu->mem);
+    as->gdma = gdma;
+    as->system_clock_enabled = true;
     as->nr[0] = as->nr[1] = 10;   /* default AES-128 */
     as->mode[0] = as->mode[1] = AES_MODE_ENCRYPT;
-    mem_register_mmio(cpu->mem, AES_PERIPH_PAGE,
-                      aes_mmio_read, aes_mmio_write, as);
+    aes_hardware_reset(as);
+
+    uint32_t page = (as->target->aes.base -
+                     as->target->peripheral_start) / 0x1000u;
+    as->fallback_read = cpu->mem->mmio[page].read;
+    as->fallback_write = cpu->mem->mmio[page].write;
+    as->fallback_ctx = cpu->mem->mmio[page].ctx;
+    if (mem_register_mmio_range(cpu->mem, as->target->aes.base,
+                                as->target->aes.register_size,
+                                aes_mmio_read, aes_mmio_write, as) != 0) {
+        free(as);
+        return NULL;
+    }
     return as;
 }
 
+int aes_stubs_attach_system_clock(aes_stubs_t *as,
+                                  esp32_periph_t *periph) {
+    if (!as || !periph) return -1;
+    if (as->system_periph) {
+        if (as->target->aes.interrupt_source != UINT8_MAX)
+            periph_deassert_interrupt(
+                as->system_periph, as->target->aes.interrupt_source);
+        (void)periph_set_system_state_handler(
+            as->system_periph, FLEXE_SYSTEM_DEVICE_AES, 0u, NULL, NULL);
+    }
+    as->system_periph = periph;
+    if (periph_set_system_state_handler(
+            periph, FLEXE_SYSTEM_DEVICE_AES, 0u,
+            aes_system_state_changed, as) != 0) {
+        as->system_periph = NULL;
+        as->system_clock_enabled = true;
+        as->system_reset_asserted = false;
+        return -1;
+    }
+    return 0;
+}
+
 void aes_stubs_destroy(aes_stubs_t *as) {
+    if (!as) return;
+    if (as->system_periph) {
+        if (as->target->aes.interrupt_source != UINT8_MAX)
+            periph_deassert_interrupt(
+                as->system_periph, as->target->aes.interrupt_source);
+        (void)periph_set_system_state_handler(
+            as->system_periph, FLEXE_SYSTEM_DEVICE_AES, 0u, NULL, NULL);
+    }
+    (void)mem_register_mmio_range(
+        as->cpu->mem, as->target->aes.base, as->target->aes.register_size,
+        as->fallback_read, as->fallback_write, as->fallback_ctx);
     free(as);
 }
 
 int aes_stubs_hook_symbols(aes_stubs_t *as, const elf_symbols_t *syms) {
-    if (!as || !syms) return 0;
+    if (!as || !syms ||
+        as->target->aes.layout != FLEXE_AES_LAYOUT_ESP32)
+        return 0;
 
     esp32_rom_stubs_t *rom = as->cpu->pc_hook_ctx;
     if (!rom) return 0;

@@ -651,6 +651,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_I2C_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SHA_V1);
+    ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_AES_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_GP_SPI);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_SDMMC_HOST_V1);
     ASSERT_TRUE(esp32->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
@@ -668,6 +669,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(esp32->sha.layout, FLEXE_SHA_LAYOUT_ESP32);
     ASSERT_EQ(esp32->sha.mode[1], FLEXE_SHA_ALGORITHM_SHA256);
     ASSERT_EQ(esp32->sha.dma_peripheral_id, UINT8_MAX);
+    ASSERT_EQ(esp32->aes.base, 0x3FF01000u);
+    ASSERT_EQ(esp32->aes.layout, FLEXE_AES_LAYOUT_ESP32);
+    ASSERT_EQ(esp32->aes.key_size_mask, 0x07u);
+    ASSERT_EQ(esp32->aes.dma_peripheral_id, UINT8_MAX);
     ASSERT_EQ(esp32->sdmmc_host.base, 0x3FF68000u);
     ASSERT_EQ(esp32->sdmmc_host.interrupt_source, 37u);
     ASSERT_EQ(esp32->sdmmc_host.slot_count, 2u);
@@ -709,6 +714,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_TWAI_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_PCNT_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_AES_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GP_SPI);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
     ASSERT_EQ(s3->twai.base, 0x6002B000u);
@@ -763,6 +769,11 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->sha.mode_count, 8u);
     ASSERT_EQ(s3->sha.mode[2], FLEXE_SHA_ALGORITHM_SHA256);
     ASSERT_EQ(s3->sha.dma_peripheral_id, 7u);
+    ASSERT_EQ(s3->aes.base, 0x6003A000u);
+    ASSERT_EQ(s3->aes.layout, FLEXE_AES_LAYOUT_S2_S3);
+    ASSERT_EQ(s3->aes.key_size_mask, 0x05u);
+    ASSERT_EQ(s3->aes.dma_peripheral_id, 6u);
+    ASSERT_EQ(s3->aes.interrupt_source, 77u);
     ASSERT_EQ(s3->default_cpu_frequency_mhz, 160u);
     ASSERT_EQ(s3->cpu_frequency_word, 0x3FCEF758u);
     ASSERT_EQ(s3->secondary_core.base, 0x600C0000u);
@@ -773,7 +784,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 8u);
-    ASSERT_EQ(s3->system_clock.gate_count, 19u);
+    ASSERT_EQ(s3->system_clock.gate_count, 20u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
@@ -804,6 +815,10 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.gate[18].device,
               FLEXE_SYSTEM_DEVICE_PCNT);
     ASSERT_EQ(s3->system_clock.gate[18].clock_mask, 1u << 10);
+    ASSERT_EQ(s3->system_clock.gate[19].device,
+              FLEXE_SYSTEM_DEVICE_AES);
+    ASSERT_EQ(s3->system_clock.gate[19].clock_mask, 1u << 1);
+    ASSERT_EQ(s3->system_clock.gate[19].reset_mask, 1u << 1);
     ASSERT_EQ(s3->system_clock.gate[7].device,
               FLEXE_SYSTEM_DEVICE_SHA);
     ASSERT_EQ(s3->system_clock.gate[7].clock_mask, 1u << 2);

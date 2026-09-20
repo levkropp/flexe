@@ -51,7 +51,7 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 19u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 20u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
@@ -69,7 +69,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 63u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 64u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -109,6 +109,7 @@ typedef enum {
     FLEXE_TARGET_CAP_SDMMC_HOST_V1                  = 1ull << 31,
     FLEXE_TARGET_CAP_TWAI_V1                        = 1ull << 32,
     FLEXE_TARGET_CAP_PCNT_V1                        = 1ull << 33,
+    FLEXE_TARGET_CAP_AES_V1                         = 1ull << 34,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -1098,6 +1099,31 @@ typedef struct {
     flexe_sha_algorithm_t mode[FLEXE_TARGET_SHA_MODE_MAX];
 } flexe_sha_desc_t;
 
+typedef enum {
+    FLEXE_AES_LAYOUT_NONE = 0,
+    /* Original ESP32: START/IDLE precede MODE and input/output share one
+     * four-word TEXT bank. */
+    FLEXE_AES_LAYOUT_ESP32,
+    /* S2/S3 generation: separate input/output banks, a three-state trigger,
+     * chaining-mode controls, and an optional central-GDMA stream. */
+    FLEXE_AES_LAYOUT_S2_S3,
+} flexe_aes_layout_t;
+
+/* AES mode values and register placement are fixed by the selected IP
+ * layout. Target data supplies the instantiated address, supported key-size
+ * mode bits, interrupt wiring, and GDMA trigger so the crypto engine does not
+ * infer a chip from firmware, symbols, or an absolute PC. key_size_mask bit N
+ * admits MODE key-size code N (0/1/2 = 128/192/256-bit). */
+typedef struct {
+    uint32_t            base;
+    uint32_t            register_size;
+    uint32_t            date_reset;
+    flexe_aes_layout_t  layout;
+    uint8_t             key_size_mask;
+    uint8_t             dma_peripheral_id;
+    uint8_t             interrupt_source;
+} flexe_aes_desc_t;
+
 /* Internal analog-register I2C fabric used by ROM clock, bias, PHY, and ADC
  * code. This is distinct from the externally routed I2C controllers. The ROM
  * command ABI is described here so the same device model can serve targets
@@ -1465,6 +1491,9 @@ struct flexe_target_desc {
 
     /* Optional SHA accelerator. */
     flexe_sha_desc_t              sha;
+
+    /* Optional AES block/DMA accelerator. */
+    flexe_aes_desc_t              aes;
 
     /* Optional SENSITIVE v1 memory-protection configuration block. */
     flexe_sensitive_memprot_desc_t sensitive_memprot;

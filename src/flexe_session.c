@@ -400,10 +400,20 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
         }
     }
 
-    /* AES hardware accelerator stubs */
-    s->astubs = classic_compat ? aes_stubs_create(&s->cpu[0]) : NULL;
-    if (s->astubs && s->syms)
-        aes_stubs_hook_symbols(s->astubs, s->syms);
+    /* Target-described AES hardware. Classic compatibility also enables
+     * optional symbol hooks; S3 executes its native MMIO/GDMA protocol. */
+    s->astubs = (target->capabilities & FLEXE_TARGET_CAP_AES_V1)
+        ? aes_stubs_create(&s->cpu[0], periph_gdma(s->periph)) : NULL;
+    if (s->astubs) {
+        if (!classic_compat &&
+            aes_stubs_attach_system_clock(s->astubs, s->periph) != 0) {
+            fprintf(stderr,
+                    "flexe: failed to connect AES clock/reset controls\n");
+            return -1;
+        }
+        if (classic_compat && s->syms)
+            aes_stubs_hook_symbols(s->astubs, s->syms);
+    }
 
     /* MPI (RSA) hardware accelerator stubs */
     s->mstubs = classic_compat ? mpi_stubs_create(&s->cpu[0]) : NULL;

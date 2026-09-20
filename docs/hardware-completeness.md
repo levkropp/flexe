@@ -57,6 +57,7 @@ even when a firmware workflow succeeds.
 | S3 SD/MMC host | Partial (MMIO, timed IDMAC, and host media) | `tests/test_peripherals.c`; `scripts/check-s3-idf-sdmmc-host.sh` runs ESP-IDF 5.3.2's unmodified host driver and ISR queue in both engines, exercises slot-1 command/response plus single- and 20 KiB multi-block reads/writes, verifies GPIO-matrix routes and media, and leaves zero unsupported accesses | SDHC block media and both logical slots are modeled. SDIO cards, UHS/DDR signaling, bus-width electrical behavior, calibrated clock timing, card removal, and media-error injection remain unverified. |
 | S3 TWAI/CAN | Partial (MMIO, timed frames, and host bus) | `tests/test_twai.c`; `scripts/check-s3-idf-twai.sh` runs ESP-IDF 5.3.2's unmodified driver in both engines through GPIO routing, ISR-backed TX/RX queues, alerts, self-reception, and host-injected standard/extended frames with zero unsupported accesses | CAN 2.0 frame/FIFO/filter, arbitration-loss, retry, error confinement, bus-off, and recovery state are modeled. Electrical bit arbitration, transceiver behavior, multi-node wire timing, and calibrated error injection remain unverified. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks controller-wide clock/arbitration/AHB-reset configuration, finite chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_i2s_v2.c` checks descriptor-at-a-time circular streams; GP-SPI and stock I2S gates exercise independent consumers plus both I2S trigger IDs and directions | Full priority/arbitration behavior and other streaming consumers such as LCD/camera/continuous ADC remain unverified. |
+| S3 AES | Modeled (functional MMIO/GDMA) | `tests/test_crypto.c`; `scripts/check-s3-idf-aes.sh` runs ESP-IDF 5.3.2's unmodified mbedTLS driver twice in each engine through AES-128/256 ECB, CBC, CTR, OFB, CFB8, and CFB128 plus a 4 KiB interrupt-driven transfer | Operations complete immediately. Nondefault `ENDIAN` transformations are retained but not applied; AES-192 and accelerator GCM are not S3 hardware capabilities. |
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks, four flash/four PSRAM access-control regions, and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, access-fault generation, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_syscon_memory.c`, `tests/test_esp32s3_extmem.c`, WLED and zero-unsupported stock Arduino production audits | Cache-array/internal-SRAM ownership has exact reset, masking, and sticky locks; external flash/PSRAM access regions have exact reset, masking, and semantic state. Cache topology/timing, the external-region lock, and protection-fault generation remain unsupported. |
 | S3 CPU assist/debug recorder | Partial (MMIO) | `tests/test_assist_debug.c`, zero-site WLED production audit | Both cores implement target-described PDEBUG enable, live/frozen PC and SP recording, and silicon DATE behavior without an instruction-loop hook. Detailed debug-bus payload, stack/area watchpoints, exception records, and trace memory remain diagnostic. |
@@ -69,6 +70,27 @@ even when a firmware workflow succeeds.
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response, next prompt, and zero unsupported accesses | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
+
+The AES engine is selected from target data rather than firmware identity:
+classic ESP32 and S3 provide their native register layout, supported key-size
+codes, base address, and optional GDMA/interrupt wiring. On S3, the model
+consumes the live trigger-6 transmit chain and completes its receive chain,
+updates CBC/OFB/CTR/CFB chaining state, publishes `IDLE/BUSY/DONE`, and routes
+the level interrupt through source 77. Its SYSTEM clock and reset bits suppress
+work and restore register state just like the other attached devices. The
+pinned stock-driver image covers direct known-answer vectors, partial-length
+CTR handling, every S3 hardware block mode, and the driver's interrupt/semaphore
+path with identical interpreter/JIT output and zero unsupported MMIO. Its image
+SHA-256 is
+`27d35ac42f30490e43c81071dfe38bc184321e5b03421d5bf277814c817d03f1`
+and matching ELF SHA-256 is
+`ef6c993258461e85bbd816da17ea7afe2ea25554fd78a7d648ae24f344276388`.
+Rebuild and replay it with:
+
+```sh
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/build-s3-idf-fixture.sh --check aes
+```
 
 S3 UART0/1/2 now obey their independent
 [SYSTEM peripheral clock and reset bits](https://github.com/espressif/esp-idf/blob/v5.5.1/components/soc/esp32s3/register/soc/system_reg.h):

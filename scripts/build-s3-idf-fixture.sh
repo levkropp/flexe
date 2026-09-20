@@ -74,7 +74,7 @@ done
 
 all_fixtures=(hello crosscore nvs sleep gpio-wake gpio-isr \
     usb-serial-jtag i2c-master i2s-std sdmmc-host twai pcnt rmt-loopback \
-    socket-range)
+    socket-range aes)
 if [[ $# -eq 1 && "$1" == all ]]; then
     set -- "${all_fixtures[@]}"
 elif [[ " $* " == *" all "* ]]; then

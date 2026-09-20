@@ -170,6 +170,9 @@ static bool system_clock_geometry_valid(const flexe_target_desc_t *target)
             (gate->device == FLEXE_SYSTEM_DEVICE_SHA &&
              gate->instance == 0u &&
              (target->capabilities & FLEXE_TARGET_CAP_SHA_V1)) ||
+            (gate->device == FLEXE_SYSTEM_DEVICE_AES &&
+             gate->instance == 0u &&
+             (target->capabilities & FLEXE_TARGET_CAP_AES_V1)) ||
             (gate->device == FLEXE_SYSTEM_DEVICE_LEDC &&
              gate->instance == 0u &&
              (target->capabilities & FLEXE_TARGET_CAP_LEDC_V1)) ||

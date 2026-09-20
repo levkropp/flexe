@@ -53,7 +53,7 @@ static void check_raw_aes_vector(const uint8_t *key, int key_bytes,
                                  const uint8_t cipher[16]) {
     xtensa_cpu_t cpu;
     setup(&cpu);
-    aes_stubs_t *aes = aes_stubs_create(&cpu);
+    aes_stubs_t *aes = aes_stubs_create(&cpu, NULL);
     ASSERT_TRUE(aes != NULL);
     ASSERT_EQ(mem_read32(cpu.mem, AES_BASE_ADDR + 0x04u), 1);
 
@@ -298,10 +298,28 @@ TEST(sha_accelerator_matches_known_answers) {
 #define S3_SHA_H                (S3_SHA_BASE + 0x40u)
 #define S3_SHA_TEXT             (S3_SHA_BASE + 0x80u)
 
+#define S3_AES_BASE             0x6003A000u
+#define S3_AES_KEY              (S3_AES_BASE + 0x00u)
+#define S3_AES_TEXT_IN          (S3_AES_BASE + 0x20u)
+#define S3_AES_TEXT_OUT         (S3_AES_BASE + 0x30u)
+#define S3_AES_MODE             (S3_AES_BASE + 0x40u)
+#define S3_AES_TRIGGER          (S3_AES_BASE + 0x48u)
+#define S3_AES_STATE            (S3_AES_BASE + 0x4Cu)
+#define S3_AES_IV               (S3_AES_BASE + 0x50u)
+#define S3_AES_DMA_ENABLE       (S3_AES_BASE + 0x90u)
+#define S3_AES_BLOCK_MODE       (S3_AES_BASE + 0x94u)
+#define S3_AES_BLOCK_NUM        (S3_AES_BASE + 0x98u)
+#define S3_AES_INC_SEL          (S3_AES_BASE + 0x9Cu)
+#define S3_AES_INT_CLEAR        (S3_AES_BASE + 0xACu)
+#define S3_AES_INT_ENABLE       (S3_AES_BASE + 0xB0u)
+#define S3_AES_DATE             (S3_AES_BASE + 0xB4u)
+#define S3_AES_DMA_EXIT         (S3_AES_BASE + 0xB8u)
+
 #define S3_SYSTEM_BASE          0x600C0000u
 #define S3_SYSTEM_CLK_EN1       (S3_SYSTEM_BASE + 0x01Cu)
 #define S3_SYSTEM_RST_EN1       (S3_SYSTEM_BASE + 0x024u)
 #define S3_SYSTEM_SHA           (1u << 2)
+#define S3_SYSTEM_AES           (1u << 1)
 
 #define S3_GDMA_BASE            0x6003F000u
 #define S3_GDMA_IN_CONF1        (S3_GDMA_BASE + 0x004u)
@@ -345,6 +363,12 @@ typedef struct {
     sha_stubs_t *sha;
 } s3_sha_fixture_t;
 
+typedef struct {
+    xtensa_cpu_t cpu;
+    esp32_periph_t *periph;
+    aes_stubs_t *aes;
+} s3_aes_fixture_t;
+
 static bool s3_sha_fixture_init(s3_sha_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
     const flexe_target_desc_t *target =
@@ -371,6 +395,36 @@ static bool s3_sha_fixture_init(s3_sha_fixture_t *fixture) {
 
 static void s3_sha_fixture_destroy(s3_sha_fixture_t *fixture) {
     sha_stubs_destroy(fixture->sha);
+    periph_destroy(fixture->periph);
+    mem_destroy(fixture->cpu.mem);
+}
+
+static bool s3_aes_fixture_init(s3_aes_fixture_t *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    const flexe_target_desc_t *target =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_cpu_reset_for_target(&fixture->cpu, target);
+    fixture->cpu.mem = mem_create_for_target(target);
+    if (!fixture->cpu.mem) return false;
+    fixture->periph = periph_create(fixture->cpu.mem);
+    if (!fixture->periph || !periph_gdma(fixture->periph)) return false;
+    fixture->aes = aes_stubs_create(
+        &fixture->cpu, periph_gdma(fixture->periph));
+    if (!fixture->aes ||
+        aes_stubs_attach_system_clock(
+            fixture->aes, fixture->periph) != 0)
+        return false;
+    mem_write32(fixture->cpu.mem, S3_SYSTEM_CLK_EN1,
+                mem_read32(fixture->cpu.mem, S3_SYSTEM_CLK_EN1) |
+                S3_SYSTEM_AES);
+    mem_write32(fixture->cpu.mem, S3_SYSTEM_RST_EN1,
+                mem_read32(fixture->cpu.mem, S3_SYSTEM_RST_EN1) &
+                ~S3_SYSTEM_AES);
+    return true;
+}
+
+static void s3_aes_fixture_destroy(s3_aes_fixture_t *fixture) {
+    aes_stubs_destroy(fixture->aes);
     periph_destroy(fixture->periph);
     mem_destroy(fixture->cpu.mem);
 }
@@ -517,6 +571,273 @@ static void s3_gdma_descriptor(xtensa_mem_t *mem, uint32_t descriptor,
     mem_write32(mem, descriptor, dw0);
     mem_write32(mem, descriptor + 4u, buffer);
     mem_write32(mem, descriptor + 8u, next);
+}
+
+static void s3_aes_write_words(xtensa_mem_t *mem, uint32_t base,
+                               const uint8_t *bytes, size_t length) {
+    for (size_t offset = 0u; offset < length; offset += 4u)
+        mem_write32(mem, base + (uint32_t)offset,
+                    crypto_le32(bytes + offset));
+}
+
+static void s3_aes_read_words(xtensa_mem_t *mem, uint32_t base,
+                              uint8_t *bytes, size_t length) {
+    for (size_t offset = 0u; offset < length; offset += 4u) {
+        uint32_t word = mem_read32(mem, base + (uint32_t)offset);
+        bytes[offset] = (uint8_t)word;
+        bytes[offset + 1u] = (uint8_t)(word >> 8);
+        bytes[offset + 2u] = (uint8_t)(word >> 16);
+        bytes[offset + 3u] = (uint8_t)(word >> 24);
+    }
+}
+
+static void s3_aes_direct(s3_aes_fixture_t *fixture,
+                          const uint8_t *key, size_t key_bytes,
+                          bool decrypt, const uint8_t input[16],
+                          uint8_t output[16]) {
+    for (unsigned word = 0u; word < 8u; word++)
+        mem_write32(fixture->cpu.mem, S3_AES_KEY + word * 4u, 0u);
+    s3_aes_write_words(fixture->cpu.mem, S3_AES_KEY, key, key_bytes);
+    s3_aes_write_words(fixture->cpu.mem, S3_AES_TEXT_IN, input, 16u);
+    uint32_t mode = (uint32_t)(key_bytes / 8u - 2u) |
+                    (decrypt ? 4u : 0u);
+    mem_write32(fixture->cpu.mem, S3_AES_MODE, mode);
+    mem_write32(fixture->cpu.mem, S3_AES_TRIGGER, 1u);
+    ASSERT_EQ(mem_read32(fixture->cpu.mem, S3_AES_STATE), 0u);
+    s3_aes_read_words(fixture->cpu.mem, S3_AES_TEXT_OUT, output, 16u);
+}
+
+static bool s3_aes_dma(s3_aes_fixture_t *fixture,
+                       const uint8_t *key, size_t key_bytes,
+                       bool decrypt, uint32_t block_mode,
+                       const uint8_t iv[16], const uint8_t *input,
+                       uint8_t *output, size_t length,
+                       uint8_t final_iv[16], bool interrupt) {
+    const uint32_t tx_descriptor = 0x3FC8F000u;
+    const uint32_t rx_descriptor = 0x3FC8F010u;
+    const uint32_t tx_buffer = 0x3FC90000u;
+    const uint32_t rx_buffer = 0x3FC91000u;
+    if (length == 0u || (length & 15u) != 0u || length > 0x800u)
+        return false;
+
+    for (size_t index = 0u; index < length; index++) {
+        mem_write8(fixture->cpu.mem, tx_buffer + (uint32_t)index,
+                   input[index]);
+        mem_write8(fixture->cpu.mem, rx_buffer + (uint32_t)index, 0u);
+    }
+    s3_gdma_descriptor(fixture->cpu.mem, tx_descriptor, tx_buffer,
+                       (uint32_t)length, true, true, 0u);
+    s3_gdma_descriptor(fixture->cpu.mem, rx_descriptor, rx_buffer,
+                       (uint32_t)length, true, true, 0u);
+    mem_write32(fixture->cpu.mem, S3_GDMA_OUT_INT_CLR, UINT32_MAX);
+    mem_write32(fixture->cpu.mem, S3_GDMA_IN_INT_CLR, UINT32_MAX);
+    mem_write32(fixture->cpu.mem, S3_GDMA_OUT_PERI_SEL, 6u);
+    mem_write32(fixture->cpu.mem, S3_GDMA_IN_PERI_SEL, 6u);
+    mem_write32(fixture->cpu.mem, S3_GDMA_OUT_LINK,
+                (tx_descriptor & 0xFFFFFu) | S3_GDMA_LINK_START);
+    mem_write32(fixture->cpu.mem, S3_GDMA_IN_LINK,
+                (rx_descriptor & 0xFFFFFu) | S3_GDMA_IN_LINK_START);
+
+    for (unsigned word = 0u; word < 8u; word++)
+        mem_write32(fixture->cpu.mem, S3_AES_KEY + word * 4u, 0u);
+    s3_aes_write_words(fixture->cpu.mem, S3_AES_KEY, key, key_bytes);
+    uint8_t zero_iv[16] = {0};
+    s3_aes_write_words(fixture->cpu.mem, S3_AES_IV,
+                       iv ? iv : zero_iv, sizeof(zero_iv));
+    mem_write32(fixture->cpu.mem, S3_AES_MODE,
+                (uint32_t)(key_bytes / 8u - 2u) |
+                (decrypt ? 4u : 0u));
+    mem_write32(fixture->cpu.mem, S3_AES_BLOCK_MODE, block_mode);
+    mem_write32(fixture->cpu.mem, S3_AES_BLOCK_NUM,
+                (uint32_t)(length / 16u));
+    mem_write32(fixture->cpu.mem, S3_AES_INC_SEL, 0u);
+    mem_write32(fixture->cpu.mem, S3_AES_INT_ENABLE,
+                interrupt ? 1u : 0u);
+    mem_write32(fixture->cpu.mem, S3_AES_DMA_ENABLE, 1u);
+    mem_write32(fixture->cpu.mem, S3_AES_TRIGGER, 1u);
+    if (mem_read32(fixture->cpu.mem, S3_AES_STATE) != 2u)
+        return false;
+
+    for (size_t index = 0u; index < length; index++)
+        output[index] = mem_read8(
+            fixture->cpu.mem, rx_buffer + (uint32_t)index);
+    if (final_iv)
+        s3_aes_read_words(
+            fixture->cpu.mem, S3_AES_IV, final_iv, 16u);
+    if (interrupt) {
+        ASSERT_TRUE(periph_interrupt_pending(fixture->periph, 77));
+        mem_write32(fixture->cpu.mem, S3_AES_INT_CLEAR, 1u);
+        ASSERT_FALSE(periph_interrupt_pending(fixture->periph, 77));
+    }
+    mem_write32(fixture->cpu.mem, S3_AES_DMA_EXIT, 0u);
+    mem_write32(fixture->cpu.mem, S3_AES_DMA_ENABLE, 0u);
+    ASSERT_EQ(mem_read32(fixture->cpu.mem, S3_AES_STATE), 0u);
+    return true;
+}
+
+TEST(esp32s3_aes_direct_modes_honor_clock_and_reset) {
+    static const uint8_t key128[16] = {
+        0x00,0x01,0x02,0x03, 0x04,0x05,0x06,0x07,
+        0x08,0x09,0x0a,0x0b, 0x0c,0x0d,0x0e,0x0f,
+    };
+    static const uint8_t key256[32] = {
+        0x00,0x01,0x02,0x03, 0x04,0x05,0x06,0x07,
+        0x08,0x09,0x0a,0x0b, 0x0c,0x0d,0x0e,0x0f,
+        0x10,0x11,0x12,0x13, 0x14,0x15,0x16,0x17,
+        0x18,0x19,0x1a,0x1b, 0x1c,0x1d,0x1e,0x1f,
+    };
+    static const uint8_t plain[16] = {
+        0x00,0x11,0x22,0x33, 0x44,0x55,0x66,0x77,
+        0x88,0x99,0xaa,0xbb, 0xcc,0xdd,0xee,0xff,
+    };
+    static const uint8_t cipher128[16] = {
+        0x69,0xc4,0xe0,0xd8, 0x6a,0x7b,0x04,0x30,
+        0xd8,0xcd,0xb7,0x80, 0x70,0xb4,0xc5,0x5a,
+    };
+    static const uint8_t cipher256[16] = {
+        0x8e,0xa2,0xb7,0xca, 0x51,0x67,0x45,0xbf,
+        0xea,0xfc,0x49,0x90, 0x4b,0x49,0x60,0x89,
+    };
+    s3_aes_fixture_t fixture;
+    bool ready = s3_aes_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_aes_fixture_destroy(&fixture);
+        return;
+    }
+
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_AES_DATE), 0x20191210u);
+    uint8_t output[16];
+    s3_aes_direct(&fixture, key128, sizeof(key128), false, plain, output);
+    assert_aes_block(output, cipher128);
+    s3_aes_direct(&fixture, key128, sizeof(key128), true,
+                  cipher128, output);
+    assert_aes_block(output, plain);
+    s3_aes_direct(&fixture, key256, sizeof(key256), false, plain, output);
+    assert_aes_block(output, cipher256);
+
+    uint32_t clocks = mem_read32(fixture.cpu.mem, S3_SYSTEM_CLK_EN1);
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_CLK_EN1,
+                clocks & ~S3_SYSTEM_AES);
+    memset(output, 0, sizeof(output));
+    for (unsigned word = 0u; word < 4u; word++)
+        mem_write32(fixture.cpu.mem, S3_AES_TEXT_OUT + word * 4u, 0u);
+    s3_aes_direct(&fixture, key128, sizeof(key128), false, plain, output);
+    static const uint8_t zero[16] = {0};
+    assert_aes_block(output, zero);
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_CLK_EN1,
+                clocks | S3_SYSTEM_AES);
+    s3_aes_direct(&fixture, key128, sizeof(key128), false, plain, output);
+    assert_aes_block(output, cipher128);
+
+    uint32_t resets = mem_read32(fixture.cpu.mem, S3_SYSTEM_RST_EN1);
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_RST_EN1,
+                resets | S3_SYSTEM_AES);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_AES_MODE), 0u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_AES_TEXT_OUT), 0u);
+    mem_write32(fixture.cpu.mem, S3_AES_MODE, 2u);
+    ASSERT_EQ(mem_read32(fixture.cpu.mem, S3_AES_MODE), 0u);
+    mem_write32(fixture.cpu.mem, S3_SYSTEM_RST_EN1,
+                resets & ~S3_SYSTEM_AES);
+    s3_aes_direct(&fixture, key128, sizeof(key128), false, plain, output);
+    assert_aes_block(output, cipher128);
+    ASSERT_EQ(periph_unhandled_count(fixture.periph), 0u);
+
+    s3_aes_fixture_destroy(&fixture);
+}
+
+TEST(esp32s3_aes_gdma_modes_match_known_answers) {
+    static const uint8_t key[16] = {
+        0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,
+        0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c,
+    };
+    static const uint8_t iv[16] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+        0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+    };
+    static const uint8_t counter[16] = {
+        0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,
+        0xf8,0xf9,0xfa,0xfb,0xfc,0xfd,0xfe,0xff,
+    };
+    static const uint8_t plain[32] = {
+        0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
+        0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a,
+        0xae,0x2d,0x8a,0x57,0x1e,0x03,0xac,0x9c,
+        0x9e,0xb7,0x6f,0xac,0x45,0xaf,0x8e,0x51,
+    };
+    static const uint8_t cbc[32] = {
+        0x76,0x49,0xab,0xac,0x81,0x19,0xb2,0x46,
+        0xce,0xe9,0x8e,0x9b,0x12,0xe9,0x19,0x7d,
+        0x50,0x86,0xcb,0x9b,0x50,0x72,0x19,0xee,
+        0x95,0xdb,0x11,0x3a,0x91,0x76,0x78,0xb2,
+    };
+    static const uint8_t ctr[32] = {
+        0x87,0x4d,0x61,0x91,0xb6,0x20,0xe3,0x26,
+        0x1b,0xef,0x68,0x64,0x99,0x0d,0xb6,0xce,
+        0x98,0x06,0xf6,0x6b,0x79,0x70,0xfd,0xff,
+        0x86,0x17,0x18,0x7b,0xb9,0xff,0xfd,0xff,
+    };
+    static const uint8_t ofb[32] = {
+        0x3b,0x3f,0xd9,0x2e,0xb7,0x2d,0xad,0x20,
+        0x33,0x34,0x49,0xf8,0xe8,0x3c,0xfb,0x4a,
+        0x77,0x89,0x50,0x8d,0x16,0x91,0x8f,0x03,
+        0xf5,0x3c,0x52,0xda,0xc5,0x4e,0xd8,0x25,
+    };
+    static const uint8_t cfb128[32] = {
+        0x3b,0x3f,0xd9,0x2e,0xb7,0x2d,0xad,0x20,
+        0x33,0x34,0x49,0xf8,0xe8,0x3c,0xfb,0x4a,
+        0xc8,0xa6,0x45,0x37,0xa0,0xb3,0xa9,0x3f,
+        0xcd,0xe3,0xcd,0xad,0x9f,0x1c,0xe5,0x8b,
+    };
+    s3_aes_fixture_t fixture;
+    bool ready = s3_aes_fixture_init(&fixture);
+    ASSERT_TRUE(ready);
+    if (!ready) {
+        s3_aes_fixture_destroy(&fixture);
+        return;
+    }
+
+    uint8_t output[32];
+    uint8_t roundtrip[32];
+    uint8_t final_iv[16];
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), false, 1u,
+                           iv, plain, output, sizeof(output), final_iv,
+                           true));
+    ASSERT_TRUE(memcmp(output, cbc, sizeof(cbc)) == 0);
+    ASSERT_TRUE(memcmp(final_iv, cbc + 16u, 16u) == 0);
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), true, 1u,
+                           iv, cbc, roundtrip, sizeof(roundtrip), final_iv,
+                           false));
+    ASSERT_TRUE(memcmp(roundtrip, plain, sizeof(plain)) == 0);
+    ASSERT_TRUE(memcmp(final_iv, cbc + 16u, 16u) == 0);
+
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), true, 3u,
+                           counter, plain, output, sizeof(output), final_iv,
+                           false));
+    ASSERT_TRUE(memcmp(output, ctr, sizeof(ctr)) == 0);
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), true, 2u,
+                           iv, plain, output, sizeof(output), final_iv,
+                           false));
+    ASSERT_TRUE(memcmp(output, ofb, sizeof(ofb)) == 0);
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), false, 5u,
+                           iv, plain, output, sizeof(output), final_iv,
+                           false));
+    ASSERT_TRUE(memcmp(output, cfb128, sizeof(cfb128)) == 0);
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), true, 5u,
+                           iv, cfb128, roundtrip, sizeof(roundtrip), final_iv,
+                           false));
+    ASSERT_TRUE(memcmp(roundtrip, plain, sizeof(plain)) == 0);
+
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), false, 4u,
+                           iv, plain, output, sizeof(output), final_iv,
+                           false));
+    ASSERT_TRUE(s3_aes_dma(&fixture, key, sizeof(key), true, 4u,
+                           iv, output, roundtrip, sizeof(roundtrip), final_iv,
+                           false));
+    ASSERT_TRUE(memcmp(roundtrip, plain, sizeof(plain)) == 0);
+    ASSERT_EQ(periph_unhandled_count(fixture.periph), 0u);
+
+    s3_aes_fixture_destroy(&fixture);
 }
 
 TEST(esp32s3_gdma_misc_configuration_is_retained_and_masked) {
@@ -877,6 +1198,8 @@ void run_crypto_tests(void) {
     RUN_TEST(sha_accelerator_matches_known_answers);
     RUN_TEST(esp32s3_sha_direct_modes_match_known_answers);
     RUN_TEST(esp32s3_sha_honors_system_clock_and_reset);
+    RUN_TEST(esp32s3_aes_direct_modes_honor_clock_and_reset);
+    RUN_TEST(esp32s3_aes_gdma_modes_match_known_answers);
     RUN_TEST(esp32s3_gdma_misc_configuration_is_retained_and_masked);
     RUN_TEST(esp32s3_sha_consumes_chained_gdma_descriptors);
     RUN_TEST(esp32s3_gdma_honors_owner_check_and_writeback);

@@ -24,6 +24,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_I2C_V1 |
                         FLEXE_TARGET_CAP_RADIO_REGS_V1 |
                         FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_AES_V1 |
                         FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
                         FLEXE_TARGET_CAP_TWAI_V1 |
@@ -240,6 +241,14 @@ static const flexe_target_desc_t TARGETS[] = {
                 FLEXE_SHA_ALGORITHM_SHA512,
             },
         },
+        .aes = {
+            .base = 0x3FF01000u,
+            .register_size = 0x1000u,
+            .layout = FLEXE_AES_LAYOUT_ESP32,
+            .key_size_mask = 0x07u,
+            .dma_peripheral_id = UINT8_MAX,
+            .interrupt_source = UINT8_MAX,
+        },
         .gp_spi = {
             .register_size = 0x1000u,
             .date_reset = 0x01604270u,
@@ -380,6 +389,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_RADIO_REGS_V1 |
                         FLEXE_TARGET_CAP_GDMA_V1 |
                         FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_AES_V1 |
                         FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_RMT_V1 |
                         FLEXE_TARGET_CAP_LEDC_V1 |
@@ -575,7 +585,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 8u,
-            .gate_count = 19u,
+            .gate_count = 20u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -743,6 +753,14 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x020u,
                     .clock_mask = 1u << 10,
                     .reset_mask = 1u << 10,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_AES,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 1,
+                    .reset_mask = 1u << 1,
                 },
             },
             .low_power = {
@@ -1533,6 +1551,15 @@ static const flexe_target_desc_t TARGETS[] = {
                 FLEXE_SHA_ALGORITHM_SHA512_256,
                 FLEXE_SHA_ALGORITHM_SHA512_T,
             },
+        },
+        .aes = {
+            .base = 0x6003A000u,
+            .register_size = 0x1000u,
+            .date_reset = 0x20191210u,
+            .layout = FLEXE_AES_LAYOUT_S2_S3,
+            .key_size_mask = 0x05u,
+            .dma_peripheral_id = 6u,
+            .interrupt_source = 77u,
         },
         .sensitive_memprot = {
             .base = 0x600C1000u,

@@ -14526,6 +14526,8 @@ static void system_clock_gate_changed(
         break;
     case FLEXE_SYSTEM_DEVICE_SHA:
         break;
+    case FLEXE_SYSTEM_DEVICE_AES:
+        break;
     case FLEXE_SYSTEM_DEVICE_LEDC:
         ledc_set_system_state(p, clock_enabled, reset_asserted);
         break;

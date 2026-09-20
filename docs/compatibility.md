@@ -311,6 +311,18 @@ and configurable SHA-512/t are not yet modeled.
 Requests for the unsupported SHA modes or malformed DMA chains are rejected
 with a diagnostic rather than returning invented digest data.
 
+The AES accelerator follows the same target-described composition. Classic
+ESP32 retains its shared input/output register bank and optional symbol hooks;
+S3 uses separate text banks plus its native GDMA trigger and interrupt source,
+without depending on an ELF symbol or firmware PC. AES-128/256 ECB, CBC, CTR,
+OFB, CFB8, and CFB128 update their architectural key, IV, state, descriptor,
+and interrupt state. A pinned ESP-IDF 5.3.2 fixture calls only public mbedTLS
+APIs and forces a 4 KiB CBC operation through the driver's interrupt/semaphore
+path; two interpreter and two JIT runs produce the same ciphertext checksum
+with zero unsupported MMIO. S3 does not advertise hardware AES-192 or GCM.
+Accelerator latency and nondefault `ENDIAN` transformations remain outside the
+functional model.
+
 The S3 RTC counter advances on the same shared dual-core virtual timeline as
 the other target-described timers. Its two-half latch, runtime CPU-frequency
 scaling, and switching among the nominal 136 kHz RC slow, 32.768 kHz crystal,
