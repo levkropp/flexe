@@ -1477,6 +1477,7 @@ static bool gp_spi_geometry_valid(const flexe_target_desc_t *target) {
         desc->register_size > 0x1000u)
         return false;
 
+    bool output_signal_seen[FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT] = {0};
     for (unsigned i = 0u; i < desc->host_count; i++) {
         const flexe_gp_spi_instance_desc_t *instance = &desc->instance[i];
         if ((instance->base & 0xFFFu) != 0u ||
@@ -1484,10 +1485,18 @@ static bool gp_spi_geometry_valid(const flexe_target_desc_t *target) {
             instance->base >= target->peripheral_end ||
             desc->register_size > target->peripheral_end - instance->base ||
             instance->interrupt_source >= FLEXE_TARGET_INTERRUPT_SOURCE_MAX ||
-            instance->clock_out_signal == FLEXE_TARGET_MATRIX_SIGNAL_NONE ||
+            instance->clock_out_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            instance->clock_out_signal ==
+                FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT ||
+            output_signal_seen[instance->clock_out_signal] ||
+            instance->data_out_signal_count == 0u ||
+            instance->data_out_signal_count >
+                FLEXE_TARGET_GP_SPI_DATA_MAX ||
             instance->chip_select_count == 0u ||
             instance->chip_select_count > FLEXE_TARGET_GP_SPI_CS_MAX)
             return false;
+        output_signal_seen[instance->clock_out_signal] = true;
         if ((target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) &&
             instance->interrupt_source >=
                 target->interrupt_matrix.source_count)
@@ -1498,10 +1507,23 @@ static bool gp_spi_geometry_valid(const flexe_target_desc_t *target) {
                  FLEXE_TARGET_GDMA_PERIPHERAL_NONE ||
              instance->gdma_peripheral_id >= 64u))
             return false;
-        for (unsigned cs = 0u; cs < instance->chip_select_count; cs++)
-            if (instance->chip_select_out_signal[cs] ==
-                FLEXE_TARGET_MATRIX_SIGNAL_NONE)
+        for (unsigned data = 0u; data < instance->data_out_signal_count;
+             data++) {
+            uint16_t signal = instance->data_out_signal[data];
+            if (signal >= FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+                signal == FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT ||
+                output_signal_seen[signal])
                 return false;
+            output_signal_seen[signal] = true;
+        }
+        for (unsigned cs = 0u; cs < instance->chip_select_count; cs++) {
+            uint16_t signal = instance->chip_select_out_signal[cs];
+            if (signal >= FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+                signal == FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT ||
+                output_signal_seen[signal])
+                return false;
+            output_signal_seen[signal] = true;
+        }
         bool has_iomux = instance->iomux_clock_pin != FLEXE_TARGET_GPIO_NONE;
         if (has_iomux !=
                 (instance->iomux_chip_select0_pin != FLEXE_TARGET_GPIO_NONE) ||

@@ -500,6 +500,11 @@ TEST(system_clock_uart_gates_and_resets_are_per_port)
     ASSERT_TRUE(clocks0 & SC_UART1_GATE);
     ASSERT_TRUE(clocks1 & SC_UART2_GATE);
 
+    uint32_t uart0_route = s3->gpio.base + 0x554u + 4u * 4u;
+    mem_write32(mem, uart0_route, s3->uart[0].tx_output_signal);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 4), 1);
+
     mem_write32(mem, SC_UART0_BASE, 'A');
     ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 1);
     mem_write32(mem, SC_UART0_BASE + SC_UART_INT_ENA, 1u << 1);
@@ -508,6 +513,8 @@ TEST(system_clock_uart_gates_and_resets_are_per_port)
     mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN0_OFF,
                 clocks0 & ~SC_UART0_GATE);
     ASSERT_FALSE(periph_interrupt_pending(periph, 27));
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), -1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 4), -1);
     mem_write32(mem, SC_UART0_BASE, 'B');
     ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 1);
     const uint8_t input[] = { 'x', 'y' };
@@ -517,6 +524,8 @@ TEST(system_clock_uart_gates_and_resets_are_per_port)
 
     mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_CLK_EN0_OFF, clocks0);
     ASSERT_TRUE(periph_interrupt_pending(periph, 27));
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 4), 1);
     ASSERT_EQ(periph_uart_rx_inject_num(periph, 0, input, sizeof(input)),
               sizeof(input));
     ASSERT_EQ(mem_read32(mem, SC_UART0_BASE), 'x');
@@ -525,6 +534,8 @@ TEST(system_clock_uart_gates_and_resets_are_per_port)
     mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN0_OFF,
                 SC_UART0_GATE);
     ASSERT_FALSE(periph_interrupt_pending(periph, 27));
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), -1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 4), -1);
     ASSERT_EQ(periph_uart_rx_pending_num(periph, 0), 0u);
     ASSERT_EQ(mem_read32(mem, SC_UART0_BASE + SC_UART_INT_ENA), 0u);
     ASSERT_EQ(mem_read32(mem, SC_UART0_BASE + SC_UART_CONF1), 0u);
@@ -536,6 +547,8 @@ TEST(system_clock_uart_gates_and_resets_are_per_port)
     mem_write32(mem, SC_UART1_BASE, '2');
     ASSERT_EQ(periph_uart_tx_count_num(periph, 1), 2);
     mem_write32(mem, SC_SYSTEM_BASE + SC_PERIP_RST_EN0_OFF, 0u);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 4), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 4), 1);
     mem_write32(mem, SC_UART0_BASE, 'D');
     ASSERT_EQ(periph_uart_tx_count_num(periph, 0), 2);
 

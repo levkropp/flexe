@@ -2816,6 +2816,19 @@ static void uart_reset_state(esp32_periph_t *p, unsigned uart_num) {
     uart_intr_update(p, (int)uart_num);
 }
 
+static void uart_update_gpio_output(esp32_periph_t *p, unsigned uart_num) {
+    if (!uart_num_valid(p, (int)uart_num) || !p->target_gpio) return;
+    const flexe_uart_instance_desc_t *desc = uart_desc(p, (int)uart_num);
+    const uart_state_t *uart = &p->uart[uart_num];
+    bool active = uart->clock_enabled && !uart->reset_asserted;
+    /* Fast mode exports complete bytes to the host transport. Keep the
+     * architectural TX producer at its idle-high level between those
+     * aggregate transfers, and release it while the controller is gated. */
+    flexe_gpio_drive_output_signal(
+        p->target_gpio, desc->tx_output_signal,
+        active ? 1 : -1, active ? 1 : -1);
+}
+
 static void uart_set_system_state(esp32_periph_t *p, unsigned uart_num,
                                   bool clock_enabled,
                                   bool reset_asserted) {
@@ -2826,6 +2839,7 @@ static void uart_set_system_state(esp32_periph_t *p, unsigned uart_num,
     uart->reset_asserted = reset_asserted;
     if (reset_rising) uart_reset_state(p, uart_num);
     uart_intr_update(p, (int)uart_num);
+    uart_update_gpio_output(p, uart_num);
 }
 
 static uint32_t uart_read(void *ctx, uint32_t addr) {
@@ -2899,15 +2913,22 @@ static void uart_write(void *ctx, uint32_t addr, uint32_t val) {
 static int uart_register_target(esp32_periph_t *p) {
     if (!p || p->target->uart_count > UART_COUNT) return -1;
     const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
+    bool tx_signal_seen[FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT] = {0};
     for (int uart_num = 0; uart_num < (int)p->target->uart_count;
          uart_num++) {
         const flexe_uart_instance_desc_t *desc = uart_desc(p, uart_num);
         if (!desc || ip->register_size == 0u ||
+            desc->tx_output_signal >=
+                FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT ||
+            desc->tx_output_signal ==
+                FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT ||
+            tx_signal_seen[desc->tx_output_signal] ||
             ip->date_offset >= sizeof(p->uart[uart_num].shadow) ||
             mem_register_mmio_range(p->mem, desc->base,
                                     ip->register_size,
                                     uart_read, uart_write, p) != 0)
             return -1;
+        tx_signal_seen[desc->tx_output_signal] = true;
         p->uart[uart_num].clock_enabled = true;
         uart_reset_state(p, (unsigned)uart_num);
     }
@@ -14607,6 +14628,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
             flexe_io_mux_set_input_changed_handler(
                 p->io_mux, target_io_mux_input_changed, p);
         }
+        for (unsigned uart = 0u; uart < target->uart_count; uart++) {
+            flexe_gpio_set_output_signal_modeled(
+                p->target_gpio, target->uart[uart].tx_output_signal);
+            uart_update_gpio_output(p, uart);
+        }
     }
 
     if (target->capabilities & FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1) {
@@ -14745,6 +14771,11 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                     &spi->instance[host];
                 flexe_gpio_set_output_signal_modeled(
                     p->target_gpio, instance->clock_out_signal);
+                for (unsigned data = 0u;
+                     data < instance->data_out_signal_count; data++)
+                    flexe_gpio_set_output_signal_modeled(
+                        p->target_gpio,
+                        instance->data_out_signal[data]);
                 for (unsigned cs = 0u; cs < instance->chip_select_count;
                      cs++)
                     flexe_gpio_set_output_signal_modeled(

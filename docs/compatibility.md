@@ -169,6 +169,10 @@ reset or clock effects. The memory/radio state is
 available to downstream consumers without fabricating memory loss, RF, or
 radio-controller behavior that is not modeled yet. Other SYSTEM fields remain
 explicit unsupported-access diagnostics unless they have a semantic consumer.
+Target-described UART TX and GP-SPI clock/data/chip-select producers are also
+valid GPIO-matrix routes across firmware builds. UART exports complete bytes
+and an idle-high pad, while GP-SPI exports complete transactions; fast mode
+does not fabricate baud or serial-clock edges.
 
 The S3 SYSCON memory-policy owner supplies exact reset and masked readback for
 the RF front-end controls and the 11 SRAM/3 ROM bank clock, force-down, and

@@ -294,6 +294,64 @@ TEST(target_gpio_peripheral_output_resolves_matrix_inversion_and_enable)
     mem_destroy(mem);
 }
 
+TEST(target_gpio_accepts_target_described_serial_output_producers)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(periph != NULL);
+    if (!periph) {
+        mem_destroy(mem);
+        return;
+    }
+
+    /* These are ordinary target-described producers, not Marauder-specific
+     * pin exceptions: GPIO11 is SPI2 D and GPIO21 is UART1 TX on that board. */
+    uint32_t spi_route = s3->gpio.base + 0x554u + 11u * 4u;
+    uint32_t uart_route = s3->gpio.base + 0x554u + 21u * 4u;
+    int before = periph_unhandled_count(periph);
+    mem_write32(mem, spi_route,
+                s3->gp_spi.instance[0].data_out_signal[1]);
+    mem_write32(mem, uart_route, s3->uart[1].tx_output_signal);
+    ASSERT_EQ(periph_unhandled_count(periph), before);
+    ASSERT_EQ(periph_gpio_out_signal(periph, 11),
+              s3->gp_spi.instance[0].data_out_signal[1]);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 11), -1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 11), -1);
+    ASSERT_EQ(periph_gpio_out_signal(periph, 21),
+              s3->uart[1].tx_output_signal);
+    ASSERT_EQ(periph_gpio_pin_level(periph, 21), 1);
+    ASSERT_EQ(periph_gpio_output_enabled(periph, 21), 1);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
+TEST(target_gpio_rejects_invalid_serial_output_geometry)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    flexe_target_desc_t invalid = *s3;
+    invalid.uart[1].tx_output_signal = FLEXE_TARGET_MATRIX_SIGNAL_NONE;
+    xtensa_mem_t *mem = mem_create_for_target(&invalid);
+    esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph == NULL);
+    periph_destroy(periph);
+    mem_destroy(mem);
+
+    invalid = *s3;
+    invalid.gp_spi.instance[0].data_out_signal[1] =
+        invalid.gp_spi.instance[0].clock_out_signal;
+    mem = mem_create_for_target(&invalid);
+    periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph == NULL);
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads)
 {
     const flexe_target_desc_t *s3 =
@@ -501,6 +559,8 @@ void run_target_gpio_tests(void)
     RUN_TEST(target_gpio_input_buffer_gates_host_samples_and_interrupts);
     RUN_TEST(target_gpio_driven_output_feeds_enabled_input_without_host_sample);
     RUN_TEST(target_gpio_peripheral_output_resolves_matrix_inversion_and_enable);
+    RUN_TEST(target_gpio_accepts_target_described_serial_output_producers);
+    RUN_TEST(target_gpio_rejects_invalid_serial_output_geometry);
     RUN_TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads);
     RUN_TEST(target_gpio_pad_hold_defers_output_notifications_until_release);
     RUN_TEST(target_gpio_open_drain_releases_high_and_notifies_pad);

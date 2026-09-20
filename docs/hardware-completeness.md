@@ -50,8 +50,8 @@ even when a firmware workflow succeeds.
 | S3 optional 8 MiB octal PSRAM | Partial (MSPI/MMU) | `tests/test_spi_mem.c` covers mode registers, hybrid burst and row crossing; `scripts/check-s3-psram-opi.sh` checks stock Arduino-ESP32 3.3.11 external-RAM allocation and repeated array traffic; default board remains unpopulated | AP Memory APS6408L-3OBMx command subset is modeled; DQS/electrical timing, refresh/PASR retention, and other PSRAM chips/board wirings are not. |
 | S3 NVS, SPIFFS, reset persistence | Partial | `tests/test_loader.c`, `tests/test_spi_mem.c`, `scripts/check-s3-idf-nvs.sh`, NerdMiner POST/save/restart/reload gate, `scripts/check-s3-idf-sleep.sh` | Flash array and NOR chip state survive SoC restart; S3 deep-sleep flash power-down retains profiled nonvolatile status, while other flash profiles and partition/filesystem variants need gates. |
 | S3 GPIO/RTCIO/IO_MUX | Partial (MMIO) | `tests/test_gpio.c`, `tests/test_rtc_io.c`, `tests/test_rtc_cntl.c`, `scripts/check-s3-idf-gpio-isr.sh`, stock Arduino ADC gate, native EXT0/EXT1 wake gate | Stock ESP-IDF's per-pin ISR, FreeRTOS task notification, digital open-drain release, IO_MUX input-buffer gating, driven-output input feedback, RTC GPIO wake, and pad hold work; physical pulls, drive strength, and electrical levels are not complete. |
-| S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior and all UART DMA modes are not claimed. |
-| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, and GP-SPI segmented/slave modes remain. |
+| S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; target-described UART TX producers route through the GPIO matrix with an idle-high pad state; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior, baud-rate edges, and all UART DMA modes are not claimed. |
+| S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; target-described GP-SPI clock/data/chip-select producers route through the GPIO matrix; stock Arduino Wire and I2C-slave gates, direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, GP-SPI wire edges, and segmented/slave modes remain. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_peripherals.c` exercises GP-SPI full-duplex GDMA | Full priority and peripheral interactions remain unverified. |
 | S3 SYSTEM/SYSCON clock and power policy | Partial (MMIO) | `tests/test_system_clock.c`, `tests/test_syscon_memory.c`, WLED/Marauder production audits | Both complete peripheral clock/reset banks and the 11-SRAM/3-ROM plus RF front-end memory policies have exact reset/readback state and semantic observers; effects are attached for selected modeled devices. Cache timing, unattached-device effects, and actual bank power loss remain unsupported. |
 | S3 cache/SRAM allocation and memory protection | Partial (MMIO) | `tests/test_sensitive_memprot.c`, `tests/test_esp32s3_extmem.c`, WLED production audit | Cache-array/internal-SRAM ownership has exact reset, masking, locks, and semantic state; protection configuration retains documented policy. Cache topology/timing and access-fault generation remain unsupported. |
@@ -62,7 +62,7 @@ even when a firmware workflow succeeds.
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path. One explicit demod diagnostic and two RMT memory-power-down diagnostics remain; DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
 | S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh`, WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
-| S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response and next prompt | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
+| S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response, next prompt, and zero unsupported accesses | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
 
 S3 UART0/1/2 now obey their independent
@@ -880,7 +880,9 @@ exercised under the S3 JIT rather than merely with JIT-capable code present. Its
 unsupported-access ceiling was 88 after the shared internal analog/private-PHY,
 modem clock/reset, and RTC digital-domain models described below. The ROM's
 read-modify-write baseband-clock capture protocol subsequently reduced that
-ceiling to 6. The GPS probe
+ceiling to 6. Target-described GP-SPI data producers and UART TX producers now
+make those last GPIO-matrix routes functional without board-pin or firmware-PC
+exceptions, reducing the same gate to zero unsupported accesses. The GPS probe
 makes the application-ready boundary occur near 5 billion aggregate cycles;
 the earlier 2-billion-cycle cutoff was a normal `WAITI` during those firmware
 delays, not a deadlock. Pin and replay that boundary with:
@@ -894,14 +896,14 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 The gate keeps the general sandbox transport connected through the initial
 prompt, sends the bytes for `help\n` through UART0, checks the firmware's
 command header and a representative entry, and requires a second prompt.
-The accepted run retains an upper bound of 6 unsupported accesses so the
-interaction cannot hide a register-model regression.
+The accepted run requires zero unsupported accesses so the interaction cannot
+hide a register-model regression. UART remains an aggregate-byte model with an
+idle-high pad, and GP-SPI remains an aggregate-transaction model; neither claim
+implies that fast mode synthesizes every serial wire edge.
 
 This is a controller-bootstrap compatibility boundary, not a claim that
 Bluetooth packets, scanning, coexistence timing, RF propagation, or the
-private analog PHY are complete. Unsupported-access diagnostics remain
-visible during the accepted boot instead of being converted into fake radio
-success.
+private analog PHY are complete.
 
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),

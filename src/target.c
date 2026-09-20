@@ -74,9 +74,12 @@ static const flexe_target_desc_t TARGETS[] = {
             .date_reset = 0x15122500u,
         },
         .uart = {
-            { .base = 0x3FF40000u, .interrupt_source = 34u },
-            { .base = 0x3FF50000u, .interrupt_source = 35u },
-            { .base = 0x3FF6E000u, .interrupt_source = 36u },
+            { .base = 0x3FF40000u, .interrupt_source = 34u,
+              .tx_output_signal = 14u },
+            { .base = 0x3FF50000u, .interrupt_source = 35u,
+              .tx_output_signal = 17u },
+            { .base = 0x3FF6E000u, .interrupt_source = 36u,
+              .tx_output_signal = 198u },
         },
         .i2c = {
             .register_size = 0x104u,
@@ -186,6 +189,7 @@ static const flexe_target_desc_t TARGETS[] = {
                 {
                     .base = 0x3FF64000u,
                     .clock_out_signal = 8u,
+                    .data_out_signal = { 9u, 10u, 12u, 13u },
                     .chip_select_out_signal = {
                         11u, 61u, 62u,
                         FLEXE_TARGET_MATRIX_SIGNAL_NONE,
@@ -193,6 +197,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_MATRIX_SIGNAL_NONE,
                     },
                     .interrupt_source = 30u,
+                    .data_out_signal_count = 4u,
                     .chip_select_count = 3u,
                     .iomux_clock_pin = 14u,
                     .iomux_chip_select0_pin = 15u,
@@ -202,6 +207,7 @@ static const flexe_target_desc_t TARGETS[] = {
                 {
                     .base = 0x3FF65000u,
                     .clock_out_signal = 63u,
+                    .data_out_signal = { 64u, 65u, 66u, 67u },
                     .chip_select_out_signal = {
                         68u, 69u, 70u,
                         FLEXE_TARGET_MATRIX_SIGNAL_NONE,
@@ -209,6 +215,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_MATRIX_SIGNAL_NONE,
                     },
                     .interrupt_source = 31u,
+                    .data_out_signal_count = 4u,
                     .chip_select_count = 3u,
                     .iomux_clock_pin = 18u,
                     .iomux_chip_select0_pin = 5u,
@@ -379,9 +386,12 @@ static const flexe_target_desc_t TARGETS[] = {
             .date_reset = 0x02008270u,
         },
         .uart = {
-            { .base = 0x60000000u, .interrupt_source = 27u },
-            { .base = 0x60010000u, .interrupt_source = 28u },
-            { .base = 0x6002E000u, .interrupt_source = 29u },
+            { .base = 0x60000000u, .interrupt_source = 27u,
+              .tx_output_signal = 12u },
+            { .base = 0x60010000u, .interrupt_source = 28u,
+              .tx_output_signal = 15u },
+            { .base = 0x6002E000u, .interrupt_source = 29u,
+              .tx_output_signal = 18u },
         },
         .i2c = {
             .register_size = 0x184u,
@@ -1340,10 +1350,15 @@ static const flexe_target_desc_t TARGETS[] = {
                 {
                     .base = 0x60024000u,
                     .clock_out_signal = 101u,
+                    .data_out_signal = {
+                        102u, 103u, 104u, 105u,
+                        106u, 107u, 108u, 109u,
+                    },
                     .chip_select_out_signal = {
                         110u, 111u, 112u, 113u, 114u, 115u,
                     },
                     .interrupt_source = 21u,
+                    .data_out_signal_count = 8u,
                     .chip_select_count = 6u,
                     .iomux_clock_pin = 12u,
                     .iomux_chip_select0_pin = 10u,
@@ -1353,6 +1368,7 @@ static const flexe_target_desc_t TARGETS[] = {
                 {
                     .base = 0x60025000u,
                     .clock_out_signal = 66u,
+                    .data_out_signal = { 67u, 68u, 69u, 70u },
                     .chip_select_out_signal = {
                         71u, 72u, 127u,
                         FLEXE_TARGET_MATRIX_SIGNAL_NONE,
@@ -1360,6 +1376,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_MATRIX_SIGNAL_NONE,
                     },
                     .interrupt_source = 22u,
+                    .data_out_signal_count = 4u,
                     .chip_select_count = 3u,
                     .iomux_clock_pin = FLEXE_TARGET_GPIO_NONE,
                     .iomux_chip_select0_pin = FLEXE_TARGET_GPIO_NONE,

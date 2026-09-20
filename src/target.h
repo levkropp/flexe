@@ -28,6 +28,9 @@
 #define FLEXE_TARGET_TIMER_GROUP_EVENT_MAX 3u
 #define FLEXE_TARGET_SPI_MEM_HOST_MAX 2u
 #define FLEXE_TARGET_GP_SPI_CS_MAX 6u
+#define FLEXE_TARGET_GP_SPI_DATA_MAX 8u
+#define FLEXE_TARGET_GPIO_MATRIX_OUTPUT_COUNT 512u
+#define FLEXE_TARGET_GPIO_MATRIX_SOFTWARE_OUTPUT 256u
 #define FLEXE_TARGET_INTERRUPT_CORE_MAX 2u
 #define FLEXE_TARGET_INTERRUPT_SOURCE_MAX 128u
 #define FLEXE_TARGET_SOFTWARE_INTERRUPT_MAX 4u
@@ -57,7 +60,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 55u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 56u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -163,6 +166,9 @@ typedef struct {
 typedef struct {
     uint32_t base;
     uint32_t interrupt_source;
+    /* GPIO-matrix TX producer. The functional UART model emits complete
+     * bytes and an idle-high pad state; it does not synthesize baud edges. */
+    uint16_t tx_output_signal;
 } flexe_uart_instance_desc_t;
 
 /* External I2C controller front end. ESP32 and ESP32-S3 retain the same
@@ -1090,8 +1096,13 @@ typedef enum {
 typedef struct {
     uint32_t base;
     uint16_t clock_out_signal;
+    /* Data outputs represented by the aggregate GP-SPI transaction model.
+     * Their matrix routes are functional even though fast mode does not emit
+     * individual serial clock/data edges. */
+    uint16_t data_out_signal[FLEXE_TARGET_GP_SPI_DATA_MAX];
     uint16_t chip_select_out_signal[FLEXE_TARGET_GP_SPI_CS_MAX];
     uint8_t  interrupt_source;
+    uint8_t  data_out_signal_count;
     uint8_t  chip_select_count;
     uint8_t  iomux_clock_pin;
     uint8_t  iomux_chip_select0_pin;
