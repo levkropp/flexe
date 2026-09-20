@@ -36,7 +36,7 @@ jobs:
       - name: Build
         run: cmake --build build --target xtensa-tests -j"$(nproc)"
       - name: Unit tests
-        run: ./build/xtensa-tests
+        run: ./build/xtensa-tests --quiet
 
   sanitizers:
     name: asan + ubsan
@@ -61,7 +61,7 @@ jobs:
           # forgets to tear down its emulator leaks a whole address space.
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./build-asan/xtensa-tests
+        run: ./build-asan/xtensa-tests --quiet
 
   # The JIT has two backends and only one of them is exercised by a host
   # build. A native aarch64 runner would be better, but a cross-compile at

@@ -12,6 +12,7 @@ extern int test_passes;
 extern int test_failures;
 void test_set_suite(const char *name);
 bool test_begin(const char *name);
+void test_end(const char *name, int failures_before);
 const char *test_build_symbol_elf(void);
 
 #define ASSERT_EQ(a, b) do { \
@@ -38,12 +39,9 @@ const char *test_build_symbol_elf(void);
 #define TEST(name) static void name(void)
 #define RUN_TEST(name) do { \
     if (!test_begin(#name)) break; \
-    printf("  %s... ", #name); \
     int _before = test_failures; \
     name(); \
-    test_count++; \
-    if (test_failures == _before) printf("ok\n"); \
-    else printf("\n"); \
+    test_end(#name, _before); \
 } while(0)
 
 #define TEST_SUITE(name) test_set_suite(name)

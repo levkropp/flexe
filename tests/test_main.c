@@ -13,6 +13,7 @@ static int test_filter_count;
 static int test_matches;
 static bool test_suite_printed;
 static bool test_list_only;
+static bool test_quiet;
 
 static unsigned char test_ascii_lower(unsigned char ch)
 {
@@ -61,11 +62,24 @@ bool test_begin(const char *name)
         printf("%s :: %s\n", test_suite, name);
         return false;
     }
-    if (!test_suite_printed) {
+    if (!test_quiet && !test_suite_printed) {
         printf("Suite: %s\n", test_suite);
         test_suite_printed = true;
     }
+    if (!test_quiet) printf("  %s... ", name);
     return true;
+}
+
+void test_end(const char *name, int failures_before)
+{
+    test_count++;
+    if (test_failures == failures_before) {
+        if (!test_quiet) printf("ok\n");
+    } else if (test_quiet) {
+        fprintf(stderr, "  FAILED %s :: %s\n", test_suite, name);
+    } else {
+        printf("\n");
+    }
 }
 
 #ifndef FLEXE_HAS_JIT
@@ -78,9 +92,10 @@ static void run_jit_tests(void)
 static void test_usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s [--list] [FILTER ...]\n"
+            "usage: %s [--list] [--quiet] [FILTER ...]\n"
             "Run all tests by default, or tests whose suite/test name "
-            "contains any FILTER.\n",
+            "contains any FILTER. --quiet prints only failures and the "
+            "summary.\n",
             program);
 }
 
@@ -89,6 +104,9 @@ int main(int argc, char **argv)
     for (int index = 1; index < argc; index++) {
         if (strcmp(argv[index], "--list") == 0) {
             test_list_only = true;
+        } else if (strcmp(argv[index], "-q") == 0 ||
+                   strcmp(argv[index], "--quiet") == 0) {
+            test_quiet = true;
         } else if (strcmp(argv[index], "-h") == 0 ||
                    strcmp(argv[index], "--help") == 0) {
             test_usage(argv[0]);
@@ -102,7 +120,8 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!test_list_only) printf("Running xtensa-emulator tests...\n\n");
+    if (!test_list_only && !test_quiet)
+        printf("Running xtensa-emulator tests...\n\n");
 
     run_decode_tests();
     run_alu_tests();
@@ -164,7 +183,8 @@ int main(int argc, char **argv)
         return 2;
     }
     if (test_list_only) return 0;
-    printf("\n%d tests, %d passed, %d failed\n",
+    printf(test_quiet ? "%d tests, %d passed, %d failed\n" :
+                        "\n%d tests, %d passed, %d failed\n",
            test_count, test_passes, test_failures);
     return test_failures > 0 ? 1 : 0;
 }

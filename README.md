@@ -110,6 +110,7 @@ assertions, and remaining board-specific coverage.
 cmake --build build --target xtensa-tests -j
 ./build/xtensa-tests
 ./build/xtensa-tests system_clock          # focused, case-insensitive filter
+./build/xtensa-tests --quiet                # failures and final totals only
 ./scripts/test-fixtures.sh                 # all Arduino hardware gates
 ./scripts/test-fixtures.sh spi-master i2c-wire
 ./scripts/check-stock-roms.sh              # curated external ROMs

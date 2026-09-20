@@ -19,13 +19,20 @@ error, which keeps misspelled focused checks from silently passing:
 ```sh
 ./build/xtensa-tests system_clock
 ./build/xtensa-tests --list rmt
+./build/xtensa-tests --quiet
 ```
+
+`--quiet` retains assertion diagnostics and the final totals without printing
+one line per passing test. It is the default CI form and keeps full-suite logs
+small during rapid hardware-model iterations.
 
 The suite covers instruction decode and execution, memory translation,
 register windows, exceptions, interrupts, peripheral registers and timing,
 FreeRTOS/service stubs, and both JIT backends. The encoding-space sweep compiles
 thousands of instruction forms and compares their architectural effects with
-the interpreter.
+the interpreter. Its cases reuse two independently backed machines and one JIT
+cache, with isolated instruction slots and bounded cache rollovers, so the
+exhaustive comparison does not allocate a complete emulator per encoding.
 
 For host-memory validation:
 
@@ -35,13 +42,14 @@ cmake -S . -B build-asan \
   -DNATIVE_ARCH=OFF \
   -DFLEXE_SANITIZERS=ON
 cmake --build build-asan --target xtensa-tests -j
-ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
   ./build-asan/xtensa-tests
 ```
 
 `FLEXE_SANITIZERS=ON` enables ASan+UBSan and disables LTO for this build, which
-keeps instrumented relinks dependency-scoped. Apple's ASan runtime does not
-provide LeakSanitizer; use `ASAN_OPTIONS=detect_leaks=0` on macOS.
+keeps instrumented relinks dependency-scoped. CI adds
+`ASAN_OPTIONS=detect_leaks=1` on Linux; Apple's ASan runtime does not provide
+LeakSanitizer.
 
 ## Compiled-firmware hardware gates
 

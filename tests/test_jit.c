@@ -2326,19 +2326,73 @@ TEST(test_waiti_time_is_not_counted_as_retired_instructions) {
  */
 #define FUZZ_SCRATCH 0x3FFE0000u
 #define FUZZ_PAD     4            /* NOP.N slots before the candidate */
+#define FUZZ_PROGRAM_STRIDE 32u
+#define FUZZ_PROGRAM_SLOTS  8192u /* BASE..0x400BFFFF instruction SRAM */
 
-static void fuzz_program(xtensa_cpu_t *cpu, uint32_t insn, int ilen,
-                         unsigned seed) {
-    setup(cpu);
+typedef struct {
+    xtensa_cpu_t interp;
+    xtensa_cpu_t native;
+    jit_state_t *jit;
+    unsigned next_slot;
+} fuzz_context_t;
+
+static bool fuzz_context_init(fuzz_context_t *ctx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    setup(&ctx->interp);
+    setup(&ctx->native);
+    if (ctx->interp.mem && ctx->native.mem)
+        ctx->jit = jit_init();
+    if (ctx->interp.mem && ctx->native.mem && ctx->jit) return true;
+    jit_destroy(ctx->jit);
+    teardown(&ctx->interp);
+    teardown(&ctx->native);
+    return false;
+}
+
+static void fuzz_context_destroy(fuzz_context_t *ctx)
+{
+    if (!ctx) return;
+    jit_destroy(ctx->jit);
+    teardown(&ctx->interp);
+    teardown(&ctx->native);
+}
+
+static uint32_t fuzz_next_pc(fuzz_context_t *ctx)
+{
+    if (ctx->next_slot == FUZZ_PROGRAM_SLOTS) {
+        /* Every live block has a distinct PC within instruction SRAM. Reuse
+         * the address range only after discarding the corresponding code. */
+        jit_flush(ctx->jit);
+        ctx->next_slot = 0u;
+    }
+    return BASE + FUZZ_PROGRAM_STRIDE * ctx->next_slot++;
+}
+
+static void fuzz_program(xtensa_cpu_t *cpu, uint32_t pc, uint32_t insn,
+                         int ilen, unsigned seed) {
+    /* The sweep used to allocate two complete machine memories and mmap a
+     * 128-MiB JIT cache for every case. Keep the independently backed
+     * machines, but reset only CPU state and the bytes each case consumes. */
+    xtensa_mem_t *mem = cpu->mem;
+    xtensa_cpu_init(cpu);
+    cpu->mem = mem;
+    cpu->pc = pc;
     for (unsigned i = 0; i < FUZZ_PAD; i++)
-        put_insn2(cpu, BASE + i * 2u, narrow(0xD, 15, 0, 3));   /* NOP.N */
-    if (ilen == 2) put_insn2(cpu, BASE + FUZZ_PAD * 2u, (uint16_t)insn);
-    else           put_insn3(cpu, BASE + FUZZ_PAD * 2u, insn);
+        put_insn2(cpu, pc + i * 2u, narrow(0xD, 15, 0, 3));   /* NOP.N */
+    uint32_t candidate_pc = pc + FUZZ_PAD * 2u;
+    if (ilen == 2) put_insn2(cpu, candidate_pc, (uint16_t)insn);
+    else           put_insn3(cpu, candidate_pc, insn);
     /* Trailing NOPs rather than a RET: a terminator would be part of the
      * block, and its target is a scratch pointer rather than code. */
     for (unsigned i = 0; i < 4u; i++)
-        put_insn2(cpu, BASE + FUZZ_PAD * 2u + (unsigned)ilen + i * 2u,
+        put_insn2(cpu, candidate_pc + (unsigned)ilen + i * 2u,
                   narrow(0xD, 15, 0, 3));
+    /* Bound every slot explicitly so a scan cannot consume a neighboring
+     * case after the address range rolls over. ILL.N itself stays interpreted
+     * and is never part of the compared native prefix. */
+    put_insn2(cpu, candidate_pc + (unsigned)ilen + 8u,
+              narrow(0xD, 15, 0, 2));
 
     /* Two register profiles. Profile 0 makes every register a distinct valid
      * scratch pointer, so whichever field an encoding treats as a base
@@ -2384,51 +2438,46 @@ static int fuzz_mem_differs(xtensa_cpu_t *a, xtensa_cpu_t *b, uint32_t pc,
 }
 
 /* Returns 1 if the case was actually compared, 0 if skipped. */
-static int fuzz_case(uint32_t insn, int ilen, unsigned seed) {
-    xtensa_cpu_t ic, jc;
+static int fuzz_case(fuzz_context_t *ctx, uint32_t insn, int ilen,
+                     unsigned seed) {
+    xtensa_cpu_t *ic = &ctx->interp;
+    xtensa_cpu_t *jc = &ctx->native;
+    uint32_t pc = fuzz_next_pc(ctx);
 
     /* The native block runs first because only its return value says how many
      * guest instructions it covered -- it may stop short of the candidate, or
      * run past it into the trailing NOPs. The interpreted reference then
      * replays exactly that many, so the two are always comparing the same
      * instruction sequence. */
-    fuzz_program(&jc, insn, ilen, seed);
-    jit_state_t *jit = jit_init();
-    if (!jit) { teardown(&jc); return 0; }
+    fuzz_program(jc, pc, insn, ilen, seed);
     for (int i = 0; i < JIT_HOT_THRESHOLD + 1; i++)
-        (void)jit_get_block(jit, &jc, BASE);
-    jit_block_fn fn = jit_get_block(jit, &jc, BASE);
-    if (!fn) { jit_destroy(jit); teardown(&jc); return 0; }
+        (void)jit_get_block(ctx->jit, jc, pc);
+    jit_block_fn fn = jit_get_block(ctx->jit, jc, pc);
+    if (!fn) return 0;
 
-    int ran = fn(&jc);
+    int ran = fn(jc);
     /* The block stopped before the candidate: the JIT declined to compile it
      * and the interpreter owns it. */
     if (ran < (int)FUZZ_PAD + 1) {
-        jit_destroy(jit); teardown(&jc); return 0;
+        return 0;
     }
 
-    fuzz_program(&ic, insn, ilen, seed);
-    run_interp(&ic, ran);
+    fuzz_program(ic, pc, insn, ilen, seed);
+    run_interp(ic, ran);
     /* Trapped, halted or rotated the window: not comparable work. */
-    if (ic.exception || ic.halted || !ic.running || ic.windowbase != 0 ||
-        jc.exception) {
-        jit_destroy(jit); teardown(&ic); teardown(&jc); return 0;
-    }
+    if (ic->exception || ic->halted || !ic->running || ic->windowbase != 0 ||
+        jc->exception) return 0;
 
     char name[32];
     snprintf(name, sizeof name, "fuzz:%06X/%d/%u", insn & 0xFFFFFF, ilen,
              seed & 1u);
-    int diffs = compare_state(&ic, &jc, name);
+    int diffs = compare_state(ic, jc, name);
     /* Memory is only comparable under profile 0. Profile 1's registers are
      * not addresses, so anything that stores lands somewhere arbitrary and
      * identical in both engines -- but not worth asserting on. */
     if ((seed & 1u) == 0u)
-        diffs += fuzz_mem_differs(&ic, &jc, insn, name);
+        diffs += fuzz_mem_differs(ic, jc, pc, name);
     if (diffs == 0) test_passes++; else test_failures += diffs;
-
-    jit_destroy(jit);
-    teardown(&ic);
-    teardown(&jc);
     return 1;
 }
 
@@ -2447,6 +2496,10 @@ TEST(test_jit_encoding_sweep_matches_interpreter) {
     const unsigned ntriples = (unsigned)(sizeof(rst) / sizeof(rst[0]));
     int compared = 0;
     unsigned seed = 1u;
+    fuzz_context_t context;
+    bool context_ready = fuzz_context_init(&context);
+    ASSERT_TRUE(context_ready);
+    if (!context_ready) return;
 
     /* 24-bit formats. For op0=0 the op1/op2 loops walk the QRST sub-opcode
      * space; for op0=2 (RRI8) the same bits are the 8-bit offset, so the
@@ -2464,8 +2517,9 @@ TEST(test_jit_encoding_sweep_matches_interpreter) {
                                     ((uint32_t)rst[k][1] << 8) |
                                     ((uint32_t)rst[k][0] << 12) |
                                     (op1 << 16) | (op2 << 20);
-                    compared += fuzz_case(insn, 3, seed * 2u);
-                    compared += fuzz_case(insn, 3, seed * 2u + 1u);
+                    compared += fuzz_case(&context, insn, 3, seed * 2u);
+                    compared += fuzz_case(
+                        &context, insn, 3, seed * 2u + 1u);
                     seed++;
                 }
             }
@@ -2478,11 +2532,13 @@ TEST(test_jit_encoding_sweep_matches_interpreter) {
             for (unsigned k = 0; k < ntriples; k++) {
                 uint32_t insn = op0 | ((uint32_t)rst[k][2] << 4) |
                                 ((uint32_t)rst[k][1] << 8) | (r << 12);
-                compared += fuzz_case(insn, 2, seed * 2u);
-                compared += fuzz_case(insn, 2, seed * 2u + 1u);
+                compared += fuzz_case(&context, insn, 2, seed * 2u);
+                compared += fuzz_case(
+                    &context, insn, 2, seed * 2u + 1u);
                 seed++;
             }
 
+    fuzz_context_destroy(&context);
     /* The sweep is only meaningful if it actually reached the emitter. */
     ASSERT_TRUE(compared > 200);
     fprintf(stderr, "  [sweep] %d encodings compiled and compared\n", compared);
