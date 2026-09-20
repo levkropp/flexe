@@ -105,7 +105,7 @@ if grep -q '^\[reset\] system reset requested' "$tmpdir/emu.err"; then
 fi
 
 unhandled=$(awk '/^Unhandled:/{print $2; exit}' "$tmpdir/emu.err")
-[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 88 ]] ||
+[[ -n "$unhandled" && "$unhandled" -gt 0 && "$unhandled" -le 6 ]] ||
     fail "unsupported-access count exceeded the accepted bootstrap baseline"
 jit_insns=$(awk '/^  Insns JIT:/{print $3; exit}' "$tmpdir/emu.err")
 [[ -n "$jit_insns" && "$jit_insns" -gt 0 ]] ||

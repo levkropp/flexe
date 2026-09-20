@@ -877,8 +877,10 @@ the native Wi-Fi stack, completes its LED and absent-GPS delays, and prints the
 v1.16.0 command prompt without an assertion, watchdog, or software reset. The
 gate now requires nonzero native instruction retirement, so this path is
 exercised under the S3 JIT rather than merely with JIT-capable code present. Its
-unsupported-access ceiling is 88 after the shared internal analog/private-PHY,
-modem clock/reset, and RTC digital-domain models described below. The GPS probe
+unsupported-access ceiling was 88 after the shared internal analog/private-PHY,
+modem clock/reset, and RTC digital-domain models described below. The ROM's
+read-modify-write baseband-clock capture protocol subsequently reduced that
+ceiling to 6. The GPS probe
 makes the application-ready boundary occur near 5 billion aggregate cycles;
 the earlier 2-billion-cycle cutoff was a normal `WAITI` during those firmware
 delays, not a deadlock. Pin and replay that boundary with:
@@ -892,7 +894,7 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 The gate keeps the general sandbox transport connected through the initial
 prompt, sends the bytes for `help\n` through UART0, checks the firmware's
 command header and a representative entry, and requires a second prompt.
-The accepted run retains an upper bound of 88 unsupported accesses so the
+The accepted run retains an upper bound of 6 unsupported accesses so the
 interaction cannot hide a register-model regression.
 
 This is a controller-bootstrap compatibility boundary, not a claim that

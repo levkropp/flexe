@@ -414,9 +414,32 @@ TEST(esp32s3_bt_time_latch_tracks_shared_guest_clock)
     mem_write32(mem, count, capture);
     ASSERT_EQ(mem_read32(mem, count), 3u);
     ASSERT_EQ(mem_read32(mem, phase), 623u);
+
+    /* The immutable ROM preserves the previous count while setting the
+     * capture bit. This is the production protocol, not a bare strobe. */
+    cpu1.virtual_time_us = 625u;
+    mem_write32(mem, count, mem_read32(mem, count) | capture);
+    ASSERT_EQ(mem_read32(mem, count), 4u);
+    ASSERT_EQ(mem_read32(mem, phase), 624u);
     ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
+    /* With its modem clock stopped, the request remains asserted and
+     * completes on the first observation after the clock resumes. */
+    mem_write32(mem, clock,
+                mem_read32(mem, clock) &
+                ~s3->radio.time_latch.clock_mask);
+    mem_write32(mem, count, mem_read32(mem, count) | capture);
+    ASSERT_EQ(mem_read32(mem, count), capture | 4u);
+    cpu1.virtual_time_us = 938u;
+    mem_write32(mem, clock,
+                mem_read32(mem, clock) |
+                s3->radio.time_latch.clock_mask);
+    ASSERT_EQ(mem_read32(mem, count), 5u);
+    ASSERT_EQ(mem_read32(mem, phase), 623u);
+    ASSERT_EQ(periph_unhandled_count(periph), 0u);
+
     mem_write32(mem, count, 0x12345u);
-    ASSERT_EQ(mem_read32(mem, count), 3u);
+    ASSERT_EQ(mem_read32(mem, count), 5u);
     ASSERT_EQ(periph_unhandled_count(periph), 1u);
 
     periph_destroy(periph);

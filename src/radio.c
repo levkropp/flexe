@@ -452,6 +452,11 @@ static uint32_t radio_read(void *ctx, uint32_t address)
     if (word && window >= 0 && radio_window_in_reset(
             radio, (unsigned)window))
         return *word;
+    const flexe_radio_time_latch_desc_t *latch = &desc->time_latch;
+    if (word && latch->count_address == address &&
+        (*word & latch->capture_mask) == latch->capture_mask &&
+        radio_clock_enabled(radio, latch->clock_mask))
+        radio_capture_time(radio);
     if (word) return *word;
     return radio->fallback_read ?
         radio->fallback_read(radio->fallback_ctx, address) : 0u;
@@ -478,11 +483,22 @@ static void radio_write(void *ctx, uint32_t address, uint32_t value)
 
     const flexe_radio_time_latch_desc_t *latch = &desc->time_latch;
     if (latch->count_address && address == latch->count_address) {
-        if ((value & latch->capture_mask) &&
-            radio_clock_enabled(radio, latch->clock_mask))
-            radio_capture_time(radio);
-        if (value != latch->capture_mask && radio->fallback_write)
+        uint32_t previous = *word;
+        bool request = (value & latch->capture_mask) ==
+                       latch->capture_mask;
+        bool valid = (value & ~(latch->capture_mask |
+                                latch->count_mask)) == 0u;
+        if (request && valid) {
+            /* The ROM read-modify-writes the capture command so an existing
+             * half-slot count accompanies the trigger. Keep the request
+             * pending while its modem clock is stopped; functional fast mode
+             * otherwise resolves and self-clears it at this boundary. */
+            *word = previous | latch->capture_mask;
+            if (radio_clock_enabled(radio, latch->clock_mask))
+                radio_capture_time(radio);
+        } else if (radio->fallback_write) {
             radio->fallback_write(radio->fallback_ctx, address, value);
+        }
         return;
     }
     if (latch->phase_address && address == latch->phase_address) {
