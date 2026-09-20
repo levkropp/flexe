@@ -7,6 +7,20 @@
 
 typedef struct flexe_gdma flexe_gdma_t;
 
+typedef void (*flexe_gdma_activity_fn)(void *ctx);
+
+/* One descriptor completed by a streaming peripheral. Unlike the existing
+ * fixed-length helpers below, a stream keeps following a non-null `next`
+ * pointer (including a circular list) and raises EOF independently for each
+ * descriptor. */
+typedef struct {
+    uint32_t descriptor_address;
+    uint32_t buffer_address;
+    size_t length;
+    bool eof;
+    bool chain_complete;
+} flexe_gdma_descriptor_t;
+
 /* The controller presents one level-sensitive interrupt per RX/TX channel.
  * `receive` selects the RX half; `level` is INT_RAW & INT_ENA != 0. */
 typedef void (*flexe_gdma_irq_changed_fn)(void *ctx, unsigned channel,
@@ -17,6 +31,13 @@ flexe_gdma_t *flexe_gdma_create(
     mmio_write_fn fallback_write, void *fallback_ctx,
     flexe_gdma_irq_changed_fn irq_changed, void *irq_ctx);
 void flexe_gdma_destroy(flexe_gdma_t *gdma);
+
+/* Notify one composed peripheral when guest programming changes a channel's
+ * route or running state. This is a scheduling hint; the peripheral must
+ * still query its own trigger ID before doing work. */
+void flexe_gdma_set_activity_handler(flexe_gdma_t *gdma,
+                                     flexe_gdma_activity_fn changed,
+                                     void *ctx);
 
 /* Whether a started TX descriptor stream is routed to this peripheral.
  * A peripheral enable bit may remain set after the driver intentionally
@@ -35,5 +56,22 @@ int flexe_gdma_read_tx(flexe_gdma_t *gdma, uint8_t peripheral_id,
  * as a target peripheral driving the GDMA input would. */
 int flexe_gdma_write_rx(flexe_gdma_t *gdma, uint8_t peripheral_id,
                         const uint8_t *data, size_t length);
+
+/* Descriptor-at-a-time transport for continuous devices. `pending_length`
+ * reports the next TX descriptor's valid byte count or the next RX
+ * descriptor's capacity without mutating channel state. Completion follows
+ * the descriptor's next pointer and parks only at the end of a finite chain
+ * or on an architectural error. */
+bool flexe_gdma_pending_length(const flexe_gdma_t *gdma,
+                               uint8_t peripheral_id, bool receive,
+                               size_t *length);
+int flexe_gdma_read_tx_descriptor(flexe_gdma_t *gdma,
+                                  uint8_t peripheral_id,
+                                  uint8_t *data, size_t capacity,
+                                  flexe_gdma_descriptor_t *completed);
+int flexe_gdma_write_rx_descriptor(flexe_gdma_t *gdma,
+                                   uint8_t peripheral_id,
+                                   const uint8_t *data, size_t length,
+                                   flexe_gdma_descriptor_t *completed);
 
 #endif /* FLEXE_GDMA_H */

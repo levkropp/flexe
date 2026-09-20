@@ -691,6 +691,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SENS_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GDMA_V1);
+    ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_I2S_V2);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_SHA_V1);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_GP_SPI);
     ASSERT_TRUE(s3->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF);
@@ -711,6 +712,14 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->gdma.channel_stride, 0xC0u);
     ASSERT_EQ(s3->gdma.channel_count, 5u);
     ASSERT_EQ(s3->gdma.descriptor_address_prefix, 0x3FC00000u);
+    ASSERT_EQ(s3->i2s_v2.instance_count, 2u);
+    ASSERT_EQ(s3->i2s_v2.register_size, 0x100u);
+    ASSERT_EQ(s3->i2s_v2.instance[0].base, 0x6000F000u);
+    ASSERT_EQ(s3->i2s_v2.instance[0].interrupt_source, 25u);
+    ASSERT_EQ(s3->i2s_v2.instance[0].gdma_peripheral_id, 3u);
+    ASSERT_EQ(s3->i2s_v2.instance[1].base, 0x6002D000u);
+    ASSERT_EQ(s3->i2s_v2.instance[1].interrupt_source, 26u);
+    ASSERT_EQ(s3->i2s_v2.instance[1].gdma_peripheral_id, 4u);
     ASSERT_EQ(s3->sha.base, 0x6003B000u);
     ASSERT_EQ(s3->sha.layout, FLEXE_SHA_LAYOUT_UNIFIED);
     ASSERT_EQ(s3->sha.mode_count, 8u);
@@ -726,7 +735,7 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
     ASSERT_EQ(s3->system_clock.sysclk_conf_offset, 0x60u);
     ASSERT_EQ(s3->system_clock.sysclk_conf_reset, 1u);
     ASSERT_EQ(s3->system_clock.register_count, 8u);
-    ASSERT_EQ(s3->system_clock.gate_count, 14u);
+    ASSERT_EQ(s3->system_clock.gate_count, 16u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.bank_count, 2u);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[0], UINT32_MAX);
     ASSERT_EQ(s3->system_clock.peripheral_banks.valid_mask[1], 0x7FFu);
@@ -761,6 +770,14 @@ TEST(target_descriptors_are_stable_and_parse_aliases) {
               FLEXE_SYSTEM_DEVICE_EDMA);
     ASSERT_EQ(s3->system_clock.gate[13].clock_mask, 1u);
     ASSERT_EQ(s3->system_clock.gate[13].reset_mask, 1u << 1);
+    ASSERT_EQ(s3->system_clock.gate[14].device,
+              FLEXE_SYSTEM_DEVICE_I2S);
+    ASSERT_EQ(s3->system_clock.gate[14].instance, 0u);
+    ASSERT_EQ(s3->system_clock.gate[14].clock_mask, 1u << 4);
+    ASSERT_EQ(s3->system_clock.gate[15].device,
+              FLEXE_SYSTEM_DEVICE_I2S);
+    ASSERT_EQ(s3->system_clock.gate[15].instance, 1u);
+    ASSERT_EQ(s3->system_clock.gate[15].clock_mask, 1u << 21);
     ASSERT_EQ(s3->rtc_cntl.wdt_pause_in_sleep_mask, 1u << 9);
     ASSERT_EQ(s3->io_mux.base, 0x60009000u);
     ASSERT_EQ(s3->io_mux.gpio_count, 49u);

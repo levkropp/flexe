@@ -147,6 +147,7 @@ int main(int argc, char **argv)
     run_systimer_tests();
     run_timer_group_target_tests();
     run_rmt_v1_tests();
+    run_i2s_v2_tests();
     run_ledc_v1_tests();
     run_usb_serial_jtag_tests();
     run_spi_mem_tests();

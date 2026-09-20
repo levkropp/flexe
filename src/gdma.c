@@ -84,6 +84,7 @@
 
 typedef struct {
     uint32_t link_address;
+    uint32_t next_desc;
     uint32_t current_desc;
     uint32_t previous_desc;
     bool active;
@@ -91,6 +92,7 @@ typedef struct {
 
 typedef struct {
     uint32_t link_address;
+    uint32_t next_desc;
     uint32_t current_desc;
     uint32_t previous_desc;
     bool auto_return;
@@ -105,6 +107,8 @@ struct flexe_gdma {
     void *fallback_ctx;
     flexe_gdma_irq_changed_fn irq_changed;
     void *irq_ctx;
+    flexe_gdma_activity_fn activity_changed;
+    void *activity_ctx;
     bool rx_irq_level[FLEXE_TARGET_GDMA_CHANNEL_MAX];
     bool tx_irq_level[FLEXE_TARGET_GDMA_CHANNEL_MAX];
     uint32_t *regs;
@@ -205,6 +209,7 @@ static void gdma_update_irq(flexe_gdma_t *gdma, unsigned channel,
 static void gdma_rx_reset_fsm(flexe_gdma_t *gdma, unsigned channel)
 {
     gdma_rx_channel_t *rx = &gdma->rx[channel];
+    rx->next_desc = 0u;
     rx->current_desc = 0u;
     rx->previous_desc = 0u;
     rx->active = false;
@@ -249,6 +254,7 @@ static void gdma_rx_power_on_reset(flexe_gdma_t *gdma, unsigned channel)
 static void gdma_tx_reset_fsm(flexe_gdma_t *gdma, unsigned channel)
 {
     gdma_tx_channel_t *tx = &gdma->tx[channel];
+    tx->next_desc = 0u;
     tx->current_desc = 0u;
     tx->previous_desc = 0u;
     tx->active = false;
@@ -349,6 +355,8 @@ static void gdma_write(void *ctx, uint32_t addr, uint32_t value)
     if (off == GDMA_V1_IN_CONF0_OFF) {
         if (value & GDMA_V1_IN_RESET) gdma_rx_reset_fsm(gdma, channel);
         *reg = value & ~GDMA_V1_IN_RESET;
+        if (gdma->activity_changed)
+            gdma->activity_changed(gdma->activity_ctx);
         return;
     }
     if (off == GDMA_V1_IN_INT_ST_OFF || off == GDMA_V1_IN_STATE_OFF ||
@@ -374,20 +382,29 @@ static void gdma_write(void *ctx, uint32_t addr, uint32_t value)
         rx->link_address = value & GDMA_V1_LINK_ADDR_MASK;
         rx->auto_return = (value & GDMA_V1_IN_LINK_AUTO_RETURN) != 0u;
         if (value & GDMA_V1_IN_LINK_STOP) rx->active = false;
-        if (value & (GDMA_V1_IN_LINK_START | GDMA_V1_IN_LINK_RESTART))
+        if (value & (GDMA_V1_IN_LINK_START | GDMA_V1_IN_LINK_RESTART)) {
             rx->active = true;
+            rx->next_desc = desc->descriptor_address_prefix |
+                            rx->link_address;
+        }
         *reg = rx->link_address |
                (rx->auto_return ? GDMA_V1_IN_LINK_AUTO_RETURN : 0u) |
                (rx->active ? 0u : GDMA_V1_IN_LINK_PARK);
+        if (gdma->activity_changed)
+            gdma->activity_changed(gdma->activity_ctx);
         return;
     }
     if (off == GDMA_V1_IN_PERI_SEL_OFF) {
         *reg = value & GDMA_V1_PERI_SEL_MASK;
+        if (gdma->activity_changed)
+            gdma->activity_changed(gdma->activity_ctx);
         return;
     }
     if (off == GDMA_V1_OUT_CONF0_OFF) {
         if (value & GDMA_V1_OUT_RESET) gdma_tx_reset_fsm(gdma, channel);
         *reg = value & ~GDMA_V1_OUT_RESET;
+        if (gdma->activity_changed)
+            gdma->activity_changed(gdma->activity_ctx);
         return;
     }
     if (off == GDMA_V1_OUT_INT_ST_OFF || off == GDMA_V1_OUT_STATE_OFF ||
@@ -412,13 +429,20 @@ static void gdma_write(void *ctx, uint32_t addr, uint32_t value)
         gdma_tx_channel_t *tx = &gdma->tx[channel];
         tx->link_address = value & GDMA_V1_LINK_ADDR_MASK;
         if (value & GDMA_V1_LINK_STOP) tx->active = false;
-        if (value & (GDMA_V1_LINK_START | GDMA_V1_LINK_RESTART))
+        if (value & (GDMA_V1_LINK_START | GDMA_V1_LINK_RESTART)) {
             tx->active = true;
+            tx->next_desc = desc->descriptor_address_prefix |
+                            tx->link_address;
+        }
         *reg = tx->link_address | (tx->active ? 0u : GDMA_V1_LINK_PARK);
+        if (gdma->activity_changed)
+            gdma->activity_changed(gdma->activity_ctx);
         return;
     }
     if (off == GDMA_V1_OUT_PERI_SEL_OFF) {
         *reg = value & GDMA_V1_PERI_SEL_MASK;
+        if (gdma->activity_changed)
+            gdma->activity_changed(gdma->activity_ctx);
         return;
     }
     *reg = value;
@@ -601,6 +625,227 @@ bool flexe_gdma_tx_active(const flexe_gdma_t *gdma, uint8_t peripheral_id)
     return gdma_active_tx_channel(gdma, peripheral_id) >= 0;
 }
 
+static int gdma_active_rx_channel(const flexe_gdma_t *gdma,
+                                  uint8_t peripheral_id)
+{
+    if (!gdma) return -1;
+    const flexe_gdma_desc_t *geometry = &gdma->target->gdma;
+    for (unsigned i = 0u; i < geometry->channel_count; i++) {
+        uint32_t addr = gdma_channel_addr(
+            gdma, i, GDMA_V1_IN_PERI_SEL_OFF);
+        uint32_t peri = gdma->regs[(addr - geometry->base) / sizeof(uint32_t)];
+        if (gdma->rx[i].active &&
+            (peri & GDMA_V1_PERI_SEL_MASK) == peripheral_id)
+            return (int)i;
+    }
+    return -1;
+}
+
+bool flexe_gdma_pending_length(const flexe_gdma_t *gdma,
+                               uint8_t peripheral_id, bool receive,
+                               size_t *length)
+{
+    if (!gdma || !length) return false;
+    int selected = receive ?
+        gdma_active_rx_channel(gdma, peripheral_id) :
+        gdma_active_tx_channel(gdma, peripheral_id);
+    if (selected < 0) return false;
+    unsigned channel = (unsigned)selected;
+    const flexe_gdma_desc_t *geometry = &gdma->target->gdma;
+    uint32_t descriptor = receive ? gdma->rx[channel].next_desc :
+                                    gdma->tx[channel].next_desc;
+    if (!descriptor)
+        descriptor = geometry->descriptor_address_prefix |
+            (receive ? gdma->rx[channel].link_address :
+                       gdma->tx[channel].link_address);
+    if ((descriptor & 3u) != 0u ||
+        !gdma_ram_range_valid(gdma->mem, descriptor,
+                              GDMA_V1_DESC_BYTES, false))
+        return false;
+    uint32_t control = mem_read32(gdma->mem, descriptor);
+    *length = receive ? control & GDMA_V1_DESC_SIZE_MASK :
+        (control & GDMA_V1_DESC_LENGTH_MASK) >> GDMA_V1_DESC_LENGTH_SHIFT;
+    return *length != 0u;
+}
+
+static void gdma_tx_advance_status(flexe_gdma_t *gdma, unsigned channel,
+                                   uint32_t descriptor)
+{
+    gdma_tx_channel_t *tx = &gdma->tx[channel];
+    tx->previous_desc = tx->current_desc;
+    tx->current_desc = descriptor;
+    uint32_t *current = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_DESC_OFF));
+    uint32_t *previous = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_DESC_PREV_OFF));
+    uint32_t *previous2 = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_DESC_PREV2_OFF));
+    if (previous2) *previous2 = previous ? *previous : 0u;
+    if (previous) *previous = current ? *current : 0u;
+    if (current) *current = descriptor;
+}
+
+static void gdma_rx_advance_status(flexe_gdma_t *gdma, unsigned channel,
+                                   uint32_t descriptor)
+{
+    gdma_rx_channel_t *rx = &gdma->rx[channel];
+    rx->previous_desc = rx->current_desc;
+    rx->current_desc = descriptor;
+    uint32_t *current = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_IN_DESC_OFF));
+    uint32_t *previous = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_IN_DESC_PREV_OFF));
+    uint32_t *previous2 = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_IN_DESC_PREV2_OFF));
+    if (previous2) *previous2 = previous ? *previous : 0u;
+    if (previous) *previous = current ? *current : 0u;
+    if (current) *current = descriptor;
+}
+
+int flexe_gdma_read_tx_descriptor(flexe_gdma_t *gdma,
+                                  uint8_t peripheral_id,
+                                  uint8_t *data, size_t capacity,
+                                  flexe_gdma_descriptor_t *completed)
+{
+    if (!gdma || (!data && capacity != 0u)) return -1;
+    int selected = gdma_active_tx_channel(gdma, peripheral_id);
+    if (selected < 0) return -1;
+    unsigned channel = (unsigned)selected;
+    gdma_tx_channel_t *tx = &gdma->tx[channel];
+    const flexe_gdma_desc_t *geometry = &gdma->target->gdma;
+    uint32_t descriptor = tx->next_desc ? tx->next_desc :
+        geometry->descriptor_address_prefix | tx->link_address;
+    uint32_t *conf0 = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_CONF0_OFF));
+    uint32_t *conf1 = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_CONF1_OFF));
+    bool auto_writeback = conf0 && (*conf0 & GDMA_V1_OUT_AUTO_WRBACK) != 0u;
+    bool check_owner = conf1 && (*conf1 & GDMA_V1_OUT_CHECK_OWNER) != 0u;
+    if ((descriptor & 3u) != 0u ||
+        !gdma_ram_range_valid(gdma->mem, descriptor,
+                              GDMA_V1_DESC_BYTES, auto_writeback)) {
+        tx->current_desc = descriptor;
+        gdma_tx_finish(gdma, channel, false, false);
+        return -1;
+    }
+    uint32_t control = mem_read32(gdma->mem, descriptor);
+    uint32_t buffer = mem_read32(gdma->mem, descriptor + 4u);
+    uint32_t next = mem_read32(gdma->mem, descriptor + 8u);
+    size_t size = control & GDMA_V1_DESC_SIZE_MASK;
+    size_t valid = (control & GDMA_V1_DESC_LENGTH_MASK) >>
+                   GDMA_V1_DESC_LENGTH_SHIFT;
+    bool eof = (control & GDMA_V1_DESC_EOF) != 0u;
+    if ((check_owner && (control & GDMA_V1_DESC_OWNER) == 0u) ||
+        valid == 0u || valid > size || valid > capacity ||
+        !gdma_ram_range_valid(gdma->mem, buffer, valid, false)) {
+        tx->current_desc = descriptor;
+        gdma_tx_finish(gdma, channel, false, false);
+        return -1;
+    }
+    for (size_t i = 0u; i < valid; i++)
+        data[i] = mem_read8(gdma->mem, buffer + (uint32_t)i);
+    gdma_tx_advance_status(gdma, channel, descriptor);
+    if (auto_writeback)
+        mem_write32(gdma->mem, descriptor,
+                    control & ~GDMA_V1_DESC_OWNER);
+    uint32_t *raw = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_INT_RAW_OFF));
+    uint32_t *eof_desc = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_EOF_DESC_OFF));
+    uint32_t *eof_prev = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_OUT_EOF_PREV_OFF));
+    if (raw)
+        *raw |= GDMA_V1_OUT_DONE_INT |
+                (eof ? GDMA_V1_OUT_EOF_INT : 0u) |
+                (next == 0u ? GDMA_V1_OUT_TOTAL_EOF_INT : 0u);
+    if (eof && eof_desc) *eof_desc = descriptor;
+    if (eof && eof_prev) *eof_prev = tx->previous_desc;
+    tx->next_desc = next;
+    if (!next) {
+        tx->active = false;
+        uint32_t *link = gdma_reg(gdma, gdma_channel_addr(
+            gdma, channel, GDMA_V1_OUT_LINK_OFF));
+        if (link) *link = tx->link_address | GDMA_V1_LINK_PARK;
+    }
+    gdma_update_irq(gdma, channel, false);
+    if (completed) {
+        completed->descriptor_address = descriptor;
+        completed->buffer_address = buffer;
+        completed->length = valid;
+        completed->eof = eof;
+        completed->chain_complete = next == 0u;
+    }
+    return 0;
+}
+
+int flexe_gdma_write_rx_descriptor(flexe_gdma_t *gdma,
+                                   uint8_t peripheral_id,
+                                   const uint8_t *data, size_t length,
+                                   flexe_gdma_descriptor_t *completed)
+{
+    if (!gdma || (!data && length != 0u)) return -1;
+    int selected = gdma_active_rx_channel(gdma, peripheral_id);
+    if (selected < 0) return -1;
+    unsigned channel = (unsigned)selected;
+    gdma_rx_channel_t *rx = &gdma->rx[channel];
+    const flexe_gdma_desc_t *geometry = &gdma->target->gdma;
+    uint32_t descriptor = rx->next_desc ? rx->next_desc :
+        geometry->descriptor_address_prefix | rx->link_address;
+    uint32_t *conf1 = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_IN_CONF1_OFF));
+    bool check_owner = conf1 && (*conf1 & GDMA_V1_IN_CHECK_OWNER) != 0u;
+    if ((descriptor & 3u) != 0u ||
+        !gdma_ram_range_valid(gdma->mem, descriptor,
+                              GDMA_V1_DESC_BYTES, true)) {
+        rx->current_desc = descriptor;
+        gdma_rx_finish(gdma, channel, GDMA_V1_IN_DSCR_ERR_INT);
+        return -1;
+    }
+    uint32_t control = mem_read32(gdma->mem, descriptor);
+    uint32_t buffer = mem_read32(gdma->mem, descriptor + 4u);
+    uint32_t next = mem_read32(gdma->mem, descriptor + 8u);
+    size_t size = control & GDMA_V1_DESC_SIZE_MASK;
+    if ((check_owner && (control & GDMA_V1_DESC_OWNER) == 0u) ||
+        length == 0u || length > size ||
+        !gdma_ram_range_valid(gdma->mem, buffer, length, true)) {
+        rx->current_desc = descriptor;
+        gdma_rx_finish(gdma, channel, GDMA_V1_IN_DSCR_ERR_INT);
+        return -1;
+    }
+    for (size_t i = 0u; i < length; i++)
+        mem_write8(gdma->mem, buffer + (uint32_t)i, data[i]);
+    gdma_rx_advance_status(gdma, channel, descriptor);
+    control &= ~(GDMA_V1_DESC_OWNER | GDMA_V1_DESC_LENGTH_MASK);
+    control |= ((uint32_t)length << GDMA_V1_DESC_LENGTH_SHIFT) &
+               GDMA_V1_DESC_LENGTH_MASK;
+    mem_write32(gdma->mem, descriptor, control);
+    uint32_t *raw = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_IN_INT_RAW_OFF));
+    uint32_t *success_desc = gdma_reg(gdma, gdma_channel_addr(
+        gdma, channel, GDMA_V1_IN_SUC_EOF_DESC_OFF));
+    if (raw) *raw |= GDMA_V1_IN_DONE_INT | GDMA_V1_IN_SUC_EOF_INT;
+    if (success_desc) *success_desc = descriptor;
+    rx->next_desc = next;
+    if (!next) {
+        rx->active = false;
+        uint32_t *link = gdma_reg(gdma, gdma_channel_addr(
+            gdma, channel, GDMA_V1_IN_LINK_OFF));
+        if (link)
+            *link = rx->link_address |
+                    (rx->auto_return ? GDMA_V1_IN_LINK_AUTO_RETURN : 0u) |
+                    GDMA_V1_IN_LINK_PARK;
+    }
+    gdma_update_irq(gdma, channel, true);
+    if (completed) {
+        completed->descriptor_address = descriptor;
+        completed->buffer_address = buffer;
+        completed->length = length;
+        completed->eof = true;
+        completed->chain_complete = next == 0u;
+    }
+    return 0;
+}
+
 int flexe_gdma_read_tx(flexe_gdma_t *gdma, uint8_t peripheral_id,
                        uint8_t *data, size_t length)
 {
@@ -717,6 +962,15 @@ flexe_gdma_t *flexe_gdma_create(
         return NULL;
     }
     return gdma;
+}
+
+void flexe_gdma_set_activity_handler(flexe_gdma_t *gdma,
+                                     flexe_gdma_activity_fn changed,
+                                     void *ctx)
+{
+    if (!gdma) return;
+    gdma->activity_changed = changed;
+    gdma->activity_ctx = changed ? ctx : NULL;
 }
 
 void flexe_gdma_destroy(flexe_gdma_t *gdma)

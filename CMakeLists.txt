@@ -112,6 +112,7 @@ set(LIB_SOURCES
     src/apb_saradc.c
     src/gpio.c
     src/gdma.c
+    src/i2s_v2.c
     src/rmt_v1.c
     src/io_mux.c
     src/rtc_cntl.c
@@ -256,6 +257,7 @@ set(TEST_SOURCES
     tests/test_systimer.c
     tests/test_timer_group.c
     tests/test_rmt_v1.c
+    tests/test_i2s_v2.c
     tests/test_ledc_v1.c
     tests/test_usb_serial_jtag.c
     tests/test_spi_mem.c
@@ -353,6 +355,7 @@ if(UNIX)
     add_flexe_runner(flexe-s3-idf-usb-serial-jtag-test s3_idf_usb_serial_jtag_test.c)
     add_flexe_runner(flexe-s3-idf-gpio-isr-test s3_idf_gpio_isr_test.c)
     add_flexe_runner(flexe-s3-idf-i2c-master-test s3_idf_i2c_master_test.c)
+    add_flexe_runner(flexe-s3-idf-i2s-std-test s3_idf_i2s_std_test.c)
     add_flexe_runner(flexe-rtc-gpio-test rtc_gpio_test.c)
     add_flexe_runner(flexe-rtc-i2c-test rtc_i2c_test.c)
     add_flexe_runner(flexe-scheduler-test scheduler_test.c)

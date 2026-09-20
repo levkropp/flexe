@@ -367,7 +367,8 @@ int periph_emac_phy_get_reg(const esp32_periph_t *p, uint8_t phy_address,
 int periph_emac_rx_inject(esp32_periph_t *p, const uint8_t *frame,
                           size_t len);
 
-/* Attach a TX audio sink and inject bytes for RX DMA. I2S ports 0/1 are
+/* Attach a TX audio sink and inject bytes for RX DMA. Classic local DMA and
+ * target-described I2S v2/GDMA expose the same host contract. Ports 0/1 are
  * independent; the RX FIFO accepts as many bytes as fit and zero-fills when
  * firmware consumes faster than the host supplies. */
 int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,

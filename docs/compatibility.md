@@ -15,6 +15,7 @@ execution for the common windowed LX7 instruction profile, native memory map,
 flash/cache-MMU windows, mask ROM, dual-core startup, system timer, timer
 groups and main watchdogs, SPI-memory controllers,
 general-purpose SPI2/SPI3 controllers and bidirectional AHB GDMA,
+I2S0/I2S1 v2 controllers with timed circular-GDMA transport,
 CPU/system-clock selection, RTC boot-handoff storage, live slow-clock and
 power-on reset state, RTC interrupt aggregation and watchdog, a read-only
 revision-0 eFuse profile, digital pad configuration, UARTs, native USB
@@ -240,6 +241,20 @@ Slave mode, segmented/config-buffer transactions, bus arbitration, signal
 edges, and clock-derived transfer duration remain outside this functional envelope.
 Unsupported framing and invalid DMA setup are diagnosed instead of silently
 reported as successful transfers.
+
+The S3 I2S v2 model is also selected entirely by target geometry: the two
+controller bases, SYSTEM clock/reset bits, interrupt sources, GDMA trigger
+IDs, source clocks, and GPIO-matrix producers are descriptor data. Standard
+master TX and host-fed RX advance one GDMA descriptor at a time on a shared
+dual-core virtual timeline; finite and circular lists retain the controller's
+ownership, EOF, completion, park, and level-interrupt behavior. The pinned
+ESP-IDF 5.3.2 `s3_idf_i2s_std` fixture uses the stock standard-mode driver to
+preload a four-descriptor ring and complete two blocking 48 kHz, stereo,
+16-bit writes. `scripts/check-s3-idf-i2s-std.sh` runs interpreter and JIT in
+parallel and requires identical payload, metadata, BCLK/WS/data matrix routes,
+and zero unsupported MMIO. It does not claim wire-level clock/data edges,
+PDM, slave/external clocks, calibrated underrun latency, or general audio-codec
+behavior.
 
 The S3 SHA model uses target-described mode mappings and consumes the active
 AHB GDMA v1 transmit chain selected for SHA, including chained descriptors,

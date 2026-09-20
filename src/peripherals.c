@@ -8,6 +8,7 @@
 #include "gdma.h"
 #include "gpio.h"
 #include "io_mux.h"
+#include "i2s_v2.h"
 #include "rtc_cntl.h"
 #include "rtc_io.h"
 #include "regi2c.h"
@@ -1150,6 +1151,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
     X(SDMMC,    sdmmc_next_fire,    sdmmc_eval_events,    false) \
     X(TWAI,     twai_next_fire,     twai_eval_events,     false) \
     X(I2S,      i2s_next_fire,      i2s_eval_events,      false) \
+    X(I2S_V2,   i2s_v2_next_fire,   i2s_v2_eval_events,   false) \
     X(RMT,      rmt_next_fire,      rmt_eval_events,      false) \
     X(RMT_V1,   rmt_v1_next_fire,   rmt_v1_eval_events,   false) \
     X(LEDC,     ledc_next_fire,     ledc_eval_events,     true)  \
@@ -1222,6 +1224,13 @@ static void emac_reset_state(esp32_periph_t *p);
 static void emac_dport_update(esp32_periph_t *p);
 static uint32_t i2s_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void i2s_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static uint32_t i2s_v2_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void i2s_v2_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
+static void i2s_v2_state_changed(void *ctx);
+static void i2s_v2_irq_changed(void *ctx, unsigned port, bool level);
+static void i2s_v2_emit_tx(void *ctx, int port, const uint8_t *data,
+                           size_t len, uint32_t sample_rate,
+                           uint8_t bits_per_sample, uint8_t channels);
 static uint32_t rmt_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void rmt_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu);
 static void rmt_reset_state(esp32_periph_t *p);
@@ -1843,6 +1852,7 @@ struct esp32_periph {
     flexe_esp32s3_extmem_t *s3_extmem;
     flexe_efuse_t *target_efuse;
     flexe_gdma_t *gdma;
+    flexe_i2s_v2_t *i2s_v2;
     flexe_gp_spi_t *gp_spi;
     flexe_rmt_v1_t *rmt_v1;
     uint64_t rmt_tx_edge_cycle;
@@ -14103,6 +14113,10 @@ static void system_clock_gate_changed(
         /* The control state is queryable and attachable even though no
          * external-memory DMA data engine is present yet. */
         break;
+    case FLEXE_SYSTEM_DEVICE_I2S:
+        flexe_i2s_v2_set_system_state(
+            p->i2s_v2, instance, clock_enabled, reset_asserted);
+        break;
     case FLEXE_SYSTEM_DEVICE_NONE:
         return;
     }
@@ -14198,6 +14212,61 @@ static void target_timer_group_reset_requested(
                 "[reset] timer-group %u watchdog action %d requested reset\n",
                 group, (int)action);
     if (p) p->reset_requested = true;
+}
+
+/* ---- Target-described I2S v2 + central GDMA ---- */
+
+static uint32_t i2s_v2_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu)
+{
+    return p && p->i2s_v2 ?
+        flexe_i2s_v2_next_event(p->i2s_v2, cpu) : UINT32_MAX;
+}
+
+static void i2s_v2_eval_events(esp32_periph_t *p, xtensa_cpu_t *cpu)
+{
+    (void)cpu;
+    if (p && p->i2s_v2) flexe_i2s_v2_eval(p->i2s_v2);
+}
+
+static void i2s_v2_state_changed(void *ctx)
+{
+    esp32_periph_t *p = ctx;
+    if (!p) return;
+    periph_event_source_changed(p, PERIPH_EVENT_I2S_V2);
+    for (unsigned core = 0u; core < 2u; core++)
+        if (p->cpu[core]) xtensa_recompute_next_timer(p->cpu[core]);
+}
+
+static void i2s_v2_irq_changed(void *ctx, unsigned port, bool level)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || !p->i2s_v2 ||
+        port >= p->target->i2s_v2.instance_count)
+        return;
+    int source = p->target->i2s_v2.instance[port].interrupt_source;
+    if (level) periph_assert_interrupt(p, source);
+    else periph_deassert_interrupt(p, source);
+}
+
+static void i2s_v2_emit_tx(void *ctx, int port, const uint8_t *data,
+                           size_t len, uint32_t sample_rate,
+                           uint8_t bits_per_sample, uint8_t channels)
+{
+    esp32_periph_t *p = ctx;
+    if (!p || port < 0 || port >= I2S_PORT_COUNT) return;
+    i2s_state_t *state = &p->i2s[port];
+    if (state->tx_cb)
+        state->tx_cb(state->tx_cb_ctx, port, data, len, sample_rate,
+                     bits_per_sample, channels);
+
+    sbx_event_t event = { .kind = SBX_EV_I2S_TX, .cycle = 0 };
+    event.i2s_tx.port = (uint8_t)port;
+    event.i2s_tx.bits_per_sample = bits_per_sample;
+    event.i2s_tx.channels = channels;
+    event.i2s_tx.len = (uint16_t)len;
+    event.i2s_tx.sample_rate = sample_rate;
+    event.i2s_tx.data = data;
+    sbx_events_emit(&event);
 }
 
 static uint32_t rmt_v1_next_fire(esp32_periph_t *p, xtensa_cpu_t *cpu)
@@ -14806,6 +14875,39 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         }
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_I2S_V2) {
+        p->i2s_v2 = flexe_i2s_v2_create(
+            mem, p->gdma, default_read, default_write, p,
+            i2s_v2_state_changed, p, i2s_v2_irq_changed, p);
+        if (!p->i2s_v2) {
+            periph_destroy(p);
+            return NULL;
+        }
+        for (unsigned port = 0u;
+             port < target->i2s_v2.instance_count; port++) {
+            const flexe_i2s_v2_instance_desc_t *instance =
+                &target->i2s_v2.instance[port];
+            (void)flexe_i2s_v2_set_tx_callback(
+                p->i2s_v2, port, i2s_v2_emit_tx, p);
+            if (!p->target_gpio) continue;
+            const uint16_t clocks[] = {
+                instance->mclk_output_signal,
+                instance->tx_bck_output_signal,
+                instance->tx_ws_output_signal,
+                instance->rx_bck_output_signal,
+                instance->rx_ws_output_signal,
+            };
+            for (size_t index = 0u;
+                 index < sizeof(clocks) / sizeof(clocks[0]); index++)
+                flexe_gpio_set_output_signal_modeled(
+                    p->target_gpio, clocks[index]);
+            for (unsigned data = 0u;
+                 data < instance->data_output_count; data++)
+                flexe_gpio_set_output_signal_modeled(
+                    p->target_gpio, instance->data_output_signal[data]);
+        }
+    }
+
     if (target->capabilities & FLEXE_TARGET_CAP_GP_SPI) {
         p->gp_spi = flexe_gp_spi_create(
             p, default_read, default_write, p);
@@ -15330,6 +15432,8 @@ void periph_destroy(esp32_periph_t *p) {
     p->gp_spi = NULL;
     flexe_rmt_v1_destroy(p->rmt_v1);
     p->rmt_v1 = NULL;
+    flexe_i2s_v2_destroy(p->i2s_v2);
+    p->i2s_v2 = NULL;
     flexe_gdma_destroy(p->gdma);
     flexe_spi_mem_destroy(p->spi_mem);
     flexe_timer_group_destroy(p->target_timer_group);
@@ -15682,7 +15786,10 @@ void periph_i2c_attachments_restore(
 
 int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,
                                periph_i2s_tx_fn fn, void *ctx) {
-    if (!p || port < 0 || port >= I2S_PORT_COUNT) return -1;
+    if (!p || port < 0 || port >= I2S_PORT_COUNT ||
+        (p->i2s_v2 &&
+         (unsigned)port >= p->target->i2s_v2.instance_count))
+        return -1;
     p->i2s[port].tx_cb = fn;
     p->i2s[port].tx_cb_ctx = fn ? ctx : NULL;
     return 0;
@@ -15692,11 +15799,17 @@ size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
                             const uint8_t *data, size_t len) {
     if (!p || port < 0 || port >= I2S_PORT_COUNT || (!data && len != 0))
         return 0;
+    if (p->i2s_v2)
+        return flexe_i2s_v2_rx_inject(
+            p->i2s_v2, (unsigned)port, data, len);
     return i2s_rx_fifo_push(&p->i2s[port], data, len);
 }
 
 size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port) {
     if (!p || port < 0 || port >= I2S_PORT_COUNT) return 0;
+    if (p->i2s_v2)
+        return flexe_i2s_v2_rx_pending(
+            p->i2s_v2, (unsigned)port);
     return p->i2s[port].rx_len;
 }
 
@@ -16038,6 +16151,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     flexe_esp32s3_extmem_attach_cpus(p->s3_extmem, cpu0, cpu1);
     flexe_systimer_attach_cpus(p->systimer, cpu0, cpu1);
     flexe_timer_group_attach_cpus(p->target_timer_group, cpu0, cpu1);
+    flexe_i2s_v2_attach_cpus(p->i2s_v2, cpu0, cpu1);
     flexe_rmt_v1_attach_cpus(p->rmt_v1, cpu0, cpu1);
     flexe_radio_attach_cpus(p->radio_regs, cpu0, cpu1);
     flexe_rtc_cntl_attach_cpus(p->target_rtc_cntl, cpu0, cpu1);
@@ -16056,6 +16170,7 @@ void periph_attach_cpus(esp32_periph_t *p, xtensa_cpu_t *cpu0, xtensa_cpu_t *cpu
     if (p->systimer) candidates |= 1u << PERIPH_EVENT_SYSTIMER;
     if (p->target_timer_group)
         candidates |= 1u << PERIPH_EVENT_TIMER_GROUP;
+    if (p->i2s_v2) candidates |= 1u << PERIPH_EVENT_I2S_V2;
     if (p->rmt_v1) candidates |= 1u << PERIPH_EVENT_RMT_V1;
     if (p->target->capabilities & FLEXE_TARGET_CAP_LEDC_V1)
         candidates |= 1u << PERIPH_EVENT_LEDC;

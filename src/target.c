@@ -328,6 +328,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_SYSCON_MEMORY_V1 |
                         FLEXE_TARGET_CAP_ASSIST_DEBUG_V1 |
                         FLEXE_TARGET_CAP_APB_SARADC_V1 |
+                        FLEXE_TARGET_CAP_I2S_V2 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
         .vecbase_reset = 0x40000000u,
@@ -443,7 +444,7 @@ static const flexe_target_desc_t TARGETS[] = {
             .sysclk_conf_reset = 0x00000001u,
             .sysclk_conf_writable_mask = 0x00000FFFu,
             .register_count = 8u,
-            .gate_count = 14u,
+            .gate_count = 16u,
             .reg = {
                 { .offset = 0x014u, .reset = 0x00000001u,
                   .writable_mask = 0x00000001u },
@@ -572,6 +573,22 @@ static const flexe_target_desc_t TARGETS[] = {
                     .reset_offset = 0x044u,
                     .clock_mask = 1u << 0,
                     .reset_mask = 1u << 1,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2S,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 4,
+                    .reset_mask = 1u << 4,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2S,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 21,
+                    .reset_mask = 1u << 21,
                 },
             },
             .low_power = {
@@ -1309,6 +1326,42 @@ static const flexe_target_desc_t TARGETS[] = {
              * ETS_DMA_IN_CH0..4 and ETS_DMA_OUT_CH0..4 are level sources. */
             .rx_interrupt_source = { 66u, 67u, 68u, 69u, 70u },
             .tx_interrupt_source = { 71u, 72u, 73u, 74u, 75u },
+        },
+        .i2s_v2 = {
+            .register_size = 0x100u,
+            /* ESP32-S3 I2S_CLK_SEL: XTAL, PLL240M, PLL160M, external. */
+            .source_clock_hz = {
+                40000000u, 240000000u, 160000000u, 0u,
+            },
+            .date_reset = 0x02009070u,
+            .instance_count = 2u,
+            .instance = {
+                {
+                    .base = 0x6000F000u,
+                    .mclk_output_signal = 23u,
+                    .tx_bck_output_signal = 22u,
+                    .tx_ws_output_signal = 24u,
+                    .rx_bck_output_signal = 26u,
+                    .rx_ws_output_signal = 27u,
+                    .data_output_signal = { 25u, 128u },
+                    .interrupt_source = 25u,
+                    .gdma_peripheral_id = 3u,
+                    .data_output_count = 2u,
+                },
+                {
+                    .base = 0x6002D000u,
+                    .mclk_output_signal = 21u,
+                    .tx_bck_output_signal = 28u,
+                    .tx_ws_output_signal = 29u,
+                    .rx_bck_output_signal = 31u,
+                    .rx_ws_output_signal = 32u,
+                    .data_output_signal = { 30u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE },
+                    .interrupt_source = 26u,
+                    .gdma_peripheral_id = 4u,
+                    .data_output_count = 1u,
+                },
+            },
         },
         .sha = {
             .base = 0x6003B000u,

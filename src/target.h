@@ -50,19 +50,21 @@
 #define FLEXE_TARGET_EFUSE_READ_WORD_MAX 96u
 #define FLEXE_TARGET_SENS_ADC_UNIT_MAX 2u
 #define FLEXE_TARGET_SYSTEM_REGISTER_MAX 8u
-#define FLEXE_TARGET_SYSTEM_GATE_MAX 14u
+#define FLEXE_TARGET_SYSTEM_GATE_MAX 16u
 #define FLEXE_TARGET_SYSTEM_PERIPHERAL_BANK_MAX 2u
 #define FLEXE_TARGET_RADIO_WINDOW_MAX 10u
 #define FLEXE_TARGET_RADIO_COMPLETION_MAX 4u
 #define FLEXE_TARGET_RADIO_REGISTER_MAX 8u
 #define FLEXE_TARGET_SYSCON_ACE_REGION_MAX 4u
 #define FLEXE_TARGET_GDMA_CHANNEL_MAX 5u
+#define FLEXE_TARGET_I2S_MAX 2u
+#define FLEXE_TARGET_I2S_DATA_OUT_MAX 2u
 #define FLEXE_TARGET_SHA_MODE_MAX 8u
 #define FLEXE_SPI_MEM_CS_NONE UINT8_MAX
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 59u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 60u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -98,6 +100,7 @@ typedef enum {
     FLEXE_TARGET_CAP_LEDC_V1                      = 1ull << 27,
     FLEXE_TARGET_CAP_SYSCON_MEMORY_V1             = 1ull << 28,
     FLEXE_TARGET_CAP_ASSIST_DEBUG_V1               = 1ull << 29,
+    FLEXE_TARGET_CAP_I2S_V2                        = 1ull << 30,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -953,6 +956,31 @@ typedef struct {
     uint8_t  tx_interrupt_source[FLEXE_TARGET_GDMA_CHANNEL_MAX];
 } flexe_gdma_desc_t;
 
+/* S3-generation I2S v2 uses the SoC-wide GDMA engine rather than the local
+ * link controller in classic ESP32 I2S. Register semantics belong to the IP;
+ * placement, clocks, interrupt wiring, DMA trigger IDs, and matrix producers
+ * remain target data so the model is reusable across compatible chips. */
+typedef struct {
+    uint32_t base;
+    uint16_t mclk_output_signal;
+    uint16_t tx_bck_output_signal;
+    uint16_t tx_ws_output_signal;
+    uint16_t rx_bck_output_signal;
+    uint16_t rx_ws_output_signal;
+    uint16_t data_output_signal[FLEXE_TARGET_I2S_DATA_OUT_MAX];
+    uint8_t  interrupt_source;
+    uint8_t  gdma_peripheral_id;
+    uint8_t  data_output_count;
+} flexe_i2s_v2_instance_desc_t;
+
+typedef struct {
+    uint32_t register_size;
+    uint32_t source_clock_hz[4]; /* CLKM_CONF.CLK_SEL encoding */
+    uint32_t date_reset;
+    uint8_t instance_count;
+    flexe_i2s_v2_instance_desc_t instance[FLEXE_TARGET_I2S_MAX];
+} flexe_i2s_v2_desc_t;
+
 typedef enum {
     FLEXE_SHA_LAYOUT_NONE = 0,
     /* Classic ESP32: one START/CONTINUE/LOAD/BUSY quartet per algorithm and
@@ -1341,8 +1369,11 @@ struct flexe_target_desc {
     /* Optional on-chip memory clock and power policy in the SYSCON page. */
     flexe_syscon_memory_desc_t    syscon_memory;
 
-    /* Optional general-purpose DMA fabric and SHA accelerator. */
+    /* Optional general-purpose DMA fabric and streaming audio controller. */
     flexe_gdma_desc_t             gdma;
+    flexe_i2s_v2_desc_t           i2s_v2;
+
+    /* Optional SHA accelerator. */
     flexe_sha_desc_t              sha;
 
     /* Optional SENSITIVE v1 memory-protection configuration block. */

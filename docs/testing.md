@@ -171,6 +171,9 @@ plain pulse widths, carrier-demodulated envelopes, finite counted-loop
 interrupts, explicitly stopped infinite loops, a two-channel simultaneous
 start barrier, and sustained FreeRTOS execution. Build commands and
 artifact hashes are in [Hardware completeness](hardware-completeness.md).
+`check-s3-idf-i2s-std.sh` runs the stock standard-I2S driver in interpreter
+and JIT concurrently, checking circular GDMA progress, blocking-writer wakeup,
+audio metadata, and GPIO-matrix routing with zero unsupported MMIO.
 
 Use the fixture builder rather than making disposable build directories by
 hand. It finds the pinned ESP-IDF v5.3.2 checkout from `FLEXE_IDF_PATH`, an
@@ -190,7 +193,7 @@ keeps Ninja output and `sdkconfig` files under the user cache, outside the
 repository. A content fingerprint covers the project sources, generated
 configuration, pinned IDF/tool metadata, build flags, deterministic timestamp,
 and both artifact hashes. An unchanged run therefore skips the IDF environment
-export and Ninja entirely; all ten artifact lookups take about one second on
+export and Ninja entirely; all eleven artifact lookups take about one second on
 the reference MacBook. A cache miss retains full logs and prints only progress,
 exact artifact paths and hashes, and gate results. Pass `--verbose` when live
 compiler output and ccache statistics are useful. `--check` also updates just
