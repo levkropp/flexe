@@ -96,8 +96,8 @@ Set `FLEXE_FIXTURE_BUILD_ROOT` to another directory to isolate a
 board/toolchain configuration, or to `temporary` for a clean disposable
 build.
 CI restores older per-fixture outputs as a fallback, recompiles only fixtures
-whose fingerprints changed, and caches the shared compiled core without each
-fixture's much larger intermediate build tree.
+whose fingerprints changed, and caches the shared compiled core separately
+without each fixture's much larger intermediate build tree.
 
 ## Production ROM gates
 
