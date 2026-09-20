@@ -214,6 +214,10 @@ continuous force levels, complete teardown, and zero unsupported MMIO.
 `check-s3-idf-lcd-i80.sh` runs the native LCD_CAM i80 driver through its
 SYSTEM gate, GPIO setup, GDMA command/parameter/color transactions, shared
 interrupt callbacks, and teardown in both engines with zero unsupported MMIO.
+`check-s3-idf-camera.sh` pins the official `esp32-camera` 2.1.7 component and
+runs its unmodified OV2640 SCCB, GPIO, LCD_CAM, circular-GDMA, ISR, camera-task,
+full-frame validation, and teardown paths twice in each engine with zero
+unsupported MMIO.
 `check-s3-idf-aes.sh` likewise runs the public mbedTLS AES API twice per engine,
 covering all six S3 block modes, AES-128/256 known-answer vectors, partial CTR,
 and a 4 KiB interrupt-driven GDMA round trip.
@@ -233,11 +237,15 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 
 The helper accepts short names for every `tests/fixtures/s3_idf_*` project and
 keeps Ninja output and `sdkconfig` files under the user cache, outside the
-repository. A content fingerprint covers the project sources, generated
-configuration, pinned IDF/tool metadata, build flags, deterministic timestamp,
-and both artifact hashes. An unchanged run therefore skips the IDF environment
-export and Ninja entirely; all seventeen artifact lookups take about one second on
-the reference MacBook. A cache miss retains full logs and prints only progress,
+repository. Fixtures with an `idf_component.yml` are mirrored into that cache,
+where `managed_components/` is preserved across edits; they must commit a
+`dependencies.lock`, and a build fails if the component manager changes it.
+Thus official external components remain content-pinned without dirtying or
+bloating the source tree. A content fingerprint covers the project sources,
+generated configuration, pinned IDF/tool metadata, build flags, deterministic
+timestamp, and both artifact hashes. An unchanged run therefore skips the IDF
+environment export and Ninja entirely; all eighteen artifact lookups take under
+two seconds on the reference MacBook. A cache miss retains full logs and prints only progress,
 exact artifact paths and hashes, and gate results. Pass `--verbose` when live
 compiler output and ccache statistics are useful. `--check` also updates just
 the selected host emulator and endpoint-harness targets, avoiding stale

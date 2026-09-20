@@ -3,6 +3,9 @@ build-asan/
 build-pgo/
 *.pdf
 *.bin
+managed_components/
+sdkconfig
+sdkconfig.old
 
 # Python bytecode from tools/
 __pycache__/

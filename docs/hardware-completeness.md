@@ -54,7 +54,7 @@ even when a firmware workflow succeeds.
 | S3 UART/USB console | Partial (MMIO and host I/O) | Official ESP-IDF and Arduino UART output gates; `tests/test_system_clock.c` covers independent UART clock/reset and host RX gating; target-described UART TX producers route through the GPIO matrix with an idle-high pad state; the pinned Marauder gate injects a binary-safe host UART event and verifies its CLI response; `tests/test_usb_serial_jtag.c` covers USB Serial/JTAG clock/reset, packet, and SOF gating; `scripts/check-s3-idf-usb-serial-jtag.sh` replays stock ESP-IDF driver RX/TX | USB protocol/electrical behavior, baud-rate edges, and all UART DMA modes are not claimed. |
 | S3 I2C, GP-SPI | Partial (MMIO) | `tests/test_peripherals.c`, `tests/test_system_clock.c`, `tests/test_spi_mem.c`; target-described I2C SDA/SCL and GP-SPI clock/data/chip-select producers route through the GPIO matrix; stock Arduino Wire, I2C-slave, and SPI-master gates replay in both engines with zero unsupported accesses; direct ESP-IDF 5.3 I2C-master and SPI-master replay gates | More I2C guest-driver/device combinations, slave overflow/clock stretching, GPIO-matrix I2C waveforms, GP-SPI wire edges, and segmented/slave modes remain. |
 | S3 I2S v2 | Partial (MMIO and timed GDMA stream) | `tests/test_i2s_v2.c`; `scripts/check-s3-idf-i2s-std.sh` runs ESP-IDF 5.3.2's unmodified standard-mode driver in interpreter and JIT, streams port-0 TX and host-fed port-1 RX through four-descriptor rings, wakes blocking writers/readers through GDMA EOF interrupts, verifies 48/32 kHz stereo 16-bit configuration and both GPIO-matrix routes, and leaves zero unsupported accesses | Standard master TX/RX and both ports are driver-gated. PDM, slave/external-clock behavior, wire-level BCLK/WS/data edges, underrun/overrun latency, and calibrated audio timing remain unverified. |
-| S3 LCD_CAM i80 TX / camera RX | Partial (MMIO/GDMA and host buses) | `tests/test_lcd_cam.c`; `scripts/check-s3-idf-lcd-i80.sh` runs ESP-IDF 5.3.2's unmodified i80 driver twice in each engine through SYSTEM reset/clock, GPIO routing, dummy bootstrap, polling command/parameter writes, queued color descriptors, the shared interrupt ISR, callbacks, and teardown with zero unsupported accesses. Unit coverage injects parallel-camera bytes through multiple GDMA descriptors while preserving the peripheral EOF and VSYNC interrupt boundaries | Command and DMA-controlled i80 output plus host-fed raw camera input, 8/16-bit stride, and bit/byte order are modeled. Finite non-DMA LCD counts, RGB scanout, camera color conversion, line timing, pad-edge timing, and electrical behavior remain diagnostic or unverified; the camera path does not yet have a stock `esp32-camera` gate. |
+| S3 LCD_CAM i80 TX / camera RX | Partial (MMIO/GDMA and host buses) | `tests/test_lcd_cam.c`; `scripts/check-s3-idf-lcd-i80.sh` runs ESP-IDF 5.3.2's unmodified i80 driver twice in each engine. `scripts/check-s3-idf-camera.sh` runs pinned official `esp32-camera` 2.1.7 through OV2640 SCCB detection/configuration, GPIO routing, ten descriptor completions on a circular ring, five independent peripheral EOFs, VSYNC, ISR/task wakeups, a complete 160x120 RGB565 frame, and teardown twice in both engines with zero unsupported accesses | Command and DMA-controlled i80 output plus host-fed raw camera input, 8/16-bit stride, and bit/byte order are modeled. Finite non-DMA LCD counts, RGB scanout, camera color conversion, line timing, pad-edge timing, additional sensors/formats, and electrical behavior remain diagnostic or unverified. |
 | S3 SD/MMC host | Partial (MMIO, timed IDMAC, and host media) | `tests/test_peripherals.c`; `scripts/check-s3-idf-sdmmc-host.sh` runs ESP-IDF 5.3.2's unmodified host driver and ISR queue in both engines, exercises slot-1 command/response plus single- and 20 KiB multi-block reads/writes, verifies GPIO-matrix routes and media, and leaves zero unsupported accesses | SDHC block media and both logical slots are modeled. SDIO cards, UHS/DDR signaling, bus-width electrical behavior, calibrated clock timing, card removal, and media-error injection remain unverified. |
 | S3 TWAI/CAN | Partial (MMIO, timed frames, and host bus) | `tests/test_twai.c`; `scripts/check-s3-idf-twai.sh` runs ESP-IDF 5.3.2's unmodified driver in both engines through GPIO routing, ISR-backed TX/RX queues, alerts, self-reception, and host-injected standard/extended frames with zero unsupported accesses | CAN 2.0 frame/FIFO/filter, arbitration-loss, retry, error confinement, bus-off, and recovery state are modeled. Electrical bit arbitration, transceiver behavior, multi-node wire timing, and calibrated error injection remain unverified. |
 | S3 GDMA | Partial (MMIO) | `tests/test_crypto.c` checks controller-wide clock/arbitration/AHB-reset configuration, finite chained TX/RX descriptors, ownership/writeback, errors, and per-channel level interrupts on both cores; `tests/test_i2s_v2.c` and `tests/test_lcd_cam.c` check streaming consumers and distinct descriptor/peripheral-EOF boundaries; GP-SPI, stock I2S, stock LCD i80, and host-fed camera coverage exercise independent consumers plus I2S trigger IDs 3/4 and LCD_CAM trigger 5 | Full priority/arbitration behavior and other streaming consumers such as continuous ADC remain unverified. |
@@ -584,6 +584,35 @@ Rebuild and replay it with:
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check lcd-i80
 ```
+
+The independent `tests/fixtures/s3_idf_camera` project pins Espressif's
+official `esp32-camera` 2.1.7 component and its `esp_jpeg` 1.3.1 dependency by
+component hash. No camera function is hooked. The real component probes and
+configures a host OV2640 register model through the legacy ESP-IDF SCCB/I2C
+driver, routes all camera signals through the GPIO matrix, then captures a
+complete 160x120 RGB565 pattern through LCD_CAM, ten descriptor completions on
+an eight-node circular GDMA ring, five separately signaled peripheral EOF
+intervals, both interrupt handlers,
+and the component's FreeRTOS camera task. The guest validates every byte and
+tears the driver down. Two runs in each engine produce identical results and
+zero unsupported accesses. Its application image SHA-256 is
+`cfc3488469d641959f3efd262b83df7a88ea504fe44720676af088dcb3144922`;
+the matching ELF SHA-256 is
+`2c3a9686b85619395b6d0c6dc071e02ffbccc59650df3c8400f9f6a09bde3ccc`.
+Rebuild and replay it with:
+
+```sh
+S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
+  ./scripts/build-s3-idf-fixture.sh --check camera
+```
+
+The fixture helper detects component manifests and mirrors only that small
+project into its external cache. `managed_components/`, generated metadata,
+and downloads never enter the repository; the preserved external component
+tree and shared ccache make an unchanged build lookup about 0.3 seconds and a
+complete four-run interpreter/JIT gate about 1.2 seconds on the reference
+MacBook. A committed `dependencies.lock` is mandatory, and the helper rejects
+the build if the component manager rewrites it.
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,
 threshold refill interrupts, end/error interrupts, pulse-timed TX and

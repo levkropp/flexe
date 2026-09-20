@@ -408,6 +408,7 @@ if(UNIX)
     add_flexe_fixture_entry(s3_idf_gpio_isr s3_idf_gpio_isr_test.c)
     add_flexe_fixture_entry(s3_idf_i2c_master s3_idf_i2c_master_test.c)
     add_flexe_fixture_entry(s3_idf_i2s_std s3_idf_i2s_std_test.c)
+    add_flexe_fixture_entry(s3_idf_camera s3_idf_camera_test.c)
 
     # The driver-level EMAC gate intentionally reuses the HAL harness with an
     # extra command-line mode rather than compiling a second entry object.
@@ -444,6 +445,7 @@ if(UNIX)
     add_flexe_runner(flexe-s3-idf-gpio-isr-test s3_idf_gpio_isr_test.c)
     add_flexe_runner(flexe-s3-idf-i2c-master-test s3_idf_i2c_master_test.c)
     add_flexe_runner(flexe-s3-idf-i2s-std-test s3_idf_i2s_std_test.c)
+    add_flexe_runner(flexe-s3-idf-camera-test s3_idf_camera_test.c)
     add_flexe_runner(flexe-rtc-gpio-test rtc_gpio_test.c)
     add_flexe_runner(flexe-rtc-i2c-test rtc_i2c_test.c)
     add_flexe_runner(flexe-scheduler-test scheduler_test.c)

@@ -74,7 +74,7 @@ done
 
 all_fixtures=(hello crosscore nvs sleep gpio-wake gpio-isr \
     usb-serial-jtag i2c-master i2s-std sdmmc-host twai pcnt rmt-loopback \
-    socket-range aes mcpwm lcd-i80)
+    socket-range aes mcpwm lcd-i80 camera)
 if [[ $# -eq 1 && "$1" == all ]]; then
     set -- "${all_fixtures[@]}"
 elif [[ " $* " == *" all "* ]]; then
@@ -332,6 +332,27 @@ run_logged() {
     return "$status"
 }
 
+component_manifest_for_project() {
+    find "$1" \( -name .git -o -name build -o -name managed_components \) \
+            -prune -o -type f -name idf_component.yml -print -quit
+}
+
+# IDF's component manager writes managed_components/ beside the project that
+# it configures. Keep those downloads and generated metadata in the external
+# fixture cache, while retaining them across source edits so a normal rebuild
+# never redownloads a pinned dependency. The destination is always a validated
+# child of build_root and has no user-authored files.
+sync_component_project() {
+    local source=$1 destination=$2
+    mkdir -p -- "$destination"
+    find "$destination" -mindepth 1 -maxdepth 1 \
+            ! -name managed_components -exec rm -rf -- {} +
+    tar -C "$source" -cf - \
+            --exclude=.git --exclude=build --exclude=managed_components \
+            --exclude=sdkconfig --exclude=sdkconfig.old . |
+        tar -C "$destination" -xf -
+}
+
 fixture_fingerprint() {
     local project_dir=$1 sdkconfig_file=$2 config_signature=$3 epoch=$4
     local cache_version=$5
@@ -354,8 +375,9 @@ fixture_fingerprint() {
             value=$(printenv "$variable" 2>/dev/null || true)
             printf 'environment-%s=%s\n' "$variable" "$value"
         done
-        find "$project_dir" -type f \
-                ! -path '*/.git/*' ! -path '*/build/*' -print |
+        find "$project_dir" \
+                \( -name .git -o -name build -o -name managed_components \) \
+                -prune -o -type f -print |
             LC_ALL=C sort | while IFS= read -r input; do
                 relative=${input#"$project_dir"/}
                 digest=$(openssl dgst -sha256 "$input" | awk '{print $NF}')
@@ -415,6 +437,10 @@ host_target_for_key() {
     s3_idf_i2s_std)
         host_target=flexe-fixture-test
         host_entry=s3-idf-i2s-std
+        ;;
+    s3_idf_camera)
+        host_target=flexe-fixture-test
+        host_entry=s3-idf-camera
         ;;
     s3_idf_sdmmc_host)
         host_target=flexe-fixture-test
@@ -519,6 +545,16 @@ for index in "${!projects[@]}"; do
     key=${keys[$index]}
 
     build_dir="$build_root/$key-build"
+    effective_project=$project
+    component_manifest=$(component_manifest_for_project "$project")
+    if [[ -n "$component_manifest" ]]; then
+        if [[ ! -f "$project/dependencies.lock" ]]; then
+            echo "error: managed-component fixture $key needs a pinned dependencies.lock" >&2
+            echo "       generate it in a throwaway copy; the source tree is never mutated" >&2
+            exit 1
+        fi
+        effective_project="$build_root/$key-source"
+    fi
     sdkconfig="$build_root/$key-sdkconfig"
     mkdir -p -- "$build_dir"
     input_stamp="$build_dir/.flexe-idf-input.sha256"
@@ -560,6 +596,9 @@ for index in "${!projects[@]}"; do
         exit 1
     }
     helper_extra_cppflags="${original_extra_cppflags:+$original_extra_cppflags }-fdebug-prefix-map=$build_dir=."
+    if [[ "$effective_project" != "$project" ]]; then
+        helper_extra_cppflags="$helper_extra_cppflags -fdebug-prefix-map=$effective_project=."
+    fi
     if [[ ${#idf_cache_args[@]} -ne 0 ]]; then
         export CCACHE_BASEDIR=$build_dir
     fi
@@ -656,6 +695,9 @@ for index in "${!projects[@]}"; do
     else
         rm -f -- "$input_stamp"
         initialize_idf_environment
+        if [[ "$effective_project" != "$project" ]]; then
+            sync_component_project "$project" "$effective_project"
+        fi
         if [[ -f "$build_dir/CMakeCache.txt" &&
               ( "$force_rebuild" -eq 1 ||
                 -z "$prior_cache_version" ||
@@ -668,7 +710,7 @@ for index in "${!projects[@]}"; do
             run_logged "$key full clean" "$build_root/$key-fullclean.log" \
                 env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
                 "SOURCE_DATE_EPOCH=$epoch" \
-                "$idf_py" -C "$project" -B "$build_dir" fullclean
+                "$idf_py" -C "$effective_project" -B "$build_dir" fullclean
             prior_signature=
         fi
         if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
@@ -679,7 +721,7 @@ for index in "${!projects[@]}"; do
                 env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
                 "SOURCE_DATE_EPOCH=$epoch" \
                 "EXTRA_CPPFLAGS=$helper_extra_cppflags" \
-                "$idf_py" "${idf_cache_args[@]}" -C "$project" \
+                "$idf_py" "${idf_cache_args[@]}" -C "$effective_project" \
                     -B "$build_dir" -D "SDKCONFIG=$sdkconfig" \
                     -D IDF_TARGET=esp32s3 build
         else
@@ -688,6 +730,13 @@ for index in "${!projects[@]}"; do
                 env "GIT_CEILING_DIRECTORIES=$fixture_git_ceiling" \
                 "SOURCE_DATE_EPOCH=$epoch" \
                 cmake --build "$build_dir" --parallel
+        fi
+        if [[ "$effective_project" != "$project" ]] &&
+           ! cmp -s "$project/dependencies.lock" \
+                    "$effective_project/dependencies.lock"; then
+            echo "error: $key dependencies.lock is stale or was not honored" >&2
+            echo "       regenerate the pinned lock in a throwaway project copy" >&2
+            exit 1
         fi
         printf '%s\n' "$config_signature" > "$config_stamp.tmp"
         mv "$config_stamp.tmp" "$config_stamp"
