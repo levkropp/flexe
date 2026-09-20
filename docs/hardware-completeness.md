@@ -60,7 +60,7 @@ even when a firmware workflow succeeds.
 | S3 LEDC PWM | Partial (MMIO) | `tests/test_ledc_v1.c`, `scripts/check-s3-ledc.sh`: stock Arduino repeatedly drives GPIO4 at 5 kHz with four readback duties, byte-identical replay, and zero unsupported accesses | Aggregate PWM output and timed fade/interrupt are modeled; individual electrical edges and overflow-counter behavior are not. |
 | S3 RMT TX | Partial (MMIO and GPIO-matrix output) | `tests/test_rmt_v1.c`, `scripts/check-s3-wled-rmt.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; WLED 16.0.1 emits 317 sustained pulse frames, and stock ESP-IDF drivers exercise plain, carrier, finite, infinite, and synchronized two-channel output | Pad edges are scheduled only for a watched matrix input or GPIO interrupt; `GPIO_IN` polls on demand. End-marker finite loops work with auto-stop and batching beyond 1023; end-marker infinite loops run until `TX_STOP`; selected synchronous channels share the final `TX_START` timestamp. Markerless loops, counted loops without auto-stop, always-on carrier, dynamic sync-group changes, silicon-calibrated carrier phase, and fine status remain unsupported. |
 | S3 RMT RX | Partial (MMIO, filtered/demodulated GPIO input, host symbols) | `tests/test_rmt_v1.c`, `scripts/check-s3-rmt-rx.sh`, `scripts/check-s3-idf-rmt-loopback.sh`; stock Arduino-ESP32 3.3.11 filters a GPIO4 glitch, demodulates a carrier waveform, and receives a 96-symbol host frame with zero unsupported startup/device accesses; stock ESP-IDF 5.3.2 receives both plain and modulated TX pad pulses through its ISR callback with zero unsupported accesses | Host samples, software GPIO feedback, and RMT TX loopback share the GPIO-matrix edge path; pulse RAM becomes inaccessible and loses contents under `RMT_MEM_FORCE_PD`. DMA, odd pulse tails, delayed-ISR overrun, and dynamic mid-segment route changes remain unsupported. |
-| S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh`, WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
+| S3 SENS clocks, RTC SAR ADC and temperature sensor | Partial (MMIO plus host samples) | `tests/test_sens.c`, `tests/test_apb_saradc.c`, `scripts/check-s3-adc.sh` (deterministic interpreter/JIT replay with zero unsupported accesses), WLED production audit | The complete IO-mux/SARADC/temperature/RTC-I2C clock and SARADC/temperature/RTC-I2C/coprocessor reset fabric has exact state; ADC and temperature effects are connected. Digital/DMA conversion, ULP execution, unattached clock/reset effects, contention, and physical calibration remain unsupported. |
 | S3 network-facing workflow | Partial (service shim) | NerdMiner BSD-socket portal, WLED native lwIP/Ethernet UI and JSON state, and `scripts/check-s3-idf-socket-range.sh` with a stock 10-socket ESP-IDF build | Wi-Fi RF/PHY, association realism, and general transport modes are unsupported; the socket bridge requires ELF symbols and a VFS range within its 64-FD `select()` layout. |
 | S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response, next prompt, and zero unsupported accesses | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
@@ -719,8 +719,9 @@ A ground conversion yields zero rather than claiming an
 ordinary external-pad sample. `tests/fixtures/s3_adc/s3_adc.ino`, compiled with
 Arduino-ESP32 3.3.11 for `esp32:esp32:esp32s3`, reads GPIO4 (ADC1 channel 3)
 and GPIO11 (ADC2 channel 0) repeatedly. With injected raw codes 2645 and
-1450, the interpreter emitted five matching pairs within two billion
-aggregate cycles. Its merged image SHA-256 is
+1450, both engines emit the same five matching pairs within two billion
+aggregate cycles, and two runs of each engine replay byte-for-byte. Its
+merged image SHA-256 is
 `5178a6d97110c3682664ecbe602e0bbce40367c639ebc46ab3f714d879c4ec34`
 and matching ELF SHA-256 is
 `7c156185527896c78a8cf8de1155b10f417350ac1dad27a7ef255298fdad99d0`.
@@ -729,10 +730,10 @@ When grant is forced, only a forced RTC grant completes an RTC ADC2 conversion;
 the SENS RTC_FORCE bit bypasses that arbiter. With no modeled competing
 requester, unforced RTC conversion proceeds. Digital and Wi-Fi/PWDET
 requesters and simultaneous contention are still unsupported, and forcing
-those owners remains diagnostic. The gate keeps 145 other unsupported accesses
-visible, including RF power-detector trim and RTC setup. This is raw-code
-functional behavior, not physical analog, attenuation, calibration accuracy, or
-continuous/DMA ADC fidelity. Recheck with the external compiled fixture:
+those owners remains diagnostic. The interpreter's complete production run
+uses zero unsupported accesses. This is raw-code functional behavior, not
+physical analog, attenuation, calibration accuracy, or continuous/DMA ADC
+fidelity. Recheck with the external compiled fixture:
 
 ```sh
 ./scripts/build-s3-arduino-fixture.sh --check adc
