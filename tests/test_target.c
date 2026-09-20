@@ -2,6 +2,7 @@
 #include "test_helpers.h"
 #include "savestate.h"
 #include "target.h"
+#include "touch_v2.h"
 
 TEST(target_reset_uses_lx7_core_configuration) {
     const flexe_target_desc_t *s3 =
@@ -166,6 +167,26 @@ TEST(target_lx7_savestate_uses_descriptor_backing_sizes) {
     mem_destroy(restored.mem);
 }
 
+TEST(target_extensions_are_bounded_and_device_owned) {
+    const flexe_target_desc_t *classic =
+        flexe_target_by_id(FLEXE_TARGET_ESP32);
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_touch_v2_desc_t *touch =
+        flexe_touch_v2_descriptor(s3);
+
+    ASSERT_TRUE(touch != NULL);
+    ASSERT_EQ(touch ? touch->channel_count : 0u, 15u);
+    ASSERT_TRUE(flexe_touch_v2_descriptor(classic) == NULL);
+    ASSERT_TRUE(flexe_target_extension(s3, UINT32_C(0xFFFFFFFF)) == NULL);
+    ASSERT_TRUE(flexe_target_extension(NULL,
+                                      FLEXE_TARGET_EXTENSION_TOUCH_V2) == NULL);
+
+    flexe_target_desc_t invalid = *s3;
+    invalid.extension_count = FLEXE_TARGET_EXTENSION_MAX + 1u;
+    ASSERT_TRUE(flexe_touch_v2_descriptor(&invalid) == NULL);
+}
+
 void run_target_tests(void) {
     TEST_SUITE("Xtensa target descriptors");
 
@@ -176,4 +197,5 @@ void run_target_tests(void) {
     RUN_TEST(target_cpu_frequency_uses_target_rom_abi_word);
     RUN_TEST(target_lx7_does_not_build_classic_predecode_table);
     RUN_TEST(target_lx7_savestate_uses_descriptor_backing_sizes);
+    RUN_TEST(target_extensions_are_bounded_and_device_owned);
 }

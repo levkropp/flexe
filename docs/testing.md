@@ -31,6 +31,14 @@ error, which keeps misspelled focused checks from silently passing:
 one line per passing test. It is the default CI form and keeps full-suite logs
 small during rapid hardware-model iterations.
 
+Peripheral-specific target geometry belongs in the owning device header and
+is attached through the target extension registry. Do not add new device
+descriptor structs or fields to `target.h`: that header sits on the emulator's
+hot interface boundary, so changing it invalidates almost every translation
+unit in every compiler and sanitizer build. Extension tags are stable and
+device-owned; changing an extension layout rebuilds only `target.c`, the device
+model, and its direct consumers.
+
 The suite covers instruction decode and execution, memory translation,
 register windows, exceptions, interrupts, peripheral registers and timing,
 FreeRTOS/service stubs, and both JIT backends. The encoding-space sweep compiles

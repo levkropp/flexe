@@ -14,13 +14,16 @@ TEST(touch_v2_scans_host_samples_and_routes_rtc_interrupts)
 {
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
-    const flexe_touch_v2_desc_t *touch = &s3->touch_v2;
+    const flexe_touch_v2_desc_t *touch =
+        flexe_touch_v2_descriptor(s3);
     const flexe_rtc_cntl_desc_t *rtc = &s3->rtc_cntl;
     const flexe_sens_desc_t *sens = &s3->sens;
     xtensa_mem_t *mem = mem_create_for_target(s3);
     esp32_periph_t *periph = mem ? periph_create(mem) : NULL;
+    ASSERT_TRUE(touch != NULL);
     ASSERT_TRUE(periph != NULL);
-    if (!periph) {
+    if (!touch || !periph) {
+        periph_destroy(periph);
         mem_destroy(mem);
         return;
     }
@@ -143,7 +146,10 @@ TEST(touch_v2_rejects_invalid_or_absent_geometry)
     const flexe_target_desc_t *s3 =
         flexe_target_by_id(FLEXE_TARGET_ESP32S3);
     flexe_target_desc_t invalid = *s3;
-    invalid.touch_v2.channel_count = FLEXE_TARGET_TOUCH_CHANNEL_MAX + 1u;
+    flexe_touch_v2_desc_t invalid_touch =
+        *flexe_touch_v2_descriptor(s3);
+    invalid_touch.channel_count = FLEXE_TARGET_TOUCH_CHANNEL_MAX + 1u;
+    invalid.extension[0].descriptor = &invalid_touch;
     mem = mem_create_for_target(&invalid);
     ASSERT_TRUE(mem != NULL);
     ASSERT_TRUE(flexe_touch_v2_create(mem, NULL, NULL) == NULL);

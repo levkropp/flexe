@@ -1,7 +1,63 @@
 #include "target.h"
+#include "touch_v2.h"
 
 #include <stddef.h>
 #include <string.h>
+
+static const flexe_touch_v2_desc_t ESP32S3_TOUCH_V2 = {
+    .channel_count = 15u,
+    .first_external_channel = 1u,
+    .rtc_control2_offset = 0x10Cu,
+    .rtc_scan_control_offset = 0x110u,
+    .rtc_sleep_threshold_offset = 0x114u,
+    .rtc_approach_offset = 0x118u,
+    .rtc_filter_offset = 0x11Cu,
+    .rtc_clock_enable_mask = 1u << 31,
+    .rtc_reset_mask = 1u << 29,
+    .rtc_start_force_mask = 1u << 16,
+    .rtc_start_enable_mask = 1u << 15,
+    .rtc_timer_enable_mask = 1u << 13,
+    .rtc_scan_channel_mask = 0x7FFFu << 10,
+    .rtc_scan_channel_shift = 10u,
+    .rtc_sleep_channel_mask = 0x1Fu << 27,
+    .rtc_sleep_channel_shift = 27u,
+    .rtc_sleep_threshold_mask = 0x003FFFFFu,
+    .rtc_sleep_benchmark_clear_mask = 1u << 23,
+    .sens_config_offset = 0x05Cu,
+    .sens_denoise_offset = 0x060u,
+    .sens_threshold_base_offset = 0x064u,
+    .sens_channel_status_offset = 0x09Cu,
+    .sens_status_base_offset = 0x0A0u,
+    .sens_sleep_status_offset = 0x0DCu,
+    .sens_approach_status_offset = 0x0E0u,
+    .sens_config_reset = 0xFFF07FFFu,
+    .sens_approach_channel_mask = {
+        0xFu << 28, 0xFu << 24, 0xFu << 20,
+    },
+    .sens_approach_channel_shift = { 28u, 24u, 20u },
+    .sens_unit_done_mask = 1u << 19,
+    .sens_denoise_done_mask = 1u << 18,
+    .sens_data_select_mask = 3u << 16,
+    .sens_data_select_shift = 16u,
+    .sens_status_clear_mask = 1u << 15,
+    .sens_output_enable_mask = 0x7FFFu,
+    .sens_threshold_mask = 0x003FFFFFu,
+    .sens_measure_done_mask = 1u << 31,
+    .sens_channel_clear_mask = 0x7FFFu << 15,
+    .sens_channel_clear_shift = 15u,
+    .sens_active_mask = 0x7FFFu,
+    .sens_current_channel_mask = 0xFu << 22,
+    .sens_current_channel_shift = 22u,
+    .sens_data_mask = 0x003FFFFFu,
+    .sens_debounce_mask = 7u << 29,
+    .sens_debounce_shift = 29u,
+    .interrupt_done_mask = 1u << 6,
+    .interrupt_active_mask = 1u << 7,
+    .interrupt_inactive_mask = 1u << 8,
+    .interrupt_scan_done_mask = 1u << 4,
+    .interrupt_timeout_mask = 1u << 18,
+    .interrupt_approach_done_mask = 1u << 20,
+};
 
 /* Image chip IDs follow Espressif's public esp_chip_id_t values. The mapped
  * flash windows match esptool's target definitions. Keeping recognized but
@@ -1446,60 +1502,6 @@ static const flexe_target_desc_t TARGETS[] = {
                 },
             },
         },
-        .touch_v2 = {
-            .channel_count = 15u,
-            .first_external_channel = 1u,
-            .rtc_control2_offset = 0x10Cu,
-            .rtc_scan_control_offset = 0x110u,
-            .rtc_sleep_threshold_offset = 0x114u,
-            .rtc_approach_offset = 0x118u,
-            .rtc_filter_offset = 0x11Cu,
-            .rtc_clock_enable_mask = 1u << 31,
-            .rtc_reset_mask = 1u << 29,
-            .rtc_start_force_mask = 1u << 16,
-            .rtc_start_enable_mask = 1u << 15,
-            .rtc_timer_enable_mask = 1u << 13,
-            .rtc_scan_channel_mask = 0x7FFFu << 10,
-            .rtc_scan_channel_shift = 10u,
-            .rtc_sleep_channel_mask = 0x1Fu << 27,
-            .rtc_sleep_channel_shift = 27u,
-            .rtc_sleep_threshold_mask = 0x003FFFFFu,
-            .rtc_sleep_benchmark_clear_mask = 1u << 23,
-            .sens_config_offset = 0x05Cu,
-            .sens_denoise_offset = 0x060u,
-            .sens_threshold_base_offset = 0x064u,
-            .sens_channel_status_offset = 0x09Cu,
-            .sens_status_base_offset = 0x0A0u,
-            .sens_sleep_status_offset = 0x0DCu,
-            .sens_approach_status_offset = 0x0E0u,
-            .sens_config_reset = 0xFFF07FFFu,
-            .sens_approach_channel_mask = {
-                0xFu << 28, 0xFu << 24, 0xFu << 20,
-            },
-            .sens_approach_channel_shift = { 28u, 24u, 20u },
-            .sens_unit_done_mask = 1u << 19,
-            .sens_denoise_done_mask = 1u << 18,
-            .sens_data_select_mask = 3u << 16,
-            .sens_data_select_shift = 16u,
-            .sens_status_clear_mask = 1u << 15,
-            .sens_output_enable_mask = 0x7FFFu,
-            .sens_threshold_mask = 0x003FFFFFu,
-            .sens_measure_done_mask = 1u << 31,
-            .sens_channel_clear_mask = 0x7FFFu << 15,
-            .sens_channel_clear_shift = 15u,
-            .sens_active_mask = 0x7FFFu,
-            .sens_current_channel_mask = 0xFu << 22,
-            .sens_current_channel_shift = 22u,
-            .sens_data_mask = 0x003FFFFFu,
-            .sens_debounce_mask = 7u << 29,
-            .sens_debounce_shift = 29u,
-            .interrupt_done_mask = 1u << 6,
-            .interrupt_active_mask = 1u << 7,
-            .interrupt_inactive_mask = 1u << 8,
-            .interrupt_scan_done_mask = 1u << 4,
-            .interrupt_timeout_mask = 1u << 18,
-            .interrupt_approach_done_mask = 1u << 20,
-        },
         .apb_saradc = {
             .base = 0x60040000u,
             .register_size = 0x1000u,
@@ -2003,6 +2005,10 @@ static const flexe_target_desc_t TARGETS[] = {
             { 0x50000000u, 0x50002000u }, /* RTC slow/reset vector 0 */
             { 0x600FE000u, 0x60100000u }, /* RTC fast memory */
         },
+        .extension_count = 1u,
+        .extension = {
+            { FLEXE_TARGET_EXTENSION_TOUCH_V2, &ESP32S3_TOUCH_V2 },
+        },
     },
 };
 
@@ -2027,6 +2033,18 @@ const flexe_target_desc_t *flexe_target_by_name(const char *name)
         if (strcmp(TARGETS[i].name, name) == 0) return &TARGETS[i];
     if (strcmp(name, "esp32-s3") == 0)
         return flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    return NULL;
+}
+
+const void *flexe_target_extension(const flexe_target_desc_t *target,
+                                   uint32_t tag)
+{
+    if (!target || tag == 0u ||
+        target->extension_count > FLEXE_TARGET_EXTENSION_MAX)
+        return NULL;
+    for (unsigned i = 0u; i < target->extension_count; i++)
+        if (target->extension[i].tag == tag)
+            return target->extension[i].descriptor;
     return NULL;
 }
 

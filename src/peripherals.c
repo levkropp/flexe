@@ -15489,6 +15489,8 @@ static void rtc_calibration_write(void *ctx, uint32_t addr, uint32_t value)
 esp32_periph_t *periph_create(xtensa_mem_t *mem) {
     const flexe_target_desc_t *target = mem_target(mem);
     if (!mem || !target) return NULL;
+    const flexe_touch_v2_desc_t *touch_v2_desc =
+        flexe_touch_v2_descriptor(target);
     esp32_periph_t *p = calloc(1, sizeof(esp32_periph_t));
     if (!p) return NULL;
     p->mem = mem;
@@ -15935,7 +15937,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
                 flexe_rtc_cntl_set_pad_hold_listener(
                     p->target_rtc_cntl, target_rtc_pad_hold_changed, p);
         }
-        if (target->capabilities & FLEXE_TARGET_CAP_TOUCH_V2) {
+        if (touch_v2_desc) {
             p->touch_v2 = flexe_touch_v2_create(
                 mem, target_touch_irq, p);
             flexe_sens_attach_touch_v2(p->target_sens, p->touch_v2);
@@ -15960,8 +15962,7 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
              !p->target_rtc_io) ||
             ((target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) &&
              !p->target_rtc_cntl) ||
-            ((target->capabilities & FLEXE_TARGET_CAP_TOUCH_V2) &&
-             !p->touch_v2) ||
+            (touch_v2_desc && !p->touch_v2) ||
             (target->flash_mmu.shared_instruction_data &&
              !p->shared_flash_mmu) ||
             ((target->capabilities & FLEXE_TARGET_CAP_ESP32S3_EXTMEM) &&

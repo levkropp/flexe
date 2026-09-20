@@ -10,7 +10,7 @@ enum {
 };
 
 struct flexe_touch_v2 {
-    const flexe_target_desc_t *target;
+    const flexe_touch_v2_desc_t *desc;
     flexe_touch_v2_irq_fn irq;
     void *irq_ctx;
     uint32_t rtc_control2;
@@ -38,13 +38,20 @@ static bool contiguous_field(uint32_t mask, unsigned shift)
     return (field & (field + 1u)) == 0u;
 }
 
-static bool touch_geometry_valid(const flexe_target_desc_t *target)
+const flexe_touch_v2_desc_t *flexe_touch_v2_descriptor(
+    const flexe_target_desc_t *target)
 {
-    if (!target || !(target->capabilities & FLEXE_TARGET_CAP_TOUCH_V2) ||
+    return flexe_target_extension(target, FLEXE_TARGET_EXTENSION_TOUCH_V2);
+}
+
+static bool touch_geometry_valid(const flexe_target_desc_t *target,
+                                 const flexe_touch_v2_desc_t *desc)
+{
+    if (!target || !desc ||
+        !(target->capabilities & FLEXE_TARGET_CAP_TOUCH_V2) ||
         !(target->capabilities & FLEXE_TARGET_CAP_RTC_CNTL_V1) ||
         !(target->capabilities & FLEXE_TARGET_CAP_SENS_V1))
         return false;
-    const flexe_touch_v2_desc_t *desc = &target->touch_v2;
     if (desc->channel_count == 0u ||
         desc->channel_count > FLEXE_TARGET_TOUCH_CHANNEL_MAX ||
         desc->first_external_channel >= desc->channel_count ||
@@ -86,12 +93,12 @@ static bool touch_geometry_valid(const flexe_target_desc_t *target)
 
 static uint32_t touch_channel_mask(const flexe_touch_v2_t *touch)
 {
-    return (1u << touch->target->touch_v2.channel_count) - 1u;
+    return (1u << touch->desc->channel_count) - 1u;
 }
 
 static bool touch_running_internal(const flexe_touch_v2_t *touch)
 {
-    const flexe_touch_v2_desc_t *desc = &touch->target->touch_v2;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
     if ((touch->rtc_control2 & desc->rtc_clock_enable_mask) == 0u ||
         (touch->rtc_control2 & desc->rtc_reset_mask) != 0u)
         return false;
@@ -104,7 +111,7 @@ static bool touch_running_internal(const flexe_touch_v2_t *touch)
 
 static uint32_t touch_scan_mask(const flexe_touch_v2_t *touch)
 {
-    const flexe_touch_v2_desc_t *desc = &touch->target->touch_v2;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
     uint32_t rtc = (touch->rtc_scan_control &
                     desc->rtc_scan_channel_mask) >>
                    desc->rtc_scan_channel_shift;
@@ -118,7 +125,7 @@ static void touch_reset_measurements(flexe_touch_v2_t *touch)
     touch->current_channel = 0u;
     touch->measurement_done = false;
     for (unsigned channel = 0u;
-         channel < touch->target->touch_v2.channel_count; channel++) {
+         channel < touch->desc->channel_count; channel++) {
         touch->benchmark[channel] = 0u;
         touch->smooth[channel] = 0u;
         touch->debounce[channel] = 0u;
@@ -127,7 +134,7 @@ static void touch_reset_measurements(flexe_touch_v2_t *touch)
 
 static void touch_scan(flexe_touch_v2_t *touch)
 {
-    const flexe_touch_v2_desc_t *desc = &touch->target->touch_v2;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
     uint32_t enabled = touch_scan_mask(touch);
     uint32_t before = touch->active;
     uint32_t active = 0u;
@@ -172,7 +179,7 @@ static void touch_scan(flexe_touch_v2_t *touch)
 static uint32_t touch_selected_data(const flexe_touch_v2_t *touch,
                                     unsigned channel)
 {
-    const flexe_touch_v2_desc_t *desc = &touch->target->touch_v2;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
     unsigned selection = (touch->sens_config &
                           desc->sens_data_select_mask) >>
                          desc->sens_data_select_shift;
@@ -188,13 +195,15 @@ flexe_touch_v2_t *flexe_touch_v2_create(
 {
     if (!mem) return NULL;
     const flexe_target_desc_t *target = mem_target(mem);
-    if (!touch_geometry_valid(target)) return NULL;
+    const flexe_touch_v2_desc_t *desc =
+        flexe_touch_v2_descriptor(target);
+    if (!touch_geometry_valid(target, desc)) return NULL;
     flexe_touch_v2_t *touch = calloc(1u, sizeof(*touch));
     if (!touch) return NULL;
-    touch->target = target;
+    touch->desc = desc;
     touch->irq = irq;
     touch->irq_ctx = irq ? irq_ctx : NULL;
-    touch->sens_config = target->touch_v2.sens_config_reset;
+    touch->sens_config = desc->sens_config_reset;
     return touch;
 }
 
@@ -207,7 +216,7 @@ void flexe_touch_v2_rtc_config_changed(
     flexe_touch_v2_t *touch, uint16_t offset, uint32_t value)
 {
     if (!touch) return;
-    const flexe_touch_v2_desc_t *desc = &touch->target->touch_v2;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
     if (offset == desc->rtc_control2_offset) {
         uint32_t before = touch->rtc_control2;
         touch->rtc_control2 = value;
@@ -259,7 +268,7 @@ bool flexe_touch_v2_sens_read(
     flexe_touch_v2_t *touch, uint32_t offset, uint32_t *value)
 {
     if (!touch || !value) return false;
-    const flexe_touch_v2_desc_t *desc = &touch->target->touch_v2;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
     if (offset == desc->sens_config_offset) {
         *value = touch->sens_config |
                  (touch->measurement_done ? desc->sens_unit_done_mask : 0u);
@@ -321,7 +330,7 @@ bool flexe_touch_v2_sens_write(
     flexe_touch_v2_t *touch, uint32_t offset, uint32_t value)
 {
     if (!touch) return false;
-    const flexe_touch_v2_desc_t *desc = &touch->target->touch_v2;
+    const flexe_touch_v2_desc_t *desc = touch->desc;
     if (offset == desc->sens_config_offset) {
         uint32_t writable = desc->sens_approach_channel_mask[0] |
                             desc->sens_approach_channel_mask[1] |
@@ -373,8 +382,8 @@ bool flexe_touch_v2_sens_write(
 void flexe_touch_v2_set_raw(
     flexe_touch_v2_t *touch, unsigned channel, uint32_t value)
 {
-    if (!touch || channel >= touch->target->touch_v2.channel_count) return;
-    touch->raw[channel] = value & touch->target->touch_v2.sens_data_mask;
+    if (!touch || channel >= touch->desc->channel_count) return;
+    touch->raw[channel] = value & touch->desc->sens_data_mask;
     if (touch_running_internal(touch)) touch_scan(touch);
 }
 
