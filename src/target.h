@@ -54,7 +54,7 @@
 #define FLEXE_TARGET_GPIO_NONE UINT8_MAX
 #define FLEXE_TARGET_GDMA_PERIPHERAL_NONE UINT8_MAX
 #define FLEXE_TARGET_MATRIX_SIGNAL_NONE UINT16_MAX
-#define FLEXE_TARGET_DESCRIPTOR_VERSION 50u
+#define FLEXE_TARGET_DESCRIPTOR_VERSION 51u
 
 /* Device-model capabilities are architectural properties of a target, not
  * guesses derived from a firmware image. Keep each bit tied to a reusable IP
@@ -88,6 +88,7 @@ typedef enum {
     FLEXE_TARGET_CAP_APB_SARADC_V1                = 1ull << 25,
     FLEXE_TARGET_CAP_RTC_IO_V1                    = 1ull << 26,
     FLEXE_TARGET_CAP_LEDC_V1                      = 1ull << 27,
+    FLEXE_TARGET_CAP_SYSCON_MEMORY_V1             = 1ull << 28,
 } flexe_target_capability_t;
 
 typedef enum {
@@ -773,6 +774,26 @@ typedef struct {
     uint16_t ticks_per_half_slot;
 } flexe_radio_time_latch_desc_t;
 
+/* Public SYSCON controls for on-chip ROM/SRAM and RF front-end memories.
+ * The bank masks are target data: later family members may expose different
+ * bank counts or place the controls elsewhere in the shared SYSCON page. */
+typedef struct {
+    uint32_t base;
+    uint32_t register_size;
+    uint16_t front_end_power_offset;
+    uint16_t clock_force_on_offset;
+    uint16_t power_down_offset;
+    uint16_t power_up_offset;
+    uint32_t front_end_power_reset;
+    uint32_t clock_force_on_reset;
+    uint32_t power_down_reset;
+    uint32_t power_up_reset;
+    uint32_t front_end_force_power_down_mask;
+    uint32_t front_end_force_power_up_mask;
+    uint32_t sram_bank_mask;
+    uint32_t rom_bank_mask;
+} flexe_syscon_memory_desc_t;
+
 /* Public SYSCON/APB control registers governing the private radio apertures.
  * The surrounding page is intentionally not a generic retained window:
  * unlisted registers continue through the diagnostic fallback until their
@@ -1185,6 +1206,9 @@ struct flexe_target_desc {
 
     /* Optional RF/baseband/controller register and calibration surfaces. */
     flexe_radio_desc_t            radio;
+
+    /* Optional on-chip memory clock and power policy in the SYSCON page. */
+    flexe_syscon_memory_desc_t    syscon_memory;
 
     /* Optional general-purpose DMA fabric and SHA accelerator. */
     flexe_gdma_desc_t             gdma;

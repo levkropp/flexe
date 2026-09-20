@@ -15,6 +15,7 @@
 #include "sens.h"
 #include "sensitive_memprot.h"
 #include "spi_mem.h"
+#include "syscon_memory.h"
 #include "system_clock.h"
 #include "systimer.h"
 #include "timer_group.h"
@@ -1851,6 +1852,7 @@ struct esp32_periph {
     flexe_sens_t *target_sens;
     flexe_apb_saradc_t *target_apb_saradc;
     flexe_sensitive_memprot_t *sensitive_memprot;
+    flexe_syscon_memory_t *syscon_memory;
     flexe_system_clock_t *system_clock;
     periph_system_state_fn
         system_state_handler[FLEXE_TARGET_SYSTEM_GATE_MAX];
@@ -14897,10 +14899,25 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
         return NULL;
     }
 
+    if (target->capabilities & FLEXE_TARGET_CAP_SYSCON_MEMORY_V1) {
+        p->syscon_memory = flexe_syscon_memory_create(
+            mem, default_read, default_write, p);
+        if (!p->syscon_memory) {
+            periph_destroy(p);
+            return NULL;
+        }
+    }
+
     if (!classic &&
         (target->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1)) {
+        mmio_read_fn fallback_read = p->syscon_memory ?
+            flexe_syscon_memory_mmio_read : default_read;
+        mmio_write_fn fallback_write = p->syscon_memory ?
+            flexe_syscon_memory_mmio_write : default_write;
+        void *fallback_ctx = p->syscon_memory ?
+            (void *)p->syscon_memory : (void *)p;
         p->radio_regs = flexe_radio_create(
-            mem, default_read, default_write, p);
+            mem, fallback_read, fallback_write, fallback_ctx);
         if (!p->radio_regs) {
             periph_destroy(p);
             return NULL;
@@ -15086,8 +15103,14 @@ esp32_periph_t *periph_create(xtensa_mem_t *mem) {
      * registration also touches the adjacent FE2 page. The RF descriptor is
      * the actual owner of that page. */
     if (target->capabilities & FLEXE_TARGET_CAP_RADIO_REGS_V1) {
+        mmio_read_fn fallback_read = p->syscon_memory ?
+            flexe_syscon_memory_mmio_read : default_read;
+        mmio_write_fn fallback_write = p->syscon_memory ?
+            flexe_syscon_memory_mmio_write : default_write;
+        void *fallback_ctx = p->syscon_memory ?
+            (void *)p->syscon_memory : (void *)p;
         p->radio_regs = flexe_radio_create(
-            mem, default_read, default_write, p);
+            mem, fallback_read, fallback_write, fallback_ctx);
         if (!p->radio_regs) {
             periph_destroy(p);
             return NULL;
@@ -15222,6 +15245,7 @@ void periph_destroy(esp32_periph_t *p) {
     flexe_rtc_cntl_set_digital_domain_listener(
         p->target_rtc_cntl, NULL, NULL);
     flexe_radio_destroy(p->radio_regs);
+    flexe_syscon_memory_destroy(p->syscon_memory);
     flexe_efuse_destroy(p->target_efuse);
     if (p->target->capabilities & FLEXE_TARGET_CAP_EFUSE_READ_V1)
         (void)mem_register_mmio_range(

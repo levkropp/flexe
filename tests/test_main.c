@@ -121,6 +121,7 @@ int main(int argc, char **argv)
     run_radio_tests();
     run_esp32s3_extmem_tests();
     run_system_clock_tests();
+    run_syscon_memory_tests();
     run_sandbox_input_tests();
     run_systimer_tests();
     run_timer_group_target_tests();

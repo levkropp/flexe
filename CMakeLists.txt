@@ -116,6 +116,7 @@ set(LIB_SOURCES
     src/radio.c
     src/sens.c
     src/sensitive_memprot.c
+    src/syscon_memory.c
     src/system_clock.c
     src/systimer.c
     src/timer_group.c
@@ -244,6 +245,7 @@ set(TEST_SOURCES
     tests/test_radio.c
     tests/test_esp32s3_extmem.c
     tests/test_system_clock.c
+    tests/test_syscon_memory.c
     tests/test_sandbox_input.c
     tests/test_systimer.c
     tests/test_timer_group.c

@@ -316,6 +316,7 @@ static const flexe_target_desc_t TARGETS[] = {
                         FLEXE_TARGET_CAP_GP_SPI |
                         FLEXE_TARGET_CAP_RMT_V1 |
                         FLEXE_TARGET_CAP_LEDC_V1 |
+                        FLEXE_TARGET_CAP_SYSCON_MEMORY_V1 |
                         FLEXE_TARGET_CAP_APB_SARADC_V1 |
                         FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
         .reset_vector = 0x40000400u,
@@ -1054,6 +1055,24 @@ static const flexe_target_desc_t TARGETS[] = {
             .grant_force_mask = 1u << 5,
             .rtc_force_mask = 1u << 3,
             .force_selection_mask = 7u << 2,
+        },
+        .syscon_memory = {
+            .base = 0x60026000u,
+            .register_size = 0x1000u,
+            .front_end_power_offset = 0x09Cu,
+            .clock_force_on_offset = 0x0A8u,
+            .power_down_offset = 0x0ACu,
+            .power_up_offset = 0x0B0u,
+            /* ESP32-S3 reset keeps every front-end memory powered and all
+             * ROM/SRAM bank clocks and power explicitly forced on. */
+            .front_end_power_reset = 0x00000055u,
+            .clock_force_on_reset = 0x00003FFFu,
+            .power_down_reset = 0u,
+            .power_up_reset = 0x00003FFFu,
+            .front_end_force_power_down_mask = 0x000000AAu,
+            .front_end_force_power_up_mask = 0x00000055u,
+            .sram_bank_mask = 0x00003FF8u,
+            .rom_bank_mask = 0x00000007u,
         },
         .radio = {
             .window_count = 9u,

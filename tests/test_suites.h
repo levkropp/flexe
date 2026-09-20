@@ -18,6 +18,7 @@ void run_apb_saradc_tests(void);
 void run_radio_tests(void);
 void run_esp32s3_extmem_tests(void);
 void run_system_clock_tests(void);
+void run_syscon_memory_tests(void);
 void run_sandbox_input_tests(void);
 void run_systimer_tests(void);
 void run_timer_group_target_tests(void);

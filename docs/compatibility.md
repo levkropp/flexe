@@ -168,6 +168,13 @@ radio-controller behavior that is not modeled yet. Effects for other peripheral
 fields remain explicit unsupported-access diagnostics even though their
 architectural register values are retained.
 
+The S3 SYSCON memory-policy owner supplies exact reset and masked readback for
+the RF front-end controls and the 11 SRAM/3 ROM bank clock, force-down, and
+force-up policies. It publishes normalized semantic state for cache and power
+consumers and composes with the radio owner on their shared MMIO page. Flexe
+does not yet model cache timing or erase backing memory when firmware requests
+that a bank be powered down.
+
 The external I2C model is shared by classic ESP32 and ESP32-S3 through target
 descriptors rather than fixed addresses or command encodings. It implements
 both native instances, their FIFO command lists, master writes and repeated-
