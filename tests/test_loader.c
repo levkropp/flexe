@@ -1147,6 +1147,52 @@ TEST(loader_multi_segment) {
     mem_destroy(mem);
 }
 
+TEST(loader_skips_reserved_image_blocks) {
+    uint8_t bin[96] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 4;
+    put_le32(&bin[4], 0x400D0044u);
+
+    /* Normal DROM data starts at image offset 0x20. */
+    put_le32(&bin[24], 0x3F400020u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x11111111u);
+
+    /* ESP image addresses below 0x10000000 are non-loaded blocks. Address
+     * zero is emitted by both esptool and espflash to align mapped segments;
+     * address four is also reserved by ESP-IDF for a possible MD5 block. */
+    put_le32(&bin[36], 0u);
+    put_le32(&bin[40], 4u);
+    put_le32(&bin[44], 0xA5A5A5A5u);
+    put_le32(&bin[48], 4u);
+    put_le32(&bin[52], 4u);
+    put_le32(&bin[56], 0x5A5A5A5Au);
+
+    /* The reserved blocks still consume image bytes. The IROM payload is at
+     * offset 0x44, which must remain reflected in the flash MMU mapping. */
+    put_le32(&bin[60], 0x400D0044u);
+    put_le32(&bin[64], 4u);
+    put_le32(&bin[68], 0x22222222u);
+
+    const char *path = write_temp(bin, 72);
+    ASSERT_TRUE(path != NULL);
+    xtensa_mem_t *mem = mem_create();
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+
+    load_result_t res = loader_load_bin(mem, path);
+    ASSERT_EQ(res.result, 0);
+    ASSERT_EQ(res.segment_count, 4);
+    ASSERT_EQ(res.segments[1].addr, 0u);
+    ASSERT_EQ(res.segments[1].image_off, 44u);
+    ASSERT_EQ(res.segments[2].addr, 4u);
+    ASSERT_EQ(res.segments[2].image_off, 56u);
+    ASSERT_EQ(mem_read32(mem, 0x3F400020u), 0x11111111u);
+    ASSERT_EQ(mem_read32(mem, 0x400D0044u), 0x22222222u);
+    ASSERT_EQ(mem_unmapped_count(mem), 0u);
+    mem_destroy(mem);
+}
+
 TEST(loader_nerdminer_reconstructs_huge_app_partitions) {
     uint8_t bin[64] = {0};
     bin[0] = 0xE9;
@@ -1252,6 +1298,7 @@ void run_loader_tests(void) {
     RUN_TEST(loader_rejects_unknown_image_chip_id);
     RUN_TEST(target_descriptors_are_stable_and_parse_aliases);
     RUN_TEST(loader_multi_segment);
+    RUN_TEST(loader_skips_reserved_image_blocks);
     RUN_TEST(loader_nerdminer_reconstructs_huge_app_partitions);
     RUN_TEST(loader_replaces_temporary_flash_maps_with_boot_mmu);
     RUN_TEST(loader_bad_magic);

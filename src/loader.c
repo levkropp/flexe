@@ -7,6 +7,7 @@
 #include <openssl/md5.h>
 
 #define ESP_IMAGE_HEADER_SIZE 24u
+#define ESP_IMAGE_RESERVED_LOAD_ADDR_END 0x10000000u
 
 static uint16_t read_le16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -318,6 +319,15 @@ static int range_fits(uint32_t addr, uint32_t size,
     return addr >= start && (uint64_t)addr + size <= end;
 }
 
+/* Match the ESP-IDF image loader's should_load() convention. Addresses below
+ * 0x10000000 are reserved non-loaded blocks: address 0 is alignment padding
+ * and address 4 is reserved for a possible MD5 block. Their bytes still
+ * occupy space in the image, so they must be parsed and retained in segment
+ * metadata, but they are never copied into guest memory. */
+static int loader_segment_is_reserved(uint32_t load_addr) {
+    return load_addr < ESP_IMAGE_RESERVED_LOAD_ADDR_END;
+}
+
 /* Refuse a warm reboot if the boot image bytes no longer match the image
  * used to build internal RAM. Otherwise we would silently boot stale code. */
 static int loader_flash_image_matches(xtensa_mem_t *mem,
@@ -412,7 +422,10 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
             return -1;
         }
 
-        uint8_t *buf = malloc(data_len);
+        /* A zero-length segment is valid. Allocate a stable pointer anyway so
+         * the read and warm-reset comparison paths do not depend on the
+         * implementation-defined shape of malloc(0). */
+        uint8_t *buf = malloc(data_len ? data_len : 1u);
         if (!buf) {
             snprintf(res->error, sizeof(res->error), "Segment %d malloc failed", i);
             return -1;
@@ -443,6 +456,7 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
                                     target->drom_end);
         int is_irom = addr_in_range(load_addr, target->irom_start,
                                     target->irom_end);
+        int is_reserved = loader_segment_is_reserved(load_addr);
         if ((is_drom && !range_fits(load_addr, data_len, target->drom_start,
                                     target->drom_end)) ||
             (is_irom && !range_fits(load_addr, data_len, target->irom_start,
@@ -453,7 +467,7 @@ static int loader_parse_image(xtensa_mem_t *mem, FILE *f, long offset,
             free(buf);
             return -1;
         }
-        if (!is_drom && !is_irom &&
+        if (!is_drom && !is_irom && !is_reserved &&
             mem_load(mem, load_addr, buf, data_len) != 0) {
             snprintf(res->error, sizeof(res->error),
                      "Segment %d load failed at 0x%08X (%u bytes, region: %s)",
