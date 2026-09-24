@@ -155,9 +155,10 @@ results and methodology.
 
 ## Architecture
 
-The core is a switch interpreter with a tracing JIT. Cold or unsupported
-instructions remain interpreted; hot basic blocks are compiled, chained, and
-checked against firmware-visible timers and interrupts.
+A session composes a target-described SoC, one or two Xtensa cores, shared
+memory and MMIO, ROM/service boundaries, board devices, and host endpoints.
+The interpreter defines CPU behavior; the tracing JIT compiles eligible hot
+blocks while preserving timer, interrupt, scheduler, and hook boundaries.
 
 ```text
 src/                 CPU, JIT, memory, peripheral, and service models
@@ -168,7 +169,8 @@ scripts/             build, test, corpus, and benchmark entry points
 docs/                design, compatibility, testing, and performance notes
 ```
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed design.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) for subsystem ownership, execution and
+timing contracts, reset semantics, extension rules, and the current source map.
 
 ## License
 

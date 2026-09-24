@@ -1,579 +1,310 @@
 # Architecture
 
-Detailed design decisions and internal structure for the Xtensa LX6 emulator.
+This document is a map of Flexe's current implementation. It explains where
+architectural decisions live and how the major subsystems compose; it is not a
+register-support checklist. See [hardware completeness](docs/hardware-completeness.md)
+for the exact modeled boundary, [firmware compatibility](docs/compatibility.md)
+for validated workflows, and [performance](docs/performance.md) for measured
+throughput.
 
----
+## Design contract
 
-## 1. Execution Model
+Flexe is a functional ESP32-family emulator built around four rules:
 
-### 1.1 Interpreter Core
+1. **Target data, not firmware identity, describes the machine.** Memory maps,
+   core generation, reset state, interrupt wiring, MMU geometry, peripheral
+   instances, and clock/reset connections come from versioned target
+   descriptors.
+2. **The interpreter defines CPU behavior.** Native translation is an
+   optimization over the same architectural state. Cold or unsupported code
+   falls back safely, and differential verification can compare both paths.
+3. **Firmware-visible time and ordering are deterministic.** Timers,
+   interrupts, DMA completion, sleep, and both cores share one emulated
+   timeline. Flexe does not claim cache-, bus-, or cycle-accurate timing, nor
+   truly simultaneous host execution of the two guest cores.
+4. **Unsupported behavior stays visible.** Unknown MMIO and unregistered
+   service calls are counted and can be attributed to guest PC/core. A quiet
+   zero-valued fallback helps firmware continue far enough to diagnose the
+   next gap, but it is never evidence that the device is implemented.
 
-The emulator uses a **switch-based interpreter** as the execution engine. Each
-iteration of the main loop:
+Classic ESP32/LX6 and ESP32-S3/LX7 are currently stable functional targets.
+That status is narrower than complete silicon equivalence; the capability
+matrix remains authoritative.
 
-1. Fetch instruction bytes from memory at PC
-2. Determine length (2 or 3 bytes) by checking `op0 >= 8`
-3. Extract fields from the instruction word
-4. Dispatch to the instruction handler via nested `switch` on opcode fields
-5. Execute the instruction (modify registers, memory, PC)
-6. Check for loop-back (`PC == LEND && LCOUNT != 0`)
-7. Check for pending interrupts
-8. Advance cycle counter
+## System composition
 
-```
-xtensa_step(cpu):
-    insn = fetch(cpu->pc)
-    len = (op0 >= 8) ? 2 : 3
-    next_pc = cpu->pc + len
-    execute(cpu, insn)          // may modify next_pc
-    loop_check(cpu, &next_pc)   // zero-overhead loop
-    cpu->pc = next_pc
-    cpu->ccount++
-    interrupt_check(cpu)
-```
-
-### 1.2 Batched Execution
-
-For performance, the public API exposes `xtensa_run(cpu, n_cycles)` which executes
-up to `n_cycles` instructions before returning. This amortizes the per-call overhead
-and allows the host to interleave display updates, input handling, etc.
-
-```c
-int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
-    for (int i = 0; i < max_cycles && cpu->running; i++) {
-        xtensa_step(cpu);
-    }
-    return cpu->ccount;  /* cycles actually executed */
-}
-```
-
-### 1.3 Future: Threaded Interpreter
-
-GCC's computed-goto extension can eliminate the switch dispatch overhead:
-
-```c
-static void *dispatch_table[256] = { &&op_ADD, &&op_SUB, ... };
-goto *dispatch_table[opcode];
-op_ADD:
-    ar[r] = ar[s] + ar[t];
-    DISPATCH_NEXT;
+```text
+CLI / embedding / firmware harness
+                  |
+          flexe_session_t
+      +-----------+-----------+
+      |           |           |
+ target desc   loader      host endpoints
+      |        + ROM ELF   (UART, GPIO, buses,
+      |           |         storage, network)
+      +-----+-----+-----------+
+            |
+       shared memory
+       + MMIO fabric
+       /           \
+  CPU0 / CPU1    device models
+       |          + interrupts/DMA
+ interpreter
+ or tracing JIT
+       |
+ ROM and service-hook boundaries
 ```
 
-This is a ~30% speedup but makes the code less readable. Defer until performance
-is a measured bottleneck.
-
----
-
-## 2. Memory Architecture
-
-### 2.1 Address Space Layout
-
-The ESP32 has a 32-bit address space. The emulator divides it into regions:
-
-```
-0x0000_0000 - 0x3EFF_FFFF  : Unmapped (fault on access)
-0x3F00_0000 - 0x3F3F_FFFF  : External memory (PSRAM, if present)
-0x3F40_0000 - 0x3F7F_FFFF  : External flash (data, cache-mapped)
-0x3F80_0000 - 0x3FBF_FFFF  : External PSRAM (data)
-0x3FF0_0000 - 0x3FF7_FFFF  : Peripheral registers (I/O)
-0x3FF8_0000 - 0x3FFF_FFFF  : Internal SRAM (data bus view)
-0x4000_0000 - 0x400C_1FFF  : Internal ROM + SRAM (instruction bus view)
-0x400C_2000 - 0x40BF_FFFF  : External flash (instruction, cache-mapped)
-0x5000_0000 - 0x5000_1FFF  : RTC FAST memory
-0x6000_0000 - 0x6000_1FFF  : RTC SLOW memory
-```
-
-### 2.2 Implementation: Flat Array + Region Dispatch
-
-Use a flat `uint8_t *mem` allocation for RAM/ROM regions and a dispatch function
-for peripheral I/O:
-
-```c
-typedef struct {
-    uint8_t *sram;         /* 520 KB internal SRAM at host base 0 */
-    uint8_t *rom;          /* 384 KB internal ROM */
-    uint8_t *flash;        /* External flash image (up to 16 MB) */
-    uint8_t *rtc_fast;     /* 8 KB RTC FAST */
-    uint8_t *rtc_slow;     /* 8 KB RTC SLOW */
-    uint8_t *psram;        /* Optional external PSRAM (up to 4 MB) */
-
-    /* Peripheral dispatch */
-    peripheral_read_fn  periph_read;
-    peripheral_write_fn periph_write;
-    void *periph_ctx;
-} xtensa_mem_t;
-```
-
-Address translation from ESP32 address to host pointer:
-
-```c
-uint8_t *mem_ptr(xtensa_mem_t *m, uint32_t addr) {
-    if (addr >= 0x3FFB0000 && addr < 0x40000000)
-        return m->sram + (addr - 0x3FFB0000);       /* SRAM data bus */
-    if (addr >= 0x40070000 && addr < 0x400C2000)
-        return m->sram + (addr - 0x40070000);        /* SRAM insn bus (alias) */
-    if (addr >= 0x40000000 && addr < 0x40060000)
-        return m->rom + (addr - 0x40000000);          /* ROM */
-    if (addr >= 0x3F400000 && addr < 0x3F800000)
-        return m->flash + (addr - 0x3F400000);        /* Flash data */
-    if (addr >= 0x400C2000 && addr < 0x40C00000)
-        return m->flash + (addr - 0x400C2000);        /* Flash insn */
-    /* ... etc */
-    return NULL;  /* unmapped -> exception */
-}
-```
-
-Key detail: SRAM is accessible from both the data bus (0x3FFxxxxx) and instruction
-bus (0x4007xxxx) at different addresses. Both map to the same physical memory. The
-emulator uses a single `sram` buffer and translates both address ranges to it.
-
-### 2.3 Peripheral Register Dispatch
-
-Addresses in `0x3FF00000-0x3FF7FFFF` are peripheral registers. These are dispatched
-to peripheral handler functions:
-
-```c
-uint32_t peripheral_read(void *ctx, uint32_t addr) {
-    switch (addr & 0xFFFF0000) {
-    case 0x3FF00000: return dport_read(addr);
-    case 0x3FF40000: return uart_read(addr);
-    case 0x3FF42000: return spi_read(addr, 0);
-    case 0x3FF44000: return gpio_read(addr);
-    case 0x3FF48000: return rtc_read(addr);
-    case 0x3FF5A000: return efuse_read(addr);
-    case 0x3FF5F000: return timer_read(addr, 0);
-    case 0x3FF60000: return timer_read(addr, 1);
-    /* ... */
-    default:
-        log_warn("Unhandled peripheral read: 0x%08X", addr);
-        return 0;
-    }
-}
-```
-
-Unhandled peripheral accesses return 0 and log a warning. This allows iterative
-development: run firmware, see what peripherals it accesses, add stubs.
-
-### 2.4 Flash Image
-
-The flash image is loaded from the .bin file and mapped at two address ranges:
-- `0x3F400000` (data read via cache)
-- `0x400C2000` (instruction fetch via cache)
-
-Both map to the same underlying flash data. The emulator ignores cache behavior
-and provides direct access (since we're not modeling timing).
-
----
-
-## 3. Instruction Decode
-
-### 3.1 Decode Strategy
-
-Two-level decode using `op0` (4-bit) as the first dispatch, then format-specific
-sub-dispatch:
-
-```
-op0 = 0: RRR format -> dispatch on op1, then op2
-op0 = 1: L32R (RI16 format)
-op0 = 2: RRI8 "LSAI" group -> dispatch on r field (loads/stores/ADDI/MOVI/branches)
-op0 = 3: RRI8 "LSCI" group (FP loads/stores, if FP enabled)
-op0 = 4: MAC16 group
-op0 = 5: CALL format -> dispatch on n field (CALL0/4/8/12, J)
-op0 = 6: BRI12 "SI" group -> dispatch on n,m fields (BEQZ/BNEZ/BGEZ/BLTZ/LOOP)
-op0 = 7: BRI8 "B" group -> dispatch on r field (all 2-operand branches)
-op0 = 8-15: Narrow (16-bit) instructions
-```
-
-### 3.2 Field Extraction Macros
-
-```c
-/* 24-bit instruction fields */
-#define XT_OP0(i)    ((i) & 0xF)
-#define XT_T(i)      (((i) >> 4) & 0xF)
-#define XT_S(i)      (((i) >> 8) & 0xF)
-#define XT_R(i)      (((i) >> 12) & 0xF)
-#define XT_OP1(i)    (((i) >> 16) & 0xF)
-#define XT_OP2(i)    (((i) >> 20) & 0xF)
-#define XT_IMM8(i)   (((i) >> 16) & 0xFF)
-#define XT_IMM12(i)  (((i) >> 12) & 0xFFF)
-#define XT_IMM16(i)  (((i) >> 8) & 0xFFFF)
-#define XT_SR(i)     (((i) >> 8) & 0xFF)
-
-/* CALL format */
-#define XT_N(i)      (((i) >> 4) & 0x3)
-#define XT_OFFSET18(i) (((i) >> 6) & 0x3FFFF)
-
-/* BRI8 format */
-#define XT_M(i)      (((i) >> 6) & 0x3)
-
-/* 16-bit narrow instruction fields */
-#define XT_OP0_N(i)  ((i) & 0xF)
-#define XT_T_N(i)    (((i) >> 4) & 0xF)
-#define XT_S_N(i)    (((i) >> 8) & 0xF)
-#define XT_R_N(i)    (((i) >> 12) & 0xF)
-```
-
-### 3.3 Sign Extension Helper
-
-```c
-static inline int32_t sign_extend(uint32_t val, int bits) {
-    uint32_t sign_bit = 1u << (bits - 1);
-    return (int32_t)((val ^ sign_bit) - sign_bit);
-}
-```
-
----
-
-## 4. Register Window Emulation
-
-### 4.1 Physical Register File
-
-64 physical 32-bit registers, 16 visible at a time through the window:
-
-```
-Physical:  AR[0]  AR[1]  ...  AR[63]
-                    ^--- windowbase * 4
-Visible:   a0     a1     ...  a15
-```
-
-### 4.2 Window Overflow Detection
-
-On `ENTRY`, check if the new window overlaps with an existing valid window:
-
-```c
-void window_check_overflow(xtensa_cpu_t *cpu, int callinc) {
-    int new_wb = (cpu->windowbase + callinc) & 15;
-    /* Check if windows at new_wb+0 through new_wb+3 are occupied */
-    for (int i = 0; i < 4; i++) {
-        int check = (new_wb + i) & 15;
-        if (cpu->windowstart & (1 << check)) {
-            /* Overlap detected: spill the overlapping window */
-            window_spill(cpu, check);
-        }
-    }
-}
-```
-
-### 4.3 Synthesized Spill Strategy
-
-Rather than jumping to exception vectors (which requires ROM code), the emulator
-directly implements the spill in C:
-
-```c
-void window_spill(xtensa_cpu_t *cpu, int window_idx) {
-    /* Save a0-a3 to Base Save Area of callee's stack frame */
-    int base = window_idx * 4;
-    uint32_t sp = cpu->ar[(base + 1) & 63];  /* a1 of that window = its SP */
-    for (int i = 0; i < 4; i++) {
-        mem_write32(cpu->mem, sp - 16 + i*4, cpu->ar[(base + i) & 63]);
-    }
-    /* Clear windowstart bit */
-    cpu->windowstart &= ~(1 << window_idx);
-}
-```
-
-This is equivalent to what the ROM's WindowOverflow4 handler does, but without
-the overhead of exception entry/exit. If firmware needs CALL8/CALL12 overflow
-(which saves more registers to the Extra Save Area), the spill function handles
-those cases too.
-
-### 4.4 When to Use Full Exception Emulation
-
-If a firmware image installs custom window exception handlers (writes to VECBASE
-window overflow vector addresses), switch to full exception emulation:
-
-1. Save EPC, EPS, set EXCCAUSE
-2. Jump to VECBASE + WindowOverflow4/8/12 offset
-3. Let the firmware's handler code run
-4. Return via RFWO/RFWU
-
-This is the fallback path. The synthesized path is the fast default.
-
----
-
-## 5. Exception and Interrupt Architecture
-
-### 5.1 Exception Dispatch
-
-```
-exception(cpu, cause):
-    if (cpu->ps.excm):
-        // Double exception
-        cpu->depc = cpu->pc
-        cpu->pc = cpu->vecbase + 0x1C0  // DoubleExceptionVector
-    else:
-        cpu->epc[1] = cpu->pc
-        cpu->eps[1] = cpu->ps
-        cpu->exccause = cause
-        cpu->ps.excm = 1
-        cpu->ps.intlevel = max(cpu->ps.intlevel, 1)  // mask level-1
-        cpu->pc = vector_address(cpu, cause)
-```
-
-### 5.2 Vector Offsets (from VECBASE)
-
-| Offset | Vector |
-|--------|--------|
-| 0x000  | WindowOverflow4 |
-| 0x040  | WindowOverflow8 |
-| 0x080  | WindowOverflow12 |
-| 0x0C0  | WindowUnderflow4 |
-| 0x100  | WindowUnderflow8 |
-| 0x140  | WindowUnderflow12 |
-| 0x180  | KernelExceptionVector |
-| 0x1C0  | DoubleExceptionVector |
-| 0x200  | UserExceptionVector |
-| 0x240  | Level2InterruptVector |
-| 0x280  | Level3InterruptVector |
-| 0x2C0  | Level4InterruptVector |
-| 0x300  | Level5InterruptVector |
-| 0x340  | NMIExceptionVector (level 7) |
-
-The reset vector is at a fixed address (0x40000400 for ESP32), not relative to VECBASE.
-
-### 5.3 Interrupt Handling
-
-Interrupts are checked between instructions. An interrupt is taken if:
-1. `INTENABLE & INTERRUPT != 0` (interrupt is enabled)
-2. The interrupt's level > `PS.INTLEVEL` (not masked)
-3. `PS.EXCM == 0` (not already in exception handler — for level-1 only)
-
-Timer interrupts: when `CCOUNT == CCOMPARE[n]`, set the corresponding interrupt
-bit. The interrupt matrix routes this to a CPU interrupt line.
-
-### 5.4 PS Register Detailed Layout
-
-```
-Bit 0-3:   INTLEVEL (current interrupt mask level, 0-15)
-Bit 4:     EXCM     (exception mode, suppresses level-1 interrupts)
-Bit 5:     UM       (user mode, 0=kernel 1=user)
-Bit 6-7:   RING     (privilege ring, 0-3)
-Bit 8-11:  OWB      (old window base, saved during exceptions)
-Bit 12-15: (reserved)
-Bit 16-17: CALLINC  (window increment for current call, 1/2/3 for CALL4/8/12)
-Bit 18:    WOE      (window overflow enable)
-```
-
----
-
-## 6. Peripheral Model Architecture
-
-### 6.1 Peripheral Interface
-
-Each peripheral implements a standard interface:
-
-```c
-typedef struct {
-    const char *name;
-    uint32_t base_addr;
-    uint32_t size;
-    uint32_t (*read)(void *state, uint32_t offset);
-    void (*write)(void *state, uint32_t offset, uint32_t value);
-    void (*tick)(void *state, uint32_t cycles);  /* optional: periodic update */
-    void (*reset)(void *state);
-} peripheral_t;
-```
-
-The `tick` function is called periodically (not every cycle) for peripherals that
-need time-based behavior (timers, UART TX timing, etc.).
-
-### 6.2 SPI Device Bus
-
-SPI peripherals (display, touch, flash) connect through a virtual SPI bus:
-
-```c
-typedef struct {
-    uint8_t (*transfer)(void *dev, uint8_t mosi_byte);
-    void (*cs_changed)(void *dev, bool active);
-    void *device_state;
-} spi_device_t;
-```
-
-The SPI controller model drives this interface based on register writes:
-1. Firmware writes MOSI data to SPI registers
-2. Firmware sets the "start" bit
-3. Emulator calls `transfer()` on the selected device
-4. MISO data (if any) is placed in read registers
-
-### 6.3 Display Model
-
-The ILI9341 model maintains:
-- Current command state (waiting for command vs. data)
-- Column/row address window (set by CASET/RASET)
-- 320x240x16bpp framebuffer (RGB565)
-- Current write position within the address window
-
-On RAMWR data: pixels are written sequentially to the framebuffer at the current
-position, advancing column-first then row, wrapping within the address window.
-
-The framebuffer is exposed to the host via `xtensa_emu_get_framebuffer()` for
-SDL rendering.
-
----
-
-## 7. Integration API
-
-### 7.1 Library API
-
-```c
-/* Lifecycle */
-xtensa_emu_t *xtensa_emu_create(void);
-void xtensa_emu_destroy(xtensa_emu_t *emu);
-void xtensa_emu_reset(xtensa_emu_t *emu);
-
-/* Loading */
-int xtensa_emu_load_bin(xtensa_emu_t *emu, const char *firmware_path);
-int xtensa_emu_load_elf(xtensa_emu_t *emu, const char *elf_path);
-
-/* Execution */
-int xtensa_emu_run(xtensa_emu_t *emu, int max_cycles);
-void xtensa_emu_stop(xtensa_emu_t *emu);
-bool xtensa_emu_is_running(xtensa_emu_t *emu);
-
-/* Display */
-const uint16_t *xtensa_emu_get_framebuffer(xtensa_emu_t *emu);
-void xtensa_emu_get_display_size(xtensa_emu_t *emu, int *w, int *h);
-
-/* Input */
-void xtensa_emu_touch_event(xtensa_emu_t *emu, int x, int y, bool pressed);
-void xtensa_emu_gpio_set(xtensa_emu_t *emu, int pin, bool level);
-
-/* I/O */
-typedef void (*xtensa_uart_cb)(void *ctx, const char *data, int len);
-void xtensa_emu_set_uart_callback(xtensa_emu_t *emu, xtensa_uart_cb cb, void *ctx);
-
-/* Debug */
-void xtensa_emu_dump_regs(xtensa_emu_t *emu, FILE *out);
-uint32_t xtensa_emu_get_pc(xtensa_emu_t *emu);
-uint32_t xtensa_emu_read_reg(xtensa_emu_t *emu, int reg);
-int xtensa_emu_disasm(xtensa_emu_t *emu, uint32_t addr, char *buf, int bufsize);
-```
-
-### 7.2 Thread Safety
-
-The emulator is **not thread-safe internally**. The host application is responsible
-for synchronization:
-
-- Call `xtensa_emu_run()` from a dedicated emulator thread
-- Use a mutex when calling `get_framebuffer()`, `touch_event()`, etc. from other threads
-- The `stop()` function sets an atomic flag that `run()` checks each iteration
-
-This matches cyd-emulator's existing pattern: app runs in a background thread,
-main thread handles SDL events and rendering.
-
-### 7.3 cyd-emulator Integration Pattern
-
-```c
-/* In emu_main.c */
-void *emu_xtensa_thread(void *arg) {
-    xtensa_emu_t *emu = (xtensa_emu_t *)arg;
-    while (emu_running) {
-        xtensa_emu_run(emu, 8000000);  /* ~33ms at 240MHz */
-        /* Yield to allow display update */
-        usleep(1000);
-    }
-    return NULL;
-}
-
-/* In render loop */
-void render_xtensa_display(void) {
-    const uint16_t *fb = xtensa_emu_get_framebuffer(emu);
-    /* Convert RGB565 to SDL texture and render */
-}
-
-/* In event handler */
-void handle_mouse_event(SDL_Event *e) {
-    if (xtensa_mode) {
-        xtensa_emu_touch_event(emu, x, y, pressed);
-    }
-}
-```
-
----
-
-## 8. Testing Strategy
-
-### 8.1 Unit Tests
-
-Each instruction category has a dedicated test file. Tests create a CPU, set up
-registers, execute one instruction, and verify the result:
-
-```c
-void test_add(void) {
-    xtensa_cpu_t cpu;
-    xtensa_cpu_reset(&cpu);
-    ar_write(&cpu, 4, 100);    /* a4 = 100 */
-    ar_write(&cpu, 5, 200);    /* a5 = 200 */
-    /* ADD a3, a4, a5:  op2=8 op1=0 r=3 s=4 t=5 op0=0 */
-    execute_insn(&cpu, encode_rrr(0x8, 0x0, 3, 4, 5, 0x0));
-    ASSERT_EQ(ar_read(&cpu, 3), 300);
-}
-```
-
-### 8.2 Integration Tests
-
-Load real .bin firmware images and verify behavior:
-- **hello_world**: Boot to app_main, verify UART output contains "Hello world!"
-- **blink**: Verify GPIO output toggles
-- **display_test**: Verify framebuffer contains expected pixels
-
-### 8.3 Differential Testing
-
-For complex instructions (window operations, exceptions), compare behavior against
-a reference implementation by running the same instruction sequence and comparing
-register/memory state. Can use QEMU as a black-box reference (run same binary,
-compare traces) without copying any code.
-
----
-
-## 9. File Organization
-
-```
-xtensa-emulator/
-  ARCHITECTURE.md            # This file
-  CMakeLists.txt             # Build system
-  src/
-    xtensa.h                 # Public API + CPU state
-    xtensa.c                 # Instruction interpreter
-    xtensa_decode.h          # Instruction field extraction (inline)
-    memory.h                 # Memory subsystem API
-    memory.c                 # Memory implementation
-    loader.h                 # Firmware loader API
-    loader.c                 # .bin + ELF loading
-    window.h                 # Window overflow/underflow
-    window.c
-    exception.h              # Exception/interrupt dispatch
-    exception.c
-    interrupt.h              # Interrupt controller
-    interrupt.c
-    peripherals/
-      peripheral.h           # Common peripheral interface
-      dport.c                # System registers
-      uart.c                 # UART console
-      gpio.c                 # GPIO matrix
-      spi.c                  # SPI controller
-      timer.c                # TIMG watchdog/GP timers
-      rtc.c                  # RTC_CNTL
-      efuse.c                # eFuse block
-      intmatrix.c            # Interrupt matrix
-      display.c              # ILI9341 display model
-      touch.c                # XPT2046 touch model
-  tests/
-    test_main.c              # Test runner entry point
-    test_helpers.h           # Assert macros, CPU setup helpers
-    test_alu.c               # Arithmetic instruction tests
-    test_shift.c             # Shift instruction tests
-    test_move.c              # Move instruction tests
-    test_branch.c            # Branch instruction tests
-    test_memory.c            # Load/store tests
-    test_loader.c            # .bin parser tests
-    test_loop.c              # Zero-overhead loop tests
-    test_muldiv.c            # Multiply/divide tests
-    test_misc.c              # Misc operations tests
-    test_window.c            # Register window tests
-    test_exception.c         # Exception handling tests
-    test_interrupt.c         # Interrupt tests
-    test_programs/           # Assembled test binaries
-  tools/
-    xt-dis.c                 # Standalone disassembler
-```
+[`flexe_session_t`](src/flexe_session.h) is the machine owner used by the CLI
+and integration harnesses. Construction in
+[`flexe_session.c`](src/flexe_session.c) follows this order:
+
+1. Probe the ESP image and resolve or verify the selected target.
+2. Allocate target-sized memory backings and optionally load the matching
+   official ROM ELF.
+3. Construct the target's MMIO devices from capabilities and descriptors.
+4. Load the application, install its flash-MMU state, and synthesize only the
+   boot state absent from a standalone app image.
+5. Reset one or two Xtensa cores from target data and connect interrupts,
+   timers, ROM/service hooks, board devices, and host endpoints.
+6. Install the native JIT on supported hosts unless the caller selects the
+   interpreter.
+
+The session also owns batch scheduling, software/deep-sleep rebuilds, APP-CPU
+startup and reset, asynchronous wake, and the lifetime of every attached
+compatibility service.
+
+## Target descriptions
+
+[`target_types.h`](src/target_types.h) is the small stable boundary used by
+hot CPU and memory headers. The complete versioned descriptor is declared in
+[`target.h`](src/target.h) and instantiated in [`target.c`](src/target.c).
+A descriptor contains:
+
+- image chip ID, LX generation, core count, reset vectors, and core identity;
+- physical backings, guest aliases, executable ranges, and flash-MMU layout;
+- capability bits selecting reusable IP models;
+- register geometry, reset values, interrupt sources, GPIO-matrix signals,
+  clocks, resets, and DMA identities for each device instance;
+- bootloader-to-application state such as flash geometry and ROM ABI data.
+
+`periph_create()` consumes those capabilities to construct the SoC. A device
+model should not infer the chip from a firmware entry point or duplicate a
+target address map internally.
+
+Large or fast-changing device descriptors live with their owning device and
+attach through the target extension registry. For example,
+[`touch_v2.h`](src/touch_v2.h) owns the touch-v2 descriptor and its stable
+extension tag. This keeps peripheral changes from invalidating the entire
+build through `target.h`.
+
+Board population is separate from the SoC descriptor. Optional PSRAM and
+external SPI/I2C/storage devices are attached during machine construction, so
+the same controller model can serve a headless harness, a CYD, or another
+board without firmware-specific controller logic.
+
+## Images, ROM, and memory
+
+[`loader.c`](src/loader.c) understands standalone ESP application images and
+merged factory images. It validates the target and declared flash geometry,
+copies internal-memory segments, retains flash-backed segments in NOR, and
+seeds the target-described cache MMU. ESP-reserved non-loaded image blocks are
+parsed for correct offsets but never copied to guest address zero.
+
+A standalone app has no partition table or bootloader handoff, so the loader
+creates the smallest coherent factory layout needed by the SDK. A merged
+image keeps its real partitions and bytes. Software reset reconstructs
+internal application segments from the original image without overwriting
+live guest-modified flash; selecting a different OTA image is a separate,
+currently unsupported operation.
+
+[`rom_elf.c`](src/rom_elf.c) loads immutable mask-ROM sections and the ROM's
+linker-described data/BSS interface from an official Espressif ROM ELF. ROM
+symbol data also resolves ABI state that cannot safely be guessed from an SDK
+version.
+
+[`memory.c`](src/memory.c) uses host allocations for SRAM, ROM, flash data and
+instruction views, RTC memory, and optional PSRAM. A 4 KiB direct page table
+maps the 32-bit guest address space onto those backings, including physical
+aliases and live cache-MMU remaps. Ordinary RAM access is a page lookup and
+host load/store; a miss enters the MMIO path.
+
+MMIO handlers are registered by page or range and may implement byte-enable-
+aware writes for FIFO, strobe, and write-one-to-clear registers. A miss that
+matches neither memory nor a device is counted separately from modeled
+peripheral fallback. Instruction-stream changes notify the interpreter and
+JIT so stale decoded or translated code is discarded.
+
+## Xtensa execution
+
+[`xtensa.c`](src/xtensa.c) is the reference implementation for the common
+windowed Xtensa behavior used by LX6 and LX7. CPU state includes the 64-entry
+physical register file, window state, special/user registers, exception and
+debug state, interrupt inputs, compare timers, loop registers, floating-point
+state, and separate elapsed-cycle and retired-instruction counters.
+
+The interpreter predecodes executable memory, then executes instructions with
+architectural register-window, exception-vector, interrupt, timer, and
+zero-overhead-loop behavior. Guest window vectors are the default. The
+optional window accelerator is admitted only for canonical handlers and must
+preserve the same visible state.
+
+[`jit.c`](src/jit.c) is a tracing basic-block JIT for ARM64 and x86-64 hosts.
+It is selected by a target translation profile rather than by chip name or
+firmware address. Its important correctness properties are:
+
+- hot code is compiled lazily; unsupported instructions and contexts return
+  to the interpreter;
+- exact ROM/service-hook membership terminates translation at host boundaries;
+- block keys include architectural context such as register-window and loop
+  state;
+- block chaining is bounded by scheduler, timer, interrupt, debugger, and
+  batch-budget safepoints;
+- flash writes and MMU remaps invalidate affected native code;
+- `--jit-verify` journals RAM, runs replayable blocks through both engines,
+  and compares architectural state. MMIO blocks are not replayed because
+  device reads and writes can be destructive.
+
+Backend-specific emission lives in
+[`jit_emit_arm64.h`](src/jit_emit_arm64.h) and
+[`jit_emit_x64.h`](src/jit_emit_x64.h). Unsupported hosts build
+[`jit_stub.c`](src/jit_stub.c) and use the interpreter. The AOT recompiler in
+`tools/` remains experimental and opt-in; it is not part of the supported
+default execution path.
+
+## Time, interrupts, and two cores
+
+Flexe keeps work and time distinct:
+
+- `insn_count` is guest instructions actually retired;
+- `cycle_count` is elapsed emulated core cycles, including idle advancement;
+- `virtual_time_us` records time skipped by functional waits and scheduler
+  fast-forwarding rather than instruction execution.
+
+The interpreter and JIT stop at a computed event horizon so compare timers,
+peripheral deadlines, and newly deliverable interrupts remain observable.
+Device models expose their next event and raise target interrupt sources
+through the interrupt matrix. `WAITI` and idle firmware may advance directly
+to useful work without being credited with retired instructions.
+
+The two guest cores share memory, peripherals, and time, but execute
+cooperatively in deterministic batches. `flexe_session_post_batch()` starts
+CPU1 through the target's boot contract, alternates runnable work, handles
+spinlock handoff, and reconciles both cores onto one timeline. This preserves
+firmware-visible ordering and cross-core interrupts; it intentionally does
+not model sub-instruction races or simultaneous cache/bus contention.
+
+## Device models and host boundaries
+
+[`peripherals.c`](src/peripherals.c) contains the classic SoC container and the
+composition layer for reusable target-described devices. Larger IP blocks
+live in focused files such as `gpio.c`, `gdma.c`, `timer_group.c`,
+`spi_mem.c`, `i2s_v2.c`, and `lcd_cam.c`.
+
+A functional device model normally owns:
+
+- register reset/read/write behavior and reserved-bit masks;
+- clock/reset gating and any retained state;
+- scheduled completion and interrupt transitions;
+- DMA descriptor ownership and memory effects where relevant;
+- a controller-level host API for external wires or media.
+
+Fast mode often completes a bus transaction as one ordered operation rather
+than synthesizing every SCL, SPI clock, UART baud, or PWM edge. Aggregate
+callbacks still expose meaningful transactions and output state. Individual
+edges belong in a model only when firmware-visible behavior depends on them.
+
+Host attachment APIs in [`peripherals.h`](src/peripherals.h) connect virtual
+I2C targets, SPI devices, SD/MMC cards, CAN peers, Ethernet/MDIO, audio, PWM,
+and other external endpoints without putting host policy inside a register
+model. [`sandbox_input.h`](src/sandbox_input.h) and
+[`sandbox_events.h`](src/sandbox_events.h) provide a bounded frontend-neutral
+input/event vocabulary. Board devices such as the ILI9341/XPT2046/SD stack are
+consumers of the same controller boundary.
+
+## ROM and service compatibility
+
+Not every useful fast-mode boundary is silicon MMIO. The hook registry in
+[`rom_stubs.c`](src/rom_stubs.c) can implement mask-ROM services and selected
+SDK/runtime services at their ABI boundary. Hooks are resolved from official
+ROM symbols, application ELF symbols, stable ABI information, or complete
+structural fingerprints. An exact hook bitmap keeps the normal instruction
+path cheap and prevents the JIT from compiling across a service boundary.
+
+Compatibility mode can replace selected FreeRTOS, display, Wi-Fi, Bluetooth,
+VFS, and library services while still executing guest callbacks and device
+drivers. Native mode (`-N`) runs the firmware's own FreeRTOS and relies more
+heavily on modeled hardware. Documentation and tests must label service-shim
+success separately from MMIO hardware support; one is not evidence for the
+other.
+
+## Reset, sleep, and retention
+
+A system software reset rebuilds CPUs, controller registers, service state,
+and the JIT while preserving state that lives outside the resetting SoC or is
+architecturally retained. This includes live NOR contents and host device
+attachments; target-specific RTC, pad-hold, and external-memory retention is
+handled explicitly. Controller FIFOs and in-flight transactions do not leak
+through the rebuild.
+
+APP-CPU reset is applied at a safe scheduler boundary without rebuilding the
+shared SoC. Light sleep advances or waits on the shared timeline and resumes
+the machine; deep sleep takes the reset path with the target's RTC retention
+and wake cause. Asynchronous GPIO/touch wake remains host-drivable while both
+cores retire no instructions.
+
+## Diagnostics and verification
+
+The main correctness layers are:
+
+1. Unit tests for CPU, memory, loaders, device state, timing, and service
+   boundaries.
+2. Interpreter/JIT differential tests, including broad encoding-space sweeps.
+3. Compiled Arduino and ESP-IDF fixtures that drive real registers, DMA,
+   interrupts, and host endpoints in both engines.
+4. Production firmware scenarios that require sustained useful behavior,
+   output parity, bounded execution, and explicit unsupported-access limits.
+5. GCC, Clang, sanitizer, and cross-backend CI builds.
+
+See [testing](docs/testing.md) for commands and gate structure. An emulator
+change is not complete merely because firmware prints a boot banner: the
+relevant state transition needs focused coverage, and any compatibility claim
+needs an end-to-end gate.
+
+## Source map
+
+| Area | Primary sources |
+|---|---|
+| Machine ownership and scheduling | `src/flexe_session.[ch]` |
+| Target data and extension registry | `src/target.[ch]`, `src/target_types.h` |
+| CPU and window behavior | `src/xtensa.[ch]`, `src/window_accel.c` |
+| Native translation | `src/jit.c`, `src/jit_emit_*.h` |
+| Memory, image, ROM, and XIP | `src/memory.[ch]`, `src/loader.[ch]`, `src/rom_elf.[ch]`, `src/flash_mmu.[ch]` |
+| SoC/device composition | `src/peripherals.[ch]` and focused device modules |
+| ROM and compatibility services | `src/*_stubs.[ch]`, `src/guest_call.[ch]`, `src/firmware_scan.[ch]` |
+| Board/external device models | `src/spi_display.[ch]`, `src/axp192.[ch]`, `src/sx127x.[ch]`, `src/ublox_gps.[ch]` |
+| CLI and frontend event plumbing | `src/main.c`, `src/sandbox_*.[ch]` |
+| Validation | `tests/`, `tests/fixtures/`, `tools/`, `scripts/` |
+
+## Extending Flexe
+
+For a new target, add architectural geometry to a target descriptor, opt into
+only reusable capabilities the target actually has, and supply focused tests
+for every differing register layout or connection. A descriptor existing is
+not sufficient to claim execution support.
+
+For a new device, keep its state machine and descriptor in the owning module,
+register MMIO through the memory API, connect clock/reset/interrupt/DMA state,
+and expose external behavior at a controller-level attachment boundary. Use a
+target extension when adding the descriptor to `target.h` would create broad
+rebuild coupling.
+
+For a new instruction, implement and test interpreter semantics first, update
+the disassembler, then add native translation only when its guards and exit
+behavior can be compared against the interpreter. A JIT optimization must be
+safe to decline at runtime.
+
+For a host service acceleration, prefer symbols or complete structural
+validation over firmware names and fixed PCs. Preserve the guest ABI, time,
+interrupt, and memory effects, and keep the boundary visible to every
+execution engine.
