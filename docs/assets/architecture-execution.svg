@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="846" viewBox="0 0 1120 846" role="img" aria-labelledby="title desc">
+<title id="title">two engines, the same cpu state</title>
+<desc id="desc">Guest dispatch chooses interpreter or tracing JIT. Guarded exits return to the interpreter. Both share architectural state and stop for firmware-visible boundaries. Verification journals RAM, replays eligible blocks, and compares state; destructive MMIO is excluded.</desc>
+<defs>
+<pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+<path d="M 48 0 H 0 V 48" fill="none" stroke="#50fa7b" stroke-opacity=".045"/>
+</pattern>
+<radialGradient id="glow">
+<stop stop-color="#50fa7b" stop-opacity=".12"/>
+<stop offset="1" stop-color="#50fa7b" stop-opacity="0"/>
+</radialGradient>
+<marker id="arrow-green" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="back-green" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-purple" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="back-purple" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-amber" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="back-amber" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-blue" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+<marker id="back-blue" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+</defs>
+<style>text{font-family:"Segoe UI",Arial,sans-serif;fill:#c0c0d0}.heading,.box-title,.wordmark{font-family:"Comic Neue","Comic Sans MS","Chalkboard SE",cursive;font-weight:700}.heading{font-size:36px;fill:#e4e4f0}.box-title{font-size:25px}.wordmark{font-size:92px;fill:#50fa7b;letter-spacing:2px}.copy{font-size:20px}.small{font-size:18px}.muted{font-size:20px;fill:#9d9dbd}.eyebrow{font-size:16px;fill:#50fa7b;letter-spacing:2px}.mono{font-family:Consolas,Menlo,monospace;font-size:20px;fill:#50fa7b}</style>
+<rect x="1" y="1" width="1118" height="844" rx="20" fill="#0a0a1e" stroke="#272747"/>
+<rect x="1" y="1" width="1118" height="844" rx="20" fill="url(#grid)"/>
+<text x="32" y="39" class="eyebrow" >the execution path</text>
+<text x="32" y="86" class="heading" >two engines, the same cpu state</text>
+<text x="32" y="122" class="muted" >the interpreter defines behavior. the jit accelerates eligible hot blocks.</text>
+<rect x="32" y="240" width="268" height="132" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="54" y="277" class="box-title" style="fill:#50fa7b">guest dispatch</text>
+<text x="54" y="310" class="copy" >pc + execution context</text>
+<text x="54" y="336" class="copy" >exact hook lookup</text>
+<rect x="412" y="167" width="294" height="119" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="434" y="204" class="box-title" style="fill:#50fa7b">interpreter</text>
+<text x="434" y="237" class="copy" >cold / unsupported code</text>
+<text x="434" y="263" class="copy" >reference semantics</text>
+<rect x="412" y="344" width="294" height="119" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="434" y="381" class="box-title" style="fill:#bd93f9">tracing jit</text>
+<text x="434" y="414" class="copy" >eligible hot basic blocks</text>
+<text x="434" y="440" class="copy" >arm64 / x86-64</text>
+<rect x="818" y="240" width="270" height="132" rx="16" fill="#12122e" stroke="#8be9fd66"/>
+<text x="840" y="277" class="box-title" style="fill:#8be9fd">shared cpu state</text>
+<text x="840" y="310" class="copy" >registers + windows</text>
+<text x="840" y="336" class="copy" >memory + counters</text>
+<path d="M 300 276 H 352 V 226 H 409" fill="none" stroke="#50fa7b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+<path d="M 300 335 H 352 V 404 H 409" fill="none" stroke="#bd93f9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<path d="M 709 226 H 759 V 276 H 815" fill="none" stroke="#8be9fd" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<path d="M 709 404 H 759 V 335 H 815" fill="none" stroke="#8be9fd" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<path d="M 559 344 V 289" fill="none" stroke="#bd93f9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<text x="583" y="322" class="small" >guarded exit</text>
+<rect x="32" y="499" width="1056" height="91" rx="14" fill="#12122e" stroke="#303054"/>
+<text x="54" y="535" class="box-title" >stop at the next boundary</text>
+<text x="54" y="567" class="copy" >timers · interrupts · scheduler · hooks · debugger · cycle budget</text>
+<text x="32" y="631" class="box-title" >verify replayable blocks with --jit-verify</text>
+<rect x="32" y="653" width="312" height="110" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="54" y="690" class="box-title" style="fill:#bd93f9">run native</text>
+<text x="54" y="723" class="copy" >journal ram effects</text>
+<path d="M 346 696 H 401" fill="none" stroke="#bd93f9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<rect x="404" y="653" width="312" height="110" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="426" y="690" class="box-title" style="fill:#50fa7b">replay interpreter</text>
+<text x="426" y="723" class="copy" >restore the same input state</text>
+<path d="M 718 696 H 773" fill="none" stroke="#50fa7b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+<rect x="776" y="653" width="312" height="110" rx="16" fill="#12122e" stroke="#8be9fd66"/>
+<text x="798" y="690" class="box-title" style="fill:#8be9fd">compare state</text>
+<text x="798" y="723" class="copy" >check architectural effects</text>
+<text x="32" y="810" class="small" >destructive mmio is excluded from replay. flash writes and mmu remaps invalidate code.</text>
+</svg>

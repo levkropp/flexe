@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="792" viewBox="0 0 1120 792" role="img" aria-labelledby="title desc">
+<title id="title">one session, one little machine</title>
+<desc id="desc">CLI and harnesses create a session. Target descriptors configure cores and devices, the loader initializes shared memory, and host endpoints attach through controller APIs. Cores and devices share memory/MMIO, interrupts, and one timeline.</desc>
+<defs>
+<pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+<path d="M 48 0 H 0 V 48" fill="none" stroke="#50fa7b" stroke-opacity=".045"/>
+</pattern>
+<radialGradient id="glow">
+<stop stop-color="#50fa7b" stop-opacity=".12"/>
+<stop offset="1" stop-color="#50fa7b" stop-opacity="0"/>
+</radialGradient>
+<marker id="arrow-green" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="back-green" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-purple" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="back-purple" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-amber" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="back-amber" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-blue" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+<marker id="back-blue" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+</defs>
+<style>text{font-family:"Segoe UI",Arial,sans-serif;fill:#c0c0d0}.heading,.box-title,.wordmark{font-family:"Comic Neue","Comic Sans MS","Chalkboard SE",cursive;font-weight:700}.heading{font-size:36px;fill:#e4e4f0}.box-title{font-size:25px}.wordmark{font-size:92px;fill:#50fa7b;letter-spacing:2px}.copy{font-size:20px}.small{font-size:18px}.muted{font-size:20px;fill:#9d9dbd}.eyebrow{font-size:16px;fill:#50fa7b;letter-spacing:2px}.mono{font-family:Consolas,Menlo,monospace;font-size:20px;fill:#50fa7b}</style>
+<rect x="1" y="1" width="1118" height="790" rx="20" fill="#0a0a1e" stroke="#272747"/>
+<rect x="1" y="1" width="1118" height="790" rx="20" fill="url(#grid)"/>
+<text x="32" y="39" class="eyebrow" >the machine</text>
+<text x="32" y="86" class="heading" >one session, one little machine</text>
+<text x="32" y="122" class="muted" >target data configures cores, memory, and devices. the session connects them.</text>
+<rect x="366" y="155" width="388" height="95" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="388" y="192" class="box-title" style="fill:#bd93f9">cli / embedding / harness</text>
+<path d="M 560 250 V 284" fill="none" stroke="#bd93f9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<rect x="32" y="284" width="1056" height="433" rx="20" fill="#0d0d25" stroke="#44446c"/>
+<text x="54" y="322" class="mono" >flexe_session_t</text>
+<text x="1066" y="322" class="small" text-anchor="end">owns setup, scheduling, reset, and lifetimes</text>
+<rect x="56" y="346" width="292" height="118" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="78" y="383" class="box-title" style="fill:#50fa7b">target descriptors</text>
+<text x="78" y="416" class="copy" >geometry + capabilities</text>
+<text x="78" y="442" class="copy" >memory / clocks / irqs</text>
+<rect x="414" y="346" width="292" height="118" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="436" y="383" class="box-title" style="fill:#bd93f9">firmware loader</text>
+<text x="436" y="416" class="copy" >app or merged image</text>
+<text x="436" y="442" class="copy" >optional official rom elf</text>
+<rect x="772" y="346" width="292" height="118" rx="16" fill="#12122e" stroke="#8be9fd66"/>
+<text x="794" y="383" class="box-title" style="fill:#8be9fd">host endpoints</text>
+<text x="794" y="416" class="copy" >input, media, network</text>
+<text x="794" y="442" class="copy" >controller attachment apis</text>
+<path d="M 202 464 V 510" fill="none" stroke="#50fa7b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+<path d="M 560 464 V 510" fill="none" stroke="#bd93f9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<path d="M 918 464 V 510" fill="none" stroke="#8be9fd" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)" marker-start="url(#back-blue)"/>
+<rect x="56" y="510" width="292" height="145" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="78" y="547" class="box-title" style="fill:#50fa7b">cpu0 / cpu1</text>
+<text x="78" y="580" class="copy" >interpreter or tracing jit</text>
+<text x="78" y="606" class="copy" >rom + service boundaries</text>
+<rect x="414" y="510" width="292" height="145" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="436" y="547" class="box-title" style="fill:#bd93f9">shared memory</text>
+<text x="436" y="580" class="copy" >ram / rom / flash / psram</text>
+<text x="436" y="606" class="copy" >page table + mmio fabric</text>
+<rect x="772" y="510" width="292" height="145" rx="16" fill="#12122e" stroke="#8be9fd66"/>
+<text x="794" y="547" class="box-title" style="fill:#8be9fd">device models</text>
+<text x="794" y="580" class="copy" >registers / dma / deadlines</text>
+<text x="794" y="606" class="copy" >board devices on buses</text>
+<path d="M 351 571 H 411" fill="none" stroke="#bd93f9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-purple)" marker-start="url(#back-purple)"/>
+<path d="M 709 571 H 769" fill="none" stroke="#8be9fd" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)" marker-start="url(#back-blue)"/>
+<path d="M 918 657 V 692 H 202 V 657" fill="none" stroke="#50fa7b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+<rect x="368" y="675" width="384" height="33" rx="5" fill="#0d0d25" stroke="none"/>
+<text x="560" y="698" class="small" text-anchor="middle">interrupts · one shared timeline</text>
+<text x="32" y="757" class="muted" >hardware controllers and host service hooks have separate support boundaries.</text>
+</svg>

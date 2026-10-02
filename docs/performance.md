@@ -1,9 +1,9 @@
-# Performance
+# performance
 
 Flexe reports elapsed emulated time separately from retired guest
 instructions. Keep those measurements separate when evaluating a workload.
 
-## Metrics
+## metrics
 
 - **Real-time factor** is simulated ESP32 seconds divided by host wall seconds.
   `1.0x` keeps pace with a 240 MHz ESP32.
@@ -17,7 +17,7 @@ Firmware that spins, traps, or idles prematurely can show a flattering
 real-time factor while doing no useful work. The benchmark scripts therefore
 print retired instructions and UART activity next to elapsed time.
 
-## Current production baseline
+## current production baseline
 
 This snapshot was recorded on 2026-09-08 on an Apple-silicon MacBook with
 Apple Clang 21. The build used `Release`, LTO, and `NATIVE_ARCH=ON`; PGO was
@@ -53,7 +53,7 @@ produced the pinned `F29E02EB` LED waveform. These accelerators are selected by
 complete instruction signatures and decoded call/literal targets, never by a
 WLED address; unsafe or unfamiliar calls continue in the guest.
 
-## ESP32-S3 WLED baseline
+## esp32-s3 wled baseline
 
 The pinned WLED 16.0.1 ESP32-S3 4M QSPI scenario was measured on 2026-09-19
 on an Apple-silicon MacBook with a `Release`, LTO, host-native build. Each run
@@ -81,7 +81,7 @@ hook registry before every instruction, so a service boundary cannot be
 compiled merely because a neighboring ROM address is eligible. This is a
 target-level mechanism shared by firmware rather than a WLED address list.
 
-## Reproducible compute benchmark
+## reproducible compute benchmark
 
 `bench-compute.sh` builds an in-repository Arduino sketch and executes a fixed
 number of rounds. It covers a dependent scalar chain, strided memory traffic,
@@ -94,7 +94,7 @@ ARDUINO_CLI=/path/to/arduino-cli ./scripts/bench-compute.sh
 
 Useful overrides are `BENCH_ROUNDS`, `BENCH_REPS`, and `MIN_REALTIME`.
 
-## Production firmware
+## production firmware
 
 Use the scripted stock scenarios when the image has one:
 
@@ -129,7 +129,7 @@ generic progress gate and both engines produce the same UART digest. `BATCH`
 and `MAX_UNMAPPED` override its 10,000-instruction scheduling quantum and
 1,000-access unmapped-memory ceiling.
 
-## JIT coverage
+## jit coverage
 
 In a six-billion-cycle WLED 16.0.1 scenario on 2026-09-09, compiled blocks
 execute 80.6% of retired instructions. The remaining count includes work
@@ -161,7 +161,7 @@ million. Across three two-billion-cycle pairs for all seven production images,
 retired-instruction throughput improved by 1.6% to 21.9%; every scripted JIT
 and interpreter artifact remained unchanged.
 
-## Profiling
+## profiling
 
 Build the sampling profiler separately so its dispatch-loop layout does not
 affect normal measurements:

@@ -1,12 +1,30 @@
-# Functional hardware-completeness milestone
+# functional hardware-completeness milestone
+
+need the quick version? [what runs](compatibility.md) lists firmware and setup;
+[peripheral notes](peripheral-notes.md) group register details by device.
+this page keeps the full evidence and acceptance criteria.
+
+[jump to the capability matrix →](#current-capability-matrix)
+
+a functional development and ci target for common esp32 and esp32-s3
+firmware. fast mode preserves useful behavior and ordering within the limits
+shown here.
+
+## acceptance boundary
+
+- link each support claim to evidence and name its missing modes.
+- exercise real firmware through sustained output or interaction.
+- require focused tests, repeatable gates, and interpreter/jit agreement.
+- keep mechanisms generic, diagnostics visible, and ci green.
+
+<details>
+<summary>full milestone acceptance criteria</summary>
 
 This milestone asks whether Flexe is a dependable **functional** development
 and CI target for common classic ESP32 and ESP32-S3 firmware. It does not claim
 cycle accuracy, calibrated latency, electrical fidelity, RF certification, or
 that a host-backed service shim is a modeled silicon device. Those are separate
 accuracy envelopes; `fast` mode remains the default.
-
-## Acceptance boundary
 
 The milestone is complete only when:
 
@@ -32,12 +50,17 @@ The milestone is complete only when:
 4. The repository stays lean and CI stays green. Improvements are generic
    SoC/core/device mechanisms, not firmware-name or fixed-PC workarounds.
 
-## Current capability matrix
+</details>
+
+## current capability matrix
 
 “Modeled” means functional behavior under the cited gates, not complete silicon
 or timing equivalence. “Partial” retains explicit unsupported paths and must
 not be advertised as general hardware support. A service shim is named as such
 even when a firmware workflow succeeds.
+
+<details>
+<summary>full capability matrix: status, evidence, and remaining work</summary>
 
 | Area | Status | Evidence | Remaining boundary |
 |---|---|---|---|
@@ -74,6 +97,43 @@ even when a firmware workflow succeeds.
 | S3 Bluetooth controller bootstrap | Partial (MMIO) | `tests/test_radio.c` checks modem clocks, selective reset and RTC power/isolation domains, baseband time, immutable controller identity, and command consumption; `scripts/check-s3-marauder.sh` boots the official v1.16.0 MultiBoard S3 image through native Bluetooth and Wi-Fi setup, injects `help` through UART0, and verifies its response, next prompt, and zero unsupported accesses | General controller scheduling, Bluetooth packets, coexistence fidelity, and RF remain unsupported. |
 | Cycle/cache/electrical/RF fidelity | Unsupported | Outside this functional milestone | Requires calibrated hardware traces and declared tolerances. |
 
+</details>
+
+## driver and production evidence
+
+choose a topic for exact artifacts, assertions, rebuild commands, and limits.
+
+- [aes stock-driver replay](#aes-stock-driver-replay)
+- [serial consoles and host input](#serial-consoles-and-host-input)
+- [s3 production milestone](#s3-production-milestone)
+- [native startup and reset](#native-startup-and-reset)
+- [rtc sleep, touch, and power](#rtc-sleep-touch-and-power)
+- [gpio hold and external wake](#gpio-hold-and-external-wake)
+- [gpio interrupts](#gpio-interrupts)
+- [native nvs persistence](#native-nvs-persistence)
+- [i2c master and slave](#i2c-master-and-slave)
+- [spi master and dma](#spi-master-and-dma)
+- [pulse counting](#pulse-counting)
+- [motor pwm](#motor-pwm)
+- [lcd and camera](#lcd-and-camera)
+- [rmt transmit and receive](#rmt-transmit-and-receive)
+- [wled led frames and mmio audit](#wled-led-frames-and-mmio-audit)
+- [wled web ui](#wled-web-ui)
+- [rtc sar adc](#rtc-sar-adc)
+- [continuous adc](#continuous-adc)
+- [led pwm](#led-pwm)
+- [optional octal psram](#optional-octal-psram)
+- [radio controller bootstrap](#radio-controller-bootstrap)
+- [nerdminer portal and restart](#nerdminer-portal-and-restart)
+- [socket descriptor ranges](#socket-descriptor-ranges)
+
+## aes stock-driver replay
+
+native aes block modes and interrupt-driven gdma; exact artifacts and rebuild command.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The AES engine is selected from target data rather than firmware identity:
 classic ESP32 and S3 provide their native register layout, supported key-size
 codes, base address, and optional GDMA/interrupt wiring. On S3, the model
@@ -94,6 +154,15 @@ Rebuild and replay it with:
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check aes
 ```
+
+</details>
+
+## serial consoles and host input
+
+clock/reset-aware uart and usb serial, phy selection, sandbox input, and stock usb-driver replay.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 S3 UART0/1/2 now obey their independent
 [SYSTEM peripheral clock and reset bits](https://github.com/espressif/esp-idf/blob/v5.5.1/components/soc/esp32s3/register/soc/system_reg.h):
@@ -150,6 +219,15 @@ external build path, so a clean pinned build reproduces these hashes. An
 intentional toolchain, source, flag, or timestamp change may provide matching
 `*_SHA256` overrides to its gate.
 
+</details>
+
+## s3 production milestone
+
+nerdminer filesystem/portal/reset and wled web workflows, with their service boundaries.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 S3 now meets the supported functional-target boundary. The NerdMiner
 filesystem result is a meaningful end-to-end flash-format/mount check. With
 the matching application ELF, the host-backed socket/select boundary lets the
@@ -174,6 +252,15 @@ scenario. The remaining RF/PHY gaps prohibit claims of radio or silicon
 equivalence, but do not invalidate the documented functional support tier.
 ROM images and third-party firmware binaries are not copied into this
 repository.
+
+</details>
+
+## native startup and reset
+
+stock hello-world and dual-core startup, app-cpu reset, matching artifacts, and pinned toolchain.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The official ESP-IDF v5.3.2 `examples/get-started/hello_world` image built
 from commit `9d7f2d69f50d1288526d4f1027108e314e8c879f` (application image
@@ -211,6 +298,15 @@ safely cached ESP-IDF components across projects.
 Clean builds through the fixture helper reproduce these hashes by fixing the
 embedded timestamp and normalizing the external build path. Intentional input
 changes can supply their matching `*_SHA256` overrides.
+
+</details>
+
+## rtc sleep, touch, and power
+
+timer sleep, touch light-sleep wake, clock and power policy, retention, and unsupported analog effects.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The S3 RTC controller now owns its documented 48-bit sleep alarm, wake enable,
 sleep state, timer interrupt, target-described digital power/isolation fields,
@@ -341,6 +437,15 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check sleep
 ```
 
+</details>
+
+## gpio hold and external wake
+
+ext0/ext1 wake and rtc pad selection; firmware replays, retained state, and electrical limits.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The S3 RTC controller also models the documented EXT0/EXT1 wake configuration
 (`rtc_cntl_reg.h`, `rtc_io_reg.h`): RTCIO selects EXT0's RTC-owned input pad;
 EXT1 selects up to 22 RTC pads and triggers on any high or all low, latching
@@ -369,6 +474,15 @@ electrical behavior are not inferred from the host's digital level:
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check gpio-wake
 ```
+
+</details>
+
+## gpio interrupts
+
+stock gpio isr service, host-injected edges, notifications, input gating, and open-drain behavior.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The separate `tests/fixtures/s3_idf_gpio_isr` project uses the [stock
 ESP-IDF GPIO ISR service](https://docs.espressif.com/projects/esp-idf/en/release-v5.3/esp32s3/api-reference/peripherals/gpio.html)
@@ -406,6 +520,15 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
 Independent builds may supply matching `*_SHA256` overrides for the
 external artifacts.
 
+</details>
+
+## native nvs persistence
+
+the guest nvs/flash driver stores, restarts, reloads, and erases values without host nvs shims.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The separate `tests/fixtures/s3_idf_nvs` project uses ESP-IDF v5.3.2's real
 `nvs_flash` implementation to open a namespace, write and commit a 32-bit
 value, request a software reset, and read the value after the second boot. It
@@ -425,6 +548,15 @@ accesses across its two boots:
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check nvs
 ```
+
+</details>
+
+## i2c master and slave
+
+arduino and esp-idf fifo/repeated-start/nack flows plus slave-driver and reset replay.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The shared Arduino Wire fixture also runs unmodified on S3 with valid S3
 GPIOs. Its 40-byte write exceeds the 32-byte controller FIFO, then a
@@ -487,6 +619,15 @@ slave-driver implementations remain unverified:
 ./scripts/build-s3-arduino-fixture.sh --check i2c-slave
 ```
 
+</details>
+
+## spi master and dma
+
+full-duplex lengths, receive-only dma, target routes, reset replay, and exact output parity.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The S3 GP-SPI gate compiles the same ESP-IDF `spi_master` fixture used for
 classic ESP32 against Arduino-ESP32 3.3.11, selecting SPI3 and S3-valid pins.
 The driver completes five full-duplex lengths (1, 4, 5, 17, and 33 bytes),
@@ -510,6 +651,15 @@ physical pin levels:
 ```sh
 ./scripts/build-s3-arduino-fixture.sh --check spi-master
 ```
+
+</details>
+
+## pulse counting
+
+matrix input, glitch filters, direction control, limits, and stock-driver watch-point interrupts.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The target-described PCNT model covers the classic ESP32 and S3 variants
 without firmware-name or fixed-PC behavior. Target data supplies each
@@ -539,6 +689,15 @@ Rebuild and replay it with:
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check pcnt
 ```
+
+</details>
+
+## motor pwm
+
+timer/operator/capture, matrix loopback, live updates, callbacks, and functional timing limits.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The MCPWM V1 timer/operator engine is likewise selected entirely from target
 data. Classic ESP32 and S3 descriptors provide the two group apertures,
@@ -578,6 +737,15 @@ electrical or cycle accuracy. Dead-time and carrier settings are exposed to
 aggregate sinks, but their analog transition shape and phase are not modeled;
 the stock gate also does not yet cover every fault/brake and cross-timer sync
 combination.
+
+</details>
+
+## lcd and camera
+
+i80 output and pinned camera-driver input through gpio, gdma, interrupts, and full-frame validation.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The target-described S3 LCD_CAM model owns the complete documented register
 page and implements the i80 transmit and raw parallel-camera receive engines.
@@ -640,6 +808,15 @@ tree and shared ccache make an unchanged build lookup about 0.3 seconds and a
 complete four-run interpreter/JIT gate about 1.2 seconds on the reference
 MacBook. A committed `dependencies.lock` is mandatory, and the helper rejects
 the build if the component manager rewrites it.
+
+</details>
+
+## rmt transmit and receive
+
+plain/carrier/loop/sync paths, host and gpio-loopback receive, pulse filtering, and explicit unmodeled modes.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The S3 RMT V1 model handles direct pulse RAM, per-channel dividers,
 threshold refill interrupts, end/error interrupts, pulse-timed TX and
@@ -748,6 +925,16 @@ and its matching ELF SHA-256 is
 `b7e2cbf74fb0b5374c469d43578fbf548b93329557d14060e3c0b56854fefab3`.
 `SOURCE_DATE_EPOCH` fixes Arduino-ESP32's embedded compile date and time to
 the fixture revision, so a clean rebuild reproduces both hashes.
+
+</details>
+
+## wled led frames and mmio audit
+
+pinned led output, radio/clock/memory-policy register consumers, performance samples, and zero-site audit.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 For the WLED 16.0.1 S3 4M QSPI image (SHA-256
 `eb54c6c3648b7037d54df9f21fe02c9d9606b871faea04ce08b5f6f77dc79c81`),
 4 billion aggregate cycles produced 317 completed RMT transmissions and
@@ -873,6 +1060,15 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-wled-rmt.sh
 ```
 
+</details>
+
+## wled web ui
+
+raw lwip/ethernet, host libslirp forwarding, real http and json readback; matching build required.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 A separate build of WLED v16.0.1 from its tagged source (`29b389d`, image
 SHA-256 `8e165290df301b0bcea5763637db1f0ec9d4ad5b1d07b8588a1baa5ebd50bad5`,
 ELF SHA-256 `a6ca2cb74ce281fd4f3846b6347e3f2abc434d1ced2d553630ba3a8478fe1965`)
@@ -900,6 +1096,15 @@ The guest AP address `4.3.2.1` was observed in WLED's gratuitous ARP frames;
 it is a gate input, not a hardcoded emulator address. This source-built image
 is not byte-identical to the pinned release image; its ELF must not be used
 to symbolize that release binary.
+
+</details>
+
+## rtc sar adc
+
+host-fed one-shot adc, stock arduino reads, arbiter configuration, and analog/calibration limits.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The S3 RTC SAR ADC model follows Espressif's S3 `sens_reg.h` and `adc_ll.h`
 register contract: software pad selection and START, hardware-owned DONE/DATA,
@@ -933,6 +1138,15 @@ external compiled fixture:
 ./scripts/build-s3-arduino-fixture.sh --check adc
 ```
 
+</details>
+
+## continuous adc
+
+adc1 pattern frames through gdma and the stock driver ring buffer, with deterministic host-fed samples.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The target-described APB_SARADC model adds the digital continuous-conversion
 path without replacing any guest driver routine. It retains the S3 control,
 FSM wait, pattern, ADC2 arbiter, filter-selection, DMA, clock, data-status, and
@@ -965,6 +1179,15 @@ sample-rate clock. ADC2 requester contention, simultaneous-conversion timing,
 IIR filtering, threshold monitors, conversion latency, and physical analog
 behavior remain explicit unsupported or unverified boundaries.
 
+</details>
+
+## led pwm
+
+stock arduino pwm output, live duties, clock/reset handling, and fade behavior.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The S3 LEDC model follows Espressif's `esp32s3` `ledc_reg.h`,
 `system_reg.h`, `gpio_sig_map.h`, and `interrupts.h`: eight low-speed-only
 channels at `0x60019000`, four timers, shadowed divider/resolution updates,
@@ -988,6 +1211,15 @@ inputs, and can reproduce the artifact with `--rebuild`:
 ./scripts/build-s3-arduino-fixture.sh --check ledc
 ```
 
+</details>
+
+## optional octal psram
+
+board-selected 8 mib profile, cache-mmu-backed allocations, and repeatable memory checks.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The optional AP Memory 8 MiB OPI profile is selected by the board, not
 inferred from firmware: `--psram ap-8m-opi` attaches it on CS1. The pinned
 stock Arduino-ESP32 3.3.11 fixture checks 8 KiB of allocated external RAM
@@ -999,6 +1231,15 @@ PSRAM. Build and run it with:
 ```sh
 ./scripts/build-s3-arduino-fixture.sh --check psram-opi
 ```
+
+</details>
+
+## radio controller bootstrap
+
+native controller state and official marauder cli replay; rf, bluetooth packet scheduling, and coexistence remain outside the claim.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
 
 The native S3 `esp_wifi_internal_tx`/`tx_by_ref` and
 `esp_wifi_internal_reg_rxcb` symbols now form an optional Ethernet-frame
@@ -1060,6 +1301,15 @@ This is a controller-bootstrap compatibility boundary, not a claim that
 Bluetooth packets, scanning, coexistence timing, RF propagation, or the
 private analog PHY are complete.
 
+</details>
+
+## nerdminer portal and restart
+
+real portal post/save/restart/reload, retained spiffs and rom handoff, plus the current zero-site requirement.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 For the NerdMiner v1.8.3 S3 factory image (SHA-256
 `8dd4bad43944def2287cf8b6bed7762c1881b6e7f04f7bd1556ad555202f8c22`),
 an earlier interpreter audit, before RTC power-sequencer support, reported
@@ -1114,6 +1364,15 @@ S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/check-s3-nerdminer-portal.sh
 ```
 
+</details>
+
+## socket descriptor ranges
+
+guest vfs registration selects the socket interval; unknown symbols or unsupported select ranges stay diagnostic.
+
+<details>
+<summary>artifacts, assertions, commands, and limits</summary>
+
 The S3 BSD-socket service no longer assumes this Arduino build's descriptor
 base `48`. ESP-IDF's
 [`esp_vfs_lwip_sockets_register`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/lwip/port/esp32xx/vfs_lwip.c)
@@ -1140,3 +1399,5 @@ The
 is represented, but images built to retain that watchdog into user code need
 a separate boot-configuration path. Unsupported PHY diagnostics remain a
 blocker for real radio behavior.
+
+</details>

@@ -1,177 +1,160 @@
-# Flexe
+<p align="center">
+  <img src="docs/assets/flexe-banner.svg" alt="flexe — free little xtensa emulator. esp32 + esp32-s3, written in c, with interpreter and jit engines." width="960">
+</p>
 
-**F**ree **l**ittle **x**tensa **e**mulator: a lightweight ESP32/Xtensa LX6
-and ESP32-S3/LX7 emulator with interpreter and JIT support, written in C.
-Flexe boots unmodified ESP-IDF and Arduino firmware,
-models the peripherals used by real boards, and includes ARM64 and x86-64 JIT
-backends.
+<p align="center">
+  <a href="https://levkropp.github.io/flexe/">the little website</a> ·
+  <a href="docs/compatibility.md">what runs</a> ·
+  <a href="ARCHITECTURE.md">how it works</a> ·
+  <a href="docs/testing.md">testing</a> ·
+  <a href="docs/performance.md">the numbers</a>
+</p>
 
-Flexe is under active development. Bruce, Marauder, Meshtastic, NerdMiner,
-openHASP, Tasmota, and WLED pass scripted end-to-end scenarios, and the broader
-production corpus passes the generic interpreter/JIT gate described in
-[Firmware compatibility](docs/compatibility.md). The current
-[functional hardware milestone](docs/hardware-completeness.md) states what
-must be demonstrated before broader support claims.
+<a id="flexe"></a>
 
-## Highlights
+# hello, flexe
 
-- Xtensa LX6 integer, loop, MAC16, floating-point, exception, interrupt, and
-  windowed-register execution
-- ESP32 SRAM, ROM, flash, RTC memory, PSRAM, flash MMU, and dual-core model
-- Functional and event-timed GPIO, UART, SPI, I2C, I2S, RMT, LEDC, PCNT,
-  MCPWM, TWAI, Ethernet, SDMMC/SDIO, ADC/DAC, RTC, timer, watchdog, and crypto
-  models, with each model's timing limits documented separately
-- CYD ILI9341 display, XPT2046 touch, SD/FAT, and SPIFFS integration
-- FreeRTOS, ESP timer, NVS, GPIO, Wi-Fi, Bluetooth, VFS, and ROM boundaries
-  needed by production firmware
-- Switch interpreter plus tracing JIT for Apple silicon and x86-64
-- Differential JIT verification, compiled-firmware hardware gates, stock-ROM
-  scenarios, and reproducible performance benchmarks
+a free little xtensa emulator for esp32/lx6 and esp32-s3/lx7. written in c,
+with a reference interpreter and tracing jit backends for arm64 and x86-64.
 
-Flexe is not cycle accurate. It preserves firmware-visible time and device
-ordering, but it does not model cache timing or truly simultaneous execution
-of both cores.
+feed it unmodified esp-idf or arduino firmware. give it virtual peripherals,
+a board, and some input. watch the firmware do useful work.
 
-## Build
+<a id="highlights"></a>
 
-Requirements: a C17 compiler, CMake, OpenSSL, zlib, and pthreads.
-S3 Ethernet host forwarding is optional and additionally needs libslirp 4.9+.
-If `ccache` is installed, CMake uses it automatically; pass
-`-DFLEXE_CCACHE=OFF` to disable it.
+## what's in the box
+
+| a little piece | what it does |
+|---|---|
+| real firmware | bruce, marauder, meshtastic, nerdminer, openhasp, tasmota, and wled have scripted scenarios in both engines |
+| a speedy core | register windows, integer and floating-point execution, loops, exceptions, and interrupts; hot code gets a native jit |
+| a virtual board | shared memory, flash/mmu, optional psram, two cores, and target-described peripherals |
+| things to interact with | display and touch, storage, serial, buses, audio, gpio, and host-backed network services |
+| checks that matter | cpu differential tests, stock-driver fixtures, firmware interactions, and matching output digests |
+
+esp32 and esp32-s3 are supported **functional** targets. timing, electrical,
+and rf limits still apply; the [hardware matrix](docs/hardware-completeness.md)
+tracks the exact boundary. the two cores take turns on one shared timeline.
+
+<a id="build"></a>
+
+## give it a spin
+
+you'll need a c17 compiler, cmake, openssl, zlib, and pthreads.
 
 ```sh
+git clone https://github.com/levkropp/flexe.git
+cd flexe
 cmake -S . -B build
 cmake --build build --target xtensa-emu -j
+
+# jit is on by default on arm64 and x86-64
+./build/xtensa-emu firmware.bin
+
+# symbols make debugging and service hooks more useful
+./build/xtensa-emu -s firmware.elf -c 10000000 firmware.bin
 ```
 
-On macOS with Homebrew OpenSSL:
+<a id="run-firmware"></a>
+
+for esp32-s3, use the firmware's own freertos and a matching official rom elf:
+
+```sh
+./build/xtensa-emu --target esp32s3 -N \
+  -R /path/to/esp32s3_rev0_rom.elf firmware.bin
+```
+
+roms and production firmware are supplied separately.
+[the compatibility guide](docs/compatibility.md#target-selection) explains
+target detection, rom requirements, and optional psram.
+
+<details>
+<summary>build notes, including macos</summary>
+
+with homebrew openssl:
 
 ```sh
 cmake -S . -B build -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 cmake --build build --target xtensa-emu -j
 ```
 
-Build additional outputs only when needed:
+release builds use lto and host-native tuning. use `-DNATIVE_ARCH=OFF` for
+portable binaries, `-DFLEXE_LTO=OFF` for faster edit/test links, or
+`-DFLEXE_CCACHE=OFF` to disable automatic compiler caching.
 
-- `build/xtensa-emu` — emulator CLI
-- `build/xtensa-tests` — unit and differential test suite
-- `build/flexe-stock-rom-test` — scripted production-firmware scenario runner
-- `build/flexe-generic-rom-test` — arbitrary production-ROM probe
+s3 ethernet host forwarding additionally needs libslirp 4.9+.
+test and fixture runners are built separately when their scripts need them.
 
-Release builds use LTO and host-native tuning by default. Pass
-`-DNATIVE_ARCH=OFF` for portable binaries or `-DFLEXE_LTO=OFF` for faster
-edit/test links. Fixture runners are intentionally excluded from CMake's
-default `all` target; their scripts build exactly the runners they need.
+</details>
 
-## Run firmware
+<a id="architecture"></a>
 
-```sh
-# JIT is enabled by default
-./build/xtensa-emu firmware.bin
+## meet the machine
 
-# Load ELF symbols and stop after a fixed cycle budget
-./build/xtensa-emu -s firmware.elf -c 10000000 firmware.bin
+![a session connects target data, a firmware loader, execution engines, shared memory, device models, and host endpoints.](docs/assets/architecture-system.svg)
 
-# Compare with the interpreter
-./build/xtensa-emu --no-jit -s firmware.elf -c 10000000 firmware.bin
+a session owns the machine. target descriptors choose its layout; the
+interpreter defines cpu behavior; the jit accelerates eligible hot blocks.
+board devices and host endpoints attach through controller APIs.
 
-# Quiet firmware UART output, or trace instructions to stderr
-./build/xtensa-emu -q firmware.bin
-./build/xtensa-emu -T -c 1000000 firmware.bin 2>trace.log
-```
+[walk through the architecture →](ARCHITECTURE.md)
 
-Common options:
+<a id="production-status"></a>
 
-| Option | Meaning |
+## what runs?
+
+the classic corpus covers seven firmware families, including display/touch,
+serial, storage, network, radio-service, and led scenarios. s3 has its own
+pinned production and stock-driver gates.
+
+a pass belongs to a **specific image and scenario**. a service-backed network
+workflow and a modeled hardware controller have different support boundaries.
+
+[see versions, scenarios, and remaining gaps →](docs/compatibility.md)
+
+## a few useful switches
+
+| switch | what it's for |
 |---|---|
-| `-J` | Enable the JIT (the default on ARM64 and x86-64) |
-| `--no-jit` | Run only the interpreter |
-| `--jit-stats` | Print compilation and coverage statistics |
-| `--jit-verify` | Replay compiled blocks in the interpreter and compare state |
-| `-s ELF` | Load symbols and firmware hooks from an ELF image |
-| `-R ROM_ELF` | Load official ESP32 ROM code and data images |
-| `--usb-console` | Use native USB Serial/JTAG instead of UART0 for console output |
-| `--sandbox-events` | Stream peripheral NDJSON and accept GPIO, touch, ADC, binary UART, or I2S sample input on stdin |
-| `--unhandled-report` | Rank unsupported MMIO by register, guest PC, core, and direction; uses the interpreter for accurate attribution |
-| `--strict-mmio` | Fail on any unsupported MMIO access without disabling the JIT |
-| `-c N` | Stop after `N` aggregate emulated cycles |
-| `-q` | Suppress emulator diagnostics |
-| `-T` | Emit an instruction trace to stderr |
-| `-b ADDR` | Set a breakpoint on both cores |
-| `-m ADDR[:LEN]` | Dump guest memory on exit |
+| `--no-jit` | compare with the interpreter |
+| `--jit-stats` / `--jit-verify` | inspect native coverage / compare replayable blocks |
+| `-s ELF` / `-R ROM_ELF` | load application symbols / official mask-rom code and data |
+| `--strict-mmio` | fail on unsupported peripheral accesses while keeping the jit enabled |
+| `--unhandled-report` | attribute unsupported accesses to registers and guest pcs in the interpreter |
+| `--sandbox-events` | exchange peripheral events and host input as ndjson |
+| `--usb-console` | use the native usb serial/jtag console |
+| `-c N` / `-b ADDR` | set a cycle budget / breakpoint |
+| `-T` / `-m ADDR[:LEN]` | trace instructions / dump memory |
+| `-q` | suppress emulator diagnostics |
 
-## Production status
+<a id="test"></a>
 
-Bruce, Marauder, Meshtastic, NerdMiner, openHASP, Tasmota, and WLED pass
-scripted board-level scenarios in both engines. See
-[Firmware compatibility](docs/compatibility.md) for pinned versions,
-assertions, and remaining board-specific coverage.
-
-## Test
+## keep it honest
 
 ```sh
 cmake --build build --target xtensa-tests -j
-./build/xtensa-tests
-./build/xtensa-tests system_clock          # focused, case-insensitive filter
-./scripts/run-unit-tests.sh                 # compact success, full failure log
-./scripts/test-fixtures.sh                 # all Arduino hardware gates
+./scripts/run-unit-tests.sh
 ./scripts/test-fixtures.sh spi-master i2c-wire
-./scripts/build-s3-arduino-fixture.sh --check ledc rmt-rx
-./scripts/build-s3-idf-fixture.sh --check all
-./scripts/check-stock-roms.sh              # curated external ROMs
 FLEXE_ROMS=/path/to/roms ./scripts/check-firmware.sh
 ```
 
-Production ROMs are intentionally not committed. The stock runner accepts
-`BRUCE_BIN`, `MARAUDER_BIN`, `MESHTASTIC_BIN`, `NERDMINER_BIN`,
-`OPENHASP_BIN`, `TASMOTA_BIN`, and `WLED_BIN`; the generic runner accepts paths
-or a `FLEXE_ROMS` directory. Set `FLEXE_ROM_ELF` for images that use data from
-the official ESP32 mask ROM, including the pinned Meshtastic build.
+[testing](docs/testing.md) covers focused suites, stock drivers, sanitizer
+builds, and production gates.
 
-See [Testing](docs/testing.md) for sanitizer builds, fixture configuration,
-JIT verification, and what each gate asserts.
+<a id="performance"></a>
 
-## Performance
+## how fast?
 
-Flexe measures two different things:
+on the documented apple-silicon runs, the repeated classic wled gate measured
+**1.482× interpreted / 3.522× jit**. the s3 wled gate measured
+**1.34–1.49× / 2.29–2.43×**, with exact frame parity.
 
-- real-time factor — simulated ESP32 time divided by host wall time;
-  `1.0x` keeps pace with a 240 MHz ESP32
-- retired MIPS — actual guest instructions executed per host second, excluding
-  halted and fast-forwarded time
+those are workload and host measurements. real-time factor measures guest
+time; retired mips measures executed instructions. idle jumps count only
+toward time.
 
-```sh
-ARDUINO_CLI=/path/to/arduino-cli ./scripts/bench-compute.sh
-MESHTASTIC_BIN=/path/to/meshtastic.bin ./scripts/bench-stock-roms.sh
-./scripts/bench-firmware.sh /path/to/firmware.bin
-```
+[dated results and reproducible commands →](docs/performance.md)
 
-In the current Apple-silicon release benchmark, every image in the five-ROM
-generic corpus clears real time in both engines. The stricter repeated WLED
-acceptance benchmark sustains 1.482x interpreted and 3.522x under the JIT.
-The pinned S3 WLED gate sustains at least 1.34x interpreted and 2.29x under the
-JIT with exact frame parity. See [Performance](docs/performance.md) for dated
-results and methodology.
+## license
 
-## Architecture
-
-A session composes a target-described SoC, one or two Xtensa cores, shared
-memory and MMIO, ROM/service boundaries, board devices, and host endpoints.
-The interpreter defines CPU behavior; the tracing JIT compiles eligible hot
-blocks while preserving timer, interrupt, scheduler, and hook boundaries.
-
-```text
-src/                 CPU, JIT, memory, peripheral, and service models
-tests/               unit and differential tests
-tests/fixtures/      Arduino firmware used by hardware gates
-tools/               host-side integration runners and diagnostics
-scripts/             build, test, corpus, and benchmark entry points
-docs/                design, compatibility, testing, and performance notes
-```
-
-Read [ARCHITECTURE.md](ARCHITECTURE.md) for subsystem ownership, execution and
-timing contracts, reset semantics, extension rules, and the current source map.
-
-## License
-
-MIT
+mit licensed. made with excessive respect for a little cpu.

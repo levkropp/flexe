@@ -1,9 +1,27 @@
-# Testing
+# testing
 
-Flexe uses layered tests because instruction correctness, peripheral behavior,
-and a successful production boot catch different classes of defects.
+pick the smallest gate that exercises the behavior you changed.
 
-## Unit and differential suite
+| checking | start with |
+|---|---|
+| cpu or device state | `./scripts/run-unit-tests.sh system_clock` (replace the filter) |
+| all unit/differential cases | `./scripts/run-unit-tests.sh` |
+| classic stock drivers | `./scripts/test-fixtures.sh spi-master i2c-wire` |
+| s3 arduino drivers | `./scripts/build-s3-arduino-fixture.sh --check all` |
+| s3 esp-idf drivers | `./scripts/build-s3-idf-fixture.sh --check all` |
+| production interactions | `./scripts/check-stock-roms.sh` |
+| arbitrary firmware progress | `FLEXE_ROMS=/path/to/roms ./scripts/check-firmware.sh` |
+| memory safety | [sanitizer build](#unit-and-differential-suite) |
+
+build the unit runner first using the commands below. firmware gates need
+the matching toolchain, external images, and rom elf described in each section.
+
+[units](#unit-and-differential-suite) ·
+[drivers](#compiled-firmware-hardware-gates) ·
+[production](#production-rom-gates) · [jit verification](#jit-verification) ·
+[traces](#traces)
+
+## unit and differential suite
 
 ```sh
 cmake -S . -B build -DFLEXE_LTO=OFF
@@ -68,7 +86,7 @@ keeps instrumented relinks dependency-scoped. CI adds
 `ASAN_OPTIONS=detect_leaks=1` on Linux; Apple's ASan runtime does not provide
 LeakSanitizer.
 
-## Compiled-firmware hardware gates
+## compiled-firmware hardware gates
 
 The fixtures under `tests/fixtures/` are real Arduino-ESP32 sketches. Their C
 harnesses under `tools/` attach host endpoints, inject input, and assert the
@@ -101,6 +119,9 @@ Configuration:
 | `FLEXE_FIXTURE_GATE_JOBS` | Concurrent fixture gates; host-aware by default |
 | `FLEXE_FIXTURE_ENGINE_JOBS` | `2` (default) runs JIT and interpreter together; `1` serializes them |
 
+<details>
+<summary>classic fixture caches, parallel builds, and logs</summary>
+
 Compiled sketch outputs persist under `FLEXE_BUILD_DIR/arduino-fixtures` by
 default, and a content fingerprint covers the fixture source, FQBN,
 optimization, Arduino CLI and installed core versions, executable wrapper,
@@ -122,6 +143,8 @@ CI restores older per-fixture outputs as a fallback, recompiles only fixtures
 whose fingerprints changed, and caches the shared compiled core separately
 without each fixture's much larger intermediate build tree.
 
+</details>
+
 The stock ESP32-S3 Arduino gates use Arduino-ESP32 3.3.11 and have their own
 cached entry point:
 
@@ -129,6 +152,9 @@ cached entry point:
 ./scripts/build-s3-arduino-fixture.sh --check ledc rmt-rx
 ./scripts/build-s3-arduino-fixture.sh --check all
 ```
+
+<details>
+<summary>s3 arduino caching, hashes, and build controls</summary>
 
 It validates the installed core, derives a stable `SOURCE_DATE_EPOCH`, builds
 only the required host runners, finds the official S3 ROM ELF, and passes the
@@ -147,7 +173,9 @@ reserves two logical CPUs per gate and caps concurrency at four; set
 `FLEXE_FIXTURE_GATE_JOBS=1` for serialized diagnosis or choose another positive
 limit for the host.
 
-## Production ROM gates
+</details>
+
+## production rom gates
 
 The curated scenarios require external images:
 
@@ -174,6 +202,9 @@ FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 See [Firmware compatibility](compatibility.md) for the assertions and current
 known failures.
 
+<details>
+<summary>what the s3 production gates assert</summary>
+
 The S3 production gates also use external pinned images and the official ROM
 ELF. `check-s3-nerdminer-portal.sh` exercises provisioning and reset,
 `check-s3-marauder.sh` runs the official v1.16.0 MultiBoard S3 image through
@@ -196,6 +227,11 @@ processes. The watcher has a wall deadline and monitors the emulator PID, so a
 failed guest still terminates with the gate's normal diagnostics.
 See [Hardware completeness](hardware-completeness.md) for exact inputs and
 scope.
+
+</details>
+
+<details>
+<summary>what each s3 stock-driver gate asserts</summary>
 
 The direct ESP-IDF S3 driver gates are separate from `test-fixtures.sh`.
 For example, `check-s3-idf-i2c-master.sh` replays a pinned ESP-IDF 5.3
@@ -245,6 +281,8 @@ MMIO.
 covering all six S3 block modes, AES-128/256 known-answer vectors, partial CTR,
 and a 4 KiB interrupt-driven GDMA round trip.
 
+</details>
+
 Use the fixture builder rather than making disposable build directories by
 hand. It finds the pinned ESP-IDF v5.3.2 checkout from `FLEXE_IDF_PATH`, an
 active IDF environment, or the conventional `~/esp/esp-idf` install, and
@@ -257,6 +295,9 @@ FLEXE_IDF_PATH=/path/to/esp-idf \
 S3_ROM_ELF=/path/to/esp32s3_rev0_rom.elf \
   ./scripts/build-s3-idf-fixture.sh --check all
 ```
+
+<details>
+<summary>s3 esp-idf caching, reproducibility, and build controls</summary>
 
 The helper accepts short names for every `tests/fixtures/s3_idf_*` project and
 keeps Ninja output and `sdkconfig` files under the user cache, outside the
@@ -292,6 +333,8 @@ not compete with compilation. Set
 `FLEXE_IDF_CCACHE_DIR` to relocate those caches; the script's `--help` lists
 the remaining controls.
 
+</details>
+
 The classic `test-fixtures.sh` gate keeps full per-engine loader and device
 traces in temporary logs and prints only each successful runner's result line.
 On failure it emits both complete logs so diagnostics are not lost. Set
@@ -299,7 +342,7 @@ On failure it emits both complete logs so diagnostics are not lost. Set
 parallel compiler jobs are likewise quiet by default, while failed jobs retain
 their complete output.
 
-## JIT verification
+## jit verification
 
 `--jit-verify` runs each eligible compiled block natively, rolls back its memory
 effects, replays the same guest-instruction count in the interpreter, and
@@ -319,7 +362,7 @@ peripheral access. Unlike `--unhandled-report`, it only checks the aggregate
 counter and therefore leaves the JIT enabled; rerun a failure with
 `--unhandled-report` to attribute registers and guest PCs in the interpreter.
 
-## Traces
+## traces
 
 Use `-T` to write a verbose emulator trace, then narrow it with
 `build/trace-filter`:

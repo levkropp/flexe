@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>flexe — free little xtensa emulator</title>
-  <meta name="description" content="a fast xtensa lx6 (esp32) emulator in c with arm64 and x86-64 jit backends and production-firmware integration tests.">
+  <meta name="description" content="a friendly esp32 and esp32-s3 emulator in c, with interpreter and jit engines, virtual peripherals, and production-firmware integration tests.">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -165,7 +165,7 @@
       padding: 48px 0 64px;
     }
 
-    .features h2, .install h2 {
+    .features h2, .install h2, .docs h2 {
       font-size: 34px;
       color: #c0c0e0;
       text-align: center;
@@ -264,6 +264,11 @@
     }
 
     .footer a:hover { color: #50fa7b; }
+
+    .docs { padding: 24px 0 64px; }
+    .docs-figure { display: block; width: 100%; height: auto; margin-bottom: 24px; border-radius: 12px; }
+    .docs-links { display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; }
+    .docs-note { color: #9999bb; font-size: 14px; text-align: center; max-width: 700px; margin: 24px auto 0; }
   </style>
 </head>
 <body>
@@ -272,7 +277,7 @@
     <!-- hero -->
     <section class="hero">
       <h1>flexe</h1>
-      <p class="tagline">free little xtensa emulator. boots real esp-idf firmware, models esp32 hardware, and tests production roms end to end.</p>
+      <p class="tagline">free little xtensa emulator. boots real esp-idf and arduino firmware on virtual esp32 and esp32-s3 hardware.</p>
       <div class="hero-buttons">
         <a href="https://github.com/levkropp/flexe" class="btn btn-primary">view on github</a>
         <a href="#benchmarks" class="btn btn-secondary">see the numbers</a>
@@ -337,12 +342,12 @@ wled         <span class="g">2.32× real-time</span></pre>
           <p>unmodified bruce, esp32 marauder, meshtastic, nerdminer, openhasp, tasmota, and wled images pass scripted hardware and service scenarios on both engines. pinned output digests catch a jit that produces the wrong result rather than no result.</p>
         </div>
         <div class="feature-card">
-          <h3>full lx6 isa</h3>
-          <p>alu, shifts, branches, zero-overhead loops, mac16, fpu, guest-managed window overflow/underflow vectors, exceptions and interrupts (levels 1–7, ccompare timers, waiti).</p>
+          <h3>a little lx6 / lx7 machine</h3>
+          <p>integer and floating-point execution, register windows, loops, exceptions, and interrupts. target descriptors select esp32/lx6 or esp32-s3/lx7 geometry and supported behavior.</p>
         </div>
         <div class="feature-card">
           <h3>dual core, like the real thing</h3>
-          <p>pro cpu + app cpu, synchronized cycle counts, freertos preemption on both. the benchmark counts instructions executed on <em>both</em> cores — no funny accounting.</p>
+          <p>two guest cores take turns on one deterministic timeline, sharing memory and interrupts. retired instructions count work on both cores; idle jumps count only toward elapsed time.</p>
         </div>
         <div class="feature-card">
           <h3>stub superpowers</h3>
@@ -359,6 +364,19 @@ wled         <span class="g">2.32× real-time</span></pre>
       </div>
     </section>
 
+
+    <!-- the same visual map used in the readme -->
+    <section class="docs" aria-labelledby="docs-title">
+      <h2 id="docs-title">meet the machine</h2>
+      <img class="docs-figure" src="assets/architecture-system.svg" width="1120" height="792" loading="lazy" alt="one session connects target descriptors, the firmware loader, execution engines, shared memory, device models, and host endpoints.">
+      <nav class="docs-links" aria-label="project documentation">
+        <a class="btn btn-secondary" href="https://github.com/levkropp/flexe/blob/master/ARCHITECTURE.md">how it works</a>
+        <a class="btn btn-secondary" href="https://github.com/levkropp/flexe/blob/master/docs/compatibility.md">what runs</a>
+        <a class="btn btn-secondary" href="https://github.com/levkropp/flexe/blob/master/docs/testing.md">keep it honest</a>
+      </nav>
+      <p class="docs-note">functional hardware, with explicit limits. each firmware pass belongs to a pinned image and scenario; host-backed services and modeled controllers have separate support boundaries.</p>
+    </section>
+
     <!-- install -->
     <section class="install">
       <h2>get it</h2>
@@ -366,7 +384,7 @@ wled         <span class="g">2.32× real-time</span></pre>
         <span class="cmd">git clone</span> https://github.com/levkropp/flexe.git<br>
         <span class="cmd">cd</span> flexe<br>
         <span class="cmd">cmake</span> -S . -B build<br>
-        <span class="cmd">cmake</span> --build build -j<br>
+        <span class="cmd">cmake</span> --build build --target xtensa-emu -j<br>
         <span class="comment"># then feed it an esp-idf .bin</span><br>
         <span class="cmd">./build/xtensa-emu</span> -s app.elf -c 10000000 app.bin
       </div>

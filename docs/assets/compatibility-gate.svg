@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="493" viewBox="0 0 1120 493" role="img" aria-labelledby="title desc">
+<title id="title">what a compatibility pass means</title>
+<desc id="desc">Load a pinned image, run interpreter and JIT with the same inputs, drive scenario interactions, and compare outputs and progress under explicit diagnostic limits. Service-backed workflows are distinct from modeled hardware.</desc>
+<defs>
+<pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+<path d="M 48 0 H 0 V 48" fill="none" stroke="#50fa7b" stroke-opacity=".045"/>
+</pattern>
+<radialGradient id="glow">
+<stop stop-color="#50fa7b" stop-opacity=".12"/>
+<stop offset="1" stop-color="#50fa7b" stop-opacity="0"/>
+</radialGradient>
+<marker id="arrow-green" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="back-green" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-purple" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="back-purple" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-amber" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="back-amber" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-blue" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+<marker id="back-blue" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+</defs>
+<style>text{font-family:"Segoe UI",Arial,sans-serif;fill:#c0c0d0}.heading,.box-title,.wordmark{font-family:"Comic Neue","Comic Sans MS","Chalkboard SE",cursive;font-weight:700}.heading{font-size:36px;fill:#e4e4f0}.box-title{font-size:25px}.wordmark{font-size:92px;fill:#50fa7b;letter-spacing:2px}.copy{font-size:20px}.small{font-size:18px}.muted{font-size:20px;fill:#9d9dbd}.eyebrow{font-size:16px;fill:#50fa7b;letter-spacing:2px}.mono{font-family:Consolas,Menlo,monospace;font-size:20px;fill:#50fa7b}</style>
+<rect x="1" y="1" width="1118" height="491" rx="20" fill="#0a0a1e" stroke="#272747"/>
+<rect x="1" y="1" width="1118" height="491" rx="20" fill="url(#grid)"/>
+<text x="32" y="39" class="eyebrow" >firmware compatibility</text>
+<text x="32" y="86" class="heading" >what a pass actually means</text>
+<text x="32" y="122" class="muted" >a boot banner is just the beginning.</text>
+<rect x="32" y="170" width="240" height="154" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="54" y="207" class="box-title" style="fill:#bd93f9">pinned image</text>
+<text x="54" y="240" class="copy" >known version + board</text>
+<text x="54" y="266" class="copy" >matching rom elf</text>
+<path d="M 275 247 H 301" fill="none" stroke="#bd93f9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<rect x="304" y="170" width="240" height="154" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="326" y="207" class="box-title" style="fill:#50fa7b">both engines</text>
+<text x="326" y="240" class="copy" >interpreter + jit</text>
+<text x="326" y="266" class="copy" >same image + inputs</text>
+<path d="M 547 247 H 573" fill="none" stroke="#50fa7b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+<rect x="576" y="170" width="240" height="154" rx="16" fill="#12122e" stroke="#8be9fd66"/>
+<text x="598" y="207" class="box-title" style="fill:#8be9fd">interactions</text>
+<text x="598" y="240" class="copy" >commands + input</text>
+<text x="598" y="266" class="copy" >scenario assertions</text>
+<path d="M 819 247 H 845" fill="none" stroke="#8be9fd" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<rect x="848" y="170" width="240" height="154" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="870" y="207" class="box-title" style="fill:#50fa7b">matching outputs</text>
+<text x="870" y="240" class="copy" >digests + progress</text>
+<text x="870" y="266" class="copy" >declared access limits</text>
+<rect x="32" y="361" width="1056" height="100" rx="14" fill="#12122e" stroke="#303054"/>
+<text x="54" y="398" class="box-title" >a pass belongs to this image and this scenario</text>
+<text x="54" y="432" class="copy" >service-backed workflows and modeled hardware keep separate support claims.</text>
+</svg>

@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="671" viewBox="0 0 1120 671" role="img" aria-labelledby="title desc">
+<title id="title">two cores, one timeline</title>
+<desc id="desc">An illustrative cooperative sequence: CPU0 batch, CPU1 batch, idle fast-forward, timer or DMA deadline, interrupt, resumed work. Elapsed cycles count time; retired instructions count execution only.</desc>
+<defs>
+<pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+<path d="M 48 0 H 0 V 48" fill="none" stroke="#50fa7b" stroke-opacity=".045"/>
+</pattern>
+<radialGradient id="glow">
+<stop stop-color="#50fa7b" stop-opacity=".12"/>
+<stop offset="1" stop-color="#50fa7b" stop-opacity="0"/>
+</radialGradient>
+<marker id="arrow-green" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="back-green" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#50fa7b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-purple" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="back-purple" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#bd93f9" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-amber" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="back-amber" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#ffd78b" stroke-width="1.5"/>
+</marker>
+<marker id="arrow-blue" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 0 0 L 8 4 L 0 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+<marker id="back-blue" markerWidth="9" markerHeight="9" refX="1" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 8 0 L 0 4 L 8 8" fill="none" stroke="#8be9fd" stroke-width="1.5"/>
+</marker>
+</defs>
+<style>text{font-family:"Segoe UI",Arial,sans-serif;fill:#c0c0d0}.heading,.box-title,.wordmark{font-family:"Comic Neue","Comic Sans MS","Chalkboard SE",cursive;font-weight:700}.heading{font-size:36px;fill:#e4e4f0}.box-title{font-size:25px}.wordmark{font-size:92px;fill:#50fa7b;letter-spacing:2px}.copy{font-size:20px}.small{font-size:18px}.muted{font-size:20px;fill:#9d9dbd}.eyebrow{font-size:16px;fill:#50fa7b;letter-spacing:2px}.mono{font-family:Consolas,Menlo,monospace;font-size:20px;fill:#50fa7b}</style>
+<rect x="1" y="1" width="1118" height="669" rx="20" fill="#0a0a1e" stroke="#272747"/>
+<rect x="1" y="1" width="1118" height="669" rx="20" fill="url(#grid)"/>
+<text x="32" y="39" class="eyebrow" >time and ordering</text>
+<text x="32" y="86" class="heading" >two cores. one timeline.</text>
+<text x="32" y="122" class="muted" >cooperative batches keep device deadlines and interrupt delivery observable.</text>
+<text x="32" y="222" class="mono" >cpu0</text>
+<text x="32" y="312" class="mono" >cpu1</text>
+<text x="32" y="402" class="mono" >events</text>
+<path d="M 165 243 H 1081 M 165 333 H 1081" stroke="#303054" stroke-width="2" stroke-dasharray="4 7"/>
+<rect x="171" y="167" width="173" height="76" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="193" y="204" class="box-title" style="fill:#50fa7b">run batch</text>
+<rect x="355" y="257" width="173" height="76" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="377" y="294" class="box-title" style="fill:#bd93f9">run a batch</text>
+<rect x="793" y="167" width="291" height="76" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="815" y="204" class="box-title" style="fill:#50fa7b">resume useful work</text>
+<rect x="540" y="167" width="222" height="166" rx="16" fill="#ffd78b08" stroke="#ffd78b55"/>
+<text x="651" y="229" class="box-title" text-anchor="middle" style="fill:#ffd78b">idle / waiti</text>
+<text x="651" y="267" class="small" text-anchor="middle">jump to deadline</text>
+<path d="M 169 408 H 1082" fill="none" stroke="#8be9fd" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<path d="M 779 151 V 423" stroke="#8be9fd" stroke-width="2" stroke-dasharray="5 6"/>
+<circle cx="779" cy="408" r="7" fill="#8be9fd"/>
+<text x="770" y="374" class="small" text-anchor="end">timer / dma completion</text>
+<text x="797" y="448" class="small" style="fill:#8be9fd">interrupt → runnable core</text>
+<text x="171" y="448" class="small" >emulated time → (illustrative ordering)</text>
+<rect x="32" y="487" width="516" height="111" rx="16" fill="#12122e" stroke="#50fa7b66"/>
+<text x="54" y="524" class="box-title" style="fill:#50fa7b">elapsed cycles</text>
+<text x="54" y="557" class="copy" >count guest time, including idle advancement</text>
+<rect x="572" y="487" width="516" height="111" rx="16" fill="#12122e" stroke="#bd93f966"/>
+<text x="594" y="524" class="box-title" style="fill:#bd93f9">retired instructions</text>
+<text x="594" y="557" class="copy" >count executed work; idle jumps add none</text>
+<text x="32" y="639" class="small" >the guest cores take turns; this does not model simultaneous cache or bus contention.</text>
+</svg>
