@@ -6524,6 +6524,13 @@ TEST(i2s_lcd_apll_clock_and_dma_deadline) {
     ASSERT_EQ(capture.count, 2);
     ASSERT_EQ(capture.sample_rate, 20000000u);
 
+    /* Divider 2 + 1/3 must retain thirds rather than truncate to 21/64. */
+    mem_write32(mem, i2s + 0xACu, (1u << 21) | (1u << 8) | (3u << 14) | 2u);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.sample_rate, 17142857u);
+    mem_write32(mem, i2s + 0xACu, (1u << 21) | 2u);
+
     /* Without WRX2 each LCD word takes two BCK clocks. Switching back to
      * the fixed source must ignore subsequent APLL changes. */
     mem_write32(mem, i2s + 0xA8u, 1u << 5);

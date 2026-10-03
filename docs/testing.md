@@ -231,15 +231,72 @@ five modeled seconds per soak, including raw VGA capture and validation.
 
 | engine | median soak wall time | aggregate MIPS | modeled realtime | scanout frames / wall second |
 |---|---:|---:|---:|---:|
-| interpreter | 9.306 s | 129.70 | 0.537x | 31.16 |
-| JIT | 4.099 s | 294.43 | 1.220x | 70.74 |
+| interpreter | 9.550 s | 126.39 | 0.524x | 30.47 |
+| JIT | 4.395 s | 274.62 | 1.138x | 66.21 |
 
-Native JIT coverage during the soak was 96.6%. Each sample captured 290 complete
+Native JIT coverage during the soak was 96.6%. Each sample captured 291 complete
 frames in mode 8, consistent with its programmed 12,222,222 Hz pixel clock and
 400x524 scanout geometry. All UART and pixel hashes matched across engines.
 Running the same harness against commit `9ba9927` fails after the initial UART
 queries: its I2S sink reports stereo PCM at 5 MHz instead of parallel VGA. This
 confirms that the new gate detects the timing defect beyond the startup check.
+
+### agon mos and bbc basic
+
+`scripts/check-agon-mos.sh` adds an actual eZ80/MOS peer to the native VDP test.
+It uses the unmodified `agon-ez80-emulator` crate from
+[fab-agon-emulator commit 02a23e6](https://github.com/tomm/fab-agon-emulator/tree/02a23e67049cd68d5da77f0776cb375fa91a5e4a).
+The optional Rust adapter runs in a separate process; the Flexe core has no
+dependency on it. Rust and Cargo are required to build the adapter. Its
+upstream dependencies and Cargo lockfile are pinned.
+
+The script requires these external files and verifies their SHA-256 hashes:
+
+| variable | file | SHA-256 |
+|---|---|---|
+| `AGON_VDP_BIN` | Agon VDP 2.16.0 `firmware.bin` | `b807beef35823b13a0a056f11b7464cd1b1c6356dce0e4098b78ebe059ded35f` |
+| `AGON_MOS_BIN` | upstream `firmware/mos_platform.bin` at the commit above | `d564243283972690933a4554296ad6202ca4ef54572279533a942960846bebae` |
+| `AGON_BBC_BIN` | upstream `sdcard/bin/bbcbasic24.bin` at submodule commit `6b05659` | `bedbb3e977a0bbea0874a58a450b6155f3a6ea65677a19a1b6f7d415ed31ca26` |
+
+```sh
+cmake --build build --target flexe-agon-vdp-test -j
+AGON_VDP_BIN=/path/to/firmware.bin \
+AGON_MOS_BIN=/path/to/fab-agon-emulator/firmware/mos_platform.bin \
+AGON_BBC_BIN=/path/to/fab-agon-emulator/sdcard/bin/bbcbasic24.bin \
+ARTIFACTS=/tmp/agon-mos ./scripts/check-agon-mos.sh
+```
+
+The script creates a temporary SD directory containing BBC BASIC and a test
+file. UART2 links both firmware stacks, flow control follows receive capacity,
+and decoded VGA VSync pulses drive eZ80 GPIO B1. MOS starts after the native
+VDP passes initialization. Commands enter the VDP's documented serial-console
+mode through UART0 and become keyboard packets through native firmware code.
+No MOS instruction, VDP application function, or guest memory is patched.
+
+Both engines must boot MOS, run `help`, read the test file, load and run BBC
+BASIC, then execute this program:
+
+```basic
+10 MODE 8:VDU 23,1,0:COLOUR 129:CLS
+20 PRINT "FLEXE-MOS-OK"
+25 *FX 19
+30 PRINT 6*7
+40 FOR I=1 TO 3:PRINT I:NEXT
+50 END
+```
+
+The gate requires the native output `FLEXE-MOS-OK`, `42`, `1`, `2`, `3` and the
+exact final VGA hash `a53304ae`, stable over several frames. `*FX 19` exercises
+MOS's vertical-blank wait. Removing the VSync link makes BBC BASIC input stall
+and the gate fail. `ARTIFACTS` retains raw eZ80 UART bytes, a readable
+transcript, VGA captures, DAC audio, and both process logs.
+
+This is a functional integration test. The upstream eZ80 core uses wall-clock
+18.432 MHz pacing; Flexe paces faster hosts at its modeled 240 MHz clock, while
+slower hosts run at their available speed. The timing benchmark above measures
+the VDP separately. The upstream peer's host filesystem service supplies SD
+reads. Native physical PS/2 needs the currently unimplemented ULP FSM; serial
+console input does not validate that hardware path.
 
 See [Firmware compatibility](compatibility.md) for the assertions and current
 known failures.

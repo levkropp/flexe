@@ -14037,11 +14037,12 @@ static uint32_t i2s_sample_rate(const i2s_state_t *s, bool tx) {
     uint32_t b = (clkm >> 8) & 0x3Fu;
     uint32_t a = (clkm >> 14) & 0x3Fu;
     if (num == 0) num = 4;
-    uint64_t divider_64 = (uint64_t)num * 64u;
-    if (a != 0) divider_64 += (uint64_t)b * 64u / a;
-    if (divider_64 == 0) divider_64 = 256u;
     uint32_t source_hz = (clkm & (1u << 21)) ? s->apll_hz : 160000000u;
-    uint64_t module_hz = (uint64_t)source_hz * 64u / divider_64;
+    /* Preserve the programmed B/A fraction. Quantizing it to 1/64 before
+     * division changes rates even when the requested clock is exact. */
+    uint32_t fraction_a = a ? a : 1u;
+    uint32_t divider = num * fraction_a + (a ? b : 0u);
+    uint64_t module_hz = (uint64_t)source_hz * fraction_a / divider;
 
     uint32_t rate = s->regs[I2S_SAMPLE_RATE_OFF / 4u];
     uint32_t bck_div = tx ? (rate & 0x3Fu) : ((rate >> 6) & 0x3Fu);

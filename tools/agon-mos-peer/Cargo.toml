@@ -1,0 +1,7 @@
+[package]
+name = "flexe-agon-mos-peer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+[dependencies]
+agon-ez80-emulator = { git = "https://github.com/tomm/fab-agon-emulator.git", rev = "02a23e67049cd68d5da77f0776cb375fa91a5e4a" }

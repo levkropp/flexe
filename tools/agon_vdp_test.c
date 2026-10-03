@@ -34,6 +34,44 @@ typedef struct {
     bool overflow;
 } uart_t;
 
+typedef struct {
+    uint8_t samples[32768];
+    size_t len, non_silent, rises, first_rise, last_rise;
+    uint32_t rate;
+    uint8_t previous, minimum, maximum;
+    bool enabled, invalid;
+} audio_t;
+
+static void capture_audio(void *opaque, int port, const uint8_t *data,
+                           size_t len, uint32_t rate, uint8_t bits,
+                           uint8_t channels) {
+    audio_t *a = opaque;
+    if (!a->enabled) return;
+    a->rate = rate;
+    if (bits != 16u || channels != 1u || (len & 3u)) {
+        a->invalid = true;
+        return;
+    }
+    for (size_t i = 0; i < len; i += 2u) {
+        /* FabGL stores each unsigned DAC sample in the upper byte of a
+         * 16-bit LCD word, swapping halfwords for the ESP32 FIFO. */
+        uint8_t sample = data[(i ^ 2u) + 1u];
+        if (data[i ^ 2u]) a->invalid = true;
+        if (a->len == sizeof(a->samples)) { a->invalid = true; return; }
+        a->samples[a->len] = sample;
+        if (sample != 127u) a->non_silent++;
+        if (sample < a->minimum) a->minimum = sample;
+        if (sample > a->maximum) a->maximum = sample;
+        if (sample > 127u && a->previous < 127u) {
+            if (!a->rises) a->first_rise = a->len;
+            a->last_rise = a->len;
+            a->rises++;
+        }
+        a->previous = sample;
+        a->len++;
+    }
+}
+
 static uint64_t monotonic_ns(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -44,6 +82,25 @@ static uint32_t digest(const uint8_t *data, size_t len) {
     uint32_t hash = 2166136261u;
     for (size_t i = 0; i < len; i++) hash = (hash ^ data[i]) * 16777619u;
     return hash;
+}
+
+static bool save_audio(const audio_t *a, const char *dir) {
+    if (!dir) return true;
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/tone.wav", dir) >= (int)sizeof(path)) return false;
+    FILE *out = fopen(path, "wb");
+    if (!out) return false;
+    uint8_t header[44] = {0};
+    memcpy(header, "RIFF", 4); memcpy(header + 8, "WAVEfmt ", 8);
+    memcpy(header + 36, "data", 4);
+    uint32_t fields[] = {(uint32_t)a->len + 36u, 16u, a->rate, a->rate, (uint32_t)a->len};
+    const unsigned offsets[] = {4, 16, 24, 28, 40};
+    for (unsigned i = 0; i < 5u; i++)
+        for (unsigned j = 0; j < 4u; j++) header[offsets[i] + j] = (uint8_t)(fields[i] >> (j * 8u));
+    header[20] = 1; header[22] = 1; header[32] = 1; header[34] = 8;
+    bool ok = fwrite(header, 1, sizeof(header), out) == sizeof(header) &&
+              fwrite(a->samples, 1, a->len, out) == a->len;
+    return fclose(out) == 0 && ok;
 }
 
 static void capture_uart(void *opaque, uint8_t byte) {
@@ -165,12 +222,21 @@ static bool save_frame(const vga_t *v, unsigned width, unsigned height,
     return fclose(out) == 0;
 }
 
+#include "agon_mos_bridge.h"
+
 int main(int argc, char **argv) {
     bool no_jit = false;
+    unsigned mos_port = 0;
     const char *image = NULL, *artifacts = NULL;
     uint64_t soak_cycles = 240000000ull;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--no-jit")) no_jit = true;
+        else if (!strcmp(argv[i], "--mos-peer") && i + 1 < argc) {
+            char *end;
+            unsigned long port = strtoul(argv[++i], &end, 10);
+            if (*end || !port || port > 65535u) return 2;
+            mos_port = (unsigned)port;
+        }
         else if (!strcmp(argv[i], "--artifacts") && i + 1 < argc) artifacts = argv[++i];
         else if (!strcmp(argv[i], "--soak-cycles") && i + 1 < argc) {
             char *end;
@@ -180,7 +246,7 @@ int main(int argc, char **argv) {
         else return 2;
     }
     if (!image) {
-        fprintf(stderr, "usage: %s [--no-jit] [--artifacts DIR] [--soak-cycles N] FIRMWARE.bin\n", argv[0]);
+        fprintf(stderr, "usage: %s [--no-jit] [--artifacts DIR] [--soak-cycles N] [--mos-peer PORT] FIRMWARE.bin\n", argv[0]);
         return 2;
     }
     uint64_t wall_start = monotonic_ns();
@@ -190,12 +256,14 @@ int main(int argc, char **argv) {
     if (!s) return 2;
     vga_t *v = calloc(1, sizeof(*v));
     uart_t u = {0};
+    audio_t audio = {.minimum = 255u, .previous = 127u};
     if (!v) { flexe_session_destroy(s); return 2; }
     esp32_periph_t *p = flexe_session_periph(s);
     xtensa_cpu_t *cpu = flexe_session_cpu(s, 0);
     xtensa_cpu_t *other = flexe_session_cpu(s, 1);
     xtensa_mem_t *mem = flexe_session_mem(s);
     periph_set_i2s_tx_callback(p, 1, capture_vga, v);
+    periph_set_i2s_tx_callback(p, 0, capture_audio, &audio);
     periph_set_uart_callback_num(p, 2, capture_uart, &u);
     /* Release firmware.map supplies this diagnostic stop only. It does not
      * change guest execution or decide success. */
@@ -213,6 +281,11 @@ int main(int argc, char **argv) {
                                    23, 0, 0x84, 100,0,100,0};
     static const uint8_t blue_reply[] = {0x86,8,64,1,240,0,40,30,64,8,
                                          0x83,1,'F',0x84,4,0,0,170,4};
+    static const uint8_t tone[] = {23,0,0x85,0,0,127,0,4,0xf4,1}; /* 1024 Hz, 500 ms */
+    static const uint8_t tone_reply[] = {0x85,2,0,1};
+    static const uint8_t console_on[] = {23,0,254,1};
+    static const uint8_t console_off[] = {23,0,254,0};
+    static const uint8_t key_reply[] = {0x81,4,'a',0,0,1};
     unsigned stage = 0, stable = 0;
     uint64_t last_frame = 0;
     uint32_t previous_hash = 0, red_hash = 0, blue_hash = 0;
@@ -253,6 +326,42 @@ int main(int argc, char **argv) {
             stable = 0;
         }
     }
+    bool audio_ok = false;
+    if (stage == 5u) {
+        audio.enabled = true;
+        uint64_t start = cpu->cycle_count;
+        if (send_bytes(p, tone, sizeof(tone))) {
+            while (cpu->cycle_count - start < 240000000ull)
+                if (!step(s)) break;
+        }
+        audio.enabled = false;
+        double frequency = audio.rises > 1u ?
+            (double)(audio.rises - 1u) * audio.rate / (audio.last_rise - audio.first_rise) : 0;
+        audio_ok = has_bytes(&u, tone_reply, sizeof(tone_reply)) && !audio.invalid &&
+                   audio.rate >= 16380u && audio.rate <= 16390u &&
+                   frequency > 1020 && frequency < 1028 &&
+                   audio.non_silent > 7800u && audio.non_silent < 8600u &&
+                   audio.minimum < 100u && audio.maximum > 154u &&
+                   audio.len > 15000u && audio.samples[audio.len - 1u] == 127u;
+        audio_ok = save_audio(&audio, artifacts) && audio_ok;
+        fprintf(stderr, "[agon] audio ok=%d samples=%zu non_silent=%zu rate=%u tone=%.3fHz range=%u/%u rises=%zu\n",
+                audio_ok, audio.len, audio.non_silent, audio.rate, frequency,
+                audio.minimum, audio.maximum, audio.rises);
+    }
+    bool keyboard_ok = false;
+    if (stage == 5u && send_bytes(p, console_on, sizeof(console_on))) {
+        uint64_t start = cpu->cycle_count;
+        while (cpu->cycle_count - start < 2400000ull)
+            if (!step(s)) break;
+        const uint8_t key = 'a';
+        periph_uart_rx_inject_num(p, 0, &key, 1);
+        while (cpu->cycle_count - start < 24000000ull &&
+               !has_bytes(&u, key_reply, sizeof(key_reply)))
+            if (!step(s)) break;
+        keyboard_ok = has_bytes(&u, key_reply, sizeof(key_reply));
+        send_bytes(p, console_off, sizeof(console_off));
+        fprintf(stderr, "[agon] serial-console keyboard ok=%d\n", keyboard_ok);
+    }
     uint64_t soak_start = cpu->cycle_count, frames_start = v->frames;
     uint64_t retired_start = cpu->insn_count + other->insn_count;
     jit_state_t *jit_state = flexe_session_jit(s);
@@ -275,13 +384,17 @@ int main(int argc, char **argv) {
     uint64_t expected_frames = elapsed * v->rate / (240000000ull * 400u * 524u);
     bool timing_ok = soak_frames + 2u >= expected_frames &&
                      soak_frames <= expected_frames + 2u;
-    bool uart_ok = u.len == sizeof(handshake) + sizeof(red_reply) + sizeof(blue_reply) &&
+    bool uart_ok = u.len == sizeof(handshake) + sizeof(red_reply) + sizeof(blue_reply) + sizeof(tone_reply) + sizeof(key_reply) &&
                    memcmp(u.bytes, handshake, sizeof(handshake)) == 0 &&
                    memcmp(u.bytes + sizeof(handshake), red_reply, sizeof(red_reply)) == 0 &&
                    memcmp(u.bytes + sizeof(handshake) + sizeof(red_reply),
-                          blue_reply, sizeof(blue_reply)) == 0;
+                          blue_reply, sizeof(blue_reply)) == 0 &&
+                   memcmp(u.bytes + sizeof(handshake) + sizeof(red_reply) + sizeof(blue_reply),
+                          tone_reply, sizeof(tone_reply)) == 0 &&
+                   memcmp(u.bytes + sizeof(handshake) + sizeof(red_reply) + sizeof(blue_reply) + sizeof(tone_reply),
+                          key_reply, sizeof(key_reply)) == 0;
     bool ok = stage == 5u && elapsed >= soak_cycles && !v->overflow && !u.overflow &&
-              uart_ok && timing_ok &&
+              uart_ok && timing_ok && audio_ok && keyboard_ok &&
               frame_matches(v, 320, 240, 0x20u, &final_hash) && final_hash == blue_hash &&
               !cpu->debug_break && !other->debug_break &&
               !cpu->breakpoint_hit && !other->breakpoint_hit &&
@@ -290,7 +403,7 @@ int main(int argc, char **argv) {
     printf("%s engine=%s stage=%u wall=%.6f soak_wall=%.6f soak_cycles=%llu "
            "cycles=%llu retired=%llu native=%llu soak_retired=%llu soak_native=%llu "
            "frames=%llu soak_frames=%llu "
-           "pixel_hz=%u geometry=%u/%u uart=%zu uart_digest=%08x red=%08x blue=%08x "
+           "pixel_hz=%u geometry=%u/%u uart=%zu uart_digest=%08x red=%08x blue=%08x audio=%d key=%d "
            "unhandled=%d unregistered=%d unmapped=%llu pc=%08x/%08x\n",
            ok ? "PASS" : "FAIL", no_jit ? "interp" : "jit", stage, wall,
            (double)soak_wall / 1e9, (unsigned long long)elapsed,
@@ -298,7 +411,7 @@ int main(int argc, char **argv) {
            (unsigned long long)native, (unsigned long long)(retired - retired_start),
            (unsigned long long)(native - native_start), (unsigned long long)v->frames,
            (unsigned long long)soak_frames, v->rate,
-           v->columns, v->rows, u.len, digest(u.bytes, u.len), red_hash, blue_hash,
+           v->columns, v->rows, u.len, digest(u.bytes, u.len), red_hash, blue_hash, audio_ok, keyboard_ok,
            unhandled, unregistered, (unsigned long long)unmapped, cpu->pc, other->pc);
     if (!ok) {
         fprintf(stderr, "[agon] UART2:");
@@ -308,6 +421,7 @@ int main(int argc, char **argv) {
         if (v->complete) save_frame(v, v->columns == 800 ? 640 : 320,
                                       v->columns == 800 ? 480 : 240, artifacts, "failure");
     }
+    if (ok && mos_port) ok = run_mos(s, v, mos_port, artifacts);
     free(v);
     flexe_session_destroy(s);
     return ok ? 0 : 1;

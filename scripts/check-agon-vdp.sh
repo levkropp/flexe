@@ -25,7 +25,7 @@ if reps < 1 or warmups < 0 or not 0 < cycles <= 20000000000:
     sys.exit('REPS must be positive, WARMUPS nonnegative, SOAK_CYCLES in 1..20000000000')
 artifacts = os.environ.get('ARTIFACTS')
 samples = {'interp': [], 'jit': []}
-expected = {'stage': '5', 'uart': '41', 'uart_digest': '781974f3',
+expected = {'stage': '5', 'uart': '51', 'uart_digest': '1dc20a14', 'audio': '1', 'key': '1',
             'red': '56769766', 'blue': 'a2dbd34c', 'pixel_hz': '12222222',
             'geometry': '400/524', 'unhandled': '0', 'unregistered': '0', 'unmapped': '0'}
 for rep in range(warmups + reps):
@@ -66,5 +66,5 @@ if artifacts:
               'runner': runner, 'image_sha256': expected_sha, 'warmups': warmups,
               'samples': samples}
     (pathlib.Path(artifacts) / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
-print('PASS: native Agon VDP UART2, text, pixels, mode switch and scanout timing in both engines')
+print('PASS: native Agon VDP UART2, VGA, DAC tone and serial-console keyboard in both engines')
 PY

@@ -56,10 +56,14 @@ scanout using its H/V sync bits and verifies:
 - Stable complete frames, pinned pixel hashes, and matching UART output.
 - Continued scanout through a configurable soak, with frame count consistent
   with the programmed pixel clock, including blanking and double scan.
+- A native I2S0/DAC square wave requested through VDU audio commands: 1024 Hz
+  for 500 ms, followed by silence, with the expected audio acknowledgment.
+- Native UART0 serial-console input produces the correct UART2 keyboard packet.
 - Zero unsupported MMIO, unregistered ROM calls, or unmapped accesses; the
   JIT must retire native instructions during the soak.
 
-Set `ARTIFACTS=/path/to/output` to retain PPM captures and a JSON results file.
+Set `ARTIFACTS=/path/to/output` to retain PPM captures, the captured DAC tone as
+`tone.wav`, and a JSON results file.
 The matching release map supplies only a diagnostic `panic_abort` breakpoint;
 success depends on the observed UART and VGA behavior.
 
@@ -70,10 +74,20 @@ sequence completes calibration functionally. APLL SDM/divider registers now
 drive the shared I2S clock source, and LCD DMA uses its parallel word clock
 instead of PCM stereo timing. Analog lock timing is not modeled.
 
-This validates the **ESP32 VDP endpoint**, including the UART protocol and
-video modes above. The peer is a protocol harness, not an emulated eZ80/MOS
-machine. PS/2 key/mouse events, audio output, SD operations, other video modes,
-and complete Agon applications remain unvalidated. The release still logs a
+There is also a [full-machine gate](testing.md#agon-mos-and-bbc-basic) using the
+upstream eZ80 emulator as a separate process, with pinned Agon Platform MOS
+3.0.2 and BBC BASIC images. The native VDP's UART and decoded VSync connect to
+the eZ80 side. MOS boots, runs shell commands, reads a file, loads BBC BASIC,
+and runs a program that changes video mode, waits for vertical blank, and
+prints arithmetic and loop results. Both engines must produce the same pinned
+final VGA pixels.
+
+Keyboard input in these gates uses Agon's supported serial-console mode.
+**Physical PS/2 keyboard/mouse input is not supported:** FabGL uses the classic
+ULP FSM coprocessor, which Flexe does not yet execute. The eZ80 peer uses its
+upstream host filesystem service for SD access; this does not validate ESP32
+SD hardware. Other video modes, audio features beyond the tested square wave,
+and arbitrary applications still need coverage. The release still logs a
 core-1 watchdog-removal warning.
 The approximately 40,000-cycle `panic_abort` reported in
 [issue #2](https://github.com/levkropp/flexe/issues/2) was not reproduced with
