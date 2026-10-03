@@ -32,6 +32,35 @@ each firmware offers.
 firmware and rom images are supplied separately. recheck when an upstream
 release changes.
 
+### agon light / fabgl startup regression
+
+[Agon VDP 2.16.0](https://github.com/AgonPlatform/agon-vdp/releases/tag/v2.16.0)
+has a separate, limited startup gate:
+
+```sh
+AGON_VDP_BIN=/path/to/firmware.bin ./scripts/check-agon-vdp.sh
+```
+
+The gate pins the release application's SHA-256 to
+`b807beef35823b13a0a056f11b7464cd1b1c6356dce0e4098b78ebe059ded35f`.
+It runs native FreeRTOS without application symbol hooks and requires both
+engines to reach `setupVDPProtocol()` after `changeMode()` and `copy_font()`.
+The matching release `firmware.map` supplies the success and `panic_abort`
+breakpoints. CPU/time/ROM-call summaries must agree, unsupported MMIO must
+be zero, and the JIT must retire native instructions.
+
+This catches an internal analog-I2C ROM-stub defect: writes were discarded
+and reads always returned zero, leaving FabGL in the APLL calibration loop.
+Byte and masked register accesses now retain state, and the APLL reset/start
+sequence completes calibration functionally. Analog lock timing is not modeled.
+
+This is **startup coverage only**, not validated VGA pixels, audio, PS/2, or
+eZ80 communication. The release still logs a core-1 watchdog-removal warning.
+The approximately 40,000-cycle `panic_abort` reported in
+[issue #2](https://github.com/levkropp/flexe/issues/2) was not reproduced with
+this release or the locally built current source; identifying that failure
+still requires the reporter's exact image and command line.
+
 ## curated cyd scenarios
 
 `scripts/check-stock-roms.sh` checks completion, meaningful i/o, scenario

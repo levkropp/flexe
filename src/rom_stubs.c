@@ -163,6 +163,9 @@ struct esp32_rom_stubs {
     bool             single_core_mode;         /* -1 flag: fake core 1 init variables */
     bool             native_freertos;         /* -N flag: skip interrupt/lock stubs */
     bool             real_rom;                /* execute unregistered loaded ROM code */
+    /* Classic internal analog-I2C register bank, shared by both cores.
+     * host_id selects the bus route; the block/register identify the state. */
+    uint8_t          analog_i2c[256][256];
     rom_firmware_profile_t firmware_profile;  /* exact symbol-less ROM layout */
     esp32_periph_t  *periph;                 /* Peripheral state (for intr_matrix_set) */
     stub_irq_t irq[71];
@@ -3520,6 +3523,65 @@ static void stub_unregistered(xtensa_cpu_t *cpu, void *ctx) {
     rom_return(cpu, 0);
 }
 
+/* ESP32's internal analog bus is distinct from the external I2C controllers.
+ * Preserve byte and masked accesses instead of returning zero: the stock
+ * rtc_clk_apll_enable() driver polls block 0x6d, register 3, bit 7 before
+ * FabGL can start its I2S VGA clock. Calibration is functional, not timed.
+ * See ESP-IDF's esp32/regi2c_apll.h and clk_tree_ll.h. */
+static void analog_i2c_write(esp32_rom_stubs_t *s, uint8_t block,
+                             uint8_t reg, uint8_t value) {
+    uint8_t old = s->analog_i2c[block][reg];
+    if (block == 0x6du && reg == 3u) return; /* calibration result is read-only */
+    s->analog_i2c[block][reg] = value;
+    if (block == 0x6du && reg == 0u) {
+        /* CAL_RSTB low resets; CAL_START high starts a new calibration.
+         * IDF writes 0x0f, 0x3f, 0x1f, then polls CAL_END. */
+        if (!(value & 0x10u) || (value & 0x20u))
+            s->analog_i2c[block][3] &= (uint8_t)~0x80u;
+        else if (old & 0x20u)
+            s->analog_i2c[block][3] |= 0x80u;
+    }
+}
+
+static uint8_t analog_i2c_mask(uint32_t msb, uint32_t lsb) {
+    if (msb > 7u || lsb > msb) return 0u;
+    return (uint8_t)(((1u << (msb - lsb + 1u)) - 1u) << lsb);
+}
+
+static void stub_rom_i2c_read(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    rom_return(cpu, s->analog_i2c[(uint8_t)rom_arg(cpu, 0)]
+                                [(uint8_t)rom_arg(cpu, 2)]);
+}
+
+static void stub_rom_i2c_write(xtensa_cpu_t *cpu, void *ctx) {
+    analog_i2c_write(ctx, (uint8_t)rom_arg(cpu, 0),
+                    (uint8_t)rom_arg(cpu, 2), (uint8_t)rom_arg(cpu, 3));
+    rom_return_void(cpu);
+}
+
+static void stub_rom_i2c_read_mask(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint32_t msb = rom_arg(cpu, 3), lsb = rom_arg(cpu, 4);
+    uint8_t mask = analog_i2c_mask(msb, lsb);
+    uint8_t value = s->analog_i2c[(uint8_t)rom_arg(cpu, 0)]
+                                [(uint8_t)rom_arg(cpu, 2)];
+    rom_return(cpu, mask ? (value & mask) >> lsb : 0u);
+}
+
+static void stub_rom_i2c_write_mask(xtensa_cpu_t *cpu, void *ctx) {
+    esp32_rom_stubs_t *s = ctx;
+    uint8_t block = (uint8_t)rom_arg(cpu, 0), reg = (uint8_t)rom_arg(cpu, 2);
+    uint32_t msb = rom_arg(cpu, 3), lsb = rom_arg(cpu, 4);
+    uint8_t mask = analog_i2c_mask(msb, lsb);
+    if (mask) {
+        uint8_t value = (uint8_t)((s->analog_i2c[block][reg] & ~mask) |
+                                 ((rom_arg(cpu, 5) << lsb) & mask));
+        analog_i2c_write(s, block, reg, value);
+    }
+    rom_return_void(cpu);
+}
+
 /* The ESP32 ROM's POSIX entry points are not implementations of a device or
  * filesystem.  They are small newlib veneers: fetch the per-core syscall
  * table, call __getreent(), then call the corresponding *_r function that
@@ -5024,13 +5086,13 @@ esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu) {
     rom_stubs_register(s, 0x4000ca84, stub_divdi3,             "__divdi3");
     rom_stubs_register(s, 0x4000cd4c, stub_moddi3,             "__moddi3");
 
-    /* I2C ROM functions (register read/write - return 0) */
+    /* Internal analog-I2C ROM functions. */
     rom_stubs_register(s, 0x40004100, stub_phy_get_romfuncs,     "phy_get_romfuncs");
     init_phy_romfuncs(s);
-    rom_stubs_register(s, 0x40004148, stub_unregistered,        "rom_i2c_readReg");
-    rom_stubs_register(s, 0x400041a4, stub_void_unregistered,   "rom_i2c_writeReg");
-    rom_stubs_register(s, 0x400041c0, stub_unregistered,        "rom_i2c_readReg_Mask");
-    rom_stubs_register(s, 0x400041fc, stub_void_unregistered,   "rom_i2c_writeReg_Mask");
+    rom_stubs_register(s, 0x40004148, stub_rom_i2c_read,        "rom_i2c_readReg");
+    rom_stubs_register(s, 0x400041a4, stub_rom_i2c_write,       "rom_i2c_writeReg");
+    rom_stubs_register(s, 0x400041c0, stub_rom_i2c_read_mask,   "rom_i2c_readReg_Mask");
+    rom_stubs_register(s, 0x400041fc, stub_rom_i2c_write_mask,  "rom_i2c_writeReg_Mask");
 
     /* Private ESP32 Bluetooth-controller ROM table accessors. The IDF binary
      * blob expects writable pointer targets even when the host radio backend

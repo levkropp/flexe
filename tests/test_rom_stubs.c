@@ -726,6 +726,60 @@ static uint32_t call_builtin_rom_args(xtensa_cpu_t *cpu, uint32_t addr,
     return ar_read(cpu, 2);
 }
 
+TEST(test_rom_analog_i2c_apll_calibration) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    uint32_t write[] = {0x6du, 3u, 9u, 0xa5u};
+    uint32_t read[] = {0x6du, 3u, 9u};
+    uint32_t masked[] = {0x6du, 3u, 9u, 5u, 2u, 3u};
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40004148u, read, 3), 0xa5u);
+    call_builtin_rom_args(&cpu, 0x400041fcu, masked, 6);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40004148u, read, 3), 0x8du);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, masked, 5), 3u);
+    /* Full-width masks and malformed ranges must not cause undefined shifts. */
+    masked[3] = 7u; masked[4] = 0u; masked[5] = 0x1feu;
+    call_builtin_rom_args(&cpu, 0x400041fcu, masked, 6);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, masked, 5), 0xfeu);
+    masked[3] = 32u; masked[4] = 32u;
+    call_builtin_rom_args(&cpu, 0x400041fcu, masked, 6);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, masked, 5), 0u);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40004148u, read, 3), 0xfeu);
+    read[0] = 0x66u;
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x40004148u, read, 3), 0u);
+
+    uint32_t done[] = {0x6du, 3u, 3u, 7u, 7u};
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, done, 5), 0u);
+    /* Replay the unmodified IDF calibration sequence twice, proving reset
+     * clears completion and that a new start is required for each run. */
+    write[2] = 0u;
+    for (int pass = 0; pass < 2; pass++) {
+        write[3] = 0x0fu;
+        call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+        ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, done, 5), 0u);
+        write[3] = 0x1fu; /* releasing reset alone does not calibrate */
+        call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+        ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, done, 5), 0u);
+        write[3] = 0x3fu;
+        call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+        ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, done, 5), 0u);
+        write[3] = 0x1fu;
+        call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+        ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, done, 5), 1u);
+    }
+    write[2] = 3u; write[3] = 0u;
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, done, 5), 1u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+    rom_stubs_destroy(rom);
+    /* A fresh machine must not inherit another machine's calibration. */
+    rom = rom_stubs_create(&cpu);
+    ASSERT_EQ(call_builtin_rom_args(&cpu, 0x400041c0u, done, 5), 0u);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 TEST(test_rom_string_spans_and_bounded_concat) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -2974,6 +3028,7 @@ void run_rom_stub_tests(void) {
     RUN_TEST(test_cache_flash_mmu_rom_api_uses_byte_addresses);
     RUN_TEST(test_cache_sram_mmu_rom_api_maps_target_psram);
     RUN_TEST(test_stub_memcpy);
+    RUN_TEST(test_rom_analog_i2c_apll_calibration);
     RUN_TEST(test_rom_string_spans_and_bounded_concat);
     RUN_TEST(test_cpu_frequency_rom_pair);
     RUN_TEST(test_rom_newlib_scalar_helpers);

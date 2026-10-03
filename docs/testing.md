@@ -199,6 +199,13 @@ For a broader directory of images:
 FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 ```
 
+Agon VDP has a narrower native-startup regression, with its pinned image and
+coverage boundary documented in [Firmware compatibility](compatibility.md#agon-light--fabgl-startup-regression):
+
+```sh
+AGON_VDP_BIN=/path/to/agon-vdp-2.16.0/firmware.bin ./scripts/check-agon-vdp.sh
+```
+
 See [Firmware compatibility](compatibility.md) for the assertions and current
 known failures.
 
