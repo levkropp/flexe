@@ -909,6 +909,7 @@ static const int8_t RTCIO_CHANNEL_GPIO[RTC_GPIO_CHANNELS] = {
 #define I2S_OUTLINK_DSCR_BF1_OFF  0x05Cu
 #define I2S_LC_CONF_OFF           0x060u
 #define I2S_CLKM_CONF_OFF         0x0ACu
+#define I2S_CONF2_OFF             0x0A8u
 #define I2S_SAMPLE_RATE_OFF       0x0B0u
 #define I2S_STATE_OFF             0x0BCu
 #define I2S_DATE_OFF              0x0FCu
@@ -1642,6 +1643,7 @@ typedef struct {
 
 typedef struct {
     uint32_t regs[I2S_REG_FILE_SIZE / sizeof(uint32_t)];
+    uint32_t apll_hz;
     uint32_t int_raw;
     uint32_t int_ena;
     uint32_t tx_desc;
@@ -14022,6 +14024,9 @@ static uint8_t i2s_bits_per_sample(const i2s_state_t *s, bool tx) {
 }
 
 static uint8_t i2s_channel_count(const i2s_state_t *s, bool tx) {
+    /* LCD parallel output transfers one pixel/data word per clock, rather
+     * than serial stereo audio frames. FabGL uses eight-bit LCD words. */
+    if (tx && (s->regs[I2S_CONF2_OFF / 4u] & (1u << 5))) return 1u;
     uint32_t conf = s->regs[I2S_CONF_OFF / 4u];
     return conf & (tx ? I2S_CONF_TX_MONO : I2S_CONF_RX_MONO) ? 1u : 2u;
 }
@@ -14035,13 +14040,19 @@ static uint32_t i2s_sample_rate(const i2s_state_t *s, bool tx) {
     uint64_t divider_64 = (uint64_t)num * 64u;
     if (a != 0) divider_64 += (uint64_t)b * 64u / a;
     if (divider_64 == 0) divider_64 = 256u;
-    uint64_t module_hz = 160000000ull * 64u / divider_64;
+    uint32_t source_hz = (clkm & (1u << 21)) ? s->apll_hz : 160000000u;
+    uint64_t module_hz = (uint64_t)source_hz * 64u / divider_64;
 
     uint32_t rate = s->regs[I2S_SAMPLE_RATE_OFF / 4u];
     uint32_t bck_div = tx ? (rate & 0x3Fu) : ((rate >> 6) & 0x3Fu);
     if (bck_div == 0) bck_div = 1;
     uint32_t frame_bits = (uint32_t)i2s_bits_per_sample(s, tx) *
                           i2s_channel_count(s, tx);
+    if (tx && (s->regs[I2S_CONF2_OFF / 4u] & (1u << 5))) {
+        /* LCD WR runs at BCK/2; WRX2 selects one write per BCK. This also
+         * covers the stock built-in DAC's 16-bit LCD words. */
+        frame_bits = (s->regs[I2S_CONF2_OFF / 4u] & (1u << 1)) ? 1u : 2u;
+    }
     uint64_t sample_hz = module_hz / bck_div / frame_bits;
     if (sample_hz == 0) sample_hz = 1;
     if (sample_hz > UINT32_MAX) sample_hz = UINT32_MAX;
@@ -14266,6 +14277,17 @@ static void i2s_arm_event(esp32_periph_t *p, int port, bool tx) {
     i2s_kick(p);
 }
 
+void periph_set_apll_frequency(esp32_periph_t *p, uint32_t frequency_hz) {
+    if (!p) return;
+    for (int port = 0; port < I2S_PORT_COUNT; port++) {
+        i2s_state_t *s = &p->i2s[port];
+        s->apll_hz = frequency_hz;
+        if (!(s->regs[I2S_CLKM_CONF_OFF / 4u] & (1u << 21))) continue;
+        if (s->tx_active) i2s_arm_event(p, port, true);
+        if (s->rx_active) i2s_arm_event(p, port, false);
+    }
+}
+
 static void i2s_seed_ring(esp32_periph_t *p, int port, bool tx) {
     i2s_state_t *s = &p->i2s[port];
     uint32_t first = tx ? s->tx_desc : s->rx_desc;
@@ -14447,6 +14469,13 @@ static void i2s_write(void *ctx, uint32_t addr, uint32_t val) {
     case I2S_FIFO_CONF_OFF:
         s->regs[off / 4u] = val;
         i2s_refresh_active(p, port);
+        return;
+    case I2S_CONF2_OFF:
+    case I2S_CLKM_CONF_OFF:
+    case I2S_SAMPLE_RATE_OFF:
+        s->regs[off / 4u] = val;
+        if (s->tx_active) i2s_arm_event(p, port, true);
+        if (s->rx_active) i2s_arm_event(p, port, false);
         return;
     default:
         s->regs[off / 4u] = val;

@@ -6493,6 +6493,53 @@ TEST(i2s_tx_dma_descriptor_and_interrupt) {
     mem_destroy(mem);
 }
 
+TEST(i2s_lcd_apll_clock_and_dma_deadline) {
+    const uint32_t i2s = 0x3FF6D000u, desc = 0x3FFB1300u, buf = 0x3FFB2300u;
+    xtensa_mem_t *mem = mem_create();
+    esp32_periph_t *p = periph_create(mem);
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+    i2s_test_capture_t capture = {0};
+    periph_set_i2s_tx_callback(p, 1, i2s_test_capture, &capture);
+    test_spi_dma_desc(mem, desc, buf, 100, 100, 1, desc);
+    periph_set_apll_frequency(p, 50000000u);
+    mem_write32(mem, i2s + 0xA8u, (1u << 5) | (1u << 1)); /* LCD, WRX2 */
+    mem_write32(mem, i2s + 0xACu, (1u << 21) | 2u); /* APLL / 2 */
+    mem_write32(mem, i2s + 0xB0u, (8u << 12) | 1u); /* 8-bit, BCK / 1 */
+    mem_write32(mem, i2s + 0x30u, (desc & 0xFFFFFu) | (1u << 29));
+    mem_write32(mem, i2s + 0x08u, 1u << 4);
+    ASSERT_EQ(capture.count, 1);
+    ASSERT_EQ(capture.sample_rate, 25000000u);
+    ASSERT_EQ(capture.bits_per_sample, 8u);
+    ASSERT_EQ(capture.channels, 1u);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 960u); /* 100 pixels */
+
+    /* Retuning the shared APLL must rearm an already running DMA ring. */
+    periph_set_apll_frequency(p, 40000000u);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 1200u);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.count, 2);
+    ASSERT_EQ(capture.sample_rate, 20000000u);
+
+    /* Without WRX2 each LCD word takes two BCK clocks. Switching back to
+     * the fixed source must ignore subsequent APLL changes. */
+    mem_write32(mem, i2s + 0xA8u, 1u << 5);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 2400u);
+    mem_write32(mem, i2s + 0xACu, 4u);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 1200u);
+    periph_set_apll_frequency(p, 60000000u);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(capture.sample_rate, 20000000u);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 1200u);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
 TEST(i2s_rx_dma_injection_and_dual_port) {
     const uint32_t i2s0 = 0x3FF4F000u;
     const uint32_t i2s1 = 0x3FF6D000u;
@@ -7052,6 +7099,7 @@ void run_peripheral_tests(void) {
     RUN_TEST(ledc_timer_overflow_pause_and_clear);
     RUN_TEST(ledc_low_speed_output_and_dport_reset_preserve_endpoint);
     RUN_TEST(i2s_tx_dma_descriptor_and_interrupt);
+    RUN_TEST(i2s_lcd_apll_clock_and_dma_deadline);
     RUN_TEST(i2s_rx_dma_injection_and_dual_port);
     RUN_TEST(i2s_clock_and_bt_private_readback);
     RUN_TEST(rmt_register_file_shared_ram_and_apb_fifo);

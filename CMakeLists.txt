@@ -352,6 +352,7 @@ if(UNIX)
     add_flexe_runner(flexe-stock-rom-test stock_rom_test.c)
     add_flexe_runner(flexe-generic-rom-test generic_rom_test.c)
     add_flexe_runner(flexe-bench-compute bench_compute.c)
+    add_flexe_runner(flexe-agon-vdp-test agon_vdp_test.c)
 
     # Hardware fixtures used to be one executable apiece.  That made a core
     # edit relink the emulator dozens of times before the behavior gates could

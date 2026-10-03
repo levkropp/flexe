@@ -32,30 +32,49 @@ each firmware offers.
 firmware and rom images are supplied separately. recheck when an upstream
 release changes.
 
-### agon light / fabgl startup regression
+### agon light / fabgl end-to-end regression
 
 [Agon VDP 2.16.0](https://github.com/AgonPlatform/agon-vdp/releases/tag/v2.16.0)
-has a separate, limited startup gate:
+has a separate native end-to-end VDP gate:
 
 ```sh
+cmake --build build --target flexe-agon-vdp-test -j
 AGON_VDP_BIN=/path/to/firmware.bin ./scripts/check-agon-vdp.sh
 ```
 
 The gate pins the release application's SHA-256 to
 `b807beef35823b13a0a056f11b7464cd1b1c6356dce0e4098b78ebe059ded35f`.
-It runs native FreeRTOS without application symbol hooks and requires both
-engines to reach `setupVDPProtocol()` after `changeMode()` and `copy_font()`.
-The matching release `firmware.map` supplies the success and `panic_abort`
-breakpoints. CPU/time/ROM-call summaries must agree, unsupported MMIO must
-be zero, and the JIT must retire native instructions.
+It runs native FreeRTOS without an ELF, application symbol hooks, or guest
+memory patches. A UART2 peer sends the MOS handshake and VDU commands; the
+firmware itself parses them and runs FabGL's drawing and interrupt code.
+Both engines must return the exact handshake, mode information, character
+query (`F`), and pixel queries (red/blue). The gate decodes raw I2S1 LCD DMA
+scanout using its H/V sync bits and verifies:
+
+- 640x480 mode 0: red background with white `FLEXE` text.
+- A real VDU mode switch to 320x240 mode 8: blue background with the same text.
+- Stable complete frames, pinned pixel hashes, and matching UART output.
+- Continued scanout through a configurable soak, with frame count consistent
+  with the programmed pixel clock, including blanking and double scan.
+- Zero unsupported MMIO, unregistered ROM calls, or unmapped accesses; the
+  JIT must retire native instructions during the soak.
+
+Set `ARTIFACTS=/path/to/output` to retain PPM captures and a JSON results file.
+The matching release map supplies only a diagnostic `panic_abort` breakpoint;
+success depends on the observed UART and VGA behavior.
 
 This catches an internal analog-I2C ROM-stub defect: writes were discarded
 and reads always returned zero, leaving FabGL in the APLL calibration loop.
 Byte and masked register accesses now retain state, and the APLL reset/start
-sequence completes calibration functionally. Analog lock timing is not modeled.
+sequence completes calibration functionally. APLL SDM/divider registers now
+drive the shared I2S clock source, and LCD DMA uses its parallel word clock
+instead of PCM stereo timing. Analog lock timing is not modeled.
 
-This is **startup coverage only**, not validated VGA pixels, audio, PS/2, or
-eZ80 communication. The release still logs a core-1 watchdog-removal warning.
+This validates the **ESP32 VDP endpoint**, including the UART protocol and
+video modes above. The peer is a protocol harness, not an emulated eZ80/MOS
+machine. PS/2 key/mouse events, audio output, SD operations, other video modes,
+and complete Agon applications remain unvalidated. The release still logs a
+core-1 watchdog-removal warning.
 The approximately 40,000-cycle `panic_abort` reported in
 [issue #2](https://github.com/levkropp/flexe/issues/2) was not reproduced with
 this release or the locally built current source; identifying that failure

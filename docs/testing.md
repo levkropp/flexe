@@ -199,12 +199,47 @@ For a broader directory of images:
 FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 ```
 
-Agon VDP has a narrower native-startup regression, with its pinned image and
-coverage boundary documented in [Firmware compatibility](compatibility.md#agon-light--fabgl-startup-regression):
+Agon VDP has a native UART/VGA end-to-end regression, with its pinned image and
+coverage boundary documented in [Firmware compatibility](compatibility.md#agon-light--fabgl-end-to-end-regression):
 
 ```sh
+cmake --build build --target flexe-agon-vdp-test -j
 AGON_VDP_BIN=/path/to/agon-vdp-2.16.0/firmware.bin ./scripts/check-agon-vdp.sh
 ```
+
+For repeatable performance measurements, use a Release build and an otherwise
+idle host. Each sample first passes the full UART/VGA scenario, then measures
+the steady 320x240 scanout separately from boot. The benchmark defaults to one
+warmup and three samples per engine; `SOAK_CYCLES` defaults to 240 million
+cycles (one modeled second at 240 MHz). Both emulated CPUs' retired instructions
+contribute to aggregate MIPS. Realtime is modeled time divided by host wall
+time; it is not an instruction-accurate comparison with physical hardware.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target flexe-agon-vdp-test -j
+AGON_VDP_BIN=/path/to/firmware.bin SOAK_CYCLES=1200000000 \
+ARTIFACTS=/tmp/agon-results ./scripts/bench-agon-vdp.sh
+```
+
+`RUNNER` selects another build directory. CI compiles the runner with GCC and
+Clang; executing this optional gate requires the external release image.
+
+Measured on 2026-10-03 on Apple A18 Pro, macOS 26.4.1, Apple Clang 21.0.0,
+Release `-O3` with native tuning and LTO: one warmup, three samples per engine,
+five modeled seconds per soak, including raw VGA capture and validation.
+
+| engine | median soak wall time | aggregate MIPS | modeled realtime | scanout frames / wall second |
+|---|---:|---:|---:|---:|
+| interpreter | 9.306 s | 129.70 | 0.537x | 31.16 |
+| JIT | 4.099 s | 294.43 | 1.220x | 70.74 |
+
+Native JIT coverage during the soak was 96.6%. Each sample captured 290 complete
+frames in mode 8, consistent with its programmed 12,222,222 Hz pixel clock and
+400x524 scanout geometry. All UART and pixel hashes matched across engines.
+Running the same harness against commit `9ba9927` fails after the initial UART
+queries: its I2S sink reports stereo PCM at 5 MHz instead of parallel VGA. This
+confirms that the new gate detects the timing defect beyond the startup check.
 
 See [Firmware compatibility](compatibility.md) for the assertions and current
 known failures.

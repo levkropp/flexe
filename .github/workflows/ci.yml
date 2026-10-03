@@ -47,7 +47,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF
       - name: Build
-        run: cmake --build build --target xtensa-tests -j"$(nproc)"
+        run: cmake --build build --target xtensa-tests flexe-agon-vdp-test -j"$(nproc)"
       - name: Unit tests
         run: ./scripts/run-unit-tests.sh
 

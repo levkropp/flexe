@@ -780,6 +780,60 @@ TEST(test_rom_analog_i2c_apll_calibration) {
     teardown(&cpu);
 }
 
+static void capture_apll_rate(void *ctx, int port, const uint8_t *data,
+                              size_t len, uint32_t rate, uint8_t bits,
+                              uint8_t channels) {
+    *(uint32_t *)ctx = rate;
+}
+
+TEST(test_rom_apll_frequency_drives_i2s) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_periph_t *p = periph_create(cpu.mem);
+    periph_attach_cpus(p, &cpu, NULL);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    rom_stubs_set_periph(rom, p);
+    const uint32_t i2s = 0x3FF6D000u, desc = 0x3FFB1300u, buf = 0x3FFB2300u;
+    uint32_t rate = 0;
+    periph_set_i2s_tx_callback(p, 1, capture_apll_rate, &rate);
+    mem_write32(cpu.mem, desc, (1u << 31) | (1u << 30) | (100u << 12) | 100u);
+    mem_write32(cpu.mem, desc + 4u, buf);
+    mem_write32(cpu.mem, desc + 8u, desc);
+    mem_write32(cpu.mem, i2s + 0xA8u, (1u << 5) | (1u << 1));
+    mem_write32(cpu.mem, i2s + 0xACu, (1u << 21) | 2u);
+    mem_write32(cpu.mem, i2s + 0xB0u, (8u << 12) | 1u);
+    /* 40 MHz * (4 + 6 + 128/256 + 0/65536) / (2 * (2 + 2))
+     * is 52.5 MHz APLL, or a 26.25 MHz pixel clock after I2S / 2. */
+    uint32_t write[] = {0x6du, 3u, 7u, 6u};
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    write[2] = 8u; write[3] = 128u;
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    write[2] = 4u; write[3] = 2u;
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    write[2] = 0u; write[3] = 0x0fu;
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    write[3] = 0x3fu;
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    write[3] = 0x1fu;
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    mem_write32(cpu.mem, i2s + 0x30u, (desc & 0xFFFFFu) | (1u << 29));
+    mem_write32(cpu.mem, i2s + 0x08u, 1u << 4);
+    ASSERT_EQ(rate, 26250000u);
+    ASSERT_EQ(cpu.next_timer_event - cpu.ccount, 915u);
+    /* Fractional SDM0 is preserved and changing calibrated coefficients
+     * updates a running stream instead of leaving its old deadline. */
+    write[2] = 9u; write[3] = 128u;
+    call_builtin_rom_args(&cpu, 0x400041a4u, write, 4);
+    cpu.ccount = cpu.next_timer_event;
+    cpu.periph_event(&cpu);
+    ASSERT_EQ(rate, 26254882u);
+    ASSERT_EQ(rom_stubs_unregistered_count(rom), 0);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    rom_stubs_destroy(rom);
+    periph_destroy(p);
+    teardown(&cpu);
+}
+
 TEST(test_rom_string_spans_and_bounded_concat) {
     xtensa_cpu_t cpu;
     setup(&cpu);
@@ -3029,6 +3083,7 @@ void run_rom_stub_tests(void) {
     RUN_TEST(test_cache_sram_mmu_rom_api_maps_target_psram);
     RUN_TEST(test_stub_memcpy);
     RUN_TEST(test_rom_analog_i2c_apll_calibration);
+    RUN_TEST(test_rom_apll_frequency_drives_i2s);
     RUN_TEST(test_rom_string_spans_and_bounded_concat);
     RUN_TEST(test_cpu_frequency_rom_pair);
     RUN_TEST(test_rom_newlib_scalar_helpers);

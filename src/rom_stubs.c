@@ -3541,6 +3541,18 @@ static void analog_i2c_write(esp32_rom_stubs_t *s, uint8_t block,
         else if (old & 0x20u)
             s->analog_i2c[block][3] |= 0x80u;
     }
+    if (block == 0x6du && s->periph) {
+        uint8_t *apll = s->analog_i2c[block];
+        uint64_t coeff = ((uint64_t)(4u + (apll[7] & 0x3fu)) << 16) |
+                         ((uint64_t)apll[8] << 8) | apll[9];
+        uint64_t divider = (uint64_t)((apll[4] & 0x1fu) + 2u) * 2u * 65536u;
+        /* 40 MHz classic crystal; the same source is returned by
+         * ets_get_detected_xtal_freq(). Keep the fractional SDM coefficients
+         * until the final division. */
+        uint32_t hz = (apll[3] & 0x80u) ?
+            (uint32_t)(40000000ull * coeff / divider) : 0u;
+        periph_set_apll_frequency(s->periph, hz);
+    }
 }
 
 static uint8_t analog_i2c_mask(uint32_t msb, uint32_t lsb) {

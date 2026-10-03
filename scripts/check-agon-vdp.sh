@@ -1,49 +1,70 @@
 #!/usr/bin/env bash
-# Optional startup regression for the unmodified Agon VDP 2.16.0 release.
-# This checks progress past FabGL's APLL initialization, not VGA correctness.
+# Native end-to-end regression for the unmodified Agon VDP 2.16.0 release.
+# Optional environment: RUNNER, ARTIFACTS, SOAK_CYCLES, WARMUPS, REPS.
 set -euo pipefail
-
 : "${AGON_VDP_BIN:?set AGON_VDP_BIN to Agon VDP v2.16.0 firmware.bin}"
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-runner=${RUNNER:-"$root/build/xtensa-emu"}
-expected_sha=b807beef35823b13a0a056f11b7464cd1b1c6356dce0e4098b78ebe059ded35f
-actual_sha=$(openssl dgst -sha256 "$AGON_VDP_BIN" | awk '{print $NF}')
-if [[ "$actual_sha" != "$expected_sha" ]]; then
-    echo "FAIL: Agon VDP image hash $actual_sha, expected $expected_sha" >&2
-    exit 1
-fi
+exec python3 - "${RUNNER:-$root/build/flexe-agon-vdp-test}" "$AGON_VDP_BIN" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import statistics
+import subprocess
+import sys
 
-tmpdir=$(mktemp -d)
-trap 'rm -f "$tmpdir"/*.log "$tmpdir"/*.state; rmdir "$tmpdir"' EXIT
-for engine in interp jit; do
-    options=(--no-jit)
-    if [[ "$engine" == jit ]]; then options=(--jit-stats); fi
-    # Addresses come from the matching release firmware.map. setupVDPProtocol
-    # follows changeMode()/copy_font() in setup(); reaching it proves that the
-    # native VGA clock initialization returned. Catch panic_abort on either
-    # core instead of accepting mere instruction retirement in a polling loop.
-    if ! "$runner" -N --strict-mmio "${options[@]}" \
-            -b 0x40088154 -b 0x400D5884 -c 300000000 "$AGON_VDP_BIN" \
-            > "$tmpdir/$engine.log" 2>&1 ||
-       ! grep -qx 'Stop reason: breakpoint at 0x400D5884 (0x400D5884), core 1' \
-            "$tmpdir/$engine.log" ||
-       ! grep -qx 'Strict MMIO: 0 unsupported peripheral accesses' \
-            "$tmpdir/$engine.log"; then
-        cat "$tmpdir/$engine.log" >&2
-        echo "FAIL: Agon VDP $engine did not reach protocol setup" >&2
-        exit 1
-    fi
-    grep -E '^(Stop reason:|Cycles:|Insns:|Final PC:|Core 1 PC:|UART TX:|ROM calls:)' \
-        "$tmpdir/$engine.log" > "$tmpdir/$engine.state"
-done
-if ! cmp -s "$tmpdir/interp.state" "$tmpdir/jit.state"; then
-    diff -u "$tmpdir/interp.state" "$tmpdir/jit.state" >&2 || true
-    echo "FAIL: Agon VDP startup differs between engines" >&2
-    exit 1
-fi
-jit_insns=$(awk '/^  Insns JIT:/{print $3; exit}' "$tmpdir/jit.log")
-if [[ -z "$jit_insns" || "$jit_insns" -eq 0 ]]; then
-    echo "FAIL: Agon VDP gate did not retire JIT instructions" >&2
-    exit 1
-fi
-echo "PASS: Agon VDP 2.16.0 passes native VGA clock initialization in both engines, with matching startup state and zero unsupported MMIO ($jit_insns JIT instructions)"
+runner, image = sys.argv[1:]
+expected_sha = 'b807beef35823b13a0a056f11b7464cd1b1c6356dce0e4098b78ebe059ded35f'
+if hashlib.sha256(pathlib.Path(image).read_bytes()).hexdigest() != expected_sha:
+    sys.exit('FAIL: expected the unmodified Agon VDP 2.16.0 release image')
+reps = int(os.environ.get('REPS', '1'))
+warmups = int(os.environ.get('WARMUPS', '0'))
+cycles = int(os.environ.get('SOAK_CYCLES', '240000000'))
+if reps < 1 or warmups < 0 or not 0 < cycles <= 20000000000:
+    sys.exit('REPS must be positive, WARMUPS nonnegative, SOAK_CYCLES in 1..20000000000')
+artifacts = os.environ.get('ARTIFACTS')
+samples = {'interp': [], 'jit': []}
+expected = {'stage': '5', 'uart': '41', 'uart_digest': '781974f3',
+            'red': '56769766', 'blue': 'a2dbd34c', 'pixel_hz': '12222222',
+            'geometry': '400/524', 'unhandled': '0', 'unregistered': '0', 'unmapped': '0'}
+for rep in range(warmups + reps):
+    for engine in samples:
+        args = [runner, '--soak-cycles', str(cycles)]
+        if engine == 'interp':
+            args.append('--no-jit')
+        if artifacts:
+            directory = pathlib.Path(artifacts) / engine
+            directory.mkdir(parents=True, exist_ok=True)
+            args += ['--artifacts', str(directory)]
+        result = subprocess.run(args + [image], capture_output=True, text=True, timeout=600)
+        lines = [line for line in result.stdout.splitlines() if line.startswith('PASS ')]
+        if result.returncode or len(lines) != 1:
+            sys.exit(result.stdout + result.stderr + f'FAIL: Agon VDP {engine} (exit {result.returncode})')
+        fields = dict(word.split('=', 1) for word in lines[0].split()[1:])
+        if any(fields.get(key) != value for key, value in expected.items()):
+            sys.exit(lines[0] + '\nFAIL: Agon VDP differs from pinned UART/VGA output')
+        if int(fields['soak_cycles']) < cycles or (engine == 'jit' and int(fields['soak_native']) == 0):
+            sys.exit('FAIL: incomplete soak or no native JIT instructions')
+        if rep >= warmups:
+            samples[engine].append(fields)
+        print(f'{engine} {"warmup" if rep < warmups else "sample"} {rep + 1}: '
+              f'PASS, soak {fields["soak_wall"]}s', flush=True)
+
+print('engine  soak median s  aggregate MIPS  realtime  scanout FPS  native coverage')
+for engine, rows in samples.items():
+    seconds = [float(row['soak_wall']) for row in rows]
+    mips = [int(row['soak_retired']) / wall / 1e6 for row, wall in zip(rows, seconds)]
+    realtime = [int(row['soak_cycles']) / 240000000 / wall for row, wall in zip(rows, seconds)]
+    fps = [int(row['soak_frames']) / wall for row, wall in zip(rows, seconds)]
+    coverage = [int(row['soak_native']) / int(row['soak_retired']) for row in rows]
+    print(f'{engine:6} {statistics.median(seconds):13.3f} {statistics.median(mips):15.2f} '
+          f'{statistics.median(realtime):8.3f}x {statistics.median(fps):12.2f} '
+          f'{statistics.median(coverage):15.1%}')
+if artifacts:
+    report = {'host': platform.platform(), 'machine': platform.machine(),
+              'runner': runner, 'image_sha256': expected_sha, 'warmups': warmups,
+              'samples': samples}
+    (pathlib.Path(artifacts) / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
+print('PASS: native Agon VDP UART2, text, pixels, mode switch and scanout timing in both engines')
+PY

@@ -102,7 +102,7 @@ typedef int (*periph_emac_mdio_fn)(void *ctx, uint8_t phy_address,
                                    uint8_t reg, bool write,
                                    uint16_t *value);
 
-/* Raw PCM bytes consumed by one classic ESP32 I2S TX DMA descriptor. The
+/* Raw PCM or LCD parallel bytes consumed by one ESP32 I2S TX DMA descriptor. The
  * buffer is valid only for the duration of the callback. */
 typedef void (*periph_i2s_tx_fn)(void *ctx, int port, const uint8_t *data,
                                  size_t len, uint32_t sample_rate,
@@ -368,13 +368,18 @@ int periph_emac_phy_get_reg(const esp32_periph_t *p, uint8_t phy_address,
 int periph_emac_rx_inject(esp32_periph_t *p, const uint8_t *frame,
                           size_t len);
 
-/* Attach a TX audio sink and inject bytes for RX DMA. Classic local DMA and
- * target-described I2S v2/GDMA expose the same host contract. Ports 0/1 are
+/* Attach a TX audio/parallel-data sink and inject bytes for RX DMA. Classic
+ * LCD TX reports one channel and its parallel word/pixel clock as sample_rate.
+ * Classic local DMA and target-described I2S v2/GDMA expose the same host
+ * contract. Ports 0/1 are
  * independent; the RX FIFO accepts as many bytes as fit. Classic DMA
  * zero-fills an underrun, while I2S v2 retains descriptor ownership until a
  * complete buffer is available. */
 int periph_set_i2s_tx_callback(esp32_periph_t *p, int port,
                                periph_i2s_tx_fn fn, void *ctx);
+/* Classic analog-I2C ROM calibration publishes the shared APLL source.
+ * A zero frequency represents reset/unavailable calibration. */
+void periph_set_apll_frequency(esp32_periph_t *p, uint32_t frequency_hz);
 size_t periph_i2s_rx_inject(esp32_periph_t *p, int port,
                             const uint8_t *data, size_t len);
 size_t periph_i2s_rx_pending(const esp32_periph_t *p, int port);
