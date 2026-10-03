@@ -3566,7 +3566,7 @@ static void stub_rom_i2c_read_mask(xtensa_cpu_t *cpu, void *ctx) {
     uint8_t mask = analog_i2c_mask(msb, lsb);
     uint8_t value = s->analog_i2c[(uint8_t)rom_arg(cpu, 0)]
                                 [(uint8_t)rom_arg(cpu, 2)];
-    rom_return(cpu, mask ? (value & mask) >> lsb : 0u);
+    rom_return(cpu, mask ? ((uint32_t)value & mask) >> lsb : 0u);
 }
 
 static void stub_rom_i2c_write_mask(xtensa_cpu_t *cpu, void *ctx) {
