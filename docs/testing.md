@@ -199,6 +199,8 @@ For a broader directory of images:
 FLEXE_ROMS=/path/to/corpus ./scripts/check-firmware.sh
 ```
 
+### agon vdp
+
 Agon VDP has a native UART/VGA end-to-end regression, with its pinned image and
 coverage boundary documented in [Firmware compatibility](compatibility.md#agon-light--fabgl-end-to-end-regression):
 
@@ -225,14 +227,21 @@ ARTIFACTS=/tmp/agon-results ./scripts/bench-agon-vdp.sh
 `RUNNER` selects another build directory. CI compiles the runner with GCC and
 Clang; executing this optional gate requires the external release image.
 
-Measured on 2026-10-03 on Apple A18 Pro, macOS 26.4.1, Apple Clang 21.0.0,
-Release `-O3` with native tuning and LTO: one warmup, three samples per engine,
+Initial baseline before the PS-write dispatch optimization, measured on
+2026-10-03 on Apple A18 Pro, macOS 26.4.1, Apple Clang 21.0.0, Release `-O3`
+with native tuning and LTO: one warmup, three samples per engine,
 five modeled seconds per soak, including raw VGA capture and validation.
 
 | engine | median soak wall time | aggregate MIPS | modeled realtime | scanout frames / wall second |
 |---|---:|---:|---:|---:|
 | interpreter | 9.550 s | 126.39 | 0.524x | 30.47 |
 | JIT | 4.395 s | 274.62 | 1.138x | 66.21 |
+
+The subsequent generic PS-write optimization raised JIT modeled realtime to
+1.533x in five interleaved before/after pairs, a 28.7% throughput improvement;
+see [the performance comparison](performance.md#agon-vdp-critical-section-dispatch).
+`FLEXE_JIT_STATS=1` prints dispatch and coverage counters when running the
+native VDP harness directly.
 
 Native JIT coverage during the soak was 96.6%. Each sample captured 291 complete
 frames in mode 8, consistent with its programmed 12,222,222 Hz pixel clock and

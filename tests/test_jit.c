@@ -703,8 +703,8 @@ TEST(test_jit_rsil) {
     /* RSIL a2, 5: op0=0, op1=0, op2=0, r=6, s=5, t=2 */
     put_insn3(&cpu, BASE, rrr(0, 0, 6, 5, 2));
     put_insn2(&cpu, BASE + 3u, narrow(0xD, 15, 0, 3));
-    /* RSIL requests an interrupt recheck.  A native block now returns at
-     * that exact boundary, then xtensa_run resumes at the following NOP. */
+    /* With no enabled pending source, RSIL and the following instruction
+     * stay native while preserving the interpreter's architectural state. */
     test_run_differential(&cpu, 2, "rsil");
     teardown(&cpu);
 }
@@ -3007,29 +3007,45 @@ TEST(test_jit_rsr_ccount_observes_instruction_position) {
     teardown(&cpu);
 }
 
-TEST(test_jit_wsr_ps_rearms_irq_check) {
-    xtensa_cpu_t cpu;
-    setup(&cpu);
-    ar_write(&cpu, 6, 0x00060000u);
-    put_insn3(&cpu, BASE,
-              rrr(1, 3, XT_SR_PS >> 4, XT_SR_PS & 15, 6));
-    put_insn2(&cpu, BASE + 3, narrow(0xD, 15, 0, 3));
-    put_insn2(&cpu, BASE + 5, narrow(0xD, 15, 0, 3));
-    put_insn2(&cpu, BASE + 7, narrow(0xD, 15, 0, 3));
+TEST(test_jit_ps_writes_only_exit_for_enabled_pending_irq) {
+    /* Exercise both PS writers, absent/disabled/enabled pending sources,
+     * and raising/lowering INTLEVEL. A later register write proves that a
+     * pending source retains the exact instruction boundary. */
+    for (unsigned rsil = 0; rsil < 2u; rsil++) {
+        for (unsigned source = 0; source < 3u; source++) {
+            for (unsigned level = 0; level <= 5u; level += 5u) {
+                xtensa_cpu_t cpu;
+                setup(&cpu);
+                cpu.ps = 0x00060003u;
+                cpu.interrupt = source ? 1u << 6 : 0u;
+                cpu.intenable = source == 2u ? 1u << 6 : 0u;
+                ar_write(&cpu, 6, 0x00060000u | level);
+                ar_write(&cpu, 2, 10u);
+                put_insn3(&cpu, BASE, rsil ? rrr(0, 0, 6, level, 6) :
+                    rrr(1, 3, XT_SR_PS >> 4, XT_SR_PS & 15, 6));
+                put_insn2(&cpu, BASE + 3u, narrow(0xB, 2, 2, 1));
+                put_insn2(&cpu, BASE + 5u, narrow(0xD, 15, 0, 3));
+                put_insn2(&cpu, BASE + 7u, narrow(0xD, 15, 0, 3));
+                put_insn2(&cpu, BASE + 9u, narrow(0xD, 15, 0, 2));
 
-    jit_state_t *jit = jit_init();
-    ASSERT_TRUE(jit != NULL);
-    for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
-        (void)jit_get_block(jit, &cpu, BASE);
-    jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
-    ASSERT_TRUE(fn != NULL);
-    ASSERT_EQ(fn(&cpu), 1);
-    ASSERT_EQ(cpu.pc, BASE + 3u);
-    ASSERT_EQ(cpu.ps, 0x00060000u);
-    ASSERT_TRUE(cpu.irq_check);
-
-    jit_destroy(jit);
-    teardown(&cpu);
+                jit_state_t *jit = jit_init();
+                ASSERT_TRUE(jit != NULL);
+                for (int i = 0; i < JIT_HOT_THRESHOLD; i++)
+                    (void)jit_get_block(jit, &cpu, BASE);
+                jit_block_fn fn = jit_get_block(jit, &cpu, BASE);
+                ASSERT_TRUE(fn != NULL);
+                bool pending = source == 2u;
+                ASSERT_EQ(fn(&cpu), pending ? 1u : 4u);
+                ASSERT_EQ(cpu.pc, BASE + (pending ? 3u : 9u));
+                ASSERT_EQ(cpu.ps, 0x00060000u | level);
+                ASSERT_EQ(ar_read(&cpu, 2), pending ? 10u : 11u);
+                ASSERT_EQ(cpu.irq_check, pending);
+                if (rsil) ASSERT_EQ(ar_read(&cpu, 6), 0x00060003u);
+                jit_destroy(jit);
+                teardown(&cpu);
+            }
+        }
+    }
 }
 
 TEST(test_jit_wsr_ps_exits_before_pending_irq) {
@@ -4179,7 +4195,7 @@ void run_jit_tests(void) {
     RUN_TEST(test_jit_wsr_windowbase_chains_under_runtime_destination);
     RUN_TEST(test_jit_rsr_prid_wsr_ps);
     RUN_TEST(test_jit_rsr_ccount_observes_instruction_position);
-    RUN_TEST(test_jit_wsr_ps_rearms_irq_check);
+    RUN_TEST(test_jit_ps_writes_only_exit_for_enabled_pending_irq);
     RUN_TEST(test_jit_wsr_ps_exits_before_pending_irq);
     RUN_TEST(test_jit_rur_wur_user_registers);
     RUN_TEST(test_jit_entry_dispatches_compiled_callee_body);

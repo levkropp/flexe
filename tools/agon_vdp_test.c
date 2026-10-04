@@ -421,6 +421,9 @@ int main(int argc, char **argv) {
         if (v->complete) save_frame(v, v->columns == 800 ? 640 : 320,
                                       v->columns == 800 ? 480 : 240, artifacts, "failure");
     }
+    if (getenv("FLEXE_JIT_STATS") && jit_state)
+        jit_print_stats(jit_state, retired);
+    xtensa_profile_report();
     if (ok && mos_port) ok = run_mos(s, v, mos_port, artifacts);
     free(v);
     flexe_session_destroy(s);

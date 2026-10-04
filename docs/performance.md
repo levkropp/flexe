@@ -81,6 +81,46 @@ hook registry before every instruction, so a service boundary cannot be
 compiled merely because a neighboring ROM address is eligible. This is a
 target-level mechanism shared by firmware rather than a WLED address list.
 
+## agon vdp critical-section dispatch
+
+The unmodified Agon VDP 2.16.0 workload keeps native FreeRTOS, audio generation
+and I2S VGA DMA running. High JIT coverage does not guarantee long native runs:
+profiling showed frequent returns to C around critical-section PS writes.
+`RSIL` and `WSR PS` previously set the interrupt-check hint even when no enabled
+source was pending, so the next instruction checkpoint always ended the run.
+
+These two opcodes now keep the native chain when `INTERRUPT & INTENABLE` is
+zero. An enabled pending source still exits at the exact PS-write boundary,
+including when the new PS masks it. Timer horizons, MMIO interrupt checkpoints
+and register-window collision guards remain active. This is an instruction
+optimization shared by firmware, with no application addresses or hooks.
+
+Measured on 2026-10-03 on Apple A18 Pro, macOS 26.4.1, Apple Clang 21.0.0,
+Release `-O3`, native tuning and LTO, without PGO or profiling instrumentation.
+One warmup per build preceded five interleaved before/after pairs, alternating
+which build ran first. Each sample passed the complete UART/VGA/audio/key
+scenario, then measured five modeled seconds of 320x240 scanout with capture.
+The baseline was commit `1996950`.
+
+| JIT build | median soak wall | aggregate retired MIPS | modeled realtime |
+|---|---:|---:|---:|
+| before PS-write optimization | 4.197 s | 287.61 | 1.191x |
+| after PS-write optimization | 3.261 s | 370.18 | 1.533x |
+
+Throughput increased 28.7%, with 22.3% less wall time. Every soak retired
+1,207,016,237 instructions and captured 291 frames; UART and video digests,
+DAC tone and keyboard assertions were identical. Separate diagnostic runs
+covering boot plus soak reduced native dispatches from 121.0 million to
+68.9 million and increased instructions per entry from 16.0 to 28.1. Native
+coverage during the soak remained 96.6%.
+
+The full MOS/BBC BASIC scenario also passed in both engines after the change.
+See [the Agon test commands](testing.md#agon-mos-and-bbc-basic) and
+[the native VDP benchmark](testing.md#agon-vdp). Set
+`FLEXE_JIT_STATS=1` when invoking `flexe-agon-vdp-test` directly to print JIT
+counters after the native VDP scenario. A separate `FLEXE_PROFILE=ON` build
+reports interpreter samples when run with `FLEXE_PROFILE=1`.
+
 ## reproducible compute benchmark
 
 `bench-compute.sh` builds an in-repository Arduino sketch and executes a fixed

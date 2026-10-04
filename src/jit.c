@@ -1032,6 +1032,22 @@ static void emit_native_chain_barrier(emit_t *e) {
 #endif
 }
 
+/* A PS write only needs interrupt polling when an enabled source is
+ * pending. With none, the interpreter consumes the hint as a no-op at this
+ * instruction; do the same without leaving the native chain. When there is
+ * one, the per-instruction checkpoint exits before any following guest work,
+ * even if PS still masks it. */
+static void emit_ps_irq_check(emit_t *e) {
+    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_INTERRUPT);
+    emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_INTENABLE);
+    emit_test_reg32(e, RAX, RBX);
+    int no_pending_irq = emit_jcc_rel32(e, CC_E);
+    emit_mov_reg_imm32(e, RAX, 1);
+    emit_store8_disp(e, RAX, REG_CPU, (int32_t)CPU_OFF_IRQ_CHECK);
+    emit_native_chain_barrier(e);
+    emit_patch_rel32(e, no_pending_irq);
+}
+
 /* Emit memory read32 inlined fast path:
  * page = mem->page_table[(addr >> 12)]
  * if (page) result = *(uint32_t*)(page + (addr & 0xFFF))
@@ -1801,23 +1817,7 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     emit_and_reg32_imm32(e, RAX, ~0xF);
                     emit_add_reg32_imm32(e, RAX, s & 0xF);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
-                    /* Lowering INTLEVEL can unmask an already-pending
-                     * interrupt, so re-arm the check the way the
-                     * interpreter does. A byte store: irq_check is a bool
-                     * and a 32-bit one would take its neighbours with it. */
-                    emit_mov_reg_imm32(e, RAX, 1);
-                    emit_store8_disp(e, RAX, REG_CPU, (int32_t)CPU_OFF_IRQ_CHECK);
-                    /* Most RSILs merely raise the mask. Only an enabled
-                     * pending source can become observable, so keep the
-                     * common critical-section path chained and invalidate
-                     * its horizon conditionally. The dispatcher performs the
-                     * full priority/PS test at the next block boundary. */
-                    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_INTERRUPT);
-                    emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_INTENABLE);
-                    emit_test_reg32(e, RAX, RBX);
-                    int no_pending_irq = emit_jcc_rel32(e, CC_E);
-                    emit_native_chain_barrier(e);
-                    emit_patch_rel32(e, no_pending_irq);
+                    emit_ps_irq_check(e);
                     return 1;
                 }
                 /* RFWO/RFWU complete an architectural register-window
@@ -2451,36 +2451,12 @@ static int jit_compile_insn(emit_t *e, xtensa_cpu_t *cpu, int wb4, uint32_t insn
                     return 1;
                 }
                 if (sr_num == XT_SR_PS) {
-                    /* Restoring PS is the exit half of every ESP-IDF
-                     * critical section. It can lower INTLEVEL and thereby
-                     * unmask an already-pending interrupt, so mirror
-                     * sr_write()'s recheck hint as well as the register.
-                     *
-                     * A native chain normally defers interrupt polling until
-                     * its bounded exit. That is not safe for an interrupt
-                     * which was already pending behind the old PS mask: the
-                     * interpreter polls immediately after WSR, and running
-                     * another critical-section block first can expose a
-                     * half-updated scheduler list. Leave the chain at this
-                     * exact instruction when any enabled source is pending;
-                     * xtensa_step_impl() then performs the architectural
-                     * priority/mask check before another guest instruction. */
+                    /* A live window collision is rejected by the block's
+                     * writes_ps guard, including a write which enables WOE
+                     * before a later high-register operand. */
                     ra_load_ar(e, ra, RAX, wb4, t);
                     emit_store_cpu32(e, RAX, (int32_t)CPU_OFF_PS);
-                    emit_mov_reg_imm32(e, RAX, 1);
-                    emit_store8_disp(e, RAX, REG_CPU,
-                                     (int32_t)CPU_OFF_IRQ_CHECK);
-                    ra_flush(e, ra, wb4);
-                    emit_load_cpu32(e, RAX, (int32_t)CPU_OFF_INTERRUPT);
-                    emit_load_cpu32(e, RBX, (int32_t)CPU_OFF_INTENABLE);
-                    emit_test_reg32(e, RAX, RBX);
-                    int no_pending_irq = emit_jcc_rel32(e, CC_E);
-                    emit_store_cpu32_imm(e, (int32_t)CPU_OFF_PC, next_pc);
-                    emit_store32_disp_imm(e, REG_CPU,
-                                          (int32_t)CPU_OFF_PC_WRITTEN, 1);
-                    emit_acc_add(e, insn_idx + 1);
-                    emit_jmp_to_epilogue(e, jit);
-                    emit_patch_rel32(e, no_pending_irq);
+                    emit_ps_irq_check(e);
                     return 1;
                 }
                 jit_plain_sr_t field;
