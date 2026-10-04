@@ -124,6 +124,7 @@ int main(int argc, char **argv)
         printf("Running xtensa-emulator tests...\n\n");
 
     run_decode_tests();
+    run_cached_interpreter_tests();
     run_alu_tests();
     run_shift_tests();
     run_move_tests();

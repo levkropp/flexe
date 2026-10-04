@@ -2,6 +2,7 @@
 #define TEST_SUITES_H
 
 void run_decode_tests(void);
+void run_cached_interpreter_tests(void);
 void run_alu_tests(void);
 void run_shift_tests(void);
 void run_move_tests(void);

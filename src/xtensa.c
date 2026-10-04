@@ -277,6 +277,19 @@ int xtensa_fetch(const xtensa_cpu_t *cpu, uint32_t addr, uint32_t *insn_out) {
 /* Pre-decode entire instruction memory at load time.
  * Replaces per-instruction page_table lookup + byte assembly with
  * a single indexed load from a flat array. */
+enum {
+    PD_RAW, PD_SLOW, PD_ENTRY, PD_LOAD_N, PD_STORE_N, PD_ADD_N,
+    PD_ADDI_N, PD_MOVI_N, PD_MOV_N, PD_BRANCH_N, PD_RETW, PD_RET,
+    PD_ADD, PD_LOGIC, PD_EXTUI, PD_ALU, PD_FP0, PD_FP1,
+    PD_MOVI, PD_ADDI, PD_LOAD, PD_STORE, PD_FP_MEMORY,
+    PD_WINDOW_MEMORY, PD_CALL, PD_BRANCH_SI, PD_BRANCH,
+    PD_RSR, PD_WSR, PD_RSIL, PD_JX_CALLX, PD_NOP
+};
+
+#if PREDECODE_SIZE > 0
+static uint32_t predecode_pack(const xtensa_cpu_t *cpu, uint32_t insn, int ilen);
+#endif
+
 void xtensa_predecode_build(xtensa_cpu_t *cpu) {
 #if PREDECODE_SIZE == 0
     (void)cpu;
@@ -304,7 +317,7 @@ void xtensa_predecode_build(xtensa_cpu_t *cpu) {
         uint32_t insn;
         int ilen = xtensa_fetch_inline(cpu, addr, &insn);
         if (ilen > 0) {
-            cpu->predecode[addr - PREDECODE_BASE] = PREDECODE_PACK(insn, (uint32_t)ilen);
+            cpu->predecode[addr - PREDECODE_BASE] = predecode_pack(cpu, insn, ilen);
             count++;
         }
     }
@@ -866,8 +879,78 @@ unsigned xtensa_window_operand_need(const xtensa_cpu_t *cpu,
     return window_operand_need(cpu, insn, ilen);
 }
 
+#if PREDECODE_SIZE > 0
+static uint32_t predecode_pack(const xtensa_cpu_t *cpu, uint32_t insn, int ilen) {
+    /* ILL and reserved narrow opcodes have no AR operands and always use
+     * the canonical step path. They also dominate unused mapped backing;
+     * avoid running both general classifiers for these encodings. */
+    if ((insn == 0 && ilen == 3) || (ilen == 2 && XT_OP0(insn) >= 14u))
+        return PREDECODE_PACK(insn, (uint32_t)ilen) | (PD_SLOW << 27);
+    unsigned op0 = XT_OP0(insn), op1 = XT_OP1(insn), op2 = XT_OP2(insn);
+    unsigned r = XT_R(insn), t = XT_T(insn), kind = PD_SLOW;
+    if (ilen == 2) {
+        switch (op0) {
+        case 8: kind = PD_LOAD_N; break;
+        case 9: kind = PD_STORE_N; break;
+        case 10: kind = PD_ADD_N; break;
+        case 11: kind = PD_ADDI_N; break;
+        case 12: kind = t < 8 ? PD_MOVI_N : PD_BRANCH_N; break;
+        case 13:
+            if (r == 0) kind = PD_MOV_N;
+            else if (r == 15 && t == 0) kind = PD_RET;
+            else if (r == 15 && t == 1) kind = PD_RETW;
+            else if (r == 15 && t == 3) kind = PD_NOP;
+            break;
+        default: break;
+        }
+    } else {
+        switch (op0) {
+        case 0:
+            if (op1 == 0) {
+                if (op2 >= 8) kind = PD_ADD;
+                else if (op2 >= 1 && op2 <= 3) kind = PD_LOGIC;
+                else if (op2 != 0) kind = PD_ALU;
+                else if (r == 6) kind = PD_RSIL;
+                else if (r == 2 && xtensa_sync_encoding_valid(insn)) kind = PD_NOP;
+                else if (r >= 8 && r <= 11) kind = PD_ALU;
+                else if (r == 0 && XT_M(insn) == 2 && XT_N(insn) == 0) kind = PD_RET;
+                else if (r == 0 && XT_M(insn) == 2 && XT_N(insn) == 1) kind = PD_RETW;
+                else if (r == 0 && (XT_M(insn) == 3 ||
+                         (XT_M(insn) == 2 && XT_N(insn) == 2))) kind = PD_JX_CALLX;
+            } else if (op1 == 4 || op1 == 5) kind = PD_EXTUI;
+            else if (op1 == 10) kind = PD_FP0;
+            else if (op1 == 11) kind = PD_FP1;
+            else if (op1 == 8 && (op2 == 0 || op2 == 1 || op2 == 4 || op2 == 5)) kind = PD_FP_MEMORY;
+            else if (op1 == 9 && (op2 == 0 || op2 == 4)) kind = PD_WINDOW_MEMORY;
+            else if (op1 == 3 && op2 == 0) kind = PD_RSR;
+            else if (op1 == 3 && op2 == 1) kind = PD_WSR;
+            else if ((op1 == 1 && op2 != 6) || op1 == 2 || op1 == 3) kind = PD_ALU;
+            break;
+        case 1: kind = PD_LOAD; break;
+        case 2:
+            if (r == 0 || r == 1 || r == 2 || r == 9 || r == 11) kind = PD_LOAD;
+            else if (r == 4 || r == 5 || r == 6 || r == 15) kind = PD_STORE;
+            else if (r == 10) kind = PD_MOVI;
+            else if (r == 12 || r == 13) kind = PD_ADDI;
+            else if (r == 7) kind = PD_NOP;
+            break;
+        case 3: kind = PD_FP_MEMORY; break;
+        case 5: kind = PD_CALL; break;
+        case 6:
+            kind = XT_N(insn) == 3 && XT_M(insn) == 0 ? PD_ENTRY : PD_BRANCH_SI;
+            break;
+        case 7: kind = PD_BRANCH; break;
+        default: break;
+        }
+    }
+    unsigned need = kind == PD_ENTRY ? 0 : window_operand_need(cpu, insn, ilen);
+    return PREDECODE_PACK(insn, (uint32_t)ilen) | (need << 25) | (kind << 27);
+}
+#endif
+
 static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
-                                       int ilen, unsigned hazard) {
+                                       int ilen, unsigned hazard,
+                                       uint32_t packed) {
     /* Exception handlers run with EXCM set and cannot take a nested window
      * fault.  Reject that state before decoding the instruction's register
      * operands; window spill/fill handlers otherwise pay the full decoder on
@@ -875,7 +958,17 @@ static inline bool window_access_check(xtensa_cpu_t *cpu, uint32_t insn,
     if (!XT_PS_WOE(cpu->ps) || XT_PS_EXCM(cpu->ps))
         return false;
 
-    unsigned need = window_operand_need(cpu, insn, ilen);
+    unsigned need;
+    if (packed & PREDECODE_WINDOW_TAG) {
+        need = PREDECODE_WINDOW_NEED(packed);
+        if (PREDECODE_CLASS(packed) == PD_ENTRY) {
+            unsigned s = XT_S(insn);
+            unsigned dst = ((unsigned)XT_PS_CALLINC(cpu->ps) << 2) | (s & 3u);
+            need = window_need2(s, dst);
+        }
+    } else {
+        need = window_operand_need(cpu, insn, ilen);
+    }
     if (need == 0u || (hazard & ((1u << need) - 1u)) == 0u)
         return false;
     return xtensa_try_window_overflow_exception(cpu, cpu->pc, need);
@@ -1737,6 +1830,242 @@ static void exec_fp1(xtensa_cpu_t *cpu, uint32_t insn) {
     }
 }
 
+static inline __attribute__((always_inline))
+void exec_qrst_registers(xtensa_cpu_t *cpu, uint32_t insn) {
+    int op1 = XT_OP1(insn), op2 = XT_OP2(insn);
+    int r = XT_R(insn), s = XT_S(insn), t = XT_T(insn);
+    switch (op1) {
+    case 1: /* RST1 */
+        switch (op2) {
+        case 0: case 1: /* SLLI */
+            { int sa = 32 - (((op2 & 1) << 4) | t);
+              ar_write(cpu, r, (sa >= 32) ? 0 : ar_read(cpu, s) << sa);
+            } break;
+        case 2: case 3: /* SRAI */
+            { int sa = ((op2 & 1) << 4) | s;
+              ar_write(cpu, r, (uint32_t)((int32_t)ar_read(cpu, t) >> sa));
+            } break;
+        case 4: /* SRLI */
+            ar_write(cpu, r, ar_read(cpu, t) >> s);
+            break;
+        case 6: /* XSR */
+            { int sr_num = XT_SR_NUM(insn);
+              uint32_t tmp = ar_read(cpu, t);
+              ar_write(cpu, t, sr_read(cpu, sr_num));
+              sr_write(cpu, sr_num, tmp);
+            } break;
+        case 8: /* SRC - funnel shift: (AR[s]:AR[t]) >> SAR, SAR 0-32 */
+            { uint32_t sa = cpu->sar & 0x3F;
+              uint64_t concat = ((uint64_t)ar_read(cpu, s) << 32) | (uint64_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)(concat >> sa));
+            } break;
+        case 9: /* SRL - funnel shift: (0:AR[t]) >> SAR */
+            { uint32_t sa = cpu->sar & 0x3F;
+              ar_write(cpu, r, sa >= 32 ? 0 : ar_read(cpu, t) >> sa);
+            } break;
+        case 10: /* SLL - funnel shift: (AR[s]:0) >> SAR */
+            { uint32_t sa = cpu->sar & 0x3F;
+              uint64_t concat = (uint64_t)ar_read(cpu, s) << 32;
+              ar_write(cpu, r, (uint32_t)(concat >> sa));
+            } break;
+        case 11: /* SRA - arithmetic right shift by SAR */
+            { uint32_t sa = cpu->sar & 0x3F;
+              int32_t val = (int32_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)(sa >= 32 ? (val >> 31) : (val >> sa)));
+            } break;
+        case 12: /* MUL16U */
+            ar_write(cpu, r, (ar_read(cpu, s) & 0xFFFF) * (ar_read(cpu, t) & 0xFFFF));
+            break;
+        case 13: /* MUL16S */
+            { int32_t a = (int32_t)(int16_t)(ar_read(cpu, s) & 0xFFFF);
+              int32_t b = (int32_t)(int16_t)(ar_read(cpu, t) & 0xFFFF);
+              ar_write(cpu, r, (uint32_t)(a * b));
+            } break;
+        default: break;
+        }
+        break;
+
+    case 2: /* RST2 */
+        switch (op2) {
+        case 0: /* ANDB: br[r] = br[s] AND br[t] */
+            { int val = ((cpu->br >> s) & 1) & ((cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 1: /* ANDBC: br[r] = br[s] AND NOT br[t] */
+            { int val = ((cpu->br >> s) & 1) & (~(cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 2: /* ORB: br[r] = br[s] OR br[t] */
+            { int val = ((cpu->br >> s) & 1) | ((cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 3: /* ORBC: br[r] = br[s] OR NOT br[t] */
+            { int val = ((cpu->br >> s) & 1) | (~(cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 4: /* XORB: br[r] = br[s] XOR br[t] */
+            { int val = ((cpu->br >> s) & 1) ^ ((cpu->br >> t) & 1);
+              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
+            } break;
+        case 6: /* SALT */
+            ar_write(cpu, r, (int32_t)ar_read(cpu, s) < (int32_t)ar_read(cpu, t) ? 1 : 0);
+            break;
+        case 7: /* SALTU */
+            ar_write(cpu, r, ar_read(cpu, s) < ar_read(cpu, t) ? 1 : 0);
+            break;
+        case 8: /* MULL */
+            ar_write(cpu, r, ar_read(cpu, s) * ar_read(cpu, t));
+            break;
+        case 10: /* MULUH */
+            { uint64_t res = (uint64_t)ar_read(cpu, s) * (uint64_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)(res >> 32));
+            } break;
+        case 11: /* MULSH */
+            { int64_t res = (int64_t)(int32_t)ar_read(cpu, s) * (int64_t)(int32_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)((uint64_t)res >> 32));
+            } break;
+        case 12: /* QUOU */
+            { uint32_t divisor = ar_read(cpu, t);
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              ar_write(cpu, r, ar_read(cpu, s) / divisor);
+            } break;
+        case 13: /* QUOS */
+            { int32_t divisor = (int32_t)ar_read(cpu, t);
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              int32_t dividend = (int32_t)ar_read(cpu, s);
+              /* Handle INT_MIN / -1 overflow */
+              if (dividend == (int32_t)0x80000000 && divisor == -1)
+                  ar_write(cpu, r, 0x80000000);
+              else
+                  ar_write(cpu, r, (uint32_t)(dividend / divisor));
+            } break;
+        case 14: /* REMU */
+            { uint32_t divisor = ar_read(cpu, t);
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              ar_write(cpu, r, ar_read(cpu, s) % divisor);
+            } break;
+        case 15: /* REMS */
+            { int32_t divisor = (int32_t)ar_read(cpu, t);
+              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return; }
+              int32_t dividend = (int32_t)ar_read(cpu, s);
+              if (dividend == (int32_t)0x80000000 && divisor == -1)
+                  ar_write(cpu, r, 0);
+              else
+                  ar_write(cpu, r, (uint32_t)(dividend % divisor));
+            } break;
+        default: break;
+        }
+        break;
+
+    case 3: /* RST3 */
+        switch (op2) {
+        case 0: /* RSR */
+            ar_write(cpu, t, sr_read(cpu, XT_SR_NUM(insn)));
+            break;
+        case 1: /* WSR */
+            sr_write(cpu, XT_SR_NUM(insn), ar_read(cpu, t));
+            break;
+        case 2: /* SEXT - sign extend from bit position (t+7) */
+            { int bits = t + 8; /* 8..23 */
+              int32_t val = sign_extend(ar_read(cpu, s), bits);
+              ar_write(cpu, r, (uint32_t)val);
+            } break;
+        case 3: /* CLAMPS - clamp to signed range -(2^(t+7)) .. (2^(t+7)-1) */
+            { int bits = t + 7; /* 7..22 */
+              int32_t val = (int32_t)ar_read(cpu, s);
+              int32_t hi = (1 << bits) - 1;
+              int32_t lo = -(1 << bits);
+              if (val > hi) val = hi;
+              else if (val < lo) val = lo;
+              ar_write(cpu, r, (uint32_t)val);
+            } break;
+        case 4: /* MIN */
+            { int32_t a = (int32_t)ar_read(cpu, s);
+              int32_t b = (int32_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)(a < b ? a : b));
+            } break;
+        case 5: /* MAX */
+            { int32_t a = (int32_t)ar_read(cpu, s);
+              int32_t b = (int32_t)ar_read(cpu, t);
+              ar_write(cpu, r, (uint32_t)(a > b ? a : b));
+            } break;
+        case 6: /* MINU */
+            { uint32_t a = ar_read(cpu, s);
+              uint32_t b = ar_read(cpu, t);
+              ar_write(cpu, r, a < b ? a : b);
+            } break;
+        case 7: /* MAXU */
+            { uint32_t a = ar_read(cpu, s);
+              uint32_t b = ar_read(cpu, t);
+              ar_write(cpu, r, a > b ? a : b);
+            } break;
+        case 8: /* MOVEQZ */
+            if (ar_read(cpu, t) == 0)
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
+        case 9: /* MOVNEZ */
+            if (ar_read(cpu, t) != 0)
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
+        case 10: /* MOVLTZ */
+            if ((int32_t)ar_read(cpu, t) < 0)
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
+        case 11: /* MOVGEZ */
+            if ((int32_t)ar_read(cpu, t) >= 0)
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
+        case 12: /* MOVF: if (!bt) ar[r] = ar[s] */
+            if (!((cpu->br >> t) & 1))
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
+        case 13: /* MOVT: if (bt) ar[r] = ar[s] */
+            if ((cpu->br >> t) & 1)
+                ar_write(cpu, r, ar_read(cpu, s));
+            break;
+        case 14: /* RUR: r=destination, s/t=user-register number */
+            { int ur = (s << 4) | t;
+              uint32_t value;
+              switch (ur) {
+              case XT_UR_EXPSTATE:  value = cpu->expstate; break;
+              case XT_UR_THREADPTR: value = cpu->threadptr; break;
+              case XT_UR_FCR:       value = cpu->fcr; break;
+              case XT_UR_FSR:       value = cpu->fsr; break;
+              case XT_UR_F64R_LO:   value = cpu->f64r_lo; break;
+              case XT_UR_F64R_HI:   value = cpu->f64r_hi; break;
+              case XT_UR_F64S:      value = cpu->f64s; break;
+              default:              value = 0; break;
+              }
+              ar_write(cpu, r, value);
+            } break;
+        case 15: /* WUR: t=source, r/s=user-register number */
+            { int ur = (r << 4) | s;
+              uint32_t value = ar_read(cpu, t);
+              switch (ur) {
+              case XT_UR_EXPSTATE:  cpu->expstate = value; break;
+              case XT_UR_THREADPTR: cpu->threadptr = value; break;
+              case XT_UR_FCR:       cpu->fcr = value; break;
+              case XT_UR_FSR:       cpu->fsr = value; break;
+              case XT_UR_F64R_LO:   cpu->f64r_lo = value; break;
+              case XT_UR_F64R_HI:   cpu->f64r_hi = value; break;
+              case XT_UR_F64S:      cpu->f64s = value; break;
+              default: break;
+              }
+            } break;
+        default: break;
+        }
+        break;
+
+    case 4: case 5: /* EXTUI */
+        { int shift = s | ((op1 & 1) << 4);
+          uint32_t mask = (1u << (op2 + 1)) - 1;
+          ar_write(cpu, r, (ar_read(cpu, t) >> shift) & mask);
+        } break;
+
+    default: break;
+    }
+}
+
 /* Execute op0=0 (QRST) - the main RRR instruction group */
 static inline __attribute__((always_inline))
 bool exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
@@ -2015,18 +2344,12 @@ bool exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                 break;
             case 14: /* NSA: normalized shift amount */
                 { uint32_t val = ar_read(cpu, s);
-                  int n = 0;
                   if ((int32_t)val < 0) val = ~val;
-                  if (val == 0) { n = 31; }
-                  else { while (!(val & 0x80000000)) { val <<= 1; n++; } }
-                  ar_write(cpu, t, (uint32_t)n);
+                  ar_write(cpu, t, val ? (uint32_t)__builtin_clz(val) : 31u);
                 } break;
             case 15: /* NSAU: normalized shift amount unsigned */
                 { uint32_t val = ar_read(cpu, s);
-                  int n = 0;
-                  if (val == 0) { n = 32; }
-                  else { while (!(val & 0x80000000)) { val <<= 1; n++; } }
-                  ar_write(cpu, t, (uint32_t)n);
+                  ar_write(cpu, t, val ? (uint32_t)__builtin_clz(val) : 32u);
                 } break;
             case 6: /* RER: ar[t] = external_reg[ar[s]] */
                 ar_write(cpu, t, 0);  /* stub: return 0 */
@@ -2079,232 +2402,9 @@ bool exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
         }
         break;
 
-    case 1: /* RST1 */
-        switch (op2) {
-        case 0: case 1: /* SLLI */
-            { int sa = 32 - (((op2 & 1) << 4) | t);
-              ar_write(cpu, r, (sa >= 32) ? 0 : ar_read(cpu, s) << sa);
-            } break;
-        case 2: case 3: /* SRAI */
-            { int sa = ((op2 & 1) << 4) | s;
-              ar_write(cpu, r, (uint32_t)((int32_t)ar_read(cpu, t) >> sa));
-            } break;
-        case 4: /* SRLI */
-            ar_write(cpu, r, ar_read(cpu, t) >> s);
-            break;
-        case 6: /* XSR */
-            { int sr_num = XT_SR_NUM(insn);
-              uint32_t tmp = ar_read(cpu, t);
-              ar_write(cpu, t, sr_read(cpu, sr_num));
-              sr_write(cpu, sr_num, tmp);
-            } break;
-        case 8: /* SRC - funnel shift: (AR[s]:AR[t]) >> SAR, SAR 0-32 */
-            { uint32_t sa = cpu->sar & 0x3F;
-              uint64_t concat = ((uint64_t)ar_read(cpu, s) << 32) | (uint64_t)ar_read(cpu, t);
-              ar_write(cpu, r, (uint32_t)(concat >> sa));
-            } break;
-        case 9: /* SRL - funnel shift: (0:AR[t]) >> SAR */
-            { uint32_t sa = cpu->sar & 0x3F;
-              ar_write(cpu, r, sa >= 32 ? 0 : ar_read(cpu, t) >> sa);
-            } break;
-        case 10: /* SLL - funnel shift: (AR[s]:0) >> SAR */
-            { uint32_t sa = cpu->sar & 0x3F;
-              uint64_t concat = (uint64_t)ar_read(cpu, s) << 32;
-              ar_write(cpu, r, (uint32_t)(concat >> sa));
-            } break;
-        case 11: /* SRA - arithmetic right shift by SAR */
-            { uint32_t sa = cpu->sar & 0x3F;
-              int32_t val = (int32_t)ar_read(cpu, t);
-              ar_write(cpu, r, (uint32_t)(sa >= 32 ? (val >> 31) : (val >> sa)));
-            } break;
-        case 12: /* MUL16U */
-            ar_write(cpu, r, (ar_read(cpu, s) & 0xFFFF) * (ar_read(cpu, t) & 0xFFFF));
-            break;
-        case 13: /* MUL16S */
-            { int32_t a = (int32_t)(int16_t)(ar_read(cpu, s) & 0xFFFF);
-              int32_t b = (int32_t)(int16_t)(ar_read(cpu, t) & 0xFFFF);
-              ar_write(cpu, r, (uint32_t)(a * b));
-            } break;
-        default: break;
-        }
+    case 1: case 2: case 3: case 4: case 5:
+        exec_qrst_registers(cpu, insn);
         break;
-
-    case 2: /* RST2 */
-        switch (op2) {
-        case 0: /* ANDB: br[r] = br[s] AND br[t] */
-            { int val = ((cpu->br >> s) & 1) & ((cpu->br >> t) & 1);
-              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
-            } break;
-        case 1: /* ANDBC: br[r] = br[s] AND NOT br[t] */
-            { int val = ((cpu->br >> s) & 1) & (~(cpu->br >> t) & 1);
-              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
-            } break;
-        case 2: /* ORB: br[r] = br[s] OR br[t] */
-            { int val = ((cpu->br >> s) & 1) | ((cpu->br >> t) & 1);
-              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
-            } break;
-        case 3: /* ORBC: br[r] = br[s] OR NOT br[t] */
-            { int val = ((cpu->br >> s) & 1) | (~(cpu->br >> t) & 1);
-              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
-            } break;
-        case 4: /* XORB: br[r] = br[s] XOR br[t] */
-            { int val = ((cpu->br >> s) & 1) ^ ((cpu->br >> t) & 1);
-              cpu->br = (cpu->br & ~(1u << r)) | ((uint32_t)val << r);
-            } break;
-        case 6: /* SALT */
-            ar_write(cpu, r, (int32_t)ar_read(cpu, s) < (int32_t)ar_read(cpu, t) ? 1 : 0);
-            break;
-        case 7: /* SALTU */
-            ar_write(cpu, r, ar_read(cpu, s) < ar_read(cpu, t) ? 1 : 0);
-            break;
-        case 8: /* MULL */
-            ar_write(cpu, r, ar_read(cpu, s) * ar_read(cpu, t));
-            break;
-        case 10: /* MULUH */
-            { uint64_t res = (uint64_t)ar_read(cpu, s) * (uint64_t)ar_read(cpu, t);
-              ar_write(cpu, r, (uint32_t)(res >> 32));
-            } break;
-        case 11: /* MULSH */
-            { int64_t res = (int64_t)(int32_t)ar_read(cpu, s) * (int64_t)(int32_t)ar_read(cpu, t);
-              ar_write(cpu, r, (uint32_t)((uint64_t)res >> 32));
-            } break;
-        case 12: /* QUOU */
-            { uint32_t divisor = ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
-              ar_write(cpu, r, ar_read(cpu, s) / divisor);
-            } break;
-        case 13: /* QUOS */
-            { int32_t divisor = (int32_t)ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
-              int32_t dividend = (int32_t)ar_read(cpu, s);
-              /* Handle INT_MIN / -1 overflow */
-              if (dividend == (int32_t)0x80000000 && divisor == -1)
-                  ar_write(cpu, r, 0x80000000);
-              else
-                  ar_write(cpu, r, (uint32_t)(dividend / divisor));
-            } break;
-        case 14: /* REMU */
-            { uint32_t divisor = ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
-              ar_write(cpu, r, ar_read(cpu, s) % divisor);
-            } break;
-        case 15: /* REMS */
-            { int32_t divisor = (int32_t)ar_read(cpu, t);
-              if (divisor == 0) { xtensa_raise_exception(cpu, EXCCAUSE_DIVIDE_BY_ZERO, cpu->pc - 3, 0); return false; }
-              int32_t dividend = (int32_t)ar_read(cpu, s);
-              if (dividend == (int32_t)0x80000000 && divisor == -1)
-                  ar_write(cpu, r, 0);
-              else
-                  ar_write(cpu, r, (uint32_t)(dividend % divisor));
-            } break;
-        default: break;
-        }
-        break;
-
-    case 3: /* RST3 */
-        switch (op2) {
-        case 0: /* RSR */
-            ar_write(cpu, t, sr_read(cpu, XT_SR_NUM(insn)));
-            break;
-        case 1: /* WSR */
-            sr_write(cpu, XT_SR_NUM(insn), ar_read(cpu, t));
-            break;
-        case 2: /* SEXT - sign extend from bit position (t+7) */
-            { int bits = t + 8; /* 8..23 */
-              int32_t val = sign_extend(ar_read(cpu, s), bits);
-              ar_write(cpu, r, (uint32_t)val);
-            } break;
-        case 3: /* CLAMPS - clamp to signed range -(2^(t+7)) .. (2^(t+7)-1) */
-            { int bits = t + 7; /* 7..22 */
-              int32_t val = (int32_t)ar_read(cpu, s);
-              int32_t hi = (1 << bits) - 1;
-              int32_t lo = -(1 << bits);
-              if (val > hi) val = hi;
-              else if (val < lo) val = lo;
-              ar_write(cpu, r, (uint32_t)val);
-            } break;
-        case 4: /* MIN */
-            { int32_t a = (int32_t)ar_read(cpu, s);
-              int32_t b = (int32_t)ar_read(cpu, t);
-              ar_write(cpu, r, (uint32_t)(a < b ? a : b));
-            } break;
-        case 5: /* MAX */
-            { int32_t a = (int32_t)ar_read(cpu, s);
-              int32_t b = (int32_t)ar_read(cpu, t);
-              ar_write(cpu, r, (uint32_t)(a > b ? a : b));
-            } break;
-        case 6: /* MINU */
-            { uint32_t a = ar_read(cpu, s);
-              uint32_t b = ar_read(cpu, t);
-              ar_write(cpu, r, a < b ? a : b);
-            } break;
-        case 7: /* MAXU */
-            { uint32_t a = ar_read(cpu, s);
-              uint32_t b = ar_read(cpu, t);
-              ar_write(cpu, r, a > b ? a : b);
-            } break;
-        case 8: /* MOVEQZ */
-            if (ar_read(cpu, t) == 0)
-                ar_write(cpu, r, ar_read(cpu, s));
-            break;
-        case 9: /* MOVNEZ */
-            if (ar_read(cpu, t) != 0)
-                ar_write(cpu, r, ar_read(cpu, s));
-            break;
-        case 10: /* MOVLTZ */
-            if ((int32_t)ar_read(cpu, t) < 0)
-                ar_write(cpu, r, ar_read(cpu, s));
-            break;
-        case 11: /* MOVGEZ */
-            if ((int32_t)ar_read(cpu, t) >= 0)
-                ar_write(cpu, r, ar_read(cpu, s));
-            break;
-        case 12: /* MOVF: if (!bt) ar[r] = ar[s] */
-            if (!((cpu->br >> t) & 1))
-                ar_write(cpu, r, ar_read(cpu, s));
-            break;
-        case 13: /* MOVT: if (bt) ar[r] = ar[s] */
-            if ((cpu->br >> t) & 1)
-                ar_write(cpu, r, ar_read(cpu, s));
-            break;
-        case 14: /* RUR: r=destination, s/t=user-register number */
-            { int ur = (s << 4) | t;
-              uint32_t value;
-              switch (ur) {
-              case XT_UR_EXPSTATE:  value = cpu->expstate; break;
-              case XT_UR_THREADPTR: value = cpu->threadptr; break;
-              case XT_UR_FCR:       value = cpu->fcr; break;
-              case XT_UR_FSR:       value = cpu->fsr; break;
-              case XT_UR_F64R_LO:   value = cpu->f64r_lo; break;
-              case XT_UR_F64R_HI:   value = cpu->f64r_hi; break;
-              case XT_UR_F64S:      value = cpu->f64s; break;
-              default:              value = 0; break;
-              }
-              ar_write(cpu, r, value);
-            } break;
-        case 15: /* WUR: t=source, r/s=user-register number */
-            { int ur = (r << 4) | s;
-              uint32_t value = ar_read(cpu, t);
-              switch (ur) {
-              case XT_UR_EXPSTATE:  cpu->expstate = value; break;
-              case XT_UR_THREADPTR: cpu->threadptr = value; break;
-              case XT_UR_FCR:       cpu->fcr = value; break;
-              case XT_UR_FSR:       cpu->fsr = value; break;
-              case XT_UR_F64R_LO:   cpu->f64r_lo = value; break;
-              case XT_UR_F64R_HI:   cpu->f64r_hi = value; break;
-              case XT_UR_F64S:      cpu->f64s = value; break;
-              default: break;
-              }
-            } break;
-        default: break;
-        }
-        break;
-
-    case 4: case 5: /* EXTUI */
-        { int shift = s | ((op1 & 1) << 4);
-          uint32_t mask = (1u << (op2 + 1)) - 1;
-          ar_write(cpu, r, (ar_read(cpu, t) >> shift) & mask);
-        } break;
 
     case 8: /* LSCX: indexed FP loads/stores */
         switch (op2) {
@@ -2782,14 +2882,10 @@ bool exec_si(xtensa_cpu_t *cpu, uint32_t insn) {
 }
 
 /* Execute op0=7 (B) - RRI8 conditional branches */
-static inline __attribute__((always_inline))
-void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
+static inline bool branch_taken(const xtensa_cpu_t *cpu, uint32_t insn) {
     int r = XT_R(insn);
     int s = XT_S(insn);
     int t = XT_T(insn);
-    int imm8 = XT_IMM8(insn);
-    int32_t offset = sign_extend(imm8, 8);
-    uint32_t target = cpu->pc + (uint32_t)offset + 1;
     uint32_t vs = ar_read(cpu, s);
     uint32_t vt = ar_read(cpu, t);
 
@@ -2817,8 +2913,13 @@ void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
     case 13: taken = (vs & (1u << (vt & 31))) != 0; break;         /* BBS */
     }
 
-    if (taken)
-        BRANCH_TO(cpu, target);
+    return taken != 0;
+}
+
+static inline __attribute__((always_inline))
+void exec_b(xtensa_cpu_t *cpu, uint32_t insn) {
+    if (branch_taken(cpu, insn))
+        BRANCH_TO(cpu, cpu->pc + (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1u);
 }
 
 /* ===== MAC16 Helpers ===== */
@@ -3105,6 +3206,7 @@ static inline __attribute__((always_inline))
 int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
                      uint32_t *restrict prev_pc, uint32_t native_span_room) {
     uint32_t insn;
+    uint32_t packed = 0;
     const uint32_t last_pc = *prev_pc;
     *prev_pc = cpu->pc;
     if (__builtin_expect(g_dbg_step_slow, 0)) {
@@ -3205,14 +3307,15 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
 
     /* Breakpoint check */
     if (__builtin_expect(cpu->breakpoint_count > 0, 0)) {
-        /* Preserve invalid-PC-before-breakpoint ordering for debugger runs.
-         * Normal predecoded execution proves the PC range with its table
-         * bounds below and avoids this check entirely. */
-        if (__builtin_expect(!xtensa_pc_is_valid(cpu, cpu->pc), 0))
-            return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
         cpu->breakpoint_hit = false;
         for (int i = 0; i < cpu->breakpoint_count; i++) {
             if (cpu->breakpoints[i] == cpu->pc) {
+                /* A matching breakpoint must not hide an invalid-PC trap.
+                 * Nonmatches use the normal fetch path's validity proof;
+                 * validating them here repeats that work every instruction
+                 * and forces the hot loop to spill registers around a call. */
+                if (__builtin_expect(!xtensa_pc_is_valid(cpu, cpu->pc), 0))
+                    return xtensa_invalid_pc_step(cpu, *local_cc, last_pc);
                 cpu->breakpoint_hit = true;
                 cpu->breakpoint_hit_addr = cpu->pc;
                 return -1;
@@ -3271,7 +3374,7 @@ int xtensa_step_impl(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
     if (__builtin_expect(cpu->predecode != NULL, 1)) {
         uint32_t pc_off = cpu->pc - PREDECODE_BASE;
         if (__builtin_expect(pc_off < PREDECODE_SIZE, 1)) {
-            uint32_t packed = cpu->predecode[pc_off];
+            packed = cpu->predecode[pc_off];
             if (__builtin_expect(packed != 0, 1)) {
                 insn = PREDECODE_INSN(packed);
                 ilen = (int)PREDECODE_ILEN(packed);
@@ -3304,7 +3407,7 @@ have_insn:
 
     unsigned window_hazard = cpu->window_hazard;
     if (__builtin_expect(window_hazard != 0u, 0) &&
-        window_access_check(cpu, insn, ilen, window_hazard)) {
+        window_access_check(cpu, insn, ilen, window_hazard, packed)) {
         /* Faulted into a window vector; the instruction has not run and RFWO
          * returns to it. */
         cpu->ccount++;
@@ -3529,6 +3632,361 @@ static inline int xtensa_run_poll_spin(xtensa_cpu_t *cpu,
     return skip;
 }
 
+#if PREDECODE_SIZE > 0
+/* Ordinary QRST operations with no PC, PS, timer or window-context effects.
+ * This decodes instructions; it does not recognize guest functions. */
+static inline bool exec_cached_qrst(xtensa_cpu_t *cpu, uint32_t insn,
+                                     uint32_t elapsed) {
+    unsigned op1 = XT_OP1(insn), op2 = XT_OP2(insn);
+    unsigned r = XT_R(insn), s = XT_S(insn), t = XT_T(insn);
+    if (op1 == 0) {
+        if (op2 == 0) {
+            if (r == 6 && !(cpu->interrupt & cpu->intenable)) {
+                ar_write(cpu, t, cpu->ps);
+                cpu->ps = (cpu->ps & ~0xFu) | s;
+                return true;
+            }
+            if (r == 2 && xtensa_sync_encoding_valid(insn)) return true;
+            if (r >= 8 && r <= 11) {
+                exec_qrst(cpu, insn); return true;
+            }
+            return false;
+        }
+        if (op2 == 4) {
+            if (r == 8 && !cpu->real_window_vectors && XT_PS_WOE(cpu->ps))
+                return false;
+            exec_qrst(cpu, insn);
+            return true;
+        }
+        if (op2 == 6) {
+            uint32_t value = ar_read(cpu, t);
+            if (s == 0) ar_write(cpu, r, 0u - value);
+            else if (s == 1) ar_write(cpu, r, value & 0x80000000u ? 0u - value : value);
+            return true;
+        }
+        if (op2 >= 8) {
+            uint32_t left = ar_read(cpu, s) << (op2 & 3u), right = ar_read(cpu, t);
+            ar_write(cpu, r, op2 < 12 ? left + right : left - right);
+            return true;
+        }
+        if (op2 >= 1 && op2 <= 3) {
+            uint32_t left = ar_read(cpu, s), right = ar_read(cpu, t);
+            ar_write(cpu, r, op2 == 1 ? left & right : op2 == 2 ? left | right : left ^ right);
+            return true;
+        }
+        return true;
+    }
+    if (op1 == 1 && op2 == 6) return false;
+    if (op1 == 2 && op2 >= 12 && !ar_read(cpu, t)) return false;
+    if (op1 == 3 && op2 <= 1) {
+        unsigned sr = XT_SR_NUM(insn);
+        if (op2 == 0) {
+            uint32_t value = sr == XT_SR_CCOUNT ? cpu->ccount + elapsed : sr_read(cpu, sr);
+            ar_write(cpu, t, value);
+        } else {
+            uint32_t value = ar_read(cpu, t);
+            if (sr == XT_SR_CCOUNT || sr == XT_SR_CCOMPARE0 ||
+                sr == XT_SR_CCOMPARE1 || sr == XT_SR_CCOMPARE2 || sr == XT_SR_INTSET)
+                return false;
+            if ((sr == XT_SR_PS && (cpu->interrupt & cpu->intenable)) ||
+                (sr == XT_SR_INTENABLE && (cpu->interrupt & value)))
+                return false;
+            sr_write(cpu, sr, value);
+            cpu->irq_check = false;
+        }
+        return true;
+    }
+    if (op1 >= 1 && op1 <= 5) {
+        exec_qrst_registers(cpu, insn);
+        return true;
+    }
+    return false;
+}
+#endif
+
+/* Execute cached instruction classes, including ordinary control flow and
+ * register-window rotations. Every guest instruction is still interpreted
+ * and charged. Keep PC/CCOUNT local until a scheduler or timer boundary;
+ * callbacks, MMIO, window faults and debugger stops use the full step path. */
+static __attribute__((noinline))
+int xtensa_run_cached(xtensa_cpu_t *cpu, uint64_t *restrict local_cc,
+                      uint32_t *restrict prev_pc, int budget) {
+#if PREDECODE_SIZE > 0
+    if (budget < 2 || !cpu->predecode || !cpu->running || cpu->exception ||
+        cpu->record_branch_targets || cpu->jit_fallthrough_dispatch || cpu->irq_check ||
+        g_dbg_step_slow || g_mem_write32_observe || g_mem_journal_en ||
+        cpu->window_trace || g_dbg_winlog || cpu->aot_bitmap ||
+        cpu->ccount >= cpu->next_timer_event)
+        return 0;
+    uint32_t room = (uint32_t)budget;
+    uint32_t timer_room = cpu->next_timer_event - cpu->ccount;
+    if (timer_room < room) room = timer_room;
+    uint32_t pc = cpu->pc, last_pc = *prev_pc, executed = 0;
+    bool pc_written = cpu->_pc_written;
+    unsigned hazard = cpu->window_hazard;
+    bool guard_windows = hazard && XT_PS_WOE(cpu->ps) && !XT_PS_EXCM(cpu->ps);
+    int bp_count = cpu->breakpoint_count;
+    /* A range is only a fast rejection filter. Any PC inside it goes to the
+     * canonical breakpoint check, including nonmatches between breakpoints.
+     * With no breakpoints, the sentinel is outside the predecode geometry. */
+    uint32_t bp_low = bp_count ? cpu->breakpoints[0] : UINT32_MAX;
+    uint32_t bp_high = bp_low;
+    for (int i = 1; i < bp_count; i++) {
+        if (cpu->breakpoints[i] < bp_low) bp_low = cpu->breakpoints[i];
+        if (cpu->breakpoints[i] > bp_high) bp_high = cpu->breakpoints[i];
+    }
+    uint32_t bp_width = bp_high - bp_low;
+    while (executed < room) {
+        if (pc_written && (pc == GUEST_CALL_ASYNC_SENTINEL ||
+            (cpu->pc_hook && (!cpu->pc_hook_bitmap ||
+             rom_stubs_hook_bitmap_test(cpu->pc_hook_bitmap, pc))))) break;
+        uint32_t off = pc - PREDECODE_BASE;
+        if (off >= PREDECODE_SIZE) break;
+        uint32_t packed = cpu->predecode[off];
+        if (!packed) break;
+        if (pc - bp_low <= bp_width) break;
+        uint32_t insn = PREDECODE_INSN(packed);
+        unsigned ilen = PREDECODE_ILEN(packed), kind = PREDECODE_CLASS(packed);
+#if FLEXE_PROFILE_BUILD
+        uint32_t profile_sp = ar_read(cpu, 1);
+#endif
+        unsigned r = XT_R(insn), s = XT_S(insn), t = XT_T(insn);
+        if (guard_windows) {
+            unsigned need = PREDECODE_WINDOW_NEED(packed);
+            if (kind == PD_ENTRY)
+                need = window_need2(s, ((unsigned)XT_PS_CALLINC(cpu->ps) << 2) | (s & 3u));
+            if (hazard & ((1u << need) - 1u)) break;
+        }
+        uint32_t next_pc = pc + ilen;
+        bool branch = false, store = false, fp_memory = false, update_base = false;
+        unsigned width = 0, memory_reg = t;
+        uint32_t addr = 0, updated_base = 0;
+        switch (kind) {
+        case PD_LOAD_N: case PD_STORE_N:
+            width = 4; store = kind == PD_STORE_N; addr = ar_read(cpu, s) + (r << 2); break;
+        case PD_ADD_N: ar_write(cpu, r, ar_read(cpu, s) + ar_read(cpu, t)); break;
+        case PD_ADDI_N: ar_write(cpu, r, ar_read(cpu, s) + (t ? t : UINT32_MAX)); break;
+        case PD_MOVI_N: {
+            unsigned imm = ((t & 7u) << 4) | r;
+            ar_write(cpu, s, imm >= 96u ? imm - 128u : imm); break;
+        }
+        case PD_MOV_N: ar_write(cpu, t, ar_read(cpu, s)); break;
+        case PD_BRANCH_N:
+            branch = t < 12 ? ar_read(cpu, s) == 0 : ar_read(cpu, s) != 0;
+            if (branch) next_pc += (((t & 3u) << 4) | r) + 2u;
+            break;
+        case PD_RET: next_pc = ar_read(cpu, 0); branch = true; break;
+        case PD_RETW: {
+            uint32_t a0 = ar_read(cpu, 0), n = a0 >> 30;
+            if (!n) { n = cpu->window_callsize[cpu->windowbase]; if (!n) n = 4; }
+            unsigned wb = (cpu->windowbase - n) & 15u;
+            if (!(cpu->windowstart & (1u << wb))) goto cached_done;
+            cpu->windowstart &= ~(1u << cpu->windowbase);
+            cpu->windowbase = wb;
+            window_hazard_refresh(cpu);
+            next_pc = (next_pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+            branch = true;
+            goto window_context_changed;
+        }
+        case PD_ENTRY: {
+            if (cpu->seed_entry_link || !cpu->real_window_vectors || !XT_PS_WOE(cpu->ps) ||
+                XT_PS_EXCM(cpu->ps) || !window_vectors_ready(cpu, VECOFS_WINDOW_OVERFLOW4))
+                goto cached_done;
+            unsigned callinc = XT_PS_CALLINC(cpu->ps);
+            uint32_t sp = ar_read(cpu, s) - ((uint32_t)XT_IMM12(insn) << 3);
+            ar_write(cpu, (callinc << 2) | (s & 3u), sp);
+            unsigned old_wb = cpu->windowbase;
+            cpu->windowbase = (old_wb + callinc) & 15u;
+            cpu->windowstart |= 1u << cpu->windowbase;
+            cpu->window_callsize[cpu->windowbase] = (uint8_t)callinc;
+            XT_PS_SET_OWB(cpu->ps, old_wb);
+            window_hazard_refresh(cpu);
+            goto window_context_changed;
+        }
+        case PD_ADD: {
+            unsigned op2 = XT_OP2(insn);
+            uint32_t a = ar_read(cpu, s) << (op2 & 3u), b = ar_read(cpu, t);
+            ar_write(cpu, r, op2 < 12 ? a + b : a - b); break;
+        }
+        case PD_LOGIC: {
+            unsigned op2 = XT_OP2(insn);
+            uint32_t a = ar_read(cpu, s), b = ar_read(cpu, t);
+            ar_write(cpu, r, op2 == 1 ? a & b : op2 == 2 ? a | b : a ^ b); break;
+        }
+        case PD_EXTUI: {
+            unsigned shift = s | ((XT_OP1(insn) & 1u) << 4);
+            ar_write(cpu, r, (ar_read(cpu, t) >> shift) & ((1u << (XT_OP2(insn) + 1u)) - 1u)); break;
+        }
+        case PD_FP0: exec_fp0(cpu, insn); break;
+        case PD_FP1: exec_fp1(cpu, insn); break;
+        case PD_ALU:
+            if (!exec_cached_qrst(cpu, insn, executed)) goto cached_done;
+            if (XT_OP1(insn) == 0 && XT_OP2(insn) == 4 && r == 8) goto window_context_changed;
+            break;
+        case PD_RSR:
+            ar_write(cpu, t, XT_SR_NUM(insn) == XT_SR_CCOUNT ? cpu->ccount + executed : sr_read(cpu, XT_SR_NUM(insn)));
+            break;
+        case PD_WSR:
+            if (!exec_cached_qrst(cpu, insn, executed)) goto cached_done;
+            goto window_context_changed;
+        case PD_RSIL:
+            if (cpu->interrupt & cpu->intenable) goto cached_done;
+            ar_write(cpu, t, cpu->ps);
+            cpu->ps = (cpu->ps & ~0xFu) | s;
+            break;
+        case PD_MOVI: ar_write(cpu, t, (uint32_t)sign_extend((s << 8) | XT_IMM8(insn), 12)); break;
+        case PD_ADDI:
+            ar_write(cpu, t, ar_read(cpu, s) + (uint32_t)(sign_extend(XT_IMM8(insn), 8) * (r == 13 ? 256 : 1))); break;
+        case PD_LOAD: case PD_STORE:
+            store = kind == PD_STORE;
+            if (XT_OP0(insn) == 1) {
+                width = 4;
+                addr = (next_pc & ~3u) + (0xFFFC0000u | ((uint32_t)XT_IMM16(insn) << 2));
+            } else {
+                width = r == 0 || r == 4 ? 1 : r == 1 || r == 5 || r == 9 ? 2 : 4;
+                addr = ar_read(cpu, s) + (uint32_t)XT_IMM8(insn) * width;
+            }
+            break;
+        case PD_WINDOW_MEMORY:
+            width = 4; store = XT_OP2(insn) == 4;
+            addr = ar_read(cpu, s) + (uint32_t)((int32_t)(r << 2) - 64);
+            break;
+        case PD_FP_MEMORY:
+            width = 4; fp_memory = true;
+            if (XT_OP0(insn) == 0) {
+                store = XT_OP2(insn) >= 4; memory_reg = r;
+                update_base = (XT_OP2(insn) & 1u) != 0;
+                updated_base = ar_read(cpu, s) + ar_read(cpu, t);
+                addr = update_base ? ar_read(cpu, s) : updated_base;
+            } else {
+                if (r != 0 && r != 4 && r != 8 && r != 12) goto cached_done;
+                store = r == 4 || r == 12;
+                addr = ar_read(cpu, s) + ((uint32_t)XT_IMM8(insn) << 2);
+                update_base = r >= 8; updated_base = addr;
+            }
+            break;
+        case PD_CALL: {
+            unsigned nn = XT_N(insn);
+            if (nn) {
+                XT_PS_SET_CALLINC(cpu->ps, nn);
+                ar_write(cpu, nn * 4u, (nn << 30) | (next_pc & 0x3FFFFFFFu));
+            } else ar_write(cpu, 0, next_pc);
+            next_pc = (((pc >> 2) + (uint32_t)sign_extend(XT_OFFSET18(insn), 18) + 1u) << 2);
+            branch = true; break;
+        }
+        case PD_JX_CALLX: {
+            uint32_t target = ar_read(cpu, s);
+            unsigned nn = XT_N(insn);
+            if (XT_M(insn) == 3) {
+                if (nn) {
+                    XT_PS_SET_CALLINC(cpu->ps, nn);
+                    ar_write(cpu, nn * 4u, (nn << 30) | (next_pc & 0x3FFFFFFFu));
+                } else ar_write(cpu, 0, next_pc);
+            }
+            next_pc = target; branch = true; break;
+        }
+        case PD_BRANCH_SI: {
+            unsigned nn = XT_N(insn), m = XT_M(insn);
+            int32_t val = (int32_t)ar_read(cpu, s);
+            if (nn == 0) { next_pc += (uint32_t)sign_extend(XT_OFFSET18(insn), 18) + 1u; branch = true; }
+            else if (nn == 1) {
+                if (m == 0 && cpu->poll_spin_count) goto cached_done;
+                branch = m == 0 ? val == 0 : m == 1 ? val != 0 : m == 2 ? val < 0 : val >= 0;
+                if (branch) next_pc += (uint32_t)sign_extend(XT_IMM12(insn), 12) + 1u;
+            } else if (nn == 2) {
+                int32_t cmp = b4const[r];
+                branch = m == 0 ? val == cmp : m == 1 ? val != cmp : m == 2 ? val < cmp : val >= cmp;
+                if (branch) next_pc += (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1u;
+            } else if (m >= 2) {
+                branch = m == 2 ? (uint32_t)val < b4constu[r] : (uint32_t)val >= b4constu[r];
+                if (branch) next_pc += (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1u;
+            } else if (m == 1 && r <= 1) {
+                branch = r == 0 ? !(cpu->br & (1u << s)) : (cpu->br & (1u << s)) != 0;
+                if (branch) next_pc += (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1u;
+            } else if (m == 1 && r >= 8 && r <= 10) {
+                uint32_t end = next_pc + (uint32_t)XT_IMM8(insn) + 1u;
+                cpu->lend = end; cpu->lbeg = next_pc;
+                if ((r == 9 && val == 0) || (r == 10 && val <= 0)) {
+                    next_pc = end; branch = true;
+                } else cpu->lcount = (uint32_t)val - 1u;
+            } else goto cached_done;
+            break;
+        }
+        case PD_BRANCH:
+            branch = branch_taken(cpu, insn);
+            if (branch) next_pc += (uint32_t)sign_extend(XT_IMM8(insn), 8) + 1u;
+            break;
+        case PD_NOP: break;
+        default: goto cached_done;
+        }
+        goto memory_access;
+window_context_changed:
+        hazard = cpu->window_hazard;
+        guard_windows = hazard && XT_PS_WOE(cpu->ps) && !XT_PS_EXCM(cpu->ps);
+memory_access:
+        if (width) {
+            uint8_t *page = cpu->mem->page_table[addr >> 12];
+            unsigned offset = addr & 0xFFFu;
+            if (!page || offset + width > 0x1000u) break;
+            uint8_t *ptr = page + offset;
+            uint32_t value = 0;
+            if (store) {
+                value = fp_memory ? float_to_bits(cpu->fr[memory_reg]) : ar_read(cpu, t);
+                if (width == 1) *ptr = (uint8_t)value;
+                else if (width == 2) { uint16_t half = (uint16_t)value; memcpy(ptr, &half, 2); }
+                else memcpy(ptr, &value, 4);
+            } else {
+                if (width == 1) value = *ptr;
+                else if (width == 2) {
+                    uint16_t half; memcpy(&half, ptr, 2);
+                    value = r == 9 && XT_OP0(insn) == 2 ? (uint32_t)(int32_t)(int16_t)half : half;
+                } else memcpy(&value, ptr, 4);
+                if (fp_memory) cpu->fr[memory_reg] = bits_to_float(value);
+                else ar_write(cpu, t, value);
+            }
+            if (update_base) ar_write(cpu, s, updated_base);
+        }
+#if FLEXE_PROFILE_BUILD
+        xtensa_profile_tick_sp(pc, profile_sp);
+#endif
+        last_pc = pc; pc = next_pc; pc_written = branch;
+        if (cpu->lcount && pc == cpu->lend && !branch) {
+            cpu->lcount--; pc = cpu->lbeg; pc_written = true;
+        }
+        executed++;
+    }
+cached_done:
+    if (executed) {
+        cpu->pc = pc; cpu->_pc_written = pc_written;
+        cpu->ccount += executed; *local_cc += executed; *prev_pc = last_pc;
+        if (bp_count) cpu->breakpoint_hit = false;
+        if (cpu->ccount >= cpu->next_timer_event) xtensa_fire_timers(cpu);
+        if (cpu->irq_check) {
+            cpu->irq_check = false;
+            if (cpu->interrupt & cpu->intenable) xtensa_check_interrupts(cpu);
+        }
+    }
+    return (int)executed;
+#else
+    (void)cpu; (void)local_cc; (void)prev_pc; (void)budget;
+    return 0;
+#endif
+}
+
+/* Invalidated flash mappings and unsupported classes use the canonical
+ * decoder. Reject them before entering the cached runner: repeated cache
+ * misses must not add a function call to every interpreted instruction. */
+static inline bool cached_dispatch_ready(const xtensa_cpu_t *cpu) {
+#if PREDECODE_SIZE > 0
+    if (!cpu->predecode) return false;
+    uint32_t off = cpu->pc - PREDECODE_BASE;
+    return off < PREDECODE_SIZE && PREDECODE_CLASS(cpu->predecode[off]) > PD_SLOW;
+#else
+    (void)cpu;
+    return false;
+#endif
+}
+
 /* Batch execution: step_impl is always_inline → entire decode/execute loop
  * lives in this function body, eliminating per-instruction call overhead.
  * cycle_count is cached in a local to stay in a register across iterations
@@ -3585,6 +4043,12 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
          * keep timer/preemption cadence and throughput accounting honest. */
         if (__builtin_expect(cpu->accelerated_blocks, 0)) {
             for (; executed < remaining; executed++) {
+                int cached = (cpu->record_branch_targets || !cached_dispatch_ready(cpu))
+                           ? 0 : xtensa_run_cached(cpu, &cc, &prev_pc, remaining - executed);
+                executed += cached;
+                if (executed >= remaining || (cached &&
+                    (!cpu->running || cpu->halted || cpu->core_handoff || cpu->exception)))
+                    break;
                 int step_result = xtensa_step_impl(
                         cpu, &cc, &prev_pc,
                         (uint32_t)(remaining - executed));
@@ -3611,6 +4075,12 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
             }
         } else {
             for (; executed < remaining; executed++) {
+                int cached = (cpu->record_branch_targets || !cached_dispatch_ready(cpu))
+                           ? 0 : xtensa_run_cached(cpu, &cc, &prev_pc, remaining - executed);
+                executed += cached;
+                if (executed >= remaining || (cached &&
+                    (!cpu->running || cpu->halted || cpu->core_handoff || cpu->exception)))
+                    break;
                 int step_result = xtensa_step_impl(cpu, &cc, &prev_pc, 0u);
                 if (__builtin_expect(step_result != 0, 0)) {
                     if (step_result < 0 || step_result > 1) {
@@ -3627,9 +4097,10 @@ int xtensa_run(xtensa_cpu_t *cpu, int max_cycles) {
         }
         cpu->native_span_room = 0u;
         exec_total += executed;
-        /* No progress, or the CPU stopped: either way do not spin. */
+        /* A debugger stop also ends the invocation: retrying a breakpoint
+         * would charge the rest of the budget without advancing PC. */
         if (executed == 0 || !cpu->running || cpu->core_handoff ||
-            cpu->debug_break) break;
+            cpu->debug_break || (cpu->breakpoint_count && cpu->breakpoint_hit)) break;
     }
 
     cpu->cycle_count = cc;

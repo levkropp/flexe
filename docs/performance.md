@@ -81,6 +81,57 @@ hook registry before every instruction, so a service boundary cannot be
 compiled merely because a neighboring ROM address is eligible. This is a
 target-level mechanism shared by firmware rather than a WLED address list.
 
+## agon vdp interpreter dispatch
+
+On 2026-10-03 the interpreter reached a 1.095x median in three alternating
+before/after pairs against commit `8a928cc`. The host was Apple A18 Pro,
+macOS 26.4.1 and Apple Clang 21.0.0, using Release `-O3`, native tuning and
+LTO, without PGO or profiling instrumentation. Each fresh process passed the
+complete VDP scenario before timing five modeled seconds of native FreeRTOS,
+320x240 VGA DMA scanout and raw capture.
+
+| Interpreter build | median soak wall | aggregate retired MIPS | modeled realtime |
+|---|---:|---:|---:|
+| before cached instruction classes | 8.062 s | 149.72 | 0.620x |
+| after cached instruction classes | 4.564 s | 264.46 | 1.095x |
+
+Throughput increased 76.6%, with 43.4% less wall time. After-change samples
+were 4.520, 4.564 and 4.702 seconds (1.063x--1.106x realtime). All three
+clear realtime on this host. Host scheduling and thermal load can move this
+margin, so rerun the benchmark on the intended deployment machine.
+
+The existing 32-bit predecode entries now also hold an instruction class and
+the highest integer operand window, keeping the same memory footprint. The
+batch interpreter dispatches those classes directly and keeps PC/CCOUNT local
+across mapped-memory instructions, ordinary branches and safe window rotations.
+Every instruction is still executed and charged. Timer horizons, pending
+interrupts, window faults, MMIO, hooks, tracing, write observers and journaling
+retain the canonical step boundary. Breakpoint ranges are only a conservative
+filter; matching stops still use the normal validity and breakpoint checks.
+Invalidated or unsupported entries bypass the cached runner before paying a
+function call. No guest function, firmware address or instruction sequence is
+recognized by this optimization, and no host code is generated.
+
+All six runs retired 1,207,016,237 instructions in the soak, captured 291
+frames, and reported zero native instructions. UART digest `1dc20a14`, video
+hashes `56769766`/`a2dbd34c`, DAC tone, keyboard packets and final PCs matched.
+Differential unit tests compare cached batches with uncached stepping across
+window overflow/underflow, register-file wraparound, loop and CCOUNT reads,
+breakpoints, PS writes, timers, MMIO interrupts, page boundaries, hooks and
+journal rollback. The tests also caught a batch-runner breakpoint retry bug:
+a reached breakpoint now ends the invocation instead of consuming the rest
+of its budget at the same PC.
+
+The seven stock driven scenarios and the full MOS/BBC BASIC scenario passed
+in both engines. Short 600-million-cycle boot benchmarks are more sensitive
+to cache construction and process startup: repeated comparisons showed small
+slowdowns for some short boots and gains for longer-running workloads. The
+Agon steady-soak gain does not imply an equal gain for every firmware.
+
+Reproduce with [the native VDP benchmark](testing.md#agon-vdp), using
+`SOAK_CYCLES=1200000000 WARMUPS=1 REPS=3`. Performance numbers are host-dependent;
+the pinned output checks remain the correctness gate.
+
 ## agon vdp critical-section dispatch
 
 The unmodified Agon VDP 2.16.0 workload keeps native FreeRTOS, audio generation

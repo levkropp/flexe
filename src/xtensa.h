@@ -46,7 +46,7 @@ typedef bool (*xtensa_pc_hook_contains_fn)(uint32_t pc, void *ctx);
 
 /* Pre-decoded instruction table: entire firmware decoded at load time.
  * Direct-indexed by (pc - PREDECODE_BASE), no tags, no cache misses.
- * Packed: bits 0-23 = instruction word, bits 24-25 = ilen (2 or 3).
+ * Each 32-bit entry holds the raw instruction, length and dispatch metadata.
  * 0 = invalid/not-decoded (unmapped memory).
  *
  * PREDECODE_END controls the flash size coverage. Benchmark with:
@@ -71,10 +71,15 @@ typedef bool (*xtensa_pc_hook_contains_fn)(uint32_t pc, void *ctx);
 #define PREDECODE_SIZE  0u
 #endif
 
-/* Packed: bits 0-23 = instruction word, bits 24-31 = ilen (2 or 3). */
-#define PREDECODE_PACK(insn, ilen) ((insn) | ((uint32_t)(ilen) << 24))
+/* Packed: raw instruction in 0..23, wide flag in 24, highest operand
+ * window in 25..26, and interpreter class in 27..31. Class zero is a raw
+ * entry constructed by callers; its operands are decoded at execution. */
+#define PREDECODE_PACK(insn, ilen) ((insn) | ((uint32_t)((ilen) == 3) << 24))
 #define PREDECODE_INSN(packed)     ((packed) & 0x00FFFFFFu)
-#define PREDECODE_ILEN(packed)     ((packed) >> 24)
+#define PREDECODE_ILEN(packed)     (2u + (((packed) >> 24) & 1u))
+#define PREDECODE_WINDOW_TAG      (31u << 27)
+#define PREDECODE_WINDOW_NEED(packed) (((packed) >> 25) & 3u)
+#define PREDECODE_CLASS(packed)   ((packed) >> 27)
 
 /*
  * Special Register Numbers (for RSR/WSR/XSR)

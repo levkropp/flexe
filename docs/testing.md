@@ -237,6 +237,12 @@ five modeled seconds per soak, including raw VGA capture and validation.
 | interpreter | 9.550 s | 126.39 | 0.524x | 30.47 |
 | JIT | 4.395 s | 274.62 | 1.138x | 66.21 |
 
+The cached interpreter dispatch optimization subsequently measured 1.095x
+median (1.063x--1.106x across three alternating before/after pairs) on the
+same host, against a fresh `8a928cc` baseline of 0.620x. It preserved retired
+instruction counts and every UART/VGA/audio/key check. See
+[the interpreter comparison](performance.md#agon-vdp-interpreter-dispatch).
+
 The subsequent generic PS-write optimization raised JIT modeled realtime to
 1.533x in five interleaved before/after pairs, a 28.7% throughput improvement;
 see [the performance comparison](performance.md#agon-vdp-critical-section-dispatch).

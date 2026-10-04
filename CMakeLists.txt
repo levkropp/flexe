@@ -247,6 +247,7 @@ endif()
 set(TEST_SOURCES
     tests/test_main.c
     tests/test_decode.c
+    tests/test_cached_interpreter.c
     tests/test_alu.c
     tests/test_shift.c
     tests/test_move.c

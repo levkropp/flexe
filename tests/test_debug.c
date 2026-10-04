@@ -561,6 +561,36 @@ TEST(test_bp_same_address_on_both_cores) {
     teardown(&core0);
 }
 
+TEST(test_bp_invalid_pc_traps_before_matching_breakpoint) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.pc = 0xDEADBEEFu;
+    ASSERT_EQ(xtensa_set_breakpoint(&cpu, cpu.pc), 0);
+
+    ASSERT_EQ(xtensa_step(&cpu), (uint32_t)-1);
+    ASSERT_TRUE(cpu.exception);
+    ASSERT_FALSE(cpu.running);
+    ASSERT_FALSE(cpu.breakpoint_hit);
+    ASSERT_EQ(cpu.pc, 0xDEADBEEFu);
+
+    teardown(&cpu);
+}
+
+TEST(test_bp_invalid_pc_traps_with_nonmatching_breakpoint) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    cpu.pc = 0xDEADBEEFu;
+    ASSERT_EQ(xtensa_set_breakpoint(&cpu, BASE), 0);
+
+    ASSERT_EQ(xtensa_run(&cpu, 10), 1);
+    ASSERT_TRUE(cpu.exception);
+    ASSERT_FALSE(cpu.running);
+    ASSERT_FALSE(cpu.breakpoint_hit);
+    ASSERT_EQ(cpu.pc, 0xDEADBEEFu);
+
+    teardown(&cpu);
+}
+
 /* ===== ROM Stub Stats Test ===== */
 
 TEST(test_rom_stub_call_count) {
@@ -626,6 +656,8 @@ void run_debug_tests(void) {
     RUN_TEST(test_bp_max_exceeded);
     RUN_TEST(test_bp_duplicate);
     RUN_TEST(test_bp_same_address_on_both_cores);
+    RUN_TEST(test_bp_invalid_pc_traps_before_matching_breakpoint);
+    RUN_TEST(test_bp_invalid_pc_traps_with_nonmatching_breakpoint);
 
     TEST_SUITE("ROM Stub Stats");
     RUN_TEST(test_rom_stub_call_count);
