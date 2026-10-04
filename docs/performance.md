@@ -121,6 +121,59 @@ See [the Agon test commands](testing.md#agon-mos-and-bbc-basic) and
 counters after the native VDP scenario. A separate `FLEXE_PROFILE=ON` build
 reports interpreter samples when run with `FLEXE_PROFILE=1`.
 
+### effect on the classic ESP32 corpus
+
+The same `1996950` versus `a9ae927` comparison was repeated on seven pinned
+production images, using identical Release settings on the same host. These
+measurements cover the generic runner's normal ROM/RTOS service configuration,
+including process startup and boot; Agon's native FreeRTOS soak above measures
+a different workload. Each run executed two billion core-0 cycles with a
+10,000-instruction scheduling batch, a zero-unmapped-access limit and the
+official `esp32_rev300_rom.elf`. One warmup per image/build preceded five
+interleaved pairs, alternating execution order. Runs were serialized.
+
+| Firmware | Before median wall | After median wall | Throughput change |
+|---|---:|---:|---:|
+| Bruce 1.16.1 CYD | 0.422 s | 0.396 s | +6.8% |
+| Marauder 1.15.1 CYD | 0.266 s | 0.247 s | +7.9% |
+| NerdMiner 1.8.3 | 0.773 s | 0.683 s | +13.1% |
+| Meshtastic 2.7.26 T-Beam | 0.358 s | 0.324 s | +10.4% |
+| openHASP 0.7.0-rc13 Lanbon L8 | 0.586 s | 0.592 s | -0.9% |
+| Tasmota 15.6.0 | 0.744 s | 0.689 s | +8.0% |
+| WLED 16.0.1 | 4.124 s | 3.987 s | +3.4% |
+
+Throughput change is `before_wall / after_wall - 1`, calculated from unrounded
+medians. Every run passed, with identical retired instruction counts and UART
+digests across both builds and all samples. The measured benefit extends to
+six images; the small openHASP difference was investigated with ten additional
+interleaved pairs, each timing five complete runs. Their median totals were
+2.958 s before and 2.963 s after, a 0.2% wall-time difference; child CPU time
+also differed by 0.2%. Paired timings varied in both directions, so no
+meaningful performance change was detected for openHASP.
+
+The seven driven stock-ROM scenarios also completed on both JIT builds and the
+current interpreter, including each scenario's six-billion-cycle soak. They
+agreed on every framebuffer or LED digest and passed their hardware/network
+assertions with zero unhandled MMIO or unregistered ROM calls. This audit
+refreshed two old framebuffer references in `check-stock-roms.sh`: Marauder's
+converged Swift Pair screen (`B4586420`) and openHASP's complete RGB page
+(`CCBF47C5`). Both outputs were already present before the PS optimization,
+matched the interpreter and were inspected visually. The RGB digest also
+matches an independently constructed 320x240 page of 107 red, 106 green and
+107 blue columns.
+
+To reproduce individual generic runs with each Release build:
+
+```sh
+FLEXE_ROM_ELF=/path/to/esp32_rev300_rom.elf \
+  /usr/bin/time -p /path/to/build/flexe-generic-rom-test \
+  --cycles 2000000000 --batch 10000 --max-unmapped 0 /path/to/firmware.bin
+```
+
+Alternate the two builds, warm them up first, compare median timings and
+require equal instruction counts and UART digests. Use the
+[stock-ROM gates](testing.md#production-rom-gates) for the driven scenarios.
+
 ## reproducible compute benchmark
 
 `bench-compute.sh` builds an in-repository Arduino sketch and executes a fixed

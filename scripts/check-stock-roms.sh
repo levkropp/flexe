@@ -79,6 +79,12 @@ fi
 # The new pictures are real -- ~9100 non-black pixels, the same order as
 # before -- and both engines agree on them, so this is a behaviour change from
 # a more faithful flash layout rather than a miscompile.
+#
+# Marauder 1.15.1 and openHASP were re-pinned on 2026-10-03 after reviewing the
+# converged Swift Pair screen and complete RGB page. Baseline 1996950, the
+# optimized JIT, and the interpreter all produced these same outputs. The
+# openHASP digest also matches independently constructed 107/106/107-column
+# RGB565 bars; these updates are unrelated to the PS-write optimization.
 expected_artifact() {
     case "$1" in
     b0ed2710db5dfdd7117487b624ff742860614e1c3d8095d42b39b54f4ca18924) echo D3337E28 ;;  # Bruce 1.16.1 CYD
@@ -88,8 +94,8 @@ expected_artifact() {
     ad91696012f407bf782826793edd509119acf00e4751cd0d30eddd6223d6bf2d) echo 28C56B5E ;;
     6459db43b36b5d303485185e0fc9fa4e672c0409246592b9c955550fc3091a26) echo 28C56B5E ;;  # re-pinned
     968c1babf8b72c82a86e7e4cb3b86fcd4d619a67ad879aab02e7358f2a1a30d1) echo 3F42FBF0 ;;  # re-pinned
-    72fa27948cd7f3bce4b6eabaaa8757b0d0e7854c534e8a502ce197d2397d899b) echo F1858410 ;;
-    2f7a57fe7e23160ff2a73b214540d420abe395c5caa30ed809a40b16b67b0ee2) echo 026EBEE5 ;;  # openHASP 0.7.0-rc13 Lanbon L8
+    72fa27948cd7f3bce4b6eabaaa8757b0d0e7854c534e8a502ce197d2397d899b) echo B4586420 ;;  # Marauder 1.15.1 CYD, converged Swift Pair UI
+    2f7a57fe7e23160ff2a73b214540d420abe395c5caa30ed809a40b16b67b0ee2) echo CCBF47C5 ;;  # openHASP 0.7.0-rc13 Lanbon L8, complete RGB page
     5249c9b49e40c9fb96869f3fc573c3a00c9d99ea55997fd9117aaafbf7c0e7f3) echo 6AD58DC5 ;;  # Tasmota 15.6.0
     628917b0753edcfc9a8408e6387c6d1ace6a360d315441e9563d60299fef8594) echo F29E02EB ;;  # WLED 16.0.1
     *) echo "" ;;
