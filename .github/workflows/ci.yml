@@ -47,9 +47,11 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF
       - name: Build
-        run: cmake --build build --target xtensa-tests flexe-agon-vdp-test -j"$(nproc)"
+        run: cmake --build build --target xtensa-emu xtensa-tests flexe-agon-vdp-test -j"$(nproc)"
       - name: Unit tests
         run: ./scripts/run-unit-tests.sh
+      - name: CLI trace regressions
+        run: python3 tests/test_cli_trace.py
 
   sanitizers:
     name: asan + ubsan
@@ -77,7 +79,7 @@ jobs:
             -DNATIVE_ARCH=OFF \
             -DFLEXE_SANITIZERS=ON
       - name: Build
-        run: cmake --build build-asan --target xtensa-tests -j"$(nproc)"
+        run: cmake --build build-asan --target xtensa-emu xtensa-tests -j"$(nproc)"
       - name: Unit tests
         env:
           # Leak detection is on: the suite is leak-clean, and a test that
@@ -86,6 +88,12 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           FLEXE_BUILD_DIR: build-asan
         run: ./scripts/run-unit-tests.sh
+      - name: CLI trace regressions
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          FLEXE_CLI_BINARY: build-asan/xtensa-emu
+        run: python3 tests/test_cli_trace.py
 
   # The JIT has two backends and only one of them is exercised by a host
   # build. A native aarch64 runner would be better, but a cross-compile at

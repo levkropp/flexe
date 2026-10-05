@@ -478,6 +478,22 @@ counter and therefore leaves the JIT enabled; rerun a failure with
 
 ## traces
 
+Instruction and call traces (`-t`, `-T`, `-W`, `-F`, `-C`, `-A`) use the
+interpreter so each step remains visible. They keep the normal dual-core
+scheduling cadence, including partial batches at trace-window boundaries.
+`-H` uses a PC hook and can retain the JIT.
+
+The CLI regression creates small firmware images and ELF symbols locally;
+it needs no Xtensa toolchain or downloaded firmware. It checks dual-core
+startup, deferred tasks remaining deferred through guest loops, and complete
+instruction output. CI runs it with GCC, Clang, and ASan+UBSan:
+
+```sh
+cmake --build build --target xtensa-emu -j
+python3 tests/test_cli_trace.py
+# For another build tree, set FLEXE_CLI_BINARY=/path/to/xtensa-emu.
+```
+
 Use `-T` to write a verbose emulator trace, then narrow it with
 `build/trace-filter`:
 

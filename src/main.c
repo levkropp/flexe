@@ -1291,6 +1291,12 @@ int main(int argc, char *argv[]) {
     }
     const char *firmware = argv[optind];
 
+    /* An instruction trace must observe every instruction. A JIT PC hook
+     * can otherwise retire an entire hot block inside xtensa_step(), hiding
+     * instructions and changing the single-step budget. */
+    if (trace || call_trace || assert_count)
+        jit_enabled = 0;
+
     if (unhandled_report) {
         if (jit_enabled)
             fprintf(stderr,
@@ -1564,18 +1570,17 @@ int main(int argc, char *argv[]) {
      * NOTE: g_htrace uses PC hook instead of single-step, so not listed here */
     int need_step = trace || call_trace || assert_count;
 
+    /* FreeRTOS startup and deferred-task launch belong to their explicit
+     * scheduler/trampoline hooks. An unchanged PC can be a real guest loop;
+     * it must not cause the frontend to launch a task on core 0. */
+
     /* Unified execution loop.
      * Keep running as long as either core 0 or core 1 is alive — otherwise a
      * core 0 task exit (e.g. main_task returning after vTaskDelete) would
      * terminate the whole session, starving core 1 of the periodic esp_timer
      * ticks that drive LVGL tick subsystems. */
     int batch = 10000;
-    /* Core 1 executes inside flexe_session_post_batch() and its instructions
-     * would otherwise go uncounted against the -c budget (and understated
-     * in throughput metrics). Track its ccount delta per iteration. The
-     * delta is clamped: firmware can xwsr/reset ccount, which would wrap
-     * the subtraction. */
-    uint32_t prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
+    int trace_batch_steps = 0;
     unsigned observed_resets = flexe_session_reset_count(session);
     while (cycles < max_cycles_u64 &&
            (cpu->running || (cpu1_any && cpu1_any->running) ||
@@ -1606,9 +1611,10 @@ int main(int argc, char *argv[]) {
             cpu->window_trace_active = (trace_start == 0 || ccnt >= trace_start) &&
                                       (ccnt < trace_end);
         bool was_async_sleeping = flexe_session_async_sleeping(session);
-        int in_trace_window = need_step && !was_async_sleeping &&
+        int in_trace_window = need_step && !was_async_sleeping && !cpu->halted &&
             (trace_start == 0 || ccnt >= trace_start) &&
             (ccnt < trace_end);
+        int core0_quantum = 1;
 
         if (in_trace_window) {
             /* --- Single-step with full trace output --- */
@@ -1638,8 +1644,11 @@ int main(int argc, char *argv[]) {
             }
             prev_pc = cpu->pc;
 
+            if (trace_batch_steps == 0)
+                cpu->core_handoff = false;
             int rc = xtensa_step(cpu);
             cycles++;
+            trace_batch_steps++;
 
             if (do_trace_output && verbose_trace) {
                 for (int r = 0; r < 16; r++) {
@@ -1741,24 +1750,12 @@ int main(int argc, char *argv[]) {
                 exc_repeat = 0;
             }
 
-            if (!cpu->running) {
+            if (!cpu->running && !(cpu1_any && cpu1_any->running)) {
                 stop_reason = STOP_CPU_STOPPED;
                 break;
             }
-            if (cpu->pc == prev_pc && frt && !native_freertos) {
-                uint32_t param;
-                uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
-                if (fn) {
-                    ar_write(cpu, 1,
-                             flexe_target_bootstrap_stack(cpu->target, 0));
-                    ar_write(cpu, 2, param);
-                    cpu->pc = fn;
-                    cpu->ps = 0x00040020u;
-                }
-            }
         } else {
             /* --- Batch execution --- */
-            uint32_t pc_before = cpu->pc;
             uint64_t remaining = max_cycles_u64 - cycles;
             uint64_t wanted = was_async_sleeping ?
                 (uint64_t)xtensa_cpu_freq_mhz(cpu) * 1000u :
@@ -1771,6 +1768,7 @@ int main(int argc, char *argv[]) {
                 uint64_t to_window = trace_start - cpu->cycle_count;
                 if (to_window < (uint64_t)n) n = (int)to_window;
             }
+            core0_quantum = n;
             int ran = flexe_session_run_core(session, 0, n);
             cycles += ran;
 
@@ -1799,18 +1797,16 @@ int main(int argc, char *argv[]) {
                     (!was_async_sleeping && !cpu->running &&
                      !(cpu1_any && cpu1_any->running))) break;
             }
-            if (cpu->pc == pc_before && frt && !native_freertos) {
-                uint32_t param;
-                uint32_t fn = freertos_stubs_consume_deferred_task(frt, &param);
-                if (fn) {
-                    ar_write(cpu, 1,
-                             flexe_target_bootstrap_stack(cpu->target, 0));
-                    ar_write(cpu, 2, param);
-                    cpu->pc = fn;
-                    cpu->ps = 0x00040020u;
-                }
-            }
         }
+
+        /* Trace output is per instruction; SoC scheduling remains per batch.
+         * Running APP_CPU for a full batch after each printed instruction
+         * lets it race 10,000 times ahead and expire PRO_CPU's boot timers.
+         * Yield early for a real handoff, WAITI or the end of a trace window. */
+        if (in_trace_window && trace_batch_steps < batch &&
+            cpu->running && !cpu->halted && !cpu->core_handoff &&
+            cpu->cycle_count < trace_end && cycles < max_cycles_u64)
+            continue;
 
         /* Preemptive timeslice + core 1 management. The -c limit is an
          * aggregate dual-core budget, so core 1 may consume only what core 0
@@ -1819,9 +1815,12 @@ int main(int argc, char *argv[]) {
          * amount at a final WAITI boundary. */
         uint64_t core1_room = cycles < max_cycles_u64
                             ? max_cycles_u64 - cycles : 0u;
-        int core1_batch = core1_room < (uint64_t)batch
-                        ? (int)core1_room : batch;
-        flexe_session_post_batch(session, core1_batch);
+        int peer_quantum = in_trace_window ? trace_batch_steps : core0_quantum;
+        trace_batch_steps = 0;
+        int core1_batch = core1_room < (uint64_t)peer_quantum
+                        ? (int)core1_room : peer_quantum;
+        int core1_ran = flexe_session_post_batch(session, core1_batch);
+        cycles += (uint64_t)core1_ran;
 
         /* A session reset replaces peripheral and compatibility providers
          * while retaining the CPU and memory objects. Do not keep pointers
@@ -1835,18 +1834,8 @@ int main(int argc, char *argv[]) {
             rom = flexe_session_rom(session);
             frt = flexe_session_frt(session);
             hb_stub_count = 0;
-            prev_cc1 = cpu1_any ? cpu1_any->ccount : 0;
         }
         flexe_host_net_pump(host_net);
-
-        /* Charge core 1's executed instructions against the budget */
-        if (cpu1_any) {
-            uint32_t d1 = cpu1_any->ccount - prev_cc1;
-            prev_cc1 = cpu1_any->ccount;
-            if (!was_async_sleeping &&
-                d1 <= (uint32_t)core1_batch * 4) /* clamps resets/xwsr */
-                cycles += d1;
-        }
 
         /* Progress heartbeat */
         if (heartbeat_interval > 0 &&

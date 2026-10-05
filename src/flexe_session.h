@@ -118,8 +118,11 @@ int flexe_session_run_core(flexe_session_t *s, int core, int max_cycles);
  * - Checks preempt on core 0
  * - Detects core 1 start condition
  * - Runs core 1 batch (batch_size instructions)
- * - Syncs cycle counts between cores */
-void flexe_session_post_batch(flexe_session_t *s, int batch_size);
+ * - Syncs cycle counts between cores
+ * Returns core 1 work charged by run_core (instructions plus WAITI idle),
+ * excluding clock synchronization, callbacks and CCOUNT resets. Callers
+ * with an aggregate budget must use this rather than a CCOUNT delta. */
+int flexe_session_post_batch(flexe_session_t *s, int batch_size);
 
 /* Configure optional callbacks (call after create, before running). */
 void flexe_session_set_rom_log_cb(flexe_session_t *s, rom_log_fn fn, void *ctx);

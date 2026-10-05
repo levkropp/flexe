@@ -1007,9 +1007,10 @@ static void session_finish_async_sleep(flexe_session_t *s, uint32_t cause)
     }
 }
 
-void flexe_session_post_batch(flexe_session_t *s, int batch_size)
+int flexe_session_post_batch(flexe_session_t *s, int batch_size)
 {
-    if (!s) return;
+    if (!s) return 0;
+    int core1_ran = 0;
 
     if (periph_take_cpu_reset_request(s->periph, 1u))
         session_reset_app_cpu(s);
@@ -1041,7 +1042,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
                 s->async_sleep_timeout_us * s->async_sleep_mhz)
             cause = RTC_TIMER_WAKE_CAUSE;
         if (cause != 0u) session_finish_async_sleep(s, cause);
-        return;
+        return core1_ran;
     }
 
     /* Compatibility for frontends built against the older API which still
@@ -1075,7 +1076,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     /* Dual-core: run core 1 batch (or poll scheduler if parked) */
     if (!s->single_core && s->cpu[1].pc != 0) {
         if (app_cpu_released && s->cpu[1].running) {
-            flexe_session_run_core(s, 1, batch_size);
+            core1_ran = flexe_session_run_core(s, 1, batch_size);
             if (s->frt && !s->native_freertos)
                 freertos_stubs_check_preempt_core(s->frt, 1);
         } else if (app_cpu_released && s->frt && !s->native_freertos) {
@@ -1164,7 +1165,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
                 s->async_sleep_phase_cycles = 0u;
                 s->async_sleep_mhz = xtensa_cpu_freq_mhz(&s->cpu[0]);
                 if (cause != 0u) session_finish_async_sleep(s, cause);
-                return;
+                return core1_ran;
             }
             /* A sleep with nothing armed to end it would step forward for
              * ever. That is a firmware bug or a gap in what is modelled here;
@@ -1173,7 +1174,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
                 fprintf(stderr, "[sleep] no wake source armed; refusing to "
                         "sleep (wake_ena=0x%X)\n", cause);
                 periph_finish_wake(s->periph, 0);
-                return;
+                return core1_ran;
             }
             const uint64_t SLICE_US = 1000;
             uint32_t mhz = xtensa_cpu_freq_mhz(&s->cpu[0]);
@@ -1195,7 +1196,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
                 s->preserve_rtc_mem = 1;
                 flexe_session_reset(s);
                 periph_set_wake_state(s->periph, cause, RTC_DEEPSLEEP_RESET_CAUSE);
-                return;
+                return core1_ran;
             }
             periph_finish_wake(s->periph, cause);
         }
@@ -1205,7 +1206,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
         fprintf(stderr, "[reset] system reset requested (#%u)\n",
                 s->resets + 1u);
         flexe_session_reset(s);
-        return;
+        return core1_ran;
     }
 
     esp_timer_stubs_tick(s->etimer);
@@ -1214,6 +1215,7 @@ void flexe_session_post_batch(flexe_session_t *s, int batch_size)
     freertos_stubs_tick(s->frt);
     /* And any queued WiFi/IP event, which likewise re-enters guest code. */
     wifi_stubs_tick(s->wstubs, &s->cpu[0], &s->cpu[1]);
+    return core1_ran;
 }
 
 /* ===== Callback configuration ===== */
