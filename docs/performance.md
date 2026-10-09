@@ -320,3 +320,55 @@ FLEXE_PROFILE=1 ./build-prof/flexe-generic-rom-test firmware.bin
 `FLEXE_JIT_STATS=1` enables JIT counters in compatible runners. Profile before
 changing hot code: even compiled-out instrumentation can move the dispatch
 loop enough to change results.
+
+## head-to-head: esp-emulator 0.48.0
+
+measured 2026-10-09 on apple a18 pro, macos, flexe `Release` + lto +
+`NATIVE_ARCH=ON` (fresh `build-release` tree), esp-emulator 0.48.0 installed
+from its `install.sh` with stock defaults. same merged esp32-s3 factory images
+on both sides, built from esp-idf commit `9d7f2d69` (v5.3.2): the pinned
+`s3_idf_hello` and `s3_idf_aes` fixtures plus a purpose-built `cpuburn` app
+(100m loop-carried xorshift/multiply rounds, no sleeps, no reset).
+each cell is the median wall time to the same uart marker over five
+interleaved runs, alternating contenders with a 2 s settle between runs.
+all contenders produced identical outputs: `AES_DONE ... checksum=a6b69af2`
+and `BURN_DONE acc=68264db2` on both emulators and both flexe engines.
+
+| workload | what it measures | esp-emu | flexe interp | flexe jit |
+|---|---|---:|---:|---:|
+| aes fixture → `AES_DONE` | boot + crypto driver run | 0.062 s | 0.072 s | 0.077 s |
+| cpuburn → `BURN_DONE` | sustained integer compute | 13.906 s | 8.900 s | 0.737 s |
+| hello → `Restarting in 0 seconds` | boot + 10 s freertos countdown | 10.068 s | 0.086 s | 0.106 s |
+
+read the rows separately:
+
+- **aes** is startup-dominated (~50–120 ms for everyone). all three are tied;
+  nobody's engine matters when the firmware barely runs.
+- **cpuburn** is the execution-speed comparison: 1,211,426,975 instructions
+  retired, 99.6% of them natively in flexe's jit (`--jit-stats`), i.e. about
+  1,640 mips. flexe jit is **18.9×** faster than esp-emu here
+  (13.906 / 0.737); flexe's own interpreter is 1.56× faster than esp-emu and
+  the jit is 12.1× faster than the interpreter. a 10× `--batch-size` change on
+  the esp-emu side moved its time from 13.9 s to 13.2 s, so this is not a
+  tuning artifact.
+- **hello** is mostly ten one-second `vTaskDelay` sleeps. esp-emu paces those
+  in real time (~10 s wall); flexe jumps to the next timer deadline
+  (~0.1 s wall). that gap is virtual-time fast-forwarding for idle firmware,
+  which is what makes flexe cheap in ci — not execution speed.
+
+reproduce the compute comparison with any esp-idf v5.3.2 checkout and the
+official s3 rom elf:
+
+```sh
+# build the burn app for s3, merge, and run each contender to BURN_DONE
+idf.py set-target esp32s3 && idf.py build
+idf.py merge-bin -o cpuburn_merged.bin
+esp-emu --chip esp32s3 --firmware cpuburn_merged.bin \
+  --timeout 300s --exit-on "BURN_DONE"
+./build-release/xtensa-emu -N -q --strict-mmio --target esp32s3 \
+  -R /path/to/esp32s3_rev0_rom.elf -c 12000000000 cpuburn_merged.bin
+```
+
+the benchmark script used here stops the clock at the first marker byte in a
+piped stream and kills the process, so no contender pays for extra idle after
+the finish line. rerun on the intended host before quoting these numbers.

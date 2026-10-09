@@ -120,6 +120,9 @@ workflow and a modeled hardware controller have different support boundaries.
 | `--jit-stats` / `--jit-verify` | inspect native coverage / compare replayable blocks |
 | `-s ELF` / `-R ROM_ELF` | load application symbols / official mask-rom code and data |
 | `--efuse BLOB` | override s3 mac and chip revision from a 336-byte efuse blob |
+| `--strap-mode HEX` | raw strap sample for rom boot selection (`0x07` = s3 uart0 download) |
+| `--uart-tcp HOST:PORT` | bridge uart0 to a tcp server (esptool `socket://` transport) |
+| `--control-tcp HOST:PORT` | host control channel: reset, erase/write flash, ping |
 | `--strict-mmio` | fail on unsupported peripheral accesses while keeping the jit enabled |
 | `--unhandled-report` | attribute unsupported accesses to registers and guest pcs in the interpreter |
 | `--sandbox-events` | exchange peripheral events and host input as ndjson |
@@ -154,7 +157,37 @@ those are workload and host measurements. real-time factor measures guest
 time; retired mips measures executed instructions. idle jumps count only
 toward time.
 
+against the official [esp-emulator](https://github.com/espressif/esp-emulator)
+0.48.0 on the same s3 images and host, a sustained 1.21-billion-instruction
+compute loop finished in **0.737 s jit / 8.900 s interpreted** vs **13.906 s**
+for esp-emu — identical `BURN_DONE` checksums everywhere, 99.6% of flexe's
+instructions retired natively. short boot-only runs tie; ten seconds of
+freertos sleep take ~0.1 s here against ~10 s there, because idle time jumps
+to the next deadline instead of pacing wall clock.
+
 [dated results and reproducible commands →](docs/performance.md)
+
+## flexe and esp-emulator
+
+espressif now ships an official [esp-emulator](https://github.com/espressif/esp-emulator)
+(rust, beta). it distributes prebuilt `esp-emu` binaries plus a browser/wasm
+build, with default rom elfs embedded. the overlap with flexe is esp32-s3 only;
+the two projects cover different chips and different depth.
+
+| | flexe | esp-emulator |
+|---|---|---|
+| targets | esp32/lx6 and esp32-s3/lx7 | esp32-c3/c5/c6/h2/p4/s3/s31 (no classic esp32) |
+| source | c, mit, build from source; interpreter + arm64/x86-64 tracing jit with `--jit-verify` parity | rust core distributed as prebuilt release + wasm; repo holds installer, docs, tools, `test_apps` |
+| cpu/rom | common windowed lx6/lx7 profile; official rom elf supplied separately via `-R` | rv32imac/fc + lx7 s3, pmp/pma and apm/tee/pms enforcement; default rom elfs embedded, `--rom` to override |
+| peripherals/boards | deep wired + board matrix: display/touch, sd/mmc, i2s, lcd-cam/camera, twai, adc, touch v2, rmt, ledc, pcnt, mcpwm, aes/sha/rsa, sleep/wake, optional s3 psram; scripted bruce/marauder/meshtastic/nerdminer/openhasp/tasmota/wled + agon vdp gates | documented uart, usb-serial-jtag, gpio, systimer, timer groups, plic/clic, efuse, spi flash (1–128 mb, 32-bit addr), gdma, gp-spi, rmt, ledc, pcnt, mcpwm, i2c + eeprom slave, watchdogs |
+| network/radio/crypto | host-backed lwip socket bridge (+ libslirp ethernet hostfwd on s3) and controller bootstrap; wi-fi/ble stay service shims, no rf/phy claim | soft ap (wpa2-psk, wpa3-sae, enterprise via radius), user/tap/vmnet backends with dhcp/dns/mdns/ipv6/`hostfwd`/matter nat, openeth + p4 gmac, ble via bumble/physical hci, two-node thread mesh, aes/sha/rsa/ecc/hmac/ds/xts/ecdsa/key-manager |
+| workflow | `--strict-mmio` / `--unhandled-report`, checkpoints, `--sandbox-events` ndjson, instruction/window/call traces, `--efuse` revision blobs, `--uart-tcp`/`--control-tcp` bridges | `socket://` esptool/espefuse + `--control-tcp`, `--efuse` revision blobs, `--gdb` stub, `--trace` perfetto timeline, browser dashboard |
+
+use esp-emulator for risc-v chips, real wi-fi/ble/thread networking depth,
+flashing/debugging workflows, and browser runs. use flexe for classic esp32 at
+all, for s3 wired-peripheral/board depth with interpreter/jit agreement, and
+for open-source c-level cpu/device work. both boot the real mask rom; flexe
+requires the matching official rom elf as an external input.
 
 ## license
 

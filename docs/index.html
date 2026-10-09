@@ -305,7 +305,9 @@ meshtastic  <span class="g">25.03× real-time</span>
 nerdminer   <span class="g">12.84× real-time</span>
 openhasp     <span class="g">8.31× real-time</span>
 tasmota      <span class="g">8.29× real-time</span>
-wled         <span class="g">2.32× real-time</span></pre>
+wled         <span class="g">2.32× real-time</span>
+<span class="c"># same s3 image, same host, esp-emulator 0.48.0 vs flexe (2026-10-09):</span>
+cpuburn     <span class="g">0.74s jit vs 13.91s official</span> <span class="c">(1.21b insns, identical checksum)</span></pre>
       </div>
     </section>
 
@@ -395,7 +397,7 @@ wled         <span class="g">2.32× real-time</span></pre>
         <span class="prereq">zlib + pthreads</span>
         <span class="prereq">an esp-idf firmware .bin to play with</span>
       </div>
-      <p class="bench-note">production benchmarks measured on apple silicon with a release, lto, host-native build. jit is on by default. real-time factor is measured against a 240 mhz esp32.</p>
+      <p class="bench-note">production benchmarks measured on apple silicon with a release, lto, host-native build. jit is on by default. real-time factor is measured against a 240 mhz esp32. the esp-emulator 0.48.0 head-to-head (2026-10-09, same s3 images, same host) is documented with the other dated results.</p>
     </section>
 
     <!-- footer -->
