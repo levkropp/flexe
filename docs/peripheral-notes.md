@@ -188,8 +188,9 @@ software-output selection and inversion, matrix input selection and constant
 inputs, host-driven digital inputs, IO_MUX `FUN_IE` gating of digital reads,
 matrix inputs and interrupts, driven-output input feedback, edge/level status
 latching, W1TS/W1TC aliases, and the shared normal/NMI sources routed through
-both cores' target interrupt matrices. The virtual target currently supplies
-zero-valued strap inputs. Time-varying producers such as RMT and MCPWM are
+both cores' target interrupt matrices. Strapping pins default to zero and
+can be overridden per boot with `--strap-mode` (raw `GPIO_STRAP_REG` value;
+`0x07` selects s3 uart0 download). Time-varying producers such as RMT and MCPWM are
 sampled at the current guest time on every relevant `GPIO_IN` read; only a
 matrix-input or GPIO-interrupt consumer asks the event queue to retain their
 individual edges. Host samples, pad hold, RTC ownership, output inversion,

@@ -220,6 +220,19 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
             return -1;
         }
     }
+    if (cfg->has_strap_mode) {
+        int strap_res = periph_set_strap_mode(s->periph, cfg->strap_mode);
+        if (strap_res == -2) {
+            fprintf(stderr,
+                    "flexe: --strap-mode supplied but this target has no "
+                    "strap model\n");
+            return -1;
+        }
+        if (strap_res != 0) {
+            fprintf(stderr, "flexe: strap apply error\n");
+            return -1;
+        }
+    }
     if (cfg->unhandled_audit)
         periph_unhandled_audit_enable(s->periph);
     if (cfg->uart_cb)

@@ -116,6 +116,7 @@ struct flexe_gpio {
     uint64_t output_signal_enable[GPIO_FUNC_OUT_SIGNAL_WORDS];
     uint32_t clock_gate;
     uint32_t date;
+    uint32_t strap;
     bool irq_level[2];
     uint64_t held_pins;
     uint64_t rtc_owned;
@@ -731,7 +732,7 @@ static uint32_t gpio_read(void *ctx, uint32_t addr)
     case GPIO_SDIO_SELECT_OFF: return gpio->sdio_select;
     case GPIO_ENABLE_OFF: return gpio->enable[0];
     case GPIO_ENABLE1_OFF: return gpio->enable[1];
-    case GPIO_STRAP_OFF: return desc->strap_reset & GPIO_STRAP_MASK;
+    case GPIO_STRAP_OFF: return gpio->strap & GPIO_STRAP_MASK;
     case GPIO_IN_OFF:
     case GPIO_IN1_OFF: {
         unsigned bank = off == GPIO_IN_OFF ? 0u : 1u;
@@ -1010,6 +1011,7 @@ flexe_gpio_t *flexe_gpio_create(
     gpio->irq_ctx = irq_ctx;
     gpio->clock_gate = GPIO_CLOCK_GATE_ENABLE;
     gpio->date = target->gpio.date_reset & GPIO_DATE_MASK;
+    gpio->strap = target->gpio.strap_reset & GPIO_STRAP_MASK;
     gpio->input_enable[0] = (uint32_t)target->gpio.valid_gpio_mask;
     gpio->input_enable[1] =
         (uint32_t)(target->gpio.valid_gpio_mask >> 32u);
@@ -1058,6 +1060,12 @@ void flexe_gpio_set_input_enable(flexe_gpio_t *gpio, unsigned pin,
         bool pad = (gpio->input[bank] & mask) != 0u;
         gpio_notify_input_signals(gpio, pin, pad, pad, old_enabled, enabled);
     }
+}
+
+void flexe_gpio_set_strap(flexe_gpio_t *gpio, uint32_t value)
+{
+    if (!gpio) return;
+    gpio->strap = value & GPIO_STRAP_MASK;
 }
 
 void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level)

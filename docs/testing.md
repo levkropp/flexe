@@ -333,6 +333,10 @@ gate needs a build with
 libslirp 4.9 or newer and `jq`; it binds a randomly selected host loopback
 port and checks page delivery, a JSON state change, readback, and Ethernet
 delivery.
+`check-s3-remote-channels.sh` boots the pinned hello image with `--uart-tcp`
+and `--control-tcp`, then checks ping/unknown/erase/write replies, reboot
+survival of both servers, and post-reset uart output arriving on the bridge
+socket.
 Interactive gates use one bounded incremental output watcher for readiness and
 UART markers. It reads only newly appended bytes (and can decode sandbox JSONL
 UART events in-stream), replacing tight shell loops that repeatedly rescanned

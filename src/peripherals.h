@@ -555,6 +555,17 @@ int  periph_intr_matrix_get(const esp32_periph_t *p, int core, int cpu_int);
  * firmware's gpio_get_level() returns the new value on its next read. */
 void periph_gpio_set_input(esp32_periph_t *p, int pin, int level);
 
+/* Override the GPIO_STRAP_REG sample for ROM boot-mode selection
+ * (--strap-mode). Returns 0 when applied, -2 when this machine has no GPIO
+ * strap model (classic ESP32). */
+int periph_set_strap_mode(esp32_periph_t *p, uint32_t strap);
+
+/* Host-side NOR erase/program for the control channel. See implementation
+ * notes for NOR semantics and invalidation. */
+int periph_flash_host_erase(esp32_periph_t *p, uint32_t offset, uint32_t len);
+int periph_flash_host_write(esp32_periph_t *p, uint32_t offset,
+                             const uint8_t *data, uint32_t len);
+
 /* Capacitive touch: set the raw count a pad reports. The ESP32 counts *down*
  * as capacitance rises, so a touched pad reads below its threshold. Pads are
  * 0-9, mapping to GPIO 4, 0, 2, 15, 13, 12, 14, 27, 33, 32. */

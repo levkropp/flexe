@@ -62,6 +62,17 @@ typedef struct {
 } elf32_sym_t;
 
 typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+} elf32_phdr_t;
+
+typedef struct {
     const char *name;
     uint32_t addr;
     uint32_t size;
@@ -71,6 +82,9 @@ typedef struct {
 _Static_assert(sizeof(elf32_ehdr_t) == 52, "ELF32 header layout");
 _Static_assert(sizeof(elf32_shdr_t) == 40, "ELF32 section layout");
 _Static_assert(sizeof(elf32_sym_t) == 16, "ELF32 symbol layout");
+_Static_assert(sizeof(elf32_phdr_t) == 32, "ELF32 segment layout");
+
+#define ELF_PT_LOAD 1u
 
 static void rom_error(rom_elf_load_result_t *res, const char *fmt, ...)
 {
@@ -274,6 +288,57 @@ rom_elf_load_result_t rom_elf_load(xtensa_mem_t *mem, const char *path)
 
     rom_data_section_t data_sections[ROM_ELF_MAX_DATA_SECTIONS];
     unsigned data_count = 0;
+
+    /* Section headers skip mask-ROM bytes the startup unpack table copies
+     * into DRAM (S3 initializers near the end of IRAM0). Those bytes only
+     * exist as PT_LOAD paddr ranges, which is also how QEMU-style loaders
+     * see them. Load every ROM-range segment first; the curated section
+     * pass below overwrites any overlap with identical file bytes. */
+    if (ehdr.e_phoff != 0u && ehdr.e_phnum != 0u) {
+        if (ehdr.e_phentsize < sizeof(elf32_phdr_t) ||
+            ehdr.e_phoff > file_size ||
+            ehdr.e_phnum > (file_size - ehdr.e_phoff) / ehdr.e_phentsize) {
+            rom_error(&res, "Malformed ELF segment table");
+            free(buf);
+            return res;
+        }
+        for (uint32_t i = 0u; i < ehdr.e_phnum; i++) {
+            size_t off = ehdr.e_phoff + (size_t)i * ehdr.e_phentsize;
+            elf32_phdr_t ph;
+            memcpy(&ph, buf + off, sizeof(ph));
+            if (ph.p_type != ELF_PT_LOAD || ph.p_memsz == 0u) continue;
+            if (!file_range_valid(ph.p_offset, ph.p_filesz, file_size) ||
+                ph.p_filesz > ph.p_memsz) {
+                rom_error(&res, "Malformed ROM segment %u", i);
+                free(buf);
+                return res;
+            }
+            if (!rom_range_contains(mem, ph.p_paddr, ph.p_memsz)) continue;
+            if (!guest_range_mapped(mem, ph.p_paddr, ph.p_memsz) ||
+                mem_load(mem, ph.p_paddr, buf + ph.p_offset,
+                         ph.p_filesz) != 0) {
+                rom_error(&res, "ROM segment %u does not fit at 0x%08X",
+                          i, ph.p_paddr);
+                free(buf);
+                return res;
+            }
+            if (ph.p_memsz > ph.p_filesz) {
+                uint32_t tail = ph.p_memsz - ph.p_filesz;
+                uint8_t *dst = mem_get_ptr_w(mem, ph.p_paddr + ph.p_filesz);
+                if (!dst || !guest_range_mapped(mem, ph.p_paddr + ph.p_filesz,
+                                                tail)) {
+                    rom_error(&res, "ROM segment %u tail does not fit at "
+                              "0x%08X", i, ph.p_paddr + ph.p_filesz);
+                    free(buf);
+                    return res;
+                }
+                memset(dst, 0, tail);
+            }
+            res.sections_loaded++;
+            res.bytes_loaded += ph.p_memsz;
+        }
+    }
+
     for (uint32_t i = 0; i < ehdr.e_shnum; i++) {
         elf32_shdr_t sh;
         const char *name;

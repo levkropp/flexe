@@ -115,6 +115,11 @@ void flexe_gpio_set_input(flexe_gpio_t *gpio, unsigned pin, bool level);
 /* Raw pad sample for RTCIO and wake logic, independent of digital FUN_IE. */
 int flexe_gpio_input_level(const flexe_gpio_t *gpio, unsigned pin);
 
+/* Override the strapping-pin sample seen in GPIO_STRAP_REG. The mask keeps
+ * unstrapped bits at their reset value; call before reset so ROM boot
+ * decisions observe it. */
+void flexe_gpio_set_strap(flexe_gpio_t *gpio, uint32_t value);
+
 /* Resolve a peripheral input routed through the GPIO matrix. Returns -1 for
  * an invalid signal, IO_MUX bypass, or an unbonded selected pin. */
 int flexe_gpio_input_signal_level(const flexe_gpio_t *gpio, unsigned signal);

@@ -1071,12 +1071,80 @@ TEST(spi_mem_s3_optional_ap_opi_psram_registers_array_and_cache) {
     mem_destroy(mem);
 }
 
+TEST(spi_mem_host_erase_write_sync_backings_and_invalidate)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    xtensa_cpu_t cpu;
+    spi_mem_invalidate_probe_t probe = {0};
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    xtensa_cpu_init_for_target(&cpu, s3);
+    cpu.mem = mem;
+    cpu.code_invalidate = spi_mem_test_invalidate;
+    cpu.code_invalidate_ctx = &probe;
+    periph_attach_cpus(periph, &cpu, NULL);
+
+    /* Virtual page 3 aliases physical flash page 2. */
+    mem_write32(mem, s3->flash_mmu.table_base[0] + 3u * 4u, 2u);
+    probe.calls = 0u;
+    const uint32_t offset = 0x20020u;
+    const uint8_t pattern[4] = {0xAAu, 0x55u, 0xF0u, 0x0Fu};
+    const uint8_t ones[4] = {0xFFu, 0xFFu, 0xFFu, 0xFFu};
+    const uint8_t zeros[4] = {0u, 0u, 0u, 0u};
+
+    ASSERT_EQ(periph_flash_host_write(NULL, offset, pattern, 4u), -1);
+    ASSERT_EQ(periph_flash_host_write(periph, offset, NULL, 4u), -1);
+    ASSERT_EQ(periph_flash_host_erase(NULL, offset, 4u), -1);
+    ASSERT_EQ(periph_flash_host_write(periph, offset, pattern, 0u), 0);
+    ASSERT_EQ(probe.calls, 0u);
+
+    ASSERT_EQ(periph_flash_host_write(periph, offset, pattern, 4u), 0);
+    ASSERT_EQ(mem->flash_data[offset], 0xAAu);
+    ASSERT_EQ(mem->flash_insn[offset], 0xAAu);
+    ASSERT_EQ(probe.calls, 1u);
+    ASSERT_EQ(probe.addr, 0x42030000u);
+    ASSERT_EQ(probe.len, 0x10000u);
+
+    /* NOR programming only clears bits: ones do not stick, zeros do. */
+    ASSERT_EQ(periph_flash_host_write(periph, offset, ones, 4u), 0);
+    ASSERT_EQ(mem->flash_data[offset], 0xAAu);
+    ASSERT_EQ(periph_flash_host_write(periph, offset, zeros, 4u), 0);
+    ASSERT_EQ(mem->flash_data[offset], 0u);
+    ASSERT_EQ(mem->flash_insn[offset + 3u], 0u);
+
+    probe.calls = 0u;
+    ASSERT_EQ(periph_flash_host_erase(periph, offset, 4u), 0);
+    ASSERT_EQ(mem->flash_data[offset], 0xFFu);
+    ASSERT_EQ(mem->flash_insn[offset], 0xFFu);
+    ASSERT_EQ(probe.calls, 1u);
+
+    uint32_t size = mem_flash_physical_size(mem);
+    ASSERT_TRUE(size > 4u);
+    ASSERT_EQ(periph_flash_host_write(periph, size - 2u, pattern, 4u), -1);
+    ASSERT_EQ(periph_flash_host_erase(periph, size, 4u), -1);
+    ASSERT_EQ(mem->flash_data[offset], 0xFFu);
+    ASSERT_EQ(periph_unhandled_count(periph), 0);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_spi_mem_tests(void) {
     TEST_SUITE("Target SPI memory controller");
     RUN_TEST(spi_mem_uses_target_layouts_and_reports_jedec_id);
     RUN_TEST(spi_mem_classic_routes_psram_by_chip_select_and_wire_phases);
     RUN_TEST(spi_mem_unpopulated_chip_select_clocks_any_command_width);
     RUN_TEST(spi_mem_s3_program_erase_and_shared_mmu_invalidation);
+    RUN_TEST(spi_mem_host_erase_write_sync_backings_and_invalidate);
     RUN_TEST(spi_mem_reports_allocated_flash_capacity);
     RUN_TEST(spi_mem_sfdp_matches_advertised_gd25q_c_profiles);
     RUN_TEST(spi_mem_gd25q32c_status_survives_flash_reset);

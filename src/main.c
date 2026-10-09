@@ -10,6 +10,7 @@
 #include "rom_stubs.h"
 #include "wifi_stubs.h"
 #include "host_net_slirp.h"
+#include "uart_tcp.h"
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
 #include "savestate.h"
@@ -469,6 +470,9 @@ static void check_assertions(const trace_assert_t *asserts, int count,
 /* ===== UART stdout callback ===== */
 
 static int g_suppress_uart_stdout = 0;
+/* UART TCP bridge (esptool socket://). While a client is connected, guest
+ * UART0 TX belongs to the socket and host stdout stays out of the path. */
+static uart_tcp_bridge_t *g_uart_bridge = NULL;
 
 /* UART TX bytes arrive one at a time from the MMIO handler. Writing each
  * with putchar() pays a flockfile/funlockfile mutex pair per byte, which
@@ -486,10 +490,127 @@ static void uart_out_flush(void) {
 
 static void uart_stdout_cb(void *ctx, uint8_t byte) {
     (void)ctx;
+    if (g_uart_bridge && uart_tcp_bridge_has_client(g_uart_bridge)) {
+        uart_tcp_bridge_send(g_uart_bridge, byte);
+        return;
+    }
     if (g_suppress_uart_stdout) return;
     g_uart_out_buf[g_uart_out_len++] = (char)byte;
     if (byte == '\n' || g_uart_out_len == sizeof(g_uart_out_buf))
         uart_out_flush();
+}
+
+/* ===== Host control channel (--control-tcp) =====
+ * Newline-delimited commands served while the emulator runs: reset,
+ * erase-flash, erase-region OFF LEN, write-region OFF FILE, ping.
+ * Flash operations act on the live NOR backing with the same code
+ * invalidation as guest writes. A reset rebuilds the machine in-process,
+ * so the emulator output stream survives it. */
+static unsigned long ctrl_parse_number(const char *text, int *ok)
+{
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 0);
+    *ok = end != NULL && *end == '\0';
+    return value;
+}
+
+static void handle_control_line(flexe_session_t *session,
+                                 ctrl_tcp_server_t *ctrl, const char *line)
+{
+    if (strcmp(line, "ping") == 0) {
+        ctrl_tcp_reply(ctrl, "ok");
+        return;
+    }
+    if (strcmp(line, "reset") == 0 || strcmp(line, "reset --soft") == 0) {
+        /* One software-reset path preserving flash, like the guest's own
+         * restart; a power-on reset with cleared flash is not modeled. */
+        flexe_session_reset(session);
+        ctrl_tcp_reply(ctrl, "ok");
+        return;
+    }
+    if (strcmp(line, "erase-flash") == 0) {
+        xtensa_mem_t *mem = flexe_session_mem(session);
+        esp32_periph_t *periph = flexe_session_periph(session);
+        uint32_t size = mem ? mem_flash_physical_size(mem) : 0u;
+        if (!mem || !periph || size == 0u ||
+            periph_flash_host_erase(periph, 0u, size) != 0)
+            ctrl_tcp_reply(ctrl, "err: erase-flash failed");
+        else
+            ctrl_tcp_reply(ctrl, "ok");
+        return;
+    }
+    if (strncmp(line, "erase-region ", 13) == 0) {
+        char off_text[32], len_text[32];
+        if (sscanf(line + 13, "%31s %31s", off_text, len_text) == 2) {
+            int ok_off = 0, ok_len = 0;
+            unsigned long off = ctrl_parse_number(off_text, &ok_off);
+            unsigned long len = ctrl_parse_number(len_text, &ok_len);
+            esp32_periph_t *periph = flexe_session_periph(session);
+            if (ok_off && ok_len && periph &&
+                periph_flash_host_erase(periph, (uint32_t)off,
+                                         (uint32_t)len) == 0) {
+                ctrl_tcp_reply(ctrl, "ok");
+                return;
+            }
+        }
+        ctrl_tcp_reply(ctrl, "err: usage: erase-region OFFSET LENGTH");
+        return;
+    }
+    if (strncmp(line, "write-region ", 13) == 0) {
+        char off_text[32], path[1024];
+        if (sscanf(line + 13, "%31s %1023s", off_text, path) == 2) {
+            int ok_off = 0;
+            unsigned long off = ctrl_parse_number(off_text, &ok_off);
+            FILE *f = fopen(path, "rb");
+            if (ok_off && f) {
+                fseek(f, 0, SEEK_END);
+                long size = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                uint8_t *data = size > 0 ? malloc((size_t)size) : NULL;
+                if (data && fread(data, 1u, (size_t)size, f) == (size_t)size) {
+                    esp32_periph_t *periph = flexe_session_periph(session);
+                    if (periph && periph_flash_host_write(
+                            periph, (uint32_t)off, data,
+                            (uint32_t)size) == 0) {
+                        free(data);
+                        fclose(f);
+                        ctrl_tcp_reply(ctrl, "ok");
+                        return;
+                    }
+                }
+                free(data);
+                fclose(f);
+            } else if (f) {
+                fclose(f);
+            }
+        }
+        ctrl_tcp_reply(ctrl, "err: usage: write-region OFFSET FILE");
+        return;
+    }
+    ctrl_tcp_reply(ctrl, "err: unknown command");
+}
+
+/* Pump the UART bridge and drain control commands. Control lines run here so
+ * a control-triggered reset is observed by the reset-count check below,
+ * which refreshes the freshly rebuilt peripheral handles. */
+static void pump_remote_channels(uart_tcp_bridge_t *bridge,
+                                  ctrl_tcp_server_t *ctrl,
+                                  flexe_session_t *session)
+{
+    if (bridge)
+        uart_tcp_bridge_pump(bridge, flexe_session_periph(session));
+    if (!ctrl) return;
+    ctrl_tcp_pump(ctrl);
+    for (unsigned n = 0u; n < 16u; n++) {
+        char line[1024];
+        int res = ctrl_tcp_poll_line(ctrl, line, sizeof(line));
+        if (res == 0) break;
+        if (res < 0) {
+            ctrl_tcp_reply(ctrl, "err: line too long");
+            continue;
+        }
+        handle_control_line(session, ctrl, line);
+    }
 }
 
 /* ===== Exception cause names ===== */
@@ -692,9 +813,12 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
     fprintf(stderr, "  --psram <chip>  Attach optional S3 PSRAM: ap-8m-opi (default: none)\n");
     fprintf(stderr, "  --efuse <file>   Load a 336-byte eFuse blob overriding MAC and chip revision (S3)\n");
+    fprintf(stderr, "  --strap-mode <hex>  GPIO_STRAP_REG sample for ROM boot selection (0x02 = UART download)\n");
     fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
     fprintf(stderr, "  --sandbox-events  Emit peripheral NDJSON and accept GPIO/touch/ADC/UART/I2S input on stdin\n");
     fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
+    fprintf(stderr, "  --uart-tcp <HOST:PORT>  Bridge UART0 to a TCP server for esptool socket:// (UART RX/TX move to the socket while connected)\n");
+    fprintf(stderr, "  --control-tcp <HOST:PORT>  Host control channel: reset, erase-flash, erase-region OFF LEN, write-region OFF FILE, ping\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -1076,6 +1200,10 @@ int main(int argc, char *argv[]) {
     const char *aot_dylib_path = NULL;
     const char *net_hostfwd_spec = NULL;
     const char *efuse_path = NULL;
+    const char *uart_tcp_spec = NULL;
+    const char *control_tcp_spec = NULL;
+    uint32_t strap_mode = 0;
+    int has_strap_mode = 0;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
     flexe_board_psram_t board_psram = FLEXE_BOARD_PSRAM_DEFAULT;
 
@@ -1178,8 +1306,27 @@ int main(int argc, char *argv[]) {
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
             continue;
+        } else if (strcmp(argv[i], "--uart-tcp") == 0 && i + 1 < argc) {
+            uart_tcp_spec = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--control-tcp") == 0 && i + 1 < argc) {
+            control_tcp_spec = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
         } else if (strcmp(argv[i], "--efuse") == 0 && i + 1 < argc) {
             efuse_path = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--strap-mode") == 0 && i + 1 < argc) {
+            strap_mode = (uint32_t)strtoul(argv[i + 1], NULL, 0);
+            has_strap_mode = 1;
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1335,6 +1482,8 @@ int main(int argc, char *argv[]) {
         .elf_path = elf_path,
         .rom_elf_path = rom_elf_path,
         .efuse_path = efuse_path,
+        .strap_mode = strap_mode,
+        .has_strap_mode = has_strap_mode,
         .sdcard_path = sdcard_path,
         .sdcard_size = sdcard_size,
         .entry_override = has_entry_override ? entry_override : 0,
@@ -1590,6 +1739,45 @@ int main(int argc, char *argv[]) {
      * ticks that drive LVGL tick subsystems. */
     int batch = 10000;
     int trace_batch_steps = 0;
+    /* Host TCP bridges live outside the session so resets never drop them. */
+    uart_tcp_bridge_t *uart_bridge = NULL;
+    ctrl_tcp_server_t *ctrl_server = NULL;
+    if (uart_tcp_spec) {
+        char uart_host[256];
+        int uart_port = 0;
+        if (uart_tcp_parse_endpoint(uart_tcp_spec, uart_host,
+                                    sizeof(uart_host), &uart_port) != 0 ||
+            (uart_bridge = uart_tcp_bridge_create(uart_host,
+                                                  uart_port)) == NULL) {
+            fprintf(stderr, "flexe: cannot listen on --uart-tcp %s\n",
+                    uart_tcp_spec);
+            flexe_host_net_destroy(host_net);
+            flexe_session_destroy(session);
+            ring_destroy(g_ring);
+            return 1;
+        }
+        g_uart_bridge = uart_bridge;
+        fprintf(stderr, "flexe: UART0 bridged to TCP %s:%d\n", uart_host,
+                uart_port);
+    }
+    if (control_tcp_spec) {
+        char ctrl_host[256];
+        int ctrl_port = 0;
+        if (uart_tcp_parse_endpoint(control_tcp_spec, ctrl_host,
+                                    sizeof(ctrl_host), &ctrl_port) != 0 ||
+            (ctrl_server = ctrl_tcp_create(ctrl_host, ctrl_port)) == NULL) {
+            fprintf(stderr, "flexe: cannot listen on --control-tcp %s\n",
+                    control_tcp_spec);
+            uart_tcp_bridge_destroy(uart_bridge);
+            g_uart_bridge = NULL;
+            flexe_host_net_destroy(host_net);
+            flexe_session_destroy(session);
+            ring_destroy(g_ring);
+            return 1;
+        }
+        fprintf(stderr, "flexe: control channel on TCP %s:%d\n", ctrl_host,
+                ctrl_port);
+    }
     unsigned observed_resets = flexe_session_reset_count(session);
     while (cycles < max_cycles_u64 &&
            (cpu->running || (cpu1_any && cpu1_any->running) ||
@@ -1845,6 +2033,7 @@ int main(int argc, char *argv[]) {
             hb_stub_count = 0;
         }
         flexe_host_net_pump(host_net);
+        pump_remote_channels(uart_bridge, ctrl_server, session);
 
         /* Progress heartbeat */
         if (heartbeat_interval > 0 &&
@@ -2195,6 +2384,9 @@ int main(int argc, char *argv[]) {
         g_htrace = NULL;
     }
     flexe_host_net_destroy(host_net);
+    uart_tcp_bridge_destroy(uart_bridge);
+    g_uart_bridge = NULL;
+    ctrl_tcp_destroy(ctrl_server);
     flexe_session_destroy(session);
     return strict_mmio && unhandled_count != 0 ? 1 : 0;
 }

@@ -183,6 +183,9 @@ the image's chip id and revision bounds select the machine.
 | `--target esp32` / `--target esp32s3` | assert a target, useful in ci |
 | `-R ROM_ELF` | load the official matching mask-rom code and data |
 | `--efuse BLOB` | load a 336-byte efuse blob overriding s3 mac and chip revision (default: revision-0 profile) |
+| `--strap-mode HEX` | raw `GPIO_STRAP_REG` sample for rom boot selection (`0x07` = s3 uart0 download; default: spi boot) |
+| `--uart-tcp HOST:PORT` | bridge uart0 to a tcp server; while a client is connected, uart rx/tx move off stdin/stdout |
+| `--control-tcp HOST:PORT` | host control channel: `reset`, `erase-flash`, `erase-region`, `write-region`, `ping` |
 | `-s firmware.elf` | load application symbols for debugging and symbol-based services |
 | `-N` | run the firmware's native freertos; use for s3 |
 | `--psram ap-8m-opi` | opt into an 8 mib aps6408l-3obmx octal psram on s3 cs1 |
@@ -204,6 +207,29 @@ official rom binaries are not copied into the repository.
 hardware-facing hooks retain priority; other mask-rom calls execute the
 loaded instructions. native translation uses target descriptors and exact
 hook membership, rather than firmware names or pc lists.
+
+## host tcp channels
+
+`--uart-tcp` bridges uart0 to a tcp server (one client at a time; recabling
+drops the previous client) and `--control-tcp` serves `reset`, `erase-flash`,
+`erase-region OFF LEN`, `write-region OFF FILE`, and `ping` with one reply
+per line. a control reset rebuilds the machine in-process with flash
+preserved, so both servers and the output stream survive it; to boot a newly
+flashed image normally, restart without `--strap-mode`. control flash
+operations share the guest write path, including translated-code
+invalidation. `scripts/check-s3-remote-channels.sh` gates replies, reboot
+survival, and post-reset uart output on the bridge socket.
+
+esptool over `socket://` is **blocked, not working**: the s3 rom enters uart0
+download mode correctly under `--strap-mode 0x07` (the banner reports
+`boot:0x7 (UART0_BOOT)`), but its startup unpack table copies dram
+initializers from mask-rom bytes the official rom elf does not ship
+(`PT_LOAD` file ranges there are all zeros), so the unpack zeroes the
+interface state — including `ets_ops_table_ptr` — and the download stub
+traps before speaking slip. qemu-style loaders see the same absence; it is
+a property of the distributed elf, verified word-for-word against the
+unpack table and section headers. host-side slip flashing without the rom
+stub is future work; the transports above are ready for it.
 
 ## where the boundaries are
 

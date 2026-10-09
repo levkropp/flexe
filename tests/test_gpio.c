@@ -636,6 +636,49 @@ TEST(target_gpio_diagnoses_behavior_outside_functional_envelope)
     mem_destroy(mem);
 }
 
+TEST(target_gpio_strap_override_visible_in_strap_register)
+{
+    const flexe_target_desc_t *s3 =
+        flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    const flexe_gpio_desc_t *desc = &s3->gpio;
+    xtensa_mem_t *mem = mem_create_for_target(s3);
+    esp32_periph_t *periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+
+    ASSERT_EQ(periph_set_strap_mode(NULL, 2u), -1);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x038u), 0u);
+    ASSERT_EQ(periph_set_strap_mode(periph, 0x02u), 0);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x038u), 0x02u);
+    ASSERT_EQ(periph_set_strap_mode(periph, 0x1FFFFu), 0);
+    ASSERT_EQ(mem_read32(mem, desc->base + 0x038u), 0xFFFFu);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+
+    /* Classic ESP32 has no strap model, so the override has nowhere to go. */
+    const flexe_target_desc_t *classic =
+        flexe_target_by_id(FLEXE_TARGET_ESP32);
+    mem = mem_create_for_target(classic);
+    periph = periph_create(mem);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_TRUE(periph != NULL);
+    if (!mem || !periph) {
+        periph_destroy(periph);
+        mem_destroy(mem);
+        return;
+    }
+    ASSERT_EQ(periph_set_strap_mode(periph, 0x02u), -2);
+
+    periph_destroy(periph);
+    mem_destroy(mem);
+}
+
 void run_target_gpio_tests(void)
 {
     TEST_SUITE("Target GPIO");
@@ -650,5 +693,6 @@ void run_target_gpio_tests(void)
     RUN_TEST(target_gpio_resolves_matrix_inputs_and_rejects_unbonded_pads);
     RUN_TEST(target_gpio_pad_hold_defers_output_notifications_until_release);
     RUN_TEST(target_gpio_open_drain_releases_high_and_notifies_pad);
+    RUN_TEST(target_gpio_strap_override_visible_in_strap_register);
     RUN_TEST(target_gpio_diagnoses_behavior_outside_functional_envelope);
 }

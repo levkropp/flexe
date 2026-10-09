@@ -167,6 +167,7 @@ set(LIB_SOURCES
     src/hierarchical_trace.c
     src/sandbox_input.c
     src/sandbox_events.c
+    src/uart_tcp.c
     src/aot.c
 )
 
@@ -269,6 +270,7 @@ set(TEST_SOURCES
     tests/test_system_clock.c
     tests/test_syscon_memory.c
     tests/test_sandbox_input.c
+    tests/test_uart_tcp.c
     tests/test_systimer.c
     tests/test_timer_group.c
     tests/test_rmt_v1.c

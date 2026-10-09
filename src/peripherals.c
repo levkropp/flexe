@@ -17510,8 +17510,57 @@ bool periph_touch_running(const esp32_periph_t *p) {
     return p && flexe_touch_v2_running(p->touch_v2);
 }
 
-void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {
-    if (!p || pin < 0) return;
+int periph_set_strap_mode(esp32_periph_t *p, uint32_t strap)
+{
+    if (!p) return -1;
+    if (!p->target_gpio) return -2;
+    flexe_gpio_set_strap(p->target_gpio, strap);
+    return 0;
+}
+
+/* Host-side NOR mutation for the control channel and other host-driven
+ * flash operations. Erase fills 0xFF; write AND-merges like NOR programming
+ * (program a range twice without an erase and only cleared bits survive).
+ * Both synchronize the data and instruction backings and invalidate
+ * translated code through the same path as guest writes. Bounds are checked
+ * against the physical backing. Returns 0 on success, -1 on bad
+ * input/out-of-range, -2 when this machine has no flash backing. */
+int periph_flash_host_erase(esp32_periph_t *p, uint32_t offset, uint32_t len)
+{
+    if (!p || !p->mem) return -1;
+    uint32_t size = mem_flash_physical_size(p->mem);
+    if (size == 0u) return -2;
+    if (len == 0u) return 0;
+    if (offset >= size || len > size - offset) return -1;
+    uint8_t *data = mem_backing_ptr(p->mem, FLEXE_MEM_FLASH_DATA);
+    uint8_t *insn = mem_backing_ptr(p->mem, FLEXE_MEM_FLASH_INSN);
+    if (!data || !insn) return -2;
+    memset(data + offset, 0xFF, len);
+    memset(insn + offset, 0xFF, len);
+    periph_flash_changed(p, offset, len);
+    return 0;
+}
+
+int periph_flash_host_write(esp32_periph_t *p, uint32_t offset,
+                             const uint8_t *data, uint32_t len)
+{
+    if (!p || !p->mem) return -1;
+    uint32_t size = mem_flash_physical_size(p->mem);
+    if (size == 0u) return -2;
+    if (len == 0u) return 0;
+    if (!data || offset >= size || len > size - offset) return -1;
+    uint8_t *flash_data = mem_backing_ptr(p->mem, FLEXE_MEM_FLASH_DATA);
+    uint8_t *flash_insn = mem_backing_ptr(p->mem, FLEXE_MEM_FLASH_INSN);
+    if (!flash_data || !flash_insn) return -2;
+    for (uint32_t i = 0u; i < len; i++) {
+        flash_data[offset + i] &= data[i];
+        flash_insn[offset + i] &= data[i];
+    }
+    periph_flash_changed(p, offset, len);
+    return 0;
+}
+
+void periph_gpio_set_input(esp32_periph_t *p, int pin, int level) {    if (!p || pin < 0) return;
     if (p->target_gpio) {
         flexe_gpio_set_input(p->target_gpio, (unsigned)pin, level != 0);
         return;

@@ -32,6 +32,8 @@ typedef struct {
     const char *elf_path;           /* ELF symbol file (NULL = no symbols) */
     const char *rom_elf_path;       /* ESP32 ROM ELF (NULL = FLEXE_ROM_ELF) */
     const char *efuse_path;         /* 336-byte eFuse blob (NULL = profile) */
+    uint32_t    strap_mode;         /* GPIO_STRAP_REG sample for ROM boot */
+    int         has_strap_mode;     /* 1 = override strapping pins */
     const char *sdcard_path;        /* SD card backing image (NULL = none) */
     uint64_t    sdcard_size;        /* SD card size override (0 = auto) */
 
