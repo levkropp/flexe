@@ -48,7 +48,11 @@ power-on reset state, RTC interrupt aggregation and watchdog, a read-only
 revision-0 eFuse profile, digital pad configuration, UARTs, native USB
 Serial/JTAG, digital GPIO matrix, external I2C controllers, and interrupt
 matrix. Its unified SHA accelerator supports direct and GDMA-fed SHA-1,
-SHA-224, SHA-256, SHA-384, and SHA-512 blocks.
+SHA-224, SHA-256, SHA-384, and SHA-512 blocks. The S3 eFuse profile defaults
+to revision 0.0 with a locally administered MAC; `--efuse` loads a 336-byte
+QEMU-compatible blob that overrides the factory MAC, wafer revision, and ADC
+calibration block versions, so firmware with `REV_MIN` constraints observes
+the stated silicon.
 Run S3 firmware with native FreeRTOS (`-N`) and an official matching ROM ELF
 (`-R /path/to/esp32s3_rev0_rom.elf`). Native translation is selected by the
 target descriptor rather than a firmware identity or PC list. Unsupported

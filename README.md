@@ -119,6 +119,7 @@ workflow and a modeled hardware controller have different support boundaries.
 | `--no-jit` | compare with the interpreter |
 | `--jit-stats` / `--jit-verify` | inspect native coverage / compare replayable blocks |
 | `-s ELF` / `-R ROM_ELF` | load application symbols / official mask-rom code and data |
+| `--efuse BLOB` | override s3 mac and chip revision from a 336-byte efuse blob |
 | `--strict-mmio` | fail on unsupported peripheral accesses while keeping the jit enabled |
 | `--unhandled-report` | attribute unsupported accesses to registers and guest pcs in the interpreter |
 | `--sandbox-events` | exchange peripheral events and host input as ndjson |

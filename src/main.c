@@ -691,6 +691,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --jit-stats     Print JIT block/coverage statistics on exit\n");
     fprintf(stderr, "  --target <soc>  Require auto, esp32, or esp32s3 (default: auto)\n");
     fprintf(stderr, "  --psram <chip>  Attach optional S3 PSRAM: ap-8m-opi (default: none)\n");
+    fprintf(stderr, "  --efuse <file>   Load a 336-byte eFuse blob overriding MAC and chip revision (S3)\n");
     fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
     fprintf(stderr, "  --sandbox-events  Emit peripheral NDJSON and accept GPIO/touch/ADC/UART/I2S input on stdin\n");
     fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
@@ -1074,6 +1075,7 @@ int main(int argc, char *argv[]) {
     /* AOT statically-recompiled firmware dylib */
     const char *aot_dylib_path = NULL;
     const char *net_hostfwd_spec = NULL;
+    const char *efuse_path = NULL;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
     flexe_board_psram_t board_psram = FLEXE_BOARD_PSRAM_DEFAULT;
 
@@ -1172,6 +1174,12 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--net-hostfwd") == 0 && i + 1 < argc) {
             net_hostfwd_spec = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--efuse") == 0 && i + 1 < argc) {
+            efuse_path = argv[i + 1];
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1326,6 +1334,7 @@ int main(int argc, char *argv[]) {
         .bin_path = firmware,
         .elf_path = elf_path,
         .rom_elf_path = rom_elf_path,
+        .efuse_path = efuse_path,
         .sdcard_path = sdcard_path,
         .sdcard_size = sdcard_size,
         .entry_override = has_entry_override ? entry_override : 0,

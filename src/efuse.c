@@ -2,6 +2,8 @@
 #include "target.h"
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 struct flexe_efuse {
@@ -11,6 +13,10 @@ struct flexe_efuse {
     mmio_write_fn fallback_write;
     void *fallback_ctx;
     uint32_t date;
+    /* Per-instance read image. Starts as the compiled profile; a blob file
+     * or (in the future) guest burn commands merge fields into it. The
+     * shared target descriptor is never written. */
+    uint32_t image[FLEXE_TARGET_EFUSE_READ_WORD_MAX];
 };
 
 static bool efuse_geometry_valid(const flexe_target_desc_t *target)
@@ -61,7 +67,7 @@ static uint32_t efuse_read(void *ctx, uint32_t addr)
     uint32_t offset = addr - desc->base;
     unsigned index = 0u;
     if (efuse_read_word(desc, offset, &index))
-        return desc->read_data[index];
+        return efuse->image[index];
     if (offset == desc->date_offset) return efuse->date;
     return efuse->fallback_read ?
         efuse->fallback_read(efuse->fallback_ctx, addr) : 0u;
@@ -102,6 +108,8 @@ flexe_efuse_t *flexe_efuse_create(
     efuse->date = target->efuse.date_reset;
 
     const flexe_efuse_desc_t *desc = &target->efuse;
+    for (unsigned i = 0u; i < desc->read_data_word_count; i++)
+        efuse->image[i] = desc->read_data[i];
     if (mem_register_mmio_range(mem, desc->base, desc->register_size,
                                 efuse_read, efuse_write, efuse) != 0) {
         free(efuse);
@@ -119,4 +127,78 @@ void flexe_efuse_destroy(flexe_efuse_t *efuse)
         efuse->fallback_read, efuse->fallback_write,
         efuse->fallback_ctx);
     free(efuse);
+}
+
+int flexe_efuse_blob_load(const char *path,
+                           uint32_t words[FLEXE_EFUSE_BLOB_WORDS])
+{
+    if (!path || !words) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint8_t raw[FLEXE_EFUSE_BLOB_BYTES];
+    size_t got = fread(raw, 1u, sizeof(raw), f);
+    int trailing = fgetc(f);
+    fclose(f);
+    if (got != sizeof(raw) || trailing != EOF) return -1;
+    for (unsigned i = 0u; i < FLEXE_EFUSE_BLOB_WORDS; i++) {
+        words[i] = (uint32_t)raw[4u * i] |
+                   ((uint32_t)raw[4u * i + 1u] << 8) |
+                   ((uint32_t)raw[4u * i + 2u] << 16) |
+                   ((uint32_t)raw[4u * i + 3u] << 24);
+    }
+    return 0;
+}
+
+/* One merged blob field: SN source bits land in one instance-image word.
+ * Register/bit facts follow ESP-IDF's esp32s3 efuse table and register
+ * definitions (RD_MAC_SPI_SYS_* hold BLOCK1 slices; RD_SYS_PART1_DATA4 holds
+ * BLOCK2 word 4). Widths here never cross a word boundary. */
+typedef struct {
+    unsigned blob_word;
+    unsigned blob_shift;
+    unsigned width;
+    unsigned image_word;
+    unsigned image_shift;
+} efuse_blob_field_t;
+
+static void efuse_merge_field(uint32_t *image,
+                               const uint32_t *blob,
+                               const efuse_blob_field_t *field)
+{
+    uint32_t value = (blob[field->blob_word] >> field->blob_shift) &
+                     (field->width >= 32u ? UINT32_MAX
+                                          : ((1u << field->width) - 1u));
+    uint32_t mask = (field->width >= 32u ? UINT32_MAX
+                                         : ((1u << field->width) - 1u))
+                    << field->image_shift;
+    image[field->image_word] =
+        (image[field->image_word] & ~mask) |
+        ((value << field->image_shift) & mask);
+}
+
+/* ESP32-S3 identity fields: factory MAC (BLK1[47:0]), wafer revision
+ * (BLK1 minor lo/hi + major), and ADC-calibration block versions (BLK1
+ * minor, BLK2 major). Package, flash/PSRAM capacity, and analog trim stay at
+ * profile defaults until a consumer needs them. */
+static const efuse_blob_field_t efuse_s3_blob_fields[] = {
+    { 6u, 0u, 32u, 6u, 0u },    /* MAC low 32 */
+    { 7u, 0u, 16u, 7u, 0u },    /* MAC high 16 */
+    { 9u, 18u, 3u, 9u, 18u },   /* WAFER_VERSION_MINOR_LO */
+    { 9u, 24u, 3u, 9u, 24u },   /* BLK_VERSION_MINOR */
+    { 11u, 23u, 1u, 11u, 23u }, /* WAFER_VERSION_MINOR_HI */
+    { 11u, 24u, 2u, 11u, 24u }, /* WAFER_VERSION_MAJOR */
+    { 16u, 0u, 2u, 16u, 0u },   /* BLK_VERSION_MAJOR */
+};
+
+int flexe_efuse_apply_blob(flexe_efuse_t *efuse,
+                            const uint32_t words[FLEXE_EFUSE_BLOB_WORDS])
+{
+    if (!efuse || !words) return -1;
+    if (efuse->target->id != FLEXE_TARGET_ESP32S3) return 1;
+    if (efuse->target->efuse.read_data_word_count <= 16u) return -1;
+    for (unsigned i = 0u;
+         i < sizeof(efuse_s3_blob_fields) / sizeof(efuse_s3_blob_fields[0]);
+         i++)
+        efuse_merge_field(efuse->image, words, &efuse_s3_blob_fields[i]);
+    return 0;
 }

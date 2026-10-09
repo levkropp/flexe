@@ -16362,6 +16362,14 @@ void periph_psram_chip_restore(esp32_periph_t *p,
     flexe_spi_mem_psram_restore(p ? p->spi_mem : NULL, state, power_cycle);
 }
 
+int periph_apply_efuse_blob(esp32_periph_t *p,
+                             const uint32_t words[FLEXE_EFUSE_BLOB_WORDS])
+{
+    if (!p || !words) return -1;
+    if (!p->target_efuse) return -2;
+    return flexe_efuse_apply_blob(p->target_efuse, words);
+}
+
 void periph_destroy(esp32_periph_t *p) {
     if (!p) return;
     free(p->unhandled_audit);

@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include "target_types.h"
 #include "memory.h"
+#include "efuse.h"
 #include "gpio.h"
 #include "rtc_io.h"
 #include "rtc_cntl.h"
@@ -271,6 +272,12 @@ void periph_unhandled_audit_take(esp32_periph_t *p,
 void periph_unhandled_audit_resume(esp32_periph_t *p,
                                   periph_unhandled_audit_snapshot_t *snapshot);
 void periph_unhandled_audit_dispose(periph_unhandled_audit_snapshot_t *snapshot);
+
+/* Merge an eFuse blob image into the session eFuse device. Returns 0 when
+ * applied, 1 when the target has no blob field map yet, -1 on bad input, -2
+ * when this machine has no eFuse device at all. */
+int periph_apply_efuse_blob(esp32_periph_t *p,
+                             const uint32_t words[FLEXE_EFUSE_BLOB_WORDS]);
 
 /* Attach/detach a 7-bit target address on either APB I2C master or the
  * RTC-domain I2C master. Passing NULL as fn detaches the address. */

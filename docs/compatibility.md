@@ -182,6 +182,7 @@ the image's chip id and revision bounds select the machine.
 | `--target auto` | default: detect the target |
 | `--target esp32` / `--target esp32s3` | assert a target, useful in ci |
 | `-R ROM_ELF` | load the official matching mask-rom code and data |
+| `--efuse BLOB` | load a 336-byte efuse blob overriding s3 mac and chip revision (default: revision-0 profile) |
 | `-s firmware.elf` | load application symbols for debugging and symbol-based services |
 | `-N` | run the firmware's native freertos; use for s3 |
 | `--psram ap-8m-opi` | opt into an 8 mib aps6408l-3obmx octal psram on s3 cs1 |

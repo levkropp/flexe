@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "rom_elf.h"
 #include "peripherals.h"
+#include "efuse.h"
 #include "rom_stubs.h"
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
@@ -191,6 +192,33 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
     if (!s->periph) {
         fprintf(stderr, "flexe: failed to create peripherals\n");
         return -1;
+    }
+    if (cfg->efuse_path && *cfg->efuse_path) {
+        uint32_t efuse_blob[FLEXE_EFUSE_BLOB_WORDS];
+        if (flexe_efuse_blob_load(cfg->efuse_path, efuse_blob) != 0) {
+            fprintf(stderr,
+                    "flexe: eFuse blob load error: %s "
+                    "(expected exactly %u bytes)\n",
+                    cfg->efuse_path, FLEXE_EFUSE_BLOB_BYTES);
+            return -1;
+        }
+        int efuse_res = periph_apply_efuse_blob(s->periph, efuse_blob);
+        if (efuse_res == -2) {
+            fprintf(stderr,
+                    "flexe: --efuse supplied but this target has no "
+                    "eFuse model\n");
+            return -1;
+        }
+        if (efuse_res == 1) {
+            fprintf(stderr,
+                    "flexe: --efuse blob has no field map for this target; "
+                    "compiled profile stays in effect\n");
+            return -1;
+        }
+        if (efuse_res != 0) {
+            fprintf(stderr, "flexe: eFuse blob apply error\n");
+            return -1;
+        }
     }
     if (cfg->unhandled_audit)
         periph_unhandled_audit_enable(s->periph);
