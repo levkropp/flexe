@@ -748,9 +748,15 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
                                  transaction->miso_bytes);
     case 0x03u: case 0x0Bu: case 0x3Bu:
     case 0x6Bu: case 0xBBu: case 0xEBu:
+    case 0x13u: /* 4-byte-address plain read (spi_flash_defs.h CMD_READ_4B) */
+    case 0x0Cu: case 0x3Cu: case 0xBCu: case 0x6Cu: case 0xECu:
+        /* 4-byte fast-read mirrors (FASTRD_4B through FASTRD_QIO_4B).
+         * Fast mode collapses their dummy-cycle timing like the 3-byte
+         * set above; the driver issues 0xBC for DIO reads past 16 MiB. */
         spi_mem_read_data(spi_mem, host, offset, transaction->miso_bytes);
         return true;
     case 0x02u: case 0x32u:
+    case 0x12u: /* 4-byte-address page program (CMD_PROGRAM_PAGE_4B) */
         if (flash->status[0] & FLASH_SR_WEL) {
             if (spi_mem_program(spi_mem, offset, transaction->mosi, mosi) ==
                 SPI_MEM_WRITE_UNSUPPORTED) return false;
@@ -758,6 +764,7 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
         }
         return true;
     case 0x20u:
+    case 0x21u: /* 4-byte-address sector erase (CMD_SECTOR_ERASE_4B) */
         if (flash->status[0] & FLASH_SR_WEL) {
             if (spi_mem_erase(spi_mem, offset & ~0xFFFu, 0x1000u) ==
                 SPI_MEM_WRITE_UNSUPPORTED) return false;
@@ -772,6 +779,7 @@ static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
         }
         return true;
     case 0xD8u:
+    case 0xDCu: /* 4-byte-address 64 KiB erase (CMD_LARGE_BLOCK_ERASE_4B) */
         if (flash->status[0] & FLASH_SR_WEL) {
             if (spi_mem_erase(spi_mem, offset & ~0xFFFFu, 0x10000u) ==
                 SPI_MEM_WRITE_UNSUPPORTED) return false;

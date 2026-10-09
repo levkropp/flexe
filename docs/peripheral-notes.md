@@ -104,7 +104,8 @@ ROM's live boot-handoff structure then describe the same device. Newer ROM
 handoff pointers are resolved from the official ROM ELF, while older fixed
 ROM ABI addresses remain target data. The functional SPI-memory model supports
 raw reads, NOR page programming, sector/block/chip erase, status and power-down
-commands. Page programs wrap inside their 256-byte physical page. For its
+commands, plus their 4-byte-address variants (`0x13`/`0x12`/`0x21`/`0xDC` and
+the fast-read mirrors) for data regions above 16 MiB. Page programs wrap inside their 256-byte physical page. For its
 default 4 MiB GigaDevice `C8 40 16` profile, the model follows the
 [GD25Q32C datasheet's protection tables](https://download.gigadevice.com/Datasheet/DS-00088-GD25Q32C-Rev4.1.pdf):
 BP4..0 and CMP block page programs and whole sector/block erases that touch

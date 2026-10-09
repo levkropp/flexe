@@ -394,6 +394,10 @@ MMIO.
 `check-s3-idf-aes.sh` likewise runs the public mbedTLS AES API twice per engine,
 covering all six S3 block modes, AES-128/256 known-answer vectors, partial CTR,
 and a 4 KiB interrupt-driven GDMA round trip.
+`check-s3-idf-flash32.sh` builds a 32 MiB S3 image and verifies JEDEC/size
+reporting plus stock `esp_flash` erase/program/read below the line and at
+16 MiB and above through 4-byte-address opcodes, twice per engine with zero
+unsupported MMIO.
 
 </details>
 

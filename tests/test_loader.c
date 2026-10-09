@@ -341,8 +341,45 @@ TEST(loader_reports_image_revision_metadata) {
     ASSERT_EQ(info.flash_size, 8u * 1024u * 1024u);
 }
 
-TEST(loader_rejects_reserved_flash_capacity) {
-    uint8_t bin[24] = {0};
+TEST(loader_accepts_32mib_on_s3_and_rejects_it_on_classic) {
+    uint8_t bin[36] = {0};
+    bin[0] = 0xE9;
+    bin[1] = 1;
+    bin[3] = 0x52; /* 32 MiB capacity, 40 MHz speed */
+    put_le32(&bin[4], 0x40080000u);
+    put_le16(&bin[12], 0x0009u);
+    bin[14] = 3;
+    put_le16(&bin[15], 0u);
+    put_le16(&bin[17], 99u);
+    put_le32(&bin[24], 0x3FFB0000u);
+    put_le32(&bin[28], 4u);
+    put_le32(&bin[32], 0x12345678u);
+
+    const char *path = write_temp(bin, sizeof(bin));
+    ASSERT_TRUE(path != NULL);
+    loader_image_info_t info;
+    char error[256];
+    ASSERT_EQ(loader_probe_bin(path, &info, error, sizeof(error)), 0);
+    ASSERT_EQ(info.target, FLEXE_TARGET_ESP32S3);
+    ASSERT_EQ(info.flash_size, 32u * 1024u * 1024u);
+
+    const flexe_target_desc_t *s3 = flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    xtensa_mem_t *mem = mem_create_for_target_with_flash(
+        s3, info.flash_size);
+    ASSERT_TRUE(mem != NULL);
+    ASSERT_EQ(mem_flash_physical_size(mem), 32u * 1024u * 1024u);
+    /* JEDEC capacity byte tracks the grown backing: 0x19 == 2^25. */
+    ASSERT_EQ(mem_flash_jedec_id(mem), 0x001940C8u);
+    mem_destroy(mem);
+
+    /* Classic ESP32 tops out at 16 MiB, so the same header is refused. */
+    const flexe_target_desc_t *classic =
+        flexe_target_by_id(FLEXE_TARGET_ESP32);
+    ASSERT_TRUE(mem_create_for_target_with_flash(
+                    classic, info.flash_size) == NULL);
+}
+
+TEST(loader_rejects_reserved_flash_capacity) {    uint8_t bin[24] = {0};
     bin[0] = 0xE9;
     bin[1] = 0;
     bin[3] = 0x80;
@@ -1287,6 +1324,7 @@ void run_loader_tests(void) {
     RUN_TEST(session_software_reset_preserves_guest_flash);
     RUN_TEST(session_software_reset_preserves_external_nor_state);
     RUN_TEST(loader_reports_image_revision_metadata);
+    RUN_TEST(loader_accepts_32mib_on_s3_and_rejects_it_on_classic);
     RUN_TEST(loader_rejects_reserved_flash_capacity);
     RUN_TEST(loader_rejects_app_larger_than_declared_flash);
     RUN_TEST(loader_recognizes_s3_before_rejecting_classic_memory);
