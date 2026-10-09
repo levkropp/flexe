@@ -16,6 +16,19 @@
 #include <arpa/inet.h>
 #endif
 
+/* Bounded wait helpers: CI runners are shared and heavily loaded, so
+ * synchronization points wait on wall-clock deadlines (with a short sleep
+ * to stay friendly) instead of spinning a fixed syscall count. Usual case
+ * still resolves on the first iteration. */
+static void test_sleep_ms(unsigned ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000u);
+#endif
+}
+
 TEST(uart_tcp_parse_endpoint_accepts_host_port_forms)
 {
     char host[256];
@@ -83,8 +96,10 @@ static void test_tcp_close(int fd)
 static void pump_until_client(uart_tcp_bridge_t *b, esp32_periph_t *periph)
 {
     for (int i = 0;
-         i < 1000 && !uart_tcp_bridge_has_client(b); i++)
+         i < 10000 && !uart_tcp_bridge_has_client(b); i++) {
         uart_tcp_bridge_pump(b, periph);
+        test_sleep_ms(1u);
+    }
 }
 
 static int client_readable(int fd)
@@ -167,8 +182,10 @@ TEST(uart_tcp_bridge_moves_bytes_both_ways)
     ASSERT_EQ(periph_uart_rx_inject(periph, direct, 2u), 2u);
     ASSERT_EQ(periph_uart_rx_pending_num(periph, 0), 2u);
     for (int i = 0;
-         i < 1000 && periph_uart_rx_pending_num(periph, 0) < 4u; i++)
+         i < 10000 && periph_uart_rx_pending_num(periph, 0) < 4u; i++) {
         uart_tcp_bridge_pump(bridge, periph);
+        test_sleep_ms(1u);
+    }
     ASSERT_TRUE(periph_uart_rx_pending_num(periph, 0) >= 4u);
 
     /* A second connection replaces the first, like recabling UART. The
@@ -185,7 +202,7 @@ TEST(uart_tcp_bridge_moves_bytes_both_ways)
     }
     char c = 0;
     int got_c = 0;
-    for (int i = 0; i < 1000 && !got_c; i++) {
+    for (unsigned spins = 0u; spins < 10000u && !got_c; spins++) {
         uart_tcp_bridge_pump(bridge, periph);
         uart_tcp_bridge_send(bridge, 0x43u);
         uart_tcp_bridge_pump(bridge, periph);
@@ -197,6 +214,7 @@ TEST(uart_tcp_bridge_moves_bytes_both_ways)
 #endif
             got_c = n2 == 1 && c == 'C';
         }
+        test_sleep_ms(1u);
     }
     ASSERT_TRUE(got_c);
     ASSERT_EQ(c, 'C');
@@ -234,16 +252,17 @@ TEST(ctrl_tcp_serves_line_commands)
     ASSERT_TRUE(send(client, cmd, strlen(cmd), 0) == (ssize_t)strlen(cmd));
 #endif
     int got_ping = 0;
-    for (int i = 0; i < 1000 && !got_ping; i++) {
+    for (unsigned spins = 0u; spins < 10000u && !got_ping; spins++) {
         ctrl_tcp_pump(ctrl);
         if (ctrl_tcp_poll_line(ctrl, line, sizeof(line)) == 1)
             got_ping = strcmp(line, "ping") == 0;
+        test_sleep_ms(1u);
     }
     ASSERT_TRUE(got_ping);
     ASSERT_EQ(ctrl_tcp_reply(ctrl, "ok"), 0);
     char reply[8] = {0};
     size_t reply_got = 0u;
-    for (int i = 0; i < 1000 && reply_got < 3u; i++) {
+    for (unsigned spins = 0u; spins < 10000u && reply_got < 3u; spins++) {
         if (client_readable(client)) {
 #ifdef _WIN32
             int n = recv(client, reply + reply_got, (int)(3u - reply_got),
@@ -254,6 +273,7 @@ TEST(ctrl_tcp_serves_line_commands)
             if (n <= 0) break;
             reply_got += (size_t)n;
         }
+        test_sleep_ms(1u);
     }
     ASSERT_EQ(reply_got, 3u);
     ASSERT_TRUE(memcmp(reply, "ok\n", 3) == 0);
@@ -269,10 +289,11 @@ TEST(ctrl_tcp_serves_line_commands)
     ASSERT_TRUE(send(client, part2, 5, 0) == 5);
 #endif
     int got_reset = 0;
-    for (int i = 0; i < 1000 && !got_reset; i++) {
+    for (unsigned spins = 0u; spins < 10000u && !got_reset; spins++) {
         ctrl_tcp_pump(ctrl);
         if (ctrl_tcp_poll_line(ctrl, line, sizeof(line)) == 1)
             got_reset = strcmp(line, "reset") == 0;
+        test_sleep_ms(1u);
     }
     ASSERT_TRUE(got_reset);
 
