@@ -147,6 +147,7 @@ int main(int argc, char **argv)
     run_syscon_memory_tests();
     run_sandbox_input_tests();
     run_uart_tcp_tests();
+    run_ble_hci_tests();
     run_systimer_tests();
     run_timer_group_target_tests();
     run_rmt_v1_tests();

@@ -487,12 +487,36 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
     if (s->vstubs && s->syms)
         vfs_stubs_hook_symbols(s->vstubs, s->syms);
 
-    /* Bluetooth / NimBLE stubs */
-    s->bstubs = classic_compat ? bt_stubs_create(&s->cpu[0]) : NULL;
+    /* Bluetooth / NimBLE stubs. S3 keeps its native controller unless an
+     * external HCI backend is requested; then only the HCI transport is
+     * hooked and GAP/GATT stay native. The backend needs --elf symbols. */
+    if (cfg->ble_hci_backend && classic_compat) {
+        fprintf(stderr,
+                "flexe: --ble-hci is currently S3-only; classic "
+                "keeps its observer/virtual HCI behavior\n");
+        return -1;
+    }
+    s->bstubs = (classic_compat || cfg->ble_hci_backend) ?
+        bt_stubs_create(&s->cpu[0]) : NULL;
     if (s->bstubs) {
-        bt_stubs_hook_firmware_addrs(s->bstubs, res.entry_point);
-        if (s->syms)
-            bt_stubs_hook_symbols(s->bstubs, s->syms);
+        if (classic_compat) {
+            bt_stubs_hook_firmware_addrs(s->bstubs, res.entry_point);
+            if (s->syms)
+                bt_stubs_hook_symbols(s->bstubs, s->syms);
+        } else if (cfg->ble_hci_backend) {
+            /* Transport-only hooks: controller init, GAP, and GATT keep
+             * running natively so the genuine host drives the backend. */
+            if (!s->syms) {
+                fprintf(stderr,
+                        "flexe: --ble-hci needs application symbols "
+                        "(-s ELF) for HCI transport hooks\n");
+                return -1;
+            }
+            bt_stubs_hook_hci_transport(s->bstubs, s->syms);
+        }
+    } else if (cfg->ble_hci_backend) {
+        fprintf(stderr, "flexe: failed to create BT stubs for --ble-hci\n");
+        return -1;
     }
 
     /* Pre-decode instruction memory for fast fetch */

@@ -25,6 +25,7 @@ void run_system_clock_tests(void);
 void run_syscon_memory_tests(void);
 void run_sandbox_input_tests(void);
 void run_uart_tcp_tests(void);
+void run_ble_hci_tests(void);
 void run_systimer_tests(void);
 void run_timer_group_target_tests(void);
 void run_rmt_v1_tests(void);

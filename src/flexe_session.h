@@ -34,6 +34,7 @@ typedef struct {
     const char *efuse_path;         /* 336-byte eFuse blob (NULL = profile) */
     uint32_t    strap_mode;         /* GPIO_STRAP_REG sample for ROM boot */
     int         has_strap_mode;     /* 1 = override strapping pins */
+    int         ble_hci_backend;    /* 1 = hook HCI transport for ext. controller */
     const char *sdcard_path;        /* SD card backing image (NULL = none) */
     uint64_t    sdcard_size;        /* SD card size override (0 = auto) */
 

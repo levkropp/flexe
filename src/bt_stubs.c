@@ -111,8 +111,15 @@ static const marauder_bt_layout_t marauder_v1151_bt = {
 /* A ble_gap_event is 52 bytes in this ESP32 NimBLE build.  Its discovery
  * descriptor begins at +4 and holds a pointer to the advertisement payload.
  * This bounded RTC-fast gap lies between the virtual PHY and WiFi buffers. */
+/* HCI backend chunks controller payloads through the event scratch so no
+ * guest heap call ever runs in borrowed context: heap code with interrupts
+ * masked trips the interrupt watchdog under contention. Backend pumps and
+ * app-level advertisement injection target different firmware classes, so
+ * they never share a pump. */
 #define BLE_EVENT_SCRATCH_ADDR 0x50001C00u
 #define BLE_EVENT_SCRATCH_SIZE 64u
+#define BLE_HCI_CHUNK_ADDR BLE_EVENT_SCRATCH_ADDR
+#define BLE_HCI_CHUNK_SIZE BLE_EVENT_SCRATCH_SIZE
 #define BLE_DATA_SCRATCH_ADDR  0x50001C40u
 #define BLE_DATA_MAX_LEN       31u
 #define BLE_GAP_EVENT_DISC     7u
@@ -188,6 +195,32 @@ struct bt_stubs {
     bt_advertisement_tx_cb advertisement_tx_cb;
     void              *advertisement_tx_ctx;
     bt_stubs_stats_t    stats;
+
+    /* External HCI controller backend (--ble-hci tcp:HOST:PORT). When
+     * attached, commands forward instead of using the virtual controller. */
+    ble_hci_conn_t   *hci_backend;
+    /* ESP-IDF VHCI-transport entry points (resolved, never hooked):
+     * events go through the raw pool buffer, ACL through rx_acl. */
+    uint32_t           hci_alloc_evt_addr;
+    uint32_t           hci_to_hs_evt_addr;
+    uint32_t           hci_free_evt_addr;
+    uint32_t           hci_rx_acl_addr;
+    uint32_t           hci_alloc_acl_addr;
+    uint32_t           hci_msys_acl_addr;
+    uint32_t           hci_append_addr;
+    uint32_t           hci_mbuf_free_addr;
+    uint32_t           hci_mbuf_len_addr;
+    uint32_t           hci_copydata_addr;
+    uint32_t           hci_free_chain_addr;
+    /* Debug-only pool addresses for non-allocating depth reads. */
+    uint32_t           hci_pool_evt_addr;
+    uint32_t           hci_pool_evt_lo_addr;
+    uint32_t           hci_mpool_acl_addr;
+    /* Controller packets that arrived while the guest could not take them.
+     * Raw bytes wait here; guest mbufs are only allocated at delivery. */
+    ble_hci_packet_t   hci_pending[16];
+    unsigned           hci_pending_count;
+    uint64_t           hci_dropped_packets;
 };
 
 /* ===== Calling convention helpers ===== */
@@ -747,6 +780,593 @@ static void stub_nimble_host_noop(xtensa_cpu_t *cpu, void *ctx)
 {
     (void)ctx;
     bt_return(cpu, 0);
+}
+
+/* ===== External HCI controller backend (--ble-hci) =====
+ *
+ * Forwards NimBLE HCI commands to an H4-speaking controller (Bumble) and
+ * injects its events/ACL back into the genuine host. Command transactions
+ * stay synchronous like the intercepted ble_hs_hci_cmd_tx contract: the
+ * forwarder round-trips the matching Command Complete/Status inline.
+ * Anything else the controller emits while waiting is retained for the
+ * asynchronous pump, which delivers at a safe inter-batch boundary using
+ * the host's own transport allocators, so buffer ownership always matches
+ * what the guest frees. */
+
+#define BLE_HCI_BACKEND_SYNC_TIMEOUT_MS 5000
+#define BLE_HCI_EVCODE_COMMAND_COMPLETE 0x0Eu
+#define BLE_HCI_EVCODE_COMMAND_STATUS 0x0Fu
+#define BLE_HCI_ERR_HW_FAILURE 0x03u
+
+static void bt_hci_queue_async(bt_stubs_t *bt, const ble_hci_packet_t *packet)
+{
+    if (packet->type == BLE_HCI_H4_EVT)
+        bt->stats.hci_forwarded_events++;
+    else if (packet->type == BLE_HCI_H4_ACL)
+        bt->stats.hci_forwarded_acl++;
+    if (bt->hci_pending_count >=
+        sizeof(bt->hci_pending) / sizeof(bt->hci_pending[0])) {
+        bt->hci_dropped_packets++;
+        bt->stats.hci_injection_failures++;
+        return;
+    }
+    bt->hci_pending[bt->hci_pending_count++] = *packet;
+}
+
+void bt_stubs_set_hci_backend(bt_stubs_t *bt, ble_hci_conn_t *conn)
+{
+    if (!bt) return;
+    bt->hci_backend = conn;
+}
+
+/* Copy controller return parameters into the caller's response buffer,
+ * zero-padding short replies like the virtual controller does. */
+static void bt_hci_fill_response(xtensa_cpu_t *cpu, uint32_t rsp,
+                                  uint32_t rsp_len, const uint8_t *params,
+                                  size_t params_len)
+{
+    for (uint32_t i = 0u; i < rsp_len; i++)
+        mem_write8(cpu->mem, rsp + i,
+                   i < params_len ? params[i] : 0u);
+}
+
+static bool bt_hci_is_sync_ack(const ble_hci_packet_t *packet,
+                               uint16_t opcode, uint8_t *status_out,
+                               const uint8_t **params_out,
+                               size_t *params_len_out)
+{
+    if (packet->type != BLE_HCI_H4_EVT || packet->payload_len < 2u)
+        return false;
+    uint8_t code = packet->payload[0];
+    if (code == BLE_HCI_EVCODE_COMMAND_COMPLETE &&
+        packet->payload_len >= 6u) {
+        uint16_t echoed = (uint16_t)packet->payload[3] |
+                          ((uint16_t)packet->payload[4] << 8);
+        if (echoed != opcode) return false;
+        *status_out = packet->payload[5];
+        *params_out = packet->payload + 6u;
+        *params_len_out = packet->payload[1] >= 4u ?
+            (size_t)packet->payload[1] - 4u : 0u;
+        return true;
+    }
+    if (code == BLE_HCI_EVCODE_COMMAND_STATUS &&
+        packet->payload_len >= 6u) {
+        uint16_t echoed = (uint16_t)packet->payload[4] |
+                          ((uint16_t)packet->payload[5] << 8);
+        if (echoed != opcode) return false;
+        *status_out = packet->payload[2];
+        *params_out = NULL;
+        *params_len_out = 0u;
+        return true;
+    }
+    return false;
+}
+
+static int forward_ble_hs_hci_cmd_tx(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    if (!bt->hci_backend) return 0; /* no backend: run the guest original */
+    uint32_t opcode = bt_arg(cpu, 0) & 0xFFFFu;
+    uint32_t cmd = bt_arg(cpu, 1);
+    uint32_t cmd_len = bt_arg(cpu, 2) & 0xFFu;
+    uint32_t rsp = bt_arg(cpu, 3);
+    uint32_t rsp_len = bt_arg(cpu, 4) & 0xFFu;
+    bt->stats.hci_command_calls++;
+    bt->stats.hci_forwarded_commands++;
+
+    uint8_t params[255];
+    for (uint32_t i = 0u; i < cmd_len; i++)
+        params[i] = mem_read8(cpu->mem, cmd + i);
+    if (ble_hci_send_cmd(bt->hci_backend, (uint16_t)opcode, params,
+                         cmd_len) != 0) {
+        bt->stats.hci_backend_timeouts++;
+        bt_log(bt, "HCI forward 0x%04x: transport send failed\n", opcode);
+        bt_return(cpu, BLE_HCI_ERR_HW_FAILURE);
+        return 1;
+    }
+
+    int waited = 0;
+    for (;;) {
+        ble_hci_packet_t packet;
+        int rc = ble_hci_recv(bt->hci_backend, &packet, 50);
+        if (rc < 0) {
+            bt->stats.hci_backend_timeouts++;
+            bt_log(bt, "HCI forward 0x%04x: transport lost\n", opcode);
+            bt_return(cpu, BLE_HCI_ERR_HW_FAILURE);
+            return 1;
+        }
+        if (rc == 0) {
+            waited += 50;
+            if (waited >= BLE_HCI_BACKEND_SYNC_TIMEOUT_MS) {
+                bt->stats.hci_backend_timeouts++;
+                bt_log(bt, "HCI forward 0x%04x: ack timeout\n", opcode);
+                bt_return(cpu, BLE_HCI_ERR_HW_FAILURE);
+                return 1;
+            }
+            continue;
+        }
+        uint8_t status = 0u;
+        const uint8_t *retparams = NULL;
+        size_t retparams_len = 0u;
+        if (bt_hci_is_sync_ack(&packet, (uint16_t)opcode, &status,
+                               &retparams, &retparams_len)) {
+            if (status == 0u && retparams)
+                bt_hci_fill_response(cpu, rsp, rsp_len, retparams,
+                                     retparams_len);
+            bt_return(cpu, status);
+            return 1;
+        }
+        /* Not our ack: a genuinely asynchronous controller event. */
+        bt_hci_queue_async(bt, &packet);
+    }
+}
+
+/* Deliver one controller packet through ESP-IDF's own VHCI-transport
+ * entries: events land in a transport pool buffer handed to to_hs_evt,
+ * ACL lands in a host msys mbuf handed to ble_hs_rx_data. This mirrors
+ * host_rcv_pkt, so buffer ownership matches what the guest frees. (ACL
+ * uses the msys pool rather than the dedicated 24-buffer transport pool,
+ * which was observed to drain under a long GATT session while msys keeps
+ * cycling; the FROM_LL flag it skips only feeds disabled IPC flow
+ * control.) Returns 0 when delivered, -1 when the guest cannot take it
+ * yet (the packet stays queued for a later pump), -2 when it can never be
+ * delivered. */
+static int bt_hci_deliver(bt_stubs_t *bt, xtensa_cpu_t *cpu,
+                          xtensa_cpu_t *peer, const ble_hci_packet_t *packet)
+{
+    if (packet->type != BLE_HCI_H4_EVT &&
+        packet->type != BLE_HCI_H4_ACL)
+        return -2; /* SCO/ISO have no host consumer. */
+    if (!guest_call_injection_is_quiescent(cpu, peer)) {
+        /* The NimBLE host task can spin on one core while the other parks
+         * in WAITI; borrow whichever core is quiescent. */
+        if (peer && peer != cpu &&
+            guest_call_injection_is_quiescent(peer, cpu)) {
+            cpu = peer;
+            peer = NULL;
+        } else {
+            if (getenv("FLEXE_BTDBG")) {
+                fprintf(stderr,
+                        "[bt] hci deliver deferred "
+                        "(cycle=%llu pc=0x%08x run=%d halt=%d exc=%d ingc=%u il=%u excm=%d)\n",
+                        (unsigned long long)cpu->cycle_count, cpu->pc,
+                        cpu->running, cpu->halted, cpu->exception,
+                        cpu->in_guest_call, XT_PS_INTLEVEL(cpu->ps),
+                        XT_PS_EXCM(cpu->ps) != 0);
+                fflush(stderr);
+            }
+            return -1;
+        }
+    }
+    if (packet->type == BLE_HCI_H4_EVT) {
+        if (bt->hci_alloc_evt_addr == 0u || bt->hci_to_hs_evt_addr == 0u) {
+            if (getenv("FLEXE_BTDBG")) {
+                fprintf(stderr, "[bt] hci deliver missing evt symbols\n");
+                fflush(stderr);
+            }
+            return -2;
+        }
+        uint32_t alloc_arg = 0u;
+        uint32_t evbuf = 0u;
+        int alloc_rc =
+            guest_call8(cpu, bt->hci_alloc_evt_addr, &alloc_arg, 1,
+                        2000000u, &evbuf);
+        if (getenv("FLEXE_BTDBG")) {
+            fprintf(stderr, "[bt] hci deliver evt alloc=%d evbuf=0x%08x\n",
+                    alloc_rc, evbuf);
+            fflush(stderr);
+        }
+        if (alloc_rc != 0 || evbuf == 0u)
+            return -1;
+        for (size_t i = 0u; i < packet->payload_len; i++)
+            mem_write8(cpu->mem, evbuf + (uint32_t)i,
+                       packet->payload[i]);
+        uint32_t rc = 1u;
+        int delivered =
+            guest_call8(cpu, bt->hci_to_hs_evt_addr, &evbuf, 1, 2000000u,
+                        &rc);
+        (void)rc;
+        if (getenv("FLEXE_BTDBG"))
+            fprintf(stderr, "[bt] hci deliver evt len=%zu -> %s\n",
+                    packet->payload_len,
+                    delivered == 0 ? "ok" : "guest-busy");
+        fflush(stderr);
+        if (delivered != 0) {
+            /* Host did not take ownership: release the pool buffer so a
+             * later retry can allocate again. Without this the 30-buffer
+             * event pool drains and every later delivery fails. */
+            if (bt->hci_free_evt_addr != 0u) {
+                uint32_t free_arg[1] = {evbuf};
+                guest_call8(cpu, bt->hci_free_evt_addr, free_arg, 1,
+                            2000000u, NULL);
+            } else {
+                bt->stats.hci_injection_failures++;
+            }
+            return -1;
+        }
+        bt->stats.hci_injected_events++;
+        return 0;
+    }
+    if (bt->hci_rx_acl_addr == 0u || bt->hci_alloc_acl_addr == 0u ||
+        bt->hci_append_addr == 0u || bt->hci_mbuf_free_addr == 0u)
+        return -2;
+    /* Pool mbuf plus chunked append through static scratch: no guest heap
+     * call runs in borrowed context. Prefer the host msys ACL pool: the
+     * dedicated transport pool has been observed to drain under a long
+     * GATT session while msys keeps cycling (same free path either way).
+     * Fall back to the transport allocator when msys is unavailable. */
+    uint32_t om = 0u;
+    int alloc_rc = -1;
+    if (bt->hci_msys_acl_addr != 0u)
+        alloc_rc = guest_call8(cpu, bt->hci_msys_acl_addr, NULL, 0,
+                               2000000u, &om);
+    if (alloc_rc != 0 || om == 0u)
+        alloc_rc = guest_call8(cpu, bt->hci_alloc_acl_addr, NULL, 0,
+                               2000000u, &om);
+    if (getenv("FLEXE_BTDBG")) {
+        fprintf(stderr, "[bt] hci deliver acl alloc=%d om=0x%08x\n",
+                alloc_rc, om);
+        fflush(stderr);
+    }
+    if (alloc_rc != 0 || om == 0u)
+        return -1;
+    size_t off = 0u;
+    while (off < packet->payload_len) {
+        size_t chunk = packet->payload_len - off;
+        if (chunk > BLE_HCI_CHUNK_SIZE) chunk = BLE_HCI_CHUNK_SIZE;
+        for (size_t i = 0u; i < chunk; i++)
+            mem_write8(cpu->mem,
+                       BLE_HCI_CHUNK_ADDR + (uint32_t)i,
+                       packet->payload[off + i]);
+        uint32_t append_args[3] = {om, BLE_HCI_CHUNK_ADDR,
+                                   (uint32_t)chunk};
+        uint32_t append_rc = 1u;
+        if (guest_call8(cpu, bt->hci_append_addr, append_args, 3,
+                        2000000u, &append_rc) != 0 ||
+            append_rc != 0u) {
+            uint32_t free_one[1] = {om};
+            guest_call8(cpu, bt->hci_mbuf_free_addr, free_one, 1,
+                        2000000u, NULL);
+            return -1;
+        }
+        off += chunk;
+    }
+    uint32_t rx_args[2] = {om, 0u};
+    uint32_t rc = 0u;
+    int call = guest_call8(cpu, bt->hci_rx_acl_addr, rx_args, 2, 2000000u,
+                           &rc);
+    (void)rc;
+    if (getenv("FLEXE_BTDBG")) {
+        unsigned acl_free = 9999u;
+        if (bt->hci_mpool_acl_addr != 0u) {
+            uint32_t ext =
+                (uint32_t)mem_read8(cpu->mem,
+                    bt->hci_mpool_acl_addr + 4u) |
+                ((uint32_t)mem_read8(cpu->mem,
+                    bt->hci_mpool_acl_addr + 5u) << 8) |
+                ((uint32_t)mem_read8(cpu->mem,
+                    bt->hci_mpool_acl_addr + 6u) << 16) |
+                ((uint32_t)mem_read8(cpu->mem,
+                    bt->hci_mpool_acl_addr + 7u) << 24);
+            if (ext != 0u)
+                acl_free = (unsigned)mem_read8(cpu->mem, ext + 6u) |
+                           ((unsigned)mem_read8(cpu->mem, ext + 7u) << 8);
+        }
+        fprintf(stderr, "[bt] hci deliver acl len=%zu -> %s aclfree=%u\n",
+                packet->payload_len, call == 0 ? "ok" : "guest-busy",
+                acl_free);
+        fflush(stderr);
+    }
+    if (call != 0) {
+        uint32_t free_one[1] = {om};
+        guest_call8(cpu, bt->hci_mbuf_free_addr, free_one, 1, 2000000u,
+                    NULL);
+        return -1;
+    }
+    bt->stats.hci_injected_events++;
+    return 0;
+}
+
+void bt_stubs_hci_pump(bt_stubs_t *bt, xtensa_cpu_t *peer)
+{
+    if (!bt || !bt->hci_backend) return;
+    xtensa_cpu_t *cpu = bt->cpu;
+    if (getenv("FLEXE_BTDBG")) {
+        static unsigned long pumps = 0u;
+        if ((++pumps % 5000u) == 0u) {
+            /* Counter-only: allocating pool buffers here to probe would
+             * consume the very pool the pump needs (the evt probe was
+             * never freed and drained the 30-buffer pool). Depth is read
+             * straight from guest RAM: no guest call, no leak. */
+            unsigned evt_free = 9999u, evt_lo_free = 9999u, acl_free = 9999u;
+            if (bt->hci_pool_evt_addr != 0u)
+                evt_free = (unsigned)mem_read8(cpu->mem,
+                           bt->hci_pool_evt_addr + 6u) |
+                           ((unsigned)mem_read8(cpu->mem,
+                           bt->hci_pool_evt_addr + 7u) << 8);
+            if (bt->hci_pool_evt_lo_addr != 0u)
+                evt_lo_free = (unsigned)mem_read8(cpu->mem,
+                           bt->hci_pool_evt_lo_addr + 6u) |
+                           ((unsigned)mem_read8(cpu->mem,
+                           bt->hci_pool_evt_lo_addr + 7u) << 8);
+            if (bt->hci_mpool_acl_addr != 0u) {
+                uint32_t ext = (uint32_t)mem_read8(cpu->mem,
+                               bt->hci_mpool_acl_addr + 4u) |
+                               ((uint32_t)mem_read8(cpu->mem,
+                               bt->hci_mpool_acl_addr + 5u) << 8) |
+                               ((uint32_t)mem_read8(cpu->mem,
+                               bt->hci_mpool_acl_addr + 6u) << 16) |
+                               ((uint32_t)mem_read8(cpu->mem,
+                               bt->hci_mpool_acl_addr + 7u) << 24);
+                if (ext != 0u)
+                    acl_free = (unsigned)mem_read8(cpu->mem, ext + 6u) |
+                               ((unsigned)mem_read8(cpu->mem, ext + 7u)
+                                << 8);
+            }
+            fprintf(stderr,
+                    "[bt] hci pump alive #%lu queued=%u "
+                    "evt(free=%u lo=%u acl=%u) "
+                    "c0(halt=%d) c1(halt=%d)\n",
+                    pumps, bt->hci_pending_count, evt_free, evt_lo_free,
+                    acl_free, bt->cpu->halted, peer ? peer->halted : -1);
+            fflush(stderr);
+        }
+    }
+    /* Deliver already-queued packets before reading new ones. */
+    unsigned i = 0u;
+    while (i < bt->hci_pending_count) {
+        int delivered = bt_hci_deliver(bt, cpu, peer, &bt->hci_pending[i]);
+        if (delivered == -2) {
+            bt->stats.hci_injection_failures++;
+        } else if (delivered != 0) {
+            break;
+        }
+        i++;
+    }
+    if (i != 0u) {
+        memmove(bt->hci_pending, bt->hci_pending + i,
+                (bt->hci_pending_count - i) * sizeof(bt->hci_pending[0]));
+        bt->hci_pending_count -= i;
+    }
+    for (;;) {
+        ble_hci_packet_t packet;
+        int rc = ble_hci_recv(bt->hci_backend, &packet, 0);
+        if (rc <= 0) return;
+        if (getenv("FLEXE_BTDBG")) {
+            char hex[129];
+            size_t show = packet.payload_len < 64u ?
+                packet.payload_len : 64u;
+            for (size_t i = 0u; i < show; i++)
+                snprintf(hex + 2u * i, 3u, "%02x",
+                         packet.payload[i]);
+            hex[2u * show] = '\0';
+            fprintf(stderr, "[bt] hci pump got type=%u len=%zu %s\n",
+                    packet.type, packet.payload_len, hex);
+            fflush(stderr);
+        }
+        if (packet.type == BLE_HCI_H4_EVT)
+            bt->stats.hci_forwarded_events++;
+        else if (packet.type == BLE_HCI_H4_ACL)
+            bt->stats.hci_forwarded_acl++;
+        int delivered = bt_hci_deliver(bt, cpu, peer, &packet);
+        if (delivered == -2)
+            bt->stats.hci_injection_failures++;
+        else if (delivered != 0)
+            bt_hci_queue_async(bt, &packet);
+    }
+}
+
+/* Forward one host-to-controller ACL packet: copy the mbuf chain out in
+ * static-scratch chunks (no guest heap in borrowed context), emit it as
+ * H4, then release the chain. The transport owns the chain, so every exit
+ * frees it. */
+static int forward_ble_hci_acl_tx(xtensa_cpu_t *cpu, void *ctx)
+{
+    bt_stubs_t *bt = ctx;
+    if (!bt->hci_backend) return 0; /* no backend: run the guest original */
+    if (bt->hci_mbuf_len_addr == 0u || bt->hci_copydata_addr == 0u ||
+        bt->hci_free_chain_addr == 0u)
+        return 0;
+    uint32_t om = bt_arg(cpu, 0);
+    if (om == 0u) return 0;
+    bt->stats.hci_command_calls++;
+    if (getenv("FLEXE_BTDBG")) {
+        fprintf(stderr, "[bt] hci acl TX om=0x%08x\n", om);
+        fflush(stderr);
+    }
+
+    uint32_t total = 0u;
+    int len_rc = guest_call8(cpu, bt->hci_mbuf_len_addr, &om, 1, 2000000u,
+                             &total);
+    if (getenv("FLEXE_BTDBG")) {
+        fprintf(stderr, "[bt] hci acl TX len=%d total=%u\n", len_rc, total);
+        fflush(stderr);
+    }
+    if (len_rc != 0 ||
+        total == 0u || total > BLE_HCI_MAX_PACKET) {
+        uint32_t chain[1] = {om};
+        guest_call8(cpu, bt->hci_free_chain_addr, chain, 1, 2000000u,
+                    NULL);
+        bt->stats.hci_injection_failures++;
+        return 1;
+    }
+    static uint8_t flat[BLE_HCI_MAX_PACKET];
+    size_t off = 0u;
+    uint32_t copy_rc = 1u;
+    while (off < total) {
+        size_t chunk = total - off;
+        if (chunk > BLE_HCI_CHUNK_SIZE) chunk = BLE_HCI_CHUNK_SIZE;
+        uint32_t copy_args[4] = {om, (uint32_t)off, (uint32_t)chunk,
+                                 BLE_HCI_CHUNK_ADDR};
+        if (guest_call8(cpu, bt->hci_copydata_addr, copy_args, 4,
+                        2000000u, &copy_rc) != 0 ||
+            copy_rc != 0)
+            break;
+        for (size_t i = 0u; i < chunk; i++)
+            flat[off + i] =
+                mem_read8(cpu->mem, BLE_HCI_CHUNK_ADDR + (uint32_t)i);
+        off += chunk;
+    }
+    int rc = 1;
+    if (off == total &&
+        ble_hci_send_raw(bt->hci_backend, BLE_HCI_H4_ACL, flat,
+                         total) == 0) {
+        if (getenv("FLEXE_BTDBG")) {
+            char hex[65];
+            size_t show = total < 32u ? total : 32u;
+            for (size_t i = 0u; i < show; i++)
+                snprintf(hex + 2u * i, 3u, "%02x", flat[i]);
+            hex[2u * show] = '\0';
+            fprintf(stderr, "[bt] hci acl TX total=%u head=%s\n",
+                    total, hex);
+            fflush(stderr);
+        }
+        bt->stats.hci_forwarded_acl++;
+        rc = 0;
+    }
+    {
+        uint32_t chain[1] = {om};
+        uint32_t free_rc = 0xFFFFFFFFu;
+        int free_call = guest_call8(cpu, bt->hci_free_chain_addr, chain, 1,
+                                    2000000u, &free_rc);
+        if (getenv("FLEXE_BTDBG")) {
+            unsigned acl_free = 9999u;
+            if (bt->hci_mpool_acl_addr != 0u) {
+                uint32_t ext =
+                    (uint32_t)mem_read8(cpu->mem,
+                        bt->hci_mpool_acl_addr + 4u) |
+                    ((uint32_t)mem_read8(cpu->mem,
+                        bt->hci_mpool_acl_addr + 5u) << 8) |
+                    ((uint32_t)mem_read8(cpu->mem,
+                        bt->hci_mpool_acl_addr + 6u) << 16) |
+                    ((uint32_t)mem_read8(cpu->mem,
+                        bt->hci_mpool_acl_addr + 7u) << 24);
+                if (ext != 0u)
+                    acl_free = (unsigned)mem_read8(cpu->mem, ext + 6u) |
+                               ((unsigned)mem_read8(cpu->mem, ext + 7u)
+                                << 8);
+            }
+            fprintf(stderr,
+                    "[bt] hci acl TX free call=%d rc=%u aclfree=%u\n",
+                    free_call, free_rc, acl_free);
+            fflush(stderr);
+        }
+    }
+    if (rc != 0) bt->stats.hci_injection_failures++;
+    bt_return(cpu, (uint32_t)rc);
+    return 1;
+}
+
+int bt_stubs_hook_hci_transport(bt_stubs_t *bt, const elf_symbols_t *syms)
+{
+    if (!bt || !syms) return 0;
+    esp32_rom_stubs_t *rom = bt->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    bt->rom = rom;
+
+    struct {
+        const char *name;
+        uint32_t *slot;
+    } resolved[] = {
+        {"ble_transport_alloc_evt", &bt->hci_alloc_evt_addr},
+        {"ble_transport_to_hs_evt", &bt->hci_to_hs_evt_addr},
+        {"ble_transport_free", &bt->hci_free_evt_addr},
+        {"ble_hs_rx_data", &bt->hci_rx_acl_addr},
+        {"ble_transport_alloc_acl_from_ll", &bt->hci_alloc_acl_addr},
+        {"ble_hs_mbuf_acl_pkt", &bt->hci_msys_acl_addr},
+        {"os_mbuf_append", &bt->hci_append_addr},
+        {"os_mbuf_free", &bt->hci_mbuf_free_addr},
+        {"os_mbuf_len", &bt->hci_mbuf_len_addr},
+        {"os_mbuf_copydata", &bt->hci_copydata_addr},
+        {"os_mbuf_free_chain", &bt->hci_free_chain_addr},
+        {"pool_evt", &bt->hci_pool_evt_addr},
+        {"pool_evt_lo", &bt->hci_pool_evt_lo_addr},
+        {"mpool_acl", &bt->hci_mpool_acl_addr},
+    };
+    int found = 0;
+    for (unsigned i = 0u;
+         i < sizeof(resolved) / sizeof(resolved[0]); i++) {
+        if (elf_symbols_find(syms, resolved[i].name,
+                             resolved[i].slot) == 0 &&
+            *resolved[i].slot != 0u)
+            found++;
+        else
+            *resolved[i].slot = 0u;
+    }
+    /* The event entry is spelled _impl in the symbol table; the public
+     * name is a link-time alias. rx_evt takes the same buffer shape. */
+    static const char *const evt_names[] = {
+        "ble_transport_to_hs_evt",
+        "ble_transport_to_hs_evt_impl",
+        "ble_hs_hci_rx_evt",
+    };
+    for (unsigned i = 0u;
+         i < sizeof(evt_names) / sizeof(evt_names[0]); i++) {
+        uint32_t addr = 0u;
+        if (elf_symbols_find(syms, evt_names[i], &addr) == 0 &&
+            addr != 0u) {
+            if (bt->hci_to_hs_evt_addr == 0u) {
+                bt->hci_to_hs_evt_addr = addr;
+                found++;
+            }
+            break;
+        }
+    }
+    if (bt->hci_to_hs_evt_addr == 0u)
+        bt->hci_to_hs_evt_addr = 0u;
+    uint32_t cmd_tx = 0u;
+    if (elf_symbols_find(syms, "ble_hs_hci_cmd_tx", &cmd_tx) != 0 ||
+        cmd_tx == 0u)
+        return 0;
+    if (getenv("FLEXE_BTDBG")) {
+        fprintf(stderr,
+                "[bt] hci addrs cmd_tx=0x%08x rx_acl=0x%08x alloc_evt=0x%08x "
+                "to_hs=0x%08x mlen=0x%08x "
+                "copy=0x%08x freechain=0x%08x\n",
+                cmd_tx, bt->hci_rx_acl_addr, bt->hci_alloc_evt_addr,
+                bt->hci_to_hs_evt_addr, bt->hci_mbuf_len_addr,
+                bt->hci_copydata_addr, bt->hci_free_chain_addr);
+        fflush(stderr);
+    }
+    rom_stubs_register_conditional_ctx(rom, cmd_tx,
+                                       forward_ble_hs_hci_cmd_tx,
+                                       "ble_hs_hci_cmd_tx", bt);
+    uint32_t acl_tx = 0u;
+    if (elf_symbols_find(syms, "ble_transport_to_ll_acl_impl",
+                         &acl_tx) == 0 &&
+        acl_tx != 0u)
+        rom_stubs_register_conditional_ctx(rom, acl_tx,
+                                           forward_ble_hci_acl_tx,
+                                           "ble_transport_to_ll_acl", bt);
+    else
+        bt_log(bt, "HCI transport: no ACL TX symbol; host-to-controller "
+                   "ACL stays unforwarded\n");
+    fprintf(stderr,
+            "[bt] HCI transport: forwarding to external controller "
+            "(%d/%u support symbols)\n",
+            found,
+            (unsigned)(sizeof(resolved) / sizeof(resolved[0])));
+    return 1 + found;
 }
 
 /* ===== Public API ===== */

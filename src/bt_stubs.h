@@ -3,6 +3,7 @@
 
 #include "xtensa.h"
 #include "elf_symbols.h"
+#include "ble_hci.h"
 #include <stddef.h>
 
 typedef struct bt_stubs bt_stubs_t;
@@ -41,6 +42,12 @@ typedef struct {
     uint64_t advertisement_tx_frames;
     uint64_t advertisement_tx_bytes;
     uint64_t advertisement_tx_failures;
+    uint64_t hci_forwarded_commands;
+    uint64_t hci_forwarded_events;
+    uint64_t hci_forwarded_acl;
+    uint64_t hci_backend_timeouts;
+    uint64_t hci_injected_events;
+    uint64_t hci_injection_failures;
 } bt_stubs_stats_t;
 
 bt_stubs_t *bt_stubs_create(xtensa_cpu_t *cpu);
@@ -52,6 +59,22 @@ int bt_stubs_hook_symbols(bt_stubs_t *bt, const elf_symbols_t *syms);
 /* Observe the real NimBLE lifecycle and attach its HCI transport to the
  * virtual controller in verified symbol-less production ROMs. */
 int bt_stubs_hook_firmware_addrs(bt_stubs_t *bt, uint32_t entry_point);
+
+/* Hook only the NimBLE HCI transport for an external controller backend:
+ * forwards ble_hs_hci_cmd_tx and resolves (without hooking) the receive and
+ * mbuf entry points. Controller init, GAP, and GATT keep running natively,
+ * unlike the broader compatibility hook set above. Requires --elf. */
+int bt_stubs_hook_hci_transport(bt_stubs_t *bt, const elf_symbols_t *syms);
+
+/* Attach an external HCI controller. All commands forward instead of using
+ * the virtual controller; events/ACL inject through the pump below.
+ * NULL detaches and restores virtual behavior. */
+void bt_stubs_set_hci_backend(bt_stubs_t *bt, ble_hci_conn_t *conn);
+
+/* Drain controller packets into the guest host at a safe boundary. Queues
+ * what cannot be delivered yet for the next pump. `peer` is the other
+ * core (or NULL); delivery borrows whichever core is quiescent. */
+void bt_stubs_hci_pump(bt_stubs_t *bt, xtensa_cpu_t *peer);
 
 /* Snapshot virtual-controller activity for integration gates. */
 void bt_stubs_get_stats(const bt_stubs_t *bt, bt_stubs_stats_t *stats);

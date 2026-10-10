@@ -186,6 +186,7 @@ the image's chip id and revision bounds select the machine.
 | `--strap-mode HEX` | raw `GPIO_STRAP_REG` sample for rom boot selection (`0x07` = s3 uart0 download; default: spi boot) |
 | `--uart-tcp HOST:PORT` | bridge uart0 to a tcp server; while a client is connected, uart rx/tx move off stdin/stdout |
 | `--control-tcp HOST:PORT` | host control channel: `reset`, `erase-flash`, `erase-region`, `write-region`, `ping` |
+| `--ble-hci tcp:HOST:PORT` | s3-only: forward NimBLE HCI to an external H4 controller; requires `-s ELF` |
 | `-s firmware.elf` | load application symbols for debugging and symbol-based services |
 | `-N` | run the firmware's native freertos; use for s3 |
 | `--psram ap-8m-opi` | opt into an 8 mib aps6408l-3obmx octal psram on s3 cs1 |
@@ -219,6 +220,17 @@ flashed image normally, restart without `--strap-mode`. control flash
 operations share the guest write path, including translated-code
 invalidation. `scripts/check-s3-remote-channels.sh` gates replies, reboot
 survival, and post-reset uart output on the bridge socket.
+
+`--ble-hci` is s3-only and forwards the guest's genuine NimBLE HCI to an
+external H4-speaking controller (Bumble) over tcp, injecting its
+events/ACL back into the host through the firmware's own transport
+entries, so GAP/GATT run natively and a real phone can scan, connect, and
+walk the GATT table. it needs application symbols (`-s ELF`) for the HCI
+transport hooks and stays clear of classic targets, which keep their
+observer/virtual-HCI behavior. `scripts/check-s3-ble-hci.sh` (with
+`tools/ble_hci_peer.py`, `pip3 install bumble`) gates a full phone session
+against the IDF bleprph example: three SIG services plus the custom
+service, reads, writes, notification subscribes, and a clean disconnect.
 
 esptool over `socket://` is **blocked, not working**: the s3 rom enters uart0
 download mode correctly under `--strap-mode 0x07` (the banner reports

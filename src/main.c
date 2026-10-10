@@ -11,6 +11,8 @@
 #include "wifi_stubs.h"
 #include "host_net_slirp.h"
 #include "uart_tcp.h"
+#include "ble_hci.h"
+#include "bt_stubs.h"
 #include "elf_symbols.h"
 #include "freertos_stubs.h"
 #include "savestate.h"
@@ -819,6 +821,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
     fprintf(stderr, "  --uart-tcp <HOST:PORT>  Bridge UART0 to a TCP server for esptool socket:// (UART RX/TX move to the socket while connected)\n");
     fprintf(stderr, "  --control-tcp <HOST:PORT>  Host control channel: reset, erase-flash, erase-region OFF LEN, write-region OFF FILE, ping\n");
+    fprintf(stderr, "  --ble-hci <tcp:HOST:PORT>  Forward NimBLE HCI to an external controller (Bumble); requires -s ELF\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -1202,6 +1205,7 @@ int main(int argc, char *argv[]) {
     const char *efuse_path = NULL;
     const char *uart_tcp_spec = NULL;
     const char *control_tcp_spec = NULL;
+    const char *ble_hci_spec = NULL;
     uint32_t strap_mode = 0;
     int has_strap_mode = 0;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
@@ -1314,6 +1318,12 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--control-tcp") == 0 && i + 1 < argc) {
             control_tcp_spec = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--ble-hci") == 0 && i + 1 < argc) {
+            ble_hci_spec = argv[i + 1];
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1484,6 +1494,7 @@ int main(int argc, char *argv[]) {
         .efuse_path = efuse_path,
         .strap_mode = strap_mode,
         .has_strap_mode = has_strap_mode,
+        .ble_hci_backend = ble_hci_spec != NULL,
         .sdcard_path = sdcard_path,
         .sdcard_size = sdcard_size,
         .entry_override = has_entry_override ? entry_override : 0,
@@ -1742,6 +1753,7 @@ int main(int argc, char *argv[]) {
     /* Host TCP bridges live outside the session so resets never drop them. */
     uart_tcp_bridge_t *uart_bridge = NULL;
     ctrl_tcp_server_t *ctrl_server = NULL;
+    ble_hci_conn_t *ble_hci = NULL;
     if (uart_tcp_spec) {
         char uart_host[256];
         int uart_port = 0;
@@ -1777,6 +1789,30 @@ int main(int argc, char *argv[]) {
         }
         fprintf(stderr, "flexe: control channel on TCP %s:%d\n", ctrl_host,
                 ctrl_port);
+    }
+    if (ble_hci_spec) {
+        const char *spec = ble_hci_spec;
+        if (strncmp(spec, "tcp:", 4) == 0) spec += 4;
+        char ble_host[256];
+        int ble_port = 0;
+        bt_stubs_t *bt = flexe_session_bt(session);
+        if (uart_tcp_parse_endpoint(spec, ble_host, sizeof(ble_host),
+                                    &ble_port) != 0 ||
+            !bt ||
+            (ble_hci = ble_hci_connect(ble_host, ble_port)) == NULL) {
+            fprintf(stderr, "flexe: cannot reach --ble-hci %s\n",
+                    ble_hci_spec);
+            uart_tcp_bridge_destroy(uart_bridge);
+            g_uart_bridge = NULL;
+            ctrl_tcp_destroy(ctrl_server);
+            flexe_host_net_destroy(host_net);
+            flexe_session_destroy(session);
+            ring_destroy(g_ring);
+            return 1;
+        }
+        bt_stubs_set_hci_backend(bt, ble_hci);
+        fprintf(stderr, "flexe: BLE HCI forwarding to TCP %s:%d\n", ble_host,
+                ble_port);
     }
     unsigned observed_resets = flexe_session_reset_count(session);
     while (cycles < max_cycles_u64 &&
@@ -2030,10 +2066,14 @@ int main(int argc, char *argv[]) {
             if (rmt_stats_enabled) rmt_stats_attach(periph, rmt_stats);
             rom = flexe_session_rom(session);
             frt = flexe_session_frt(session);
+            if (ble_hci)
+                bt_stubs_set_hci_backend(flexe_session_bt(session), ble_hci);
             hb_stub_count = 0;
         }
         flexe_host_net_pump(host_net);
         pump_remote_channels(uart_bridge, ctrl_server, session);
+        if (ble_hci)
+            bt_stubs_hci_pump(flexe_session_bt(session), cpu1_any);
 
         /* Progress heartbeat */
         if (heartbeat_interval > 0 &&
@@ -2387,6 +2427,7 @@ int main(int argc, char *argv[]) {
     uart_tcp_bridge_destroy(uart_bridge);
     g_uart_bridge = NULL;
     ctrl_tcp_destroy(ctrl_server);
+    ble_hci_close(ble_hci);
     flexe_session_destroy(session);
     return strict_mmio && unhandled_count != 0 ? 1 : 0;
 }
