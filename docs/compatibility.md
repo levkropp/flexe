@@ -187,6 +187,8 @@ the image's chip id and revision bounds select the machine.
 | `--uart-tcp HOST:PORT` | bridge uart0 to a tcp server; while a client is connected, uart rx/tx move off stdin/stdout |
 | `--control-tcp HOST:PORT` | host control channel: `reset`, `erase-flash`, `erase-region`, `write-region`, `ping` |
 | `--ble-hci tcp:HOST:PORT` | s3-only: forward NimBLE HCI to an external H4 controller; requires `-s ELF` |
+| `--wifi-ssid SSID` + `--wifi-password PASS` | model a station network in the air; association then enforces the match |
+| `--net-hostfwd ap\|sta:HOST_PORT:GUEST_IP:GUEST_PORT` | s3-only user-mode Ethernet forward off host loopback; repeatable within one interface and /24 |
 | `-s firmware.elf` | load application symbols for debugging and symbol-based services |
 | `-N` | run the firmware's native freertos; use for s3 |
 | `--psram ap-8m-opi` | opt into an 8 mib aps6408l-3obmx octal psram on s3 cs1 |
@@ -231,6 +233,23 @@ observer/virtual-HCI behavior. `scripts/check-s3-ble-hci.sh` (with
 `tools/ble_hci_peer.py`, `pip3 install bumble`) gates a full phone session
 against the IDF bleprph example: three SIG services plus the custom
 service, reads, writes, notification subscribes, and a clean disconnect.
+
+`--wifi-ssid` with `--wifi-password` models one station network in the air
+for classic targets (s3 keeps its native wi-fi stack). without it every
+association succeeds, exactly as before; with it, `esp_wifi_connect()`
+reports unknown ssids as `NO_AP_FOUND`, a first wrong-password attempt as
+`AUTH_FAIL` and retries as `CONNECTION_FAIL`, matching esp-emulator's
+station model, and the provisioned network appears in scan results with
+the bssid the association events report. `esp_wifi_get_config()` echoes
+the firmware's own configuration once set and otherwise answers with the
+modeled network as though nvs had saved it, which is what lets
+portal-provisioned firmware connect with no explicit `set_config`, like
+the classic wifi_client fixture does.
+
+`--net-hostfwd` is repeatable: each flag adds one loopback listener to the
+same user-mode network, so one guest can serve several host ports. every
+forward must name the network's own interface (`ap` or `sta`) and an
+address in its /24; the network stays restricted to loopback either way.
 
 esptool over `socket://` is **blocked, not working**: the s3 rom enters uart0
 download mode correctly under `--strap-mode 0x07` (the banner reports

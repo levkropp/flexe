@@ -818,10 +818,11 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --strap-mode <hex>  GPIO_STRAP_REG sample for ROM boot selection (0x02 = UART download)\n");
     fprintf(stderr, "  --usb-console   Route console output from native USB Serial/JTAG instead of UART0\n");
     fprintf(stderr, "  --sandbox-events  Emit peripheral NDJSON and accept GPIO/touch/ADC/UART/I2S input on stdin\n");
-    fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp)\n");
+    fprintf(stderr, "  --net-hostfwd ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT  Forward host loopback TCP through the native S3 Ethernet netif (requires libslirp; repeatable, same interface and /24)\n");
     fprintf(stderr, "  --uart-tcp <HOST:PORT>  Bridge UART0 to a TCP server for esptool socket:// (UART RX/TX move to the socket while connected)\n");
     fprintf(stderr, "  --control-tcp <HOST:PORT>  Host control channel: reset, erase-flash, erase-region OFF LEN, write-region OFF FILE, ping\n");
     fprintf(stderr, "  --ble-hci <tcp:HOST:PORT>  Forward NimBLE HCI to an external controller (Bumble); requires -s ELF\n");
+    fprintf(stderr, "  --wifi-ssid <SSID> --wifi-password <PASS>  Model a station network in the air; association then enforces SSID/password match\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -1201,11 +1202,15 @@ int main(int argc, char *argv[]) {
     int usb_console = 0;
     /* AOT statically-recompiled firmware dylib */
     const char *aot_dylib_path = NULL;
-    const char *net_hostfwd_spec = NULL;
+#define FLEXE_MAX_HOSTFWD 8
+    const char *net_hostfwd_specs[FLEXE_MAX_HOSTFWD];
+    int net_hostfwd_count = 0;
     const char *efuse_path = NULL;
     const char *uart_tcp_spec = NULL;
     const char *control_tcp_spec = NULL;
     const char *ble_hci_spec = NULL;
+    const char *wifi_ssid = NULL;
+    const char *wifi_password = NULL;
     uint32_t strap_mode = 0;
     int has_strap_mode = 0;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
@@ -1305,7 +1310,12 @@ int main(int argc, char *argv[]) {
             argc -= 2;
             continue;
         } else if (strcmp(argv[i], "--net-hostfwd") == 0 && i + 1 < argc) {
-            net_hostfwd_spec = argv[i + 1];
+            if (net_hostfwd_count >= FLEXE_MAX_HOSTFWD) {
+                fprintf(stderr, "flexe: at most %d --net-hostfwd forwards\n",
+                        FLEXE_MAX_HOSTFWD);
+                return 1;
+            }
+            net_hostfwd_specs[net_hostfwd_count++] = argv[i + 1];
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1324,6 +1334,18 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--ble-hci") == 0 && i + 1 < argc) {
             ble_hci_spec = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--wifi-ssid") == 0 && i + 1 < argc) {
+            wifi_ssid = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--wifi-password") == 0 && i + 1 < argc) {
+            wifi_password = argv[i + 1];
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1495,6 +1517,8 @@ int main(int argc, char *argv[]) {
         .strap_mode = strap_mode,
         .has_strap_mode = has_strap_mode,
         .ble_hci_backend = ble_hci_spec != NULL,
+        .wifi_ssid = wifi_ssid,
+        .wifi_password = wifi_password,
         .sdcard_path = sdcard_path,
         .sdcard_size = sdcard_size,
         .entry_override = has_entry_override ? entry_override : 0,
@@ -1525,19 +1549,28 @@ int main(int argc, char *argv[]) {
     /* Pull out pointers for use in the execution loop */
     xtensa_cpu_t *cpu = flexe_session_cpu(session, 0);
     flexe_host_net_t *host_net = NULL;
-    if (net_hostfwd_spec) {
+    if (net_hostfwd_count > 0) {
         if (cpu->target->id != FLEXE_TARGET_ESP32S3) {
             fprintf(stderr, "[net] --net-hostfwd currently requires ESP32-S3\n");
             flexe_session_destroy(session);
             ring_destroy(g_ring);
             return 1;
         }
-        host_net = flexe_host_net_create(net_hostfwd_spec,
+        host_net = flexe_host_net_create(net_hostfwd_specs[0],
                                          flexe_session_wifi(session));
         if (!host_net) {
             flexe_session_destroy(session);
             ring_destroy(g_ring);
             return 1;
+        }
+        for (int i = 1; i < net_hostfwd_count; i++) {
+            if (flexe_host_net_add_forward(host_net,
+                                           net_hostfwd_specs[i]) != 0) {
+                flexe_host_net_destroy(host_net);
+                flexe_session_destroy(session);
+                ring_destroy(g_ring);
+                return 1;
+            }
         }
     }
     xtensa_mem_t *mem = flexe_session_mem(session);

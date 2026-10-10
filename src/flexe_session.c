@@ -479,6 +479,29 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
             wifi_stubs_hook_socket_symbols_from_vfs(s->wstubs, s->syms);
             wifi_stubs_hook_ethernet_symbols(s->wstubs, s->syms);
         }
+        /* The modeled station network is host configuration: validate once
+         * here so every later association applies the same policy, and the
+         * reset path carries it via the host-config snapshot. */
+        if (cfg->wifi_ssid || cfg->wifi_password) {
+            const char *ssid = cfg->wifi_ssid ? cfg->wifi_ssid : "";
+            const char *password = cfg->wifi_password ? cfg->wifi_password :
+                                                       "";
+            if (strlen(ssid) > 32u || strlen(password) > 64u) {
+                fprintf(stderr,
+                        "flexe: --wifi-ssid holds 32 bytes and "
+                        "--wifi-password 64 bytes\n");
+                return -1;
+            }
+            if (!ssid[0]) {
+                fprintf(stderr,
+                        "flexe: --wifi-password needs --wifi-ssid\n");
+                return -1;
+            }
+            wifi_stubs_set_sta_credentials(s->wstubs, ssid, password);
+        }
+    } else if (cfg->wifi_ssid || cfg->wifi_password) {
+        fprintf(stderr, "flexe: failed to create WiFi stubs for --wifi-ssid\n");
+        return -1;
     }
 
     /* VFS / SPIFFS / FATFS stubs (host-backed file I/O).

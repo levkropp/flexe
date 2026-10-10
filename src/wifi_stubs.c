@@ -133,6 +133,15 @@ typedef struct {
 #define WIFI_AUTH_WPA_WPA2_PSK 4
 #define WIFI_AUTH_WPA3_PSK     6
 
+/* Disconnect reasons (wifi_err_reason_t). Verified against esp-emulator's
+ * station model: unknown SSID reports NO_AP_FOUND, a first wrong-password
+ * attempt reports AUTH_FAIL and retries report CONNECTION_FAIL, and an
+ * explicit disconnect reports ASSOC_LEAVE. */
+#define WIFI_REASON_ASSOC_LEAVE     8
+#define WIFI_REASON_NO_AP_FOUND     201
+#define WIFI_REASON_AUTH_FAIL       202
+#define WIFI_REASON_CONNECTION_FAIL 205
+
 /* ESP-IDF esp_err_t values and classic ESP32 MAC interface numbering. */
 #define ESP_ERR_INVALID_ARG_VALUE   0x102u
 #define ESP_ERR_NOT_SUPPORTED_VALUE 0x106u
@@ -264,10 +273,24 @@ struct wifi_stubs {
     /* When non-zero, name lookups answer with this address and outbound
      * traffic is redirected to it, port preserved. */
     uint32_t           dns_override;
-    /* Station credentials the host has pre-provisioned, reported by
-     * esp_wifi_get_config() as though saved in NVS. Empty by default. */
+    /* Station credentials the host has pre-provisioned: the virtual
+     * network that exists in the air. Reported by esp_wifi_get_config()
+     * as though saved in NVS when the firmware never configured the
+     * station itself. Empty by default, which leaves the legacy
+     * always-succeed association behavior in place. */
     char               sta_ssid[33];
     char               sta_password[65];
+    /* Station configuration the firmware supplied via esp_wifi_set_config().
+     * Kept apart from the host network so esp_wifi_connect() can apply
+     * real association policy: unknown SSID, wrong password, or success. */
+    char               cfg_ssid[33];
+    char               cfg_password[65];
+    bool               cfg_valid;
+    unsigned           connect_attempts; /* connects since last set_config */
+    /* Reason reported with the next STA_DISCONNECTED event. Explicit
+     * esp_wifi_disconnect() uses ASSOC_LEAVE; failed associations use
+     * the NO_AP_FOUND / AUTH_FAIL / CONNECTION_FAIL codes. */
+    uint8_t            disconnect_reason;
     uint8_t            channel;         /* 1-14 */
     uint8_t            sta_mac[6];      /* STA MAC */
     uint8_t            ap_mac[6];       /* AP MAC */
@@ -2038,10 +2061,12 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
     if (kind == EVT_DATA_STA_CONNECTED ||
         kind == EVT_DATA_STA_DISCONNECTED) {
         /* wifi_event_sta_connected_t: ssid[32], ssid_len, bssid[6], channel,
-         * authmode. */
-        for (int i = 0; i < 32 && ws->sta_ssid[i]; i++)
-            mem_write8(cpu->mem, p + (uint32_t)i, (uint8_t)ws->sta_ssid[i]);
-        mem_write8(cpu->mem, p + 32u, (uint8_t)strlen(ws->sta_ssid));
+         * authmode. Report the network the station joined: the firmware's
+         * own configuration when it supplied one, else the host network. */
+        const char *ssid = ws->cfg_valid ? ws->cfg_ssid : ws->sta_ssid;
+        for (int i = 0; i < 32 && ssid[i]; i++)
+            mem_write8(cpu->mem, p + (uint32_t)i, (uint8_t)ssid[i]);
+        mem_write8(cpu->mem, p + 32u, (uint8_t)strlen(ssid));
         static const uint8_t bssid[6] = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
         for (int i = 0; i < 6; i++)
             mem_write8(cpu->mem, p + 33u + (uint32_t)i, bssid[i]);
@@ -2052,7 +2077,7 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
             /* wifi_event_sta_disconnected_t replaces channel/authmode with
              * reason and RSSI. IDF always supplies this payload; Arduino's
              * event bridge copies all 41 bytes without accepting NULL. */
-            mem_write8(cpu->mem, p + 39u, 8);    /* WIFI_REASON_ASSOC_LEAVE */
+            mem_write8(cpu->mem, p + 39u, ws->disconnect_reason);
             mem_write8(cpu->mem, p + 40u, (uint8_t)(int8_t)-55);
         }
     } else if (kind == EVT_DATA_GOT_IP) {
@@ -2276,6 +2301,21 @@ static void stub_esp_wifi_set_config(xtensa_cpu_t *cpu, void *ctx)
             ws->ap_ssid[i] = mem_read8(cpu->mem, config_ptr + (uint32_t)i);
         ws->ap_ssid[32] = 0;
         wifi_log(ws, "esp_wifi_set_config(AP, ssid=\"%s\")\n", ws->ap_ssid);
+    } else if (config_ptr && iface == 0) { /* WIFI_IF_STA */
+        /* wifi_sta_config_t: ssid[32] then password[64]. A new station
+         * configuration restarts association policy from scratch. */
+        for (int i = 0; i < 32; i++)
+            ws->cfg_ssid[i] = (char)mem_read8(cpu->mem,
+                                              config_ptr + (uint32_t)i);
+        ws->cfg_ssid[32] = 0;
+        for (int i = 0; i < 64; i++)
+            ws->cfg_password[i] = (char)mem_read8(cpu->mem,
+                                                  config_ptr + 32u +
+                                                  (uint32_t)i);
+        ws->cfg_password[64] = 0;
+        ws->cfg_valid = true;
+        ws->connect_attempts = 0;
+        wifi_log(ws, "esp_wifi_set_config(STA, ssid=\"%s\")\n", ws->cfg_ssid);
     } else {
         wifi_log(ws, "esp_wifi_set_config(iface=%u)\n", iface);
     }
@@ -2302,14 +2342,21 @@ static void stub_esp_wifi_get_config(xtensa_cpu_t *cpu, void *ctx)
     if (config_ptr) {
         for (int i = 0; i < 128; i++)
             mem_write8(cpu->mem, config_ptr + (uint32_t)i, 0);
-        /* wifi_sta_config_t: ssid[32] then password[64]. */
-        if (iface == 0 && ws && ws->sta_ssid[0]) {
-            for (int i = 0; i < 32 && ws->sta_ssid[i]; i++)
-                mem_write8(cpu->mem, config_ptr + (uint32_t)i,
-                           (uint8_t)ws->sta_ssid[i]);
-            for (int i = 0; i < 64 && ws->sta_password[i]; i++)
-                mem_write8(cpu->mem, config_ptr + 32u + (uint32_t)i,
-                           (uint8_t)ws->sta_password[i]);
+        /* wifi_sta_config_t: ssid[32] then password[64]. Echo the
+         * firmware's own configuration once set; otherwise report the
+         * host-provisioned network as though NVS had saved it. */
+        if (iface == 0 && ws) {
+            const char *ssid = ws->cfg_valid ? ws->cfg_ssid : ws->sta_ssid;
+            const char *password = ws->cfg_valid ? ws->cfg_password :
+                                                   ws->sta_password;
+            if (ssid[0]) {
+                for (int i = 0; i < 32 && ssid[i]; i++)
+                    mem_write8(cpu->mem, config_ptr + (uint32_t)i,
+                               (uint8_t)ssid[i]);
+                for (int i = 0; i < 64 && password[i]; i++)
+                    mem_write8(cpu->mem, config_ptr + 32u + (uint32_t)i,
+                               (uint8_t)password[i]);
+            }
         }
     }
     ws_return(cpu, 0);
@@ -2368,8 +2415,9 @@ static void stub_esp_wifi_sta_get_ap_info(xtensa_cpu_t *cpu, void *ctx)
     static const uint8_t bssid[6] = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
     for (int i = 0; i < 6; i++)
         mem_write8(cpu->mem, rec + (uint32_t)i, bssid[i]);
-    for (int i = 0; i < 32 && ws->sta_ssid[i]; i++)
-        mem_write8(cpu->mem, rec + 6u + (uint32_t)i, (uint8_t)ws->sta_ssid[i]);
+    const char *joined = ws->cfg_valid ? ws->cfg_ssid : ws->sta_ssid;
+    for (int i = 0; i < 32 && joined[i]; i++)
+        mem_write8(cpu->mem, rec + 6u + (uint32_t)i, (uint8_t)joined[i]);
     mem_write8(cpu->mem, rec + 39u, 1);              /* primary channel */
     mem_write8(cpu->mem, rec + 44u, (uint8_t)(int8_t)-55); /* rssi */
     ws_return(cpu, 0);
@@ -2379,7 +2427,43 @@ static void stub_esp_wifi_connect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     ws->stats.wifi_connect_calls++;
+    ws->connect_attempts++;
+    /* With no modeled network in the air, keep the legacy behavior: every
+     * association succeeds. Once the host provisions one via
+     * --wifi-ssid/--wifi-password, apply real policy against the
+     * firmware's configured station credentials. */
+    if (ws->sta_ssid[0]) {
+        /* The running configuration is the firmware's own once set, else
+         * the NVS-saved network it would load on hardware. */
+        const char *eff_ssid = ws->cfg_valid ? ws->cfg_ssid : ws->sta_ssid;
+        const char *eff_pass = ws->cfg_valid ? ws->cfg_password :
+                                               ws->sta_password;
+        bool ssid_match = eff_ssid[0] &&
+                          strcmp(eff_ssid, ws->sta_ssid) == 0;
+        if (!ssid_match) {
+            ws->sta_connected = false;
+            ws->disconnect_reason = WIFI_REASON_NO_AP_FOUND;
+            wifi_queue_event(ws, "WIFI_EVENT", 5 /* STA_DISCONNECTED */,
+                             EVT_DATA_STA_DISCONNECTED);
+            wifi_log(ws, "esp_wifi_connect() → no AP (ssid=\"%s\")\n",
+                     eff_ssid);
+            ws_return(cpu, 0);
+            return;
+        }
+        if (strcmp(eff_pass, ws->sta_password) != 0) {
+            ws->sta_connected = false;
+            ws->disconnect_reason = ws->connect_attempts <= 1 ?
+                WIFI_REASON_AUTH_FAIL : WIFI_REASON_CONNECTION_FAIL;
+            wifi_queue_event(ws, "WIFI_EVENT", 5 /* STA_DISCONNECTED */,
+                             EVT_DATA_STA_DISCONNECTED);
+            wifi_log(ws, "esp_wifi_connect() → auth fail (attempt %u)\n",
+                     ws->connect_attempts);
+            ws_return(cpu, 0);
+            return;
+        }
+    }
     ws->sta_connected = true;
+    ws->disconnect_reason = WIFI_REASON_ASSOC_LEAVE;
     /* Association then address assignment, in that order, as on hardware. */
     wifi_queue_event(ws, "WIFI_EVENT", 4 /* STA_CONNECTED */,
                      EVT_DATA_STA_CONNECTED);
@@ -2392,6 +2476,7 @@ static void stub_esp_wifi_disconnect(xtensa_cpu_t *cpu, void *ctx)
 {
     wifi_stubs_t *ws = ctx;
     ws->sta_connected = false;
+    ws->disconnect_reason = WIFI_REASON_ASSOC_LEAVE;
     wifi_queue_event(ws, "WIFI_EVENT", 5 /* STA_DISCONNECTED */,
                      EVT_DATA_STA_DISCONNECTED);
     wifi_log(ws, "esp_wifi_disconnect()\n");
@@ -2414,6 +2499,31 @@ static void stub_esp_wifi_scan_stop(xtensa_cpu_t *cpu, void *ctx)
     ws->scan_active = false;
     wifi_log(ws, "esp_wifi_scan_stop()\n");
     ws_return(cpu, 0);
+}
+
+/* The scan result list is the synthetic neighborhood with the
+ * host-provisioned network spliced into the last slot, so a firmware
+ * scanning for the network it was told to join actually finds it (with
+ * the same BSSID the association events report). With no provisioned
+ * network the list is exactly the legacy fakes. */
+static void wifi_scan_entry(const wifi_stubs_t *ws, unsigned i,
+                            const char **ssid, const uint8_t **bssid,
+                            uint8_t *channel, int8_t *rssi, uint8_t *auth)
+{
+    static const uint8_t net_bssid[6] = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
+    if (ws->sta_ssid[0] && i == FAKE_AP_COUNT - 1u) {
+        *ssid = ws->sta_ssid;
+        *bssid = net_bssid;
+        *channel = 1;
+        *rssi = -55;
+        *auth = ws->sta_password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+        return;
+    }
+    *ssid = fake_aps[i].ssid;
+    *bssid = fake_aps[i].bssid;
+    *channel = fake_aps[i].channel;
+    *rssi = fake_aps[i].rssi;
+    *auth = fake_aps[i].auth;
 }
 
 static void stub_esp_wifi_scan_get_ap_num(xtensa_cpu_t *cpu, void *ctx)
@@ -2457,19 +2567,24 @@ static void stub_esp_wifi_scan_get_ap_records(xtensa_cpu_t *cpu, void *ctx)
         for (int j = 0; j < WIFI_AP_RECORD_SIZE; j++)
             mem_write8(cpu->mem, base + (uint32_t)j, 0);
 
+        const char *ssid;
+        const uint8_t *bssid;
+        uint8_t channel, auth;
+        int8_t rssi;
+        wifi_scan_entry(ws, i, &ssid, &bssid, &channel, &rssi, &auth);
         /* bssid at +0 */
         for (int j = 0; j < 6; j++)
-            mem_write8(cpu->mem, base + (uint32_t)j, fake_aps[i].bssid[j]);
+            mem_write8(cpu->mem, base + (uint32_t)j, bssid[j]);
         /* ssid at +6 */
-        int slen = (int)strlen(fake_aps[i].ssid);
+        int slen = (int)strlen(ssid);
         for (int j = 0; j < slen && j < 32; j++)
-            mem_write8(cpu->mem, base + 6 + (uint32_t)j, (uint8_t)fake_aps[i].ssid[j]);
+            mem_write8(cpu->mem, base + 6 + (uint32_t)j, (uint8_t)ssid[j]);
         /* primary channel at +39 */
-        mem_write8(cpu->mem, base + 39, fake_aps[i].channel);
+        mem_write8(cpu->mem, base + 39, channel);
         /* rssi at +44 */
-        mem_write8(cpu->mem, base + 44, (uint8_t)fake_aps[i].rssi);
+        mem_write8(cpu->mem, base + 44, (uint8_t)rssi);
         /* authmode at +45 — stored as single byte in packed struct */
-        mem_write8(cpu->mem, base + 45, fake_aps[i].auth);
+        mem_write8(cpu->mem, base + 45, auth);
     }
 
     if (num_ptr)
@@ -2817,6 +2932,7 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
     ws->hostent_buf = HOSTENT_SCRATCH_ADDR;
     ws->channel = 1;
     ws->wifi_mode = WIFI_MODE_NULL;
+    ws->disconnect_reason = 8; /* WIFI_REASON_ASSOC_LEAVE */
 
     /* Default MACs (locally-administered) */
     ws->sta_mac[0] = 0x24; ws->sta_mac[1] = 0x6F;

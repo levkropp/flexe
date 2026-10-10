@@ -203,6 +203,33 @@ static int parse_spec(const char *spec, uint32_t *iface,
            parse_port(port, guest_port) == 0 ? 0 : -1;
 }
 
+static int add_forward(flexe_host_net_t *net, uint32_t iface,
+                       uint16_t host_port, struct in_addr guest_ip,
+                       uint16_t guest_port)
+{
+    if (iface != net->iface) {
+        fprintf(stderr, "[net] forward targets %s but the network is %s\n",
+                iface ? "AP" : "STA", net->iface ? "AP" : "STA");
+        return -1;
+    }
+    uint32_t vnetwork = ntohl(net->config.vnetwork.s_addr);
+    if ((ntohl(guest_ip.s_addr) & 0xFFFFFF00u) != vnetwork) {
+        fprintf(stderr, "[net] forward guest IP %s is outside the network\n",
+                inet_ntoa(guest_ip));
+        return -1;
+    }
+    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+    if (slirp_add_hostfwd(net->slirp, 0, loopback, host_port,
+                          guest_ip, guest_port) != 0) {
+        fprintf(stderr, "[net] cannot listen on 127.0.0.1:%u\n", host_port);
+        return -1;
+    }
+    fprintf(stderr, "[net] 127.0.0.1:%u -> %s %s:%u (Ethernet user mode)\n",
+            host_port, iface ? "AP" : "STA", inet_ntoa(guest_ip),
+            guest_port);
+    return 0;
+}
+
 flexe_host_net_t *flexe_host_net_create(const char *spec, wifi_stubs_t *wifi)
 {
     if (!wifi_stubs_has_ethernet_boundary(wifi)) {
@@ -257,18 +284,28 @@ flexe_host_net_t *flexe_host_net_create(const char *spec, wifi_stubs_t *wifi)
         flexe_host_net_destroy(net);
         return NULL;
     }
-    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
-    if (slirp_add_hostfwd(net->slirp, 0, loopback, host_port,
-                          guest_ip, guest_port) != 0) {
-        fprintf(stderr, "[net] cannot listen on 127.0.0.1:%u\n", host_port);
+    if (add_forward(net, iface, host_port, guest_ip,
+                    guest_port) != 0) {
         flexe_host_net_destroy(net);
         return NULL;
     }
     wifi_stubs_set_ethernet_tx_callback(wifi, host_tx, net);
-    fprintf(stderr, "[net] 127.0.0.1:%u -> %s %s:%u (Ethernet user mode)\n",
-            host_port, iface ? "AP" : "STA", inet_ntoa(guest_ip),
-            guest_port);
     return net;
+}
+
+/* Expose one more loopback listener. Every forward shares the instance's
+ * interface and /24: libslirp models one user-mode network, not a router. */
+int flexe_host_net_add_forward(flexe_host_net_t *net, const char *spec)
+{
+    if (!net || !net->slirp) return -1;
+    uint32_t iface = 0;
+    uint16_t host_port = 0, guest_port = 0;
+    struct in_addr guest_ip = {0};
+    if (parse_spec(spec, &iface, &host_port, &guest_ip, &guest_port) != 0) {
+        fprintf(stderr, "[net] expected ap|sta:HOST_PORT:GUEST_IP:GUEST_PORT\n");
+        return -1;
+    }
+    return add_forward(net, iface, host_port, guest_ip, guest_port);
 }
 
 void flexe_host_net_attach(flexe_host_net_t *net, wifi_stubs_t *wifi)
@@ -335,5 +372,7 @@ void flexe_host_net_attach(flexe_host_net_t *net, wifi_stubs_t *wifi)
 { (void)net; (void)wifi; }
 void flexe_host_net_pump(flexe_host_net_t *net) { (void)net; }
 void flexe_host_net_destroy(flexe_host_net_t *net) { (void)net; }
+int flexe_host_net_add_forward(flexe_host_net_t *net, const char *spec)
+{ (void)net; (void)spec; return -1; }
 
 #endif

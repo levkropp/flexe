@@ -123,6 +123,7 @@ workflow and a modeled hardware controller have different support boundaries.
 | `--strap-mode HEX` | raw strap sample for rom boot selection (`0x07` = s3 uart0 download) |
 | `--uart-tcp HOST:PORT` | bridge uart0 to a tcp server (esptool `socket://` transport) |
 | `--control-tcp HOST:PORT` | host control channel: reset, erase/write flash, ping |
+| `--wifi-ssid SSID` + `--wifi-password PASS` | model a station network; association enforces the match |
 | `--ble-hci tcp:HOST:PORT` | forward s3 NimBLE HCI to an external controller (needs `-s ELF`) |
 | `--strict-mmio` | fail on unsupported peripheral accesses while keeping the jit enabled |
 | `--unhandled-report` | attribute unsupported accesses to registers and guest pcs in the interpreter |

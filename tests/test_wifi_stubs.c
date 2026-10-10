@@ -1443,6 +1443,361 @@ TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time) {
 #endif
 }
 
+/* ===== Station association policy =====
+ *
+ * The station path models a provisioned virtual network: once the host
+ * supplies one, esp_wifi_connect() enforces SSID/password match with the
+ * hardware reason codes (verified against esp-emulator's station model).
+ * With no provisioned network the legacy always-succeed behavior holds.
+ * Events are observed through the guest scratch payloads: with no handlers
+ * registered each tick still lays out exactly one event and drains it. */
+
+#define STATION_CFG_ADDR   0x3FFB2000u
+#define STATION_REC_ADDR   0x3FFB2100u
+#define STATION_NUM_ADDR   0x3FFB2200u
+#define STATION_ARR_ADDR   0x3FFB2300u
+#define STATION_EVT_SCRATCH 0x3FFE9000u
+
+static elf_symbols_t *wifi_test_station_symbols(uint32_t *addrs)
+{
+    static const char *path = "/tmp/flexe_test_station_symbols.elf";
+    static const char *names[] = {
+        "esp_wifi_set_config", "esp_wifi_get_config",
+        "esp_wifi_connect", "esp_wifi_disconnect",
+        "esp_wifi_sta_get_ap_info",
+        "esp_wifi_scan_start", "esp_wifi_scan_stop",
+        "esp_wifi_scan_get_ap_num", "esp_wifi_scan_get_ap_records",
+    };
+    static const uint32_t base_addrs[] = {
+        0x40375000u, 0x40375040u,
+        0x40375080u, 0x403750C0u,
+        0x40375100u,
+        0x40375140u, 0x40375180u,
+        0x403751C0u, 0x40375200u,
+    };
+    static const char section_names[] = "\0.symtab\0.strtab\0.shstrtab\0";
+    char strings[512] = {0};
+    wifi_test_elf_symbol_t symbols[10] = {{0}};
+    size_t strings_len = 1u;
+    for (size_t i = 0; i < 9u; i++) {
+        size_t len = strlen(names[i]) + 1u;
+        if (strings_len + len > sizeof(strings)) return NULL;
+        symbols[i + 1u].name = (uint32_t)strings_len;
+        symbols[i + 1u].value = base_addrs[i];
+        symbols[i + 1u].size = 0x20u;
+        symbols[i + 1u].info = 0x12u; /* global function */
+        symbols[i + 1u].shndx = 1u;
+        memcpy(strings + strings_len, names[i], len);
+        strings_len += len;
+        addrs[i] = base_addrs[i];
+    }
+
+    uint32_t strings_off = sizeof(wifi_test_elf_header_t);
+    uint32_t symbols_off = strings_off + (uint32_t)strings_len;
+    uint32_t sections_str_off = symbols_off + sizeof(symbols);
+    uint32_t sections_off = (sections_str_off + sizeof(section_names) + 3u)
+                          & ~3u;
+    size_t image_size = sections_off + 4u * sizeof(wifi_test_elf_section_t);
+    uint8_t *image = calloc(1u, image_size);
+    if (!image) return NULL;
+
+    wifi_test_elf_header_t header = {0};
+    header.ident[0] = 0x7Fu;
+    header.ident[1] = 'E';
+    header.ident[2] = 'L';
+    header.ident[3] = 'F';
+    header.ident[4] = 1u; /* ELF32 */
+    header.ident[5] = 1u; /* little-endian */
+    header.ident[6] = 1u;
+    header.type = 2u;
+    header.machine = 94u; /* Xtensa */
+    header.version = 1u;
+    header.entry = base_addrs[0];
+    header.shoff = sections_off;
+    header.ehsize = sizeof(header);
+    header.shentsize = sizeof(wifi_test_elf_section_t);
+    header.shnum = 4u;
+    header.shstrndx = 3u;
+    memcpy(image, &header, sizeof(header));
+    memcpy(image + strings_off, strings, strings_len);
+    memcpy(image + symbols_off, symbols, sizeof(symbols));
+    memcpy(image + sections_str_off, section_names,
+           sizeof(section_names));
+
+    wifi_test_elf_section_t sections[4] = {{0}};
+    sections[1].name = 1u;
+    sections[1].type = 2u; /* SYMTAB */
+    sections[1].offset = symbols_off;
+    sections[1].size = sizeof(symbols);
+    sections[1].link = 2u;
+    sections[1].entsize = sizeof(wifi_test_elf_symbol_t);
+    sections[2].name = 9u;
+    sections[2].type = 3u; /* STRTAB */
+    sections[2].offset = strings_off;
+    sections[2].size = (uint32_t)strings_len;
+    sections[3].name = 17u;
+    sections[3].type = 3u;
+    sections[3].offset = sections_str_off;
+    sections[3].size = sizeof(section_names);
+    memcpy(image + sections_off, sections, sizeof(sections));
+
+    FILE *out = fopen(path, "wb");
+    if (!out) { free(image); return NULL; }
+    size_t written = fwrite(image, 1u, image_size, out);
+    fclose(out);
+    free(image);
+    if (written != image_size) { remove(path); return NULL; }
+    elf_symbols_t *loaded = elf_symbols_load(path);
+    remove(path);
+    return loaded;
+}
+
+static void station_write_config(xtensa_cpu_t *cpu, const char *ssid,
+                                 const char *password)
+{
+    for (int i = 0; i < 128; i++)
+        mem_write8(cpu->mem, STATION_CFG_ADDR + (uint32_t)i, 0);
+    for (int i = 0; i < 32 && ssid[i]; i++)
+        mem_write8(cpu->mem, STATION_CFG_ADDR + (uint32_t)i,
+                   (uint8_t)ssid[i]);
+    for (int i = 0; i < 64 && password[i]; i++)
+        mem_write8(cpu->mem, STATION_CFG_ADDR + 32u + (uint32_t)i,
+                   (uint8_t)password[i]);
+}
+
+static void station_read_cstr(xtensa_cpu_t *cpu, uint32_t addr, char *out,
+                              size_t cap)
+{
+    size_t i = 0;
+    for (; i + 1u < cap; i++) {
+        uint8_t c = mem_read8(cpu->mem, addr + (uint32_t)i);
+        out[i] = (char)c;
+        if (!c) return;
+    }
+    out[i] = '\0';
+}
+
+TEST(station_connect_applies_provisioned_policy) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    uint32_t addr[9] = {0};
+    elf_symbols_t *syms = wifi_test_station_symbols(addr);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) >= 9);
+    wifi_stubs_set_sta_credentials(wifi, "myssid", "mypassword");
+
+    /* Unknown SSID: NO_AP_FOUND, and the station is not connected. */
+    station_write_config(&cpu, "othernet", "secret123");
+    invoke_wifi_call0_4(&cpu, addr[0], 0u, STATION_CFG_ADDR, 0u, 0u);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+    invoke_wifi_call0(&cpu, addr[2], 0u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + 39u), 201u);
+    invoke_wifi_call0(&cpu, addr[4], STATION_REC_ADDR);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+
+    /* Wrong password: AUTH_FAIL first, CONNECTION_FAIL on retry. */
+    station_write_config(&cpu, "myssid", "wrongpass123");
+    invoke_wifi_call0_4(&cpu, addr[0], 0u, STATION_CFG_ADDR, 0u, 0u);
+    invoke_wifi_call0(&cpu, addr[2], 0u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + 39u), 202u);
+    invoke_wifi_call0(&cpu, addr[2], 0u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + 39u), 205u);
+    invoke_wifi_call0(&cpu, addr[4], STATION_REC_ADDR);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+
+    /* Matching credentials: association then address assignment. */
+    station_write_config(&cpu, "myssid", "mypassword");
+    invoke_wifi_call0_4(&cpu, addr[0], 0u, STATION_CFG_ADDR, 0u, 0u);
+    invoke_wifi_call0(&cpu, addr[2], 0u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    char ssid[40];
+    station_read_cstr(&cpu, STATION_EVT_SCRATCH, ssid, sizeof(ssid));
+    ASSERT_EQ(strcmp(ssid, "myssid"), 0);
+    ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + 39u), 1u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ(mem_read32(cpu.mem, STATION_EVT_SCRATCH + 8u), 0x0A00020Fu);
+    invoke_wifi_call0(&cpu, addr[4], STATION_REC_ADDR);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+    station_read_cstr(&cpu, STATION_REC_ADDR + 6u, ssid, sizeof(ssid));
+    ASSERT_EQ(strcmp(ssid, "myssid"), 0);
+
+    /* Explicit disconnect reports ASSOC_LEAVE and drops the station. */
+    invoke_wifi_call0(&cpu, addr[3], 0u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + 39u), 8u);
+    invoke_wifi_call0(&cpu, addr[4], STATION_REC_ADDR);
+    ASSERT_EQ(ar_read(&cpu, 2), UINT32_MAX);
+
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(station_connect_succeeds_without_provisioned_network) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    uint32_t addr[9] = {0};
+    elf_symbols_t *syms = wifi_test_station_symbols(addr);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) >= 9);
+
+    /* Legacy behavior is preserved exactly when no network is modeled:
+     * any configuration (or none at all) associates. */
+    station_write_config(&cpu, "anything", "whatever");
+    invoke_wifi_call0_4(&cpu, addr[0], 0u, STATION_CFG_ADDR, 0u, 0u);
+    invoke_wifi_call0(&cpu, addr[2], 0u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    char ssid[40];
+    station_read_cstr(&cpu, STATION_EVT_SCRATCH, ssid, sizeof(ssid));
+    ASSERT_EQ(strcmp(ssid, "anything"), 0);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ(mem_read32(cpu.mem, STATION_EVT_SCRATCH + 8u), 0x0A00020Fu);
+    invoke_wifi_call0(&cpu, addr[4], STATION_REC_ADDR);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(station_connect_uses_nvs_persona_without_set_config) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    uint32_t addr[9] = {0};
+    elf_symbols_t *syms = wifi_test_station_symbols(addr);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) >= 9);
+    wifi_stubs_set_sta_credentials(wifi, "flexe-net", "flexe-secret");
+
+    /* Firmware that never calls set_config connects with the NVS-saved
+     * network, exactly what the classic wifi_client fixture exercises. */
+    invoke_wifi_call0(&cpu, addr[2], 0u);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    char ssid[40];
+    station_read_cstr(&cpu, STATION_EVT_SCRATCH, ssid, sizeof(ssid));
+    ASSERT_EQ(strcmp(ssid, "flexe-net"), 0);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    ASSERT_EQ(mem_read32(cpu.mem, STATION_EVT_SCRATCH + 8u), 0x0A00020Fu);
+    invoke_wifi_call0(&cpu, addr[4], STATION_REC_ADDR);
+    ASSERT_EQ(ar_read(&cpu, 2), 0u);
+
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(station_scan_lists_provisioned_network) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    uint32_t addr[9] = {0};
+    elf_symbols_t *syms = wifi_test_station_symbols(addr);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) >= 9);
+    wifi_stubs_set_sta_credentials(wifi, "FlexeTest", "unusedpass");
+
+    invoke_wifi_call0(&cpu, addr[5], 0u);
+    invoke_wifi_call0(&cpu, addr[7], STATION_NUM_ADDR);
+    ASSERT_EQ(mem_read16(cpu.mem, STATION_NUM_ADDR), 8u);
+    mem_write16(cpu.mem, STATION_NUM_ADDR, 8u);
+    invoke_wifi_call0_4(&cpu, addr[8], STATION_NUM_ADDR, STATION_ARR_ADDR,
+                        0u, 0u);
+    ASSERT_EQ(mem_read16(cpu.mem, STATION_NUM_ADDR), 8u);
+    char ssid[40];
+    station_read_cstr(&cpu, STATION_ARR_ADDR + 6u, ssid, sizeof(ssid));
+    ASSERT_EQ(strcmp(ssid, "Linksys-5G"), 0);
+    uint32_t last = STATION_ARR_ADDR + 7u * 80u;
+    station_read_cstr(&cpu, last + 6u, ssid, sizeof(ssid));
+    ASSERT_EQ(strcmp(ssid, "FlexeTest"), 0);
+    static const uint8_t net_bssid[6] = {0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
+    for (int i = 0; i < 6; i++)
+        ASSERT_EQ(mem_read8(cpu.mem, last + (uint32_t)i), net_bssid[i]);
+    ASSERT_EQ(mem_read8(cpu.mem, last + 39u), 1u);
+    ASSERT_EQ(mem_read8(cpu.mem, last + 44u), (uint8_t)(int8_t)-55);
+    ASSERT_EQ(mem_read8(cpu.mem, last + 45u), 3u);
+
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(station_scan_without_network_keeps_legacy_list) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    uint32_t addr[9] = {0};
+    elf_symbols_t *syms = wifi_test_station_symbols(addr);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) >= 9);
+
+    invoke_wifi_call0(&cpu, addr[5], 0u);
+    mem_write16(cpu.mem, STATION_NUM_ADDR, 8u);
+    invoke_wifi_call0_4(&cpu, addr[8], STATION_NUM_ADDR, STATION_ARR_ADDR,
+                        0u, 0u);
+    ASSERT_EQ(mem_read16(cpu.mem, STATION_NUM_ADDR), 8u);
+    char ssid[40];
+    station_read_cstr(&cpu, STATION_ARR_ADDR + 7u * 80u + 6u, ssid,
+                      sizeof(ssid));
+    ASSERT_EQ(strcmp(ssid, "DIRECT-roku"), 0);
+
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
+TEST(station_get_config_echoes_firmware_then_nvs) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    uint32_t addr[9] = {0};
+    elf_symbols_t *syms = wifi_test_station_symbols(addr);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) >= 9);
+    wifi_stubs_set_sta_credentials(wifi, "myssid", "mypassword");
+
+    /* Before the firmware configures the station, the host network
+     * answers as though NVS had saved it. */
+    invoke_wifi_call0_4(&cpu, addr[1], 0u, STATION_REC_ADDR, 0u, 0u);
+    char ssid[40], password[72];
+    station_read_cstr(&cpu, STATION_REC_ADDR, ssid, sizeof(ssid));
+    station_read_cstr(&cpu, STATION_REC_ADDR + 32u, password,
+                      sizeof(password));
+    ASSERT_EQ(strcmp(ssid, "myssid"), 0);
+    ASSERT_EQ(strcmp(password, "mypassword"), 0);
+
+    /* Once configured, the firmware reads back its own credentials. */
+    station_write_config(&cpu, "othernet", "secret123");
+    invoke_wifi_call0_4(&cpu, addr[0], 0u, STATION_CFG_ADDR, 0u, 0u);
+    invoke_wifi_call0_4(&cpu, addr[1], 0u, STATION_REC_ADDR, 0u, 0u);
+    station_read_cstr(&cpu, STATION_REC_ADDR, ssid, sizeof(ssid));
+    station_read_cstr(&cpu, STATION_REC_ADDR + 32u, password,
+                      sizeof(password));
+    ASSERT_EQ(strcmp(ssid, "othernet"), 0);
+    ASSERT_EQ(strcmp(password, "secret123"), 0);
+
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks);
@@ -1461,4 +1816,10 @@ void run_wifi_stub_tests(void) {
     RUN_TEST(stripped_idf5_picolibc_family_relocates_without_profile);
     RUN_TEST(idf5_picolibc_recv_peek_preserves_http_request);
     RUN_TEST(nonblocking_udp_empty_polls_are_bounded_in_guest_time);
+    RUN_TEST(station_connect_applies_provisioned_policy);
+    RUN_TEST(station_connect_succeeds_without_provisioned_network);
+    RUN_TEST(station_connect_uses_nvs_persona_without_set_config);
+    RUN_TEST(station_scan_lists_provisioned_network);
+    RUN_TEST(station_scan_without_network_keeps_legacy_list);
+    RUN_TEST(station_get_config_echoes_firmware_then_nvs);
 }

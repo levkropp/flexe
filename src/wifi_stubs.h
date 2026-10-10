@@ -128,10 +128,14 @@ int wifi_stubs_inject_promiscuous_frame(wifi_stubs_t *ws,
 /* Enable event log mode: prefix wifi output with [cycle] WIFI format */
 void wifi_stubs_set_event_log(wifi_stubs_t *ws, bool enabled);
 
-/* Pre-provision station credentials, reported by esp_wifi_get_config() as
- * though a previous run had saved them. Firmware that provisions WiFi through
- * a captive portal checks for saved credentials to decide whether to start
- * the portal, so without these it can never be driven past provisioning. */
+/* Provision the modeled station network: the virtual AP that exists in
+ * the air. Reported by esp_wifi_get_config() as though a previous run had
+ * saved it, which lets portal-provisioned firmware run past provisioning;
+ * once the firmware configures the station itself, esp_wifi_connect()
+ * enforces SSID/password match against this network (unknown SSID and
+ * wrong password fail with the hardware reason codes). Empty by default,
+ * which keeps the legacy always-succeed association behavior. Survives
+ * software reset via the host-config snapshot. */
 void wifi_stubs_set_sta_credentials(wifi_stubs_t *ws, const char *ssid,
                                     const char *password);
 
