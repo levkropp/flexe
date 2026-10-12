@@ -845,7 +845,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --control-tcp <HOST:PORT>  Host control channel: reset, erase-flash, erase-region OFF LEN, write-region OFF FILE, ping\n");
     fprintf(stderr, "  --ble-hci <tcp:HOST:PORT>  Forward NimBLE HCI to an external controller (Bumble); requires -s ELF\n");
     fprintf(stderr, "  --wifi-ssid <SSID> --wifi-password <PASS>  Model a station network in the air; association then enforces SSID/password match\n");
-    fprintf(stderr, "  --wifi-ap-client <AA:BB:CC:DD:EE:FF>  Provision a Soft-AP station that auto-joins at AP start (repeatable)\n");
+    fprintf(stderr, "  --wifi-ap-client <AA:BB:CC:DD:EE:FF[=PASSWORD]>  Provision a Soft-AP station that auto-joins at AP start (repeatable)\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -1235,6 +1235,7 @@ int main(int argc, char *argv[]) {
     const char *wifi_ssid = NULL;
     const char *wifi_password = NULL;
     uint8_t wifi_ap_clients[WIFI_AP_CLIENT_MAX][6];
+    char wifi_ap_client_passwords[WIFI_AP_CLIENT_MAX][65];
     unsigned wifi_ap_client_count = 0;
     uint32_t strap_mode = 0;
     int has_strap_mode = 0;
@@ -1381,11 +1382,31 @@ int main(int argc, char *argv[]) {
                         WIFI_AP_CLIENT_MAX);
                 return 1;
             }
-            if (parse_mac_address(argv[i + 1],
-                                  wifi_ap_clients[wifi_ap_client_count]) != 0) {
-                fprintf(stderr, "flexe: --wifi-ap-client wants AA:BB:CC:DD:EE:FF\n");
+            /* MAC[=PASSWORD]: the password is the WPA2 passphrase the
+             * station offers; split on the first '=' so passwords may
+             * contain '=' themselves. */
+            const char *spec = argv[i + 1];
+            const char *eq = strchr(spec, '=');
+            size_t mac_len = eq ? (size_t)(eq - spec) : strlen(spec);
+            char mac_text[32];
+            if (mac_len >= sizeof(mac_text)) {
+                fprintf(stderr, "flexe: --wifi-ap-client wants AA:BB:CC:DD:EE:FF[=PASSWORD]\n");
                 return 1;
             }
+            memcpy(mac_text, spec, mac_len);
+            mac_text[mac_len] = '\0';
+            if (parse_mac_address(mac_text,
+                                  wifi_ap_clients[wifi_ap_client_count]) != 0) {
+                fprintf(stderr, "flexe: --wifi-ap-client wants AA:BB:CC:DD:EE:FF[=PASSWORD]\n");
+                return 1;
+            }
+            const char *password = eq ? eq + 1 : "";
+            if (strlen(password) > 64u) {
+                fprintf(stderr, "flexe: --wifi-ap-client password holds 64 bytes\n");
+                return 1;
+            }
+            memcpy(wifi_ap_client_passwords[wifi_ap_client_count], password,
+                   strlen(password) + 1u);
             wifi_ap_client_count++;
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
@@ -1583,6 +1604,8 @@ int main(int argc, char *argv[]) {
     sess_cfg.wifi_ap_client_count = wifi_ap_client_count;
     memcpy(sess_cfg.wifi_ap_clients, wifi_ap_clients,
            sizeof(sess_cfg.wifi_ap_clients));
+    memcpy(sess_cfg.wifi_ap_client_passwords, wifi_ap_client_passwords,
+           sizeof(sess_cfg.wifi_ap_client_passwords));
     flexe_session_t *session = flexe_session_create(&sess_cfg);
     if (!session) {
         fprintf(stderr, "Failed to create emulator session\n");

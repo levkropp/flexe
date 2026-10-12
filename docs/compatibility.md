@@ -188,7 +188,7 @@ the image's chip id and revision bounds select the machine.
 | `--control-tcp HOST:PORT` | host control channel: `reset`, `erase-flash`, `erase-region`, `write-region`, `ping` |
 | `--ble-hci tcp:HOST:PORT` | s3-only: forward NimBLE HCI to an external H4 controller; requires `-s ELF` |
 | `--wifi-ssid SSID` + `--wifi-password PASS` | model a station network in the air; association then enforces the match |
-| `--wifi-ap-client AA:BB:CC:DD:EE:FF` | provision a Soft-AP station that auto-joins at AP start (repeatable) |
+| `--wifi-ap-client AA:BB:CC:DD:EE:FF[=PASSWORD]` | provision a Soft-AP station that auto-joins at AP start (repeatable) |
 | `--net-hostfwd ap\|sta:HOST_PORT:GUEST_IP:GUEST_PORT` | s3-only user-mode Ethernet forward off host loopback; repeatable within one interface and /24 |
 | `-s firmware.elf` | load application symbols for debugging and symbol-based services |
 | `-N` | run the firmware's native freertos; use for s3 |
@@ -253,7 +253,9 @@ password, channel, authmode, hidden flag, client cap, with out-of-range
 fields held at their previous values) and echoes it from
 `esp_wifi_get_config()`. Provisioned stations auto-join when the AP
 starts — and rejoin after a reboot, like reconnecting phones — with
-incrementing AIDs capped by `max_connection`; every join and leave
+incrementing AIDs capped by `max_connection`; a secured AP only admits
+stations offering its password (wrong passphrases fail silently, as on
+hardware), while an open AP admits everyone. Every join and leave
 arrives as `AP_STACONNECTED(14)` / `AP_STADISCONNECTED(15)` carrying the
 station MAC and AID, and stopping the AP drops all stations first. Event
 delivery passes the contents of the firmware's `WIFI_EVENT` / `IP_EVENT`

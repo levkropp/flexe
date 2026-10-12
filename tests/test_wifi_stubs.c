@@ -1881,8 +1881,8 @@ TEST(ap_provisioned_clients_join_at_start) {
     elf_symbols_t *syms = wifi_test_station_symbols(addr);
     ASSERT_TRUE(syms != NULL);
     ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) == 15);
-    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_a), 0);
-    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_b), 0);
+    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_a, "secret12"), 0);
+    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_b, "secret12"), 0);
 
     ap_write_config(&cpu, "FlexeAP", "secret12", 6u, 3u, 0u, 4u);
     invoke_wifi_call0_4(&cpu, addr[0], 1u, AP_CFG_ADDR, 0u, 0u);
@@ -1943,9 +1943,9 @@ TEST(ap_join_enforces_max_connection) {
     ap_write_config(&cpu, "FlexeAP", "secret12", 6u, 3u, 0u, 1u);
     invoke_wifi_call0_4(&cpu, addr[0], 1u, AP_CFG_ADDR, 0u, 0u);
     invoke_wifi_call0(&cpu, addr[9], 2u); /* WIFI_MODE_AP */
-    invoke_wifi_call0(&cpu, addr[10], 0u); /* start */
-    ASSERT_EQ(wifi_stubs_ap_client_join(wifi, ap_mac_a), 0);
-    /* Table has room but the AP is full. */
+    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_a, "secret12"), 0);
+    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_b, "secret12"), 0);
+    invoke_wifi_call0(&cpu, addr[10], 0u); /* start: A joins, B hits the cap */
     ASSERT_EQ(wifi_stubs_ap_client_join(wifi, ap_mac_b), -1);
     /* Joining twice is idempotent, not a second event. */
     ASSERT_EQ(wifi_stubs_ap_client_join(wifi, ap_mac_a), 0);
@@ -1954,7 +1954,7 @@ TEST(ap_join_enforces_max_connection) {
     for (int i = 0; i < 6; i++)
         ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + (uint32_t)i),
                   ap_mac_a[i]);
-    /* Leaving an unknown station fails. */
+    /* Leaving a never-connected station fails. */
     ASSERT_EQ(wifi_stubs_ap_client_leave(wifi, ap_mac_b), -1);
     ASSERT_EQ(wifi_stubs_ap_client_leave(wifi, ap_mac_a), 0);
 
@@ -2131,6 +2131,55 @@ TEST(event_base_uses_canonical_global) {
     teardown(&cpu);
 }
 
+TEST(ap_join_enforces_password) {
+    xtensa_cpu_t cpu;
+    setup(&cpu);
+    esp32_rom_stubs_t *rom = rom_stubs_create(&cpu);
+    wifi_stubs_t *wifi = wifi_stubs_create(&cpu);
+    uint32_t addr[12] = {0};
+    elf_symbols_t *syms = wifi_test_station_symbols(addr);
+    ASSERT_TRUE(syms != NULL);
+    ASSERT_TRUE(wifi_stubs_hook_symbols(wifi, syms) == 15);
+    static const uint8_t mac_c[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x03};
+    static const uint8_t mac_d[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x04};
+    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_a, "secret12"), 0);
+    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, ap_mac_b, "wrongpass"), 0);
+    ASSERT_EQ(wifi_stubs_ap_provision_client(wifi, mac_c, NULL), 0);
+
+    ap_write_config(&cpu, "FlexeAP", "secret12", 6u, 3u, 0u, 4u);
+    invoke_wifi_call0_4(&cpu, addr[0], 1u, AP_CFG_ADDR, 0u, 0u);
+    invoke_wifi_call0(&cpu, addr[9], 2u); /* WIFI_MODE_AP */
+    invoke_wifi_call0(&cpu, addr[10], 0u); /* start: only A joins */
+    wifi_stubs_tick(wifi, &cpu, NULL); /* AP_START */
+    wifi_stubs_tick(wifi, &cpu, NULL); /* join A */
+    for (int i = 0; i < 6; i++)
+        ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + (uint32_t)i),
+                  ap_mac_a[i]);
+    /* Wrong and missing passwords queue nothing: a further tick lays out
+     * no event, so the scratch still shows A's join. */
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    for (int i = 0; i < 6; i++)
+        ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + (uint32_t)i),
+                  ap_mac_a[i]);
+    ASSERT_EQ(wifi_stubs_ap_client_join(wifi, ap_mac_b), -1);
+    ASSERT_EQ(wifi_stubs_ap_client_join(wifi, mac_c), -1);
+
+    /* An open AP admits everyone, credential or not. */
+    ap_write_config(&cpu, "FlexeAP", "", 6u, 0u, 0u, 4u);
+    invoke_wifi_call0_4(&cpu, addr[0], 1u, AP_CFG_ADDR, 0u, 0u);
+    ASSERT_EQ(wifi_stubs_ap_client_join(wifi, mac_d), 0);
+    wifi_stubs_tick(wifi, &cpu, NULL);
+    for (int i = 0; i < 6; i++)
+        ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + (uint32_t)i),
+                  mac_d[i]);
+    ASSERT_EQ(mem_read8(cpu.mem, STATION_EVT_SCRATCH + 6u), 2u);
+
+    elf_symbols_destroy(syms);
+    wifi_stubs_destroy(wifi);
+    rom_stubs_destroy(rom);
+    teardown(&cpu);
+}
+
 void run_wifi_stub_tests(void) {
     TEST_SUITE("WiFi stubs");
     RUN_TEST(s3_socket_boundary_resolves_select_without_wifi_api_hooks);
@@ -2158,5 +2207,6 @@ void run_wifi_stub_tests(void) {
     RUN_TEST(ap_config_capture_and_echo);
     RUN_TEST(ap_provisioned_clients_join_at_start);
     RUN_TEST(ap_join_enforces_max_connection);
+    RUN_TEST(ap_join_enforces_password);
     RUN_TEST(event_base_uses_canonical_global);
 }

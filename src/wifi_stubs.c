@@ -339,6 +339,7 @@ struct wifi_stubs {
      * entries that auto-join when the AP starts. */
     struct {
         uint8_t mac[6];
+        char    password[65];
         uint8_t aid;
         bool    connected;
         bool    provisioned;
@@ -4162,6 +4163,9 @@ void wifi_stubs_snapshot_host_config(const wifi_stubs_t *ws,
         if (!ws->ap_clients[i].provisioned) continue;
         memcpy(out->ap_client_macs[out->ap_client_count],
                ws->ap_clients[i].mac, 6u);
+        snprintf(out->ap_client_passwords[out->ap_client_count],
+                 sizeof(out->ap_client_passwords[out->ap_client_count]),
+                 "%s", ws->ap_clients[i].password);
         out->ap_client_count++;
     }
     out->ethernet_tx_cb = ws->ethernet_tx_cb;
@@ -4175,7 +4179,8 @@ void wifi_stubs_apply_host_config(wifi_stubs_t *ws,
     ws->dns_override = cfg->dns_override;
     for (unsigned i = 0u; i < cfg->ap_client_count &&
          i < WIFI_AP_CLIENT_MAX; i++)
-        wifi_stubs_ap_provision_client(ws, cfg->ap_client_macs[i]);
+        wifi_stubs_ap_provision_client(ws, cfg->ap_client_macs[i],
+                                       cfg->ap_client_passwords[i]);
     wifi_stubs_set_ethernet_tx_callback(ws, cfg->ethernet_tx_cb,
                                         cfg->ethernet_tx_ctx);
 }
@@ -4202,20 +4207,26 @@ static unsigned ap_connected_count(const wifi_stubs_t *ws)
     return n;
 }
 
-int wifi_stubs_ap_provision_client(wifi_stubs_t *ws, const uint8_t mac[6])
+int wifi_stubs_ap_provision_client(wifi_stubs_t *ws, const uint8_t mac[6],
+                                   const char *password)
 {
     if (!ws || !mac) return -1;
     int slot = ap_client_find(ws, mac);
-    if (slot >= 0) {
-        ws->ap_clients[slot].provisioned = true;
-        return 0;
+    if (slot < 0) {
+        if (ws->ap_client_count >= WIFI_AP_CLIENT_MAX) return -1;
+        slot = (int)ws->ap_client_count++;
+        memcpy(ws->ap_clients[slot].mac, mac, 6u);
+        ws->ap_clients[slot].aid = 0;
+        ws->ap_clients[slot].connected = false;
     }
-    if (ws->ap_client_count >= WIFI_AP_CLIENT_MAX) return -1;
-    unsigned i = ws->ap_client_count++;
-    memcpy(ws->ap_clients[i].mac, mac, 6u);
-    ws->ap_clients[i].aid = 0;
-    ws->ap_clients[i].connected = false;
-    ws->ap_clients[i].provisioned = true;
+    ws->ap_clients[slot].password[0] = '\0';
+    if (password) {
+        strncpy(ws->ap_clients[slot].password, password,
+                sizeof(ws->ap_clients[slot].password) - 1);
+        ws->ap_clients[slot].password[sizeof(ws->ap_clients[slot].password)
+                                      - 1] = '\0';
+    }
+    ws->ap_clients[slot].provisioned = true;
     return 0;
 }
 
@@ -4233,6 +4244,17 @@ int wifi_stubs_ap_client_join(wifi_stubs_t *ws, const uint8_t mac[6])
     }
     unsigned cap = ws->ap_max_conn ? ws->ap_max_conn : WIFI_AP_CLIENT_MAX;
     if (ap_connected_count(ws) >= cap) return -1;
+    /* A secured AP only admits stations offering its password; an open AP
+     * admits everyone. A failed handshake produces no WIFI event on the AP
+     * side, matching hardware. */
+    if (ws->ap_password[0] &&
+        strcmp(ws->ap_clients[slot].password,
+               (const char *)ws->ap_password) != 0) {
+        wifi_log(ws, "AP client %02X:%02X:%02X:%02X:%02X:%02X rejected "
+                 "(password mismatch)\n",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        return -1;
+    }
     if (ws->ap_clients[slot].aid == 0u) {
         do {
             ws->ap_next_aid++;

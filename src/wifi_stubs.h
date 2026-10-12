@@ -156,11 +156,13 @@ void wifi_stubs_set_dns_override(wifi_stubs_t *ws, uint32_t addr_net_order);
  * max_connection the model accepts. */
 #define WIFI_AP_CLIENT_MAX 8
 
-/* Provision one Soft-AP client by MAC: a virtual phone that auto-joins
- * when the AP starts (and rejoins after a reboot, like a reconnecting
- * phone). Repeatable up to WIFI_AP_CLIENT_MAX. Returns 0 on success,
- * -1 when the table is full. */
-int wifi_stubs_ap_provision_client(wifi_stubs_t *ws, const uint8_t mac[6]);
+/* Provision one Soft-AP client by MAC with an optional password: a virtual
+ * phone that auto-joins when the AP starts (and rejoins after a reboot,
+ * like a reconnecting phone). A secured AP only admits stations offering
+ * its password; an open AP admits everyone. Repeatable up to
+ * WIFI_AP_CLIENT_MAX. Returns 0 on success, -1 when the table is full. */
+int wifi_stubs_ap_provision_client(wifi_stubs_t *ws, const uint8_t mac[6],
+                                   const char *password);
 
 /* Drive one client join/leave immediately, delivering AP_STACONNECTED(14)
  * / AP_STADISCONNECTED(15) with the station's MAC and AID. Join assigns the
@@ -177,6 +179,7 @@ typedef struct {
     char     sta_password[65];
     uint32_t dns_override;
     uint8_t  ap_client_macs[WIFI_AP_CLIENT_MAX][6];
+    char     ap_client_passwords[WIFI_AP_CLIENT_MAX][65];
     unsigned ap_client_count;
     wifi_ethernet_tx_cb ethernet_tx_cb;
     void    *ethernet_tx_ctx;

@@ -55,8 +55,9 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id,
 }
 
 void setup() {
-  WiFi.mode(WIFI_AP);
-
+  /* Configure before bringing the interface up: Arduino's WiFi.mode()
+   * already starts an unconfigured (open) AP, and anything joining there
+   * would outrun the secured configuration below. */
   wifi_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
   strcpy((char *)cfg.ap.ssid, "FlexeAP");
@@ -65,6 +66,8 @@ void setup() {
   cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
   cfg.ap.max_connection = 4;
   if (esp_wifi_set_config(WIFI_IF_AP, &cfg) != ESP_OK) { fail(1); return; }
+
+  WiFi.mode(WIFI_AP);
 
   /* The configured AP reads back whole: SSID, password, channel,
    * authmode, and client cap. */

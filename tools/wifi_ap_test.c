@@ -23,6 +23,8 @@
 #define MAX_CYCLES     8000000000ull
 #define RESULT_COUNT   8u
 
+#define TEST_PASS "secret12"
+
 #define TEST_MAC_0 0xAAu
 #define TEST_MAC_1 0xBBu
 #define TEST_MAC_2 0xCCu
@@ -69,9 +71,17 @@ int main(int argc, char **argv) {
         TEST_MAC_0, TEST_MAC_1, TEST_MAC_2,
         TEST_MAC_3, TEST_MAC_4, TEST_MAC_5,
     };
+    /* A second station offers the wrong passphrase: the secured AP must
+     * reject it silently, so the fixture only ever sees the first. */
+    static const uint8_t stranger[6] = {
+        TEST_MAC_0, TEST_MAC_1, TEST_MAC_2,
+        TEST_MAC_3, TEST_MAC_4, 0x02u,
+    };
     if (wifi_stubs_ap_provision_client(flexe_session_wifi(session),
-                                       phone) != 0) {
-        fprintf(stderr, "error: cannot provision AP client\n");
+                                       phone, TEST_PASS) != 0 ||
+        wifi_stubs_ap_provision_client(flexe_session_wifi(session),
+                                       stranger, "wrongpass") != 0) {
+        fprintf(stderr, "error: cannot provision AP clients\n");
         flexe_session_destroy(session);
         elf_symbols_destroy(symbols);
         return 2;
