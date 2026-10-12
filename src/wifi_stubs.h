@@ -152,6 +152,23 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu, xtensa_cpu_t *peer);
  * name surfaces as EINVAL from sendto(), far from its cause. */
 void wifi_stubs_set_dns_override(wifi_stubs_t *ws, uint32_t addr_net_order);
 
+/* Maximum stations tracked on the Soft-AP. Matches the largest
+ * max_connection the model accepts. */
+#define WIFI_AP_CLIENT_MAX 8
+
+/* Provision one Soft-AP client by MAC: a virtual phone that auto-joins
+ * when the AP starts (and rejoins after a reboot, like a reconnecting
+ * phone). Repeatable up to WIFI_AP_CLIENT_MAX. Returns 0 on success,
+ * -1 when the table is full. */
+int wifi_stubs_ap_provision_client(wifi_stubs_t *ws, const uint8_t mac[6]);
+
+/* Drive one client join/leave immediately, delivering AP_STACONNECTED(14)
+ * / AP_STADISCONNECTED(15) with the station's MAC and AID. Join assigns the
+ * next AID, honors max_connection, and is idempotent while connected.
+ * Both require a running AP and return 0 on success, -1 otherwise. */
+int wifi_stubs_ap_client_join(wifi_stubs_t *ws, const uint8_t mac[6]);
+int wifi_stubs_ap_client_leave(wifi_stubs_t *ws, const uint8_t mac[6]);
+
 /* Host-supplied settings that must outlive a software reset: the firmware
  * reboots precisely to come back up with what it saved, and the emulated
  * network it comes back to has to be the same one. */
@@ -159,6 +176,8 @@ typedef struct {
     char     sta_ssid[33];
     char     sta_password[65];
     uint32_t dns_override;
+    uint8_t  ap_client_macs[WIFI_AP_CLIENT_MAX][6];
+    unsigned ap_client_count;
     wifi_ethernet_tx_cb ethernet_tx_cb;
     void    *ethernet_tx_ctx;
 } wifi_host_config_t;

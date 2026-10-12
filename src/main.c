@@ -516,6 +516,28 @@ static unsigned long ctrl_parse_number(const char *text, int *ok)
     return value;
 }
 
+/* Parse AA:BB:CC:DD:EE:FF into six bytes. Returns 0 on success. */
+static int parse_mac_address(const char *text, uint8_t mac[6])
+{
+    if (!text) return -1;
+    for (int i = 0; i < 6; i++) {
+        if (!isxdigit((unsigned char)text[0]) ||
+            !isxdigit((unsigned char)text[1]))
+            return -1;
+        char byte[3] = {text[0], text[1], '\0'};
+        char *end = NULL;
+        unsigned long value = strtoul(byte, &end, 16);
+        if (!end || *end) return -1;
+        mac[i] = (uint8_t)value;
+        text += 2;
+        if (i < 5) {
+            if (*text != ':') return -1;
+            text++;
+        }
+    }
+    return *text == '\0' ? 0 : -1;
+}
+
 static void handle_control_line(flexe_session_t *session,
                                  ctrl_tcp_server_t *ctrl, const char *line)
 {
@@ -823,6 +845,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --control-tcp <HOST:PORT>  Host control channel: reset, erase-flash, erase-region OFF LEN, write-region OFF FILE, ping\n");
     fprintf(stderr, "  --ble-hci <tcp:HOST:PORT>  Forward NimBLE HCI to an external controller (Bumble); requires -s ELF\n");
     fprintf(stderr, "  --wifi-ssid <SSID> --wifi-password <PASS>  Model a station network in the air; association then enforces SSID/password match\n");
+    fprintf(stderr, "  --wifi-ap-client <AA:BB:CC:DD:EE:FF>  Provision a Soft-AP station that auto-joins at AP start (repeatable)\n");
     fprintf(stderr, "\nCheckpoint options:\n");
     fprintf(stderr, "  --checkpoint-interval <N>   Auto-save checkpoint every N cycles\n");
     fprintf(stderr, "  --checkpoint-dir <PATH>     Directory for checkpoint files (default: .)\n");
@@ -1211,6 +1234,8 @@ int main(int argc, char *argv[]) {
     const char *ble_hci_spec = NULL;
     const char *wifi_ssid = NULL;
     const char *wifi_password = NULL;
+    uint8_t wifi_ap_clients[WIFI_AP_CLIENT_MAX][6];
+    unsigned wifi_ap_client_count = 0;
     uint32_t strap_mode = 0;
     int has_strap_mode = 0;
     flexe_target_id_t target_id = FLEXE_TARGET_AUTO;
@@ -1346,6 +1371,22 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(argv[i], "--wifi-password") == 0 && i + 1 < argc) {
             wifi_password = argv[i + 1];
+            memmove(&argv[i], &argv[i + 2],
+                    (size_t)(argc - i - 1) * sizeof(char *));
+            argc -= 2;
+            continue;
+        } else if (strcmp(argv[i], "--wifi-ap-client") == 0 && i + 1 < argc) {
+            if (wifi_ap_client_count >= WIFI_AP_CLIENT_MAX) {
+                fprintf(stderr, "flexe: at most %d --wifi-ap-client addrs\n",
+                        WIFI_AP_CLIENT_MAX);
+                return 1;
+            }
+            if (parse_mac_address(argv[i + 1],
+                                  wifi_ap_clients[wifi_ap_client_count]) != 0) {
+                fprintf(stderr, "flexe: --wifi-ap-client wants AA:BB:CC:DD:EE:FF\n");
+                return 1;
+            }
+            wifi_ap_client_count++;
             memmove(&argv[i], &argv[i + 2],
                     (size_t)(argc - i - 1) * sizeof(char *));
             argc -= 2;
@@ -1539,6 +1580,9 @@ int main(int argc, char *argv[]) {
         .touch_fn = sandbox_touch_state_fn,
         .touch_ctx = NULL,
     };
+    sess_cfg.wifi_ap_client_count = wifi_ap_client_count;
+    memcpy(sess_cfg.wifi_ap_clients, wifi_ap_clients,
+           sizeof(sess_cfg.wifi_ap_clients));
     flexe_session_t *session = flexe_session_create(&sess_cfg);
     if (!session) {
         fprintf(stderr, "Failed to create emulator session\n");

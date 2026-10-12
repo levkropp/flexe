@@ -71,6 +71,7 @@ all_fixtures=(
     touch_pad
     twai_bus
     uhci_dma
+    wifi_ap
     wifi_client
 )
 

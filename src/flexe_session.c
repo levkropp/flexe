@@ -499,7 +499,12 @@ static int session_build(flexe_session_t *s, bool preserve_flash)
             }
             wifi_stubs_set_sta_credentials(s->wstubs, ssid, password);
         }
-    } else if (cfg->wifi_ssid || cfg->wifi_password) {
+        for (unsigned i = 0u; i < cfg->wifi_ap_client_count &&
+             i < WIFI_AP_CLIENT_MAX; i++)
+            wifi_stubs_ap_provision_client(s->wstubs,
+                                           cfg->wifi_ap_clients[i]);
+    } else if (cfg->wifi_ssid || cfg->wifi_password ||
+               cfg->wifi_ap_client_count) {
         fprintf(stderr, "flexe: failed to create WiFi stubs for --wifi-ssid\n");
         return -1;
     }

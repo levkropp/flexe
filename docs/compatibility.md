@@ -188,6 +188,7 @@ the image's chip id and revision bounds select the machine.
 | `--control-tcp HOST:PORT` | host control channel: `reset`, `erase-flash`, `erase-region`, `write-region`, `ping` |
 | `--ble-hci tcp:HOST:PORT` | s3-only: forward NimBLE HCI to an external H4 controller; requires `-s ELF` |
 | `--wifi-ssid SSID` + `--wifi-password PASS` | model a station network in the air; association then enforces the match |
+| `--wifi-ap-client AA:BB:CC:DD:EE:FF` | provision a Soft-AP station that auto-joins at AP start (repeatable) |
 | `--net-hostfwd ap\|sta:HOST_PORT:GUEST_IP:GUEST_PORT` | s3-only user-mode Ethernet forward off host loopback; repeatable within one interface and /24 |
 | `-s firmware.elf` | load application symbols for debugging and symbol-based services |
 | `-N` | run the firmware's native freertos; use for s3 |
@@ -245,6 +246,23 @@ the firmware's own configuration once set and otherwise answers with the
 modeled network as though nvs had saved it, which is what lets
 portal-provisioned firmware connect with no explicit `set_config`, like
 the classic wifi_client fixture does.
+
+`--wifi-ap-client` provisions Soft-AP stations by MAC (repeatable up to
+eight). The AP captures the firmware's full `wifi_ap_config_t` (SSID,
+password, channel, authmode, hidden flag, client cap, with out-of-range
+fields held at their previous values) and echoes it from
+`esp_wifi_get_config()`. Provisioned stations auto-join when the AP
+starts — and rejoin after a reboot, like reconnecting phones — with
+incrementing AIDs capped by `max_connection`; every join and leave
+arrives as `AP_STACONNECTED(14)` / `AP_STADISCONNECTED(15)` carrying the
+station MAC and AID, and stopping the AP drops all stations first. Event
+delivery passes the contents of the firmware's `WIFI_EVENT` / `IP_EVENT`
+globals rather than the pointer seen at registration, because duplicate
+string literals across translation units (seen live on Arduino core 3.x)
+defeat the pointer comparisons real handlers make while the hardware
+always carries the one global. `tests/fixtures/wifi_ap` with
+`tools/wifi_ap_test.c` gates the whole lifecycle: config echo, AP_START,
+join payload, harness-driven leave, and zero unhandled accesses.
 
 `--net-hostfwd` is repeatable: each flag adds one loopback listener to the
 same user-mode network, so one guest can serve several host ports. every

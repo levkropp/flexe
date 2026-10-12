@@ -37,6 +37,8 @@ typedef struct {
     int         ble_hci_backend;    /* 1 = hook HCI transport for ext. controller */
     const char *wifi_ssid;          /* modeled station network SSID (NULL = open air) */
     const char *wifi_password;      /* modeled station network password (NULL = none) */
+    uint8_t     wifi_ap_clients[WIFI_AP_CLIENT_MAX][6]; /* provisioned Soft-AP stations */
+    unsigned    wifi_ap_client_count;
     const char *sdcard_path;        /* SD card backing image (NULL = none) */
     uint64_t    sdcard_size;        /* SD card size override (0 = auto) */
 

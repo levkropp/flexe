@@ -187,12 +187,18 @@ typedef enum {
     EVT_DATA_STA_CONNECTED,
     EVT_DATA_STA_DISCONNECTED,
     EVT_DATA_GOT_IP,
+    EVT_DATA_AP_STA_CONNECTED,
+    EVT_DATA_AP_STA_DISCONNECTED,
 } evt_data_kind_t;
 
 typedef struct {
     char            base_name[16];
     int32_t         event_id;
     evt_data_kind_t data_kind;
+    /* Carried for AP client events: the station's MAC and AID at queue
+     * time, so a later leave cannot rewrite an undelivered join. */
+    uint8_t         client_mac[6];
+    uint8_t         client_aid;
 } pending_event_t;
 
 typedef struct {
@@ -291,6 +297,14 @@ struct wifi_stubs {
      * esp_wifi_disconnect() uses ASSOC_LEAVE; failed associations use
      * the NO_AP_FOUND / AUTH_FAIL / CONNECTION_FAIL codes. */
     uint8_t            disconnect_reason;
+    /* Addresses of the WIFI_EVENT / IP_EVENT globals when the application
+     * ELF names them (0 = unknown). Delivery passes the globals' contents
+     * instead of the pointer seen at registration: duplicate string
+     * literals across translation units defeat the pointer comparisons
+     * real handlers make, while the hardware always carries the one
+     * global. Falls back to the recorded pointer without symbols. */
+    uint32_t           wifi_event_global;
+    uint32_t           ip_event_global;
     uint8_t            channel;         /* 1-14 */
     uint8_t            sta_mac[6];      /* STA MAC */
     uint8_t            ap_mac[6];       /* AP MAC */
@@ -307,9 +321,30 @@ struct wifi_stubs {
     bool               scan_active;
     bool               scan_done;       /* results ready to collect */
 
-    /* AP config storage */
+    /* Soft-AP configuration the firmware supplied via
+     * esp_wifi_set_config(). Offsets follow wifi_ap_config_t: ssid[32]@0,
+     * password[64]@32, ssid_len@96, channel@97, authmode(u32)@100,
+     * hidden@104, max_connection@105. */
     uint8_t            ap_ssid[33];
-    uint8_t            ap_pass[65];
+    uint8_t            ap_password[65];
+    uint8_t            ap_ssid_len;
+    uint8_t            ap_channel;
+    uint8_t            ap_authmode;
+    uint8_t            ap_hidden;
+    uint8_t            ap_max_conn;
+    bool               ap_configured;
+    bool               ap_running;
+    /* Stations joined to the Soft-AP. A fixed table with incrementing AIDs
+     * mirrors the firmware-visible association state; the host provisions
+     * entries that auto-join when the AP starts. */
+    struct {
+        uint8_t mac[6];
+        uint8_t aid;
+        bool    connected;
+        bool    provisioned;
+    } ap_clients[WIFI_AP_CLIENT_MAX];
+    unsigned           ap_client_count;
+    unsigned           ap_next_aid;
 
     /* Event system */
     event_handler_t    event_handlers[MAX_EVENT_HANDLERS];
@@ -1976,6 +2011,9 @@ static void stub_esp_wifi_deinit(xtensa_cpu_t *cpu, void *ctx)
 
 static void wifi_queue_event(wifi_stubs_t *ws, const char *base,
                              int32_t event_id, evt_data_kind_t kind);
+static void wifi_queue_ap_client_event(wifi_stubs_t *ws, int32_t event_id,
+                                       evt_data_kind_t kind,
+                                       const uint8_t mac[6], uint8_t aid);
 
 static void stub_esp_wifi_start(xtensa_cpu_t *cpu, void *ctx)
 {
@@ -1992,8 +2030,18 @@ static void stub_esp_wifi_start(xtensa_cpu_t *cpu, void *ctx)
      * showed before this. */
     if (ws->wifi_mode == WIFI_MODE_STA || ws->wifi_mode == WIFI_MODE_APSTA)
         wifi_queue_event(ws, "WIFI_EVENT", 2 /* STA_START */, EVT_DATA_NONE);
-    if (ws->wifi_mode == WIFI_MODE_AP || ws->wifi_mode == WIFI_MODE_APSTA)
+    if (ws->wifi_mode == WIFI_MODE_AP || ws->wifi_mode == WIFI_MODE_APSTA) {
         wifi_queue_event(ws, "WIFI_EVENT", 12 /* AP_START */, EVT_DATA_NONE);
+        ws->ap_running = true;
+        /* Provisioned stations come up with the AP, as phones reconnecting
+         * to a rebooted hotspot do. */
+        for (unsigned i = 0u; i < ws->ap_client_count; i++) {
+            if (!ws->ap_clients[i].provisioned ||
+                ws->ap_clients[i].connected)
+                continue;
+            wifi_stubs_ap_client_join(ws, ws->ap_clients[i].mac);
+        }
+    }
     ws_return(cpu, 0);
 }
 
@@ -2004,8 +2052,15 @@ static void stub_esp_wifi_stop(xtensa_cpu_t *cpu, void *ctx)
     wifi_log(ws, "esp_wifi_stop()\n");
     if (ws->wifi_mode == WIFI_MODE_STA || ws->wifi_mode == WIFI_MODE_APSTA)
         wifi_queue_event(ws, "WIFI_EVENT", 3 /* STA_STOP */, EVT_DATA_NONE);
-    if (ws->wifi_mode == WIFI_MODE_AP || ws->wifi_mode == WIFI_MODE_APSTA)
+    if (ws->wifi_mode == WIFI_MODE_AP || ws->wifi_mode == WIFI_MODE_APSTA) {
         wifi_queue_event(ws, "WIFI_EVENT", 13 /* AP_STOP */, EVT_DATA_NONE);
+        /* Hardware drops every station when the AP goes down. */
+        for (unsigned i = 0u; i < ws->ap_client_count; i++) {
+            if (ws->ap_clients[i].connected)
+                wifi_stubs_ap_client_leave(ws, ws->ap_clients[i].mac);
+        }
+        ws->ap_running = false;
+    }
     ws_return(cpu, 0);
 }
 
@@ -2050,10 +2105,45 @@ static void wifi_queue_event(wifi_stubs_t *ws, const char *base,
     e->base_name[sizeof(e->base_name) - 1] = '\0';
     e->event_id = event_id;
     e->data_kind = kind;
+    memset(e->client_mac, 0, sizeof(e->client_mac));
+    e->client_aid = 0;
+}
+
+/* Queue a Soft-AP client event carrying the station's identity. */
+static void wifi_queue_ap_client_event(wifi_stubs_t *ws, int32_t event_id,
+                                       evt_data_kind_t kind,
+                                       const uint8_t mac[6], uint8_t aid) {
+    if (ws->pending_event_count >= MAX_PENDING_EVENTS) return;
+    pending_event_t *e = &ws->pending_events[ws->pending_event_count++];
+    strncpy(e->base_name, "WIFI_EVENT", sizeof(e->base_name) - 1);
+    e->base_name[sizeof(e->base_name) - 1] = '\0';
+    e->event_id = event_id;
+    e->data_kind = kind;
+    memcpy(e->client_mac, mac, 6u);
+    e->client_aid = aid;
+}
+
+/* The event-base pointer real handlers compare against: the contents of
+ * the firmware's WIFI_EVENT / IP_EVENT global, which is the one address
+ * both registration and posting agree on in hardware. */
+static uint32_t wifi_canonical_base(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
+                                    uint32_t recorded, const char *name)
+{
+    uint32_t global = 0u;
+    if (strcmp(name, "WIFI_EVENT") == 0)
+        global = ws->wifi_event_global;
+    else if (strcmp(name, "IP_EVENT") == 0)
+        global = ws->ip_event_global;
+    if (global != 0u) {
+        uint32_t canonical = mem_read32(cpu->mem, global);
+        if (canonical != 0u) return canonical;
+    }
+    return recorded;
 }
 
 /* Lay out the event payload the handler expects, in guest scratch. */
 static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
+                                      const pending_event_t *e,
                                       evt_data_kind_t kind) {
     uint32_t p = WIFI_EVENT_SCRATCH;
     for (int i = 0; i < 64; i++) mem_write8(cpu->mem, p + (uint32_t)i, 0);
@@ -2080,6 +2170,18 @@ static uint32_t wifi_write_event_data(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
             mem_write8(cpu->mem, p + 39u, ws->disconnect_reason);
             mem_write8(cpu->mem, p + 40u, (uint8_t)(int8_t)-55);
         }
+    } else if (kind == EVT_DATA_AP_STA_CONNECTED ||
+               kind == EVT_DATA_AP_STA_DISCONNECTED) {
+        /* wifi_event_ap_staconnected_t: mac[6], aid, is_mesh_child.
+         * The disconnect variant appends the u16 reason. Identity comes
+         * from the queued event so a later leave cannot rewrite an
+         * undelivered join. */
+        for (int i = 0; i < 6; i++)
+            mem_write8(cpu->mem, p + (uint32_t)i, e->client_mac[i]);
+        mem_write8(cpu->mem, p + 6u, e->client_aid);
+        mem_write8(cpu->mem, p + 7u, 0); /* is_mesh_child */
+        if (kind == EVT_DATA_AP_STA_DISCONNECTED)
+            mem_write16(cpu->mem, p + 8u, WIFI_REASON_ASSOC_LEAVE);
     } else if (kind == EVT_DATA_GOT_IP) {
         /* IDF 5 removed IDF 4's leading legacy if_index from
          * ip_event_got_ip_t. Getting this wrong is silent: callbacks still
@@ -2109,6 +2211,10 @@ static uint32_t wifi_event_data_size(const wifi_stubs_t *ws,
         return 41u; /* sizeof(wifi_event_sta_disconnected_t), IDF 4.x */
     case EVT_DATA_GOT_IP:
         return ws->idf_major >= 5u ? 20u : 24u;
+    case EVT_DATA_AP_STA_CONNECTED:
+        return 8u; /* mac[6], aid, is_mesh_child */
+    case EVT_DATA_AP_STA_DISCONNECTED:
+        return 10u; /* + u16 reason */
     default:
         return 0u;
     }
@@ -2206,9 +2312,9 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
          * reach the architecture-defined idle boundary instead. */
         if (!guest_call_injection_is_quiescent(cpu, peer)) return;
 
-        uint32_t data = wifi_write_event_data(ws, cpu, e->data_kind);
+        uint32_t data = wifi_write_event_data(ws, cpu, e, e->data_kind);
         uint32_t args[5] = {
-            base,
+            wifi_canonical_base(ws, cpu, base, e->base_name),
             (uint32_t)e->event_id,
             data,
             wifi_event_data_size(ws, e->data_kind),
@@ -2240,7 +2346,7 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
         pending_event_t e = ws->pending_events[0];
         wifi_pop_pending_event(ws);
 
-        uint32_t data = wifi_write_event_data(ws, cpu, e.data_kind);
+        uint32_t data = wifi_write_event_data(ws, cpu, &e, e.data_kind);
 
         for (int i = 0; i < ws->event_handler_count &&
                         ws->dispatch_count < MAX_EVENT_HANDLERS; i++) {
@@ -2250,7 +2356,9 @@ void wifi_stubs_tick(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
             int d = ws->dispatch_count++;
             ws->dispatch[d].handler = h->handler_addr;
             ws->dispatch[d].args[0] = h->handler_arg;
-            ws->dispatch[d].args[1] = h->event_base;
+            ws->dispatch[d].args[1] = wifi_canonical_base(ws, cpu,
+                                                          h->event_base,
+                                                          h->base_name);
             ws->dispatch[d].args[2] = (uint32_t)e.event_id;
             ws->dispatch[d].args[3] = data;
         }
@@ -2300,7 +2408,23 @@ static void stub_esp_wifi_set_config(xtensa_cpu_t *cpu, void *ctx)
         for (int i = 0; i < 32; i++)
             ws->ap_ssid[i] = mem_read8(cpu->mem, config_ptr + (uint32_t)i);
         ws->ap_ssid[32] = 0;
-        wifi_log(ws, "esp_wifi_set_config(AP, ssid=\"%s\")\n", ws->ap_ssid);
+        for (int i = 0; i < 64; i++)
+            ws->ap_password[i] = mem_read8(cpu->mem,
+                                           config_ptr + 32u + (uint32_t)i);
+        ws->ap_password[64] = 0;
+        ws->ap_ssid_len = mem_read8(cpu->mem, config_ptr + 96u);
+        uint8_t channel = mem_read8(cpu->mem, config_ptr + 97u);
+        if (channel >= 1u && channel <= 14u) ws->ap_channel = channel;
+        uint32_t authmode = mem_read32(cpu->mem, config_ptr + 100u);
+        if (authmode <= 8u) ws->ap_authmode = (uint8_t)authmode;
+        ws->ap_hidden = mem_read8(cpu->mem, config_ptr + 104u) & 1u;
+        uint8_t max_conn = mem_read8(cpu->mem, config_ptr + 105u);
+        if (max_conn >= 1u && max_conn <= WIFI_AP_CLIENT_MAX)
+            ws->ap_max_conn = max_conn;
+        ws->ap_configured = true;
+        wifi_log(ws, "esp_wifi_set_config(AP, ssid=\"%s\", ch=%u, auth=%u, max=%u)\n",
+                 ws->ap_ssid, ws->ap_channel, ws->ap_authmode,
+                 ws->ap_max_conn);
     } else if (config_ptr && iface == 0) { /* WIFI_IF_STA */
         /* wifi_sta_config_t: ssid[32] then password[64]. A new station
          * configuration restarts association policy from scratch. */
@@ -2357,6 +2481,21 @@ static void stub_esp_wifi_get_config(xtensa_cpu_t *cpu, void *ctx)
                     mem_write8(cpu->mem, config_ptr + 32u + (uint32_t)i,
                                (uint8_t)password[i]);
             }
+        } else if (iface == 1 && ws && ws->ap_configured) {
+            /* wifi_ap_config_t: ssid[32]@0, password[64]@32,
+             * ssid_len@96, channel@97, authmode(u32)@100, hidden@104,
+             * max_connection@105. */
+            for (int i = 0; i < 32 && ws->ap_ssid[i]; i++)
+                mem_write8(cpu->mem, config_ptr + (uint32_t)i,
+                           ws->ap_ssid[i]);
+            for (int i = 0; i < 64 && ws->ap_password[i]; i++)
+                mem_write8(cpu->mem, config_ptr + 32u + (uint32_t)i,
+                           ws->ap_password[i]);
+            mem_write8(cpu->mem, config_ptr + 96u, ws->ap_ssid_len);
+            mem_write8(cpu->mem, config_ptr + 97u, ws->ap_channel);
+            mem_write32(cpu->mem, config_ptr + 100u, ws->ap_authmode);
+            mem_write8(cpu->mem, config_ptr + 104u, ws->ap_hidden);
+            mem_write8(cpu->mem, config_ptr + 105u, ws->ap_max_conn);
         }
     }
     ws_return(cpu, 0);
@@ -2933,6 +3072,8 @@ wifi_stubs_t *wifi_stubs_create(xtensa_cpu_t *cpu)
     ws->channel = 1;
     ws->wifi_mode = WIFI_MODE_NULL;
     ws->disconnect_reason = 8; /* WIFI_REASON_ASSOC_LEAVE */
+    ws->ap_channel = 1;
+    ws->ap_max_conn = WIFI_AP_CLIENT_MAX;
 
     /* Default MACs (locally-administered) */
     ws->sta_mac[0] = 0x24; ws->sta_mac[1] = 0x6F;
@@ -3189,6 +3330,11 @@ int wifi_stubs_hook_symbols(wifi_stubs_t *ws, const elf_symbols_t *syms)
     if (!ws || !syms) return 0;
     int hooked = wifi_stubs_hook_socket_symbols(
         ws, syms, CLASSIC_SOCKET_FD_BASE);
+    /* Remember where the event-base globals live so delivery can pass
+     * the canonical pointer real handlers compare against. Absent
+     * without symbols, in which case the recorded pointer stands. */
+    elf_symbols_find(syms, "WIFI_EVENT", &ws->wifi_event_global);
+    elf_symbols_find(syms, "IP_EVENT", &ws->ip_event_global);
     if (!ws->rom) return 0;
 
     static const wifi_symbol_hook_t hooks[] = {
@@ -4011,6 +4157,13 @@ void wifi_stubs_snapshot_host_config(const wifi_stubs_t *ws,
     snprintf(out->sta_password, sizeof(out->sta_password), "%s",
              ws->sta_password);
     out->dns_override = ws->dns_override;
+    for (unsigned i = 0u; i < ws->ap_client_count &&
+         out->ap_client_count < WIFI_AP_CLIENT_MAX; i++) {
+        if (!ws->ap_clients[i].provisioned) continue;
+        memcpy(out->ap_client_macs[out->ap_client_count],
+               ws->ap_clients[i].mac, 6u);
+        out->ap_client_count++;
+    }
     out->ethernet_tx_cb = ws->ethernet_tx_cb;
     out->ethernet_tx_ctx = ws->ethernet_tx_ctx;
 }
@@ -4020,12 +4173,96 @@ void wifi_stubs_apply_host_config(wifi_stubs_t *ws,
     if (!ws || !cfg) return;
     wifi_stubs_set_sta_credentials(ws, cfg->sta_ssid, cfg->sta_password);
     ws->dns_override = cfg->dns_override;
+    for (unsigned i = 0u; i < cfg->ap_client_count &&
+         i < WIFI_AP_CLIENT_MAX; i++)
+        wifi_stubs_ap_provision_client(ws, cfg->ap_client_macs[i]);
     wifi_stubs_set_ethernet_tx_callback(ws, cfg->ethernet_tx_cb,
                                         cfg->ethernet_tx_ctx);
 }
 
 void wifi_stubs_set_dns_override(wifi_stubs_t *ws, uint32_t addr_net_order) {
     if (ws) ws->dns_override = addr_net_order;
+}
+
+/* ===== Soft-AP client model ===== */
+
+static int ap_client_find(const wifi_stubs_t *ws, const uint8_t mac[6])
+{
+    for (unsigned i = 0u; i < ws->ap_client_count; i++) {
+        if (memcmp(ws->ap_clients[i].mac, mac, 6u) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static unsigned ap_connected_count(const wifi_stubs_t *ws)
+{
+    unsigned n = 0u;
+    for (unsigned i = 0u; i < ws->ap_client_count; i++)
+        if (ws->ap_clients[i].connected) n++;
+    return n;
+}
+
+int wifi_stubs_ap_provision_client(wifi_stubs_t *ws, const uint8_t mac[6])
+{
+    if (!ws || !mac) return -1;
+    int slot = ap_client_find(ws, mac);
+    if (slot >= 0) {
+        ws->ap_clients[slot].provisioned = true;
+        return 0;
+    }
+    if (ws->ap_client_count >= WIFI_AP_CLIENT_MAX) return -1;
+    unsigned i = ws->ap_client_count++;
+    memcpy(ws->ap_clients[i].mac, mac, 6u);
+    ws->ap_clients[i].aid = 0;
+    ws->ap_clients[i].connected = false;
+    ws->ap_clients[i].provisioned = true;
+    return 0;
+}
+
+int wifi_stubs_ap_client_join(wifi_stubs_t *ws, const uint8_t mac[6])
+{
+    if (!ws || !mac || !ws->ap_running) return -1;
+    int slot = ap_client_find(ws, mac);
+    if (slot >= 0 && ws->ap_clients[slot].connected) return 0;
+    if (slot < 0) {
+        if (ws->ap_client_count >= WIFI_AP_CLIENT_MAX) return -1;
+        slot = (int)ws->ap_client_count++;
+        memcpy(ws->ap_clients[slot].mac, mac, 6u);
+        ws->ap_clients[slot].aid = 0;
+        ws->ap_clients[slot].provisioned = false;
+    }
+    unsigned cap = ws->ap_max_conn ? ws->ap_max_conn : WIFI_AP_CLIENT_MAX;
+    if (ap_connected_count(ws) >= cap) return -1;
+    if (ws->ap_clients[slot].aid == 0u) {
+        do {
+            ws->ap_next_aid++;
+            if (ws->ap_next_aid > 255u) ws->ap_next_aid = 1u;
+        } while (ws->ap_next_aid == 0u);
+        ws->ap_clients[slot].aid = (uint8_t)ws->ap_next_aid;
+    }
+    ws->ap_clients[slot].connected = true;
+    wifi_queue_ap_client_event(ws, 14 /* AP_STACONNECTED */,
+                               EVT_DATA_AP_STA_CONNECTED, mac,
+                               ws->ap_clients[slot].aid);
+    wifi_log(ws, "AP client %02X:%02X:%02X:%02X:%02X:%02X joined (aid=%u)\n",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+             ws->ap_clients[slot].aid);
+    return 0;
+}
+
+int wifi_stubs_ap_client_leave(wifi_stubs_t *ws, const uint8_t mac[6])
+{
+    if (!ws || !mac) return -1;
+    int slot = ap_client_find(ws, mac);
+    if (slot < 0 || !ws->ap_clients[slot].connected) return -1;
+    ws->ap_clients[slot].connected = false;
+    wifi_queue_ap_client_event(ws, 15 /* AP_STADISCONNECTED */,
+                               EVT_DATA_AP_STA_DISCONNECTED, mac,
+                               ws->ap_clients[slot].aid);
+    wifi_log(ws, "AP client %02X:%02X:%02X:%02X:%02X:%02X left (aid=%u)\n",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+             ws->ap_clients[slot].aid);
+    return 0;
 }
 
 void wifi_stubs_set_event_log(wifi_stubs_t *ws, bool enabled) {
