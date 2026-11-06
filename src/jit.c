@@ -23,11 +23,21 @@
 #  define JIT_NEEDS_WX 1
 #endif
 
-/* ===== W^X + icache management (Apple Silicon) =====
- * macOS on ARM64 enforces W^X on JIT pages: write mode and execute mode
- * are toggled per-thread via pthread_jit_write_protect_np(), and the
- * icache must be invalidated after any code mutation (block emission,
- * chain patching). On x86 these are no-ops. */
+/* ===== W^X + icache management =====
+ * ARM64 instruction caches are not coherent with data writes, so the icache
+ * must be invalidated after any code mutation (block emission, chain
+ * patching) on every ARM64 OS. macOS also enforces W^X on JIT pages: write
+ * mode and execute mode are toggled per-thread via
+ * pthread_jit_write_protect_np(). On x86 these are no-ops. */
+static inline void jit_icache_invalidate(void *start, size_t len) {
+#if defined(JIT_NEEDS_WX)
+    sys_icache_invalidate(start, len);
+#elif defined(JIT_ARCH_ARM64)
+    __builtin___clear_cache((char *)start, (char *)start + len);
+#else
+    (void)start; (void)len;
+#endif
+}
 static inline void jit_wx_write_begin(void) {
 #if defined(JIT_NEEDS_WX)
     pthread_jit_write_protect_np(0);
@@ -36,10 +46,8 @@ static inline void jit_wx_write_begin(void) {
 static inline void jit_wx_write_end(void *start, size_t len) {
 #if defined(JIT_NEEDS_WX)
     pthread_jit_write_protect_np(1);
-    sys_icache_invalidate(start, len);
-#else
-    (void)start; (void)len;
 #endif
+    jit_icache_invalidate(start, len);
 }
 
 /* ===== CPU struct field offsets (computed from xtensa_cpu_t layout) ===== */
@@ -3582,9 +3590,7 @@ static void jit_patch_chain_site(uint8_t *jmp_site, uint8_t *target) {
     int64_t byte_delta = (int64_t)(target - jmp_site);
     uint32_t insn = arm64_encode_b((int32_t)(byte_delta / 4));
     memcpy(jmp_site, &insn, 4);
-#  if defined(JIT_NEEDS_WX)
-    sys_icache_invalidate(jmp_site, 4);
-#  endif
+    jit_icache_invalidate(jmp_site, 4);
 #else
     int32_t rel = (int32_t)(target - (jmp_site + 5));
     memcpy(jmp_site + 1, &rel, 4);
