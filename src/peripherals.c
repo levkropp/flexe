@@ -14162,11 +14162,12 @@ static bool i2s_process_tx_descriptor(esp32_periph_t *p, int port) {
     if (len != 0)
         i2s_emit_tx(p, port, audio, len);
 
-    s->regs[I2S_OUT_EOF_DESC_OFF / 4u] = desc;
-    s->regs[I2S_OUT_EOF_BUF_OFF / 4u] = buf;
     s->int_raw |= I2S_INT_OUT_DONE;
-    if (ctrl & I2S_DESC_EOF)
+    if (ctrl & I2S_DESC_EOF) {
+        s->regs[I2S_OUT_EOF_DESC_OFF / 4u] = desc;
+        s->regs[I2S_OUT_EOF_BUF_OFF / 4u] = buf;
         s->int_raw |= I2S_INT_OUT_EOF;
+    }
 
     if (next == 0) {
         s->int_raw |= I2S_INT_OUT_TOTAL_EOF;

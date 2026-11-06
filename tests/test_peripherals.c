@@ -6423,6 +6423,87 @@ static void i2s_test_capture(void *ctx, int port, const uint8_t *data,
     memcpy(capture->data, data, copy_len);
 }
 
+/* Original regression: Brandon Gates, MIT.
+ * EOF descriptor and buffer witnesses must survive non-EOF DMA completions.
+ */
+static void check_i2s_eof_witness(unsigned port, bool clear_first_irq) {
+    const uint32_t i2s = port ? 0x3FF6D000u : 0x3FF4F000u;
+    const uint32_t desc = 0x3FFB0000u, buf = 0x3FFB1000u;
+    const uint32_t eof_irq = 1u << 12;
+    xtensa_mem_t *mem = mem_create();
+    ASSERT_TRUE(mem != NULL);
+    if (!mem) return;
+    esp32_periph_t *p = periph_create(mem);
+    ASSERT_TRUE(p != NULL);
+    if (!p) { mem_destroy(mem); return; }
+    xtensa_cpu_t cpu;
+    xtensa_cpu_init(&cpu);
+    cpu.mem = mem;
+    periph_attach_cpus(p, &cpu, NULL);
+
+    /* Four descriptors: EOF A -> non-EOF B -> EOF C -> non-EOF D. */
+    for (unsigned i = 0; i < 4; i++) {
+        uint32_t flags = 4u | (4u << 12) | (1u << 31);
+        if ((i & 1u) == 0) flags |= 1u << 30;
+        mem_write32(mem, desc + 12 * i, flags);
+        mem_write32(mem, desc + 12 * i + 4, buf + 4 * i);
+        mem_write32(mem, desc + 12 * i + 8, i == 3 ? 0 : desc + 12 * (i + 1));
+        for (unsigned j = 0; j < 4; j++)
+            mem_write8(mem, buf + 4 * i + j, (uint8_t)(4 * i + j + 1));
+    }
+    i2s_test_capture_t capture = {0};
+    ASSERT_EQ(periph_set_i2s_tx_callback(p, (int)port, i2s_test_capture, &capture), 0);
+    mem_write32(mem, i2s + 0xACu, 4u);             /* CLKM_CONF */
+    mem_write32(mem, i2s + 0xB0u, (8u << 12) | 1u); /* SAMPLE_RATE_CONF */
+    mem_write32(mem, i2s + 0xA8u, 1u << 5);        /* LCD_EN */
+    mem_write32(mem, i2s + 0x20u, 1u << 12);       /* DSCR_EN */
+    mem_write32(mem, i2s + 0x14u, eof_irq);        /* OUT_EOF_INT_ENA */
+    mem_write32(mem, i2s + 0x30u, (desc & 0xFFFFFu) | (1u << 29));
+    mem_write32(mem, i2s + 0x08u, 1u << 4);       /* TX_START */
+
+    for (unsigned completed = 1; completed <= 4; completed++) {
+        /* TX_START completes A immediately; subsequent descriptors use the
+         * peripheral's own deadlines. The loop is finite even on failure. */
+        for (unsigned n = 0; capture.count < (int)completed && n < 32; n++) {
+            uint32_t deadline = cpu.periph_next_event(&cpu);
+            ASSERT_TRUE(deadline != UINT32_MAX);
+            if (deadline == UINT32_MAX) break;
+            cpu.ccount = deadline;
+            cpu.periph_event(&cpu);
+        }
+        unsigned witness = completed >= 3 ? 2 : 0;
+        ASSERT_EQ(capture.count, completed);
+        ASSERT_EQ(capture.port, port);
+        ASSERT_EQ(capture.len, 4u);
+        for (unsigned j = 0; j < 4; j++)
+            ASSERT_EQ(capture.data[j], 4 * (completed - 1) + j + 1);
+        ASSERT_EQ(mem_read32(mem, i2s + 0x38u), desc + 12 * witness);
+        ASSERT_EQ(mem_read32(mem, i2s + 0x40u), buf + 4 * witness);
+        ASSERT_EQ(mem_read32(mem, i2s + 0x54u), desc + 12 * (completed - 1));
+        bool pending = completed == 1 || completed == 3 ||
+                       (completed == 2 && !clear_first_irq);
+        ASSERT_EQ(!!(mem_read32(mem, i2s + 0x10u) & eof_irq), pending);
+        if ((completed == 1 && clear_first_irq) || completed == 3)
+            mem_write32(mem, i2s + 0x18u, eof_irq); /* W1C must not erase witnesses */
+    }
+
+    /* Both EOF witnesses remain read-only and retain C after D and IRQ clear. */
+    mem_write32(mem, i2s + 0x38u, 0);
+    mem_write32(mem, i2s + 0x40u, 0);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x38u), desc + 24);
+    ASSERT_EQ(mem_read32(mem, i2s + 0x40u), buf + 8);
+    ASSERT_EQ(periph_unhandled_count(p), 0);
+    periph_destroy(p);
+    mem_destroy(mem);
+}
+
+TEST(i2s_eof_witness_survives_non_eof_descriptors) {
+    for (unsigned port = 0; port < 2; port++) {
+        check_i2s_eof_witness(port, false);
+        check_i2s_eof_witness(port, true);
+    }
+}
+
 TEST(i2s_tx_dma_descriptor_and_interrupt) {
     const uint32_t i2s = 0x3FF4F000u;
     const uint32_t desc = 0x3FFB1300u;
@@ -7105,6 +7186,7 @@ void run_peripheral_tests(void) {
     RUN_TEST(ledc_fade_progress_and_completion_deadline);
     RUN_TEST(ledc_timer_overflow_pause_and_clear);
     RUN_TEST(ledc_low_speed_output_and_dport_reset_preserve_endpoint);
+    RUN_TEST(i2s_eof_witness_survives_non_eof_descriptors);
     RUN_TEST(i2s_tx_dma_descriptor_and_interrupt);
     RUN_TEST(i2s_lcd_apll_clock_and_dma_deadline);
     RUN_TEST(i2s_rx_dma_injection_and_dual_port);
