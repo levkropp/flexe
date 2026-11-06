@@ -2059,10 +2059,8 @@ static struct nvs_kv_entry *nvs_alloc(esp32_rom_stubs_t *s, const char *ns,
     for (int i = 0; i < 64; i++) {
         if (!s->nvs_kv[i].used) {
             s->nvs_kv[i].used = 1;
-            strncpy(s->nvs_kv[i].ns,  ns,  sizeof(s->nvs_kv[i].ns)  - 1);
-            s->nvs_kv[i].ns[sizeof(s->nvs_kv[i].ns) - 1] = '\0';
-            strncpy(s->nvs_kv[i].key, key, sizeof(s->nvs_kv[i].key) - 1);
-            s->nvs_kv[i].key[sizeof(s->nvs_kv[i].key) - 1] = '\0';
+            snprintf(s->nvs_kv[i].ns,  sizeof(s->nvs_kv[i].ns),  "%s", ns);
+            snprintf(s->nvs_kv[i].key, sizeof(s->nvs_kv[i].key), "%s", key);
             return &s->nvs_kv[i];
         }
     }
