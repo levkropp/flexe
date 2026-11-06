@@ -95,12 +95,42 @@ jobs:
           FLEXE_CLI_BINARY: build-asan/xtensa-emu
         run: python3 tests/test_cli_trace.py
 
-  # The JIT has two backends and only one of them is exercised by a host
-  # build. A native aarch64 runner would be better, but a cross-compile at
-  # least catches the common failure: adding an emitter helper on one side
-  # and calling it from shared code. openssl-dependent sources are skipped
-  # because the cross toolchain has no aarch64 openssl headers; none of them
-  # contain backend-specific code.
+  # The JIT has two backends and an x86-64 host build only runs one of them.
+  # This job executes the arm64 backend on Linux, where the cache maintenance
+  # differs from macOS. gcc-14 also warns about things the default gcc does not.
+  unit-aarch64:
+    name: unit tests (aarch64, gcc-14)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache libssl-dev zlib1g-dev gcc-14
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-v1-unit-aarch64-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', 'CMakeLists.txt', 'src/**', 'tests/**') }}
+          restore-keys: |
+            ccache-v1-unit-aarch64-${{ runner.os }}-
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DNATIVE_ARCH=OFF -DFLEXE_LTO=OFF
+      - name: Build
+        run: cmake --build build --target xtensa-emu xtensa-tests flexe-agon-vdp-test -j"$(nproc)"
+      - name: Unit tests
+        run: ./scripts/run-unit-tests.sh
+      - name: CLI trace regressions
+        run: python3 tests/test_cli_trace.py
+
+  # Compiles on an x86-64 host, which catches the common failure quickly:
+  # adding an emitter helper on one side and calling it from shared code.
+  # openssl-dependent sources are skipped because the cross toolchain has no
+  # aarch64 openssl headers; none of them contain backend-specific code.
   cross-aarch64:
     name: aarch64 cross-compile
     runs-on: ubuntu-latest
