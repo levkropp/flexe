@@ -541,6 +541,12 @@ static const flexe_target_desc_t TARGETS[] = {
             .mem_rx_write_shift = 11u,
             .date_offset = 0x7Cu,
             .date_reset = 0x02008270u,
+            /* UART_MEM_CONF_REG.RX_TOUT_THRHD, counted in bit times. */
+            .rx_timeout_threshold_offset = 0x60u,
+            .rx_timeout_threshold_mask = 0x3FFu,
+            .rx_timeout_threshold_shift = 17u,
+            .rx_timeout_unit_bits = 1u,
+            .clk_conf_offset = 0x78u,
         },
         .uart = {
             { .base = 0x60000000u, .interrupt_source = 27u,

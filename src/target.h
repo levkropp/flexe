@@ -184,6 +184,15 @@ typedef struct {
     uint8_t  mem_rx_write_shift;
     uint32_t date_offset;
     uint32_t date_reset;
+    /* RX idle timeout threshold. A zero mask keeps the legacy model, which
+     * raises RXFIFO_TOUT as soon as host bytes arrive. */
+    uint32_t rx_timeout_threshold_offset;
+    uint32_t rx_timeout_threshold_mask;     /* applied after the shift */
+    uint8_t  rx_timeout_threshold_shift;
+    uint8_t  rx_timeout_unit_bits;          /* bit times per threshold unit */
+    /* Source-clock select and divider register (ESP32-S3 UART_CLK_CONF);
+     * zero when the baud clock is APB without a pre-divider. */
+    uint32_t clk_conf_offset;
 } flexe_uart_ip_desc_t;
 
 typedef struct {

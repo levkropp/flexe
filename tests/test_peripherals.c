@@ -2244,6 +2244,156 @@ TEST(uart2_rx_fifo_and_interrupt) {
     mem_destroy(mem);
 }
 
+/* ESP32-S3 RX idle timeout, matching measurements on two S3 boards. */
+#define S3_UART1_BASE      0x60010000u
+#define S3_UART_TOUT       (1u << 8)
+
+typedef struct {
+    xtensa_mem_t *mem;
+    esp32_periph_t *p;
+    xtensa_cpu_t cpu;
+} s3_uart_fixture_t;
+
+static bool s3_uart_fixture_init(s3_uart_fixture_t *f, uint32_t clk_conf,
+                                 uint32_t clkdiv, uint32_t threshold_bits) {
+    const flexe_target_desc_t *s3 = flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    memset(f, 0, sizeof(*f));
+    f->mem = mem_create_for_target(s3);
+    f->p = f->mem ? periph_create(f->mem) : NULL;
+    ASSERT_TRUE(f->mem != NULL);
+    ASSERT_TRUE(f->p != NULL);
+    if (!f->mem || !f->p) {
+        periph_destroy(f->p);
+        mem_destroy(f->mem);
+        return false;
+    }
+    xtensa_cpu_init_for_target(&f->cpu, s3);
+    f->cpu.mem = f->mem;
+    periph_attach_cpus(f->p, &f->cpu, NULL);
+    mem_write32(f->mem, S3_UART1_BASE + 0x78u, clk_conf);   /* CLK_CONF */
+    mem_write32(f->mem, S3_UART1_BASE + 0x14u, clkdiv);     /* CLKDIV */
+    mem_write32(f->mem, S3_UART1_BASE + 0x60u,              /* MEM_CONF */
+                threshold_bits << 17);
+    mem_write32(f->mem, S3_UART1_BASE + 0x0Cu, S3_UART_TOUT); /* INT_ENA */
+    mem_write32(f->mem, S3_UART1_BASE + 0x24u,              /* CONF1 */
+                (1u << 23) | 100u);  /* RX_TOUT_EN, full threshold 100 */
+    return true;
+}
+
+static void s3_uart_fixture_destroy(s3_uart_fixture_t *f) {
+    periph_destroy(f->p);
+    mem_destroy(f->mem);
+}
+
+static void s3_uart_advance_us(s3_uart_fixture_t *f, uint32_t us) {
+    f->cpu.ccount += xtensa_cpu_freq_mhz(&f->cpu) * us;
+    f->cpu.periph_event(&f->cpu);
+}
+
+static uint32_t s3_uart_raw_tout(s3_uart_fixture_t *f) {
+    return mem_read32(f->mem, S3_UART1_BASE + 0x04u) & S3_UART_TOUT;
+}
+
+/* APB source, no pre-divider, CLKDIV 80: 1 Mbaud, one bit per microsecond. */
+#define S3_UART_CLK_APB_1MBAUD   (1u << 20)
+#define S3_UART_CLKDIV_1MBAUD    80u
+
+TEST(s3_uart_rx_timeout_waits_for_idle_threshold) {
+    s3_uart_fixture_t f;
+    if (!s3_uart_fixture_init(&f, S3_UART_CLK_APB_1MBAUD,
+                              S3_UART_CLKDIV_1MBAUD, 32u))
+        return;
+    const uint8_t input[] = {'A', 'B', 'C'};
+    ASSERT_EQ(periph_uart_rx_inject_num(f.p, 1, input, sizeof input), 3u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    s3_uart_advance_us(&f, 31u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    s3_uart_advance_us(&f, 1u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), S3_UART_TOUT);
+    ASSERT_EQ(mem_read32(f.mem, S3_UART1_BASE + 0x08u), S3_UART_TOUT);
+    ASSERT_TRUE(periph_interrupt_pending(f.p, 28));
+    s3_uart_fixture_destroy(&f);
+
+    /* XTAL source divided by two, CLKDIV 20: again one bit per microsecond. */
+    if (!s3_uart_fixture_init(&f, (3u << 20) | (1u << 12), 20u, 10u))
+        return;
+    ASSERT_EQ(periph_uart_rx_inject_num(f.p, 1, input, 1), 1u);
+    s3_uart_advance_us(&f, 9u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    s3_uart_advance_us(&f, 1u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), S3_UART_TOUT);
+    s3_uart_fixture_destroy(&f);
+}
+
+TEST(s3_uart_rx_timeout_clear_waits_for_empty_fifo) {
+    s3_uart_fixture_t f;
+    if (!s3_uart_fixture_init(&f, S3_UART_CLK_APB_1MBAUD,
+                              S3_UART_CLKDIV_1MBAUD, 32u))
+        return;
+    const uint8_t input[] = {'A', 'B', 'C'};
+    ASSERT_EQ(periph_uart_rx_inject_num(f.p, 1, input, sizeof input), 3u);
+    s3_uart_advance_us(&f, 32u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), S3_UART_TOUT);
+
+    /* Clearing with all three bytes unread has no effect. */
+    mem_write32(f.mem, S3_UART1_BASE + 0x10u, S3_UART_TOUT);
+    ASSERT_EQ(s3_uart_raw_tout(&f), S3_UART_TOUT);
+
+    /* Nor with a partial read; the interrupt stays pending. */
+    ASSERT_EQ(mem_read32(f.mem, S3_UART1_BASE), 'A');
+    mem_write32(f.mem, S3_UART1_BASE + 0x10u, S3_UART_TOUT);
+    ASSERT_EQ(s3_uart_raw_tout(&f), S3_UART_TOUT);
+    ASSERT_TRUE(periph_interrupt_pending(f.p, 28));
+
+    /* Once drained, the clear takes and nothing fires again. */
+    ASSERT_EQ(mem_read32(f.mem, S3_UART1_BASE), 'B');
+    ASSERT_EQ(mem_read32(f.mem, S3_UART1_BASE), 'C');
+    mem_write32(f.mem, S3_UART1_BASE + 0x10u, S3_UART_TOUT);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    ASSERT_FALSE(periph_interrupt_pending(f.p, 28));
+    s3_uart_advance_us(&f, 640u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    s3_uart_fixture_destroy(&f);
+}
+
+TEST(s3_uart_rx_timeout_restarts_on_input_and_honours_enable) {
+    s3_uart_fixture_t f;
+    if (!s3_uart_fixture_init(&f, S3_UART_CLK_APB_1MBAUD,
+                              S3_UART_CLKDIV_1MBAUD, 32u))
+        return;
+    const uint8_t byte = 'X';
+    ASSERT_EQ(periph_uart_rx_inject_num(f.p, 1, &byte, 1), 1u);
+    s3_uart_advance_us(&f, 16u);
+    ASSERT_EQ(periph_uart_rx_inject_num(f.p, 1, &byte, 1), 1u);
+    s3_uart_advance_us(&f, 16u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);   /* new input restarted idle time */
+    s3_uart_advance_us(&f, 16u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), S3_UART_TOUT);
+    while (periph_uart_rx_pending_num(f.p, 1))
+        (void)mem_read32(f.mem, S3_UART1_BASE);
+    mem_write32(f.mem, S3_UART1_BASE + 0x10u, S3_UART_TOUT);
+
+    /* Disabled timeout never fires; enabling it starts a fresh interval. */
+    mem_write32(f.mem, S3_UART1_BASE + 0x24u, 100u);
+    ASSERT_EQ(periph_uart_rx_inject_num(f.p, 1, &byte, 1), 1u);
+    s3_uart_advance_us(&f, 64u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    mem_write32(f.mem, S3_UART1_BASE + 0x24u, (1u << 23) | 100u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    s3_uart_advance_us(&f, 32u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), S3_UART_TOUT);
+
+    /* Draining cancels a pending interval. */
+    (void)mem_read32(f.mem, S3_UART1_BASE);
+    mem_write32(f.mem, S3_UART1_BASE + 0x10u, S3_UART_TOUT);
+    ASSERT_EQ(periph_uart_rx_inject_num(f.p, 1, &byte, 1), 1u);
+    s3_uart_advance_us(&f, 16u);
+    (void)mem_read32(f.mem, S3_UART1_BASE);
+    s3_uart_advance_us(&f, 64u);
+    ASSERT_EQ(s3_uart_raw_tout(&f), 0u);
+    s3_uart_fixture_destroy(&f);
+}
+
 /* Shared ESP32-family I2C command fields: byte count [7:0], ACK check
  * enable [8], expected ACK [9], master ACK value [10], opcode [13:11].
  * Opcode values themselves are target-specific. */
@@ -7120,6 +7270,9 @@ void run_peripheral_tests(void) {
     RUN_TEST(uart_rx_fifo_injection);
     RUN_TEST(uart_rx_timeout_interrupt);
     RUN_TEST(uart2_rx_fifo_and_interrupt);
+    RUN_TEST(s3_uart_rx_timeout_waits_for_idle_threshold);
+    RUN_TEST(s3_uart_rx_timeout_clear_waits_for_empty_fifo);
+    RUN_TEST(s3_uart_rx_timeout_restarts_on_input_and_honours_enable);
     RUN_TEST(i2c_master_repeated_start_read_and_interrupt);
     RUN_TEST(i2c_end_command_streams_fifo_chunks_until_stop);
     RUN_TEST(i2c_dual_port_ahb_alias_and_address_nack);
