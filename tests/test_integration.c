@@ -158,10 +158,17 @@ TEST(sum_1_to_5) {
     teardown(&cpu);
 }
 
+#include "test_iram_isync.h"
+
 void run_integration_tests(void) {
     TEST_SUITE("Integration Programs");
 
     RUN_TEST(fibonacci_10);
     RUN_TEST(counter_loop);
     RUN_TEST(sum_1_to_5);
+#ifdef FLEXE_HAS_JIT
+    RUN_TEST(iram_isync_replacement);
+#endif
+    RUN_TEST(iram_isync_first_load);
+    RUN_TEST(iram_isync_barrier_routing);
 }
