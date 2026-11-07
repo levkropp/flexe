@@ -1,6 +1,9 @@
 #ifndef XTENSA_H
 #define XTENSA_H
 
+/* Optional ISYNC observer API, for embedding translation-coherence policy. */
+#define XTENSA_HAS_INSTRUCTION_SYNC_OBSERVER 1
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -557,6 +560,10 @@ struct xtensa_cpu {
     /* Optional execution-engine code-cache invalidation hook. */
     xtensa_code_invalidate_fn code_invalidate;
     void *code_invalidate_ctx;
+
+    /* Optional ISYNC observer: host translation coherence for changed RAM. */
+    void (*instruction_sync)(xtensa_cpu_t *cpu, void *ctx);
+    void *instruction_sync_ctx;
 
     /* Cold companion to pc_hook_bitmap. Kept at the end so adding an exact
      * translation-time query does not disturb the interpreter's hot layout.

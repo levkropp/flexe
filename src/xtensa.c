@@ -911,7 +911,7 @@ static uint32_t predecode_pack(const xtensa_cpu_t *cpu, uint32_t insn, int ilen)
                 else if (op2 >= 1 && op2 <= 3) kind = PD_LOGIC;
                 else if (op2 != 0) kind = PD_ALU;
                 else if (r == 6) kind = PD_RSIL;
-                else if (r == 2 && xtensa_sync_encoding_valid(insn)) kind = PD_NOP;
+                else if (r == 2 && xtensa_sync_encoding_valid(insn)) kind = XT_T(insn) == 0u ? PD_SLOW : PD_NOP;
                 else if (r >= 8 && r <= 11) kind = PD_ALU;
                 else if (r == 0 && XT_M(insn) == 2 && XT_N(insn) == 0) kind = PD_RET;
                 else if (r == 0 && XT_M(insn) == 2 && XT_N(insn) == 1) kind = PD_RETW;
@@ -2186,10 +2186,10 @@ bool exec_qrst(xtensa_cpu_t *cpu, uint32_t insn) {
                                            cpu->pc - 3u, 0);
                     return false;
                 }
-                /* Fast mode has a single strongly ordered host timeline, so
-                 * ISYNC/RSYNC/ESYNC/DSYNC/EXTW/MEMW/EXCW need no additional
-                 * operation here. Accurate schedulers will use these as
-                 * synchronization boundaries. */
+                /* ISYNC is a translation-coherence boundary for code written
+                 * to executable RAM. Other barriers retain ordered-host semantics. */
+                if (XT_T(insn) == 0u && cpu->instruction_sync)
+                    cpu->instruction_sync(cpu, cpu->instruction_sync_ctx);
                 break;
             case 3: /* RFEI group */
                 switch (t) {
@@ -3646,7 +3646,11 @@ static inline bool exec_cached_qrst(xtensa_cpu_t *cpu, uint32_t insn,
                 cpu->ps = (cpu->ps & ~0xFu) | s;
                 return true;
             }
-            if (r == 2 && xtensa_sync_encoding_valid(insn)) return true;
+            if (r == 2 && xtensa_sync_encoding_valid(insn)) {
+                if (XT_T(insn) == 0u && cpu->instruction_sync)
+                    cpu->instruction_sync(cpu, cpu->instruction_sync_ctx);
+                return true;
+            }
             if (r >= 8 && r <= 11) {
                 exec_qrst(cpu, insn); return true;
             }

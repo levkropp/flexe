@@ -1061,6 +1061,8 @@ static void session_reset_app_cpu(flexe_session_t *s)
     cpu->aot_bitmap = old.aot_bitmap;
     cpu->code_invalidate = old.code_invalidate;
     cpu->code_invalidate_ctx = old.code_invalidate_ctx;
+    cpu->instruction_sync = old.instruction_sync;
+    cpu->instruction_sync_ctx = old.instruction_sync_ctx;
     cpu->accelerated_blocks = old.accelerated_blocks;
     cpu->record_branch_targets = old.record_branch_targets;
     cpu->window_trace = old.window_trace;

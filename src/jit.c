@@ -509,7 +509,7 @@ static int classify_for_jit(uint32_t insn, int ilen) {
                 }
                 if (r == 1) return 0;  /* MOVSP — guarded architectural move */
                 if (r == 2)
-                    return xtensa_sync_encoding_valid(insn) ? 0 : 2;
+                    return xtensa_sync_encoding_valid(insn) && XT_T(insn) != 0u ? 0 : 2;
                 if (r == 3) {
                     /* The architectural window spill/fill vectors end in
                      * RFWO/RFWU. They are self-contained block terminators;
