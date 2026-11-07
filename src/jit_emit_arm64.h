@@ -911,6 +911,13 @@ static inline void emit_load64_index(emit_t *e, int dst, int base,
                                      int idx32, int32_t disp) {
     if (disp >= 0 && disp < 4096) {
         emit_arm64_add_imm12(e, 1, ARM64_SCRATCH, base, (uint32_t)disp, 0);
+    } else if (disp >= 0 && disp < (1 << 24)) {
+        /* Two shifted/unshifted immediates reach any offset below 16 MiB. */
+        emit_arm64_add_imm12(e, 1, ARM64_SCRATCH, base,
+                             (uint32_t)disp >> 12, 1);
+        if ((uint32_t)disp & 0xFFFu)
+            emit_arm64_add_imm12(e, 1, ARM64_SCRATCH, ARM64_SCRATCH,
+                                 (uint32_t)disp & 0xFFFu, 0);
     } else {
         emit_mov_reg_imm64(e, ARM64_SCRATCH, (uint64_t)(int64_t)disp);
         emit32(e, 0x8B000000u | ((uint32_t)ARM64_SCRATCH << 16)

@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "target.h"
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -27,7 +28,220 @@ static uint8_t **backing_slot(xtensa_mem_t *mem,
 static void page_table_map(xtensa_mem_t *mem, uint32_t base, uint32_t end,
                            uint8_t *host) {
     for (uint32_t page = base; page < end; page += PAGE_SIZE)
-        mem->page_table[page >> 12] = host + (page - base);
+        mem_page_set(mem, page >> 12, host + (page - base));
+}
+
+/* ===== Translated-code coherence (see memory.h) =====
+ *
+ * State is kept per 4 KiB page of each writable backing, so every guest alias
+ * of the same bytes (ESP32-S3 DRAM/IRAM, PSRAM data/instruction windows)
+ * shares it. Marks are kept per 32-byte chunk so a diverted page's data
+ * stores do not invalidate code they cannot touch. */
+#define CODE_CHUNK_SHIFT     5u
+#define CODE_CHUNKS_PER_PAGE (PAGE_SIZE >> CODE_CHUNK_SHIFT)
+#define CODE_CHUNK_WORDS     (CODE_CHUNKS_PER_PAGE / 64u)
+#define CODE_KIND_COUNT      2u
+#define CODE_EXEC_ALIASES    2u
+#define CODE_WATCH_MAX       4u
+
+typedef struct {
+    uint64_t chunks[CODE_KIND_COUNT][CODE_CHUNK_WORDS];
+    uint32_t exec_page[CODE_EXEC_ALIASES];  /* guest pages code ran from */
+    uint8_t  exec_count;
+    uint8_t  diverted;                      /* stores take the slow path */
+} code_page_t;
+
+struct mem_code_state {
+    code_page_t *pages[FLEXE_MEM_BACKING_COUNT];
+    struct {
+        mem_code_watch_fn fn;
+        void *ctx;
+    } watch[CODE_WATCH_MAX];
+    unsigned watch_count;
+};
+
+static const flexe_mem_backing_t code_backings[] = {
+    FLEXE_MEM_SRAM, FLEXE_MEM_RTC_FAST, FLEXE_MEM_RTC_SLOW, FLEXE_MEM_PSRAM,
+};
+
+static unsigned code_kind_index(mem_code_kind_t kind) {
+    return kind == MEM_CODE_JIT ? 1u : 0u;
+}
+
+/* State for the writable backing page holding `host`, or NULL when the
+ * pointer is not writable target RAM (ROM, flash, host scratch pages). */
+static code_page_t *code_page_for_host(xtensa_mem_t *mem, const uint8_t *host,
+                                       bool create) {
+    for (unsigned i = 0; i < sizeof(code_backings) / sizeof(code_backings[0]);
+         i++) {
+        flexe_mem_backing_t backing = code_backings[i];
+        uint8_t *base = *backing_slot(mem, backing);
+        uint32_t size = mem->backing_size[backing];
+        if (!base || host < base || host >= base + size) continue;
+        if (!mem->code) {
+            if (!create) return NULL;
+            mem->code = calloc(1, sizeof(*mem->code));
+            if (!mem->code) return NULL;
+        }
+        if (!mem->code->pages[backing]) {
+            if (!create) return NULL;
+            mem->code->pages[backing] =
+                calloc((size + PAGE_SIZE - 1u) / PAGE_SIZE,
+                       sizeof(code_page_t));
+            if (!mem->code->pages[backing]) return NULL;
+        }
+        return &mem->code->pages[backing][(size_t)(host - base) / PAGE_SIZE];
+    }
+    return NULL;
+}
+
+static bool host_page_diverted(xtensa_mem_t *mem, const uint8_t *host) {
+    if (!mem->code || !host) return false;
+    const code_page_t *page = code_page_for_host(mem, host, false);
+    return page && page->diverted;
+}
+
+void mem_page_set(xtensa_mem_t *mem, uint32_t page_index, uint8_t *host) {
+    if (!mem || page_index >= MEM_PAGE_TABLE_SIZE) return;
+    mem->page_table[page_index] = host;
+    mem->write_page_table[page_index] =
+        host_page_diverted(mem, host) ? NULL : host;
+}
+
+/* Divert stores for every guest page aliasing a newly protected host page.
+ * Runs once per page that first receives translated code. */
+static void code_divert_scan(xtensa_mem_t *mem) {
+    for (uint32_t i = 0; i < MEM_PAGE_TABLE_SIZE; i++) {
+        uint8_t *host = mem->write_page_table[i];
+        if (host && host_page_diverted(mem, host))
+            mem->write_page_table[i] = NULL;
+    }
+}
+
+static bool chunk_range_any(const uint64_t *words, unsigned first,
+                            unsigned last) {
+    for (unsigned c = first; c <= last; c++)
+        if (words[c / 64u] & (1ull << (c % 64u))) return true;
+    return false;
+}
+
+void mem_code_protect(xtensa_mem_t *mem, uint32_t exec_addr, uint32_t len,
+                      mem_code_kind_t kind) {
+    if (!mem || len == 0u) return;
+    unsigned k = code_kind_index(kind);
+    uint64_t end = (uint64_t)exec_addr + len;
+    bool scan = false;
+    for (uint64_t a = exec_addr; a < end;) {
+        uint64_t page_base = a & ~(uint64_t)(PAGE_SIZE - 1u);
+        uint64_t page_end = page_base + PAGE_SIZE;
+        uint64_t hi = end < page_end ? end : page_end;
+        uint8_t *host = mem->page_table[(uint32_t)a >> 12];
+        code_page_t *page = host ? code_page_for_host(mem, host, true) : NULL;
+        if (page) {
+            bool known = false;
+            for (unsigned i = 0; i < page->exec_count; i++)
+                known = known || page->exec_page[i] == (uint32_t)page_base;
+            if (!known && page->exec_count < CODE_EXEC_ALIASES)
+                page->exec_page[page->exec_count++] = (uint32_t)page_base;
+            unsigned first = (unsigned)(a - page_base) >> CODE_CHUNK_SHIFT;
+            unsigned last = (unsigned)(hi - 1u - page_base) >> CODE_CHUNK_SHIFT;
+            for (unsigned c = first; c <= last; c++)
+                page->chunks[k][c / 64u] |= 1ull << (c % 64u);
+            if (!page->diverted) {
+                page->diverted = 1u;
+                scan = true;
+            }
+        }
+        a = page_end;
+    }
+    if (scan) code_divert_scan(mem);
+}
+
+void mem_code_clear(xtensa_mem_t *mem, mem_code_kind_t kind) {
+    if (!mem || !mem->code) return;
+    unsigned k = code_kind_index(kind);
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
+        code_page_t *pages = mem->code->pages[i];
+        if (!pages) continue;
+        uint32_t count = (mem->backing_size[i] + PAGE_SIZE - 1u) / PAGE_SIZE;
+        for (uint32_t p = 0; p < count; p++)
+            memset(pages[p].chunks[k], 0, sizeof(pages[p].chunks[k]));
+    }
+}
+
+int mem_code_watch_add(xtensa_mem_t *mem, mem_code_watch_fn fn, void *ctx) {
+    if (!mem || !fn) return -1;
+    if (!mem->code) {
+        mem->code = calloc(1, sizeof(*mem->code));
+        if (!mem->code) return -1;
+    }
+    struct mem_code_state *s = mem->code;
+    for (unsigned i = 0; i < s->watch_count; i++)
+        if (s->watch[i].fn == fn && s->watch[i].ctx == ctx) return 0;
+    if (s->watch_count >= CODE_WATCH_MAX) return -1;
+    s->watch[s->watch_count].fn = fn;
+    s->watch[s->watch_count].ctx = ctx;
+    s->watch_count++;
+    return 0;
+}
+
+void mem_code_watch_remove(xtensa_mem_t *mem, mem_code_watch_fn fn,
+                           void *ctx) {
+    if (!mem || !mem->code) return;
+    struct mem_code_state *s = mem->code;
+    for (unsigned i = 0; i < s->watch_count; i++) {
+        if (s->watch[i].fn != fn || s->watch[i].ctx != ctx) continue;
+        s->watch[i] = s->watch[--s->watch_count];
+        return;
+    }
+}
+
+/* Bytes [addr, addr + n) changed: tell watchers about marked chunks. */
+static void mem_code_modified(xtensa_mem_t *mem, uint32_t addr, unsigned n) {
+    if (!mem->code || mem->code->watch_count == 0u) return;
+    uint64_t end = (uint64_t)addr + n;
+    for (uint64_t a = addr; a < end;) {
+        uint64_t page_base = a & ~(uint64_t)(PAGE_SIZE - 1u);
+        uint64_t page_end = page_base + PAGE_SIZE;
+        uint64_t hi = end < page_end ? end : page_end;
+        uint8_t *host = mem->page_table[(uint32_t)a >> 12];
+        code_page_t *page = host ? code_page_for_host(mem, host, false) : NULL;
+        if (page) {
+            unsigned first = (unsigned)(a - page_base) >> CODE_CHUNK_SHIFT;
+            unsigned last = (unsigned)(hi - 1u - page_base) >> CODE_CHUNK_SHIFT;
+            unsigned kinds = 0u;
+            if (chunk_range_any(page->chunks[0], first, last))
+                kinds |= MEM_CODE_PREDECODE;
+            if (chunk_range_any(page->chunks[1], first, last))
+                kinds |= MEM_CODE_JIT;
+            if (kinds) {
+                uint32_t exec[CODE_EXEC_ALIASES];
+                unsigned exec_count = page->exec_count;
+                memcpy(exec, page->exec_page, sizeof(exec));
+                for (unsigned e = 0; e < exec_count; e++) {
+                    uint32_t exec_addr = exec[e] + (uint32_t)(a - page_base);
+                    for (unsigned w = 0; w < mem->code->watch_count; w++)
+                        mem->code->watch[w].fn(mem->code->watch[w].ctx,
+                                               exec_addr, (uint32_t)(hi - a),
+                                               kinds);
+                }
+            }
+        }
+        a = page_end;
+    }
+}
+
+/* A store whose store-table entry is NULL but whose page is RAM: a page
+ * holding translated code. Write it, and invalidate only when bytes change. */
+static bool code_page_store(xtensa_mem_t *mem, uint32_t addr,
+                            const void *val, unsigned n) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (!page) return false;
+    uint8_t *p = page + (addr & 0xFFFu);
+    if (memcmp(p, val, n) == 0) return true;
+    memcpy(p, val, n);
+    mem_code_modified(mem, addr, n);
+    return true;
 }
 
 static int page_table_init(xtensa_mem_t *mem) {
@@ -286,6 +500,11 @@ void mem_destroy(xtensa_mem_t *mem) {
     free(mem->rtc_slow);
     free(mem->psram);
     free(mem->mmio);
+    if (mem->code) {
+        for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++)
+            free(mem->code->pages[i]);
+        free(mem->code);
+    }
     free(mem);
 }
 
@@ -336,8 +555,8 @@ int mem_map_backing_range(xtensa_mem_t *mem, uint32_t virtual_addr,
         return -1;
 
     for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE)
-        mem->page_table[(virtual_addr + offset) >> 12] =
-            host + backing_offset + offset;
+        mem_page_set(mem, (virtual_addr + offset) >> 12,
+                     host + backing_offset + offset);
     return 0;
 }
 
@@ -348,7 +567,7 @@ int mem_unmap_range(xtensa_mem_t *mem, uint32_t virtual_addr, uint32_t size) {
         return -1;
 
     for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE)
-        mem->page_table[(virtual_addr + offset) >> 12] = NULL;
+        mem_page_set(mem, (virtual_addr + offset) >> 12, NULL);
     return 0;
 }
 
@@ -453,6 +672,7 @@ uint32_t mem_unmapped_first(const xtensa_mem_t *mem) {
 }
 
 void mem_write8_slow(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
+    if (code_page_store(mem, addr, &val, 1u)) return;
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
     if (h && h->masked_write) {
@@ -465,6 +685,7 @@ void mem_write8_slow(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
 }
 
 void mem_write16_slow(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
+    if (code_page_store(mem, addr, &val, 2u)) return;
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
     if ((xaddr & 3u) == 3u) {
         mem_write8_slow(mem, addr, (uint8_t)val);
@@ -482,6 +703,7 @@ void mem_write16_slow(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
 }
 
 void mem_write32_slow(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
+    if (code_page_store(mem, addr, &val, 4u)) return;
     uint32_t xaddr = translate_peripheral_alias(mem, addr);
     mmio_handler_t *h = mmio_lookup(mem, xaddr);
     if (h && h->masked_write)

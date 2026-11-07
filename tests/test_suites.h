@@ -8,6 +8,7 @@ void run_shift_tests(void);
 void run_move_tests(void);
 void run_loadstore_tests(void);
 void run_memory_tests(void);
+void run_code_coherence_tests(void);
 void run_flash_mmu_tests(void);
 void run_efuse_tests(void);
 void run_target_gpio_tests(void);

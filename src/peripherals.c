@@ -2492,8 +2492,8 @@ static void flash_mmu_apply_entry(esp32_periph_t *p, uint32_t entry,
                   physical <= backing_size &&
                   FLASH_MMU_PAGE_SIZE <= backing_size - physical;
     for (uint32_t off = 0; off < FLASH_MMU_PAGE_SIZE; off += PAGE_SIZE) {
-        p->mem->page_table[(vbase + off) >> 12] =
-            mapped ? backing + physical + off : NULL;
+        mem_page_set(p->mem, (vbase + off) >> 12,
+                     mapped ? backing + physical + off : NULL);
     }
 
     if (getenv("FLEXE_DBG_FLASH"))

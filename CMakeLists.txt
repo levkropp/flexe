@@ -255,6 +255,7 @@ set(TEST_SOURCES
     tests/test_move.c
     tests/test_loadstore.c
     tests/test_memory.c
+    tests/test_code_coherence.c
     tests/test_flash_mmu.c
     tests/test_efuse.c
     tests/test_gpio.c

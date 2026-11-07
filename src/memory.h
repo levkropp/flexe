@@ -51,7 +51,18 @@ struct xtensa_mem {
      * why it is worth counting anyway. */
     uint64_t unmapped_count;
     uint32_t unmapped_first;
+
+    /* Translated-code tracking (see mem_code_protect). Opaque here. */
+    struct mem_code_state *code;
+
     uint8_t *page_table[MEM_PAGE_TABLE_SIZE];
+
+    /* Every store fast path uses this table. It equals page_table except
+     * that RAM pages holding translated code (through every guest alias of
+     * the same bytes) are NULL, so stores to them take the slow path, which
+     * invalidates stale translations. Always update both through
+     * mem_page_set(). */
+    uint8_t *write_page_table[MEM_PAGE_TABLE_SIZE];
 };
 
 typedef struct xtensa_mem xtensa_mem_t;
@@ -88,6 +99,40 @@ int mem_map_backing_range(xtensa_mem_t *mem, uint32_t virtual_addr,
                           flexe_mem_backing_t backing,
                           uint32_t backing_offset, uint32_t size);
 int mem_unmap_range(xtensa_mem_t *mem, uint32_t virtual_addr, uint32_t size);
+
+/* Set one 4 KiB page-table entry (host may be NULL), keeping the store table
+ * consistent with translated-code protection. Callers outside memory.c that
+ * swap pages must use this instead of writing page_table directly. */
+void mem_page_set(xtensa_mem_t *mem, uint32_t page_index, uint8_t *host);
+
+/* ===== Translated-code coherence =====
+ *
+ * Execution engines cache work per instruction address (the predecode table,
+ * JIT blocks). When the guest stores into RAM holding such code, the cached
+ * translation must be dropped, as on hardware the next fetch sees the new
+ * bytes. An engine marks the guest range it translated with
+ * mem_code_protect(); stores into those bytes through any guest alias then
+ * reach the slow path, and when they change the bytes every registered
+ * watcher whose code kind covers them is told the executable address range.
+ * Ordinary stores keep their fast path; only RAM pages holding translated
+ * code are diverted, and a diverted store that changes no marked chunk only
+ * costs the slow-path call. */
+typedef enum {
+    MEM_CODE_PREDECODE = 1u << 0,
+    MEM_CODE_JIT       = 1u << 1,
+} mem_code_kind_t;
+
+typedef void (*mem_code_watch_fn)(void *ctx, uint32_t exec_addr,
+                                  uint32_t len, unsigned kinds);
+
+/* Mark [exec_addr, exec_addr + len) as translated code of `kind`. Ranges not
+ * backed by writable RAM are ignored. */
+void mem_code_protect(xtensa_mem_t *mem, uint32_t exec_addr, uint32_t len,
+                      mem_code_kind_t kind);
+/* Forget every mark of `kind`, e.g. after a JIT flush. Pages stay diverted. */
+void mem_code_clear(xtensa_mem_t *mem, mem_code_kind_t kind);
+int  mem_code_watch_add(xtensa_mem_t *mem, mem_code_watch_fn fn, void *ctx);
+void mem_code_watch_remove(xtensa_mem_t *mem, mem_code_watch_fn fn, void *ctx);
 
 /* Bulk load */
 int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len);
@@ -142,9 +187,19 @@ static inline const uint8_t *mem_get_ptr(xtensa_mem_t *mem, uint32_t addr) {
 }
 
 /* Resolve guest address to writable host pointer.
- * Returns NULL for MMIO or unmapped addresses. */
+ * Returns NULL for MMIO or unmapped addresses. Writes through it bypass
+ * translated-code coherence; code-carrying writers use mem_get_ptr_store(). */
 static inline uint8_t *mem_get_ptr_w(xtensa_mem_t *mem, uint32_t addr) {
     uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1))
+        return page + (addr & 0xFFF);
+    return NULL;
+}
+
+/* Host pointer for a guest store, or NULL when the store must take the slow
+ * path (MMIO, unmapped, or RAM holding translated code). */
+static inline uint8_t *mem_get_ptr_store(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->write_page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1))
         return page + (addr & 0xFFF);
     return NULL;
@@ -232,7 +287,7 @@ static inline void mem_journal_note(xtensa_mem_t *mem, uint32_t addr,
 
 static inline __attribute__((always_inline)) void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
     if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 1);
-    uint8_t *page = mem->page_table[addr >> 12];
+    uint8_t *page = mem->write_page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         page[addr & 0xFFF] = val;
         return;
@@ -242,7 +297,7 @@ static inline __attribute__((always_inline)) void mem_write8(xtensa_mem_t *mem, 
 
 static inline __attribute__((always_inline)) void mem_write16(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
     if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 2);
-    uint8_t *page = mem->page_table[addr >> 12];
+    uint8_t *page = mem->write_page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         memcpy(page + (addr & 0xFFF), &val, 2);
         return;
@@ -272,7 +327,7 @@ void mem_write32_observed(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
 static inline __attribute__((always_inline)) void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
     if (__builtin_expect(g_mem_write32_observe, 0))
         mem_write32_observed(mem, addr, val);
-    uint8_t *page = mem->page_table[addr >> 12];
+    uint8_t *page = mem->write_page_table[addr >> 12];
     if (__builtin_expect(page != NULL, 1)) {
         memcpy(page + (addr & 0xFFF), &val, 4);
         return;

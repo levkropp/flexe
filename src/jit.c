@@ -156,6 +156,7 @@ static bool jit_plain_sr(int sr, jit_plain_sr_t *out) {
 
 /* Memory struct offsets */
 #define MEM_OFF_PAGE_TABLE  offsetof(xtensa_mem_t, page_table)
+#define MEM_OFF_WRITE_PAGE_TABLE offsetof(xtensa_mem_t, write_page_table)
 
 /* JIT state */
 struct jit_state {
@@ -226,6 +227,7 @@ struct jit_state {
      * not overwrite the code cache until that block has returned to C. */
     unsigned      execution_depth;
     bool          invalidate_pending;
+    xtensa_mem_t *mem;           /* memory whose stores invalidate blocks */
 
     /* FLEXE_JIT_NOCHAIN debug: skip chain recording (all exits via epilogue) */
     int           no_chain;
@@ -1076,6 +1078,11 @@ static void emit_ps_irq_check(emit_t *e) {
 static void emit_pt_load(emit_t *e, int idx32) {
     emit_load64_index(e, RAX, REG_MEM, idx32, MEM_OFF_PAGE_TABLE);
 }
+/* Stores use the store table: NULL on pages holding translated code. */
+static void emit_pt_load_store(emit_t *e, int idx32) {
+    emit_load64_index(e, RAX, REG_MEM, idx32,
+                      (int32_t)MEM_OFF_WRITE_PAGE_TABLE);
+}
 static int emit_pt_null_jz(emit_t *e) {
     emit_test_reg64(e, RAX, RAX);
     return emit_jcc_rel32(e, CC_E);
@@ -1102,6 +1109,14 @@ static void emit_pt_load(emit_t *e, int idx32) {
     emit8(e, modrm(2, RAX, 4));  /* mod=10, reg=rax, rm=SIB */
     emit8(e, sib(3, idx32, R14 & 7));  /* scale=8, index=idx, base=r14 */
     emit32(e, (uint32_t)MEM_OFF_PAGE_TABLE);
+}
+/* Stores use the store table: NULL on pages holding translated code. */
+static void emit_pt_load_store(emit_t *e, int idx32) {
+    emit8(e, rex(1, 0, 0, (R14 >> 3) & 1));
+    emit8(e, 0x8B);
+    emit8(e, modrm(2, RAX, 4));
+    emit8(e, sib(3, idx32, R14 & 7));
+    emit32(e, (uint32_t)MEM_OFF_WRITE_PAGE_TABLE);
 }
 static int emit_pt_null_jz(emit_t *e) {
     /* test rax, rax */
@@ -1358,8 +1373,8 @@ static void emit_mem_write32(emit_t *e, int addr_reg, int val_reg,
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
 
-    /* rax = mem->page_table[ecx] */
-    emit_pt_load(e, RCX);
+    /* rax = mem->write_page_table[ecx] */
+    emit_pt_load_store(e, RCX);
 
     int slow_patch = emit_pt_null_jz(e);
 
@@ -1484,7 +1499,7 @@ static void emit_mem_write8(emit_t *e, int addr_reg, int val_reg,
     }
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
-    emit_pt_load(e, RCX);
+    emit_pt_load_store(e, RCX);
     int slow_patch = emit_pt_null_jz(e);
     emit_mov_reg32_reg32(e, RDX, addr_reg);
     emit_and_reg32_imm32(e, RDX, 0xFFF);
@@ -1522,7 +1537,7 @@ static void emit_mem_write16(emit_t *e, int addr_reg, int val_reg,
     }
     emit_mov_reg32_reg32(e, RCX, addr_reg);
     emit_shr_reg32_imm(e, RCX, 12);
-    emit_pt_load(e, RCX);
+    emit_pt_load_store(e, RCX);
     int slow_patch = emit_pt_null_jz(e);
     emit_mov_reg32_reg32(e, RDX, addr_reg);
     emit_and_reg32_imm32(e, RDX, 0xFFF);
@@ -4604,6 +4619,8 @@ void jit_install_hook(jit_state_t *jit, xtensa_cpu_t *cpu) {
     cpu->record_branch_targets = true;
     cpu->code_invalidate = jit_code_invalidate;
     cpu->code_invalidate_ctx = jit;
+    jit->mem = cpu->mem;
+    xtensa_code_watch_attach(cpu);
 
     /* The bitmap stays the same — JIT bits are added on top of ROM stub bits.
      * The interpreter's bitmap test will fire for both stubs and JIT blocks. */
@@ -4639,6 +4656,9 @@ void jit_flush(jit_state_t *jit) {
     jit->dt_count = 0;
     jit->compile_disabled = false;
     jit->invalidate_pending = false;
+    /* No translation remains, so stores need not report JIT bytes until
+     * blocks are compiled again. */
+    if (jit->mem) mem_code_clear(jit->mem, MEM_CODE_JIT);
     /* Reset code cache but preserve epilogue stub. Re-emit it to be safe. */
     jit_wx_write_begin();
     emit_t stub_e;
@@ -4739,6 +4759,13 @@ static void jit_compile_now(jit_state_t *jit, xtensa_cpu_t *cpu,
     b->chain_entry = (void *)jit->last_chain_entry;
     b->guest_insns = (uint16_t)scan.count;
     b->end_pc = scan.end_pc;
+
+    /* A guest store that changes these bytes must drop this translation.
+     * Only writable RAM is tracked; flash and ROM ranges are ignored. */
+    if (scan.end_pc > pc) {
+        jit->mem = cpu->mem;
+        mem_code_protect(cpu->mem, pc, scan.end_pc - pc, MEM_CODE_JIT);
+    }
 
     /* Set JIT bitmap bit so the interpreter's hook fires for this PC */
     jit_bitmap_set(jit, pc);

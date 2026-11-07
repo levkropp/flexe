@@ -77,7 +77,13 @@ board layout without depending on a firmware name or entry point.
 | official rom elf | [`rom_elf.c`](src/rom_elf.c) loads immutable code plus linker-described data/bss and resolves rom abi state |
 | ordinary ram access | [`memory.c`](src/memory.c) uses a direct 4 kib page lookup and host load/store |
 | device access | a memory miss enters registered page/range mmio handlers |
-| code changes | flash writes and mmu remaps invalidate decoded and native code |
+| code changes | flash writes and mmu remaps invalidate decoded and native code; guest stores that change ram holding translated code, through any alias, invalidate it too |
+
+stores use a second page table in which ram pages holding translated code
+(predecoded or compiled) are absent through every guest alias, so those
+stores reach a slow path. it writes the bytes and, only when they change a
+32-byte chunk that holds translated code, invalidates it. other stores keep
+the direct lookup.
 
 the loader validates chip and flash geometry, copies internal-memory segments,
 and maps flash-backed segments through the target mmu. esp-reserved non-loaded
@@ -116,6 +122,7 @@ a target translation profile decides which code is eligible.
 | window and loop context | include architectural context in block keys |
 | scheduler, timer, interrupt, debugger, or cycle budget | bound block chaining at safepoints |
 | flash write or mmu remap | invalidate affected native code |
+| guest store into translated ram | flush native code and stop the running chain at its next block |
 | `--jit-verify` | journal ram, replay eligible blocks, and compare architectural state |
 
 mmio blocks are excluded from differential replay because reads/writes may

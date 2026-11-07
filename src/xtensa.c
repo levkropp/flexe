@@ -323,7 +323,47 @@ void xtensa_predecode_build(xtensa_cpu_t *cpu) {
     }
     fprintf(stderr, "[predecode] Built table: %u entries, %u MB (%u MB flash coverage)\n",
             count, (uint32_t)(PREDECODE_SIZE * 4 / (1024*1024)), PREDECODE_FLASH_MB);
+    /* Guest stores into the table's RAM (IRAM, RTC fast memory) must drop
+     * the entries they change. Flash and ROM ranges are not writable. */
+    xtensa_code_watch_attach(cpu);
+    mem_code_protect(cpu->mem, PREDECODE_BASE, PREDECODE_END - PREDECODE_BASE,
+                     MEM_CODE_PREDECODE);
 #endif
+}
+
+/* Translated-code coherence: guest stores changed bytes this CPU's engines
+ * cached. Drop the predecode entries (a changed byte can belong to an
+ * instruction starting up to two bytes earlier) and, for JIT-translated
+ * bytes, the JIT's translations. A native chain in progress stops at its next
+ * block boundary, so no block compiled from the old bytes runs again. */
+static void xtensa_code_modified(void *ctx, uint32_t exec_addr, uint32_t len,
+                                 unsigned kinds) {
+    xtensa_cpu_t *cpu = ctx;
+#if PREDECODE_SIZE > 0
+    if ((kinds & MEM_CODE_PREDECODE) && cpu->predecode) {
+        uint64_t start = exec_addr >= 2u ? (uint64_t)exec_addr - 2u : 0u;
+        uint64_t end = (uint64_t)exec_addr + len;
+        if (start < PREDECODE_BASE) start = PREDECODE_BASE;
+        if (end > PREDECODE_END) end = PREDECODE_END;
+        if (start < end)
+            memset(cpu->predecode + (size_t)(start - PREDECODE_BASE), 0,
+                   (size_t)(end - start) * sizeof(uint32_t));
+    }
+#endif
+    if ((kinds & MEM_CODE_JIT) && cpu->code_invalidate) {
+        cpu->code_invalidate(cpu->code_invalidate_ctx, exec_addr, len);
+        cpu->jit_chain_limit = 0u;
+    }
+}
+
+void xtensa_code_watch_attach(xtensa_cpu_t *cpu) {
+    if (cpu && cpu->mem)
+        (void)mem_code_watch_add(cpu->mem, xtensa_code_modified, cpu);
+}
+
+void xtensa_code_watch_detach(xtensa_cpu_t *cpu) {
+    if (cpu && cpu->mem)
+        mem_code_watch_remove(cpu->mem, xtensa_code_modified, cpu);
 }
 
 void xtensa_invalidate_code(xtensa_cpu_t *cpu, uint32_t addr, size_t len) {
@@ -3925,7 +3965,10 @@ window_context_changed:
         guard_windows = hazard && XT_PS_WOE(cpu->ps) && !XT_PS_EXCM(cpu->ps);
 memory_access:
         if (width) {
-            uint8_t *page = cpu->mem->page_table[addr >> 12];
+            /* Stores to pages holding translated code leave the cached path
+             * so the exact interpreter reaches the coherence slow path. */
+            uint8_t *page = store ? cpu->mem->write_page_table[addr >> 12]
+                                  : cpu->mem->page_table[addr >> 12];
             unsigned offset = addr & 0xFFFu;
             if (!page || offset + width > 0x1000u) break;
             uint8_t *ptr = page + offset;

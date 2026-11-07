@@ -97,12 +97,15 @@ static void window_hazard_refresh_accel(xtensa_cpu_t *cpu) {
         (uint8_t)(((windows | (windows << 16)) >> shift) & 7u);
 }
 
+/* Host pointer for a save area within one page. A spill (store) uses the
+ * store table, so a page holding translated code takes the exact guest
+ * path and its coherence checks. */
 static uint8_t *ram_range(xtensa_mem_t *mem, uint32_t addr,
-                          unsigned bytes) {
+                          unsigned bytes, bool store) {
     if (bytes == 0u || addr > UINT32_MAX - (bytes - 1u) ||
         (addr >> 12) != ((addr + bytes - 1u) >> 12))
         return NULL;
-    return mem_get_ptr_w(mem, addr);
+    return store ? mem_get_ptr_store(mem, addr) : mem_get_ptr_w(mem, addr);
 }
 
 /* Native equivalent of the six canonical WindowOverflow/WindowUnderflow
@@ -126,7 +129,8 @@ bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
      * Resolving each area once is materially cheaper than one page-table
      * lookup per vector instruction.  Cross-page and observed writes retain
      * the exact guest implementation. */
-    uint8_t *core_host = ram_range(cpu->mem, frame_top - 16u, 16u);
+    uint8_t *core_host = ram_range(cpu->mem, frame_top - 16u, 16u,
+                                   !underflow);
     if (!core_host) return false;
 
     uint32_t core[4];
@@ -138,7 +142,7 @@ bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
             memcpy(&core[i], core_host + i * 4u, sizeof(core[i]));
         if (register_count > 4u) {
             if (core[1] < 12u) return false;
-            uint8_t *link = ram_range(cpu->mem, core[1] - 12u, 4u);
+            uint8_t *link = ram_range(cpu->mem, core[1] - 12u, 4u, false);
             if (!link) return false;
             memcpy(&extra_top, link, sizeof(extra_top));
         }
@@ -148,7 +152,7 @@ bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
         if (register_count > 4u) {
             uint32_t stack = ar_read(cpu, 1);
             if (stack < 12u) return false;
-            uint8_t *link = ram_range(cpu->mem, stack - 12u, 4u);
+            uint8_t *link = ram_range(cpu->mem, stack - 12u, 4u, false);
             if (!link) return false;
             memcpy(&extra_top, link, sizeof(extra_top));
         }
@@ -159,7 +163,7 @@ bool xtensa_fast_window_vector(xtensa_cpu_t *cpu, unsigned register_count,
         uint32_t extra_offset = register_count == 8u ? 32u : 48u;
         if (extra_top < extra_offset) return false;
         extra_host = ram_range(cpu->mem, extra_top - extra_offset,
-                               extra_count * 4u);
+                               extra_count * 4u, !underflow);
         if (!extra_host) return false;
         for (unsigned i = 0; i < extra_count; i++) {
             if (underflow)

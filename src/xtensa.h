@@ -704,6 +704,12 @@ void xtensa_cpu_reset_for_target(xtensa_cpu_t *cpu,
                                  const flexe_target_desc_t *target);
 void xtensa_predecode_build(xtensa_cpu_t *cpu);  /* Pre-decode instruction memory */
 void xtensa_invalidate_code(xtensa_cpu_t *cpu, uint32_t addr, size_t len);
+/* Have guest stores that change this CPU's translated code invalidate it
+ * (predecode entries, and translations through cpu->code_invalidate). The
+ * predecode build and jit_install_hook attach automatically; detach before
+ * a CPU that shares memory goes away. */
+void xtensa_code_watch_attach(xtensa_cpu_t *cpu);
+void xtensa_code_watch_detach(xtensa_cpu_t *cpu);
 int  xtensa_step(xtensa_cpu_t *cpu);
 int  xtensa_run(xtensa_cpu_t *cpu, int max_cycles);
 int  xtensa_disasm(const xtensa_cpu_t *cpu, uint32_t addr, char *buf, int bufsize);

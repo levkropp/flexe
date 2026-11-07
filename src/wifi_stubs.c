@@ -2275,7 +2275,7 @@ static bool wifi_tick_ethernet_rx(wifi_stubs_t *ws, xtensa_cpu_t *cpu,
             wifi_pop_pending_ethernet(ws);
             return true;
         }
-        cpu->mem->page_table[page_index] = rx->page;
+        mem_page_set(cpu->mem, page_index, rx->page);
     }
 
     memcpy(rx->page, frame->bytes, frame->len);
@@ -3123,7 +3123,7 @@ void wifi_stubs_destroy(wifi_stubs_t *ws)
             uint32_t page = (WIFI_ETHERNET_RX_BASE >> 12) + i;
             if (ws->cpu->mem->page_table[page] ==
                 ws->ethernet_rx_slot[i].page)
-                ws->cpu->mem->page_table[page] = NULL;
+                mem_page_set(ws->cpu->mem, page, NULL);
             free(ws->ethernet_rx_slot[i].page);
         }
     }

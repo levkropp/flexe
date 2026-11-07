@@ -708,7 +708,7 @@ static void stub_strcpy(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t off = 0;
     while (1) {
         const uint8_t *sp = mem_get_ptr(cpu->mem, src + off);
-        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        uint8_t *dp = mem_get_ptr_store(cpu->mem, dst + off);
         if (sp && dp) {
             uint32_t rem_s = 0x1000 - ((src + off) & 0xFFF);
             uint32_t rem_d = 0x1000 - ((dst + off) & 0xFFF);
@@ -739,7 +739,7 @@ static void stub_strncpy(xtensa_cpu_t *cpu, void *ctx) {
     uint32_t off = 0;
     int pad = 0;
     while (off < n) {
-        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        uint8_t *dp = mem_get_ptr_store(cpu->mem, dst + off);
         uint32_t rem_d = 0x1000 - ((dst + off) & 0xFFF);
         uint32_t chunk = n - off;
         if (chunk > rem_d) chunk = rem_d;
@@ -801,7 +801,7 @@ static void stub_strlcpy(xtensa_cpu_t *cpu, void *ctx) {
             uint32_t chunk = copy - off;
             if (chunk > rem_d) chunk = rem_d;
             if (chunk > rem_s) chunk = rem_s;
-            uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+            uint8_t *dp = mem_get_ptr_store(cpu->mem, dst + off);
             const uint8_t *sp = mem_get_ptr(cpu->mem, src + off);
             if (dp && sp) { memcpy(dp, sp, chunk); off += chunk; }
             else { mem_write8(cpu->mem, dst + off, mem_read8(cpu->mem, src + off)); off++; }
@@ -1044,7 +1044,7 @@ static void stub_memcpy(xtensa_cpu_t *cpu, void *ctx) {
         uint32_t chunk = len - off;
         if (chunk > rem_d) chunk = rem_d;
         if (chunk > rem_s) chunk = rem_s;
-        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        uint8_t *dp = mem_get_ptr_store(cpu->mem, dst + off);
         const uint8_t *sp = mem_get_ptr(cpu->mem, src + off);
         if (dp && sp) {
             memcpy(dp, sp, chunk);
@@ -1067,7 +1067,7 @@ static void stub_memset(xtensa_cpu_t *cpu, void *ctx) {
         uint32_t rem = 0x1000 - ((dst + off) & 0xFFF);
         uint32_t chunk = len - off;
         if (chunk > rem) chunk = rem;
-        uint8_t *dp = mem_get_ptr_w(cpu->mem, dst + off);
+        uint8_t *dp = mem_get_ptr_store(cpu->mem, dst + off);
         if (dp) {
             memset(dp, (int)val, chunk);
             off += chunk;

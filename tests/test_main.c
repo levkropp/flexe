@@ -166,6 +166,7 @@ int main(int argc, char **argv)
     run_branch_tests();
     run_loop_tests();
     run_integration_tests();
+    run_code_coherence_tests();
     run_window_tests();
     run_guest_call_tests();
     run_exception_tests();

@@ -45,7 +45,7 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     memset(guest_stack, 0, sizeof(guest_stack));
     uint32_t guest_stack_page = GUEST_CALL_STACK_BASE >> 12;
     uint8_t *saved_stack_page = cpu->mem->page_table[guest_stack_page];
-    cpu->mem->page_table[guest_stack_page] = guest_stack;
+    mem_page_set(cpu->mem, guest_stack_page, guest_stack);
 
     uint32_t save_ar[64];
     uint32_t save_pc = cpu->pc;
@@ -184,7 +184,7 @@ int guest_call8(xtensa_cpu_t *cpu, uint32_t entry,
     cpu->accelerated_blocks = save_accelerated;
 
     cpu->in_guest_call--;
-    cpu->mem->page_table[guest_stack_page] = saved_stack_page;
+    mem_page_set(cpu->mem, guest_stack_page, saved_stack_page);
     if (!completed)
         return -2;
     if (retval_out)
