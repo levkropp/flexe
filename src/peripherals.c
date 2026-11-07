@@ -1407,6 +1407,8 @@ typedef struct {
     uint16_t rx_head;
     uint16_t rx_tail;
     uint16_t rx_count;
+    esp32_periph_t *owner;
+    int number;
     uart_tx_cb cb;
     void    *cb_ctx;
     uint32_t shadow[64];
@@ -2790,6 +2792,43 @@ static void uart_intr_update(esp32_periph_t *p, int uart_num) {
     (void)mask;
 }
 
+/* Classic ESP32 timeout runs on the baud clock after incoming data stops.
+ * Immediate host-injection-only timeout loses tail bytes when an ISR clears
+ * TOUT while more bytes remain in the FIFO. Use the existing event clock so
+ * interpreter, JIT and WAITI all see the same hardware-level condition. */
+static void uart_rx_timeout_fire(void *ctx) {
+    uart_state_t *uart = ctx;
+    esp32_periph_t *p = uart->owner;
+    const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
+    if (uart->clock_enabled && !uart->reset_asserted && uart->rx_count &&
+        (uart->shadow[0x24 / 4] & ip->rx_timeout_enable_mask)) {
+        uart->int_raw |= UART_RXFIFO_TOUT_INT;
+        uart_intr_update(p, uart->number);
+    }
+}
+
+static void uart_arm_rx_timeout(esp32_periph_t *p, int uart_num) {
+    if (!(p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
+        return;
+    uart_state_t *uart = &p->uart[uart_num];
+    periph_cancel_deferred(p, uart_rx_timeout_fire, uart);
+    uint32_t conf1 = uart->shadow[0x24 / 4];
+    if (!uart->clock_enabled || uart->reset_asserted || !uart->rx_count ||
+        !(conf1 & p->target->uart_ip.rx_timeout_enable_mask)) return;
+    uint64_t threshold = (conf1 >> 24) & 127u;
+    uint32_t clkdiv = uart->shadow[0x14 / 4];
+    uint64_t divider16 = ((uint64_t)(clkdiv & 0xfffffu) << 4) |
+                         ((clkdiv >> 20) & 15u);
+    /* ESP-IDF 4.4 uart_ll_set_rx_tout: APB threshold counts baud/8;
+     * REF_TICK threshold uses an eightfold hardware workaround. */
+    bool apb = (uart->shadow[0x20 / 4] & (1u << 27)) != 0u;
+    uint64_t numerator = divider16 * threshold * (apb ? 8u : 1u);
+    uint64_t denominator = apb ? (16u * 80u) : (16u * 8u);
+    uint64_t delay_us = (numerator + denominator - 1u) / denominator;
+    if (!delay_us) delay_us = 1u;
+    (void)periph_schedule_deferred_us(p, delay_us, uart_rx_timeout_fire, uart);
+}
+
 static void uart_refresh_level_conditions(esp32_periph_t *p, int uart_num) {
     const flexe_uart_ip_desc_t *ip = p ? &p->target->uart_ip : NULL;
     if (!uart_num_valid(p, uart_num)) return;
@@ -2838,6 +2877,7 @@ static void uart_reset_state(esp32_periph_t *p, unsigned uart_num) {
     uart->rx_head = 0u;
     uart->rx_tail = 0u;
     uart->rx_count = 0u;
+    periph_cancel_deferred(p, uart_rx_timeout_fire, uart);
     memset(uart->shadow, 0, sizeof(uart->shadow));
     uart->shadow[ip->date_offset / 4u] = ip->date_reset;
     uart->int_raw = ip->interrupt_raw_reset;
@@ -2885,6 +2925,8 @@ static uint32_t uart_read(void *ctx, uint32_t addr) {
         uint8_t byte = uart->rx[uart->rx_tail];
         uart->rx_tail = (uint16_t)((uart->rx_tail + 1) % UART_RX_FIFO_SIZE);
         uart->rx_count--;
+        if (!uart->rx_count)
+            periph_cancel_deferred(p, uart_rx_timeout_fire, uart);
         return byte;
     }
     case 0x04: return uart->int_raw;                    /* INT_RAW */
@@ -2924,6 +2966,7 @@ static void uart_write(void *ctx, uint32_t addr, uint32_t val) {
         uart_intr_update(p, uart_num);
     } else if (off == 0x10) {       /* INT_CLR (W1TC) */
         uart->int_raw &= ~(val & ip->interrupt_valid_mask);
+        if (val & UART_RXFIFO_TOUT_INT) uart_arm_rx_timeout(p, uart_num);
         /* FIFO threshold and TX empty are level-triggered. */
         uart_refresh_level_conditions(p, uart_num);
         uart_intr_update(p, uart_num);
@@ -2931,8 +2974,9 @@ static void uart_write(void *ctx, uint32_t addr, uint32_t val) {
         if (off / 4 < 64) uart->shadow[off / 4] = val;
         if (off == 0x24) {          /* CONF1 threshold/timeout controls */
             uart_refresh_level_conditions(p, uart_num);
-            if (uart->rx_count > 0 &&
-                (val & ip->rx_timeout_enable_mask))
+            if (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)
+                uart_arm_rx_timeout(p, uart_num);
+            else if (uart->rx_count > 0 && (val & ip->rx_timeout_enable_mask))
                 uart->int_raw |= UART_RXFIFO_TOUT_INT;
             uart_intr_update(p, uart_num);
         }
@@ -2958,6 +3002,8 @@ static int uart_register_target(esp32_periph_t *p) {
                                     uart_read, uart_write, p) != 0)
             return -1;
         tx_signal_seen[desc->tx_output_signal] = true;
+        p->uart[uart_num].owner = p;
+        p->uart[uart_num].number = uart_num;
         p->uart[uart_num].clock_enabled = true;
         uart_reset_state(p, (unsigned)uart_num);
     }
@@ -16658,9 +16704,12 @@ size_t periph_uart_rx_inject_num(esp32_periph_t *p, int uart_num,
      * bursts also assert the FIFO threshold. */
     uint32_t conf1 = uart->shadow[0x24 / 4];
     uart_refresh_level_conditions(p, uart_num);
-    if (accepted > dma_accepted &&
-        (conf1 & ip->rx_timeout_enable_mask))
-        uart->int_raw |= UART_RXFIFO_TOUT_INT;
+    if (accepted > dma_accepted) {
+        if (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)
+            uart_arm_rx_timeout(p, uart_num);
+        else if (conf1 & ip->rx_timeout_enable_mask)
+            uart->int_raw |= UART_RXFIFO_TOUT_INT;
+    }
     if (accepted < len)
         uart->int_raw |= UART_RXFIFO_OVF_INT;
     uart_intr_update(p, uart_num);
