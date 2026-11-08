@@ -134,6 +134,11 @@ static const flexe_target_desc_t TARGETS[] = {
             .mem_rx_write_shift = 13u,
             .date_offset = 0x78u,
             .date_reset = 0x15122500u,
+            /* CONF1.RX_TOUT_THRHD, in eight baud bit-times on APB. */
+            .rx_timeout_threshold_offset = 0x24u,
+            .rx_timeout_threshold_mask = 0x7Fu,
+            .rx_timeout_threshold_shift = 24u,
+            .rx_timeout_unit_bits = 8u,
         },
         .uart = {
             { .base = 0x3FF40000u, .interrupt_source = 34u,
