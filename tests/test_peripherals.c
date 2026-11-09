@@ -9,6 +9,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "test_classic_uart_timeout.h"
+
 /* i2c_reg.h I2C_SLAVE_ADDRESSED, in I2C_SR_REG. */
 #define I2C_SR_SLAVE_ADDRESSED_BIT (1u << 5)
 
@@ -2191,11 +2193,16 @@ TEST(uart_rx_timeout_interrupt) {
     periph_attach_cpus(p, &cpu0, NULL);
     periph_intr_matrix_set(p, 0, 5, 34); /* UART0 -> CPU interrupt 5 */
 
+    mem_write32(mem, 0x3FF40014, 80u);
+    mem_write32(mem, 0x3FF40020, 1u << 27);
+
     /* Enable RX timeout generation in CONF1 and its interrupt in INT_ENA. */
     mem_write32(mem, 0x3FF40024, (1u << 31) | (10u << 24) | 2u);
     mem_write32(mem, 0x3FF4000C, 1u << 8);
     const uint8_t input = 'X';
     ASSERT_EQ(periph_uart_rx_inject(p, &input, 1), 1u);
+    cpu0.ccount += 80u * xtensa_cpu_freq_mhz(&cpu0);
+    cpu0.periph_event(&cpu0);
     ASSERT_EQ(mem_read32(mem, 0x3FF40004) & (1u << 8), 1u << 8);
     ASSERT_EQ(mem_read32(mem, 0x3FF40008), 1u << 8);
     ASSERT_EQ(cpu0.interrupt & (1u << 5), 1u << 5);
@@ -2218,6 +2225,8 @@ TEST(uart2_rx_fifo_and_interrupt) {
     periph_intr_matrix_set(p, 0, 8, 36); /* UART2 -> external CPU interrupt 8 */
 
     const uint32_t base = 0x3FF6E000u;
+    mem_write32(mem, base + 0x14, 80u);
+    mem_write32(mem, base + 0x20, 1u << 27);
     mem_write32(mem, base + 0x24, (1u << 31) | (10u << 24) | 2u);
     mem_write32(mem, base + 0x0C,
                 (1u << 0) | (1u << 8));
@@ -2228,6 +2237,8 @@ TEST(uart2_rx_fifo_and_interrupt) {
     ASSERT_EQ(periph_uart_rx_pending(p), 0u);
     ASSERT_EQ(mem_read32(mem, base + 0x1C) & 0xFFu,
               sizeof(nmea) - 1);
+    cpu0.ccount += 80u * xtensa_cpu_freq_mhz(&cpu0);
+    cpu0.periph_event(&cpu0);
     ASSERT_EQ(mem_read32(mem, base + 0x08) & ((1u << 0) | (1u << 8)),
               (1u << 0) | (1u << 8));
     ASSERT_EQ(cpu0.interrupt & (1u << 8), 1u << 8);
@@ -7269,6 +7280,10 @@ void run_peripheral_tests(void) {
     RUN_TEST(uart_tx_done_interrupt);
     RUN_TEST(uart_rx_fifo_injection);
     RUN_TEST(uart_rx_timeout_interrupt);
+    RUN_TEST(classic_uart_timeout_holds_until_drained);
+    RUN_TEST(classic_uart_timeout_clock_units);
+    RUN_TEST(classic_uart_timeout_restart_enable_and_drain);
+    RUN_TEST(shared_uart_timeout_reset_cancels_pending);
     RUN_TEST(uart2_rx_fifo_and_interrupt);
     RUN_TEST(s3_uart_rx_timeout_waits_for_idle_threshold);
     RUN_TEST(s3_uart_rx_timeout_clear_waits_for_empty_fifo);

@@ -2840,6 +2840,7 @@ static uint64_t uart_rx_timeout_us(const esp32_periph_t *p,
                          ((clkdiv >> 20) & 0xFu);
     uint64_t sclk_hz = 80000000u;
     uint64_t sclk_div = 1u;
+    uint64_t unit_div = 1u;
     if (ip->clk_conf_offset) {
         uint32_t clk_conf = uart->shadow[ip->clk_conf_offset / 4u];
         switch ((clk_conf >> 20) & 3u) {
@@ -2848,15 +2849,23 @@ static uint64_t uart_rx_timeout_us(const esp32_periph_t *p,
         default: break;                      /* APB */
         }
         sclk_div = ((clk_conf >> 12) & 0xFFu) + 1u;
+    } else if ((p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) &&
+               !(uart->shadow[0x20u / 4u] & (1u << 27))) {
+        /* Classic REF_TICK is 1 MHz. ESP-IDF's eightfold threshold
+         * workaround makes each register unit one eighth of a baud bit.
+         * Keep that fraction until the final microsecond ceiling. */
+        sclk_hz = 1000000u;
+        bits = threshold;
+        unit_div = 8u;
     }
     uint64_t numerator, denominator;
     if (divider16 == 0u) {          /* unprogrammed divider: assume 115200 */
         numerator = bits * 1000000u;
-        denominator = 115200u;
+        denominator = 115200u * unit_div;
     } else {
         /* bit time = divider16 * sclk_div / (16 * sclk_hz) seconds */
         numerator = bits * divider16 * sclk_div * 1000000u;
-        denominator = 16u * sclk_hz;
+        denominator = 16u * sclk_hz * unit_div;
     }
     uint64_t us = (numerator + denominator - 1u) / denominator;
     return us ? us : 1u;
