@@ -2836,11 +2836,25 @@ static uint64_t uart_rx_timeout_us(const esp32_periph_t *p,
     uint64_t bits = threshold * (ip->rx_timeout_unit_bits ?
                                  ip->rx_timeout_unit_bits : 1u);
     uint32_t clkdiv = uart->shadow[0x14u / 4u];
+    if (!ip->clk_conf_offset &&
+        (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)) {
+        /* Classic ESP32, measured on a D0WD-V3 and a PICO-D4 (PR #6): one
+         * threshold unit is 8 * CLKDIV-integer APB (80 MHz) cycles whichever
+         * clock drives the baud generator, and the divider fraction is
+         * ignored. With APB that is eight bit times; with the 1 MHz REF_TICK
+         * it is a tenth of a bit, the TRM's "8 * REF_TICK / APB". */
+        bool ref_tick = !(uart->shadow[0x20u / 4u] & (1u << 27));
+        uint64_t int_div = clkdiv & 0xFFFFFu;
+        if (int_div == 0u)          /* unprogrammed divider: assume 115200 */
+            int_div = (ref_tick ? 1000000u : 80000000u) / 115200u;
+        uint64_t apb_cycles = bits * int_div;
+        uint64_t us = (apb_cycles + 79u) / 80u;
+        return us ? us : 1u;
+    }
     uint64_t divider16 = ((uint64_t)(clkdiv & 0xFFFFFu) << 4) |
                          ((clkdiv >> 20) & 0xFu);
     uint64_t sclk_hz = 80000000u;
     uint64_t sclk_div = 1u;
-    uint64_t unit_div = 1u;
     if (ip->clk_conf_offset) {
         uint32_t clk_conf = uart->shadow[ip->clk_conf_offset / 4u];
         switch ((clk_conf >> 20) & 3u) {
@@ -2849,23 +2863,15 @@ static uint64_t uart_rx_timeout_us(const esp32_periph_t *p,
         default: break;                      /* APB */
         }
         sclk_div = ((clk_conf >> 12) & 0xFFu) + 1u;
-    } else if ((p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) &&
-               !(uart->shadow[0x20u / 4u] & (1u << 27))) {
-        /* Classic REF_TICK is 1 MHz. ESP-IDF's eightfold threshold
-         * workaround makes each register unit one eighth of a baud bit.
-         * Keep that fraction until the final microsecond ceiling. */
-        sclk_hz = 1000000u;
-        bits = threshold;
-        unit_div = 8u;
     }
     uint64_t numerator, denominator;
     if (divider16 == 0u) {          /* unprogrammed divider: assume 115200 */
         numerator = bits * 1000000u;
-        denominator = 115200u * unit_div;
+        denominator = 115200u;
     } else {
         /* bit time = divider16 * sclk_div / (16 * sclk_hz) seconds */
         numerator = bits * divider16 * sclk_div * 1000000u;
-        denominator = 16u * sclk_hz * unit_div;
+        denominator = 16u * sclk_hz;
     }
     uint64_t us = (numerator + denominator - 1u) / denominator;
     return us ? us : 1u;

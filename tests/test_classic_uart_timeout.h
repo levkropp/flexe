@@ -80,18 +80,26 @@ TEST(classic_uart_timeout_holds_until_drained) {
 }
 
 TEST(classic_uart_timeout_clock_units) {
-    /* CLKDIV's fraction is in bits20..23. Retain fractions until rounding up.
-     * APB threshold units are eight bits; REF_TICK units are one eighth bit.
-     * The two zero-divider cases retain the shared model's 115200 fallback.
+    /* One threshold unit is 8 * CLKDIV-integer APB cycles (0.1 us per
+     * divider step) for either clock: eight bits with APB, a tenth of a bit
+     * with REF_TICK. CLKDIV's fraction (bits 20..23) is ignored. The
+     * zero-divider cases assume 115200 at the selected clock.
      */
     static const struct {
         bool apb; uint32_t divider, threshold, deadline_us;
     } cases[] = {
-        {true, 80u, 4u, 32u}, {false, 8u, 32u, 32u},
-        {true, 80u | (8u << 20), 1u, 9u},
-        {false, 8u | (8u << 20), 8u, 9u},
-        {true, 0u, 4u, 278u}, {false, 0u, 8u, 9u},
+        {true, 80u, 4u, 32u}, {false, 8u, 32u, 26u},
+        {true, 80u | (8u << 20), 1u, 8u},
+        {false, 8u | (8u << 20), 8u, 7u},
+        {true, 0u, 4u, 278u}, {false, 0u, 8u, 7u},
         {true, 80u, 0u, 1u},
+        /* Silicon: REF_TICK 9600 measured 10.40 us/unit, 115200 0.801 us/unit;
+         * APB 115200 measured about eight bit times per unit. */
+        {false, 104u | (3u << 20), 20u, 208u},
+        {false, 104u | (3u << 20), 120u, 1248u},
+        {false, 8u | (11u << 20), 20u, 16u},
+        {false, 8u | (11u << 20), 120u, 96u},
+        {true, 694u | (7u << 20), 20u, 1388u},
     };
     for (unsigned port = 0; port < 3; ++port) {
         for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
